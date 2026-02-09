@@ -127,6 +127,8 @@ pub fn generate_client(service_name: &str, schema: &ParsedSchema) -> TokenStream
                 &schema.structs,
                 &schema.enums,
                 None,
+                Some(&schema.response_variants),
+                false,
             )
         })
         .collect();
@@ -211,6 +213,12 @@ pub fn generate_client(service_name: &str, schema: &ParsedSchema) -> TokenStream
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Generate a single request method. Used for both top-level and scoped clients.
+///
+/// When `response_variants` is provided, the method returns a typed result
+/// (e.g., `Result<TrainStepResponseData>`) instead of the full response enum.
+/// The pairing convention is:
+/// - Top-level (`is_scoped=false`): request `foo` → response `fooResult`
+/// - Scoped (`is_scoped=true`): request `foo` → response `foo`
 pub fn generate_request_method(
     capnp_mod: &syn::Ident,
     req_type: &syn::Ident,
@@ -219,33 +227,115 @@ pub fn generate_request_method(
     structs: &[StructDef],
     enums: &[EnumDef],
     scope: Option<&ScopedMethodContext>,
+    response_variants: Option<&[UnionVariant]>,
+    is_scoped: bool,
 ) -> TokenStream {
     let method_name = format_ident!("{}", to_snake_case(&variant.name));
     let doc = format!("{} ({} variant)", to_snake_case(&variant.name), variant.type_name);
 
     // For scoped methods, we wrap in the outer init
     let (outer_req_setup, inner_accessor, parse_call) = if let Some(sc) = scope {
-        let factory_snake = format_ident!("{}", to_snake_case(&sc.factory_name));
-        let factory_init = format_ident!("init_{}", to_snake_case(&sc.factory_name));
-        let scope_setters: Vec<TokenStream> = sc.scope_fields.iter().map(|f| {
-            let setter_name = format_ident!("set_{}", to_snake_case(&f.name));
-            let field_name = format_ident!("{}", to_snake_case(&f.name));
-            match f.type_name.as_str() {
-                "Text" => quote! { inner.#setter_name(&self.#field_name); },
-                _ => quote! { inner.#setter_name(self.#field_name); },
-            }
-        }).collect();
+        if let Some(ref parent_ctx) = sc.parent {
+            // 3-level nested: parent init -> parent setters -> nested init -> nested setters
+            let parent_init = format_ident!("init_{}", to_snake_case(&parent_ctx.factory_name));
+            let parent_setters: Vec<TokenStream> = parent_ctx.scope_fields.iter().map(|f| {
+                let setter_name = format_ident!("set_{}", to_snake_case(&f.name));
+                let field_name = format_ident!("{}", to_snake_case(&f.name));
+                match f.type_name.as_str() {
+                    "Text" => quote! { mid.#setter_name(&self.#field_name); },
+                    _ => quote! { mid.#setter_name(self.#field_name); },
+                }
+            }).collect();
 
-        (
-            quote! {
-                let mut inner = req.#factory_init();
-                #(#scope_setters)*
-            },
-            Some(factory_snake),
-            quote! { Self::parse_scoped_response(&response) },
-        )
+            let nested_init = format_ident!("init_{}", to_snake_case(&sc.factory_name));
+            let nested_setters: Vec<TokenStream> = sc.scope_fields.iter().map(|f| {
+                let setter_name = format_ident!("set_{}", to_snake_case(&f.name));
+                let field_name = format_ident!("{}", to_snake_case(&f.name));
+                match f.type_name.as_str() {
+                    "Text" => quote! { inner.#setter_name(&self.#field_name); },
+                    _ => quote! { inner.#setter_name(self.#field_name); },
+                }
+            }).collect();
+
+            let factory_snake = format_ident!("{}", to_snake_case(&sc.factory_name));
+
+            (
+                quote! {
+                    let mut mid = req.#parent_init();
+                    #(#parent_setters)*
+                    let mut inner = mid.#nested_init();
+                    #(#nested_setters)*
+                },
+                Some(factory_snake),
+                quote! { Self::parse_scoped_response(&response) },
+            )
+        } else {
+            // 2-level scoped (existing behavior)
+            let factory_snake = format_ident!("{}", to_snake_case(&sc.factory_name));
+            let factory_init = format_ident!("init_{}", to_snake_case(&sc.factory_name));
+            let scope_setters: Vec<TokenStream> = sc.scope_fields.iter().map(|f| {
+                let setter_name = format_ident!("set_{}", to_snake_case(&f.name));
+                let field_name = format_ident!("{}", to_snake_case(&f.name));
+                match f.type_name.as_str() {
+                    "Text" => quote! { inner.#setter_name(&self.#field_name); },
+                    _ => quote! { inner.#setter_name(self.#field_name); },
+                }
+            }).collect();
+
+            (
+                quote! {
+                    let mut inner = req.#factory_init();
+                    #(#scope_setters)*
+                },
+                Some(factory_snake),
+                quote! { Self::parse_scoped_response(&response) },
+            )
+        }
     } else {
         (TokenStream::new(), None, quote! { Self::parse_response(&response) })
+    };
+
+    // Determine typed return info if response_variants are available
+    let typed_info = response_variants.and_then(|resp_vars| {
+        find_typed_return_info(&variant.name, resp_vars, structs, enums, is_scoped, response_type, &parse_call)
+    });
+
+    // Detect if this method returns StreamInfo (requires streaming call with ephemeral pubkey)
+    let is_streaming = response_variants
+        .and_then(|resp_vars| {
+            let expected_name = if is_scoped {
+                variant.name.clone()
+            } else {
+                format!("{}Result", variant.name)
+            };
+            resp_vars.iter().find(|v| v.name == expected_name)
+        })
+        .map(|v| v.type_name == "StreamInfo")
+        .unwrap_or(false);
+
+    // Generate return type and response handling
+    let (return_type, response_handling) = if let Some(ref info) = typed_info {
+        let ret = &info.return_type;
+        let match_body = &info.match_body;
+        (quote! { #ret }, quote! { #match_body })
+    } else {
+        (quote! { #response_type }, quote! { #parse_call })
+    };
+
+    // For streaming methods, add ephemeral_pubkey parameter and use call_with_options
+    let (extra_param, call_expr) = if is_streaming {
+        (
+            quote! { , ephemeral_pubkey: [u8; 32] },
+            quote! {
+                let opts = CallOptions::default().ephemeral_pubkey(ephemeral_pubkey);
+                let response = self.call_with_options(payload, opts).await?;
+            },
+        )
+    } else {
+        (
+            TokenStream::new(),
+            quote! { let response = self.call(payload).await?; },
+        )
     };
 
     match variant.type_name.as_str() {
@@ -258,7 +348,7 @@ pub fn generate_request_method(
             };
             quote! {
                 #[doc = #doc]
-                pub async fn #method_name(&self) -> anyhow::Result<#response_type> {
+                pub async fn #method_name(&self #extra_param) -> anyhow::Result<#return_type> {
                     let id = self.next_id();
                     let payload = hyprstream_rpc::serialize_message(|msg| {
                         let mut req = msg.init_root::<crate::#capnp_mod::#req_type::Builder>();
@@ -266,8 +356,8 @@ pub fn generate_request_method(
                         #outer_req_setup
                         #setter
                     })?;
-                    let response = self.call(payload).await?;
-                    #parse_call
+                    #call_expr
+                    #response_handling
                 }
             }
         }
@@ -280,7 +370,7 @@ pub fn generate_request_method(
             };
             quote! {
                 #[doc = #doc]
-                pub async fn #method_name(&self, value: &str) -> anyhow::Result<#response_type> {
+                pub async fn #method_name(&self, value: &str #extra_param) -> anyhow::Result<#return_type> {
                     let id = self.next_id();
                     let payload = hyprstream_rpc::serialize_message(|msg| {
                         let mut req = msg.init_root::<crate::#capnp_mod::#req_type::Builder>();
@@ -288,8 +378,8 @@ pub fn generate_request_method(
                         #outer_req_setup
                         #setter
                     })?;
-                    let response = self.call(payload).await?;
-                    #parse_call
+                    #call_expr
+                    #response_handling
                 }
             }
         }
@@ -302,7 +392,7 @@ pub fn generate_request_method(
             };
             quote! {
                 #[doc = #doc]
-                pub async fn #method_name(&self, value: &[u8]) -> anyhow::Result<#response_type> {
+                pub async fn #method_name(&self, value: &[u8] #extra_param) -> anyhow::Result<#return_type> {
                     let id = self.next_id();
                     let payload = hyprstream_rpc::serialize_message(|msg| {
                         let mut req = msg.init_root::<crate::#capnp_mod::#req_type::Builder>();
@@ -310,8 +400,8 @@ pub fn generate_request_method(
                         #outer_req_setup
                         #setter
                     })?;
-                    let response = self.call(payload).await?;
-                    #parse_call
+                    #call_expr
+                    #response_handling
                 }
             }
         }
@@ -324,7 +414,7 @@ pub fn generate_request_method(
             };
             quote! {
                 #[doc = #doc]
-                pub async fn #method_name(&self, value: bool) -> anyhow::Result<#response_type> {
+                pub async fn #method_name(&self, value: bool #extra_param) -> anyhow::Result<#return_type> {
                     let id = self.next_id();
                     let payload = hyprstream_rpc::serialize_message(|msg| {
                         let mut req = msg.init_root::<crate::#capnp_mod::#req_type::Builder>();
@@ -332,14 +422,15 @@ pub fn generate_request_method(
                         #outer_req_setup
                         #setter
                     })?;
-                    let response = self.call(payload).await?;
-                    #parse_call
+                    #call_expr
+                    #response_handling
                 }
             }
         }
         struct_name => {
             if let Some(s) = structs.iter().find(|s| s.name == struct_name) {
-                let is_void_wrapper = s.fields.len() == 1 && s.fields[0].type_name == "Void";
+                let is_void_wrapper = s.fields.is_empty()
+                    || (s.fields.len() == 1 && s.fields[0].type_name == "Void");
 
                 if is_void_wrapper {
                     let init_method = format_ident!("init_{}", to_snake_case(&variant.name));
@@ -350,7 +441,7 @@ pub fn generate_request_method(
                     };
                     quote! {
                         #[doc = #doc]
-                        pub async fn #method_name(&self) -> anyhow::Result<#response_type> {
+                        pub async fn #method_name(&self #extra_param) -> anyhow::Result<#return_type> {
                             let id = self.next_id();
                             let payload = hyprstream_rpc::serialize_message(|msg| {
                                 let mut req = msg.init_root::<crate::#capnp_mod::#req_type::Builder>();
@@ -358,8 +449,8 @@ pub fn generate_request_method(
                                 #outer_req_setup
                                 #setter
                             })?;
-                            let response = self.call(payload).await?;
-                            #parse_call
+                            #call_expr
+                            #response_handling
                         }
                     }
                 } else {
@@ -376,7 +467,7 @@ pub fn generate_request_method(
                     quote! {
                         #[doc = #doc]
                         #[allow(unused_mut)]
-                        pub async fn #method_name(&self #(, #params)*) -> anyhow::Result<#response_type> {
+                        pub async fn #method_name(&self #(, #params)* #extra_param) -> anyhow::Result<#return_type> {
                             let id = self.next_id();
                             let payload = hyprstream_rpc::serialize_message(|msg| {
                                 let mut req = msg.init_root::<crate::#capnp_mod::#req_type::Builder>();
@@ -385,8 +476,8 @@ pub fn generate_request_method(
                                 #inner_init
                                 #(#setters)*
                             })?;
-                            let response = self.call(payload).await?;
-                            #parse_call
+                            #call_expr
+                            #response_handling
                         }
                     }
                 }
@@ -400,10 +491,185 @@ pub fn generate_request_method(
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Typed Return Info
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Information for generating a typed return from a request method.
+struct TypedReturnInfo {
+    /// The return type tokens (e.g., `()`, `bool`, `TrainStepResponseData`)
+    return_type: TokenStream,
+    /// The match body that extracts the typed value from the parse result
+    match_body: TokenStream,
+}
+
+/// Find the paired response variant and generate typed return info.
+///
+/// Returns `None` if the pairing is ambiguous or the response variant isn't found,
+/// in which case the method falls back to returning the full response enum.
+fn find_typed_return_info(
+    request_name: &str,
+    response_variants: &[UnionVariant],
+    structs: &[StructDef],
+    enums: &[EnumDef],
+    is_scoped: bool,
+    response_type: &syn::Ident,
+    parse_call: &TokenStream,
+) -> Option<TypedReturnInfo> {
+    // Find the expected response variant name
+    let expected_name = if is_scoped {
+        // Scoped: request `foo` → response `foo`
+        request_name.to_string()
+    } else {
+        // Top-level: request `foo` → response `fooResult`
+        format!("{}Result", request_name)
+    };
+
+    let resp_variant = response_variants.iter().find(|v| v.name == expected_name)?;
+    let variant_pascal = format_ident!("{}", to_pascal_case(&resp_variant.name));
+    let ct = CapnpType::classify(&resp_variant.type_name, structs, enums);
+
+    // Check if there's an Error variant in the response (for the error arm)
+    let has_error = response_variants.iter().any(|v| v.name == "error");
+
+    let error_arm = if has_error {
+        quote! {
+            #response_type::Error { message, .. } => Err(anyhow::anyhow!("{}", message)),
+        }
+    } else {
+        TokenStream::new()
+    };
+
+    let wildcard_arm = quote! {
+        _ => Err(anyhow::anyhow!("Unexpected response variant")),
+    };
+
+    match ct {
+        CapnpType::Void => Some(TypedReturnInfo {
+            return_type: quote! { () },
+            match_body: quote! {
+                match #parse_call? {
+                    #response_type::#variant_pascal => Ok(()),
+                    #error_arm
+                    #wildcard_arm
+                }
+            },
+        }),
+        CapnpType::Bool => Some(TypedReturnInfo {
+            return_type: quote! { bool },
+            match_body: quote! {
+                match #parse_call? {
+                    #response_type::#variant_pascal(v) => Ok(v),
+                    #error_arm
+                    #wildcard_arm
+                }
+            },
+        }),
+        CapnpType::Text => Some(TypedReturnInfo {
+            return_type: quote! { String },
+            match_body: quote! {
+                match #parse_call? {
+                    #response_type::#variant_pascal(v) => Ok(v),
+                    #error_arm
+                    #wildcard_arm
+                }
+            },
+        }),
+        CapnpType::Data => Some(TypedReturnInfo {
+            return_type: quote! { Vec<u8> },
+            match_body: quote! {
+                match #parse_call? {
+                    #response_type::#variant_pascal(v) => Ok(v),
+                    #error_arm
+                    #wildcard_arm
+                }
+            },
+        }),
+        CapnpType::UInt8 | CapnpType::UInt16 | CapnpType::UInt32 | CapnpType::UInt64
+        | CapnpType::Int8 | CapnpType::Int16 | CapnpType::Int32 | CapnpType::Int64
+        | CapnpType::Float32 | CapnpType::Float64 => {
+            let rust_type = rust_type_tokens(&ct.rust_owned_type());
+            Some(TypedReturnInfo {
+                return_type: quote! { #rust_type },
+                match_body: quote! {
+                    match #parse_call? {
+                        #response_type::#variant_pascal(v) => Ok(v),
+                        #error_arm
+                        #wildcard_arm
+                    }
+                },
+            })
+        }
+        CapnpType::ListText => Some(TypedReturnInfo {
+            return_type: quote! { Vec<String> },
+            match_body: quote! {
+                match #parse_call? {
+                    #response_type::#variant_pascal(v) => Ok(v),
+                    #error_arm
+                    #wildcard_arm
+                }
+            },
+        }),
+        CapnpType::ListData => Some(TypedReturnInfo {
+            return_type: quote! { Vec<Vec<u8>> },
+            match_body: quote! {
+                match #parse_call? {
+                    #response_type::#variant_pascal(v) => Ok(v),
+                    #error_arm
+                    #wildcard_arm
+                }
+            },
+        }),
+        CapnpType::ListStruct(ref inner) => {
+            let data_name = format_ident!("{}Data", inner);
+            Some(TypedReturnInfo {
+                return_type: quote! { Vec<#data_name> },
+                match_body: quote! {
+                    match #parse_call? {
+                        #response_type::#variant_pascal(v) => Ok(v),
+                        #error_arm
+                        #wildcard_arm
+                    }
+                },
+            })
+        }
+        CapnpType::Struct(ref name) => {
+            if let Some(s) = structs.iter().find(|s| s.name == *name) {
+                let data_name = format_ident!("{}Data", name);
+                let field_names: Vec<syn::Ident> = s.fields.iter()
+                    .map(|f| format_ident!("{}", to_snake_case(&f.name)))
+                    .collect();
+                let field_names2 = field_names.clone();
+                Some(TypedReturnInfo {
+                    return_type: quote! { #data_name },
+                    match_body: quote! {
+                        match #parse_call? {
+                            #response_type::#variant_pascal { #(#field_names,)* } => {
+                                Ok(#data_name { #(#field_names2,)* })
+                            }
+                            #error_arm
+                            #wildcard_arm
+                        }
+                    },
+                })
+            } else {
+                None // Fallback to full enum
+            }
+        }
+        _ => None, // Fallback to full enum for unknown types
+    }
+}
+
 /// Context for scoped method generation.
+///
+/// For nested (3-level) scoping, `parent` is `Some(...)` and contains the
+/// outer scope context. The request builder will chain: parent init -> parent setters ->
+/// nested init -> nested setters -> operation init.
 pub struct ScopedMethodContext {
     pub factory_name: String,
     pub scope_fields: Vec<FieldDef>,
+    /// Parent scope context for 3-level nesting (e.g., Repository is parent of Fs).
+    pub parent: Option<Box<ScopedMethodContext>>,
 }
 
 /// Generate method parameter tokens for a struct's fields.

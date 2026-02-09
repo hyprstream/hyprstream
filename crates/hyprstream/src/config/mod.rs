@@ -41,7 +41,7 @@ pub struct HyprConfig {
 
     /// LoRA adapter settings
     #[serde(default)]
-    pub lora: LoRAConfig,
+    pub lora: LoraAppConfig,
 
     /// Storage paths configuration
     #[serde(default)]
@@ -481,9 +481,11 @@ impl Default for GenerationConfig {
     }
 }
 
-/// LoRA adapter configuration
+/// Application-level LoRA settings (TOML config: enabled, max_adapters, etc.)
+///
+/// This is distinct from `TenantDeltaConfig` which configures LoRA weight parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LoRAConfig {
+pub struct LoraAppConfig {
     /// Enable LoRA adapters
     pub enabled: bool,
     /// Maximum number of active adapters
@@ -494,7 +496,7 @@ pub struct LoRAConfig {
     pub sparsity: f32,
 }
 
-impl Default for LoRAConfig {
+impl Default for LoraAppConfig {
     fn default() -> Self {
         Self {
             enabled: true,
@@ -512,7 +514,7 @@ pub struct HyprConfigBuilder {
     model: ModelConfig,
     runtime: RuntimeConfig,
     generation: GenerationConfig,
-    lora: LoRAConfig,
+    lora: LoraAppConfig,
     storage: StorageConfig,
     git2db: git2db::config::Git2DBConfig,
     worker: Option<hyprstream_workers::config::WorkerConfig>,
@@ -532,7 +534,7 @@ impl HyprConfigBuilder {
             model: ModelConfig::default(),
             runtime: RuntimeConfig::default(),
             generation: GenerationConfig::default(),
-            lora: LoRAConfig::default(),
+            lora: LoraAppConfig::default(),
             storage: StorageConfig::default(),
             git2db: git2db::config::Git2DBConfig::default(),
             worker: None,
@@ -792,6 +794,8 @@ pub struct ModelInfo {
     pub hidden_size: usize,
     pub intermediate_size: Option<usize>,
     pub num_attention_heads: Option<usize>,
+    pub num_key_value_heads: Option<usize>,
+    pub head_dim: Option<usize>,
     pub num_hidden_layers: Option<usize>,
     pub architecture: String,
     pub quantization: Option<String>,
@@ -1342,6 +1346,23 @@ pub struct TTTMetrics {
     pub tokens_used: usize,
     pub tokens_provided: usize,
     pub was_truncated: bool,
+
+    // Tenant-aware TTT metrics
+    /// Initial perplexity before adaptation
+    #[serde(default)]
+    pub initial_perplexity: f32,
+    /// Final perplexity after adaptation
+    #[serde(default)]
+    pub final_perplexity: f32,
+    /// Server's recommendation: true = commit, false = rollback
+    #[serde(default)]
+    pub recommendation: bool,
+    /// Number of steps determined by perplexity gating
+    #[serde(default)]
+    pub gated_steps: usize,
+    /// Whether adaptation is pending client commit/rollback
+    #[serde(default)]
+    pub pending: bool,
 }
 
 impl From<crate::training::ttt::TTTResult> for TTTMetrics {
@@ -1359,6 +1380,11 @@ impl From<crate::training::ttt::TTTResult> for TTTMetrics {
             tokens_used: r.tokens_used,
             tokens_provided: r.tokens_provided,
             was_truncated: r.was_truncated,
+            initial_perplexity: r.initial_perplexity,
+            final_perplexity: r.final_perplexity,
+            recommendation: r.recommendation,
+            gated_steps: r.gated_steps,
+            pending: r.pending,
         }
     }
 }

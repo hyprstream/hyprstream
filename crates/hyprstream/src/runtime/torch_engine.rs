@@ -64,10 +64,6 @@ pub struct TorchEngine {
     model_info: Arc<Mutex<ModelInfo>>,
     /// Active LoRA adapter name - thread safe with mutex
     pub active_lora: Arc<Mutex<Option<String>>>,
-    /// LoRA model with adapters
-    lora_model: Arc<Mutex<Option<crate::lora::torch_adapter::LoRAModel>>>,
-    /// LoRA trainer for fine-tuning
-    lora_trainer: Arc<Mutex<Option<crate::lora::trainer::LoRATrainer>>>,
     /// GPU sampler for efficient token sampling - thread safe after initialization
     sampler: TensorSampler,  // Renamed from gpu_sampler - works on both CPU and GPU
     /// Cached tokenizer vocabulary size for lock-free access
@@ -88,79 +84,6 @@ pub struct TorchEngine {
 
 /// Helper functions for tensor operations
 impl TorchEngine {
-    // ============================================================================
-    // Lock Ordering for Thread Safety
-    // ============================================================================
-    //
-    // IMPORTANT: To prevent deadlocks, always acquire locks in this order:
-    //   1. lora_model
-    //   2. lora_trainer
-    //   3. persistent_model
-    //   4. var_store
-    //
-    // The helper methods below enforce this ordering.
-    // ============================================================================
-
-    /// Acquire both LoRA model and trainer locks in the correct order.
-    ///
-    /// This helper ensures consistent lock ordering across all call sites to
-    /// prevent deadlocks. The lora_model lock is always acquired first, then
-    /// lora_trainer.
-    ///
-    /// # Thread Safety
-    /// This method acquires `lora_model` and `lora_trainer` locks.
-    /// Callers must not hold these locks when calling.
-    ///
-    /// # Returns
-    /// Returns the result of the callback function `f` which receives
-    /// mutable references to both the LoRAModel and LoRATrainer.
-    pub fn with_training_locks<T, F>(&self, f: F) -> Result<T>
-    where
-        F: FnOnce(
-            &mut crate::lora::torch_adapter::LoRAModel,
-            &mut crate::lora::trainer::LoRATrainer,
-        ) -> Result<T>,
-    {
-        // IMPORTANT: Always acquire lora_model FIRST, then lora_trainer
-        let mut model_guard = self.lora_model.lock();
-        let mut trainer_guard = self.lora_trainer.lock();
-
-        let model = model_guard
-            .as_mut()
-            .ok_or_else(|| anyhow!("LoRA model not initialized"))?;
-        let trainer = trainer_guard
-            .as_mut()
-            .ok_or_else(|| anyhow!("LoRA trainer not initialized"))?;
-
-        f(model, trainer)
-    }
-
-    /// Acquire LoRA model lock only (for read-only operations).
-    ///
-    /// Use this for operations that only need the model, not the trainer.
-    pub fn with_lora_model<T, F>(&self, f: F) -> Result<T>
-    where
-        F: FnOnce(&crate::lora::torch_adapter::LoRAModel) -> Result<T>,
-    {
-        let model_guard = self.lora_model.lock();
-        let model = model_guard
-            .as_ref()
-            .ok_or_else(|| anyhow!("LoRA model not initialized"))?;
-        f(model)
-    }
-
-    /// Acquire LoRA model lock for mutation.
-    pub fn with_lora_model_mut<T, F>(&self, f: F) -> Result<T>
-    where
-        F: FnOnce(&mut crate::lora::torch_adapter::LoRAModel) -> Result<T>,
-    {
-        let mut model_guard = self.lora_model.lock();
-        let model = model_guard
-            .as_mut()
-            .ok_or_else(|| anyhow!("LoRA model not initialized"))?;
-        f(model)
-    }
-
     /// Set the random seed for deterministic generation
     /// Useful for debugging - enables reproducible token sequences
     pub fn set_seed(&self, seed: u64) {
@@ -289,6 +212,33 @@ impl TorchEngine {
         }
     }
 
+    /// Estimate model memory usage in bytes.
+    ///
+    /// Sums the byte sizes of all parameters in the VarStore.
+    pub fn model_memory_usage(&self) -> usize {
+        let vs_guard = self.var_store.lock();
+        {
+            if let Some(vs) = vs_guard.as_ref() {
+                return vs
+                    .variables()
+                    .iter()
+                    .map(|(_, t)| {
+                        let numel = t.numel();
+                        let elem_size = match t.kind() {
+                            tch::Kind::Half | tch::Kind::BFloat16 => 2,
+                            tch::Kind::Float => 4,
+                            tch::Kind::Double => 8,
+                            tch::Kind::Int8 | tch::Kind::Uint8 => 1,
+                            _ => 4,
+                        };
+                        numel * elem_size
+                    })
+                    .sum();
+            }
+        }
+        0
+    }
+
     /// Create new PyTorch engine
     pub fn new(config: RuntimeConfig) -> Result<Self> {
         Self::new_sync(config)
@@ -367,12 +317,12 @@ impl TorchEngine {
                 hidden_size: 768,
                 intermediate_size: None,
                 num_attention_heads: None,
+                num_key_value_heads: None,
+                head_dim: None,
                 num_hidden_layers: None,
                 quantization: None,
             })),
             active_lora: Arc::new(Mutex::new(None)),
-            lora_model: Arc::new(Mutex::new(None)),
-            lora_trainer: Arc::new(Mutex::new(None)),
             sampler: TensorSampler::new(device),
             tokenizer_vocab_size: Arc::new(AtomicUsize::new(0)),
             eos_token_id: Arc::new(AtomicU32::new(0)),
@@ -552,6 +502,8 @@ impl TorchEngine {
             model_info.hidden_size = config.hidden_size;
             model_info.intermediate_size = Some(config.intermediate_size);
             model_info.num_attention_heads = Some(config.num_attention_heads);
+            model_info.num_key_value_heads = Some(config.num_key_value_heads);
+            model_info.head_dim = Some(config.head_dim);
             model_info.num_hidden_layers = Some(config.num_hidden_layers);
             model_info.vocab_size = config.vocab_size;
             model_info.context_length = effective_max_context;
@@ -890,6 +842,85 @@ impl TorchEngine {
         let _vocab_size = logits_shape[2] as usize;
 
         // Get logits for last token
+        let last_token_logits = logits.narrow(1, seq_len - 1, 1).squeeze_dim(1);
+
+        Ok(last_token_logits)
+    }
+
+    /// Run inference with KV caching and optional delta injection
+    ///
+    /// Same as `forward_cached()` but calls `forward_with_cache_and_delta()` on the model,
+    /// injecting per-tenant LoRA corrections at each attention layer.
+    pub fn forward_with_delta_cached(
+        &self,
+        input_ids: &[i64],
+        start_pos: usize,
+        use_cache: bool,
+        delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        let model_arc = self
+            .persistent_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("Persistent model not initialized"))?;
+
+        if !self.is_persistent_model_ready() {
+            return Err(anyhow!("Model not properly initialized"));
+        }
+
+        let tokens_to_process = if use_cache && start_pos > 0 {
+            &input_ids[input_ids.len() - 1..]
+        } else {
+            input_ids
+        };
+
+        let input_tensor = Tensor::from_slice(tokens_to_process)
+            .to_kind(tch::Kind::Int64)
+            .to_device(self.device)
+            .unsqueeze(0);
+
+        let model = model_arc.lock();
+
+        let logits = tch::no_grad(|| {
+            model.forward_with_cache_and_delta(&input_tensor, start_pos, delta)
+        })?;
+
+        let logits_shape = logits.size();
+        let seq_len = logits_shape[1];
+
+        let last_token_logits = logits.narrow(1, seq_len - 1, 1).squeeze_dim(1);
+
+        Ok(last_token_logits)
+    }
+
+    /// Run full forward pass with optional delta injection (no KV cache)
+    pub fn forward_with_delta_full(
+        &self,
+        input_ids: &[i64],
+        delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        let model_arc = self
+            .persistent_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("Persistent model not initialized"))?;
+
+        if !self.is_persistent_model_ready() {
+            return Err(anyhow!("Model not properly initialized"));
+        }
+
+        let input_tensor = Tensor::from_slice(input_ids)
+            .to_kind(tch::Kind::Int64)
+            .to_device(self.device)
+            .unsqueeze(0);
+
+        let model = model_arc.lock();
+
+        let logits = tch::no_grad(|| {
+            model.forward_with_cache_and_delta(&input_tensor, 0, delta)
+        })?;
+
+        let logits_shape = logits.size();
+        let seq_len = logits_shape[1];
+
         let last_token_logits = logits.narrow(1, seq_len - 1, 1).squeeze_dim(1);
 
         Ok(last_token_logits)
@@ -1268,684 +1299,203 @@ impl TorchEngine {
         TextStream::new(self, request)
     }
 
-    
-    /// Enable LoRA training for fine-tuning
-    pub fn enable_lora_training(
-        &mut self,
-        config: crate::lora::LoRAConfig,
-        training_config: crate::lora::TrainingConfig,
-    ) -> Result<()> {
-        // Get module dimensions from loaded model
-        let mut module_configs = HashMap::new();
-
-        // Get model dimensions from model_info
-        let model_info = self.model_info.lock();
-        let hidden_size = model_info.hidden_size as i64;
-
-        // Calculate intermediate size based on model architecture
-        let intermediate_size = if let Some(intermediate) = model_info.intermediate_size {
-            intermediate as i64
-        } else {
-            // Use architecture-specific defaults
-            match model_info.architecture.as_str() {
-                "Qwen2ForCausalLM" => (hidden_size as f32 * 2.6667) as i64, // Qwen uses ~2.67x
-                "LlamaForCausalLM" => (hidden_size as f32 * 2.75) as i64,   // Llama uses 2.75x
-                _ => hidden_size * 4,                                       // Default 4x expansion
-            }
-        };
-
-        // Extract dimensions for each target module
-        for module_name in &config.target_modules {
-            let (in_features, out_features) = match module_name.as_str() {
-                "q_proj" | "k_proj" | "v_proj" | "o_proj" => {
-                    // Self-attention projections
-                    (hidden_size, hidden_size)
-                }
-                "gate_proj" | "up_proj" => {
-                    // MLP projections (expand)
-                    (hidden_size, intermediate_size)
-                }
-                "down_proj" => {
-                    // MLP projection (contract)
-                    (intermediate_size, hidden_size)
-                }
-                _ => {
-                    return Err(anyhow!(
-                        "Unknown module '{}'. Supported modules: q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj",
-                        module_name
-                    ));
-                }
-            };
-
-            module_configs.insert(
-                module_name.clone(),
-                (in_features as usize, out_features as usize),
-            );
+    /// Generate with optional per-tenant delta for delta-aware inference
+    ///
+    /// When `delta` is Some, LoRA corrections are injected at each attention layer
+    /// during generation. The delta is locked per-token (not held across the entire
+    /// generation) to allow concurrent training updates.
+    pub fn generate_with_delta(
+        &self,
+        mut request: GenerationRequest,
+        delta: Option<std::sync::Arc<parking_lot::Mutex<crate::training::TenantDelta>>>,
+    ) -> Result<TextStream<'_>> {
+        if let Some(seed) = request.seed {
+            self.set_seed(seed as u64);
         }
 
-        // Create LoRA model
-        let lora_model = crate::lora::torch_adapter::LoRAModel::new(
-            config.clone(),
-            module_configs,
-            self.device,
-        )?;
+        if request.timeout.is_none() {
+            request.timeout = Some(self.config.default_generation_timeout_ms);
+        }
 
-        tracing::info!(
-            "Initialized LoRA with {} trainable parameters",
-            lora_model.num_parameters()
-        );
-
-        // Create trainer that uses the model's VarStore
-        let trainer =
-            crate::lora::trainer::LoRATrainer::new(&lora_model.vs, self.device, training_config)?;
-
-        // Store the single model and trainer
-        *self.lora_model.lock() = Some(lora_model);
-        *self.lora_trainer.lock() = Some(trainer);
-
-        // Gradient computation enabled by default in training mode
-
-        Ok(())
+        TextStream::new_with_delta(self, request, delta)
     }
 
-    /// Forward pass with LoRA adapters (Smart Hybrid with Gradient Bridge)
-    pub fn forward_with_lora(
+    /// Non-streaming generation with optional delta (convenience wrapper)
+    pub async fn generate_with_delta_params(
         &self,
-        input_ids: &Tensor,
-        _attention_mask: Option<&Tensor>,
-        training: bool,
-    ) -> Result<Tensor> {
-        // Check if LoRA is enabled
-        let lora_model = self.lora_model.lock();
-        if lora_model.is_none() {
-            // No LoRA, use standard forward pass
-            let ids: Vec<i64> = Vec::<i64>::try_from(input_ids.flatten(0, -1))?;
-            return self.forward(&ids);
+        request: GenerationRequest,
+        delta: Option<std::sync::Arc<parking_lot::Mutex<crate::training::TenantDelta>>>,
+    ) -> Result<crate::config::GenerationResult> {
+        use futures::StreamExt;
+
+        if !self.is_persistent_model_ready() {
+            return Err(anyhow!(
+                "Model not properly initialized - persistent model not ready"
+            ));
         }
 
-        // Get the persistent model for layer-wise forward pass
+        let mut stream = self.generate_with_delta(request, delta)?;
+        let mut accumulated_text = String::new();
+
+        while let Some(text_chunk) = stream.next().await {
+            accumulated_text.push_str(&text_chunk?);
+        }
+
+        let stats = stream.stats();
+        Ok(crate::config::GenerationResult {
+            text: accumulated_text,
+            tokens_generated: stats.tokens_generated,
+            finish_reason: stats.finish_reason.unwrap_or(crate::config::FinishReason::Stop),
+            generation_time_ms: stats.generation_time_ms,
+            tokens_per_second: stats.tokens_per_second,
+            quality_metrics: stats.quality_metrics,
+            prefill_tokens: stats.prefill_tokens,
+            prefill_time_ms: stats.prefill_time_ms,
+            prefill_tokens_per_sec: stats.prefill_tokens_per_sec,
+            inference_tokens: stats.inference_tokens,
+            inference_time_ms: stats.inference_time_ms,
+            inference_tokens_per_sec: stats.inference_tokens_per_sec,
+            ttt_metrics: None,
+        })
+    }
+
+
+    /// Forward pass with per-layer delta injection for TTT training.
+    ///
+    /// Uses `decode_layer_with_delta()` to inject the tenant delta's A/B matrices
+    /// after q_proj/v_proj projections inside each attention layer. This creates a
+    /// differentiable path from the loss back to the delta parameters, enabling
+    /// gradient-based training via `loss.backward()`.
+    ///
+    /// # Arguments
+    /// * `input_ids` - Token IDs [1, seq_len]
+    /// * `delta` - Tenant's LoRA delta with trainable A/B matrices
+    ///
+    /// # Returns
+    /// Logits tensor [1, seq_len, vocab_size] with gradient path to delta parameters
+    pub fn forward_with_delta(
+        &self,
+        input_ids: &Tensor,
+        delta: &crate::training::TenantDelta,
+    ) -> Result<Tensor> {
         let model = self
             .persistent_model
             .as_ref()
             .ok_or_else(|| anyhow!("Model not loaded"))?;
         let model_guard = model.lock();
 
-        // Use input_ids tensor directly
+        // Get embeddings from the base model
         let input = input_ids.to(self.device);
+        let mut hidden_states = model_guard.embed_tokens(&input)?;
 
-        // CRITICAL: Smart Hybrid Gradient Bridge
-        // Base model weights stay frozen, but we enable gradient tracking on activations
-        let logits = if training {
-            // During training: Enable gradient flow through activations
-            // The base model weights don't have requires_grad, but the activations will
-            let base_logits = model_guard.forward(&input, None)?;
+        // Generate position IDs
+        let seq_len = hidden_states.size()[1];
+        let position_ids =
+            Tensor::arange(seq_len, (tch::Kind::Int64, hidden_states.device()));
 
-            // Enable gradient tracking on the output activations
-            // This creates the gradient bridge between frozen base model and trainable LoRA
-            base_logits.set_requires_grad(true)
-        } else {
-            // During inference: No gradient tracking needed
-            tch::no_grad(|| model_guard.forward(&input, None))?
-        };
+        let num_layers = model_guard.num_layers();
 
-        // NOTE: In a full implementation, we would intercept activations at each layer
-        // and apply LoRA adapters there. For now, this simplified version demonstrates
-        // the gradient bridge concept. The actual per-layer integration would look like:
-        //
-        // for layer in model.layers:
-        //     hidden = layer.self_attn(hidden)  // Base frozen weights
-        //     if training:
-        //         hidden = hidden.set_requires_grad(true)  // Enable gradient flow
-        //     hidden = hidden + lora_adapter.forward("q_proj", hidden)  // Add LoRA
+        // Process each layer with delta injection
+        for layer_idx in 0..num_layers {
+            let (new_hidden, _kv) = model_guard.decode_layer_with_delta(
+                layer_idx,
+                &hidden_states,
+                None,                // attention_mask
+                Some(&position_ids), // position_ids
+                None,                // past_kv (no cache during training)
+                delta,
+            )?;
+            hidden_states = new_hidden;
+        }
+
+        // Apply final norm + LM head
+        hidden_states = model_guard.apply_final_norm(&hidden_states)?;
+        let logits = model_guard.lm_head(&hidden_states)?;
 
         Ok(logits)
     }
 
-    /// Train LoRA adapter on a single example
-    pub async fn train_temporal_lora(
-        &mut self,
-        prompt: &str,
-        expected_response: &str,
-        learning_rate: f32,
-    ) -> Result<()> {
-        // Initialize LoRA if not already done
-        if self.lora_model.lock().is_none() {
-            let lora_config = crate::lora::LoRAConfig {
-                rank: 16,
-                alpha: 16.0,
-                dropout: 0.1,
-                target_modules: vec!["q_proj".to_owned(), "v_proj".to_owned()],
-                ..Default::default()
-            };
-
-            let training_config = crate::lora::TrainingConfig {
-                learning_rate: learning_rate as f64,
-                ..Default::default()
-            };
-
-            self.enable_lora_training(lora_config, training_config)?;
-        }
-
-        // Tokenize inputs
-        let tokenizer = self.tokenizer.lock();
-        let tokenizer = tokenizer.as_ref().ok_or_else(|| anyhow!("No tokenizer loaded"))?;
-
-        // Combine prompt and response
-        let full_text = format!("{prompt} {expected_response}");
-        let encoding = tokenizer
-            .encode(full_text.as_str(), false)
-            .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
-
-        let ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
-        let input_ids = Tensor::from_slice(&ids).to_device(self.device).unsqueeze(0); // Add batch dimension
-
-        // Create labels (shift input_ids by 1)
-        let labels = input_ids.shallow_clone();
-
-        // Forward pass with LoRA
-        let logits = self.forward_with_lora(&input_ids, None, true)?;
-
-        // Training step - use helper to ensure correct lock ordering
-        let metrics = self.with_training_locks(|lora_model, trainer| {
-            trainer.training_step(lora_model, &logits, &labels)
-        })?;
-
-        tracing::info!(
-            "LoRA training step {}: loss={:.4}, ppl={:.2}, lr={:.6}",
-            metrics.step,
-            metrics.loss,
-            metrics.perplexity,
-            metrics.learning_rate
-        );
-
-        Ok(())
+    /// Get the number of layers in the loaded model.
+    pub fn get_num_layers(&self) -> Result<usize> {
+        let model = self
+            .persistent_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("Model not loaded"))?;
+        Ok(model.lock().num_layers())
     }
 
-    // ============================================================================
-    // RL Training Methods for Self-Supervised Learning
-    // ============================================================================
-
-    /// Atomic LoRA training step with gradient clipping.
+    /// Get module dimensions for LoRA target modules from the loaded model.
     ///
-    /// Performs a complete training step in one atomic operation:
-    /// 1. Zero gradients
-    /// 2. Backward pass (loss.backward())
-    /// 3. Gradient clipping
-    /// 4. Optimizer step
+    /// Returns a map of module_name -> (in_features, out_features) for all
+    /// supported LoRA target modules. Used by DeltaPool to initialize
+    /// per-tenant LoRA deltas with correct dimensions.
     ///
-    /// This prevents race conditions that could occur if these operations
-    /// were exposed as separate methods.
-    ///
-    /// # Arguments
-    /// - `loss` - The loss tensor to backpropagate
-    /// - `max_grad_norm` - Optional gradient clipping threshold (default: 1.0)
-    ///
-    /// # Returns
-    /// The gradient norm before clipping (useful for monitoring training stability)
-    ///
-    /// # Thread Safety
-    /// Acquires `lora_model` and `lora_trainer` locks in correct order.
-    pub fn lora_training_step(&self, loss: &Tensor, max_grad_norm: Option<f64>) -> Result<f64> {
-        self.with_training_locks(|lora_model, trainer| {
-            // 1. Zero gradients
-            trainer.optimizer.zero_grad();
+    /// Supported modules: q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj
+    pub fn get_lora_module_dims(&self) -> Result<std::collections::HashMap<String, (usize, usize)>> {
+        let model_info = self.model_info.lock();
+        let hidden_size = model_info.hidden_size;
 
-            // 2. Backward pass
-            loss.backward();
+        let num_heads = model_info.num_attention_heads
+            .ok_or_else(|| anyhow!("num_attention_heads not set in ModelInfo"))?;
+        let num_kv_heads = model_info.num_key_value_heads
+            .unwrap_or(num_heads);
+        let head_dim = model_info.head_dim
+            .unwrap_or(hidden_size / num_heads);
 
-            // 3. Gradient clipping
-            let grad_norm = {
-                let params: Vec<Tensor> = lora_model
-                    .vs
-                    .trainable_variables()
-                    .iter()
-                    .map(tch::Tensor::shallow_clone)
-                    .collect();
+        let q_out = num_heads * head_dim;
+        let kv_out = num_kv_heads * head_dim;
 
-                // Calculate total gradient norm
-                let total_norm: f64 = params
-                    .iter()
-                    .map(|p| {
-                        let grad = p.grad();
-                        if grad.numel() > 0 {
-                            grad.norm().double_value(&[])
-                        } else {
-                            0.0
-                        }
-                    })
-                    .sum::<f64>()
-                    .sqrt();
-
-                // Clip if needed
-                let clip_threshold = max_grad_norm.unwrap_or(1.0);
-                if total_norm > clip_threshold && total_norm > 0.0 {
-                    let clip_coef = clip_threshold / total_norm;
-                    for param in &params {
-                        let mut grad = param.grad();
-                        if grad.numel() > 0 {
-                            // Scale gradients in place
-                            let _ = grad.g_mul_scalar_(clip_coef);
-                        }
-                    }
-                    tracing::debug!(
-                        "Clipped gradients: {:.4} -> {:.4}",
-                        total_norm,
-                        clip_threshold
-                    );
-                }
-
-                total_norm
-            };
-
-            // 4. Optimizer step
-            trainer.optimizer.step();
-
-            Ok(grad_norm)
-        })
-    }
-
-    /// Compute RL-style loss with KL divergence penalty.
-    ///
-    /// Computes the policy gradient loss for self-supervised RL training:
-    /// ```text
-    /// loss = -advantage * sum(log_prob(response_tokens)) / num_tokens + kl_coef * KL_div
-    /// ```
-    ///
-    /// The KL divergence term prevents the model from drifting too far from
-    /// its original behavior, which helps prevent:
-    /// - Mode collapse
-    /// - Reward hacking
-    /// - Loss of base model capabilities
-    ///
-    /// # Arguments
-    /// - `prompt_tokens` - Tokenized prompt (context)
-    /// - `response_tokens` - Tokenized response to evaluate
-    /// - `advantage` - Normalized advantage (quality score - baseline)
-    /// - `kl_coef` - KL divergence penalty coefficient (0.0 to disable)
-    ///
-    /// # Returns
-    /// Tuple of (total_loss_tensor, policy_gradient_loss, kl_divergence)
-    ///
-    /// # Thread Safety
-    /// Acquires model locks for forward pass with gradient tracking.
-    pub fn compute_rl_loss_with_kl(
-        &self,
-        prompt_tokens: &[u32],
-        response_tokens: &[u32],
-        advantage: f32,
-        kl_coef: f32,
-    ) -> Result<(Tensor, f32, f32)> {
-        // Concatenate prompt + response for full sequence
-        let full_tokens: Vec<i64> = prompt_tokens
-            .iter()
-            .chain(response_tokens.iter())
-            .map(|&t| t as i64)
-            .collect();
-
-        let prompt_len = prompt_tokens.len();
-        let response_len = response_tokens.len();
-
-        if response_len == 0 {
-            return Err(anyhow!("Response tokens cannot be empty"));
-        }
-
-        // Create input tensor
-        let input_ids = Tensor::from_slice(&full_tokens)
-            .to_device(self.device)
-            .unsqueeze(0); // [1, seq_len]
-
-        // Forward pass WITH gradient tracking (don't use no_grad)
-        let logits = self.forward_with_lora(&input_ids, None, true)?; // [1, seq_len, vocab_size]
-
-        // Get log probabilities
-        let log_probs = logits.log_softmax(-1, tch::Kind::Float); // [1, seq_len, vocab_size]
-
-        // Extract log probs for response tokens only
-        // For token at position i, we look at logits at position i-1 (autoregressive)
-        let mut response_log_probs = Vec::with_capacity(response_len);
-
-        for (i, &token) in response_tokens.iter().enumerate() {
-            let pos = prompt_len + i; // Position in full sequence
-            if pos > 0 {
-                // Get log prob of this token given previous context
-                let log_prob_at_pos = log_probs
-                    .get(0) // batch dim
-                    .get((pos - 1) as i64) // position (shifted by 1)
-                    .get(token as i64); // vocab index
-                response_log_probs.push(log_prob_at_pos);
-            }
-        }
-
-        if response_log_probs.is_empty() {
-            return Err(anyhow!("No valid response tokens for loss computation"));
-        }
-
-        // Sum log probs and normalize by length
-        let log_prob_sum = Tensor::stack(&response_log_probs, 0).sum(tch::Kind::Float);
-        let avg_log_prob = &log_prob_sum / (response_log_probs.len() as f64);
-
-        // Policy gradient loss: -advantage * avg_log_prob
-        let advantage_tensor = Tensor::from_slice(&[advantage as f64]).to_device(self.device);
-        let pg_loss = -(&advantage_tensor * &avg_log_prob);
-
-        // KL divergence computation (comparing to base model without LoRA)
-        let kl_div = if kl_coef > 0.0 {
-            // For KL, we need forward pass without LoRA to get base model probs
-            // This is expensive, so we approximate using entropy regularization instead
-            // KL ≈ -H(p_lora) when p_base is uniform-ish
-            // More accurate: run base model forward pass separately
-
-            // Simplified: use negative entropy as KL proxy
-            let probs = logits.softmax(-1, tch::Kind::Float);
-            let entropy = -(&probs * &log_probs).sum(tch::Kind::Float) / (full_tokens.len() as f64);
-            let neg_entropy = -entropy; // Lower entropy = more confident = higher KL-like penalty
-
-            neg_entropy.double_value(&[]) as f32
+        let intermediate_size = if let Some(intermediate) = model_info.intermediate_size {
+            intermediate
         } else {
-            0.0
+            match model_info.architecture.as_str() {
+                "Qwen2ForCausalLM" => (hidden_size as f32 * 2.6667) as usize,
+                "LlamaForCausalLM" => (hidden_size as f32 * 2.75) as usize,
+                _ => hidden_size * 4,
+            }
         };
 
-        // Total loss = PG loss + KL penalty
-        let kl_penalty = Tensor::from_slice(&[kl_coef as f64 * kl_div as f64]).to_device(self.device);
-        let total_loss = &pg_loss + &kl_penalty;
+        let mut dims = std::collections::HashMap::new();
+        // Self-attention projections with correct dimensions
+        // q_proj: in=hidden_size, out=num_heads * head_dim
+        dims.insert("q_proj".to_string(), (hidden_size, q_out));
+        // k_proj/v_proj: in=hidden_size, out=num_kv_heads * head_dim (GQA support)
+        dims.insert("k_proj".to_string(), (hidden_size, kv_out));
+        dims.insert("v_proj".to_string(), (hidden_size, kv_out));
+        // o_proj: in=num_heads * head_dim, out=hidden_size
+        dims.insert("o_proj".to_string(), (q_out, hidden_size));
+        // MLP projections (expand)
+        for name in &["gate_proj", "up_proj"] {
+            dims.insert(name.to_string(), (hidden_size, intermediate_size));
+        }
+        // MLP projection (contract)
+        dims.insert("down_proj".to_string(), (intermediate_size, hidden_size));
 
-        let pg_loss_value = pg_loss.double_value(&[]) as f32;
-
-        Ok((total_loss, pg_loss_value, kl_div))
+        Ok(dims)
     }
 
-    /// Get the current LoRA weights as a state dictionary for checkpointing.
+    /// Validate LoRA configuration against model dimensions.
     ///
-    /// Returns a HashMap of tensor name -> tensor for all trainable LoRA parameters.
-    /// Tensors are moved to CPU to avoid GPU memory issues when storing.
-    ///
-    /// # Returns
-    /// HashMap mapping parameter names to their tensor values
-    pub fn get_lora_state_dict(&self) -> Result<HashMap<String, Tensor>> {
-        self.with_lora_model(|lora_model| {
-            let mut state_dict = HashMap::new();
+    /// Checks that the requested target modules are valid for this model.
+    /// The actual LoRA delta creation is handled by DeltaPool/TenantDelta.
+    pub fn create_lora(&mut self, config: crate::training::TenantDeltaConfig) -> Result<()> {
+        let all_dims = self.get_lora_module_dims()?;
 
-            for (name, tensor) in lora_model.vs.variables() {
-                // Move to CPU before storing to avoid GPU memory leaks
-                state_dict.insert(name.clone(), tensor.to(Device::Cpu));
+        for module_name in &config.target_modules {
+            if !all_dims.contains_key(module_name.as_str()) {
+                return Err(anyhow!(
+                    "Unknown module '{}'. Supported modules: q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj",
+                    module_name
+                ));
             }
-
-            tracing::debug!(
-                "Extracted LoRA state dict with {} parameters",
-                state_dict.len()
-            );
-
-            Ok(state_dict)
-        })
-    }
-
-    /// Save LoRA weights
-    pub fn save_lora(&self, path: &str) -> Result<()> {
-        if let Some(lora_model) = &*self.lora_model.lock() {
-            lora_model.save(path)?;
-            tracing::info!("Saved LoRA weights to {}", path);
-        } else {
-            return Err(anyhow!("No LoRA model to save"));
         }
-        Ok(())
-    }
-
-    /// Load LoRA weights
-    pub fn load_lora(&mut self, path: &str) -> Result<()> {
-        if let Some(lora_model) = &mut *self.lora_model.lock() {
-            lora_model.load(path)?;
-            tracing::info!("Loaded LoRA weights from {}", path);
-        } else {
-            return Err(anyhow!("No LoRA model initialized"));
-        }
-        Ok(())
-    }
-
-    /// Save LoRA weights in SafeTensor format
-    pub fn save_lora_weights(&self, path: &str) -> Result<()> {
-        if let Some(lora_model) = &*self.lora_model.lock() {
-            lora_model.save(path)?;
-            tracing::info!("Saved LoRA weights to SafeTensor format: {}", path);
-        } else {
-            return Err(anyhow!("No LoRA model to save"));
-        }
-        Ok(())
-    }
-
-    /// Load LoRA adapter weights from SafeTensors format.
-    ///
-    /// Loads pre-trained LoRA A and B matrices from a SafeTensors file into the
-    /// initialized LoRA model structure. This updates the VarStore with the new
-    /// weights, making them available for inference and further training.
-    ///
-    /// # Requirements
-    /// - LoRA model must be initialized first via create_lora()
-    /// - SafeTensors file must contain tensors with names matching the LoRA layer structure
-    /// - Tensor shapes must match the initialized LoRA model dimensions
-    ///
-    /// # Arguments
-    /// - `path` - Path to SafeTensors file containing LoRA weights
-    pub fn load_lora_weights(&mut self, path: &str) -> Result<()> {
-        if let Some(lora_model) = &mut *self.lora_model.lock() {
-            tracing::debug!(
-                safetensors_path = path,
-                "Loading LoRA weights from SafeTensors format"
-            );
-
-            lora_model.load(path)?;
-
-            tracing::info!(
-                safetensors_path = path,
-                total_parameters = lora_model.num_parameters(),
-                "Successfully loaded LoRA adapter weights from SafeTensors"
-            );
-        } else {
-            tracing::error!(
-                safetensors_path = path,
-                "Cannot load LoRA weights: LoRA model structure not initialized - call create_lora() first"
-            );
-            return Err(anyhow!(
-                "No LoRA model initialized - call create_lora() first"
-            ));
-        }
-        Ok(())
-    }
-
-    /// Check if LoRA model structure has been initialized.
-    ///
-    /// Returns true if a LoRA model with VarStore has been created, indicating
-    /// the engine is ready to load adapter weights. This is a prerequisite for
-    /// calling load_lora_weights().
-    pub fn has_lora_model(&self) -> bool {
-        self.lora_model.lock().is_some()
-    }
-
-    /// Initialize LoRA model structure for low-rank adaptation.
-    ///
-    /// Creates the VarStore and layer mappings required for LoRA training and inference.
-    /// This must be called before loading any adapter weights. The configuration defines
-    /// the rank (bottleneck dimension), alpha scaling factor, and target modules to adapt.
-    ///
-    /// # Architecture
-    /// - Creates a shared VarStore for all LoRA layers with automatic differentiation
-    /// - Maps target modules to their input/output dimensions for weight initialization
-    /// - Uses proper Kaiming initialization for LoRA A and zero initialization for LoRA B
-    ///
-    /// # Arguments
-    /// - `config` - LoRA configuration including rank, alpha, target modules, and dropout
-    pub fn create_lora(&mut self, config: crate::lora::LoRAConfig) -> Result<()> {
-        use crate::lora::torch_adapter::LoRAModel;
 
         tracing::info!(
             rank = config.rank,
             alpha = config.alpha,
-            dropout = config.dropout,
             target_modules = ?config.target_modules,
-            learning_rate = config.learning_rate,
-            "Initializing LoRA model structure for low-rank adaptation"
+            "LoRA configuration validated - delta creation handled by DeltaPool"
         );
-
-        // Get module dimensions from loaded model instead of hardcoding
-        let mut module_configs = std::collections::HashMap::new();
-
-        // Get model dimensions from model_info
-        let model_info = self.model_info.lock();
-        let hidden_size = model_info.hidden_size as i64;
-
-        // Calculate intermediate size based on model architecture
-        let intermediate_size = if let Some(intermediate) = model_info.intermediate_size {
-            intermediate as i64
-        } else {
-            // Use architecture-specific defaults
-            match model_info.architecture.as_str() {
-                "Qwen2ForCausalLM" => (hidden_size as f32 * 2.6667) as i64, // Qwen uses ~2.67x
-                "LlamaForCausalLM" => (hidden_size as f32 * 2.75) as i64,   // Llama uses 2.75x
-                _ => hidden_size * 4,                                       // Default 4x expansion
-            }
-        };
-
-        // Extract dimensions for each target module
-        for module_name in &config.target_modules {
-            let (in_features, out_features) = match module_name.as_str() {
-                "q_proj" | "k_proj" | "v_proj" | "o_proj" => {
-                    // Self-attention projections
-                    (hidden_size, hidden_size)
-                }
-                "gate_proj" | "up_proj" => {
-                    // MLP projections (expand)
-                    (hidden_size, intermediate_size)
-                }
-                "down_proj" => {
-                    // MLP projection (contract)
-                    (intermediate_size, hidden_size)
-                }
-                _ => {
-                    return Err(anyhow!(
-                        "Unknown module '{}'. Supported modules: q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj",
-                        module_name
-                    ));
-                }
-            };
-
-            module_configs.insert(
-                module_name.clone(),
-                (in_features as usize, out_features as usize),
-            );
-        }
-
-        tracing::info!(
-            hidden_size = hidden_size,
-            intermediate_size = intermediate_size,
-            module_configs = ?module_configs,
-            "Using model-specific dimensions for LoRA initialization"
-        );
-
-        // Initialize the LoRA model with PyTorch VarStore for gradient tracking.
-        // This creates trainable LoRA A and B matrices for each target module.
-        let lora_model = LoRAModel::new(config.clone(), module_configs, self.device)?;
-        let total_params = lora_model.num_parameters();
-
-        // Create trainer for gradient updates during training.
-        // The trainer uses the model's VarStore for parameter optimization.
-        let training_config = crate::lora::TrainingConfig {
-            learning_rate: config.learning_rate as f64,
-            ..Default::default()
-        };
-        let trainer = crate::lora::trainer::LoRATrainer::new(
-            &lora_model.vs,
-            self.device,
-            training_config,
-        )?;
-
-        // Install the LoRA model and trainer into the engine's shared state.
-        // This replaces any previously loaded LoRA model/trainer.
-        {
-            let mut lora_guard = self.lora_model.lock();
-            *lora_guard = Some(lora_model);
-        }
-        {
-            let mut trainer_guard = self.lora_trainer.lock();
-            *trainer_guard = Some(trainer);
-        }
-
-        tracing::info!(
-            total_parameters = total_params,
-            device = ?self.device,
-            "LoRA model structure created successfully - ready to load adapter weights"
-        );
-        Ok(())
-    }
-
-    /// Load LoRA adapter weights from SafeTensors file (async version).
-    ///
-    /// Save LoRA weights to SafeTensors file
-    ///
-    /// Load LoRA adapter weights from a SafeTensors file.
-    ///
-    /// This is the async wrapper for load_lora_weights(), used in training contexts
-    /// where adapter loading may be part of a larger async workflow. The actual
-    /// loading is synchronous as PyTorch tensor operations are CPU/GPU bound.
-    ///
-    /// # Requirements
-    /// - LoRA model structure must be initialized first via create_lora()
-    /// - Path must point to a valid SafeTensors file with matching tensor shapes
-    ///
-    /// # Arguments
-    /// - `path` - Path to SafeTensors file containing LoRA A and B matrices
-    pub async fn load_lora_from_file(&mut self, path: &std::path::Path) -> Result<()> {
-        tracing::info!(
-            file_path = %path.display(),
-            "Loading LoRA adapter weights from SafeTensors file"
-        );
-
-        // Delegate to synchronous implementation
-        // SafeTensors loading is I/O bound but the actual tensor operations are sync
-        self.load_lora_weights(
-            path.to_str()
-                .ok_or_else(|| anyhow!("Invalid UTF-8 path for LoRA adapter file"))?,
-        )
-    }
-
-    /// Apply LoRA adapter during forward pass (called internally)
-    pub fn apply_lora_to_output(
-        &self,
-        module_name: &str,
-        input: &Tensor,
-        base_output: &Tensor,
-    ) -> Result<Tensor> {
-        let lora_guard = self.lora_model.lock();
-
-        if let Some(lora_model) = lora_guard.as_ref() {
-            // Apply LoRA if available for this module
-            if let Some(lora_output) = lora_model.forward(module_name, input, false)? {
-                Ok(base_output + lora_output)
-            } else {
-                Ok(base_output.shallow_clone())
-            }
-        } else {
-            Ok(base_output.shallow_clone())
-        }
-    }
-
-    /// Get active LoRA adapter name
-    pub fn get_active_lora(&self) -> Result<Option<String>> {
-        let active_guard = self.active_lora.lock();
-        Ok(active_guard.clone())
-    }
-
-    /// Unload current LoRA adapter
-    pub fn unload_lora(&mut self) -> Result<()> {
-        {
-            let mut lora_guard = self.lora_model.lock();
-            *lora_guard = None;
-        }
-
-        {
-            let mut active_guard = self.active_lora.lock();
-            *active_guard = None;
-        }
-
-        tracing::info!("Unloaded LoRA adapter");
         Ok(())
     }
 
@@ -2170,6 +1720,10 @@ pub struct GenerationStats {
 pub struct TextStream<'a> {
     engine: &'a TorchEngine,
 
+    /// Optional per-tenant delta for delta-aware inference.
+    /// When present, LoRA corrections are injected at each attention layer.
+    delta: Option<std::sync::Arc<parking_lot::Mutex<crate::training::TenantDelta>>>,
+
     prompt_tokens: Vec<i64>,
     last_generated: Option<i64>,
 
@@ -2240,6 +1794,14 @@ pub struct TextStream<'a> {
 
 impl<'a> TextStream<'a> {
     fn new(engine: &'a TorchEngine, request: GenerationRequest) -> Result<Self> {
+        Self::new_with_delta(engine, request, None)
+    }
+
+    fn new_with_delta(
+        engine: &'a TorchEngine,
+        request: GenerationRequest,
+        delta: Option<std::sync::Arc<parking_lot::Mutex<crate::training::TenantDelta>>>,
+    ) -> Result<Self> {
         let prompt_tokens = engine.tokenize(request.prompt.as_str())?;
         let prompt_len = prompt_tokens.len();
 
@@ -2305,6 +1867,7 @@ impl<'a> TextStream<'a> {
 
         Ok(Self {
             engine,
+            delta,
             prompt_tokens,
             last_generated: None,
             recent_tokens: VecDeque::with_capacity(repeat_last_n),
@@ -2431,10 +1994,18 @@ impl<'a> TextStream<'a> {
             self.kv_cache_position
         };
 
+        // Lock delta once for this token's forward pass (if present)
+        let delta_guard = self.delta.as_ref().map(|d| d.lock());
+
         let logits = if self.tokens_generated == 0 {
             // PREFILL: Process full prompt and capture timing
             let prefill_start = std::time::Instant::now();
-            let result = self.engine.forward(&self.prompt_tokens)?;
+            let result = if delta_guard.is_some() {
+                let delta_ref = delta_guard.as_deref();
+                self.engine.forward_with_delta_full(&self.prompt_tokens, delta_ref)?
+            } else {
+                self.engine.forward(&self.prompt_tokens)?
+            };
             let prefill_elapsed = prefill_start.elapsed();
 
             // Store prefill timing
@@ -2442,14 +2013,15 @@ impl<'a> TextStream<'a> {
             self.first_token_time = Some(std::time::Instant::now());
 
             tracing::info!(
-                "📊 PREFILL: {} tokens in {:?} ({:.2} tok/sec)",
+                "📊 PREFILL: {} tokens in {:?} ({:.2} tok/sec){}",
                 self.prompt_tokens.len(),
                 prefill_elapsed,
                 if prefill_elapsed.as_secs_f32() > 0.0 {
                     self.prompt_tokens.len() as f32 / prefill_elapsed.as_secs_f32()
                 } else {
                     0.0
-                }
+                },
+                if delta_guard.is_some() { " [delta-aware]" } else { "" }
             );
 
             result
@@ -2466,12 +2038,25 @@ impl<'a> TextStream<'a> {
             }
 
             // Use kv_cache_position directly - this is where the next token will be written
-            self.engine.forward_cached(
-                &[last_token],
-                current_kv_pos,
-                true,
-            )?
+            if delta_guard.is_some() {
+                let delta_ref = delta_guard.as_deref();
+                self.engine.forward_with_delta_cached(
+                    &[last_token],
+                    current_kv_pos,
+                    true,
+                    delta_ref,
+                )?
+            } else {
+                self.engine.forward_cached(
+                    &[last_token],
+                    current_kv_pos,
+                    true,
+                )?
+            }
         };
+
+        // Release delta lock before sampling (no longer needed)
+        drop(delta_guard);
 
         // NOTE: Logits truncation has been DISABLED (Nov 6, 2025)
         //

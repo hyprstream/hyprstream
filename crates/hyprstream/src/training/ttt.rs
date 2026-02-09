@@ -22,10 +22,12 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::time::Instant;
 use tch::{Device, Tensor};
 
 use crate::runtime::TorchEngine;
+use super::tenant_delta::TenantDelta;
 
 /// Configuration for Test-Time Training
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +61,27 @@ pub struct TTTConfig {
     /// Whether TTT is enabled
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+
+    // Adaptive TTT thresholds (perplexity gating)
+    /// Perplexity threshold below which adaptation is skipped (input already well-modeled)
+    #[serde(default = "default_tau_skip")]
+    pub tau_skip: f32,
+
+    /// Perplexity threshold for light adaptation (1 step)
+    #[serde(default = "default_tau_light")]
+    pub tau_light: f32,
+
+    /// Perplexity threshold for heavy adaptation (3 steps)
+    #[serde(default = "default_tau_heavy")]
+    pub tau_heavy: f32,
+
+    /// Minimum loss improvement to consider adaptation beneficial (confidence gate)
+    #[serde(default = "default_delta_min")]
+    pub delta_min: f32,
+
+    /// Whether to use adaptive step counts based on perplexity
+    #[serde(default = "default_adaptive_steps")]
+    pub adaptive_steps: bool,
 }
 
 fn default_learning_rate() -> f64 {
@@ -79,6 +102,21 @@ fn default_max_ttt_context() -> usize {
 fn default_enabled() -> bool {
     true
 }
+fn default_tau_skip() -> f32 {
+    5.0
+}
+fn default_tau_light() -> f32 {
+    15.0
+}
+fn default_tau_heavy() -> f32 {
+    50.0
+}
+fn default_delta_min() -> f32 {
+    0.01
+}
+fn default_adaptive_steps() -> bool {
+    true
+}
 
 impl Default for TTTConfig {
     fn default() -> Self {
@@ -89,12 +127,17 @@ impl Default for TTTConfig {
             min_input_length: default_min_input_length(),
             max_ttt_context: default_max_ttt_context(),
             enabled: default_enabled(),
+            tau_skip: default_tau_skip(),
+            tau_light: default_tau_light(),
+            tau_heavy: default_tau_heavy(),
+            delta_min: default_delta_min(),
+            adaptive_steps: default_adaptive_steps(),
         }
     }
 }
 
 /// Result of TTT adaptation
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct TTTResult {
     /// Average loss across gradient steps
     pub avg_loss: f32,
@@ -132,6 +175,22 @@ pub struct TTTResult {
 
     /// Whether input was truncated (exceeded max_ttt_context)
     pub was_truncated: bool,
+
+    // Tenant-aware TTT fields
+    /// Initial perplexity before adaptation (exp(initial_loss))
+    pub initial_perplexity: f32,
+
+    /// Final perplexity after adaptation (exp(final_loss))
+    pub final_perplexity: f32,
+
+    /// Server's recommendation: true = commit, false = rollback
+    pub recommendation: bool,
+
+    /// Number of steps determined by perplexity gating
+    pub gated_steps: usize,
+
+    /// Whether adaptation is pending client commit/rollback
+    pub pending: bool,
 }
 
 impl TTTResult {
@@ -150,8 +209,26 @@ impl TTTResult {
             tokens_used: 0,
             tokens_provided: 0,
             was_truncated: false,
+            initial_perplexity: 0.0,
+            final_perplexity: 0.0,
+            recommendation: false,
+            gated_steps: 0,
+            pending: false,
         }
     }
+}
+
+/// Per-request TTT overrides from the client
+#[derive(Debug, Clone, Default)]
+pub struct TTTOverrides {
+    /// Override: enable/disable TTT for this request
+    pub enabled: Option<bool>,
+    /// Override: number of gradient steps (0 = skip)
+    pub gradient_steps: Option<u32>,
+    /// Override: learning rate
+    pub learning_rate: Option<f32>,
+    /// If true, server auto-commits based on its recommendation
+    pub auto_commit: bool,
 }
 
 /// Context for TTT adaptation (for future cross-model verification)
@@ -209,45 +286,130 @@ impl TestTimeTrainer {
         &self.config
     }
 
-    /// Adapt the model to input context using TTT
+    /// Perform a single gradient step on a tenant delta using AdamW
     ///
-    /// This is the main entry point for TTT. It:
-    /// 1. Validates input length
-    /// 2. Computes next-token prediction loss on input
-    /// 3. Updates LoRA weights for `gradient_steps` iterations
-    /// 4. Returns metrics about the adaptation
+    /// Steps: backward → compute grad_norm → clip_grad_norm → optimizer.step → zero_grad
+    pub fn ttt_step(
+        &self,
+        loss: &Tensor,
+        delta: &mut TenantDelta,
+        learning_rate: Option<f64>,
+    ) -> Result<(f64, bool)> {
+        if let Some(lr) = learning_rate {
+            delta.optimizer.set_lr(lr);
+        }
+
+        // Backward pass
+        loss.backward();
+
+        // Compute gradient norm for metrics
+        let grad_norm = {
+            let mut total_norm_sq = 0.0f64;
+            let variables = delta.vs.trainable_variables();
+
+            for var in &variables {
+                if var.grad().defined() {
+                    let grad = var.grad();
+                    total_norm_sq += grad.norm().double_value(&[]).powi(2);
+                }
+            }
+
+            total_norm_sq.sqrt()
+        };
+
+        let clipped = grad_norm > self.config.max_grad_norm;
+        if clipped {
+            delta.optimizer.clip_grad_norm(self.config.max_grad_norm);
+        }
+
+        // AdamW step (handles weight decay internally)
+        delta.optimizer.step();
+        delta.optimizer.zero_grad();
+
+        Ok((grad_norm, clipped))
+    }
+
+    /// Determine number of gradient steps based on perplexity gating
+    fn gate_steps(&self, perplexity: f32, overrides: &TTTOverrides) -> usize {
+        // Client override takes precedence
+        if let Some(steps) = overrides.gradient_steps {
+            return steps as usize;
+        }
+
+        if !self.config.adaptive_steps {
+            return self.config.gradient_steps;
+        }
+
+        if perplexity < self.config.tau_skip {
+            0 // Input already well-modeled
+        } else if perplexity < self.config.tau_light {
+            1 // Light adaptation
+        } else if perplexity < self.config.tau_heavy {
+            3 // Moderate adaptation
+        } else {
+            5 // Heavy adaptation
+        }
+    }
+
+    /// Compute server's commit recommendation based on confidence gate
+    fn compute_recommendation(
+        &self,
+        loss_improvement: f32,
+        _gradient_clipped: bool,
+        initial_ppl: f32,
+        final_ppl: f32,
+    ) -> bool {
+        // Gradient clipping is informational, not a veto — clipping is normal
+        // during early adaptation steps, especially with freshly initialized deltas.
+        loss_improvement > self.config.delta_min && final_ppl < initial_ppl
+    }
+
+    /// Adapt a tenant delta to input context using perplexity-gated TTT
+    ///
+    /// This is the tenant-aware entry point for TTT. It:
+    /// 1. Snapshots delta state (for rollback)
+    /// 2. Computes initial NTP loss → perplexity
+    /// 3. Gates step count based on perplexity
+    /// 4. Runs SGD gradient loop on the tenant delta
+    /// 5. Returns metrics (does NOT auto-commit — client decides)
     ///
     /// # Arguments
-    /// * `engine` - The TorchEngine with loaded model and LoRA
+    /// * `engine` - TorchEngine with loaded model
+    /// * `delta` - Tenant's LoRA delta (mutable for SGD updates)
     /// * `input_tokens` - Tokenized input context
+    /// * `overrides` - Per-request TTT overrides from client
     ///
     /// # Returns
-    /// TTTResult with adaptation metrics
-    ///
-    /// # Note
-    /// This modifies the engine's LoRA weights. For production use with
-    /// concurrent requests, consider using scratch weights (future enhancement).
-    pub fn adapt(&self, engine: &TorchEngine, input_tokens: &[u32]) -> Result<TTTResult> {
+    /// (TTTResult, pre_snapshot) where pre_snapshot is the state before adaptation
+    pub fn adapt_tenant(
+        &self,
+        engine: &TorchEngine,
+        delta: &mut TenantDelta,
+        input_tokens: &[u32],
+        overrides: &TTTOverrides,
+    ) -> Result<(TTTResult, HashMap<String, Tensor>)> {
         let start = Instant::now();
 
-        // Check if enabled
-        if !self.config.enabled {
-            return Ok(TTTResult::skipped("TTT disabled"));
+        // Check if enabled (respect override)
+        let enabled = overrides.enabled.unwrap_or(self.config.enabled);
+        if !enabled {
+            return Ok((TTTResult::skipped("TTT disabled"), HashMap::new()));
         }
 
         // Check minimum length
         if input_tokens.len() < self.config.min_input_length {
-            return Ok(TTTResult::skipped(&format!(
-                "Input too short: {} < {} tokens",
-                input_tokens.len(),
-                self.config.min_input_length
-            )));
+            return Ok((
+                TTTResult::skipped(&format!(
+                    "Input too short: {} < {} tokens",
+                    input_tokens.len(),
+                    self.config.min_input_length
+                )),
+                HashMap::new(),
+            ));
         }
 
-        // Check if LoRA is available
-        if !engine.has_lora_model() {
-            return Ok(TTTResult::skipped("No LoRA adapter loaded"));
-        }
+        // Snapshot delta state before adaptation (for rollback)
+        let pre_snapshot = delta.extract_state_dict();
 
         // Track whether input was truncated
         let tokens_provided = input_tokens.len();
@@ -261,114 +423,264 @@ impl TestTimeTrainer {
         };
         let tokens_used = tokens.len();
 
-        // TTT adaptation loop
-        let mut losses = Vec::with_capacity(self.config.gradient_steps);
-        let mut grad_norms = Vec::with_capacity(self.config.gradient_steps);
+        // Compute initial NTP loss
+        let initial_loss_tensor = self.compute_ntp_loss_with_delta(engine, delta, &tokens)?;
+        let initial_loss: f32 = initial_loss_tensor.double_value(&[]) as f32;
+        let initial_perplexity = initial_loss.exp();
 
-        // First step to get initial loss
-        let loss = self.compute_ntp_loss(engine, &tokens)?;
-        let initial_loss: f32 = loss.double_value(&[]) as f32;
-        losses.push(initial_loss);
+        // Gate step count based on perplexity
+        let gated_steps = self.gate_steps(initial_perplexity, overrides);
 
-        // Gradient step
-        let grad_norm = self.ttt_step(engine, &loss)?;
-        grad_norms.push(grad_norm as f32);
+        if gated_steps == 0 {
+            return Ok((
+                TTTResult {
+                    avg_loss: initial_loss,
+                    loss_improvement: 0.0,
+                    steps_performed: 0,
+                    adaptation_time_ms: start.elapsed().as_millis() as u64,
+                    skipped: true,
+                    skip_reason: Some(format!(
+                        "Perplexity {:.1} below skip threshold {:.1}",
+                        initial_perplexity, self.config.tau_skip
+                    )),
+                    avg_grad_norm: 0.0,
+                    max_grad_norm: 0.0,
+                    gradient_clipped: false,
+                    tokens_used,
+                    tokens_provided,
+                    was_truncated,
+                    initial_perplexity,
+                    final_perplexity: initial_perplexity,
+                    recommendation: false,
+                    gated_steps: 0,
+                    pending: false,
+                },
+                pre_snapshot,
+            ));
+        }
+
+        // Determine learning rate (respect override)
+        let lr = overrides
+            .learning_rate
+            .map(|r| r as f64)
+            .unwrap_or(delta.learning_rate);
+
+        // SGD gradient loop
+        let mut losses = vec![initial_loss];
+        let mut grad_norms = Vec::with_capacity(gated_steps);
+        let mut any_clipped = false;
+
+        // First step uses the already-computed loss
+        let (gn, clipped) = self.ttt_step(&initial_loss_tensor, delta, Some(lr))?;
+        grad_norms.push(gn as f32);
+        if clipped {
+            any_clipped = true;
+        }
 
         // Remaining steps
-        for _ in 1..self.config.gradient_steps {
-            let loss = self.compute_ntp_loss(engine, &tokens)?;
+        for _ in 1..gated_steps {
+            let loss = self.compute_ntp_loss_with_delta(engine, delta, &tokens)?;
             let loss_value = loss.double_value(&[]) as f32;
             losses.push(loss_value);
 
-            let grad_norm = self.ttt_step(engine, &loss)?;
-            grad_norms.push(grad_norm as f32);
+            let (gn, clipped) = self.ttt_step(&loss, delta, Some(lr))?;
+            grad_norms.push(gn as f32);
+            if clipped {
+                any_clipped = true;
+            }
         }
 
-        let final_loss = *losses.last().unwrap_or(&initial_loss);
-        let avg_loss = losses.iter().sum::<f32>() / losses.len() as f32;
+        // Compute final loss for perplexity
+        let final_loss_tensor = self.compute_ntp_loss_with_delta(engine, delta, &tokens)?;
+        let final_loss: f32 = final_loss_tensor.double_value(&[]) as f32;
+        let final_perplexity = final_loss.exp();
 
-        // Compute gradient norm statistics
+        let avg_loss = losses.iter().sum::<f32>() / losses.len() as f32;
+        let loss_improvement = initial_loss - final_loss;
+
         let avg_grad_norm = if !grad_norms.is_empty() {
             grad_norms.iter().sum::<f32>() / grad_norms.len() as f32
         } else {
             0.0
         };
-        let max_grad_norm = grad_norms.iter().copied().fold(0.0f32, f32::max);
-        let gradient_clipped = max_grad_norm >= self.config.max_grad_norm as f32;
+        let max_grad_norm_val = grad_norms.iter().copied().fold(0.0f32, f32::max);
 
-        Ok(TTTResult {
-            avg_loss,
-            loss_improvement: initial_loss - final_loss,
-            steps_performed: self.config.gradient_steps,
-            adaptation_time_ms: start.elapsed().as_millis() as u64,
-            skipped: false,
-            skip_reason: None,
-            avg_grad_norm,
-            max_grad_norm,
-            gradient_clipped,
-            tokens_used,
-            tokens_provided,
-            was_truncated,
-        })
+        let recommendation = self.compute_recommendation(
+            loss_improvement,
+            any_clipped,
+            initial_perplexity,
+            final_perplexity,
+        );
+
+        Ok((
+            TTTResult {
+                avg_loss,
+                loss_improvement,
+                steps_performed: gated_steps,
+                adaptation_time_ms: start.elapsed().as_millis() as u64,
+                skipped: false,
+                skip_reason: None,
+                avg_grad_norm,
+                max_grad_norm: max_grad_norm_val,
+                gradient_clipped: any_clipped,
+                tokens_used,
+                tokens_provided,
+                was_truncated,
+                initial_perplexity,
+                final_perplexity,
+                recommendation,
+                gated_steps,
+                pending: true, // Awaiting client commit/rollback
+            },
+            pre_snapshot,
+        ))
     }
 
-    /// Compute next-token prediction loss on input sequence
+    /// Compute NTP loss with a tenant delta applied
     ///
-    /// For sequence [t0, t1, t2, t3]:
-    /// - Position 0: predict t1 from t0
-    /// - Position 1: predict t2 from t0,t1
-    /// - Position 2: predict t3 from t0,t1,t2
-    ///
-    /// This is the standard causal language modeling objective.
-    fn compute_ntp_loss(&self, engine: &TorchEngine, tokens: &[u32]) -> Result<Tensor> {
-        // Convert tokens to i64 tensor
+    /// Runs a forward pass that injects the delta's A/B matrices after q_proj/v_proj
+    /// projections inside each attention layer. This creates a differentiable path
+    /// from the loss back to the delta parameters, enabling gradient-based training.
+    fn compute_ntp_loss_with_delta(
+        &self,
+        engine: &TorchEngine,
+        delta: &TenantDelta,
+        tokens: &[u32],
+    ) -> Result<Tensor> {
         let tokens_i64: Vec<i64> = tokens.iter().map(|&t| t as i64).collect();
 
         let input_ids = Tensor::from_slice(&tokens_i64)
             .to_device(self.device)
             .unsqueeze(0); // [1, seq_len]
 
-        // Forward pass with gradient tracking
-        // Uses forward_with_lora with training=true for gradient flow
-        let logits = engine.forward_with_lora(&input_ids, None, true)?;
-        // logits shape: [1, seq_len, vocab_size]
+        // Forward pass with delta injection — gradients flow through delta's A/B matrices
+        let logits = engine.forward_with_delta(&input_ids, delta)?;
 
         let seq_len = tokens.len() as i64;
         let vocab_size = logits.size()[2];
 
-        // Shift for next-token prediction:
-        // - logits[:, :-1, :] are predictions for positions 0 to seq_len-2
-        // - labels[:, 1:] are targets (tokens 1 to seq_len-1)
-
-        // Slice logits: all but last position
+        // Shift for next-token prediction
         let pred_logits = logits
             .narrow(1, 0, seq_len - 1)
-            .reshape([-1, vocab_size]); // [(seq_len-1), vocab_size]
+            .reshape([-1, vocab_size]);
 
-        // Slice labels: all but first position
-        let target_ids = input_ids.narrow(1, 1, seq_len - 1).reshape([-1]); // [seq_len-1]
+        let target_ids = input_ids.narrow(1, 1, seq_len - 1).reshape([-1]);
 
-        // Cross-entropy loss
         let loss = pred_logits.cross_entropy_loss::<Tensor>(
             &target_ids,
-            None,                  // no weight
-            tch::Reduction::Mean,  // mean reduction
-            -100,                  // ignore_index (unused here, no padding)
-            0.0,                   // no label smoothing
+            None,
+            tch::Reduction::Mean,
+            -100,
+            0.0,
         );
 
         Ok(loss)
     }
 
-    /// Perform a single TTT gradient step
+    /// Run pure training steps on a tenant delta without generation
     ///
-    /// Uses the engine's existing LoRA training infrastructure.
-    fn ttt_step(&self, engine: &TorchEngine, loss: &Tensor) -> Result<f64> {
-        // Use engine's atomic training step with our config
-        let grad_norm =
-            engine.lora_training_step(loss, Some(self.config.max_grad_norm))?;
+    /// Used by the `trainStep` API endpoint for explicit training.
+    pub fn train_step(
+        &self,
+        engine: &TorchEngine,
+        delta: &mut TenantDelta,
+        input_tokens: &[u32],
+        gradient_steps: usize,
+        learning_rate: Option<f64>,
+    ) -> Result<TTTResult> {
+        let start = Instant::now();
 
-        Ok(grad_norm)
+        let tokens_provided = input_tokens.len();
+        let was_truncated = tokens_provided > self.config.max_ttt_context;
+
+        let tokens: Vec<u32> = if was_truncated {
+            input_tokens[input_tokens.len() - self.config.max_ttt_context..].to_vec()
+        } else {
+            input_tokens.to_vec()
+        };
+        let tokens_used = tokens.len();
+
+        if tokens_used < 2 {
+            return Ok(TTTResult::skipped("Input too short for NTP loss"));
+        }
+
+        let lr = learning_rate.unwrap_or(delta.learning_rate);
+
+        // Compute initial loss
+        let initial_loss_tensor = self.compute_ntp_loss_with_delta(engine, delta, &tokens)?;
+        let initial_loss = initial_loss_tensor.double_value(&[]) as f32;
+        let initial_perplexity = initial_loss.exp();
+
+        let mut losses = vec![initial_loss];
+        let mut grad_norms = Vec::with_capacity(gradient_steps);
+        let mut any_clipped = false;
+
+        // First step
+        let (gn, clipped) = self.ttt_step(&initial_loss_tensor, delta, Some(lr))?;
+        grad_norms.push(gn as f32);
+        if clipped {
+            any_clipped = true;
+        }
+
+        // Remaining steps
+        for _ in 1..gradient_steps {
+            let loss = self.compute_ntp_loss_with_delta(engine, delta, &tokens)?;
+            losses.push(loss.double_value(&[]) as f32);
+            let (gn, clipped) = self.ttt_step(&loss, delta, Some(lr))?;
+            grad_norms.push(gn as f32);
+            if clipped {
+                any_clipped = true;
+            }
+        }
+
+        // Final loss
+        let final_loss_tensor = self.compute_ntp_loss_with_delta(engine, delta, &tokens)?;
+        let final_loss = final_loss_tensor.double_value(&[]) as f32;
+        let final_perplexity = final_loss.exp();
+
+        let avg_loss = losses.iter().sum::<f32>() / losses.len() as f32;
+        let loss_improvement = initial_loss - final_loss;
+        let avg_grad_norm = if !grad_norms.is_empty() {
+            grad_norms.iter().sum::<f32>() / grad_norms.len() as f32
+        } else {
+            0.0
+        };
+        let max_grad_norm_val = grad_norms.iter().copied().fold(0.0f32, f32::max);
+
+        let recommendation = self.compute_recommendation(
+            loss_improvement,
+            any_clipped,
+            initial_perplexity,
+            final_perplexity,
+        );
+
+        // Update delta accumulation stats
+        delta.accumulated_steps += gradient_steps as u64;
+        delta.request_count += 1;
+        // Running average of loss improvement
+        let n = delta.request_count as f64;
+        delta.avg_loss_improvement =
+            delta.avg_loss_improvement * ((n - 1.0) / n) + loss_improvement as f64 / n;
+
+        Ok(TTTResult {
+            avg_loss,
+            loss_improvement,
+            steps_performed: gradient_steps,
+            adaptation_time_ms: start.elapsed().as_millis() as u64,
+            skipped: false,
+            skip_reason: None,
+            avg_grad_norm,
+            max_grad_norm: max_grad_norm_val,
+            gradient_clipped: any_clipped,
+            tokens_used,
+            tokens_provided,
+            was_truncated,
+            initial_perplexity,
+            final_perplexity,
+            recommendation,
+            gated_steps: gradient_steps,
+            pending: false, // trainStep commits immediately based on auto_commit
+        })
     }
 }
 

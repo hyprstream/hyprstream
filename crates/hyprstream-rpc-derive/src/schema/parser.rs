@@ -69,11 +69,20 @@ pub fn parse_capnp_schema(text: &str, service_name: &str) -> Option<ParsedSchema
                             inner_request_variants: inner_req_variants,
                             inner_response_variants: inner_resp_variants,
                             capnp_inner_response: to_snake_case(&resp_variant.type_name),
+                            nested_clients: Vec::new(),
+                            parent_scope_fields: Vec::new(),
+                            parent_factory_name: None,
+                            parent_capnp_inner_response: None,
                         });
                     }
                 }
             }
         }
+    }
+
+    // Recursively detect nested scoped clients (3rd level, e.g., Fs within Repository)
+    for sc in &mut scoped_clients {
+        detect_nested_scoped_clients(text, sc, &structs_parsed);
     }
 
     let referenced: Vec<StructDef> = structs_parsed
@@ -90,6 +99,86 @@ pub fn parse_capnp_schema(text: &str, service_name: &str) -> Option<ParsedSchema
     })
 }
 
+/// Recursively detect nested scoped clients within a scoped client.
+///
+/// For each inner request variant, check if it points to a struct with
+/// `has_union && !fields.is_empty()` — the same pattern as top-level detection.
+/// Detected nested clients are added to `parent.nested_clients` and their
+/// variants are removed from `parent.inner_request_variants`.
+fn detect_nested_scoped_clients(
+    text: &str,
+    parent: &mut ScopedClient,
+    all_structs: &[StructDef],
+) {
+    let mut nested = Vec::new();
+    let mut nested_factory_names = Vec::new();
+
+    for req_variant in &parent.inner_request_variants {
+        // Skip primitives
+        if matches!(
+            req_variant.type_name.as_str(),
+            "Void" | "Text" | "Data" | "Bool"
+                | "UInt32" | "UInt64" | "Int32" | "Int64" | "Float32" | "Float64"
+        ) || req_variant.type_name.starts_with("List(")
+        {
+            continue;
+        }
+
+        if let Some(inner_struct) = all_structs.iter().find(|s| s.name == req_variant.type_name) {
+            if inner_struct.has_union && !inner_struct.fields.is_empty() {
+                let response_variant_name = format!("{}Result", req_variant.name);
+                if let Some(resp_variant) = parent
+                    .inner_response_variants
+                    .iter()
+                    .find(|v| v.name == response_variant_name)
+                {
+                    let inner_req_variants =
+                        parse_union_variants(text, &req_variant.type_name);
+                    let inner_resp_variants =
+                        parse_union_variants(text, &resp_variant.type_name);
+
+                    if !inner_req_variants.is_empty() && !inner_resp_variants.is_empty() {
+                        let client_name = if req_variant.type_name.ends_with("Request") {
+                            format!(
+                                "{}Client",
+                                &req_variant.type_name
+                                    [..req_variant.type_name.len() - 7]
+                            )
+                        } else {
+                            format!("{}Client", req_variant.type_name)
+                        };
+
+                        nested_factory_names.push(req_variant.name.clone());
+                        nested.push(ScopedClient {
+                            factory_name: req_variant.name.clone(),
+                            client_name,
+                            scope_fields: inner_struct.fields.clone(),
+                            inner_request_variants: inner_req_variants,
+                            inner_response_variants: inner_resp_variants,
+                            capnp_inner_response: to_snake_case(&resp_variant.type_name),
+                            nested_clients: Vec::new(),
+                            parent_scope_fields: parent.scope_fields.clone(),
+                            parent_factory_name: Some(parent.factory_name.clone()),
+                            parent_capnp_inner_response: Some(parent.capnp_inner_response.clone()),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Filter out nested-scope variants from parent's inner variants
+    if !nested_factory_names.is_empty() {
+        parent.inner_request_variants.retain(|v| !nested_factory_names.contains(&v.name));
+        parent.inner_response_variants.retain(|v| {
+            let result_name = v.name.strip_suffix("Result").unwrap_or(&v.name);
+            !nested_factory_names.contains(&result_name.to_string())
+        });
+    }
+
+    parent.nested_clients = nested;
+}
+
 pub fn parse_all_structs(text: &str) -> Vec<StructDef> {
     let mut structs = Vec::new();
     let lines: Vec<&str> = text.lines().collect();
@@ -98,7 +187,31 @@ pub fn parse_all_structs(text: &str) -> Vec<StructDef> {
     while i < lines.len() {
         let line = lines[i].trim();
 
-        if line.starts_with("struct ") && line.ends_with('{') {
+        if line.starts_with("struct ") && line.contains('{') && line.contains('}') {
+            // Single-line struct: struct Foo { field @0 :Type; ... }
+            let brace_open = line.find('{').unwrap();
+            let brace_close = line.rfind('}').unwrap();
+            let name = line["struct ".len()..brace_open].trim().to_string();
+            let body = line[brace_open + 1..brace_close].trim();
+
+            let mut fields = Vec::new();
+            let has_union = body.contains("union");
+
+            if !has_union && !body.is_empty() {
+                for part in body.split(';') {
+                    let part = part.trim();
+                    if !part.is_empty() && !part.starts_with('#') {
+                        if let Some(field) = parse_field_line(part) {
+                            fields.push(field);
+                        }
+                    }
+                }
+            }
+
+            structs.push(StructDef { name, fields, has_union });
+            i += 1;
+        } else if line.starts_with("struct ") && line.ends_with('{') {
+            // Multi-line struct
             let name = line["struct ".len()..line.len() - 1].trim().to_string();
 
             let mut fields = Vec::new();
@@ -399,6 +512,19 @@ pub fn collect_list_struct_types(schema: &ParsedSchema) -> Vec<String> {
                 }
             }
         }
+        // Nested scoped clients
+        for nested in &sc.nested_clients {
+            for v in &nested.inner_response_variants {
+                add_type(&v.type_name);
+            }
+            for v in &nested.inner_request_variants {
+                if let Some(s) = schema.structs.iter().find(|s| s.name == v.type_name) {
+                    for f in &s.fields {
+                        add_type(&f.type_name);
+                    }
+                }
+            }
+        }
     }
 
     types
@@ -666,6 +792,98 @@ struct ErrorInfo {
         assert!(types.contains(&"ModelInfo".to_string()));
     }
 
+    const NESTED_SCOPED_SCHEMA: &str = r#"
+@0xabcdef0123456789;
+
+struct RegistryRequest {
+  id @0 :UInt64;
+  union {
+    list @1 :Void;
+    repo @2 :RepositoryRequest;
+  }
+}
+
+struct RepositoryRequest {
+  repoId @0 :Text;
+  union {
+    fs @1 :FsRequest;
+    delete @2 :Void;
+  }
+}
+
+struct FsRequest {
+  worktree @0 :Text;
+  union {
+    open @1 :FsOpenRequest;
+    stat @2 :FsPathRequest;
+  }
+}
+
+struct FsOpenRequest {
+  path @0 :Text;
+}
+
+struct FsPathRequest {
+  path @0 :Text;
+}
+
+struct RegistryResponse {
+  requestId @0 :UInt64;
+  union {
+    listResult @1 :List(Text);
+    repoResult @2 :RepositoryResponse;
+    error @3 :ErrorInfo;
+  }
+}
+
+struct RepositoryResponse {
+  union {
+    fsResult @0 :FsResponse;
+    deleteResult @1 :Void;
+  }
+}
+
+struct FsResponse {
+  union {
+    open @0 :Text;
+    stat @1 :Text;
+  }
+}
+
+struct ErrorInfo {
+  message @0 :Text;
+}
+"#;
+
+    #[test]
+    fn parse_nested_scoped_clients() {
+        let schema = parse_capnp_schema(NESTED_SCOPED_SCHEMA, "registry").unwrap();
+        assert_eq!(schema.scoped_clients.len(), 1); // RepositoryRequest
+
+        let repo = &schema.scoped_clients[0];
+        assert_eq!(repo.factory_name, "repo");
+        assert_eq!(repo.client_name, "RepositoryClient");
+        // fs was removed from inner_request_variants (it's now a nested client)
+        assert_eq!(repo.inner_request_variants.len(), 1); // only delete
+        assert_eq!(repo.inner_request_variants[0].name, "delete");
+
+        // Check nested client
+        assert_eq!(repo.nested_clients.len(), 1); // FsRequest
+        let fs = &repo.nested_clients[0];
+        assert_eq!(fs.factory_name, "fs");
+        assert_eq!(fs.client_name, "FsClient");
+        assert_eq!(fs.scope_fields.len(), 1);
+        assert_eq!(fs.scope_fields[0].name, "worktree");
+        assert_eq!(fs.inner_request_variants.len(), 2); // open, stat
+        assert_eq!(fs.inner_request_variants[0].name, "open");
+        assert_eq!(fs.inner_request_variants[1].name, "stat");
+
+        // Check parent linkage
+        assert_eq!(fs.parent_factory_name.as_deref(), Some("repo"));
+        assert_eq!(fs.parent_scope_fields.len(), 1);
+        assert_eq!(fs.parent_scope_fields[0].name, "repoId");
+    }
+
     #[test]
     fn has_union_flag_set() {
         let structs = parse_all_structs(POLICY_SCHEMA);
@@ -673,6 +891,36 @@ struct ErrorInfo {
         assert!(req.has_union);
         let check = structs.iter().find(|s| s.name == "PolicyCheck").unwrap();
         assert!(!check.has_union);
+    }
+
+    #[test]
+    fn parse_single_line_structs() {
+        let text = r#"
+struct Foo { value @0 :UInt32; }
+struct Bar { name @0 :Text; count @1 :UInt64; }
+struct MultiLine {
+  x @0 :Text;
+  y @1 :Bool;
+}
+"#;
+        let structs = parse_all_structs(text);
+        assert_eq!(structs.len(), 3);
+
+        let foo = structs.iter().find(|s| s.name == "Foo").unwrap();
+        assert_eq!(foo.fields.len(), 1);
+        assert_eq!(foo.fields[0].name, "value");
+        assert_eq!(foo.fields[0].type_name, "UInt32");
+        assert!(!foo.has_union);
+
+        let bar = structs.iter().find(|s| s.name == "Bar").unwrap();
+        assert_eq!(bar.fields.len(), 2);
+        assert_eq!(bar.fields[0].name, "name");
+        assert_eq!(bar.fields[0].type_name, "Text");
+        assert_eq!(bar.fields[1].name, "count");
+        assert_eq!(bar.fields[1].type_name, "UInt64");
+
+        let multi = structs.iter().find(|s| s.name == "MultiLine").unwrap();
+        assert_eq!(multi.fields.len(), 2);
     }
 }
 
@@ -780,6 +1028,23 @@ pub fn merge_annotations_from_metadata(
             let response_struct_name = format!("{}Response", to_pascal_case(&scoped.factory_name));
             if let Some(desc) = annotation_map.get(&(response_struct_name, variant.name.clone())) {
                 variant.description = desc.clone();
+            }
+        }
+
+        // Merge annotations into nested scoped client variants
+        for nested in &mut scoped.nested_clients {
+            for variant in &mut nested.inner_request_variants {
+                let request_struct_name = format!("{}Request", to_pascal_case(&nested.factory_name));
+                if let Some(desc) = annotation_map.get(&(request_struct_name, variant.name.clone())) {
+                    variant.description = desc.clone();
+                }
+            }
+
+            for variant in &mut nested.inner_response_variants {
+                let response_struct_name = format!("{}Response", to_pascal_case(&nested.factory_name));
+                if let Some(desc) = annotation_map.get(&(response_struct_name, variant.name.clone())) {
+                    variant.description = desc.clone();
+                }
             }
         }
     }

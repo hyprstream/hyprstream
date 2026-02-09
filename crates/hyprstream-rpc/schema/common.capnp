@@ -78,6 +78,19 @@ struct ResponseEnvelope {
   signerPubkey @3 :Data;   # Ed25519 public key (32 bytes)
 }
 
+# Authorization subject derived from RequestIdentity.
+# Drops transport-specific fields (curve_key, token_name) to get
+# the right granularity for authorization and resource isolation.
+struct Subject {
+  union {
+    local @0 :Text;       # OS username (e.g., "alice")
+    token @1 :Text;       # Token username (e.g., "bob")
+    peer @2 :Text;        # Peer name (e.g., "gpu-server-1")
+    user @3 :Text;        # JWT claims subject (e.g., "charlie")
+    anonymous @4 :Void;
+  }
+}
+
 # =============================================================================
 # Streaming types moved to streaming.capnp
 # =============================================================================

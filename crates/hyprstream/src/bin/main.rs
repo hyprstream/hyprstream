@@ -244,6 +244,8 @@ fn main() -> Result<()> {
         }
         if let Some(msg) = info.payload().downcast_ref::<&str>() {
             eprintln!("   Message: {}", msg);
+        } else if let Some(msg) = info.payload().downcast_ref::<String>() {
+            eprintln!("   Message: {}", msg);
         }
         eprintln!("\nThis was likely caused by a threading issue or memory corruption.");
         eprintln!("Please check for unsafe RefCell usage or race conditions.");

@@ -1,8 +1,4 @@
 //! Adapter implementations for storage and caching
 //!
-//! This module provides checkpoint management for LoRA adapters
-//! The main LoRA implementations have been moved to src/lora/
-
-pub mod lora_checkpoints;
-
-pub use lora_checkpoints::*;
+//! This module provides adapter management utilities.
+//! LoRA configuration and training is handled by `crate::training`.

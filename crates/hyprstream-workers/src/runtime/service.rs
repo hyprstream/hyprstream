@@ -1150,7 +1150,7 @@ impl ZmqService for WorkerService {
     fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> AnyhowResult<Vec<u8>> {
         debug!(
             "Worker request from {} (request_id={})",
-            ctx.casbin_subject(),
+            ctx.subject(),
             ctx.request_id
         );
 

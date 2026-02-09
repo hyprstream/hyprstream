@@ -57,7 +57,7 @@ async fn list_models(
     auth_user: Option<Extension<AuthenticatedUser>>,
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
-    if !state.policy_client.check_policy(&user, "registry:*", Operation::Query).await.unwrap_or(false) {
+    if !state.policy_client.check_policy_str(&user, "registry:*", Operation::Query).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -104,7 +104,7 @@ async fn get_model_info(
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{id}");
-    if !state.policy_client.check_policy(&user, &resource, Operation::Query).await.unwrap_or(false) {
+    if !state.policy_client.check_policy_str(&user, &resource, Operation::Query).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -148,7 +148,7 @@ async fn download_model(
     Json(request): Json<DownloadModelRequest>,
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
-    if !state.policy_client.check_policy(&user, "registry:*", Operation::Write).await.unwrap_or(false) {
+    if !state.policy_client.check_policy_str(&user, "registry:*", Operation::Write).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -260,7 +260,7 @@ async fn load_model(
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{id}");
-    if !state.policy_client.check_policy(&user, &resource, Operation::Manage).await.unwrap_or(false) {
+    if !state.policy_client.check_policy_str(&user, &resource, Operation::Manage).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -314,7 +314,7 @@ async fn unload_model(
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{id}");
-    if !state.policy_client.check_policy(&user, &resource, Operation::Manage).await.unwrap_or(false) {
+    if !state.policy_client.check_policy_str(&user, &resource, Operation::Manage).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -336,7 +336,7 @@ async fn refresh_cache(
     auth_user: Option<Extension<AuthenticatedUser>>,
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
-    if !state.policy_client.check_policy(&user, "registry:*", Operation::Manage).await.unwrap_or(false) {
+    if !state.policy_client.check_policy_str(&user, "registry:*", Operation::Manage).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({

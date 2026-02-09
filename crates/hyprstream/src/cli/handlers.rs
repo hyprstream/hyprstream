@@ -386,6 +386,7 @@ pub async fn handle_write_checkpoint(
 
 /// Handle checkpoint commit command
 pub async fn handle_commit_checkpoint(
+    registry: &dyn RegistryClient,
     checkpoint_path: String,
     message: Option<String>,
     branch: Option<String>,
@@ -407,8 +408,29 @@ pub async fn handle_commit_checkpoint(
         })
         .ok_or("Invalid checkpoint path")?;
 
-    // Create checkpoint manager
-    let checkpoint_mgr = CheckpointManager::new(model_path.to_path_buf())?;
+    // Get model name from path for registry lookup
+    let model_name = model_path
+        .file_name()
+        .ok_or("Invalid model path")?
+        .to_string_lossy()
+        .to_string();
+
+    // Get RepositoryClient from registry for git operations
+    let repo_client = match registry.repo(&model_name).await {
+        Ok(client) => Some(client),
+        Err(e) => {
+            error!("Could not get RepositoryClient for '{}': {} — git commit disabled", model_name, e);
+            None
+        }
+    };
+
+    // Create checkpoint manager with repo client
+    let checkpoint_mgr = CheckpointManager::with_config(
+        model_path.to_path_buf(),
+        Default::default(),
+        None,
+        repo_client.clone(),
+    )?;
 
     // Commit checkpoint
     let commit_id = checkpoint_mgr
@@ -419,8 +441,15 @@ pub async fn handle_commit_checkpoint(
 
     // Create tag if requested
     if let Some(tag_name) = tag {
-        crate::git::helpers::create_tag(model_path, &tag_name)?;
-        info!("✅ Tag created: {}", tag_name);
+        if let Some(client) = &repo_client {
+            client.create_tag(&tag_name, None).await.map_err(|e| {
+                error!("Failed to create tag '{}': {}", tag_name, e);
+                e
+            })?;
+            info!("✅ Tag created: {}", tag_name);
+        } else {
+            error!("Cannot create tag: no RepositoryClient available");
+        }
     }
 
     Ok(())

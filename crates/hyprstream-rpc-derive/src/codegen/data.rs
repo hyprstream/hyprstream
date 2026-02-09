@@ -3,7 +3,7 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
-use crate::schema::parser::collect_list_struct_types;
+use crate::schema::collect_list_struct_types;
 use crate::schema::types::*;
 use crate::util::*;
 

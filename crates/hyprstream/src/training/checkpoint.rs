@@ -2,15 +2,21 @@
 //!
 //! Provides non-blocking checkpoint saving during training,
 //! with commits to model branches for version control.
+//!
+//! Two modes of operation:
+//! - **Direct**: Uses `PathBuf` and `tokio::fs` (when `fs` field is None).
+//! - **FsOps**: Uses `Arc<dyn FsOps>` for worktree-scoped, path-contained access.
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-use git2db::GitManager;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+
+use crate::services::{FsOps, RepositoryClient};
 
 /// Checkpoint request sent to background worker
 #[derive(Debug, Clone)]
@@ -76,23 +82,48 @@ pub struct CheckpointManager {
     worker_handle: Option<JoinHandle<()>>,
     #[allow(dead_code)]
     max_checkpoints: usize,
-    git_enabled: bool,
+    /// Repository client for git operations (None = git disabled)
+    repo_client: Option<Arc<dyn RepositoryClient>>,
     #[allow(dead_code)]
     branch_name: Option<String>, // Track which branch we're on
     /// Target adapter to update on each checkpoint (e.g., "01_coding")
     /// When set, checkpoints will also update adapters/{target_adapter}.safetensors
     target_adapter: Option<String>,
+    /// FsOps for worktree-scoped file operations (None = direct access)
+    fs: Option<Arc<dyn FsOps>>,
 }
 
 impl CheckpointManager {
-    /// Create new checkpoint manager
+    /// Create new checkpoint manager (no git operations)
     pub fn new(model_path: PathBuf) -> Result<Self> {
-        Self::with_config(model_path, CheckpointConfig::default(), None)
+        Self::with_config(model_path, CheckpointConfig::default(), None, None)
+    }
+
+    /// Create checkpoint manager with a repository client for git operations
+    pub fn with_repo_client(
+        model_path: PathBuf,
+        repo_client: Arc<dyn RepositoryClient>,
+    ) -> Result<Self> {
+        Self::with_config(
+            model_path,
+            CheckpointConfig::default(),
+            None,
+            Some(repo_client),
+        )
     }
 
     /// Create checkpoint manager for an adapter branch
-    pub fn for_adapter(model_path: PathBuf, branch_name: String) -> Result<Self> {
-        Self::with_config(model_path, CheckpointConfig::default(), Some(branch_name))
+    pub fn for_adapter(
+        model_path: PathBuf,
+        branch_name: String,
+        repo_client: Option<Arc<dyn RepositoryClient>>,
+    ) -> Result<Self> {
+        Self::with_config(
+            model_path,
+            CheckpointConfig::default(),
+            Some(branch_name),
+            repo_client,
+        )
     }
 
     /// Create with custom configuration
@@ -100,32 +131,37 @@ impl CheckpointManager {
         model_path: PathBuf,
         config: CheckpointConfig,
         branch_name: Option<String>,
+        repo_client: Option<Arc<dyn RepositoryClient>>,
     ) -> Result<Self> {
         let checkpoint_dir = model_path.join(".checkpoints");
         std::fs::create_dir_all(&checkpoint_dir)?;
 
-        let (tx, rx) = mpsc::channel(config.queue_size);
+        // Derive FsOps from repo_client if available
+        let fs: Option<Arc<dyn FsOps>> = repo_client.as_ref().and_then(|client| {
+            let branch = branch_name.as_deref().unwrap_or("main");
+            Some(client.worktree(branch))
+        });
 
-        // Check if model path is a Git repository
-        let git_enabled = model_path.join(".git").exists();
+        let (tx, rx) = mpsc::channel(config.queue_size);
 
         // Spawn checkpoint worker thread
         let worker_handle = {
-            let model_path = model_path.clone();
-            let checkpoint_dir = checkpoint_dir.clone();
             let max_checkpoints = config.max_checkpoints;
             let git_interval = config.git_commit_interval;
             let branch = branch_name.clone();
+            let client = repo_client.clone();
+            let worker_fs = fs.clone();
+            let worker_checkpoint_dir = checkpoint_dir.clone();
 
             tokio::spawn(async move {
                 Self::checkpoint_worker(
                     rx,
-                    model_path,
-                    checkpoint_dir,
+                    worker_checkpoint_dir,
                     max_checkpoints,
                     git_interval,
-                    git_enabled,
+                    client,
                     branch,
+                    worker_fs,
                 )
                 .await;
             })
@@ -137,9 +173,10 @@ impl CheckpointManager {
             checkpoint_tx: tx,
             worker_handle: Some(worker_handle),
             max_checkpoints: config.max_checkpoints,
-            git_enabled,
+            repo_client,
             branch_name,
             target_adapter: None,
+            fs,
         })
     }
 
@@ -147,12 +184,6 @@ impl CheckpointManager {
     ///
     /// When set, each checkpoint will also copy weights to
     /// `adapters/{target_adapter}.safetensors` for live inference.
-    ///
-    /// # Example
-    /// ```ignore
-    /// let manager = CheckpointManager::new(model_path)?
-    ///     .with_target_adapter("01_coding".to_owned());
-    /// ```
     pub fn with_target_adapter(mut self, adapter_name: String) -> Self {
         self.target_adapter = Some(adapter_name);
         self
@@ -199,76 +230,109 @@ impl CheckpointManager {
         // Single checkpoint file - git tracks version history
         let checkpoint_path = self.checkpoint_dir.join("checkpoint.safetensors");
 
-        // Write weights directly to filesystem
-        match weights {
-            WeightSnapshot::Memory {
-                ref data,
-                format: _,
-            } => {
-                // Direct write from memory
-                fs::write(&checkpoint_path, data).await?;
-            }
-            WeightSnapshot::FilePath {
-                ref source,
-                format: _,
-            } => {
-                // Use copy-on-write if available
-                #[cfg(target_os = "linux")]
-                {
-                    use std::process::Command;
-                    let source_str = source.to_str()
-                        .ok_or_else(|| anyhow!("source path is not valid UTF-8"))?;
-                    let checkpoint_str = checkpoint_path.to_str()
-                        .ok_or_else(|| anyhow!("checkpoint path is not valid UTF-8"))?;
-                    let result = Command::new("cp")
-                        .args(["--reflink=auto", source_str, checkpoint_str])
-                        .output();
-
-                    match result {
-                        Ok(output) if output.status.success() => {}
-                        _ => {
-                            fs::copy(source, &checkpoint_path).await?;
-                        }
+        if let Some(fs) = &self.fs {
+            // FsOps path: use relative paths within worktree
+            match weights {
+                WeightSnapshot::Memory {
+                    ref data,
+                    format: _,
+                } => {
+                    fs.write_file(".checkpoints/checkpoint.safetensors", data).await?;
+                }
+                WeightSnapshot::FilePath {
+                    ref source,
+                    format: _,
+                } => {
+                    // source is an absolute path, need to handle this:
+                    // If source is within worktree, compute relative path for copy.
+                    // Otherwise fall back to reading the source and writing via FsOps.
+                    if let Ok(rel) = source.strip_prefix(&self.model_path) {
+                        let rel_str = rel.to_string_lossy();
+                        fs.copy(&rel_str, ".checkpoints/checkpoint.safetensors").await?;
+                    } else {
+                        // Source outside worktree - read it directly and write via FsOps
+                        let data = tokio::fs::read(source).await?;
+                        fs.write_file(".checkpoints/checkpoint.safetensors", &data).await?;
                     }
                 }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    fs::copy(source, &checkpoint_path).await?;
+                WeightSnapshot::Diff {
+                    base_step,
+                    ref changes,
+                } => {
+                    let rel_diff = format!(".checkpoints/diff_from_{base_step}_to_{step}.bin");
+                    fs.write_file(&rel_diff, changes).await?;
+                    return Ok(self.checkpoint_dir.join(format!("diff_from_{base_step}_to_{step}.bin")));
                 }
             }
-            WeightSnapshot::Diff {
-                base_step,
-                ref changes,
-            } => {
-                // Save diff file
-                let diff_path = self
-                    .checkpoint_dir
-                    .join(format!("diff_from_{base_step}_to_{step}.bin"));
-                fs::write(&diff_path, changes).await?;
-                return Ok(diff_path);
+
+            // Save metadata if provided
+            if let Some(metrics) = metadata {
+                let ckpt_meta = CheckpointMetadata {
+                    step,
+                    epoch: None,
+                    timestamp: Utc::now(),
+                    metrics: Some(metrics),
+                    format: WeightFormat::SafeTensors,
+                    parent_checkpoint: None,
+                };
+                let metadata_json = serde_json::to_string_pretty(&ckpt_meta)?;
+                fs.write_file(".checkpoints/checkpoint.json", metadata_json.as_bytes()).await?;
             }
-        }
 
-        // Save metadata if provided
-        if let Some(metrics) = metadata {
-            let metadata = CheckpointMetadata {
-                step,
-                epoch: None,
-                timestamp: Utc::now(),
-                metrics: Some(metrics),
-                format: WeightFormat::SafeTensors,
-                parent_checkpoint: None,
-            };
+            // Update target adapter if configured
+            if let Some(ref adapter_name) = self.target_adapter {
+                fs.mkdir("adapters", true).await?;
+                let rel_adapter = format!("adapters/{adapter_name}.safetensors");
+                fs.copy(".checkpoints/checkpoint.safetensors", &rel_adapter).await?;
+                tracing::info!("Updated target adapter via FsOps: {}", rel_adapter);
+            }
+        } else {
+            // Direct path (original behavior)
+            match weights {
+                WeightSnapshot::Memory {
+                    ref data,
+                    format: _,
+                } => {
+                    fs::write(&checkpoint_path, data).await?;
+                }
+                WeightSnapshot::FilePath {
+                    ref source,
+                    format: _,
+                } => {
+                    crate::git::ops::cow_copy(source, &checkpoint_path)?;
+                }
+                WeightSnapshot::Diff {
+                    base_step,
+                    ref changes,
+                } => {
+                    let diff_path = self
+                        .checkpoint_dir
+                        .join(format!("diff_from_{base_step}_to_{step}.bin"));
+                    fs::write(&diff_path, changes).await?;
+                    return Ok(diff_path);
+                }
+            }
 
-            let metadata_path = checkpoint_path.with_extension("json");
-            let metadata_json = serde_json::to_string_pretty(&metadata)?;
-            fs::write(&metadata_path, metadata_json).await?;
-        }
+            // Save metadata if provided
+            if let Some(metrics) = metadata {
+                let ckpt_meta = CheckpointMetadata {
+                    step,
+                    epoch: None,
+                    timestamp: Utc::now(),
+                    metrics: Some(metrics),
+                    format: WeightFormat::SafeTensors,
+                    parent_checkpoint: None,
+                };
+                let metadata_path = checkpoint_path.with_extension("json");
+                let metadata_json = serde_json::to_string_pretty(&ckpt_meta)?;
+                fs::write(&metadata_path, metadata_json).await?;
+            }
 
-        // Update target adapter if configured
-        if let Some(ref adapter_name) = self.target_adapter {
-            self.update_target_adapter(&checkpoint_path, adapter_name)
-                .await?;
+            // Update target adapter if configured
+            if let Some(ref adapter_name) = self.target_adapter {
+                self.update_target_adapter(&checkpoint_path, adapter_name)
+                    .await?;
+            }
         }
 
         tracing::info!(
@@ -278,41 +342,17 @@ impl CheckpointManager {
         Ok(checkpoint_path)
     }
 
-    /// Update the target adapter file with checkpoint weights
+    /// Update the target adapter file with checkpoint weights (direct path only)
     async fn update_target_adapter(
         &self,
         checkpoint_path: &Path,
         adapter_name: &str,
     ) -> Result<()> {
-        // Ensure adapters directory exists
         let adapters_dir = self.model_path.join("adapters");
         fs::create_dir_all(&adapters_dir).await?;
 
         let adapter_path = adapters_dir.join(format!("{adapter_name}.safetensors"));
-
-        // Copy checkpoint to adapter path
-        #[cfg(target_os = "linux")]
-        {
-            use std::process::Command;
-            let checkpoint_str = checkpoint_path.to_str()
-                .ok_or_else(|| anyhow!("checkpoint path is not valid UTF-8"))?;
-            let adapter_str = adapter_path.to_str()
-                .ok_or_else(|| anyhow!("adapter path is not valid UTF-8"))?;
-            let result = Command::new("cp")
-                .args(["--reflink=auto", checkpoint_str, adapter_str])
-                .output();
-
-            match result {
-                Ok(output) if output.status.success() => {}
-                _ => {
-                    fs::copy(checkpoint_path, &adapter_path).await?;
-                }
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            fs::copy(checkpoint_path, &adapter_path).await?;
-        }
+        crate::git::ops::cow_copy(checkpoint_path, &adapter_path)?;
 
         tracing::info!(
             "Updated target adapter: {}",
@@ -328,56 +368,54 @@ impl CheckpointManager {
         message: Option<String>,
         branch: Option<String>,
     ) -> Result<String> {
-        if !self.git_enabled {
-            return Err(anyhow!("Git is not enabled for this model path"));
-        }
-
-        // Open repository
-        let repo = GitManager::global()
-            .get_repository(&self.model_path)
-            .map_err(|e| anyhow::anyhow!("Failed to get repository: {}", e))?
-            .open()
-            .map_err(|e| anyhow::anyhow!("Failed to open repository: {}", e))?;
+        let repo_client = self
+            .repo_client
+            .as_ref()
+            .ok_or_else(|| anyhow!("Git is not enabled (no RepositoryClient configured)"))?;
 
         // Switch branch if specified
-        if let Some(branch_name) = branch {
-            let branch_ref = format!("refs/heads/{branch_name}");
-            if repo.find_reference(&branch_ref).is_ok() {
-                repo.set_head(&branch_ref)?;
-                repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
-            } else {
-                // Create new branch
-                let head = repo.head()?.peel_to_commit()?;
-                repo.branch(&branch_name, &head, false)?;
-                repo.set_head(&branch_ref)?;
-            }
+        if let Some(ref branch_name) = branch {
+            // create_branch may fail if it already exists — that's fine
+            let _ = repo_client.create_branch(branch_name, None).await;
+            repo_client
+                .checkout(branch_name)
+                .await
+                .map_err(|e| anyhow!("Failed to checkout branch '{}': {}", branch_name, e))?;
         }
 
-        // Add checkpoint to index
-        let mut index = repo.index()?;
+        // Stage checkpoint files
         let relative_path = checkpoint_path
             .strip_prefix(&self.model_path)
             .unwrap_or(checkpoint_path);
-        index.add_path(relative_path)?;
+        let mut files_to_stage: Vec<&str> = vec![relative_path.to_str().unwrap_or("")];
 
-        // Also add metadata if it exists
         let metadata_path = checkpoint_path.with_extension("json");
-        if metadata_path.exists() {
-            let relative_metadata = metadata_path
+        let relative_metadata;
+
+        let meta_exists = if let Some(fs) = &self.fs {
+            let rel = metadata_path
                 .strip_prefix(&self.model_path)
-                .unwrap_or(&metadata_path);
-            index.add_path(relative_metadata)?;
+                .unwrap_or(&metadata_path)
+                .to_string_lossy()
+                .to_string();
+            fs.exists(&rel).await.unwrap_or(false)
+        } else {
+            metadata_path.exists()
+        };
+
+        if meta_exists {
+            relative_metadata = metadata_path
+                .strip_prefix(&self.model_path)
+                .unwrap_or(&metadata_path)
+                .to_string_lossy()
+                .to_string();
+            files_to_stage.push(&relative_metadata);
         }
 
-        index.write()?;
-
-        // Create commit
-        let tree_id = index.write_tree()?;
-        let tree = repo.find_tree(tree_id)?;
-        let sig = GitManager::global()
-            .create_signature(None, None)
-            .map_err(|e| anyhow::anyhow!("Failed to create signature: {}", e))?;
-        let parent = repo.head()?.peel_to_commit()?;
+        repo_client
+            .stage_files(&files_to_stage)
+            .await
+            .map_err(|e| anyhow!("Failed to stage files: {}", e))?;
 
         let commit_message = message.unwrap_or_else(|| {
             format!(
@@ -389,10 +427,13 @@ impl CheckpointManager {
             )
         });
 
-        let oid = repo.commit(Some("HEAD"), &sig, &sig, &commit_message, &tree, &[&parent])?;
+        let oid = repo_client
+            .commit(&commit_message)
+            .await
+            .map_err(|e| anyhow!("Failed to commit: {}", e))?;
 
         tracing::info!("Checkpoint committed to Git: {}", oid);
-        Ok(oid.to_string())
+        Ok(oid)
     }
 
     /// Wait for all pending checkpoints to complete
@@ -419,22 +460,6 @@ impl CheckpointManager {
     }
 
     /// Gracefully shutdown the checkpoint manager
-    ///
-    /// This method:
-    /// 1. Flushes all pending checkpoints
-    /// 2. Closes the channel to signal shutdown
-    /// 3. Waits for the worker to complete
-    ///
-    /// **IMPORTANT**: Always call this method before dropping the manager
-    /// to prevent checkpoint corruption. The Drop implementation will warn
-    /// if shutdown() wasn't called.
-    ///
-    /// # Example
-    /// ```ignore
-    /// let manager = CheckpointManager::new(path)?;
-    /// // ... use manager ...
-    /// manager.shutdown().await?;  // Clean shutdown
-    /// ```
     pub async fn shutdown(mut self) -> Result<()> {
         // Flush pending checkpoints first
         if let Err(e) = self.flush().await {
@@ -442,15 +467,13 @@ impl CheckpointManager {
         }
 
         // Drop the sender to signal the worker to stop
-        // (The worker will exit when the channel closes after processing all items)
         drop(std::mem::replace(
             &mut self.checkpoint_tx,
-            mpsc::channel(1).0, // Replace with a dummy sender
+            mpsc::channel(1).0,
         ));
 
         // Wait for worker to complete
         if let Some(handle) = self.worker_handle.take() {
-            // Give a reasonable timeout for the worker to finish
             match tokio::time::timeout(tokio::time::Duration::from_secs(30), handle).await {
                 Ok(Ok(())) => {
                     tracing::debug!("CheckpointManager worker shut down cleanly");
@@ -471,51 +494,62 @@ impl CheckpointManager {
     }
 
     /// Check if there are pending checkpoints in the queue
-    ///
-    /// Note: This is an approximation since we can't peek into mpsc channels.
-    /// Returns true if the channel has capacity remaining (meaning items might be queued).
     pub fn has_pending(&self) -> bool {
-        // We can check if the channel is closed as a proxy
-        // If it's closed, there are definitely no pending items
         !self.checkpoint_tx.is_closed()
     }
 
     /// Get current checkpoint info (single file, git handles history)
     pub async fn get_checkpoint(&self) -> Result<Option<CheckpointInfo>> {
-        let metadata_path = self.checkpoint_dir.join("checkpoint.json");
-
-        if !metadata_path.exists() {
-            return Ok(None);
+        if let Some(fs) = &self.fs {
+            if !fs.exists(".checkpoints/checkpoint.json").await? {
+                return Ok(None);
+            }
+            let json = fs.read_to_string(".checkpoints/checkpoint.json").await?;
+            let metadata: CheckpointMetadata = serde_json::from_str(&json)?;
+            Ok(Some(CheckpointInfo {
+                step: metadata.step,
+                path: self.checkpoint_dir.clone(),
+                metadata: Some(metadata),
+            }))
+        } else {
+            let metadata_path = self.checkpoint_dir.join("checkpoint.json");
+            if !metadata_path.exists() {
+                return Ok(None);
+            }
+            let json = fs::read_to_string(&metadata_path).await?;
+            let metadata: CheckpointMetadata = serde_json::from_str(&json)?;
+            Ok(Some(CheckpointInfo {
+                step: metadata.step,
+                path: self.checkpoint_dir.clone(),
+                metadata: Some(metadata),
+            }))
         }
-
-        let json = fs::read_to_string(&metadata_path).await?;
-        let metadata: CheckpointMetadata = serde_json::from_str(&json)?;
-
-        Ok(Some(CheckpointInfo {
-            step: metadata.step,
-            path: self.checkpoint_dir.clone(),
-            metadata: Some(metadata),
-        }))
     }
 
     /// Load current checkpoint weights path
     pub async fn load_checkpoint(&self) -> Result<PathBuf> {
         let checkpoint_path = self.checkpoint_dir.join("checkpoint.safetensors");
-        if !checkpoint_path.exists() {
+
+        if let Some(fs) = &self.fs {
+            if !fs.exists(".checkpoints/checkpoint.safetensors").await? {
+                anyhow::bail!("No checkpoint found at {:?}", checkpoint_path);
+            }
+        } else if !checkpoint_path.exists() {
             anyhow::bail!("No checkpoint found at {:?}", checkpoint_path);
         }
+
         Ok(checkpoint_path)
     }
 
     /// Worker that processes checkpoint requests in background
     async fn checkpoint_worker(
         mut rx: mpsc::Receiver<CheckpointRequest>,
-        model_path: PathBuf,
         checkpoint_dir: PathBuf,
-        _max_checkpoints: usize, // No longer used - git handles versioning
+        _max_checkpoints: usize,
         _git_interval: usize,
-        git_enabled: bool,
+        repo_client: Option<Arc<dyn RepositoryClient>>,
         branch_name: Option<String>,
+        fs: Option<Arc<dyn FsOps>>,
     ) {
         while let Some(request) = rx.recv().await {
             // Skip sentinel values
@@ -524,115 +558,136 @@ impl CheckpointManager {
             }
 
             if let Err(e) = Self::process_checkpoint(
-                &model_path,
                 &checkpoint_dir,
                 request,
-                git_enabled,
+                repo_client.as_deref(),
                 &branch_name,
+                fs.as_ref(),
             )
             .await
             {
                 tracing::error!("Failed to process checkpoint: {}", e);
             }
-
-            // Note: No cleanup needed - single file, git handles versioning
         }
     }
 
     /// Process a single checkpoint request
     async fn process_checkpoint(
-        model_path: &Path,
         checkpoint_dir: &Path,
         request: CheckpointRequest,
-        git_enabled: bool,
+        repo_client: Option<&dyn RepositoryClient>,
         branch_name: &Option<String>,
+        fs: Option<&Arc<dyn FsOps>>,
     ) -> Result<()> {
-        // Use single checkpoint file - git handles versioning (no step-N dirs)
-        fs::create_dir_all(checkpoint_dir).await?;
+        if let Some(fs) = fs {
+            // FsOps path
+            fs.mkdir(".checkpoints", true).await?;
 
-        // Save weights - single checkpoint file
-        let _weights_file = match request.weights {
-            WeightSnapshot::Memory { ref data, format } => {
-                let filename = match format {
-                    WeightFormat::SafeTensors => "checkpoint.safetensors",
-                    WeightFormat::PyTorch => "checkpoint.bin",
-                    WeightFormat::AdapterBin => "checkpoint_adapter.bin",
-                };
-                let path = checkpoint_dir.join(filename);
-                fs::write(&path, data).await?;
-                path
-            }
-
-            WeightSnapshot::FilePath { ref source, format } => {
-                let filename = match format {
-                    WeightFormat::SafeTensors => "checkpoint.safetensors",
-                    WeightFormat::PyTorch => "checkpoint.bin",
-                    WeightFormat::AdapterBin => "checkpoint_adapter.bin",
-                };
-                let dest = checkpoint_dir.join(filename);
-
-                // Try copy-on-write first (Linux only)
-                #[cfg(target_os = "linux")]
-                {
-                    use std::process::Command;
-                    let source_str = source.to_str()
-                        .ok_or_else(|| anyhow!("source path is not valid UTF-8"))?;
-                    let dest_str = dest.to_str()
-                        .ok_or_else(|| anyhow!("dest path is not valid UTF-8"))?;
-                    let result = Command::new("cp")
-                        .args(["--reflink=auto", source_str, dest_str])
-                        .output();
-
-                    match result {
-                        Ok(output) if output.status.success() => {}
-                        _ => {
-                            fs::copy(source, &dest).await?;
-                        }
-                    }
+            // Save weights
+            match request.weights {
+                WeightSnapshot::Memory { ref data, format } => {
+                    let filename = match format {
+                        WeightFormat::SafeTensors => "checkpoint.safetensors",
+                        WeightFormat::PyTorch => "checkpoint.bin",
+                        WeightFormat::AdapterBin => "checkpoint_adapter.bin",
+                    };
+                    let rel_path = format!(".checkpoints/{filename}");
+                    fs.write_file(&rel_path, data).await?;
                 }
-
-                #[cfg(not(target_os = "linux"))]
-                {
-                    fs::copy(source, &dest).await?;
+                WeightSnapshot::FilePath { ref source, format } => {
+                    let filename = match format {
+                        WeightFormat::SafeTensors => "checkpoint.safetensors",
+                        WeightFormat::PyTorch => "checkpoint.bin",
+                        WeightFormat::AdapterBin => "checkpoint_adapter.bin",
+                    };
+                    let rel_dest = format!(".checkpoints/{filename}");
+                    // Source may be outside worktree; read and write if so
+                    let data = tokio::fs::read(source).await?;
+                    fs.write_file(&rel_dest, &data).await?;
                 }
-
-                dest
+                WeightSnapshot::Diff {
+                    base_step: _,
+                    ref changes,
+                } => {
+                    fs.write_file(".checkpoints/checkpoint_diff.bin", changes).await?;
+                }
             }
 
-            WeightSnapshot::Diff {
-                base_step: _,
-                ref changes,
-            } => {
-                // Diff files still use step since they need to reference base
-                let diff_path = checkpoint_dir.join("checkpoint_diff.bin");
-                fs::write(&diff_path, changes).await?;
-                diff_path
-            }
-        };
+            // Save metadata
+            let metadata = CheckpointMetadata {
+                step: request.step,
+                epoch: request.epoch,
+                timestamp: request.timestamp,
+                metrics: request.metrics,
+                format: match &request.weights {
+                    WeightSnapshot::Memory { format, .. }
+                    | WeightSnapshot::FilePath { format, .. } => *format,
+                    WeightSnapshot::Diff { .. } => WeightFormat::SafeTensors,
+                },
+                parent_checkpoint: None,
+            };
+            let metadata_json = serde_json::to_string_pretty(&metadata)?;
+            fs.write_file(".checkpoints/checkpoint.json", metadata_json.as_bytes()).await?;
+        } else {
+            // Direct path (original behavior)
+            tokio::fs::create_dir_all(checkpoint_dir).await?;
 
-        // Save metadata
-        let metadata = CheckpointMetadata {
-            step: request.step,
-            epoch: request.epoch,
-            timestamp: request.timestamp,
-            metrics: request.metrics,
-            format: match &request.weights {
-                WeightSnapshot::Memory { format, .. } | WeightSnapshot::FilePath { format, .. } => *format,
-                WeightSnapshot::Diff { .. } => WeightFormat::SafeTensors,
-            },
-            parent_checkpoint: None,
-        };
+            let _weights_file = match request.weights {
+                WeightSnapshot::Memory { ref data, format } => {
+                    let filename = match format {
+                        WeightFormat::SafeTensors => "checkpoint.safetensors",
+                        WeightFormat::PyTorch => "checkpoint.bin",
+                        WeightFormat::AdapterBin => "checkpoint_adapter.bin",
+                    };
+                    let path = checkpoint_dir.join(filename);
+                    tokio::fs::write(&path, data).await?;
+                    path
+                }
+                WeightSnapshot::FilePath { ref source, format } => {
+                    let filename = match format {
+                        WeightFormat::SafeTensors => "checkpoint.safetensors",
+                        WeightFormat::PyTorch => "checkpoint.bin",
+                        WeightFormat::AdapterBin => "checkpoint_adapter.bin",
+                    };
+                    let dest = checkpoint_dir.join(filename);
+                    crate::git::ops::cow_copy(source, &dest)?;
+                    dest
+                }
+                WeightSnapshot::Diff {
+                    base_step: _,
+                    ref changes,
+                } => {
+                    let diff_path = checkpoint_dir.join("checkpoint_diff.bin");
+                    tokio::fs::write(&diff_path, changes).await?;
+                    diff_path
+                }
+            };
 
-        let metadata_json = serde_json::to_string_pretty(&metadata)?;
-        fs::write(checkpoint_dir.join("checkpoint.json"), metadata_json).await?;
+            // Save metadata
+            let metadata = CheckpointMetadata {
+                step: request.step,
+                epoch: request.epoch,
+                timestamp: request.timestamp,
+                metrics: request.metrics,
+                format: match &request.weights {
+                    WeightSnapshot::Memory { format, .. }
+                    | WeightSnapshot::FilePath { format, .. } => *format,
+                    WeightSnapshot::Diff { .. } => WeightFormat::SafeTensors,
+                },
+                parent_checkpoint: None,
+            };
+            let metadata_json = serde_json::to_string_pretty(&metadata)?;
+            tokio::fs::write(checkpoint_dir.join("checkpoint.json"), metadata_json).await?;
+        }
 
-        // Optionally commit to Git branch
-        if git_enabled && request.commit_to_git {
-            if let Err(e) =
-                Self::git_commit_checkpoint(model_path, checkpoint_dir, request.step, branch_name)
-                    .await
-            {
-                tracing::warn!("Failed to commit checkpoint to Git: {}", e);
+        // Optionally commit to Git via RepositoryClient
+        if let Some(client) = repo_client {
+            if request.commit_to_git {
+                if let Err(e) =
+                    Self::git_commit_checkpoint(client, request.step, branch_name).await
+                {
+                    tracing::warn!("Failed to commit checkpoint to Git: {}", e);
+                }
             }
         }
 
@@ -645,55 +700,42 @@ impl CheckpointManager {
         Ok(())
     }
 
-    /// Commit checkpoint to Git branch
+    /// Commit checkpoint to Git branch via RepositoryClient
     async fn git_commit_checkpoint(
-        model_path: &Path,
-        _checkpoint_dir: &Path,
+        repo_client: &dyn RepositoryClient,
         step: usize,
         branch_name: &Option<String>,
     ) -> Result<()> {
-        // Open repository
-        let repo = GitManager::global()
-            .get_repository(model_path)
-            .map_err(|e| anyhow::anyhow!("Failed to get repository: {}", e))?
-            .open()
-            .map_err(|e| anyhow::anyhow!("Failed to open repository: {}", e))?;
-
-        // If we have a specific branch, ensure we're on it
+        // Ensure we're on the right branch
         if let Some(branch) = branch_name {
-            // Check if we're in a worktree (adapter training)
-            let head = repo.head()?;
-            let current_branch = head.shorthand().unwrap_or("");
-
-            if !current_branch.contains(branch) {
-                // Switch to the branch if not already on it
-                let branch_ref = format!("refs/heads/{branch}");
-                repo.set_head(&branch_ref)?;
-                repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
-            }
+            // create_branch may fail if it already exists — that's fine
+            let _ = repo_client.create_branch(branch, None).await;
+            repo_client
+                .checkout(branch)
+                .await
+                .map_err(|e| anyhow!("Failed to checkout branch '{}': {}", branch, e))?;
         }
 
-        // Add checkpoint files to index (single checkpoint file, git handles versioning)
-        let mut index = repo.index()?;
-        index.add_path(Path::new(".checkpoints/checkpoint.safetensors"))?;
-        index.add_path(Path::new(".checkpoints/checkpoint.json"))?;
-        index.write()?;
+        // Stage checkpoint files
+        repo_client
+            .stage_files(&[
+                ".checkpoints/checkpoint.safetensors",
+                ".checkpoints/checkpoint.json",
+            ])
+            .await
+            .map_err(|e| anyhow!("Failed to stage checkpoint files: {}", e))?;
 
-        // Create commit
-        let tree_id = index.write_tree()?;
-        let tree = repo.find_tree(tree_id)?;
-        let sig = GitManager::global()
-            .create_signature(None, None)
-            .map_err(|e| anyhow::anyhow!("Failed to create signature: {}", e))?;
-
-        let parent_commit = repo.head()?.peel_to_commit()?;
+        // Commit
         let message = if let Some(name) = branch_name.as_ref() {
             format!("Training checkpoint step {step} (branch: {name})")
         } else {
             format!("Training checkpoint step {step}")
         };
 
-        repo.commit(Some("HEAD"), &sig, &sig, &message, &tree, &[&parent_commit])?;
+        repo_client
+            .commit(&message)
+            .await
+            .map_err(|e| anyhow!("Failed to commit: {}", e))?;
 
         // For major checkpoints, create human-friendly tags
         if step.is_multiple_of(50000) {
@@ -703,15 +745,11 @@ impl CheckpointManager {
                 format!("checkpoint-step-{step}")
             };
 
-            // Create checkpoint tag
-            let _ = crate::git::helpers::create_tag(model_path, &tag_name);
+            let _ = repo_client.create_tag(&tag_name, None).await;
         }
 
         Ok(())
     }
-
-    // Note: cleanup_old_checkpoints and list_checkpoint_dirs removed
-    // Git handles versioning - single checkpoint file, git tracks history
 }
 
 /// Checkpoint configuration
@@ -744,17 +782,12 @@ impl Drop for CheckpointManager {
     fn drop(&mut self) {
         // Check if shutdown was called properly
         if let Some(handle) = self.worker_handle.take() {
-            // Worker handle still exists - shutdown() wasn't called!
             tracing::warn!(
                 "CheckpointManager dropped without calling shutdown()! \
                  This may cause checkpoint corruption if writes were in progress. \
                  Always call `manager.shutdown().await` before dropping."
             );
-
-            // Best-effort cleanup: abort the worker
-            // This is not ideal but prevents resource leaks
             handle.abort();
         }
-        // If worker_handle is None, shutdown() was called properly
     }
 }

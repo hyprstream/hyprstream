@@ -84,7 +84,7 @@ async fn start_training(
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{lora_id}");
-    if !state.policy_client.check_policy(&user, &resource, Operation::Train).await.unwrap_or(false) {
+    if !state.policy_client.check_policy_str(&user, &resource, Operation::Train).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -121,7 +121,7 @@ async fn stop_training(
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{lora_id}");
-    if !state.policy_client.check_policy(&user, &resource, Operation::Train).await.unwrap_or(false) {
+    if !state.policy_client.check_policy_str(&user, &resource, Operation::Train).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -154,7 +154,7 @@ async fn get_status(
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{lora_id}");
-    if !state.policy_client.check_policy(&user, &resource, Operation::Query).await.unwrap_or(false) {
+    if !state.policy_client.check_policy_str(&user, &resource, Operation::Query).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -185,7 +185,7 @@ async fn submit_samples(
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{lora_id}");
-    if !state.policy_client.check_policy(&user, &resource, Operation::Train).await.unwrap_or(false) {
+    if !state.policy_client.check_policy_str(&user, &resource, Operation::Train).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -230,7 +230,7 @@ async fn write_checkpoint(
 
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{}", req.model_id);
-    if !state.policy_client.check_policy(&user, &resource, Operation::Write).await.unwrap_or(false) {
+    if !state.policy_client.check_policy_str(&user, &resource, Operation::Write).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -335,7 +335,7 @@ async fn commit_checkpoint(
 
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{model_id}");
-    if !state.policy_client.check_policy(&user, &resource, Operation::Write).await.unwrap_or(false) {
+    if !state.policy_client.check_policy_str(&user, &resource, Operation::Write).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -371,8 +371,22 @@ async fn commit_checkpoint(
         }
     };
 
-    // Create checkpoint manager
-    let checkpoint_mgr = match CheckpointManager::new(model_path.to_path_buf()) {
+    // Get RepositoryClient from registry for git operations
+    let repo_client = match state.registry.repo(&model_id).await {
+        Ok(client) => Some(client),
+        Err(e) => {
+            tracing::warn!("Could not get RepositoryClient for '{}': {} — git commit disabled", model_id, e);
+            None
+        }
+    };
+
+    // Create checkpoint manager with repo client
+    let checkpoint_mgr = match CheckpointManager::with_config(
+        model_path.to_path_buf(),
+        Default::default(),
+        None,
+        repo_client,
+    ) {
         Ok(mgr) => mgr,
         Err(e) => {
             return (
@@ -409,7 +423,7 @@ async fn start_pretraining(
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{}", req.model_id);
-    if !state.policy_client.check_policy(&user, &resource, Operation::Train).await.unwrap_or(false) {
+    if !state.policy_client.check_policy_str(&user, &resource, Operation::Train).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({

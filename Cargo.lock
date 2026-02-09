@@ -5394,9 +5394,11 @@ dependencies = [
  "opentelemetry-stdout",
  "opentelemetry_sdk",
  "parking_lot 0.12.4",
+ "pathrs",
  "prost 0.13.5",
  "rand 0.8.5",
  "rayon",
+ "reflink-copy",
  "regex",
  "reqwest 0.11.27",
  "rlimit 0.10.2",
@@ -5560,6 +5562,7 @@ dependencies = [
 name = "hyprstream-rpc-derive"
 version = "0.1.0"
 dependencies = [
+ "capnp",
  "proc-macro2",
  "quote",
  "serde",
@@ -8323,6 +8326,24 @@ name = "pathdiff"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
+
+[[package]]
+name = "pathrs"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e28a357ed3c82eb2589457e5c756717f544c6f4221ecf3e3d64c14400677c10f"
+dependencies = [
+ "bitflags 2.9.4",
+ "itertools 0.14.0",
+ "libc",
+ "memchr",
+ "once_cell",
+ "rustix 1.1.2",
+ "rustversion",
+ "static_assertions",
+ "tempfile",
+ "thiserror 2.0.17",
+]
 
 [[package]]
 name = "pbkdf2"

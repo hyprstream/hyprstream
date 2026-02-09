@@ -8,7 +8,7 @@
 //! All requests are wrapped in `SignedEnvelope` for authentication:
 //! - `RequestLoop` verifies Ed25519 signatures before dispatching
 //! - Handlers receive `EnvelopeContext` with verified identity
-//! - Services use `ctx.casbin_subject()` for policy checks
+//! - Services use `ctx.subject()` for policy checks and resource isolation
 //!
 //! # Architecture
 //!
@@ -44,7 +44,7 @@
 //! impl ZmqService for MyService {
 //!     fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<Vec<u8>> {
 //!         // ctx.identity is already verified
-//!         println!("Request from: {}", ctx.casbin_subject());
+//!         println!("Request from: {}", ctx.subject());
 //!         Ok(vec![])
 //!     }
 //!
@@ -69,6 +69,7 @@
 
 mod core;
 mod traits;
+pub mod contained_root;
 pub mod callback;
 pub mod factories;
 pub mod flight;
@@ -88,8 +89,10 @@ pub use core::{
 };
 
 pub use traits::{
-    CloneOptions, DetailedStatus, FileChangeType, FileStatus, ModelInfo, RegistryClient,
-    RegistryServiceError, RemoteInfo, RepositoryClient, WorktreeInfo,
+    CloneOptions, DetailedStatus, FsDirEntry, FsOps, FsServiceError, FsStatInfo,
+    FileChangeType, FileStatus, ModelInfo, RegistryClient,
+    RegistryServiceError, RemoteInfo, RepositoryClient, SeekWhence, WorktreeInfo,
+    MAX_FDS_GLOBAL, MAX_FDS_PER_CLIENT, MAX_FS_IO_SIZE,
 };
 
 pub use inference::{InferenceService, InferenceZmqClient, INFERENCE_ENDPOINT};

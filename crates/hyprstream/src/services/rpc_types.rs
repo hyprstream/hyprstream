@@ -595,6 +595,208 @@ impl RegistryResponse {
         serialize::write_message(&mut bytes, &msg).unwrap_or_default();
         bytes
     }
+
+    // ====================================================================
+    // Worktree-scoped (nested) response builders — repoResult → worktreeResult
+    // ====================================================================
+
+    /// Build an FS error response (repoResult → fsResult → error).
+    pub fn fs_error(request_id: u64, message: &str) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let repo_resp = response.init_repo_result();
+        let fs_resp = repo_resp.init_worktree_result();
+        let mut error_info = fs_resp.init_error();
+        error_info.set_message(message);
+        error_info.set_code("FS_ERROR");
+        error_info.set_details("");
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build an FS open response (repoResult → fsResult → open).
+    pub fn fs_open(request_id: u64, fd: u32) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let repo_resp = response.init_repo_result();
+        let fs_resp = repo_resp.init_worktree_result();
+        let mut open_resp = fs_resp.init_open();
+        open_resp.set_fd(fd);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build an FS read response (repoResult → fsResult → read or pread).
+    pub fn fs_read(request_id: u64, data: &[u8], is_pread: bool) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let repo_resp = response.init_repo_result();
+        let fs_resp = repo_resp.init_worktree_result();
+        if is_pread {
+            let mut read_resp = fs_resp.init_pread();
+            read_resp.set_data(data);
+        } else {
+            let mut read_resp = fs_resp.init_read();
+            read_resp.set_data(data);
+        }
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build an FS write response (repoResult → fsResult → write or pwrite).
+    pub fn fs_write(request_id: u64, bytes_written: u64, is_pwrite: bool) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let repo_resp = response.init_repo_result();
+        let fs_resp = repo_resp.init_worktree_result();
+        if is_pwrite {
+            let mut write_resp = fs_resp.init_pwrite();
+            write_resp.set_bytes_written(bytes_written);
+        } else {
+            let mut write_resp = fs_resp.init_write();
+            write_resp.set_bytes_written(bytes_written);
+        }
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build an FS seek response (repoResult → fsResult → seek).
+    pub fn fs_seek(request_id: u64, position: u64) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let repo_resp = response.init_repo_result();
+        let fs_resp = repo_resp.init_worktree_result();
+        let mut seek_resp = fs_resp.init_seek();
+        seek_resp.set_position(position);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build an FS stat response (repoResult → fsResult → stat).
+    pub fn fs_stat(request_id: u64, stat: &crate::services::traits::FsStatInfo) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let repo_resp = response.init_repo_result();
+        let fs_resp = repo_resp.init_worktree_result();
+        let mut stat_resp = fs_resp.init_stat();
+        stat_resp.set_exists(stat.exists);
+        stat_resp.set_is_dir(stat.is_dir);
+        stat_resp.set_size(stat.size);
+        stat_resp.set_modified_at(stat.modified_at);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build an FS list-dir response (repoResult → fsResult → listDir).
+    pub fn fs_list_dir(request_id: u64, entries: &[crate::services::traits::FsDirEntry]) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let repo_resp = response.init_repo_result();
+        let fs_resp = repo_resp.init_worktree_result();
+        let mut list_builder = fs_resp.init_list_dir(entries.len() as u32);
+        for (i, entry) in entries.iter().enumerate() {
+            let mut entry_builder = list_builder.reborrow().get(i as u32);
+            entry_builder.set_name(&entry.name);
+            entry_builder.set_is_dir(entry.is_dir);
+            entry_builder.set_size(entry.size);
+        }
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build an FS void response for a named variant (repoResult → fsResult → <void variant>).
+    pub fn fs_void(request_id: u64, variant: FsVoidVariant) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let repo_resp = response.init_repo_result();
+        let mut fs_resp = repo_resp.init_worktree_result();
+        match variant {
+            FsVoidVariant::Close => fs_resp.set_close(()),
+            FsVoidVariant::Truncate => fs_resp.set_truncate(()),
+            FsVoidVariant::Fsync => fs_resp.set_fsync(()),
+            FsVoidVariant::Mkdir => fs_resp.set_mkdir(()),
+            FsVoidVariant::Remove => fs_resp.set_remove(()),
+            FsVoidVariant::Rmdir => fs_resp.set_rmdir(()),
+            FsVoidVariant::Rename => fs_resp.set_rename(()),
+            FsVoidVariant::Copy => fs_resp.set_copy(()),
+        }
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build an FS stream info response (repoResult → fsResult → openStream).
+    pub fn fs_stream_info(
+        request_id: u64,
+        fd: u32,
+        stream_id: &str,
+        stream_endpoint: &str,
+        server_pubkey: &[u8],
+    ) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let repo_resp = response.init_repo_result();
+        let fs_resp = repo_resp.init_worktree_result();
+        let mut stream_resp = fs_resp.init_open_stream();
+        stream_resp.set_fd(fd);
+        stream_resp.set_stream_id(stream_id);
+        stream_resp.set_stream_endpoint(stream_endpoint);
+        stream_resp.set_server_pubkey(server_pubkey);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build an FS stream auth response (repoResult → fsResult → startStream).
+    pub fn fs_stream_auth(request_id: u64, stream_id: &str, authorized: bool) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<registry_capnp::registry_response::Builder>();
+        response.set_request_id(request_id);
+
+        let repo_resp = response.init_repo_result();
+        let fs_resp = repo_resp.init_worktree_result();
+        let mut auth_resp = fs_resp.init_start_stream();
+        auth_resp.set_stream_id(stream_id);
+        auth_resp.set_authorized(authorized);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
 }
 
 /// Enum for repo-scoped void response variants.
@@ -618,6 +820,19 @@ pub enum RepoVoidVariant {
     CreateTag,
     DeleteTag,
     Update,
+}
+
+/// Enum for FS-scoped void response variants.
+#[derive(Clone, Copy)]
+pub enum FsVoidVariant {
+    Close,
+    Truncate,
+    Fsync,
+    Mkdir,
+    Remove,
+    Rmdir,
+    Rename,
+    Copy,
 }
 
 // ============================================================================
@@ -739,12 +954,39 @@ impl InferenceResponse {
         bytes
     }
 
-    /// Build a success response (void).
+    /// Build a success response (generic void — only for shutdown/legacy).
     pub fn success(request_id: u64) -> Vec<u8> {
         let mut msg = Builder::new_default();
         let mut response = msg.init_root::<inference_capnp::inference_response::Builder>();
         response.set_request_id(request_id);
         response.set_success(());
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build a variant-specific Void result response.
+    ///
+    /// The typed client expects the specific variant (e.g. `createLoraResult`)
+    /// not the generic `success` variant.
+    pub fn void_result(request_id: u64, variant: &str) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<inference_capnp::inference_response::Builder>();
+        response.set_request_id(request_id);
+        match variant {
+            "createLora" => response.set_create_lora_result(()),
+            "loadLora" => response.set_load_lora_result(()),
+            "saveLora" => response.set_save_lora_result(()),
+            "unloadLora" => response.set_unload_lora_result(()),
+            "setSession" => response.set_set_session_result(()),
+            "clearSession" => response.set_clear_session_result(()),
+            "releaseSession" => response.set_release_session_result(()),
+            "commitAdaptation" => response.set_commit_adaptation_result(()),
+            "rollbackAdaptation" => response.set_rollback_adaptation_result(()),
+            "resetDelta" => response.set_reset_delta_result(()),
+            _ => response.set_success(()),
+        }
 
         let mut bytes = Vec::new();
         serialize::write_message(&mut bytes, &msg).unwrap_or_default();
@@ -790,6 +1032,24 @@ impl InferenceResponse {
         response.set_request_id(request_id);
 
         let mut stream_info = response.init_generate_stream_result();
+        stream_info.set_stream_id(stream_id);
+        stream_info.set_endpoint(endpoint);
+        stream_info.set_server_pubkey(server_pubkey);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build a train step stream result response (StreamInfo).
+    ///
+    /// Returns stream info for the client to subscribe for training results.
+    pub fn train_step_stream_result(request_id: u64, stream_id: &str, endpoint: &str, server_pubkey: &[u8; 32]) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<inference_capnp::inference_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut stream_info = response.init_train_step_stream_result();
         stream_info.set_stream_id(stream_id);
         stream_info.set_endpoint(endpoint);
         stream_info.set_server_pubkey(server_pubkey);
@@ -937,6 +1197,103 @@ impl InferenceResponse {
         complete.set_finish_reason(Self::finish_reason_to_capnp(finish_reason));
         complete.set_generation_time_ms(stats.generation_time_ms);
         complete.set_tokens_per_second(stats.tokens_per_second);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build a train step result response.
+    pub fn train_step_result(
+        request_id: u64,
+        result: &crate::training::ttt::TTTResult,
+    ) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<inference_capnp::inference_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut train_result = response.init_train_step_result();
+        train_result.set_avg_loss(result.avg_loss);
+        train_result.set_loss_improvement(result.loss_improvement);
+        train_result.set_steps_performed(result.steps_performed as u32);
+        train_result.set_adaptation_time_ms(result.adaptation_time_ms);
+        train_result.set_initial_perplexity(result.initial_perplexity);
+        train_result.set_final_perplexity(result.final_perplexity);
+        train_result.set_recommendation(result.recommendation);
+        train_result.set_committed(!result.pending);
+        train_result.set_gradient_clipped(result.gradient_clipped);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build a delta status result response.
+    pub fn delta_status(
+        request_id: u64,
+        info: &crate::services::inference::DeltaStatusInfo,
+    ) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<inference_capnp::inference_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut status = response.init_get_delta_status_result();
+        status.set_exists(info.exists);
+        status.set_accumulated_steps(info.accumulated_steps);
+        status.set_max_accumulated_steps(info.max_accumulated_steps);
+        status.set_request_count(info.request_count);
+        status.set_avg_loss_improvement(info.avg_loss_improvement);
+        status.set_memory_bytes(info.memory_bytes);
+        status.set_last_snapshot_hash(&info.last_snapshot_hash);
+        status.set_has_pending(info.has_pending);
+
+        let norm_ratios: Vec<_> = info.delta_norm_ratios.iter().collect();
+        let mut ratios = status.init_delta_norm_ratios(norm_ratios.len() as u32);
+        for (i, (name, ratio)) in norm_ratios.iter().enumerate() {
+            let mut entry = ratios.reborrow().get(i as u32);
+            entry.set_module_name(name);
+            entry.set_ratio(**ratio as f32);
+        }
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build a save adaptation result response.
+    pub fn save_adaptation_result(
+        request_id: u64,
+        info: &crate::services::inference::SaveAdaptationInfo,
+    ) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<inference_capnp::inference_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut save_result = response.init_save_adaptation_result();
+        save_result.set_adapter_name(&info.adapter_name);
+        save_result.set_adapter_path(&info.adapter_path);
+        save_result.set_content_hash(&info.content_hash);
+        save_result.set_merge_strategy(&info.merge_strategy);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
+    /// Build a snapshot delta result response.
+    pub fn snapshot_delta_result(
+        request_id: u64,
+        info: &crate::services::inference::SnapshotDeltaInfo,
+    ) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<inference_capnp::inference_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut snapshot = response.init_snapshot_delta_result();
+        snapshot.set_content_hash(&info.content_hash);
+        snapshot.set_size_bytes(info.size_bytes);
+        snapshot.set_accumulated_steps(info.accumulated_steps);
+        snapshot.set_request_count(info.request_count);
 
         let mut bytes = Vec::new();
         serialize::write_message(&mut bytes, &msg).unwrap_or_default();

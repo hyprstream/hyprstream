@@ -147,7 +147,7 @@ impl PolicyHandler for PolicyService {
         use hyprstream_rpc::auth::Scope;
 
         trace!("Issuing JWT token");
-        let subject = ctx.casbin_subject();
+        let subject = ctx.subject().to_string();
 
         // Authorize each scope via Casbin
         for scope_str in requested_scopes {
@@ -225,7 +225,7 @@ impl ZmqService for PolicyService {
     fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<Vec<u8>> {
         trace!(
             "Policy request from {} (id={})",
-            ctx.casbin_subject(),
+            ctx.subject(),
             ctx.request_id
         );
         dispatch_policy(self, ctx, payload)
@@ -266,18 +266,51 @@ impl PolicyClient {
         Self::from_zmq(zmq_client)
     }
 
-    /// Check if subject is allowed to perform operation on resource
+    /// Check if subject is allowed to perform operation on resource.
+    ///
+    /// Accepts a typed `Subject` for type safety. The string conversion
+    /// for Casbin happens internally.
     pub async fn check_policy(
         &self,
-        subject: &str,
+        subject: &hyprstream_rpc::Subject,
         resource: &str,
         operation: Operation,
     ) -> Result<bool> {
         self.check_with_domain_policy(subject, "*", resource, operation).await
     }
 
+    /// Check policy with a string subject (for HTTP route callers).
+    ///
+    /// Parses the string as a Subject, falling back to anonymous on parse failure.
+    pub async fn check_policy_str(
+        &self,
+        subject: &str,
+        resource: &str,
+        operation: Operation,
+    ) -> Result<bool> {
+        self.check_with_domain_policy_str(subject, "*", resource, operation).await
+    }
+
     /// Check with explicit domain
     pub async fn check_with_domain_policy(
+        &self,
+        subject: &hyprstream_rpc::Subject,
+        domain: &str,
+        resource: &str,
+        operation: Operation,
+    ) -> Result<bool> {
+        let subject_str = subject.to_string();
+        match self.check(&subject_str, domain, resource, operation.as_str()).await? {
+            PolicyResponseVariant::Allowed(allowed) => Ok(allowed),
+            PolicyResponseVariant::Error { message, code, .. } => {
+                Err(anyhow!("Policy check failed: {} ({})", message, code))
+            }
+            _ => Err(anyhow!("Unexpected response type for policy check")),
+        }
+    }
+
+    /// Check with explicit domain (string subject variant for HTTP routes)
+    pub async fn check_with_domain_policy_str(
         &self,
         subject: &str,
         domain: &str,

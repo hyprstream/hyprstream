@@ -45,7 +45,7 @@ struct RepositoryRequest {
   repoId @0 :Text;
   union {
     # Create a new worktree for the repository
-    createWorktree @1 :WorktreeRequest;
+    createWorktree @1 :CreateWorktreeRequest;
     # List all worktrees for the repository
     listWorktrees @2 :Void;
     # Remove a worktree from the repository
@@ -104,6 +104,8 @@ struct RepositoryRequest {
     deleteTag @29 :DeleteTagRequest;
     # Pull and update from remote repository
     update @30 :UpdateRequest;
+    # Worktree-scoped filesystem operations
+    worktree @31 :WorktreeRequest;
   }
 }
 
@@ -160,8 +162,119 @@ struct RepositoryResponse {
     createTag @28 :Void;
     deleteTag @29 :Void;
     update @30 :Void;
+    worktreeResult @31 :WorktreeResponse;
   }
 }
+
+# --- Seek direction enum ---
+
+enum SeekWhence {
+  set @0;    # SEEK_SET — from beginning
+  cur @1;    # SEEK_CUR — from current position
+  end @2;    # SEEK_END — from end of file
+}
+
+# --- WorktreeRequest: worktree-scoped filesystem operations ---
+# Generator detects non-union field (name) + inner union
+# and produces WorktreeClient with name curried in.
+
+struct WorktreeRequest {
+  name @0 :Text;
+  union {
+    # FD lifecycle
+    open @1 :FsOpenRequest;
+    close @2 :FsCloseRequest;
+    # FD I/O (max 16 MiB per read/write)
+    read @3 :FsReadRequest;
+    write @4 :FsWriteRequest;
+    pread @5 :FsPreadRequest;
+    pwrite @6 :FsPwriteRequest;
+    seek @7 :FsSeekRequest;
+    truncate @8 :FsTruncateRequest;
+    fsync @9 :FsSyncRequest;
+    # Path operations (stateless)
+    stat @10 :FsPathRequest;
+    mkdir @11 :FsMkdirRequest;
+    remove @12 :FsPathRequest;
+    rmdir @13 :FsPathRequest;
+    rename @14 :FsRenameRequest;
+    copy @15 :FsCopyRequest;
+    listDir @16 :FsPathRequest;
+    # Streaming (bulk transfer via StreamService)
+    openStream @17 :FsOpenRequest;
+    startStream @18 :FsStartStreamRequest;
+  }
+}
+
+# Open: explicit bool fields instead of platform-specific flag bits
+struct FsOpenRequest {
+  path @0 :Text;
+  read @1 :Bool;        # default true
+  write @2 :Bool;       # default false
+  create @3 :Bool;      # create if not exists
+  truncate @4 :Bool;    # truncate to zero on open
+  append @5 :Bool;      # writes always at end
+  exclusive @6 :Bool;   # fail if exists + create
+}
+
+struct FsCloseRequest { fd @0 :UInt32; }
+struct FsReadRequest { fd @0 :UInt32; length @1 :UInt64; }
+struct FsWriteRequest { fd @0 :UInt32; data @1 :Data; }
+struct FsPreadRequest { fd @0 :UInt32; offset @1 :UInt64; length @2 :UInt64; }
+struct FsPwriteRequest { fd @0 :UInt32; offset @1 :UInt64; data @2 :Data; }
+struct FsSeekRequest { fd @0 :UInt32; offset @1 :Int64; whence @2 :SeekWhence; }
+struct FsTruncateRequest { fd @0 :UInt32; length @1 :UInt64; }
+struct FsSyncRequest { fd @0 :UInt32; dataOnly @1 :Bool; }
+struct FsPathRequest { path @0 :Text; }
+struct FsMkdirRequest { path @0 :Text; recursive @1 :Bool; }
+struct FsRenameRequest { src @0 :Text; dst @1 :Text; }
+struct FsCopyRequest { src @0 :Text; dst @1 :Text; }
+struct FsStartStreamRequest { streamId @0 :Text; clientPubkey @1 :Data; }
+
+# --- WorktreeResponse ---
+
+struct WorktreeResponse {
+  union {
+    error @0 :ErrorInfo;   # Default variant (fail-closed)
+    open @1 :FsOpenResponse;
+    close @2 :Void;
+    read @3 :FsReadResponse;
+    write @4 :FsWriteResponse;
+    pread @5 :FsReadResponse;
+    pwrite @6 :FsWriteResponse;
+    seek @7 :FsSeekResponse;
+    truncate @8 :Void;
+    fsync @9 :Void;
+    stat @10 :FsStatResponse;
+    mkdir @11 :Void;
+    remove @12 :Void;
+    rmdir @13 :Void;
+    rename @14 :Void;
+    copy @15 :Void;
+    listDir @16 :List(FsDirEntryInfo);
+    openStream @17 :FsStreamInfoResponse;
+    startStream @18 :FsStreamAuthResponse;
+  }
+}
+
+struct FsOpenResponse { fd @0 :UInt32; }
+struct FsReadResponse { data @0 :Data; }
+struct FsWriteResponse { bytesWritten @0 :UInt64; }
+struct FsSeekResponse { position @0 :UInt64; }
+struct FsStatResponse {
+  exists @0 :Bool;
+  isDir @1 :Bool;
+  size @2 :UInt64;
+  modifiedAt @3 :Int64;
+}
+struct FsDirEntryInfo { name @0 :Text; isDir @1 :Bool; size @2 :UInt64; }
+struct FsStreamInfoResponse {
+  fd @0 :UInt32;
+  streamId @1 :Text;
+  streamEndpoint @2 :Text;
+  serverPubkey @3 :Data;
+}
+struct FsStreamAuthResponse { streamId @0 :Text; authorized @1 :Bool; }
 
 # Stream Started Info (for cloneStream)
 struct StreamStartedInfo {
@@ -188,9 +301,9 @@ struct RegisterRequest {
   trackingRef @2 :Text;
 }
 
-# Worktree Request (repoId removed — curried into RepositoryClient)
+# Create Worktree Request (repoId removed — curried into RepositoryClient)
 
-struct WorktreeRequest {
+struct CreateWorktreeRequest {
   path @0 :Text;
   branchName @1 :Text;
   createBranch @2 :Bool;

@@ -119,6 +119,10 @@ glob.workspace = true
 walkdir.workspace = true
 reqwest.workspace = true
 libc = "0.2"  # For system calls in overlay2 driver
+reflink-copy = "0.1"  # COW file copying (reflink when available)
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pathrs = "0.2"  # Kernel-enforced path containment via openat2(RESOLVE_IN_ROOT)
 lru.workspace = true  # LRU cache for model caching and Git repository handles
 dashmap.workspace = true  # Concurrent HashMap for thread-safe repository caching
 bitflags = "2.4"  # Capability flags for archetype detection

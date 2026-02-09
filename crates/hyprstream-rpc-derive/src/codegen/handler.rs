@@ -233,6 +233,8 @@ fn generate_dispatch_fn(
             use crate::#capnp_mod::#req_snake::Which;
             let result = match req.which()? {
                 #(#match_arms)*
+                #[allow(unreachable_patterns)]
+                _ => anyhow::bail!("Unknown request variant (not in schema)"),
             }?;
             serialize_response(request_id, &result)
         }

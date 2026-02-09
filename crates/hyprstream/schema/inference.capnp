@@ -42,6 +42,20 @@ struct InferenceRequest {
     # Client calls this after generateStream to authorize subscription
     # Future: will include client public key for DH key exchange
     startStream @16 :StartStreamRequest;
+
+    # Training loop control — tenant-aware TTT (identity from auth envelope)
+    commitAdaptation @17 :Void;
+    rollbackAdaptation @18 :Void;
+    trainStep @19 :TrainStepRequest;
+    resetDelta @20 :Void;
+
+    # Persistence operations (identity from auth envelope)
+    getDeltaStatus @21 :Void;
+    saveAdaptation @22 :SaveAdaptationRequest;
+    snapshotDelta @23 :Void;
+
+    # Streaming training (returns immediately, results via PUB/SUB)
+    trainStepStream @24 :TrainStepRequest;
   }
 }
 
@@ -71,6 +85,20 @@ struct InferenceResponse {
 
     # Stream authorization response
     startStreamResult @17 :StreamAuthResponse;
+
+    # Training loop control responses
+    commitAdaptationResult @18 :Void;
+    rollbackAdaptationResult @19 :Void;
+    trainStepResult @20 :TrainStepResult;
+    resetDeltaResult @21 :Void;
+
+    # Persistence responses
+    getDeltaStatusResult @22 :DeltaStatusResult;
+    saveAdaptationResult @23 :SaveAdaptationResult;
+    snapshotDeltaResult @24 :SnapshotDeltaResult;
+
+    # Streaming training response
+    trainStepStreamResult @25 :StreamInfo;
   }
 }
 
@@ -140,6 +168,13 @@ struct OnlineTrainingMetrics {
   tokensUsed @9 :UInt32;             # Tokens actually used for adaptation
   tokensProvided @10 :UInt32;        # Total tokens in input
   wasTruncated @11 :Bool;            # Whether input was truncated (>max_ttt_context)
+
+  # Tenant-aware TTT metrics
+  initialPerplexity @12 :Float32;    # Perplexity before adaptation
+  finalPerplexity @13 :Float32;      # Perplexity after adaptation
+  recommendation @14 :Bool;          # Server's commit/rollback recommendation
+  gatedSteps @15 :UInt32;            # Steps determined by perplexity gating
+  pending @16 :Bool;                 # Whether adaptation awaits client commit/rollback
 }
 
 enum FinishReason {
@@ -249,6 +284,7 @@ struct LoraConfig {
   alpha @1 :Float32;
   dropout @2 :Float32;
   targetModules @3 :List(Text);
+  learningRate @4 :Float32;
 }
 
 # Model Info
@@ -274,6 +310,67 @@ struct HealthStatus {
   kvCacheUsagePercent @2 :Float32;
   gpuMemoryUsedMb @3 :UInt32;
   gpuMemoryTotalMb @4 :UInt32;
+}
+
+# =============================================================================
+# Training Loop Control (TTT operations)
+# =============================================================================
+
+struct TrainStepRequest {
+  input @0 :Text;
+  gradientSteps @1 :UInt32;
+  learningRate @2 :Float32;
+  autoCommit @3 :Bool;
+}
+
+struct TrainStepResult {
+  avgLoss @0 :Float32;
+  lossImprovement @1 :Float32;
+  stepsPerformed @2 :UInt32;
+  adaptationTimeMs @3 :UInt64;
+  initialPerplexity @4 :Float32;
+  finalPerplexity @5 :Float32;
+  recommendation @6 :Bool;
+  committed @7 :Bool;
+  gradientClipped @8 :Bool;
+}
+
+struct SaveAdaptationRequest {
+  name @0 :Text;
+  mergeStrategy @1 :Text;
+  mergeWeight @2 :Float32;
+  commitMessage @3 :Text;
+}
+
+struct SaveAdaptationResult {
+  adapterName @0 :Text;
+  adapterPath @1 :Text;
+  contentHash @2 :Text;
+  mergeStrategy @3 :Text;
+}
+
+struct DeltaStatusResult {
+  exists @0 :Bool;
+  accumulatedSteps @1 :UInt64;
+  maxAccumulatedSteps @2 :UInt64;
+  requestCount @3 :UInt64;
+  avgLossImprovement @4 :Float32;
+  memoryBytes @5 :UInt64;
+  lastSnapshotHash @6 :Text;
+  deltaNormRatios @7 :List(ModuleNormRatio);
+  hasPending @8 :Bool;
+}
+
+struct ModuleNormRatio {
+  moduleName @0 :Text;
+  ratio @1 :Float32;
+}
+
+struct SnapshotDeltaResult {
+  contentHash @0 :Text;
+  sizeBytes @1 :UInt64;
+  accumulatedSteps @2 :UInt64;
+  requestCount @3 :UInt64;
 }
 
 # Error Information

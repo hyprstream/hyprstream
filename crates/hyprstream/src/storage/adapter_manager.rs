@@ -2,11 +2,18 @@
 //!
 //! This module handles the storage, discovery, and composition of LoRA adapters
 //! within the git-versioned model repositories.
+//!
+//! Two modes of operation:
+//! - **Direct** (sync): Uses `PathBuf` and `std::fs` for standalone/test use.
+//! - **FsOps** (async): Uses `Arc<dyn FsOps>` for worktree-scoped, path-contained access.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crate::services::FsOps;
 
 /// Information about a discovered adapter
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,14 +65,39 @@ impl Default for AdapterConfig {
 /// Manages LoRA adapters within a model's git repository
 pub struct AdapterManager {
     pub adapters_dir: PathBuf,
+    /// Optional FsOps for worktree-scoped file operations.
+    /// When present, async methods use contained-root access.
+    /// When absent, sync methods use direct filesystem access.
+    fs: Option<Arc<dyn FsOps>>,
 }
 
 impl AdapterManager {
-    /// Create a new adapter manager for a model
+    /// Create a new adapter manager for a model (direct filesystem access)
     pub fn new(model_path: impl AsRef<Path>) -> Self {
         let adapters_dir = model_path.as_ref().join("adapters");
-        Self { adapters_dir }
+        Self {
+            adapters_dir,
+            fs: None,
+        }
     }
+
+    /// Create a new adapter manager with FsOps for worktree-scoped access
+    pub fn with_fs(fs: Arc<dyn FsOps>) -> Self {
+        // adapters_dir is kept for backward compat but not used when fs is Some
+        Self {
+            adapters_dir: PathBuf::from("adapters"),
+            fs: Some(fs),
+        }
+    }
+
+    /// Returns true if this manager is using FsOps for file operations
+    pub fn has_fs(&self) -> bool {
+        self.fs.is_some()
+    }
+
+    // =========================================================================
+    // Sync methods (direct filesystem access — backward compatible)
+    // =========================================================================
 
     /// Ensure the adapters directory exists
     pub fn ensure_adapters_dir(&self) -> Result<()> {
@@ -254,6 +286,259 @@ impl AdapterManager {
         } else {
             anyhow::bail!("Adapter '{}' not found", identifier)
         }
+    }
+
+    // =========================================================================
+    // Async methods (FsOps — worktree-scoped, path-contained access)
+    // =========================================================================
+
+    /// Ensure the adapters directory exists (async, via FsOps)
+    pub async fn ensure_adapters_dir_async(&self) -> Result<()> {
+        if let Some(fs) = &self.fs {
+            fs.mkdir("adapters", true).await?;
+            Ok(())
+        } else {
+            self.ensure_adapters_dir()
+        }
+    }
+
+    /// List all adapters via FsOps, sorted by index
+    pub async fn list_adapters_async(&self) -> Result<Vec<AdapterInfo>> {
+        let fs = match &self.fs {
+            Some(fs) => fs,
+            None => return self.list_adapters(),
+        };
+
+        let mut adapters = Vec::new();
+
+        // Check if adapters dir exists
+        if !fs.exists("adapters").await? {
+            return Ok(adapters);
+        }
+
+        let entries = fs.list_dir("adapters").await?;
+
+        for entry in entries {
+            let name_str = &entry.name;
+
+            // Only process .safetensors files
+            if !name_str.ends_with(".safetensors") {
+                continue;
+            }
+
+            // Parse index and name from filename like "00_base.safetensors"
+            let base_name = name_str.trim_end_matches(".safetensors");
+            let (index, name) = if let Some(underscore_pos) = base_name.find('_') {
+                let index_str = &base_name[..underscore_pos];
+                let adapter_name = &base_name[underscore_pos + 1..];
+
+                if let Ok(idx) = index_str.parse::<u32>() {
+                    (idx, adapter_name.to_owned())
+                } else {
+                    (999, base_name.to_owned())
+                }
+            } else {
+                (999, base_name.to_owned())
+            };
+
+            let rel_config = format!("adapters/{base_name}.config.json");
+            let config_exists = fs.exists(&rel_config).await?;
+
+            adapters.push(AdapterInfo {
+                filename: name_str.clone(),
+                index,
+                name,
+                // For FsOps, path is relative within worktree
+                path: PathBuf::from(format!("adapters/{name_str}")),
+                size: entry.size,
+                config_path: if config_exists {
+                    Some(PathBuf::from(rel_config))
+                } else {
+                    None
+                },
+            });
+        }
+
+        adapters.sort_by_key(|a| a.index);
+        Ok(adapters)
+    }
+
+    /// Get the next available index (async, via FsOps)
+    pub async fn get_next_index_async(&self) -> Result<u32> {
+        let adapters = self.list_adapters_async().await?;
+        if adapters.is_empty() {
+            Ok(0)
+        } else {
+            Ok(adapters.last().map(|a| a.index + 1).unwrap_or(0))
+        }
+    }
+
+    /// Create an indexed adapter filename (async, via FsOps)
+    pub async fn create_indexed_name_async(&self, name: &str, index: Option<u32>) -> Result<String> {
+        let idx = if let Some(i) = index {
+            i
+        } else {
+            self.get_next_index_async().await?
+        };
+        Ok(format!("{idx:02}_{name}"))
+    }
+
+    /// Initialize adapter via FsOps (async)
+    ///
+    /// Returns the relative path within the worktree (e.g., "adapters/00_base.safetensors").
+    pub async fn initialize_adapter_async(
+        &self,
+        name: &str,
+        index: Option<u32>,
+        config: AdapterConfig,
+    ) -> Result<String> {
+        let fs = match &self.fs {
+            Some(fs) => fs,
+            None => {
+                let path = self.initialize_adapter(name, index, config)?;
+                return Ok(path.to_string_lossy().to_string());
+            }
+        };
+
+        fs.mkdir("adapters", true).await?;
+
+        let idx = if let Some(i) = index {
+            i
+        } else {
+            self.get_next_index_async().await?
+        };
+
+        let adapter_name = format!("{idx:02}_{name}");
+
+        // Save configuration file
+        let rel_config = format!("adapters/{adapter_name}.config.json");
+        let config_json = serde_json::to_string_pretty(&config)
+            .with_context(|| "Failed to serialize adapter config")?;
+        fs.write_file(&rel_config, config_json.as_bytes()).await?;
+
+        // Create empty adapter file
+        let rel_adapter = format!("adapters/{adapter_name}.safetensors");
+        fs.write_file(&rel_adapter, &[]).await?;
+
+        Ok(rel_adapter)
+    }
+
+    /// Load configuration for a specific adapter (async, via FsOps)
+    pub async fn load_adapter_config_async(&self, adapter_name: &str) -> Result<AdapterConfig> {
+        let fs = match &self.fs {
+            Some(fs) => fs,
+            None => return self.load_adapter_config(adapter_name),
+        };
+
+        let rel_config = format!("adapters/{adapter_name}.config.json");
+        let config_str = fs.read_to_string(&rel_config).await?;
+        let config: AdapterConfig = serde_json::from_str(&config_str)?;
+        Ok(config)
+    }
+
+    /// Check if any adapters exist (async, via FsOps)
+    pub async fn has_adapters_async(&self) -> Result<bool> {
+        let fs = match &self.fs {
+            Some(fs) => fs,
+            None => return Ok(self.has_adapters()),
+        };
+
+        if !fs.exists("adapters").await? {
+            return Ok(false);
+        }
+
+        let adapters = self.list_adapters_async().await?;
+        Ok(!adapters.is_empty())
+    }
+
+    /// Remove an adapter by name or index (async, via FsOps)
+    pub async fn remove_adapter_async(&self, identifier: &str) -> Result<()> {
+        let fs = match &self.fs {
+            Some(fs) => fs,
+            None => return self.remove_adapter(identifier),
+        };
+
+        let adapters = self.list_adapters_async().await?;
+
+        let to_remove = if let Ok(idx) = identifier.parse::<u32>() {
+            adapters.iter().find(|a| a.index == idx)
+        } else {
+            adapters
+                .iter()
+                .find(|a| a.name == identifier || a.filename.starts_with(identifier))
+        };
+
+        if let Some(adapter) = to_remove {
+            // Remove adapter file (path is relative for FsOps)
+            let rel_path = adapter.path.to_string_lossy();
+            fs.remove(&rel_path).await?;
+
+            // Remove config if exists
+            if let Some(config_path) = &adapter.config_path {
+                let rel_config = config_path.to_string_lossy();
+                if fs.exists(&rel_config).await? {
+                    fs.remove(&rel_config).await?;
+                }
+            }
+
+            Ok(())
+        } else {
+            anyhow::bail!("Adapter '{}' not found", identifier)
+        }
+    }
+
+    /// Write adapter config file (async, via FsOps)
+    pub async fn write_config_async(&self, adapter_name: &str, config: &AdapterConfig) -> Result<()> {
+        let fs = match &self.fs {
+            Some(fs) => fs,
+            None => {
+                let config_path = self
+                    .adapters_dir
+                    .join(format!("{adapter_name}.config.json"));
+                let config_json = serde_json::to_string_pretty(config)?;
+                std::fs::write(&config_path, config_json)?;
+                return Ok(());
+            }
+        };
+
+        let rel_config = format!("adapters/{adapter_name}.config.json");
+        let config_json = serde_json::to_string_pretty(config)?;
+        fs.write_file(&rel_config, config_json.as_bytes()).await?;
+        Ok(())
+    }
+
+    /// Write adapter weights data (async, via FsOps)
+    pub async fn write_adapter_data_async(&self, adapter_name: &str, data: &[u8]) -> Result<()> {
+        let fs = match &self.fs {
+            Some(fs) => fs,
+            None => {
+                let adapter_path = self
+                    .adapters_dir
+                    .join(format!("{adapter_name}.safetensors"));
+                std::fs::write(&adapter_path, data)?;
+                return Ok(());
+            }
+        };
+
+        let rel_path = format!("adapters/{adapter_name}.safetensors");
+        fs.write_file(&rel_path, data).await?;
+        Ok(())
+    }
+
+    /// Read adapter weights data (async, via FsOps)
+    pub async fn read_adapter_data_async(&self, adapter_name: &str) -> Result<Vec<u8>> {
+        let fs = match &self.fs {
+            Some(fs) => fs,
+            None => {
+                let adapter_path = self
+                    .adapters_dir
+                    .join(format!("{adapter_name}.safetensors"));
+                return Ok(std::fs::read(&adapter_path)?);
+            }
+        };
+
+        let rel_path = format!("adapters/{adapter_name}.safetensors");
+        Ok(fs.read_file(&rel_path).await?)
     }
 }
 

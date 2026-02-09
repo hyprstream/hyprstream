@@ -321,13 +321,14 @@ unsafe impl Send for LlamaAttention {}
 unsafe impl Sync for LlamaAttention {}
 
 impl LlamaAttention {
-    /// Apply attention with optional GQA and KV caching
+    /// Apply attention with optional GQA, KV caching, and delta injection
     fn forward(
         &self,
         hidden_states: &Tensor,
         position_ids: Option<&Tensor>,
         kv_cache: Option<&mut crate::runtime::kv_cache::LayerKVCache>,
         start_pos: usize,
+        delta: Option<&crate::training::TenantDelta>,
     ) -> Result<Tensor> {
         let (batch_size, seq_len, hidden_size) = dims3(hidden_states)?;
 
@@ -342,9 +343,28 @@ impl LlamaAttention {
         // tracing::debug!("Reshaped hidden_states_2d shape: {:?}, dtype: {:?}", hidden_states_2d.size(), hidden_states_2d.kind());
 
         // Project to Q, K, V using the projection API (handles biases automatically)
-        let q = self.q_proj.apply(&hidden_states_2d);
-        let k = self.k_proj.apply(&hidden_states_2d);
-        let v = self.v_proj.apply(&hidden_states_2d);
+        let mut q = self.q_proj.apply(&hidden_states_2d);
+        let mut k = self.k_proj.apply(&hidden_states_2d);
+        let mut v = self.v_proj.apply(&hidden_states_2d);
+
+        // Delta injection — add LoRA corrections to attention projections
+        // During inference (no_grad), corrections are detached tensors (no gradient overhead).
+        // During training, these participate in the computation graph.
+        if let Some(delta) = delta {
+            for (name, proj) in [("q_proj", &mut q), ("k_proj", &mut k), ("v_proj", &mut v)] {
+                if delta.has_module(name, self.layer_idx) {
+                    let correction = delta.forward_2d(&hidden_states_2d, name, self.layer_idx)?;
+                    let kind = proj.kind();
+                    if start_pos == 0 && self.layer_idx == 0 {
+                        tracing::info!("[TTT] Layer 0 {}: correction_norm={:.6}, proj_norm={:.4}, ratio={:.6}",
+                            name, correction.norm().double_value(&[]),
+                            proj.norm().double_value(&[]),
+                            correction.norm().double_value(&[]) / (proj.norm().double_value(&[]) + 1e-10));
+                    }
+                    *proj = &*proj + correction.to_kind(kind);
+                }
+            }
+        }
 
         // tracing::debug!("After projection - Q shape: {:?}, K shape: {:?}, V shape: {:?}",
         //               q.size(), k.size(), v.size());
@@ -464,7 +484,16 @@ impl LlamaAttention {
         ]);
 
         // Apply output projection using the projection API
-        let attn_output = self.o_proj.apply(&attn_output_2d);
+        let mut attn_output = self.o_proj.apply(&attn_output_2d);
+
+        // Delta injection for o_proj
+        if let Some(delta) = delta {
+            if delta.has_module("o_proj", self.layer_idx) {
+                let correction = delta.forward_2d(&attn_output_2d, "o_proj", self.layer_idx)?;
+                let kind = attn_output.kind();
+                attn_output = attn_output + correction.to_kind(kind);
+            }
+        }
 
         // Reshape back to 3D: [batch, seq, hidden_size]
         let attn_output = attn_output.reshape([batch_size, seq_len, hidden_size]);
@@ -716,43 +745,99 @@ struct LlamaMLP {
     up_proj: LinearProjection,
     down_proj: LinearProjection,
     activation: String, // Activation function name
+    layer_idx: usize,   // Layer index for per-layer delta lookup
 }
 
 unsafe impl Send for LlamaMLP {}
 unsafe impl Sync for LlamaMLP {}
 
 impl LlamaMLP {
-    fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
+    fn forward(
+        &self,
+        hidden_states: &Tensor,
+        delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
         // Get dimensions
         let original_shape = hidden_states.size();
         let (batch_size, seq_len, hidden_size) = if original_shape.len() == 3 {
             (original_shape[0], original_shape[1], original_shape[2])
         } else {
             // Already 2D
-            return self.forward_2d(hidden_states);
+            return self.forward_2d(hidden_states, delta);
         };
 
         // Reshape to 2D for matmul
         let hidden_2d = hidden_states.reshape([batch_size * seq_len, hidden_size]);
 
-        // Apply SwiGLU: down(act(gate(x)) * up(x))
-        let gate_pre = self.gate_proj.apply(&hidden_2d);
+        // Apply SwiGLU: down(act(gate(x)) * up(x)) with delta corrections
+        let mut gate_pre = self.gate_proj.apply(&hidden_2d);
+        let mut up = self.up_proj.apply(&hidden_2d);
+
+        if let Some(delta) = delta {
+            if delta.has_module("gate_proj", self.layer_idx) {
+                let correction = delta.forward_2d(&hidden_2d, "gate_proj", self.layer_idx)?;
+                let kind = gate_pre.kind();
+                gate_pre = gate_pre + correction.to_kind(kind);
+            }
+            if delta.has_module("up_proj", self.layer_idx) {
+                let correction = delta.forward_2d(&hidden_2d, "up_proj", self.layer_idx)?;
+                let kind = up.kind();
+                up = up + correction.to_kind(kind);
+            }
+        }
+
         let gate = self.apply_activation(&gate_pre)?;
-        let up = self.up_proj.apply(&hidden_2d);
         let gated = &gate * &up;
-        let output = self.down_proj.apply(&gated);
+
+        let mut output = self.down_proj.apply(&gated);
+        if let Some(delta) = delta {
+            if delta.has_module("down_proj", self.layer_idx) {
+                let correction = delta.forward_2d(&gated, "down_proj", self.layer_idx)?;
+                let kind = output.kind();
+                output = output + correction.to_kind(kind);
+            }
+        }
 
         // Reshape back to 3D
         let out_size = output.size()[1];
         Ok(output.reshape([batch_size, seq_len, out_size]))
     }
 
-    fn forward_2d(&self, hidden_states: &Tensor) -> Result<Tensor> {
+    fn forward_2d(
+        &self,
+        hidden_states: &Tensor,
+        delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
         // Apply SwiGLU: down(act(gate(x)) * up(x))
-        let gate_pre = self.gate_proj.apply(hidden_states);
+        let mut gate_pre = self.gate_proj.apply(hidden_states);
+        let mut up = self.up_proj.apply(hidden_states);
+
+        if let Some(delta) = delta {
+            if delta.has_module("gate_proj", self.layer_idx) {
+                let correction = delta.forward_2d(hidden_states, "gate_proj", self.layer_idx)?;
+                let kind = gate_pre.kind();
+                gate_pre = gate_pre + correction.to_kind(kind);
+            }
+            if delta.has_module("up_proj", self.layer_idx) {
+                let correction = delta.forward_2d(hidden_states, "up_proj", self.layer_idx)?;
+                let kind = up.kind();
+                up = up + correction.to_kind(kind);
+            }
+        }
+
         let gate = self.apply_activation(&gate_pre)?;
-        let up = self.up_proj.apply(hidden_states);
-        Ok(self.down_proj.apply(&(&gate * &up)))
+        let gated = &gate * &up;
+
+        let mut output = self.down_proj.apply(&gated);
+        if let Some(delta) = delta {
+            if delta.has_module("down_proj", self.layer_idx) {
+                let correction = delta.forward_2d(&gated, "down_proj", self.layer_idx)?;
+                let kind = output.kind();
+                output = output + correction.to_kind(kind);
+            }
+        }
+
+        Ok(output)
     }
 
     /// Apply the configured activation function
@@ -1397,6 +1482,7 @@ impl LlamaModel {
             up_proj,
             down_proj,
             activation: config.hidden_activation.clone(),
+            layer_idx,
         };
 
         // Build layer norms
@@ -1527,6 +1613,185 @@ impl LlamaModel {
         );
         Ok(config)
     }
+
+    /// Core forward pass with optional delta injection (internal helper)
+    ///
+    /// Shared implementation for `forward_with_cache` (delta=None) and
+    /// `forward_with_cache_and_delta` (delta=Some). Delta corrections are
+    /// injected in each attention layer's Q/V projections before KV cache update.
+    fn forward_with_cache_inner(
+        &self,
+        input: &Tensor,
+        start_pos: usize,
+        delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        tracing::trace!("LlamaModel forward_with_cache_inner: input shape={:?}, start_pos={}, has_delta={}, config: hidden_size={}, num_layers={}",
+                     input.size(), start_pos, delta.is_some(), self.config.hidden_size, self.layers.len());
+
+        // Input should be token IDs with shape [batch_size, seq_len]
+        let mut hidden_states = if let Some(embed) = &self.embed_tokens {
+            // Convert token IDs to embeddings
+            let input_shape = input.size();
+
+            let batch_size = input_shape[0];
+            let seq_len = if input_shape.len() > 1 {
+                input_shape[1]
+            } else {
+                1
+            };
+
+            // Flatten input for embedding lookup (embedding expects 1D tensor)
+            let flat_input = input.flatten(0, -1);
+
+            // Perform embedding lookup using index_select
+            let embeddings = embed.index_select(0, &flat_input);
+
+            // Get the actual hidden size from the embedding result
+            let emb_dims = embeddings.size();
+            let hidden_size = emb_dims[emb_dims.len() - 1];
+
+            // Reshape back to [batch_size, seq_len, hidden_size]
+            let mut embeddings = embeddings.reshape([batch_size, seq_len, hidden_size]);
+
+            // Scale embeddings by sqrt(hidden_size) for Gemma3
+            if self.config.scale_embeddings {
+                let scale = (hidden_size as f32).sqrt();
+                let scale_tensor = Tensor::from_slice(&[scale])
+                    .to_kind(embeddings.kind())
+                    .to_device(embeddings.device());
+                embeddings = broadcast_mul(&embeddings, &scale_tensor)?;
+            }
+
+            embeddings
+        } else {
+            // If no embedding layer, assume input is already embedded
+            input.shallow_clone()
+        };
+
+        // Apply transformer layers
+        tracing::trace!("Total layers to process: {}", self.layers.len());
+
+        // Generate position_ids based on start_pos (for proper KV cache usage)
+        let seq_len = hidden_states.size()[1];
+        let position_ids = if start_pos == 0 {
+            Tensor::arange(seq_len, (tch::Kind::Int64, hidden_states.device()))
+        } else {
+            Tensor::arange_start(
+                start_pos as i64,
+                (start_pos + seq_len as usize) as i64,
+                (tch::Kind::Int64, hidden_states.device()),
+            )
+        };
+
+        // PERF: Lock KV cache ONCE before the layer loop (not 28 times inside!)
+        let cache_guard = self.kv_cache.as_ref().map(|cache_ref| cache_ref.lock());
+
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let residual = hidden_states.shallow_clone();
+
+            // Self-attention block with optional KV cache and delta injection
+            hidden_states = layer.input_layernorm.forward(&hidden_states)?;
+
+            // Handle KV cache per layer with proper start_pos
+            let attn_output = if let Some(ref cache_manager) = cache_guard {
+                if let Some(result) = cache_manager.with_layer_cache(idx, |layer_cache| {
+                    tracing::trace!(
+                        "Layer {}: Using KV cache, cache_pos={}",
+                        idx,
+                        layer_cache.seq_pos
+                    );
+                    layer.self_attn.forward(
+                        &hidden_states,
+                        Some(&position_ids),
+                        Some(layer_cache),
+                        start_pos,
+                        delta,
+                    )
+                }) {
+                    result?
+                } else {
+                    layer
+                        .self_attn
+                        .forward(&hidden_states, Some(&position_ids), None, start_pos, delta)?
+                }
+            } else {
+                layer
+                    .self_attn
+                    .forward(&hidden_states, Some(&position_ids), None, start_pos, delta)?
+            };
+            hidden_states = residual + attn_output;
+
+            // FFN block with delta injection for MLP projections
+            let residual = hidden_states.shallow_clone();
+            hidden_states = layer.post_attention_layernorm.forward(&hidden_states)?;
+            let ffn_output = layer.mlp.forward(&hidden_states, delta)?;
+            hidden_states = residual + ffn_output;
+        }
+
+        // Final layer norm
+        if let Some(norm) = &self.norm {
+            hidden_states = norm.forward(&hidden_states)?;
+        }
+
+        // LM head
+        if let Some(lm_head) = &self.lm_head {
+            hidden_states = hidden_states.matmul(lm_head);
+        } else if let Some(output_proj) = &self.lm_head_transposed {
+            let hs_shape = hidden_states.size();
+            if hs_shape.len() == 3 {
+                let (batch_size, seq_len, hidden_size) = (hs_shape[0], hs_shape[1], hs_shape[2]);
+                let hidden_2d = hidden_states.reshape([batch_size * seq_len, hidden_size]);
+                let logits_2d = hidden_2d.matmul(output_proj);
+                hidden_states = logits_2d.reshape([batch_size, seq_len, output_proj.size()[1]]);
+            } else {
+                hidden_states = hidden_states.matmul(output_proj);
+            }
+        } else {
+            tracing::warn!("No LM head or embedding weights found - returning hidden states!");
+        }
+
+        // Mask padded vocabulary entries if vocab was padded
+        let original_vocab_size = self.config.original_vocab_size;
+        let padded_vocab_size = self.config.vocab_size;
+        if padded_vocab_size > original_vocab_size && original_vocab_size > 0 {
+            let logits_shape = hidden_states.size();
+            let actual_vocab_size = logits_shape[logits_shape.len() - 1] as usize;
+
+            if actual_vocab_size == padded_vocab_size {
+                let mask_start = original_vocab_size as i64;
+                let mask_count = (padded_vocab_size - original_vocab_size) as i64;
+
+                if mask_count > 0 {
+                    let mask_values = Tensor::full(
+                        [mask_count],
+                        -1e10_f64,
+                        (hidden_states.kind(), hidden_states.device())
+                    );
+
+                    if logits_shape.len() == 3 {
+                        let batch_size = logits_shape[0];
+                        let seq_len = logits_shape[1];
+                        for b in 0..batch_size {
+                            for s in 0..seq_len {
+                                let slice = hidden_states.select(0, b).select(0, s);
+                                slice.narrow(0, mask_start, mask_count).copy_(&mask_values);
+                            }
+                        }
+                    } else if logits_shape.len() == 2 {
+                        let rows = logits_shape[0];
+                        for i in 0..rows {
+                            let slice = hidden_states.select(0, i);
+                            slice.narrow(0, mask_start, mask_count).copy_(&mask_values);
+                        }
+                    } else {
+                        hidden_states.narrow(0, mask_start, mask_count).copy_(&mask_values);
+                    }
+                }
+            }
+        }
+
+        Ok(hidden_states)
+    }
 }
 
 impl ModelOperations for LlamaModel {
@@ -1554,199 +1819,16 @@ impl ModelOperations for LlamaModel {
     }
 
     fn forward_with_cache(&self, input: &Tensor, start_pos: usize) -> Result<Tensor> {
-        tracing::trace!("LlamaModel forward_with_cache: input shape={:?}, start_pos={}, config: hidden_size={}, num_layers={}",
-                     input.size(), start_pos, self.config.hidden_size, self.layers.len());
+        self.forward_with_cache_inner(input, start_pos, None)
+    }
 
-        // Input should be token IDs with shape [batch_size, seq_len]
-        let mut hidden_states = if let Some(embed) = &self.embed_tokens {
-            // Convert token IDs to embeddings
-            // The embedding tensor has shape [vocab_size, hidden_size]
-            // Input has shape [batch_size, seq_len] with token IDs
-
-            // Get input shape
-            let input_shape = input.size();
-            // tracing::debug!("Input tensor shape: {:?}, dtype: {:?}", input_shape, input.kind());
-            // tracing::debug!("Embedding matrix shape: {:?}, dtype: {:?}", embed.size(), embed.kind());
-
-            let batch_size = input_shape[0];
-            let seq_len = if input_shape.len() > 1 {
-                input_shape[1]
-            } else {
-                1
-            };
-
-            // Flatten input for embedding lookup (embedding expects 1D tensor)
-            let flat_input = input.flatten(0, -1);
-            // tracing::debug!("Flattened input shape: {:?}, dtype: {:?}", flat_input.size(), flat_input.kind());
-
-            // Perform embedding lookup using index_select
-            let embeddings = embed.index_select(0, &flat_input);
-
-            // Get the actual hidden size from the embedding result
-            let emb_dims = embeddings.size();
-            let hidden_size = emb_dims[emb_dims.len() - 1]; // Last dimension is hidden size
-                                                            // tracing::debug!("Embeddings shape after lookup: {:?}, hidden_size: {}", emb_dims, hidden_size);
-
-            // Reshape back to [batch_size, seq_len, hidden_size]
-            let mut embeddings = embeddings.reshape([batch_size, seq_len, hidden_size]);
-
-            // Scale embeddings by sqrt(hidden_size) for Gemma3
-            if self.config.scale_embeddings {
-                let scale = (hidden_size as f32).sqrt();
-                let scale_tensor = Tensor::from_slice(&[scale])
-                    .to_kind(embeddings.kind()) // Match embeddings dtype (likely BF16)
-                    .to_device(embeddings.device());
-                embeddings = broadcast_mul(&embeddings, &scale_tensor)?;
-            }
-
-            embeddings
-        } else {
-            // If no embedding layer, assume input is already embedded
-            input.shallow_clone()
-        };
-
-        // Apply transformer layers
-        tracing::trace!("Total layers to process: {}", self.layers.len());
-
-        // Generate position_ids based on start_pos (for proper KV cache usage)
-        let seq_len = hidden_states.size()[1];
-        let position_ids = if start_pos == 0 {
-            // Processing full prompt - positions from 0 to seq_len
-            Tensor::arange(seq_len, (tch::Kind::Int64, hidden_states.device()))
-        } else {
-            // Processing new tokens - positions from start_pos onwards
-            Tensor::arange_start(
-                start_pos as i64,
-                (start_pos + seq_len as usize) as i64,
-                (tch::Kind::Int64, hidden_states.device()),
-            )
-        };
-
-        // PERF: Lock KV cache ONCE before the layer loop (not 28 times inside!)
-        // This reduces lock overhead from O(layers) to O(1) per forward pass.
-        let cache_guard = self.kv_cache.as_ref().map(|cache_ref| cache_ref.lock());
-
-        for (idx, layer) in self.layers.iter().enumerate() {
-            let residual = hidden_states.shallow_clone();
-            // tracing::debug!("Processing layer {}, hidden_states shape: {:?}", idx, hidden_states.size());
-
-            // Self-attention block with optional KV cache
-            hidden_states = layer.input_layernorm.forward(&hidden_states)?;
-
-            // Handle KV cache per layer with proper start_pos
-            let attn_output = if let Some(ref cache_manager) = cache_guard {
-                if let Some(result) = cache_manager.with_layer_cache(idx, |layer_cache| {
-                    tracing::trace!(
-                        "Layer {}: Using KV cache, cache_pos={}",
-                        idx,
-                        layer_cache.seq_pos
-                    );
-                    layer.self_attn.forward(
-                        &hidden_states,
-                        Some(&position_ids),
-                        Some(layer_cache),
-                        start_pos,
-                    )
-                }) {
-                    result?
-                } else {
-                    layer
-                        .self_attn
-                        .forward(&hidden_states, Some(&position_ids), None, start_pos)?
-                }
-            } else {
-                layer
-                    .self_attn
-                    .forward(&hidden_states, Some(&position_ids), None, start_pos)?
-            };
-            hidden_states = residual + attn_output;
-
-            // FFN block
-            let residual = hidden_states.shallow_clone();
-            hidden_states = layer.post_attention_layernorm.forward(&hidden_states)?;
-            let ffn_output = layer.mlp.forward(&hidden_states)?;
-            hidden_states = residual + ffn_output;
-        }
-
-        // Final layer norm
-        if let Some(norm) = &self.norm {
-            hidden_states = norm.forward(&hidden_states)?;
-        }
-
-        // LM head
-        // tracing::debug!("Before LM head: hidden_states shape={:?}", hidden_states.size());
-        if let Some(lm_head) = &self.lm_head {
-            // LM head weight also needs to be transposed
-            // tracing::debug!("Using LM head: shape={:?}", lm_head.size());
-            hidden_states = hidden_states.matmul(lm_head);
-            // tracing::debug!("After LM head: logits shape={:?}", hidden_states.size());
-        } else if let Some(output_proj) = &self.lm_head_transposed {
-            // Use pre-computed transposed embedding (tied weights, cached at load time)
-            // This saves ~740MB per forward pass by avoiding the transpose allocation
-            let hs_shape = hidden_states.size();
-            if hs_shape.len() == 3 {
-                let (batch_size, seq_len, hidden_size) = (hs_shape[0], hs_shape[1], hs_shape[2]);
-                let hidden_2d = hidden_states.reshape([batch_size * seq_len, hidden_size]);
-                let logits_2d = hidden_2d.matmul(output_proj);
-                hidden_states = logits_2d.reshape([batch_size, seq_len, output_proj.size()[1]]);
-            } else {
-                hidden_states = hidden_states.matmul(output_proj);
-            }
-        } else {
-            tracing::warn!("No LM head or embedding weights found - returning hidden states!");
-        }
-
-        // Mask padded vocabulary entries if vocab was padded
-        // This ensures padded tokens can never be sampled
-        let original_vocab_size = self.config.original_vocab_size;
-        let padded_vocab_size = self.config.vocab_size;
-        if padded_vocab_size > original_vocab_size && original_vocab_size > 0 {
-            let logits_shape = hidden_states.size();
-            let actual_vocab_size = logits_shape[logits_shape.len() - 1] as usize;
-
-            // Only mask if we actually have padded tokens in the output
-            if actual_vocab_size == padded_vocab_size {
-                // Set logits for padded tokens to -1e10
-                // This makes their probability effectively zero after softmax
-                let mask_start = original_vocab_size as i64;
-                let mask_count = (padded_vocab_size - original_vocab_size) as i64;
-
-                if mask_count > 0 {
-                    // Get the last dimension (vocab dimension) and mask the padded portion
-                    // We need to use narrow + copy to update the values
-                    let mask_values = Tensor::full(
-                        [mask_count],
-                        -1e10_f64,
-                        (hidden_states.kind(), hidden_states.device())
-                    );
-
-                    // For a multi-dimensional tensor, we need to handle each batch/sequence position
-                    if logits_shape.len() == 3 {
-                        // Shape is [batch, seq_len, vocab]
-                        let batch_size = logits_shape[0];
-                        let seq_len = logits_shape[1];
-                        for b in 0..batch_size {
-                            for s in 0..seq_len {
-                                let slice = hidden_states.select(0, b).select(0, s);
-                                slice.narrow(0, mask_start, mask_count).copy_(&mask_values);
-                            }
-                        }
-                    } else if logits_shape.len() == 2 {
-                        // Shape is [batch*seq_len, vocab] or [seq_len, vocab]
-                        let rows = logits_shape[0];
-                        for i in 0..rows {
-                            let slice = hidden_states.select(0, i);
-                            slice.narrow(0, mask_start, mask_count).copy_(&mask_values);
-                        }
-                    } else {
-                        // 1D tensor [vocab]
-                        hidden_states.narrow(0, mask_start, mask_count).copy_(&mask_values);
-                    }
-                }
-            }
-        }
-
-        Ok(hidden_states)
+    fn forward_with_cache_and_delta(
+        &self,
+        input: &Tensor,
+        start_pos: usize,
+        delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        self.forward_with_cache_inner(input, start_pos, delta)
     }
 
     fn embed_tokens(&self, input_ids: &Tensor) -> Result<Tensor> {
@@ -1825,25 +1907,26 @@ impl ModelOperations for LlamaModel {
                         Some(&position_ids),
                         Some(layer_cache),
                         start_pos,
+                        None,
                     )
                 }) {
                     result?
                 } else {
                     layer
                         .self_attn
-                        .forward(&hidden_states, Some(&position_ids), None, start_pos)?
+                        .forward(&hidden_states, Some(&position_ids), None, start_pos, None)?
                 }
             } else {
                 layer
                     .self_attn
-                    .forward(&hidden_states, Some(&position_ids), None, start_pos)?
+                    .forward(&hidden_states, Some(&position_ids), None, start_pos, None)?
             };
             hidden_states = residual + attn_output;
 
             // FFN block
             let residual = hidden_states.shallow_clone();
             hidden_states = layer.post_attention_layernorm.forward(&hidden_states)?;
-            let ffn_output = layer.mlp.forward(&hidden_states)?;
+            let ffn_output = layer.mlp.forward(&hidden_states, None)?;
             hidden_states = residual + ffn_output;
         }
 
@@ -1933,6 +2016,129 @@ impl ModelOperations for LlamaModel {
         }
     }
 
+    fn decode_layer(
+        &self,
+        layer_idx: usize,
+        hidden_states: &Tensor,
+        _attention_mask: Option<&Tensor>,
+        position_ids: Option<&Tensor>,
+        _past_kv: Option<&crate::runtime::kv_cache::LayerKVCache>,
+    ) -> Result<(Tensor, Option<(Tensor, Tensor)>)> {
+        let layer = self.layers.get(layer_idx).ok_or_else(|| {
+            anyhow!(
+                "Layer index {} out of range (model has {} layers)",
+                layer_idx,
+                self.layers.len()
+            )
+        })?;
+
+        let residual = hidden_states.shallow_clone();
+
+        // Self-attention block
+        let normed = layer.input_layernorm.forward(hidden_states)?;
+
+        // Handle KV cache per layer
+        let attn_output = if let Some(cache_ref) = self.kv_cache.as_ref() {
+            let cache_manager = cache_ref.lock();
+            if let Some(result) = cache_manager.with_layer_cache(layer_idx, |layer_cache| {
+                layer.self_attn.forward(
+                    &normed,
+                    position_ids,
+                    Some(layer_cache),
+                    0, // start_pos handled by cache
+                    None,
+                )
+            }) {
+                result?
+            } else {
+                layer.self_attn.forward(&normed, position_ids, None, 0, None)?
+            }
+        } else {
+            layer.self_attn.forward(&normed, position_ids, None, 0, None)?
+        };
+
+        let hidden_states = residual + attn_output;
+
+        // FFN block
+        let residual = hidden_states.shallow_clone();
+        let normed = layer.post_attention_layernorm.forward(&hidden_states)?;
+        let ffn_output = layer.mlp.forward(&normed, None)?;
+        let hidden_states = residual + ffn_output;
+
+        // No separate KV return — cache is managed internally by LlamaAttention
+        Ok((hidden_states, None))
+    }
+
+    fn decode_layer_with_delta(
+        &self,
+        layer_idx: usize,
+        hidden_states: &Tensor,
+        _attention_mask: Option<&Tensor>,
+        position_ids: Option<&Tensor>,
+        _past_kv: Option<&crate::runtime::kv_cache::LayerKVCache>,
+        delta: &crate::training::TenantDelta,
+    ) -> Result<(Tensor, Option<(Tensor, Tensor)>)> {
+        let layer = self.layers.get(layer_idx).ok_or_else(|| {
+            anyhow!(
+                "Layer index {} out of range (model has {} layers)",
+                layer_idx,
+                self.layers.len()
+            )
+        })?;
+
+        let residual = hidden_states.shallow_clone();
+
+        // Self-attention block with delta injection (no KV cache on training path)
+        let normed = layer.input_layernorm.forward(hidden_states)?;
+        let attn_output = layer.self_attn.forward(&normed, position_ids, None, 0, Some(delta))?;
+        let hidden_states = residual + attn_output;
+
+        // FFN block with delta injection for MLP projections
+        let residual = hidden_states.shallow_clone();
+        let normed = layer.post_attention_layernorm.forward(&hidden_states)?;
+        let ffn_output = layer.mlp.forward(&normed, Some(delta))?;
+        let hidden_states = residual + ffn_output;
+
+        Ok((hidden_states, None))
+    }
+
+    fn apply_final_norm(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        if let Some(norm) = &self.norm {
+            norm.forward(hidden_states)
+        } else {
+            Ok(hidden_states.shallow_clone())
+        }
+    }
+
+    fn lm_head(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        if let Some(lm_head) = &self.lm_head {
+            // Cast hidden_states to match lm_head dtype (e.g. BFloat16) in case
+            // training path produced Float32 from delta gradient computation
+            let hidden_states = hidden_states.to_kind(lm_head.kind());
+            Ok(hidden_states.f_matmul(lm_head)
+                .map_err(|e| anyhow!("lm_head matmul failed: {}", e))?)
+        } else if let Some(output_proj) = &self.lm_head_transposed {
+            let hidden_states = hidden_states.to_kind(output_proj.kind());
+            let hs_shape = hidden_states.size();
+            if hs_shape.len() == 3 {
+                let (batch_size, seq_len, hidden_size) = (hs_shape[0], hs_shape[1], hs_shape[2]);
+                let hidden_2d = hidden_states.reshape([batch_size * seq_len, hidden_size]);
+                let logits_2d = hidden_2d.f_matmul(output_proj)
+                    .map_err(|e| anyhow!("lm_head transposed matmul failed: {}", e))?;
+                Ok(logits_2d.reshape([batch_size, seq_len, -1]))
+            } else {
+                Ok(hidden_states.f_matmul(output_proj)
+                    .map_err(|e| anyhow!("lm_head transposed matmul failed: {}", e))?)
+            }
+        } else {
+            Err(anyhow!("No LM head or embedding weights found"))
+        }
+    }
+
+    fn num_layers(&self) -> usize {
+        self.config.num_hidden_layers
+    }
+
     fn apply_rope(&self, _tensor: &Tensor, _position_ids: &Tensor) -> Result<Tensor> {
         // RoPE is applied in the attention layers, not at the model level
         // This method should not be called
@@ -1960,13 +2166,6 @@ impl ModelOperations for LlamaModel {
 
         // Apply causal masking (simplified)
         Ok(mask)
-    }
-
-    fn apply_lora(&mut self, adapter: &crate::lora::torch_adapter::LoRAModel) -> Result<()> {
-        // Apply LoRA weights with architecture-specific handling
-        // The adapter will handle GQA shape conversions for Llama 2/3
-        let _ = adapter;
-        Ok(())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

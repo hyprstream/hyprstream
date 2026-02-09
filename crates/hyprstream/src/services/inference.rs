@@ -49,13 +49,14 @@ use crate::services::PolicyClient;
 use crate::config::{FinishReason, GenerationRequest, GenerationResult, ModelInfo, TrainingMode};
 use crate::inference_capnp;
 use anyhow::bail;
-use crate::lora::LoRAConfig;
 use crate::runtime::kv_cache::CacheOwner;
 use crate::runtime::model_config::ModelConfig;
 use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
 use crate::services::rpc_types::{InferenceResponse, StreamStartedInfo};
-use crate::services::{CallOptions, EnvelopeContext};
-use crate::training::{TTTConfig, TestTimeTrainer};
+use crate::services::{CallOptions, EnvelopeContext, FsOps};
+use crate::training::{DeltaPool, TenantDeltaConfig, TTTConfig, TestTimeTrainer};
+use hyprstream_rpc::Subject;
+use crate::training::serialize_state_dict_to_bytes;
 use crate::zmq::global_context;
 use anyhow::{anyhow, Result};
 use capnp::message::{Builder, ReaderOptions};
@@ -64,26 +65,47 @@ use hyprstream_rpc::StreamChannel;
 use capnp::serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use parking_lot::RwLock;
 use tmq::{reply, Multipart};
 use tokio::runtime::Handle;
 use tokenizers::Tokenizer;
 use tracing::{debug, error, info, trace, warn};
 
-/// Pending stream to be executed after REP response is sent.
+/// Pending work to be executed after REP response is sent.
 ///
 /// This solves the streaming deadlock where the service waits for subscription
 /// before returning the response, but the client can't subscribe without
 /// the stream_id from the response.
 ///
-/// Wraps `StreamContext` from hyprstream-rpc with inference-specific data.
-struct PendingStream {
-    /// Stream context with DH-derived keys (from hyprstream-rpc)
-    stream_ctx: hyprstream_rpc::StreamContext,
-    /// Generation request to execute
-    request: GenerationRequest,
-    /// TTT adaptation metrics (if TTT was run in prepare_stream)
-    ttt_result: Option<crate::training::ttt::TTTResult>,
+/// Wraps `StreamContext` from hyprstream-rpc with operation-specific data.
+enum PendingWork {
+    /// Streaming text generation
+    Generation {
+        /// Stream context with DH-derived keys (from hyprstream-rpc)
+        stream_ctx: hyprstream_rpc::StreamContext,
+        /// Generation request to execute
+        request: GenerationRequest,
+        /// TTT adaptation metrics (if TTT was run in prepare_stream)
+        ttt_result: Option<crate::training::ttt::TTTResult>,
+        /// Per-tenant delta for delta-aware inference (looked up in prepare_stream)
+        delta: Option<std::sync::Arc<parking_lot::Mutex<crate::training::TenantDelta>>>,
+    },
+    /// Streaming training step (avoids REQ/REP timeout on backward pass compilation)
+    Training {
+        /// Stream context with DH-derived keys (from hyprstream-rpc)
+        stream_ctx: hyprstream_rpc::StreamContext,
+        /// Subject identity for tenant-aware TTT
+        subject: Subject,
+        /// Text to train on
+        input: String,
+        /// Number of gradient steps
+        gradient_steps: u32,
+        /// Learning rate override (0 = use default)
+        learning_rate: f32,
+        /// Whether to auto-commit if quality gate passes
+        auto_commit: bool,
+    },
 }
 
 /// Default endpoint for the inference service
@@ -137,6 +159,57 @@ pub struct InferenceService {
     ttt_trainer: Option<Arc<TestTimeTrainer>>,
     /// Tokenizer for TTT adaptation
     tokenizer: Option<Arc<Tokenizer>>,
+    /// Per-tenant delta pool for isolated TTT adaptations
+    delta_pool: Option<Arc<DeltaPool>>,
+    /// Base LoRA delta loaded from a .safetensors adapter file.
+    /// Applied to all tenants (composed with per-tenant delta if both exist).
+    base_delta: parking_lot::Mutex<Option<std::sync::Arc<parking_lot::Mutex<crate::training::TenantDelta>>>>,
+    /// Pending adaptations awaiting client commit/rollback
+    pending_adaptations: parking_lot::Mutex<std::collections::HashMap<Subject, PendingAdaptation>>,
+    /// Optional FsOps for worktree-scoped file operations.
+    /// When present, adapter/snapshot writes use contained-root access.
+    fs: Option<Arc<dyn FsOps>>,
+}
+
+/// A pending TTT adaptation awaiting client commit or rollback
+struct PendingAdaptation {
+    /// Delta state before adaptation (for rollback)
+    pre_adaptation_state: std::collections::HashMap<String, tch::Tensor>,
+    /// The TTT result from the adaptation
+    ttt_result: crate::training::ttt::TTTResult,
+    /// When the adaptation was created
+    created_at: Instant,
+    /// Auto-rollback after this timeout (default: 30s)
+    timeout_ms: u64,
+}
+
+/// Delta status information returned by getDeltaStatus
+pub struct DeltaStatusInfo {
+    pub exists: bool,
+    pub accumulated_steps: u64,
+    pub max_accumulated_steps: u64,
+    pub request_count: u64,
+    pub avg_loss_improvement: f32,
+    pub memory_bytes: u64,
+    pub last_snapshot_hash: String,
+    pub delta_norm_ratios: std::collections::HashMap<String, f64>,
+    pub has_pending: bool,
+}
+
+/// Save adaptation result information
+pub struct SaveAdaptationInfo {
+    pub adapter_name: String,
+    pub adapter_path: String,
+    pub content_hash: String,
+    pub merge_strategy: String,
+}
+
+/// Snapshot delta result information
+pub struct SnapshotDeltaInfo {
+    pub content_hash: String,
+    pub size_bytes: u64,
+    pub accumulated_steps: u64,
+    pub request_count: u64,
 }
 
 impl InferenceService {
@@ -148,6 +221,7 @@ impl InferenceService {
         signing_key: SigningKey,
         policy_client: PolicyClient,
         endpoint: &str,
+        fs: Option<Arc<dyn FsOps>>,
     ) -> Result<hyprstream_rpc::service::SpawnedService> {
         let model_path = model_path.as_ref().to_path_buf();
         let endpoint_owned = endpoint.to_owned();
@@ -174,7 +248,7 @@ impl InferenceService {
                 };
 
             rt.block_on(async move {
-                match Self::initialize(model_path, config, model_id, server_pubkey, signing_key, nonce_cache, policy_client).await {
+                match Self::initialize(model_path, config, model_id, server_pubkey, signing_key, nonce_cache, policy_client, fs).await {
                     Ok(service) => {
                         // Pass init_tx to run_service_loop - it signals AFTER socket binding
                         Self::run_service_loop(service, &endpoint_owned, Some(init_tx)).await;
@@ -279,6 +353,7 @@ impl InferenceService {
             signing_key.clone(),
             nonce_cache,
             policy_client,
+            None, // Callback mode: no FsOps
         )
         .await?;
 
@@ -453,6 +528,7 @@ impl InferenceService {
         signing_key: SigningKey,
         nonce_cache: Arc<InMemoryNonceCache>,
         policy_client: PolicyClient,
+        fs: Option<Arc<dyn FsOps>>,
     ) -> Result<Self> {
         // Capture runtime handle for reuse in handlers
         let runtime_handle = Handle::current();
@@ -491,6 +567,7 @@ impl InferenceService {
                         min_input_length: tc.ttt.min_input_length,
                         max_ttt_context: tc.ttt.max_ttt_context,
                         enabled: true,
+                        ..TTTConfig::default()
                     };
 
                     let device = engine.device();
@@ -506,6 +583,23 @@ impl InferenceService {
                 (None, None)
             };
 
+        // Initialize delta pool if TTT is enabled
+        let delta_pool = if ttt_trainer.is_some() {
+            let module_dims = engine.get_lora_module_dims().unwrap_or_default();
+            let device = engine.device();
+
+            let delta_config = TenantDeltaConfig::default();
+            let kv_reg = engine.kv_registry();
+            let snapshots_dir = model_path.join("adapters").join(".snapshots");
+            let num_layers = engine.get_num_layers().unwrap_or(32);
+            let pool = DeltaPool::new(delta_config, module_dims, device, kv_reg, snapshots_dir, fs.clone(), num_layers);
+
+            info!("Delta pool initialized for tenant-aware TTT");
+            Some(Arc::new(pool))
+        } else {
+            None
+        };
+
         // Use provided signing key for response signing
         Ok(Self {
             engine: RwLock::new(engine),
@@ -520,7 +614,33 @@ impl InferenceService {
             policy_client,
             ttt_trainer,
             tokenizer,
+            delta_pool,
+            base_delta: parking_lot::Mutex::new(None),
+            pending_adaptations: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            fs,
         })
+    }
+
+    /// Resolve the effective delta for a subject: compose base_delta + tenant delta if both exist.
+    ///
+    /// Returns None if no deltas exist (base model only), which is the common case
+    /// and incurs zero overhead.
+    fn resolve_delta(
+        &self,
+        subject: &hyprstream_rpc::Subject,
+    ) -> Option<std::sync::Arc<parking_lot::Mutex<crate::training::TenantDelta>>> {
+        let base = self.base_delta.lock().clone();
+        let tenant = self.delta_pool.as_ref().and_then(|pool| pool.get(subject));
+
+        match (base, tenant) {
+            (Some(base), Some(tenant)) => {
+                // Compose: base + tenant corrections
+                Some(crate::training::TenantDelta::compose(&base, &tenant))
+            }
+            (Some(base), None) => Some(base),
+            (None, Some(tenant)) => Some(tenant),
+            (None, None) => None,
+        }
     }
 
     /// Run the service loop (async with TMQ)
@@ -615,13 +735,13 @@ impl InferenceService {
 
             debug!(
                 "Inference request from {} (envelope_id={})",
-                envelope_ctx.casbin_subject(),
+                envelope_ctx.subject(),
                 envelope_ctx.request_id
             );
 
-            // Handle request - may return pending stream work (now async for policy checks)
+            // Handle request - may return pending work (now async for policy checks)
             let request_id = envelope_ctx.request_id;
-            let (response_payload, pending_stream) = match service.handle_request(&envelope_ctx, &payload).await {
+            let (response_payload, pending_work) = match service.handle_request(&envelope_ctx, &payload).await {
                 Ok((resp, pending)) => (resp, pending),
                 Err(e) => {
                     error!("inference request handling error: {}", e);
@@ -660,11 +780,14 @@ impl InferenceService {
                 }
             };
 
-            // THEN execute any pending stream (after response is sent)
+            // THEN execute any pending work (after response is sent)
             // This solves the streaming deadlock - client can subscribe after
             // receiving the stream_id in the response
-            if let Some(pending) = pending_stream {
-                service.execute_stream(pending).await;
+            if let Some(pending) = pending_work {
+                match &pending {
+                    PendingWork::Generation { .. } => service.execute_stream(pending).await,
+                    PendingWork::Training { .. } => service.execute_training_stream(pending).await,
+                }
             }
         }
     }
@@ -675,12 +798,29 @@ impl InferenceService {
     /// - Ok(Some(result)) if TTT was configured and ran (or was skipped)
     /// - Ok(None) if TTT is not configured
     /// - Err(e) if TTT failed unexpectedly
-    fn apply_ttt_adaptation(&self, prompt: &str) -> Result<Option<crate::training::ttt::TTTResult>> {
+    fn apply_ttt_adaptation(&self, prompt: &str, subject: &Subject) -> Result<Option<crate::training::ttt::TTTResult>> {
+        self.apply_ttt_adaptation_with_overrides(prompt, subject, &crate::training::ttt::TTTOverrides::default())
+    }
+
+    /// Apply TTT adaptation with per-request overrides.
+    ///
+    /// Uses subject-specific delta pool for isolated per-session adaptation.
+    fn apply_ttt_adaptation_with_overrides(
+        &self,
+        prompt: &str,
+        subject: &Subject,
+        overrides: &crate::training::ttt::TTTOverrides,
+    ) -> Result<Option<crate::training::ttt::TTTResult>> {
         use anyhow::anyhow;
 
         let ttt_trainer = match self.ttt_trainer.as_ref() {
             Some(t) => t,
             None => return Ok(None),  // TTT not configured
+        };
+
+        let pool = match self.delta_pool.as_ref() {
+            Some(p) => p,
+            None => return Ok(None),  // No delta pool
         };
 
         let tokenizer = match self.tokenizer.as_ref() {
@@ -693,30 +833,55 @@ impl InferenceService {
         let input_tokens: Vec<u32> = encoding.get_ids().to_vec();
 
         let engine = self.engine.read();
-        match ttt_trainer.adapt(&engine, &input_tokens) {
-            Ok(result) => {
+
+        // Ensure delta exists for this subject
+        let delta_arc = pool.get_or_create(subject)?;
+
+        // Lock the delta and run adaptation
+        let mut delta = delta_arc.lock();
+
+        match ttt_trainer.adapt_tenant(&engine, &mut delta, &input_tokens, overrides) {
+            Ok((result, pre_snapshot)) => {
                 if !result.skipped {
                     debug!(
-                        "TTT: steps={}, improvement={:.4}, time={}ms, grad_norm={:.4}",
+                        "TTT (subject {}): steps={}, improvement={:.4}, time={}ms, ppl={:.1}->{:.1}, rec={}",
+                        subject,
                         result.steps_performed,
                         result.loss_improvement,
                         result.adaptation_time_ms,
-                        result.avg_grad_norm
+                        result.initial_perplexity,
+                        result.final_perplexity,
+                        result.recommendation,
                     );
                 }
+
+                // Handle auto-commit vs pending
+                if overrides.auto_commit && result.recommendation && !result.skipped {
+                    debug!("TTT: auto-committed adaptation for subject {}", subject);
+                } else if !overrides.auto_commit && !result.skipped && !pre_snapshot.is_empty() {
+                    // Store pending adaptation for later commit/rollback
+                    let pending = PendingAdaptation {
+                        pre_adaptation_state: pre_snapshot,
+                        ttt_result: result.clone(),
+                        created_at: Instant::now(),
+                        timeout_ms: 30_000,
+                    };
+                    self.pending_adaptations.lock().insert(subject.clone(), pending);
+                }
+
                 Ok(Some(result))
             }
             Err(e) => {
-                warn!("TTT adaptation failed: {}", e);
-                Err(e)  // Propagate error instead of silently swallowing
+                warn!("TTT adaptation failed for subject {}: {}", subject, e);
+                Err(e)
             }
         }
     }
 
     /// Handle non-streaming generation
-    fn handle_generate(&self, request: GenerationRequest) -> Result<GenerationResult> {
+    fn handle_generate(&self, request: GenerationRequest, subject: &Subject) -> Result<GenerationResult> {
         // Apply TTT adaptation BEFORE generation (if enabled) and capture metrics
-        let ttt_result = match self.apply_ttt_adaptation(request.prompt.as_str()) {
+        let ttt_result = match self.apply_ttt_adaptation(request.prompt.as_str(), subject) {
             Ok(Some(result)) => Some(result),
             Ok(None) => None,  // TTT not configured/applicable
             Err(e) => {
@@ -726,12 +891,15 @@ impl InferenceService {
             }
         };
 
-        // Use futures::executor::block_on because we're already inside a tokio runtime
-        // (run_service_loop runs in rt.block_on), and tokio's block_on can't be nested.
-        // futures::executor::block_on works because it's a simple single-threaded executor.
+        // Look up tenant's delta and/or base delta for delta-aware inference
+        let delta = self.resolve_delta(subject);
+        info!("[TTT-DEBUG] handle_generate: subject={}, delta_resolved={}, pool_exists={}, pool_subjects={:?}",
+              subject, delta.is_some(), self.delta_pool.is_some(),
+              self.delta_pool.as_ref().map(|p| p.list_subjects()));
+
         let engine = self.engine.read();
         let mut result = futures::executor::block_on(async {
-            RuntimeEngine::generate_with_params(&*engine, request).await
+            engine.generate_with_delta_params(request, delta).await
         })?;
 
         // Attach TTT metrics to response
@@ -762,9 +930,10 @@ impl InferenceService {
         client_ephemeral_pubkey: Option<&[u8]>,
         claims: Option<hyprstream_rpc::auth::Claims>,
         expiry_secs: i64,
-    ) -> Result<(String, [u8; 32], PendingStream)> {
+        subject: &Subject,
+    ) -> Result<(String, [u8; 32], PendingWork)> {
         // Apply TTT adaptation BEFORE streaming (capture metrics for completion)
-        let ttt_result = match self.apply_ttt_adaptation(request.prompt.as_str()) {
+        let ttt_result = match self.apply_ttt_adaptation(request.prompt.as_str(), subject) {
             Ok(Some(result)) => Some(result),
             Ok(None) => None,  // TTT not configured/applicable
             Err(e) => {
@@ -795,10 +964,14 @@ impl InferenceService {
         let stream_id = stream_ctx.stream_id().to_owned();
         let server_pubkey = *stream_ctx.server_pubkey();
 
-        let pending = PendingStream {
+        // Look up tenant's delta and/or base delta for delta-aware inference
+        let delta = self.resolve_delta(subject);
+
+        let pending = PendingWork::Generation {
             stream_ctx,
             request,
             ttt_result,
+            delta,
         };
 
         Ok((stream_id, server_pubkey, pending))
@@ -822,12 +995,14 @@ impl InferenceService {
     /// Note: The read lock must be held across await because TextStream<'_> borrows from the engine.
     /// This triggers clippy::await_holding_lock, but is necessary for the streaming API.
     #[allow(clippy::await_holding_lock)]
-    async fn execute_stream(&self, pending: PendingStream) {
+    async fn execute_stream(&self, pending: PendingWork) {
         use futures::StreamExt;
 
-        let stream_ctx = &pending.stream_ctx;
-        let request = pending.request;
-        let ttt_result = pending.ttt_result;  // TTT metrics captured in prepare_stream
+        let PendingWork::Generation { stream_ctx, request, ttt_result, delta } = pending else {
+            error!("execute_stream called with non-Generation PendingWork");
+            return;
+        };
+        let stream_ctx = &stream_ctx;
 
         // Get StreamChannel
         let stream_channel = match &self.stream_channel {
@@ -841,12 +1016,13 @@ impl InferenceService {
         trace!(
             stream_id = %stream_ctx.stream_id(),
             topic = %stream_ctx.topic(),
+            has_delta = delta.is_some(),
             "Starting E2E authenticated stream via StreamChannel"
         );
 
         // Run the stream with StreamChannel's async publisher callback
         let engine = self.engine.read();
-        let stream_result = engine.generate(request);
+        let stream_result = engine.generate_with_delta(request, delta);
 
         let result = stream_channel.with_publisher(stream_ctx, |mut publisher| async move {
             match stream_result {
@@ -905,6 +1081,55 @@ impl InferenceService {
         }
     }
 
+    /// Execute streaming training step - called AFTER REP response is sent.
+    ///
+    /// Runs the training step in the background and publishes results via StreamChannel.
+    /// This avoids REQ/REP timeout on long-running training (e.g., backward pass compilation).
+    async fn execute_training_stream(&self, pending: PendingWork) {
+        let PendingWork::Training { stream_ctx, subject, input, gradient_steps, learning_rate, auto_commit } = pending else {
+            error!("execute_training_stream called with non-Training PendingWork");
+            return;
+        };
+        let stream_ctx = &stream_ctx;
+
+        let stream_channel = match &self.stream_channel {
+            Some(sc) => sc,
+            None => {
+                error!("StreamChannel not initialized for training stream");
+                return;
+            }
+        };
+
+        trace!(
+            stream_id = %stream_ctx.stream_id(),
+            "Starting training stream via StreamChannel"
+        );
+
+        let result = stream_channel.with_publisher(stream_ctx, |mut publisher| async move {
+            match self.handle_train_step(&subject, &input, gradient_steps, learning_rate, auto_commit) {
+                Ok(result) => {
+                    // Serialize training result as JSON for the completion payload
+                    let payload = serde_json::to_vec(&result)
+                        .unwrap_or_else(|e| format!("{{\"error\":\"serialize failed: {e}\"}}").into_bytes());
+                    publisher.complete_ref(&payload).await?;
+                    Ok(())
+                }
+                Err(e) => {
+                    publisher.publish_error(&e.to_string()).await?;
+                    Err(e)
+                }
+            }
+        }).await;
+
+        if let Err(e) = result {
+            error!(
+                stream_id = %stream_ctx.stream_id(),
+                error = %e,
+                "Training stream execution failed"
+            );
+        }
+    }
+
     /// Handle model info request
     fn handle_model_info(&self) -> ModelInfo {
         RuntimeEngine::model_info(&*self.engine.read())
@@ -927,33 +1152,352 @@ impl InferenceService {
     }
 
     /// Handle create LoRA
-    fn handle_create_lora(&self, config: LoRAConfig) -> Result<()> {
+    fn handle_create_lora(&self, config: TenantDeltaConfig) -> Result<()> {
+        // Propagate target modules to the delta pool so new deltas
+        // create A/B matrices for ALL configured modules, not just the default q_proj/v_proj
+        if let Some(pool) = &self.delta_pool {
+            tracing::info!(
+                "[TTT] Updating delta pool config: target_modules={:?}, rank={}, alpha={:.1}, lr={:.1e}",
+                config.target_modules, config.rank, config.alpha, config.learning_rate
+            );
+            pool.update_config(config.clone());
+        }
         self.engine.write().create_lora(config)
     }
 
-    /// Handle load LoRA
-    fn handle_load_lora(&self, path: &Path) -> Result<()> {
-        // Use futures::executor::block_on to avoid nesting tokio runtimes
-        let mut engine = self.engine.write();
-        futures::executor::block_on(async { engine.load_lora_from_file(path).await })
+    // =========================================================================
+    // Training loop control handlers (tenant-aware TTT)
+    // =========================================================================
+
+    /// Commit a pending TTT adaptation
+    fn handle_commit_adaptation(&self, subject: &Subject) -> Result<()> {
+        let mut pending = self.pending_adaptations.lock();
+
+        let adaptation = pending.remove(subject)
+            .ok_or_else(|| anyhow!("No pending adaptation for subject '{}'", subject))?;
+
+        // Get the subject's delta and update accumulation stats
+        if let Some(pool) = &self.delta_pool {
+            if let Some(delta_arc) = pool.get(subject) {
+                let mut delta = delta_arc.lock();
+                delta.accumulated_steps += adaptation.ttt_result.steps_performed as u64;
+                delta.request_count += 1;
+                let n = delta.request_count as f64;
+                delta.avg_loss_improvement = delta.avg_loss_improvement * ((n - 1.0) / n)
+                    + adaptation.ttt_result.loss_improvement as f64 / n;
+            }
+        }
+
+        debug!(
+            "Committed adaptation for subject '{}': steps={}, improvement={:.4}",
+            subject, adaptation.ttt_result.steps_performed, adaptation.ttt_result.loss_improvement
+        );
+
+        Ok(())
     }
 
-    /// Handle save LoRA
-    fn handle_save_lora(&self, path: &str) -> Result<()> {
-        self.engine.read().save_lora(path)
+    /// Rollback a pending TTT adaptation
+    fn handle_rollback_adaptation(&self, subject: &Subject) -> Result<()> {
+        let mut pending = self.pending_adaptations.lock();
+
+        let adaptation = pending.remove(subject)
+            .ok_or_else(|| anyhow!("No pending adaptation for subject '{}'", subject))?;
+
+        // Restore delta to pre-adaptation state
+        if let Some(pool) = &self.delta_pool {
+            if let Some(delta_arc) = pool.get(subject) {
+                let mut delta = delta_arc.lock();
+                delta.load_state_dict(&adaptation.pre_adaptation_state)?;
+            }
+        }
+
+        debug!("Rolled back adaptation for subject '{}'", subject);
+        Ok(())
     }
 
-    /// Handle unload LoRA
-    fn handle_unload_lora(&self) -> Result<()> {
-        self.engine.write().unload_lora()
+    /// Run pure training steps without generation
+    fn handle_train_step(
+        &self,
+        subject: &Subject,
+        input: &str,
+        gradient_steps: u32,
+        learning_rate: f32,
+        auto_commit: bool,
+    ) -> Result<crate::training::ttt::TTTResult> {
+        let ttt_trainer = self.ttt_trainer.as_ref()
+            .ok_or_else(|| anyhow!("TTT not configured"))?;
+        let tokenizer = self.tokenizer.as_ref()
+            .ok_or_else(|| anyhow!("No tokenizer available"))?;
+        let pool = self.delta_pool.as_ref()
+            .ok_or_else(|| anyhow!("Delta pool not initialized"))?;
+
+        let delta_arc = pool.get_or_create(subject)?;
+        let mut delta = delta_arc.lock();
+
+        let encoding = tokenizer.encode(input, false)
+            .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
+        let input_tokens: Vec<u32> = encoding.get_ids().to_vec();
+
+        let steps = if gradient_steps > 0 { gradient_steps as usize } else { ttt_trainer.config.gradient_steps };
+        let lr = if learning_rate > 0.0 { Some(learning_rate as f64) } else { None };
+
+        // Snapshot delta state before training (for rollback if not auto-committing)
+        let pre_snapshot = if !auto_commit {
+            delta.extract_state_dict()
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        let engine = self.engine.read();
+        let mut result = ttt_trainer.train_step(&engine, &mut delta, &input_tokens, steps, lr)?;
+
+        // If auto_commit and recommendation is positive, commit immediately.
+        // If auto_commit and recommendation is negative, rollback.
+        // If not auto_commit, store as pending for client to decide.
+        if auto_commit && result.recommendation {
+            delta.accumulated_steps += result.steps_performed as u64;
+            delta.request_count += 1;
+            result.pending = false;
+        } else if auto_commit && !result.recommendation {
+            // Auto-rollback
+            if !pre_snapshot.is_empty() {
+                let _ = delta.load_state_dict(&pre_snapshot);
+            }
+            result.pending = false;
+        } else if !auto_commit {
+            result.pending = true;
+            // Store pending adaptation for later commit/rollback
+            if !pre_snapshot.is_empty() {
+                let pending = PendingAdaptation {
+                    pre_adaptation_state: pre_snapshot,
+                    ttt_result: result.clone(),
+                    created_at: std::time::Instant::now(),
+                    timeout_ms: 30_000,
+                };
+                self.pending_adaptations.lock().insert(subject.clone(), pending);
+            }
+        }
+
+        Ok(result)
     }
 
-    /// Handle has LoRA
-    fn handle_has_lora(&self) -> bool {
-        self.engine.read().has_lora_model()
+    /// Reset a tenant's delta to zeros
+    fn handle_reset_delta(&self, subject: &Subject) -> Result<()> {
+        // Clear any pending adaptation
+        self.pending_adaptations.lock().remove(subject);
+
+        if let Some(pool) = &self.delta_pool {
+            if let Some(delta_arc) = pool.get(subject) {
+                let mut delta = delta_arc.lock();
+                delta.reset();
+                debug!("Reset delta for subject '{}'", subject);
+            } else {
+                debug!("No delta to reset for subject '{}'", subject);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get status of a tenant's delta
+    fn handle_get_delta_status(&self, subject: &Subject) -> Result<DeltaStatusInfo> {
+        let has_pending = self.pending_adaptations.lock().contains_key(subject);
+
+        if let Some(pool) = &self.delta_pool {
+            if let Some(delta_arc) = pool.get(subject) {
+                let delta = delta_arc.lock();
+                let norm_ratios = delta.delta_norm_ratio(pool.base_weight_norms());
+                return Ok(DeltaStatusInfo {
+                    exists: true,
+                    accumulated_steps: delta.accumulated_steps,
+                    max_accumulated_steps: delta.max_accumulated_steps,
+                    request_count: delta.request_count,
+                    avg_loss_improvement: delta.avg_loss_improvement as f32,
+                    memory_bytes: delta.memory_bytes() as u64,
+                    last_snapshot_hash: delta.last_snapshot_hash.clone().unwrap_or_default(),
+                    delta_norm_ratios: norm_ratios,
+                    has_pending,
+                });
+            }
+        }
+
+        Ok(DeltaStatusInfo {
+            exists: false,
+            accumulated_steps: 0,
+            max_accumulated_steps: 0,
+            request_count: 0,
+            avg_loss_improvement: 0.0,
+            memory_bytes: 0,
+            last_snapshot_hash: String::new(),
+            delta_norm_ratios: std::collections::HashMap::new(),
+            has_pending: false,
+        })
+    }
+
+    /// Save a tenant's delta as a permanent LoRA adapter
+    ///
+    /// Supports merge strategies: "replace", "additive", "do_merge" (default).
+    /// When an existing adapter exists, the delta is merged using the specified strategy.
+    async fn handle_save_adaptation(
+        &self,
+        subject: &Subject,
+        name: &str,
+        merge_strategy_name: &str,
+        merge_weight: f32,
+    ) -> Result<SaveAdaptationInfo> {
+        use crate::training::{MergeStrategy, merge_state_dicts};
+
+        let pool = self.delta_pool.as_ref()
+            .ok_or_else(|| anyhow!("Delta pool not initialized"))?;
+
+        let delta_arc = pool.get(subject)
+            .ok_or_else(|| anyhow!("No delta for subject '{}'", subject))?;
+        let delta = delta_arc.lock();
+
+        let new_state_dict = delta.extract_state_dict();
+
+        // Parse merge strategy (default to DO-Merge)
+        let strategy_name = if merge_strategy_name.is_empty() { "do_merge" } else { merge_strategy_name };
+        let weight = if merge_weight <= 0.0 || merge_weight > 1.0 { 0.3 } else { merge_weight as f64 };
+        let strategy = MergeStrategy::from_name(strategy_name, weight)?;
+
+        // Save as adapter file
+        let adapter_mgr = crate::storage::AdapterManager::new(&self.model_path);
+        let adapter_name = if name.is_empty() {
+            format!("ttt_{}", subject.to_filename())
+        } else {
+            name.to_owned()
+        };
+
+        // Check for existing adapter to merge with (loads via FsOps)
+        let existing_adapters = adapter_mgr.list_adapters().unwrap_or_default();
+        let existing_state = if let Some(existing) = existing_adapters.iter().find(|a| a.name == adapter_name) {
+            let rel_path = format!("adapters/{}", existing.path.file_name()
+                .and_then(|f| f.to_str()).unwrap_or(""));
+            if let Some(ref fs) = self.fs {
+                match fs.read_file(&rel_path).await {
+                    Ok(bytes) => {
+                        crate::training::load_state_dict_from_bytes(&bytes)
+                            .map_err(|e| {
+                                tracing::debug!("Could not load existing adapter '{}': {}", existing.name, e);
+                                e
+                            })
+                            .ok()
+                    }
+                    Err(e) => {
+                        tracing::debug!("Could not read existing adapter '{}': {}", existing.name, e);
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Determine adapter filename
+        let adapter_filename = if let Some(existing) = existing_adapters.iter().find(|a| a.name == adapter_name) {
+            existing.path.file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("adapter.safetensors")
+                .to_owned()
+        } else {
+            let next_index = adapter_mgr.get_next_index().unwrap_or(0);
+            format!("{:02}_{}.safetensors", next_index, adapter_name)
+        };
+
+        // Apply merge strategy
+        let final_state = if let Some(existing) = existing_state {
+            merge_state_dicts(&existing, &new_state_dict, &strategy)?
+        } else {
+            new_state_dict
+        };
+
+        // Write adapter file through FsOps (path-contained)
+        let fs = self.fs.as_ref()
+            .ok_or_else(|| anyhow!("FsOps not available — cannot write without path containment"))?;
+        let rel_path = format!("adapters/{}", adapter_filename);
+        fs.mkdir("adapters", true).await
+            .map_err(|e| anyhow!("FsOps mkdir failed: {}", e))?;
+        let bytes = serialize_state_dict_to_bytes(&final_state)?;
+        fs.write_file(&rel_path, &bytes).await
+            .map_err(|e| anyhow!("FsOps write_file failed: {}", e))?;
+        let result_path = rel_path;
+
+        let actual_strategy = format!("{:?}", strategy).to_lowercase();
+
+        info!(
+            "Saved adaptation for subject '{}' as adapter '{}' at {} (strategy: {})",
+            subject, adapter_name, result_path, actual_strategy
+        );
+
+        Ok(SaveAdaptationInfo {
+            adapter_name: adapter_name.clone(),
+            adapter_path: result_path,
+            content_hash: String::new(),
+            merge_strategy: strategy_name.to_owned(),
+        })
+    }
+
+    /// Snapshot a tenant's delta to a file
+    async fn handle_snapshot_delta(&self, subject: &Subject) -> Result<SnapshotDeltaInfo> {
+        let pool = self.delta_pool.as_ref()
+            .ok_or_else(|| anyhow!("Delta pool not initialized"))?;
+
+        let delta_arc = pool.get(subject)
+            .ok_or_else(|| anyhow!("No delta for subject '{}'", subject))?;
+        let mut delta = delta_arc.lock();
+
+        let filename = subject.to_filename();
+        let state_dict = delta.extract_state_dict();
+
+        // Write snapshot through FsOps (path-contained)
+        let fs = self.fs.as_ref()
+            .ok_or_else(|| anyhow!("FsOps not available — cannot write without path containment"))?;
+        let rel_snapshot = format!("adapters/.snapshots/{}.safetensors", filename);
+        fs.mkdir("adapters/.snapshots", true).await
+            .map_err(|e| anyhow!("FsOps mkdir failed: {}", e))?;
+        let bytes = serialize_state_dict_to_bytes(&state_dict)?;
+        let size_bytes = bytes.len() as u64;
+        fs.write_file(&rel_snapshot, &bytes).await
+            .map_err(|e| anyhow!("FsOps write_file failed: {}", e))?;
+        let path_str = rel_snapshot;
+
+        delta.last_snapshot_hash = Some(path_str.clone());
+
+        Ok(SnapshotDeltaInfo {
+            content_hash: path_str,
+            size_bytes,
+            accumulated_steps: delta.accumulated_steps,
+            request_count: delta.request_count,
+        })
+    }
+
+    /// Clean up timed-out pending adaptations
+    fn cleanup_pending_adaptations(&self) {
+        let mut pending = self.pending_adaptations.lock();
+        let now = Instant::now();
+        pending.retain(|tenant_id, adaptation| {
+            let elapsed = now.duration_since(adaptation.created_at).as_millis() as u64;
+            if elapsed > adaptation.timeout_ms {
+                // Auto-rollback: restore pre-adaptation state
+                if let Some(pool) = &self.delta_pool {
+                    if let Some(delta_arc) = pool.get(tenant_id) {
+                        let mut delta = delta_arc.lock();
+                        let _ = delta.load_state_dict(&adaptation.pre_adaptation_state);
+                    }
+                }
+                debug!("Auto-rolled back timed-out adaptation for subject '{}'", tenant_id);
+                false
+            } else {
+                true
+            }
+        });
     }
 
     /// Get TTT configuration (for status queries)
+    #[allow(dead_code)]
     fn get_ttt_config(&self) -> Option<crate::training::ttt::TTTConfig> {
         self.ttt_trainer.as_ref().map(|trainer| trainer.config.clone())
     }
@@ -1034,6 +1578,91 @@ impl InferenceService {
             collect_metrics: false, // Default: off for performance
         })
     }
+
+    /// Load a LoRA adapter from a safetensors file as the base delta.
+    ///
+    /// The loaded adapter is stored as `base_delta` and applied to all inference
+    /// requests. If a per-tenant TTT delta also exists, the two are composed
+    /// (corrections summed) during inference via `resolve_delta()`.
+    pub async fn load_lora(&self, path: &Path) -> Result<()> {
+        let device = self.engine.read().device();
+        // Read via FsOps (path-contained)
+        let fs = self.fs.as_ref()
+            .ok_or_else(|| anyhow!("FsOps not available — cannot read without path containment"))?;
+        let rel_path = path.to_string_lossy();
+        let bytes = fs.read_file(&rel_path).await
+            .map_err(|e| anyhow!("Failed to read LoRA adapter via FsOps: {}", e))?;
+        let delta = crate::training::TenantDelta::load_from_safetensors_bytes(&bytes, device)?;
+        *self.base_delta.lock() = Some(std::sync::Arc::new(parking_lot::Mutex::new(delta)));
+        tracing::info!("Loaded LoRA adapter as base delta from {}", path.display());
+        Ok(())
+    }
+
+    /// Save the current base delta to a safetensors file.
+    pub async fn save_lora(&self, path: &str) -> Result<()> {
+        let base = self.base_delta.lock().clone();
+        if let Some(delta_arc) = base {
+            let delta = delta_arc.lock();
+            // Sanitize name and write via FsOps (path-contained)
+            let fs = self.fs.as_ref()
+                .ok_or_else(|| anyhow!("FsOps not available — cannot write without path containment"))?;
+            let safe_name = sanitize_adapter_name(path)?;
+            let rel_path = format!("adapters/{}.safetensors", safe_name);
+            fs.mkdir("adapters", true).await
+                .map_err(|e| anyhow!("FsOps mkdir failed: {}", e))?;
+            let bytes = delta.serialize_to_safetensors_bytes()?;
+            fs.write_file(&rel_path, &bytes).await
+                .map_err(|e| anyhow!("FsOps write_file failed: {}", e))?;
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("No LoRA adapter loaded to save"))
+        }
+    }
+
+    /// Unload the current base LoRA adapter.
+    pub async fn unload_lora(&self) -> Result<()> {
+        let mut base = self.base_delta.lock();
+        if base.is_some() {
+            *base = None;
+            tracing::info!("Unloaded base LoRA delta");
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("No LoRA adapter loaded to unload"))
+        }
+    }
+
+    /// Check if a LoRA adapter (base delta) is loaded.
+    pub async fn has_lora(&self) -> Result<bool> {
+        Ok(self.base_delta.lock().is_some())
+    }
+}
+
+/// Sanitize an adapter name to prevent path traversal.
+///
+/// Strips path separators, `..`, and file extensions. Returns a safe filename stem.
+/// Only allows alphanumeric characters, underscores, and hyphens.
+fn sanitize_adapter_name(name: &str) -> Result<String> {
+    let stem = std::path::Path::new(name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(name);
+
+    // Reject path traversal
+    if stem.contains("..") || stem.contains('/') || stem.contains('\\') || stem.is_empty() {
+        return Err(anyhow!("Invalid adapter name: '{}'", name));
+    }
+
+    // Only allow alphanumeric, underscore, hyphen
+    let safe: String = stem
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+
+    if safe.is_empty() {
+        return Err(anyhow!("Adapter name '{}' contains no valid characters", name));
+    }
+
+    Ok(safe)
 }
 
 impl InferenceService {
@@ -1048,7 +1677,7 @@ impl InferenceService {
         resource: &str,
         operation: Operation,
     ) -> Option<Vec<u8>> {
-        let subject = ctx.casbin_subject();
+        let subject = ctx.subject();
 
         // Async policy check via TMQ
         let allowed = self.policy_client
@@ -1059,15 +1688,16 @@ impl InferenceService {
         if allowed {
             None // Authorized
         } else {
+            let subject_str = subject.to_string();
             debug!(
                 "Authorization denied: {} cannot {} on {}",
-                subject,
+                subject_str,
                 operation.as_str(),
                 resource
             );
             Some(InferenceResponse::unauthorized(
                 request_id,
-                &subject,
+                &subject_str,
                 resource,
                 operation.as_str(),
             ))
@@ -1079,11 +1709,11 @@ impl InferenceService {
     /// Returns (response_bytes, pending_stream) where pending_stream is Some
     /// for streaming requests. The caller should send the response FIRST,
     /// then execute the pending stream.
-    async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<PendingStream>)> {
+    async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<PendingWork>)> {
         // Log identity for audit trail
         trace!(
             "Inference request from {} (envelope_id={}, authenticated={})",
-            ctx.casbin_subject(),
+            ctx.subject(),
             ctx.request_id,
             ctx.is_authenticated()
         );
@@ -1105,10 +1735,11 @@ impl InferenceService {
                 if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Infer).await {
                     return Ok((resp, None));
                 }
+                let subject = ctx.subject();
                 let gen_req = gen_req?;
                 let request = self.parse_generation_request(gen_req)?;
 
-                match self.handle_generate(request) {
+                match self.handle_generate(request, &subject) {
                     Ok(result) => Ok((InferenceResponse::generation_result(request_id, &result), None)),
                     Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
                 }
@@ -1119,6 +1750,7 @@ impl InferenceService {
                 if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Infer).await {
                     return Ok((resp, None));
                 }
+                let subject = ctx.subject();
                 let gen_req = gen_req?;
                 let request = self.parse_generation_request(gen_req)?;
 
@@ -1136,6 +1768,7 @@ impl InferenceService {
                     client_ephemeral_pubkey,
                     claims,
                     expiry_secs,
+                    &subject,
                 ).await?;
 
                 // Get StreamService's Sub endpoint (where clients subscribe)
@@ -1159,7 +1792,7 @@ impl InferenceService {
                     return Ok((resp, None));
                 }
                 let info = self.handle_model_info();
-                let has_lora = self.engine.read().has_lora_model();
+                let has_lora = self.base_delta.lock().is_some();
                 Ok((InferenceResponse::model_info(request_id, &info, has_lora), None))
             }
 
@@ -1203,7 +1836,7 @@ impl InferenceService {
                     return Ok((resp, None));
                 }
                 let lora_config = lora_config?;
-                let config = LoRAConfig {
+                let config = TenantDeltaConfig {
                     rank: lora_config.get_rank() as usize,
                     alpha: lora_config.get_alpha(),
                     dropout: lora_config.get_dropout(),
@@ -1212,11 +1845,12 @@ impl InferenceService {
                         .iter()
                         .filter_map(|s| s.ok().and_then(|t| t.to_str().ok().map(std::borrow::ToOwned::to_owned)))
                         .collect(),
-                    learning_rate: 0.0001, // Default learning rate
+                    learning_rate: lora_config.get_learning_rate() as f64,
+                    ..TenantDeltaConfig::default()
                 };
 
                 match self.handle_create_lora(config) {
-                    Ok(()) => Ok((InferenceResponse::success(request_id), None)),
+                    Ok(()) => Ok((InferenceResponse::void_result(request_id, "createLora"), None)),
                     Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
                 }
             }
@@ -1227,8 +1861,8 @@ impl InferenceService {
                     return Ok((resp, None));
                 }
                 let path = path?.to_str()?;
-                match self.handle_load_lora(Path::new(path)) {
-                    Ok(()) => Ok((InferenceResponse::success(request_id), None)),
+                match self.load_lora(Path::new(path)).await {
+                    Ok(()) => Ok((InferenceResponse::void_result(request_id, "loadLora"), None)),
                     Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
                 }
             }
@@ -1239,8 +1873,8 @@ impl InferenceService {
                     return Ok((resp, None));
                 }
                 let path = path?.to_str()?;
-                match self.handle_save_lora(path) {
-                    Ok(()) => Ok((InferenceResponse::success(request_id), None)),
+                match self.save_lora(path).await {
+                    Ok(()) => Ok((InferenceResponse::void_result(request_id, "saveLora"), None)),
                     Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
                 }
             }
@@ -1250,8 +1884,8 @@ impl InferenceService {
                 if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
                     return Ok((resp, None));
                 }
-                match self.handle_unload_lora() {
-                    Ok(()) => Ok((InferenceResponse::success(request_id), None)),
+                match self.unload_lora().await {
+                    Ok(()) => Ok((InferenceResponse::void_result(request_id, "unloadLora"), None)),
                     Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
                 }
             }
@@ -1261,7 +1895,7 @@ impl InferenceService {
                 if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query).await {
                     return Ok((resp, None));
                 }
-                let has_lora = self.handle_has_lora();
+                let has_lora = self.has_lora().await.unwrap_or(false);
                 Ok((InferenceResponse::has_lora(request_id, has_lora), None))
             }
 
@@ -1272,7 +1906,7 @@ impl InferenceService {
                 }
                 let session_id = session_id?.to_str()?.to_owned();
                 match self.handle_set_session(session_id) {
-                    Ok(()) => Ok((InferenceResponse::success(request_id), None)),
+                    Ok(()) => Ok((InferenceResponse::void_result(request_id, "setSession"), None)),
                     Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
                 }
             }
@@ -1283,7 +1917,7 @@ impl InferenceService {
                     return Ok((resp, None));
                 }
                 self.handle_clear_session();
-                Ok((InferenceResponse::success(request_id), None))
+                Ok((InferenceResponse::void_result(request_id, "clearSession"), None))
             }
 
             Which::ReleaseSession(session_id) => {
@@ -1293,7 +1927,7 @@ impl InferenceService {
                 }
                 let session_id = session_id?.to_str()?;
                 match self.handle_release_session(session_id) {
-                    Ok(()) => Ok((InferenceResponse::success(request_id), None)),
+                    Ok(()) => Ok((InferenceResponse::void_result(request_id, "releaseSession"), None)),
                     Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
                 }
             }
@@ -1352,6 +1986,155 @@ impl InferenceService {
 
                 Ok((InferenceResponse::stream_authorized(request_id, &stream_id), None))
             }
+
+            // Training loop control
+            Which::CommitAdaptation(()) => {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
+                    return Ok((resp, None));
+                }
+                let subject = ctx.subject();
+                // Clean up timed-out pending adaptations first
+                self.cleanup_pending_adaptations();
+                match self.handle_commit_adaptation(&subject) {
+                    Ok(()) => Ok((InferenceResponse::void_result(request_id, "commitAdaptation"), None)),
+                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
+                }
+            }
+
+            Which::RollbackAdaptation(()) => {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
+                    return Ok((resp, None));
+                }
+                let subject = ctx.subject();
+                match self.handle_rollback_adaptation(&subject) {
+                    Ok(()) => Ok((InferenceResponse::void_result(request_id, "rollbackAdaptation"), None)),
+                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
+                }
+            }
+
+            Which::TrainStep(train_req) => {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
+                    return Ok((resp, None));
+                }
+                let subject = ctx.subject();
+                info!("[TTT-DEBUG] train_step: subject={}", subject);
+                let train_req = train_req?;
+                let input = train_req.get_input()?.to_str()?;
+                let gradient_steps = train_req.get_gradient_steps();
+                let learning_rate = train_req.get_learning_rate();
+                let auto_commit = train_req.get_auto_commit();
+
+                match self.handle_train_step(&subject, input, gradient_steps, learning_rate, auto_commit) {
+                    Ok(result) => Ok((InferenceResponse::train_step_result(request_id, &result), None)),
+                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
+                }
+            }
+
+            Which::TrainStepStream(train_req) => {
+                // Authorization: Write on inference:{model}
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
+                    return Ok((resp, None));
+                }
+                let subject = ctx.subject();
+                let train_req = train_req?;
+                let input = train_req.get_input()?.to_str()?.to_owned();
+                let gradient_steps = train_req.get_gradient_steps();
+                let learning_rate = train_req.get_learning_rate();
+                let auto_commit = train_req.get_auto_commit();
+
+                // DH key derivation is required for streaming
+                let client_pub_bytes = ctx.ephemeral_pubkey()
+                    .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
+
+                let stream_channel = self.stream_channel.as_ref()
+                    .ok_or_else(|| anyhow!("StreamChannel not initialized"))?;
+
+                // Calculate expiry from claims
+                let expiry_secs = ctx.claims()
+                    .map(|c| c.exp - chrono::Utc::now().timestamp())
+                    .unwrap_or(300)
+                    .max(60);
+                let claims = ctx.claims().cloned();
+
+                let stream_ctx = stream_channel
+                    .prepare_stream_with_claims(client_pub_bytes, expiry_secs, claims)
+                    .await?;
+
+                let stream_id = stream_ctx.stream_id().to_owned();
+                let server_pubkey = *stream_ctx.server_pubkey();
+
+                // Get StreamService's Sub endpoint (where clients subscribe)
+                let stream_sub_endpoint = hyprstream_rpc::registry::global()
+                    .endpoint("streams", hyprstream_rpc::registry::SocketKind::Sub)
+                    .to_zmq_string();
+
+                let pending = PendingWork::Training {
+                    stream_ctx,
+                    subject,
+                    input,
+                    gradient_steps,
+                    learning_rate,
+                    auto_commit,
+                };
+
+                let response = InferenceResponse::train_step_stream_result(
+                    request_id,
+                    &stream_id,
+                    &stream_sub_endpoint,
+                    &server_pubkey,
+                );
+                Ok((response, Some(pending)))
+            }
+
+            Which::ResetDelta(()) => {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
+                    return Ok((resp, None));
+                }
+                let subject = ctx.subject();
+                match self.handle_reset_delta(&subject) {
+                    Ok(()) => Ok((InferenceResponse::void_result(request_id, "resetDelta"), None)),
+                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
+                }
+            }
+
+            // Persistence operations
+            Which::GetDeltaStatus(()) => {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query).await {
+                    return Ok((resp, None));
+                }
+                let subject = ctx.subject();
+                match self.handle_get_delta_status(&subject) {
+                    Ok(info) => Ok((InferenceResponse::delta_status(request_id, &info), None)),
+                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
+                }
+            }
+
+            Which::SaveAdaptation(save_req) => {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
+                    return Ok((resp, None));
+                }
+                let subject = ctx.subject();
+                let save_req = save_req?;
+                let name = save_req.get_name()?.to_str()?;
+                let merge_strategy = save_req.get_merge_strategy()?.to_str()?;
+                let merge_weight = save_req.get_merge_weight();
+
+                match self.handle_save_adaptation(&subject, name, merge_strategy, merge_weight).await {
+                    Ok(info) => Ok((InferenceResponse::save_adaptation_result(request_id, &info), None)),
+                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
+                }
+            }
+
+            Which::SnapshotDelta(()) => {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
+                    return Ok((resp, None));
+                }
+                let subject = ctx.subject();
+                match self.handle_snapshot_delta(&subject).await {
+                    Ok(info) => Ok((InferenceResponse::snapshot_delta_result(request_id, &info), None)),
+                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
+                }
+            }
         }
     }
 }
@@ -1365,9 +2148,9 @@ impl InferenceService {
 /// - The service verifies signatures before processing
 /// - Identity is included for authorization checks
 ///
-/// Wraps a generated `InferenceClient`. Simple methods delegate to gen;
-/// `generate`, `apply_chat_template`, and streaming methods use manual
-/// request building because the generator doesn't fully support their types.
+/// Wraps a generated `InferenceClient`. Most methods delegate directly to the
+/// generated typed client. Streaming methods (`generate_stream`, `start_stream`)
+/// use manual request building because they need custom `CallOptions`.
 #[derive(Clone)]
 pub struct InferenceZmqClient {
     /// Generated typed client (handles all transport including streaming via call_with_options)
@@ -1410,7 +2193,7 @@ impl InferenceZmqClient {
 
     /// Generate text (non-streaming) — delegates to generated client
     pub async fn generate(&self, request: &GenerationRequest) -> Result<GenerationResult> {
-        match self.gen.generate(
+        let r = self.gen.generate(
             request.prompt.as_str(),
             request.max_tokens as u32,
             request.temperature,
@@ -1422,71 +2205,52 @@ impl InferenceZmqClient {
             request.seed.unwrap_or(0),
             &[], // images
             request.timeout.unwrap_or(0),
-        ).await? {
-            InferenceResponseVariant::GenerateResult {
-                text, tokens_generated, finish_reason, generation_time_ms,
-                tokens_per_second, prefill_tokens, prefill_time_ms,
-                prefill_tokens_per_sec, inference_tokens, inference_time_ms,
-                inference_tokens_per_sec, ..
-            } => Ok(GenerationResult {
-                text,
-                tokens_generated: tokens_generated as usize,
-                finish_reason: Self::parse_finish_reason_enum(&finish_reason),
-                generation_time_ms,
-                tokens_per_second,
-                quality_metrics: None,
-                prefill_tokens: prefill_tokens as usize,
-                prefill_time_ms,
-                prefill_tokens_per_sec,
-                inference_tokens: inference_tokens as usize,
-                inference_time_ms,
-                inference_tokens_per_sec,
-                ttt_metrics: None,  // TODO: Extract from response when available
-            }),
-            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
-            _ => Err(anyhow!("Unexpected response type")),
-        }
+        ).await?;
+        Ok(GenerationResult {
+            text: r.text,
+            tokens_generated: r.tokens_generated as usize,
+            finish_reason: Self::parse_finish_reason_enum(&r.finish_reason),
+            generation_time_ms: r.generation_time_ms,
+            tokens_per_second: r.tokens_per_second,
+            quality_metrics: None,
+            prefill_tokens: r.prefill_tokens as usize,
+            prefill_time_ms: r.prefill_time_ms,
+            prefill_tokens_per_sec: r.prefill_tokens_per_sec,
+            inference_tokens: r.inference_tokens as usize,
+            inference_time_ms: r.inference_time_ms,
+            inference_tokens_per_sec: r.inference_tokens_per_sec,
+            ttt_metrics: None,  // TODO: Extract from response when available
+        })
     }
 
     /// Check if model is ready
     pub async fn is_ready(&self) -> Result<bool> {
-        match self.gen.is_ready().await? {
-            InferenceResponseVariant::IsReadyResult(ready) => Ok(ready),
-            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
-            _ => Err(anyhow!("Unexpected response type")),
-        }
+        self.gen.is_ready().await
     }
 
     /// Get model info
     pub async fn model_info(&self) -> Result<ModelInfo> {
-        match self.gen.model_info().await? {
-            InferenceResponseVariant::ModelInfoResult {
-                model_id, architecture, vocab_size, hidden_size,
-                num_layers, num_heads, max_sequence_length, quantization, ..
-            } => Ok(ModelInfo {
-                name: model_id,
-                architecture,
-                vocab_size: vocab_size as usize,
-                hidden_size: hidden_size as usize,
-                num_hidden_layers: Some(num_layers as usize),
-                num_attention_heads: Some(num_heads as usize),
-                context_length: max_sequence_length as usize,
-                quantization: Some(quantization),
-                parameters: 0,
-                intermediate_size: None,
-            }),
-            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
-            _ => Err(anyhow!("Unexpected response type")),
-        }
+        let r = self.gen.model_info().await?;
+        Ok(ModelInfo {
+            name: r.model_id,
+            architecture: r.architecture,
+            vocab_size: r.vocab_size as usize,
+            hidden_size: r.hidden_size as usize,
+            num_hidden_layers: Some(r.num_layers as usize),
+            num_attention_heads: Some(r.num_heads as usize),
+            num_key_value_heads: None,
+            head_dim: None,
+            context_length: r.max_sequence_length as usize,
+            quantization: Some(r.quantization),
+            parameters: 0,
+            intermediate_size: None,
+        })
     }
 
     /// Health check
     pub async fn health_check(&self) -> Result<()> {
-        match self.gen.health_check().await? {
-            InferenceResponseVariant::HealthCheckResult { .. } => Ok(()),
-            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
-            _ => Err(anyhow!("Unexpected response type")),
-        }
+        let _status = self.gen.health_check().await?;
+        Ok(())
     }
 
     /// Start streaming generation with E2E authentication (manual — needs custom CallOptions)
@@ -1612,85 +2376,98 @@ impl InferenceZmqClient {
             role: m.role.clone(),
             content: m.content.clone(),
         }).collect();
-        match self.gen.apply_chat_template(&msg_data, add_generation_prompt).await? {
-            InferenceResponseVariant::ApplyChatTemplateResult(text) => Ok(text),
-            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
-            _ => Err(anyhow!("Unexpected response type")),
-        }
+        self.gen.apply_chat_template(&msg_data, add_generation_prompt).await
     }
 
     /// Create a new LoRA adapter
-    pub async fn create_lora(&self, config: &LoRAConfig) -> Result<()> {
-        match self.gen.create_lora(
-            config.rank as u32, config.alpha, config.dropout, &config.target_modules,
-        ).await? {
-            InferenceResponseVariant::CreateLoraResult => Ok(()),
-            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
-            _ => Err(anyhow!("Unexpected response type")),
-        }
+    pub async fn create_lora(&self, config: &TenantDeltaConfig) -> Result<()> {
+        self.gen.create_lora(
+            config.rank as u32, config.alpha, config.dropout, &config.target_modules, config.learning_rate as f32,
+        ).await
     }
 
-    /// Load a LoRA adapter from file
-    pub async fn load_lora(&self, path: &Path) -> Result<()> {
-        match self.gen.load_lora(&path.to_string_lossy()).await? {
-            InferenceResponseVariant::LoadLoraResult => Ok(()),
-            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
-            _ => Err(anyhow!("Unexpected response type")),
-        }
+    /// Load a LoRA adapter from a safetensors file (delegates via RPC).
+    pub async fn load_lora(&self, path: &str) -> Result<()> {
+        self.gen.load_lora(path).await
     }
 
-    /// Save the current LoRA adapter to file
+    /// Save the current LoRA adapter to a safetensors file (delegates via RPC).
     pub async fn save_lora(&self, path: &str) -> Result<()> {
-        match self.gen.save_lora(path).await? {
-            InferenceResponseVariant::SaveLoraResult => Ok(()),
-            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
-            _ => Err(anyhow!("Unexpected response type")),
-        }
+        self.gen.save_lora(path).await
     }
 
-    /// Unload the current LoRA adapter
+    /// Unload the current LoRA adapter (delegates via RPC).
     pub async fn unload_lora(&self) -> Result<()> {
-        match self.gen.unload_lora().await? {
-            InferenceResponseVariant::UnloadLoraResult => Ok(()),
-            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
-            _ => Err(anyhow!("Unexpected response type")),
-        }
+        self.gen.unload_lora().await
     }
 
-    /// Check if a LoRA adapter is loaded
+    /// Check if a LoRA adapter is loaded (delegates via RPC).
     pub async fn has_lora(&self) -> Result<bool> {
-        match self.gen.has_lora().await? {
-            InferenceResponseVariant::HasLoraResult(has_lora) => Ok(has_lora),
-            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
-            _ => Err(anyhow!("Unexpected response type")),
-        }
+        self.gen.has_lora().await
+    }
+
+    // Training loop control (TTT operations)
+
+    /// Commit a pending TTT adaptation
+    pub async fn commit_adaptation(&self) -> Result<()> {
+        self.gen.commit_adaptation().await
+    }
+
+    /// Rollback a pending TTT adaptation
+    pub async fn rollback_adaptation(&self) -> Result<()> {
+        self.gen.rollback_adaptation().await
+    }
+
+    /// Reset a tenant's delta
+    pub async fn reset_delta(&self) -> Result<()> {
+        self.gen.reset_delta().await
+    }
+
+    /// Start streaming training step with E2E authentication (manual — needs custom CallOptions)
+    pub async fn train_step_stream(
+        &self,
+        input: &str,
+        gradient_steps: u32,
+        learning_rate: f32,
+        auto_commit: bool,
+        ephemeral_pubkey: Option<[u8; 32]>,
+    ) -> Result<StreamStartedInfo> {
+        let id = self.gen.next_id();
+
+        let mut message = Builder::new_default();
+        let mut req = message.init_root::<inference_capnp::inference_request::Builder>();
+        req.set_id(id);
+
+        let mut train_req = req.init_train_step_stream();
+        train_req.set_input(input);
+        train_req.set_gradient_steps(gradient_steps);
+        train_req.set_learning_rate(learning_rate);
+        train_req.set_auto_commit(auto_commit);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+
+        let opts = match ephemeral_pubkey {
+            Some(pk) => CallOptions::default().ephemeral_pubkey(pk),
+            None => CallOptions::default(),
+        };
+        let response = self.gen.call_with_options(bytes, opts).await?;
+        Self::parse_train_step_stream_response(&response)
     }
 
     /// Set the current session ID for KV cache management
     pub async fn set_session(&self, session_id: &str) -> Result<()> {
-        match self.gen.set_session(session_id).await? {
-            InferenceResponseVariant::SetSessionResult => Ok(()),
-            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
-            _ => Err(anyhow!("Unexpected response type")),
-        }
+        self.gen.set_session(session_id).await
     }
 
     /// Clear the current session's KV cache
     pub async fn clear_session(&self) -> Result<()> {
-        match self.gen.clear_session().await? {
-            InferenceResponseVariant::ClearSessionResult => Ok(()),
-            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
-            _ => Err(anyhow!("Unexpected response type")),
-        }
+        self.gen.clear_session().await
     }
 
     /// Release a session's KV cache
     pub async fn release_session(&self, session_id: &str) -> Result<()> {
-        match self.gen.release_session(session_id).await? {
-            InferenceResponseVariant::ReleaseSessionResult => Ok(()),
-            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
-            _ => Err(anyhow!("Unexpected response type")),
-        }
+        self.gen.release_session(session_id).await
     }
 
     /// Request service shutdown
@@ -1723,6 +2500,22 @@ impl InferenceZmqClient {
         use crate::services::generated::inference_client::InferenceClient;
         match InferenceClient::parse_response(response)? {
             InferenceResponseVariant::StartStreamResult { stream_id, .. } => Ok(stream_id),
+            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
+            _ => Err(anyhow!("Unexpected response type")),
+        }
+    }
+
+    /// Parse train step stream response — returns StreamStartedInfo
+    fn parse_train_step_stream_response(response: &[u8]) -> Result<StreamStartedInfo> {
+        use crate::services::generated::inference_client::InferenceClient;
+        match InferenceClient::parse_response(response)? {
+            InferenceResponseVariant::TrainStepStreamResult { stream_id, endpoint, server_pubkey } => {
+                Ok(StreamStartedInfo {
+                    stream_id,
+                    endpoint,
+                    server_pubkey: server_pubkey.try_into().unwrap_or([0u8; 32]),
+                })
+            }
             InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
             _ => Err(anyhow!("Unexpected response type")),
         }

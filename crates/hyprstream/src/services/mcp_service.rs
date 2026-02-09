@@ -438,53 +438,135 @@ fn register_schema_tools(reg: &mut ToolRegistry, existing_names: &std::collectio
         }
     }
 
-    // Scoped: model.session.*
+    // Scoped: model.ttt.*, model.peft.*, model.infer.*
     {
-        let (_, _, session_methods) = model_client::session_schema_metadata();
-        for method in session_methods {
-            let tool_name = format!("model.session.{}", method.name);
-            if existing_names.contains(&tool_name) {
-                continue;
-            }
+        // Streaming methods per scope — return StreamInfo, need DH key exchange
+        let streaming_methods: std::collections::HashMap<&str, &[&str]> = [
+            ("ttt", &["train_stream"][..]),
+            ("infer", &["generate_stream"][..]),
+        ].into_iter().collect();
 
-            let params: Vec<(&str, &str, bool, &str)> = method.params.iter()
-                .map(|p| (p.name, p.type_name, p.required, p.description))
-                .collect();
-            let mut json_schema = params_to_json_schema(&params);
-            if let Value::Object(ref mut map) = json_schema {
-                if let Some(Value::Object(ref mut props)) = map.get_mut("properties") {
-                    props.insert("model_ref".into(), serde_json::json!({"type": "string", "description": "Model reference"}));
+        let scoped_metadata: &[(&str, fn() -> (&'static str, &'static str, &'static [model_client::MethodSchema]))] = &[
+            ("ttt", model_client::ttt_schema_metadata),
+            ("peft", model_client::peft_schema_metadata),
+            ("infer", model_client::infer_schema_metadata),
+        ];
+
+        for &(scope_name, metadata_fn) in scoped_metadata {
+            let (_, _, methods) = metadata_fn();
+            let scope_streaming = streaming_methods.get(scope_name).copied().unwrap_or(&[]);
+
+            for method in methods {
+                let tool_name = format!("model.{scope_name}.{}", method.name);
+                if existing_names.contains(&tool_name) {
+                    continue;
                 }
-                if let Some(Value::Array(ref mut req)) = map.get_mut("required") {
-                    req.insert(0, Value::String("model_ref".into()));
+
+                let is_streaming = scope_streaming.contains(&method.name);
+
+                let params: Vec<(&str, &str, bool, &str)> = method.params.iter()
+                    .map(|p| (p.name, p.type_name, p.required, p.description))
+                    .collect();
+                let mut json_schema = params_to_json_schema(&params);
+                if let Value::Object(ref mut map) = json_schema {
+                    if let Some(Value::Object(ref mut props)) = map.get_mut("properties") {
+                        props.insert("model_ref".into(), serde_json::json!({"type": "string", "description": "Model reference"}));
+                    }
+                    if let Some(Value::Array(ref mut req)) = map.get_mut("required") {
+                        req.insert(0, Value::String("model_ref".into()));
+                    }
+                }
+
+                let method_name = method.name.to_string();
+                let scope = scope_name.to_string();
+                let description = if method.description.is_empty() {
+                    format!("model.{scope_name}::{}", method.name)
+                } else {
+                    method.description.to_string()
+                };
+
+                if is_streaming {
+                    // Streaming handler: generate ephemeral keypair, call with pubkey, return StreamHandle
+                    reg.register(ToolEntry {
+                        uuid: Uuid::new_v5(&MCP_NS, tool_name.as_bytes()),
+                        name: tool_name.clone(),
+                        description,
+                        args_schema: json_schema,
+                        required_scope: "read:model:*".into(),
+                        streaming: true,
+                        handler: Arc::new(move |ctx| {
+                            let method = method_name.clone();
+                            let scope = scope.clone();
+                            Box::pin(async move {
+                                let model_ref = ctx.args["model_ref"].as_str()
+                                    .ok_or_else(|| anyhow::anyhow!("missing model_ref"))?;
+
+                                // Generate ephemeral keypair for DH key exchange
+                                let (client_secret, client_pubkey) = hyprstream_rpc::generate_ephemeral_keypair();
+                                let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
+
+                                let client = ModelZmqClient::new(ctx.signing_key, RequestIdentity::local());
+
+                                // Call the streaming method via manual wrapper (with ephemeral pubkey)
+                                let stream_info = match (scope.as_str(), method.as_str()) {
+                                    ("ttt", "train_stream") => {
+                                        let input = ctx.args["input"].as_str().unwrap_or("");
+                                        let gradient_steps = ctx.args["gradient_steps"].as_u64().unwrap_or(3) as u32;
+                                        let learning_rate = ctx.args["learning_rate"].as_f64().unwrap_or(0.0) as f32;
+                                        let auto_commit = ctx.args["auto_commit"].as_bool().unwrap_or(false);
+                                        client.train_step_stream(
+                                            model_ref, input, gradient_steps, learning_rate,
+                                            auto_commit, client_pubkey_bytes,
+                                        ).await?
+                                    }
+                                    ("infer", "generate_stream") => {
+                                        let request = crate::services::mcp_service::parse_generation_request_from_args(&ctx.args)?;
+                                        client.infer_stream(model_ref, &request, client_pubkey_bytes).await?
+                                    }
+                                    _ => anyhow::bail!("Unknown streaming method: {}.{}", scope, method),
+                                };
+
+                                let handle = StreamHandle::new(
+                                    &ctx.zmq_context,
+                                    stream_info.stream_id,
+                                    &stream_info.endpoint,
+                                    &stream_info.server_pubkey,
+                                    &client_secret,
+                                    &client_pubkey_bytes,
+                                )?;
+
+                                Ok(ToolResult::Stream(handle))
+                            })
+                        }),
+                    });
+                } else {
+                    // Sync handler: call method via the appropriate scoped client
+                    reg.register(ToolEntry {
+                        uuid: Uuid::new_v5(&MCP_NS, tool_name.as_bytes()),
+                        name: tool_name.clone(),
+                        description,
+                        args_schema: json_schema,
+                        required_scope: "read:model:*".into(),
+                        streaming: false,
+                        handler: Arc::new(move |ctx| {
+                            let method = method_name.clone();
+                            let scope = scope.clone();
+                            Box::pin(async move {
+                                let model_ref = ctx.args["model_ref"].as_str()
+                                    .ok_or_else(|| anyhow::anyhow!("missing model_ref"))?;
+                                let client = ModelZmqClient::new(ctx.signing_key, RequestIdentity::local());
+                                let result = match scope.as_str() {
+                                    "ttt" => client.gen.ttt(model_ref).call_method(&method, &ctx.args).await?,
+                                    "peft" => client.gen.peft(model_ref).call_method(&method, &ctx.args).await?,
+                                    "infer" => client.gen.infer(model_ref).call_method(&method, &ctx.args).await?,
+                                    _ => anyhow::bail!("Unknown scope: {}", scope),
+                                };
+                                Ok(ToolResult::Sync(result))
+                            })
+                        }),
+                    });
                 }
             }
-
-            let method_name = method.name.to_string();
-            let description = if method.description.is_empty() {
-                format!("model.session::{}", method.name)
-            } else {
-                method.description.to_string()
-            };
-            reg.register(ToolEntry {
-                uuid: Uuid::new_v5(&MCP_NS, tool_name.as_bytes()),
-                name: tool_name.clone(),
-                description,
-                args_schema: json_schema,
-                required_scope: "read:model:*".into(),
-                streaming: false,
-                handler: Arc::new(move |ctx| {
-                    let method = method_name.clone();
-                    Box::pin(async move {
-                        let model_ref = ctx.args["model_ref"].as_str()
-                            .ok_or_else(|| anyhow::anyhow!("missing model_ref"))?;
-                        let client = ModelZmqClient::new(ctx.signing_key, RequestIdentity::local());
-                        let gen_session = client.gen.session(model_ref);
-                        let result = gen_session.call_method(&method, &ctx.args).await?;
-                        Ok(ToolResult::Sync(result))
-                    })
-                }),
-            });
         }
     }
 }
@@ -524,6 +606,28 @@ fn params_to_json_schema(params: &[(&str, &str, bool, &str)]) -> Value {
         "type": "object",
         "properties": properties,
         "required": required,
+    })
+}
+
+/// Parse a GenerationRequest from MCP tool call JSON args.
+pub(crate) fn parse_generation_request_from_args(args: &Value) -> anyhow::Result<crate::config::GenerationRequest> {
+    use crate::config::{GenerationRequest, TemplatedPrompt};
+    Ok(GenerationRequest {
+        prompt: TemplatedPrompt::new(args["prompt"].as_str().unwrap_or("").to_string()),
+        max_tokens: args["max_tokens"].as_u64().unwrap_or(256) as usize,
+        temperature: args["temperature"].as_f64().unwrap_or(0.7) as f32,
+        top_p: args["top_p"].as_f64().unwrap_or(0.9) as f32,
+        top_k: args["top_k"].as_u64().map(|v| v as usize),
+        repeat_penalty: args["repeat_penalty"].as_f64().unwrap_or(1.1) as f32,
+        repeat_last_n: args["repeat_last_n"].as_u64().unwrap_or(64) as usize,
+        stop_tokens: args["stop_tokens"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default(),
+        seed: args["seed"].as_u64().map(|v| v as u32),
+        images: Vec::new(),
+        timeout: args["timeout_ms"].as_u64(),
+        collect_metrics: false,
     })
 }
 
@@ -895,7 +999,7 @@ impl ZmqService for McpService {
     fn handle_request(&self, ctx: &crate::services::EnvelopeContext, payload: &[u8]) -> anyhow::Result<Vec<u8>> {
         trace!(
             "McpService request from {} (id={})",
-            ctx.casbin_subject(),
+            ctx.subject(),
             ctx.request_id
         );
         dispatch_mcp(self, ctx, payload)

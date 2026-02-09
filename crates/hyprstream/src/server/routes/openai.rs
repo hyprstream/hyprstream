@@ -16,7 +16,8 @@ use tracing::{error, info, trace};
 use crate::{
     api::openai_compat::{
         ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, CompletionChoice,
-        CompletionRequest, CompletionResponse, EmbeddingRequest, ListModelsResponse, Model, Usage,
+        CompletionRequest, CompletionResponse, EmbeddingRequest, ListModelsResponse, Model,
+        OnlineTrainingDetails, Usage,
     },
     archetypes::capabilities::Infer,
     auth::Operation,
@@ -227,7 +228,7 @@ async fn chat_completions(
     let resource = format!("model:{}", request.model);
     match state
         .policy_client
-        .check_policy(&user, &resource, Operation::Infer)
+        .check_policy_str(&user, &resource, Operation::Infer)
         .await
     {
         Ok(allowed) if !allowed => {
@@ -383,6 +384,7 @@ async fn chat_completions(
                     prompt_tokens: 0,
                     completion_tokens: generation.tokens_generated,
                     total_tokens: generation.tokens_generated,
+                    online_training_details: generation.ttt_metrics.as_ref().map(OnlineTrainingDetails::from),
                 }),
             };
 
@@ -648,6 +650,14 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                                     _ => "stop",
                                 };
 
+                                let usage = Usage {
+                                    prompt_tokens: stats.prefill_tokens,
+                                    completion_tokens: stats.tokens_generated,
+                                    total_tokens: stats.prefill_tokens + stats.tokens_generated,
+                                    online_training_details: stats.ttt_metrics.as_ref()
+                                        .map(OnlineTrainingDetails::from),
+                                };
+
                                 let completion_msg = serde_json::json!({
                                     "id": sse_stream_id,
                                     "object": "chat.completion.chunk",
@@ -657,7 +667,8 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                                         "index": 0,
                                         "delta": {},
                                         "finish_reason": oai_finish_reason
-                                    }]
+                                    }],
+                                    "usage": usage
                                 });
                                 let _ = tx.send(Ok(completion_msg)).await;
 
@@ -745,7 +756,7 @@ async fn completions(
     let resource = format!("model:{}", request.model);
     match state
         .policy_client
-        .check_policy(&user, &resource, Operation::Infer)
+        .check_policy_str(&user, &resource, Operation::Infer)
         .await
     {
         Ok(allowed) if !allowed => {
@@ -852,6 +863,7 @@ async fn completions(
                     prompt_tokens: request.prompt.len() / 4, // Rough estimate: 4 chars per token
                     completion_tokens: generation.tokens_generated,
                     total_tokens: request.prompt.len() / 4 + generation.tokens_generated,
+                    online_training_details: generation.ttt_metrics.as_ref().map(OnlineTrainingDetails::from),
                 }),
             };
 

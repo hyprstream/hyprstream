@@ -21,6 +21,7 @@ pub fn generate_metadata(service_name: &str, schema: &ParsedSchema) -> TokenStre
     let json_dispatcher = generate_json_dispatcher(
         &pascal,
         &schema.request_variants,
+        &schema.response_variants,
         &schema.structs,
         &schema.scoped_clients,
     );
@@ -74,12 +75,19 @@ fn generate_schema_metadata_fn(
         .map(|v| generate_method_schema_entry(v, structs, false, ""))
         .collect();
 
-    let scoped_fns: Vec<TokenStream> = scoped_clients
+    let mut scoped_fns: Vec<TokenStream> = scoped_clients
         .iter()
         .map(|sc| {
             generate_scoped_schema_metadata_fn(service_name, sc, structs)
         })
         .collect();
+
+    // Generate metadata for nested scoped clients
+    for sc in scoped_clients {
+        for nested in &sc.nested_clients {
+            scoped_fns.push(generate_scoped_schema_metadata_fn(service_name, nested, structs));
+        }
+    }
 
     quote! {
         #[doc = #doc]
@@ -173,9 +181,24 @@ fn generate_scoped_schema_metadata_fn(
 // JSON Dispatcher
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Check if a request variant's corresponding response is StreamInfo.
+fn is_streaming_variant(variant_name: &str, response_variants: &[UnionVariant], is_scoped: bool) -> bool {
+    let expected_name = if is_scoped {
+        variant_name.to_string()
+    } else {
+        format!("{}Result", variant_name)
+    };
+    response_variants
+        .iter()
+        .find(|v| v.name == expected_name)
+        .map(|v| v.type_name == "StreamInfo")
+        .unwrap_or(false)
+}
+
 fn generate_json_dispatcher(
     pascal: &str,
     request_variants: &[UnionVariant],
+    response_variants: &[UnionVariant],
     structs: &[StructDef],
     scoped_clients: &[ScopedClient],
 ) -> TokenStream {
@@ -188,16 +211,18 @@ fn generate_json_dispatcher(
     let main_match_arms: Vec<TokenStream> = request_variants
         .iter()
         .filter(|v| !scoped_names.contains(&v.name.as_str()))
+        .filter(|v| !is_streaming_variant(&v.name, response_variants, false))
         .map(|v| generate_json_method_dispatch_arm(v, structs))
         .collect();
 
-    let scoped_dispatchers: Vec<TokenStream> = scoped_clients
+    let mut scoped_dispatchers: Vec<TokenStream> = scoped_clients
         .iter()
         .map(|sc| {
             let scoped_client_name = format_ident!("{}", sc.client_name);
             let scoped_match_arms: Vec<TokenStream> = sc
                 .inner_request_variants
                 .iter()
+                .filter(|v| !is_streaming_variant(&v.name, &sc.inner_response_variants, true))
                 .map(|v| generate_json_method_dispatch_arm(v, structs))
                 .collect();
 
@@ -214,6 +239,31 @@ fn generate_json_dispatcher(
             }
         })
         .collect();
+
+    // Generate JSON dispatchers for nested scoped clients
+    for sc in scoped_clients {
+        for nested in &sc.nested_clients {
+            let nested_client_name = format_ident!("{}", nested.client_name);
+            let nested_match_arms: Vec<TokenStream> = nested
+                .inner_request_variants
+                .iter()
+                .filter(|v| !is_streaming_variant(&v.name, &nested.inner_response_variants, true))
+                .map(|v| generate_json_method_dispatch_arm(v, structs))
+                .collect();
+
+            scoped_dispatchers.push(quote! {
+                impl #nested_client_name {
+                    /// Dispatch a nested scoped method call by name with JSON arguments.
+                    pub async fn call_method(&self, method: &str, args: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+                        match method {
+                            #(#nested_match_arms)*
+                            _ => anyhow::bail!("Unknown nested scoped method: {}", method),
+                        }
+                    }
+                }
+            });
+        }
+    }
 
     quote! {
         impl #client_name {
@@ -313,6 +363,16 @@ fn json_field_extraction_token(
             let #fname = args.get(#fname_str).and_then(|v| v.as_bool())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid bool field '{}'", #fname_str))?;
         },
+        CapnpType::UInt8 => quote! {
+            let #fname: u8 = args.get(#fname_str).and_then(|v| v.as_u64())
+                .ok_or_else(|| anyhow::anyhow!("missing or invalid u8 field '{}'", #fname_str))?
+                .try_into().map_err(|_| anyhow::anyhow!("u8 overflow for field '{}'", #fname_str))?;
+        },
+        CapnpType::UInt16 => quote! {
+            let #fname: u16 = args.get(#fname_str).and_then(|v| v.as_u64())
+                .ok_or_else(|| anyhow::anyhow!("missing or invalid u16 field '{}'", #fname_str))?
+                .try_into().map_err(|_| anyhow::anyhow!("u16 overflow for field '{}'", #fname_str))?;
+        },
         CapnpType::UInt32 => quote! {
             let #fname: u32 = args.get(#fname_str).and_then(|v| v.as_u64())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid u32 field '{}'", #fname_str))?
@@ -321,6 +381,16 @@ fn json_field_extraction_token(
         CapnpType::UInt64 => quote! {
             let #fname = args.get(#fname_str).and_then(|v| v.as_u64())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid u64 field '{}'", #fname_str))?;
+        },
+        CapnpType::Int8 => quote! {
+            let #fname: i8 = args.get(#fname_str).and_then(|v| v.as_i64())
+                .ok_or_else(|| anyhow::anyhow!("missing or invalid i8 field '{}'", #fname_str))?
+                .try_into().map_err(|_| anyhow::anyhow!("i8 overflow for field '{}'", #fname_str))?;
+        },
+        CapnpType::Int16 => quote! {
+            let #fname: i16 = args.get(#fname_str).and_then(|v| v.as_i64())
+                .ok_or_else(|| anyhow::anyhow!("missing or invalid i16 field '{}'", #fname_str))?
+                .try_into().map_err(|_| anyhow::anyhow!("i16 overflow for field '{}'", #fname_str))?;
         },
         CapnpType::Int32 => quote! {
             let #fname: i32 = args.get(#fname_str).and_then(|v| v.as_i64())

@@ -88,7 +88,7 @@ pub mod prelude {
         SigningKey, StreamHmac, VerifyingKey,
         // Envelope
         unwrap_envelope, InMemoryNonceCache, NonceCache, RequestEnvelope, RequestIdentity,
-        ResponseEnvelope, SignedEnvelope, MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
+        ResponseEnvelope, SignedEnvelope, Subject, MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
         // Error
         EnvelopeError, EnvelopeResult, Result, RpcError,
         // Service
@@ -136,7 +136,7 @@ pub use crypto::{
 pub use crypto::{generate_ephemeral_keypair, ristretto_dh, RistrettoPublic, RistrettoSecret};
 pub use envelope::{
     unwrap_envelope, InMemoryNonceCache, NonceCache, RequestEnvelope, RequestIdentity,
-    ResponseEnvelope, SignedEnvelope, MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
+    ResponseEnvelope, SignedEnvelope, Subject, MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
 };
 pub use error::{EnvelopeError, EnvelopeResult, Result, RpcError};
 pub use hyprstream_rpc_derive::{authorize, register_scopes, service_factory, FromCapnp, ToCapnp};

@@ -68,9 +68,21 @@ impl EnvelopeContext {
         }
     }
 
+    /// Get the typed authorization subject.
+    ///
+    /// Prefers Claims subject (gateway forwarding scenario) over transport identity.
+    /// This is the single source of truth for "who is this request from?" for
+    /// both authorization checks and resource isolation.
+    pub fn subject(&self) -> Subject {
+        self.claims.as_ref()
+            .map(Subject::from_claims)
+            .unwrap_or_else(|| Subject::from_identity(&self.identity))
+    }
+
     /// Get the namespaced Casbin subject for policy checks.
     ///
     /// Returns prefixed identities like `"local:alice"`, `"token:bob"`, etc.
+    #[deprecated(note = "Use ctx.subject().to_string() instead")]
     pub fn casbin_subject(&self) -> String {
         self.identity.casbin_subject()
     }
@@ -93,13 +105,16 @@ impl EnvelopeContext {
     }
 
     /// Get user subject for Casbin checks (if claims present)
+    #[deprecated(note = "Use ctx.subject() instead")]
     pub fn user_subject(&self) -> Option<String> {
         self.claims.as_ref().map(super::super::auth::claims::Claims::casbin_subject)
     }
 
     /// Get effective subject (user if present, otherwise service identity)
+    #[deprecated(note = "Use ctx.subject() instead")]
+    #[allow(deprecated)]
     pub fn effective_subject(&self) -> String {
-        self.user_subject().unwrap_or_else(|| self.casbin_subject())
+        self.user_subject().unwrap_or_else(|| self.identity.casbin_subject())
     }
 
     /// Check if request has user context
@@ -439,7 +454,7 @@ impl RequestLoop {
                     debug!(
                         "{} verified request from {} (id={})",
                         service.name(),
-                        ctx.casbin_subject(),
+                        ctx.subject(),
                         request_id
                     );
 

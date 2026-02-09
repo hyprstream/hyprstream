@@ -68,7 +68,6 @@ pub mod error;
 pub mod events;
 pub mod git;
 pub mod inference;
-pub mod lora;
 pub mod runtime;
 pub mod schema;
 pub mod server;
@@ -81,11 +80,6 @@ pub mod zmq;
 
 // Storage exports removed
 pub use runtime::{
-    AdaptationMode,
-    // REMOVED: AdaptationTrigger, AdaptationType, ConversationContext, ConversationResponse,
-    // ConversationRouter, ConversationSession, ConversationTurn, ModelPool, ModelState,
-    // PoolStats, RoutingConfig - dead code from conversation_router
-    AdapterMetrics,
     FinishReason,
     GenerationRequest,
     GenerationResult,
@@ -93,9 +87,6 @@ pub use runtime::{
     RuntimeConfig,
     RuntimeEngine,
     TorchEngine,
-    UserFeedback,
-    XLoRAAdapter,
-    XLoRARoutingStrategy,
 };
 
 // Export TorchEngine as HyprStreamEngine for backward compatibility

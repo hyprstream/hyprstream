@@ -8,7 +8,7 @@
 //! All requests are wrapped in `SignedEnvelope` for authentication:
 //! - Service infrastructure unwraps and verifies signatures before dispatching
 //! - Handlers receive `EnvelopeContext` with verified identity
-//! - Services use `ctx.casbin_subject()` for policy checks
+//! - Services use `ctx.subject()` for policy checks and resource isolation
 //!
 //! # Note
 //!

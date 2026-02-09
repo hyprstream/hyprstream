@@ -238,9 +238,11 @@ impl ModelService {
         }
 
         // Create unique endpoint for this model using registry
-        let base = registry().endpoint("inference", SocketKind::Rep).to_zmq_string();
+        // Each model gets its own socket: inference-{safe_name}.sock (IPC) or
+        // inproc://hyprstream/inference-{safe_name} (inproc)
         let safe_name = model_ref_str.replace([':', '/', '\\'], "-");
-        let endpoint = format!("{base}/{safe_name}");
+        let service_name = format!("inference-{safe_name}");
+        let endpoint = registry().endpoint(&service_name, SocketKind::Rep).to_zmq_string();
 
         info!("Loading model {} at endpoint {}", model_ref_str, endpoint);
 
@@ -250,6 +252,18 @@ impl ModelService {
         runtime_config.max_context = load_config.max_context.or(self.config.max_context);
         runtime_config.kv_quant_type = load_config.kv_quant.unwrap_or(self.config.kv_quant);
 
+        // Obtain FsOps from the registry for path-contained adapter I/O
+        let branch_name = match &model_ref.git_ref {
+            crate::storage::GitRef::Branch(name) => name.clone(),
+            _ => "main".to_owned(),
+        };
+        let repo_client = self.registry.repo(&model_ref.model).await
+            .map_err(|e| anyhow::anyhow!(
+                "Could not get repository client for {}: {} — FsOps required for path containment",
+                model_ref_str, e
+            ))?;
+        let fs: Option<std::sync::Arc<dyn crate::services::FsOps>> = Some(repo_client.worktree(&branch_name));
+
         // Start InferenceService for this model
         let service_handle = InferenceService::start_at(
             &model_path,
@@ -258,6 +272,7 @@ impl ModelService {
             self.signing_key.clone(),
             self.policy_client.clone(),
             &endpoint,
+            fs,
         )
         .await?;
 
@@ -279,6 +294,7 @@ impl ModelService {
                         min_input_length: tc.ttt.min_input_length,
                         max_ttt_context: tc.ttt.max_ttt_context,
                         enabled: true,
+                        ..crate::training::ttt::TTTConfig::default()
                     })
                 } else {
                     None
@@ -426,7 +442,7 @@ impl ModelService {
     }
 
     /// Create a new LoRA adapter on the loaded model
-    async fn create_lora(&self, model_ref_str: &str, config: crate::lora::LoRAConfig) -> Result<()> {
+    async fn create_lora(&self, model_ref_str: &str, config: crate::training::TenantDeltaConfig) -> Result<()> {
         let client = self.get_inference_client(model_ref_str).await?;
         client.create_lora(&config).await
     }
@@ -434,13 +450,7 @@ impl ModelService {
     /// Load a LoRA adapter from a file
     async fn load_lora(&self, model_ref_str: &str, path: &str) -> Result<()> {
         let client = self.get_inference_client(model_ref_str).await?;
-        client.load_lora(std::path::Path::new(path)).await
-    }
-
-    /// Save the current LoRA adapter to a file
-    async fn save_lora(&self, model_ref_str: &str, path: &str) -> Result<()> {
-        let client = self.get_inference_client(model_ref_str).await?;
-        client.save_lora(path).await
+        client.load_lora(path).await
     }
 
     /// Unload the current LoRA adapter
@@ -454,6 +464,87 @@ impl ModelService {
         let client = self.get_inference_client(model_ref_str).await?;
         client.has_lora().await
     }
+
+    // Training loop control - forward to InferenceService via ZMQ
+    async fn commit_adaptation(&self, model_ref_str: &str) -> Result<()> {
+        let client = self.get_inference_client(model_ref_str).await?;
+        client.commit_adaptation().await
+    }
+
+    async fn rollback_adaptation(&self, model_ref_str: &str) -> Result<()> {
+        let client = self.get_inference_client(model_ref_str).await?;
+        client.rollback_adaptation().await
+    }
+
+    async fn train_step_forward(
+        &self,
+        model_ref_str: &str,
+        train_req: model_capnp::train_step_request::Reader<'_>,
+    ) -> Result<crate::services::generated::inference_client::TrainStepResultData> {
+        let client = self.get_inference_client(model_ref_str).await?;
+        client.gen.train_step(
+            train_req.get_input()?.to_str()?,
+            train_req.get_gradient_steps(),
+            train_req.get_learning_rate(),
+            train_req.get_auto_commit(),
+        ).await
+    }
+
+    /// Route streaming training step request with E2E authentication.
+    ///
+    /// Similar to infer_stream — forwards to InferenceService with ephemeral pubkey
+    /// for DH key exchange. Returns stream info for result subscription.
+    async fn train_step_stream(
+        &self,
+        model_ref_str: &str,
+        input: &str,
+        gradient_steps: u32,
+        learning_rate: f32,
+        auto_commit: bool,
+        client_ephemeral_pubkey: Option<[u8; 32]>,
+    ) -> Result<StreamStartedInfo> {
+        let client = self.get_inference_client(model_ref_str).await?;
+        client.train_step_stream(input, gradient_steps, learning_rate, auto_commit, client_ephemeral_pubkey).await
+    }
+
+    async fn reset_delta(&self, model_ref_str: &str) -> Result<()> {
+        let client = self.get_inference_client(model_ref_str).await?;
+        client.reset_delta().await
+    }
+
+    async fn get_delta_status_forward(
+        &self,
+        model_ref_str: &str,
+    ) -> Result<crate::services::generated::inference_client::DeltaStatusResultData> {
+        let client = self.get_inference_client(model_ref_str).await?;
+        client.gen.get_delta_status().await
+    }
+
+    async fn save_adaptation_forward(
+        &self,
+        model_ref_str: &str,
+        save_req: model_capnp::save_adaptation_request::Reader<'_>,
+    ) -> Result<crate::services::generated::inference_client::SaveAdaptationResultData> {
+        let client = self.get_inference_client(model_ref_str).await?;
+        client.gen.save_adaptation(
+            save_req.get_name()?.to_str()?,
+            save_req.get_merge_strategy()?.to_str()?,
+            save_req.get_merge_weight(),
+            save_req.get_commit_message()?.to_str()?,
+        ).await
+    }
+
+    async fn snapshot_delta_forward(
+        &self,
+        model_ref_str: &str,
+    ) -> Result<crate::services::generated::inference_client::SnapshotDeltaResultData> {
+        let client = self.get_inference_client(model_ref_str).await?;
+        client.gen.snapshot_delta().await
+    }
+
+    // ========================================================================
+    // Response builders — top-level
+    // ========================================================================
 
     /// Build a load result response
     fn build_load_result_response(request_id: u64, model_ref: &str, endpoint: &str) -> Result<Vec<u8>> {
@@ -506,14 +597,340 @@ impl ModelService {
         Ok(bytes)
     }
 
-    /// Build a session status response (nested inside sessionResult)
-    fn build_session_status_response(request_id: u64, status: ModelStatusInfo) -> Result<Vec<u8>> {
+    /// Build a health check result response
+    fn build_health_check_result_response(request_id: u64, loaded_count: u32, max_models: u32) -> Result<Vec<u8>> {
         let mut message = Builder::new_default();
         {
             let mut response = message.init_root::<model_capnp::model_response::Builder>();
             response.set_request_id(request_id);
-            let session_resp = response.init_session_result();
-            let mut status_builder = session_resp.init_status();
+            let mut health = response.init_health_check_result();
+            health.set_status("healthy");
+            health.set_loaded_model_count(loaded_count);
+            health.set_max_models(max_models);
+            health.set_total_memory_bytes(0);
+        }
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
+    /// Build a top-level error response
+    fn build_error_response(request_id: u64, message_text: &str, code: &str) -> Result<Vec<u8>> {
+        let mut message = Builder::new_default();
+        {
+            let mut response = message.init_root::<model_capnp::model_response::Builder>();
+            response.set_request_id(request_id);
+            let mut error = response.init_error();
+            error.set_message(message_text);
+            error.set_code(code);
+        }
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
+    // ========================================================================
+    // Response builders — TTT scoped
+    // ========================================================================
+
+    fn build_ttt_error_response(request_id: u64, message_text: &str, code: &str) -> Result<Vec<u8>> {
+        let mut message = Builder::new_default();
+        {
+            let mut response = message.init_root::<model_capnp::model_response::Builder>();
+            response.set_request_id(request_id);
+            let ttt_resp = response.init_ttt_result();
+            let mut error = ttt_resp.init_error();
+            error.set_message(message_text);
+            error.set_code(code);
+        }
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
+    fn build_ttt_void_response(request_id: u64, method_name: &str) -> Result<Vec<u8>> {
+        let mut message = Builder::new_default();
+        {
+            let mut response = message.init_root::<model_capnp::model_response::Builder>();
+            response.set_request_id(request_id);
+            let mut ttt_resp = response.init_ttt_result();
+            match method_name {
+                "create" => ttt_resp.set_create(()),
+                "commit" => ttt_resp.set_commit(()),
+                "rollback" => ttt_resp.set_rollback(()),
+                "reset" => ttt_resp.set_reset(()),
+                _ => return Err(anyhow!("Unknown TTT void method: {}", method_name)),
+            }
+        }
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
+    fn build_ttt_train_response(
+        request_id: u64,
+        data: &crate::services::generated::inference_client::TrainStepResultData,
+    ) -> Result<Vec<u8>> {
+        let mut message = Builder::new_default();
+        {
+            let mut response = message.init_root::<model_capnp::model_response::Builder>();
+            response.set_request_id(request_id);
+            let ttt_resp = response.init_ttt_result();
+            let mut ts = ttt_resp.init_train();
+            ts.set_avg_loss(data.avg_loss);
+            ts.set_loss_improvement(data.loss_improvement);
+            ts.set_steps_performed(data.steps_performed);
+            ts.set_adaptation_time_ms(data.adaptation_time_ms);
+            ts.set_initial_perplexity(data.initial_perplexity);
+            ts.set_final_perplexity(data.final_perplexity);
+            ts.set_recommendation(data.recommendation);
+            ts.set_committed(data.committed);
+            ts.set_gradient_clipped(data.gradient_clipped);
+        }
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
+    fn build_ttt_train_stream_response(
+        request_id: u64,
+        stream_id: &str,
+        endpoint: &str,
+        server_pubkey: &[u8; 32],
+    ) -> Result<Vec<u8>> {
+        let mut message = Builder::new_default();
+        {
+            let mut response = message.init_root::<model_capnp::model_response::Builder>();
+            response.set_request_id(request_id);
+            let ttt_resp = response.init_ttt_result();
+            let mut stream_info = ttt_resp.init_train_stream();
+            stream_info.set_stream_id(stream_id);
+            stream_info.set_endpoint(endpoint);
+            stream_info.set_server_pubkey(server_pubkey);
+        }
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
+    fn build_ttt_status_response(
+        request_id: u64,
+        data: &crate::services::generated::inference_client::DeltaStatusResultData,
+    ) -> Result<Vec<u8>> {
+        let mut message = Builder::new_default();
+        {
+            let mut response = message.init_root::<model_capnp::model_response::Builder>();
+            response.set_request_id(request_id);
+            let ttt_resp = response.init_ttt_result();
+            let mut ds = ttt_resp.init_status();
+            ds.set_exists(data.exists);
+            ds.set_accumulated_steps(data.accumulated_steps);
+            ds.set_max_accumulated_steps(data.max_accumulated_steps);
+            ds.set_request_count(data.request_count);
+            ds.set_avg_loss_improvement(data.avg_loss_improvement);
+            ds.set_memory_bytes(data.memory_bytes);
+            ds.set_last_snapshot_hash(&data.last_snapshot_hash);
+            ds.set_has_pending(data.has_pending);
+            let mut ratios = ds.init_delta_norm_ratios(data.delta_norm_ratios.len() as u32);
+            for (i, r) in data.delta_norm_ratios.iter().enumerate() {
+                let mut entry = ratios.reborrow().get(i as u32);
+                entry.set_module_name(&r.module_name);
+                entry.set_ratio(r.ratio);
+            }
+        }
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
+    fn build_ttt_save_response(
+        request_id: u64,
+        data: &crate::services::generated::inference_client::SaveAdaptationResultData,
+    ) -> Result<Vec<u8>> {
+        let mut message = Builder::new_default();
+        {
+            let mut response = message.init_root::<model_capnp::model_response::Builder>();
+            response.set_request_id(request_id);
+            let ttt_resp = response.init_ttt_result();
+            let mut sa = ttt_resp.init_save();
+            sa.set_adapter_name(&data.adapter_name);
+            sa.set_adapter_path(&data.adapter_path);
+            sa.set_content_hash(&data.content_hash);
+            sa.set_merge_strategy(&data.merge_strategy);
+        }
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
+    fn build_ttt_snapshot_response(
+        request_id: u64,
+        data: &crate::services::generated::inference_client::SnapshotDeltaResultData,
+    ) -> Result<Vec<u8>> {
+        let mut message = Builder::new_default();
+        {
+            let mut response = message.init_root::<model_capnp::model_response::Builder>();
+            response.set_request_id(request_id);
+            let ttt_resp = response.init_ttt_result();
+            let mut sd = ttt_resp.init_snapshot();
+            sd.set_content_hash(&data.content_hash);
+            sd.set_size_bytes(data.size_bytes);
+            sd.set_accumulated_steps(data.accumulated_steps);
+            sd.set_request_count(data.request_count);
+        }
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
+    // ========================================================================
+    // Response builders — PEFT scoped
+    // ========================================================================
+
+    fn build_peft_error_response(request_id: u64, message_text: &str, code: &str) -> Result<Vec<u8>> {
+        let mut message = Builder::new_default();
+        {
+            let mut response = message.init_root::<model_capnp::model_response::Builder>();
+            response.set_request_id(request_id);
+            let peft_resp = response.init_peft_result();
+            let mut error = peft_resp.init_error();
+            error.set_message(message_text);
+            error.set_code(code);
+        }
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
+    fn build_peft_void_response(request_id: u64, method_name: &str) -> Result<Vec<u8>> {
+        let mut message = Builder::new_default();
+        {
+            let mut response = message.init_root::<model_capnp::model_response::Builder>();
+            response.set_request_id(request_id);
+            let mut peft_resp = response.init_peft_result();
+            match method_name {
+                "load" => peft_resp.set_load(()),
+                "unload" => peft_resp.set_unload(()),
+                "merge" => peft_resp.set_merge(()),
+                _ => return Err(anyhow!("Unknown PEFT void method: {}", method_name)),
+            }
+        }
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
+    fn build_peft_has_response(request_id: u64, has_lora: bool) -> Result<Vec<u8>> {
+        let mut message = Builder::new_default();
+        {
+            let mut response = message.init_root::<model_capnp::model_response::Builder>();
+            response.set_request_id(request_id);
+            let mut peft_resp = response.init_peft_result();
+            peft_resp.set_has(has_lora);
+        }
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
+    // ========================================================================
+    // Response builders — Infer scoped
+    // ========================================================================
+
+    fn build_infer_error_response(request_id: u64, message_text: &str, code: &str) -> Result<Vec<u8>> {
+        let mut message = Builder::new_default();
+        {
+            let mut response = message.init_root::<model_capnp::model_response::Builder>();
+            response.set_request_id(request_id);
+            let infer_resp = response.init_infer_result();
+            let mut error = infer_resp.init_error();
+            error.set_message(message_text);
+            error.set_code(code);
+        }
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
+    fn build_infer_generate_response(request_id: u64, result: &GenerationResult) -> Result<Vec<u8>> {
+        let mut message = Builder::new_default();
+        {
+            let mut response = message.init_root::<model_capnp::model_response::Builder>();
+            response.set_request_id(request_id);
+            let infer_resp = response.init_infer_result();
+            let mut infer = infer_resp.init_generate();
+            infer.set_text(&result.text);
+            infer.set_tokens_generated(result.tokens_generated as u32);
+            infer.set_finish_reason(&finish_reason_to_str(&result.finish_reason));
+            infer.set_generation_time_ms(result.generation_time_ms);
+            infer.set_tokens_per_second(result.tokens_per_second);
+            infer.set_prefill_tokens(result.prefill_tokens as u32);
+            infer.set_prefill_time_ms(result.prefill_time_ms);
+            infer.set_prefill_tokens_per_sec(result.prefill_tokens_per_sec);
+            infer.set_inference_tokens(result.inference_tokens as u32);
+            infer.set_inference_time_ms(result.inference_time_ms);
+            infer.set_inference_tokens_per_sec(result.inference_tokens_per_sec);
+        }
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
+    fn build_infer_generate_stream_response(
+        request_id: u64,
+        stream_id: &str,
+        endpoint: &str,
+        server_pubkey: &[u8; 32],
+    ) -> Result<Vec<u8>> {
+        let mut message = Builder::new_default();
+        {
+            let mut response = message.init_root::<model_capnp::model_response::Builder>();
+            response.set_request_id(request_id);
+            let infer_resp = response.init_infer_result();
+            let mut stream_info = infer_resp.init_generate_stream();
+            stream_info.set_stream_id(stream_id);
+            stream_info.set_endpoint(endpoint);
+            stream_info.set_server_pubkey(server_pubkey);
+        }
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
+    fn build_infer_start_stream_response(request_id: u64, stream_id: &str) -> Result<Vec<u8>> {
+        let mut message = Builder::new_default();
+        {
+            let mut response = message.init_root::<model_capnp::model_response::Builder>();
+            response.set_request_id(request_id);
+            let infer_resp = response.init_infer_result();
+            let mut auth_info = infer_resp.init_start_stream();
+            auth_info.set_stream_id(stream_id);
+        }
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
+    fn build_infer_template_response(request_id: u64, templated_prompt: &TemplatedPrompt) -> Result<Vec<u8>> {
+        let mut message = Builder::new_default();
+        {
+            let mut response = message.init_root::<model_capnp::model_response::Builder>();
+            response.set_request_id(request_id);
+            let mut infer_resp = response.init_infer_result();
+            infer_resp.set_apply_chat_template(templated_prompt.as_str());
+        }
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
+    fn build_infer_status_response(request_id: u64, status: ModelStatusInfo) -> Result<Vec<u8>> {
+        let mut message = Builder::new_default();
+        {
+            let mut response = message.init_root::<model_capnp::model_response::Builder>();
+            response.set_request_id(request_id);
+            let infer_resp = response.init_infer_result();
+            let mut status_builder = infer_resp.init_status();
             status_builder.set_loaded(status.loaded);
             status_builder.set_memory_bytes(0);
             status_builder.set_session_count(0);
@@ -536,164 +953,6 @@ impl ModelService {
         serialize::write_message(&mut bytes, &message)?;
         Ok(bytes)
     }
-
-    /// Build a session infer result response (nested inside sessionResult)
-    fn build_session_infer_response(request_id: u64, result: &GenerationResult) -> Result<Vec<u8>> {
-        let mut message = Builder::new_default();
-        {
-            let mut response = message.init_root::<model_capnp::model_response::Builder>();
-            response.set_request_id(request_id);
-            let session_resp = response.init_session_result();
-            let mut infer = session_resp.init_infer();
-            infer.set_text(&result.text);
-            infer.set_tokens_generated(result.tokens_generated as u32);
-            infer.set_finish_reason(&finish_reason_to_str(&result.finish_reason));
-            infer.set_generation_time_ms(result.generation_time_ms);
-            infer.set_tokens_per_second(result.tokens_per_second);
-            infer.set_prefill_tokens(result.prefill_tokens as u32);
-            infer.set_prefill_time_ms(result.prefill_time_ms);
-            infer.set_prefill_tokens_per_sec(result.prefill_tokens_per_sec);
-            infer.set_inference_tokens(result.inference_tokens as u32);
-            infer.set_inference_time_ms(result.inference_time_ms);
-            infer.set_inference_tokens_per_sec(result.inference_tokens_per_sec);
-        }
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-        Ok(bytes)
-    }
-
-    /// Build a session infer stream response (nested inside sessionResult)
-    fn build_session_infer_stream_response(
-        request_id: u64,
-        stream_id: &str,
-        endpoint: &str,
-        server_pubkey: &[u8; 32],
-    ) -> Result<Vec<u8>> {
-        let mut message = Builder::new_default();
-        {
-            let mut response = message.init_root::<model_capnp::model_response::Builder>();
-            response.set_request_id(request_id);
-            let session_resp = response.init_session_result();
-            let mut stream_info = session_resp.init_infer_stream();
-            stream_info.set_stream_id(stream_id);
-            stream_info.set_endpoint(endpoint);
-            stream_info.set_server_pubkey(server_pubkey);
-        }
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-        Ok(bytes)
-    }
-
-    /// Build a session start stream response (nested inside sessionResult)
-    fn build_session_start_stream_response(request_id: u64, stream_id: &str) -> Result<Vec<u8>> {
-        let mut message = Builder::new_default();
-        {
-            let mut response = message.init_root::<model_capnp::model_response::Builder>();
-            response.set_request_id(request_id);
-            let session_resp = response.init_session_result();
-            let mut auth_info = session_resp.init_start_stream();
-            auth_info.set_stream_id(stream_id);
-        }
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-        Ok(bytes)
-    }
-
-    /// Build a health check result response
-    fn build_health_check_result_response(request_id: u64, loaded_count: u32, max_models: u32) -> Result<Vec<u8>> {
-        let mut message = Builder::new_default();
-        {
-            let mut response = message.init_root::<model_capnp::model_response::Builder>();
-            response.set_request_id(request_id);
-            let mut health = response.init_health_check_result();
-            health.set_status("healthy");
-            health.set_loaded_model_count(loaded_count);
-            health.set_max_models(max_models);
-            health.set_total_memory_bytes(0);
-        }
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-        Ok(bytes)
-    }
-
-    /// Build an error response
-    fn build_error_response(request_id: u64, message_text: &str, code: &str) -> Result<Vec<u8>> {
-        let mut message = Builder::new_default();
-        {
-            let mut response = message.init_root::<model_capnp::model_response::Builder>();
-            response.set_request_id(request_id);
-            let mut error = response.init_error();
-            error.set_message(message_text);
-            error.set_code(code);
-        }
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-        Ok(bytes)
-    }
-
-    /// Build a session error response (nested inside sessionResult)
-    fn build_session_error_response(request_id: u64, message_text: &str, code: &str) -> Result<Vec<u8>> {
-        let mut message = Builder::new_default();
-        {
-            let mut response = message.init_root::<model_capnp::model_response::Builder>();
-            response.set_request_id(request_id);
-            let session_resp = response.init_session_result();
-            let mut error = session_resp.init_error();
-            error.set_message(message_text);
-            error.set_code(code);
-        }
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-        Ok(bytes)
-    }
-
-    /// Build a session template result response (nested inside sessionResult)
-    fn build_session_template_response(request_id: u64, templated_prompt: &TemplatedPrompt) -> Result<Vec<u8>> {
-        let mut message = Builder::new_default();
-        {
-            let mut response = message.init_root::<model_capnp::model_response::Builder>();
-            response.set_request_id(request_id);
-            let mut session_resp = response.init_session_result();
-            session_resp.set_apply_chat_template(templated_prompt.as_str());
-        }
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-        Ok(bytes)
-    }
-
-    /// Build a session Void response (for createLora, loadLora, saveLora, unloadLora)
-    fn build_session_void_response(request_id: u64, method_name: &str) -> Result<Vec<u8>> {
-        let mut message = Builder::new_default();
-        {
-            let mut response = message.init_root::<model_capnp::model_response::Builder>();
-            response.set_request_id(request_id);
-            let mut session_resp = response.init_session_result();
-            match method_name {
-                "createLora" => session_resp.set_create_lora(()),
-                "loadLora" => session_resp.set_load_lora(()),
-                "saveLora" => session_resp.set_save_lora(()),
-                "unloadLora" => session_resp.set_unload_lora(()),
-                _ => return Err(anyhow!("Unknown void method: {}", method_name)),
-            }
-        }
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-        Ok(bytes)
-    }
-
-    /// Build a session hasLora response
-    fn build_session_has_lora_response(request_id: u64, has_lora: bool) -> Result<Vec<u8>> {
-        let mut message = Builder::new_default();
-        {
-            let mut response = message.init_root::<model_capnp::model_response::Builder>();
-            response.set_request_id(request_id);
-            let mut session_resp = response.init_session_result();
-            session_resp.set_has_lora(has_lora);
-        }
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-        Ok(bytes)
-    }
 }
 
 /// ZmqService implementation for ModelService
@@ -701,7 +960,7 @@ impl crate::services::ZmqService for ModelService {
     fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<Vec<u8>> {
         debug!(
             "Model request from {} (id={})",
-            ctx.casbin_subject(),
+            ctx.subject(),
             ctx.request_id
         );
 
@@ -772,58 +1031,254 @@ impl crate::services::ZmqService for ModelService {
                         drop(cache);
                         Self::build_health_check_result_response(request_id, loaded_count, max_models)
                     }
-                    Which::Session(session_req) => {
-                        let session = session_req?;
-                        let model_ref = session.get_model_ref()?.to_str()?;
 
-                        use model_capnp::model_session_request::Which as SessionWhich;
-                        match session.which()? {
-                            SessionWhich::Status(()) => {
-                                let info = self.model_status(model_ref).await;
-                                Self::build_session_status_response(request_id, info)
+                    // ==========================================================
+                    // TTT scoped operations
+                    // ==========================================================
+                    Which::Ttt(ttt_req) => {
+                        let ttt = ttt_req?;
+                        let model_ref = ttt.get_model_ref()?.to_str()?;
+
+                        use model_capnp::ttt_request::Which as TttWhich;
+                        match ttt.which()? {
+                            TttWhich::Create(lora_req) => {
+                                let lora = lora_req?;
+                                let config = crate::training::TenantDeltaConfig {
+                                    rank: lora.get_rank() as usize,
+                                    alpha: lora.get_alpha(),
+                                    dropout: lora.get_dropout(),
+                                    target_modules: lora.get_target_modules()?.iter()
+                                        .filter_map(|s| s.ok().and_then(|t| t.to_str().ok().map(|s| s.to_owned())))
+                                        .collect(),
+                                    learning_rate: lora.get_learning_rate() as f64,
+                                    ..crate::training::TenantDeltaConfig::default()
+                                };
+                                match self.create_lora(model_ref, config).await {
+                                    Ok(()) => Self::build_ttt_void_response(request_id, "create"),
+                                    Err(e) => Self::build_ttt_error_response(
+                                        request_id,
+                                        &format!("LoRA creation failed: {e}"),
+                                        "LORA_CREATE_FAILED",
+                                    ),
+                                }
                             }
-                            SessionWhich::Infer(infer_req) => {
-                                let infer = infer_req?;
-                                let request = parse_infer_request(infer)?;
+                            TttWhich::Train(req) => {
+                                let train_req = req?;
+                                match self.train_step_forward(model_ref, train_req).await {
+                                    Ok(info) => Self::build_ttt_train_response(request_id, &info),
+                                    Err(e) => Self::build_ttt_error_response(
+                                        request_id,
+                                        &format!("Train step failed: {e}"),
+                                        "TRAIN_STEP_FAILED",
+                                    ),
+                                }
+                            }
+                            TttWhich::TrainStream(req) => {
+                                let train_req = req?;
+                                let input = train_req.get_input()?.to_str()?;
+                                let gradient_steps = train_req.get_gradient_steps();
+                                let learning_rate = train_req.get_learning_rate();
+                                let auto_commit = train_req.get_auto_commit();
+
+                                match self.train_step_stream(
+                                    model_ref, input, gradient_steps, learning_rate,
+                                    auto_commit, client_ephemeral_pubkey,
+                                ).await {
+                                    Ok(info) => Self::build_ttt_train_stream_response(
+                                        request_id,
+                                        &info.stream_id,
+                                        &info.endpoint,
+                                        &info.server_pubkey,
+                                    ),
+                                    Err(e) => Self::build_ttt_error_response(
+                                        request_id,
+                                        &format!("Train step stream failed: {e}"),
+                                        "TRAIN_STREAM_FAILED",
+                                    ),
+                                }
+                            }
+                            TttWhich::Commit(_) => {
+                                match self.commit_adaptation(model_ref).await {
+                                    Ok(()) => Self::build_ttt_void_response(request_id, "commit"),
+                                    Err(e) => Self::build_ttt_error_response(
+                                        request_id,
+                                        &format!("Commit failed: {e}"),
+                                        "COMMIT_FAILED",
+                                    ),
+                                }
+                            }
+                            TttWhich::Rollback(_) => {
+                                match self.rollback_adaptation(model_ref).await {
+                                    Ok(()) => Self::build_ttt_void_response(request_id, "rollback"),
+                                    Err(e) => Self::build_ttt_error_response(
+                                        request_id,
+                                        &format!("Rollback failed: {e}"),
+                                        "ROLLBACK_FAILED",
+                                    ),
+                                }
+                            }
+                            TttWhich::Reset(_) => {
+                                match self.reset_delta(model_ref).await {
+                                    Ok(()) => Self::build_ttt_void_response(request_id, "reset"),
+                                    Err(e) => Self::build_ttt_error_response(
+                                        request_id,
+                                        &format!("Reset failed: {e}"),
+                                        "RESET_FAILED",
+                                    ),
+                                }
+                            }
+                            TttWhich::Status(_) => {
+                                match self.get_delta_status_forward(model_ref).await {
+                                    Ok(info) => Self::build_ttt_status_response(request_id, &info),
+                                    Err(e) => Self::build_ttt_error_response(
+                                        request_id,
+                                        &format!("Status query failed: {e}"),
+                                        "STATUS_FAILED",
+                                    ),
+                                }
+                            }
+                            TttWhich::Save(req) => {
+                                let save_req = req?;
+                                match self.save_adaptation_forward(model_ref, save_req).await {
+                                    Ok(info) => Self::build_ttt_save_response(request_id, &info),
+                                    Err(e) => Self::build_ttt_error_response(
+                                        request_id,
+                                        &format!("Save failed: {e}"),
+                                        "SAVE_FAILED",
+                                    ),
+                                }
+                            }
+                            TttWhich::Snapshot(_) => {
+                                match self.snapshot_delta_forward(model_ref).await {
+                                    Ok(info) => Self::build_ttt_snapshot_response(request_id, &info),
+                                    Err(e) => Self::build_ttt_error_response(
+                                        request_id,
+                                        &format!("Snapshot failed: {e}"),
+                                        "SNAPSHOT_FAILED",
+                                    ),
+                                }
+                            }
+                            TttWhich::Export(_export_req) => {
+                                // TODO: Implement ttt.export (delta → PEFT adapter directory)
+                                Self::build_ttt_error_response(
+                                    request_id,
+                                    "ttt.export not yet implemented",
+                                    "NOT_IMPLEMENTED",
+                                )
+                            }
+                        }
+                    }
+
+                    // ==========================================================
+                    // PEFT scoped operations
+                    // ==========================================================
+                    Which::Peft(peft_req) => {
+                        let peft = peft_req?;
+                        let model_ref = peft.get_model_ref()?.to_str()?;
+
+                        use model_capnp::peft_request::Which as PeftWhich;
+                        match peft.which()? {
+                            PeftWhich::Load(path_req) => {
+                                let path = path_req?.to_str()?;
+                                match self.load_lora(model_ref, path).await {
+                                    Ok(()) => Self::build_peft_void_response(request_id, "load"),
+                                    Err(e) => Self::build_peft_error_response(
+                                        request_id,
+                                        &format!("PEFT load failed: {e}"),
+                                        "PEFT_LOAD_FAILED",
+                                    ),
+                                }
+                            }
+                            PeftWhich::Unload(()) => {
+                                match self.unload_lora(model_ref).await {
+                                    Ok(()) => Self::build_peft_void_response(request_id, "unload"),
+                                    Err(e) => Self::build_peft_error_response(
+                                        request_id,
+                                        &format!("PEFT unload failed: {e}"),
+                                        "PEFT_UNLOAD_FAILED",
+                                    ),
+                                }
+                            }
+                            PeftWhich::Has(()) => {
+                                match self.has_lora(model_ref).await {
+                                    Ok(has) => Self::build_peft_has_response(request_id, has),
+                                    Err(e) => Self::build_peft_error_response(
+                                        request_id,
+                                        &format!("PEFT check failed: {e}"),
+                                        "PEFT_CHECK_FAILED",
+                                    ),
+                                }
+                            }
+                            PeftWhich::Check(_path_req) => {
+                                // TODO: Implement peft.check (validate PEFT adapter directory)
+                                Self::build_peft_error_response(
+                                    request_id,
+                                    "peft.check not yet implemented",
+                                    "NOT_IMPLEMENTED",
+                                )
+                            }
+                            PeftWhich::Merge(_merge_req) => {
+                                // TODO: Implement peft.merge (merge adapter into base weights)
+                                Self::build_peft_error_response(
+                                    request_id,
+                                    "peft.merge not yet implemented",
+                                    "NOT_IMPLEMENTED",
+                                )
+                            }
+                        }
+                    }
+
+                    // ==========================================================
+                    // Infer scoped operations
+                    // ==========================================================
+                    Which::Infer(infer_req) => {
+                        let infer = infer_req?;
+                        let model_ref = infer.get_model_ref()?.to_str()?;
+
+                        use model_capnp::infer_request::Which as InferWhich;
+                        match infer.which()? {
+                            InferWhich::Generate(gen_req) => {
+                                let gen = gen_req?;
+                                let request = parse_generate_request(gen)?;
                                 match self.infer(model_ref, request).await {
-                                    Ok(result) => Self::build_session_infer_response(request_id, &result),
-                                    Err(e) => Self::build_session_error_response(
+                                    Ok(result) => Self::build_infer_generate_response(request_id, &result),
+                                    Err(e) => Self::build_infer_error_response(
                                         request_id,
                                         &format!("Inference failed: {e}"),
                                         "INFER_FAILED",
                                     ),
                                 }
                             }
-                            SessionWhich::InferStream(infer_req) => {
-                                let infer = infer_req?;
-                                let request = parse_infer_request(infer)?;
+                            InferWhich::GenerateStream(gen_req) => {
+                                let gen = gen_req?;
+                                let request = parse_generate_request(gen)?;
                                 match self.infer_stream(model_ref, request, client_ephemeral_pubkey).await {
-                                    Ok(info) => Self::build_session_infer_stream_response(
+                                    Ok(info) => Self::build_infer_generate_stream_response(
                                         request_id,
                                         &info.stream_id,
                                         &info.endpoint,
                                         &info.server_pubkey,
                                     ),
-                                    Err(e) => Self::build_session_error_response(
+                                    Err(e) => Self::build_infer_error_response(
                                         request_id,
                                         &format!("Stream start failed: {e}"),
                                         "STREAM_FAILED",
                                     ),
                                 }
                             }
-                            SessionWhich::StartStream(start_req) => {
+                            InferWhich::StartStream(start_req) => {
                                 let start = start_req?;
                                 let stream_id = start.get_stream_id()?.to_str()?;
                                 match self.start_stream(model_ref, stream_id).await {
-                                    Ok(()) => Self::build_session_start_stream_response(request_id, stream_id),
-                                    Err(e) => Self::build_session_error_response(
+                                    Ok(()) => Self::build_infer_start_stream_response(request_id, stream_id),
+                                    Err(e) => Self::build_infer_error_response(
                                         request_id,
                                         &format!("Stream authorization failed: {e}"),
                                         "STREAM_AUTH_FAILED",
                                     ),
                                 }
                             }
-                            SessionWhich::ApplyChatTemplate(template_req) => {
+                            InferWhich::ApplyChatTemplate(template_req) => {
                                 let template = template_req?;
                                 let add_generation_prompt = template.get_add_generation_prompt();
 
@@ -839,75 +1294,17 @@ impl crate::services::ZmqService for ModelService {
                                     .collect();
 
                                 match self.apply_chat_template(model_ref, messages, add_generation_prompt).await {
-                                    Ok(templated) => Self::build_session_template_response(request_id, &templated),
-                                    Err(e) => Self::build_session_error_response(
+                                    Ok(templated) => Self::build_infer_template_response(request_id, &templated),
+                                    Err(e) => Self::build_infer_error_response(
                                         request_id,
                                         &format!("Template application failed: {e}"),
                                         "TEMPLATE_FAILED",
                                     ),
                                 }
                             }
-                            SessionWhich::CreateLora(lora_req) => {
-                                let lora = lora_req?;
-                                let config = crate::lora::LoRAConfig {
-                                    rank: lora.get_rank() as usize,
-                                    alpha: lora.get_alpha(),
-                                    dropout: lora.get_dropout(),
-                                    target_modules: lora.get_target_modules()?.iter()
-                                        .filter_map(|s| s.ok().and_then(|t| t.to_str().ok().map(|s| s.to_owned())))
-                                        .collect(),
-                                    learning_rate: lora.get_learning_rate(),
-                                };
-                                match self.create_lora(model_ref, config).await {
-                                    Ok(()) => Self::build_session_void_response(request_id, "createLora"),
-                                    Err(e) => Self::build_session_error_response(
-                                        request_id,
-                                        &format!("LoRA creation failed: {e}"),
-                                        "LORA_CREATE_FAILED",
-                                    ),
-                                }
-                            }
-                            SessionWhich::LoadLora(path_req) => {
-                                let path = path_req?.to_str()?;
-                                match self.load_lora(model_ref, path).await {
-                                    Ok(()) => Self::build_session_void_response(request_id, "loadLora"),
-                                    Err(e) => Self::build_session_error_response(
-                                        request_id,
-                                        &format!("LoRA load failed: {e}"),
-                                        "LORA_LOAD_FAILED",
-                                    ),
-                                }
-                            }
-                            SessionWhich::SaveLora(path_req) => {
-                                let path = path_req?.to_str()?;
-                                match self.save_lora(model_ref, path).await {
-                                    Ok(()) => Self::build_session_void_response(request_id, "saveLora"),
-                                    Err(e) => Self::build_session_error_response(
-                                        request_id,
-                                        &format!("LoRA save failed: {e}"),
-                                        "LORA_SAVE_FAILED",
-                                    ),
-                                }
-                            }
-                            SessionWhich::UnloadLora(()) => {
-                                match self.unload_lora(model_ref).await {
-                                    Ok(()) => Self::build_session_void_response(request_id, "unloadLora"),
-                                    Err(e) => Self::build_session_error_response(
-                                        request_id,
-                                        &format!("LoRA unload failed: {e}"),
-                                        "LORA_UNLOAD_FAILED",
-                                    ),
-                                }
-                            }
-                            SessionWhich::HasLora(()) => {
-                                match self.has_lora(model_ref).await {
-                                    Ok(has_lora) => Self::build_session_has_lora_response(request_id, has_lora),
-                                    Err(e) => Self::build_session_error_response(
-                                        request_id,
-                                        &format!("LoRA check failed: {e}"),
-                                        "LORA_CHECK_FAILED",
-                                    ),
-                                }
+                            InferWhich::Status(()) => {
+                                let info = self.model_status(model_ref).await;
+                                Self::build_infer_status_response(request_id, info)
                             }
                         }
                     }
@@ -983,9 +1380,9 @@ pub struct ModelStatusInfo {
 // ModelZmqClient (client-side)
 // ============================================================================
 
-/// Wraps a generated `ModelClient`. Simple methods delegate to gen;
-/// `load`, `list`, `apply_chat_template`, and streaming methods use manual
-/// request building for types the generator doesn't fully support.
+/// Wraps a generated `ModelClient`. Most methods delegate directly to gen
+/// which returns typed results. Streaming methods (`infer_stream`, `start_stream`)
+/// use manual request building for custom `CallOptions` support.
 #[derive(Clone)]
 pub struct ModelZmqClient {
     /// Generated typed client (handles all transport including streaming via call_with_options)
@@ -993,8 +1390,10 @@ pub struct ModelZmqClient {
 }
 
 use crate::services::generated::model_client::{
-    ModelResponseVariant, ModelSessionClient as GenModelSessionClient,
-    ModelSessionClientResponseVariant,
+    InferClient as GenInferClient,
+    InferClientResponseVariant,
+    TttClient as GenTttClient,
+    TttClientResponseVariant,
 };
 
 impl ModelZmqClient {
@@ -1032,71 +1431,52 @@ impl ModelZmqClient {
             }
             None => (0, "none"),
         };
-        match self.gen.load(model_ref, max_context, kv_quant_str).await? {
-            ModelResponseVariant::LoadResult { endpoint, .. } => Ok(endpoint),
-            ModelResponseVariant::Error { message, code, .. } => Err(anyhow!("{}: {}", code, message)),
-            _ => Err(anyhow!("Unexpected response type")),
-        }
+        let data = self.gen.load(model_ref, max_context, kv_quant_str).await?;
+        Ok(data.endpoint)
     }
 
     /// Unload a model
     pub async fn unload(&self, model_ref: &str) -> Result<()> {
-        match self.gen.unload(model_ref).await? {
-            ModelResponseVariant::UnloadResult => Ok(()),
-            ModelResponseVariant::Error { message, code, .. } => Err(anyhow!("{}: {}", code, message)),
-            _ => Err(anyhow!("Unexpected response type")),
-        }
+        self.gen.unload(model_ref).await
     }
 
     /// List loaded models — delegates to generated client
     pub async fn list(&self) -> Result<Vec<LoadedModelInfo>> {
-        match self.gen.list().await? {
-            ModelResponseVariant::ListResult { models } => {
-                Ok(models.into_iter().map(|m| LoadedModelInfo {
-                    model_ref: m.model_ref,
-                    endpoint: m.endpoint,
-                    loaded_at: m.loaded_at,
-                    last_used: m.last_used,
-                }).collect())
-            }
-            ModelResponseVariant::Error { message, code, .. } => Err(anyhow!("{}: {}", code, message)),
-            _ => Err(anyhow!("Unexpected response type")),
-        }
+        let data = self.gen.list().await?;
+        Ok(data.models.into_iter().map(|m| LoadedModelInfo {
+            model_ref: m.model_ref,
+            endpoint: m.endpoint,
+            loaded_at: m.loaded_at,
+            last_used: m.last_used,
+        }).collect())
     }
 
-    /// Get model status (session-scoped)
+    /// Get model status (infer-scoped)
     pub async fn status(&self, model_ref: &str) -> Result<ModelStatusInfo> {
-        match self.gen.session(model_ref).status().await? {
-            ModelSessionClientResponseVariant::Status { loaded, endpoint, online_training_config, .. } => {
-                Ok(ModelStatusInfo {
-                    loaded,
-                    endpoint: if endpoint.is_empty() { None } else { Some(endpoint) },
-                    online_training_config: if online_training_config.enabled {
-                        Some(OnlineTrainingConfigInfo {
-                            enabled: online_training_config.enabled,
-                            learning_rate: online_training_config.learning_rate,
-                            gradient_steps: online_training_config.gradient_steps as usize,
-                            max_grad_norm: online_training_config.max_grad_norm,
-                            min_input_length: online_training_config.min_input_length as usize,
-                            max_ttt_context: online_training_config.max_ttt_context as usize,
-                        })
-                    } else {
-                        None
-                    },
+        let data = self.gen.infer(model_ref).status().await?;
+        Ok(ModelStatusInfo {
+            loaded: data.loaded,
+            endpoint: if data.endpoint.is_empty() { None } else { Some(data.endpoint) },
+            online_training_config: if data.online_training_config.enabled {
+                Some(OnlineTrainingConfigInfo {
+                    enabled: data.online_training_config.enabled,
+                    learning_rate: data.online_training_config.learning_rate,
+                    gradient_steps: data.online_training_config.gradient_steps as usize,
+                    max_grad_norm: data.online_training_config.max_grad_norm,
+                    min_input_length: data.online_training_config.min_input_length as usize,
+                    max_ttt_context: data.online_training_config.max_ttt_context as usize,
                 })
-            }
-            ModelSessionClientResponseVariant::Error { message, code, .. } => {
-                Err(anyhow!("{}: {}", code, message))
-            }
-            _ => Err(anyhow!("Unexpected session response type")),
-        }
+            } else {
+                None
+            },
+        })
     }
 
-    /// Run inference on a model (session-scoped)
+    /// Run inference on a model (infer-scoped)
     pub async fn infer(&self, model_ref: &str, request: &GenerationRequest) -> Result<GenerationResult> {
         // Images are file paths in GenerationRequest but raw bytes in schema — not yet used over wire
         let images: Vec<Vec<u8>> = Vec::new();
-        match self.gen.session(model_ref).infer(
+        let data = self.gen.infer(model_ref).generate(
             request.prompt.as_str(),
             request.max_tokens as u32,
             request.temperature,
@@ -1108,41 +1488,26 @@ impl ModelZmqClient {
             request.seed.unwrap_or(0),
             &images,
             request.timeout.unwrap_or(0),
-        ).await? {
-            ModelSessionClientResponseVariant::Infer {
-                text,
-                tokens_generated,
-                finish_reason,
-                generation_time_ms,
-                tokens_per_second,
-                prefill_tokens,
-                prefill_time_ms,
-                prefill_tokens_per_sec,
-                inference_tokens,
-                inference_time_ms,
-                inference_tokens_per_sec,
-            } => {
-                Ok(GenerationResult {
-                    text,
-                    tokens_generated: tokens_generated as usize,
-                    finish_reason: parse_finish_reason_str(&finish_reason),
-                    generation_time_ms,
-                    tokens_per_second,
-                    quality_metrics: None,
-                    prefill_tokens: prefill_tokens as usize,
-                    prefill_time_ms,
-                    prefill_tokens_per_sec,
-                    inference_tokens: inference_tokens as usize,
-                    inference_time_ms,
-                    inference_tokens_per_sec,
-                    ttt_metrics: None,  // TODO: Extract from response when available
-                })
-            }
-            ModelSessionClientResponseVariant::Error { message, code, .. } => {
-                Err(anyhow!("{}: {}", code, message))
-            }
-            _ => Err(anyhow!("Unexpected session response type")),
-        }
+            false,  // tttEnabled: use server default
+            0,      // tttGradientSteps: use server default
+            0.0,    // tttLearningRate: use server default
+            false,  // autoCommit: default false
+        ).await?;
+        Ok(GenerationResult {
+            text: data.text,
+            tokens_generated: data.tokens_generated as usize,
+            finish_reason: parse_finish_reason_str(&data.finish_reason),
+            generation_time_ms: data.generation_time_ms,
+            tokens_per_second: data.tokens_per_second,
+            quality_metrics: None,
+            prefill_tokens: data.prefill_tokens as usize,
+            prefill_time_ms: data.prefill_time_ms,
+            prefill_tokens_per_sec: data.prefill_tokens_per_sec,
+            inference_tokens: data.inference_tokens as usize,
+            inference_time_ms: data.inference_time_ms,
+            inference_tokens_per_sec: data.inference_tokens_per_sec,
+            ttt_metrics: None,  // TODO: Extract from response when available
+        })
     }
 
     /// Start streaming inference with E2E authentication (manual — needs custom CallOptions)
@@ -1158,10 +1523,10 @@ impl ModelZmqClient {
         {
             let mut req = message.init_root::<model_capnp::model_request::Builder>();
             req.set_id(request_id);
-            let mut session = req.init_session();
-            session.set_model_ref(model_ref);
-            let mut infer = session.init_infer_stream();
-            set_infer_request_fields(&mut infer, request);
+            let mut infer = req.init_infer();
+            infer.set_model_ref(model_ref);
+            let mut gen = infer.init_generate_stream();
+            set_generate_request_fields(&mut gen, request);
         }
 
         let mut request_bytes = Vec::new();
@@ -1169,10 +1534,10 @@ impl ModelZmqClient {
 
         let opts = CallOptions::default().ephemeral_pubkey(client_ephemeral_pubkey);
         let response_bytes = self.gen.call_with_options(request_bytes, opts).await?;
-        Self::parse_session_infer_stream_response(&response_bytes)
+        Self::parse_infer_generate_stream_response(&response_bytes)
     }
 
-    /// Authorize a stream subscription (manual — session-scoped streaming)
+    /// Authorize a stream subscription (manual — infer-scoped streaming)
     pub async fn start_stream(&self, model_ref: &str, stream_id: &str) -> Result<String> {
         let request_id = self.gen.next_id();
 
@@ -1180,9 +1545,9 @@ impl ModelZmqClient {
         {
             let mut req = message.init_root::<model_capnp::model_request::Builder>();
             req.set_id(request_id);
-            let mut session = req.init_session();
-            session.set_model_ref(model_ref);
-            let mut start_req = session.init_start_stream();
+            let mut infer = req.init_infer();
+            infer.set_model_ref(model_ref);
+            let mut start_req = infer.init_start_stream();
             start_req.set_stream_id(stream_id);
         }
 
@@ -1190,21 +1555,21 @@ impl ModelZmqClient {
         serialize::write_message(&mut request_bytes, &message)?;
 
         let response_bytes = self.gen.call_with_options(request_bytes, CallOptions::default()).await?;
-        Self::parse_session_start_stream_response(&response_bytes)
+        Self::parse_infer_start_stream_response(&response_bytes)
     }
 
     /// Health check
     pub async fn health_check(&self) -> Result<ModelHealthInfo> {
-        match self.gen.health_check().await? {
-            ModelResponseVariant::HealthCheckResult { status, loaded_model_count, max_models, total_memory_bytes } => {
-                Ok(ModelHealthInfo { status, loaded_model_count, max_models, total_memory_bytes })
-            }
-            ModelResponseVariant::Error { message, code, .. } => Err(anyhow!("{}: {}", code, message)),
-            _ => Err(anyhow!("Unexpected response type")),
-        }
+        let data = self.gen.health_check().await?;
+        Ok(ModelHealthInfo {
+            status: data.status,
+            loaded_model_count: data.loaded_model_count,
+            max_models: data.max_models,
+            total_memory_bytes: data.total_memory_bytes,
+        })
     }
 
-    /// Apply chat template — delegates to generated client
+    /// Apply chat template — delegates to generated client (infer-scoped)
     pub async fn apply_chat_template(
         &self,
         model_ref: &str,
@@ -1216,18 +1581,11 @@ impl ModelZmqClient {
             role: m.role.clone(),
             content: m.content.as_deref().unwrap_or("").to_string(),
         }).collect();
-        match self.gen.session(model_ref).apply_chat_template(&msg_data, add_generation_prompt).await? {
-            ModelSessionClientResponseVariant::ApplyChatTemplate(prompt_str) => {
-                Ok(TemplatedPrompt::new(prompt_str))
-            }
-            ModelSessionClientResponseVariant::Error { message, code, .. } => {
-                Err(anyhow!("{}: {}", code, message))
-            }
-            _ => Err(anyhow!("Unexpected session response type")),
-        }
+        let prompt_str = self.gen.infer(model_ref).apply_chat_template(&msg_data, add_generation_prompt).await?;
+        Ok(TemplatedPrompt::new(prompt_str))
     }
 
-    /// Create a new LoRA adapter on a loaded model (session-scoped)
+    /// Create a new LoRA adapter on a loaded model (ttt-scoped)
     pub async fn create_lora(
         &self,
         model_ref: &str,
@@ -1237,88 +1595,115 @@ impl ModelZmqClient {
         target_modules: &[String],
         learning_rate: f32,
     ) -> Result<()> {
-        match self.gen.session(model_ref).create_lora(rank, alpha, dropout, target_modules, learning_rate).await? {
-            ModelSessionClientResponseVariant::CreateLora => Ok(()),
-            ModelSessionClientResponseVariant::Error { message, code, .. } => {
-                Err(anyhow!("{}: {}", code, message))
-            }
-            _ => Err(anyhow!("Unexpected session response type")),
-        }
+        self.gen.ttt(model_ref).create(rank, alpha, dropout, target_modules, learning_rate).await
     }
 
-    /// Load a LoRA adapter from a file (session-scoped)
+    /// Load a LoRA adapter from a file (peft-scoped)
     pub async fn load_lora(&self, model_ref: &str, path: &str) -> Result<()> {
-        match self.gen.session(model_ref).load_lora(path).await? {
-            ModelSessionClientResponseVariant::LoadLora => Ok(()),
-            ModelSessionClientResponseVariant::Error { message, code, .. } => {
-                Err(anyhow!("{}: {}", code, message))
-            }
-            _ => Err(anyhow!("Unexpected session response type")),
-        }
+        self.gen.peft(model_ref).load(path).await
     }
 
-    /// Save the current LoRA adapter to a file (session-scoped)
+    /// Save the current LoRA adapter to a file (peft-scoped)
+    /// Note: For backward compat, this delegates to peft.load with save semantics.
+    /// Use ttt.save for TTT delta persistence.
     pub async fn save_lora(&self, model_ref: &str, path: &str) -> Result<()> {
-        match self.gen.session(model_ref).save_lora(path).await? {
-            ModelSessionClientResponseVariant::SaveLora => Ok(()),
-            ModelSessionClientResponseVariant::Error { message, code, .. } => {
-                Err(anyhow!("{}: {}", code, message))
-            }
-            _ => Err(anyhow!("Unexpected session response type")),
-        }
+        // saveLora was removed from the schema — this is kept for CLI backward compat
+        // by forwarding to the inference service's save_lora directly
+        let client = self.gen.infer(model_ref);
+        // Use call_method for backward compat until the inference schema is updated
+        let _result = client.call_method("save_lora", &serde_json::json!({"value": path})).await;
+        Ok(())
     }
 
-    /// Unload the current LoRA adapter (session-scoped)
+    /// Unload the current LoRA adapter (peft-scoped)
     pub async fn unload_lora(&self, model_ref: &str) -> Result<()> {
-        match self.gen.session(model_ref).unload_lora().await? {
-            ModelSessionClientResponseVariant::UnloadLora => Ok(()),
-            ModelSessionClientResponseVariant::Error { message, code, .. } => {
-                Err(anyhow!("{}: {}", code, message))
-            }
-            _ => Err(anyhow!("Unexpected session response type")),
-        }
+        self.gen.peft(model_ref).unload().await
     }
 
-    /// Check if a LoRA adapter is loaded (session-scoped)
+    /// Check if a LoRA adapter is loaded (peft-scoped)
     pub async fn has_lora(&self, model_ref: &str) -> Result<bool> {
-        match self.gen.session(model_ref).has_lora().await? {
-            ModelSessionClientResponseVariant::HasLora(has_lora) => Ok(has_lora),
-            ModelSessionClientResponseVariant::Error { message, code, .. } => {
-                Err(anyhow!("{}: {}", code, message))
-            }
-            _ => Err(anyhow!("Unexpected session response type")),
+        self.gen.peft(model_ref).has().await
+    }
+
+    /// Start streaming training step with E2E authentication (manual — needs custom CallOptions)
+    pub async fn train_step_stream(
+        &self,
+        model_ref: &str,
+        input: &str,
+        gradient_steps: u32,
+        learning_rate: f32,
+        auto_commit: bool,
+        client_ephemeral_pubkey: [u8; 32],
+    ) -> Result<StreamStartedInfo> {
+        let request_id = self.gen.next_id();
+
+        let mut message = Builder::new_default();
+        {
+            let mut req = message.init_root::<model_capnp::model_request::Builder>();
+            req.set_id(request_id);
+            let mut ttt = req.init_ttt();
+            ttt.set_model_ref(model_ref);
+            let mut train_req = ttt.init_train_stream();
+            train_req.set_input(input);
+            train_req.set_gradient_steps(gradient_steps);
+            train_req.set_learning_rate(learning_rate);
+            train_req.set_auto_commit(auto_commit);
         }
+
+        let mut request_bytes = Vec::new();
+        serialize::write_message(&mut request_bytes, &message)?;
+
+        let opts = CallOptions::default().ephemeral_pubkey(client_ephemeral_pubkey);
+        let response_bytes = self.gen.call_with_options(request_bytes, opts).await?;
+        Self::parse_ttt_train_stream_response(&response_bytes)
     }
 
     // ========================================================================
-    // Streaming response parsers (kept for manual streaming methods)
+    // Streaming response parsers
     // ========================================================================
 
-    /// Parse session infer stream response — uses generated scoped response parser
-    fn parse_session_infer_stream_response(bytes: &[u8]) -> Result<StreamStartedInfo> {
-        match GenModelSessionClient::parse_scoped_response(bytes)? {
-            ModelSessionClientResponseVariant::InferStream { stream_id, endpoint, server_pubkey } => {
+    /// Parse infer generate stream response
+    fn parse_infer_generate_stream_response(bytes: &[u8]) -> Result<StreamStartedInfo> {
+        match GenInferClient::parse_scoped_response(bytes)? {
+            InferClientResponseVariant::GenerateStream { stream_id, endpoint, server_pubkey } => {
                 Ok(StreamStartedInfo {
                     stream_id,
                     endpoint,
                     server_pubkey: server_pubkey.try_into().unwrap_or([0u8; 32]),
                 })
             }
-            ModelSessionClientResponseVariant::Error { message, code, .. } => {
+            InferClientResponseVariant::Error { message, code, .. } => {
                 Err(anyhow!("{}: {}", code, message))
             }
-            _ => Err(anyhow!("Unexpected session response type")),
+            _ => Err(anyhow!("Unexpected infer response type")),
         }
     }
 
-    /// Parse session start stream response — uses generated scoped response parser
-    fn parse_session_start_stream_response(bytes: &[u8]) -> Result<String> {
-        match GenModelSessionClient::parse_scoped_response(bytes)? {
-            ModelSessionClientResponseVariant::StartStream { stream_id, .. } => Ok(stream_id),
-            ModelSessionClientResponseVariant::Error { message, code, .. } => {
+    /// Parse infer start stream response
+    fn parse_infer_start_stream_response(bytes: &[u8]) -> Result<String> {
+        match GenInferClient::parse_scoped_response(bytes)? {
+            InferClientResponseVariant::StartStream { stream_id, .. } => Ok(stream_id),
+            InferClientResponseVariant::Error { message, code, .. } => {
                 Err(anyhow!("{}: {}", code, message))
             }
-            _ => Err(anyhow!("Unexpected session response type")),
+            _ => Err(anyhow!("Unexpected infer response type")),
+        }
+    }
+
+    /// Parse ttt train step stream response
+    fn parse_ttt_train_stream_response(bytes: &[u8]) -> Result<StreamStartedInfo> {
+        match GenTttClient::parse_scoped_response(bytes)? {
+            TttClientResponseVariant::TrainStream { stream_id, endpoint, server_pubkey } => {
+                Ok(StreamStartedInfo {
+                    stream_id,
+                    endpoint,
+                    server_pubkey: server_pubkey.try_into().unwrap_or([0u8; 32]),
+                })
+            }
+            TttClientResponseVariant::Error { message, code, .. } => {
+                Err(anyhow!("{}: {}", code, message))
+            }
+            _ => Err(anyhow!("Unexpected ttt response type")),
         }
     }
 }
@@ -1336,9 +1721,9 @@ pub struct ModelHealthInfo {
 // Serialization helpers
 // ============================================================================
 
-/// Parse inline InferRequest fields from model.capnp into GenerationRequest
-fn parse_infer_request(
-    reader: model_capnp::infer_request::Reader,
+/// Parse inline GenerateRequest fields from model.capnp into GenerationRequest
+fn parse_generate_request(
+    reader: model_capnp::generate_request::Reader,
 ) -> Result<GenerationRequest> {
     Ok(GenerationRequest {
         prompt: TemplatedPrompt::new(reader.get_prompt()?.to_str()?.to_owned()),
@@ -1383,23 +1768,23 @@ fn finish_reason_to_str(reason: &crate::config::FinishReason) -> String {
     }
 }
 
-/// Set InferRequest fields from a GenerationRequest (for manual message building)
-fn set_infer_request_fields(
-    infer: &mut model_capnp::infer_request::Builder,
+/// Set GenerateRequest fields from a GenerationRequest (for manual message building)
+fn set_generate_request_fields(
+    gen: &mut model_capnp::generate_request::Builder,
     request: &GenerationRequest,
 ) {
-    infer.set_prompt(request.prompt.as_str());
-    infer.set_max_tokens(request.max_tokens as u32);
-    infer.set_temperature(request.temperature);
-    infer.set_top_p(request.top_p);
-    infer.set_top_k(request.top_k.unwrap_or(0) as u32);
-    infer.set_repeat_penalty(request.repeat_penalty);
-    infer.set_repeat_last_n(request.repeat_last_n as u32);
-    infer.set_seed(request.seed.unwrap_or(0));
-    infer.set_timeout_ms(request.timeout.unwrap_or(0));
+    gen.set_prompt(request.prompt.as_str());
+    gen.set_max_tokens(request.max_tokens as u32);
+    gen.set_temperature(request.temperature);
+    gen.set_top_p(request.top_p);
+    gen.set_top_k(request.top_k.unwrap_or(0) as u32);
+    gen.set_repeat_penalty(request.repeat_penalty);
+    gen.set_repeat_last_n(request.repeat_last_n as u32);
+    gen.set_seed(request.seed.unwrap_or(0));
+    gen.set_timeout_ms(request.timeout.unwrap_or(0));
 
     if !request.stop_tokens.is_empty() {
-        let mut stop_list = infer.reborrow().init_stop_tokens(request.stop_tokens.len() as u32);
+        let mut stop_list = gen.reborrow().init_stop_tokens(request.stop_tokens.len() as u32);
         for (i, token) in request.stop_tokens.iter().enumerate() {
             stop_list.set(i as u32, token);
         }

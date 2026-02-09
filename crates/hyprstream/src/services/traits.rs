@@ -221,6 +221,173 @@ impl RegistryServiceError {
     }
 }
 
+/// Filesystem service error type.
+#[derive(Debug, Error)]
+pub enum FsServiceError {
+    /// Bad file descriptor.
+    #[error("Bad file descriptor: {0}")]
+    BadFd(u32),
+    /// Path or file not found.
+    #[error("Not found: {0}")]
+    NotFound(String),
+    /// Permission denied (FD not owned by caller, or access denied).
+    #[error("Permission denied: {0}")]
+    PermissionDenied(String),
+    /// Underlying I/O error.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// Path escaped containment root (symlink or traversal attack).
+    #[error("Path containment violation: {0}")]
+    PathEscape(String),
+    /// Resource limit exceeded (too many FDs, IO size too large).
+    #[error("Resource limit exceeded: {0}")]
+    ResourceLimit(String),
+    /// Transport / communication error.
+    #[error("Transport error: {0}")]
+    Transport(String),
+    /// Service is unavailable.
+    #[error("Service unavailable")]
+    Unavailable,
+}
+
+// Note: FsServiceError derives thiserror::Error which provides std::error::Error.
+// anyhow's blanket `From<E: std::error::Error>` handles the conversion automatically.
+
+/// File stat information.
+#[derive(Debug, Clone)]
+pub struct FsStatInfo {
+    pub exists: bool,
+    pub is_dir: bool,
+    pub size: u64,
+    pub modified_at: i64,
+}
+
+/// Directory entry information.
+#[derive(Debug, Clone)]
+pub struct FsDirEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+}
+
+/// Seek direction for filesystem operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeekWhence {
+    /// From beginning of file (SEEK_SET).
+    Set,
+    /// From current position (SEEK_CUR).
+    Cur,
+    /// From end of file (SEEK_END).
+    End,
+}
+
+/// Maximum I/O size per read/write operation (16 MiB).
+pub const MAX_FS_IO_SIZE: u64 = 16 * 1024 * 1024;
+/// Maximum open file descriptors per client.
+pub const MAX_FDS_PER_CLIENT: u32 = 64;
+/// Maximum open file descriptors globally.
+pub const MAX_FDS_GLOBAL: u32 = 4096;
+
+/// POSIX-like filesystem operations trait (async, for remote callers).
+///
+/// Server-side handlers are synchronous (matching existing pattern).
+/// This trait is implemented by the generated FsClient over ZMQ.
+#[async_trait]
+pub trait FsOps: Send + Sync {
+    /// Open a file, returning a file descriptor.
+    async fn open(
+        &self,
+        path: &str,
+        write: bool,
+        create: bool,
+        truncate: bool,
+    ) -> Result<u32, FsServiceError>;
+
+    /// Close a file descriptor.
+    async fn close(&self, fd: u32) -> Result<(), FsServiceError>;
+
+    /// Read up to `len` bytes from a file descriptor.
+    async fn read(&self, fd: u32, len: u64) -> Result<Vec<u8>, FsServiceError>;
+
+    /// Write bytes to a file descriptor.
+    async fn write(&self, fd: u32, data: &[u8]) -> Result<u64, FsServiceError>;
+
+    /// Read at a specific offset without changing the file position.
+    async fn pread(&self, fd: u32, offset: u64, len: u64) -> Result<Vec<u8>, FsServiceError>;
+
+    /// Write at a specific offset without changing the file position.
+    async fn pwrite(&self, fd: u32, offset: u64, data: &[u8]) -> Result<u64, FsServiceError>;
+
+    /// Seek to a position in the file.
+    async fn seek(&self, fd: u32, offset: i64, whence: SeekWhence) -> Result<u64, FsServiceError>;
+
+    /// Truncate a file to the given length.
+    async fn truncate(&self, fd: u32, len: u64) -> Result<(), FsServiceError>;
+
+    /// Sync file data (and optionally metadata) to disk.
+    async fn fsync(&self, fd: u32, data_only: bool) -> Result<(), FsServiceError>;
+
+    /// Stat a path.
+    async fn stat(&self, path: &str) -> Result<FsStatInfo, FsServiceError>;
+
+    /// Create a directory (optionally recursive).
+    async fn mkdir(&self, path: &str, recursive: bool) -> Result<(), FsServiceError>;
+
+    /// Remove a file.
+    async fn remove(&self, path: &str) -> Result<(), FsServiceError>;
+
+    /// Remove an empty directory.
+    async fn rmdir(&self, path: &str) -> Result<(), FsServiceError>;
+
+    /// Rename a file or directory.
+    async fn rename(&self, src: &str, dst: &str) -> Result<(), FsServiceError>;
+
+    /// Copy a file (uses reflink/COW when possible).
+    async fn copy(&self, src: &str, dst: &str) -> Result<(), FsServiceError>;
+
+    /// List directory entries.
+    async fn list_dir(&self, path: &str) -> Result<Vec<FsDirEntry>, FsServiceError>;
+
+    // =========================================================================
+    // Convenience methods (default implementations using primitives above)
+    // =========================================================================
+
+    /// Convenience: read entire file as bytes.
+    async fn read_file(&self, path: &str) -> Result<Vec<u8>, FsServiceError> {
+        let fd = self.open(path, false, false, false).await?;
+        let info = self.stat(path).await?;
+        let data = self.read(fd, info.size).await?;
+        self.close(fd).await?;
+        Ok(data)
+    }
+
+    /// Convenience: read entire file as UTF-8 string.
+    async fn read_to_string(&self, path: &str) -> Result<String, FsServiceError> {
+        let data = self.read_file(path).await?;
+        String::from_utf8(data).map_err(|e| {
+            FsServiceError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })
+    }
+
+    /// Convenience: write entire file atomically (create+truncate+write+fsync+close).
+    async fn write_file(&self, path: &str, data: &[u8]) -> Result<(), FsServiceError> {
+        let fd = self.open(path, true, true, true).await?;
+        self.write(fd, data).await?;
+        self.fsync(fd, false).await?;
+        self.close(fd).await?;
+        Ok(())
+    }
+
+    /// Convenience: check if path exists.
+    async fn exists(&self, path: &str) -> Result<bool, FsServiceError> {
+        match self.stat(path).await {
+            Ok(info) => Ok(info.exists),
+            Err(FsServiceError::NotFound(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 /// Transport-agnostic registry client trait.
 ///
 /// Implementations can be:
@@ -680,5 +847,21 @@ pub trait RepositoryClient: Send + Sync {
     /// This provides more detailed information than `status()`, including
     /// per-file change types (Added, Modified, Deleted, etc.).
     async fn detailed_status(&self) -> Result<DetailedStatus, RegistryServiceError>;
+
+    // === Filesystem Operations ===
+
+    /// Get a POSIX filesystem client scoped to a worktree.
+    ///
+    /// Returns a client providing path-contained file operations.
+    /// All paths are relative to the worktree root.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let wt = repo_client.worktree("main");
+    /// let fd = wt.open("config.json", false, false, false).await?;
+    /// let data = wt.read(fd, 4096).await?;
+    /// wt.close(fd).await?;
+    /// ```
+    fn worktree(&self, name: &str) -> Arc<dyn FsOps>;
 }
 
