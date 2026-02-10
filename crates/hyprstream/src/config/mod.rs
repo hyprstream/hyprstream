@@ -1439,6 +1439,18 @@ pub struct HyprstreamTrainingConfig {
     /// TTT-specific configuration (for TestTimeTraining mode)
     #[serde(default)]
     pub ttt: TTTTrainingConfig,
+
+    /// LoRA rank for TTT delta (default: 8)
+    #[serde(default = "default_lora_rank")]
+    pub lora_rank: usize,
+
+    /// LoRA alpha scaling factor (default: None, which means alpha = rank)
+    #[serde(default)]
+    pub lora_alpha: Option<f32>,
+
+    /// Target modules for LoRA adaptation (default: ["q_proj", "v_proj"])
+    #[serde(default = "default_target_modules")]
+    pub target_modules: Vec<String>,
 }
 
 /// TTT-specific configuration
@@ -1511,6 +1523,9 @@ impl Default for HyprstreamTrainingConfig {
             min_quality_threshold: default_training_min_quality(),
             train_base_model: false,
             ttt: TTTTrainingConfig::default(),
+            lora_rank: default_lora_rank(),
+            lora_alpha: None,
+            target_modules: default_target_modules(),
         }
     }
 }
@@ -1530,6 +1545,12 @@ pub enum TrainingMode {
 }
 
 // Default functions for HyprstreamTrainingConfig
+pub fn default_lora_rank() -> usize {
+    8
+}
+pub fn default_target_modules() -> Vec<String> {
+    vec!["q_proj".to_owned(), "v_proj".to_owned()]
+}
 fn default_training_learning_rate() -> f64 {
     1e-5
 }

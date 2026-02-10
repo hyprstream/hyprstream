@@ -535,9 +535,12 @@ fn tensor_to_safetensors_data(tensor: &Tensor) -> Result<(safetensors::Dtype, Ve
         other => return Err(anyhow!("Unsupported tensor kind for safetensors: {:?}", other)),
     };
     let shape: Vec<usize> = cpu_tensor.size().iter().map(|&d| d as usize).collect();
-    let numel: usize = shape.iter().product();
+    let numel: usize = shape.iter().try_fold(1usize, |acc, &dim| {
+        acc.checked_mul(dim).ok_or_else(|| anyhow!("Tensor numel overflow: shape {:?}", shape))
+    })?;
     let elem_size = kind.elt_size_in_bytes();
-    let byte_len = numel * elem_size;
+    let byte_len = numel.checked_mul(elem_size)
+        .ok_or_else(|| anyhow!("Tensor byte length overflow: {} * {}", numel, elem_size))?;
     let mut bytes = vec![0u8; byte_len];
     cpu_tensor.copy_data_u8(&mut bytes, numel);
     Ok((dtype, shape, bytes))
@@ -558,8 +561,7 @@ impl TenantDelta {
     /// Uses standard HuggingFace PEFT naming convention:
     /// `base_model.model.layers.{N}.{self_attn|mlp}.{module}.lora_{A|B}.weight`
     pub fn serialize_to_safetensors_bytes(&self) -> Result<Vec<u8>> {
-        let _guard = tch::no_grad_guard();
-        let mut tensor_data: Vec<(String, safetensors::Dtype, Vec<usize>, Vec<u8>)> = Vec::new();
+        let mut pairs: Vec<(String, Tensor)> = Vec::new();
 
         for layer_idx in 0..self.num_layers {
             for module in &self.target_modules {
@@ -571,41 +573,19 @@ impl TenantDelta {
                         "base_model.model.layers.{}.{}.{}.lora_A.weight",
                         layer_idx, subpath, module
                     );
-                    let cpu = a.to_device(Device::Cpu).contiguous();
-                    let (dtype, shape, bytes) = tensor_to_safetensors_data(&cpu)?;
-                    tensor_data.push((peft_key, dtype, shape, bytes));
+                    pairs.push((peft_key, a.shallow_clone()));
                 }
                 if let Some(b) = self.lora_b.get(&key) {
                     let peft_key = format!(
                         "base_model.model.layers.{}.{}.{}.lora_B.weight",
                         layer_idx, subpath, module
                     );
-                    let cpu = b.to_device(Device::Cpu).contiguous();
-                    let (dtype, shape, bytes) = tensor_to_safetensors_data(&cpu)?;
-                    tensor_data.push((peft_key, dtype, shape, bytes));
+                    pairs.push((peft_key, b.shallow_clone()));
                 }
             }
         }
 
-        if tensor_data.is_empty() {
-            return Err(anyhow!("No LoRA matrices to serialize"));
-        }
-
-        let views: Vec<(String, TensorView<'_>)> = tensor_data
-            .iter()
-            .map(|(key, dtype, shape, bytes)| {
-                let view = TensorView::new(*dtype, shape.clone(), bytes)
-                    .expect("TensorView construction should not fail for valid data");
-                (key.clone(), view)
-            })
-            .collect();
-        let data_refs: Vec<(&str, TensorView<'_>)> = views
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.clone()))
-            .collect();
-
-        safetensors::tensor::serialize(data_refs, &None)
-            .map_err(|e| anyhow!("safetensors serialization failed: {}", e))
+        serialize_tensor_pairs_to_bytes(pairs.into_iter())
     }
 
     /// Load per-layer LoRA from safetensors bytes (in memory).
@@ -644,6 +624,27 @@ impl TenantDelta {
 
         if lora_a.is_empty() {
             return Err(anyhow!("No LoRA A matrices found in safetensors data"));
+        }
+
+        // Validate that all A/B pairs have consistent shapes
+        for (key, a_tensor) in &lora_a {
+            let a_shape = a_tensor.size();
+            if a_shape.len() != 2 {
+                return Err(anyhow!("LoRA A tensor '{}' has invalid rank: expected 2, got {}", key, a_shape.len()));
+            }
+            if let Some(b_tensor) = lora_b.get(key) {
+                let b_shape = b_tensor.size();
+                if b_shape.len() != 2 {
+                    return Err(anyhow!("LoRA B tensor '{}' has invalid rank: expected 2, got {}", key, b_shape.len()));
+                }
+                // A is [rank, in_dim], B is [out_dim, rank] — inner dims must match
+                if a_shape[0] != b_shape[1] {
+                    return Err(anyhow!(
+                        "LoRA rank mismatch for '{}': A shape {:?} vs B shape {:?} (A[0]={} != B[1]={})",
+                        key, a_shape, b_shape, a_shape[0], b_shape[1]
+                    ));
+                }
+            }
         }
 
         let num_layers = max_layer + 1;
@@ -710,17 +711,24 @@ fn safetensors_view_to_tensor(view: &safetensors::tensor::TensorView<'_>, device
     Ok(tensor.to(device))
 }
 
-/// Serialize a state dict (HashMap<String, Tensor>) to safetensors bytes.
+/// Shared safetensors serialization: converts (key, tensor) pairs to bytes.
 ///
-/// This replaces direct `Tensor::save_multi()` calls, allowing writes through FsOps.
-pub fn serialize_state_dict_to_bytes(state_dict: &HashMap<String, Tensor>) -> Result<Vec<u8>> {
+/// Used by both `TenantDelta::serialize_to_safetensors_bytes()` (PEFT keys)
+/// and `serialize_state_dict_to_bytes()` (raw keys).
+fn serialize_tensor_pairs_to_bytes(
+    pairs: impl Iterator<Item = (String, Tensor)>,
+) -> Result<Vec<u8>> {
     let _guard = tch::no_grad_guard();
     let mut tensor_data: Vec<(String, safetensors::Dtype, Vec<usize>, Vec<u8>)> = Vec::new();
 
-    for (key, tensor) in state_dict {
+    for (key, tensor) in pairs {
         let cpu = tensor.to_device(Device::Cpu).contiguous();
         let (dtype, shape, bytes) = tensor_to_safetensors_data(&cpu)?;
-        tensor_data.push((key.clone(), dtype, shape, bytes));
+        tensor_data.push((key, dtype, shape, bytes));
+    }
+
+    if tensor_data.is_empty() {
+        return Err(anyhow!("No tensors to serialize"));
     }
 
     let views: Vec<(String, TensorView<'_>)> = tensor_data
@@ -738,6 +746,15 @@ pub fn serialize_state_dict_to_bytes(state_dict: &HashMap<String, Tensor>) -> Re
 
     safetensors::tensor::serialize(data_refs, &None)
         .map_err(|e| anyhow!("safetensors serialization failed: {}", e))
+}
+
+/// Serialize a state dict (HashMap<String, Tensor>) to safetensors bytes.
+///
+/// This replaces direct `Tensor::save_multi()` calls, allowing writes through FsOps.
+pub fn serialize_state_dict_to_bytes(state_dict: &HashMap<String, Tensor>) -> Result<Vec<u8>> {
+    serialize_tensor_pairs_to_bytes(
+        state_dict.iter().map(|(k, v)| (k.clone(), v.shallow_clone())),
+    )
 }
 
 /// Load a state dict from safetensors bytes.
@@ -768,11 +785,19 @@ fn tensor_bytes(t: &Tensor) -> usize {
     numel * elem_size
 }
 
-// SAFETY: TenantDelta contains a VarStore which is NOT thread-safe on its own.
-// It is only safe because DeltaPool wraps it in Arc<Mutex<TenantDelta>>.
-// DO NOT use TenantDelta directly without mutex protection.
+// SAFETY: TenantDelta contains a VarStore backed by tch-rs raw pointers.
+// VarStore itself is not Send/Sync, but all mutable access to TenantDelta
+// goes through DeltaPool which wraps it in Arc<parking_lot::Mutex<TenantDelta>>.
+// The Mutex ensures exclusive access, making cross-thread use safe.
+//
+// Invariant: TenantDelta must NEVER be shared across threads without a Mutex.
+// DeltaPool enforces this — all public APIs return Arc<Mutex<TenantDelta>>.
 unsafe impl Send for TenantDelta {}
 unsafe impl Sync for TenantDelta {}
+
+/// Type-safe wrapper that enforces Mutex protection for TenantDelta.
+/// All cross-thread access must go through this wrapper.
+pub type SharedTenantDelta = std::sync::Arc<parking_lot::Mutex<TenantDelta>>;
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]

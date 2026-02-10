@@ -282,6 +282,11 @@ pub enum SeekWhence {
 }
 
 /// Maximum I/O size per read/write operation (16 MiB).
+///
+/// This limit ensures each FsOps read/write RPC message stays well under
+/// the Cap'n Proto default traversal limit (8M words = 64 MiB). The 4x
+/// safety margin accounts for capnp framing, SignedEnvelope canonicalization,
+/// and other metadata overhead per message.
 pub const MAX_FS_IO_SIZE: u64 = 16 * 1024 * 1024;
 /// Maximum open file descriptors per client.
 pub const MAX_FDS_PER_CLIENT: u32 = 64;
@@ -353,12 +358,56 @@ pub trait FsOps: Send + Sync {
     // =========================================================================
 
     /// Convenience: read entire file as bytes.
+    ///
+    /// Large files are automatically chunked to stay within MAX_FS_IO_SIZE
+    /// per read call, avoiding transport-layer message size limits.
+    /// The fd is always closed, even on read errors (best-effort cleanup).
     async fn read_file(&self, path: &str) -> Result<Vec<u8>, FsServiceError> {
         let fd = self.open(path, false, false, false).await?;
-        let info = self.stat(path).await?;
-        let data = self.read(fd, info.size).await?;
+
+        let info = match self.stat(path).await {
+            Ok(info) => info,
+            Err(e) => {
+                let _ = self.close(fd).await;
+                return Err(e);
+            }
+        };
+
+        let total = info.size as usize;
+        let chunk_size = MAX_FS_IO_SIZE as usize;
+
+        if total <= chunk_size {
+            let data = match self.read(fd, info.size).await {
+                Ok(data) => data,
+                Err(e) => {
+                    let _ = self.close(fd).await;
+                    return Err(e);
+                }
+            };
+            self.close(fd).await?;
+            return Ok(data);
+        }
+
+        let mut result = Vec::with_capacity(total);
+        let mut remaining = total;
+        while remaining > 0 {
+            let to_read = remaining.min(chunk_size) as u64;
+            let chunk = match self.read(fd, to_read).await {
+                Ok(chunk) => chunk,
+                Err(e) => {
+                    let _ = self.close(fd).await;
+                    return Err(e);
+                }
+            };
+            if chunk.is_empty() {
+                break; // EOF
+            }
+            remaining -= chunk.len();
+            result.extend_from_slice(&chunk);
+        }
+
         self.close(fd).await?;
-        Ok(data)
+        Ok(result)
     }
 
     /// Convenience: read entire file as UTF-8 string.
@@ -370,10 +419,39 @@ pub trait FsOps: Send + Sync {
     }
 
     /// Convenience: write entire file atomically (create+truncate+write+fsync+close).
+    ///
+    /// Large payloads are automatically chunked to stay within MAX_FS_IO_SIZE
+    /// per write call, avoiding transport-layer message size limits.
+    /// Handles POSIX short writes by advancing offset by actual bytes written.
+    /// The fd is always closed, even on write/fsync errors (best-effort cleanup).
     async fn write_file(&self, path: &str, data: &[u8]) -> Result<(), FsServiceError> {
         let fd = self.open(path, true, true, true).await?;
-        self.write(fd, data).await?;
-        self.fsync(fd, false).await?;
+
+        let chunk_size = MAX_FS_IO_SIZE as usize;
+        let mut offset = 0;
+        while offset < data.len() {
+            let end = (offset + chunk_size).min(data.len());
+            let written = match self.write(fd, &data[offset..end]).await {
+                Ok(n) => n as usize,
+                Err(e) => {
+                    let _ = self.close(fd).await;
+                    return Err(e);
+                }
+            };
+            if written == 0 {
+                let _ = self.close(fd).await;
+                return Err(FsServiceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "write returned 0 bytes",
+                )));
+            }
+            offset += written;
+        }
+
+        if let Err(e) = self.fsync(fd, false).await {
+            let _ = self.close(fd).await;
+            return Err(e);
+        }
         self.close(fd).await?;
         Ok(())
     }

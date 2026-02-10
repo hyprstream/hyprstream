@@ -57,7 +57,6 @@ pub mod mcp_capnp {
     include!(concat!(env!("OUT_DIR"), "/mcp_capnp.rs"));
 }
 
-pub mod adapters;
 pub mod api;
 pub mod archetypes;
 pub mod auth;
@@ -88,9 +87,6 @@ pub use runtime::{
     RuntimeEngine,
     TorchEngine,
 };
-
-// Export TorchEngine as HyprStreamEngine for backward compatibility
-pub use runtime::TorchEngine as HyprStreamEngine;
 
 // Export init function from runtime
 pub use runtime::create_engine as init;

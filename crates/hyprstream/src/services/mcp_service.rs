@@ -98,6 +98,8 @@ pub struct ToolCallContext {
     pub args: Value,
     pub signing_key: SigningKey,
     pub zmq_context: Arc<zmq::Context>,
+    /// Authenticated identity propagated to backend services
+    pub identity: RequestIdentity,
     /// ServiceContext for typed_client() / client() access (optional for backward compat)
     pub ctx: Option<Arc<ServiceContext>>,
 }
@@ -169,7 +171,7 @@ fn register_tools() -> ToolRegistry {
                 .ok_or_else(|| anyhow::anyhow!("missing model_ref"))?;
             let max_context = ctx.args["max_context"].as_u64().map(|v| v as usize);
             let config = ModelLoadConfig { max_context, kv_quant: None };
-            let client = ModelZmqClient::new(ctx.signing_key, RequestIdentity::local());
+            let client = ModelZmqClient::new(ctx.signing_key, ctx.identity.clone());
             let result = client.load(model_ref, Some(&config)).await?;
             Ok(ToolResult::Sync(serde_json::to_value(&result)?))
         })),
@@ -184,7 +186,7 @@ fn register_tools() -> ToolRegistry {
         required_scope: "read:model:*".into(),
         streaming: false,
         handler: Arc::new(|ctx| Box::pin(async move {
-            let client = ModelZmqClient::new(ctx.signing_key, RequestIdentity::local());
+            let client = ModelZmqClient::new(ctx.signing_key, ctx.identity.clone());
             let models = client.list().await?;
             let models_json: Vec<Value> = models.into_iter().map(|m| serde_json::json!({
                 "model_ref": m.model_ref,
@@ -214,7 +216,7 @@ fn register_tools() -> ToolRegistry {
             let model_ref = ctx.args["model_ref"].as_str()
                 .ok_or_else(|| anyhow::anyhow!("missing model_ref"))?
                 .to_owned();
-            let client = ModelZmqClient::new(ctx.signing_key, RequestIdentity::local());
+            let client = ModelZmqClient::new(ctx.signing_key, ctx.identity.clone());
             client.unload(&model_ref).await?;
             Ok(ToolResult::Sync(serde_json::json!({"unloaded": model_ref})))
         })),
@@ -229,7 +231,7 @@ fn register_tools() -> ToolRegistry {
         required_scope: "read:registry:*".into(),
         streaming: false,
         handler: Arc::new(|ctx| Box::pin(async move {
-            let client = RegistryZmqClient::new(ctx.signing_key, RequestIdentity::local());
+            let client = RegistryZmqClient::new(ctx.signing_key, ctx.identity.clone());
             let models = client.list_models().await?;
             let models_json: Vec<Value> = models.into_iter().map(|m| {
                 let path_str = m.path.to_string_lossy().to_string();
@@ -264,7 +266,7 @@ fn register_tools() -> ToolRegistry {
             let model_ref = ctx.args["model_ref"].as_str()
                 .ok_or_else(|| anyhow::anyhow!("missing model_ref"))?
                 .to_owned();
-            let client = ModelZmqClient::new(ctx.signing_key, RequestIdentity::local());
+            let client = ModelZmqClient::new(ctx.signing_key, ctx.identity.clone());
             let status = client.status(&model_ref).await?;
             Ok(ToolResult::Sync(serde_json::json!({
                 "model_ref": model_ref,
@@ -299,7 +301,7 @@ fn register_tools() -> ToolRegistry {
             let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
 
             // Call backend — get StreamStartedInfo
-            let client = RegistryZmqClient::new(ctx.signing_key, RequestIdentity::local());
+            let client = RegistryZmqClient::new(ctx.signing_key, ctx.identity.clone());
             let stream_info = client.clone_stream(
                 url,
                 name,
@@ -428,7 +430,7 @@ fn register_schema_tools(reg: &mut ToolRegistry, existing_names: &std::collectio
                     Box::pin(async move {
                         let repo_id = ctx.args["repo_id"].as_str()
                             .ok_or_else(|| anyhow::anyhow!("missing repo_id"))?;
-                        let client = RegistryZmqClient::new(ctx.signing_key, RequestIdentity::local());
+                        let client = RegistryZmqClient::new(ctx.signing_key, ctx.identity.clone());
                         let gen_repo = client.gen.repo(repo_id);
                         let result = gen_repo.call_method(&method, &ctx.args).await?;
                         Ok(ToolResult::Sync(result))
@@ -505,7 +507,7 @@ fn register_schema_tools(reg: &mut ToolRegistry, existing_names: &std::collectio
                                 let (client_secret, client_pubkey) = hyprstream_rpc::generate_ephemeral_keypair();
                                 let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
 
-                                let client = ModelZmqClient::new(ctx.signing_key, RequestIdentity::local());
+                                let client = ModelZmqClient::new(ctx.signing_key, ctx.identity.clone());
 
                                 // Call the streaming method via manual wrapper (with ephemeral pubkey)
                                 let stream_info = match (scope.as_str(), method.as_str()) {
@@ -554,7 +556,7 @@ fn register_schema_tools(reg: &mut ToolRegistry, existing_names: &std::collectio
                             Box::pin(async move {
                                 let model_ref = ctx.args["model_ref"].as_str()
                                     .ok_or_else(|| anyhow::anyhow!("missing model_ref"))?;
-                                let client = ModelZmqClient::new(ctx.signing_key, RequestIdentity::local());
+                                let client = ModelZmqClient::new(ctx.signing_key, ctx.identity.clone());
                                 let result = match scope.as_str() {
                                     "ttt" => client.gen.ttt(model_ref).call_method(&method, &ctx.args).await?,
                                     "peft" => client.gen.peft(model_ref).call_method(&method, &ctx.args).await?,
@@ -634,7 +636,7 @@ pub(crate) fn parse_generation_request_from_args(args: &Value) -> anyhow::Result
 /// Dispatch a method call to the appropriate generated client.
 async fn dispatch_schema_call(service: &str, method: &str, ctx: &ToolCallContext) -> anyhow::Result<Value> {
     let signing_key = ctx.signing_key.clone();
-    let identity = RequestIdentity::local();
+    let identity = ctx.identity.clone();
 
     match service {
         "model" => {
@@ -773,10 +775,16 @@ impl McpService {
 
         self.check_scope(&entry.required_scope)?;
 
+        // Propagate authenticated identity to backend services (not local())
+        let identity = match &self.claims {
+            Some(claims) => RequestIdentity::api_token(&claims.sub, "mcp"),
+            None => RequestIdentity::local(),
+        };
         let ctx = ToolCallContext {
             args,
             signing_key: self.signing_key.clone(),
             zmq_context: self.context.clone(),
+            identity,
             ctx: self.service_ctx.clone(),
         };
 
@@ -887,6 +895,7 @@ impl McpHandler for McpService {
         let loaded_model_count = tokio::task::block_in_place(|| {
             let rt = tokio::runtime::Handle::current();
             rt.block_on(async {
+                // Status check uses local identity (internal health check, no user context)
                 let client = ModelZmqClient::new(self.signing_key.clone(), RequestIdentity::local());
                 client.list().await
                     .map(|models| models.len() as u32)

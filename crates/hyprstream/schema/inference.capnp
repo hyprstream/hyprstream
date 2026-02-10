@@ -56,6 +56,9 @@ struct InferenceRequest {
 
     # Streaming training (returns immediately, results via PUB/SUB)
     trainStepStream @24 :TrainStepRequest;
+
+    # Export delta as PEFT adapter directory (identity from auth envelope)
+    exportPeftAdapter @25 :ExportPeftRequest;
   }
 }
 
@@ -99,6 +102,9 @@ struct InferenceResponse {
 
     # Streaming training response
     trainStepStreamResult @25 :StreamInfo;
+
+    # Export PEFT adapter response
+    exportPeftAdapterResult @26 :ExportPeftResult;
   }
 }
 
@@ -371,6 +377,18 @@ struct SnapshotDeltaResult {
   sizeBytes @1 :UInt64;
   accumulatedSteps @2 :UInt64;
   requestCount @3 :UInt64;
+}
+
+# Export PEFT Adapter
+
+struct ExportPeftRequest {
+  name @0 :Text;
+  commitMessage @1 :Text;
+}
+
+struct ExportPeftResult {
+  adapterPath @0 :Text;
+  contentHash @1 :Text;
 }
 
 # Error Information

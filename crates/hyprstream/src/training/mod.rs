@@ -28,7 +28,7 @@ pub use delta_pool::DeltaPool;
 
 pub use quality_filter::{FilterReason, FilterResult, QualityFilter, QualityFilterConfig};
 
-pub use tenant_delta::{TenantDelta, TenantDeltaConfig, serialize_state_dict_to_bytes, load_state_dict_from_bytes};
+pub use tenant_delta::{TenantDelta, TenantDeltaConfig, SharedTenantDelta, serialize_state_dict_to_bytes, load_state_dict_from_bytes};
 
 pub use merge::{MergeStrategy, merge_state_dicts};
 

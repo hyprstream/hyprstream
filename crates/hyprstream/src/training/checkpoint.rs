@@ -299,6 +299,12 @@ impl CheckpointManager {
                     ref source,
                     format: _,
                 } => {
+                    // Validate source is a regular file (not a symlink to an external location)
+                    let metadata = std::fs::symlink_metadata(source)
+                        .map_err(|e| anyhow!("Cannot stat source file {:?}: {}", source, e))?;
+                    if metadata.file_type().is_symlink() {
+                        return Err(anyhow!("Source path {:?} is a symlink; refusing to copy", source));
+                    }
                     crate::git::ops::cow_copy(source, &checkpoint_path)?;
                 }
                 WeightSnapshot::Diff {
@@ -461,12 +467,7 @@ impl CheckpointManager {
 
     /// Gracefully shutdown the checkpoint manager
     pub async fn shutdown(mut self) -> Result<()> {
-        // Flush pending checkpoints first
-        if let Err(e) = self.flush().await {
-            tracing::warn!("Error flushing checkpoints during shutdown: {}", e);
-        }
-
-        // Drop the sender to signal the worker to stop
+        // Drop the sender first to prevent new requests, then let worker drain
         drop(std::mem::replace(
             &mut self.checkpoint_tx,
             mpsc::channel(1).0,

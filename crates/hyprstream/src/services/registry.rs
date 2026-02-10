@@ -927,12 +927,44 @@ impl RegistryService {
     fn handle_status(&self, repo_id: &str) -> Result<git2db::RepositoryStatus> {
         let id = Self::parse_repo_id(repo_id)?;
 
-        // Use captured runtime handle instead of creating new runtime
-        self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
-            let handle = registry.repo(&id)?;
-            let status = handle.status().await?;
-            Ok(status)
+        // Use with_repo_blocking to properly resolve worktree path for bare repos
+        self.with_repo_blocking(&id, |repo| {
+            let head = repo.head().ok();
+            let branch = head.as_ref().and_then(|h| h.shorthand().map(String::from));
+            let head_oid = head.as_ref().and_then(git2::Reference::target);
+
+            let statuses = repo.statuses(None)
+                .map_err(|e| anyhow!("Failed to get statuses: {}", e))?;
+            let is_clean = statuses.is_empty();
+            let modified_files: Vec<std::path::PathBuf> = statuses
+                .iter()
+                .filter_map(|e| e.path().map(std::path::PathBuf::from))
+                .collect();
+
+            // Compute ahead/behind
+            let (ahead, behind) = if let Some(ref head_ref) = repo.head().ok() {
+                if let Some(branch_name) = head_ref.shorthand() {
+                    let upstream_name = format!("origin/{}", branch_name);
+                    if let Ok(upstream) = repo.revparse_single(&upstream_name) {
+                        if let (Ok(local), Ok(remote)) = (
+                            head_ref.peel_to_commit(),
+                            upstream.peel_to_commit(),
+                        ) {
+                            repo.graph_ahead_behind(local.id(), remote.id())
+                                .unwrap_or((0, 0))
+                        } else { (0, 0) }
+                    } else { (0, 0) }
+                } else { (0, 0) }
+            } else { (0, 0) };
+
+            Ok(git2db::RepositoryStatus {
+                branch,
+                head: head_oid,
+                ahead,
+                behind,
+                is_clean,
+                modified_files,
+            })
         })
     }
 
@@ -1192,10 +1224,50 @@ impl RegistryService {
         })
     }
 
+    /// Resolve a worktree path from a repository handle.
+    ///
+    /// For bare repositories (cloned models), `handle.worktree()` returns the bare
+    /// repo path (e.g. `models/name/name.git`), which can't be used for operations
+    /// that require a working tree (status, staging, etc.). This method finds the
+    /// actual worktree for the tracking ref.
+    async fn resolve_worktree_path(handle: &git2db::RepositoryHandle<'_>) -> Result<std::path::PathBuf> {
+        let base_path = handle.worktree()?.to_path_buf();
+
+        // Detect bare repository: path ends in .git or has HEAD but no .git subdir
+        let is_bare = base_path.extension().map_or(false, |ext| ext == "git")
+            || (base_path.join("HEAD").exists() && !base_path.join(".git").exists());
+
+        if !is_bare {
+            return Ok(base_path);
+        }
+
+        // Try the tracking ref's worktree first
+        let tracked = handle.metadata()?;
+        let branch = match &tracked.tracking_ref {
+            git2db::GitRef::Branch(b) => Some(b.as_str()),
+            _ => None,
+        };
+
+        if let Some(branch) = branch {
+            if let Ok(Some(wt)) = handle.get_worktree(branch).await {
+                return Ok(wt.path().to_path_buf());
+            }
+        }
+
+        // Fallback: try any available worktree
+        if let Ok(worktrees) = handle.get_worktrees().await {
+            if let Some(wt) = worktrees.into_iter().next() {
+                return Ok(wt.path().to_path_buf());
+            }
+        }
+
+        Err(anyhow!("No worktrees found for bare repository: {:?}", base_path))
+    }
+
     /// Execute a blocking git2 operation on a repository.
     ///
     /// Handles the boilerplate of: parse_repo_id → block_on → read registry →
-    /// get handle → worktree path → spawn_blocking → Repository::open → operation.
+    /// get handle → resolve worktree → spawn_blocking → Repository::open → operation.
     fn with_repo_blocking<F, T>(&self, id: &git2db::RepoId, f: F) -> Result<T>
     where
         F: FnOnce(git2::Repository) -> Result<T> + Send + 'static,
@@ -1204,7 +1276,7 @@ impl RegistryService {
         self.runtime_handle.block_on(async {
             let registry = self.registry.read().await;
             let handle = registry.repo(id)?;
-            let repo_path = handle.worktree()?.to_path_buf();
+            let repo_path = Self::resolve_worktree_path(&handle).await?;
             tokio::task::spawn_blocking(move || {
                 let repo = git2::Repository::open(&repo_path)
                     .map_err(|e| anyhow!("Failed to open repository: {}", e))?;

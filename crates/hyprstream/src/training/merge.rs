@@ -103,6 +103,13 @@ pub fn additive_merge(existing: &Tensor, new: &Tensor, weight: f64) -> Result<Te
             new.size()
         ));
     }
+    if existing.device() != new.device() {
+        return Err(anyhow!(
+            "Device mismatch in additive merge: {:?} vs {:?}",
+            existing.device(),
+            new.device()
+        ));
+    }
     Ok(existing * (1.0 - weight) + new * weight)
 }
 
@@ -124,6 +131,13 @@ pub fn do_merge(existing: &Tensor, new: &Tensor, weight: f64) -> Result<Tensor> 
             "Shape mismatch in DO-merge: {:?} vs {:?}",
             existing.size(),
             new.size()
+        ));
+    }
+    if existing.device() != new.device() {
+        return Err(anyhow!(
+            "Device mismatch in DO-merge: {:?} vs {:?}",
+            existing.device(),
+            new.device()
         ));
     }
 

@@ -212,6 +212,12 @@ pub struct SnapshotDeltaInfo {
     pub request_count: u64,
 }
 
+/// Export PEFT adapter result information
+pub struct ExportPeftInfo {
+    pub adapter_path: String,
+    pub content_hash: String,
+}
+
 impl InferenceService {
     /// Start the inference service at a specific endpoint
     pub async fn start_at(
@@ -341,7 +347,17 @@ impl InferenceService {
         let (model_path, model_ref) = Self::wait_for_load_model(&dealer)?;
 
         // Initialize the engine and load the model
-        let server_pubkey = VerifyingKey::default(); // Callback mode doesn't need signature verification
+        // SECURITY NOTE: Callback mode uses IPC (unix socket / inproc) between model service
+        // and inference worker — both in the same trust domain. Signature verification is
+        // skipped because the worker process doesn't have the server's public key.
+        // This is acceptable for IPC but must NOT be used for network-facing endpoints.
+        if callback_endpoint.starts_with("tcp://") {
+            return Err(anyhow!(
+                "Callback mode must use IPC transport (ipc:// or inproc://), not TCP. \
+                 TCP callback would bypass signature verification."
+            ));
+        }
+        let server_pubkey = VerifyingKey::default();
         // Generate signing key for callback mode (separate process, no shared key access)
         let signing_key = hyprstream_rpc::crypto::signing::generate_signing_keypair().0;
         let nonce_cache = Arc::new(InMemoryNonceCache::new());
@@ -393,8 +409,8 @@ impl InferenceService {
                             return Ok((model_path, model_ref));
                         }
                         Which::Shutdown(()) => {
-                            info!("Received Shutdown before LoadModel, exiting");
-                            std::process::exit(0);
+                            info!("Received Shutdown before LoadModel, returning");
+                            return Err(anyhow!("Shutdown requested before LoadModel"));
                         }
                         Which::Infer(_) => {
                             warn!("Received Infer before LoadModel, ignoring");
@@ -447,8 +463,8 @@ impl InferenceService {
                 Self::build_load_model_response(true, "")
             }
             Which::Shutdown(()) => {
-                info!("Received Shutdown command, exiting");
-                std::process::exit(0);
+                info!("Received Shutdown command, returning");
+                return Err(anyhow!("Shutdown requested"));
             }
             Which::Infer(infer_data) => {
                 let infer_data = infer_data?;
@@ -588,13 +604,28 @@ impl InferenceService {
             let module_dims = engine.get_lora_module_dims().unwrap_or_default();
             let device = engine.device();
 
-            let delta_config = TenantDeltaConfig::default();
+            let delta_config = if let Some(ref tc) = training_config {
+                let alpha = tc.lora_alpha.unwrap_or(tc.lora_rank as f32);
+                TenantDeltaConfig {
+                    rank: tc.lora_rank,
+                    alpha,
+                    target_modules: tc.target_modules.clone(),
+                    learning_rate: tc.ttt.learning_rate,
+                    ..TenantDeltaConfig::default()
+                }
+            } else {
+                TenantDeltaConfig::default()
+            };
             let kv_reg = engine.kv_registry();
             let snapshots_dir = model_path.join("adapters").join(".snapshots");
             let num_layers = engine.get_num_layers().unwrap_or(32);
+
+            info!(
+                "Delta pool initialized: rank={}, alpha={:.1}, modules={:?}, lr={:.1e}",
+                delta_config.rank, delta_config.alpha, delta_config.target_modules, delta_config.learning_rate
+            );
             let pool = DeltaPool::new(delta_config, module_dims, device, kv_reg, snapshots_dir, fs.clone(), num_layers);
 
-            info!("Delta pool initialized for tenant-aware TTT");
             Some(Arc::new(pool))
         } else {
             None
@@ -714,6 +745,9 @@ impl InferenceService {
                 .collect();
 
             trace!("inference received request ({} bytes)", request.len());
+
+            // Clean up expired pending adaptations on each request
+            service.cleanup_expired_adaptations();
 
             // Unwrap and verify SignedEnvelope
             let (envelope_ctx, payload) = match hyprstream_rpc::unwrap_envelope(&request, &service.server_pubkey, &*service.nonce_cache) {
@@ -1196,6 +1230,33 @@ impl InferenceService {
         Ok(())
     }
 
+    /// Clean up expired pending adaptations (auto-rollback after timeout)
+    fn cleanup_expired_adaptations(&self) {
+        let mut pending = self.pending_adaptations.lock();
+        let expired: Vec<Subject> = pending.iter()
+            .filter(|(_, a)| a.created_at.elapsed().as_millis() as u64 > a.timeout_ms)
+            .map(|(s, _)| s.clone())
+            .collect();
+
+        for subject in expired {
+            if let Some(adaptation) = pending.remove(&subject) {
+                // Restore delta to pre-adaptation state
+                if let Some(pool) = &self.delta_pool {
+                    if let Some(delta_arc) = pool.get(&subject) {
+                        let mut delta = delta_arc.lock();
+                        if let Err(e) = delta.load_state_dict(&adaptation.pre_adaptation_state) {
+                            warn!("Failed to rollback expired adaptation for '{}': {}", subject, e);
+                        }
+                    }
+                }
+                warn!(
+                    "Auto-rolled back expired adaptation for '{}' (timeout {}ms)",
+                    subject, adaptation.timeout_ms
+                );
+            }
+        }
+    }
+
     /// Rollback a pending TTT adaptation
     fn handle_rollback_adaptation(&self, subject: &Subject) -> Result<()> {
         let mut pending = self.pending_adaptations.lock();
@@ -1471,6 +1532,82 @@ impl InferenceService {
             size_bytes,
             accumulated_steps: delta.accumulated_steps,
             request_count: delta.request_count,
+        })
+    }
+
+    /// Export a tenant's delta as a PEFT-compatible adapter directory.
+    ///
+    /// Creates `adapters/{name}/adapter_model.safetensors` with HuggingFace PEFT naming
+    /// and `adapters/{name}/adapter_config.json` with PEFT metadata.
+    async fn handle_export_peft_adapter(
+        &self,
+        subject: &Subject,
+        name: &str,
+        _commit_message: &str,
+    ) -> Result<ExportPeftInfo> {
+        let pool = self.delta_pool.as_ref()
+            .ok_or_else(|| anyhow!("Delta pool not initialized"))?;
+
+        let delta_arc = pool.get(subject)
+            .ok_or_else(|| anyhow!("No delta for subject '{}'", subject))?;
+        let delta = delta_arc.lock();
+
+        let adapter_name = if name.is_empty() {
+            format!("ttt_{}", subject.to_filename())
+        } else {
+            name.to_owned()
+        };
+
+        // Serialize as PEFT-compatible safetensors (with HuggingFace key naming)
+        let safetensors_bytes = delta.serialize_to_safetensors_bytes()?;
+
+        // Generate PEFT adapter_config.json
+        let adapter_config = serde_json::json!({
+            "peft_type": "LORA",
+            "auto_mapping": null,
+            "base_model_name_or_path": "",
+            "bias": "none",
+            "fan_in_fan_out": false,
+            "inference_mode": true,
+            "init_lora_weights": true,
+            "layers_to_transform": null,
+            "layers_pattern": null,
+            "lora_alpha": delta.scaling * delta.rank as f64,
+            "lora_dropout": 0.0,
+            "modules_to_save": null,
+            "r": delta.rank,
+            "rank_pattern": {},
+            "alpha_pattern": {},
+            "revision": null,
+            "target_modules": delta.target_modules.clone(),
+            "task_type": "CAUSAL_LM"
+        });
+        let config_bytes = serde_json::to_vec_pretty(&adapter_config)?;
+
+        // Write through FsOps (path-contained)
+        let fs = self.fs.as_ref()
+            .ok_or_else(|| anyhow!("FsOps not available — cannot write without path containment"))?;
+
+        let dir_path = format!("adapters/{}", adapter_name);
+        fs.mkdir(&dir_path, true).await
+            .map_err(|e| anyhow!("FsOps mkdir failed: {}", e))?;
+
+        let safetensors_path = format!("{}/adapter_model.safetensors", dir_path);
+        fs.write_file(&safetensors_path, &safetensors_bytes).await
+            .map_err(|e| anyhow!("FsOps write adapter_model.safetensors failed: {}", e))?;
+
+        let config_path = format!("{}/adapter_config.json", dir_path);
+        fs.write_file(&config_path, &config_bytes).await
+            .map_err(|e| anyhow!("FsOps write adapter_config.json failed: {}", e))?;
+
+        info!(
+            "Exported PEFT adapter for subject '{}' as '{}' ({} bytes safetensors)",
+            subject, adapter_name, safetensors_bytes.len()
+        );
+
+        Ok(ExportPeftInfo {
+            adapter_path: dir_path,
+            content_hash: String::new(),
         })
     }
 
@@ -2132,6 +2269,21 @@ impl InferenceService {
                 let subject = ctx.subject();
                 match self.handle_snapshot_delta(&subject).await {
                     Ok(info) => Ok((InferenceResponse::snapshot_delta_result(request_id, &info), None)),
+                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
+                }
+            }
+
+            Which::ExportPeftAdapter(export_req) => {
+                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
+                    return Ok((resp, None));
+                }
+                let subject = ctx.subject();
+                let export_req = export_req?;
+                let name = export_req.get_name()?.to_str()?;
+                let commit_message = export_req.get_commit_message()?.to_str()?;
+
+                match self.handle_export_peft_adapter(&subject, name, commit_message).await {
+                    Ok(info) => Ok((InferenceResponse::export_peft_adapter_result(request_id, &info), None)),
                     Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
                 }
             }

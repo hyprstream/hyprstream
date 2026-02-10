@@ -542,6 +542,16 @@ impl ModelService {
         client.gen.snapshot_delta().await
     }
 
+    async fn export_peft_adapter_forward(
+        &self,
+        model_ref_str: &str,
+        name: &str,
+        commit_message: &str,
+    ) -> Result<crate::services::generated::inference_client::ExportPeftResultData> {
+        let client = self.get_inference_client(model_ref_str).await?;
+        client.gen.export_peft_adapter(name, commit_message).await
+    }
+
     // ========================================================================
     // Response builders — top-level
     // ========================================================================
@@ -777,6 +787,24 @@ impl ModelService {
             sd.set_size_bytes(data.size_bytes);
             sd.set_accumulated_steps(data.accumulated_steps);
             sd.set_request_count(data.request_count);
+        }
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
+    fn build_ttt_export_response(
+        request_id: u64,
+        data: &crate::services::generated::inference_client::ExportPeftResultData,
+    ) -> Result<Vec<u8>> {
+        let mut message = Builder::new_default();
+        {
+            let mut response = message.init_root::<model_capnp::model_response::Builder>();
+            response.set_request_id(request_id);
+            let ttt_resp = response.init_ttt_result();
+            let mut export = ttt_resp.init_export();
+            export.set_adapter_path(&data.adapter_path);
+            export.set_content_hash(&data.content_hash);
         }
         let mut bytes = Vec::new();
         serialize::write_message(&mut bytes, &message)?;
@@ -1158,13 +1186,18 @@ impl crate::services::ZmqService for ModelService {
                                     ),
                                 }
                             }
-                            TttWhich::Export(_export_req) => {
-                                // TODO: Implement ttt.export (delta → PEFT adapter directory)
-                                Self::build_ttt_error_response(
-                                    request_id,
-                                    "ttt.export not yet implemented",
-                                    "NOT_IMPLEMENTED",
-                                )
+                            TttWhich::Export(export_req) => {
+                                let export_req = export_req?;
+                                let name = export_req.get_name()?.to_str()?;
+                                let commit_message = export_req.get_commit_message()?.to_str()?;
+                                match self.export_peft_adapter_forward(model_ref, name, commit_message).await {
+                                    Ok(info) => Self::build_ttt_export_response(request_id, &info),
+                                    Err(e) => Self::build_ttt_error_response(
+                                        request_id,
+                                        &format!("Export failed: {e}"),
+                                        "EXPORT_FAILED",
+                                    ),
+                                }
                             }
                         }
                     }

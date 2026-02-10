@@ -219,15 +219,27 @@ impl DeltaPool {
                         if let Some(ref fs) = self.fs {
                             // FsOps path: serialize in-memory and write through contained-root
                             let rel_path = format!("adapters/.snapshots/{}.safetensors", id_filename);
-                            let result = futures::executor::block_on(async {
-                                fs.mkdir("adapters/.snapshots", true).await
-                                    .map_err(|e| anyhow::anyhow!("FsOps mkdir failed: {}", e))?;
-                                let state_dict = d.extract_state_dict();
-                                let bytes = serialize_state_dict_to_bytes(&state_dict)?;
-                                fs.write_file(&rel_path, &bytes).await
-                                    .map_err(|e| anyhow::anyhow!("FsOps write_file failed: {}", e))?;
-                                Ok::<(), anyhow::Error>(())
-                            });
+                            // Extract state dict while holding the lock, then release before async I/O
+                            let state_dict = d.extract_state_dict();
+                            let memory_bytes = d.memory_bytes();
+                            drop(d); // Release lock before async operations
+                            const MAX_SNAPSHOT_BYTES: usize = 512 * 1024 * 1024; // 512 MB
+                            let result = if memory_bytes > MAX_SNAPSHOT_BYTES {
+                                tracing::warn!(
+                                    "Delta '{}' exceeds max snapshot size ({} bytes > {}), skipping snapshot",
+                                    id, memory_bytes, MAX_SNAPSHOT_BYTES
+                                );
+                                Err(anyhow::anyhow!("Delta too large for snapshot"))
+                            } else {
+                                futures::executor::block_on(async {
+                                    fs.mkdir("adapters/.snapshots", true).await
+                                        .map_err(|e| anyhow::anyhow!("FsOps mkdir failed: {}", e))?;
+                                    let bytes = serialize_state_dict_to_bytes(&state_dict)?;
+                                    fs.write_file(&rel_path, &bytes).await
+                                        .map_err(|e| anyhow::anyhow!("FsOps write_file failed: {}", e))?;
+                                    Ok::<(), anyhow::Error>(())
+                                })
+                            };
                             match result {
                                 Ok(()) => {
                                     tracing::info!(

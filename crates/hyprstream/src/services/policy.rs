@@ -187,6 +187,15 @@ impl PolicyHandler for PolicyService {
             ttl
         };
 
+        const MIN_TTL_SECONDS: u32 = 60;
+        if requested_ttl < MIN_TTL_SECONDS {
+            return Ok(PolicyResponseVariant::Error {
+                message: format!("TTL too short: {} < {} seconds minimum", requested_ttl, MIN_TTL_SECONDS),
+                code: "TTL_TOO_SHORT".to_string(),
+                details: String::new(),
+            });
+        }
+
         if requested_ttl > self.token_config.max_ttl_seconds {
             return Ok(PolicyResponseVariant::Error {
                 message: format!("TTL exceeds maximum: {} > {}", requested_ttl, self.token_config.max_ttl_seconds),

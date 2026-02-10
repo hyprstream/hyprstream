@@ -12,7 +12,10 @@ use anyhow::{bail, Result};
 use tracing::{info, warn};
 
 use crate::cli::commands::KVQuantArg;
-use crate::config::{HyprstreamTrainingConfig, TrainingMode, TTTTrainingConfig};
+use crate::config::{
+    default_lora_rank, default_target_modules, HyprstreamTrainingConfig, TrainingMode,
+    TTTTrainingConfig,
+};
 use crate::runtime::model_config::ModelConfig;
 use crate::runtime::template_engine::ChatMessage;
 use crate::services::{InferenceZmqClient, PolicyClient, RegistryClient, INFERENCE_ENDPOINT};
@@ -266,6 +269,9 @@ fn save_training_config(
         steps_per_cycle: 10,
         min_quality_threshold: 0.3,
         train_base_model: false,
+        lora_rank: default_lora_rank(),
+        lora_alpha: None,
+        target_modules: default_target_modules(),
         ttt: TTTTrainingConfig {
             learning_rate: learning_rate as f64,
             gradient_steps: 3,

@@ -1300,6 +1300,24 @@ impl InferenceResponse {
         bytes
     }
 
+    /// Build an export PEFT adapter result response.
+    pub fn export_peft_adapter_result(
+        request_id: u64,
+        info: &crate::services::inference::ExportPeftInfo,
+    ) -> Vec<u8> {
+        let mut msg = Builder::new_default();
+        let mut response = msg.init_root::<inference_capnp::inference_response::Builder>();
+        response.set_request_id(request_id);
+
+        let mut export_result = response.init_export_peft_adapter_result();
+        export_result.set_adapter_path(&info.adapter_path);
+        export_result.set_content_hash(&info.content_hash);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &msg).unwrap_or_default();
+        bytes
+    }
+
     /// Convert FinishReason to Cap'n Proto enum.
     fn finish_reason_to_capnp(reason: &FinishReason) -> inference_capnp::FinishReason {
         match reason {
