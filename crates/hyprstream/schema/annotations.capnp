@@ -11,6 +11,9 @@ annotation mcpDescription(field, union, group, struct, enum, enumerant) :Text;
 # Parameter description - used for field-level documentation in MCP tools
 annotation paramDescription(field) :Text;
 
+# MCP scope annotation - overrides the default "read:{service}:*" scope for write operations
+annotation mcpScope(field) :Text;
+
 # Mark as deprecated with reason
 annotation deprecated(field, union, struct, enum) :Text;
 

@@ -19,6 +19,8 @@ pub struct UnionVariant {
     pub name: String,
     pub type_name: String,
     pub description: String,
+    /// MCP scope override (e.g., "write:model:*"). Empty string means use default.
+    pub scope: String,
 }
 
 #[derive(Debug)]

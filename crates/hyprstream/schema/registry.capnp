@@ -1,5 +1,8 @@
 @0xd4e6f8a2b1c3d5e7;
 
+using import "annotations.capnp".mcpScope;
+using import "annotations.capnp".mcpDescription;
+
 # Cap'n Proto schema for registry service
 #
 # The registry service manages git repositories (models).
@@ -23,15 +26,15 @@ struct RegistryRequest {
     # Get repository information by name
     getByName @3 :Text;
     # Clone a model repository from a URL
-    clone @4 :CloneRequest;
+    clone @4 :CloneRequest $mcpScope("write:registry:*");
     # Register an existing local repository
-    register @5 :RegisterRequest;
+    register @5 :RegisterRequest $mcpScope("write:registry:*");
     # Remove a repository from the registry
-    remove @6 :Text;
+    remove @6 :Text $mcpScope("write:registry:*");
     # Check registry service health
     healthCheck @7 :Void;
     # Clone a model repository from a URL (streaming progress)
-    cloneStream @8 :CloneRequest;
+    cloneStream @8 :CloneRequest $mcpScope("write:registry:*") $mcpDescription("Clone a model repository from a URL (streaming progress)");
 
     # Repository-scoped operations (requires repoId)
     repo @9 :RepositoryRequest;

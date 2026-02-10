@@ -37,7 +37,7 @@ pub fn generate_response_enum_from_variants(
 
     quote! {
         #[doc = #doc]
-        #[derive(Debug)]
+        #[derive(Debug, serde::Serialize)]
         pub enum #enum_name {
             #(#variant_tokens,)*
         }
@@ -310,7 +310,7 @@ pub fn generate_request_method(
             };
             resp_vars.iter().find(|v| v.name == expected_name)
         })
-        .map(|v| v.type_name == "StreamInfo")
+        .map(|v| v.type_name == "StreamInfo" || v.type_name == "StreamStartedInfo")
         .unwrap_or(false);
 
     // Generate return type and response handling

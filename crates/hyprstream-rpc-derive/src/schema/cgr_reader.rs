@@ -90,9 +90,10 @@ fn parse_cgr(
         );
     }
 
-    // Find annotation node IDs by display_name (for mcpDescription, paramDescription)
+    // Find annotation node IDs by display_name (for mcpDescription, paramDescription, mcpScope)
     let mcp_desc_id = find_annotation_id(&nodes, &node_map, "mcpDescription");
     let param_desc_id = find_annotation_id(&nodes, &node_map, "paramDescription");
+    let mcp_scope_id = find_annotation_id(&nodes, &node_map, "mcpScope");
 
     let pascal = to_pascal_case(service_name);
     let request_name = format!("{pascal}Request");
@@ -114,6 +115,7 @@ fn parse_cgr(
         &node_map,
         mcp_desc_id,
         param_desc_id,
+        mcp_scope_id,
     )?;
     let response_variants = extract_union_variants(
         response_node,
@@ -121,6 +123,7 @@ fn parse_cgr(
         &node_map,
         mcp_desc_id,
         param_desc_id,
+        mcp_scope_id,
     )?;
 
     if request_variants.is_empty() || response_variants.is_empty() {
@@ -150,6 +153,7 @@ fn parse_cgr(
         &node_map,
         mcp_desc_id,
         param_desc_id,
+        mcp_scope_id,
     )?;
 
     // Recursively detect nested scoped clients (3rd level)
@@ -161,6 +165,7 @@ fn parse_cgr(
             &node_map,
             mcp_desc_id,
             param_desc_id,
+            mcp_scope_id,
         )?;
     }
 
@@ -295,6 +300,7 @@ fn extract_union_variants(
     node_map: &BTreeMap<u64, NodeInfo>,
     mcp_desc_id: Option<u64>,
     _param_desc_id: Option<u64>,
+    mcp_scope_id: Option<u64>,
 ) -> Result<Vec<UnionVariant>, String> {
     let _ = nodes; // Available for future use
     let struct_reader = match struct_node.which() {
@@ -334,15 +340,18 @@ fn extract_union_variants(
             Err(e) => return Err(format!("Field error: {e}")),
         };
 
-        let description = extract_annotation_text(
+        let annotations = field.get_annotations().map_err(|e| format!("{e}"))?;
+        let description = extract_annotation_text(annotations, mcp_desc_id);
+        let scope = extract_annotation_text(
             field.get_annotations().map_err(|e| format!("{e}"))?,
-            mcp_desc_id,
+            mcp_scope_id,
         );
 
         variants.push(UnionVariant {
             name,
             type_name,
             description,
+            scope,
         });
     }
 
@@ -503,6 +512,7 @@ fn detect_scoped_clients(
     node_map: &BTreeMap<u64, NodeInfo>,
     mcp_desc_id: Option<u64>,
     param_desc_id: Option<u64>,
+    mcp_scope_id: Option<u64>,
 ) -> Result<Vec<ScopedClient>, String> {
     let mut scoped = Vec::new();
 
@@ -540,7 +550,7 @@ fn detect_scoped_clients(
         };
         let inner_node = nodes.get(node_map[&inner_node_id].index);
         let inner_req_variants =
-            extract_union_variants(inner_node, nodes, node_map, mcp_desc_id, param_desc_id)?;
+            extract_union_variants(inner_node, nodes, node_map, mcp_desc_id, param_desc_id, mcp_scope_id)?;
 
         // Extract inner union variants from the response struct
         let resp_node_id = match find_struct_node_id(node_map, &resp_variant.type_name) {
@@ -549,7 +559,7 @@ fn detect_scoped_clients(
         };
         let resp_node = nodes.get(node_map[&resp_node_id].index);
         let inner_resp_variants =
-            extract_union_variants(resp_node, nodes, node_map, mcp_desc_id, param_desc_id)?;
+            extract_union_variants(resp_node, nodes, node_map, mcp_desc_id, param_desc_id, mcp_scope_id)?;
 
         if inner_req_variants.is_empty() || inner_resp_variants.is_empty() {
             continue;
@@ -589,6 +599,7 @@ fn detect_nested_scoped_clients_cgr(
     node_map: &BTreeMap<u64, NodeInfo>,
     mcp_desc_id: Option<u64>,
     param_desc_id: Option<u64>,
+    mcp_scope_id: Option<u64>,
 ) -> Result<(), String> {
     let mut nested = Vec::new();
     let mut nested_factory_names = Vec::new();
@@ -623,7 +634,7 @@ fn detect_nested_scoped_clients_cgr(
         };
         let inner_node = nodes.get(node_map[&inner_node_id].index);
         let inner_req_variants =
-            extract_union_variants(inner_node, nodes, node_map, mcp_desc_id, param_desc_id)?;
+            extract_union_variants(inner_node, nodes, node_map, mcp_desc_id, param_desc_id, mcp_scope_id)?;
 
         let resp_node_id = match find_struct_node_id(node_map, &resp_variant.type_name) {
             Some(id) => id,
@@ -631,7 +642,7 @@ fn detect_nested_scoped_clients_cgr(
         };
         let resp_node = nodes.get(node_map[&resp_node_id].index);
         let inner_resp_variants =
-            extract_union_variants(resp_node, nodes, node_map, mcp_desc_id, param_desc_id)?;
+            extract_union_variants(resp_node, nodes, node_map, mcp_desc_id, param_desc_id, mcp_scope_id)?;
 
         if inner_req_variants.is_empty() || inner_resp_variants.is_empty() {
             continue;

@@ -2,6 +2,7 @@
 
 using import "annotations.capnp".mcpDescription;
 using import "annotations.capnp".paramDescription;
+using import "annotations.capnp".mcpScope;
 
 # Cap'n Proto schema for model service
 #
@@ -22,8 +23,8 @@ struct ModelRequest {
 
   # Request payload (union of request types)
   union {
-    load @1 :LoadModelRequest $mcpDescription("Load a model into memory for inference");
-    unload @2 :UnloadModelRequest $mcpDescription("Unload a model from memory to free resources");
+    load @1 :LoadModelRequest $mcpDescription("Load a model into memory for inference") $mcpScope("write:model:*");
+    unload @2 :UnloadModelRequest $mcpDescription("Unload a model from memory to free resources") $mcpScope("write:model:*");
     list @3 :Void $mcpDescription("List all models currently loaded in memory");
     healthCheck @4 :Void $mcpDescription("Check model service health and status");
 

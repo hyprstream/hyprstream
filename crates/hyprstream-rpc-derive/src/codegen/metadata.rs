@@ -15,6 +15,7 @@ pub fn generate_metadata(service_name: &str, schema: &ParsedSchema) -> TokenStre
         service_name,
         &pascal,
         &schema.request_variants,
+        &schema.response_variants,
         &schema.structs,
         &schema.scoped_clients,
     );
@@ -52,6 +53,10 @@ fn generate_metadata_structs() -> TokenStream {
             pub is_scoped: bool,
             pub scope_field: &'static str,
             pub description: &'static str,
+            /// MCP scope override from $mcpScope annotation (e.g., "write:model:*"). Empty = use default.
+            pub scope: &'static str,
+            /// True if the response type is StreamInfo/StreamStartedInfo (streaming method).
+            pub is_streaming: bool,
         }
     }
 }
@@ -60,6 +65,7 @@ fn generate_schema_metadata_fn(
     service_name: &str,
     pascal: &str,
     request_variants: &[UnionVariant],
+    response_variants: &[UnionVariant],
     structs: &[StructDef],
     scoped_clients: &[ScopedClient],
 ) -> TokenStream {
@@ -72,7 +78,7 @@ fn generate_schema_metadata_fn(
     let method_entries: Vec<TokenStream> = request_variants
         .iter()
         .filter(|v| !scoped_names.contains(&v.name.as_str()))
-        .map(|v| generate_method_schema_entry(v, structs, false, ""))
+        .map(|v| generate_method_schema_entry(v, structs, false, "", response_variants, false))
         .collect();
 
     let mut scoped_fns: Vec<TokenStream> = scoped_clients
@@ -107,9 +113,13 @@ fn generate_method_schema_entry(
     structs: &[StructDef],
     is_scoped: bool,
     scope_field: &str,
+    response_variants: &[UnionVariant],
+    is_scoped_streaming_check: bool,
 ) -> TokenStream {
     let method_name = to_snake_case(&v.name);
     let method_desc = &v.description;
+    let scope_str = v.scope.as_str();
+    let is_streaming = is_streaming_variant(&v.name, response_variants, is_scoped_streaming_check);
     let ct = CapnpType::classify_primitive(&v.type_name);
 
     let params = match ct {
@@ -141,7 +151,15 @@ fn generate_method_schema_entry(
     };
 
     quote! {
-        MethodSchema { name: #method_name, params: &[#(#params),*], is_scoped: #is_scoped, scope_field: #scope_field, description: #method_desc }
+        MethodSchema {
+            name: #method_name,
+            params: &[#(#params),*],
+            is_scoped: #is_scoped,
+            scope_field: #scope_field,
+            description: #method_desc,
+            scope: #scope_str,
+            is_streaming: #is_streaming,
+        }
     }
 }
 
@@ -163,7 +181,7 @@ fn generate_scoped_schema_metadata_fn(
     let method_entries: Vec<TokenStream> = sc
         .inner_request_variants
         .iter()
-        .map(|v| generate_method_schema_entry(v, structs, true, &scope_field_name))
+        .map(|v| generate_method_schema_entry(v, structs, true, &scope_field_name, &sc.inner_response_variants, true))
         .collect();
 
     quote! {
@@ -181,7 +199,7 @@ fn generate_scoped_schema_metadata_fn(
 // JSON Dispatcher
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Check if a request variant's corresponding response is StreamInfo.
+/// Check if a request variant's corresponding response is StreamInfo or StreamStartedInfo.
 fn is_streaming_variant(variant_name: &str, response_variants: &[UnionVariant], is_scoped: bool) -> bool {
     let expected_name = if is_scoped {
         variant_name.to_string()
@@ -191,7 +209,7 @@ fn is_streaming_variant(variant_name: &str, response_variants: &[UnionVariant], 
     response_variants
         .iter()
         .find(|v| v.name == expected_name)
-        .map(|v| v.type_name == "StreamInfo")
+        .map(|v| v.type_name == "StreamInfo" || v.type_name == "StreamStartedInfo")
         .unwrap_or(false)
 }
 
@@ -208,12 +226,38 @@ fn generate_json_dispatcher(
         .map(|sc| sc.factory_name.as_str())
         .collect();
 
+    // Non-streaming dispatch arms for call_method
     let main_match_arms: Vec<TokenStream> = request_variants
         .iter()
         .filter(|v| !scoped_names.contains(&v.name.as_str()))
         .filter(|v| !is_streaming_variant(&v.name, response_variants, false))
         .map(|v| generate_json_method_dispatch_arm(v, structs))
         .collect();
+
+    // Streaming dispatch arms for call_streaming_method
+    let main_streaming_arms: Vec<TokenStream> = request_variants
+        .iter()
+        .filter(|v| !scoped_names.contains(&v.name.as_str()))
+        .filter(|v| is_streaming_variant(&v.name, response_variants, false))
+        .map(|v| generate_json_streaming_dispatch_arm(v, structs))
+        .collect();
+
+    let streaming_method = quote! {
+        /// Dispatch a streaming method call by name with JSON arguments and an ephemeral public key.
+        /// Returns the StreamInfo/StreamStartedInfo as a JSON value.
+        #[allow(unused_variables)]
+        pub async fn call_streaming_method(
+            &self,
+            method: &str,
+            args: &serde_json::Value,
+            ephemeral_pubkey: [u8; 32],
+        ) -> anyhow::Result<serde_json::Value> {
+            match method {
+                #(#main_streaming_arms)*
+                _ => anyhow::bail!("Unknown streaming method: {}", method),
+            }
+        }
+    };
 
     let mut scoped_dispatchers: Vec<TokenStream> = scoped_clients
         .iter()
@@ -226,6 +270,30 @@ fn generate_json_dispatcher(
                 .map(|v| generate_json_method_dispatch_arm(v, structs))
                 .collect();
 
+            // Streaming dispatch arms for scoped clients
+            let scoped_streaming_arms: Vec<TokenStream> = sc
+                .inner_request_variants
+                .iter()
+                .filter(|v| is_streaming_variant(&v.name, &sc.inner_response_variants, true))
+                .map(|v| generate_json_streaming_dispatch_arm(v, structs))
+                .collect();
+
+            let scoped_streaming_method = quote! {
+                /// Dispatch a scoped streaming method call by name with JSON arguments and an ephemeral public key.
+                #[allow(unused_variables)]
+                pub async fn call_streaming_method(
+                    &self,
+                    method: &str,
+                    args: &serde_json::Value,
+                    ephemeral_pubkey: [u8; 32],
+                ) -> anyhow::Result<serde_json::Value> {
+                    match method {
+                        #(#scoped_streaming_arms)*
+                        _ => anyhow::bail!("Unknown scoped streaming method: {}", method),
+                    }
+                }
+            };
+
             quote! {
                 impl #scoped_client_name {
                     /// Dispatch a scoped method call by name with JSON arguments.
@@ -235,6 +303,8 @@ fn generate_json_dispatcher(
                             _ => anyhow::bail!("Unknown scoped method: {}", method),
                         }
                     }
+
+                    #scoped_streaming_method
                 }
             }
         })
@@ -268,13 +338,15 @@ fn generate_json_dispatcher(
     quote! {
         impl #client_name {
             /// Dispatch a method call by name with JSON arguments.
-            /// Returns the response variant as a Debug-formatted JSON string.
+            /// Returns the response as a proper JSON value.
             pub async fn call_method(&self, method: &str, args: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
                 match method {
                     #(#main_match_arms)*
                     _ => anyhow::bail!("Unknown method: {}", method),
                 }
             }
+
+            #streaming_method
         }
 
         #(#scoped_dispatchers)*
@@ -292,15 +364,15 @@ fn generate_json_method_dispatch_arm(
     match ct {
         CapnpType::Void => quote! {
             #method_name_str => {
-                let result = self.#method_name().await?;
-                Ok(serde_json::to_value(format!("{:?}", result))?)
+                self.#method_name().await?;
+                Ok(serde_json::Value::Null)
             }
         },
         CapnpType::Text => quote! {
             #method_name_str => {
                 let value = args[#method_name_str].as_str().or_else(|| args["value"].as_str()).unwrap_or_default();
                 let result = self.#method_name(value).await?;
-                Ok(serde_json::to_value(format!("{:?}", result))?)
+                Ok(serde_json::to_value(&result)?)
             }
         },
         _ => {
@@ -335,11 +407,80 @@ fn generate_json_method_dispatch_arm(
                     #method_name_str => {
                         #(#extractions)*
                         let result = self.#method_name(#(#args_list),*).await?;
-                        Ok(serde_json::to_value(format!("{:?}", result))?)
+                        Ok(serde_json::to_value(&result)?)
                     }
                 }
             } else {
                 let err_msg = format!("Method {}: struct type not found", method_name_str);
+                quote! {
+                    #method_name_str => anyhow::bail!(#err_msg),
+                }
+            }
+        }
+    }
+}
+
+/// Generate a streaming dispatch arm for call_streaming_method.
+/// Like generate_json_method_dispatch_arm but passes ephemeral_pubkey to the typed method.
+fn generate_json_streaming_dispatch_arm(
+    v: &UnionVariant,
+    structs: &[StructDef],
+) -> TokenStream {
+    let method_name_str = to_snake_case(&v.name);
+    let method_name = format_ident!("{}", method_name_str);
+    let ct = CapnpType::classify_primitive(&v.type_name);
+
+    match ct {
+        CapnpType::Void => quote! {
+            #method_name_str => {
+                let result = self.#method_name(ephemeral_pubkey).await?;
+                Ok(serde_json::to_value(&result)?)
+            }
+        },
+        CapnpType::Text => quote! {
+            #method_name_str => {
+                let value = args[#method_name_str].as_str().or_else(|| args["value"].as_str()).unwrap_or_default();
+                let result = self.#method_name(value, ephemeral_pubkey).await?;
+                Ok(serde_json::to_value(&result)?)
+            }
+        },
+        _ => {
+            if let Some(sdef) = structs.iter().find(|s| s.name == v.type_name) {
+                let extractions: Vec<TokenStream> = sdef
+                    .fields
+                    .iter()
+                    .map(|f| {
+                        let fname = format_ident!("{}", to_snake_case(&f.name));
+                        let fname_str = to_snake_case(&f.name);
+                        json_field_extraction_token(&fname, &fname_str, &f.type_name)
+                    })
+                    .collect();
+
+                let args_list: Vec<TokenStream> = sdef
+                    .fields
+                    .iter()
+                    .map(|f| {
+                        let fname = format_ident!("{}", to_snake_case(&f.name));
+                        let fct = CapnpType::classify_primitive(&f.type_name);
+                        match fct {
+                            CapnpType::Data
+                            | CapnpType::ListText
+                            | CapnpType::ListData
+                            | CapnpType::ListStruct(_) => quote! { &#fname },
+                            _ => quote! { #fname },
+                        }
+                    })
+                    .collect();
+
+                quote! {
+                    #method_name_str => {
+                        #(#extractions)*
+                        let result = self.#method_name(#(#args_list,)* ephemeral_pubkey).await?;
+                        Ok(serde_json::to_value(&result)?)
+                    }
+                }
+            } else {
+                let err_msg = format!("Streaming method {}: struct type not found", method_name_str);
                 quote! {
                     #method_name_str => anyhow::bail!(#err_msg),
                 }

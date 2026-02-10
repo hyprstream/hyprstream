@@ -47,7 +47,7 @@ fn generate_enum_type(e: &EnumDef) -> TokenStream {
 
     quote! {
         #[doc = #doc]
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
         pub enum #enum_name {
             #(#variants,)*
         }
@@ -76,7 +76,7 @@ fn generate_data_struct(
 
     quote! {
         #[doc = #doc]
-        #[derive(Debug, Clone)]
+        #[derive(Debug, Clone, serde::Serialize)]
         pub struct #data_name {
             #(#fields,)*
         }

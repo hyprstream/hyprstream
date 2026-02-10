@@ -439,7 +439,7 @@ pub fn parse_variant_line(line: &str) -> Option<UnionVariant> {
     let _ordinal: u32 = ordinal_str.parse().ok()?;
     let type_name = line[colon_pos + 1..].trim().to_string();
 
-    Some(UnionVariant { name, type_name, description: String::new() })
+    Some(UnionVariant { name, type_name, description: String::new(), scope: String::new() })
 }
 
 /// Collect all struct names that need Data structs generated.
