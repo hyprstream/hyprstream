@@ -63,9 +63,9 @@ pub use config::{HypervisorType, ImageConfig, PoolConfig, WorkerConfig, Workflow
 pub use error::WorkerError;
 
 // Re-export service types
-pub use runtime::{WorkerService, RuntimeClient, RuntimeZmq};
-pub use image::{ImageClient, ImageZmq, RafsStore};
-pub use workflow::{WorkflowService, WorkflowClient, WorkflowZmq};
+pub use runtime::{WorkerService, RuntimeClient};
+pub use image::{ImageClient, RafsStore};
+pub use workflow::{WorkflowService, WorkflowClient};
 pub use events::{
     // Spawner types (new API)
     ProxyService, ServiceSpawner, SpawnedService,
@@ -82,18 +82,29 @@ pub use events::{
     EVENTS_PUB, EVENTS_SUB,
 };
 
-/// Generated Cap'n Proto code
-pub mod workers_capnp {
-    #![allow(dead_code)]
-    #![allow(clippy::all)]
-    #![allow(clippy::unwrap_used)]
-    #![allow(clippy::expect_used)]
-    #![allow(clippy::match_same_arms)]
-    #![allow(clippy::semicolon_if_nothing_returned)]
-    #![allow(clippy::doc_markdown)]
-    #![allow(clippy::indexing_slicing)]
-    #![allow(clippy::cast_possible_truncation)]
-    #![allow(clippy::cast_sign_loss)]
-    #![allow(clippy::cast_possible_wrap)]
-    include!(concat!(env!("OUT_DIR"), "/workers_capnp.rs"));
+// Re-export annotations_capnp and streaming_capnp from hyprstream-rpc (compiled once, shared by all crates)
+pub use hyprstream_rpc::annotations_capnp;
+pub use hyprstream_rpc::streaming_capnp;
+
+/// Generated Cap'n Proto code for resource-scoped worker schema
+pub mod worker_capnp {
+    #![allow(dead_code, clippy::all, clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::match_same_arms, clippy::semicolon_if_nothing_returned)]
+    #![allow(clippy::doc_markdown, clippy::indexing_slicing)]
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    include!(concat!(env!("OUT_DIR"), "/worker_capnp.rs"));
 }
+
+/// Generated Cap'n Proto code for workflow service schema
+pub mod workflow_capnp {
+    #![allow(dead_code, clippy::all, clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::match_same_arms, clippy::semicolon_if_nothing_returned)]
+    #![allow(clippy::doc_markdown, clippy::indexing_slicing)]
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    include!(concat!(env!("OUT_DIR"), "/workflow_capnp.rs"));
+}
+
+/// Generated RPC dispatch code from `generate_rpc_service!` proc macro.
+///
+/// Provides `WorkerHandler`/`dispatch_worker` and `WorkflowHandler`/`dispatch_workflow`.
+pub mod generated;

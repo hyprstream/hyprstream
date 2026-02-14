@@ -7,6 +7,10 @@
 //! - Memory-mapped disk persistence
 //! - FlightSQL interface for embeddings and similarity search
 
+// Re-export annotations_capnp and streaming_capnp from hyprstream-rpc (compiled once, shared by all crates)
+pub use hyprstream_rpc::annotations_capnp;
+pub use hyprstream_rpc::streaming_capnp;
+
 // Cap'n Proto generated modules (must be at crate root for path resolution)
 // Note: common_capnp is in hyprstream-rpc crate (envelope types)
 pub mod events_capnp {
@@ -49,7 +53,22 @@ pub mod model_capnp {
     include!(concat!(env!("OUT_DIR"), "/model_capnp.rs"));
 }
 
-pub mod adapters;
+pub mod mcp_capnp {
+    #![allow(dead_code, unused_imports)]
+    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
+    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    include!(concat!(env!("OUT_DIR"), "/mcp_capnp.rs"));
+}
+
+pub mod worker_capnp {
+    #![allow(dead_code, unused_imports)]
+    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
+    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    include!(concat!(env!("OUT_DIR"), "/worker_capnp.rs"));
+}
+
 pub mod api;
 pub mod archetypes;
 pub mod auth;
@@ -60,7 +79,6 @@ pub mod error;
 pub mod events;
 pub mod git;
 pub mod inference;
-pub mod lora;
 pub mod runtime;
 pub mod schema;
 pub mod server;
@@ -73,11 +91,6 @@ pub mod zmq;
 
 // Storage exports removed
 pub use runtime::{
-    AdaptationMode,
-    // REMOVED: AdaptationTrigger, AdaptationType, ConversationContext, ConversationResponse,
-    // ConversationRouter, ConversationSession, ConversationTurn, ModelPool, ModelState,
-    // PoolStats, RoutingConfig - dead code from conversation_router
-    AdapterMetrics,
     FinishReason,
     GenerationRequest,
     GenerationResult,
@@ -85,13 +98,7 @@ pub use runtime::{
     RuntimeConfig,
     RuntimeEngine,
     TorchEngine,
-    UserFeedback,
-    XLoRAAdapter,
-    XLoRARoutingStrategy,
 };
-
-// Export TorchEngine as HyprStreamEngine for backward compatibility
-pub use runtime::TorchEngine as HyprStreamEngine;
 
 // Export init function from runtime
 pub use runtime::create_engine as init;

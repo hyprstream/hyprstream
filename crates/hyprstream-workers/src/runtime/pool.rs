@@ -284,7 +284,11 @@ impl SandboxPool {
 
         // 6. Prepare the VM (creates configuration)
         // Note: Annotations are passed to prepare_vm, config was set via set_hypervisor_config()
-        let annotations = sandbox.annotations.clone();
+        // Convert Vec<KeyValue> → HashMap for Kata's Hypervisor trait API
+        let annotations: std::collections::HashMap<String, String> = sandbox.annotations
+            .iter()
+            .map(|kv| (kv.key.clone(), kv.value.clone()))
+            .collect();
         hypervisor
             .prepare_vm(&sandbox.id, None, &annotations, None)
             .await

@@ -11,18 +11,18 @@ use std::path::Path;
 
 // Re-export everything from the unified config
 pub use crate::config::{
-    FinishReason, GenerationConfig, GenerationRequest, GenerationResult, HyprConfig, LoRAConfig,
+    FinishReason, GenerationConfig, GenerationRequest, GenerationResult, HyprConfig,
     ModelConfig, ModelInfo, RuntimeConfig,
 };
 
 pub mod architectures; // Architecture-specific model implementations (includes Janus placeholder utils)
+pub mod batched_lora; // Batched multi-tenant LoRA forward pass
 // REMOVED: pub mod conversation_router; // Dead code - VDB TemporalStreamingLayer removed
 pub mod generation_metrics; // Quality metrics for self-supervised training
 pub mod kv_quant; // KV cache quantization types
 pub mod tensor_sampling; // Device-agnostic tensor-based sampling
 pub mod image_utils; // Image loading and preprocessing for multimodal models
 pub mod kv_cache; // Key-Value caching for efficient autoregressive generation
-pub mod lora_integration; // LoRA integration with gradient bridge
 pub mod model_config; // Unified model configuration management
 pub mod model_factory; // Single factory for model creation
 pub mod rope; // Rotary Position Embedding (RoPE) implementation
@@ -44,27 +44,6 @@ pub use generation_metrics::{GenerationMetricsAccumulator, GenerationQualityMetr
 
 #[derive(Debug, Clone)]
 pub struct MistralEngine;
-
-#[derive(Debug, Clone)]
-pub struct XLoRAAdapter {
-    pub id: String,
-}
-
-#[derive(Debug, Clone)]
-pub enum AdaptationMode {
-    Disabled,
-}
-
-#[derive(Debug, Clone)]
-pub struct UserFeedback;
-
-#[derive(Debug, Clone)]
-pub enum XLoRARoutingStrategy {
-    Default,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct AdapterMetrics;
 
 #[derive(Debug, Clone)]
 pub enum ModelBuilderConfig {
@@ -112,69 +91,6 @@ pub trait RuntimeEngine: Send + Sync {
         Ok(formatted)
     }
 
-    // NEW: X-LoRA and real-time adaptation capabilities (default implementations for backward compatibility)
-
-    /// Update adapter weights in real-time (< 5ms target)
-    async fn update_adapter_realtime(
-        &mut self,
-        _adapter_id: &str,
-        _weights: &crate::adapters::lora_checkpoints::LoRAWeightsData,
-    ) -> Result<()> {
-        Err(anyhow::anyhow!(
-            "Real-time adapter updates not supported by this engine"
-        ))
-    }
-
-    /// Switch active adapters instantly (< 1ms target)
-    async fn switch_active_adapters(&mut self, _adapter_ids: &[String]) -> Result<()> {
-        Err(anyhow::anyhow!(
-            "Adapter switching not supported by this engine"
-        ))
-    }
-
-    /// Configure X-LoRA multi-adapter routing
-    async fn configure_xlora(
-        &mut self,
-        _max_adapters: usize,
-        _routing_strategy: XLoRARoutingStrategy,
-    ) -> Result<()> {
-        Err(anyhow::anyhow!("X-LoRA not supported by this engine"))
-    }
-
-    /// Enable real-time adaptation mode
-    async fn enable_realtime_adaptation(&mut self, _mode: AdaptationMode) -> Result<()> {
-        Err(anyhow::anyhow!(
-            "Real-time adaptation not supported by this engine"
-        ))
-    }
-
-    /// Process generation feedback for learning
-    async fn process_generation_feedback(
-        &mut self,
-        _request: &GenerationRequest,
-        _result: &GenerationResult,
-        _feedback: Option<UserFeedback>,
-    ) -> Result<()> {
-        // Default: no-op for engines that don't support learning
-        Ok(())
-    }
-
-    /// Get adapter performance metrics
-    async fn get_adapter_metrics(
-        &self,
-    ) -> Result<std::collections::HashMap<String, AdapterMetrics>> {
-        Ok(std::collections::HashMap::new())
-    }
-
-    /// Load LoRA checkpoint as adapter
-    async fn load_lora_checkpoint(
-        &mut self,
-        _checkpoint: &crate::adapters::lora_checkpoints::LoRACheckpoint,
-    ) -> Result<String> {
-        Err(anyhow::anyhow!(
-            "LoRA checkpoint loading not supported by this engine"
-        ))
-    }
 }
 
 /// Create the default runtime engine (now uses PyTorch)

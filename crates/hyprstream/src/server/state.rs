@@ -2,7 +2,7 @@
 
 use crate::{
     api::training_service::TrainingService,
-    services::{ModelZmqClient, PolicyZmqClient, RegistryClient},
+    services::{ModelZmqClient, PolicyClient, RegistryClient},
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::sync::Arc;
@@ -21,7 +21,7 @@ pub struct ServerState {
     pub model_client: ModelZmqClient,
 
     /// Policy client for authorization checks via ZMQ
-    pub policy_client: PolicyZmqClient,
+    pub policy_client: PolicyClient,
 
     /// Registry client for model operations
     pub registry: Arc<dyn RegistryClient>,
@@ -80,7 +80,7 @@ impl ServerState {
     pub async fn new(
         config: ServerConfig,
         model_client: ModelZmqClient,
-        policy_client: PolicyZmqClient,
+        policy_client: PolicyClient,
         registry: Arc<dyn RegistryClient>,
         signing_key: SigningKey,
     ) -> Result<Self, anyhow::Error> {

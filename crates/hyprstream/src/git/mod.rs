@@ -3,4 +3,4 @@
 //! This module contains hyprstream-specific git extensions.
 //! Core git functionality is provided by git2db.
 
-pub mod helpers;
+pub mod ops;

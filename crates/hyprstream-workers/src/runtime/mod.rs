@@ -28,25 +28,43 @@ mod service;
 pub mod spawner;
 mod virtiofs;
 
+// Generated wire types re-exported from client (originally from worker_client)
+// Note: Filter types and Metadata are hand-written in client.rs with extra functionality
 pub use client::{
-    ContainerAttributes, ContainerFilter, ContainerMetadata, ContainerStats,
-    ContainerStatsFilter, ContainerStatusResponse, CpuUsage, ExecSyncResponse,
-    FilesystemIdentifier, FilesystemUsage, LinuxPodSandboxStats, MemoryUsage,
-    NetworkInterfaceUsage, NetworkUsage, PodSandboxAttributes, PodSandboxFilter,
-    PodSandboxMetadata, PodSandboxStats, PodSandboxStatsFilter, PodSandboxStatusResponse,
-    ProcessUsage, RuntimeCondition, RuntimeClient, RuntimeStatus, RuntimeZmq,
-    StatusResponse, VersionResponse,
-};
-pub use container::{
-    Container, ContainerConfig, ContainerState, ContainerStatus, ImageSpec as ContainerImageSpec,
+    // Generated client
+    GenWorkerClient,
+    // Generated response/stats types
+    VersionInfo, RuntimeStatus, RuntimeCondition,
+    PodSandboxStatusResponse, ContainerStatusResponse,
+    ExecSyncResult,
+    PodSandboxStats, PodSandboxAttributes, LinuxPodSandboxStats,
+    ContainerStats as ContainerStatsWire, ContainerAttributes,
+    CpuUsage, MemoryUsage, NetworkUsage, NetworkInterfaceUsage,
+    ProcessUsage, FilesystemUsage, FilesystemIdentifier,
+    Timestamp,
+    PodSandboxInfo, ContainerInfo,
+    // Generated enum types
+    PodSandboxStateEnum, ContainerStateEnum,
+    // Generated DTOs (now canonical - no duplicates)
+    ImageSpec, PodSandboxConfig, PodSandboxStatus, PodSandboxNetworkStatus,
+    ContainerConfig, ContainerStatus,
+    DNSConfig, PortMapping, LinuxPodSandboxConfig,
+    LinuxSandboxSecurityContext,
+    Mount, Device, LinuxContainerConfig,
+    LinuxContainerSecurityContext, Capability,
+    AuthConfig as AuthConfigWire, StreamInfo,
+    ImageInfo, ImageStatusResult,
+    // Hand-written types (from client.rs)
+    ContainerFilter, ContainerMetadata, ContainerStatsFilter,
     KeyValue,
+    PodSandboxFilter, PodSandboxMetadata, PodSandboxStatsFilter,
+    RuntimeClient, StatusResponse,
 };
+// Domain entities (business logic only - not DTOs)
+pub use container::{Container, ContainerState};
 pub use pool::{PoolStats, SandboxPool};
-pub use sandbox::{
-    PodIP, PodSandbox, PodSandboxConfig, PodSandboxNetworkStatus, PodSandboxState,
-    PodSandboxStatus,
-};
-pub use service::{AttachResponse, FdStreamAuthResponse, WorkerService};
+pub use sandbox::{PodSandbox, PodSandboxState};
+pub use service::WorkerService;
 // Re-export service infrastructure from hyprstream-rpc for convenience
 pub use hyprstream_rpc::service::{EnvelopeContext, ServiceHandle, ZmqService};
 pub use virtiofs::{SandboxVirtiofs, SandboxVirtiofsBuilder};

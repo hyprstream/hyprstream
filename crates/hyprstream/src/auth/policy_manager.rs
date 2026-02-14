@@ -124,32 +124,25 @@ m = (g(r.sub, p.sub) || keyMatch(r.sub, p.sub)) && \
     (p.act == "*" || r.act == p.act)
 "#;
 
-/// Default policy rules (deny-all by default for security)
-/// Add explicit policies for access grants
+/// Default policy rules (allow-all by default — add deny rules to restrict access)
 ///
 /// Policy format: p, subject, domain, resource, action, effect
-const DEFAULT_POLICY_CSV: &str = r#"# Default policy (secure default with local user access)
-# Add explicit policies below to grant additional access.
+const DEFAULT_POLICY_CSV: &str = r#"# Default policy (allow-all — add deny rules to restrict access)
 #
 # Policy format: p, subject, domain, resource, action, effect
 #
-# Default policies for local users (CLI operations):
-p, local:*, *, registry, query, allow
-p, local:*, *, registry:*, query, allow
-p, local:*, *, registry:*, write, allow
-p, local:*, *, model:*, infer, allow
+# Default: allow all operations for all subjects.
+p, *, *, *, *, allow
 #
-# Examples for additional policies:
-#   p, admin, *, *, *, allow             # Admin has full access to all domains
-#   p, trainer, HfModel, model:*, train, allow  # Trainer can train HfModel domain
-#   p, user, HfModel, model:*, infer, allow     # User can infer in HfModel domain
-#   p, analyst, HfDataset, data:*, query, allow # Analyst can query datasets
-#   p, *, *, *, manage, deny             # Nobody can manage (explicit deny)
+# Examples for restricting access:
+#   p, anonymous, *, *, manage, deny     # Anonymous users cannot manage
+#   p, *, *, *, train, deny              # Nobody can train by default
+#   p, trainer, HfModel, model:*, train, allow  # ...except trainers in HfModel domain
 #
 # Role assignments:
 #   g, alice, trainer        # Assign alice to trainer role
 #
-# IMPORTANT: Add policies above to grant access to specific users/roles.
+# Add deny rules above to restrict access for specific users/roles.
 "#;
 
 /// Validate policy.csv format before loading
@@ -232,7 +225,7 @@ impl PolicyManager {
 
         // Create default policy.csv if not exists
         if !policy_path.exists() {
-            info!("Creating default policy.csv (deny-all - add policies to grant access)");
+            info!("Creating default policy.csv (allow-all - add deny rules to restrict access)");
             tokio::fs::write(&policy_path, DEFAULT_POLICY_CSV).await?;
         }
 

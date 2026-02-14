@@ -343,6 +343,7 @@ impl TrainingService {
             inference_tokens: 0,
             inference_time_ms: 0,
             inference_tokens_per_sec: 0.0,
+            ttt_metrics: None,
         })
     }
 

@@ -1,4 +1,4 @@
-@0xe7f8a9b0c1d2e3f4;
+@0xf1a2b3c4d5e6f708;
 
 # Cap'n Proto schema for policy service
 #
@@ -44,27 +44,21 @@ struct IssueToken {
   ttl @1 :UInt32;
 }
 
-# Response for authorization checks
+# Unified policy response (covers both check and token issuance)
 struct PolicyResponse {
   # Request ID this response corresponds to
   requestId @0 :UInt64;
 
   # Response payload
   union {
-    # Authorization result
+    # Authorization result (for check)
     allowed @1 :Bool;
 
     # Error occurred
     error @2 :ErrorInfo;
-  }
-}
 
-# Response for token issuance
-struct IssueTokenResponse {
-  requestId @0 :UInt64;
-  union {
-    success @1 :TokenInfo;
-    error @2 :ErrorInfo;
+    # Token issuance result (for issueToken)
+    tokenSuccess @3 :TokenInfo;
   }
 }
 

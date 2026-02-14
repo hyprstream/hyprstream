@@ -4,7 +4,7 @@
 //! Implementations can be in-process (channels) or remote (gRPC, etc.).
 
 use crate::config::{GenerationRequest, GenerationResult, ModelInfo};
-use crate::lora::LoRAConfig;
+use crate::training::TenantDeltaConfig;
 use async_trait::async_trait;
 use std::path::Path;
 use thiserror::Error;
@@ -46,7 +46,7 @@ pub trait InferenceClient: Send + Sync {
     // === LoRA Operations ===
 
     /// Initialize LoRA adapter structure for training.
-    async fn create_lora(&self, config: LoRAConfig) -> Result<(), InferenceError>;
+    async fn create_lora(&self, config: TenantDeltaConfig) -> Result<(), InferenceError>;
 
     /// Load LoRA adapter weights from file.
     async fn load_lora(&self, path: &Path) -> Result<(), InferenceError>;

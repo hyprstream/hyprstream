@@ -25,7 +25,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::config::{GenerationRequest, GenerationResult, ModelInfo};
-use crate::lora::LoRAConfig;
+use crate::training::TenantDeltaConfig;
 use crate::runtime::kv_cache::CacheOwner;
 use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
 
@@ -219,33 +219,26 @@ impl LocalInferenceService {
                 let _ = reply.send(result);
             }
 
-            InferenceRequest::LoadLora { path, reply } => {
-                let result = self
-                    .engine
-                    .load_lora_from_file(&path)
-                    .await
-                    .map_err(|e| InferenceError::LoRA(e.to_string()));
-                let _ = reply.send(result);
+            InferenceRequest::LoadLora { path: _, reply } => {
+                let _ = reply.send(Err(InferenceError::LoRA(
+                    "LoRA operations are handled by InferenceService (RPC mode)".to_owned(),
+                )));
             }
 
-            InferenceRequest::SaveLora { path, reply } => {
-                let result = path.to_str()
-                    .ok_or_else(|| InferenceError::LoRA("Invalid path".to_owned()))
-                    .and_then(|p| {
-                        self.engine.save_lora(p)
-                            .map_err(|e| InferenceError::LoRA(e.to_string()))
-                    });
-                let _ = reply.send(result);
+            InferenceRequest::SaveLora { path: _, reply } => {
+                let _ = reply.send(Err(InferenceError::LoRA(
+                    "LoRA operations are handled by InferenceService (RPC mode)".to_owned(),
+                )));
             }
 
             InferenceRequest::UnloadLora { reply } => {
-                let result = self.engine.unload_lora()
-                    .map_err(|e| InferenceError::LoRA(e.to_string()));
-                let _ = reply.send(result);
+                let _ = reply.send(Err(InferenceError::LoRA(
+                    "LoRA operations are handled by InferenceService (RPC mode)".to_owned(),
+                )));
             }
 
             InferenceRequest::HasLora { reply } => {
-                let has_lora = self.engine.has_lora_model();
+                let has_lora = false; // LoRA state managed by InferenceService's base_delta
                 let _ = reply.send(Ok(has_lora));
             }
 
@@ -411,7 +404,7 @@ impl InferenceClient for LocalInferenceClient {
         rx.await.map_err(|_| InferenceError::channel("No response"))?
     }
 
-    async fn create_lora(&self, config: LoRAConfig) -> Result<(), InferenceError> {
+    async fn create_lora(&self, config: TenantDeltaConfig) -> Result<(), InferenceError> {
         let (tx, rx) = oneshot::channel();
         self.sender
             .send(InferenceRequest::CreateLora { config, reply: tx })

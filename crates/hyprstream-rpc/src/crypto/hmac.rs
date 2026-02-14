@@ -175,54 +175,6 @@ impl ChainedStreamHmac {
     }
 }
 
-/// Legacy sequence-based HMAC (kept for compatibility).
-///
-/// Prefer `ChainedStreamHmac` for new code.
-pub struct StreamHmac {
-    key: HmacKey,
-}
-
-impl StreamHmac {
-    /// Create a new StreamHmac with the given key.
-    pub fn new(key: HmacKey) -> Self {
-        Self { key }
-    }
-
-    /// Create from raw key bytes.
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self::new(HmacKey::new(bytes))
-    }
-
-    /// Compute MAC for a stream chunk (sequence-based, legacy).
-    pub fn compute(&self, request_id: u64, sequence: u64, data: &[u8]) -> [u8; 32] {
-        // Build input: request_id || sequence || data
-        let mut input = Vec::with_capacity(16 + data.len());
-        input.extend_from_slice(&request_id.to_le_bytes());
-        input.extend_from_slice(&sequence.to_le_bytes());
-        input.extend_from_slice(data);
-
-        // Compute MAC using backend (Blake3 or HMAC-SHA256)
-        keyed_mac(self.key.as_bytes(), &input)
-    }
-
-    /// Verify HMAC for a stream chunk (sequence-based, legacy).
-    pub fn verify(
-        &self,
-        request_id: u64,
-        sequence: u64,
-        data: &[u8],
-        expected_mac: &[u8; 32],
-    ) -> EnvelopeResult<()> {
-        let computed = self.compute(request_id, sequence, data);
-
-        if computed.ct_eq(expected_mac).into() {
-            Ok(())
-        } else {
-            Err(EnvelopeError::InvalidHmac)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,64 +290,4 @@ mod tests {
         assert_eq!(hmac.chain_state(), &mac);
     }
 
-    // =========================================================================
-    // Legacy sequence-based HMAC tests (for compatibility)
-    // =========================================================================
-
-    #[test]
-    fn test_legacy_hmac_compute_verify() -> crate::EnvelopeResult<()> {
-        let key = [0x42u8; 32];
-        let hmac = StreamHmac::from_bytes(key);
-
-        let request_id = 12345u64;
-        let sequence = 1u64;
-        let data = b"test chunk data";
-
-        let mac = hmac.compute(request_id, sequence, data);
-        hmac.verify(request_id, sequence, data, &mac)?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_legacy_hmac_tampered_data_fails() {
-        let key = [0x42u8; 32];
-        let hmac = StreamHmac::from_bytes(key);
-
-        let request_id = 12345u64;
-        let sequence = 1u64;
-        let data = b"original data";
-        let tampered = b"tampered data";
-
-        let mac = hmac.compute(request_id, sequence, data);
-        let result = hmac.verify(request_id, sequence, tampered, &mac);
-        assert!(matches!(result, Err(EnvelopeError::InvalidHmac)));
-    }
-
-    #[test]
-    fn test_legacy_hmac_wrong_sequence_fails() {
-        let key = [0x42u8; 32];
-        let hmac = StreamHmac::from_bytes(key);
-
-        let request_id = 12345u64;
-        let data = b"test data";
-
-        let mac = hmac.compute(request_id, 1, data);
-        let result = hmac.verify(request_id, 2, data, &mac);
-        assert!(matches!(result, Err(EnvelopeError::InvalidHmac)));
-    }
-
-    #[test]
-    fn test_legacy_different_keys_different_macs() {
-        let hmac1 = StreamHmac::from_bytes([0x01u8; 32]);
-        let hmac2 = StreamHmac::from_bytes([0x02u8; 32]);
-
-        let request_id = 12345u64;
-        let sequence = 1u64;
-        let data = b"test data";
-
-        let mac1 = hmac1.compute(request_id, sequence, data);
-        let mac2 = hmac2.compute(request_id, sequence, data);
-
-        assert_ne!(mac1, mac2);
-    }
 }

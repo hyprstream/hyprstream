@@ -54,8 +54,8 @@ pub async fn handle_remote_list(
     for remote in remotes {
         if verbose {
             println!("  {} (fetch): {}", remote.name, remote.url);
-            if let Some(push_url) = &remote.push_url {
-                println!("  {} (push):  {}", remote.name, push_url);
+            if !remote.push_url.is_empty() {
+                println!("  {} (push):  {}", remote.name, remote.push_url);
             }
         } else {
             println!("  {}\t{}", remote.name, remote.url);

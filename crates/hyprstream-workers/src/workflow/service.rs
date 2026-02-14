@@ -5,13 +5,78 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
+use anyhow::Result as AnyhowResult;
+use async_trait::async_trait;
+use hyprstream_rpc::prelude::SigningKey;
+use hyprstream_rpc::service::{AuthorizeFn, EnvelopeContext, ZmqService};
+use hyprstream_rpc::transport::TransportConfig;
+
 use crate::error::Result;
 use crate::events::{EventSubscriber, ReceivedEvent};
+use crate::generated::workflow_client::{
+    WorkflowHandler, dispatch_workflow, WorkflowResponseVariant,
+    WorkflowDef as WorkflowDefWire, WorkflowInfo, WorkflowRun as WorkflowRunWire,
+    JobRun as JobRunWire, StepRun as StepRunWire,
+    RunStatusEnum,
+    // Request types
+    DispatchRequest, SubscribeRequest,
+};
 
-use super::client::{WorkflowDef, WorkflowInfo, WorkflowRun, RunStatus};
 use super::subscription::WorkflowSubscription;
-use super::triggers::{EventHandler, HandlerResult};
-use super::{RunId, WorkflowId};
+use super::triggers::{EventHandler, EventTrigger, HandlerResult};
+use super::{RunId, WorkflowId, Workflow};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Internal domain types — NOT exposed in the public API.
+// The public WorkflowClient trait uses generated *Data types from the schema.
+// These exist for internal service state where the domain model differs
+// from the wire format (e.g., HashMap vs Vec, Option<DateTime> vs i64).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Internal workflow definition (domain model, not wire format)
+#[derive(Debug, Clone)]
+pub(crate) struct WorkflowDef {
+    pub path: String,
+    pub repo_id: String,
+    pub workflow: Workflow,
+    pub triggers: Vec<EventTrigger>,
+}
+
+/// Internal workflow run state
+#[derive(Debug, Clone)]
+pub(crate) struct WorkflowRun {
+    pub id: String,
+    pub workflow_id: String,
+    pub status: RunStatus,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub jobs: HashMap<String, JobRun>,
+}
+
+/// Internal run status
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RunStatus {
+    Queued,
+}
+
+/// Internal job run state
+#[derive(Debug, Clone)]
+pub(crate) struct JobRun {
+    pub name: String,
+    pub status: RunStatus,
+    pub steps: Vec<StepRun>,
+}
+
+/// Internal step run state
+#[derive(Debug, Clone)]
+pub(crate) struct StepRun {
+    pub name: String,
+    pub status: RunStatus,
+    pub exit_code: Option<i32>,
+}
+
+/// Service name for endpoint registry
+const SERVICE_NAME: &str = "workflow";
 
 /// WorkflowService handles workflow orchestration
 ///
@@ -35,6 +100,15 @@ pub struct WorkflowService {
 
     /// Background event loop handle
     event_loop_handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+
+    // Infrastructure (for ZmqService / Spawnable)
+    /// Transport configuration
+    transport: TransportConfig,
+    /// Signing key for message authentication
+    signing_key: SigningKey,
+
+    /// Optional authorization callback (injected by parent crate)
+    authorize_fn: Option<AuthorizeFn>,
 }
 
 impl WorkflowService {
@@ -43,7 +117,13 @@ impl WorkflowService {
     /// # Arguments
     ///
     /// * `context` - ZMQ context for event subscription (must be same as EventService for inproc://)
-    pub fn new(context: Arc<zmq::Context>) -> Self {
+    /// * `transport` - Transport configuration for ZMQ service binding
+    /// * `signing_key` - Signing key for message authentication
+    pub fn new(
+        context: Arc<zmq::Context>,
+        transport: TransportConfig,
+        signing_key: SigningKey,
+    ) -> Self {
         Self {
             workflows: RwLock::new(HashMap::new()),
             runs: RwLock::new(HashMap::new()),
@@ -51,7 +131,15 @@ impl WorkflowService {
             context,
             handlers: RwLock::new(Vec::new()),
             event_loop_handle: tokio::sync::Mutex::new(None),
+            transport,
+            signing_key,
+            authorize_fn: None,
         }
+    }
+
+    /// Set the authorization callback for policy checks.
+    pub fn set_authorize_fn(&mut self, authorize_fn: AuthorizeFn) {
+        self.authorize_fn = Some(authorize_fn);
     }
 
     /// Initialize the service
@@ -170,7 +258,7 @@ impl WorkflowService {
     }
 
     /// Scan a repository for workflows
-    pub async fn scan_repo(&self, repo_id: &str) -> Result<Vec<WorkflowDef>> {
+    pub(crate) async fn scan_repo(&self, repo_id: &str) -> Result<Vec<WorkflowDef>> {
         // TODO: Read .github/workflows/*.yml from repo
         // TODO: Parse each workflow file
         // TODO: Return list of workflow definitions
@@ -179,7 +267,7 @@ impl WorkflowService {
     }
 
     /// Register a workflow
-    pub async fn register_workflow(&self, workflow: WorkflowDef) -> Result<WorkflowId> {
+    pub(crate) async fn register_workflow(&self, workflow: WorkflowDef) -> Result<WorkflowId> {
         let workflow_id = format!("{}:{}", workflow.repo_id, workflow.path);
 
         let mut workflows = self.workflows.write().await;
@@ -189,7 +277,7 @@ impl WorkflowService {
         Ok(workflow_id)
     }
 
-    /// List registered workflows
+    /// List registered workflows (returns wire-format types directly)
     pub async fn list_workflows(&self) -> Result<Vec<WorkflowInfo>> {
         let workflows = self.workflows.read().await;
 
@@ -206,7 +294,7 @@ impl WorkflowService {
     }
 
     /// Dispatch a workflow manually
-    pub async fn dispatch(
+    pub(crate) async fn dispatch(
         &self,
         workflow_id: &WorkflowId,
         inputs: HashMap<String, String>,
@@ -242,7 +330,7 @@ impl WorkflowService {
     }
 
     /// Get a workflow run
-    pub async fn get_run(&self, run_id: &RunId) -> Result<WorkflowRun> {
+    pub(crate) async fn get_run(&self, run_id: &RunId) -> Result<WorkflowRun> {
         let runs = self.runs.read().await;
         runs.get(run_id)
             .cloned()
@@ -250,7 +338,7 @@ impl WorkflowService {
     }
 
     /// List runs for a workflow
-    pub async fn list_runs(&self, workflow_id: &WorkflowId) -> Result<Vec<WorkflowRun>> {
+    pub(crate) async fn list_runs(&self, workflow_id: &WorkflowId) -> Result<Vec<WorkflowRun>> {
         let runs = self.runs.read().await;
         Ok(runs
             .values()
@@ -283,4 +371,195 @@ impl WorkflowService {
     }
 }
 
-// Note: Default implementation removed - WorkflowService requires zmq::Context
+// ═══════════════════════════════════════════════════════════════════════════════
+// WorkflowHandler Implementation — bridges generated types to business logic
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Convert internal RunStatus to generated RunStatusEnum
+fn to_status_enum(status: &RunStatus) -> RunStatusEnum {
+    match status {
+        RunStatus::Queued => RunStatusEnum::Queued,
+    }
+}
+
+/// Convert internal WorkflowRun to generated WorkflowRunWire
+fn to_run_data(run: &WorkflowRun) -> WorkflowRunWire {
+    WorkflowRunWire {
+        id: run.id.clone(),
+        workflow_id: run.workflow_id.clone(),
+        status: to_status_enum(&run.status),
+        started_at: run.started_at.map(|t| t.timestamp()).unwrap_or(0),
+        completed_at: run.completed_at.map(|t| t.timestamp()).unwrap_or(0),
+        jobs: run.jobs.values().map(|j| JobRunWire {
+            name: j.name.clone(),
+            status: to_status_enum(&j.status),
+            steps: j.steps.iter().map(|s| StepRunWire {
+                name: s.name.clone(),
+                status: to_status_enum(&s.status),
+                exit_code: s.exit_code.unwrap_or(0),
+            }).collect(),
+        }).collect(),
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl WorkflowHandler for WorkflowService {
+    async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> AnyhowResult<()> {
+        if let Some(ref auth_fn) = self.authorize_fn {
+            let subject = ctx.subject().to_string();
+            let allowed = auth_fn(subject.clone(), resource.to_string(), operation.to_string()).await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Policy check failed for {} on {}: {} - denying access", subject, resource, e);
+                    false
+                });
+            if allowed {
+                Ok(())
+            } else {
+                anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource)
+            }
+        } else {
+            // No authorization configured — fail-closed
+            anyhow::bail!("Authorization not configured for workflow service")
+        }
+    }
+
+    async fn handle_scan_repo(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+    ) -> AnyhowResult<WorkflowResponseVariant> {
+        let workflows = self.scan_repo(repo_id).await?;
+        Ok(WorkflowResponseVariant::ScanRepoResult(
+            workflows.iter().map(|wf| WorkflowDefWire {
+                path: wf.path.clone(),
+                repo_id: wf.repo_id.clone(),
+                name: wf.workflow.name.clone(),
+                triggers: Vec::new(), // EventTrigger is empty struct for now
+                yaml: String::new(),  // TODO: serialize workflow back to YAML
+            }).collect()
+        ))
+    }
+
+    async fn handle_register(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &WorkflowDefWire,
+    ) -> AnyhowResult<WorkflowResponseVariant> {
+        let workflow_def = WorkflowDef {
+            path: data.path.clone(),
+            repo_id: data.repo_id.clone(),
+            workflow: Workflow {
+                name: data.name.clone(),
+                on: super::parser::WorkflowTrigger::List(Vec::new()),
+                env: HashMap::new(),
+                jobs: HashMap::new(),
+            },
+            triggers: Vec::new(), // TODO: convert EventTrigger to EventTrigger
+        };
+        let workflow_id = self.register_workflow(workflow_def).await?;
+        Ok(WorkflowResponseVariant::RegisterResult(workflow_id))
+    }
+
+    async fn handle_list(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+    ) -> AnyhowResult<WorkflowResponseVariant> {
+        let workflows = self.list_workflows().await?;
+        Ok(WorkflowResponseVariant::ListResult(workflows))
+    }
+
+    async fn handle_dispatch(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        request: &DispatchRequest,
+    ) -> AnyhowResult<WorkflowResponseVariant> {
+        let inputs_map: HashMap<String, String> = request.inputs.iter()
+            .map(|kv| (kv.key.clone(), kv.value.clone()))
+            .collect();
+        let run_id = self.dispatch(&request.workflow_id.clone(), inputs_map).await?;
+        Ok(WorkflowResponseVariant::DispatchResult(run_id))
+    }
+
+    async fn handle_subscribe(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        request: &SubscribeRequest,
+    ) -> AnyhowResult<WorkflowResponseVariant> {
+        // TODO: implement subscription via event handler registration
+        tracing::info!(workflow_id = %request.workflow_id, "Subscribe request (not yet implemented)");
+        Ok(WorkflowResponseVariant::SubscribeResult(
+            format!("sub-{}", request.workflow_id)
+        ))
+    }
+
+    async fn handle_unsubscribe(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        sub_id: &str,
+    ) -> AnyhowResult<WorkflowResponseVariant> {
+        // TODO: implement unsubscription
+        tracing::info!(sub_id = %sub_id, "Unsubscribe request (not yet implemented)");
+        Ok(WorkflowResponseVariant::UnsubscribeResult)
+    }
+
+    async fn handle_get_run(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        run_id: &str,
+    ) -> AnyhowResult<WorkflowResponseVariant> {
+        let run = self.get_run(&run_id.to_owned()).await?;
+        let data = to_run_data(&run);
+        Ok(WorkflowResponseVariant::GetRunResult(data))
+    }
+
+    async fn handle_list_runs(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        workflow_id: &str,
+    ) -> AnyhowResult<WorkflowResponseVariant> {
+        let runs = self.list_runs(&workflow_id.to_owned()).await?;
+        Ok(WorkflowResponseVariant::ListRunsResult(
+            runs.iter().map(to_run_data).collect()
+        ))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ZmqService Implementation — delegates to generated dispatch_workflow
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[async_trait(?Send)]
+impl ZmqService for WorkflowService {
+    async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> AnyhowResult<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
+        tracing::debug!(
+            "Workflow request from {} (request_id={})",
+            ctx.subject(),
+            ctx.request_id
+        );
+        dispatch_workflow(self, ctx, payload).await
+    }
+
+    fn name(&self) -> &str {
+        SERVICE_NAME
+    }
+
+    fn context(&self) -> &Arc<zmq::Context> {
+        &self.context
+    }
+
+    fn transport(&self) -> &TransportConfig {
+        &self.transport
+    }
+
+    fn signing_key(&self) -> SigningKey {
+        self.signing_key.clone()
+    }
+}

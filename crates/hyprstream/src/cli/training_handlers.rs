@@ -12,10 +12,13 @@ use anyhow::{bail, Result};
 use tracing::{info, warn};
 
 use crate::cli::commands::KVQuantArg;
-use crate::config::{HyprstreamTrainingConfig, TrainingMode, TTTTrainingConfig};
+use crate::config::{
+    default_lora_rank, default_target_modules, HyprstreamTrainingConfig, TrainingMode,
+    TTTTrainingConfig,
+};
 use crate::runtime::model_config::ModelConfig;
 use crate::runtime::template_engine::ChatMessage;
-use crate::services::{InferenceZmqClient, PolicyZmqClient, RegistryClient, INFERENCE_ENDPOINT};
+use crate::services::{InferenceZmqClient, PolicyClient, RegistryClient, INFERENCE_ENDPOINT};
 use crate::storage::ModelRef;
 use hyprstream_rpc::{RequestIdentity, SigningKey, VerifyingKey};
 use std::path::PathBuf;
@@ -63,7 +66,8 @@ pub async fn handle_training_init(
             .map_err(|e| anyhow::anyhow!("Failed to create worktree: {}", e))?;
         println!("✓ Created worktree at {}", worktree_path.display());
 
-        // Initialize adapter in worktree
+        // Initialize adapter in worktree (use FsOps from repo_client)
+        let fs = repo_client.worktree(&new_branch);
         init_adapter_at_path(
             &worktree_path,
             adapter_name.as_deref(),
@@ -73,6 +77,7 @@ pub async fn handle_training_init(
             learning_rate,
             mode,
             &format!("{}:{}", model_ref.model, new_branch),
+            Some(&fs),
         )
         .await?;
 
@@ -120,6 +125,7 @@ pub async fn handle_training_init(
             )
         })?;
 
+    let fs = repo_client.worktree(&branch_name);
     init_adapter_at_path(
         &model_path,
         adapter_name.as_deref(),
@@ -129,6 +135,7 @@ pub async fn handle_training_init(
         learning_rate,
         mode,
         &model_ref.to_string(),
+        Some(&fs),
     )
     .await?;
 
@@ -143,6 +150,8 @@ pub async fn handle_training_init(
 }
 
 /// Initialize adapter at a specific path
+///
+/// When `fs` is provided, uses worktree-scoped FsOps for config writes.
 async fn init_adapter_at_path(
     model_path: &std::path::Path,
     adapter_name: Option<&str>,
@@ -152,15 +161,21 @@ async fn init_adapter_at_path(
     learning_rate: f32,
     mode: &str,
     model_ref_str: &str,
+    fs: Option<&std::sync::Arc<dyn crate::services::FsOps>>,
 ) -> Result<()> {
     use crate::runtime::{RuntimeEngine, TorchEngine};
     use crate::storage::AdapterManager;
 
-    let adapter_manager = AdapterManager::new(model_path);
-    adapter_manager.ensure_adapters_dir()?;
+    let adapter_manager = if let Some(fs_ref) = fs {
+        AdapterManager::with_fs(std::sync::Arc::clone(fs_ref))
+    } else {
+        AdapterManager::new(model_path)
+    };
+
+    adapter_manager.ensure_adapters_dir_async().await?;
 
     let adapter_base_name = adapter_name.unwrap_or("default");
-    let indexed_adapter_name = adapter_manager.create_indexed_name(adapter_base_name, index)?;
+    let indexed_adapter_name = adapter_manager.create_indexed_name_async(adapter_base_name, index).await?;
 
     println!("\n→ Initializing adapter: {indexed_adapter_name}");
 
@@ -183,10 +198,10 @@ async fn init_adapter_at_path(
     RuntimeEngine::load_model(&mut engine, model_path).await?;
 
     // Create LoRA configuration
-    let lora_config = crate::lora::LoRAConfig {
+    let lora_config = crate::training::TenantDeltaConfig {
         rank: rank as usize,
         alpha: alpha as f32,
-        dropout: 0.1,
+        dropout: 0.0,
         target_modules: vec![
             "q_proj".to_owned(),
             "k_proj".to_owned(),
@@ -196,26 +211,28 @@ async fn init_adapter_at_path(
             "up_proj".to_owned(),
             "down_proj".to_owned(),
         ],
-        learning_rate,
+        learning_rate: learning_rate as f64,
+        ..crate::training::TenantDeltaConfig::default()
     };
 
-    engine.create_lora(lora_config)?;
+    engine.create_lora(lora_config.clone())?;
 
-    // Save adapter weights
+    // Create initial adapter weights via TenantDelta and save as safetensors
     let adapter_path = adapter_manager
         .adapters_dir
         .join(format!("{indexed_adapter_name}.safetensors"));
-    let adapter_path_str = adapter_path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("adapter path is not valid UTF-8"))?;
-    engine.save_lora_weights(adapter_path_str)?;
+    let device = engine.device();
+    let module_dims = engine.get_lora_module_dims()?;
+    let delta_config = lora_config.clone();
+    let num_layers = engine.get_num_layers().unwrap_or(32);
+    let delta = crate::training::TenantDelta::new(&delta_config, &module_dims, device, num_layers)?;
+    let bytes = delta.serialize_to_safetensors_bytes()?;
+    std::fs::write(&adapter_path, &bytes)?;
 
-    // Save adapter config
-    let config_path = adapter_manager
-        .adapters_dir
-        .join(format!("{indexed_adapter_name}.config.json"));
-    let config_json = serde_json::to_string_pretty(&adapter_config)?;
-    std::fs::write(&config_path, config_json)?;
+    // Save adapter config via FsOps or direct
+    adapter_manager
+        .write_config_async(&indexed_adapter_name, &adapter_config)
+        .await?;
 
     println!(
         "✓ Created adapter: adapters/{indexed_adapter_name}.safetensors"
@@ -252,6 +269,9 @@ fn save_training_config(
         steps_per_cycle: 10,
         min_quality_threshold: 0.3,
         train_base_model: false,
+        lora_rank: default_lora_rank(),
+        lora_alpha: None,
+        target_modules: default_target_modules(),
         ttt: TTTTrainingConfig {
             learning_rate: learning_rate as f64,
             gradient_steps: 3,
@@ -325,7 +345,7 @@ pub async fn handle_training_infer(
     info!("Using model at: {} (TTT enabled)", model_path.display());
 
     // Create policy client
-    let policy_client = PolicyZmqClient::new(signing_key.clone(), RequestIdentity::local());
+    let policy_client = PolicyClient::new(signing_key.clone(), RequestIdentity::local());
 
     // Configure runtime
     let mut runtime_config = RuntimeConfig::default();
@@ -340,6 +360,7 @@ pub async fn handle_training_infer(
         signing_key.clone(),
         policy_client,
         INFERENCE_ENDPOINT,
+        None, // CLI: no FsOps
     )
     .await?;
 
@@ -540,7 +561,7 @@ pub async fn handle_training_batch(
     runtime_config.max_context = max_context;
     runtime_config.kv_quant_type = kv_quant.into();
 
-    let policy_client = PolicyZmqClient::new(signing_key.clone(), RequestIdentity::local());
+    let policy_client = PolicyClient::new(signing_key.clone(), RequestIdentity::local());
     // Start InferenceService with TTT enabled
     let mut service_handle = InferenceService::start_at(
         &model_path,
@@ -549,6 +570,7 @@ pub async fn handle_training_batch(
         signing_key.clone(),
         policy_client,
         INFERENCE_ENDPOINT,
+        None, // CLI: no FsOps
     )
     .await?;
 
@@ -667,19 +689,22 @@ pub async fn handle_training_checkpoint(
         git2db::GitRef::Branch(name) => Some(name.as_str()),
         _ => None,
     };
-    let model_path = registry.model_path(&model_ref.model, branch).await
+    let _model_path = registry.model_path(&model_ref.model, branch).await
         .map_err(|e| anyhow::anyhow!("Model '{}' not found: {}", model_ref, e))?;
 
-    let adapter_manager = AdapterManager::new(&model_path);
-    let adapters = adapter_manager.list_adapters()?;
-
-    if adapters.is_empty() {
-        bail!("No adapters found in {}", model_path.display());
-    }
-
-    // Check for dirty files using service layer
+    // Get repo_client first so we can use FsOps for adapter listing
     let repo_client = registry.repo(&model_ref.model).await
         .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
+
+    let branch_for_fs = branch.unwrap_or("main");
+    let fs = repo_client.worktree(branch_for_fs);
+
+    let adapter_manager = AdapterManager::with_fs(std::sync::Arc::clone(&fs));
+    let adapters = adapter_manager.list_adapters_async().await?;
+
+    if adapters.is_empty() {
+        bail!("No adapters found for model {}", model_ref);
+    }
 
     let status = repo_client.status().await
         .map_err(|e| anyhow::anyhow!("Failed to get repository status: {}", e))?;
@@ -706,21 +731,15 @@ pub async fn handle_training_checkpoint(
     // Stage adapter files using service layer
     let mut files_to_stage: Vec<String> = Vec::new();
     for adapter in &adapters {
-        let relative_path = adapter
-            .path
-            .strip_prefix(&model_path)
-            .unwrap_or(&adapter.path);
-        files_to_stage.push(relative_path.to_str()
-            .ok_or_else(|| anyhow::anyhow!("Invalid path: {:?}", relative_path))?.to_owned());
+        // adapter.path is relative for FsOps-backed managers (e.g., "adapters/00_base.safetensors")
+        let rel_path = adapter.path.to_string_lossy().to_string();
+        files_to_stage.push(rel_path);
 
-        // Also stage config if exists
-        let config_path = adapter.path.with_extension("config.json");
-        if config_path.exists() {
-            let relative_config = config_path
-                .strip_prefix(&model_path)
-                .unwrap_or(&config_path);
-            files_to_stage.push(relative_config.to_str()
-                .ok_or_else(|| anyhow::anyhow!("Invalid path: {:?}", relative_config))?.to_owned());
+        // Also stage config if exists (check via FsOps)
+        let base_name = adapter.filename.trim_end_matches(".safetensors");
+        let rel_config = format!("adapters/{base_name}.config.json");
+        if fs.exists(&rel_config).await.unwrap_or(false) {
+            files_to_stage.push(rel_config);
         }
     }
 
@@ -744,22 +763,17 @@ pub async fn handle_training_checkpoint(
 
     println!("\n✓ Created commit: {}", &commit_id[..8.min(commit_id.len())]);
 
-    // Push if requested (requires direct repo access)
+    // Push if requested
     if push {
         println!("Pushing to {remote}...");
 
-        // For push, we still need direct repo access (no service layer API yet)
-        let repo = git2db::GitManager::global()
-            .get_repository(&model_path)?
-            .open()?;
-
-        let mut remote_obj = repo.find_remote(remote)?;
         let refspec = format!(
             "refs/heads/{}:refs/heads/{}",
             model_ref.git_ref,
             model_ref.git_ref
         );
-        remote_obj.push(&[&refspec], None)?;
+        repo_client.push(remote, &refspec, false).await
+            .map_err(|e| anyhow::anyhow!("Failed to push: {}", e))?;
         println!("✓ Pushed to {remote}");
     }
 

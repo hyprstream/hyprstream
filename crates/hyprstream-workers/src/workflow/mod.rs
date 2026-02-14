@@ -26,11 +26,21 @@ mod subscription;
 mod runner;
 
 pub use service::WorkflowService;
-pub use client::{WorkflowClient, WorkflowZmq};
+pub use client::WorkflowClient;
 pub use parser::{Workflow, Job, Step};
 pub use triggers::{EventTrigger, EventHandler, HandlerResult};
 pub use subscription::WorkflowSubscription;
 pub use runner::WorkflowRunner;
+
+// Re-export generated wire-format types for external consumers
+pub use client::{
+    GenWorkflowClient,
+    WorkflowDef, WorkflowInfo, WorkflowRun,
+    JobRun, StepRun, RunStatusEnum,
+    KeyValue as WorkflowKeyValue,
+    EventTrigger as EventTriggerWire,
+    WorkflowResponseVariant,
+};
 
 /// Workflow ID
 pub type WorkflowId = String;

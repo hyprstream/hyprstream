@@ -96,7 +96,7 @@ struct StreamState {
 
 impl StreamState {
     /// Find position in buffer matching the given MAC
-    /// Supports both 32-byte legacy HMAC and 16-byte StreamBlock MAC
+    /// Matches MAC by length (16-byte truncated StreamBlock MAC)
     fn find_mac_position(&self, mac: &[u8]) -> Option<usize> {
         self.messages.iter().position(|msg| {
             if msg.mac.len() == mac.len() {

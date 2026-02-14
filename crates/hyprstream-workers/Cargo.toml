@@ -90,6 +90,9 @@ systemd = ["dbus", "hyprstream-rpc/systemd"]
 
 [build-dependencies]
 capnpc = { workspace = true }
+capnp = { workspace = true }
+serde_json = { workspace = true }
+hyprstream-rpc-build = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

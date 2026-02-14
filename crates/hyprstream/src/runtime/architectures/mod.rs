@@ -201,19 +201,6 @@ pub trait ModelOperations: Send {
     /// Forward pass through the model
     fn forward(&self, input: &Tensor, past_kv: Option<&Tensor>) -> Result<Tensor>;
 
-    /// Forward pass with LoRA integration support (for gradient bridge)
-    /// Returns (logits, layer_activations) where layer_activations is for LoRA adapters
-    fn forward_with_lora_hooks(
-        &self,
-        input: &Tensor,
-        _lora_model: Option<&crate::lora::torch_adapter::LoRAModel>,
-        _training: bool,
-    ) -> Result<(Tensor, Vec<(String, Tensor)>)> {
-        // Default implementation without LoRA hooks
-        let logits = self.forward(input, None)?;
-        Ok((logits, Vec::new()))
-    }
-
     /// Get VarStore for training (if available)
     fn var_store(&self) -> Option<&nn::VarStore> {
         None // Default implementation returns None
@@ -229,6 +216,23 @@ pub trait ModelOperations: Send {
         // Default implementation just calls regular forward
         // Models that support KV caching should override this
         self.forward(input, None)
+    }
+
+    /// Forward pass with KV caching and optional per-tenant delta injection
+    ///
+    /// When `delta` is `Some`, LoRA corrections are injected at each attention layer's
+    /// Q/V projections before KV cache update. This is the unified path for both
+    /// base model inference (delta=None) and delta-aware inference (delta=Some).
+    ///
+    /// Default implementation ignores delta and falls back to `forward_with_cache()`.
+    /// Only architectures that support delta injection (Llama) need to override this.
+    fn forward_with_cache_and_delta(
+        &self,
+        input: &Tensor,
+        start_pos: usize,
+        _delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        self.forward_with_cache(input, start_pos)
     }
 
     /// Get token embeddings for input IDs
@@ -291,6 +295,26 @@ pub trait ModelOperations: Send {
         Err(anyhow!("decode_layer not implemented for this architecture"))
     }
 
+    /// Decode a single layer with per-tenant delta injection (for TTT training path)
+    ///
+    /// The delta's A/B matrices are injected after q_proj/v_proj projections inside
+    /// the attention layer, creating a differentiable path from loss back to delta
+    /// parameters. No KV cache is used (training path).
+    ///
+    /// Default implementation ignores the delta and falls back to `decode_layer()`.
+    /// Only architectures that support delta injection need to override this.
+    fn decode_layer_with_delta(
+        &self,
+        layer_idx: usize,
+        hidden_states: &Tensor,
+        attention_mask: Option<&Tensor>,
+        position_ids: Option<&Tensor>,
+        past_kv: Option<&crate::runtime::kv_cache::LayerKVCache>,
+        _delta: &crate::training::TenantDelta,
+    ) -> Result<(Tensor, Option<(Tensor, Tensor)>)> {
+        self.decode_layer(layer_idx, hidden_states, attention_mask, position_ids, past_kv)
+    }
+
     /// Apply final layer normalization
     fn apply_final_norm(&self, _hidden_states: &Tensor) -> Result<Tensor> {
         Err(anyhow!("apply_final_norm not implemented for this architecture"))
@@ -318,9 +342,6 @@ pub trait ModelOperations: Send {
 
     /// Get attention mask for the architecture
     fn get_attention_mask(&self, seq_len: usize, past_kv_len: usize) -> Result<Tensor>;
-
-    /// Apply LoRA adapter with architecture-specific handling (for cache/storage only)
-    fn apply_lora(&mut self, adapter: &crate::lora::torch_adapter::LoRAModel) -> Result<()>;
 
     /// Downcast to Any for accessing architecture-specific methods
     fn as_any(&self) -> &dyn std::any::Any;
