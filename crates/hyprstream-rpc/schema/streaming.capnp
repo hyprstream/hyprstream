@@ -1,5 +1,7 @@
 @0xe7f8a9b0c1d2e3f4;
 
+using import "annotations.capnp".fixedSize;
+
 # Streaming Cap'n Proto types for hyprstream RPC
 #
 # This schema defines all streaming primitives for PUB/SUB communication.
@@ -27,7 +29,7 @@
 struct StreamInfo {
   streamId @0 :Text;      # Unique stream identifier (e.g., "stream-{uuid}")
   endpoint @1 :Text;      # XPUB endpoint to subscribe to
-  serverPubkey @2 :Data;  # Server's ephemeral Ristretto255 public key (32 bytes) for DH
+  serverPubkey @2 :Data $fixedSize(32);  # Server's ephemeral Ristretto255 public key for DH
 }
 
 # Stream registration - wrapped in SignedEnvelope for authorization
@@ -38,21 +40,6 @@ struct StreamInfo {
 struct StreamRegister {
   topic @0 :Text;    # DH-derived topic (e.g., hex(HKDF(shared)[..32]))
   exp @1 :Int64;     # Expiration timestamp (Unix millis)
-}
-
-# Request to start/authorize a stream subscription
-#
-# Client calls this after receiving StreamInfo to authorize subscription.
-# Future: may include client ephemeral pubkey for late DH exchange.
-struct StartStreamRequest {
-  streamId @0 :Text;        # Stream ID from StreamInfo
-  clientPubkey @1 :Data;    # Client's ephemeral Ristretto255 public key (32 bytes)
-}
-
-# Response confirming stream authorization
-struct StreamAuthResponse {
-  streamId @0 :Text;        # Confirmed stream ID
-  serverPubkey @1 :Data;    # Server's ephemeral Ristretto255 public key (if not in StreamInfo)
 }
 
 # =============================================================================

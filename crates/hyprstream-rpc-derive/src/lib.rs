@@ -82,6 +82,15 @@ pub fn derive_to_capnp(input: TokenStream) -> TokenStream {
                     fields.named.iter().filter_map(|f| {
                         let field_name = f.ident.as_ref()?;
 
+                        // Check for enum_type (must come before skip check)
+                        if let Some(capnp_enum_path) = get_enum_type(&f.attrs) {
+                            let capnp_name = get_rename(&f.attrs)
+                                .unwrap_or_else(|| to_accessor_name(&field_name.to_string()));
+                            let setter = format_ident!("set_{}", capnp_name);
+                            let ty = &f.ty;
+                            return Some(generate_enum_setter(field_name, &setter, ty, &capnp_enum_path));
+                        }
+
                         // Check for skip
                         if has_skip_attr(&f.attrs) {
                             return None;
@@ -179,6 +188,14 @@ pub fn derive_from_capnp(input: TokenStream) -> TokenStream {
                 Fields::Named(fields) => {
                     fields.named.iter().filter_map(|f| {
                         let field_name = f.ident.as_ref()?;
+
+                        // Check for enum_type (must come before skip check)
+                        if let Some(_capnp_enum_path) = get_enum_type(&f.attrs) {
+                            let capnp_name = get_rename(&f.attrs)
+                                .unwrap_or_else(|| to_accessor_name(&field_name.to_string()));
+                            let getter = format_ident!("get_{}", capnp_name);
+                            return Some(generate_enum_getter(field_name, &getter));
+                        }
 
                         // Check for skip - use Default
                         if has_skip_attr(&f.attrs) {
@@ -297,6 +314,32 @@ fn get_rename(attrs: &[Attribute]) -> Option<String> {
     None
 }
 
+/// Get enum_type path from #[capnp(enum_type = "path::to::CapnpEnum")] attribute.
+///
+/// When present on a field, the derive macros generate enum conversion code
+/// using `Into` trait instead of skipping the field. Requires the user to
+/// implement `From<RustEnum> for CapnpEnum` and `From<CapnpEnum> for RustEnum`.
+fn get_enum_type(attrs: &[Attribute]) -> Option<syn::Path> {
+    for attr in attrs {
+        if attr.path().is_ident("capnp") {
+            if let Meta::List(list) = &attr.meta {
+                if let Ok(Expr::Assign(assign)) = syn::parse2::<Expr>(list.tokens.clone()) {
+                    if let Expr::Path(path) = &*assign.left {
+                        if path.path.is_ident("enum_type") {
+                            if let Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) = &*assign.right {
+                                if let Ok(p) = syn::parse_str::<syn::Path>(&s.value()) {
+                                    return Some(p);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Cap'n Proto Rust uses snake_case for accessors.
 /// This function simply returns the name as-is.
 fn to_accessor_name(s: &str) -> String {
@@ -313,83 +356,9 @@ fn is_option_type(ty: &syn::Type) -> bool {
     false
 }
 
-/// Generate setter code for a field
-fn generate_setter(
-    field_name: &syn::Ident,
-    setter: &syn::Ident,
-    ty: &syn::Type,
-) -> proc_macro2::TokenStream {
-    // Check if type is String
-    if is_string_type(ty) {
-        quote! {
-            builder.#setter(&self.#field_name);
-        }
-    } else if is_option_type(ty) {
-        // For Option<String>, only set if Some
-        quote! {
-            if let Some(ref v) = self.#field_name {
-                builder.#setter(v);
-            }
-        }
-    } else if is_vec_type(ty) {
-        // For Vec<T>, need to initialize a list
-        quote! {
-            {
-                let mut list = builder.reborrow().#setter(self.#field_name.len() as u32);
-                for (i, item) in self.#field_name.iter().enumerate() {
-                    list.set(i as u32, item);
-                }
-            }
-        }
-    } else {
-        // Primitive types - direct set
-        quote! {
-            builder.#setter(self.#field_name);
-        }
-    }
-}
-
-/// Generate getter code for a field
-fn generate_getter(
-    field_name: &syn::Ident,
-    getter: &syn::Ident,
-    ty: &syn::Type,
-    is_optional: bool,
-) -> proc_macro2::TokenStream {
-    if is_string_type(ty) {
-        quote! {
-            #field_name: reader.#getter()?.to_str()?.to_string(),
-        }
-    } else if is_pathbuf_type(ty) {
-        quote! {
-            #field_name: std::path::PathBuf::from(reader.#getter()?.to_str()?),
-        }
-    } else if is_option_type(ty) || is_optional {
-        // For Option<String>
-        quote! {
-            #field_name: {
-                let s = reader.#getter()?.to_str()?;
-                if s.is_empty() { None } else { Some(s.to_string()) }
-            },
-        }
-    } else if is_vec_string_type(ty) {
-        quote! {
-            #field_name: {
-                let list = reader.#getter()?;
-                let mut v = Vec::with_capacity(list.len() as usize);
-                for i in 0..list.len() {
-                    v.push(list.get(i)?.to_str()?.to_string());
-                }
-                v
-            },
-        }
-    } else {
-        // Primitive types - direct get
-        quote! {
-            #field_name: reader.#getter(),
-        }
-    }
-}
+// ═══════════════════════════════════════════════════════════════════════════════
+// Type detection helpers
+// ═══════════════════════════════════════════════════════════════════════════════
 
 /// Check if type is String
 fn is_string_type(ty: &syn::Type) -> bool {
@@ -406,6 +375,16 @@ fn is_pathbuf_type(ty: &syn::Type) -> bool {
     if let syn::Type::Path(type_path) = ty {
         if let Some(segment) = type_path.path.segments.last() {
             return segment.ident == "PathBuf";
+        }
+    }
+    false
+}
+
+/// Check if type is DateTime (from chrono::DateTime<Utc>)
+fn is_datetime_type(ty: &syn::Type) -> bool {
+    if let syn::Type::Path(type_path) = ty {
+        if let Some(segment) = type_path.path.segments.last() {
+            return segment.ident == "DateTime";
         }
     }
     false
@@ -435,6 +414,413 @@ fn is_vec_string_type(ty: &syn::Type) -> bool {
         }
     }
     false
+}
+
+/// Check if type is Vec<u8> (maps to Cap'n Proto Data)
+fn is_vec_u8_type(ty: &syn::Type) -> bool {
+    if let syn::Type::Path(type_path) = ty {
+        if let Some(segment) = type_path.path.segments.last() {
+            if segment.ident == "Vec" {
+                if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                    if let Some(syn::GenericArgument::Type(syn::Type::Path(inner_path))) = args.args.first() {
+                        if let Some(inner_seg) = inner_path.path.segments.last() {
+                            return inner_seg.ident == "u8";
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Extract the inner type from Vec<T> or Option<T>
+fn extract_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
+    if let syn::Type::Path(type_path) = ty {
+        if let Some(segment) = type_path.path.segments.last() {
+            if segment.ident == "Vec" || segment.ident == "Option" {
+                if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                    if let Some(syn::GenericArgument::Type(inner)) = args.args.first() {
+                        return Some(inner);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Check if type is a known primitive (not a struct requiring FromCapnp/ToCapnp)
+fn is_known_primitive(ty: &syn::Type) -> bool {
+    if let syn::Type::Path(type_path) = ty {
+        if let Some(segment) = type_path.path.segments.last() {
+            let name = segment.ident.to_string();
+            return matches!(
+                name.as_str(),
+                "String" | "bool" | "u8" | "u16" | "u32" | "u64"
+                    | "i8" | "i16" | "i32" | "i64" | "f32" | "f64" | "PathBuf"
+            );
+        }
+    }
+    false
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Code generation: setters (ToCapnp) and getters (FromCapnp)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Generate setter code for a field (ToCapnp)
+///
+/// Dispatch order:
+/// 1. String              → set_field(&str)
+/// 2. PathBuf             → set_field(path.to_str())
+/// 3. DateTime<Utc>       → init Timestamp, set seconds + nanos
+/// 4. Vec<String>         → init list, set text items
+/// 5. Option<String>      → if let Some, set_field
+///    Option<DateTime>    → if let Some, init Timestamp
+/// 6. Option<T> (struct)  → if let Some, init + write_to
+/// 7. Vec<T> (struct)     → init list, loop write_to
+/// 8. Vec<T> (primitive)  → init list, loop set
+/// 9. Known primitive     → direct set_field(value)
+/// 10. Fallback (struct)  → init + write_to
+fn generate_setter(
+    field_name: &syn::Ident,
+    setter: &syn::Ident,
+    ty: &syn::Type,
+) -> proc_macro2::TokenStream {
+    // Derive init_field ident from set_field ident
+    let setter_str = setter.to_string();
+    let field_suffix = &setter_str["set_".len()..];
+    let initter = format_ident!("init_{}", field_suffix);
+
+    // 1. String
+    if is_string_type(ty) {
+        return quote! {
+            builder.#setter(&self.#field_name);
+        };
+    }
+
+    // 2. PathBuf
+    if is_pathbuf_type(ty) {
+        return quote! {
+            if let Some(s) = self.#field_name.to_str() {
+                builder.#setter(s);
+            }
+        };
+    }
+
+    // 3. DateTime<Utc> → Timestamp struct (seconds + nanos)
+    if is_datetime_type(ty) {
+        return quote! {
+            {
+                let mut ts = builder.reborrow().#initter();
+                ts.set_seconds(self.#field_name.timestamp());
+                ts.set_nanos(self.#field_name.timestamp_subsec_nanos() as i32);
+            }
+        };
+    }
+
+    // 4. Vec<String>
+    if is_vec_string_type(ty) {
+        return quote! {
+            {
+                let mut list = builder.reborrow().#initter(self.#field_name.len() as u32);
+                for (i, item) in self.#field_name.iter().enumerate() {
+                    list.set(i as u32, item);
+                }
+            }
+        };
+    }
+
+    // 4b. Vec<u8> → Data (capnp set_field takes &[u8])
+    if is_vec_u8_type(ty) {
+        return quote! {
+            builder.#setter(&self.#field_name);
+        };
+    }
+
+    // 5. Option<T>
+    if is_option_type(ty) {
+        if let Some(inner) = extract_inner_type(ty) {
+            if is_string_type(inner) {
+                // Option<String>
+                return quote! {
+                    if let Some(ref v) = self.#field_name {
+                        builder.#setter(v);
+                    }
+                };
+            } else if is_datetime_type(inner) {
+                // Option<DateTime<Utc>> → Timestamp pointer (null = not set)
+                return quote! {
+                    if let Some(ref dt) = self.#field_name {
+                        let mut ts = builder.reborrow().#initter();
+                        ts.set_seconds(dt.timestamp());
+                        ts.set_nanos(dt.timestamp_subsec_nanos() as i32);
+                    }
+                };
+            } else if is_known_primitive(inner) {
+                // Option<primitive> — set if Some
+                return quote! {
+                    if let Some(v) = self.#field_name {
+                        builder.#setter(v);
+                    }
+                };
+            } else {
+                // Option<struct> — init + write_to
+                return quote! {
+                    if let Some(ref v) = self.#field_name {
+                        hyprstream_rpc::capnp::ToCapnp::write_to(v, &mut builder.reborrow().#initter());
+                    }
+                };
+            }
+        }
+        // Fallback for Option without extractable inner type
+        return quote! {
+            if let Some(ref v) = self.#field_name {
+                builder.#setter(v);
+            }
+        };
+    }
+
+    // 7 & 8. Vec<T>
+    if is_vec_type(ty) {
+        if let Some(inner) = extract_inner_type(ty) {
+            if is_known_primitive(inner) {
+                // 8. Vec<primitive> — init list, set items
+                return quote! {
+                    {
+                        let mut list = builder.reborrow().#initter(self.#field_name.len() as u32);
+                        for (i, item) in self.#field_name.iter().enumerate() {
+                            list.set(i as u32, *item);
+                        }
+                    }
+                };
+            } else {
+                // 7. Vec<struct> — init list, write_to items
+                return quote! {
+                    {
+                        let mut list = builder.reborrow().#initter(self.#field_name.len() as u32);
+                        for (i, item) in self.#field_name.iter().enumerate() {
+                            hyprstream_rpc::capnp::ToCapnp::write_to(item, &mut list.reborrow().get(i as u32));
+                        }
+                    }
+                };
+            }
+        }
+    }
+
+    // 9. Known primitive — direct set
+    if is_known_primitive(ty) {
+        return quote! {
+            builder.#setter(self.#field_name);
+        };
+    }
+
+    // 10. Fallback: nested struct — init + write_to
+    quote! {
+        hyprstream_rpc::capnp::ToCapnp::write_to(&self.#field_name, &mut builder.reborrow().#initter());
+    }
+}
+
+/// Generate setter code for a field with `#[capnp(enum_type)]` (ToCapnp).
+///
+/// Converts the Rust enum to the capnp enum via `Into`, then calls the setter.
+/// For `Option<Enum>`, only sets if `Some`.
+fn generate_enum_setter(
+    field_name: &syn::Ident,
+    setter: &syn::Ident,
+    ty: &syn::Type,
+    _capnp_enum_path: &syn::Path,
+) -> proc_macro2::TokenStream {
+    if is_option_type(ty) {
+        quote! {
+            if let Some(ref v) = self.#field_name {
+                builder.#setter((*v).into());
+            }
+        }
+    } else {
+        quote! {
+            builder.#setter(self.#field_name.into());
+        }
+    }
+}
+
+/// Generate getter code for a field with `#[capnp(enum_type)]` (FromCapnp).
+///
+/// Reads the capnp enum and converts to the Rust enum via `Into`.
+/// Falls back to `Default::default()` if the enum value is not recognized.
+fn generate_enum_getter(
+    field_name: &syn::Ident,
+    getter: &syn::Ident,
+) -> proc_macro2::TokenStream {
+    quote! {
+        #field_name: reader.#getter().ok().map(Into::into).unwrap_or_default(),
+    }
+}
+
+/// Generate getter code for a field (FromCapnp)
+///
+/// Dispatch order:
+/// 1. String              → reader.get_field()?.to_str()?.to_string()
+/// 2. PathBuf             → PathBuf::from(reader.get_field()?.to_str()?)
+/// 3. DateTime<Utc>       → read Timestamp struct → from_timestamp
+/// 4. Vec<String>         → iterate text list
+/// 5. Option<String>      → empty string → None
+///    Option<DateTime>    → has_field() check + Timestamp read
+/// 6. Option<T> (struct)  → has_field() check + read_from
+/// 7. Vec<T> (struct)     → iterate struct list with read_from
+/// 8. Vec<T> (primitive)  → iterate primitive list
+/// 9. Known primitive     → direct reader.get_field()
+/// 10. Fallback (struct)  → read_from
+fn generate_getter(
+    field_name: &syn::Ident,
+    getter: &syn::Ident,
+    ty: &syn::Type,
+    is_optional: bool,
+) -> proc_macro2::TokenStream {
+    // Derive has_field ident from get_field ident
+    let getter_str = getter.to_string();
+    let field_suffix = &getter_str["get_".len()..];
+    let has_ident = format_ident!("has_{}", field_suffix);
+
+    // 1. String
+    if is_string_type(ty) {
+        return quote! {
+            #field_name: reader.#getter()?.to_str()?.to_string(),
+        };
+    }
+
+    // 2. PathBuf
+    if is_pathbuf_type(ty) {
+        return quote! {
+            #field_name: std::path::PathBuf::from(reader.#getter()?.to_str()?),
+        };
+    }
+
+    // 3. DateTime<Utc> → read Timestamp struct (seconds + nanos)
+    if is_datetime_type(ty) {
+        return quote! {
+            #field_name: {
+                let ts = reader.#getter()?;
+                chrono::DateTime::from_timestamp(ts.get_seconds(), ts.get_nanos() as u32)
+                    .unwrap_or_default()
+            },
+        };
+    }
+
+    // 4. Vec<String>
+    if is_vec_string_type(ty) {
+        return quote! {
+            #field_name: {
+                let list = reader.#getter()?;
+                let mut v = Vec::with_capacity(list.len() as usize);
+                for i in 0..list.len() {
+                    v.push(list.get(i)?.to_str()?.to_string());
+                }
+                v
+            },
+        };
+    }
+
+    // 4b. Vec<u8> → Data (capnp get_field returns Result<&[u8]>)
+    if is_vec_u8_type(ty) {
+        return quote! {
+            #field_name: reader.#getter()?.to_vec(),
+        };
+    }
+
+    // 5 & 6. Option<T>
+    if is_option_type(ty) || is_optional {
+        if let Some(inner) = extract_inner_type(ty) {
+            if is_string_type(inner) {
+                // Option<String> — empty string → None
+                return quote! {
+                    #field_name: {
+                        let s = reader.#getter()?.to_str()?;
+                        if s.is_empty() { None } else { Some(s.to_string()) }
+                    },
+                };
+            } else if is_datetime_type(inner) {
+                // Option<DateTime<Utc>> — has_field() check + Timestamp read
+                return quote! {
+                    #field_name: if reader.#has_ident() {
+                        let ts = reader.#getter()?;
+                        Some(chrono::DateTime::from_timestamp(ts.get_seconds(), ts.get_nanos() as u32)
+                            .unwrap_or_default())
+                    } else {
+                        None
+                    },
+                };
+            } else if is_known_primitive(inner) {
+                // Option<primitive> — treat 0/false/default as None
+                return quote! {
+                    #field_name: {
+                        let s = reader.#getter()?.to_str()?;
+                        if s.is_empty() { None } else { Some(s.to_string()) }
+                    },
+                };
+            } else {
+                // Option<struct> — has_field() check + read_from
+                return quote! {
+                    #field_name: if reader.#has_ident() {
+                        Some(hyprstream_rpc::capnp::FromCapnp::read_from(reader.#getter()?)?)
+                    } else {
+                        None
+                    },
+                };
+            }
+        }
+        // Fallback for #[capnp(optional)] on non-Option type
+        return quote! {
+            #field_name: {
+                let s = reader.#getter()?.to_str()?;
+                if s.is_empty() { None } else { Some(s.to_string()) }
+            },
+        };
+    }
+
+    // 7 & 8. Vec<T>
+    if is_vec_type(ty) {
+        if let Some(inner) = extract_inner_type(ty) {
+            if is_known_primitive(inner) {
+                // 8. Vec<primitive> — iterate primitive list
+                return quote! {
+                    #field_name: {
+                        let list = reader.#getter()?;
+                        let mut v = Vec::with_capacity(list.len() as usize);
+                        for i in 0..list.len() {
+                            v.push(list.get(i));
+                        }
+                        v
+                    },
+                };
+            } else {
+                // 7. Vec<struct> — iterate struct list with read_from
+                return quote! {
+                    #field_name: {
+                        let list = reader.#getter()?;
+                        let mut v = Vec::with_capacity(list.len() as usize);
+                        for i in 0..list.len() {
+                            v.push(hyprstream_rpc::capnp::FromCapnp::read_from(list.get(i))?);
+                        }
+                        v
+                    },
+                };
+            }
+        }
+    }
+
+    // 9. Known primitive — direct get (no ? needed, returns value directly)
+    if is_known_primitive(ty) {
+        return quote! {
+            #field_name: reader.#getter(),
+        };
+    }
+
+    // 10. Fallback: nested struct — read_from
+    quote! {
+        #field_name: hyprstream_rpc::capnp::FromCapnp::read_from(reader.#getter()?)?,
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -813,13 +1199,53 @@ impl syn::parse::Parse for ServiceFactoryArgs {
 ///     hyprstream_rpc_derive::generate_rpc_service!("policy");
 /// }
 /// ```
+/// Arguments for `generate_rpc_service!` macro.
+///
+/// Supports:
+/// - `generate_rpc_service!("name")` — standard (server-side, handler included)
+/// - `generate_rpc_service!("name", types_crate = some_crate)` — client-only, domain types from external crate
+/// - `generate_rpc_service!("name", scope_handlers)` — generate typed scope sub-traits for inner dispatch
+struct RpcServiceArgs {
+    name: syn::LitStr,
+    types_crate: Option<syn::Path>,
+    scope_handlers: bool,
+}
+
+impl syn::parse::Parse for RpcServiceArgs {
+    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
+        let name: syn::LitStr = input.parse()?;
+        let mut types_crate = None;
+        let mut scope_handlers = false;
+
+        while input.peek(syn::Token![,]) {
+            input.parse::<syn::Token![,]>()?;
+            if input.is_empty() {
+                break;
+            }
+            let ident: syn::Ident = input.parse()?;
+            if ident == "types_crate" {
+                input.parse::<syn::Token![=]>()?;
+                types_crate = Some(input.parse::<syn::Path>()?);
+            } else if ident == "scope_handlers" {
+                scope_handlers = true;
+            } else {
+                return Err(syn::Error::new(ident.span(), format!("unknown option: {ident}")));
+            }
+        }
+
+        Ok(RpcServiceArgs { name, types_crate, scope_handlers })
+    }
+}
+
 #[proc_macro]
 pub fn generate_rpc_service(input: TokenStream) -> TokenStream {
-    let service_name: syn::LitStr = match syn::parse(input) {
-        Ok(n) => n,
+    let args: RpcServiceArgs = match syn::parse(input) {
+        Ok(a) => a,
         Err(e) => return e.to_compile_error().into(),
     };
+    let service_name = &args.name;
     let name = service_name.value();
+    let types_crate = args.types_crate.as_ref();
 
     // Try CGR-based parser first (reads binary from OUT_DIR, includes full type
     // resolution and annotations). Falls back to text parser if CGR unavailable.
@@ -906,5 +1332,5 @@ pub fn generate_rpc_service(input: TokenStream) -> TokenStream {
         }
     };
 
-    codegen::generate_service(&name, &parsed).into()
+    codegen::generate_service(&name, &parsed, types_crate, args.scope_handlers).into()
 }

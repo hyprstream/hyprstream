@@ -1,8 +1,9 @@
 @0xd4e5f6a7b8c9d0e1;
 
-using import "annotations.capnp".mcpDescription;
-using import "annotations.capnp".paramDescription;
-using import "annotations.capnp".mcpScope;
+using import "/annotations.capnp".mcpDescription;
+using import "/annotations.capnp".paramDescription;
+using import "/annotations.capnp".mcpScope;
+using import "/streaming.capnp".StreamInfo;
 
 # Cap'n Proto schema for model service
 #
@@ -23,8 +24,8 @@ struct ModelRequest {
 
   # Request payload (union of request types)
   union {
-    load @1 :LoadModelRequest $mcpDescription("Load a model into memory for inference") $mcpScope("write:model:*");
-    unload @2 :UnloadModelRequest $mcpDescription("Unload a model from memory to free resources") $mcpScope("write:model:*");
+    load @1 :LoadModelRequest $mcpDescription("Load a model into memory for inference") $mcpScope(write);
+    unload @2 :UnloadModelRequest $mcpDescription("Unload a model from memory to free resources") $mcpScope(write);
     list @3 :Void $mcpDescription("List all models currently loaded in memory");
     healthCheck @4 :Void $mcpDescription("Check model service health and status");
 
@@ -103,11 +104,9 @@ struct InferRequest {
       $mcpDescription("Run inference with automatic domain adaptation. When TTT is enabled, the model adapts to your prompt before responding. If autoCommit is false (default), the adaptation is PENDING — check onlineTrainingMetrics.recommendation in the response, then call commitAdaptation (if true) or rollbackAdaptation (if false). Pending adaptations auto-rollback after 30 seconds.");
     generateStream @2 :GenerateRequest
       $mcpDescription("Stream inference with automatic domain adaptation. The final SSE chunk includes usage.online_training metrics. If autoCommit is false, the adaptation is PENDING — call commitAdaptation or rollbackAdaptation based on the recommendation field. Pending adaptations auto-rollback after 30 seconds.");
-    startStream @3 :StartStreamRequest
-      $mcpDescription("Authorize a streaming subscription (client must call after generateStream)");
-    applyChatTemplate @4 :ApplyChatTemplateRequest
+    applyChatTemplate @3 :ApplyChatTemplateRequest
       $mcpDescription("Apply chat template to messages for a loaded model");
-    status @5 :Void
+    status @4 :Void
       $mcpDescription("Get detailed status information about a model including online training configuration");
   }
 }
@@ -168,9 +167,8 @@ struct InferResponse {
     error @0 :ErrorInfo;
     generate @1 :InferResult;
     generateStream @2 :StreamInfo;
-    startStream @3 :StreamAuthResponse;
-    applyChatTemplate @4 :Text;
-    status @5 :ModelStatusResponse;
+    applyChatTemplate @3 :Text;
+    status @4 :ModelStatusResponse;
   }
 }
 
@@ -198,18 +196,6 @@ struct ErrorInfo {
   message @0 :Text;
   code @1 :Text;
   details @2 :Text;
-}
-
-# =============================================================================
-# Stream Setup (aligns with streaming.capnp::StreamInfo)
-# =============================================================================
-
-# Stream info for streaming responses (includes server pubkey for E2E auth)
-# Note: Matches streaming.capnp::StreamInfo for consistency
-struct StreamInfo {
-  streamId @0 :Text;
-  endpoint @1 :Text;
-  serverPubkey @2 :Data;  # Server's ephemeral Ristretto255 public key (32 bytes) for DH
 }
 
 # KV cache quantization type
@@ -252,20 +238,6 @@ struct GenerateRequest {
   tttGradientSteps @12 :UInt32 $paramDescription("Override: number of gradient steps (0 = skip)");
   tttLearningRate @13 :Float32 $paramDescription("Override: learning rate");
   autoCommit @14 :Bool $paramDescription("If true, server auto-commits based on its recommendation. If false (default), adaptation is pending until client commits.");
-}
-
-# Start stream request (authorizes SUB subscription)
-# Client must call this after generateStream to authorize subscription
-struct StartStreamRequest {
-  streamId @0 :Text;      # Stream ID from generateStream response (e.g., "stream-uuid")
-  clientPubkey @1 :Data;  # Client's ephemeral Ristretto255 public key (32 bytes) for DH
-}
-
-# Stream authorization response
-# Note: Aligns with streaming.capnp::StreamAuthResponse
-struct StreamAuthResponse {
-  streamId @0 :Text;
-  serverPubkey @1 :Data;  # Server's ephemeral Ristretto255 public key (if not in StreamInfo)
 }
 
 # Response when model is loaded

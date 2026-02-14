@@ -16,7 +16,7 @@ pub mod streaming;
 pub mod factory;
 
 pub use traits::{RpcHandler, RpcRequest, RpcService};
-pub use zmq::{CallOptions, EnvelopeContext, ServiceHandle, RequestLoop, ZmqClient, ZmqService};
+pub use zmq::{AuthorizeFn, CallOptions, Continuation, EnvelopeContext, ServiceHandle, RequestLoop, ZmqClient, ZmqService};
 pub use streaming::StreamService;
 pub use spawner::{InprocManager, Spawnable, SpawnedService};
 pub use factory::{get_factory, list_factories, ServiceClient, ServiceContext, ServiceFactory};

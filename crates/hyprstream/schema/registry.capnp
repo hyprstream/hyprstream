@@ -1,7 +1,8 @@
 @0xd4e6f8a2b1c3d5e7;
 
-using import "annotations.capnp".mcpScope;
-using import "annotations.capnp".mcpDescription;
+using import "/annotations.capnp".mcpScope;
+using import "/annotations.capnp".mcpDescription;
+using import "/streaming.capnp".StreamInfo;
 
 # Cap'n Proto schema for registry service
 #
@@ -20,21 +21,21 @@ struct RegistryRequest {
   # Request payload (union of request types)
   union {
     # List all models available in the registry
-    list @1 :Void;
+    list @1 :Void $mcpScope(query);
     # Get repository information by ID
-    get @2 :Text;
+    get @2 :Text $mcpScope(query);
     # Get repository information by name
-    getByName @3 :Text;
+    getByName @3 :Text $mcpScope(query);
     # Clone a model repository from a URL
-    clone @4 :CloneRequest $mcpScope("write:registry:*");
+    clone @4 :CloneRequest $mcpScope(write);
     # Register an existing local repository
-    register @5 :RegisterRequest $mcpScope("write:registry:*");
+    register @5 :RegisterRequest $mcpScope(write);
     # Remove a repository from the registry
-    remove @6 :Text $mcpScope("write:registry:*");
+    remove @6 :Text $mcpScope(manage);
     # Check registry service health
     healthCheck @7 :Void;
     # Clone a model repository from a URL (streaming progress)
-    cloneStream @8 :CloneRequest $mcpScope("write:registry:*") $mcpDescription("Clone a model repository from a URL (streaming progress)");
+    cloneStream @8 :CloneRequest $mcpScope(write) $mcpDescription("Clone a model repository from a URL (streaming progress)");
 
     # Repository-scoped operations (requires repoId)
     repo @9 :RepositoryRequest;
@@ -48,65 +49,65 @@ struct RepositoryRequest {
   repoId @0 :Text;
   union {
     # Create a new worktree for the repository
-    createWorktree @1 :CreateWorktreeRequest;
+    createWorktree @1 :CreateWorktreeRequest $mcpScope(write);
     # List all worktrees for the repository
-    listWorktrees @2 :Void;
+    listWorktrees @2 :Void $mcpScope(query);
     # Remove a worktree from the repository
-    removeWorktree @3 :RemoveWorktreeRequest;
+    removeWorktree @3 :RemoveWorktreeRequest $mcpScope(manage);
     # Create a new branch in the repository
-    createBranch @4 :BranchRequest;
+    createBranch @4 :BranchRequest $mcpScope(write);
     # List all branches in the repository
-    listBranches @5 :Void;
+    listBranches @5 :Void $mcpScope(query);
     # Checkout a branch or reference
-    checkout @6 :CheckoutRequest;
+    checkout @6 :CheckoutRequest $mcpScope(write);
     # Stage all modified files
-    stageAll @7 :Void;
+    stageAll @7 :Void $mcpScope(write);
     # Stage specific files
-    stageFiles @8 :StageFilesRequest;
+    stageFiles @8 :StageFilesRequest $mcpScope(write);
     # Create a commit with staged changes
-    commit @9 :CommitRequest;
+    commit @9 :CommitRequest $mcpScope(write);
     # Merge a branch into current branch
-    merge @10 :MergeRequest;
+    merge @10 :MergeRequest $mcpScope(write);
     # Abort an in-progress merge
-    abortMerge @11 :Void;
+    abortMerge @11 :Void $mcpScope(write);
     # Continue a merge after resolving conflicts
-    continueMerge @12 :ContinueMergeRequest;
+    continueMerge @12 :ContinueMergeRequest $mcpScope(write);
     # Exit merge state without committing
-    quitMerge @13 :Void;
+    quitMerge @13 :Void $mcpScope(write);
     # Get the current HEAD reference
-    getHead @14 :Void;
+    getHead @14 :Void $mcpScope(query);
     # Get information about a specific reference
-    getRef @15 :GetRefRequest;
+    getRef @15 :GetRefRequest $mcpScope(query);
     # Get repository status (short format)
-    status @16 :Void;
+    status @16 :Void $mcpScope(query);
     # Get detailed repository status with file changes
-    detailedStatus @17 :Void;
+    detailedStatus @17 :Void $mcpScope(query);
     # List all remotes for the repository
-    listRemotes @18 :Void;
+    listRemotes @18 :Void $mcpScope(query);
     # Add a new remote to the repository
-    addRemote @19 :AddRemoteRequest;
+    addRemote @19 :AddRemoteRequest $mcpScope(write);
     # Remove a remote from the repository
-    removeRemote @20 :RemoveRemoteRequest;
+    removeRemote @20 :RemoveRemoteRequest $mcpScope(manage);
     # Set the URL for a remote
-    setRemoteUrl @21 :SetRemoteUrlRequest;
+    setRemoteUrl @21 :SetRemoteUrlRequest $mcpScope(write);
     # Rename a remote
-    renameRemote @22 :RenameRemoteRequest;
+    renameRemote @22 :RenameRemoteRequest $mcpScope(write);
     # Push commits to a remote repository
-    push @23 :PushRequest;
+    push @23 :PushRequest $mcpScope(write);
     # Amend the last commit with new changes
-    amendCommit @24 :AmendCommitRequest;
+    amendCommit @24 :AmendCommitRequest $mcpScope(write);
     # Create a commit with specified author information
-    commitWithAuthor @25 :CommitWithAuthorRequest;
+    commitWithAuthor @25 :CommitWithAuthorRequest $mcpScope(write);
     # Stage all files including untracked files
-    stageAllIncludingUntracked @26 :Void;
+    stageAllIncludingUntracked @26 :Void $mcpScope(write);
     # List all tags in the repository
-    listTags @27 :Void;
+    listTags @27 :Void $mcpScope(query);
     # Create a new tag
-    createTag @28 :CreateTagRequest;
+    createTag @28 :CreateTagRequest $mcpScope(write);
     # Delete a tag from the repository
-    deleteTag @29 :DeleteTagRequest;
+    deleteTag @29 :DeleteTagRequest $mcpScope(manage);
     # Pull and update from remote repository
-    update @30 :UpdateRequest;
+    update @30 :UpdateRequest $mcpScope(write);
     # Worktree-scoped filesystem operations
     worktree @31 :WorktreeRequest;
   }
@@ -126,7 +127,7 @@ struct RegistryResponse {
     registerResult @6 :TrackedRepository;
     removeResult @7 :Void;
     healthCheckResult @8 :HealthStatus;
-    cloneStreamResult @9 :StreamStartedInfo;
+    cloneStreamResult @9 :StreamInfo;
     repoResult @10 :RepositoryResponse;
   }
 }
@@ -184,10 +185,10 @@ enum SeekWhence {
 struct WorktreeRequest {
   name @0 :Text;
   union {
-    # FD lifecycle
-    open @1 :FsOpenRequest;
+    # FD lifecycle (authorized at open, no per-op auth)
+    open @1 :FsOpenRequest $mcpScope(write);
     close @2 :FsCloseRequest;
-    # FD I/O (max 16 MiB per read/write)
+    # FD I/O (capability-based, authorized at open)
     read @3 :FsReadRequest;
     write @4 :FsWriteRequest;
     pread @5 :FsPreadRequest;
@@ -196,16 +197,15 @@ struct WorktreeRequest {
     truncate @8 :FsTruncateRequest;
     fsync @9 :FsSyncRequest;
     # Path operations (stateless)
-    stat @10 :FsPathRequest;
-    mkdir @11 :FsMkdirRequest;
-    remove @12 :FsPathRequest;
-    rmdir @13 :FsPathRequest;
-    rename @14 :FsRenameRequest;
-    copy @15 :FsCopyRequest;
-    listDir @16 :FsPathRequest;
+    stat @10 :FsPathRequest $mcpScope(query);
+    mkdir @11 :FsMkdirRequest $mcpScope(write);
+    remove @12 :FsPathRequest $mcpScope(write);
+    rmdir @13 :FsPathRequest $mcpScope(write);
+    rename @14 :FsRenameRequest $mcpScope(write);
+    copy @15 :FsCopyRequest $mcpScope(write);
+    listDir @16 :FsPathRequest $mcpScope(query);
     # Streaming (bulk transfer via StreamService)
-    openStream @17 :FsOpenRequest;
-    startStream @18 :FsStartStreamRequest;
+    openStream @17 :FsOpenRequest $mcpScope(write);
   }
 }
 
@@ -232,7 +232,6 @@ struct FsPathRequest { path @0 :Text; }
 struct FsMkdirRequest { path @0 :Text; recursive @1 :Bool; }
 struct FsRenameRequest { src @0 :Text; dst @1 :Text; }
 struct FsCopyRequest { src @0 :Text; dst @1 :Text; }
-struct FsStartStreamRequest { streamId @0 :Text; clientPubkey @1 :Data; }
 
 # --- WorktreeResponse ---
 
@@ -256,7 +255,6 @@ struct WorktreeResponse {
     copy @15 :Void;
     listDir @16 :List(FsDirEntryInfo);
     openStream @17 :FsStreamInfoResponse;
-    startStream @18 :FsStreamAuthResponse;
   }
 }
 
@@ -276,14 +274,6 @@ struct FsStreamInfoResponse {
   streamId @1 :Text;
   streamEndpoint @2 :Text;
   serverPubkey @3 :Data;
-}
-struct FsStreamAuthResponse { streamId @0 :Text; authorized @1 :Bool; }
-
-# Stream Started Info (for cloneStream)
-struct StreamStartedInfo {
-  streamId @0 :Text;
-  streamEndpoint @1 :Text;
-  serverPubkey @2 :Data;  # 32-byte DH public key for key derivation
 }
 
 # Clone Request

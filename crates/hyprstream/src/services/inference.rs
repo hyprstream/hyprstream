@@ -28,32 +28,21 @@
 //! InferenceService publishes to StreamService's XSUB (PUB socket).
 //! StreamService validates JWT at subscription and forwards to clients.
 //!
-//! # Authorization (Future Enhancement)
+//! # Authorization
 //!
-//! Currently uses manual Casbin checks via `check_auth()`. Can be refactored to use
-//! `#[authorize]` macro when moving to typed handlers:
-//!
-//! ```ignore
-//! #[register_scopes]
-//! impl InferenceService {
-//!     #[authorize(action = "infer", resource = "model", identifier_field = "model")]
-//!     fn handle_generate(&self, ctx: &EnvelopeContext, req: GenerateRequest) -> Result<Vec<u8>> {
-//!         // JWT validation and scope checks automatically enforced
-//!         // ctx.user_claims is guaranteed to exist here
-//!     }
-//! }
-//! ```
+//! Uses `InferenceHandler::authorize()` via generated dispatch for policy-backed
+//! authorization on all requests. The handler delegates to PolicyClient.
 
 use crate::auth::Operation;
 use crate::services::PolicyClient;
 use crate::config::{FinishReason, GenerationRequest, GenerationResult, ModelInfo, TrainingMode};
 use crate::inference_capnp;
-use anyhow::bail;
 use crate::runtime::kv_cache::CacheOwner;
 use crate::runtime::model_config::ModelConfig;
 use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
-use crate::services::rpc_types::{InferenceResponse, StreamStartedInfo};
-use crate::services::{CallOptions, EnvelopeContext, FsOps};
+use crate::services::rpc_types::StreamInfo;
+use crate::services::EnvelopeContext;
+use crate::services::FsOps;
 use crate::training::{DeltaPool, TenantDeltaConfig, TTTConfig, TestTimeTrainer};
 use hyprstream_rpc::Subject;
 use crate::training::serialize_state_dict_to_bytes;
@@ -66,7 +55,7 @@ use capnp::serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use tmq::{reply, Multipart};
 use tokio::runtime::Handle;
 use tokenizers::Tokenizer;
@@ -89,7 +78,7 @@ enum PendingWork {
         /// TTT adaptation metrics (if TTT was run in prepare_stream)
         ttt_result: Option<crate::training::ttt::TTTResult>,
         /// Per-tenant delta for delta-aware inference (looked up in prepare_stream)
-        delta: Option<std::sync::Arc<parking_lot::Mutex<crate::training::TenantDelta>>>,
+        delta: Option<Arc<Mutex<crate::training::TenantDelta>>>,
     },
     /// Streaming training step (avoids REQ/REP timeout on backward pass compilation)
     Training {
@@ -106,6 +95,28 @@ enum PendingWork {
         /// Whether to auto-commit if quality gate passes
         auto_commit: bool,
     },
+}
+
+/// Wraps a `!Send` future to satisfy the `Send` bound on [`Continuation`].
+///
+/// # Safety
+///
+/// This is safe because InferenceService's continuations only run on its
+/// dedicated single-threaded tokio runtime (`run_service_loop`). They are
+/// never sent between threads. The `Send` bound comes from the [`Continuation`]
+/// type alias (`Pin<Box<dyn Future + Send>>`), which exists for services that
+/// use `RequestLoop` (which requires `Send`). InferenceService uses a custom loop.
+///
+/// The specific `!Send` type is `parking_lot::RwLockReadGuard` held across an
+/// `.await` in `execute_stream`, protecting the `TorchEngine` during streaming
+/// token generation.
+struct UnsafeSendFuture(std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>);
+unsafe impl Send for UnsafeSendFuture {}
+impl std::future::Future for UnsafeSendFuture {
+    type Output = ();
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        self.0.as_mut().poll(cx)
+    }
 }
 
 /// Default endpoint for the inference service
@@ -132,10 +143,13 @@ pub const INFERENCE_ENDPOINT: &str = "inproc://hyprstream/inference";
 /// - StreamService validates JWT at subscription (prevents hijacking)
 /// - InferenceService just publishes chunks (no authorization logic)
 /// - Clients subscribe via StreamService with JWT tokens
-pub struct InferenceService {
+/// Inner state of InferenceService, shared via Arc for continuations.
+///
+/// All methods are defined on this inner type. `InferenceService` wraps it
+/// in `Arc` and implements `Deref` so all field/method access is transparent.
+/// Streaming continuations clone the `Arc` to own the state across await points.
+pub struct InferenceServiceInner {
     engine: RwLock<TorchEngine>,
-    /// Model identifier for events
-    model_id: String,
     /// Model path for checkpoint management
     #[allow(dead_code)] // Future: checkpoint management
     model_path: PathBuf,
@@ -163,13 +177,39 @@ pub struct InferenceService {
     delta_pool: Option<Arc<DeltaPool>>,
     /// Base LoRA delta loaded from a .safetensors adapter file.
     /// Applied to all tenants (composed with per-tenant delta if both exist).
-    base_delta: parking_lot::Mutex<Option<std::sync::Arc<parking_lot::Mutex<crate::training::TenantDelta>>>>,
+    base_delta: Mutex<Option<Arc<Mutex<crate::training::TenantDelta>>>>,
     /// Pending adaptations awaiting client commit/rollback
-    pending_adaptations: parking_lot::Mutex<std::collections::HashMap<Subject, PendingAdaptation>>,
+    pending_adaptations: Mutex<std::collections::HashMap<Subject, PendingAdaptation>>,
     /// Optional FsOps for worktree-scoped file operations.
     /// When present, adapter/snapshot writes use contained-root access.
     fs: Option<Arc<dyn FsOps>>,
 }
+
+/// ZMQ-based inference service
+///
+/// Wraps `InferenceServiceInner` in `Arc` for continuation-based streaming.
+/// All field and method access is transparent via `Deref`.
+pub struct InferenceService {
+    inner: Arc<InferenceServiceInner>,
+}
+
+impl Clone for InferenceService {
+    fn clone(&self) -> Self {
+        Self { inner: Arc::clone(&self.inner) }
+    }
+}
+
+impl std::ops::Deref for InferenceService {
+    type Target = InferenceServiceInner;
+    fn deref(&self) -> &Self::Target { &self.inner }
+}
+
+// SAFETY: InferenceServiceInner contains tch-rs types (raw pointers) behind
+// parking_lot::RwLock/Mutex, providing proper synchronization. This is consistent
+// with the codebase pattern for tch-rs wrappers (LlamaModel, TenantDelta,
+// TestTimeTrainer, etc.) which all have `unsafe impl Send + Sync`.
+unsafe impl Send for InferenceServiceInner {}
+unsafe impl Sync for InferenceServiceInner {}
 
 /// A pending TTT adaptation awaiting client commit or rollback
 struct PendingAdaptation {
@@ -231,11 +271,6 @@ impl InferenceService {
     ) -> Result<hyprstream_rpc::service::SpawnedService> {
         let model_path = model_path.as_ref().to_path_buf();
         let endpoint_owned = endpoint.to_owned();
-        let model_id = model_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(std::borrow::ToOwned::to_owned)
-            .unwrap_or_else(|| "unknown".to_owned());
         let nonce_cache = Arc::new(InMemoryNonceCache::new());
 
         // Use oneshot to get initialization result
@@ -254,7 +289,7 @@ impl InferenceService {
                 };
 
             rt.block_on(async move {
-                match Self::initialize(model_path, config, model_id, server_pubkey, signing_key, nonce_cache, policy_client, fs).await {
+                match Self::initialize(model_path, config, server_pubkey, signing_key, nonce_cache, policy_client, fs).await {
                     Ok(service) => {
                         // Pass init_tx to run_service_loop - it signals AFTER socket binding
                         Self::run_service_loop(service, &endpoint_owned, Some(init_tx)).await;
@@ -361,10 +396,9 @@ impl InferenceService {
         // Generate signing key for callback mode (separate process, no shared key access)
         let signing_key = hyprstream_rpc::crypto::signing::generate_signing_keypair().0;
         let nonce_cache = Arc::new(InMemoryNonceCache::new());
-        let mut service = Self::initialize(
+        let service = Self::initialize(
             model_path.clone(),
             config,
-            model_ref.clone(),
             server_pubkey,
             signing_key.clone(),
             nonce_cache,
@@ -373,12 +407,7 @@ impl InferenceService {
         )
         .await?;
 
-        // Create StreamChannel for streaming operations
-        let stream_channel = StreamChannel::new(
-            Arc::clone(&ctx),
-            signing_key,
-        );
-        service.stream_channel = Some(stream_channel);
+        // StreamChannel already created in initialize()
 
         // Send LoadModelResponse
         let response = Self::build_load_model_response(true, "")?;
@@ -504,8 +533,8 @@ impl InferenceService {
         let signed = hyprstream_rpc::envelope::SignedEnvelope::new_signed(envelope, &signing_key);
         let ctx = EnvelopeContext::from_verified(&signed);
 
-        // Reuse existing request handling
-        let (response, _pending_stream) = self.handle_request(&ctx, request_data).await?;
+        // Dispatch via generated handler
+        let (response, _continuation) = dispatch_inference(self, &ctx, request_data).await?;
         Ok(response)
     }
 
@@ -539,7 +568,6 @@ impl InferenceService {
     async fn initialize(
         model_path: PathBuf,
         config: RuntimeConfig,
-        model_id: String,
         server_pubkey: VerifyingKey,
         signing_key: SigningKey,
         nonce_cache: Arc<InMemoryNonceCache>,
@@ -631,24 +659,30 @@ impl InferenceService {
             None
         };
 
-        // Use provided signing key for response signing
-        Ok(Self {
-            engine: RwLock::new(engine),
-            model_id,
-            model_path,
-            session_id: RwLock::new(None),
-            runtime_handle,
-            stream_channel: None, // Initialized in run_service_loop
-            server_pubkey,
-            signing_key,
-            nonce_cache,
-            policy_client,
-            ttt_trainer,
-            tokenizer,
-            delta_pool,
-            base_delta: parking_lot::Mutex::new(None),
-            pending_adaptations: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            fs,
+        // Create StreamChannel upfront (lazy socket init on first use)
+        let stream_channel = StreamChannel::new(
+            Arc::clone(&global_context()),
+            signing_key.clone(),
+        );
+
+        Ok(InferenceService {
+            inner: Arc::new(InferenceServiceInner {
+                engine: RwLock::new(engine),
+                model_path,
+                session_id: RwLock::new(None),
+                runtime_handle,
+                stream_channel: Some(stream_channel),
+                server_pubkey,
+                signing_key,
+                nonce_cache,
+                policy_client,
+                ttt_trainer,
+                tokenizer,
+                delta_pool,
+                base_delta: Mutex::new(None),
+                pending_adaptations: Mutex::new(std::collections::HashMap::new()),
+                fs,
+            }),
         })
     }
 
@@ -659,7 +693,7 @@ impl InferenceService {
     fn resolve_delta(
         &self,
         subject: &hyprstream_rpc::Subject,
-    ) -> Option<std::sync::Arc<parking_lot::Mutex<crate::training::TenantDelta>>> {
+    ) -> Option<Arc<Mutex<crate::training::TenantDelta>>> {
         let base = self.base_delta.lock().clone();
         let tenant = self.delta_pool.as_ref().and_then(|pool| pool.get(subject));
 
@@ -679,7 +713,7 @@ impl InferenceService {
     /// The `ready_tx` channel signals when sockets are bound and the service is ready.
     /// This ensures callers wait for actual readiness, not just initialization.
     async fn run_service_loop(
-        mut service: Self,
+        service: Self,
         endpoint: &str,
         ready_tx: Option<tokio::sync::oneshot::Sender<Result<()>>>,
     ) {
@@ -703,13 +737,7 @@ impl InferenceService {
             }
         };
 
-        // Create StreamChannel for streaming generation
-        // Uses lazy socket initialization - socket is created on first use
-        let stream_channel = StreamChannel::new(
-            Arc::clone(&ctx),
-            service.signing_key.clone(),
-        );
-        service.stream_channel = Some(stream_channel);
+        // StreamChannel already created in initialize()
 
         let stream_endpoint = hyprstream_rpc::registry::global()
             .endpoint("streams", hyprstream_rpc::registry::SocketKind::Push)
@@ -774,12 +802,13 @@ impl InferenceService {
             );
 
             // Handle request - may return pending work (now async for policy checks)
+            // Handle request via generated dispatch
             let request_id = envelope_ctx.request_id;
-            let (response_payload, pending_work) = match service.handle_request(&envelope_ctx, &payload).await {
-                Ok((resp, pending)) => (resp, pending),
+            let (response_payload, continuation) = match dispatch_inference(&service, &envelope_ctx, &payload).await {
+                Ok((resp, cont)) => (resp, cont),
                 Err(e) => {
                     error!("inference request handling error: {}", e);
-                    (InferenceResponse::error(request_id, &e.to_string()), None)
+                    (vec![], None)
                 }
             };
 
@@ -814,14 +843,11 @@ impl InferenceService {
                 }
             };
 
-            // THEN execute any pending work (after response is sent)
-            // This solves the streaming deadlock - client can subscribe after
-            // receiving the stream_id in the response
-            if let Some(pending) = pending_work {
-                match &pending {
-                    PendingWork::Generation { .. } => service.execute_stream(pending).await,
-                    PendingWork::Training { .. } => service.execute_training_stream(pending).await,
-                }
+            // Execute continuation AFTER REP is sent.
+            // This guarantees the client has the StreamInfo (stream_id)
+            // before any data flows on the PUB/SUB channel.
+            if let Some(future) = continuation {
+                future.await;
             }
         }
     }
@@ -1661,61 +1687,6 @@ impl InferenceService {
             .release_session(&CacheOwner::Session(session_id.to_owned()))
     }
 
-    /// Parse a generation request from capnp
-    fn parse_generation_request(
-        &self,
-        reader: inference_capnp::generation_request::Reader,
-    ) -> Result<GenerationRequest> {
-        use crate::config::TemplatedPrompt;
-        let prompt = TemplatedPrompt::new(reader.get_prompt()?.to_str()?.to_owned());
-        let max_tokens = reader.get_max_tokens() as usize;
-        let temperature = reader.get_temperature();
-        let top_p = reader.get_top_p();
-        let top_k = if reader.get_top_k() == 0 {
-            None
-        } else {
-            Some(reader.get_top_k() as usize)
-        };
-        let repeat_penalty = reader.get_repeat_penalty();
-        let repeat_last_n = reader.get_repeat_last_n() as usize;
-
-        let stop_tokens: Vec<String> = reader
-            .get_stop_tokens()?
-            .iter()
-            .filter_map(|s| s.ok().and_then(|t| t.to_str().ok().map(std::borrow::ToOwned::to_owned)))
-            .collect();
-
-        let seed = if reader.get_seed() == 0 {
-            None
-        } else {
-            Some(reader.get_seed())
-        };
-
-        // Parse images if present - convert from bytes to paths
-        let images: Vec<String> = Vec::new(); // Images are bytes in capnp, but strings in GenerationRequest
-
-        let timeout = if reader.get_timeout_ms() == 0 {
-            None
-        } else {
-            Some(reader.get_timeout_ms())
-        };
-
-        Ok(GenerationRequest {
-            prompt,
-            max_tokens,
-            temperature,
-            top_p,
-            top_k,
-            repeat_penalty,
-            repeat_last_n,
-            stop_tokens,
-            seed,
-            images,
-            timeout,
-            collect_metrics: false, // Default: off for performance
-        })
-    }
-
     /// Load a LoRA adapter from a safetensors file as the base delta.
     ///
     /// The loaded adapter is stored as `base_delta` and applied to all inference
@@ -1730,7 +1701,7 @@ impl InferenceService {
         let bytes = fs.read_file(&rel_path).await
             .map_err(|e| anyhow!("Failed to read LoRA adapter via FsOps: {}", e))?;
         let delta = crate::training::TenantDelta::load_from_safetensors_bytes(&bytes, device)?;
-        *self.base_delta.lock() = Some(std::sync::Arc::new(parking_lot::Mutex::new(delta)));
+        *self.base_delta.lock() = Some(Arc::new(Mutex::new(delta)));
         tracing::info!("Loaded LoRA adapter as base delta from {}", path.display());
         Ok(())
     }
@@ -1802,494 +1773,411 @@ fn sanitize_adapter_name(name: &str) -> Result<String> {
     Ok(safe)
 }
 
-impl InferenceService {
-    /// Check authorization for an operation.
-    ///
-    /// Returns the unauthorized response if the check fails, or None if authorized.
-    /// Uses PolicyClient for async policy checks via TMQ.
-    async fn check_auth(
-        &self,
-        ctx: &EnvelopeContext,
-        request_id: u64,
-        resource: &str,
-        operation: Operation,
-    ) -> Option<Vec<u8>> {
+// ═══════════════════════════════════════════════════════════════════════════════
+// InferenceHandler Implementation — generated dispatch for typed handler trait
+// ═══════════════════════════════════════════════════════════════════════════════
+
+use crate::services::generated::inference_client::{
+    InferenceHandler, dispatch_inference,
+    InferenceResponseVariant,
+    HealthStatus, TrainStepResult, DeltaStatusResult, ModuleNormRatio,
+    SaveAdaptationResult, SnapshotDeltaResult, ExportPeftResult,
+    OnlineTrainingMetrics, QualityMetrics, FinishReasonEnum,
+    ChatTemplateRequest, LoraConfig, TrainStepRequest, SaveAdaptationRequest, ExportPeftRequest,
+};
+// Conflicting names — use canonical path at usage sites:
+//   inference_client::GenerationResult, inference_client::ModelInfo, inference_client::StreamInfo
+
+#[async_trait::async_trait(?Send)]
+impl InferenceHandler for InferenceService {
+    async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
+        let op = Operation::from_str(operation)?;
+        let subject = ctx.subject();
+        let allowed = self.policy_client.check_policy(&subject, resource, op).await.unwrap_or_else(|e| {
+            warn!("Policy check failed for {} on {}: {} - denying access", subject, resource, e);
+            false
+        });
+        if allowed {
+            Ok(())
+        } else {
+            anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource)
+        }
+    }
+
+    async fn handle_generate(
+        &self, ctx: &EnvelopeContext, _request_id: u64,
+        data: &crate::services::generated::inference_client::GenerationRequest,
+    ) -> Result<InferenceResponseVariant> {
+        let subject = ctx.subject();
+        let request = GenerationRequest {
+            prompt: crate::config::TemplatedPrompt::new(data.prompt.clone()),
+            max_tokens: data.max_tokens as usize,
+            temperature: data.temperature,
+            top_p: data.top_p,
+            top_k: if data.top_k == 0 { None } else { Some(data.top_k as usize) },
+            repeat_penalty: data.repeat_penalty,
+            repeat_last_n: data.repeat_last_n as usize,
+            stop_tokens: data.stop_tokens.clone(),
+            seed: if data.seed == 0 { None } else { Some(data.seed) },
+            images: vec![],
+            timeout: if data.timeout_ms == 0 { None } else { Some(data.timeout_ms) },
+            collect_metrics: false,
+        };
+        let result = InferenceService::handle_generate(self, request, &subject)?;
+        Ok(InferenceResponseVariant::GenerateResult(generation_result_to_data(&result)))
+    }
+
+    async fn handle_generate_stream(
+        &self, ctx: &EnvelopeContext, _request_id: u64,
+        data: &crate::services::generated::inference_client::GenerationRequest,
+    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
+        let subject = ctx.subject();
+        let request = GenerationRequest {
+            prompt: crate::config::TemplatedPrompt::new(data.prompt.clone()),
+            max_tokens: data.max_tokens as usize,
+            temperature: data.temperature,
+            top_p: data.top_p,
+            top_k: if data.top_k == 0 { None } else { Some(data.top_k as usize) },
+            repeat_penalty: data.repeat_penalty,
+            repeat_last_n: data.repeat_last_n as usize,
+            stop_tokens: data.stop_tokens.clone(),
+            seed: if data.seed == 0 { None } else { Some(data.seed) },
+            images: vec![],
+            timeout: if data.timeout_ms == 0 { None } else { Some(data.timeout_ms) },
+            collect_metrics: false,
+        };
+
+        // Calculate expiry from claims
+        let expiry_secs = ctx.claims()
+            .map(|c| c.exp - chrono::Utc::now().timestamp())
+            .unwrap_or(300)
+            .max(60);
+
+        let client_ephemeral_pubkey = ctx.ephemeral_pubkey();
+        let claims = ctx.claims().cloned();
+        let (stream_id, server_pubkey, pending) = self.prepare_stream(request, client_ephemeral_pubkey, claims, expiry_secs, &subject).await?;
+
+        let stream_sub_endpoint = hyprstream_rpc::registry::global()
+            .endpoint("streams", hyprstream_rpc::registry::SocketKind::Sub)
+            .to_zmq_string();
+
+        let stream_info = crate::services::generated::inference_client::StreamInfo {
+            stream_id,
+            endpoint: stream_sub_endpoint,
+            server_pubkey,
+        };
+
+        // Build continuation that executes the stream after REP is sent.
+        // Uses UnsafeSendFuture because execute_stream holds a parking_lot::RwLockReadGuard
+        // (which is !Send) across an .await during streaming token generation.
+        // This is safe because the continuation only runs on InferenceService's
+        // single-threaded tokio runtime.
+        let service = self.clone();
+        let continuation: hyprstream_rpc::service::Continuation = Box::pin(UnsafeSendFuture(Box::pin(async move {
+            service.execute_stream(pending).await;
+        })));
+
+        Ok((stream_info, continuation))
+    }
+
+    async fn handle_model_info(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+        let info = InferenceService::handle_model_info(self);
+        let has_lora = self.base_delta.lock().is_some();
+        Ok(InferenceResponseVariant::ModelInfoResult(crate::services::generated::inference_client::ModelInfo {
+            model_id: info.name,
+            architecture: info.architecture,
+            vocab_size: info.vocab_size as u32,
+            hidden_size: info.hidden_size as u32,
+            num_layers: info.num_hidden_layers.unwrap_or(0) as u32,
+            num_heads: info.num_attention_heads.unwrap_or(0) as u32,
+            max_sequence_length: info.context_length as u32,
+            quantization: info.quantization.unwrap_or_default(),
+            has_vision: false,
+            lora_loaded: has_lora,
+        }))
+    }
+
+    async fn handle_is_ready(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+        let ready = InferenceService::handle_is_ready(self);
+        Ok(InferenceResponseVariant::IsReadyResult(ready))
+    }
+
+    async fn handle_apply_chat_template(
+        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        data: &ChatTemplateRequest,
+    ) -> Result<InferenceResponseVariant> {
+        let chat_messages: Vec<crate::runtime::template_engine::ChatMessage> = data.messages
+            .iter()
+            .map(|m| crate::runtime::template_engine::ChatMessage {
+                role: m.role.clone(),
+                content: m.content.clone(),
+            })
+            .collect();
+        let result = InferenceService::handle_apply_chat_template(self, chat_messages, data.add_generation_prompt)?;
+        Ok(InferenceResponseVariant::ApplyChatTemplateResult(result))
+    }
+
+    async fn handle_create_lora(
+        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        data: &LoraConfig,
+    ) -> Result<InferenceResponseVariant> {
+        let config = crate::training::TenantDeltaConfig {
+            rank: data.rank as usize,
+            alpha: data.alpha,
+            dropout: data.dropout,
+            target_modules: data.target_modules.clone(),
+            learning_rate: data.learning_rate as f64,
+            ..crate::training::TenantDeltaConfig::default()
+        };
+        InferenceService::handle_create_lora(self, config)?;
+        Ok(InferenceResponseVariant::CreateLoraResult)
+    }
+
+    async fn handle_load_lora(&self, _ctx: &EnvelopeContext, _request_id: u64, value: &str) -> Result<InferenceResponseVariant> {
+        self.load_lora(Path::new(value)).await?;
+        Ok(InferenceResponseVariant::LoadLoraResult)
+    }
+
+    async fn handle_save_lora(&self, _ctx: &EnvelopeContext, _request_id: u64, value: &str) -> Result<InferenceResponseVariant> {
+        self.save_lora(value).await?;
+        Ok(InferenceResponseVariant::SaveLoraResult)
+    }
+
+    async fn handle_unload_lora(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+        self.unload_lora().await?;
+        Ok(InferenceResponseVariant::UnloadLoraResult)
+    }
+
+    async fn handle_has_lora(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+        let has = self.has_lora().await?;
+        Ok(InferenceResponseVariant::HasLoraResult(has))
+    }
+
+    async fn handle_set_session(&self, _ctx: &EnvelopeContext, _request_id: u64, value: &str) -> Result<InferenceResponseVariant> {
+        InferenceService::handle_set_session(self, value.to_owned())?;
+        Ok(InferenceResponseVariant::SetSessionResult)
+    }
+
+    async fn handle_clear_session(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+        InferenceService::handle_clear_session(self);
+        Ok(InferenceResponseVariant::ClearSessionResult)
+    }
+
+    async fn handle_release_session(&self, _ctx: &EnvelopeContext, _request_id: u64, value: &str) -> Result<InferenceResponseVariant> {
+        InferenceService::handle_release_session(self, value)?;
+        Ok(InferenceResponseVariant::ReleaseSessionResult)
+    }
+
+    async fn handle_health_check(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+        let model_loaded = self.engine.read().is_loaded();
+        Ok(InferenceResponseVariant::HealthCheckResult(HealthStatus {
+            status: if model_loaded { "ok".into() } else { "not_loaded".into() },
+            model_loaded,
+            kv_cache_usage_percent: 0.0,
+            gpu_memory_used_mb: 0,
+            gpu_memory_total_mb: 0,
+        }))
+    }
+
+    async fn handle_shutdown(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+        info!("Inference service shutdown requested");
+        Ok(InferenceResponseVariant::Success)
+    }
+
+    async fn handle_commit_adaptation(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+        let subject = ctx.subject();
+        self.cleanup_pending_adaptations();
+        InferenceService::handle_commit_adaptation(self, &subject)?;
+        Ok(InferenceResponseVariant::CommitAdaptationResult)
+    }
+
+    async fn handle_rollback_adaptation(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+        let subject = ctx.subject();
+        InferenceService::handle_rollback_adaptation(self, &subject)?;
+        Ok(InferenceResponseVariant::RollbackAdaptationResult)
+    }
+
+    async fn handle_train_step(
+        &self, ctx: &EnvelopeContext, _request_id: u64,
+        data: &TrainStepRequest,
+    ) -> Result<InferenceResponseVariant> {
+        let subject = ctx.subject();
+        let result = InferenceService::handle_train_step(self, &subject, &data.input, data.gradient_steps, data.learning_rate, data.auto_commit)?;
+        Ok(InferenceResponseVariant::TrainStepResult(TrainStepResult {
+            avg_loss: result.avg_loss,
+            loss_improvement: result.loss_improvement,
+            steps_performed: result.steps_performed as u32,
+            adaptation_time_ms: result.adaptation_time_ms,
+            initial_perplexity: result.initial_perplexity,
+            final_perplexity: result.final_perplexity,
+            recommendation: result.recommendation,
+            committed: !result.pending,
+            gradient_clipped: result.gradient_clipped,
+        }))
+    }
+
+    async fn handle_train_step_stream(
+        &self, ctx: &EnvelopeContext, _request_id: u64,
+        data: &TrainStepRequest,
+    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
         let subject = ctx.subject();
 
-        // Async policy check via TMQ
-        let allowed = self.policy_client
-            .check_policy(&subject, resource, operation)
-            .await
-            .unwrap_or(false);
+        // DH key derivation
+        let client_pub_bytes = ctx.ephemeral_pubkey()
+            .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
+        let stream_channel = self.stream_channel.as_ref()
+            .ok_or_else(|| anyhow!("StreamChannel not initialized"))?;
 
-        if allowed {
-            None // Authorized
-        } else {
-            let subject_str = subject.to_string();
-            debug!(
-                "Authorization denied: {} cannot {} on {}",
-                subject_str,
-                operation.as_str(),
-                resource
-            );
-            Some(InferenceResponse::unauthorized(
-                request_id,
-                &subject_str,
-                resource,
-                operation.as_str(),
-            ))
-        }
+        let expiry_secs = ctx.claims()
+            .map(|c| c.exp - chrono::Utc::now().timestamp())
+            .unwrap_or(300)
+            .max(60);
+        let claims = ctx.claims().cloned();
+
+        let stream_ctx = stream_channel.prepare_stream_with_claims(client_pub_bytes, expiry_secs, claims).await?;
+
+        let stream_id = stream_ctx.stream_id().to_owned();
+        let server_pubkey = *stream_ctx.server_pubkey();
+        let stream_sub_endpoint = hyprstream_rpc::registry::global()
+            .endpoint("streams", hyprstream_rpc::registry::SocketKind::Sub)
+            .to_zmq_string();
+
+        let stream_info = crate::services::generated::inference_client::StreamInfo {
+            stream_id,
+            endpoint: stream_sub_endpoint,
+            server_pubkey,
+        };
+
+        let pending = PendingWork::Training {
+            stream_ctx,
+            subject,
+            input: data.input.clone(),
+            gradient_steps: data.gradient_steps,
+            learning_rate: data.learning_rate,
+            auto_commit: data.auto_commit,
+        };
+
+        // Build continuation
+        let service = self.clone();
+        let continuation: hyprstream_rpc::service::Continuation = Box::pin(async move {
+            service.execute_training_stream(pending).await;
+        });
+
+        Ok((stream_info, continuation))
     }
 
-    /// Handle a capnp request and return a response with optional pending stream.
-    ///
-    /// Returns (response_bytes, pending_stream) where pending_stream is Some
-    /// for streaming requests. The caller should send the response FIRST,
-    /// then execute the pending stream.
-    async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<PendingWork>)> {
-        // Log identity for audit trail
-        trace!(
-            "Inference request from {} (envelope_id={}, authenticated={})",
-            ctx.subject(),
-            ctx.request_id,
-            ctx.is_authenticated()
-        );
+    async fn handle_reset_delta(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+        let subject = ctx.subject();
+        InferenceService::handle_reset_delta(self, &subject)?;
+        Ok(InferenceResponseVariant::ResetDeltaResult)
+    }
 
-        // Deserialize inner request from payload
-        let reader = serialize::read_message(payload, ReaderOptions::new())?;
-        let req = reader.get_root::<inference_capnp::inference_request::Reader>()?;
+    async fn handle_get_delta_status(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+        let subject = ctx.subject();
+        let info = InferenceService::handle_get_delta_status(self, &subject)?;
+        Ok(InferenceResponseVariant::GetDeltaStatusResult(DeltaStatusResult {
+            exists: info.exists,
+            accumulated_steps: info.accumulated_steps,
+            max_accumulated_steps: info.max_accumulated_steps,
+            request_count: info.request_count,
+            avg_loss_improvement: info.avg_loss_improvement,
+            memory_bytes: info.memory_bytes,
+            last_snapshot_hash: info.last_snapshot_hash,
+            delta_norm_ratios: info.delta_norm_ratios.into_iter().map(|(name, ratio)| ModuleNormRatio {
+                module_name: name,
+                ratio: ratio as f32,
+            }).collect(),
+            has_pending: info.has_pending,
+        }))
+    }
 
-        let request_id = req.get_id();
+    async fn handle_save_adaptation(
+        &self, ctx: &EnvelopeContext, _request_id: u64,
+        data: &SaveAdaptationRequest,
+    ) -> Result<InferenceResponseVariant> {
+        let subject = ctx.subject();
+        let info = InferenceService::handle_save_adaptation(self, &subject, &data.name, &data.merge_strategy, data.merge_weight).await?;
+        Ok(InferenceResponseVariant::SaveAdaptationResult(SaveAdaptationResult {
+            adapter_name: info.adapter_name,
+            adapter_path: info.adapter_path,
+            content_hash: info.content_hash,
+            merge_strategy: info.merge_strategy,
+        }))
+    }
 
-        use inference_capnp::inference_request::Which;
+    async fn handle_snapshot_delta(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+        let subject = ctx.subject();
+        let info = InferenceService::handle_snapshot_delta(self, &subject).await?;
+        Ok(InferenceResponseVariant::SnapshotDeltaResult(SnapshotDeltaResult {
+            content_hash: info.content_hash,
+            size_bytes: info.size_bytes,
+            accumulated_steps: info.accumulated_steps,
+            request_count: info.request_count,
+        }))
+    }
 
-        // Resource for authorization checks
-        let resource = format!("inference:{}", self.model_id);
-
-        match req.which()? {
-            Which::Generate(gen_req) => {
-                // Authorization: Infer on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Infer).await {
-                    return Ok((resp, None));
-                }
-                let subject = ctx.subject();
-                let gen_req = gen_req?;
-                let request = self.parse_generation_request(gen_req)?;
-
-                match self.handle_generate(request, &subject) {
-                    Ok(result) => Ok((InferenceResponse::generation_result(request_id, &result), None)),
-                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
-                }
-            }
-
-            Which::GenerateStream(gen_req) => {
-                // Authorization: Infer on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Infer).await {
-                    return Ok((resp, None));
-                }
-                let subject = ctx.subject();
-                let gen_req = gen_req?;
-                let request = self.parse_generation_request(gen_req)?;
-
-                // Calculate expiry from claims (for stream pre-authorization)
-                let expiry_secs = ctx.claims()
-                    .map(|c| c.exp - chrono::Utc::now().timestamp())
-                    .unwrap_or(300) // Default: 5 minutes
-                    .max(60); // At least 60 seconds
-
-                // Prepare stream with DH key exchange and pre-authorization via StreamChannel
-                let client_ephemeral_pubkey = ctx.ephemeral_pubkey();
-                let claims = ctx.claims().cloned();
-                let (stream_id, server_pubkey, pending) = self.prepare_stream(
-                    request,
-                    client_ephemeral_pubkey,
-                    claims,
-                    expiry_secs,
-                    &subject,
-                ).await?;
-
-                // Get StreamService's Sub endpoint (where clients subscribe)
-                let stream_sub_endpoint = hyprstream_rpc::registry::global()
-                    .endpoint("streams", hyprstream_rpc::registry::SocketKind::Sub)
-                    .to_zmq_string();
-
-                // Return response with stream_id AND server_pubkey for client DH
-                let response = InferenceResponse::stream_started(
-                    request_id,
-                    &stream_id,
-                    &stream_sub_endpoint,
-                    &server_pubkey,
-                );
-                Ok((response, Some(pending)))
-            }
-
-            Which::ModelInfo(()) => {
-                // Authorization: Query on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query).await {
-                    return Ok((resp, None));
-                }
-                let info = self.handle_model_info();
-                let has_lora = self.base_delta.lock().is_some();
-                Ok((InferenceResponse::model_info(request_id, &info, has_lora), None))
-            }
-
-            Which::IsReady(()) => {
-                // Authorization: Query on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query).await {
-                    return Ok((resp, None));
-                }
-                let ready = self.handle_is_ready();
-                Ok((InferenceResponse::ready(request_id, ready), None))
-            }
-
-            Which::ApplyChatTemplate(template_req) => {
-                // Authorization: Query on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query).await {
-                    return Ok((resp, None));
-                }
-                let template_req = template_req?;
-                let messages: Vec<crate::runtime::template_engine::ChatMessage> = template_req
-                    .get_messages()?
-                    .iter()
-                    .filter_map(|m| {
-                        Some(crate::runtime::template_engine::ChatMessage {
-                            role: m.get_role().ok()?.to_str().ok()?.to_owned(),
-                            content: m.get_content().ok()?.to_str().ok()?.to_owned(),
-                        })
-                    })
-                    .collect();
-
-                let add_generation_prompt = template_req.get_add_generation_prompt();
-
-                match self.handle_apply_chat_template(messages, add_generation_prompt) {
-                    Ok(result) => Ok((InferenceResponse::template_result(request_id, &result), None)),
-                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
-                }
-            }
-
-            Which::CreateLora(lora_config) => {
-                // Authorization: Write on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
-                    return Ok((resp, None));
-                }
-                let lora_config = lora_config?;
-                let config = TenantDeltaConfig {
-                    rank: lora_config.get_rank() as usize,
-                    alpha: lora_config.get_alpha(),
-                    dropout: lora_config.get_dropout(),
-                    target_modules: lora_config
-                        .get_target_modules()?
-                        .iter()
-                        .filter_map(|s| s.ok().and_then(|t| t.to_str().ok().map(std::borrow::ToOwned::to_owned)))
-                        .collect(),
-                    learning_rate: lora_config.get_learning_rate() as f64,
-                    ..TenantDeltaConfig::default()
-                };
-
-                match self.handle_create_lora(config) {
-                    Ok(()) => Ok((InferenceResponse::void_result(request_id, "createLora"), None)),
-                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
-                }
-            }
-
-            Which::LoadLora(path) => {
-                // Authorization: Write on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
-                    return Ok((resp, None));
-                }
-                let path = path?.to_str()?;
-                match self.load_lora(Path::new(path)).await {
-                    Ok(()) => Ok((InferenceResponse::void_result(request_id, "loadLora"), None)),
-                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
-                }
-            }
-
-            Which::SaveLora(path) => {
-                // Authorization: Write on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
-                    return Ok((resp, None));
-                }
-                let path = path?.to_str()?;
-                match self.save_lora(path).await {
-                    Ok(()) => Ok((InferenceResponse::void_result(request_id, "saveLora"), None)),
-                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
-                }
-            }
-
-            Which::UnloadLora(()) => {
-                // Authorization: Write on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
-                    return Ok((resp, None));
-                }
-                match self.unload_lora().await {
-                    Ok(()) => Ok((InferenceResponse::void_result(request_id, "unloadLora"), None)),
-                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
-                }
-            }
-
-            Which::HasLora(()) => {
-                // Authorization: Query on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query).await {
-                    return Ok((resp, None));
-                }
-                let has_lora = self.has_lora().await.unwrap_or(false);
-                Ok((InferenceResponse::has_lora(request_id, has_lora), None))
-            }
-
-            Which::SetSession(session_id) => {
-                // Authorization: Write on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
-                    return Ok((resp, None));
-                }
-                let session_id = session_id?.to_str()?.to_owned();
-                match self.handle_set_session(session_id) {
-                    Ok(()) => Ok((InferenceResponse::void_result(request_id, "setSession"), None)),
-                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
-                }
-            }
-
-            Which::ClearSession(()) => {
-                // Authorization: Write on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
-                    return Ok((resp, None));
-                }
-                self.handle_clear_session();
-                Ok((InferenceResponse::void_result(request_id, "clearSession"), None))
-            }
-
-            Which::ReleaseSession(session_id) => {
-                // Authorization: Write on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
-                    return Ok((resp, None));
-                }
-                let session_id = session_id?.to_str()?;
-                match self.handle_release_session(session_id) {
-                    Ok(()) => Ok((InferenceResponse::void_result(request_id, "releaseSession"), None)),
-                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
-                }
-            }
-
-            Which::HealthCheck(()) => {
-                // Health check is public (no authorization required)
-                let model_loaded = self.engine.read().is_loaded();
-                Ok((InferenceResponse::health(request_id, model_loaded), None))
-            }
-
-            Which::Shutdown(()) => {
-                // Authorization: Manage on inference (shutdown requires admin)
-                if let Some(resp) = self.check_auth(ctx, request_id, "inference", Operation::Manage).await {
-                    return Ok((resp, None));
-                }
-                info!("Inference service shutdown requested");
-                Ok((InferenceResponse::success(request_id), None))
-            }
-
-            Which::StartStream(start_req) => {
-                // Authorization: Infer on inference:{model} (same as generating)
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Infer).await {
-                    return Ok((resp, None));
-                }
-
-                let start_req = start_req?;
-                let stream_id = start_req.get_stream_id()?.to_str()?.to_owned();
-
-                // Validate stream_id format
-                if !stream_id.starts_with("stream-") {
-                    return Ok((InferenceResponse::error(request_id, "Invalid stream_id format"), None));
-                }
-
-                // Get StreamChannel
-                let stream_channel = match &self.stream_channel {
-                    Some(sc) => sc,
-                    None => {
-                        error!(stream_id = %stream_id, "StreamChannel not available for stream authorization");
-                        return Ok((InferenceResponse::error(request_id, "Stream service not available"), None));
-                    }
-                };
-
-                // Send AUTHORIZE message to StreamService via StreamChannel
-                // Include expiry from claims so StreamService can GC expired entries
-                let exp = ctx.claims().map(|c| c.exp).unwrap_or_else(|| {
-                    // Default: 5 minutes from now if no claims
-                    chrono::Utc::now().timestamp() + 300
-                });
-                let claims = ctx.claims().cloned();
-
-                if let Err(e) = stream_channel.register_topic(&stream_id, exp, claims).await {
-                    error!(stream_id = %stream_id, error = %e, "Failed to send authorize message to StreamService");
-                    return Ok((InferenceResponse::error(request_id, &format!("Stream authorization failed: {e}")), None));
-                }
-                info!(stream_id = %stream_id, exp = exp, "Stream authorized for subscription");
-
-                Ok((InferenceResponse::stream_authorized(request_id, &stream_id), None))
-            }
-
-            // Training loop control
-            Which::CommitAdaptation(()) => {
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
-                    return Ok((resp, None));
-                }
-                let subject = ctx.subject();
-                // Clean up timed-out pending adaptations first
-                self.cleanup_pending_adaptations();
-                match self.handle_commit_adaptation(&subject) {
-                    Ok(()) => Ok((InferenceResponse::void_result(request_id, "commitAdaptation"), None)),
-                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
-                }
-            }
-
-            Which::RollbackAdaptation(()) => {
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
-                    return Ok((resp, None));
-                }
-                let subject = ctx.subject();
-                match self.handle_rollback_adaptation(&subject) {
-                    Ok(()) => Ok((InferenceResponse::void_result(request_id, "rollbackAdaptation"), None)),
-                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
-                }
-            }
-
-            Which::TrainStep(train_req) => {
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
-                    return Ok((resp, None));
-                }
-                let subject = ctx.subject();
-                info!("[TTT-DEBUG] train_step: subject={}", subject);
-                let train_req = train_req?;
-                let input = train_req.get_input()?.to_str()?;
-                let gradient_steps = train_req.get_gradient_steps();
-                let learning_rate = train_req.get_learning_rate();
-                let auto_commit = train_req.get_auto_commit();
-
-                match self.handle_train_step(&subject, input, gradient_steps, learning_rate, auto_commit) {
-                    Ok(result) => Ok((InferenceResponse::train_step_result(request_id, &result), None)),
-                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
-                }
-            }
-
-            Which::TrainStepStream(train_req) => {
-                // Authorization: Write on inference:{model}
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
-                    return Ok((resp, None));
-                }
-                let subject = ctx.subject();
-                let train_req = train_req?;
-                let input = train_req.get_input()?.to_str()?.to_owned();
-                let gradient_steps = train_req.get_gradient_steps();
-                let learning_rate = train_req.get_learning_rate();
-                let auto_commit = train_req.get_auto_commit();
-
-                // DH key derivation is required for streaming
-                let client_pub_bytes = ctx.ephemeral_pubkey()
-                    .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
-
-                let stream_channel = self.stream_channel.as_ref()
-                    .ok_or_else(|| anyhow!("StreamChannel not initialized"))?;
-
-                // Calculate expiry from claims
-                let expiry_secs = ctx.claims()
-                    .map(|c| c.exp - chrono::Utc::now().timestamp())
-                    .unwrap_or(300)
-                    .max(60);
-                let claims = ctx.claims().cloned();
-
-                let stream_ctx = stream_channel
-                    .prepare_stream_with_claims(client_pub_bytes, expiry_secs, claims)
-                    .await?;
-
-                let stream_id = stream_ctx.stream_id().to_owned();
-                let server_pubkey = *stream_ctx.server_pubkey();
-
-                // Get StreamService's Sub endpoint (where clients subscribe)
-                let stream_sub_endpoint = hyprstream_rpc::registry::global()
-                    .endpoint("streams", hyprstream_rpc::registry::SocketKind::Sub)
-                    .to_zmq_string();
-
-                let pending = PendingWork::Training {
-                    stream_ctx,
-                    subject,
-                    input,
-                    gradient_steps,
-                    learning_rate,
-                    auto_commit,
-                };
-
-                let response = InferenceResponse::train_step_stream_result(
-                    request_id,
-                    &stream_id,
-                    &stream_sub_endpoint,
-                    &server_pubkey,
-                );
-                Ok((response, Some(pending)))
-            }
-
-            Which::ResetDelta(()) => {
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
-                    return Ok((resp, None));
-                }
-                let subject = ctx.subject();
-                match self.handle_reset_delta(&subject) {
-                    Ok(()) => Ok((InferenceResponse::void_result(request_id, "resetDelta"), None)),
-                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
-                }
-            }
-
-            // Persistence operations
-            Which::GetDeltaStatus(()) => {
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query).await {
-                    return Ok((resp, None));
-                }
-                let subject = ctx.subject();
-                match self.handle_get_delta_status(&subject) {
-                    Ok(info) => Ok((InferenceResponse::delta_status(request_id, &info), None)),
-                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
-                }
-            }
-
-            Which::SaveAdaptation(save_req) => {
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
-                    return Ok((resp, None));
-                }
-                let subject = ctx.subject();
-                let save_req = save_req?;
-                let name = save_req.get_name()?.to_str()?;
-                let merge_strategy = save_req.get_merge_strategy()?.to_str()?;
-                let merge_weight = save_req.get_merge_weight();
-
-                match self.handle_save_adaptation(&subject, name, merge_strategy, merge_weight).await {
-                    Ok(info) => Ok((InferenceResponse::save_adaptation_result(request_id, &info), None)),
-                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
-                }
-            }
-
-            Which::SnapshotDelta(()) => {
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
-                    return Ok((resp, None));
-                }
-                let subject = ctx.subject();
-                match self.handle_snapshot_delta(&subject).await {
-                    Ok(info) => Ok((InferenceResponse::snapshot_delta_result(request_id, &info), None)),
-                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
-                }
-            }
-
-            Which::ExportPeftAdapter(export_req) => {
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write).await {
-                    return Ok((resp, None));
-                }
-                let subject = ctx.subject();
-                let export_req = export_req?;
-                let name = export_req.get_name()?.to_str()?;
-                let commit_message = export_req.get_commit_message()?.to_str()?;
-
-                match self.handle_export_peft_adapter(&subject, name, commit_message).await {
-                    Ok(info) => Ok((InferenceResponse::export_peft_adapter_result(request_id, &info), None)),
-                    Err(e) => Ok((InferenceResponse::error(request_id, &e.to_string()), None)),
-                }
-            }
-        }
+    async fn handle_export_peft_adapter(
+        &self, ctx: &EnvelopeContext, _request_id: u64,
+        data: &ExportPeftRequest,
+    ) -> Result<InferenceResponseVariant> {
+        let subject = ctx.subject();
+        let info = InferenceService::handle_export_peft_adapter(self, &subject, &data.name, &data.commit_message).await?;
+        Ok(InferenceResponseVariant::ExportPeftAdapterResult(ExportPeftResult {
+            adapter_path: info.adapter_path,
+            content_hash: info.content_hash,
+        }))
     }
 }
+
+/// Convert a GenerationResult to the generated data type.
+fn generation_result_to_data(result: &GenerationResult) -> crate::services::generated::inference_client::GenerationResult {
+    let finish_reason = match &result.finish_reason {
+        FinishReason::MaxTokens => FinishReasonEnum::MaxTokens,
+        FinishReason::StopToken(_) => FinishReasonEnum::StopToken,
+        FinishReason::EndOfSequence => FinishReasonEnum::EndOfSequence,
+        FinishReason::Error(_) => FinishReasonEnum::Error,
+        FinishReason::Stop => FinishReasonEnum::Stop,
+    };
+    crate::services::generated::inference_client::GenerationResult {
+        text: result.text.clone(),
+        tokens_generated: result.tokens_generated as u32,
+        finish_reason,
+        generation_time_ms: result.generation_time_ms,
+        tokens_per_second: result.tokens_per_second,
+        quality_metrics: QualityMetrics::default(),
+        prefill_tokens: result.prefill_tokens as u32,
+        prefill_time_ms: result.prefill_time_ms,
+        prefill_tokens_per_sec: result.prefill_tokens_per_sec,
+        inference_tokens: result.inference_tokens as u32,
+        inference_time_ms: result.inference_time_ms,
+        inference_tokens_per_sec: result.inference_tokens_per_sec,
+        online_training_metrics: result.ttt_metrics.as_ref()
+            .map(|m| OnlineTrainingMetrics {
+                avg_loss: m.avg_loss,
+                loss_improvement: m.loss_improvement,
+                steps_performed: m.steps_performed as u32,
+                adaptation_time_ms: m.adaptation_time_ms,
+                skipped: m.skipped,
+                skip_reason: m.skip_reason.clone().unwrap_or_default(),
+                avg_grad_norm: m.avg_grad_norm,
+                max_grad_norm: m.max_grad_norm,
+                gradient_clipped: m.gradient_clipped,
+                tokens_used: m.tokens_used as u32,
+                tokens_provided: m.tokens_provided as u32,
+                was_truncated: m.was_truncated,
+                initial_perplexity: m.initial_perplexity,
+                final_perplexity: m.final_perplexity,
+                recommendation: m.recommendation,
+                gated_steps: m.gated_steps as u32,
+                pending: m.pending,
+            })
+            .unwrap_or_default(),
+    }
+}
+
+// Note: InferenceService does NOT implement ZmqService because it uses a custom
+// single-threaded tokio runtime in `run_service_loop` (not RequestLoop).
+// Both `run_service_loop` and `handle_callback_infer` call `dispatch_inference` directly.
 
 /// Client for the inference service
 ///
@@ -2300,16 +2188,13 @@ impl InferenceService {
 /// - The service verifies signatures before processing
 /// - Identity is included for authorization checks
 ///
-/// Wraps a generated `InferenceClient`. Most methods delegate directly to the
-/// generated typed client. Streaming methods (`generate_stream`, `start_stream`)
-/// use manual request building because they need custom `CallOptions`.
+/// Wraps a generated `InferenceClient`. All methods delegate to the
+/// autogenerated typed client.
 #[derive(Clone)]
 pub struct InferenceZmqClient {
     /// Generated typed client (handles all transport including streaming via call_with_options)
     pub(crate) gen: crate::services::generated::inference_client::InferenceClient,
 }
-
-use crate::services::generated::inference_client::InferenceResponseVariant;
 
 impl InferenceZmqClient {
     /// Create a new inference client with signing credentials
@@ -2319,13 +2204,8 @@ impl InferenceZmqClient {
 
     /// Create an inference client connected to a specific endpoint
     pub fn with_endpoint(endpoint: &str, signing_key: SigningKey, identity: RequestIdentity) -> Self {
-        use hyprstream_rpc::service::factory::ServiceClient;
-        let server_verifying_key = signing_key.verifying_key();
-        let base = crate::services::core::ZmqClientBase::new(
-            endpoint, global_context(), signing_key, server_verifying_key, identity,
-        );
         Self {
-            gen: crate::services::generated::inference_client::InferenceClient::from_zmq(base),
+            gen: crate::services::core::create_service_client(endpoint, signing_key, identity),
         }
     }
 
@@ -2405,115 +2285,61 @@ impl InferenceZmqClient {
         Ok(())
     }
 
-    /// Start streaming generation with E2E authentication (manual — needs custom CallOptions)
+    /// Start streaming generation with E2E authentication — delegates to generated client
     pub async fn generate_stream(
         &self,
         request: &GenerationRequest,
         ephemeral_pubkey: Option<[u8; 32]>,
-    ) -> Result<StreamStartedInfo> {
-        let id = self.gen.next_id();
-
-        let mut message = Builder::new_default();
-        let mut req = message.init_root::<inference_capnp::inference_request::Builder>();
-        req.set_id(id);
-
-        let mut gen_req = req.init_generate_stream();
-        gen_req.set_prompt(request.prompt.as_str());
-        gen_req.set_max_tokens(request.max_tokens as u32);
-        gen_req.set_temperature(request.temperature);
-        gen_req.set_top_p(request.top_p);
-        gen_req.set_top_k(request.top_k.unwrap_or(0) as u32);
-        gen_req.set_repeat_penalty(request.repeat_penalty);
-        gen_req.set_repeat_last_n(request.repeat_last_n as u32);
-        gen_req.set_seed(request.seed.unwrap_or(0));
-        gen_req.set_timeout_ms(request.timeout.unwrap_or(0));
-
-        if !request.stop_tokens.is_empty() {
-            let mut stop_list = gen_req.init_stop_tokens(request.stop_tokens.len() as u32);
-            for (i, token) in request.stop_tokens.iter().enumerate() {
-                stop_list.set(i as u32, token);
-            }
-        }
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-
-        let opts = match ephemeral_pubkey {
-            Some(pk) => CallOptions::default().ephemeral_pubkey(pk),
-            None => CallOptions::default(),
-        };
-        let response = self.gen.call_with_options(bytes, opts).await?;
-        Self::parse_stream_started_response(&response)
-    }
-
-    /// Authorize a stream subscription (manual — preserves exact request shape)
-    pub async fn start_stream(&self, stream_id: &str) -> Result<String> {
-        let id = self.gen.next_id();
-
-        let mut message = Builder::new_default();
-        let mut req = message.init_root::<inference_capnp::inference_request::Builder>();
-        req.set_id(id);
-
-        let mut start_req = req.init_start_stream();
-        start_req.set_stream_id(stream_id);
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-
-        let response = self.gen.call_with_options(bytes, CallOptions::default()).await?;
-        Self::parse_stream_authorized_response(&response)
+    ) -> Result<StreamInfo> {
+        self.gen.generate_stream(
+            request.prompt.as_str(),
+            request.max_tokens as u32,
+            request.temperature,
+            request.top_p,
+            request.top_k.unwrap_or(0) as u32,
+            request.repeat_penalty,
+            request.repeat_last_n as u32,
+            &request.stop_tokens,
+            request.seed.unwrap_or(0),
+            &[], // images
+            request.timeout.unwrap_or(0),
+            ephemeral_pubkey.unwrap_or([0u8; 32]),
+        ).await
     }
 
     /// Start streaming generation with E2E authenticated handle.
+    ///
+    /// Returns the canonical `StreamHandle` from hyprstream-rpc which provides:
+    /// - `recv_next()` for blocking receive with HMAC verification
+    /// - `try_next()` for non-blocking receive
+    ///
+    /// Use `StreamChunkMessage::from_stream_payload()` to convert received
+    /// `StreamPayload` values to inference-specific message types.
     pub async fn generate_stream_handle(
         &self,
         request: &GenerationRequest,
-        claims: crate::auth::Claims,
-    ) -> Result<StreamHandle> {
-        use hyprstream_rpc::crypto::{
-            derive_stream_keys, generate_ephemeral_keypair, ristretto_dh, RistrettoPublic,
-        };
+    ) -> Result<crate::services::rpc_types::StreamHandle> {
+        use hyprstream_rpc::crypto::generate_ephemeral_keypair;
 
         let (client_secret, client_pubkey) = generate_ephemeral_keypair();
         let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
 
         let info = self.generate_stream(request, Some(client_pubkey_bytes)).await?;
 
-        let use_e2e = info.server_pubkey != [0u8; 32];
-
-        use crate::zmq::global_context;
-
-        if !use_e2e {
+        if info.server_pubkey == [0u8; 32] {
             anyhow::bail!(
                 "Server did not provide Ristretto255 public key - E2E authentication required"
             );
         }
 
-        let server_ristretto_pubkey = RistrettoPublic::from_bytes(&info.server_pubkey)
-            .ok_or_else(|| anyhow::anyhow!("Invalid server Ristretto255 public key encoding"))?;
-
-        let shared_secret = ristretto_dh(&client_secret, &server_ristretto_pubkey);
-
-        let keys = derive_stream_keys(
-            &shared_secret,
-            &client_pubkey_bytes,
-            &info.server_pubkey,
-        )?;
-
-        tracing::info!(
-            stream_id = %info.stream_id,
-            topic = %keys.topic,
-            "Creating E2E authenticated stream handle"
-        );
-
-        StreamHandle::new(
+        // Use the canonical StreamHandle which performs DH key exchange internally
+        crate::services::rpc_types::StreamHandle::new(
             &global_context(),
             info.stream_id,
             &info.endpoint,
-            keys.topic,
-            *keys.mac_key,
-            claims,
-            self.gen.signing_key().clone(),
+            &info.server_pubkey,
+            &client_secret,
+            &client_pubkey_bytes,
         )
     }
 
@@ -2523,8 +2349,8 @@ impl InferenceZmqClient {
         messages: &[crate::runtime::template_engine::ChatMessage],
         add_generation_prompt: bool,
     ) -> Result<String> {
-        use crate::services::generated::inference_client::ChatMessageData;
-        let msg_data: Vec<ChatMessageData> = messages.iter().map(|m| ChatMessageData {
+        use crate::services::generated::inference_client::ChatMessage;
+        let msg_data: Vec<ChatMessage> = messages.iter().map(|m| ChatMessage {
             role: m.role.clone(),
             content: m.content.clone(),
         }).collect();
@@ -2575,7 +2401,7 @@ impl InferenceZmqClient {
         self.gen.reset_delta().await
     }
 
-    /// Start streaming training step with E2E authentication (manual — needs custom CallOptions)
+    /// Start streaming training step with E2E authentication — delegates to generated client
     pub async fn train_step_stream(
         &self,
         input: &str,
@@ -2583,28 +2409,14 @@ impl InferenceZmqClient {
         learning_rate: f32,
         auto_commit: bool,
         ephemeral_pubkey: Option<[u8; 32]>,
-    ) -> Result<StreamStartedInfo> {
-        let id = self.gen.next_id();
-
-        let mut message = Builder::new_default();
-        let mut req = message.init_root::<inference_capnp::inference_request::Builder>();
-        req.set_id(id);
-
-        let mut train_req = req.init_train_step_stream();
-        train_req.set_input(input);
-        train_req.set_gradient_steps(gradient_steps);
-        train_req.set_learning_rate(learning_rate);
-        train_req.set_auto_commit(auto_commit);
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-
-        let opts = match ephemeral_pubkey {
-            Some(pk) => CallOptions::default().ephemeral_pubkey(pk),
-            None => CallOptions::default(),
-        };
-        let response = self.gen.call_with_options(bytes, opts).await?;
-        Self::parse_train_step_stream_response(&response)
+    ) -> Result<StreamInfo> {
+        self.gen.train_step_stream(
+            input,
+            gradient_steps,
+            learning_rate,
+            auto_commit,
+            ephemeral_pubkey.unwrap_or([0u8; 32]),
+        ).await
     }
 
     /// Set the current session ID for KV cache management
@@ -2626,52 +2438,11 @@ impl InferenceZmqClient {
     pub async fn shutdown(&self) -> Result<()> {
         match self.gen.shutdown().await? {
             InferenceResponseVariant::Success => Ok(()),
-            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
+            InferenceResponseVariant::Error(ref e) => Err(anyhow!("{}", e.message)),
             _ => Err(anyhow!("Unexpected response type")),
         }
     }
 
-    /// Parse stream started response — uses generated response parser
-    fn parse_stream_started_response(response: &[u8]) -> Result<StreamStartedInfo> {
-        use crate::services::generated::inference_client::InferenceClient;
-        match InferenceClient::parse_response(response)? {
-            InferenceResponseVariant::GenerateStreamResult { stream_id, endpoint, server_pubkey } => {
-                Ok(StreamStartedInfo {
-                    stream_id,
-                    endpoint,
-                    server_pubkey: server_pubkey.try_into().unwrap_or([0u8; 32]),
-                })
-            }
-            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
-            _ => Err(anyhow!("Unexpected response type")),
-        }
-    }
-
-    /// Parse stream authorized response — uses generated response parser
-    fn parse_stream_authorized_response(response: &[u8]) -> Result<String> {
-        use crate::services::generated::inference_client::InferenceClient;
-        match InferenceClient::parse_response(response)? {
-            InferenceResponseVariant::StartStreamResult { stream_id, .. } => Ok(stream_id),
-            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
-            _ => Err(anyhow!("Unexpected response type")),
-        }
-    }
-
-    /// Parse train step stream response — returns StreamStartedInfo
-    fn parse_train_step_stream_response(response: &[u8]) -> Result<StreamStartedInfo> {
-        use crate::services::generated::inference_client::InferenceClient;
-        match InferenceClient::parse_response(response)? {
-            InferenceResponseVariant::TrainStepStreamResult { stream_id, endpoint, server_pubkey } => {
-                Ok(StreamStartedInfo {
-                    stream_id,
-                    endpoint,
-                    server_pubkey: server_pubkey.try_into().unwrap_or([0u8; 32]),
-                })
-            }
-            InferenceResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
-            _ => Err(anyhow!("Unexpected response type")),
-        }
-    }
 }
 
 // ============================================================================
@@ -2700,222 +2471,13 @@ pub enum StreamChunkMessage {
 }
 
 impl StreamChunkMessage {
-    /// Parse an InferencePayload message from StreamService
+    /// Convert a generic StreamPayload to an inference-specific StreamChunkMessage.
     ///
-    /// Note: This parses the inner inference_capnp::InferencePayload.
-    /// HMAC verification and ordering happen at the StreamBlock level
-    /// using the outer streaming_capnp::StreamBlock wrapper.
-    pub fn from_capnp(payload: inference_capnp::inference_payload::Reader) -> Result<Self> {
-        use inference_capnp::inference_payload::Which;
-
-        let stream_id = payload.get_stream_id()?.to_str()?.to_owned();
-        tracing::trace!(stream_id = %stream_id, "Parsing inference payload");
-
-        // Parse union variant
-        match payload.which()? {
-            Which::Token(token) => {
-                let token = token?.to_str()?.to_owned();
-                Ok(StreamChunkMessage::Chunk { text: token })
-            }
-            Which::Complete(complete) => {
-                let complete = complete?;
-                let finish_reason = match complete.get_finish_reason()? {
-                    inference_capnp::FinishReason::MaxTokens => FinishReason::MaxTokens,
-                    inference_capnp::FinishReason::StopToken => FinishReason::StopToken(String::new()),
-                    inference_capnp::FinishReason::EndOfSequence => FinishReason::EndOfSequence,
-                    inference_capnp::FinishReason::Error => FinishReason::Error(String::new()),
-                    inference_capnp::FinishReason::Stop => FinishReason::Stop,
-                };
-                let stats = crate::runtime::GenerationStats {
-                    tokens_generated: complete.get_tokens_generated() as usize,
-                    finish_reason: Some(finish_reason),
-                    generation_time_ms: complete.get_generation_time_ms(),
-                    tokens_per_second: complete.get_tokens_per_second(),
-                    quality_metrics: None,
-                    prefill_tokens: 0,
-                    prefill_time_ms: 0,
-                    prefill_tokens_per_sec: 0.0,
-                    inference_tokens: 0,
-                    inference_time_ms: 0,
-                    inference_tokens_per_sec: 0.0,
-                    inference_tokens_per_sec_ema: 0.0,
-                };
-                Ok(StreamChunkMessage::Complete { stats })
-            }
-            Which::Error(error) => {
-                let error = error?;
-                let error_msg = error.get_message()?.to_str()?.to_owned();
-                Ok(StreamChunkMessage::Error {
-                    error: error_msg,
-                })
-            }
-        }
-    }
-
-    /// Returns true if this is the last message (Complete or Error)
-    pub fn is_last(&self) -> bool {
-        matches!(self, StreamChunkMessage::Complete { .. } | StreamChunkMessage::Error { .. })
-    }
-}
-
-/// Handle for receiving stream chunks from StreamService with E2E authentication.
-///
-/// Subscribes to StreamService using DH-derived topic and verifies HMAC chain.
-///
-/// # E2E Authentication Protocol
-///
-/// 1. Client generates ephemeral keypair, includes pubkey in request envelope
-/// 2. Server generates ephemeral keypair, returns pubkey in StreamInfo
-/// 3. Both derive: shared_secret = DH(my_secret, their_pubkey)
-/// 4. Both derive: (topic, mac_key) = HKDF(shared_secret, pubkeys)
-/// 5. Client subscribes to DH-derived topic (unpredictable, non-colliding)
-/// 6. Client verifies HMAC chain on received chunks
-pub struct StreamHandle {
-    /// ZMQ SUB socket
-    subscriber: zmq::Socket,
-    /// Stream ID (for display/logging only, not used for routing)
-    stream_id: String,
-    /// DH-derived topic (64 hex chars) - used for ZMQ subscription
-    topic: String,
-    /// StreamVerifier for HMAC chain verification (new StreamBlock format)
-    verifier: crate::services::rpc_types::StreamVerifier,
-    /// Buffer for parsed payloads (StreamBlock can contain multiple)
-    pending_payloads: std::collections::VecDeque<crate::services::rpc_types::StreamPayload>,
-    /// Whether stream has completed
-    stream_completed: bool,
-    /// Claims for legacy JWT subscription (backwards compatibility)
-    #[allow(dead_code)]
-    claims: crate::auth::Claims,
-    /// Signing key for legacy JWT subscription
-    #[allow(dead_code)]
-    signing_key: ed25519_dalek::SigningKey,
-}
-
-impl StreamHandle {
-    /// Create a new E2E authenticated stream handle.
-    ///
-    /// # Arguments
-    /// * `context` - ZMQ context
-    /// * `stream_id` - Stream ID for display/logging
-    /// * `endpoint` - StreamService SUB endpoint
-    /// * `topic` - DH-derived topic for ZMQ subscription (from Ristretto255 key exchange)
-    /// * `mac_key` - DH-derived HMAC key for chain verification
-    /// * `claims` - User authorization claims
-    /// * `signing_key` - Ed25519 signing key
-    pub fn new(
-        context: &zmq::Context,
-        stream_id: String,
-        endpoint: &str,
-        topic: String,
-        mac_key: [u8; 32],
-        claims: crate::auth::Claims,
-        signing_key: ed25519_dalek::SigningKey,
-    ) -> Result<Self> {
-        use crate::services::rpc_types::StreamVerifier;
-
-        // Create SUB socket
-        let subscriber = context.socket(zmq::SUB)?;
-
-        // Connect to StreamService endpoint
-        subscriber.connect(endpoint)?;
-
-        // Subscribe to DH-derived topic (E2E authentication via Ristretto255)
-        subscriber.set_subscribe(topic.as_bytes())?;
-
-        tracing::info!(
-            stream_id = %stream_id,
-            topic = %topic,
-            endpoint = %endpoint,
-            "Subscribed to E2E authenticated stream (StreamBlock format)"
-        );
-
-        // Create verifier for HMAC chain verification
-        let verifier = StreamVerifier::new(mac_key, topic.clone());
-
-        Ok(Self {
-            subscriber,
-            stream_id,
-            topic,
-            verifier,
-            pending_payloads: std::collections::VecDeque::new(),
-            stream_completed: false,
-            claims,
-            signing_key,
-        })
-    }
-
-    /// Receive next chunk (blocking) with HMAC verification.
-    ///
-    /// Returns `None` if the stream has ended (Complete or Error message received).
-    ///
-    /// # StreamBlock Format
-    ///
-    /// Messages are received as 3-frame multipart: [topic, capnp StreamBlock, 16-byte mac]
-    /// The StreamBlock contains multiple payloads which are buffered and returned one at a time.
-    ///
-    /// # HMAC Verification
-    ///
-    /// Each block's HMAC is verified against the chain:
-    /// - First block: HMAC(mac_key, topic || capnp)[..16]
-    /// - Subsequent: HMAC(mac_key, prev_mac || capnp)[..16]
-    ///
-    /// If verification fails, returns an error.
-    pub fn next_chunk(&mut self) -> Result<Option<StreamChunkMessage>> {
-        use crate::services::rpc_types::StreamPayload;
-
-        // Return buffered payloads first
-        if let Some(payload) = self.pending_payloads.pop_front() {
-            return Ok(Some(self.convert_payload(payload)));
-        }
-
-        // Stream completed, no more data
-        if self.stream_completed {
-            return Ok(None);
-        }
-
-        // Receive multipart message from StreamService
-        // StreamBlock format: [topic, capnp, 16-byte mac]
-        let msg = self.subscriber.recv_multipart(0)?;
-
-        // Validate 3-frame StreamBlock format
-        if msg.len() != 3 || msg[2].len() != 16 {
-            bail!(
-                "Invalid StreamBlock format: expected 3 frames with 16-byte MAC, got {} frames{}",
-                msg.len(),
-                if msg.len() >= 3 { format!(" with {}-byte MAC", msg[2].len()) } else { String::new() }
-            );
-        }
-
-        // Verify and parse StreamBlock
-        let payloads = self.verifier.verify(&msg)?;
-
-        // Buffer all payloads
-        for payload in payloads {
-            // Check if this is a completion/error (marks end of stream)
-            let is_terminal = matches!(
-                payload,
-                StreamPayload::Complete { .. } | StreamPayload::Error { .. }
-            );
-            if is_terminal {
-                self.stream_completed = true;
-            }
-            self.pending_payloads.push_back(payload);
-        }
-
-        // Return first payload from buffer
-        if let Some(payload) = self.pending_payloads.pop_front() {
-            return Ok(Some(self.convert_payload(payload)));
-        }
-
-        // Empty block (shouldn't happen but handle gracefully)
-        Ok(None)
-    }
-
-    /// Convert ParsedStreamPayload to StreamChunkMessage
-    fn convert_payload(&self, payload: crate::services::rpc_types::StreamPayload) -> StreamChunkMessage {
+    /// This bridges the generic streaming layer (StreamPayload) to the inference-specific
+    /// message types used by consumers.
+    pub fn from_stream_payload(payload: crate::services::rpc_types::StreamPayload) -> Self {
         use crate::services::rpc_types::{InferenceStreamPayload, StreamPayloadExt};
 
-        // Convert generic payload to inference-specific
         match payload.to_inference() {
             Ok(InferenceStreamPayload::Token(text)) => {
                 StreamChunkMessage::Chunk { text }
@@ -2924,7 +2486,6 @@ impl StreamHandle {
                 StreamChunkMessage::Error { error: message }
             }
             Ok(InferenceStreamPayload::Complete(stats)) => {
-                // Build quality metrics if present
                 let quality_metrics = if stats.perplexity.is_some() || stats.avg_entropy.is_some() {
                     Some(crate::runtime::generation_metrics::GenerationQualityMetrics {
                         perplexity: stats.perplexity.unwrap_or(0.0),
@@ -2935,7 +2496,6 @@ impl StreamHandle {
                     None
                 };
 
-                // Convert to GenerationStats with full metrics
                 let gen_stats = crate::runtime::GenerationStats {
                     tokens_generated: stats.tokens_generated,
                     generation_time_ms: stats.generation_time_ms,
@@ -2958,21 +2518,16 @@ impl StreamHandle {
                 StreamChunkMessage::Complete { stats: gen_stats }
             }
             Err(e) => {
-                // If parsing fails, return as error
                 StreamChunkMessage::Error { error: format!("Failed to parse payload: {e}") }
             }
         }
     }
 
-    /// Get the stream ID (for display/logging)
-    pub fn stream_id(&self) -> &str {
-        &self.stream_id
-    }
-
-    /// Get the DH-derived topic (for debugging)
-    pub fn topic(&self) -> &str {
-        &self.topic
+    /// Returns true if this is the last message (Complete or Error)
+    pub fn is_last(&self) -> bool {
+        matches!(self, StreamChunkMessage::Complete { .. } | StreamChunkMessage::Error { .. })
     }
 }
 
-// Note: Default impl removed - InferenceZmqClient requires signing credentials
+// StreamHandle consolidated: uses hyprstream_rpc::streaming::StreamHandle (re-exported via rpc_types)
+// Use StreamChunkMessage::from_stream_payload() to convert StreamPayload → StreamChunkMessage

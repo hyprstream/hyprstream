@@ -19,9 +19,11 @@
 //! 2. Token expiration
 //! 3. Scopes via `Claims.has_scope(&Scope)` for each tool call
 
+use async_trait::async_trait;
 use crate::services::{ModelZmqClient, RegistryZmqClient, PolicyClient, InferenceZmqClient};
-use crate::services::generated::mcp_client_gen::{
-    McpHandler, McpResponseVariant, ToolDefinitionData, dispatch_mcp,
+use crate::services::generated::mcp_client::{
+    McpHandler, McpResponseVariant, ToolDefinition, ServiceStatus,
+    ToolList, ServiceMetrics, CallTool, dispatch_mcp,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures::future::BoxFuture;
@@ -750,29 +752,27 @@ impl ServerHandler for McpService {
 // McpHandler Implementation (generated trait)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+#[async_trait::async_trait(?Send)]
 impl McpHandler for McpService {
-    fn handle_get_status(
+    async fn handle_get_status(
         &self,
         _ctx: &crate::services::EnvelopeContext,
         _request_id: u64,
     ) -> anyhow::Result<McpResponseVariant> {
-        let loaded_model_count = tokio::task::block_in_place(|| {
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(async {
-                // Status check uses local identity (internal health check, no user context)
-                let client = ModelZmqClient::new(self.signing_key.clone(), RequestIdentity::local());
-                client.list().await
-                    .map(|models| models.len() as u32)
-                    .unwrap_or(0)
-            })
-        });
+        let loaded_model_count = {
+            // Status check uses local identity (internal health check, no user context)
+            let client = ModelZmqClient::new(self.signing_key.clone(), RequestIdentity::local());
+            client.list().await
+                .map(|models| models.len() as u32)
+                .unwrap_or(0)
+        };
 
         let scopes: Vec<String> = self.claims
             .as_ref()
             .map(|c| c.scopes.iter().map(|s| s.to_string()).collect())
             .unwrap_or_default();
 
-        Ok(McpResponseVariant::GetStatusResult {
+        Ok(McpResponseVariant::GetStatusResult(ServiceStatus {
             is_running: true,
             loaded_model_count,
             is_authenticated: self.claims.is_some(),
@@ -780,16 +780,16 @@ impl McpHandler for McpService {
                 .map(|c| c.sub.clone())
                 .unwrap_or_default(),
             scopes,
-        })
+        }))
     }
 
-    fn handle_list_tools(
+    async fn handle_list_tools(
         &self,
         _ctx: &crate::services::EnvelopeContext,
         _request_id: u64,
     ) -> anyhow::Result<McpResponseVariant> {
-        let tools: Vec<ToolDefinitionData> = self.registry.list().map(|entry| {
-            ToolDefinitionData {
+        let tools: Vec<ToolDefinition> = self.registry.list().map(|entry| {
+            ToolDefinition {
                 name: entry.uuid.to_string(),
                 description: entry.description.clone(),
                 is_read_only: entry.required_scope.starts_with("read:"),
@@ -799,43 +799,38 @@ impl McpHandler for McpService {
             }
         }).collect();
 
-        Ok(McpResponseVariant::ListToolsResult { tools })
+        Ok(McpResponseVariant::ListToolsResult(ToolList { tools }))
     }
 
-    fn handle_get_metrics(
+    async fn handle_get_metrics(
         &self,
         _ctx: &crate::services::EnvelopeContext,
         _request_id: u64,
     ) -> anyhow::Result<McpResponseVariant> {
-        Ok(McpResponseVariant::GetMetricsResult {
+        Ok(McpResponseVariant::GetMetricsResult(ServiceMetrics {
             total_calls: 0,
             calls_per_tool: Vec::new(),
             average_call_duration_ms: 0.0,
             uptime_seconds: 0.0,
-        })
+        }))
     }
 
-    fn handle_call_tool(
+    async fn handle_call_tool(
         &self,
         _ctx: &crate::services::EnvelopeContext,
         _request_id: u64,
-        tool_name: &str,
-        arguments: &str,
-        _caller_identity: &str,
+        data: &CallTool,
     ) -> anyhow::Result<McpResponseVariant> {
-        let uuid = Uuid::parse_str(tool_name)
-            .map_err(|e| anyhow::anyhow!("Invalid tool UUID '{}': {}", tool_name, e))?;
+        let uuid = Uuid::parse_str(&data.tool_name)
+            .map_err(|e| anyhow::anyhow!("Invalid tool UUID '{}': {}", data.tool_name, e))?;
 
-        let args: Value = if arguments.is_empty() {
+        let args: Value = if data.arguments.is_empty() {
             Value::Object(serde_json::Map::new())
         } else {
-            serde_json::from_str(arguments)?
+            serde_json::from_str(&data.arguments)?
         };
 
-        let result = tokio::task::block_in_place(|| {
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(self.dispatch_tool(&uuid, args))
-        });
+        let result = self.dispatch_tool(&uuid, args).await;
 
         match result {
             Ok(call_result) => {
@@ -847,18 +842,18 @@ impl McpHandler for McpService {
                     })
                     .collect::<Vec<_>>()
                     .join("");
-                Ok(McpResponseVariant::CallToolResult {
+                Ok(McpResponseVariant::CallToolResult(crate::services::generated::mcp_client::ToolResult {
                     success: true,
                     result: text,
                     error_message: String::new(),
-                })
+                }))
             }
             Err(e) => {
-                Ok(McpResponseVariant::CallToolResult {
+                Ok(McpResponseVariant::CallToolResult(crate::services::generated::mcp_client::ToolResult {
                     success: false,
                     result: "null".to_string(),
                     error_message: format!("{}", e),
-                })
+                }))
             }
         }
     }
@@ -868,14 +863,15 @@ impl McpHandler for McpService {
 // ZmqService Implementation (internal control plane)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+#[async_trait(?Send)]
 impl ZmqService for McpService {
-    fn handle_request(&self, ctx: &crate::services::EnvelopeContext, payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+    async fn handle_request(&self, ctx: &crate::services::EnvelopeContext, payload: &[u8]) -> anyhow::Result<(Vec<u8>, Option<crate::services::Continuation>)> {
         trace!(
             "McpService request from {} (id={})",
             ctx.subject(),
             ctx.request_id
         );
-        dispatch_mcp(self, ctx, payload)
+        dispatch_mcp(self, ctx, payload).await
     }
 
     fn name(&self) -> &str {

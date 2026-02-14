@@ -1,5 +1,7 @@
 //! Build script for Hyprstream
 
+#![allow(clippy::expect_used, clippy::print_stderr)]
+
 use std::env;
 use std::path::Path;
 use std::process::Command;
@@ -11,6 +13,7 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=schema/");
+    println!("cargo:rerun-if-changed=../hyprstream-rpc/schema/streaming.capnp");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");
 
@@ -45,7 +48,9 @@ fn main() {
 
 fn compile_capnp_schemas() {
     let schema_dir = Path::new("schema");
-    let out_dir = env::var("OUT_DIR").unwrap();
+    let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+    let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-rpc/schema");
 
     // Skip if schema directory doesn't exist
     if !schema_dir.exists() {
@@ -53,7 +58,7 @@ fn compile_capnp_schemas() {
     }
 
     // Note: common.capnp (identity, envelope) is in hyprstream-rpc crate
-    for name in ["events", "inference", "registry", "policy", "model", "mcp"] {
+    for name in ["events", "inference", "registry", "policy", "model", "mcp", "worker"] {
         let path = schema_dir.join(format!("{name}.capnp"));
         if path.exists() {
             let cgr_path = Path::new(&out_dir).join(format!("{name}.cgr"));
@@ -62,202 +67,18 @@ fn compile_capnp_schemas() {
             // 1. Compile to Rust AND save raw CodeGeneratorRequest
             capnpc::CompilerCommand::new()
                 .src_prefix("schema")
+                .import_path(&rpc_schema_dir)
                 .file(&path)
                 .raw_code_generator_request_path(&cgr_path)  // ← Save CGR!
                 .run()
                 .unwrap_or_else(|e| panic!("failed to compile {name}.capnp: {e}"));
 
             // 2. Parse CGR and extract schema metadata with annotations
-            if let Err(e) = parse_schema_and_extract_annotations(&cgr_path, &metadata_path, name) {
-                eprintln!("Warning: Failed to parse schema for {name}: {e}");
-                eprintln!("Falling back to text parsing (annotations not available)");
+            if let Err(e) = hyprstream_rpc_build::parse_schema_and_extract_annotations(&cgr_path, &metadata_path, name) {
+                println!("cargo:warning=Failed to parse schema for {name}: {e}");
+                println!("cargo:warning=Falling back to text parsing (annotations not available)");
             }
         }
-    }
-}
-
-/// Parse CodeGeneratorRequest and extract annotations using capnp crate.
-fn parse_schema_and_extract_annotations(
-    cgr_path: &Path,
-    output_path: &Path,
-    name: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use capnp::message::ReaderOptions;
-    use capnp::serialize;
-    use capnp::schema_capnp::{node, field};
-
-    // Read the CodeGeneratorRequest binary
-    let file = std::fs::File::open(cgr_path)?;
-    let reader = serialize::read_message(file, ReaderOptions::new())?;
-
-    // Parse as CodeGeneratorRequest (defined in schema.capnp)
-    let cgr = reader.get_root::<capnp::schema_capnp::code_generator_request::Reader>()?;
-
-    // Extract all nodes (structs, enums, etc.)
-    let nodes = cgr.get_nodes()?;
-
-    let mut structs = Vec::new();
-    let mut enums = Vec::new();
-    let mut annotations_map = serde_json::Map::new();
-
-    // Iterate through nodes and extract structure + annotations
-    for i in 0..nodes.len() {
-        let node = nodes.get(i);
-        let node_id = node.get_id();
-        let display_name = node.get_display_name()?.to_str()?.to_string();
-
-        // Extract node-level annotations
-        let node_annotations = extract_annotations(node.get_annotations()?)?;
-        if !node_annotations.is_empty() {
-            annotations_map.insert(display_name.clone(), serde_json::json!(node_annotations));
-        }
-
-        // Process based on node type
-        match node.which()? {
-            node::Struct(struct_reader) => {
-                let mut fields = Vec::new();
-                let struct_fields = struct_reader.get_fields()?;
-
-                for j in 0..struct_fields.len() {
-                    let field = struct_fields.get(j);
-                    let field_name = field.get_name()?.to_str()?.to_string();
-                    let discriminant = field.get_discriminant_value();
-
-                    // Extract field-level annotations
-                    let field_annotations = extract_annotations(field.get_annotations()?)?;
-
-                    // Get field type name
-                    let type_name = match field.which()? {
-                        field::Slot(slot) => {
-                            extract_type_name(slot.get_type()?)
-                        }
-                        field::Group(_) => "Group".to_string(),
-                    };
-
-                    fields.push(serde_json::json!({
-                        "name": field_name,
-                        "type": type_name,
-                        "discriminant": discriminant,
-                        "annotations": field_annotations,
-                    }));
-                }
-
-                structs.push(serde_json::json!({
-                    "name": display_name,
-                    "id": node_id,
-                    "fields": fields,
-                }));
-            }
-            node::Enum(enum_reader) => {
-                let mut variants = Vec::new();
-                let enumerants = enum_reader.get_enumerants()?;
-
-                for j in 0..enumerants.len() {
-                    let enumerant = enumerants.get(j);
-                    let variant_name = enumerant.get_name()?.to_str()?.to_string();
-                    let code_order = enumerant.get_code_order();
-
-                    variants.push(serde_json::json!({
-                        "name": variant_name,
-                        "value": code_order,
-                    }));
-                }
-
-                enums.push(serde_json::json!({
-                    "name": display_name,
-                    "id": node_id,
-                    "variants": variants,
-                }));
-            }
-            _ => {
-                // Ignore interfaces, consts, etc. for now
-            }
-        }
-    }
-
-    let metadata = serde_json::json!({
-        "service": name,
-        "structs": structs,
-        "enums": enums,
-        "annotations": annotations_map,
-    });
-
-    // Write metadata JSON
-    std::fs::write(output_path, serde_json::to_string_pretty(&metadata)?)?;
-    println!("cargo:warning=Extracted schema metadata for {name} to {}", output_path.display());
-
-    Ok(())
-}
-
-/// Extract annotations from a list and return as JSON array.
-fn extract_annotations(
-    annotations: capnp::struct_list::Reader<capnp::schema_capnp::annotation::Owned>
-) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
-    let mut result = Vec::new();
-
-    for i in 0..annotations.len() {
-        let ann = annotations.get(i);
-        let ann_id = ann.get_id();
-
-        // Try to extract annotation value (typically Text for our annotations)
-        if let Ok(value) = ann.get_value() {
-            if let Ok(text_value) = extract_text_from_value(value) {
-                result.push(serde_json::json!({
-                    "id": ann_id,
-                    "value": text_value,
-                }));
-            }
-        }
-    }
-
-    Ok(result)
-}
-
-/// Extract text value from a Cap'n Proto Value (if it's a Text type).
-fn extract_text_from_value(
-    value: capnp::schema_capnp::value::Reader
-) -> Result<String, Box<dyn std::error::Error>> {
-    use capnp::schema_capnp::value;
-
-    match value.which()? {
-        value::Text(text_reader) => Ok(text_reader?.to_str()?.to_string()),
-        _ => Err("Not a text value".into()),
-    }
-}
-
-/// Extract a human-readable type name from a Type.
-fn extract_type_name(
-    type_reader: capnp::schema_capnp::type_::Reader
-) -> String {
-    use capnp::schema_capnp::type_;
-
-    match type_reader.which() {
-        Ok(type_::Void(())) => "Void".to_string(),
-        Ok(type_::Bool(())) => "Bool".to_string(),
-        Ok(type_::Int8(())) => "Int8".to_string(),
-        Ok(type_::Int16(())) => "Int16".to_string(),
-        Ok(type_::Int32(())) => "Int32".to_string(),
-        Ok(type_::Int64(())) => "Int64".to_string(),
-        Ok(type_::Uint8(())) => "UInt8".to_string(),
-        Ok(type_::Uint16(())) => "UInt16".to_string(),
-        Ok(type_::Uint32(())) => "UInt32".to_string(),
-        Ok(type_::Uint64(())) => "UInt64".to_string(),
-        Ok(type_::Float32(())) => "Float32".to_string(),
-        Ok(type_::Float64(())) => "Float64".to_string(),
-        Ok(type_::Text(())) => "Text".to_string(),
-        Ok(type_::Data(())) => "Data".to_string(),
-        Ok(type_::List(list_type)) => {
-            if let Ok(element_type) = list_type.get_element_type() {
-                format!("List({})", extract_type_name(element_type))
-            } else {
-                "List".to_string()
-            }
-        }
-        Ok(type_::Enum(_)) => "Enum".to_string(),
-        Ok(type_::Struct(_)) => "Struct".to_string(),
-        Ok(type_::Interface(_)) => "Interface".to_string(),
-        Ok(type_::AnyPointer(_)) => "AnyPointer".to_string(),
-        Err(_) => "Unknown".to_string(),
     }
 }
 

@@ -42,10 +42,10 @@
 //! }
 //!
 //! impl ZmqService for MyService {
-//!     fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<Vec<u8>> {
+//!     fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<Continuation>)> {
 //!         // ctx.identity is already verified
 //!         println!("Request from: {}", ctx.subject());
-//!         Ok(vec![])
+//!         Ok((vec![], None))
 //!     }
 //!
 //!     fn name(&self) -> &str { "my-service" }
@@ -85,7 +85,7 @@ pub mod stream;
 pub mod worker;
 
 pub use core::{
-    CallOptions, EnvelopeContext, ZmqClient, ZmqService,
+    CallOptions, Continuation, EnvelopeContext, ZmqClient, ZmqService,
 };
 
 pub use traits::{
@@ -97,7 +97,7 @@ pub use traits::{
 
 pub use inference::{InferenceService, InferenceZmqClient, INFERENCE_ENDPOINT};
 pub use registry::{
-    RegistryService, RegistryZmq, RegistryZmqClient, RepositoryZmqClient,
+    RegistryService, RegistryZmqClient, RepositoryZmqClient,
 };
 pub use policy::PolicyService;
 pub use generated::policy_client::PolicyClient;
@@ -106,7 +106,7 @@ pub use model::{
     ModelZmqClient, MODEL_ENDPOINT,
 };
 pub use stream::StreamService;
-pub use worker::WorkerClient;
+pub use worker::{WorkerZmqClient, WorkflowZmqClient, build_authorize_fn};
 pub use oai::OAIService;
 pub use flight::FlightService;
 pub use callback::{CallbackRouter, Instance};

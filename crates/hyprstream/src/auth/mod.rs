@@ -71,6 +71,23 @@ impl Operation {
         }
     }
 
+    /// Parse from operation name string (e.g., "write", "query").
+    ///
+    /// Used by generated `authorize()` overrides to convert the string action
+    /// from `$mcpScope` annotations into an `Operation` enum value.
+    pub fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "infer" => Ok(Operation::Infer),
+            "train" => Ok(Operation::Train),
+            "query" => Ok(Operation::Query),
+            "write" => Ok(Operation::Write),
+            "serve" => Ok(Operation::Serve),
+            "manage" => Ok(Operation::Manage),
+            "context" => Ok(Operation::Context),
+            other => anyhow::bail!("Unknown operation: {}", other),
+        }
+    }
+
     /// All operations
     pub fn all() -> &'static [Operation] {
         &[
@@ -164,6 +181,18 @@ mod tests {
         assert_eq!(Operation::Train.as_str(), "train");
         assert_eq!(Operation::Manage.as_str(), "manage");
         assert_eq!(Operation::Context.as_str(), "context");
+    }
+
+    #[test]
+    fn test_operation_from_str() {
+        assert!(matches!(Operation::from_str("infer"), Ok(Operation::Infer)));
+        assert!(matches!(Operation::from_str("train"), Ok(Operation::Train)));
+        assert!(matches!(Operation::from_str("query"), Ok(Operation::Query)));
+        assert!(matches!(Operation::from_str("write"), Ok(Operation::Write)));
+        assert!(matches!(Operation::from_str("serve"), Ok(Operation::Serve)));
+        assert!(matches!(Operation::from_str("manage"), Ok(Operation::Manage)));
+        assert!(matches!(Operation::from_str("context"), Ok(Operation::Context)));
+        assert!(Operation::from_str("foo").is_err());
     }
 
     #[test]

@@ -11,20 +11,24 @@ use crate::schema::types::*;
 use crate::util::*;
 
 /// Generate all scoped client structs and impls, including nested scoped clients.
-pub fn generate_scoped_clients(service_name: &str, schema: &ParsedSchema) -> TokenStream {
+pub fn generate_scoped_clients(service_name: &str, schema: &ParsedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
     let mut tokens = TokenStream::new();
     let pascal = to_pascal_case(service_name);
-    let capnp_mod = format_ident!("{}_capnp", service_name);
+    let capnp_mod_ident = format_ident!("{}_capnp", service_name);
+    let capnp_mod: TokenStream = match types_crate {
+        Some(tc) => quote! { #tc::#capnp_mod_ident },
+        None => quote! { crate::#capnp_mod_ident },
+    };
 
     for sc in &schema.scoped_clients {
         tokens.extend(generate_scoped_client(
-            &pascal, &capnp_mod, sc, &schema.structs, &schema.enums,
+            &pascal, &capnp_mod, sc, &schema.structs, &schema.enums, types_crate,
         ));
 
         // Generate nested scoped clients (3rd level)
         for nested in &sc.nested_clients {
             tokens.extend(generate_nested_scoped_client(
-                &pascal, &capnp_mod, nested, sc, &schema.structs, &schema.enums,
+                &pascal, &capnp_mod, nested, sc, &schema.structs, &schema.enums, types_crate,
             ));
         }
     }
@@ -34,10 +38,11 @@ pub fn generate_scoped_clients(service_name: &str, schema: &ParsedSchema) -> Tok
 
 fn generate_scoped_client(
     pascal: &str,
-    capnp_mod: &syn::Ident,
+    capnp_mod: &TokenStream,
     sc: &ScopedClient,
     all_structs: &[StructDef],
     enums: &[EnumDef],
+    types_crate: Option<&syn::Path>,
 ) -> TokenStream {
     let client_name = format_ident!("{}", sc.client_name);
     let response_type = format_ident!("{}ResponseVariant", sc.client_name);
@@ -50,6 +55,7 @@ fn generate_scoped_client(
         &sc.inner_response_variants,
         all_structs,
         enums,
+        types_crate,
     );
 
     // Scope fields for the struct
@@ -66,7 +72,7 @@ fn generate_scoped_client(
 
     let inner_which = format_ident!("InnerWhich");
     let inner_match_arms: Vec<TokenStream> = sc.inner_response_variants.iter().map(|v| {
-        generate_parse_match_arm(&response_type, capnp_mod, v, all_structs, enums, &inner_which)
+        generate_parse_match_arm(&response_type, capnp_mod, v, all_structs, enums, &inner_which, types_crate)
     }).collect();
 
     // Request methods
@@ -87,6 +93,7 @@ fn generate_scoped_client(
             Some(&scope_ctx),
             Some(&sc.inner_response_variants),
             true,
+            types_crate,
         )
     }).collect();
 
@@ -127,12 +134,12 @@ fn generate_scoped_client(
                     &mut std::io::Cursor::new(bytes),
                     capnp::message::ReaderOptions::new(),
                 )?;
-                let resp = reader.get_root::<crate::#capnp_mod::#outer_resp_type::Reader>()?;
-                use crate::#capnp_mod::#outer_resp_type::Which;
+                let resp = reader.get_root::<#capnp_mod::#outer_resp_type::Reader>()?;
+                use #capnp_mod::#outer_resp_type::Which;
                 match resp.which()? {
                     Which::#resp_variant_pascal(inner) => {
                         let inner = inner?;
-                        use crate::#capnp_mod::#inner_resp_mod::Which as InnerWhich;
+                        use #capnp_mod::#inner_resp_mod::Which as InnerWhich;
                         match inner.which()? {
                             #(#inner_match_arms)*
                             #[allow(unreachable_patterns)]
@@ -203,11 +210,12 @@ fn generate_nested_factory_method(
 /// and response parsing unwraps 3 levels.
 fn generate_nested_scoped_client(
     pascal: &str,
-    capnp_mod: &syn::Ident,
+    capnp_mod: &TokenStream,
     nested: &ScopedClient,
     parent: &ScopedClient,
     all_structs: &[StructDef],
     enums: &[EnumDef],
+    types_crate: Option<&syn::Path>,
 ) -> TokenStream {
     let client_name = format_ident!("{}", nested.client_name);
     let response_type = format_ident!("{}ResponseVariant", nested.client_name);
@@ -220,6 +228,7 @@ fn generate_nested_scoped_client(
         &nested.inner_response_variants,
         all_structs,
         enums,
+        types_crate,
     );
 
     // Parent scope field defs (e.g., repo_id: String)
@@ -246,7 +255,7 @@ fn generate_nested_scoped_client(
 
     let inner_which = format_ident!("DeepWhich");
     let inner_match_arms: Vec<TokenStream> = nested.inner_response_variants.iter().map(|v| {
-        generate_parse_match_arm(&response_type, capnp_mod, v, all_structs, enums, &inner_which)
+        generate_parse_match_arm(&response_type, capnp_mod, v, all_structs, enums, &inner_which, types_crate)
     }).collect();
 
     // Request methods use NestedScopedMethodContext (3-level envelope)
@@ -271,6 +280,7 @@ fn generate_nested_scoped_client(
             Some(&scope_ctx),
             Some(&nested.inner_response_variants),
             true,
+            types_crate,
         )
     }).collect();
 
@@ -307,16 +317,16 @@ fn generate_nested_scoped_client(
                     &mut std::io::Cursor::new(bytes),
                     capnp::message::ReaderOptions::new(),
                 )?;
-                let resp = reader.get_root::<crate::#capnp_mod::#outer_resp_type::Reader>()?;
-                use crate::#capnp_mod::#outer_resp_type::Which;
+                let resp = reader.get_root::<#capnp_mod::#outer_resp_type::Reader>()?;
+                use #capnp_mod::#outer_resp_type::Which;
                 match resp.which()? {
                     Which::#parent_resp_variant_pascal(mid) => {
                         let mid = mid?;
-                        use crate::#capnp_mod::#parent_inner_resp_mod::Which as MidWhich;
+                        use #capnp_mod::#parent_inner_resp_mod::Which as MidWhich;
                         match mid.which()? {
                             MidWhich::#nested_resp_variant_pascal(inner) => {
                                 let inner = inner?;
-                                use crate::#capnp_mod::#nested_inner_resp_mod::Which as DeepWhich;
+                                use #capnp_mod::#nested_inner_resp_mod::Which as DeepWhich;
                                 match inner.which()? {
                                     #(#inner_match_arms)*
                                     #[allow(unreachable_patterns)]
@@ -344,4 +354,3 @@ fn generate_nested_scoped_client(
         }
     }
 }
-

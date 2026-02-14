@@ -32,7 +32,7 @@ pub mod key_exchange;
 pub mod signing;
 
 pub use backend::{derive_key, keyed_mac, keyed_mac_truncated};
-pub use hmac::{ChainedStreamHmac, HmacKey, StreamHmac};
+pub use hmac::{ChainedStreamHmac, HmacKey};
 pub use key_exchange::{derive_stream_keys, DefaultKeyExchange, KeyExchange, SharedSecret, StreamKeys};
 pub use signing::{
     generate_signing_keypair, sign_message, signing_key_from_bytes, verify_message,

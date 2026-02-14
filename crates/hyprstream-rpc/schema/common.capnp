@@ -126,3 +126,9 @@ struct Claims {
   scopes @3 :List(Scope); # Structured scopes
   admin @4 :Bool;        # Admin override
 }
+
+# UTC timestamp with nanosecond precision
+struct Timestamp {
+  seconds @0 :Int64;   # Seconds since Unix epoch (1970-01-01T00:00:00Z)
+  nanos @1 :Int32;     # Nanosecond offset [0, 999999999]
+}

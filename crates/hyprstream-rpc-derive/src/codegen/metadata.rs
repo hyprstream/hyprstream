@@ -24,6 +24,7 @@ pub fn generate_metadata(service_name: &str, schema: &ParsedSchema) -> TokenStre
         &schema.request_variants,
         &schema.response_variants,
         &schema.structs,
+        &schema.enums,
         &schema.scoped_clients,
     );
 
@@ -55,8 +56,10 @@ fn generate_metadata_structs() -> TokenStream {
             pub description: &'static str,
             /// MCP scope override from $mcpScope annotation (e.g., "write:model:*"). Empty = use default.
             pub scope: &'static str,
-            /// True if the response type is StreamInfo/StreamStartedInfo (streaming method).
+            /// True if the response type is StreamInfo (streaming method).
             pub is_streaming: bool,
+            /// True if this method should be hidden from the CLI ($cliHidden annotation).
+            pub cli_hidden: bool,
         }
     }
 }
@@ -120,6 +123,7 @@ fn generate_method_schema_entry(
     let method_desc = &v.description;
     let scope_str = v.scope.as_str();
     let is_streaming = is_streaming_variant(&v.name, response_variants, is_scoped_streaming_check);
+    let cli_hidden = v.cli_hidden;
     let ct = CapnpType::classify_primitive(&v.type_name);
 
     let params = match ct {
@@ -159,6 +163,7 @@ fn generate_method_schema_entry(
             description: #method_desc,
             scope: #scope_str,
             is_streaming: #is_streaming,
+            cli_hidden: #cli_hidden,
         }
     }
 }
@@ -199,7 +204,7 @@ fn generate_scoped_schema_metadata_fn(
 // JSON Dispatcher
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Check if a request variant's corresponding response is StreamInfo or StreamStartedInfo.
+/// Check if a request variant's corresponding response is StreamInfo.
 fn is_streaming_variant(variant_name: &str, response_variants: &[UnionVariant], is_scoped: bool) -> bool {
     let expected_name = if is_scoped {
         variant_name.to_string()
@@ -209,7 +214,7 @@ fn is_streaming_variant(variant_name: &str, response_variants: &[UnionVariant], 
     response_variants
         .iter()
         .find(|v| v.name == expected_name)
-        .map(|v| v.type_name == "StreamInfo" || v.type_name == "StreamStartedInfo")
+        .map(|v| v.type_name == "StreamInfo")
         .unwrap_or(false)
 }
 
@@ -218,6 +223,7 @@ fn generate_json_dispatcher(
     request_variants: &[UnionVariant],
     response_variants: &[UnionVariant],
     structs: &[StructDef],
+    enums: &[EnumDef],
     scoped_clients: &[ScopedClient],
 ) -> TokenStream {
     let client_name = format_ident!("{}Client", pascal);
@@ -231,7 +237,7 @@ fn generate_json_dispatcher(
         .iter()
         .filter(|v| !scoped_names.contains(&v.name.as_str()))
         .filter(|v| !is_streaming_variant(&v.name, response_variants, false))
-        .map(|v| generate_json_method_dispatch_arm(v, structs))
+        .map(|v| generate_json_method_dispatch_arm(v, structs, enums))
         .collect();
 
     // Streaming dispatch arms for call_streaming_method
@@ -239,12 +245,12 @@ fn generate_json_dispatcher(
         .iter()
         .filter(|v| !scoped_names.contains(&v.name.as_str()))
         .filter(|v| is_streaming_variant(&v.name, response_variants, false))
-        .map(|v| generate_json_streaming_dispatch_arm(v, structs))
+        .map(|v| generate_json_streaming_dispatch_arm(v, structs, enums))
         .collect();
 
     let streaming_method = quote! {
         /// Dispatch a streaming method call by name with JSON arguments and an ephemeral public key.
-        /// Returns the StreamInfo/StreamStartedInfo as a JSON value.
+        /// Returns the StreamInfo as a JSON value.
         #[allow(unused_variables)]
         pub async fn call_streaming_method(
             &self,
@@ -267,7 +273,7 @@ fn generate_json_dispatcher(
                 .inner_request_variants
                 .iter()
                 .filter(|v| !is_streaming_variant(&v.name, &sc.inner_response_variants, true))
-                .map(|v| generate_json_method_dispatch_arm(v, structs))
+                .map(|v| generate_json_method_dispatch_arm(v, structs, enums))
                 .collect();
 
             // Streaming dispatch arms for scoped clients
@@ -275,7 +281,7 @@ fn generate_json_dispatcher(
                 .inner_request_variants
                 .iter()
                 .filter(|v| is_streaming_variant(&v.name, &sc.inner_response_variants, true))
-                .map(|v| generate_json_streaming_dispatch_arm(v, structs))
+                .map(|v| generate_json_streaming_dispatch_arm(v, structs, enums))
                 .collect();
 
             let scoped_streaming_method = quote! {
@@ -318,7 +324,7 @@ fn generate_json_dispatcher(
                 .inner_request_variants
                 .iter()
                 .filter(|v| !is_streaming_variant(&v.name, &nested.inner_response_variants, true))
-                .map(|v| generate_json_method_dispatch_arm(v, structs))
+                .map(|v| generate_json_method_dispatch_arm(v, structs, enums))
                 .collect();
 
             scoped_dispatchers.push(quote! {
@@ -356,10 +362,11 @@ fn generate_json_dispatcher(
 fn generate_json_method_dispatch_arm(
     v: &UnionVariant,
     structs: &[StructDef],
+    enums: &[EnumDef],
 ) -> TokenStream {
     let method_name_str = to_snake_case(&v.name);
     let method_name = format_ident!("{}", method_name_str);
-    let ct = CapnpType::classify_primitive(&v.type_name);
+    let ct = CapnpType::classify(&v.type_name, structs, enums);
 
     match ct {
         CapnpType::Void => quote! {
@@ -377,28 +384,31 @@ fn generate_json_method_dispatch_arm(
         },
         _ => {
             if let Some(sdef) = structs.iter().find(|s| s.name == v.type_name) {
-                let extractions: Vec<TokenStream> = sdef
+                // Filter fields: skip union-only struct fields (they have no method param)
+                let settable_fields: Vec<&FieldDef> = sdef
                     .fields
+                    .iter()
+                    .filter(|f| !is_union_only_struct(&f.type_name, structs))
+                    .collect();
+
+                let extractions: Vec<TokenStream> = settable_fields
                     .iter()
                     .map(|f| {
                         let fname = format_ident!("{}", to_snake_case(&f.name));
                         let fname_str = to_snake_case(&f.name);
-                        json_field_extraction_token(&fname, &fname_str, &f.type_name)
+                        json_field_extraction_token(&fname, &fname_str, &f.type_name, structs, enums)
                     })
                     .collect();
 
-                let args_list: Vec<TokenStream> = sdef
-                    .fields
+                let args_list: Vec<TokenStream> = settable_fields
                     .iter()
                     .map(|f| {
                         let fname = format_ident!("{}", to_snake_case(&f.name));
-                        let fct = CapnpType::classify_primitive(&f.type_name);
-                        match fct {
-                            CapnpType::Data
-                            | CapnpType::ListText
-                            | CapnpType::ListData
-                            | CapnpType::ListStruct(_) => quote! { &#fname },
-                            _ => quote! { #fname },
+                        let fct = CapnpType::classify(&f.type_name, structs, enums);
+                        if fct.is_by_ref() {
+                            quote! { &#fname }
+                        } else {
+                            quote! { #fname }
                         }
                     })
                     .collect();
@@ -425,10 +435,11 @@ fn generate_json_method_dispatch_arm(
 fn generate_json_streaming_dispatch_arm(
     v: &UnionVariant,
     structs: &[StructDef],
+    enums: &[EnumDef],
 ) -> TokenStream {
     let method_name_str = to_snake_case(&v.name);
     let method_name = format_ident!("{}", method_name_str);
-    let ct = CapnpType::classify_primitive(&v.type_name);
+    let ct = CapnpType::classify(&v.type_name, structs, enums);
 
     match ct {
         CapnpType::Void => quote! {
@@ -446,28 +457,30 @@ fn generate_json_streaming_dispatch_arm(
         },
         _ => {
             if let Some(sdef) = structs.iter().find(|s| s.name == v.type_name) {
-                let extractions: Vec<TokenStream> = sdef
+                let settable_fields: Vec<&FieldDef> = sdef
                     .fields
+                    .iter()
+                    .filter(|f| !is_union_only_struct(&f.type_name, structs))
+                    .collect();
+
+                let extractions: Vec<TokenStream> = settable_fields
                     .iter()
                     .map(|f| {
                         let fname = format_ident!("{}", to_snake_case(&f.name));
                         let fname_str = to_snake_case(&f.name);
-                        json_field_extraction_token(&fname, &fname_str, &f.type_name)
+                        json_field_extraction_token(&fname, &fname_str, &f.type_name, structs, enums)
                     })
                     .collect();
 
-                let args_list: Vec<TokenStream> = sdef
-                    .fields
+                let args_list: Vec<TokenStream> = settable_fields
                     .iter()
                     .map(|f| {
                         let fname = format_ident!("{}", to_snake_case(&f.name));
-                        let fct = CapnpType::classify_primitive(&f.type_name);
-                        match fct {
-                            CapnpType::Data
-                            | CapnpType::ListText
-                            | CapnpType::ListData
-                            | CapnpType::ListStruct(_) => quote! { &#fname },
-                            _ => quote! { #fname },
+                        let fct = CapnpType::classify(&f.type_name, structs, enums);
+                        if fct.is_by_ref() {
+                            quote! { &#fname }
+                        } else {
+                            quote! { #fname }
                         }
                     })
                     .collect();
@@ -489,12 +502,23 @@ fn generate_json_streaming_dispatch_arm(
     }
 }
 
+/// Check if a type name refers to a union-only struct (no regular fields).
+fn is_union_only_struct(type_name: &str, structs: &[StructDef]) -> bool {
+    if let Some(s) = structs.iter().find(|s| s.name == type_name) {
+        s.has_union && s.fields.is_empty()
+    } else {
+        false
+    }
+}
+
 fn json_field_extraction_token(
     fname: &syn::Ident,
     fname_str: &str,
     type_name: &str,
+    structs: &[StructDef],
+    enums: &[EnumDef],
 ) -> TokenStream {
-    let ct = CapnpType::classify_primitive(type_name);
+    let ct = CapnpType::classify(type_name, structs, enums);
     match ct {
         CapnpType::Text => quote! {
             let #fname = args.get(#fname_str).and_then(|v| v.as_str())
@@ -569,9 +593,37 @@ fn json_field_extraction_token(
                     .ok_or_else(|| anyhow::anyhow!("non-string element in array field '{}'", #fname_str)))
                 .collect::<Result<Vec<_>, _>>()?;
         },
-        CapnpType::ListStruct(_) => quote! {
-            let #fname = Vec::new(); // TODO: List struct from JSON
-        },
+        CapnpType::ListPrimitive(_) => {
+            let rust_type = rust_type_tokens(&ct.rust_owned_type());
+            quote! {
+                let #fname: #rust_type = serde_json::from_value(
+                    args.get(#fname_str).cloned().unwrap_or(serde_json::Value::Array(vec![]))
+                ).unwrap_or_default();
+            }
+        }
+        CapnpType::ListStruct(ref inner) => {
+            let data_name = format_ident!("{}", inner);
+            quote! {
+                let #fname: Vec<#data_name> = serde_json::from_value(
+                    args.get(#fname_str).cloned().unwrap_or(serde_json::Value::Array(vec![]))
+                ).unwrap_or_default();
+            }
+        }
+        CapnpType::Struct(ref name) => {
+            let data_name = format_ident!("{}", name);
+            quote! {
+                let #fname: #data_name = serde_json::from_value(
+                    args.get(#fname_str).cloned().unwrap_or_default()
+                ).unwrap_or_default();
+            }
+        }
+        CapnpType::Enum(_) => {
+            // Enum params are passed as &str to the client method
+            quote! {
+                let #fname = args.get(#fname_str).and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("missing or invalid enum field '{}'", #fname_str))?;
+            }
+        }
         _ => quote! {
             let #fname = args.get(#fname_str).and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid field '{}'", #fname_str))?;

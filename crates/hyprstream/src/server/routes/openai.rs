@@ -27,9 +27,8 @@ use crate::{
 };
 
 // E2E authenticated streaming via Ristretto255 DH key exchange
-use hyprstream_rpc::crypto::{
-    derive_stream_keys, generate_ephemeral_keypair, ristretto_dh, RistrettoPublic,
-};
+use hyprstream_rpc::crypto::generate_ephemeral_keypair;
+use hyprstream_rpc::streaming::StreamHandle;
 
 /// RAII guard for metrics cleanup
 struct MetricsGuard<'a> {
@@ -484,7 +483,7 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
         let (client_secret, client_pubkey) = generate_ephemeral_keypair();
         let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
 
-        // Start ZMQ stream - returns StreamStartedInfo with stream_id, endpoint, server_pubkey
+        // Start ZMQ stream - returns StreamInfo with stream_id, endpoint, server_pubkey
         let stream_info = match state.model_client.infer_stream(&model_name, &gen_request, client_pubkey_bytes).await {
             Ok(info) => {
                 info!("ZMQ stream started: id={}, endpoint={}", info.stream_id, info.endpoint);
@@ -496,68 +495,27 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                 return;
             }
         };
-        let _zmq_stream_id = stream_info.stream_id; // Keep for logging, but topic is DH-derived
-        let endpoint = stream_info.endpoint;
 
-        // Derive stream keys using Ristretto255 DH key exchange
-        let server_pubkey = match RistrettoPublic::from_bytes(&stream_info.server_pubkey) {
-            Some(pk) => pk,
-            None => {
-                error!("Invalid server Ristretto public key encoding");
-                let _ = tx.send(Err(anyhow::anyhow!("Invalid server public key"))).await;
-                return;
-            }
-        };
-        let shared_secret = ristretto_dh(&client_secret, &server_pubkey);
-        let stream_keys = match derive_stream_keys(
-            &shared_secret,
-            &client_pubkey_bytes,
-            &stream_info.server_pubkey,
-        ) {
-            Ok(keys) => keys,
-            Err(e) => {
-                error!("Failed to derive stream keys: {}", e);
-                let _ = tx.send(Err(anyhow::anyhow!("Failed to derive stream keys: {}", e))).await;
-                return;
-            }
-        };
-
-        // Create ZMQ SUB socket and subscribe to DH-derived topic
+        // Create StreamHandle — DH, SUB socket, and HMAC verification all encapsulated
         let ctx = crate::zmq::global_context();
-        let sub_socket = match ctx.socket(zmq::SUB) {
-            Ok(s) => s,
+        let mut stream_handle = match StreamHandle::new(
+            &ctx,
+            stream_info.stream_id.clone(),
+            &stream_info.endpoint,
+            &stream_info.server_pubkey,
+            &client_secret,
+            &client_pubkey_bytes,
+        ) {
+            Ok(h) => h,
             Err(e) => {
-                error!("Failed to create SUB socket: {}", e);
-                let _ = tx.send(Err(anyhow::anyhow!("Failed to create stream socket: {}", e))).await;
+                error!("Failed to create stream handle: {}", e);
+                let _ = tx.send(Err(anyhow::anyhow!("Failed to create stream: {}", e))).await;
                 return;
             }
         };
-
-        if let Err(e) = sub_socket.connect(&endpoint) {
-            error!("Failed to connect to stream endpoint: {}", e);
-            let _ = tx.send(Err(anyhow::anyhow!("Failed to connect to stream: {}", e))).await;
-            return;
-        }
-
-        // Subscribe to DH-derived topic (64 hex chars)
-        if let Err(e) = sub_socket.set_subscribe(stream_keys.topic.as_bytes()) {
-            error!("Failed to subscribe to stream: {}", e);
-            let _ = tx.send(Err(anyhow::anyhow!("Failed to subscribe to stream: {}", e))).await;
-            return;
-        }
-
-        // Set receive timeout to allow periodic cancellation checks (100ms)
-        if let Err(e) = sub_socket.set_rcvtimeo(100) {
-            error!("Failed to set socket timeout: {}", e);
-            // Continue without timeout - less responsive to cancellation but still works
-        }
 
         // OpenAI-style stream ID for SSE responses
         let sse_stream_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
-
-        // Create StreamVerifier for HMAC chain verification
-        use crate::services::rpc_types::StreamVerifier;
-        let mut verifier = StreamVerifier::new(*stream_keys.mac_key, stream_keys.topic.clone());
 
         // Send initial role message
         let initial_msg = serde_json::json!({
@@ -586,122 +544,103 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                 break;
             }
 
-            // Receive multipart StreamBlock: [topic, capnp, 16-byte mac]
-            match sub_socket.recv_multipart(0) {
-                Ok(frames) => {
-                    // Validate StreamBlock format
-                    if frames.len() != 3 || frames[2].len() != 16 {
-                        error!(
-                            "Invalid StreamBlock: expected 3 frames with 16-byte MAC, got {} frames",
-                            frames.len()
-                        );
-                        continue;
-                    }
+            // Try non-blocking receive (StreamHandle handles DH verification internally)
+            match stream_handle.try_next() {
+                Ok(Some(payload)) => {
+                    use crate::services::rpc_types::{InferenceStreamPayload, StreamPayloadExt};
+                    match payload.to_inference() {
+                        Ok(InferenceStreamPayload::Token(text)) => {
+                            let sse_chunk = serde_json::json!({
+                                "id": sse_stream_id,
+                                "object": "chat.completion.chunk",
+                                "created": chrono::Utc::now().timestamp(),
+                                "model": model_name,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {
+                                        "content": text
+                                    },
+                                    "finish_reason": null
+                                }]
+                            });
 
-                    // Verify HMAC chain and parse payloads
-                    let payloads = match verifier.verify(&frames) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            error!("StreamBlock verification failed: {}", e);
-                            continue;
+                            if tx.send(Ok(sse_chunk)).await.is_err() {
+                                info!("Client disconnected during streaming");
+                                break 'outer;
+                            }
                         }
-                    };
+                        Ok(InferenceStreamPayload::Complete(stats)) => {
+                            info!(
+                                "Streaming complete: {} tokens in {}ms ({:.2} tok/s)",
+                                stats.tokens_generated,
+                                stats.generation_time_ms,
+                                stats.tokens_per_second
+                            );
 
-                    // Process each payload in the block
-                    for payload in payloads {
-                        use crate::services::rpc_types::{InferenceStreamPayload, StreamPayloadExt};
-                        match payload.to_inference() {
-                            Ok(InferenceStreamPayload::Token(text)) => {
-                                let sse_chunk = serde_json::json!({
-                                    "id": sse_stream_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": chrono::Utc::now().timestamp(),
-                                    "model": model_name,
-                                    "choices": [{
-                                        "index": 0,
-                                        "delta": {
-                                            "content": text
-                                        },
-                                        "finish_reason": null
-                                    }]
-                                });
+                            state.metrics.total_tokens.fetch_add(
+                                stats.tokens_generated as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
 
-                                if tx.send(Ok(sse_chunk)).await.is_err() {
-                                    info!("Client disconnected during streaming");
-                                    break 'outer;
-                                }
-                            }
-                            Ok(InferenceStreamPayload::Complete(stats)) => {
-                                info!(
-                                    "Streaming complete: {} tokens in {}ms ({:.2} tok/s)",
-                                    stats.tokens_generated,
-                                    stats.generation_time_ms,
-                                    stats.tokens_per_second
-                                );
+                            // Map finish_reason to OpenAI format
+                            let oai_finish_reason = match stats.finish_reason.as_str() {
+                                "max_tokens" | "MaxTokens" | "length" => "length",
+                                _ => "stop",
+                            };
 
-                                state.metrics.total_tokens.fetch_add(
-                                    stats.tokens_generated as u64,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
+                            let usage = Usage {
+                                prompt_tokens: stats.prefill_tokens,
+                                completion_tokens: stats.tokens_generated,
+                                total_tokens: stats.prefill_tokens + stats.tokens_generated,
+                                online_training_details: stats.ttt_metrics.as_ref()
+                                    .map(OnlineTrainingDetails::from),
+                            };
 
-                                // Map finish_reason to OpenAI format
-                                let oai_finish_reason = match stats.finish_reason.as_str() {
-                                    "max_tokens" | "MaxTokens" | "length" => "length",
-                                    _ => "stop",
-                                };
+                            let completion_msg = serde_json::json!({
+                                "id": sse_stream_id,
+                                "object": "chat.completion.chunk",
+                                "created": chrono::Utc::now().timestamp(),
+                                "model": model_name,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {},
+                                    "finish_reason": oai_finish_reason
+                                }],
+                                "usage": usage
+                            });
+                            let _ = tx.send(Ok(completion_msg)).await;
 
-                                let usage = Usage {
-                                    prompt_tokens: stats.prefill_tokens,
-                                    completion_tokens: stats.tokens_generated,
-                                    total_tokens: stats.prefill_tokens + stats.tokens_generated,
-                                    online_training_details: stats.ttt_metrics.as_ref()
-                                        .map(OnlineTrainingDetails::from),
-                                };
-
-                                let completion_msg = serde_json::json!({
-                                    "id": sse_stream_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": chrono::Utc::now().timestamp(),
-                                    "model": model_name,
-                                    "choices": [{
-                                        "index": 0,
-                                        "delta": {},
-                                        "finish_reason": oai_finish_reason
-                                    }],
-                                    "usage": usage
-                                });
-                                let _ = tx.send(Ok(completion_msg)).await;
-
-                                let _ = tx.send(Ok(serde_json::json!({"done": true}))).await;
-                                break 'outer;
-                            }
-                            Ok(InferenceStreamPayload::Error(message)) => {
-                                error!("Stream error: {}", message);
-                                let _ = tx.send(Err(anyhow::anyhow!("Generation error: {}", message))).await;
-                                break 'outer;
-                            }
-                            Err(e) => {
-                                error!("Failed to parse stream payload: {}", e);
-                                continue;
-                            }
+                            let _ = tx.send(Ok(serde_json::json!({"done": true}))).await;
+                            break 'outer;
+                        }
+                        Ok(InferenceStreamPayload::Error(message)) => {
+                            error!("Stream error: {}", message);
+                            let _ = tx.send(Err(anyhow::anyhow!("Generation error: {}", message))).await;
+                            break 'outer;
+                        }
+                        Err(e) => {
+                            error!("Failed to parse stream payload: {}", e);
+                            continue;
                         }
                     }
                 }
-                Err(zmq::Error::EAGAIN) => {
-                    // Timeout - yield and check for cancellation
+                Ok(None) => {
+                    if stream_handle.is_completed() {
+                        break 'outer;
+                    }
+                    // No data available - yield and retry
                     tokio::task::yield_now().await;
                     continue;
                 }
                 Err(e) => {
-                    error!("ZMQ recv error: {}", e);
+                    error!("Stream receive error: {}", e);
                     let _ = tx.send(Err(anyhow::anyhow!("Stream receive error: {}", e))).await;
                     break;
                 }
             }
         }
 
-        // Explicit socket cleanup
-        let _ = sub_socket.disconnect(&endpoint);
+        // StreamHandle owns the socket and cleans up on drop
         // Metrics are automatically decremented by MetricsGuard drop
     });
 

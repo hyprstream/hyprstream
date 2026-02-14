@@ -32,6 +32,8 @@ pub enum CapnpType {
     Float64,
     ListText,
     ListData,
+    /// List of a primitive numeric type (e.g., `List(Int64)` → `ListPrimitive(Int64)`).
+    ListPrimitive(Box<CapnpType>),
     /// List of a named struct type (e.g., `List(ModelInfo)` → `ListStruct("ModelInfo")`).
     ListStruct(String),
     /// A known struct type from the schema.
@@ -65,7 +67,14 @@ impl CapnpType {
                 match inner {
                     "Text" => Self::ListText,
                     "Data" => Self::ListData,
-                    _ => Self::ListStruct(inner.to_string()),
+                    _ => {
+                        let inner_type = Self::classify(inner, structs, enums);
+                        if inner_type.is_numeric() {
+                            Self::ListPrimitive(Box::new(inner_type))
+                        } else {
+                            Self::ListStruct(inner.to_string())
+                        }
+                    }
                 }
             }
             t => {
@@ -104,8 +113,9 @@ impl CapnpType {
             Self::Float64 => "f64".into(),
             Self::ListText => "Vec<String>".into(),
             Self::ListData => "Vec<Vec<u8>>".into(),
-            Self::ListStruct(inner) => format!("Vec<{inner}Data>"),
-            Self::Struct(name) => format!("{name}Data"),
+            Self::ListPrimitive(inner) => format!("Vec<{}>", inner.rust_owned_type()),
+            Self::ListStruct(inner) => format!("Vec<{inner}>"),
+            Self::Struct(name) => format!("{name}"),
             Self::Enum(name) => format!("{name}Enum"),
             Self::Unknown(_) => "Vec<u8>".into(),
         }
@@ -118,7 +128,8 @@ impl CapnpType {
             Self::Data => "&[u8]".into(),
             Self::ListText => "&[String]".into(),
             Self::ListData => "&[Vec<u8>]".into(),
-            Self::ListStruct(inner) => format!("&[{inner}Data]"),
+            Self::ListPrimitive(inner) => format!("&[{}]", inner.rust_owned_type()),
+            Self::ListStruct(inner) => format!("&[{inner}]"),
             Self::Enum(_) => "&str".into(),
             _ => self.rust_owned_type(),
         }
@@ -132,6 +143,7 @@ impl CapnpType {
                 | Self::Data
                 | Self::ListText
                 | Self::ListData
+                | Self::ListPrimitive(_)
                 | Self::ListStruct(_)
                 | Self::Enum(_)
         )
@@ -206,6 +218,21 @@ pub fn to_snake_case(s: &str) -> String {
     result
 }
 
+/// Convert PascalCase to snake_case matching Cap'n Proto's Rust codegen naming.
+///
+/// Unlike `to_snake_case` (which groups consecutive uppercase letters like `DNS` → `dns`),
+/// capnp inserts `_` before every uppercase letter: `DNSConfig` → `d_n_s_config`.
+pub fn to_capnp_module_name(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() + 8);
+    for (i, c) in s.chars().enumerate() {
+        if c.is_ascii_uppercase() && i > 0 {
+            result.push('_');
+        }
+        result.push(c.to_ascii_lowercase());
+    }
+    result
+}
+
 /// Convert a Rust type string into a TokenStream for use in quote!.
 pub fn rust_type_tokens(type_str: &str) -> TokenStream {
     let ts: TokenStream = type_str.parse().unwrap_or_else(|_| quote! { Vec<u8> });
@@ -225,10 +252,12 @@ mod tests {
         vec![StructDef {
             name: "ModelInfo".into(),
             fields: vec![
-                FieldDef { name: "name".into(), type_name: "Text".into(), description: String::new() },
-                FieldDef { name: "size".into(), type_name: "UInt64".into(), description: String::new() },
+                FieldDef { name: "name".into(), type_name: "Text".into(), description: String::new(), fixed_size: None },
+                FieldDef { name: "size".into(), type_name: "UInt64".into(), description: String::new(), fixed_size: None },
             ],
             has_union: false,
+            domain_type: None,
+            origin_file: None,
         }]
     }
 
@@ -236,6 +265,7 @@ mod tests {
         vec![EnumDef {
             name: "Status".into(),
             variants: vec![("active".into(), 0), ("inactive".into(), 1)],
+            origin_file: None,
         }]
     }
 
@@ -257,6 +287,42 @@ mod tests {
             CapnpType::classify_primitive("List(ModelInfo)"),
             CapnpType::ListStruct("ModelInfo".into())
         );
+    }
+
+    #[test]
+    fn classify_list_primitives() {
+        assert_eq!(
+            CapnpType::classify_primitive("List(Int64)"),
+            CapnpType::ListPrimitive(Box::new(CapnpType::Int64))
+        );
+        assert_eq!(
+            CapnpType::classify_primitive("List(UInt8)"),
+            CapnpType::ListPrimitive(Box::new(CapnpType::UInt8))
+        );
+        assert_eq!(
+            CapnpType::classify_primitive("List(Bool)"),
+            CapnpType::ListPrimitive(Box::new(CapnpType::Bool))
+        );
+        assert_eq!(
+            CapnpType::classify_primitive("List(Float64)"),
+            CapnpType::ListPrimitive(Box::new(CapnpType::Float64))
+        );
+        // Verify owned types
+        assert_eq!(
+            CapnpType::ListPrimitive(Box::new(CapnpType::Int64)).rust_owned_type(),
+            "Vec<i64>"
+        );
+        assert_eq!(
+            CapnpType::ListPrimitive(Box::new(CapnpType::UInt8)).rust_owned_type(),
+            "Vec<u8>"
+        );
+        // Verify param types
+        assert_eq!(
+            CapnpType::ListPrimitive(Box::new(CapnpType::Int64)).rust_param_type(),
+            "&[i64]"
+        );
+        // Verify is_by_ref
+        assert!(CapnpType::ListPrimitive(Box::new(CapnpType::Int64)).is_by_ref());
     }
 
     #[test]
@@ -284,9 +350,9 @@ mod tests {
         assert_eq!(CapnpType::ListText.rust_owned_type(), "Vec<String>");
         assert_eq!(
             CapnpType::ListStruct("ModelInfo".into()).rust_owned_type(),
-            "Vec<ModelInfoData>"
+            "Vec<ModelInfo>"
         );
-        assert_eq!(CapnpType::Struct("ModelInfo".into()).rust_owned_type(), "ModelInfoData");
+        assert_eq!(CapnpType::Struct("ModelInfo".into()).rust_owned_type(), "ModelInfo");
         assert_eq!(CapnpType::Enum("Status".into()).rust_owned_type(), "StatusEnum");
     }
 

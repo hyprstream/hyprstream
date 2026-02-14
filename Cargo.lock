@@ -5374,6 +5374,7 @@ dependencies = [
  "hyprstream-flight",
  "hyprstream-metrics",
  "hyprstream-rpc",
+ "hyprstream-rpc-build",
  "hyprstream-rpc-derive",
  "hyprstream-workers",
  "image",
@@ -5559,6 +5560,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyprstream-rpc-build"
+version = "0.1.0"
+dependencies = [
+ "capnp",
+ "serde_json",
+]
+
+[[package]]
 name = "hyprstream-rpc-derive"
 version = "0.1.0"
 dependencies = [
@@ -5588,6 +5597,7 @@ dependencies = [
  "hex",
  "hypervisor",
  "hyprstream-rpc",
+ "hyprstream-rpc-build",
  "hyprstream-rpc-derive",
  "kata-sys-util",
  "kata-types",

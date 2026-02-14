@@ -8,6 +8,7 @@ members = [
     "crates/hyprstream-flight",
     "crates/cas-serve",
     "crates/hyprstream-rpc",
+    "crates/hyprstream-rpc-build",
     "crates/hyprstream-rpc-derive",
     "crates/hyprstream-workers",
 ]
@@ -195,6 +196,9 @@ version = "1.0"
 
 [workspace.dependencies.pkg-config]
 version = "0.3"
+
+[workspace.dependencies.hyprstream-rpc-build]
+path = "crates/hyprstream-rpc-build"
 
 [workspace.dependencies.capnpc]
 version = "0.20"

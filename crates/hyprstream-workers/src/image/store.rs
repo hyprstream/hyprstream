@@ -24,7 +24,7 @@ use nydus_storage::backend::{BlobBackend, BlobBufReader};
 use crate::config::ImageConfig;
 use crate::error::{Result, WorkerError};
 
-use super::client::{AuthConfig as CriAuthConfig, Image, ImageSpec};
+use super::{AuthConfig as GenAuthConfig, ImageSpec, ImageInfo, ImageStatusResult, FilesystemUsage, FilesystemIdentifier};
 use super::manifest::{AuthConfig, ImageReference, ManifestFetcher, ManifestResult};
 
 /// RAFS-backed image store with Dragonfly-native blob fetching
@@ -85,7 +85,7 @@ impl RafsStore {
     pub async fn pull_with_auth(
         &self,
         image_ref: &str,
-        auth: Option<&CriAuthConfig>,
+        auth: Option<&GenAuthConfig>,
     ) -> Result<String> {
         tracing::info!(image = %image_ref, "Pulling image");
 
@@ -99,7 +99,7 @@ impl RafsStore {
                 reason: e.to_string(),
             })?;
 
-        // Convert CRI auth to manifest auth (CRI uses String, manifest uses Option<String>)
+        // Convert CRI auth (GenAuthConfig with String fields) to manifest auth (Option<String> fields)
         let manifest_auth = auth.map(|a| AuthConfig {
             username: if a.username.is_empty() { None } else { Some(a.username.clone()) },
             password: if a.password.is_empty() { None } else { Some(a.password.clone()) },
@@ -159,7 +159,7 @@ impl RafsStore {
         // 4. Download config blob via nydus-storage
         let config_path = self.blobs_dir.join(digest_to_filename(&manifest.config.digest));
         if !config_path.exists() {
-            self.download_blob(&img_ref, &manifest.config.digest, &config_path, auth)
+            self.download_blob(&img_ref, &manifest.config.digest, &config_path, manifest_auth.as_ref())
                 .await?;
             tracing::debug!(digest = %manifest.config.digest, "Downloaded config");
         }
@@ -173,7 +173,7 @@ impl RafsStore {
                     size = %layer.size,
                     "Downloading layer via nydus-storage"
                 );
-                self.download_blob(&img_ref, &layer.digest, &layer_path, auth)
+                self.download_blob(&img_ref, &layer.digest, &layer_path, manifest_auth.as_ref())
                     .await?;
             } else {
                 tracing::debug!(digest = %layer.digest, "Layer already cached");
@@ -227,7 +227,7 @@ impl RafsStore {
         img_ref: &ImageReference,
         digest: &str,
         dest_path: &Path,
-        auth: Option<&CriAuthConfig>,
+        auth: Option<&AuthConfig>,
     ) -> Result<()> {
         // Extract blob ID from digest (remove "sha256:" prefix)
         let blob_id = digest
@@ -295,7 +295,7 @@ impl RafsStore {
         &self,
         img_ref: &ImageReference,
         blob_id: &str,
-        auth: Option<&CriAuthConfig>,
+        auth: Option<&AuthConfig>,
     ) -> RegistryConfig {
         let mut config = RegistryConfig {
             host: img_ref.host.clone(),
@@ -314,18 +314,20 @@ impl RafsStore {
             );
         }
 
-        // Set authentication if provided (CRI AuthConfig uses String, not Option<String>)
+        // Set authentication if provided (both now use Option<String>)
         if let Some(auth) = auth {
-            if !auth.username.is_empty() && !auth.password.is_empty() {
-                use base64::Engine;
-                let credentials = format!("{}:{}", auth.username, auth.password);
-                config.auth = Some(
-                    base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes()),
-                );
-            } else if !auth.auth.is_empty() {
-                config.registry_token = Some(auth.auth.clone());
-            } else if !auth.registry_token.is_empty() {
-                config.registry_token = Some(auth.registry_token.clone());
+            if let (Some(username), Some(password)) = (&auth.username, &auth.password) {
+                if !username.is_empty() && !password.is_empty() {
+                    use base64::Engine;
+                    let credentials = format!("{}:{}", username, password);
+                    config.auth = Some(
+                        base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes()),
+                    );
+                }
+            } else if let Some(token) = &auth.token {
+                if !token.is_empty() {
+                    config.registry_token = Some(token.clone());
+                }
             }
         }
 
@@ -409,7 +411,7 @@ impl RafsStore {
     }
 
     /// List all images
-    pub async fn list(&self) -> Result<Vec<Image>> {
+    pub async fn list(&self) -> Result<Vec<ImageInfo>> {
         let mut images = Vec::new();
 
         if self.refs_dir.exists() {
@@ -421,17 +423,17 @@ impl RafsStore {
 
                     if let Ok(metadata_str) = std::fs::read_to_string(&metadata_path) {
                         if let Ok(metadata) = serde_json::from_str::<ImageMetadata>(&metadata_str) {
-                            images.push(Image {
+                            images.push(ImageInfo {
                                 id: metadata.image_id.clone(),
                                 repo_tags: vec![metadata.image_ref.clone()],
                                 repo_digests: vec![metadata.config_digest.clone()],
                                 size: 0, // TODO: Calculate from layers
-                                uid: None,
+                                uid: -1,
                                 username: String::new(),
-                                spec: Some(ImageSpec {
+                                spec: ImageSpec {
                                     image: metadata.image_ref.clone(),
                                     ..Default::default()
-                                }),
+                                },
                                 pinned: false,
                             });
                         }
@@ -558,34 +560,35 @@ impl RafsStore {
     // ─────────────────────────────────────────────────────────────────────────
 
     /// List all images (CRI ImageClient aligned)
-    pub async fn list_images(&self) -> Result<Vec<Image>> {
+    pub async fn list_images(&self) -> Result<Vec<ImageInfo>> {
         self.list().await
     }
 
     /// Get image status (CRI ImageClient aligned)
-    pub async fn image_status(&self, image_ref: &str, _verbose: bool) -> Result<super::client::ImageStatusResponse> {
+    pub async fn image_status(&self, image_ref: &str, _verbose: bool) -> Result<ImageStatusResult> {
         if self.exists(image_ref) {
             let metadata = self.get_metadata(image_ref)?;
-            Ok(super::client::ImageStatusResponse {
-                image: Some(Image {
+            Ok(ImageStatusResult {
+                image: ImageInfo {
                     id: metadata.image_id.clone(),
                     repo_tags: vec![metadata.image_ref.clone()],
                     repo_digests: vec![metadata.config_digest.clone()],
                     size: 0, // TODO: Calculate from layers
-                    uid: None,
+                    uid: -1,
                     username: String::new(),
-                    spec: Some(ImageSpec {
+                    spec: ImageSpec {
                         image: metadata.image_ref.clone(),
                         ..Default::default()
-                    }),
+                    },
                     pinned: false,
-                }),
-                info: std::collections::HashMap::new(),
+                },
+                info: vec![],
             })
         } else {
-            Ok(super::client::ImageStatusResponse {
-                image: None,
-                info: std::collections::HashMap::new(),
+            // Empty id = not found
+            Ok(ImageStatusResult {
+                image: ImageInfo::default(),
+                info: vec![],
             })
         }
     }
@@ -598,7 +601,7 @@ impl RafsStore {
     }
 
     /// Get filesystem info (CRI ImageClient aligned)
-    pub async fn fs_info(&self) -> Result<Vec<super::client::FilesystemUsage>> {
+    pub async fn fs_info(&self) -> Result<Vec<FilesystemUsage>> {
         let mut used_bytes = 0u64;
         let mut inodes_used = 0u64;
 
@@ -632,9 +635,9 @@ impl RafsStore {
             }
         }
 
-        Ok(vec![super::client::FilesystemUsage {
+        Ok(vec![FilesystemUsage {
             timestamp: chrono::Utc::now().timestamp(),
-            fs_id: super::client::FilesystemIdentifier {
+            fs_id: FilesystemIdentifier {
                 mountpoint: self.blobs_dir.to_string_lossy().to_string(),
             },
             used_bytes,

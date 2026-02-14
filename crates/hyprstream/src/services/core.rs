@@ -22,7 +22,22 @@ use anyhow::Result;
 use hyprstream_rpc::prelude::*;
 
 // Re-export core types from hyprstream-rpc
-pub use hyprstream_rpc::service::{CallOptions, EnvelopeContext, ZmqClient as ZmqClientBase, ZmqService};
+pub use hyprstream_rpc::service::{CallOptions, Continuation, EnvelopeContext, ZmqClient as ZmqClientBase, ZmqService};
+
+/// Create a generated service client with standard ZMQ boilerplate.
+///
+/// Uses the global ZMQ context and derives the server verifying key from the signing key.
+pub fn create_service_client<C: hyprstream_rpc::service::factory::ServiceClient>(
+    endpoint: &str,
+    signing_key: SigningKey,
+    identity: RequestIdentity,
+) -> C {
+    let server_verifying_key = signing_key.verifying_key();
+    let base = ZmqClientBase::new(
+        endpoint, global_context(), signing_key, server_verifying_key, identity,
+    );
+    C::from_zmq(base)
+}
 
 /// Authenticated ZMQ client with automatic request signing and response verification.
 ///
@@ -136,13 +151,14 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl ZmqService for EchoService {
-        fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<Vec<u8>> {
+        async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {
             // Echo back the payload, but prepend the user
             let user = ctx.user();
             let mut response = format!("from {}:", user).into_bytes();
             response.extend_from_slice(payload);
-            Ok(response)
+            Ok((response, None))
         }
 
         fn name(&self) -> &str {

@@ -10,12 +10,15 @@ use tracing::info;
 
 use hyprstream_workers::image::{AuthConfig, ImageClient, ImageSpec};
 use hyprstream_workers::runtime::{
-    ContainerConfig, ContainerFilter, ContainerImageSpec, ContainerState, ContainerStats,
-    PodSandboxConfig, PodSandboxFilter, PodSandboxState, PodSandboxStats,
-    RuntimeClient,
+    ContainerConfig, ContainerFilter,
+    ContainerState, ContainerStateEnum, ContainerStatsWire, KeyValue, Timestamp,
+    PodSandboxConfig, PodSandboxFilter, PodSandboxState, PodSandboxStateEnum,
+    PodSandboxStats, RuntimeClient,
 };
+// Use the generated ContainerMetadata to match generated ContainerConfig's field type
+use hyprstream_workers::generated::worker_client::ContainerMetadata;
 
-use crate::services::WorkerClient;
+use crate::services::WorkerZmqClient;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // List Command
@@ -23,7 +26,7 @@ use crate::services::WorkerClient;
 
 /// Handle `worker list` command
 pub async fn handle_worker_list(
-    client: &WorkerClient,
+    client: &WorkerZmqClient,
     sandbox_filter: Option<String>,
     containers_only: bool,
     sandboxes_only: bool,
@@ -44,11 +47,11 @@ pub async fn handle_worker_list(
             println!("SANDBOX ID                              STATE           CREATED");
             for sb in &sandboxes {
                 let state = match sb.state {
-                    PodSandboxState::SandboxReady => "Ready",
-                    PodSandboxState::SandboxNotReady => "NotReady",
+                    PodSandboxStateEnum::SandboxReady => "Ready",
+                    PodSandboxStateEnum::SandboxNotReady => "NotReady",
                 };
                 let id_short = truncate_id(&sb.id, 36);
-                println!("{:<40}{:<16}{}", id_short, state, sb.created_at);
+                println!("{:<40}{:<16}{}", id_short, state, format_timestamp(sb.created_at.clone()));
             }
         }
     }
@@ -73,10 +76,10 @@ pub async fn handle_worker_list(
             );
             for c in &containers {
                 let state = match c.state {
-                    ContainerState::ContainerCreated => "Created",
-                    ContainerState::ContainerRunning => "Running",
-                    ContainerState::ContainerExited => "Exited",
-                    ContainerState::ContainerUnknown => "Unknown",
+                    ContainerStateEnum::ContainerCreated => "Created",
+                    ContainerStateEnum::ContainerRunning => "Running",
+                    ContainerStateEnum::ContainerExited => "Exited",
+                    ContainerStateEnum::ContainerUnknown => "Unknown",
                 };
                 let id_short = truncate_id(&c.id, 36);
                 let image = if c.image.image.is_empty() { "-" } else { &c.image.image };
@@ -105,7 +108,7 @@ pub async fn handle_worker_list(
 
 /// Handle `worker run` command
 pub async fn handle_worker_run(
-    client: &WorkerClient,
+    client: &WorkerZmqClient,
     image: &str,
     command: Vec<String>,
     sandbox_id: Option<String>,
@@ -120,7 +123,7 @@ pub async fn handle_worker_run(
     // 1. Ensure image is pulled
     let image_spec = ImageSpec {
         image: image.to_owned(),
-        annotations: Default::default(),
+        annotations: vec![],
         runtime_handler: String::new(),
     };
 
@@ -142,18 +145,16 @@ pub async fn handle_worker_run(
     };
 
     // 3. Create container config
-    // Convert image ImageSpec to runtime ImageSpec
-    let runtime_image_spec = ContainerImageSpec {
-        image: image_spec.image.clone(),
-        annotations: image_spec.annotations.clone(),
-        runtime_handler: image_spec.runtime_handler.clone(),
-    };
     let container_config = ContainerConfig {
-        metadata: hyprstream_workers::runtime::ContainerMetadata {
+        metadata: ContainerMetadata {
             name: name.unwrap_or_else(generate_name),
             attempt: 0,
         },
-        image: runtime_image_spec,
+        image: ImageSpec {
+            image: image_spec.image.clone(),
+            annotations: Default::default(),
+            runtime_handler: image_spec.runtime_handler.clone(),
+        },
         command: if command.is_empty() {
             vec![]
         } else {
@@ -162,15 +163,7 @@ pub async fn handle_worker_run(
         args: vec![],
         working_dir: workdir.unwrap_or_default(),
         envs: parse_env_vars(&env),
-        mounts: vec![],
-        devices: vec![],
-        labels: Default::default(),
-        annotations: Default::default(),
-        log_path: String::new(),
-        stdin: false,
-        stdin_once: false,
-        tty: false,
-        linux: None,
+        ..Default::default()
     };
 
     // 4. Create and start container
@@ -188,7 +181,7 @@ pub async fn handle_worker_run(
         // Wait for container to exit
         loop {
             let status = client.container_status(&container_id, false).await?;
-            if status.status.state == ContainerState::ContainerExited {
+            if status.status.state == ContainerStateEnum::ContainerExited {
                 println!(
                     "Container exited with code {:?}",
                     status.status.exit_code
@@ -213,7 +206,7 @@ pub async fn handle_worker_run(
 
 /// Handle `worker stop` command
 pub async fn handle_worker_stop(
-    client: &WorkerClient,
+    client: &WorkerZmqClient,
     id: &str,
     timeout: i64,
     force: bool,
@@ -239,7 +232,7 @@ pub async fn handle_worker_stop(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Handle `worker start` command
-pub async fn handle_worker_start(client: &WorkerClient, container_id: &str) -> Result<()> {
+pub async fn handle_worker_start(client: &WorkerZmqClient, container_id: &str) -> Result<()> {
     info!(container_id = %container_id, "Starting container");
 
     client.start_container(container_id).await?;
@@ -252,7 +245,7 @@ pub async fn handle_worker_start(client: &WorkerClient, container_id: &str) -> R
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Handle `worker restart` command
-pub async fn handle_worker_restart(client: &WorkerClient, id: &str, timeout: i64) -> Result<()> {
+pub async fn handle_worker_restart(client: &WorkerZmqClient, id: &str, timeout: i64) -> Result<()> {
     info!(id = %id, "Restarting");
 
     // Stop then start
@@ -276,14 +269,14 @@ pub async fn handle_worker_restart(client: &WorkerClient, id: &str, timeout: i64
 
 /// Handle `worker rm` command
 pub async fn handle_worker_rm(
-    client: &WorkerClient,
+    client: &WorkerZmqClient,
     ids: Vec<String>,
     force: bool,
 ) -> Result<()> {
     for id in ids {
         // Try as container first
         if let Ok(status) = client.container_status(&id, false).await {
-            if status.status.state == ContainerState::ContainerRunning {
+            if status.status.state == ContainerStateEnum::ContainerRunning {
                 if force {
                     client.stop_container(&id, 0).await?;
                 } else {
@@ -316,7 +309,7 @@ pub async fn handle_worker_rm(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Handle `worker status` command
-pub async fn handle_worker_status(client: &WorkerClient, id: &str, verbose: bool) -> Result<()> {
+pub async fn handle_worker_status(client: &WorkerZmqClient, id: &str, verbose: bool) -> Result<()> {
     // Try as container
     if let Ok(status) = client.container_status(id, verbose).await {
         println!("Type: Container");
@@ -324,15 +317,13 @@ pub async fn handle_worker_status(client: &WorkerClient, id: &str, verbose: bool
         println!("State: {:?}", status.status.state);
         let image_str = if status.status.image.image.is_empty() { "-" } else { &status.status.image.image };
         println!("Image: {image_str}");
-        println!("Created: {}", status.status.created_at);
-        if status.status.state == ContainerState::ContainerExited {
+        println!("Created: {}", format_timestamp(status.status.created_at));
+        if status.status.state == ContainerStateEnum::ContainerExited {
             println!("Exit Code: {}", status.status.exit_code);
         }
         if verbose {
             println!("\nInfo:");
-            for (k, v) in &status.info {
-                println!("  {k}: {v}");
-            }
+            print_kv_info(&status.info);
         }
         return Ok(());
     }
@@ -342,12 +333,10 @@ pub async fn handle_worker_status(client: &WorkerClient, id: &str, verbose: bool
     println!("Type: Sandbox");
     println!("ID: {}", status.status.id);
     println!("State: {:?}", status.status.state);
-    println!("Created: {}", status.status.created_at);
+    println!("Created: {}", format_timestamp(status.status.created_at));
     if verbose {
         println!("\nInfo:");
-        for (k, v) in &status.info {
-            println!("  {k}: {v}");
-        }
+        print_kv_info(&status.info);
     }
 
     Ok(())
@@ -359,7 +348,7 @@ pub async fn handle_worker_status(client: &WorkerClient, id: &str, verbose: bool
 
 /// Handle `worker stats` command
 pub async fn handle_worker_stats(
-    client: &WorkerClient,
+    client: &WorkerZmqClient,
     ids: Vec<String>,
     no_header: bool,
 ) -> Result<()> {
@@ -389,18 +378,13 @@ pub async fn handle_worker_stats(
     Ok(())
 }
 
-fn print_container_stats(id: &str, stats: &ContainerStats) {
-    let cpu_pct = stats
-        .cpu
-        .as_ref()
-        .map(|c| format!("{:.2}%", c.usage_nano_cores as f64 / 1e9 * 100.0))
-        .unwrap_or_else(|| "-".to_owned());
-
-    let mem = stats
-        .memory
-        .as_ref()
-        .map(|m| format!("{} / {}", format_size(m.usage_bytes), format_size(m.available_bytes)))
-        .unwrap_or_else(|| "-".to_owned());
+fn print_container_stats(id: &str, stats: &ContainerStatsWire) {
+    let cpu_pct = format!("{:.2}%", stats.cpu.usage_nano_cores as f64 / 1e9 * 100.0);
+    let mem = format!(
+        "{} / {}",
+        format_size(stats.memory.usage_bytes),
+        format_size(stats.memory.available_bytes),
+    );
 
     println!(
         "{:<40}{:<12}{:<24}{:<16}",
@@ -412,27 +396,20 @@ fn print_container_stats(id: &str, stats: &ContainerStats) {
 }
 
 fn print_sandbox_stats(id: &str, stats: &PodSandboxStats) {
-    let cpu_pct = stats
-        .linux
-        .as_ref()
-        .and_then(|l| l.cpu.as_ref())
-        .map(|c| format!("{:.2}%", c.usage_nano_cores as f64 / 1e9 * 100.0))
-        .unwrap_or_else(|| "-".to_owned());
-
-    let mem = stats
-        .linux
-        .as_ref()
-        .and_then(|l| l.memory.as_ref())
-        .map(|m| format!("{} / {}", format_size(m.usage_bytes), format_size(m.available_bytes)))
-        .unwrap_or_else(|| "-".to_owned());
-
-    let net = stats
-        .linux
-        .as_ref()
-        .and_then(|l| l.network.as_ref())
-        .and_then(|n| n.default_interface.as_ref())
-        .map(|i| format!("{} / {}", format_size(i.rx_bytes), format_size(i.tx_bytes)))
-        .unwrap_or_else(|| "-".to_owned());
+    let cpu_pct = format!(
+        "{:.2}%",
+        stats.linux.cpu.usage_nano_cores as f64 / 1e9 * 100.0,
+    );
+    let mem = format!(
+        "{} / {}",
+        format_size(stats.linux.memory.usage_bytes),
+        format_size(stats.linux.memory.available_bytes),
+    );
+    let net = format!(
+        "{} / {}",
+        format_size(stats.linux.network.default_interface.rx_bytes),
+        format_size(stats.linux.network.default_interface.tx_bytes),
+    );
 
     println!(
         "{:<40}{:<12}{:<24}{:<16}",
@@ -449,7 +426,7 @@ fn print_sandbox_stats(id: &str, stats: &PodSandboxStats) {
 
 /// Handle `worker exec` command
 pub async fn handle_worker_exec(
-    client: &WorkerClient,
+    client: &WorkerZmqClient,
     container_id: &str,
     command: Vec<String>,
     timeout: i64,
@@ -484,67 +461,50 @@ pub async fn handle_worker_exec(
 /// Handle `worker terminal` command - attach to container I/O streams
 ///
 /// This provides tmux-like terminal streaming with DH-authenticated E2E security:
-/// - Performs DH key exchange with worker to derive topic + mac_key
-/// - Uses StreamHandle for HMAC-verified streaming
+/// - StreamHandle encapsulates DH key exchange, subscription, and HMAC verification
 /// - Handles detach sequence (default: Ctrl-])
 pub async fn handle_worker_terminal(
-    client: &WorkerClient,
+    client: &WorkerZmqClient,
     container_id: &str,
     detach_keys: &str,
 ) -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use tokio::signal;
+    use hyprstream_rpc::streaming::{StreamHandle, StreamPayload};
 
     info!(container_id = %container_id, "Attaching to container terminal");
 
-    // 1. Call Attach RPC to get stream info and server pubkey
-    let attach_response = client.attach(container_id).await?;
-
-    // 2. Generate client DH keypair
+    // 1. Generate client DH keypair
     let (client_secret, client_pubkey) = hyprstream_rpc::generate_ephemeral_keypair();
     let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
 
-    // 3. Complete DH handshake
-    let auth_response = client.start_fd_stream(&attach_response.stream_id, &client_pubkey_bytes).await?;
-    if !auth_response.authorized {
-        anyhow::bail!("FD stream authorization failed");
-    }
+    // 2. Call Attach RPC with ephemeral pubkey — server does DH + pre-auth atomically
+    let attach_response = client.attach(container_id, client_pubkey_bytes).await?;
 
-    // 4. Derive stream keys from DH
-    let server_pub = hyprstream_rpc::crypto::RistrettoPublic::from_bytes(&attach_response.server_pubkey)
-        .ok_or_else(|| anyhow::anyhow!("Invalid server public key"))?;
-    let shared_secret = hyprstream_rpc::crypto::ristretto_dh(&client_secret, &server_pub);
-    let keys = hyprstream_rpc::crypto::derive_stream_keys(
-        &shared_secret,
-        &client_pubkey_bytes,
+    // 3. Create StreamHandle — DH, SUB socket, and HMAC verification all encapsulated
+    let zmq_ctx = crate::zmq::global_context();
+    let mut stream_handle = StreamHandle::new(
+        &zmq_ctx,
+        attach_response.stream_id.clone(),
+        &attach_response.endpoint,
         &attach_response.server_pubkey,
-    ).map_err(|e| anyhow::anyhow!("Key derivation failed: {}", e))?;
+        &client_secret,
+        &client_pubkey_bytes,
+    )?;
 
     println!(
         "Attached to container {}\n\
          Stream ID: {}\n\
          Endpoint: {}\n\
-         Topic: {}...\n\
          Detach with: {}",
-        truncate_id(&attach_response.container_id, 12),
+        truncate_id(container_id, 12),
         truncate_id(&attach_response.stream_id, 16),
-        attach_response.stream_endpoint,
-        &keys.topic[..16],
+        attach_response.endpoint,
         detach_keys,
     );
 
-    // 5. Set up ZMQ subscriber with DH-derived topic
-    let context = zmq::Context::new();
-    let sub_socket = context.socket(zmq::SUB)?;
-    sub_socket.connect(&attach_response.stream_endpoint)?;
-    sub_socket.set_subscribe(keys.topic.as_bytes())?;
-
-    // Create stream verifier for HMAC chain verification
-    use crate::services::rpc_types::StreamVerifier;
-    let mut verifier = StreamVerifier::new(*keys.mac_key, keys.topic.clone());
-
-    // 6. Set up terminal control
+    // 5. Set up terminal control
     let running = Arc::new(AtomicBool::new(true));
     let running_signal = running.clone();
 
@@ -559,52 +519,31 @@ pub async fn handle_worker_terminal(
 
     println!("\n--- Terminal attached. Press {detach_keys} to detach ---\n");
 
-    // 7. Main I/O loop with HMAC-verified streaming
-    let topic_bytes = keys.topic.as_bytes().to_vec();
+    // 6. Main I/O loop — StreamHandle handles HMAC-verified receive
     let running_recv = running.clone();
 
     let recv_handle = std::thread::spawn(move || {
         while running_recv.load(Ordering::SeqCst) {
-            // Poll with 100ms timeout
-            if sub_socket.poll(zmq::POLLIN, 100).unwrap_or(0) > 0 {
-                // Receive multipart message: [topic, capnp, mac]
-                if let Ok(frames) = sub_socket.recv_multipart(0) {
-                    if frames.len() != 3 || frames[2].len() != 16 {
-                        tracing::warn!("Invalid StreamBlock format");
-                        continue;
-                    }
-
-                    // Verify topic matches
-                    if frames[0] != topic_bytes {
-                        continue;
-                    }
-
-                    // Verify HMAC and parse payloads
-                    match verifier.verify(&frames) {
-                        Ok(payloads) => {
-                            for payload in payloads {
-                                use crate::services::rpc_types::StreamPayload;
-                                match payload {
-                                    StreamPayload::Data(data) => {
-                                        // Worker FD data is raw bytes (terminal output)
-                                        print!("{}", String::from_utf8_lossy(&data));
-                                        let _ = io::stdout().flush();
-                                    }
-                                    StreamPayload::Complete(_) => {
-                                        println!("\n--- Stream complete ---");
-                                        return;
-                                    }
-                                    StreamPayload::Error(message) => {
-                                        eprintln!("\n--- Stream error: {message} ---");
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("StreamBlock verification failed: {}", e);
-                        }
-                    }
+            match stream_handle.try_next() {
+                Ok(Some(StreamPayload::Data(data))) => {
+                    // Worker FD data is raw bytes (terminal output)
+                    print!("{}", String::from_utf8_lossy(&data));
+                    let _ = io::stdout().flush();
+                }
+                Ok(Some(StreamPayload::Complete(_))) => {
+                    println!("\n--- Stream complete ---");
+                    return;
+                }
+                Ok(Some(StreamPayload::Error(message))) => {
+                    eprintln!("\n--- Stream error: {message} ---");
+                    return;
+                }
+                Ok(None) => {
+                    // No data available, brief sleep to avoid busy-wait
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => {
+                    tracing::warn!("Stream receive error: {}", e);
                 }
             }
         }
@@ -661,7 +600,7 @@ fn parse_detach_keys(keys: &str) -> u8 {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Handle `worker images list` command
-pub async fn handle_images_list(client: &WorkerClient, _verbose: bool) -> Result<()> {
+pub async fn handle_images_list(client: &WorkerZmqClient, _verbose: bool) -> Result<()> {
     let images = client.list_images(None).await?;
 
     println!(
@@ -682,7 +621,7 @@ pub async fn handle_images_list(client: &WorkerClient, _verbose: bool) -> Result
 
 /// Handle `worker images pull` command
 pub async fn handle_images_pull(
-    client: &WorkerClient,
+    client: &WorkerZmqClient,
     image: &str,
     username: Option<String>,
     password: Option<String>,
@@ -691,7 +630,7 @@ pub async fn handle_images_pull(
 
     let image_spec = ImageSpec {
         image: image.to_owned(),
-        annotations: Default::default(),
+        annotations: vec![],
         runtime_handler: String::new(),
     };
 
@@ -699,7 +638,10 @@ pub async fn handle_images_pull(
         (Some(u), Some(p)) => Some(AuthConfig {
             username: u,
             password: p,
-            ..Default::default()
+            auth: String::new(),
+            server_address: String::new(),
+            identity_token: String::new(),
+            registry_token: String::new(),
         }),
         _ => None,
     };
@@ -712,26 +654,26 @@ pub async fn handle_images_pull(
 
 /// Handle `worker images rm` command
 pub async fn handle_images_rm(
-    client: &WorkerClient,
+    client: &WorkerZmqClient,
     images: Vec<String>,
     _force: bool,
 ) -> Result<()> {
-    for image in images {
+    for img in images {
         let image_spec = ImageSpec {
-            image: image.clone(),
-            annotations: Default::default(),
+            image: img.clone(),
+            annotations: vec![],
             runtime_handler: String::new(),
         };
 
         client.remove_image(&image_spec).await?;
-        println!("Deleted: {image}");
+        println!("Deleted: {img}");
     }
 
     Ok(())
 }
 
 /// Handle `worker images df` command
-pub async fn handle_images_df(client: &WorkerClient) -> Result<()> {
+pub async fn handle_images_df(client: &WorkerZmqClient) -> Result<()> {
     let usage = client.image_fs_info().await?;
 
     println!(
@@ -754,6 +696,23 @@ pub async fn handle_images_df(client: &WorkerClient) -> Result<()> {
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper Functions
 // ─────────────────────────────────────────────────────────────────────────────
+
+fn format_timestamp(ts: Timestamp) -> String {
+    use chrono::{TimeZone, Utc};
+    if ts.seconds == 0 && ts.nanos == 0 {
+        return "-".to_owned();
+    }
+    Utc.timestamp_opt(ts.seconds, ts.nanos as u32)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn print_kv_info(info: &[KeyValue]) {
+    for kv in info {
+        println!("  {}: {}", kv.key, kv.value);
+    }
+}
 
 fn parse_sandbox_state(filter: &Option<String>) -> Option<PodSandboxState> {
     filter.as_ref().and_then(|s| {
@@ -809,12 +768,12 @@ fn generate_name() -> String {
     format!("container-{}", timestamp % 100000)
 }
 
-fn parse_env_vars(env: &[String]) -> Vec<hyprstream_workers::runtime::KeyValue> {
+fn parse_env_vars(env: &[String]) -> Vec<KeyValue> {
     env.iter()
         .filter_map(|e| {
             let parts: Vec<&str> = e.splitn(2, '=').collect();
             if parts.len() == 2 {
-                Some(hyprstream_workers::runtime::KeyValue {
+                Some(KeyValue {
                     key: parts[0].to_owned(),
                     value: parts[1].to_owned(),
                 })

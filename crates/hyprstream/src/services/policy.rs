@@ -1,30 +1,15 @@
 //! Policy service for authorization checks over ZMQ
 //!
 //! Wraps PolicyManager and exposes it as a ZmqService.
-//! Runs on multi-threaded runtime where block_in_place works.
-//!
-//! # Architecture
-//!
-//! ```text
-//! InferenceService (single-threaded)
-//!       │
-//!       │ PolicyClient.check_policy() [async ZMQ I/O]
-//!       ▼
-//! PolicyService (multi-threaded)
-//!       │
-//!       │ block_in_place + PolicyManager.check()
-//!       ▼
-//! Casbin enforcer
-//! ```
-//!
-//! This architecture solves the threading issue where InferenceService
-//! uses a single-threaded runtime (due to tch-rs raw pointers) but
-//! PolicyManager needs block_in_place() which requires multi-threaded.
+//! Handlers are async and use `.await` directly (compatible with single-threaded runtime).
 
+use async_trait::async_trait;
 use crate::auth::{Operation, PolicyManager};
 use crate::services::{EnvelopeContext, ZmqService};
 use crate::services::generated::policy_client::{
-    PolicyClient, PolicyHandler, PolicyResponseVariant, dispatch_policy,
+    ErrorInfo, PolicyClient, PolicyHandler, PolicyResponseVariant, TokenInfo,
+    PolicyCheck, IssueToken,
+    dispatch_policy,
 };
 use crate::zmq::global_context;
 use anyhow::{anyhow, Result};
@@ -43,9 +28,7 @@ const SERVICE_NAME: &str = "policy";
 // PolicyService (server-side)
 // ============================================================================
 
-/// Policy service that wraps PolicyManager
-///
-/// Runs on multi-threaded runtime where block_in_place works safely.
+/// Policy service that wraps PolicyManager.
 /// Receives policy check requests over ZMQ and delegates to PolicyManager.
 pub struct PolicyService {
     // Business logic
@@ -95,54 +78,48 @@ impl PolicyService {
 // PolicyHandler implementation (generated trait)
 // ============================================================================
 
+#[async_trait::async_trait(?Send)]
 impl PolicyHandler for PolicyService {
-    fn handle_check(
+    async fn handle_check(
         &self,
         _ctx: &EnvelopeContext,
         _request_id: u64,
-        subject: &str,
-        domain: &str,
-        resource: &str,
-        operation: &str,
+        data: &PolicyCheck,
     ) -> Result<PolicyResponseVariant> {
         trace!(
             "Policy check: subject={}, domain={}, resource={}, operation={}",
-            subject, domain, resource, operation
+            data.subject, data.domain, data.resource, data.operation
         );
 
         // Parse operation
-        let operation = match Self::parse_operation(operation) {
+        let operation = match Self::parse_operation(&data.operation) {
             Ok(op) => op,
             Err(_) => {
-                return Ok(PolicyResponseVariant::Error {
-                    message: format!("Invalid operation: {operation}"),
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: format!("Invalid operation: {}", data.operation),
                     code: "INVALID_OPERATION".to_string(),
                     details: String::new(),
-                });
+                }));
             }
         };
 
         // Check authorization
-        let allowed = tokio::task::block_in_place(|| {
-            let handle = tokio::runtime::Handle::current();
-            handle.block_on(self.policy_manager.check_with_domain(
-                subject,
-                domain,
-                resource,
-                operation,
-            ))
-        });
+        let allowed = self.policy_manager.check_with_domain(
+            &data.subject,
+            &data.domain,
+            &data.resource,
+            operation,
+        ).await;
 
         debug!("Policy check result: allowed={}", allowed);
         Ok(PolicyResponseVariant::Allowed(allowed))
     }
 
-    fn handle_issue_token(
+    async fn handle_issue_token(
         &self,
         ctx: &EnvelopeContext,
         _request_id: u64,
-        requested_scopes: &[String],
-        ttl: u32,
+        data: &IssueToken,
     ) -> Result<PolicyResponseVariant> {
         use hyprstream_rpc::auth::Scope;
 
@@ -150,62 +127,59 @@ impl PolicyHandler for PolicyService {
         let subject = ctx.subject().to_string();
 
         // Authorize each scope via Casbin
-        for scope_str in requested_scopes {
+        for scope_str in &data.requested_scopes {
             let scope = match Scope::parse(scope_str) {
                 Ok(s) => s,
                 Err(_) => {
-                    return Ok(PolicyResponseVariant::Error {
+                    return Ok(PolicyResponseVariant::Error(ErrorInfo {
                         message: format!("Invalid scope format: {scope_str}"),
                         code: "INVALID_SCOPE".to_string(),
                         details: String::new(),
-                    });
+                    }));
                 }
             };
 
-            let allowed = tokio::task::block_in_place(|| {
-                let handle = tokio::runtime::Handle::current();
-                handle.block_on(self.policy_manager.check(
-                    &subject,
-                    &scope.to_string(),
-                    Operation::Infer,
-                ))
-            });
+            let allowed = self.policy_manager.check(
+                &subject,
+                &scope.to_string(),
+                Operation::Infer,
+            ).await;
 
             if !allowed {
-                return Ok(PolicyResponseVariant::Error {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
                     message: format!("Access denied for scope: {}", scope),
                     code: "UNAUTHORIZED".to_string(),
                     details: String::new(),
-                });
+                }));
             }
         }
 
         // Validate TTL
-        let requested_ttl = if ttl == 0 {
+        let requested_ttl = if data.ttl == 0 {
             self.token_config.default_ttl_seconds
         } else {
-            ttl
+            data.ttl
         };
 
         const MIN_TTL_SECONDS: u32 = 60;
         if requested_ttl < MIN_TTL_SECONDS {
-            return Ok(PolicyResponseVariant::Error {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: format!("TTL too short: {} < {} seconds minimum", requested_ttl, MIN_TTL_SECONDS),
                 code: "TTL_TOO_SHORT".to_string(),
                 details: String::new(),
-            });
+            }));
         }
 
         if requested_ttl > self.token_config.max_ttl_seconds {
-            return Ok(PolicyResponseVariant::Error {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: format!("TTL exceeds maximum: {} > {}", requested_ttl, self.token_config.max_ttl_seconds),
                 code: "TTL_EXCEEDED".to_string(),
                 details: String::new(),
-            });
+            }));
         }
 
         // Parse scopes into Scope objects
-        let parsed_scopes: Result<Vec<Scope>> = requested_scopes
+        let parsed_scopes: Result<Vec<Scope>> = data.requested_scopes
             .iter()
             .map(|s| Scope::parse(s))
             .collect();
@@ -223,21 +197,22 @@ impl PolicyHandler for PolicyService {
 
         let token = crate::auth::jwt::encode(&claims, &self.signing_key);
 
-        Ok(PolicyResponseVariant::TokenSuccess {
+        Ok(PolicyResponseVariant::TokenSuccess(TokenInfo {
             token,
             expires_at: claims.exp,
-        })
+        }))
     }
 }
 
+#[async_trait(?Send)]
 impl ZmqService for PolicyService {
-    fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<Vec<u8>> {
+    async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {
         trace!(
             "Policy request from {} (id={})",
             ctx.subject(),
             ctx.request_id
         );
-        dispatch_policy(self, ctx, payload)
+        dispatch_policy(self, ctx, payload).await
     }
 
     fn name(&self) -> &str {
@@ -311,8 +286,8 @@ impl PolicyClient {
         let subject_str = subject.to_string();
         match self.check(&subject_str, domain, resource, operation.as_str()).await? {
             PolicyResponseVariant::Allowed(allowed) => Ok(allowed),
-            PolicyResponseVariant::Error { message, code, .. } => {
-                Err(anyhow!("Policy check failed: {} ({})", message, code))
+            PolicyResponseVariant::Error(ref e) => {
+                Err(anyhow!("Policy check failed: {} ({})", e.message, e.code))
             }
             _ => Err(anyhow!("Unexpected response type for policy check")),
         }
@@ -328,8 +303,8 @@ impl PolicyClient {
     ) -> Result<bool> {
         match self.check(subject, domain, resource, operation.as_str()).await? {
             PolicyResponseVariant::Allowed(allowed) => Ok(allowed),
-            PolicyResponseVariant::Error { message, code, .. } => {
-                Err(anyhow!("Policy check failed: {} ({})", message, code))
+            PolicyResponseVariant::Error(ref e) => {
+                Err(anyhow!("Policy check failed: {} ({})", e.message, e.code))
             }
             _ => Err(anyhow!("Unexpected response type for policy check")),
         }
@@ -342,11 +317,11 @@ impl PolicyClient {
         ttl: Option<u32>,
     ) -> Result<(String, i64)> {
         match self.issue_token(&scopes, ttl.unwrap_or(0)).await? {
-            PolicyResponseVariant::TokenSuccess { token, expires_at } => {
-                Ok((token, expires_at))
+            PolicyResponseVariant::TokenSuccess(ref data) => {
+                Ok((data.token.clone(), data.expires_at))
             }
-            PolicyResponseVariant::Error { message, code, .. } => {
-                Err(anyhow!("Token issuance failed: {} ({})", message, code))
+            PolicyResponseVariant::Error(ref e) => {
+                Err(anyhow!("Token issuance failed: {} ({})", e.message, e.code))
             }
             _ => Err(anyhow!("Unexpected response type for issue_token")),
         }

@@ -11,8 +11,8 @@ use thiserror::Error;
 
 use crate::storage::ModelRef;
 
-// Re-export RemoteInfo from rpc_types for public API
-pub use super::rpc_types::RemoteInfo;
+// Re-export RemoteInfo from generated types for public API
+pub use super::generated::registry_client::RemoteInfo;
 
 /// File change type for detailed status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -536,7 +536,7 @@ pub trait RegistryClient: Send + Sync {
 
     /// Clone a repository with streaming progress.
     ///
-    /// Returns StreamStartedInfo containing:
+    /// Returns StreamInfo containing:
     /// - stream_id: For client display/logging
     /// - endpoint: StreamService SUB endpoint
     /// - server_pubkey: Server's ephemeral Ristretto255 public key for DH
@@ -552,7 +552,7 @@ pub trait RegistryClient: Send + Sync {
         name: Option<&str>,
         options: &CloneOptions,
         ephemeral_pubkey: Option<[u8; 32]>,
-    ) -> Result<crate::services::rpc_types::StreamStartedInfo, RegistryServiceError>;
+    ) -> Result<crate::services::rpc_types::StreamInfo, RegistryServiceError>;
 
     /// Register an existing repository.
     ///

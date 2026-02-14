@@ -225,7 +225,7 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
 
     // Service includes infrastructure - directly Spawnable via blanket impl
-    let worker_service = WorkerService::new(
+    let mut worker_service = WorkerService::new(
         pool_config,
         image_config,
         rafs_store,
@@ -233,6 +233,13 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         ctx.transport("worker", SocketKind::Rep),
         ctx.signing_key().clone(),
     )?;
+
+    // Wire up policy-backed authorization
+    let policy_client = crate::services::PolicyClient::new(
+        ctx.signing_key().clone(),
+        hyprstream_rpc::RequestIdentity::local(),
+    );
+    worker_service.set_authorize_fn(super::worker::build_authorize_fn(policy_client));
 
     Ok(Box::new(worker_service))
 }

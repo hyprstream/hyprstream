@@ -21,6 +21,8 @@ pub struct UnionVariant {
     pub description: String,
     /// MCP scope override (e.g., "write:model:*"). Empty string means use default.
     pub scope: String,
+    /// Whether this method is hidden from CLI (internal-only).
+    pub cli_hidden: bool,
 }
 
 #[derive(Debug)]
@@ -28,6 +30,12 @@ pub struct StructDef {
     pub name: String,
     pub fields: Vec<FieldDef>,
     pub has_union: bool,
+    /// Domain type path from `$domainType` annotation (e.g., "runtime::VersionResponse").
+    /// When set, the generated client returns this type via `FromCapnp::read_from()`.
+    pub domain_type: Option<String>,
+    /// Origin file stem for imported types (e.g., `Some("streaming")` for types from streaming.capnp).
+    /// `None` means the type is local to the service's own schema file.
+    pub origin_file: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,12 +43,17 @@ pub struct FieldDef {
     pub name: String,
     pub type_name: String,
     pub description: String,
+    /// From `$fixedSize(N)` annotation: generates `[u8; N]` instead of `Vec<u8>` for Data fields.
+    pub fixed_size: Option<u32>,
 }
 
 #[derive(Debug)]
 pub struct EnumDef {
     pub name: String,
     pub variants: Vec<(String, u32)>,
+    /// Origin file stem for imported types (e.g., `Some("streaming")` for types from streaming.capnp).
+    /// `None` means the type is local to the service's own schema file.
+    pub origin_file: Option<String>,
 }
 
 /// A scoped client detected from nested union patterns in the schema.
@@ -61,9 +74,12 @@ pub struct ScopedClient {
     /// Nested scoped clients detected within this scope (3rd level, e.g., Fs within Repository)
     pub nested_clients: Vec<ScopedClient>,
     /// Parent scope fields (empty for top-level scoped clients)
+    #[allow(dead_code)]
     pub parent_scope_fields: Vec<FieldDef>,
     /// Parent factory name (None for top-level scoped clients)
+    #[allow(dead_code)]
     pub parent_factory_name: Option<String>,
     /// Parent capnp inner response module (None for top-level scoped clients)
+    #[allow(dead_code)]
     pub parent_capnp_inner_response: Option<String>,
 }

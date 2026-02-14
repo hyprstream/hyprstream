@@ -30,7 +30,7 @@
 use anyhow::Result;
 use hyprstream_rpc::prelude::{FromCapnp, ToCapnp};
 
-use crate::workers_capnp;
+use crate::worker_capnp;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Individual Event Types (with derive macros)
@@ -41,7 +41,7 @@ use crate::workers_capnp;
 /// Published when a Kata VM sandbox is successfully started.
 /// Topic format: `worker.{sandbox_id}.started`
 #[derive(Debug, Clone, ToCapnp, FromCapnp)]
-#[capnp(workers_capnp::sandbox_started)]
+#[capnp(worker_capnp::sandbox_started)]
 pub struct SandboxStarted {
     /// Unique sandbox identifier
     pub sandbox_id: String,
@@ -56,7 +56,7 @@ pub struct SandboxStarted {
 /// Published when a Kata VM sandbox stops (gracefully or due to error).
 /// Topic format: `worker.{sandbox_id}.stopped`
 #[derive(Debug, Clone, ToCapnp, FromCapnp)]
-#[capnp(workers_capnp::sandbox_stopped)]
+#[capnp(worker_capnp::sandbox_stopped)]
 pub struct SandboxStopped {
     /// Unique sandbox identifier
     pub sandbox_id: String,
@@ -71,7 +71,7 @@ pub struct SandboxStopped {
 /// Published when an OCI container starts within a sandbox.
 /// Topic format: `worker.{container_id}.started`
 #[derive(Debug, Clone, ToCapnp, FromCapnp)]
-#[capnp(workers_capnp::container_started)]
+#[capnp(worker_capnp::container_started)]
 pub struct ContainerStarted {
     /// Unique container identifier
     pub container_id: String,
@@ -86,7 +86,7 @@ pub struct ContainerStarted {
 /// Published when an OCI container stops within a sandbox.
 /// Topic format: `worker.{container_id}.stopped`
 #[derive(Debug, Clone, ToCapnp, FromCapnp)]
-#[capnp(workers_capnp::container_stopped)]
+#[capnp(worker_capnp::container_stopped)]
 pub struct ContainerStopped {
     /// Unique container identifier
     pub container_id: String,
@@ -120,7 +120,7 @@ impl WorkerEvent {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         use capnp::message::ReaderOptions;
         use capnp::serialize;
-        use workers_capnp::worker_event;
+        use worker_capnp::worker_event;
 
         let reader = serialize::read_message(&mut std::io::Cursor::new(bytes), ReaderOptions::new())?;
         let event = reader.get_root::<worker_event::Reader>()?;
@@ -177,7 +177,7 @@ impl WorkerEvent {
 /// Serialize a SandboxStarted event to Cap'n Proto bytes.
 pub fn serialize_sandbox_started(event: &SandboxStarted) -> Result<Vec<u8>> {
     hyprstream_rpc::serialize_message(|msg| {
-        let builder = msg.init_root::<workers_capnp::worker_event::Builder>();
+        let builder = msg.init_root::<worker_capnp::worker_event::Builder>();
         let mut started = builder.init_sandbox_started();
         event.write_to(&mut started);
     })
@@ -186,7 +186,7 @@ pub fn serialize_sandbox_started(event: &SandboxStarted) -> Result<Vec<u8>> {
 /// Serialize a SandboxStopped event to Cap'n Proto bytes.
 pub fn serialize_sandbox_stopped(event: &SandboxStopped) -> Result<Vec<u8>> {
     hyprstream_rpc::serialize_message(|msg| {
-        let builder = msg.init_root::<workers_capnp::worker_event::Builder>();
+        let builder = msg.init_root::<worker_capnp::worker_event::Builder>();
         let mut stopped = builder.init_sandbox_stopped();
         event.write_to(&mut stopped);
     })
@@ -195,7 +195,7 @@ pub fn serialize_sandbox_stopped(event: &SandboxStopped) -> Result<Vec<u8>> {
 /// Serialize a ContainerStarted event to Cap'n Proto bytes.
 pub fn serialize_container_started(event: &ContainerStarted) -> Result<Vec<u8>> {
     hyprstream_rpc::serialize_message(|msg| {
-        let builder = msg.init_root::<workers_capnp::worker_event::Builder>();
+        let builder = msg.init_root::<worker_capnp::worker_event::Builder>();
         let mut started = builder.init_container_started();
         event.write_to(&mut started);
     })
@@ -204,7 +204,7 @@ pub fn serialize_container_started(event: &ContainerStarted) -> Result<Vec<u8>> 
 /// Serialize a ContainerStopped event to Cap'n Proto bytes.
 pub fn serialize_container_stopped(event: &ContainerStopped) -> Result<Vec<u8>> {
     hyprstream_rpc::serialize_message(|msg| {
-        let builder = msg.init_root::<workers_capnp::worker_event::Builder>();
+        let builder = msg.init_root::<worker_capnp::worker_event::Builder>();
         let mut stopped = builder.init_container_stopped();
         event.write_to(&mut stopped);
     })

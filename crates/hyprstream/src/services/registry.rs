@@ -6,9 +6,7 @@
 use crate::auth::Operation;
 use crate::services::PolicyClient;
 use crate::registry_capnp;
-use crate::services::rpc_types::{
-    DetailedStatusData, FsVoidVariant, HealthStatus, RemoteInfo, RegistryResponse, WorktreeData,
-};
+
 use crate::services::traits::{CloneOptions, DetailedStatus, FileChangeType, FileStatus};
 use crate::services::traits::{FsDirEntry, FsServiceError, FsStatInfo, SeekWhence, MAX_FDS_GLOBAL, MAX_FDS_PER_CLIENT, MAX_FS_IO_SIZE};
 use crate::services::contained_root::{self, ContainedRoot};
@@ -20,8 +18,6 @@ use hyprstream_rpc::serialize_message;
 use hyprstream_rpc::{StreamChannel, StreamContext};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use capnp::message::ReaderOptions;
-use capnp::serialize;
 use dashmap::DashMap;
 use git2db::{CloneBuilder, Git2DB, GitRef, RepoId, RepositoryStatus, TrackedRepository};
 use parking_lot::Mutex;
@@ -32,7 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 /// Service name for endpoint registry
@@ -41,23 +37,41 @@ const SERVICE_NAME: &str = "registry";
 // Generated client types
 use crate::services::generated::registry_client::{
     RegistryClient as GenRegistryClient, RegistryResponseVariant,
+    RegistryHandler, RepoHandler, WorktreeHandler, dispatch_registry,
+    StreamInfo, ErrorInfo, HealthStatus, DetailedStatusInfo, RemoteInfo,
+    CloneRequest, RegisterRequest,
+    CreateWorktreeRequest, RemoveWorktreeRequest,
+    BranchRequest, CheckoutRequest, StageFilesRequest,
+    CommitRequest, MergeRequest, ContinueMergeRequest,
+    GetRefRequest, AddRemoteRequest, RemoveRemoteRequest,
+    SetRemoteUrlRequest, RenameRemoteRequest,
+    PushRequest, AmendCommitRequest, CommitWithAuthorRequest,
+    CreateTagRequest, DeleteTagRequest, UpdateRequest,
+    FsOpenRequest, FsOpenResponse, FsCloseRequest,
+    FsReadRequest, FsReadResponse,
+    FsWriteRequest, FsWriteResponse,
+    FsPreadRequest, FsPwriteRequest, FsSeekRequest, FsSeekResponse,
+    FsTruncateRequest, FsSyncRequest, FsPathRequest, FsMkdirRequest,
+    FsRenameRequest, FsCopyRequest,
+    FsStatResponse, FsDirEntryInfo, FsStreamInfoResponse,
+    SeekWhenceEnum,
 };
+// Conflicting names — use canonical path at usage sites:
+//   registry_client::TrackedRepository, registry_client::RepositoryStatus, registry_client::WorktreeInfo
 
 // ============================================================================
 // Parsing Helper Functions
 // ============================================================================
 
 /// Parse a stream started response — uses generated response parser
-fn parse_stream_started_response(response: &[u8]) -> Result<crate::services::rpc_types::StreamStartedInfo> {
+fn parse_stream_started_response(response: &[u8]) -> Result<crate::services::rpc_types::StreamInfo> {
     match GenRegistryClient::parse_response(response)? {
-        RegistryResponseVariant::CloneStreamResult { stream_id, stream_endpoint, server_pubkey } => {
-            Ok(crate::services::rpc_types::StreamStartedInfo {
-                stream_id,
-                endpoint: stream_endpoint,
-                server_pubkey: server_pubkey.try_into().unwrap_or([0u8; 32]),
-            })
-        }
-        RegistryResponseVariant::Error { message, .. } => Err(anyhow!("{}", message)),
+        RegistryResponseVariant::CloneStreamResult(data) => Ok(crate::services::rpc_types::StreamInfo {
+            stream_id: data.stream_id,
+            endpoint: data.endpoint,
+            server_pubkey: data.server_pubkey,
+        }),
+        RegistryResponseVariant::Error(ref e) => Err(anyhow!("{}", e.message)),
         _ => Err(anyhow!("Expected clone_stream_result response")),
     }
 }
@@ -96,19 +110,19 @@ fn variant_to_tracked_repository(
 }
 
 // ============================================================================
-// RegistryZmq - Wrapper implementing RegistryClient trait
+// RegistryZmqClient - Wrapper implementing RegistryClient trait
 // ============================================================================
 
 /// ZMQ-based registry client wrapping the generated `RegistryClient`.
 ///
 /// Simple methods delegate to `gen`; `list()` and `clone_stream()` use manual
 /// parsing (List(TrackedRepository) placeholder and custom CallOptions respectively).
-pub struct RegistryZmq {
+pub struct RegistryZmqClient {
     /// Generated typed client (handles all transport including streaming via call_with_options)
     pub(crate) gen: GenRegistryClient,
 }
 
-impl RegistryZmq {
+impl RegistryZmqClient {
     /// Create a new registry client with signing credentials.
     pub fn new(signing_key: SigningKey, identity: RequestIdentity) -> Self {
         let endpoint = endpoint_registry().endpoint(SERVICE_NAME, SocketKind::Rep).to_zmq_string();
@@ -117,16 +131,8 @@ impl RegistryZmq {
 
     /// Create a registry client connected to a specific endpoint.
     pub fn with_endpoint(endpoint: &str, signing_key: SigningKey, identity: RequestIdentity) -> Self {
-        use crate::services::core::ZmqClientBase;
-        use crate::zmq::global_context;
-        use hyprstream_rpc::service::factory::ServiceClient;
-
-        let server_verifying_key = signing_key.verifying_key();
-        let base = ZmqClientBase::new(
-            endpoint, global_context(), signing_key, server_verifying_key, identity,
-        );
         Self {
-            gen: GenRegistryClient::from_zmq(base),
+            gen: crate::services::core::create_service_client(endpoint, signing_key, identity),
         }
     }
 
@@ -142,7 +148,7 @@ impl RegistryZmq {
 use crate::services::traits::{RegistryClient, RegistryServiceError, RepositoryClient, WorktreeInfo};
 
 #[async_trait]
-impl RegistryClient for RegistryZmq {
+impl RegistryClient for RegistryZmqClient {
     async fn list(&self) -> Result<Vec<TrackedRepository>, RegistryServiceError> {
         let repos = self.gen.list().await
             .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
@@ -194,7 +200,7 @@ impl RegistryClient for RegistryZmq {
         name: Option<&str>,
         options: &CloneOptions,
         ephemeral_pubkey: Option<[u8; 32]>,
-    ) -> Result<crate::services::rpc_types::StreamStartedInfo, RegistryServiceError> {
+    ) -> Result<crate::services::rpc_types::StreamInfo, RegistryServiceError> {
         // Manual: needs custom CallOptions for ephemeral pubkey
         let id = self.gen.next_id();
         let payload = serialize_message(|msg| {
@@ -411,16 +417,13 @@ impl FdTable {
 ///
 /// Wraps git2db::Git2DB and provides a Cap'n Proto interface over ZMQ.
 ///
-/// Note: The runtime handle is captured on creation to avoid the nested runtime
-/// anti-pattern. Handler methods use this handle for async operations instead
-///
 /// ## Streaming Support
 ///
-/// For streaming clone operations, the service:
-/// 1. Performs DH key exchange with the client
-/// 2. Pre-authorizes the stream with StreamService (so client can subscribe)
-/// 3. Queues the clone task to a background worker thread
-/// 4. The worker publishes progress via PUSH to StreamService
+/// Streaming clone uses the Continuation pipeline (same as inference streaming):
+/// 1. Handler performs DH key exchange and returns (StreamInfo, Continuation)
+/// 2. Dispatch serializes StreamInfo as the REP response
+/// 3. RequestLoop spawns the Continuation after REP is sent
+/// 4. Continuation publishes clone progress via PUB/SUB
 ///
 /// The registry is wrapped in RwLock for interior mutability since some operations
 /// (like clone) require mutable access but ZmqService::handle_request takes &self.
@@ -429,16 +432,12 @@ pub struct RegistryService {
     registry: Arc<RwLock<Git2DB>>,
     #[allow(dead_code)] // Future: base directory for relative path operations
     base_dir: PathBuf,
-    /// Captured runtime handle for async operations in sync handlers
-    runtime_handle: tokio::runtime::Handle,
     /// Policy client for authorization checks (uses ZMQ to PolicyService)
     policy_client: PolicyClient,
     // Infrastructure (for Spawnable)
     context: Arc<zmq::Context>,
     transport: TransportConfig,
     signing_key: SigningKey,
-    /// Channel to send pending clone streams to the background worker
-    pending_clone_tx: std::sync::mpsc::Sender<PendingCloneStreamTask>,
     /// File descriptor table for FS operations.
     fd_table: Arc<FdTable>,
     /// Cached contained roots for worktrees: (repo_id, worktree_name) → ContainedRoot.
@@ -475,22 +474,6 @@ impl git2db::callback_config::ProgressReporter for CloneProgressReporter {
     }
 }
 
-/// Task sent to the background streaming worker
-struct PendingCloneStreamTask {
-    /// Stream context with DH-derived keys
-    stream_ctx: StreamContext,
-    /// Clone URL
-    url: String,
-    /// Optional name for the repository
-    name: Option<String>,
-    /// Shallow clone flag
-    shallow: bool,
-    /// Clone depth
-    depth: Option<u32>,
-    /// Branch to clone
-    branch: Option<String>,
-}
-
 impl RegistryService {
     /// Create a new registry service with infrastructure
     ///
@@ -504,28 +487,8 @@ impl RegistryService {
     ) -> Result<Self> {
         let base_dir = base_dir.as_ref().to_path_buf();
         let registry = Git2DB::open(&base_dir).await?;
-        // Capture the runtime handle to avoid nested runtime anti-pattern
-        let runtime_handle = tokio::runtime::Handle::current();
 
-        // Create channel for pending clone streams
-        let (pending_clone_tx, pending_clone_rx) = std::sync::mpsc::channel::<PendingCloneStreamTask>();
-
-        // Spawn background worker for streaming clone operations
-        // Worker creates its own StreamChannel and tokio runtime
         let worker_registry = Arc::new(RwLock::new(registry));
-        let worker_registry_clone = Arc::clone(&worker_registry);
-        let worker_context = Arc::clone(&context);
-        let worker_signing_key = signing_key.clone();
-
-        std::thread::spawn(move || {
-            // Create worker's own StreamChannel
-            let worker_stream_channel = StreamChannel::new(worker_context, worker_signing_key);
-            Self::streaming_worker(
-                worker_stream_channel,
-                worker_registry_clone,
-                pending_clone_rx,
-            );
-        });
 
         // Create FD table and spawn reaper
         let fd_table = Arc::new(FdTable::new());
@@ -537,12 +500,10 @@ impl RegistryService {
         let service = Self {
             registry: worker_registry,
             base_dir,
-            runtime_handle,
             policy_client,
             context,
             transport,
             signing_key,
-            pending_clone_tx,
             fd_table,
             contained_roots: DashMap::new(),
         };
@@ -572,64 +533,26 @@ impl RegistryService {
         }
     }
 
-    /// Background worker thread for streaming clone operations.
-    ///
-    /// Creates its own tokio runtime for async operations and uses
-    /// StreamChannel for publishing progress updates.
-    fn streaming_worker(
-        stream_channel: StreamChannel,
-        registry: Arc<RwLock<Git2DB>>,
-        receiver: std::sync::mpsc::Receiver<PendingCloneStreamTask>,
-    ) {
-        info!("Registry streaming worker started");
-
-        // Create a dedicated tokio runtime for this worker thread
-        let rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => {
-                error!("Failed to create tokio runtime for streaming worker: {}", e);
-                return;
-            }
-        };
-
-        // Process pending streams
-        loop {
-            match receiver.recv() {
-                Ok(task) => {
-                    rt.block_on(Self::execute_clone_stream_task(
-                        &stream_channel,
-                        &registry,
-                        task,
-                    ));
-                }
-                Err(_) => {
-                    // Channel closed, shutdown
-                    debug!("Registry streaming worker shutting down");
-                    break;
-                }
-            }
-        }
-    }
-
-    /// Execute a single streaming clone task with real-time progress.
+    /// Execute a streaming clone with real-time progress via Continuation.
     ///
     /// Uses git2db's callback_config to receive progress updates during clone,
     /// which are forwarded to the client via StreamChannel in real-time.
-    async fn execute_clone_stream_task(
-        stream_channel: &StreamChannel,
-        registry: &Arc<RwLock<Git2DB>>,
-        task: PendingCloneStreamTask,
+    /// Called as a Continuation after the REP response is sent.
+    async fn execute_clone_stream(
+        stream_channel: StreamChannel,
+        registry: Arc<RwLock<Git2DB>>,
+        stream_ctx: StreamContext,
+        url: String,
+        name: Option<String>,
+        shallow: bool,
+        depth: Option<u32>,
+        branch: Option<String>,
     ) {
         use hyprstream_rpc::streaming::ProgressUpdate;
 
-        let stream_ctx = &task.stream_ctx;
-
         debug!(
             stream_id = %stream_ctx.stream_id(),
-            url = %task.url,
+            url = %url,
             "Starting streaming clone with progress reporting"
         );
 
@@ -644,14 +567,9 @@ impl RegistryService {
             .with_progress(git2db::callback_config::ProgressConfig::Channel(reporter));
 
         // Execute clone and stream progress concurrently
-        let result = stream_channel.with_publisher(stream_ctx, |mut publisher| async move {
+        let result = stream_channel.with_publisher(&stream_ctx, |mut publisher| async move {
             // Spawn clone task - runs concurrently with progress streaming
-            let registry_clone = Arc::clone(registry);
-            let url = task.url.clone();
-            let name = task.name.clone();
-            let shallow = task.shallow;
-            let depth = task.depth;
-            let branch = task.branch.clone();
+            let registry_clone = Arc::clone(&registry);
 
             let clone_handle = tokio::spawn(async move {
                 // CloneBuilder manages locks internally for optimal performance
@@ -710,49 +628,15 @@ impl RegistryService {
         }
     }
 
-    /// Check authorization for an operation.
-    ///
-    /// Returns the unauthorized response if the check fails, or None if authorized.
-    /// Uses PolicyClient for async policy checks over ZMQ.
-    fn check_auth(
-        &self,
-        ctx: &EnvelopeContext,
-        request_id: u64,
-        resource: &str,
-        operation: Operation,
-    ) -> Option<Vec<u8>> {
+    /// Check if a request is authorized (returns bool for generated handler methods).
+    async fn is_authorized(&self, ctx: &EnvelopeContext, resource: &str, operation: Operation) -> bool {
         let subject = ctx.subject();
-        // RegistryService runs on multi-threaded runtime, so block_in_place is safe
-        let allowed = tokio::task::block_in_place(|| {
-            self.runtime_handle.block_on(
-                self.policy_client.check_policy(&subject, resource, operation)
-            )
-        }).unwrap_or_else(|e| {
-            // Log error before denying - prevents silent failures
-            warn!(
-                "Policy check failed for {} on {}: {} - denying access",
-                subject, resource, e
-            );
-            false
-        });
-
-        if allowed {
-            None // Authorized
-        } else {
-            debug!(
-                "Authorization denied: {} cannot {} on {}",
-                subject,
-                operation.as_str(),
-                resource
-            );
-            let subject_str = subject.to_string();
-            Some(RegistryResponse::unauthorized(
-                request_id,
-                &subject_str,
-                resource,
-                operation.as_str(),
-            ))
-        }
+        self.policy_client.check_policy(&subject, resource, operation)
+            .await
+            .unwrap_or_else(|e| {
+                warn!("Policy check failed for {} on {}: {} - denying access", subject, resource, e);
+                false
+            })
     }
 
     /// Parse a RepoId from string
@@ -815,22 +699,22 @@ impl RegistryService {
     }
 
     /// Handle a list repositories request
-    fn handle_list(&self) -> Result<Vec<TrackedRepository>> {
-        let registry = self.registry.blocking_read();
+    async fn handle_list(&self) -> Result<Vec<TrackedRepository>> {
+        let registry = self.registry.read().await;
         Ok(registry.list().cloned().collect())
     }
 
     /// Handle get repository by ID
-    fn handle_get(&self, repo_id: &str) -> Result<Option<TrackedRepository>> {
+    async fn handle_get(&self, repo_id: &str) -> Result<Option<TrackedRepository>> {
         let id = Self::parse_repo_id(repo_id)?;
-        let registry = self.registry.blocking_read();
+        let registry = self.registry.read().await;
         let result = registry.list().find(|r| r.id == id).cloned();
         Ok(result)
     }
 
     /// Handle get repository by name
-    fn handle_get_by_name(&self, name: &str) -> Result<Option<TrackedRepository>> {
-        let registry = self.registry.blocking_read();
+    async fn handle_get_by_name(&self, name: &str) -> Result<Option<TrackedRepository>> {
+        let registry = self.registry.read().await;
         let result = registry
             .list()
             .find(|r| r.name.as_ref() == Some(&name.to_owned()))
@@ -839,92 +723,68 @@ impl RegistryService {
     }
 
     /// Handle list branches
-    fn handle_list_branches(&self, repo_id: &str) -> Result<Vec<String>> {
+    async fn handle_list_branches(&self, repo_id: &str) -> Result<Vec<String>> {
         let id = Self::parse_repo_id(repo_id)?;
-
-        // Use captured runtime handle instead of creating new runtime
-        self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
-            let handle = registry.repo(&id)?;
-            let branches = handle.branch().list().await?;
-            Ok(branches.into_iter().map(|b| b.name).collect())
-        })
+        let registry = self.registry.read().await;
+        let handle = registry.repo(&id)?;
+        let branches = handle.branch().list().await?;
+        Ok(branches.into_iter().map(|b| b.name).collect())
     }
 
     /// Handle create branch
-    fn handle_create_branch(
+    async fn handle_create_branch(
         &self,
         repo_id: &str,
         branch_name: &str,
         start_point: Option<&str>,
     ) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
-
-        // Use captured runtime handle instead of creating new runtime
-        self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
-            let handle = registry.repo(&id)?;
-            handle.branch().create(branch_name, start_point).await?;
-            Ok(())
-        })
+        let registry = self.registry.read().await;
+        let handle = registry.repo(&id)?;
+        handle.branch().create(branch_name, start_point).await?;
+        Ok(())
     }
 
     /// Handle checkout
-    fn handle_checkout(&self, repo_id: &str, ref_name: &str) -> Result<()> {
+    async fn handle_checkout(&self, repo_id: &str, ref_name: &str) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
-
-        // Use captured runtime handle instead of creating new runtime
-        self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
-            let handle = registry.repo(&id)?;
-            handle.branch().checkout(ref_name).await?;
-            Ok(())
-        })
+        let registry = self.registry.read().await;
+        let handle = registry.repo(&id)?;
+        handle.branch().checkout(ref_name).await?;
+        Ok(())
     }
 
     /// Handle stage all
-    fn handle_stage_all(&self, repo_id: &str) -> Result<()> {
+    async fn handle_stage_all(&self, repo_id: &str) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
-
-        // Use captured runtime handle instead of creating new runtime
-        self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
-            let handle = registry.repo(&id)?;
-            handle.staging().add_all().await?;
-            Ok(())
-        })
+        let registry = self.registry.read().await;
+        let handle = registry.repo(&id)?;
+        handle.staging().add_all().await?;
+        Ok(())
     }
 
     /// Handle commit
-    fn handle_commit(&self, repo_id: &str, message: &str) -> Result<String> {
+    async fn handle_commit(&self, repo_id: &str, message: &str) -> Result<String> {
         let id = Self::parse_repo_id(repo_id)?;
-
-        // Use captured runtime handle instead of creating new runtime
-        self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
-            let handle = registry.repo(&id)?;
-            let oid = handle.commit(message).await?;
-            Ok(oid.to_string())
-        })
+        let registry = self.registry.read().await;
+        let handle = registry.repo(&id)?;
+        let oid = handle.commit(message).await?;
+        Ok(oid.to_string())
     }
 
     /// Handle merge
-    fn handle_merge(&self, repo_id: &str, source: &str, message: Option<&str>) -> Result<String> {
+    async fn handle_merge(&self, repo_id: &str, source: &str, message: Option<&str>) -> Result<String> {
         let id = Self::parse_repo_id(repo_id)?;
         let source = source.to_owned();
         let message = message.map(std::borrow::ToOwned::to_owned);
-
-        // Use captured runtime handle instead of creating new runtime
-        self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
-            let handle = registry.repo(&id)?;
-            let oid = handle.merge(&source, message.as_deref()).await?;
-            Ok(oid.to_string())
-        })
+        let registry = self.registry.read().await;
+        let handle = registry.repo(&id)?;
+        let oid = handle.merge(&source, message.as_deref()).await?;
+        Ok(oid.to_string())
     }
 
     /// Handle status
-    fn handle_status(&self, repo_id: &str) -> Result<git2db::RepositoryStatus> {
+    async fn handle_status(&self, repo_id: &str) -> Result<git2db::RepositoryStatus> {
         let id = Self::parse_repo_id(repo_id)?;
 
         // Use with_repo_blocking to properly resolve worktree path for bare repos
@@ -965,11 +825,11 @@ impl RegistryService {
                 is_clean,
                 modified_files,
             })
-        })
+        }).await
     }
 
     /// Handle clone operation
-    fn handle_clone(
+    async fn handle_clone(
         &self,
         url: &str,
         name: Option<&str>,
@@ -977,30 +837,26 @@ impl RegistryService {
         depth: Option<u32>,
         branch: Option<&str>,
     ) -> Result<TrackedRepository> {
-        // Use captured runtime handle instead of creating new runtime
-        // CloneBuilder manages locks internally for optimal performance
-        self.runtime_handle.block_on(async {
-            Self::clone_repo_inner(
-                Arc::clone(&self.registry),
-                url,
-                name,
-                shallow,
-                depth,
-                branch,
-                None,
-            ).await
-        })
+        Self::clone_repo_inner(
+            Arc::clone(&self.registry),
+            url,
+            name,
+            shallow,
+            depth,
+            branch,
+            None,
+        ).await
     }
 
     // ========================================================================
     // Streaming Clone Support
     // ========================================================================
 
-    /// Prepare a streaming clone operation and queue it for background execution.
+    /// Prepare a streaming clone operation and return (StreamInfo, Continuation).
     ///
-    /// Creates a temporary StreamChannel to perform DH key exchange and pre-authorization,
-    /// then queues the clone task. Returns stream info for the client.
-    fn prepare_clone_stream(
+    /// Creates a StreamChannel for DH key exchange and pre-authorization.
+    /// The continuation contains the clone work, executed by RequestLoop after REP is sent.
+    async fn prepare_clone_stream(
         &self,
         url: &str,
         name: Option<&str>,
@@ -1008,22 +864,19 @@ impl RegistryService {
         depth: Option<u32>,
         branch: Option<&str>,
         client_ephemeral_pubkey: Option<&[u8]>,
-    ) -> Result<(String, [u8; 32])> {
+    ) -> Result<(StreamInfo, hyprstream_rpc::service::Continuation)> {
         // DH key derivation is required
         let client_pub_bytes = client_ephemeral_pubkey
             .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
 
-        // Create temporary StreamChannel for DH key exchange and pre-authorization
+        // Create StreamChannel for DH key exchange and publishing
         let stream_channel = StreamChannel::new(
             Arc::clone(&self.context),
             self.signing_key.clone(),
         );
 
         // 10 minutes expiry for clone operations
-        // Use block_on since we're in a sync context
-        let stream_ctx = self.runtime_handle.block_on(
-            stream_channel.prepare_stream(client_pub_bytes, 600)
-        )?;
+        let stream_ctx = stream_channel.prepare_stream(client_pub_bytes, 600).await?;
 
         debug!(
             stream_id = %stream_ctx.stream_id(),
@@ -1031,65 +884,75 @@ impl RegistryService {
             "Clone stream prepared (DH + pre-authorization via StreamChannel)"
         );
 
-        let stream_id = stream_ctx.stream_id().to_owned();
-        let server_pubkey = *stream_ctx.server_pubkey();
+        let stream_endpoint = endpoint_registry()
+            .endpoint("streams", SocketKind::Sub)
+            .to_zmq_string();
 
-        // Create task and send to worker
-        let task = PendingCloneStreamTask {
-            stream_ctx,
-            url: url.to_owned(),
-            name: name.map(std::borrow::ToOwned::to_owned),
-            shallow,
-            depth,
-            branch: branch.map(std::borrow::ToOwned::to_owned),
+        let stream_info = StreamInfo {
+            stream_id: stream_ctx.stream_id().to_owned(),
+            endpoint: stream_endpoint,
+            server_pubkey: *stream_ctx.server_pubkey(),
         };
 
-        self.pending_clone_tx.send(task)
-            .map_err(|_| anyhow!("Streaming worker channel closed"))?;
+        // Build continuation that executes the clone and streams progress
+        let registry = Arc::clone(&self.registry);
+        let url = url.to_owned();
+        let name = name.map(std::borrow::ToOwned::to_owned);
+        let branch = branch.map(std::borrow::ToOwned::to_owned);
 
-        Ok((stream_id, server_pubkey))
+        let continuation: hyprstream_rpc::service::Continuation = Box::pin(async move {
+            Self::execute_clone_stream(
+                stream_channel,
+                registry,
+                stream_ctx,
+                url,
+                name,
+                shallow,
+                depth,
+                branch,
+            ).await;
+        });
+
+        Ok((stream_info, continuation))
     }
 
     /// Handle list worktrees
-    fn handle_list_worktrees(&self, repo_id: &str) -> Result<Vec<WorktreeData>> {
+    async fn handle_list_worktrees(&self, repo_id: &str) -> Result<Vec<crate::services::generated::registry_client::WorktreeInfo>> {
         let id = Self::parse_repo_id(repo_id)?;
+        let registry = self.registry.read().await;
+        let handle = registry.repo(&id)?;
+        let mut worktrees = handle.get_worktrees().await?;
 
-        // Use captured runtime handle instead of creating new runtime
-        self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
-            let handle = registry.repo(&id)?;
-            let mut worktrees = handle.get_worktrees().await?;
+        let mut result = Vec::with_capacity(worktrees.len());
+        for wt in &mut worktrees {
+            // Extract branch name from worktree path (last component)
+            let branch_name = wt
+                .path()
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(std::borrow::ToOwned::to_owned)
+                .unwrap_or_default();
 
-            let mut result = Vec::with_capacity(worktrees.len());
-            for wt in &mut worktrees {
-                // Extract branch name from worktree path (last component)
-                let branch_name = wt
-                    .path()
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .map(std::borrow::ToOwned::to_owned);
+            // Use WorktreeHandle::status() - single source of truth for dirty status
+            let status = wt.status().await.ok();
+            let is_dirty = status.as_ref().map(|s| !s.is_clean).unwrap_or(false);
+            let head_oid = status
+                .and_then(|s| s.head.map(|h| h.to_string()))
+                .unwrap_or_default();
 
-                // Use WorktreeHandle::status() - single source of truth for dirty status
-                let status = wt.status().await.ok();
-                let is_dirty = status.as_ref().map(|s| !s.is_clean).unwrap_or(false);
-                let head_oid = status
-                    .and_then(|s| s.head.map(|h| h.to_string()))
-                    .unwrap_or_default();
-
-                result.push(WorktreeData {
-                    path: wt.path().to_path_buf(),
-                    branch_name,
-                    head_oid,
-                    is_locked: false,
-                    is_dirty,
-                });
-            }
-            Ok(result)
-        })
+            result.push(crate::services::generated::registry_client::WorktreeInfo {
+                path: wt.path().to_string_lossy().to_string(),
+                branch_name,
+                head_oid,
+                is_locked: false,
+                is_dirty,
+            });
+        }
+        Ok(result)
     }
 
     /// Handle create worktree
-    fn handle_create_worktree(
+    async fn handle_create_worktree(
         &self,
         repo_id: &str,
         path: &str,
@@ -1098,19 +961,15 @@ impl RegistryService {
         let id = Self::parse_repo_id(repo_id)?;
         let path = PathBuf::from(path);
         let branch = branch.to_owned();
-
-        // Use captured runtime handle instead of creating new runtime
-        self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
-            let handle = registry.repo(&id)?;
-            let worktree = handle.create_worktree(&path, &branch).await?;
-            Ok(worktree.path().to_path_buf())
-        })
+        let registry = self.registry.read().await;
+        let handle = registry.repo(&id)?;
+        let worktree = handle.create_worktree(&path, &branch).await?;
+        Ok(worktree.path().to_path_buf())
     }
 
     /// Handle register operation
     #[allow(deprecated)]
-    fn handle_register(
+    async fn handle_register(
         &self,
         path: &str,
         name: Option<&str>,
@@ -1121,107 +980,91 @@ impl RegistryService {
         // Note: tracking_ref is not yet used by register_repository
 
         // Register requires write lock
-        self.runtime_handle.block_on(async {
-            let mut registry = self.registry.write().await;
+        let mut registry = self.registry.write().await;
 
-            // Generate a new repo ID
-            let repo_id = RepoId::new();
+        // Generate a new repo ID
+        let repo_id = RepoId::new();
 
-            // Derive URL from path (local file URL)
-            let url = format!("file://{}", path.display());
+        // Derive URL from path (local file URL)
+        let url = format!("file://{}", path.display());
 
-            // Use deprecated method for now (builder pattern would require more refactoring)
-            registry.register_repository(&repo_id, name, url).await?;
+        // TODO: Migrate to registry.register(repo_id) builder API
+        registry.register_repository(&repo_id, name, url).await?;
 
-            // Get the tracked repository to return
-            let repo = registry
-                .list()
-                .find(|r| r.id == repo_id)
-                .cloned()
-                .ok_or_else(|| anyhow!("Failed to find registered repository"))?;
+        // Get the tracked repository to return
+        let repo = registry
+            .list()
+            .find(|r| r.id == repo_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("Failed to find registered repository"))?;
 
-            Ok(repo)
-        })
+        Ok(repo)
     }
 
     /// Handle remove operation
-    fn handle_remove(&self, repo_id: &str) -> Result<()> {
+    async fn handle_remove(&self, repo_id: &str) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
 
         // Remove requires write lock
-        self.runtime_handle.block_on(async {
-            let mut registry = self.registry.write().await;
-            registry.remove_repository(&id).await?;
-            Ok(())
-        })
+        let mut registry = self.registry.write().await;
+        registry.remove_repository(&id).await?;
+        Ok(())
     }
 
     /// Handle remove worktree operation
-    fn handle_remove_worktree(&self, repo_id: &str, worktree_path: &str) -> Result<()> {
+    async fn handle_remove_worktree(&self, repo_id: &str, worktree_path: &str) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
         let worktree_path = PathBuf::from(worktree_path);
+        let registry = self.registry.read().await;
+        let handle = registry.repo(&id)?;
 
-        self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
-            let handle = registry.repo(&id)?;
+        // Get base repo path
+        let repo_path = handle.worktree()?;
 
-            // Get base repo path
-            let repo_path = handle.worktree()?;
+        // Extract worktree name from path
+        let worktree_name = worktree_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| anyhow!("Invalid worktree path"))?;
 
-            // Extract worktree name from path
-            let worktree_name = worktree_path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .ok_or_else(|| anyhow!("Invalid worktree path"))?;
-
-            // Use GitManager to remove worktree
-            git2db::GitManager::global().remove_worktree(repo_path, worktree_name, None)?;
-            Ok(())
-        })
+        // Use GitManager to remove worktree
+        git2db::GitManager::global().remove_worktree(repo_path, worktree_name, None)?;
+        Ok(())
     }
 
     /// Handle stage files operation
-    fn handle_stage_files(&self, repo_id: &str, files: Vec<String>) -> Result<()> {
+    async fn handle_stage_files(&self, repo_id: &str, files: Vec<String>) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
+        let registry = self.registry.read().await;
+        let handle = registry.repo(&id)?;
 
-        self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
-            let handle = registry.repo(&id)?;
-
-            for file in files {
-                handle.staging().add(&file).await?;
-            }
-            Ok(())
-        })
+        for file in files {
+            handle.staging().add(&file).await?;
+        }
+        Ok(())
     }
 
     /// Handle get HEAD operation
-    fn handle_get_head(&self, repo_id: &str) -> Result<String> {
+    async fn handle_get_head(&self, repo_id: &str) -> Result<String> {
         let id = Self::parse_repo_id(repo_id)?;
+        let registry = self.registry.read().await;
+        let handle = registry.repo(&id)?;
 
-        self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
-            let handle = registry.repo(&id)?;
-
-            // Get HEAD ref (DefaultBranch resolves to HEAD)
-            let oid = handle.resolve_git_ref(&GitRef::DefaultBranch).await?;
-            Ok(oid.to_string())
-        })
+        // Get HEAD ref (DefaultBranch resolves to HEAD)
+        let oid = handle.resolve_git_ref(&GitRef::DefaultBranch).await?;
+        Ok(oid.to_string())
     }
 
     /// Handle get ref operation
-    fn handle_get_ref(&self, repo_id: &str, ref_name: &str) -> Result<String> {
+    async fn handle_get_ref(&self, repo_id: &str, ref_name: &str) -> Result<String> {
         let id = Self::parse_repo_id(repo_id)?;
         let ref_name = ref_name.to_owned();
+        let registry = self.registry.read().await;
+        let handle = registry.repo(&id)?;
 
-        self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
-            let handle = registry.repo(&id)?;
-
-            // Try to resolve as a revspec
-            let oid = handle.resolve_revspec(&ref_name).await?;
-            Ok(oid.to_string())
-        })
+        // Try to resolve as a revspec
+        let oid = handle.resolve_revspec(&ref_name).await?;
+        Ok(oid.to_string())
     }
 
     /// Resolve a worktree path from a repository handle.
@@ -1266,39 +1109,37 @@ impl RegistryService {
 
     /// Execute a blocking git2 operation on a repository.
     ///
-    /// Handles the boilerplate of: parse_repo_id → block_on → read registry →
-    /// get handle → resolve worktree → spawn_blocking → Repository::open → operation.
-    fn with_repo_blocking<F, T>(&self, id: &git2db::RepoId, f: F) -> Result<T>
+    /// Handles the boilerplate of: read registry → get handle → resolve worktree →
+    /// spawn_blocking → Repository::open → operation.
+    async fn with_repo_blocking<F, T>(&self, id: &git2db::RepoId, f: F) -> Result<T>
     where
         F: FnOnce(git2::Repository) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
-        self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
-            let handle = registry.repo(id)?;
-            let repo_path = Self::resolve_worktree_path(&handle).await?;
-            tokio::task::spawn_blocking(move || {
-                let repo = git2::Repository::open(&repo_path)
-                    .map_err(|e| anyhow!("Failed to open repository: {}", e))?;
-                f(repo)
-            })
-            .await
-            .map_err(|e| anyhow!("Task join error: {}", e))?
+        let registry = self.registry.read().await;
+        let handle = registry.repo(id)?;
+        let repo_path = Self::resolve_worktree_path(&handle).await?;
+        tokio::task::spawn_blocking(move || {
+            let repo = git2::Repository::open(&repo_path)
+                .map_err(|e| anyhow!("Failed to open repository: {}", e))?;
+            f(repo)
         })
+        .await
+        .map_err(|e| anyhow!("Task join error: {}", e))?
     }
 
     /// Handle update operation (fetch from remote)
-    fn handle_update(&self, repo_id: &str, refspec: Option<&str>) -> Result<()> {
+    async fn handle_update(&self, repo_id: &str, refspec: Option<&str>) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
         let refspec = refspec.map(std::borrow::ToOwned::to_owned);
         self.with_repo_blocking(&id, move |repo| {
             crate::git::ops::fetch(&repo, "origin", refspec.as_deref())
-        })
+        }).await
     }
 
     /// Handle health check
-    fn handle_health_check(&self) -> Result<HealthStatus> {
-        let registry = self.registry.blocking_read();
+    async fn handle_health_check(&self) -> Result<HealthStatus> {
+        let registry = self.registry.read().await;
         let repo_count = registry.list().count() as u32;
         Ok(HealthStatus {
             status: "healthy".to_owned(),
@@ -1310,79 +1151,64 @@ impl RegistryService {
     }
 
     /// Handle list remotes operation
-    fn handle_list_remotes(&self, repo_id: &str) -> Result<Vec<RemoteInfo>> {
+    async fn handle_list_remotes(&self, repo_id: &str) -> Result<Vec<RemoteInfo>> {
         let id = Self::parse_repo_id(repo_id)?;
+        let registry = self.registry.read().await;
+        let handle = registry.repo(&id)?;
 
-        self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
-            let handle = registry.repo(&id)?;
-
-            let remotes = handle.remote().list().await?;
-            let result = remotes
-                .into_iter()
-                .map(|remote| RemoteInfo {
-                    name: remote.name,
-                    url: remote.url,
-                    push_url: remote.push_url,
-                })
-                .collect();
-            Ok(result)
-        })
+        let remotes = handle.remote().list().await?;
+        let result = remotes
+            .into_iter()
+            .map(|remote| RemoteInfo {
+                name: remote.name,
+                url: remote.url,
+                push_url: remote.push_url.unwrap_or_default(),
+            })
+            .collect();
+        Ok(result)
     }
 
     /// Handle add remote operation
-    fn handle_add_remote(&self, repo_id: &str, name: &str, url: &str) -> Result<()> {
+    async fn handle_add_remote(&self, repo_id: &str, name: &str, url: &str) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
         let name = name.to_owned();
         let url = url.to_owned();
-
-        self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
-            let handle = registry.repo(&id)?;
-            handle.remote().add(&name, &url).await?;
-            Ok(())
-        })
+        let registry = self.registry.read().await;
+        let handle = registry.repo(&id)?;
+        handle.remote().add(&name, &url).await?;
+        Ok(())
     }
 
     /// Handle remove remote operation
-    fn handle_remove_remote(&self, repo_id: &str, name: &str) -> Result<()> {
+    async fn handle_remove_remote(&self, repo_id: &str, name: &str) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
         let name = name.to_owned();
-
-        self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
-            let handle = registry.repo(&id)?;
-            handle.remote().remove(&name).await?;
-            Ok(())
-        })
+        let registry = self.registry.read().await;
+        let handle = registry.repo(&id)?;
+        handle.remote().remove(&name).await?;
+        Ok(())
     }
 
     /// Handle set remote URL operation
-    fn handle_set_remote_url(&self, repo_id: &str, name: &str, url: &str) -> Result<()> {
+    async fn handle_set_remote_url(&self, repo_id: &str, name: &str, url: &str) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
         let name = name.to_owned();
         let url = url.to_owned();
-
-        self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
-            let handle = registry.repo(&id)?;
-            handle.remote().set_url(&name, &url).await?;
-            Ok(())
-        })
+        let registry = self.registry.read().await;
+        let handle = registry.repo(&id)?;
+        handle.remote().set_url(&name, &url).await?;
+        Ok(())
     }
 
     /// Handle rename remote operation
-    fn handle_rename_remote(&self, repo_id: &str, old_name: &str, new_name: &str) -> Result<()> {
+    async fn handle_rename_remote(&self, repo_id: &str, old_name: &str, new_name: &str) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
         let old_name = old_name.to_owned();
         let new_name = new_name.to_owned();
-
-        self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
-            let handle = registry.repo(&id)?;
-            handle.remote().rename(&old_name, &new_name).await?;
-            Ok(())
-        })
+        let registry = self.registry.read().await;
+        let handle = registry.repo(&id)?;
+        handle.remote().rename(&old_name, &new_name).await?;
+        Ok(())
     }
 
     // ========================================================================
@@ -1390,13 +1216,13 @@ impl RegistryService {
     // ========================================================================
 
     /// Handle push operation
-    fn handle_push(&self, repo_id: &str, remote: &str, refspec: &str, force: bool) -> Result<()> {
+    async fn handle_push(&self, repo_id: &str, remote: &str, refspec: &str, force: bool) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
         let remote = remote.to_owned();
         let refspec = refspec.to_owned();
         self.with_repo_blocking(&id, move |repo| {
             crate::git::ops::push(&repo, &remote, &refspec, force)
-        })
+        }).await
     }
 
     // ========================================================================
@@ -1404,16 +1230,16 @@ impl RegistryService {
     // ========================================================================
 
     /// Handle amend commit operation
-    fn handle_amend_commit(&self, repo_id: &str, message: &str) -> Result<String> {
+    async fn handle_amend_commit(&self, repo_id: &str, message: &str) -> Result<String> {
         let id = Self::parse_repo_id(repo_id)?;
         let message = message.to_owned();
         self.with_repo_blocking(&id, move |repo| {
             Ok(crate::git::ops::amend_head(&repo, &message)?.to_string())
-        })
+        }).await
     }
 
     /// Handle commit with author operation
-    fn handle_commit_with_author(
+    async fn handle_commit_with_author(
         &self,
         repo_id: &str,
         message: &str,
@@ -1426,15 +1252,15 @@ impl RegistryService {
         let author_email = author_email.to_owned();
         self.with_repo_blocking(&id, move |repo| {
             Ok(crate::git::ops::commit_with_author(&repo, &message, &author_name, &author_email)?.to_string())
-        })
+        }).await
     }
 
     /// Handle stage all including untracked operation
-    fn handle_stage_all_including_untracked(&self, repo_id: &str) -> Result<()> {
+    async fn handle_stage_all_including_untracked(&self, repo_id: &str) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
         self.with_repo_blocking(&id, |repo| {
             crate::git::ops::stage_all_with_untracked(&repo)
-        })
+        }).await
     }
 
     // ========================================================================
@@ -1442,28 +1268,28 @@ impl RegistryService {
     // ========================================================================
 
     /// Handle abort merge operation
-    fn handle_abort_merge(&self, repo_id: &str) -> Result<()> {
+    async fn handle_abort_merge(&self, repo_id: &str) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
         self.with_repo_blocking(&id, |repo| {
             crate::git::ops::abort_merge(&repo)
-        })
+        }).await
     }
 
     /// Handle continue merge operation
-    fn handle_continue_merge(&self, repo_id: &str, message: Option<&str>) -> Result<String> {
+    async fn handle_continue_merge(&self, repo_id: &str, message: Option<&str>) -> Result<String> {
         let id = Self::parse_repo_id(repo_id)?;
         let message = message.map(std::borrow::ToOwned::to_owned);
         self.with_repo_blocking(&id, move |repo| {
             Ok(crate::git::ops::continue_merge(&repo, message.as_deref())?.to_string())
-        })
+        }).await
     }
 
     /// Handle quit merge operation
-    fn handle_quit_merge(&self, repo_id: &str) -> Result<()> {
+    async fn handle_quit_merge(&self, repo_id: &str) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
         self.with_repo_blocking(&id, |repo| {
             crate::git::ops::quit_merge(&repo)
-        })
+        }).await
     }
 
     // ========================================================================
@@ -1471,30 +1297,30 @@ impl RegistryService {
     // ========================================================================
 
     /// Handle list tags operation
-    fn handle_list_tags(&self, repo_id: &str) -> Result<Vec<String>> {
+    async fn handle_list_tags(&self, repo_id: &str) -> Result<Vec<String>> {
         let id = Self::parse_repo_id(repo_id)?;
         self.with_repo_blocking(&id, |repo| {
             crate::git::ops::list_tags(&repo)
-        })
+        }).await
     }
 
     /// Handle create tag operation
-    fn handle_create_tag(&self, repo_id: &str, name: &str, target: Option<&str>) -> Result<()> {
+    async fn handle_create_tag(&self, repo_id: &str, name: &str, target: Option<&str>) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
         let name = name.to_owned();
         let target = target.map(std::borrow::ToOwned::to_owned);
         self.with_repo_blocking(&id, move |repo| {
             crate::git::ops::create_tag(&repo, &name, target.as_deref(), false)
-        })
+        }).await
     }
 
     /// Handle delete tag operation
-    fn handle_delete_tag(&self, repo_id: &str, name: &str) -> Result<()> {
+    async fn handle_delete_tag(&self, repo_id: &str, name: &str) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
         let name = name.to_owned();
         self.with_repo_blocking(&id, move |repo| {
             crate::git::ops::delete_tag(&repo, &name)
-        })
+        }).await
     }
 
     // ========================================================================
@@ -1502,11 +1328,11 @@ impl RegistryService {
     // ========================================================================
 
     /// Handle detailed status operation
-    fn handle_detailed_status(&self, repo_id: &str) -> Result<DetailedStatusData> {
+    async fn handle_detailed_status(&self, repo_id: &str) -> Result<DetailedStatusInfo> {
         let id = Self::parse_repo_id(repo_id)?;
         self.with_repo_blocking(&id, |repo| {
             crate::git::ops::detailed_status(&repo)
-        })
+        }).await
     }
 
     // ========================================================================
@@ -1514,7 +1340,7 @@ impl RegistryService {
     // ========================================================================
 
     /// Get or create a ContainedRoot for a (repo_id, worktree) pair.
-    fn get_contained_root(
+    async fn get_contained_root(
         &self,
         repo_id: &str,
         worktree: &str,
@@ -1528,37 +1354,41 @@ impl RegistryService {
         let id = Self::parse_repo_id(repo_id)
             .map_err(|e| FsServiceError::NotFound(e.to_string()))?;
 
-        let worktree_path = self.runtime_handle.block_on(async {
-            let registry = self.registry.read().await;
-            let handle = registry.repo(&id)
+        let registry = self.registry.read().await;
+        let handle = registry.repo(&id)
+            .map_err(|e| FsServiceError::NotFound(e.to_string()))?;
+        let worktrees = handle.get_worktrees().await
+            .map_err(|e| FsServiceError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+
+        // Find the worktree matching the requested name
+        let mut worktree_path = None;
+        for wt in &worktrees {
+            let wt_name = wt.path()
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            if wt_name == worktree {
+                worktree_path = Some(wt.path().to_path_buf());
+                break;
+            }
+        }
+
+        // If worktree name is "." or empty, use the repo's base worktree path
+        let worktree_path = if let Some(p) = worktree_path {
+            p
+        } else if worktree == "." || worktree.is_empty() {
+            let repo = handle.open_repo()
                 .map_err(|e| FsServiceError::NotFound(e.to_string()))?;
-            let worktrees = handle.get_worktrees().await
-                .map_err(|e| FsServiceError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
-
-            // Find the worktree matching the requested name
-            for wt in &worktrees {
-                let wt_name = wt.path()
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("");
-                if wt_name == worktree {
-                    return Ok(wt.path().to_path_buf());
-                }
-            }
-
-            // If worktree name is "." or empty, use the repo's base worktree path
-            if worktree == "." || worktree.is_empty() {
-                let repo = handle.open_repo()
-                    .map_err(|e| FsServiceError::NotFound(e.to_string()))?;
-                if let Some(wdir) = repo.workdir() {
-                    return Ok(wdir.to_path_buf());
-                }
-            }
-
-            Err(FsServiceError::NotFound(
+            repo.workdir()
+                .map(|wdir| wdir.to_path_buf())
+                .ok_or_else(|| FsServiceError::NotFound(
+                    format!("worktree '{}' not found for repo '{}'", worktree, repo_id),
+                ))?
+        } else {
+            return Err(FsServiceError::NotFound(
                 format!("worktree '{}' not found for repo '{}'", worktree, repo_id),
-            ))
-        })?;
+            ));
+        };
 
         let root = contained_root::open_contained_root(&worktree_path)?;
         let root: Arc<dyn ContainedRoot> = Arc::from(root);
@@ -1567,7 +1397,7 @@ impl RegistryService {
     }
 
     /// Handle FS open
-    fn handle_fs_open(
+    async fn handle_fs_open(
         &self,
         ctx: &EnvelopeContext,
         repo_id: &str,
@@ -1581,7 +1411,7 @@ impl RegistryService {
         exclusive: bool,
     ) -> Result<u32, FsServiceError> {
         let _ = read; // always open for reading
-        let root = self.get_contained_root(repo_id, worktree)?;
+        let root = self.get_contained_root(repo_id, worktree).await?;
         let file = root.open_file(path, write, create, truncate, append, exclusive)?;
 
         let subject = ctx.subject().to_string();
@@ -1599,7 +1429,7 @@ impl RegistryService {
     }
 
     /// Handle FS close
-    fn handle_fs_close(&self, ctx: &EnvelopeContext, fd: u32) -> Result<(), FsServiceError> {
+    async fn handle_fs_close(&self, ctx: &EnvelopeContext, fd: u32) -> Result<(), FsServiceError> {
         let client_id = ctx.subject().to_string();
         // Verify ownership before removing
         {
@@ -1613,7 +1443,7 @@ impl RegistryService {
     }
 
     /// Handle FS read
-    fn handle_fs_read(
+    async fn handle_fs_read(
         &self,
         ctx: &EnvelopeContext,
         fd: u32,
@@ -1633,7 +1463,7 @@ impl RegistryService {
     }
 
     /// Handle FS write
-    fn handle_fs_write(
+    async fn handle_fs_write(
         &self,
         ctx: &EnvelopeContext,
         fd: u32,
@@ -1654,7 +1484,7 @@ impl RegistryService {
     }
 
     /// Handle FS pread (positional read)
-    fn handle_fs_pread(
+    async fn handle_fs_pread(
         &self,
         ctx: &EnvelopeContext,
         fd: u32,
@@ -1676,7 +1506,7 @@ impl RegistryService {
     }
 
     /// Handle FS pwrite (positional write)
-    fn handle_fs_pwrite(
+    async fn handle_fs_pwrite(
         &self,
         ctx: &EnvelopeContext,
         fd: u32,
@@ -1699,7 +1529,7 @@ impl RegistryService {
     }
 
     /// Handle FS seek
-    fn handle_fs_seek(
+    async fn handle_fs_seek(
         &self,
         ctx: &EnvelopeContext,
         fd: u32,
@@ -1718,7 +1548,7 @@ impl RegistryService {
     }
 
     /// Handle FS truncate
-    fn handle_fs_truncate(
+    async fn handle_fs_truncate(
         &self,
         ctx: &EnvelopeContext,
         fd: u32,
@@ -1733,7 +1563,7 @@ impl RegistryService {
     }
 
     /// Handle FS fsync
-    fn handle_fs_fsync(
+    async fn handle_fs_fsync(
         &self,
         ctx: &EnvelopeContext,
         fd: u32,
@@ -1749,13 +1579,13 @@ impl RegistryService {
     }
 
     /// Handle FS stat
-    fn handle_fs_stat(
+    async fn handle_fs_stat(
         &self,
         repo_id: &str,
         worktree: &str,
         path: &str,
     ) -> Result<FsStatInfo, FsServiceError> {
-        let root = self.get_contained_root(repo_id, worktree)?;
+        let root = self.get_contained_root(repo_id, worktree).await?;
         match root.stat(path) {
             Ok(meta) => {
                 let modified_at = meta
@@ -1785,14 +1615,14 @@ impl RegistryService {
     }
 
     /// Handle FS mkdir
-    fn handle_fs_mkdir(
+    async fn handle_fs_mkdir(
         &self,
         repo_id: &str,
         worktree: &str,
         path: &str,
         recursive: bool,
     ) -> Result<(), FsServiceError> {
-        let root = self.get_contained_root(repo_id, worktree)?;
+        let root = self.get_contained_root(repo_id, worktree).await?;
         if recursive {
             root.mkdir_all(path)
         } else {
@@ -1801,772 +1631,540 @@ impl RegistryService {
     }
 
     /// Handle FS remove file
-    fn handle_fs_remove(
+    async fn handle_fs_remove(
         &self,
         repo_id: &str,
         worktree: &str,
         path: &str,
     ) -> Result<(), FsServiceError> {
-        let root = self.get_contained_root(repo_id, worktree)?;
+        let root = self.get_contained_root(repo_id, worktree).await?;
         root.remove_file(path)
     }
 
     /// Handle FS rmdir
-    fn handle_fs_rmdir(
+    async fn handle_fs_rmdir(
         &self,
         repo_id: &str,
         worktree: &str,
         path: &str,
     ) -> Result<(), FsServiceError> {
-        let root = self.get_contained_root(repo_id, worktree)?;
+        let root = self.get_contained_root(repo_id, worktree).await?;
         root.remove_dir(path)
     }
 
     /// Handle FS rename
-    fn handle_fs_rename(
+    async fn handle_fs_rename(
         &self,
         repo_id: &str,
         worktree: &str,
         src: &str,
         dst: &str,
     ) -> Result<(), FsServiceError> {
-        let root = self.get_contained_root(repo_id, worktree)?;
+        let root = self.get_contained_root(repo_id, worktree).await?;
         root.rename(src, dst)
     }
 
     /// Handle FS copy
-    fn handle_fs_copy(
+    async fn handle_fs_copy(
         &self,
         repo_id: &str,
         worktree: &str,
         src: &str,
         dst: &str,
     ) -> Result<(), FsServiceError> {
-        let root = self.get_contained_root(repo_id, worktree)?;
+        let root = self.get_contained_root(repo_id, worktree).await?;
         root.copy_file(src, dst)
     }
 
     /// Handle FS list directory
-    fn handle_fs_list_dir(
+    async fn handle_fs_list_dir(
         &self,
         repo_id: &str,
         worktree: &str,
         path: &str,
     ) -> Result<Vec<FsDirEntry>, FsServiceError> {
-        let root = self.get_contained_root(repo_id, worktree)?;
+        let root = self.get_contained_root(repo_id, worktree).await?;
         root.list_dir(path)
     }
 
 }
 
-impl ZmqService for RegistryService {
-    fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<Vec<u8>> {
-        // Log identity for audit trail
-        debug!(
-            "Registry request from {} (envelope_id={}, authenticated={})",
-            ctx.subject(),
-            ctx.request_id,
-            ctx.is_authenticated()
-        );
+// ============================================================================
+// Generated Handler Helpers
+// ============================================================================
 
-        // Deserialize inner request from payload
-        let reader = serialize::read_message(payload, ReaderOptions::new())?;
-        let req = reader.get_root::<registry_capnp::registry_request::Reader>()?;
+fn tracked_repo_to_data(repo: &TrackedRepository) -> crate::services::generated::registry_client::TrackedRepository {
+    crate::services::generated::registry_client::TrackedRepository {
+        id: repo.id.to_string(),
+        name: repo.name.clone().unwrap_or_default(),
+        url: repo.url.clone(),
+        worktree_path: repo.worktree_path.to_string_lossy().to_string(),
+        tracking_ref: match &repo.tracking_ref {
+            GitRef::Branch(b) => b.clone(),
+            _ => String::new(),
+        },
+        current_oid: repo.current_oid.clone().unwrap_or_default(),
+        registered_at: repo.registered_at,
+    }
+}
 
-        let request_id = req.get_id();
+macro_rules! tracked_variant {
+    ($variant:ident, $repo:expr) => {{
+        let d = tracked_repo_to_data($repo);
+        RegistryResponseVariant::$variant(d)
+    }};
+}
 
-        // Handle based on request type
-        use registry_capnp::registry_request::Which;
-        use crate::services::rpc_types::RepoVoidVariant;
+fn reg_error(msg: &str) -> RegistryResponseVariant {
+    RegistryResponseVariant::Error(ErrorInfo {
+        message: msg.to_owned(),
+        code: "INTERNAL".to_owned(),
+        details: String::new(),
+    })
+}
 
-        match req.which()? {
-            Which::List(()) => {
-                if let Some(resp) = self.check_auth(ctx, request_id, "registry", Operation::Query) {
-                    return Ok(resp);
-                }
-                match self.handle_list() {
-                    Ok(repos) => Ok(RegistryResponse::list_result(request_id, &repos)),
-                    Err(e) => Ok(RegistryResponse::error(request_id, &e.to_string())),
-                }
-            }
+// ============================================================================
+// Generated RegistryHandler Implementation
+// ============================================================================
 
-            Which::Get(id) => {
-                let id_str = id?.to_str()?;
-                let resource = format!("registry:{id_str}");
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
-                    return Ok(resp);
-                }
-                match self.handle_get(id_str) {
-                    Ok(Some(repo)) => Ok(RegistryResponse::get_result(request_id, &repo)),
-                    Ok(None) => Ok(RegistryResponse::error(request_id, "Repository not found")),
-                    Err(e) => Ok(RegistryResponse::error(request_id, &e.to_string())),
-                }
-            }
-
-            Which::GetByName(name) => {
-                let name_str = name?.to_str()?;
-                let resource = format!("registry:{name_str}");
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
-                    return Ok(resp);
-                }
-                match self.handle_get_by_name(name_str) {
-                    Ok(Some(repo)) => Ok(RegistryResponse::get_by_name_result(request_id, &repo)),
-                    Ok(None) => Ok(RegistryResponse::error(request_id, "Repository not found")),
-                    Err(e) => Ok(RegistryResponse::error(request_id, &e.to_string())),
-                }
-            }
-
-            Which::Clone(clone_req) => {
-                if let Some(resp) = self.check_auth(ctx, request_id, "registry", Operation::Write) {
-                    return Ok(resp);
-                }
-                let clone_req = clone_req?;
-                let url = clone_req.get_url()?.to_str()?;
-                let name = if clone_req.has_name() {
-                    let n = clone_req.get_name()?.to_str()?;
-                    if n.is_empty() { None } else { Some(n) }
-                } else {
-                    None
-                };
-                let shallow = clone_req.get_shallow();
-                let depth = clone_req.get_depth();
-                let branch = if clone_req.has_branch() {
-                    let b = clone_req.get_branch()?.to_str()?;
-                    if b.is_empty() { None } else { Some(b) }
-                } else {
-                    None
-                };
-
-                match self.handle_clone(url, name, shallow, Some(depth), branch) {
-                    Ok(repo) => Ok(RegistryResponse::clone_result(request_id, &repo)),
-                    Err(e) => Ok(RegistryResponse::error(request_id, &e.to_string())),
-                }
-            }
-
-            Which::CloneStream(clone_req) => {
-                if let Some(resp) = self.check_auth(ctx, request_id, "registry", Operation::Write) {
-                    return Ok(resp);
-                }
-                let clone_req = clone_req?;
-                let url = clone_req.get_url()?.to_str()?;
-                let name = if clone_req.has_name() {
-                    let n = clone_req.get_name()?.to_str()?;
-                    if n.is_empty() { None } else { Some(n) }
-                } else {
-                    None
-                };
-                let shallow = clone_req.get_shallow();
-                let depth = clone_req.get_depth();
-                let branch = if clone_req.has_branch() {
-                    let b = clone_req.get_branch()?.to_str()?;
-                    if b.is_empty() { None } else { Some(b) }
-                } else {
-                    None
-                };
-
-                let client_ephemeral_pubkey = ctx.ephemeral_pubkey();
-
-                match self.prepare_clone_stream(url, name, shallow, Some(depth), branch, client_ephemeral_pubkey) {
-                    Ok((stream_id, server_pubkey)) => {
-                        let stream_endpoint = endpoint_registry()
-                            .endpoint("streams", SocketKind::Sub)
-                            .to_zmq_string();
-
-                        Ok(RegistryResponse::clone_stream_result(
-                            request_id,
-                            &stream_id,
-                            &stream_endpoint,
-                            &server_pubkey,
-                        ))
-                    }
-                    Err(e) => Ok(RegistryResponse::error(request_id, &e.to_string())),
-                }
-            }
-
-            Which::Register(reg_req) => {
-                if let Some(resp) = self.check_auth(ctx, request_id, "registry", Operation::Write) {
-                    return Ok(resp);
-                }
-                let reg_req = reg_req?;
-                let path = reg_req.get_path()?.to_str()?;
-                let name = if reg_req.has_name() {
-                    let n = reg_req.get_name()?.to_str()?;
-                    if n.is_empty() { None } else { Some(n) }
-                } else {
-                    None
-                };
-                let tracking_ref = if reg_req.has_tracking_ref() {
-                    let r = reg_req.get_tracking_ref()?.to_str()?;
-                    if r.is_empty() { None } else { Some(r) }
-                } else {
-                    None
-                };
-
-                match self.handle_register(path, name, tracking_ref) {
-                    Ok(repo) => Ok(RegistryResponse::register_result(request_id, &repo)),
-                    Err(e) => Ok(RegistryResponse::error(request_id, &e.to_string())),
-                }
-            }
-
-            Which::Remove(repo_id) => {
-                let repo_id = repo_id?.to_str()?;
-                let resource = format!("registry:{repo_id}");
-                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Manage) {
-                    return Ok(resp);
-                }
-                match self.handle_remove(repo_id) {
-                    Ok(()) => Ok(RegistryResponse::remove_result(request_id)),
-                    Err(e) => Ok(RegistryResponse::error(request_id, &e.to_string())),
-                }
-            }
-
-            Which::HealthCheck(()) => {
-                match self.handle_health_check() {
-                    Ok(status) => Ok(RegistryResponse::health_check_result(request_id, &status)),
-                    Err(e) => Ok(RegistryResponse::error(request_id, &e.to_string())),
-                }
-            }
-
-            // Repository-scoped operations (nested under repo)
-            Which::Repo(repo_req) => {
-                let repo_req = repo_req?;
-                let repo_id = repo_req.get_repo_id()?.to_str()?;
-                let resource = format!("registry:{repo_id}");
-
-                use registry_capnp::repository_request::Which as RepoWhich;
-                match repo_req.which()? {
-                    RepoWhich::CreateWorktree(wt_req) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
-                            return Ok(resp);
-                        }
-                        let wt_req = wt_req?;
-                        let path = wt_req.get_path()?.to_str()?;
-                        let branch = wt_req.get_branch_name()?.to_str()?;
-                        match self.handle_create_worktree(repo_id, path, branch) {
-                            Ok(wt_path) => Ok(RegistryResponse::repo_create_worktree(request_id, &wt_path)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::ListWorktrees(()) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
-                            return Ok(resp);
-                        }
-                        match self.handle_list_worktrees(repo_id) {
-                            Ok(worktrees) => Ok(RegistryResponse::repo_list_worktrees(request_id, &worktrees)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::RemoveWorktree(wt_req) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Manage) {
-                            return Ok(resp);
-                        }
-                        let wt_req = wt_req?;
-                        let worktree_path = wt_req.get_worktree_path()?.to_str()?;
-                        match self.handle_remove_worktree(repo_id, worktree_path) {
-                            Ok(()) => Ok(RegistryResponse::repo_void(request_id, RepoVoidVariant::RemoveWorktree)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::CreateBranch(branch_req) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
-                            return Ok(resp);
-                        }
-                        let branch_req = branch_req?;
-                        let branch_name = branch_req.get_branch_name()?.to_str()?;
-                        let start_point = if branch_req.has_start_point() {
-                            Some(branch_req.get_start_point()?.to_str()?)
-                        } else {
-                            None
-                        };
-                        match self.handle_create_branch(repo_id, branch_name, start_point) {
-                            Ok(()) => Ok(RegistryResponse::repo_void(request_id, RepoVoidVariant::CreateBranch)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::ListBranches(()) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
-                            return Ok(resp);
-                        }
-                        match self.handle_list_branches(repo_id) {
-                            Ok(branches) => Ok(RegistryResponse::repo_list_branches(request_id, &branches)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::Checkout(checkout_req) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
-                            return Ok(resp);
-                        }
-                        let checkout_req = checkout_req?;
-                        let ref_name = checkout_req.get_ref_name()?.to_str()?;
-                        match self.handle_checkout(repo_id, ref_name) {
-                            Ok(()) => Ok(RegistryResponse::repo_void(request_id, RepoVoidVariant::Checkout)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::StageAll(()) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
-                            return Ok(resp);
-                        }
-                        match self.handle_stage_all(repo_id) {
-                            Ok(()) => Ok(RegistryResponse::repo_void(request_id, RepoVoidVariant::StageAll)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::StageFiles(stage_req) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
-                            return Ok(resp);
-                        }
-                        let stage_req = stage_req?;
-                        let files_reader = stage_req.get_files()?;
-                        let mut files = Vec::new();
-                        for file in files_reader.iter() {
-                            files.push(file?.to_str()?.to_owned());
-                        }
-                        match self.handle_stage_files(repo_id, files) {
-                            Ok(()) => Ok(RegistryResponse::repo_void(request_id, RepoVoidVariant::StageFiles)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::Commit(commit_req) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
-                            return Ok(resp);
-                        }
-                        let commit_req = commit_req?;
-                        let message = commit_req.get_message()?.to_str()?;
-                        match self.handle_commit(repo_id, message) {
-                            Ok(oid) => Ok(RegistryResponse::repo_commit(request_id, &oid)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::Merge(merge_req) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
-                            return Ok(resp);
-                        }
-                        let merge_req = merge_req?;
-                        let source = merge_req.get_source()?.to_str()?;
-                        let message = if merge_req.has_message() {
-                            Some(merge_req.get_message()?.to_str()?.to_owned())
-                        } else {
-                            None
-                        };
-                        match self.handle_merge(repo_id, source, message.as_deref()) {
-                            Ok(_oid) => Ok(RegistryResponse::repo_void(request_id, RepoVoidVariant::Merge)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::AbortMerge(()) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
-                            return Ok(resp);
-                        }
-                        match self.handle_abort_merge(repo_id) {
-                            Ok(()) => Ok(RegistryResponse::repo_void(request_id, RepoVoidVariant::AbortMerge)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::ContinueMerge(merge_req) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
-                            return Ok(resp);
-                        }
-                        let merge_req = merge_req?;
-                        let message = if merge_req.has_message() {
-                            let m = merge_req.get_message()?.to_str()?;
-                            if m.is_empty() { None } else { Some(m) }
-                        } else {
-                            None
-                        };
-                        match self.handle_continue_merge(repo_id, message) {
-                            Ok(_oid) => Ok(RegistryResponse::repo_void(request_id, RepoVoidVariant::ContinueMerge)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::QuitMerge(()) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
-                            return Ok(resp);
-                        }
-                        match self.handle_quit_merge(repo_id) {
-                            Ok(()) => Ok(RegistryResponse::repo_void(request_id, RepoVoidVariant::QuitMerge)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::GetHead(()) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
-                            return Ok(resp);
-                        }
-                        match self.handle_get_head(repo_id) {
-                            Ok(oid) => Ok(RegistryResponse::repo_get_head(request_id, &oid)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::GetRef(ref_req) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
-                            return Ok(resp);
-                        }
-                        let ref_req = ref_req?;
-                        let ref_name = ref_req.get_ref_name()?.to_str()?;
-                        match self.handle_get_ref(repo_id, ref_name) {
-                            Ok(oid) => Ok(RegistryResponse::repo_get_ref(request_id, &oid)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::Status(()) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
-                            return Ok(resp);
-                        }
-                        match self.handle_status(repo_id) {
-                            Ok(status) => Ok(RegistryResponse::repo_status(request_id, &status)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::DetailedStatus(()) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
-                            return Ok(resp);
-                        }
-                        match self.handle_detailed_status(repo_id) {
-                            Ok(status) => Ok(RegistryResponse::repo_detailed_status(request_id, &status)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::ListRemotes(()) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
-                            return Ok(resp);
-                        }
-                        match self.handle_list_remotes(repo_id) {
-                            Ok(remotes) => Ok(RegistryResponse::repo_list_remotes(request_id, &remotes)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::AddRemote(remote_req) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
-                            return Ok(resp);
-                        }
-                        let remote_req = remote_req?;
-                        let name = remote_req.get_name()?.to_str()?;
-                        let url = remote_req.get_url()?.to_str()?;
-                        match self.handle_add_remote(repo_id, name, url) {
-                            Ok(()) => Ok(RegistryResponse::repo_void(request_id, RepoVoidVariant::AddRemote)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::RemoveRemote(remote_req) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
-                            return Ok(resp);
-                        }
-                        let remote_req = remote_req?;
-                        let name = remote_req.get_name()?.to_str()?;
-                        match self.handle_remove_remote(repo_id, name) {
-                            Ok(()) => Ok(RegistryResponse::repo_void(request_id, RepoVoidVariant::RemoveRemote)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::SetRemoteUrl(remote_req) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
-                            return Ok(resp);
-                        }
-                        let remote_req = remote_req?;
-                        let name = remote_req.get_name()?.to_str()?;
-                        let url = remote_req.get_url()?.to_str()?;
-                        match self.handle_set_remote_url(repo_id, name, url) {
-                            Ok(()) => Ok(RegistryResponse::repo_void(request_id, RepoVoidVariant::SetRemoteUrl)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::RenameRemote(remote_req) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
-                            return Ok(resp);
-                        }
-                        let remote_req = remote_req?;
-                        let old_name = remote_req.get_old_name()?.to_str()?;
-                        let new_name = remote_req.get_new_name()?.to_str()?;
-                        match self.handle_rename_remote(repo_id, old_name, new_name) {
-                            Ok(()) => Ok(RegistryResponse::repo_void(request_id, RepoVoidVariant::RenameRemote)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::Push(push_req) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
-                            return Ok(resp);
-                        }
-                        let push_req = push_req?;
-                        let remote = push_req.get_remote()?.to_str()?;
-                        let refspec = push_req.get_refspec()?.to_str()?;
-                        let force = push_req.get_force();
-                        match self.handle_push(repo_id, remote, refspec, force) {
-                            Ok(()) => Ok(RegistryResponse::repo_void(request_id, RepoVoidVariant::Push)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::AmendCommit(amend_req) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
-                            return Ok(resp);
-                        }
-                        let amend_req = amend_req?;
-                        let message = amend_req.get_message()?.to_str()?;
-                        match self.handle_amend_commit(repo_id, message) {
-                            Ok(oid) => Ok(RegistryResponse::repo_amend_commit(request_id, &oid)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::CommitWithAuthor(commit_req) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
-                            return Ok(resp);
-                        }
-                        let commit_req = commit_req?;
-                        let message = commit_req.get_message()?.to_str()?;
-                        let author_name = commit_req.get_author_name()?.to_str()?;
-                        let author_email = commit_req.get_author_email()?.to_str()?;
-                        match self.handle_commit_with_author(repo_id, message, author_name, author_email) {
-                            Ok(oid) => Ok(RegistryResponse::repo_commit_with_author(request_id, &oid)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::StageAllIncludingUntracked(()) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
-                            return Ok(resp);
-                        }
-                        match self.handle_stage_all_including_untracked(repo_id) {
-                            Ok(()) => Ok(RegistryResponse::repo_void(request_id, RepoVoidVariant::StageAllIncludingUntracked)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::ListTags(()) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
-                            return Ok(resp);
-                        }
-                        match self.handle_list_tags(repo_id) {
-                            Ok(tags) => Ok(RegistryResponse::repo_list_tags(request_id, &tags)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::CreateTag(tag_req) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
-                            return Ok(resp);
-                        }
-                        let tag_req = tag_req?;
-                        let name = tag_req.get_name()?.to_str()?;
-                        let target = if tag_req.has_target() {
-                            let t = tag_req.get_target()?.to_str()?;
-                            if t.is_empty() { None } else { Some(t) }
-                        } else {
-                            None
-                        };
-                        match self.handle_create_tag(repo_id, name, target) {
-                            Ok(()) => Ok(RegistryResponse::repo_void(request_id, RepoVoidVariant::CreateTag)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::DeleteTag(tag_req) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
-                            return Ok(resp);
-                        }
-                        let tag_req = tag_req?;
-                        let name = tag_req.get_name()?.to_str()?;
-                        match self.handle_delete_tag(repo_id, name) {
-                            Ok(()) => Ok(RegistryResponse::repo_void(request_id, RepoVoidVariant::DeleteTag)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-                    RepoWhich::Update(update_req) => {
-                        if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
-                            return Ok(resp);
-                        }
-                        let update_req = update_req?;
-                        let refspec = if update_req.has_refspec() {
-                            let r = update_req.get_refspec()?.to_str()?;
-                            if r.is_empty() { None } else { Some(r) }
-                        } else {
-                            None
-                        };
-                        match self.handle_update(repo_id, refspec) {
-                            Ok(()) => Ok(RegistryResponse::repo_void(request_id, RepoVoidVariant::Update)),
-                            Err(e) => Ok(RegistryResponse::repo_error(request_id, &e.to_string())),
-                        }
-                    }
-
-                    // Worktree-scoped filesystem operations (nested under repo → worktree)
-                    RepoWhich::Worktree(wt_req) => {
-                        let wt_req = wt_req?;
-                        let worktree = wt_req.get_name()?.to_str()?;
-
-                        use registry_capnp::worktree_request::Which as WtWhich;
-                        match wt_req.which()? {
-                            WtWhich::Open(open_req) => {
-                                let open_req = open_req?;
-                                let path = open_req.get_path()?.to_str()?;
-                                let write = open_req.get_write();
-                                // Require Write auth if opening for write, else Query
-                                let op = if write { Operation::Write } else { Operation::Query };
-                                if let Some(resp) = self.check_auth(ctx, request_id, &resource, op) {
-                                    return Ok(resp);
-                                }
-                                match self.handle_fs_open(
-                                    ctx, repo_id, worktree, path,
-                                    open_req.get_read(), write,
-                                    open_req.get_create(), open_req.get_truncate(),
-                                    open_req.get_append(), open_req.get_exclusive(),
-                                ) {
-                                    Ok(fd) => Ok(RegistryResponse::fs_open(request_id, fd)),
-                                    Err(e) => Ok(RegistryResponse::fs_error(request_id, &e.to_string())),
-                                }
-                            }
-                            WtWhich::Close(close_req) => {
-                                let close_req = close_req?;
-                                match self.handle_fs_close(ctx, close_req.get_fd()) {
-                                    Ok(()) => Ok(RegistryResponse::fs_void(request_id, FsVoidVariant::Close)),
-                                    Err(e) => Ok(RegistryResponse::fs_error(request_id, &e.to_string())),
-                                }
-                            }
-                            WtWhich::Read(read_req) => {
-                                let read_req = read_req?;
-                                match self.handle_fs_read(ctx, read_req.get_fd(), read_req.get_length()) {
-                                    Ok(data) => Ok(RegistryResponse::fs_read(request_id, &data, false)),
-                                    Err(e) => Ok(RegistryResponse::fs_error(request_id, &e.to_string())),
-                                }
-                            }
-                            WtWhich::Write(write_req) => {
-                                let write_req = write_req?;
-                                let data = write_req.get_data()?;
-                                match self.handle_fs_write(ctx, write_req.get_fd(), data) {
-                                    Ok(n) => Ok(RegistryResponse::fs_write(request_id, n, false)),
-                                    Err(e) => Ok(RegistryResponse::fs_error(request_id, &e.to_string())),
-                                }
-                            }
-                            WtWhich::Pread(pread_req) => {
-                                let pread_req = pread_req?;
-                                match self.handle_fs_pread(
-                                    ctx, pread_req.get_fd(),
-                                    pread_req.get_offset(), pread_req.get_length(),
-                                ) {
-                                    Ok(data) => Ok(RegistryResponse::fs_read(request_id, &data, true)),
-                                    Err(e) => Ok(RegistryResponse::fs_error(request_id, &e.to_string())),
-                                }
-                            }
-                            WtWhich::Pwrite(pwrite_req) => {
-                                let pwrite_req = pwrite_req?;
-                                let data = pwrite_req.get_data()?;
-                                match self.handle_fs_pwrite(
-                                    ctx, pwrite_req.get_fd(),
-                                    pwrite_req.get_offset(), data,
-                                ) {
-                                    Ok(n) => Ok(RegistryResponse::fs_write(request_id, n, true)),
-                                    Err(e) => Ok(RegistryResponse::fs_error(request_id, &e.to_string())),
-                                }
-                            }
-                            WtWhich::Seek(seek_req) => {
-                                let seek_req = seek_req?;
-                                use registry_capnp::SeekWhence as CapnpWhence;
-                                let whence = match seek_req.get_whence()? {
-                                    CapnpWhence::Set => crate::services::traits::SeekWhence::Set,
-                                    CapnpWhence::Cur => crate::services::traits::SeekWhence::Cur,
-                                    CapnpWhence::End => crate::services::traits::SeekWhence::End,
-                                };
-                                match self.handle_fs_seek(ctx, seek_req.get_fd(), seek_req.get_offset(), whence) {
-                                    Ok(pos) => Ok(RegistryResponse::fs_seek(request_id, pos)),
-                                    Err(e) => Ok(RegistryResponse::fs_error(request_id, &e.to_string())),
-                                }
-                            }
-                            WtWhich::Truncate(trunc_req) => {
-                                let trunc_req = trunc_req?;
-                                match self.handle_fs_truncate(ctx, trunc_req.get_fd(), trunc_req.get_length()) {
-                                    Ok(()) => Ok(RegistryResponse::fs_void(request_id, FsVoidVariant::Truncate)),
-                                    Err(e) => Ok(RegistryResponse::fs_error(request_id, &e.to_string())),
-                                }
-                            }
-                            WtWhich::Fsync(fsync_req) => {
-                                let fsync_req = fsync_req?;
-                                match self.handle_fs_fsync(ctx, fsync_req.get_fd(), fsync_req.get_data_only()) {
-                                    Ok(()) => Ok(RegistryResponse::fs_void(request_id, FsVoidVariant::Fsync)),
-                                    Err(e) => Ok(RegistryResponse::fs_error(request_id, &e.to_string())),
-                                }
-                            }
-                            WtWhich::Stat(stat_req) => {
-                                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
-                                    return Ok(resp);
-                                }
-                                let stat_req = stat_req?;
-                                let path = stat_req.get_path()?.to_str()?;
-                                match self.handle_fs_stat(repo_id, worktree, path) {
-                                    Ok(stat) => Ok(RegistryResponse::fs_stat(request_id, &stat)),
-                                    Err(e) => Ok(RegistryResponse::fs_error(request_id, &e.to_string())),
-                                }
-                            }
-                            WtWhich::Mkdir(mkdir_req) => {
-                                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
-                                    return Ok(resp);
-                                }
-                                let mkdir_req = mkdir_req?;
-                                let path = mkdir_req.get_path()?.to_str()?;
-                                let recursive = mkdir_req.get_recursive();
-                                match self.handle_fs_mkdir(repo_id, worktree, path, recursive) {
-                                    Ok(()) => Ok(RegistryResponse::fs_void(request_id, FsVoidVariant::Mkdir)),
-                                    Err(e) => Ok(RegistryResponse::fs_error(request_id, &e.to_string())),
-                                }
-                            }
-                            WtWhich::Remove(remove_req) => {
-                                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
-                                    return Ok(resp);
-                                }
-                                let remove_req = remove_req?;
-                                let path = remove_req.get_path()?.to_str()?;
-                                match self.handle_fs_remove(repo_id, worktree, path) {
-                                    Ok(()) => Ok(RegistryResponse::fs_void(request_id, FsVoidVariant::Remove)),
-                                    Err(e) => Ok(RegistryResponse::fs_error(request_id, &e.to_string())),
-                                }
-                            }
-                            WtWhich::Rmdir(rmdir_req) => {
-                                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
-                                    return Ok(resp);
-                                }
-                                let rmdir_req = rmdir_req?;
-                                let path = rmdir_req.get_path()?.to_str()?;
-                                match self.handle_fs_rmdir(repo_id, worktree, path) {
-                                    Ok(()) => Ok(RegistryResponse::fs_void(request_id, FsVoidVariant::Rmdir)),
-                                    Err(e) => Ok(RegistryResponse::fs_error(request_id, &e.to_string())),
-                                }
-                            }
-                            WtWhich::Rename(rename_req) => {
-                                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
-                                    return Ok(resp);
-                                }
-                                let rename_req = rename_req?;
-                                let src = rename_req.get_src()?.to_str()?;
-                                let dst = rename_req.get_dst()?.to_str()?;
-                                match self.handle_fs_rename(repo_id, worktree, src, dst) {
-                                    Ok(()) => Ok(RegistryResponse::fs_void(request_id, FsVoidVariant::Rename)),
-                                    Err(e) => Ok(RegistryResponse::fs_error(request_id, &e.to_string())),
-                                }
-                            }
-                            WtWhich::Copy(copy_req) => {
-                                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Write) {
-                                    return Ok(resp);
-                                }
-                                let copy_req = copy_req?;
-                                let src = copy_req.get_src()?.to_str()?;
-                                let dst = copy_req.get_dst()?.to_str()?;
-                                match self.handle_fs_copy(repo_id, worktree, src, dst) {
-                                    Ok(()) => Ok(RegistryResponse::fs_void(request_id, FsVoidVariant::Copy)),
-                                    Err(e) => Ok(RegistryResponse::fs_error(request_id, &e.to_string())),
-                                }
-                            }
-                            WtWhich::ListDir(list_req) => {
-                                if let Some(resp) = self.check_auth(ctx, request_id, &resource, Operation::Query) {
-                                    return Ok(resp);
-                                }
-                                let list_req = list_req?;
-                                let path = list_req.get_path()?.to_str()?;
-                                match self.handle_fs_list_dir(repo_id, worktree, path) {
-                                    Ok(entries) => Ok(RegistryResponse::fs_list_dir(request_id, &entries)),
-                                    Err(e) => Ok(RegistryResponse::fs_error(request_id, &e.to_string())),
-                                }
-                            }
-                            WtWhich::OpenStream(_) | WtWhich::StartStream(_) => {
-                                // Streaming operations are not yet implemented
-                                Ok(RegistryResponse::fs_error(request_id, "FS streaming not yet implemented"))
-                            }
-                        }
-                    }
-                }
-            }
+#[async_trait::async_trait(?Send)]
+impl RegistryHandler for RegistryService {
+    async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
+        let op = Operation::from_str(operation)?;
+        if self.is_authorized(ctx, resource, op).await {
+            Ok(())
+        } else {
+            anyhow::bail!("Unauthorized: {} cannot {} on {}", ctx.subject(), operation, resource)
         }
+    }
+
+    async fn handle_list(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<RegistryResponseVariant> {
+        match self.handle_list().await {
+            Ok(repos) => Ok(RegistryResponseVariant::ListResult(
+                repos.iter().map(tracked_repo_to_data).collect()
+            )),
+            Err(e) => Ok(reg_error(&e.to_string())),
+        }
+    }
+
+    async fn handle_get(&self, _ctx: &EnvelopeContext, _request_id: u64, value: &str) -> Result<RegistryResponseVariant> {
+        match self.handle_get(value).await {
+            Ok(Some(repo)) => Ok(tracked_variant!(GetResult, &repo)),
+            Ok(None) => Ok(reg_error("Repository not found")),
+            Err(e) => Ok(reg_error(&e.to_string())),
+        }
+    }
+
+    async fn handle_get_by_name(&self, _ctx: &EnvelopeContext, _request_id: u64, value: &str) -> Result<RegistryResponseVariant> {
+        match self.handle_get_by_name(value).await {
+            Ok(Some(repo)) => Ok(tracked_variant!(GetByNameResult, &repo)),
+            Ok(None) => Ok(reg_error("Repository not found")),
+            Err(e) => Ok(reg_error(&e.to_string())),
+        }
+    }
+
+    async fn handle_clone(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        data: &CloneRequest,
+    ) -> Result<RegistryResponseVariant> {
+        let name_opt = if data.name.is_empty() { None } else { Some(data.name.as_str()) };
+        let branch_opt = if data.branch.is_empty() { None } else { Some(data.branch.as_str()) };
+        match self.handle_clone(&data.url, name_opt, data.shallow, Some(data.depth), branch_opt).await {
+            Ok(repo) => Ok(tracked_variant!(CloneResult, &repo)),
+            Err(e) => Ok(reg_error(&e.to_string())),
+        }
+    }
+
+    async fn handle_clone_stream(&self, ctx: &EnvelopeContext, _request_id: u64,
+        data: &CloneRequest,
+    ) -> Result<(StreamInfo, hyprstream_rpc::service::Continuation)> {
+        let name_opt = if data.name.is_empty() { None } else { Some(data.name.as_str()) };
+        let branch_opt = if data.branch.is_empty() { None } else { Some(data.branch.as_str()) };
+        let client_ephemeral_pubkey = ctx.ephemeral_pubkey();
+        self.prepare_clone_stream(&data.url, name_opt, data.shallow, Some(data.depth), branch_opt, client_ephemeral_pubkey).await
+    }
+
+    async fn handle_register(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        data: &RegisterRequest,
+    ) -> Result<RegistryResponseVariant> {
+        let name_opt = if data.name.is_empty() { None } else { Some(data.name.as_str()) };
+        let tracking_ref_opt = if data.tracking_ref.is_empty() { None } else { Some(data.tracking_ref.as_str()) };
+        match self.handle_register(&data.path, name_opt, tracking_ref_opt).await {
+            Ok(repo) => Ok(tracked_variant!(RegisterResult, &repo)),
+            Err(e) => Ok(reg_error(&e.to_string())),
+        }
+    }
+
+    async fn handle_remove(&self, _ctx: &EnvelopeContext, _request_id: u64, value: &str) -> Result<RegistryResponseVariant> {
+        match self.handle_remove(value).await {
+            Ok(()) => Ok(RegistryResponseVariant::RemoveResult),
+            Err(e) => Ok(reg_error(&e.to_string())),
+        }
+    }
+
+    async fn handle_health_check(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<RegistryResponseVariant> {
+        match self.handle_health_check().await {
+            Ok(status) => Ok(RegistryResponseVariant::HealthCheckResult(status)),
+            Err(e) => Ok(reg_error(&e.to_string())),
+        }
+    }
+
+}
+
+// ============================================================================
+// Generated RepoHandler Implementation (repo-scoped operations)
+// ============================================================================
+//
+// Auth is handled by the generated dispatch_repo() function via authorize().
+// Each method delegates to the corresponding internal method on RegistryService.
+
+#[async_trait::async_trait(?Send)]
+impl RepoHandler for RegistryService {
+    async fn handle_create_worktree(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, data: &CreateWorktreeRequest,
+    ) -> Result<String> {
+        let path_buf = self.handle_create_worktree(repo_id, &data.path, &data.branch_name).await?;
+        Ok(path_buf.to_string_lossy().to_string())
+    }
+
+    async fn handle_list_worktrees(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str,
+    ) -> Result<Vec<crate::services::generated::registry_client::WorktreeInfo>> {
+        self.handle_list_worktrees(repo_id).await
+    }
+
+    async fn handle_remove_worktree(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, data: &RemoveWorktreeRequest,
+    ) -> Result<()> {
+        self.handle_remove_worktree(repo_id, &data.worktree_path).await
+    }
+
+    async fn handle_create_branch(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, data: &BranchRequest,
+    ) -> Result<()> {
+        let sp = if data.start_point.is_empty() { None } else { Some(data.start_point.as_str()) };
+        self.handle_create_branch(repo_id, &data.branch_name, sp).await
+    }
+
+    async fn handle_list_branches(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str,
+    ) -> Result<Vec<String>> {
+        self.handle_list_branches(repo_id).await
+    }
+
+    async fn handle_checkout(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, data: &CheckoutRequest,
+    ) -> Result<()> {
+        self.handle_checkout(repo_id, &data.ref_name).await
+    }
+
+    async fn handle_stage_all(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str,
+    ) -> Result<()> {
+        self.handle_stage_all(repo_id).await
+    }
+
+    async fn handle_stage_files(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, data: &StageFilesRequest,
+    ) -> Result<()> {
+        self.handle_stage_files(repo_id, data.files.clone()).await
+    }
+
+    async fn handle_commit(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, data: &CommitRequest,
+    ) -> Result<String> {
+        self.handle_commit(repo_id, &data.message).await
+    }
+
+    async fn handle_merge(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, data: &MergeRequest,
+    ) -> Result<()> {
+        let msg = if data.message.is_empty() { None } else { Some(data.message.as_str()) };
+        self.handle_merge(repo_id, &data.source, msg).await?;
+        Ok(())
+    }
+
+    async fn handle_abort_merge(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str,
+    ) -> Result<()> {
+        self.handle_abort_merge(repo_id).await
+    }
+
+    async fn handle_continue_merge(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, data: &ContinueMergeRequest,
+    ) -> Result<()> {
+        let msg = if data.message.is_empty() { None } else { Some(data.message.as_str()) };
+        self.handle_continue_merge(repo_id, msg).await?;
+        Ok(())
+    }
+
+    async fn handle_quit_merge(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str,
+    ) -> Result<()> {
+        self.handle_quit_merge(repo_id).await
+    }
+
+    async fn handle_get_head(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str,
+    ) -> Result<String> {
+        self.handle_get_head(repo_id).await
+    }
+
+    async fn handle_get_ref(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, data: &GetRefRequest,
+    ) -> Result<String> {
+        self.handle_get_ref(repo_id, &data.ref_name).await
+    }
+
+    async fn handle_status(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str,
+    ) -> Result<crate::services::generated::registry_client::RepositoryStatus> {
+        let status = self.handle_status(repo_id).await?;
+        Ok(crate::services::generated::registry_client::RepositoryStatus {
+            branch: status.branch.unwrap_or_default(),
+            head_oid: status.head.map(|h| h.to_string()).unwrap_or_default(),
+            ahead: status.ahead as u32,
+            behind: status.behind as u32,
+            is_clean: status.is_clean,
+            modified_files: status.modified_files.iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect(),
+        })
+    }
+
+    async fn handle_detailed_status(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str,
+    ) -> Result<DetailedStatusInfo> {
+        self.handle_detailed_status(repo_id).await
+    }
+
+    async fn handle_list_remotes(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str,
+    ) -> Result<Vec<RemoteInfo>> {
+        self.handle_list_remotes(repo_id).await
+    }
+
+    async fn handle_add_remote(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, data: &AddRemoteRequest,
+    ) -> Result<()> {
+        self.handle_add_remote(repo_id, &data.name, &data.url).await
+    }
+
+    async fn handle_remove_remote(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, data: &RemoveRemoteRequest,
+    ) -> Result<()> {
+        self.handle_remove_remote(repo_id, &data.name).await
+    }
+
+    async fn handle_set_remote_url(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, data: &SetRemoteUrlRequest,
+    ) -> Result<()> {
+        self.handle_set_remote_url(repo_id, &data.name, &data.url).await
+    }
+
+    async fn handle_rename_remote(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, data: &RenameRemoteRequest,
+    ) -> Result<()> {
+        self.handle_rename_remote(repo_id, &data.old_name, &data.new_name).await
+    }
+
+    async fn handle_push(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, data: &PushRequest,
+    ) -> Result<()> {
+        self.handle_push(repo_id, &data.remote, &data.refspec, data.force).await
+    }
+
+    async fn handle_amend_commit(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, data: &AmendCommitRequest,
+    ) -> Result<String> {
+        self.handle_amend_commit(repo_id, &data.message).await
+    }
+
+    async fn handle_commit_with_author(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, data: &CommitWithAuthorRequest,
+    ) -> Result<String> {
+        self.handle_commit_with_author(repo_id, &data.message, &data.author_name, &data.author_email).await
+    }
+
+    async fn handle_stage_all_including_untracked(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str,
+    ) -> Result<()> {
+        self.handle_stage_all_including_untracked(repo_id).await
+    }
+
+    async fn handle_list_tags(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str,
+    ) -> Result<Vec<String>> {
+        self.handle_list_tags(repo_id).await
+    }
+
+    async fn handle_create_tag(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, data: &CreateTagRequest,
+    ) -> Result<()> {
+        let t = if data.target.is_empty() { None } else { Some(data.target.as_str()) };
+        self.handle_create_tag(repo_id, &data.name, t).await
+    }
+
+    async fn handle_delete_tag(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, data: &DeleteTagRequest,
+    ) -> Result<()> {
+        self.handle_delete_tag(repo_id, &data.name).await
+    }
+
+    async fn handle_update(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, data: &UpdateRequest,
+    ) -> Result<()> {
+        let r = if data.refspec.is_empty() { None } else { Some(data.refspec.as_str()) };
+        self.handle_update(repo_id, r).await
+    }
+}
+
+// ============================================================================
+// Generated WorktreeHandler Implementation (nested scope under RepoHandler)
+// ============================================================================
+
+#[async_trait::async_trait(?Send)]
+impl WorktreeHandler for RegistryService {
+    async fn handle_open(&self, ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str, data: &FsOpenRequest,
+    ) -> Result<FsOpenResponse> {
+        let fd = self.handle_fs_open(
+            ctx, repo_id, name, &data.path,
+            data.read, data.write, data.create,
+            data.truncate, data.append, data.exclusive,
+        ).await?;
+        Ok(FsOpenResponse { fd })
+    }
+
+    async fn handle_close(&self, ctx: &EnvelopeContext, _request_id: u64,
+        _repo_id: &str, _name: &str, data: &FsCloseRequest,
+    ) -> Result<()> {
+        self.handle_fs_close(ctx, data.fd).await?;
+        Ok(())
+    }
+
+    async fn handle_read(&self, ctx: &EnvelopeContext, _request_id: u64,
+        _repo_id: &str, _name: &str, data: &FsReadRequest,
+    ) -> Result<FsReadResponse> {
+        let read_data = self.handle_fs_read(ctx, data.fd, data.length).await?;
+        Ok(FsReadResponse { data: read_data })
+    }
+
+    async fn handle_write(&self, ctx: &EnvelopeContext, _request_id: u64,
+        _repo_id: &str, _name: &str, data: &FsWriteRequest,
+    ) -> Result<FsWriteResponse> {
+        let bytes_written = self.handle_fs_write(ctx, data.fd, &data.data).await?;
+        Ok(FsWriteResponse { bytes_written })
+    }
+
+    async fn handle_pread(&self, ctx: &EnvelopeContext, _request_id: u64,
+        _repo_id: &str, _name: &str, data: &FsPreadRequest,
+    ) -> Result<FsReadResponse> {
+        let read_data = self.handle_fs_pread(ctx, data.fd, data.offset, data.length).await?;
+        Ok(FsReadResponse { data: read_data })
+    }
+
+    async fn handle_pwrite(&self, ctx: &EnvelopeContext, _request_id: u64,
+        _repo_id: &str, _name: &str, data: &FsPwriteRequest,
+    ) -> Result<FsWriteResponse> {
+        let bytes_written = self.handle_fs_pwrite(ctx, data.fd, data.offset, &data.data).await?;
+        Ok(FsWriteResponse { bytes_written })
+    }
+
+    async fn handle_seek(&self, ctx: &EnvelopeContext, _request_id: u64,
+        _repo_id: &str, _name: &str, data: &FsSeekRequest,
+    ) -> Result<FsSeekResponse> {
+        let whence = match data.whence {
+            SeekWhenceEnum::Set => SeekWhence::Set,
+            SeekWhenceEnum::Cur => SeekWhence::Cur,
+            SeekWhenceEnum::End => SeekWhence::End,
+        };
+        let position = self.handle_fs_seek(ctx, data.fd, data.offset, whence).await?;
+        Ok(FsSeekResponse { position })
+    }
+
+    async fn handle_truncate(&self, ctx: &EnvelopeContext, _request_id: u64,
+        _repo_id: &str, _name: &str, data: &FsTruncateRequest,
+    ) -> Result<()> {
+        self.handle_fs_truncate(ctx, data.fd, data.length).await?;
+        Ok(())
+    }
+
+    async fn handle_fsync(&self, ctx: &EnvelopeContext, _request_id: u64,
+        _repo_id: &str, _name: &str, data: &FsSyncRequest,
+    ) -> Result<()> {
+        self.handle_fs_fsync(ctx, data.fd, data.data_only).await?;
+        Ok(())
+    }
+
+    async fn handle_stat(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str, data: &FsPathRequest,
+    ) -> Result<FsStatResponse> {
+        let stat = self.handle_fs_stat(repo_id, name, &data.path).await?;
+        Ok(FsStatResponse {
+            exists: stat.exists,
+            is_dir: stat.is_dir,
+            size: stat.size,
+            modified_at: stat.modified_at,
+        })
+    }
+
+    async fn handle_mkdir(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str, data: &FsMkdirRequest,
+    ) -> Result<()> {
+        self.handle_fs_mkdir(repo_id, name, &data.path, data.recursive).await?;
+        Ok(())
+    }
+
+    async fn handle_remove(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str, data: &FsPathRequest,
+    ) -> Result<()> {
+        self.handle_fs_remove(repo_id, name, &data.path).await?;
+        Ok(())
+    }
+
+    async fn handle_rmdir(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str, data: &FsPathRequest,
+    ) -> Result<()> {
+        self.handle_fs_rmdir(repo_id, name, &data.path).await?;
+        Ok(())
+    }
+
+    async fn handle_rename(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str, data: &FsRenameRequest,
+    ) -> Result<()> {
+        self.handle_fs_rename(repo_id, name, &data.src, &data.dst).await?;
+        Ok(())
+    }
+
+    async fn handle_copy(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str, data: &FsCopyRequest,
+    ) -> Result<()> {
+        self.handle_fs_copy(repo_id, name, &data.src, &data.dst).await?;
+        Ok(())
+    }
+
+    async fn handle_list_dir(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str, data: &FsPathRequest,
+    ) -> Result<Vec<FsDirEntryInfo>> {
+        let entries = self.handle_fs_list_dir(repo_id, name, &data.path).await?;
+        Ok(entries.into_iter().map(|e| FsDirEntryInfo {
+            name: e.name,
+            is_dir: e.is_dir,
+            size: e.size,
+        }).collect())
+    }
+
+    async fn handle_open_stream(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        _repo_id: &str, _name: &str, _data: &FsOpenRequest,
+    ) -> Result<FsStreamInfoResponse> {
+        anyhow::bail!("FS streaming not yet implemented")
+    }
+}
+
+#[async_trait(?Send)]
+impl ZmqService for RegistryService {
+    async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {
+        dispatch_registry(self, ctx, payload).await
     }
 
     fn name(&self) -> &str {
@@ -2595,7 +2193,7 @@ use hyprstream_metrics::checkpoint::manager::{
 };
 
 #[async_trait]
-impl MetricsRegistryClient for RegistryZmq {
+impl MetricsRegistryClient for RegistryZmqClient {
     async fn get_by_name(
         &self,
         name: &str,
@@ -2617,8 +2215,6 @@ impl MetricsRegistryClient for RegistryZmq {
     }
 }
 
-// Type alias for backwards compatibility
-pub type RegistryZmqClient = RegistryZmq;
 
 // ============================================================================
 // Repository-Level Client (Adapter over Generated Client)
@@ -2643,13 +2239,8 @@ impl RepositoryZmqClient {
         signing_key: SigningKey,
         identity: RequestIdentity,
     ) -> Self {
-        use crate::services::core::ZmqClientBase;
-        use crate::zmq::global_context;
-        use hyprstream_rpc::service::factory::ServiceClient;
-        let server_verifying_key = signing_key.verifying_key();
-        let zmq_client = ZmqClientBase::new(&endpoint, global_context(), signing_key, server_verifying_key, identity);
-        let registry_client =
-            crate::services::generated::registry_client::RegistryClient::from_zmq(zmq_client);
+        let registry_client: crate::services::generated::registry_client::RegistryClient =
+            crate::services::core::create_service_client(&endpoint, signing_key, identity);
         let gen = registry_client.repo(&repo_id.to_string());
         Self {
             gen,
@@ -2991,12 +2582,7 @@ impl RepositoryClient for RepositoryZmqClient {
     // ========================================================================
 
     async fn list_remotes(&self) -> Result<Vec<RemoteInfo>, RegistryServiceError> {
-        let remotes = self.gen.list_remotes().await.map_err(Self::transport_err)?;
-        Ok(remotes.into_iter().map(|r| RemoteInfo {
-            name: r.name,
-            url: r.url,
-            push_url: Some(r.push_url),
-        }).collect())
+        self.gen.list_remotes().await.map_err(Self::transport_err)
     }
 
     async fn add_remote(&self, name: &str, url: &str) -> Result<(), RegistryServiceError> {

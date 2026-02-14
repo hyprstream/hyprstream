@@ -64,6 +64,14 @@ pub mod streaming_capnp {
     include!(concat!(env!("OUT_DIR"), "/streaming_capnp.rs"));
 }
 
+pub mod annotations_capnp {
+    #![allow(dead_code, unused_imports)]
+    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
+    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    include!(concat!(env!("OUT_DIR"), "/annotations_capnp.rs"));
+}
+
 pub mod auth;
 pub mod capnp;
 pub mod crypto;
@@ -85,7 +93,7 @@ pub mod prelude {
         // Crypto
         generate_signing_keypair, signing_key_from_bytes, verifying_key_from_bytes,
         ChainedStreamHmac, DefaultKeyExchange, HmacKey, KeyExchange, SharedSecret,
-        SigningKey, StreamHmac, VerifyingKey,
+        SigningKey, VerifyingKey,
         // Envelope
         unwrap_envelope, InMemoryNonceCache, NonceCache, RequestEnvelope, RequestIdentity,
         ResponseEnvelope, SignedEnvelope, Subject, MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
@@ -129,7 +137,7 @@ pub mod socket;
 pub use capnp::{serialize_message, FromCapnp, ToCapnp};
 pub use crypto::{
     generate_signing_keypair, signing_key_from_bytes, verifying_key_from_bytes, ChainedStreamHmac,
-    DefaultKeyExchange, HmacKey, KeyExchange, SharedSecret, SigningKey, StreamHmac, VerifyingKey,
+    DefaultKeyExchange, HmacKey, KeyExchange, SharedSecret, SigningKey, VerifyingKey,
 };
 
 #[cfg(not(feature = "fips"))]
@@ -140,7 +148,7 @@ pub use envelope::{
 };
 pub use error::{EnvelopeError, EnvelopeResult, Result, RpcError};
 pub use hyprstream_rpc_derive::{authorize, register_scopes, service_factory, FromCapnp, ToCapnp};
-pub use service::{EnvelopeContext, RequestLoop, ServiceClient, ServiceHandle, ZmqClient, ZmqService};
+pub use service::{Continuation, EnvelopeContext, RequestLoop, ServiceClient, ServiceHandle, ZmqClient, ZmqService};
 pub use streaming::{
     ChannelProgressReporter, forward_progress_to_stream, progress_channel,
     ProgressUpdate, ResponseStream, StreamChannel, StreamContext, StreamHandle,

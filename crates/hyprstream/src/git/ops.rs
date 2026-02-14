@@ -8,7 +8,7 @@ use anyhow::{anyhow, Result};
 use git2::Repository;
 use std::path::Path;
 
-use crate::services::rpc_types::{DetailedStatusData, FileStatusData};
+use crate::services::generated::registry_client::{DetailedStatusInfo, FileStatusInfo};
 
 // === Commit Operations ===
 
@@ -141,7 +141,7 @@ pub fn delete_tag(repo: &Repository, name: &str) -> Result<()> {
 // === Status ===
 
 /// Detailed status with per-file change info, ahead/behind, merge state
-pub fn detailed_status(repo: &Repository) -> Result<DetailedStatusData> {
+pub fn detailed_status(repo: &Repository) -> Result<DetailedStatusInfo> {
     let repo_path = repo
         .workdir()
         .unwrap_or_else(|| repo.path())
@@ -151,13 +151,15 @@ pub fn detailed_status(repo: &Repository) -> Result<DetailedStatusData> {
     let branch = repo
         .head()
         .ok()
-        .and_then(|h| h.shorthand().map(std::borrow::ToOwned::to_owned));
+        .and_then(|h| h.shorthand().map(std::borrow::ToOwned::to_owned))
+        .unwrap_or_default();
 
     // Get HEAD OID
-    let head = repo
+    let head_oid = repo
         .head()
         .ok()
-        .and_then(|h| h.target().map(|o| o.to_string()));
+        .and_then(|h| h.target().map(|o| o.to_string()))
+        .unwrap_or_default();
 
     // Check for merge/rebase in progress
     let merge_in_progress = repo.find_reference("MERGE_HEAD").is_ok();
@@ -174,40 +176,40 @@ pub fn detailed_status(repo: &Repository) -> Result<DetailedStatusData> {
 
             // Index status
             let index_status = if status.contains(git2::Status::INDEX_NEW) {
-                Some("A".to_owned())
+                "A"
             } else if status.contains(git2::Status::INDEX_MODIFIED) {
-                Some("M".to_owned())
+                "M"
             } else if status.contains(git2::Status::INDEX_DELETED) {
-                Some("D".to_owned())
+                "D"
             } else if status.contains(git2::Status::INDEX_RENAMED) {
-                Some("R".to_owned())
+                "R"
             } else if status.contains(git2::Status::INDEX_TYPECHANGE) {
-                Some("T".to_owned())
+                "T"
             } else {
-                None
+                ""
             };
 
             // Worktree status
             let worktree_status = if status.contains(git2::Status::WT_NEW) {
-                Some("?".to_owned())
+                "?"
             } else if status.contains(git2::Status::WT_MODIFIED) {
-                Some("M".to_owned())
+                "M"
             } else if status.contains(git2::Status::WT_DELETED) {
-                Some("D".to_owned())
+                "D"
             } else if status.contains(git2::Status::WT_RENAMED) {
-                Some("R".to_owned())
+                "R"
             } else if status.contains(git2::Status::WT_TYPECHANGE) {
-                Some("T".to_owned())
+                "T"
             } else if status.contains(git2::Status::CONFLICTED) {
-                Some("U".to_owned())
+                "U"
             } else {
-                None
+                ""
             };
 
-            files.push(FileStatusData {
+            files.push(FileStatusInfo {
                 path: path.to_owned(),
-                index_status,
-                worktree_status,
+                index_status: index_status.to_owned(),
+                worktree_status: worktree_status.to_owned(),
             });
         }
     }
@@ -236,9 +238,9 @@ pub fn detailed_status(repo: &Repository) -> Result<DetailedStatusData> {
         (0, 0)
     };
 
-    Ok(DetailedStatusData {
+    Ok(DetailedStatusInfo {
         branch,
-        head,
+        head_oid,
         merge_in_progress,
         rebase_in_progress,
         files,

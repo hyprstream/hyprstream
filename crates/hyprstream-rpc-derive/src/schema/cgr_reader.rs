@@ -53,6 +53,7 @@ struct NodeInfo {
     /// Index into the CGR nodes list (for re-reading)
     index: u32,
     /// Parent node ID (scope_id)
+    #[allow(dead_code)]
     parent_id: u64,
 }
 
@@ -90,10 +91,13 @@ fn parse_cgr(
         );
     }
 
-    // Find annotation node IDs by display_name (for mcpDescription, paramDescription, mcpScope)
+    // Find annotation node IDs by display_name (for mcpDescription, paramDescription, mcpScope, cliHidden, domainType)
     let mcp_desc_id = find_annotation_id(&nodes, &node_map, "mcpDescription");
     let param_desc_id = find_annotation_id(&nodes, &node_map, "paramDescription");
     let mcp_scope_id = find_annotation_id(&nodes, &node_map, "mcpScope");
+    let cli_hidden_id = find_annotation_id(&nodes, &node_map, "cliHidden");
+    let domain_type_id = find_annotation_id(&nodes, &node_map, "domainType");
+    let fixed_size_id = find_annotation_id(&nodes, &node_map, "fixedSize");
 
     let pascal = to_pascal_case(service_name);
     let request_name = format!("{pascal}Request");
@@ -116,6 +120,7 @@ fn parse_cgr(
         mcp_desc_id,
         param_desc_id,
         mcp_scope_id,
+        cli_hidden_id,
     )?;
     let response_variants = extract_union_variants(
         response_node,
@@ -124,6 +129,7 @@ fn parse_cgr(
         mcp_desc_id,
         param_desc_id,
         mcp_scope_id,
+        cli_hidden_id,
     )?;
 
     if request_variants.is_empty() || response_variants.is_empty() {
@@ -139,10 +145,12 @@ fn parse_cgr(
         service_name,
         mcp_desc_id,
         param_desc_id,
+        domain_type_id,
+        fixed_size_id,
     )?;
 
-    // Extract all enums
-    let enums = extract_all_enums(&nodes, &node_map, service_name)?;
+    // Extract all enums (pass all_structs for imported type resolution)
+    let enums = extract_all_enums(&nodes, &node_map, service_name, &all_structs)?;
 
     // Detect scoped clients (nested union pattern)
     let mut scoped_clients = detect_scoped_clients(
@@ -154,6 +162,7 @@ fn parse_cgr(
         mcp_desc_id,
         param_desc_id,
         mcp_scope_id,
+        cli_hidden_id,
     )?;
 
     // Recursively detect nested scoped clients (3rd level)
@@ -166,6 +175,7 @@ fn parse_cgr(
             mcp_desc_id,
             param_desc_id,
             mcp_scope_id,
+            cli_hidden_id,
         )?;
     }
 
@@ -287,6 +297,106 @@ fn extract_annotation_text(
     String::new()
 }
 
+/// Extract a UInt32 annotation value (e.g., `$fixedSize(32)`).
+fn extract_annotation_u32(
+    annotations: capnp::struct_list::Reader<capnp::schema_capnp::annotation::Owned>,
+    target_id: Option<u64>,
+) -> Option<u32> {
+    let target_id = target_id?;
+    for i in 0..annotations.len() {
+        let ann = annotations.get(i);
+        if ann.get_id() == target_id {
+            if let Ok(value) = ann.get_value() {
+                if let Ok(capnp::schema_capnp::value::Uint32(n)) = value.which() {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract an enum annotation value by resolving the ordinal to a variant name.
+///
+/// For `$mcpScope(write)`, the CGR stores `value::Enum(ordinal)`. We resolve
+/// the annotation's declaration node to find its type (the ScopeAction enum),
+/// then look up the enumerant name by ordinal.
+fn extract_annotation_enum(
+    annotations: capnp::struct_list::Reader<capnp::schema_capnp::annotation::Owned>,
+    target_id: Option<u64>,
+    nodes: &capnp::struct_list::Reader<capnp::schema_capnp::node::Owned>,
+    node_map: &BTreeMap<u64, NodeInfo>,
+) -> String {
+    let target_id = match target_id {
+        Some(id) => id,
+        None => return String::new(),
+    };
+    for i in 0..annotations.len() {
+        let ann = annotations.get(i);
+        if ann.get_id() == target_id {
+            if let Ok(value) = ann.get_value() {
+                if let Ok(capnp::schema_capnp::value::Enum(ordinal)) = value.which() {
+                    // Resolve the annotation declaration node to get the enum type
+                    if let Some(ann_info) = node_map.get(&target_id) {
+                        let ann_node = nodes.get(ann_info.index);
+                        if let Ok(capnp::schema_capnp::node::Annotation(ann_reader)) = ann_node.which() {
+                            if let Ok(type_reader) = ann_reader.get_type() {
+                                if let Ok(capnp::schema_capnp::type_::Enum(enum_type)) = type_reader.which() {
+                                    let enum_type_id = enum_type.get_type_id();
+                                    if let Some(enum_info) = node_map.get(&enum_type_id) {
+                                        let enum_node = nodes.get(enum_info.index);
+                                        if let Ok(capnp::schema_capnp::node::Enum(enum_reader)) = enum_node.which() {
+                                            if let Ok(enumerants) = enum_reader.get_enumerants() {
+                                                // Find enumerant matching ordinal
+                                                for j in 0..enumerants.len() {
+                                                    let enumerant = enumerants.get(j);
+                                                    if enumerant.get_code_order() == ordinal {
+                                                        if let Ok(name) = enumerant.get_name() {
+                                                            if let Ok(s) = name.to_str() {
+                                                                return s.to_string();
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Fallback: also try Text for backward compatibility
+                if let Ok(capnp::schema_capnp::value::Text(text_reader)) = value.which() {
+                    if let Ok(text) = text_reader {
+                        if let Ok(s) = text.to_str() {
+                            return s.to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+/// Check if a Void annotation is present (e.g., $cliHidden).
+fn has_annotation(
+    annotations: capnp::struct_list::Reader<capnp::schema_capnp::annotation::Owned>,
+    target_id: Option<u64>,
+) -> bool {
+    let target_id = match target_id {
+        Some(id) => id,
+        None => return false,
+    };
+    for i in 0..annotations.len() {
+        if annotations.get(i).get_id() == target_id {
+            return true;
+        }
+    }
+    false
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Union variant extraction
 // ─────────────────────────────────────────────────────────────────────────────
@@ -301,8 +411,8 @@ fn extract_union_variants(
     mcp_desc_id: Option<u64>,
     _param_desc_id: Option<u64>,
     mcp_scope_id: Option<u64>,
+    cli_hidden_id: Option<u64>,
 ) -> Result<Vec<UnionVariant>, String> {
-    let _ = nodes; // Available for future use
     let struct_reader = match struct_node.which() {
         Ok(capnp::schema_capnp::node::Struct(s)) => s,
         _ => return Ok(Vec::new()),
@@ -342,9 +452,15 @@ fn extract_union_variants(
 
         let annotations = field.get_annotations().map_err(|e| format!("{e}"))?;
         let description = extract_annotation_text(annotations, mcp_desc_id);
-        let scope = extract_annotation_text(
+        let scope = extract_annotation_enum(
             field.get_annotations().map_err(|e| format!("{e}"))?,
             mcp_scope_id,
+            nodes,
+            node_map,
+        );
+        let cli_hidden = has_annotation(
+            field.get_annotations().map_err(|e| format!("{e}"))?,
+            cli_hidden_id,
         );
 
         variants.push(UnionVariant {
@@ -352,6 +468,7 @@ fn extract_union_variants(
             type_name,
             description,
             scope,
+            cli_hidden,
         });
     }
 
@@ -362,133 +479,297 @@ fn extract_union_variants(
 // Struct extraction
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Extract a single struct definition from a CGR node.
+fn extract_struct_from_node(
+    node: capnp::schema_capnp::node::Reader,
+    info: &NodeInfo,
+    node_map: &BTreeMap<u64, NodeInfo>,
+    mcp_desc_id: Option<u64>,
+    param_desc_id: Option<u64>,
+    domain_type_id: Option<u64>,
+    fixed_size_id: Option<u64>,
+    origin_file: Option<String>,
+) -> Result<Option<StructDef>, String> {
+    let struct_reader = match node.which() {
+        Ok(capnp::schema_capnp::node::Struct(s)) => s,
+        _ => return Ok(None),
+    };
+
+    let domain_type = {
+        let annotations = node.get_annotations().map_err(|e| format!("{e}"))?;
+        let dt = extract_annotation_text(annotations, domain_type_id);
+        if dt.is_empty() { None } else { Some(dt) }
+    };
+
+    let fields_reader = struct_reader.get_fields().map_err(|e| format!("{e}"))?;
+    let mut fields = Vec::new();
+    let mut has_union = false;
+
+    for j in 0..fields_reader.len() {
+        let field = fields_reader.get(j);
+        let disc = field.get_discriminant_value();
+
+        if disc != 0xFFFF {
+            has_union = true;
+            continue;
+        }
+
+        let field_name = field
+            .get_name()
+            .map_err(|e| format!("{e}"))?
+            .to_str()
+            .map_err(|e| format!("{e}"))?
+            .to_string();
+
+        let type_name = match field.which() {
+            Ok(capnp::schema_capnp::field::Slot(slot)) => {
+                let type_reader = slot.get_type().map_err(|e| format!("{e}"))?;
+                resolve_type_name(type_reader, node_map)
+            }
+            Ok(capnp::schema_capnp::field::Group(_)) => "Group".into(),
+            Err(e) => return Err(format!("Field error: {e}")),
+        };
+
+        let description = {
+            let annotations = field.get_annotations().map_err(|e| format!("{e}"))?;
+            let desc = extract_annotation_text(annotations, param_desc_id);
+            if desc.is_empty() {
+                extract_annotation_text(
+                    field.get_annotations().map_err(|e| format!("{e}"))?,
+                    mcp_desc_id,
+                )
+            } else {
+                desc
+            }
+        };
+
+        let fixed_size = extract_annotation_u32(
+            field.get_annotations().map_err(|e| format!("{e}"))?,
+            fixed_size_id,
+        );
+
+        fields.push(FieldDef {
+            name: field_name,
+            type_name,
+            description,
+            fixed_size,
+        });
+    }
+
+    if struct_reader.get_discriminant_count() > 0 {
+        has_union = true;
+    }
+
+    Ok(Some(StructDef {
+        name: info.short_name.clone(),
+        fields,
+        has_union,
+        domain_type,
+        origin_file,
+    }))
+}
+
 /// Extract all struct definitions from the schema (for the given service file).
+///
+/// Two-pass extraction:
+/// 1. First pass: extract local types from this schema file
+/// 2. Second pass: find imported types referenced by variants/fields but not in the local set
 fn extract_all_structs(
     nodes: &capnp::struct_list::Reader<capnp::schema_capnp::node::Owned>,
     node_map: &BTreeMap<u64, NodeInfo>,
     service_name: &str,
     mcp_desc_id: Option<u64>,
     param_desc_id: Option<u64>,
+    domain_type_id: Option<u64>,
+    fixed_size_id: Option<u64>,
 ) -> Result<Vec<StructDef>, String> {
     let file_prefix = format!("{service_name}.capnp:");
     let mut structs = Vec::new();
 
-    // Iterate in node_map order (BTreeMap = deterministic)
+    // Pass 1: extract local types
     for info in node_map.values() {
-        // Only include top-level structs from this schema file
         if !info.display_name.starts_with(&file_prefix) {
             continue;
         }
 
         let node = nodes.get(info.index);
-        if let Ok(capnp::schema_capnp::node::Struct(struct_reader)) = node.which() {
-            let fields_reader = struct_reader.get_fields().map_err(|e| format!("{e}"))?;
-            let mut fields = Vec::new();
-            let mut has_union = false;
+        if let Some(s) = extract_struct_from_node(
+            node, info, node_map, mcp_desc_id, param_desc_id, domain_type_id, fixed_size_id, None,
+        )? {
+            structs.push(s);
+        }
+    }
 
-            for j in 0..fields_reader.len() {
-                let field = fields_reader.get(j);
-                let disc = field.get_discriminant_value();
+    // Pass 2: find imported structs referenced by local types but not yet extracted.
+    // Collect type names from non-union fields of extracted structs...
+    let local_names: std::collections::HashSet<String> =
+        structs.iter().map(|s| s.name.clone()).collect();
+    let mut referenced_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for s in &structs {
+        for f in &s.fields {
+            collect_type_refs(&f.type_name, &mut referenced_names);
+        }
+    }
 
-                if disc != 0xFFFF {
-                    has_union = true;
-                    continue; // Union fields are not scope fields
+    // ...AND from union variant types of all local struct CGR nodes.
+    // extract_struct_from_node only captures non-union fields, so union variant
+    // type references (e.g., `generateStreamResult @4 :StreamInfo`) are missed.
+    // Scan the raw CGR to pick them up.
+    for info in node_map.values() {
+        if !info.display_name.starts_with(&file_prefix) {
+            continue;
+        }
+        let node = nodes.get(info.index);
+        if let Ok(capnp::schema_capnp::node::Struct(s)) = node.which() {
+            if let Ok(fields) = s.get_fields() {
+                for i in 0..fields.len() {
+                    let field = fields.get(i);
+                    if field.get_discriminant_value() != 0xFFFF {
+                        // Union field — resolve its type reference
+                        if let Ok(capnp::schema_capnp::field::Slot(slot)) = field.which() {
+                            if let Ok(type_reader) = slot.get_type() {
+                                let type_name = resolve_type_name(type_reader, node_map);
+                                collect_type_refs(&type_name, &mut referenced_names);
+                            }
+                        }
+                    }
                 }
-
-                // Non-union field = scope field or regular field
-                let field_name = field
-                    .get_name()
-                    .map_err(|e| format!("{e}"))?
-                    .to_str()
-                    .map_err(|e| format!("{e}"))?
-                    .to_string();
-
-                let type_name = match field.which() {
-                    Ok(capnp::schema_capnp::field::Slot(slot)) => {
-                        let type_reader = slot.get_type().map_err(|e| format!("{e}"))?;
-                        resolve_type_name(type_reader, node_map)
-                    }
-                    Ok(capnp::schema_capnp::field::Group(_)) => "Group".into(),
-                    Err(e) => return Err(format!("Field error: {e}")),
-                };
-
-                // Use paramDescription for field descriptions, fall back to mcpDescription
-                let description = {
-                    let annotations = field.get_annotations().map_err(|e| format!("{e}"))?;
-                    let desc = extract_annotation_text(annotations, param_desc_id);
-                    if desc.is_empty() {
-                        extract_annotation_text(
-                            field.get_annotations().map_err(|e| format!("{e}"))?,
-                            mcp_desc_id,
-                        )
-                    } else {
-                        desc
-                    }
-                };
-
-                fields.push(FieldDef {
-                    name: field_name,
-                    type_name,
-                    description,
-                });
             }
+        }
+    }
 
-            // Also check if there are union fields even if we haven't seen one yet
-            // (the discriminant count tells us)
-            if struct_reader.get_discriminant_count() > 0 {
-                has_union = true;
+    // For each referenced type not in the local set, look it up in node_map
+    for ref_name in &referenced_names {
+        if local_names.contains(ref_name) || is_primitive_type(ref_name) {
+            continue;
+        }
+        // Find the node by short_name
+        if let Some(info) = node_map.values().find(|n| n.short_name == *ref_name) {
+            // Only extract if it's from a different file
+            if !info.display_name.starts_with(&file_prefix) {
+                let origin = extract_file_stem(&info.display_name);
+                let node = nodes.get(info.index);
+                if let Some(s) = extract_struct_from_node(
+                    node, info, node_map, mcp_desc_id, param_desc_id, domain_type_id,
+                    fixed_size_id, Some(origin),
+                )? {
+                    structs.push(s);
+                }
             }
-
-            structs.push(StructDef {
-                name: info.short_name.clone(),
-                fields,
-                has_union,
-            });
         }
     }
 
     Ok(structs)
 }
 
+/// Extract file stem from a CGR display_name (e.g., "streaming.capnp:StreamInfo" → "streaming").
+fn extract_file_stem(display_name: &str) -> String {
+    display_name
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .strip_suffix(".capnp")
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Collect struct/enum type references from a capnp type name string.
+fn collect_type_refs(type_name: &str, refs: &mut std::collections::HashSet<String>) {
+    if let Some(inner) = type_name.strip_prefix("List(").and_then(|s| s.strip_suffix(')')) {
+        collect_type_refs(inner, refs);
+    } else if !is_primitive_type(type_name) {
+        refs.insert(type_name.to_string());
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Enum extraction
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Extract a single enum definition from a CGR node.
+fn extract_enum_from_node(
+    node: capnp::schema_capnp::node::Reader,
+    info: &NodeInfo,
+    origin_file: Option<String>,
+) -> Result<Option<EnumDef>, String> {
+    let enum_reader = match node.which() {
+        Ok(capnp::schema_capnp::node::Enum(e)) => e,
+        _ => return Ok(None),
+    };
+
+    let enumerants = enum_reader.get_enumerants().map_err(|e| format!("{e}"))?;
+    let mut variants = Vec::new();
+
+    for j in 0..enumerants.len() {
+        let enumerant = enumerants.get(j);
+        let variant_name = enumerant
+            .get_name()
+            .map_err(|e| format!("{e}"))?
+            .to_str()
+            .map_err(|e| format!("{e}"))?
+            .to_string();
+        let code_order = enumerant.get_code_order() as u32;
+        variants.push((variant_name, code_order));
+    }
+
+    Ok(Some(EnumDef {
+        name: info.short_name.clone(),
+        variants,
+        origin_file,
+    }))
+}
+
 /// Extract all enum definitions from the schema.
+///
+/// Two-pass extraction (same strategy as extract_all_structs):
+/// 1. Local enums from this schema file
+/// 2. Imported enums referenced by local struct fields
 fn extract_all_enums(
     nodes: &capnp::struct_list::Reader<capnp::schema_capnp::node::Owned>,
     node_map: &BTreeMap<u64, NodeInfo>,
     service_name: &str,
+    all_structs: &[StructDef],
 ) -> Result<Vec<EnumDef>, String> {
     let file_prefix = format!("{service_name}.capnp:");
     let mut enums = Vec::new();
 
+    // Pass 1: local enums
     for info in node_map.values() {
         if !info.display_name.starts_with(&file_prefix) {
             continue;
         }
 
         let node = nodes.get(info.index);
-        if let Ok(capnp::schema_capnp::node::Enum(enum_reader)) = node.which() {
-            let enumerants = enum_reader.get_enumerants().map_err(|e| format!("{e}"))?;
-            let mut variants = Vec::new();
+        if let Some(e) = extract_enum_from_node(node, info, None)? {
+            enums.push(e);
+        }
+    }
 
-            for j in 0..enumerants.len() {
-                let enumerant = enumerants.get(j);
-                let variant_name = enumerant
-                    .get_name()
-                    .map_err(|e| format!("{e}"))?
-                    .to_str()
-                    .map_err(|e| format!("{e}"))?
-                    .to_string();
-                let code_order = enumerant.get_code_order() as u32;
-                variants.push((variant_name, code_order));
+    // Pass 2: imported enums referenced by local struct fields
+    let local_enum_names: std::collections::HashSet<String> =
+        enums.iter().map(|e| e.name.clone()).collect();
+    let local_struct_names: std::collections::HashSet<String> =
+        all_structs.iter().map(|s| s.name.clone()).collect();
+
+    let mut referenced_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for s in all_structs {
+        for f in &s.fields {
+            collect_type_refs(&f.type_name, &mut referenced_names);
+        }
+    }
+
+    for ref_name in &referenced_names {
+        if local_enum_names.contains(ref_name) || local_struct_names.contains(ref_name) || is_primitive_type(ref_name) {
+            continue;
+        }
+        if let Some(info) = node_map.values().find(|n| n.short_name == *ref_name) {
+            if !info.display_name.starts_with(&file_prefix) {
+                let origin = extract_file_stem(&info.display_name);
+                let node = nodes.get(info.index);
+                if let Some(e) = extract_enum_from_node(node, info, Some(origin))? {
+                    enums.push(e);
+                }
             }
-
-            enums.push(EnumDef {
-                name: info.short_name.clone(),
-                variants,
-            });
         }
     }
 
@@ -513,6 +794,7 @@ fn detect_scoped_clients(
     mcp_desc_id: Option<u64>,
     param_desc_id: Option<u64>,
     mcp_scope_id: Option<u64>,
+    cli_hidden_id: Option<u64>,
 ) -> Result<Vec<ScopedClient>, String> {
     let mut scoped = Vec::new();
 
@@ -528,8 +810,10 @@ fn detect_scoped_clients(
             None => continue,
         };
 
-        // Scoped client pattern: struct has union AND non-union scope fields
-        if !inner_struct.has_union || inner_struct.fields.is_empty() {
+        // Scoped client pattern: struct has union (with or without scope fields).
+        // Union-only structs (no scope fields) produce scoped clients with empty scope_fields,
+        // used for resource-oriented dispatch (e.g., worker sandbox/container/image scopes).
+        if !inner_struct.has_union {
             continue;
         }
 
@@ -550,7 +834,7 @@ fn detect_scoped_clients(
         };
         let inner_node = nodes.get(node_map[&inner_node_id].index);
         let inner_req_variants =
-            extract_union_variants(inner_node, nodes, node_map, mcp_desc_id, param_desc_id, mcp_scope_id)?;
+            extract_union_variants(inner_node, nodes, node_map, mcp_desc_id, param_desc_id, mcp_scope_id, cli_hidden_id)?;
 
         // Extract inner union variants from the response struct
         let resp_node_id = match find_struct_node_id(node_map, &resp_variant.type_name) {
@@ -559,7 +843,7 @@ fn detect_scoped_clients(
         };
         let resp_node = nodes.get(node_map[&resp_node_id].index);
         let inner_resp_variants =
-            extract_union_variants(resp_node, nodes, node_map, mcp_desc_id, param_desc_id, mcp_scope_id)?;
+            extract_union_variants(resp_node, nodes, node_map, mcp_desc_id, param_desc_id, mcp_scope_id, cli_hidden_id)?;
 
         if inner_req_variants.is_empty() || inner_resp_variants.is_empty() {
             continue;
@@ -600,6 +884,7 @@ fn detect_nested_scoped_clients_cgr(
     mcp_desc_id: Option<u64>,
     param_desc_id: Option<u64>,
     mcp_scope_id: Option<u64>,
+    cli_hidden_id: Option<u64>,
 ) -> Result<(), String> {
     let mut nested = Vec::new();
     let mut nested_factory_names = Vec::new();
@@ -634,7 +919,7 @@ fn detect_nested_scoped_clients_cgr(
         };
         let inner_node = nodes.get(node_map[&inner_node_id].index);
         let inner_req_variants =
-            extract_union_variants(inner_node, nodes, node_map, mcp_desc_id, param_desc_id, mcp_scope_id)?;
+            extract_union_variants(inner_node, nodes, node_map, mcp_desc_id, param_desc_id, mcp_scope_id, cli_hidden_id)?;
 
         let resp_node_id = match find_struct_node_id(node_map, &resp_variant.type_name) {
             Some(id) => id,
@@ -642,7 +927,7 @@ fn detect_nested_scoped_clients_cgr(
         };
         let resp_node = nodes.get(node_map[&resp_node_id].index);
         let inner_resp_variants =
-            extract_union_variants(resp_node, nodes, node_map, mcp_desc_id, param_desc_id, mcp_scope_id)?;
+            extract_union_variants(resp_node, nodes, node_map, mcp_desc_id, param_desc_id, mcp_scope_id, cli_hidden_id)?;
 
         if inner_req_variants.is_empty() || inner_resp_variants.is_empty() {
             continue;

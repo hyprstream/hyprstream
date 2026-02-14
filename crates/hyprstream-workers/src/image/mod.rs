@@ -34,9 +34,10 @@ mod client;
 mod manifest;
 mod store;
 
-pub use client::{
-    AuthConfig, FilesystemIdentifier, FilesystemUsage, Image, ImageFilter, ImageClient,
-    ImageSpec, ImageStatusResponse, ImageZmq,
+pub use client::ImageClient;
+pub use crate::generated::worker_client::{
+    ImageSpec, ImageInfo, ImageStatusResult,
+    AuthConfig, FilesystemUsage, FilesystemIdentifier,
 };
 pub use manifest::{ImageReference, ManifestFetcher, ManifestResult, OciManifest};
 pub use store::{GcStats, ImageMetadata, RafsStore};

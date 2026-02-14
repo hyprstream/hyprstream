@@ -1,4 +1,4 @@
-//! Data struct and enum type generation.
+//! Data struct and enum type generation with ToCapnp/FromCapnp trait impls.
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -7,8 +7,26 @@ use crate::schema::collect_list_struct_types;
 use crate::schema::types::*;
 use crate::util::*;
 
-/// Generate Rust data structs for structs used in List() and response contexts, and enum types.
-pub fn generate_data_structs(schema: &ParsedSchema) -> TokenStream {
+/// Resolve the capnp module path for a type based on its origin file.
+fn resolve_capnp_mod(
+    origin_file: Option<&str>,
+    service_name: &str,
+    types_crate: Option<&syn::Path>,
+) -> TokenStream {
+    let mod_name = origin_file.unwrap_or(service_name);
+    let capnp_mod_ident = format_ident!("{}_capnp", mod_name);
+    match types_crate {
+        Some(tc) => quote! { #tc::#capnp_mod_ident },
+        None => quote! { crate::#capnp_mod_ident },
+    }
+}
+
+/// Generate Rust data structs with ToCapnp/FromCapnp impls, and enum types.
+pub fn generate_data_structs(
+    schema: &ParsedSchema,
+    service_name: &str,
+    types_crate: Option<&syn::Path>,
+) -> TokenStream {
     let mut tokens = TokenStream::new();
 
     // Generate enum types
@@ -16,11 +34,18 @@ pub fn generate_data_structs(schema: &ParsedSchema) -> TokenStream {
         tokens.extend(generate_enum_type(e));
     }
 
-    // Generate data structs
+    // Generate data structs with trait impls
     let list_struct_types = collect_list_struct_types(schema);
     for type_name in &list_struct_types {
         if let Some(s) = schema.structs.iter().find(|s| s.name == *type_name) {
+            let capnp_mod = resolve_capnp_mod(
+                s.origin_file.as_deref(),
+                service_name,
+                types_crate,
+            );
             tokens.extend(generate_data_struct(type_name, s, &schema.enums, &schema.structs));
+            tokens.extend(generate_to_capnp_impl(type_name, s, &schema.enums, &schema.structs, &capnp_mod, service_name, types_crate));
+            tokens.extend(generate_from_capnp_impl(type_name, s, &schema.enums, &schema.structs, &capnp_mod, service_name, types_crate));
         }
     }
 
@@ -47,7 +72,7 @@ fn generate_enum_type(e: &EnumDef) -> TokenStream {
 
     quote! {
         #[doc = #doc]
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
         pub enum #enum_name {
             #(#variants,)*
         }
@@ -60,7 +85,7 @@ fn generate_data_struct(
     enums: &[EnumDef],
     structs: &[StructDef],
 ) -> TokenStream {
-    let data_name = format_ident!("{}Data", type_name);
+    let data_name = format_ident!("{}", type_name);
     let doc = format!("Generated from Cap'n Proto struct {type_name}");
 
     let fields: Vec<TokenStream> = s
@@ -68,17 +93,313 @@ fn generate_data_struct(
         .iter()
         .map(|field| {
             let rust_name = format_ident!("{}", to_snake_case(&field.name));
-            let rust_type =
-                rust_type_tokens(&CapnpType::classify(&field.type_name, structs, enums).rust_owned_type());
+            let rust_type = if field.type_name == "Data" && field.fixed_size.is_some() {
+                let n = field.fixed_size.unwrap() as usize;
+                let ts: TokenStream = format!("[u8; {n}]").parse().unwrap();
+                ts
+            } else {
+                rust_type_tokens(&CapnpType::classify(&field.type_name, structs, enums).rust_owned_type())
+            };
             quote! { pub #rust_name: #rust_type }
         })
         .collect();
 
     quote! {
         #[doc = #doc]
-        #[derive(Debug, Clone, serde::Serialize)]
+        #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
         pub struct #data_name {
             #(#fields,)*
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ToCapnp impl generation
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn generate_to_capnp_impl(
+    type_name: &str,
+    s: &StructDef,
+    enums: &[EnumDef],
+    structs: &[StructDef],
+    capnp_mod: &TokenStream,
+    service_name: &str,
+    types_crate: Option<&syn::Path>,
+) -> TokenStream {
+    let data_name = format_ident!("{}", type_name);
+    let capnp_struct = format_ident!("{}", to_capnp_module_name(type_name));
+
+    let field_setters: Vec<TokenStream> = s.fields.iter().map(|field| {
+        generate_data_field_setter(field, enums, structs, service_name, types_crate)
+    }).collect();
+
+    quote! {
+        impl hyprstream_rpc::capnp::ToCapnp for #data_name {
+            type Builder<'a> = #capnp_mod::#capnp_struct::Builder<'a>;
+
+            #[allow(unused_variables, unused_mut)]
+            fn write_to(&self, builder: &mut Self::Builder<'_>) {
+                #(#field_setters)*
+            }
+        }
+    }
+}
+
+/// Look up a referenced type's origin_file from the structs/enums lists.
+fn lookup_origin_file<'a>(
+    type_name: &str,
+    structs: &'a [StructDef],
+    enums: &'a [EnumDef],
+) -> Option<&'a str> {
+    if let Some(s) = structs.iter().find(|s| s.name == type_name) {
+        return s.origin_file.as_deref();
+    }
+    if let Some(e) = enums.iter().find(|e| e.name == type_name) {
+        return e.origin_file.as_deref();
+    }
+    None
+}
+
+fn generate_data_field_setter(
+    field: &FieldDef,
+    enums: &[EnumDef],
+    structs: &[StructDef],
+    service_name: &str,
+    types_crate: Option<&syn::Path>,
+) -> TokenStream {
+    let rust_name = format_ident!("{}", to_snake_case(&field.name));
+    let field_snake = to_snake_case(&field.name);
+    let setter_name = format_ident!("set_{}", &field_snake);
+    let ct = CapnpType::classify(&field.type_name, structs, enums);
+
+    match ct {
+        CapnpType::Void => TokenStream::new(),
+        CapnpType::Text | CapnpType::Data => {
+            quote! { builder.#setter_name(&self.#rust_name); }
+        }
+        CapnpType::Bool | CapnpType::UInt8 | CapnpType::UInt16 | CapnpType::UInt32 | CapnpType::UInt64
+        | CapnpType::Int8 | CapnpType::Int16 | CapnpType::Int32 | CapnpType::Int64
+        | CapnpType::Float32 | CapnpType::Float64 => {
+            quote! { builder.#setter_name(self.#rust_name); }
+        }
+        CapnpType::Enum(ref name) => {
+            if let Some(e) = enums.iter().find(|e| e.name == *name) {
+                let field_capnp_mod = resolve_capnp_mod(
+                    lookup_origin_file(name, structs, enums),
+                    service_name,
+                    types_crate,
+                );
+                let enum_rust_name = format_ident!("{}Enum", name);
+                let type_ident = format_ident!("{}", name);
+                let match_arms: Vec<TokenStream> = e.variants.iter().map(|(vname, _)| {
+                    let v_pascal = format_ident!("{}", to_pascal_case(vname));
+                    quote! { #enum_rust_name::#v_pascal => #field_capnp_mod::#type_ident::#v_pascal }
+                }).collect();
+                quote! {
+                    builder.#setter_name(match self.#rust_name {
+                        #(#match_arms,)*
+                    });
+                }
+            } else {
+                TokenStream::new()
+            }
+        }
+        CapnpType::Struct(_) => {
+            let init_name = format_ident!("init_{}", &field_snake);
+            quote! {
+                hyprstream_rpc::capnp::ToCapnp::write_to(&self.#rust_name, &mut builder.reborrow().#init_name());
+            }
+        }
+        CapnpType::ListText => {
+            let init_name = format_ident!("init_{}", &field_snake);
+            quote! {
+                {
+                    let mut list = builder.reborrow().#init_name(self.#rust_name.len() as u32);
+                    for (i, item) in self.#rust_name.iter().enumerate() {
+                        list.set(i as u32, item.as_str());
+                    }
+                }
+            }
+        }
+        CapnpType::ListData => {
+            let init_name = format_ident!("init_{}", &field_snake);
+            quote! {
+                {
+                    let mut list = builder.reborrow().#init_name(self.#rust_name.len() as u32);
+                    for (i, item) in self.#rust_name.iter().enumerate() {
+                        list.set(i as u32, item.as_slice());
+                    }
+                }
+            }
+        }
+        CapnpType::ListPrimitive(_) => {
+            let init_name = format_ident!("init_{}", &field_snake);
+            quote! {
+                {
+                    let mut list = builder.reborrow().#init_name(self.#rust_name.len() as u32);
+                    for (i, item) in self.#rust_name.iter().enumerate() {
+                        list.set(i as u32, *item);
+                    }
+                }
+            }
+        }
+        CapnpType::ListStruct(_) => {
+            let init_name = format_ident!("init_{}", &field_snake);
+            quote! {
+                {
+                    let mut list = builder.reborrow().#init_name(self.#rust_name.len() as u32);
+                    for (i, item) in self.#rust_name.iter().enumerate() {
+                        hyprstream_rpc::capnp::ToCapnp::write_to(item, &mut list.reborrow().get(i as u32));
+                    }
+                }
+            }
+        }
+        _ => TokenStream::new(),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FromCapnp impl generation
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn generate_from_capnp_impl(
+    type_name: &str,
+    s: &StructDef,
+    enums: &[EnumDef],
+    structs: &[StructDef],
+    capnp_mod: &TokenStream,
+    service_name: &str,
+    types_crate: Option<&syn::Path>,
+) -> TokenStream {
+    let data_name = format_ident!("{}", type_name);
+    let capnp_struct = format_ident!("{}", to_capnp_module_name(type_name));
+
+    let field_readers: Vec<TokenStream> = s.fields.iter().map(|field| {
+        generate_data_field_reader(field, enums, structs, service_name, types_crate)
+    }).collect();
+
+    quote! {
+        impl hyprstream_rpc::capnp::FromCapnp for #data_name {
+            type Reader<'a> = #capnp_mod::#capnp_struct::Reader<'a>;
+
+            #[allow(unused_variables)]
+            fn read_from(reader: Self::Reader<'_>) -> anyhow::Result<Self> {
+                Ok(Self {
+                    #(#field_readers)*
+                })
+            }
+        }
+    }
+}
+
+fn generate_data_field_reader(
+    field: &FieldDef,
+    enums: &[EnumDef],
+    structs: &[StructDef],
+    service_name: &str,
+    types_crate: Option<&syn::Path>,
+) -> TokenStream {
+    let rust_name = format_ident!("{}", to_snake_case(&field.name));
+    let getter_name = format_ident!("get_{}", to_snake_case(&field.name));
+    let ct = CapnpType::classify(&field.type_name, structs, enums);
+
+    match ct {
+        CapnpType::Void => quote! { #rust_name: (), },
+        CapnpType::Text => quote! { #rust_name: reader.#getter_name()?.to_str()?.to_string(), },
+        CapnpType::Data if field.fixed_size.is_some() => {
+            let n = field.fixed_size.unwrap() as usize;
+            let n_lit = proc_macro2::Literal::usize_unsuffixed(n);
+            let field_name_str = field.name.as_str();
+            quote! {
+                #rust_name: {
+                    let data = reader.#getter_name()?;
+                    if data.len() != #n_lit {
+                        anyhow::bail!(
+                            "{}: expected {} bytes, got {}",
+                            #field_name_str, #n_lit, data.len()
+                        );
+                    }
+                    let mut arr = [0u8; #n_lit];
+                    arr.copy_from_slice(data);
+                    arr
+                },
+            }
+        }
+        CapnpType::Data => quote! { #rust_name: reader.#getter_name()?.to_vec(), },
+        CapnpType::Bool | CapnpType::UInt8 | CapnpType::UInt16 | CapnpType::UInt32 | CapnpType::UInt64
+        | CapnpType::Int8 | CapnpType::Int16 | CapnpType::Int32 | CapnpType::Int64
+        | CapnpType::Float32 | CapnpType::Float64 => {
+            quote! { #rust_name: reader.#getter_name(), }
+        }
+        CapnpType::Enum(ref name) => {
+            if let Some(e) = enums.iter().find(|e| e.name == *name) {
+                let field_capnp_mod = resolve_capnp_mod(
+                    lookup_origin_file(name, structs, enums),
+                    service_name,
+                    types_crate,
+                );
+                let enum_rust_name = format_ident!("{}Enum", name);
+                let type_ident = format_ident!("{}", name);
+                let match_arms: Vec<TokenStream> = e.variants.iter().map(|(vname, _)| {
+                    let v_pascal = format_ident!("{}", to_pascal_case(vname));
+                    quote! { #field_capnp_mod::#type_ident::#v_pascal => #enum_rust_name::#v_pascal }
+                }).collect();
+                quote! {
+                    #rust_name: match reader.#getter_name()? {
+                        #(#match_arms,)*
+                        _ => Default::default(),
+                    },
+                }
+            } else {
+                quote! { #rust_name: Default::default(), }
+            }
+        }
+        CapnpType::Struct(_) => {
+            quote! {
+                #rust_name: hyprstream_rpc::capnp::FromCapnp::read_from(reader.#getter_name()?)?,
+            }
+        }
+        CapnpType::ListText => {
+            quote! {
+                #rust_name: {
+                    let list = reader.#getter_name()?;
+                    let mut result = Vec::with_capacity(list.len() as usize);
+                    for i in 0..list.len() {
+                        result.push(list.get(i)?.to_str()?.to_string());
+                    }
+                    result
+                },
+            }
+        }
+        CapnpType::ListData => {
+            quote! {
+                #rust_name: {
+                    let list = reader.#getter_name()?;
+                    let mut result = Vec::with_capacity(list.len() as usize);
+                    for i in 0..list.len() {
+                        result.push(list.get(i)?.to_vec());
+                    }
+                    result
+                },
+            }
+        }
+        CapnpType::ListPrimitive(_) => {
+            quote! {
+                #rust_name: reader.#getter_name()?.iter().collect(),
+            }
+        }
+        CapnpType::ListStruct(_) => {
+            quote! {
+                #rust_name: {
+                    let list = reader.#getter_name()?;
+                    let mut result = Vec::with_capacity(list.len() as usize);
+                    for i in 0..list.len() {
+                        result.push(hyprstream_rpc::capnp::FromCapnp::read_from(list.get(i))?);
+                    }
+                    result
+                },
+            }
+        }
+        _ => quote! { #rust_name: Default::default(), },
     }
 }

@@ -1,5 +1,7 @@
 @0xa8c9e2f1d3b5a7c0;
 
+using import "/streaming.capnp".StreamInfo;
+
 # Cap'n Proto schema for inference service
 #
 # The inference service uses REQ/REP pattern for request handling.
@@ -7,8 +9,8 @@
 #
 # Streaming Architecture:
 #   - Wire format types are in hyprstream-rpc/schema/streaming.capnp
-#   - This file defines inference-specific payload types
-#   - InferencePayload gets serialized into streaming.capnp::StreamBlock.payloads
+#   - Streaming payloads use generic StreamPayload (data/complete/error/heartbeat)
+#   - Completion metadata serialized as JSON InferenceComplete (see rpc_types.rs)
 
 struct InferenceRequest {
   # Request ID for tracking
@@ -38,27 +40,22 @@ struct InferenceRequest {
     healthCheck @14 :Void;
     shutdown @15 :Void;
 
-    # Stream authorization handshake
-    # Client calls this after generateStream to authorize subscription
-    # Future: will include client public key for DH key exchange
-    startStream @16 :StartStreamRequest;
-
     # Training loop control — tenant-aware TTT (identity from auth envelope)
-    commitAdaptation @17 :Void;
-    rollbackAdaptation @18 :Void;
-    trainStep @19 :TrainStepRequest;
-    resetDelta @20 :Void;
+    commitAdaptation @16 :Void;
+    rollbackAdaptation @17 :Void;
+    trainStep @18 :TrainStepRequest;
+    resetDelta @19 :Void;
 
     # Persistence operations (identity from auth envelope)
-    getDeltaStatus @21 :Void;
-    saveAdaptation @22 :SaveAdaptationRequest;
-    snapshotDelta @23 :Void;
+    getDeltaStatus @20 :Void;
+    saveAdaptation @21 :SaveAdaptationRequest;
+    snapshotDelta @22 :Void;
 
     # Streaming training (returns immediately, results via PUB/SUB)
-    trainStepStream @24 :TrainStepRequest;
+    trainStepStream @23 :TrainStepRequest;
 
     # Export delta as PEFT adapter directory (identity from auth envelope)
-    exportPeftAdapter @25 :ExportPeftRequest;
+    exportPeftAdapter @24 :ExportPeftRequest;
   }
 }
 
@@ -86,25 +83,22 @@ struct InferenceResponse {
     releaseSessionResult @15 :Void;
     healthCheckResult @16 :HealthStatus;
 
-    # Stream authorization response
-    startStreamResult @17 :StreamAuthResponse;
-
     # Training loop control responses
-    commitAdaptationResult @18 :Void;
-    rollbackAdaptationResult @19 :Void;
-    trainStepResult @20 :TrainStepResult;
-    resetDeltaResult @21 :Void;
+    commitAdaptationResult @17 :Void;
+    rollbackAdaptationResult @18 :Void;
+    trainStepResult @19 :TrainStepResult;
+    resetDeltaResult @20 :Void;
 
     # Persistence responses
-    getDeltaStatusResult @22 :DeltaStatusResult;
-    saveAdaptationResult @23 :SaveAdaptationResult;
-    snapshotDeltaResult @24 :SnapshotDeltaResult;
+    getDeltaStatusResult @21 :DeltaStatusResult;
+    saveAdaptationResult @22 :SaveAdaptationResult;
+    snapshotDeltaResult @23 :SnapshotDeltaResult;
 
     # Streaming training response
-    trainStepStreamResult @25 :StreamInfo;
+    trainStepStreamResult @24 :StreamInfo;
 
     # Export PEFT adapter response
-    exportPeftAdapterResult @26 :ExportPeftResult;
+    exportPeftAdapterResult @25 :ExportPeftResult;
   }
 }
 
@@ -192,84 +186,12 @@ enum FinishReason {
 }
 
 # =============================================================================
-# Stream Setup (aligns with streaming.capnp::StreamInfo)
+# Legacy types removed:
+#   - InferencePayload: Replaced by generic StreamPayload (streaming.capnp)
+#   - InferenceComplete (capnp): The Rust/JSON version in rpc_types.rs is the
+#     actual wire format, serialized into StreamPayload::Complete as JSON bytes.
+#   - InferenceStats: Legacy, was replaced by InferenceComplete.
 # =============================================================================
-
-# Response when starting a stream - contains info needed to subscribe
-# Note: Matches streaming.capnp::StreamInfo for consistency
-struct StreamInfo {
-  streamId @0 :Text;
-  endpoint @1 :Text;
-  serverPubkey @2 :Data;  # Server's ephemeral Ristretto255 public key (32 bytes) for DH
-}
-
-# Stream authorization handshake
-# Note: Matches streaming.capnp::StartStreamRequest/StreamAuthResponse
-
-struct StartStreamRequest {
-  streamId @0 :Text;
-  clientPubkey @1 :Data;  # Client's ephemeral Ristretto255 public key (32 bytes)
-}
-
-struct StreamAuthResponse {
-  streamId @0 :Text;
-  serverPubkey @1 :Data;  # Server's ephemeral Ristretto255 public key (if not in StreamInfo)
-}
-
-# =============================================================================
-# Inference Payload (serialized into streaming.capnp::StreamBlock.payloads)
-# =============================================================================
-
-# The actual inference payload - gets serialized into wire format StreamBlock.payloads
-# This is the application-layer content, not the wire format.
-struct InferencePayload {
-  streamId @0 :Text;
-
-  union {
-    token @1 :Text;                   # Generated token text
-    complete @2 :InferenceStats;      # Generation complete with stats
-    error @3 :ErrorInfo;              # Error during generation
-  }
-}
-
-# Inference-specific completion statistics
-#
-# Serialized into StreamPayload.complete (streaming.capnp) as raw bytes.
-# Contains full generation metrics including prefill and inference breakdown.
-struct InferenceComplete {
-  # Overall metrics
-  tokensGenerated @0 :UInt32;
-  finishReason @1 :Text;          # "stop", "length", "eos", "error"
-  generationTimeMs @2 :UInt64;
-  tokensPerSecond @3 :Float32;
-
-  # Prefill metrics (processing the prompt)
-  prefillTokens @4 :UInt32;
-  prefillTimeMs @5 :UInt64;
-  prefillTokensPerSec @6 :Float32;
-
-  # Inference metrics (generating new tokens, excluding prefill)
-  inferenceTokens @7 :UInt32;
-  inferenceTimeMs @8 :UInt64;
-  inferenceTokensPerSec @9 :Float32;
-  inferenceTokensPerSecEma @10 :Float32;  # EMA for adaptive batching
-
-  # Optional quality metrics (0.0 means not set)
-  perplexity @11 :Float32;
-  avgEntropy @12 :Float32;
-
-  # Online training metrics in streaming completion
-  onlineTrainingMetrics @13 :OnlineTrainingMetrics;
-}
-
-# Legacy inference stats (kept for backwards compatibility)
-struct InferenceStats {
-  tokensGenerated @0 :UInt32;
-  finishReason @1 :FinishReason;
-  generationTimeMs @2 :UInt64;
-  tokensPerSecond @3 :Float32;
-  qualityMetrics @4 :QualityMetrics;  # Inference-specific quality metrics
-}
 
 # Chat Template
 

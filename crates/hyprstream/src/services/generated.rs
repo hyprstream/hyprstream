@@ -7,13 +7,13 @@
 pub mod model_client {
     #![allow(dead_code, unused_imports, unused_variables)]
     #![allow(clippy::all)]
-    hyprstream_rpc_derive::generate_rpc_service!("model");
+    hyprstream_rpc_derive::generate_rpc_service!("model", scope_handlers);
 }
 
 pub mod registry_client {
     #![allow(dead_code, unused_imports, unused_variables)]
     #![allow(clippy::all)]
-    hyprstream_rpc_derive::generate_rpc_service!("registry");
+    hyprstream_rpc_derive::generate_rpc_service!("registry", scope_handlers);
 }
 
 pub mod policy_client {
@@ -25,11 +25,14 @@ pub mod policy_client {
 pub mod inference_client {
     #![allow(dead_code, unused_imports, unused_variables)]
     #![allow(clippy::all)]
-    hyprstream_rpc_derive::generate_rpc_service!("inference");
+    hyprstream_rpc_derive::generate_rpc_service!("inference", scope_handlers);
 }
 
-pub mod mcp_client_gen {
+pub mod mcp_client {
     #![allow(dead_code, unused_imports, unused_variables)]
     #![allow(clippy::all)]
     hyprstream_rpc_derive::generate_rpc_service!("mcp");
 }
+
+// worker_client — use hyprstream_workers::generated::worker_client instead.
+// workflow_client — use hyprstream_workers::generated::workflow_client instead.
