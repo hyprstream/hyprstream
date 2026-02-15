@@ -401,9 +401,8 @@ pub async fn handle_list(
     }
 
     // Get current user for permission checks (OS user for CLI)
-    let current_user = users::get_current_username()
-        .map(|u| u.to_string_lossy().to_string())
-        .unwrap_or_else(|| "anonymous".to_owned());
+    // Prefix with "local:" for Casbin subject format alignment
+    let current_user = hyprstream_rpc::envelope::RequestIdentity::local().casbin_subject();
 
     // Get archetype registry for capability detection
     let archetype_registry = crate::archetypes::global_registry();

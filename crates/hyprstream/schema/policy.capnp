@@ -45,6 +45,10 @@ struct IssueToken {
 
   # RFC 8707 resource indicator for audience binding (empty = no binding)
   audience @2 :Text;
+
+  # Explicit subject for token (empty = use envelope identity).
+  # Requires caller to have `manage` permission on `policy:issue-token`.
+  subject @3 :Text;
 }
 
 # Unified policy response (covers both check and token issuance)

@@ -77,6 +77,16 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         .context("Failed to initialize policy manager")?,
     );
 
+    // Spawn file watcher for policy hot-reload
+    let pm_clone = Arc::clone(&policy_manager);
+    let policy_csv = policies_dir.join("policy.csv");
+    tokio::task::block_in_place(|| {
+        let rt = tokio::runtime::Handle::current();
+        rt.spawn(async move {
+            super::policy::watch_policy_file(pm_clone, policy_csv).await;
+        });
+    });
+
     // Service includes infrastructure - directly Spawnable via blanket impl
     let policy_service = PolicyService::new(
         policy_manager,
@@ -274,6 +284,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     ));
 
     // Create server state (blocking since we're in sync context)
+    let resource_url = config.oai.resource_url();
     let server_state = tokio::task::block_in_place(|| {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(ServerState::new(
@@ -282,6 +293,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
             policy_client,
             registry_client,
             ctx.signing_key().clone(),
+            resource_url,
         ))
     })
     .context("Failed to create server state")?;
@@ -397,6 +409,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         signing_key: ctx.signing_key().clone(),
         transport: ctx.transport("mcp", SocketKind::Rep),
         ctx: None, // ServiceContext not yet available as Arc — handlers use signing_key directly
+        expected_audience: Some(config.mcp.resource_url()),
     };
 
     // Clone config for HTTP/SSE server before consuming it for ZMQ service

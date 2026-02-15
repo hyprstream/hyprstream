@@ -813,7 +813,6 @@ fn handle_quick_command(
                             name,
                             expires,
                             scope,
-                            admin,
                         } => {
                             let keys_dir = registry_path.join("keys");
                             let signing_key =
@@ -824,7 +823,6 @@ fn handle_quick_command(
                                 name,
                                 &expires,
                                 scope,
-                                admin,
                             )
                             .await
                         }

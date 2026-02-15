@@ -77,7 +77,7 @@ pub enum PolicyCommand {
 
     /// Apply a built-in policy template
     ApplyTemplate {
-        /// Template name: local, public-inference, public-read
+        /// Template name (run list-templates to see options)
         template: String,
         /// Preview changes without applying
         #[arg(long)]
@@ -107,10 +107,6 @@ pub enum TokenCommand {
         /// Limit token to specific resources (repeatable, e.g., --scope model:qwen3-small)
         #[arg(long, short = 's')]
         scope: Vec<String>,
-
-        /// Create an admin token (hypr_admin_ prefix)
-        #[arg(long)]
-        admin: bool,
     },
 
     /// List all API tokens

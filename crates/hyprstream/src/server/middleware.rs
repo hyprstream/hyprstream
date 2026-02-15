@@ -16,8 +16,6 @@ use tracing::{debug, info, warn};
 pub struct AuthenticatedUser {
     /// Username (from JWT sub claim)
     pub user: String,
-    /// Whether this is an admin token
-    pub is_admin: bool,
 }
 
 /// JWT authentication middleware
@@ -36,7 +34,8 @@ pub async fn auth_middleware(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "));
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .map(str::trim);
 
     // If no token provided, allow anonymous access
     let Some(token) = token else {
@@ -53,7 +52,6 @@ pub async fn auth_middleware(
                 debug!("JWT validated for user: {}", claims.sub);
                 let user = AuthenticatedUser {
                     user: claims.sub.clone(),
-                    is_admin: claims.admin,
                 };
                 request.extensions_mut().insert(user);
                 return next.run(request).await;
@@ -107,11 +105,10 @@ pub async fn rate_limit_middleware(
 }
 
 /// Build WWW-Authenticate header value with resource_metadata URL (RFC 9728).
-fn build_www_authenticate(_state: &ServerState) -> String {
-    let config = crate::config::HyprConfig::load().unwrap_or_default();
+fn build_www_authenticate(state: &ServerState) -> String {
     let resource_metadata_url = format!(
         "{}/.well-known/oauth-protected-resource",
-        config.oai.resource_url()
+        state.resource_url
     );
     format!(
         "Bearer resource_metadata=\"{}\"",

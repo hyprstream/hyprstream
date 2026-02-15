@@ -215,6 +215,9 @@ async fn issue_token(
     scopes: Vec<String>,
     resource: Option<String>,
 ) -> Response {
+    // Compute scope_str before passing scopes to the client call
+    let scope_str = scopes.join(" ");
+
     let result = state
         .policy_client
         .issue_jwt_token_with_audience(scopes, Some(state.token_ttl), resource)
@@ -235,6 +238,7 @@ async fn issue_token(
                     "access_token": token,
                     "token_type": "Bearer",
                     "expires_in": expires_in,
+                    "scope": scope_str,
                 })),
             )
                 .into_response()

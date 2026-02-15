@@ -40,7 +40,9 @@ pub async fn handle_policy_show(
 
         if policies.is_empty() && groupings.is_empty() {
             println!("No policies defined.");
-            println!("\nTo create policies, run:");
+            println!("\nTo get started, apply a template:");
+            println!("  hyprstream policy apply-template local    # local CLI full access");
+            println!("\nOr edit manually:");
             println!("  hyprstream policy edit");
             return Ok(());
         }
@@ -145,12 +147,6 @@ pub async fn handle_policy_history(
 /// Handle `policy edit` - Open policy in $VISUAL/$EDITOR
 pub async fn handle_policy_edit(policy_manager: &PolicyManager) -> Result<()> {
     let policy_path = policy_manager.policy_csv_path();
-
-    // Ensure policy file exists
-    if !policy_path.exists() {
-        info!("Creating policy file at {:?}", policy_path);
-        tokio::fs::write(&policy_path, default_policy_template()).await?;
-    }
 
     // Get editor from environment
     let editor = std::env::var("VISUAL")
@@ -447,7 +443,6 @@ pub async fn handle_token_create(
     name: Option<String>,
     expires: &str,
     scopes: Vec<String>,
-    admin: bool,
 ) -> Result<()> {
     // Parse expiration
     let expires_duration = parse_duration(expires)?;
@@ -465,7 +460,7 @@ pub async fn handle_token_create(
     let now = chrono::Utc::now().timestamp();
     let exp = (chrono::Utc::now() + duration).timestamp();
     let prefixed_subject = format!("token:{user}");
-    let claims = Claims::new(prefixed_subject.clone(), now, exp, admin);
+    let claims = Claims::new(prefixed_subject.clone(), now, exp);
 
     // Encode and sign the JWT
     let token = jwt::encode(&claims, signing_key);
@@ -491,10 +486,6 @@ pub async fn handle_token_create(
         println!("  Scopes:  * (all resources)");
     } else {
         println!("  Scopes:  {}", scopes.join(", "));
-    }
-
-    if admin {
-        println!("  Admin:   yes");
     }
 
     println!();
@@ -594,36 +585,22 @@ fn has_uncommitted_changes(policies_dir: &Path) -> Result<bool> {
     Ok(!output.stdout.is_empty())
 }
 
-/// Truncate a string to max length, adding "..." if truncated
+/// Truncate a string to max length, adding "..." if truncated.
+/// Uses char_indices for O(n) slicing without intermediate allocation.
 fn truncate_str(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_owned()
     } else if max_len > 3 {
-        format!("{}...", &s[..max_len - 3])
+        let end = s.char_indices()
+            .nth(max_len - 3)
+            .map_or(s.len(), |(i, _)| i);
+        format!("{}...", &s[..end])
     } else {
-        s[..max_len].to_string()
+        let end = s.char_indices()
+            .nth(max_len)
+            .map_or(s.len(), |(i, _)| i);
+        s[..end].to_owned()
     }
-}
-
-/// Default policy template for new policy files (header only, no rules)
-fn default_policy_template() -> &'static str {
-    r#"# Hyprstream Access Control Policy
-# Format: p, subject, resource, action
-#
-# Subjects: user names or role names
-# Resources: model:<name>, data:<name>, or * for all
-# Actions: infer, train, query, write, serve, manage, or * for all
-#
-# Examples:
-# p, admin, *, *                    # Admin can do anything
-# p, trainer, model:*, infer        # Trainers can infer any model
-# p, trainer, model:*, train        # Trainers can train any model
-# p, analyst, data:*, query         # Analysts can query data
-#
-# Role assignments (g, user, role):
-# g, alice, trainer                 # Alice has the trainer role
-# g, bob, analyst                   # Bob has the analyst role
-"#
 }
 
 /// Built-in policy template
@@ -702,12 +679,8 @@ pub async fn handle_policy_apply_template(
         .parent()
         .context("Could not find .registry directory")?;
 
-    // Read existing policy content
-    let existing_content = if policy_path.exists() {
-        tokio::fs::read_to_string(&policy_path).await?
-    } else {
-        default_policy_template().to_owned()
-    };
+    // Read existing policy content (PolicyManager::new() guarantees file exists)
+    let existing_content = tokio::fs::read_to_string(&policy_path).await?;
 
     // Check if template rules already exist
     if existing_content.contains(template.rules.trim()) {

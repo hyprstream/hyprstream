@@ -16,7 +16,6 @@ pub struct Claims {
     pub sub: String,
     pub exp: i64,
     pub iat: i64,
-    pub admin: bool,
     /// RFC 8707 audience claim for resource indicator binding.
     /// When present, resource servers MUST validate this matches their canonical URI.
     /// Tokens without `aud` (legacy/env-var tokens) continue to work for backward compatibility.
@@ -31,7 +30,7 @@ impl ToCapnp for Claims {
         builder.set_sub(&self.sub);
         builder.set_exp(self.exp);
         builder.set_iat(self.iat);
-        builder.set_admin(self.admin);
+        builder.set_admin(false); // Deprecated: always false
         if let Some(ref aud) = self.aud {
             builder.set_aud(aud);
         }
@@ -54,7 +53,6 @@ impl FromCapnp for Claims {
             sub: reader.get_sub()?.to_str()?.to_owned(),
             exp: reader.get_exp(),
             iat: reader.get_iat(),
-            admin: reader.get_admin(),
             aud,
         })
     }
@@ -62,12 +60,11 @@ impl FromCapnp for Claims {
 
 impl Claims {
     /// Create new claims.
-    pub fn new(sub: String, iat: i64, exp: i64, admin: bool) -> Self {
+    pub fn new(sub: String, iat: i64, exp: i64) -> Self {
         Self {
             sub,
             exp,
             iat,
-            admin,
             aud: None,
         }
     }
@@ -95,24 +92,23 @@ mod tests {
 
     #[test]
     fn test_claims_new() {
-        let claims = Claims::new("alice".to_owned(), 1000, 2000, false);
+        let claims = Claims::new("alice".to_owned(), 1000, 2000);
         assert_eq!(claims.sub, "alice");
         assert_eq!(claims.iat, 1000);
         assert_eq!(claims.exp, 2000);
-        assert!(!claims.admin);
         assert!(claims.aud.is_none());
     }
 
     #[test]
     fn test_claims_with_audience() {
-        let claims = Claims::new("alice".to_owned(), 1000, 2000, false)
+        let claims = Claims::new("alice".to_owned(), 1000, 2000)
             .with_audience(Some("https://api.example.com".to_owned()));
         assert_eq!(claims.aud, Some("https://api.example.com".to_owned()));
     }
 
     #[test]
     fn test_claims_casbin_subject() {
-        let claims = Claims::new("alice".to_owned(), 1000, 2000, false);
+        let claims = Claims::new("alice".to_owned(), 1000, 2000);
         assert_eq!(claims.casbin_subject(), "user:alice");
     }
 }

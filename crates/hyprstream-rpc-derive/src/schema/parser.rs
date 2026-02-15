@@ -570,6 +570,8 @@ struct PolicyCheck {
 struct IssueToken {
   requestedScopes @0 :List(Text);
   ttl @1 :UInt32;
+  audience @2 :Text;
+  subject @3 :Text;
 }
 
 struct PolicyResponse {
@@ -696,9 +698,11 @@ struct ErrorInfo {
         assert_eq!(check_struct.fields[3].name, "operation");
 
         let issue_struct = schema.structs.iter().find(|s| s.name == "IssueToken").unwrap();
-        assert_eq!(issue_struct.fields.len(), 2);
+        assert_eq!(issue_struct.fields.len(), 4);
         assert_eq!(issue_struct.fields[0].type_name, "List(Text)");
         assert_eq!(issue_struct.fields[1].type_name, "UInt32");
+        assert_eq!(issue_struct.fields[2].type_name, "Text");
+        assert_eq!(issue_struct.fields[3].type_name, "Text");
     }
 
     #[test]

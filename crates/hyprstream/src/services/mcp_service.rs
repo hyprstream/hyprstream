@@ -21,6 +21,7 @@
 
 use async_trait::async_trait;
 use crate::services::{ModelZmqClient, RegistryZmqClient, PolicyClient, InferenceZmqClient};
+use http::header::AUTHORIZATION;
 use crate::services::generated::mcp_client::{
     McpHandler, McpResponseVariant, ToolDefinition, ServiceStatus,
     ToolList, ServiceMetrics, CallTool, dispatch_mcp,
@@ -79,6 +80,8 @@ pub struct McpConfig {
     pub transport: TransportConfig,
     /// Service context for client construction (optional for backward compat)
     pub ctx: Option<Arc<ServiceContext>>,
+    /// Expected audience (resource URL) for future defense-in-depth
+    pub expected_audience: Option<String>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -313,22 +316,12 @@ fn register_schema_tools(reg: &mut ToolRegistry) {
                                     _ => anyhow::bail!("Unknown scope: {}", scope),
                                 };
 
-                                let stream_id = stream_info_json["stream_id"].as_str()
-                                    .ok_or_else(|| anyhow::anyhow!("missing stream_id in streaming response"))?
-                                    .to_string();
-                                let endpoint = stream_info_json["endpoint"].as_str()
-                                    .or_else(|| stream_info_json["stream_endpoint"].as_str())
-                                    .ok_or_else(|| anyhow::anyhow!("missing endpoint in streaming response"))?;
-                                let server_pubkey: Vec<u8> = stream_info_json["server_pubkey"].as_array()
-                                    .ok_or_else(|| anyhow::anyhow!("missing server_pubkey in streaming response"))?
-                                    .iter()
-                                    .map(|v| v.as_u64().unwrap_or(0) as u8)
-                                    .collect();
+                                let (stream_id, endpoint, server_pubkey) = parse_stream_info(&stream_info_json)?;
 
                                 let handle = StreamHandle::new(
                                     &ctx.zmq_context,
                                     stream_id,
-                                    endpoint,
+                                    &endpoint,
                                     &server_pubkey,
                                     &client_secret,
                                     &client_pubkey_bytes,
@@ -436,22 +429,12 @@ fn register_streaming_tool(
                     _ => anyhow::bail!("No streaming support for service: {}", service),
                 };
 
-                let stream_id = stream_info_json["stream_id"].as_str()
-                    .ok_or_else(|| anyhow::anyhow!("missing stream_id in streaming response"))?
-                    .to_string();
-                let endpoint = stream_info_json["endpoint"].as_str()
-                    .or_else(|| stream_info_json["stream_endpoint"].as_str())
-                    .ok_or_else(|| anyhow::anyhow!("missing endpoint in streaming response"))?;
-                let server_pubkey: Vec<u8> = stream_info_json["server_pubkey"].as_array()
-                    .ok_or_else(|| anyhow::anyhow!("missing server_pubkey in streaming response"))?
-                    .iter()
-                    .map(|v| v.as_u64().unwrap_or(0) as u8)
-                    .collect();
+                let (stream_id, endpoint, server_pubkey) = parse_stream_info(&stream_info_json)?;
 
                 let handle = StreamHandle::new(
                     &ctx.zmq_context,
                     stream_id,
-                    endpoint,
+                    &endpoint,
                     &server_pubkey,
                     &client_secret,
                     &client_pubkey_bytes,
@@ -501,6 +484,23 @@ fn params_to_json_schema(params: &[(&str, &str, bool, &str)]) -> Value {
     })
 }
 
+/// Parse stream_id, endpoint, and server_pubkey from a streaming response JSON.
+fn parse_stream_info(json: &Value) -> anyhow::Result<(String, String, Vec<u8>)> {
+    let stream_id = json["stream_id"].as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing stream_id in streaming response"))?
+        .to_string();
+    let endpoint = json["endpoint"].as_str()
+        .or_else(|| json["stream_endpoint"].as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing endpoint in streaming response"))?
+        .to_string();
+    let server_pubkey: Vec<u8> = json["server_pubkey"].as_array()
+        .ok_or_else(|| anyhow::anyhow!("missing server_pubkey in streaming response"))?
+        .iter()
+        .map(|v| v.as_u64().unwrap_or(0) as u8)
+        .collect();
+    Ok((stream_id, endpoint, server_pubkey))
+}
+
 /// Dispatch a method call to the appropriate generated client.
 async fn dispatch_schema_call(service: &str, method: &str, ctx: &ToolCallContext) -> anyhow::Result<Value> {
     let signing_key = ctx.signing_key.clone();
@@ -535,10 +535,9 @@ async fn dispatch_schema_call(service: &str, method: &str, ctx: &ToolCallContext
 pub struct McpService {
     /// UUID-keyed tool registry
     registry: Arc<ToolRegistry>,
-    /// JWT claims extracted from token (if provided)
+    /// JWT claims from HYPRSTREAM_TOKEN env var (stdio transport fallback)
     claims: Option<Claims>,
     /// Verifying key for JWT validation
-    #[allow(dead_code)]
     verifying_key: VerifyingKey,
     // === ZmqService infrastructure ===
     context: Arc<zmq::Context>,
@@ -546,6 +545,9 @@ pub struct McpService {
     signing_key: SigningKey,
     /// ServiceContext for typed_client() / client() access
     service_ctx: Option<Arc<ServiceContext>>,
+    /// Expected audience for tokens (resource URL, for future defense-in-depth)
+    #[allow(dead_code)]
+    expected_audience: Option<String>,
 }
 
 impl McpService {
@@ -586,6 +588,7 @@ impl McpService {
             transport: config.transport,
             signing_key: config.signing_key,
             service_ctx: config.ctx,
+            expected_audience: config.expected_audience,
         })
     }
 
@@ -615,16 +618,59 @@ impl McpService {
         }).collect()
     }
 
-    /// Dispatch a tool call by UUID
-    async fn dispatch_tool(&self, uuid: &Uuid, args: Value) -> Result<CallToolResult, ErrorData> {
+    /// Extract identity from HTTP Bearer token or fall back to env/local.
+    ///
+    /// This is pure authentication (identity extraction). No audience checks,
+    /// no scope filtering — ZMQ backends handle authorization via Casbin.
+    ///
+    /// Priority:
+    /// 1. HTTP transport: extract from `Authorization: Bearer <token>` header
+    ///    - Valid token → `RequestIdentity::api_token(sub, "mcp")`
+    ///    - Invalid/expired token → `RequestIdentity::anonymous()` (let ZMQ reject)
+    ///    - No token → `RequestIdentity::anonymous()` (NOT local!)
+    /// 2. Stdio/ZMQ transport (no HTTP Parts): use env var claims or `local()`
+    fn extract_identity(&self, context: &RequestContext<RoleServer>) -> RequestIdentity {
+        // Check for HTTP transport by looking for http::request::Parts in extensions
+        if let Some(parts) = context.extensions.get::<http::request::Parts>() {
+            // HTTP transport — extract Bearer token from Authorization header
+            let token = parts
+                .headers
+                .get(AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|h| h.strip_prefix("Bearer ").map(str::trim));
+
+            match token {
+                Some(token) => {
+                    match jwt::decode(token, &self.verifying_key) {
+                        Ok(claims) => {
+                            trace!("MCP HTTP auth: token validated for {}", claims.sub);
+                            RequestIdentity::api_token(&claims.sub, "mcp")
+                        }
+                        Err(e) => {
+                            trace!("MCP HTTP auth: token validation failed: {}", e);
+                            RequestIdentity::anonymous()
+                        }
+                    }
+                }
+                None => {
+                    trace!("MCP HTTP auth: no Bearer token, using anonymous");
+                    RequestIdentity::anonymous()
+                }
+            }
+        } else {
+            // Stdio/ZMQ transport — use env var claims or local identity
+            match &self.claims {
+                Some(claims) => RequestIdentity::api_token(&claims.sub, "mcp"),
+                None => RequestIdentity::local(),
+            }
+        }
+    }
+
+    /// Dispatch a tool call by UUID with a specific identity
+    async fn dispatch_tool(&self, uuid: &Uuid, args: Value, identity: RequestIdentity) -> Result<CallToolResult, ErrorData> {
         let entry = self.registry.get(uuid)
             .ok_or_else(|| ErrorData::invalid_request(format!("Unknown tool: {}", uuid), None))?;
 
-        // Propagate authenticated identity to backend services (not local())
-        let identity = match &self.claims {
-            Some(claims) => RequestIdentity::api_token(&claims.sub, "mcp"),
-            None => RequestIdentity::local(),
-        };
         let ctx = ToolCallContext {
             args,
             signing_key: self.signing_key.clone(),
@@ -701,6 +747,7 @@ impl ServerHandler for McpService {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListToolsResult, ErrorData>> + Send + '_ {
+        // Tool listing is public; authorization happens at call_tool time via ZMQ backends
         std::future::ready(Ok(ListToolsResult {
             meta: None,
             tools: self.tools_list(),
@@ -711,8 +758,9 @@ impl ServerHandler for McpService {
     fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<CallToolResult, ErrorData>> + Send + '_ {
+        let identity = self.extract_identity(&context);
         async move {
             let uuid = Uuid::parse_str(&request.name)
                 .map_err(|e| ErrorData::invalid_request(format!("Invalid UUID: {}", e), None))?;
@@ -722,7 +770,7 @@ impl ServerHandler for McpService {
                 None => Value::Object(serde_json::Map::new()),
             };
 
-            self.dispatch_tool(&uuid, args).await
+            self.dispatch_tool(&uuid, args, identity).await
         }
     }
 }
@@ -791,7 +839,7 @@ impl McpHandler for McpService {
 
     async fn handle_call_tool(
         &self,
-        _ctx: &crate::services::EnvelopeContext,
+        ctx: &crate::services::EnvelopeContext,
         _request_id: u64,
         data: &CallTool,
     ) -> anyhow::Result<McpResponseVariant> {
@@ -804,7 +852,9 @@ impl McpHandler for McpService {
             serde_json::from_str(&data.arguments)?
         };
 
-        let result = self.dispatch_tool(&uuid, args).await;
+        // ZMQ transport: use envelope identity (already authenticated by ZMQ layer)
+        let identity = RequestIdentity::api_token(ctx.subject().to_string(), "mcp");
+        let result = self.dispatch_tool(&uuid, args, identity).await;
 
         match result {
             Ok(call_result) => {

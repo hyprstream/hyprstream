@@ -43,6 +43,9 @@ pub struct ServerState {
 
     /// Context store for RAG/CAG (optional)
     pub context_store: Option<Arc<ContextStore<hyprstream_metrics::storage::duckdb::DuckDbBackend>>>,
+
+    /// Cached resource URL for WWW-Authenticate headers (avoids per-request config reload)
+    pub resource_url: String,
 }
 
 /// Metrics collector
@@ -83,6 +86,7 @@ impl ServerState {
         policy_client: PolicyClient,
         registry: Arc<dyn RegistryClient>,
         signing_key: SigningKey,
+        resource_url: String,
     ) -> Result<Self, anyhow::Error> {
         let verifying_key = signing_key.verifying_key();
         let signing_key = Arc::new(signing_key);
@@ -116,6 +120,7 @@ impl ServerState {
             signing_key,
             verifying_key,
             context_store: None, // Initialize via enable_context_store() if needed
+            resource_url,
         })
     }
 

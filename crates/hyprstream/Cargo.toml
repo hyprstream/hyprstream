@@ -66,6 +66,7 @@ once_cell.workspace = true  # For global GitService singleton
 dirs = "5"  # User directory paths for CLI
 
 rmcp = { version = "0.14", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+http = "1"  # HTTP types (request::Parts) for MCP identity extraction
 schemars = "1.2"
 
 tracing-log.workspace = true
@@ -118,6 +119,7 @@ capnp-futures.workspace = true  # Cap'n Proto async support
 glob.workspace = true
 walkdir.workspace = true
 reqwest.workspace = true
+notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
 libc = "0.2"  # For system calls in overlay2 driver
 reflink-copy = "0.1"  # COW file copying (reflink when available)
 

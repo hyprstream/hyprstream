@@ -7,12 +7,11 @@
 //!
 //! ```text
 //! hypr_eyJ...  (standard token)
-//! hypr_admin_eyJ...  (admin token)
 //! ```
 //!
 //! The JWT itself follows RFC 7519:
 //! - Header: `{"alg":"EdDSA","typ":"JWT"}`
-//! - Payload: Claims (sub, exp, iat, scope, admin)
+//! - Payload: Claims (sub, exp, iat)
 //! - Signature: Ed25519 over `base64url(header).base64url(payload)`
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -25,8 +24,6 @@ use super::Claims;
 /// Token prefix for standard API keys
 pub const TOKEN_PREFIX: &str = "hypr_";
 
-/// Token prefix for admin keys
-pub const ADMIN_TOKEN_PREFIX: &str = "hypr_admin_";
 
 /// JWT header (static for EdDSA)
 const JWT_HEADER: &str = r#"{"alg":"EdDSA","typ":"JWT"}"#;
@@ -61,7 +58,7 @@ pub enum JwtError {
 
 /// Encode and sign a JWT token
 ///
-/// Returns a token with the appropriate prefix (hypr_ or hypr_admin_)
+/// Returns a token with the `hypr_` prefix.
 pub fn encode(claims: &Claims, signing_key: &SigningKey) -> String {
     // Encode header and payload
     let header_b64 = URL_SAFE_NO_PAD.encode(JWT_HEADER);
@@ -81,23 +78,15 @@ pub fn encode(claims: &Claims, signing_key: &SigningKey) -> String {
     // Combine into JWT
     let jwt = format!("{signing_input}.{signature_b64}");
 
-    // Add prefix
-    let prefix = if claims.admin { ADMIN_TOKEN_PREFIX } else { TOKEN_PREFIX };
-    format!("{prefix}{jwt}")
+    format!("{TOKEN_PREFIX}{jwt}")
 }
 
 /// Decode and verify a JWT token
 ///
 /// Returns the claims if the token is valid and not expired.
 pub fn decode(token: &str, verifying_key: &VerifyingKey) -> Result<Claims, JwtError> {
-    // Strip prefix
-    let jwt = if let Some(rest) = token.strip_prefix(ADMIN_TOKEN_PREFIX) {
-        rest
-    } else if let Some(rest) = token.strip_prefix(TOKEN_PREFIX) {
-        rest
-    } else {
-        return Err(JwtError::InvalidPrefix);
-    };
+    let jwt = token.strip_prefix(TOKEN_PREFIX)
+        .ok_or(JwtError::InvalidPrefix)?;
 
     // Split into parts
     let parts: Vec<&str> = jwt.split('.').collect();
@@ -152,15 +141,11 @@ pub fn decode(token: &str, verifying_key: &VerifyingKey) -> Result<Claims, JwtEr
 /// Decode a JWT without verifying the signature (for introspection)
 ///
 /// WARNING: Only use this for debugging or when signature has already been verified.
+/// Restricted to test and debug builds to prevent misuse in production.
+#[cfg(test)]
 pub fn decode_unverified(token: &str) -> Result<Claims, JwtError> {
-    // Strip prefix
-    let jwt = if let Some(rest) = token.strip_prefix(ADMIN_TOKEN_PREFIX) {
-        rest
-    } else if let Some(rest) = token.strip_prefix(TOKEN_PREFIX) {
-        rest
-    } else {
-        return Err(JwtError::InvalidPrefix);
-    };
+    let jwt = token.strip_prefix(TOKEN_PREFIX)
+        .ok_or(JwtError::InvalidPrefix)?;
 
     // Split into parts
     let parts: Vec<&str> = jwt.split('.').collect();
@@ -180,9 +165,4 @@ pub fn decode_unverified(token: &str) -> Result<Claims, JwtError> {
 /// Check if a token string has a valid prefix
 pub fn has_valid_prefix(token: &str) -> bool {
     token.starts_with(TOKEN_PREFIX)
-}
-
-/// Check if a token is an admin token (by prefix)
-pub fn is_admin_token(token: &str) -> bool {
-    token.starts_with(ADMIN_TOKEN_PREFIX)
 }

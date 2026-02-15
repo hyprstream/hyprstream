@@ -8,7 +8,7 @@
 pub mod jwt;
 mod policy_manager;
 
-pub use jwt::{Claims, JwtError, TOKEN_PREFIX, ADMIN_TOKEN_PREFIX};
+pub use jwt::{Claims, JwtError, TOKEN_PREFIX};
 pub use policy_manager::{PolicyManager, PolicyError};
 
 /// Operation types that can be controlled via policies

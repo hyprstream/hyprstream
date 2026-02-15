@@ -5,7 +5,7 @@
 //!   infer:model:qwen-7b     - Specific model inference
 //!   subscribe:stream:abc    - Specific stream subscription
 //!   read:model:*            - Read any model (explicit wildcard)
-//!   admin:*:*               - Admin wildcard
+//!   manage:*:*              - Manage all resources
 
 use crate::common_capnp;
 use crate::capnp::{ToCapnp, FromCapnp};
@@ -20,7 +20,7 @@ use std::fmt;
 ///   infer:model:qwen-7b     - Specific model inference
 ///   subscribe:stream:abc    - Specific stream subscription
 ///   read:model:*            - Read any model (explicit wildcard)
-///   admin:*:*               - Admin wildcard
+///   manage:*:*              - Manage all resources
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scope {
     pub action: String,

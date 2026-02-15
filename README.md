@@ -43,7 +43,7 @@ chmod +x hyprstream-v0.2.0-x86_64.AppImage
 export PATH="$HOME/.local/bin;$PATH"
 
 # Apply policy template - make local users admin; hyprstream is deny by default
-hyprstream apply-template local
+hyprstream policy apply-template local
 
 hyprstream service start
 ```

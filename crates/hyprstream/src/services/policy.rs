@@ -122,7 +122,31 @@ impl PolicyHandler for PolicyService {
         data: &IssueToken,
     ) -> Result<PolicyResponseVariant> {
         trace!("Issuing JWT token");
-        let subject = ctx.subject().to_string();
+
+        // Determine subject: explicit subject (if provided and authorized) or envelope identity
+        let subject = if !data.subject.is_empty() {
+            // Explicit subject requires `manage` permission on `policy:issue-token`
+            let caller = ctx.subject().to_string();
+            let allowed = self.policy_manager.check_with_domain(
+                &caller,
+                "*",
+                "policy:issue-token",
+                Operation::Manage,
+            ).await;
+            if !allowed {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: format!(
+                        "Subject '{}' is not authorized to issue tokens on behalf of '{}'",
+                        caller, data.subject
+                    ),
+                    code: "UNAUTHORIZED_SUBJECT".to_string(),
+                    details: "Requires 'manage' permission on 'policy:issue-token'".to_string(),
+                }));
+            }
+            data.subject.clone()
+        } else {
+            ctx.subject().to_string()
+        };
 
         // Validate TTL
         let requested_ttl = if data.ttl == 0 {
@@ -156,11 +180,11 @@ impl PolicyHandler for PolicyService {
         } else {
             Some(data.audience.clone())
         };
+
         let claims = hyprstream_rpc::auth::Claims::new(
             subject,
             now,
             now + requested_ttl as i64,
-            ctx.identity.is_local() || ctx.user().contains("admin"),
         ).with_audience(audience);
 
         let token = crate::auth::jwt::encode(&claims, &self.signing_key);
@@ -294,7 +318,26 @@ impl PolicyClient {
         ttl: Option<u32>,
         audience: Option<String>,
     ) -> Result<(String, i64)> {
-        match self.issue_token(&scopes, ttl.unwrap_or(0), &audience.unwrap_or_default()).await? {
+        self.issue_jwt_token_full(scopes, ttl, audience, None).await
+    }
+
+    /// Issue a JWT token with all options including explicit subject.
+    ///
+    /// When `subject` is `Some(...)`, the token is issued on behalf of that subject.
+    /// Requires caller to have `manage` permission on `policy:issue-token`.
+    pub async fn issue_jwt_token_full(
+        &self,
+        scopes: Vec<String>,
+        ttl: Option<u32>,
+        audience: Option<String>,
+        subject: Option<String>,
+    ) -> Result<(String, i64)> {
+        match self.issue_token(
+            &scopes,
+            ttl.unwrap_or(0),
+            &audience.unwrap_or_default(),
+            &subject.unwrap_or_default(),
+        ).await? {
             PolicyResponseVariant::TokenSuccess(ref data) => {
                 Ok((data.token.clone(), data.expires_at))
             }
@@ -302,6 +345,78 @@ impl PolicyClient {
                 Err(anyhow!("Token issuance failed: {} ({})", e.message, e.code))
             }
             _ => Err(anyhow!("Unexpected response type for issue_token")),
+        }
+    }
+}
+
+// ============================================================================
+// Policy file watcher (hot-reload)
+// ============================================================================
+
+/// Watch policy.csv for changes and reload PolicyManager automatically.
+///
+/// Watches the parent directory (not the file directly) to handle atomic
+/// rename patterns used by editors like vim and emacs.
+pub(crate) async fn watch_policy_file(
+    policy_manager: Arc<PolicyManager>,
+    policy_csv: std::path::PathBuf,
+) {
+    use notify::{Event, EventKind, RecursiveMode, Watcher};
+    use tracing::{info, warn};
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(16);
+
+    let csv_path = policy_csv.clone();
+    let mut watcher = match notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+        if let Ok(event) = res {
+            match event.kind {
+                EventKind::Modify(_) | EventKind::Create(_) => {
+                    // Only trigger for events involving our policy.csv
+                    if event.paths.iter().any(|p| p.ends_with("policy.csv")) {
+                        let _ = tx.blocking_send(());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }) {
+        Ok(w) => w,
+        Err(e) => {
+            warn!("Failed to create policy file watcher: {}", e);
+            return;
+        }
+    };
+
+    // Watch parent directory to catch atomic renames
+    let watch_dir = match policy_csv.parent() {
+        Some(dir) => dir,
+        None => {
+            warn!("policy.csv has no parent directory, cannot watch");
+            return;
+        }
+    };
+
+    if let Err(e) = watcher.watch(watch_dir, RecursiveMode::NonRecursive) {
+        warn!("Failed to watch {}: {}", watch_dir.display(), e);
+        return;
+    }
+
+    info!("Watching {} for policy changes", csv_path.display());
+
+    loop {
+        // Wait for first event
+        if rx.recv().await.is_none() {
+            break; // Channel closed
+        }
+
+        // Debounce: wait 500ms then drain remaining events
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        while rx.try_recv().is_ok() {}
+
+        // Reload policy
+        match policy_manager.reload().await {
+            Ok(()) => info!("Policy reloaded from disk"),
+            Err(e) => warn!("Failed to reload policy: {}", e),
         }
     }
 }

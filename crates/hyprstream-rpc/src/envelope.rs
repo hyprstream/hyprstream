@@ -1289,14 +1289,14 @@ mod tests {
         assert_eq!(anon.casbin_subject(), "anonymous");
 
         // Verify namespacing prevents collisions
-        let admin_local = RequestIdentity::Local {
-            user: "admin".into(),
+        let alice_local = RequestIdentity::Local {
+            user: "alice".into(),
         };
-        let admin_peer = RequestIdentity::Peer {
-            name: "admin".into(),
+        let alice_peer = RequestIdentity::Peer {
+            name: "alice".into(),
             curve_key: [0u8; 32],
         };
-        assert_ne!(admin_local.casbin_subject(), admin_peer.casbin_subject());
+        assert_ne!(alice_local.casbin_subject(), alice_peer.casbin_subject());
     }
 
     #[test]
@@ -1617,7 +1617,6 @@ mod tests {
             "charlie".to_owned(),
             1000,
             2000,
-            false,
         );
         assert_eq!(Subject::from_claims(&claims), Subject::User("charlie".into()));
     }
