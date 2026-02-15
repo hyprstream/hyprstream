@@ -48,25 +48,30 @@ pub async fn handle_policy_show(
         }
 
         // Print policy rules as a table
+        // Casbin model: p = sub, dom, obj, act, eft
         if !policies.is_empty() {
-            println!("┌──────────────────────────────────────────────────────────────┐");
-            println!("│ Policy Rules                                                 │");
-            println!("├────────────────────┬────────────────────┬────────────────────┤");
-            println!("│ Subject            │ Resource           │ Action             │");
-            println!("├────────────────────┼────────────────────┼────────────────────┤");
+            println!("┌──────────────────────────────────────────────────────────────────────────────┐");
+            println!("│ Policy Rules                                                                 │");
+            println!("├────────────────┬────────────────┬────────────────┬────────────────┬──────────┤");
+            println!("│ Subject        │ Domain         │ Resource       │ Action         │ Effect   │");
+            println!("├────────────────┼────────────────┼────────────────┼────────────────┼──────────┤");
 
             for p in &policies {
                 let sub = p.first().map(std::string::String::as_str).unwrap_or("");
-                let obj = p.get(1).map(std::string::String::as_str).unwrap_or("");
-                let act = p.get(2).map(std::string::String::as_str).unwrap_or("");
+                let dom = p.get(1).map(std::string::String::as_str).unwrap_or("");
+                let obj = p.get(2).map(std::string::String::as_str).unwrap_or("");
+                let act = p.get(3).map(std::string::String::as_str).unwrap_or("");
+                let eft = p.get(4).map(std::string::String::as_str).unwrap_or("");
                 println!(
-                    "│ {:18} │ {:18} │ {:18} │",
-                    truncate_str(sub, 18),
-                    truncate_str(obj, 18),
-                    truncate_str(act, 18)
+                    "│ {:14} │ {:14} │ {:14} │ {:14} │ {:8} │",
+                    truncate_str(sub, 14),
+                    truncate_str(dom, 14),
+                    truncate_str(obj, 14),
+                    truncate_str(act, 14),
+                    truncate_str(eft, 8)
                 );
             }
-            println!("└────────────────────┴────────────────────┴────────────────────┘");
+            println!("└────────────────┴────────────────┴────────────────┴────────────────┴──────────┘");
         }
 
         // Print role assignments
@@ -679,25 +684,19 @@ pub async fn handle_policy_apply_template(
         .parent()
         .context("Could not find .registry directory")?;
 
-    // Read existing policy content (PolicyManager::new() guarantees file exists)
+    // Read existing policy content for rollback (PolicyManager::new() guarantees file exists)
     let existing_content = tokio::fs::read_to_string(&policy_path).await?;
 
-    // Check if template rules already exist
-    if existing_content.contains(template.rules.trim()) {
-        println!("Template '{template_name}' is already applied.");
-        return Ok(());
-    }
-
-    // Append the template rules
-    let new_content = format!("{}\n{}", existing_content.trim_end(), template.rules);
+    // Full overwrite — templates are idempotent
+    let new_content = template.rules.to_owned();
 
     println!("Applying template: {template_name}");
     println!("Description: {}", template.description);
     println!();
-    println!("Rules to add:");
+    println!("Rules:");
     for line in template.rules.lines() {
         if !line.trim().is_empty() && !line.starts_with('#') {
-            println!("  + {line}");
+            println!("  {line}");
         }
     }
     println!();
