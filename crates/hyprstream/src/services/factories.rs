@@ -340,6 +340,36 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// OAuth Service Factory
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Factory for OAuthService (OAuth 2.1 Authorization Server)
+///
+/// This service provides OAuth 2.1 authorization for MCP and OAI services.
+/// It delegates token issuance to PolicyService over ZMQ.
+#[service_factory("oauth")]
+fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+    info!("Creating OAuthService");
+
+    use crate::config::HyprConfig;
+    use crate::services::OAuthService;
+
+    let config = HyprConfig::load().unwrap_or_default();
+
+    let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::local());
+
+    let oauth_service = OAuthService::new(
+        config.oauth.clone(),
+        policy_client,
+        global_context(),
+        ctx.transport("oauth", SocketKind::Rep),
+        ctx.verifying_key(),
+    );
+
+    Ok(Box::new(oauth_service))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // MCP Service Factory
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -396,7 +426,22 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                     session_mgr,
                     StreamableHttpServerConfig::default(),
                 );
-            let router = axum::Router::new().nest_service("/mcp", service);
+            // Add protected resource metadata (RFC 9728) for OAuth discovery
+            let mcp_full_config = crate::config::HyprConfig::load().unwrap_or_default();
+            let mcp_resource_url = mcp_full_config.mcp.resource_url();
+            let mcp_oauth_issuer = mcp_full_config.oauth.issuer_url();
+            let router = axum::Router::new()
+                .route(
+                    "/.well-known/oauth-protected-resource",
+                    axum::routing::get(move || async move {
+                        axum::Json(crate::services::oauth::protected_resource_metadata(
+                            &mcp_resource_url,
+                            &mcp_oauth_issuer,
+                            &["read:*:*", "infer:model:*", "write:*:*"],
+                        ))
+                    }),
+                )
+                .nest_service("/mcp", service);
 
             let addr = format!("{}:{}", mcp_host, http_port);
             let listener = match tokio::net::TcpListener::bind(&addr).await {

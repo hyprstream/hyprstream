@@ -121,38 +121,8 @@ impl PolicyHandler for PolicyService {
         _request_id: u64,
         data: &IssueToken,
     ) -> Result<PolicyResponseVariant> {
-        use hyprstream_rpc::auth::Scope;
-
         trace!("Issuing JWT token");
         let subject = ctx.subject().to_string();
-
-        // Authorize each scope via Casbin
-        for scope_str in &data.requested_scopes {
-            let scope = match Scope::parse(scope_str) {
-                Ok(s) => s,
-                Err(_) => {
-                    return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                        message: format!("Invalid scope format: {scope_str}"),
-                        code: "INVALID_SCOPE".to_string(),
-                        details: String::new(),
-                    }));
-                }
-            };
-
-            let allowed = self.policy_manager.check(
-                &subject,
-                &scope.to_string(),
-                Operation::Infer,
-            ).await;
-
-            if !allowed {
-                return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                    message: format!("Access denied for scope: {}", scope),
-                    code: "UNAUTHORIZED".to_string(),
-                    details: String::new(),
-                }));
-            }
-        }
 
         // Validate TTL
         let requested_ttl = if data.ttl == 0 {
@@ -178,22 +148,20 @@ impl PolicyHandler for PolicyService {
             }));
         }
 
-        // Parse scopes into Scope objects
-        let parsed_scopes: Result<Vec<Scope>> = data.requested_scopes
-            .iter()
-            .map(|s| Scope::parse(s))
-            .collect();
-        let parsed_scopes = parsed_scopes?;
-
-        // Create and sign JWT
+        // Create and sign JWT with optional audience binding (RFC 8707)
+        // Scopes are not embedded in JWT - Casbin enforces authorization server-side
         let now = chrono::Utc::now().timestamp();
+        let audience = if data.audience.is_empty() {
+            None
+        } else {
+            Some(data.audience.clone())
+        };
         let claims = hyprstream_rpc::auth::Claims::new(
             subject,
             now,
             now + requested_ttl as i64,
-            parsed_scopes,
             ctx.identity.is_local() || ctx.user().contains("admin"),
-        );
+        ).with_audience(audience);
 
         let token = crate::auth::jwt::encode(&claims, &self.signing_key);
 
@@ -316,7 +284,17 @@ impl PolicyClient {
         scopes: Vec<String>,
         ttl: Option<u32>,
     ) -> Result<(String, i64)> {
-        match self.issue_token(&scopes, ttl.unwrap_or(0)).await? {
+        self.issue_jwt_token_with_audience(scopes, ttl, None).await
+    }
+
+    /// Issue a JWT token with requested scopes and optional audience (RFC 8707)
+    pub async fn issue_jwt_token_with_audience(
+        &self,
+        scopes: Vec<String>,
+        ttl: Option<u32>,
+        audience: Option<String>,
+    ) -> Result<(String, i64)> {
+        match self.issue_token(&scopes, ttl.unwrap_or(0), &audience.unwrap_or_default()).await? {
             PolicyResponseVariant::TokenSuccess(ref data) => {
                 Ok((data.token.clone(), data.expires_at))
             }

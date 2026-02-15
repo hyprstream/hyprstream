@@ -80,6 +80,10 @@ pub struct HyprConfig {
     #[serde(default)]
     pub mcp: MCPConfig,
 
+    /// OAuth 2.1 authorization server configuration
+    #[serde(default)]
+    pub oauth: OAuthConfig,
+
     /// StreamService configuration (buffer sizes, TTL, etc.)
     #[serde(default)]
     pub streaming: StreamingConfig,
@@ -118,6 +122,11 @@ pub struct OAIConfig {
     #[serde(default = "default_oai_port")]
     pub port: u16,
 
+    /// External URL for this server (used in OAuth metadata and WWW-Authenticate headers).
+    /// Auto-derived from host:port if not set.
+    #[serde(default)]
+    pub external_url: Option<String>,
+
     /// TLS certificate path (optional)
     #[serde(default)]
     pub tls_cert: Option<PathBuf>,
@@ -140,10 +149,23 @@ impl Default for OAIConfig {
         Self {
             host: default_oai_host(),
             port: default_oai_port(),
+            external_url: None,
             tls_cert: None,
             tls_key: None,
             request_timeout_secs: default_oai_timeout(),
             cors: server::CorsConfig::default(),
+        }
+    }
+}
+
+impl OAIConfig {
+    /// Get the resource URL, using external_url if set, otherwise deriving from host:port.
+    pub fn resource_url(&self) -> String {
+        if let Some(ref url) = self.external_url {
+            url.clone()
+        } else {
+            let host = if self.host == "0.0.0.0" { "localhost" } else { &self.host };
+            format!("http://{}:{}", host, self.port)
         }
     }
 }
@@ -204,6 +226,11 @@ pub struct MCPConfig {
     /// Port for HTTP/SSE server
     #[serde(default = "default_mcp_port")]
     pub http_port: u16,
+
+    /// External URL for this server (used in OAuth metadata).
+    /// Auto-derived from host:http_port if not set.
+    #[serde(default)]
+    pub external_url: Option<String>,
 }
 
 impl Default for MCPConfig {
@@ -211,12 +238,89 @@ impl Default for MCPConfig {
         Self {
             host: default_mcp_host(),
             http_port: default_mcp_port(),
+            external_url: None,
+        }
+    }
+}
+
+impl MCPConfig {
+    /// Get the resource URL, using external_url if set, otherwise deriving from host:http_port.
+    pub fn resource_url(&self) -> String {
+        if let Some(ref url) = self.external_url {
+            url.clone()
+        } else {
+            let host = if self.host == "0.0.0.0" { "localhost" } else { &self.host };
+            format!("http://{}:{}", host, self.http_port)
         }
     }
 }
 
 fn default_mcp_host() -> String { "0.0.0.0".to_owned() }
 fn default_mcp_port() -> u16 { 6790 }
+
+/// OAuth 2.1 authorization server configuration
+///
+/// Provides OAuth 2.1 (draft-ietf-oauth-v2-1-13) authorization for MCP and OAI services.
+/// Supports RFC 7591 (Dynamic Client Registration), RFC 8414 (AS Metadata),
+/// RFC 8707 (Resource Indicators), and Client ID Metadata Documents.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthConfig {
+    /// Host address for OAuth server
+    #[serde(default = "default_oauth_host")]
+    pub host: String,
+
+    /// Port for OAuth server
+    #[serde(default = "default_oauth_port")]
+    pub port: u16,
+
+    /// External URL for this server (used in metadata responses).
+    /// Auto-derived from host:port if not set.
+    #[serde(default)]
+    pub external_url: Option<String>,
+
+    /// Default scopes granted to new clients
+    #[serde(default = "default_oauth_scopes")]
+    pub default_scopes: Vec<String>,
+
+    /// Token TTL in seconds
+    #[serde(default = "default_oauth_token_ttl")]
+    pub token_ttl_seconds: u32,
+}
+
+impl Default for OAuthConfig {
+    fn default() -> Self {
+        Self {
+            host: default_oauth_host(),
+            port: default_oauth_port(),
+            external_url: None,
+            default_scopes: default_oauth_scopes(),
+            token_ttl_seconds: default_oauth_token_ttl(),
+        }
+    }
+}
+
+impl OAuthConfig {
+    /// Get the issuer URL, using external_url if set, otherwise deriving from host:port.
+    pub fn issuer_url(&self) -> String {
+        if let Some(ref url) = self.external_url {
+            url.clone()
+        } else {
+            let host = if self.host == "0.0.0.0" { "localhost" } else { &self.host };
+            format!("http://{}:{}", host, self.port)
+        }
+    }
+}
+
+fn default_oauth_host() -> String { "0.0.0.0".to_owned() }
+fn default_oauth_port() -> u16 { 6791 }
+fn default_oauth_scopes() -> Vec<String> {
+    vec![
+        "read:*:*".to_owned(),
+        "infer:model:*".to_owned(),
+        "write:*:*".to_owned(),
+    ]
+}
+fn default_oauth_token_ttl() -> u32 { 3600 }
 
 /// StreamService configuration
 ///
@@ -335,6 +439,7 @@ fn default_startup_services() -> Vec<String> {
         "streams".to_owned(),   // Streaming proxy with JWT validation
         "worker".to_owned(),    // Container workloads
         "model".to_owned(),     // Model management
+        "oauth".to_owned(),     // OAuth 2.1 authorization server
         "oai".to_owned(),       // OpenAI-compatible HTTP API
         "flight".to_owned(),    // Arrow Flight SQL server
         "mcp".to_owned(),       // Model Context Protocol service
@@ -523,6 +628,7 @@ pub struct HyprConfigBuilder {
     oai: OAIConfig,
     flight: FlightConfig,
     mcp: MCPConfig,
+    oauth: OAuthConfig,
     streaming: StreamingConfig,
 }
 
@@ -543,6 +649,7 @@ impl HyprConfigBuilder {
             oai: OAIConfig::default(),
             flight: FlightConfig::default(),
             mcp: MCPConfig::default(),
+            oauth: OAuthConfig::default(),
             streaming: StreamingConfig::default(),
         }
     }
@@ -563,6 +670,7 @@ impl HyprConfigBuilder {
             oai: config.oai,
             flight: config.flight,
             mcp: config.mcp,
+            oauth: config.oauth,
             streaming: config.streaming,
         }
     }
@@ -595,6 +703,7 @@ impl HyprConfigBuilder {
             oai: self.oai,
             flight: self.flight,
             mcp: self.mcp,
+            oauth: self.oauth,
             streaming: self.streaming,
         }
     }

@@ -1,19 +1,27 @@
-//! JWT claims with structured scopes.
+//! JWT claims for authentication.
+//!
+//! Authorization is enforced server-side via Casbin policies, not JWT scopes.
 
-use super::Scope;
 use crate::common_capnp;
 use crate::capnp::{ToCapnp, FromCapnp};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-/// JWT claims with structured scopes.
+/// JWT claims for authentication.
+///
+/// Note: Authorization is enforced via Casbin policies server-side.
+/// Scopes are NOT embedded in JWTs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: String,
     pub exp: i64,
     pub iat: i64,
-    pub scopes: Vec<Scope>,
     pub admin: bool,
+    /// RFC 8707 audience claim for resource indicator binding.
+    /// When present, resource servers MUST validate this matches their canonical URI.
+    /// Tokens without `aud` (legacy/env-var tokens) continue to work for backward compatibility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aud: Option<String>,
 }
 
 impl ToCapnp for Claims {
@@ -24,15 +32,11 @@ impl ToCapnp for Claims {
         builder.set_exp(self.exp);
         builder.set_iat(self.iat);
         builder.set_admin(self.admin);
-
-        // Cap'n Proto uses u32 for list lengths - cap at u32::MAX (safe: no one has 4B scopes)
-        let scopes_len = u32::try_from(self.scopes.len()).unwrap_or(u32::MAX);
-        let mut scopes_builder = builder.reborrow().init_scopes(scopes_len);
-        for (i, scope) in self.scopes.iter().enumerate() {
-            let idx = u32::try_from(i).unwrap_or(u32::MAX);
-            let mut scope_builder = scopes_builder.reborrow().get(idx);
-            scope.write_to(&mut scope_builder);
+        if let Some(ref aud) = self.aud {
+            builder.set_aud(aud);
         }
+        // Write empty scopes list for wire compatibility
+        builder.reborrow().init_scopes(0);
     }
 }
 
@@ -40,50 +44,38 @@ impl FromCapnp for Claims {
     type Reader<'a> = common_capnp::claims::Reader<'a>;
 
     fn read_from(reader: Self::Reader<'_>) -> Result<Self> {
-        let scopes_reader = reader.get_scopes()?;
-        let mut scopes = Vec::with_capacity(scopes_reader.len() as usize);
-        for scope_reader in scopes_reader.iter() {
-            scopes.push(Scope::read_from(scope_reader)?);
-        }
+        // Scopes on the wire are ignored - authorization is via Casbin
+        let aud = reader.get_aud().ok()
+            .and_then(|s| s.to_str().ok())
+            .map(|s| s.to_owned())
+            .filter(|s| !s.is_empty());
 
         Ok(Self {
             sub: reader.get_sub()?.to_str()?.to_owned(),
             exp: reader.get_exp(),
             iat: reader.get_iat(),
-            scopes,
             admin: reader.get_admin(),
+            aud,
         })
     }
 }
 
 impl Claims {
     /// Create new claims.
-    pub fn new(sub: String, iat: i64, exp: i64, scopes: Vec<Scope>, admin: bool) -> Self {
+    pub fn new(sub: String, iat: i64, exp: i64, admin: bool) -> Self {
         Self {
             sub,
             exp,
             iat,
-            scopes,
             admin,
+            aud: None,
         }
     }
 
-    /// Check if claims grant required scope.
-    ///
-    /// FAIL-SECURE: Empty scopes deny all (not allow all)
-    pub fn has_scope(&self, required: &Scope) -> bool {
-        // FAIL-SECURE: Empty scopes deny all
-        if self.scopes.is_empty() && !self.admin {
-            return false;
-        }
-
-        // Admin override
-        if self.admin {
-            return true;
-        }
-
-        // Check if any granted scope permits required scope
-        self.scopes.iter().any(|s| s.grants(required))
+    /// Create new claims with an audience (RFC 8707 resource indicator).
+    pub fn with_audience(mut self, audience: Option<String>) -> Self {
+        self.aud = audience;
+        self
     }
 
     /// Check if token is expired.
@@ -102,46 +94,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_claims_has_scope_exact() -> Result<()> {
-        let claims = Claims::new(
-            "alice".to_owned(),
-            1000,
-            2000,
-            vec![Scope::parse("infer:model:qwen-7b")?],
-            false,
-        );
-        let required = Scope::parse("infer:model:qwen-7b")?;
-        assert!(claims.has_scope(&required));
-        Ok(())
+    fn test_claims_new() {
+        let claims = Claims::new("alice".to_owned(), 1000, 2000, false);
+        assert_eq!(claims.sub, "alice");
+        assert_eq!(claims.iat, 1000);
+        assert_eq!(claims.exp, 2000);
+        assert!(!claims.admin);
+        assert!(claims.aud.is_none());
     }
 
     #[test]
-    fn test_claims_has_scope_wildcard() -> Result<()> {
-        let claims = Claims::new(
-            "alice".to_owned(),
-            1000,
-            2000,
-            vec![Scope::parse("infer:model:*")?],
-            false,
-        );
-        let required = Scope::parse("infer:model:qwen-7b")?;
-        assert!(claims.has_scope(&required));
-        Ok(())
+    fn test_claims_with_audience() {
+        let claims = Claims::new("alice".to_owned(), 1000, 2000, false)
+            .with_audience(Some("https://api.example.com".to_owned()));
+        assert_eq!(claims.aud, Some("https://api.example.com".to_owned()));
     }
 
     #[test]
-    fn test_claims_fail_secure_empty_scopes() -> Result<()> {
-        let claims = Claims::new("alice".to_owned(), 1000, 2000, vec![], false);
-        let required = Scope::parse("infer:model:qwen-7b")?;
-        assert!(!claims.has_scope(&required));
-        Ok(())
-    }
-
-    #[test]
-    fn test_claims_admin_override() -> Result<()> {
-        let claims = Claims::new("admin".to_owned(), 1000, 2000, vec![], true);
-        let required = Scope::parse("infer:model:qwen-7b")?;
-        assert!(claims.has_scope(&required));
-        Ok(())
+    fn test_claims_casbin_subject() {
+        let claims = Claims::new("alice".to_owned(), 1000, 2000, false);
+        assert_eq!(claims.casbin_subject(), "user:alice");
     }
 }

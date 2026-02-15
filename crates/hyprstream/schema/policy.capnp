@@ -42,6 +42,9 @@ struct IssueToken {
 
   # Optional TTL in seconds (0 = use default)
   ttl @1 :UInt32;
+
+  # RFC 8707 resource indicator for audience binding (empty = no binding)
+  audience @2 :Text;
 }
 
 # Unified policy response (covers both check and token issuance)

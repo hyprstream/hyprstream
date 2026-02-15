@@ -856,9 +856,8 @@ fn generate_getter(
 /// The macro generates:
 /// 1. JWT token validation via `ctx.validate_jwt()`
 /// 2. Structured scope construction: `Scope::new(action, resource, request.identifier_field)`
-/// 3. Casbin policy check (optional, based on service configuration)
-/// 4. JWT scope check via `claims.has_scope(&required_scope)`
-/// 5. Original method call if all checks pass
+/// 3. Casbin policy check (single source of truth for authorization)
+/// 4. Original method call if all checks pass
 ///
 /// # Security
 ///
@@ -915,15 +914,8 @@ pub fn authorize(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ));
             }
 
-            // Check claims scope (uses Scope::grants() with safe wildcard matching)
-            if !claims.has_scope(&required_scope) {
-                return Err(anyhow::anyhow!(
-                    "Forbidden: Missing scope '{}'",
-                    required_scope.to_string()
-                ));
-            }
-
-            // Authorization passed - execute original function body
+            // Authorization passed (Casbin is the single source of truth)
+            // JWT scope checks removed - Casbin enforces all authorization
             #fn_block
         }
     };

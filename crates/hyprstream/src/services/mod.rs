@@ -77,6 +77,7 @@ pub mod generated;
 pub mod inference;
 pub mod mcp_service;
 pub mod model;
+pub mod oauth;
 pub mod oai;
 pub mod policy;
 pub mod registry;
@@ -107,6 +108,7 @@ pub use model::{
 };
 pub use stream::StreamService;
 pub use worker::{WorkerZmqClient, WorkflowZmqClient, build_authorize_fn};
+pub use oauth::OAuthService;
 pub use oai::OAIService;
 pub use flight::FlightService;
 pub use callback::{CallbackRouter, Instance};

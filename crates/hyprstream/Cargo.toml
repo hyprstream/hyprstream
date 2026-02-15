@@ -129,6 +129,7 @@ bitflags = "2.4"  # Capability flags for archetype detection
 casbin = "2"  # Access control library for RBAC/ABAC
 indicatif.workspace = true              # Progress bars
 fastrand.workspace = true                # Fast random number generation for sampling
+rand.workspace = true                    # Cryptographic random for OAuth auth codes
 xdg.workspace = true                     # XDG Base Directory specification
 blake3.workspace = true                  # Fast cryptographic hashing for checksums
 tempfile.workspace = true                # Temporary files for model conversion

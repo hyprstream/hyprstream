@@ -1617,7 +1617,6 @@ mod tests {
             "charlie".to_owned(),
             1000,
             2000,
-            vec![],
             false,
         );
         assert_eq!(Subject::from_claims(&claims), Subject::User("charlie".into()));

@@ -460,19 +460,12 @@ pub async fn handle_token_create(
         format!("token-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"))
     });
 
-    // Parse scopes into structured Scope objects
-    use hyprstream_rpc::auth::Scope;
-    let parsed_scopes: Result<Vec<Scope>> = scopes
-        .iter()
-        .map(|s| Scope::parse(s))
-        .collect();
-    let parsed_scopes = parsed_scopes.context("Invalid scope format. Expected 'action:resource:identifier'")?;
-
     // Create JWT claims with prefixed subject (token:user)
+    // Scopes are not embedded in JWT - Casbin enforces authorization server-side
     let now = chrono::Utc::now().timestamp();
     let exp = (chrono::Utc::now() + duration).timestamp();
     let prefixed_subject = format!("token:{user}");
-    let claims = Claims::new(prefixed_subject.clone(), now, exp, parsed_scopes, admin);
+    let claims = Claims::new(prefixed_subject.clone(), now, exp, admin);
 
     // Encode and sign the JWT
     let token = jwt::encode(&claims, signing_key);

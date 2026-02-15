@@ -125,6 +125,7 @@ struct Claims {
   iat @2 :Int64;         # Issued at timestamp
   scopes @3 :List(Scope); # Structured scopes
   admin @4 :Bool;        # Admin override
+  aud @5 :Text;          # RFC 8707 audience (resource indicator)
 }
 
 # UTC timestamp with nanosecond precision

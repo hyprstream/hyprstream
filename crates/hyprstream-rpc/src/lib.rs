@@ -147,7 +147,7 @@ pub use envelope::{
     ResponseEnvelope, SignedEnvelope, Subject, MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
 };
 pub use error::{EnvelopeError, EnvelopeResult, Result, RpcError};
-pub use hyprstream_rpc_derive::{authorize, register_scopes, service_factory, FromCapnp, ToCapnp};
+pub use hyprstream_rpc_derive::{authorize, service_factory, FromCapnp, ToCapnp};
 pub use service::{Continuation, EnvelopeContext, RequestLoop, ServiceClient, ServiceHandle, ZmqClient, ZmqService};
 pub use streaming::{
     ChannelProgressReporter, forward_progress_to_stream, progress_channel,

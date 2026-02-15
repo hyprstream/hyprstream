@@ -17,7 +17,7 @@
 //! `Authorization: Bearer <token>` header (HTTP) and validates:
 //! 1. JWT signature via Ed25519
 //! 2. Token expiration
-//! 3. Scopes via `Claims.has_scope(&Scope)` for each tool call
+//! 3. Backend services enforce authorization via Casbin policies
 
 use async_trait::async_trait;
 use crate::services::{ModelZmqClient, RegistryZmqClient, PolicyClient, InferenceZmqClient};
@@ -27,7 +27,7 @@ use crate::services::generated::mcp_client::{
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures::future::BoxFuture;
-use hyprstream_rpc::auth::{jwt, Claims, Scope};
+use hyprstream_rpc::auth::{jwt, Claims};
 use hyprstream_rpc::envelope::RequestIdentity;
 use hyprstream_rpc::service::factory::ServiceContext;
 use hyprstream_rpc::service::ZmqService;
@@ -565,9 +565,8 @@ impl McpService {
 
         if let Some(ref claims) = claims {
             tracing::info!(
-                "McpService authenticated as: {} with scopes: {:?}",
-                claims.sub,
-                claims.scopes
+                "McpService authenticated as: {}",
+                claims.sub
             );
         }
 
@@ -588,24 +587,6 @@ impl McpService {
             signing_key: config.signing_key,
             service_ctx: config.ctx,
         })
-    }
-
-    /// Check if current claims have required scope
-    fn check_scope(&self, required: &str) -> Result<(), ErrorData> {
-        let scope = Scope::parse(required)
-            .map_err(|e| ErrorData::internal_error(format!("Invalid scope: {}", e), None))?;
-
-        match &self.claims {
-            Some(claims) if claims.has_scope(&scope) => Ok(()),
-            Some(claims) => Err(ErrorData::invalid_request(
-                format!("Insufficient scope: {} (have: {:?})", required, claims.scopes),
-                None,
-            )),
-            None => Err(ErrorData::invalid_request(
-                "No authentication provided. Set HYPRSTREAM_TOKEN environment variable.".to_string(),
-                None,
-            )),
-        }
     }
 
     /// Convert registry to rmcp Tool list
@@ -638,8 +619,6 @@ impl McpService {
     async fn dispatch_tool(&self, uuid: &Uuid, args: Value) -> Result<CallToolResult, ErrorData> {
         let entry = self.registry.get(uuid)
             .ok_or_else(|| ErrorData::invalid_request(format!("Unknown tool: {}", uuid), None))?;
-
-        self.check_scope(&entry.required_scope)?;
 
         // Propagate authenticated identity to backend services (not local())
         let identity = match &self.claims {
@@ -767,11 +746,6 @@ impl McpHandler for McpService {
                 .unwrap_or(0)
         };
 
-        let scopes: Vec<String> = self.claims
-            .as_ref()
-            .map(|c| c.scopes.iter().map(|s| s.to_string()).collect())
-            .unwrap_or_default();
-
         Ok(McpResponseVariant::GetStatusResult(ServiceStatus {
             is_running: true,
             loaded_model_count,
@@ -779,7 +753,7 @@ impl McpHandler for McpService {
             authenticated_user: self.claims.as_ref()
                 .map(|c| c.sub.clone())
                 .unwrap_or_default(),
-            scopes,
+            scopes: vec![],  // Scopes no longer in JWT; authorization via Casbin
         }))
     }
 
