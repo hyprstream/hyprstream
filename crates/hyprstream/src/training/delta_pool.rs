@@ -210,7 +210,7 @@ impl DeltaPool {
 
         oldest_tenant.and_then(|tid| {
             self.deltas.remove(&tid).map(|(id, delta)| {
-                let id_filename = id.to_filename();
+                let id_filename = id.to_string();
                 // Auto-snapshot to file before eviction
                 let snapshot_path = {
                     let d = delta.lock();
@@ -363,8 +363,8 @@ mod tests {
             2,
         );
 
-        let tid_a = Subject::Local("tenant-a".into());
-        let tid_b = Subject::Local("tenant-b".into());
+        let tid_a = Subject::new("tenant-a");
+        let tid_b = Subject::new("tenant-b");
 
         let delta_a = pool.get_or_create(&tid_a).unwrap();
         let delta_b = pool.get_or_create(&tid_b).unwrap();
@@ -391,8 +391,8 @@ mod tests {
             2,
         );
 
-        let tid_a = Subject::Local("tenant-a".into());
-        let tid_b = Subject::Local("tenant-b".into());
+        let tid_a = Subject::new("tenant-a");
+        let tid_b = Subject::new("tenant-b");
 
         let delta_a = pool.get_or_create(&tid_a).unwrap();
         let delta_b = pool.get_or_create(&tid_b).unwrap();
@@ -422,9 +422,9 @@ mod tests {
             2,
         );
 
-        let tid_a = Subject::Local("tenant-a".into());
-        let tid_b = Subject::Local("tenant-b".into());
-        let tid_c = Subject::Local("tenant-c".into());
+        let tid_a = Subject::new("tenant-a");
+        let tid_b = Subject::new("tenant-b");
+        let tid_c = Subject::new("tenant-c");
 
         let _a = pool.get_or_create(&tid_a).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -454,7 +454,7 @@ mod tests {
             2,
         );
 
-        let tid = Subject::Local("tenant".into());
+        let tid = Subject::new("tenant");
         let _delta = pool.get_or_create(&tid).unwrap();
 
         let usage = pool.total_memory_usage();

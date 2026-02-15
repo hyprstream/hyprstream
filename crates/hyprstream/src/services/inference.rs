@@ -1451,7 +1451,7 @@ impl InferenceService {
         // Save as adapter file
         let adapter_mgr = crate::storage::AdapterManager::new(&self.model_path);
         let adapter_name = if name.is_empty() {
-            format!("ttt_{}", subject.to_filename())
+            format!("ttt_{}", subject.to_string())
         } else {
             name.to_owned()
         };
@@ -1536,7 +1536,7 @@ impl InferenceService {
             .ok_or_else(|| anyhow!("No delta for subject '{}'", subject))?;
         let mut delta = delta_arc.lock();
 
-        let filename = subject.to_filename();
+        let filename = subject.to_string();
         let state_dict = delta.extract_state_dict();
 
         // Write snapshot through FsOps (path-contained)
@@ -1579,7 +1579,7 @@ impl InferenceService {
         let delta = delta_arc.lock();
 
         let adapter_name = if name.is_empty() {
-            format!("ttt_{}", subject.to_filename())
+            format!("ttt_{}", subject.to_string())
         } else {
             name.to_owned()
         };

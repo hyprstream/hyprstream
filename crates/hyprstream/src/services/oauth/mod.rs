@@ -176,11 +176,10 @@ impl Spawnable for OAuthService {
 /// Create a Protected Resource Metadata JSON response (RFC 9728).
 ///
 /// Used by MCP and OAI servers to advertise their OAuth authorization server.
-pub fn protected_resource_metadata(resource_url: &str, oauth_issuer_url: &str, scopes: &[&str]) -> serde_json::Value {
+pub fn protected_resource_metadata(resource_url: &str, oauth_issuer_url: &str) -> serde_json::Value {
     serde_json::json!({
         "resource": resource_url,
         "authorization_servers": [oauth_issuer_url],
-        "scopes_supported": scopes,
     })
 }
 
@@ -194,7 +193,6 @@ mod tests {
         let meta = protected_resource_metadata(
             "http://localhost:6790",
             "http://localhost:6791",
-            &["read:*:*", "infer:model:*"],
         );
         assert_eq!(meta["resource"], "http://localhost:6790");
         assert_eq!(meta["authorization_servers"][0], "http://localhost:6791");

@@ -79,11 +79,6 @@ impl Claims {
     pub fn is_expired(&self) -> bool {
         chrono::Utc::now().timestamp() > self.exp
     }
-
-    /// Get Casbin subject string.
-    pub fn casbin_subject(&self) -> String {
-        format!("user:{}", self.sub)
-    }
 }
 
 #[cfg(test)]
@@ -107,8 +102,9 @@ mod tests {
     }
 
     #[test]
-    fn test_claims_casbin_subject() {
+    fn test_claims_subject() {
+        use crate::envelope::Subject;
         let claims = Claims::new("alice".to_owned(), 1000, 2000);
-        assert_eq!(claims.casbin_subject(), "user:alice");
+        assert_eq!(Subject::from(&claims), Subject::new("alice"));
     }
 }

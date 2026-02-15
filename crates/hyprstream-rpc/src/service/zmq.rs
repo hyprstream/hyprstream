@@ -8,7 +8,7 @@
 //! All requests are wrapped in `SignedEnvelope` for authentication:
 //! - `RequestLoop` unwraps and verifies signatures before dispatching
 //! - Handlers receive `EnvelopeContext` with verified identity
-//! - Services use `ctx.casbin_subject()` for policy checks
+//! - Services use `ctx.subject()` for policy checks
 
 use crate::prelude::*;
 use crate::transport::TransportConfig;
@@ -41,7 +41,7 @@ pub type Continuation = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>
 ///
 /// This struct is passed to service handlers after the `RequestLoop`
 /// has verified the envelope signature. Handlers use this for:
-/// - Authorization checks via `casbin_subject()`
+/// - Authorization checks via `subject()`
 /// - Correlation via `request_id`
 /// - Stream HMAC key derivation via `ephemeral_pubkey`
 ///
@@ -50,8 +50,9 @@ pub type Continuation = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>
 /// ```ignore
 /// fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<Continuation>)> {
 ///     // Check authorization
-///     if !policy_manager.check(&ctx.casbin_subject(), "Model", "infer") {
-///         return Err(anyhow!("unauthorized: {}", ctx.casbin_subject()));
+///     let sub = ctx.subject().to_string();
+///     if !policy_manager.check(&sub, "Model", "infer") {
+///         return Err(anyhow!("unauthorized: {}", sub));
 ///     }
 ///     // Process request...
 /// }
@@ -92,19 +93,11 @@ impl EnvelopeContext {
     /// both authorization checks and resource isolation.
     pub fn subject(&self) -> Subject {
         self.claims.as_ref()
-            .map(Subject::from_claims)
-            .unwrap_or_else(|| Subject::from_identity(&self.identity))
+            .map(Subject::from)
+            .unwrap_or_else(|| Subject::from(&self.identity))
     }
 
-    /// Get the namespaced Casbin subject for policy checks.
-    ///
-    /// Returns prefixed identities like `"local:alice"`, `"token:bob"`, etc.
-    #[deprecated(note = "Use ctx.subject().to_string() instead")]
-    pub fn casbin_subject(&self) -> String {
-        self.identity.casbin_subject()
-    }
-
-    /// Get the raw user string (without namespace prefix).
+    /// Get the bare username string.
     pub fn user(&self) -> &str {
         self.identity.user()
     }
@@ -119,19 +112,6 @@ impl EnvelopeContext {
     /// Claims are already verified by the envelope signature.
     pub fn claims(&self) -> Option<&crate::auth::Claims> {
         self.claims.as_ref()
-    }
-
-    /// Get user subject for Casbin checks (if claims present)
-    #[deprecated(note = "Use ctx.subject() instead")]
-    pub fn user_subject(&self) -> Option<String> {
-        self.claims.as_ref().map(super::super::auth::claims::Claims::casbin_subject)
-    }
-
-    /// Get effective subject (user if present, otherwise service identity)
-    #[deprecated(note = "Use ctx.subject() instead")]
-    #[allow(deprecated)]
-    pub fn effective_subject(&self) -> String {
-        self.user_subject().unwrap_or_else(|| self.identity.casbin_subject())
     }
 
     /// Check if request has user context
@@ -177,7 +157,7 @@ impl EnvelopeContext {
 /// impl ZmqService for MyService {
 ///     fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<Continuation>)> {
 ///         // ctx.identity is already verified
-///         info!("Request from {} (id={})", ctx.casbin_subject(), ctx.request_id);
+///         info!("Request from {} (id={})", ctx.subject(), ctx.request_id);
 ///         Ok((vec![], None))
 ///     }
 ///

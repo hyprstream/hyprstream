@@ -37,30 +37,7 @@ pub fn generate_metadata(service_name: &str, schema: &ParsedSchema) -> TokenStre
 
 fn generate_metadata_structs() -> TokenStream {
     quote! {
-        /// Schema for a single method parameter.
-        #[derive(Debug, Clone)]
-        pub struct ParamSchema {
-            pub name: &'static str,
-            pub type_name: &'static str,
-            pub required: bool,
-            pub description: &'static str,
-        }
-
-        /// Schema for a service method.
-        #[derive(Debug, Clone)]
-        pub struct MethodSchema {
-            pub name: &'static str,
-            pub params: &'static [ParamSchema],
-            pub is_scoped: bool,
-            pub scope_field: &'static str,
-            pub description: &'static str,
-            /// MCP scope override from $mcpScope annotation (e.g., "write:model:*"). Empty = use default.
-            pub scope: &'static str,
-            /// True if the response type is StreamInfo (streaming method).
-            pub is_streaming: bool,
-            /// True if this method should be hidden from the CLI ($cliHidden annotation).
-            pub cli_hidden: bool,
-        }
+        pub use hyprstream_rpc::service::metadata::{ParamMeta as ParamSchema, MethodMeta as MethodSchema};
     }
 }
 
@@ -163,7 +140,7 @@ fn generate_method_schema_entry(
             description: #method_desc,
             scope: #scope_str,
             is_streaming: #is_streaming,
-            cli_hidden: #cli_hidden,
+            hidden: #cli_hidden,
         }
     }
 }

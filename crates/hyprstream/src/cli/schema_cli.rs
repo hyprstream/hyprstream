@@ -84,7 +84,7 @@ macro_rules! extract_methods {
                 scope_field: m.scope_field.to_string(),
                 description: m.description.to_string(),
                 is_streaming: m.is_streaming,
-                cli_hidden: m.cli_hidden,
+                cli_hidden: m.hidden,
             })
             .collect::<Vec<_>>()
     }};
@@ -111,7 +111,7 @@ macro_rules! extract_scoped_methods {
                 scope_field: m.scope_field.to_string(),
                 description: m.description.to_string(),
                 is_streaming: m.is_streaming,
-                cli_hidden: m.cli_hidden,
+                cli_hidden: m.hidden,
             })
             .collect();
         (service_name.to_string(), scope_name.to_string(), views)

@@ -225,7 +225,7 @@ mod tests {
         let batched = BatchedLoRAForward::new(pool, 4, 0.5, device);
 
         let x = Tensor::randn([1, 5, 64], (Kind::Float, device));
-        let tenant = Subject::Local("missing".into());
+        let tenant = Subject::new("missing");
 
         let result = batched.single_tenant_forward(&x, "q_proj", &tenant, 0).unwrap();
         assert_eq!(result.size(), vec![1, 5, 64]);
@@ -240,7 +240,7 @@ mod tests {
         let (pool, device) = create_test_pool();
 
         // Create a delta for tenant A
-        let tenant_a = Subject::Local("tenant-a".into());
+        let tenant_a = Subject::new("tenant-a");
         pool.get_or_create(&tenant_a).unwrap();
 
         let batched = BatchedLoRAForward::new(pool, 4, 0.5, device);
@@ -254,8 +254,8 @@ mod tests {
     fn test_batched_forward_isolation() {
         let (pool, device) = create_test_pool();
 
-        let tenant_a = Subject::Local("tenant-a".into());
-        let tenant_b = Subject::Local("tenant-b".into());
+        let tenant_a = Subject::new("tenant-a");
+        let tenant_b = Subject::new("tenant-b");
         pool.get_or_create(&tenant_a).unwrap();
         pool.get_or_create(&tenant_b).unwrap();
 
@@ -287,7 +287,7 @@ mod tests {
     fn test_batched_matches_sequential() {
         let (pool, device) = create_test_pool();
 
-        let tenant = Subject::Local("tenant-test".into());
+        let tenant = Subject::new("tenant-test");
         pool.get_or_create(&tenant).unwrap();
 
         let batched = BatchedLoRAForward::new(pool.clone(), 4, 0.5, device);

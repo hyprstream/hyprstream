@@ -14,6 +14,7 @@ pub mod spawner;
 pub mod manager;
 pub mod streaming;
 pub mod factory;
+pub mod metadata;
 
 pub use traits::{RpcHandler, RpcRequest, RpcService};
 pub use zmq::{AuthorizeFn, CallOptions, Continuation, EnvelopeContext, ServiceHandle, RequestLoop, ZmqClient, ZmqService};

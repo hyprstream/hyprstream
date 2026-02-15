@@ -163,6 +163,7 @@ pub use service::spawner::{
 
 // Service manager re-exports
 pub use service::{detect_service_manager, ServiceManager, StandaloneManager};
+pub use service::metadata::{MethodMeta, ParamMeta};
 #[cfg(feature = "systemd")]
 pub use service::SystemdManager;
 

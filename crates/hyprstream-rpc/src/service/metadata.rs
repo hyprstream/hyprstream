@@ -1,0 +1,45 @@
+//! RPC schema introspection metadata types.
+//!
+//! These types represent metadata extracted from Cap'n Proto schema annotations
+//! (`$mcpScope`, `$mcpDescription`, `$cliHidden`, `$paramDescription`).
+//! They are the shared source of truth used by both the `generate_rpc_service!`
+//! codegen macro and the runtime `ServiceFactory` inventory.
+
+/// Schema metadata for a single RPC method parameter.
+///
+/// Extracted from Cap'n Proto struct field definitions and `$paramDescription` annotations.
+#[derive(Debug, Clone)]
+pub struct ParamMeta {
+    pub name: &'static str,
+    pub type_name: &'static str,
+    pub required: bool,
+    pub description: &'static str,
+}
+
+/// Schema metadata for a single RPC method.
+///
+/// Extracted from Cap'n Proto union variants and schema annotations
+/// (`$mcpScope`, `$mcpDescription`, `$cliHidden`).
+#[derive(Debug, Clone)]
+pub struct MethodMeta {
+    pub name: &'static str,
+    pub params: &'static [ParamMeta],
+    pub description: &'static str,
+    /// Required authorization scope action (from `$mcpScope`). Empty = default (`"query"`).
+    pub scope: &'static str,
+    pub is_streaming: bool,
+    pub is_scoped: bool,
+    pub scope_field: &'static str,
+    /// Whether to hide from auto-generated interfaces (from `$cliHidden`).
+    pub hidden: bool,
+}
+
+/// Function type for service schema metadata.
+///
+/// Returns `(service_name, methods)`.
+pub type SchemaMetadataFn = fn() -> (&'static str, &'static [MethodMeta]);
+
+/// Function type for scoped service schema metadata.
+///
+/// Returns `(service_name, scope_name, methods)`.
+pub type ScopedSchemaMetadataFn = fn() -> (&'static str, &'static str, &'static [MethodMeta]);

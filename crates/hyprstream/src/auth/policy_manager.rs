@@ -28,7 +28,7 @@
 //! p, operator, *, *, *, allow
 //! p, trainer, *, model:*, infer, allow
 //! p, trainer, *, model:*, train, allow
-//! g, token:alice, trainer
+//! g, alice, trainer
 //! ```
 
 use crate::auth::Operation;
@@ -140,12 +140,12 @@ const DEFAULT_POLICY_CSV: &str = r#"# Hyprstream Access Control Policy — deny-
 #   hyprstream policy apply-template public-read       # anonymous registry browse
 #
 # Or add rules manually:
-#   p, local:*, *, *, *, allow                         # local users full access
-#   p, token:alice, *, model:*, infer, allow           # Alice can infer via token
+#   p, alice, *, *, *, allow                           # Alice full access
+#   p, alice, *, model:*, infer, allow                 # Alice can infer
 #   p, anonymous, *, inference:*, infer, allow         # public inference
 #
 # Role assignments:
-#   g, token:alice, trainer
+#   g, alice, trainer
 #   p, trainer, *, model:*, train, allow
 "#;
 
@@ -172,7 +172,7 @@ fn validate_policy_csv(policy_path: &Path) -> Result<(), PolicyError> {
                     "Invalid policy format at line {}:\n\
                     Found:    {}\n\
                     Expected: p, subject, domain, resource, action, effect\n\
-                    Example:  p, local:*, *, *, *, allow\n\n\
+                    Example:  p, alice, *, *, *, allow\n\n\
                     Your policy has {} fields but 6 are required.\n\
                     Edit {} to fix the format.",
                     line_num + 1, line, fields.len(), policy_path.display()
@@ -188,7 +188,7 @@ fn validate_policy_csv(policy_path: &Path) -> Result<(), PolicyError> {
                     "Invalid role format at line {}:\n\
                     Found:    {}\n\
                     Expected: g, user, role\n\
-                    Example:  g, token:alice, trainer",
+                    Example:  g, alice, trainer",
                     line_num + 1, line
                 )));
             }

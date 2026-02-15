@@ -220,10 +220,7 @@ Add to your `~/.claude/claude_desktop_config.json`:
 {
   "mcpServers": {
     "hyprstream": {
-      "url": "http://localhost:6790/mcp",
-      "env": {
-        "HYPRSTREAM_TOKEN": "hypr_eyJhbGciOiJFZDI1NTE5..."
-      }
+      "url": "http://localhost:6790/mcp"
     }
   }
 }

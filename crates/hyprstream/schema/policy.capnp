@@ -5,6 +5,9 @@
 # The policy service handles authorization checks via Casbin.
 # Uses REQ/REP pattern. Runs on multi-threaded runtime.
 
+using import "/annotations.capnp".mcpScope;
+using import "/annotations.capnp".mcpDescription;
+
 # Unified policy request with union discriminator (follows RegistryRequest pattern)
 struct PolicyRequest {
   # Request ID for tracking
@@ -16,7 +19,10 @@ struct PolicyRequest {
     check @1 :PolicyCheck;
 
     # JWT token issuance
-    issueToken @2 :IssueToken;
+    issueToken @2 :IssueToken $mcpScope(manage);
+
+    # List all supported authorization scopes discovered from service schemas
+    listScopes @3 :Void $mcpScope(query) $mcpDescription("List all supported authorization scopes discovered from service schemas");
   }
 }
 
@@ -66,6 +72,9 @@ struct PolicyResponse {
 
     # Token issuance result (for issueToken)
     tokenSuccess @3 :TokenInfo;
+
+    # Supported scopes list (for listScopes)
+    listScopesResult @4 :ScopeList;
   }
 }
 
@@ -80,4 +89,9 @@ struct ErrorInfo {
   message @0 :Text;
   code @1 :Text;
   details @2 :Text;
+}
+
+# List of supported authorization scopes
+struct ScopeList {
+  scopes @0 :List(Text);
 }

@@ -29,6 +29,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 
 use crate::envelope::RequestIdentity;
 use crate::registry::{global as global_registry, SocketKind};
+use crate::service::metadata::SchemaMetadataFn;
 use crate::service::spawner::Spawnable;
 use crate::service::ZmqClient;
 use crate::transport::TransportConfig;
@@ -185,6 +186,12 @@ pub struct ServiceFactory {
 
     /// Raw `.capnp` schema bytes (compile-time embedded via `include_bytes!`)
     pub schema: Option<&'static [u8]>,
+
+    /// Schema metadata function for compile-time scope discovery.
+    ///
+    /// When set, returns `(service_name, &[MethodMeta])` derived from Cap'n Proto
+    /// schema annotations. Used by PolicyService to discover supported scopes.
+    pub metadata: Option<SchemaMetadataFn>,
 }
 
 impl ServiceFactory {
@@ -192,14 +199,26 @@ impl ServiceFactory {
     ///
     /// Called by the `#[service_factory]` macro-generated code.
     pub const fn new(name: &'static str, factory: ServiceFactoryFn) -> Self {
-        Self { name, factory, schema: None }
+        Self { name, factory, schema: None, metadata: None }
     }
 
     /// Create a new service factory with schema bytes.
     ///
     /// Called by the `#[service_factory("name", schema = "...")]` macro-generated code.
     pub const fn with_schema(name: &'static str, factory: ServiceFactoryFn, schema: &'static [u8]) -> Self {
-        Self { name, factory, schema: Some(schema) }
+        Self { name, factory, schema: Some(schema), metadata: None }
+    }
+
+    /// Create a new service factory with schema bytes and metadata.
+    ///
+    /// Called by the `#[service_factory("name", schema = "...", metadata = ...)]` macro-generated code.
+    pub const fn with_metadata(
+        name: &'static str,
+        factory: ServiceFactoryFn,
+        schema: &'static [u8],
+        metadata: SchemaMetadataFn,
+    ) -> Self {
+        Self { name, factory, schema: Some(schema), metadata: Some(metadata) }
     }
 }
 

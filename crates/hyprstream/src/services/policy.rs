@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use crate::auth::{Operation, PolicyManager};
 use crate::services::{EnvelopeContext, ZmqService};
 use crate::services::generated::policy_client::{
-    ErrorInfo, PolicyClient, PolicyHandler, PolicyResponseVariant, TokenInfo,
+    ErrorInfo, PolicyClient, PolicyHandler, PolicyResponseVariant, TokenInfo, ScopeList,
     PolicyCheck, IssueToken,
     dispatch_policy,
 };
@@ -35,6 +35,8 @@ pub struct PolicyService {
     policy_manager: Arc<PolicyManager>,
     signing_key: Arc<SigningKey>,
     token_config: crate::config::TokenConfig,
+    /// Supported scopes computed once at construction from ServiceFactory inventory
+    supported_scopes: Vec<String>,
     // Infrastructure (for Spawnable)
     context: Arc<zmq::Context>,
     transport: TransportConfig,
@@ -53,6 +55,7 @@ impl PolicyService {
             policy_manager,
             signing_key,
             token_config,
+            supported_scopes: compute_supported_scopes(),
             context,
             transport,
         }
@@ -72,6 +75,31 @@ impl PolicyService {
         }
     }
 
+}
+
+/// Collect all supported scopes from compile-time schema metadata
+/// via the ServiceFactory inventory. No hardcoded service imports needed.
+///
+/// Scopes use flat format `action:service:*` — coarse-grained per OAuth convention.
+/// Fine-grained authorization is handled by Casbin resource patterns.
+fn compute_supported_scopes() -> Vec<String> {
+    use hyprstream_rpc::service::factory::list_factories;
+
+    let mut scopes = std::collections::BTreeSet::new();
+
+    for factory in list_factories() {
+        if let Some(metadata_fn) = factory.metadata {
+            let (service_name, methods) = metadata_fn();
+            for method in methods {
+                // Fallback is "query" (ScopeAction::query @0), NOT "read"
+                // which doesn't exist in Operation or ScopeAction enums.
+                let action = if method.scope.is_empty() { "query" } else { method.scope };
+                scopes.insert(format!("{}:{}:*", action, service_name));
+            }
+        }
+    }
+
+    scopes.into_iter().collect()
 }
 
 // ============================================================================
@@ -123,7 +151,9 @@ impl PolicyHandler for PolicyService {
     ) -> Result<PolicyResponseVariant> {
         trace!("Issuing JWT token");
 
-        // Determine subject: explicit subject (if provided and authorized) or envelope identity
+        // Determine subject: explicit subject (if provided and authorized) or envelope identity.
+        // JWT sub must contain a bare username (e.g. "randy", "birdetta") — the identity
+        // system adds the namespace prefix ("token:randy") when the JWT is decoded.
         let subject = if !data.subject.is_empty() {
             // Explicit subject requires `manage` permission on `policy:issue-token`
             let caller = ctx.subject().to_string();
@@ -145,7 +175,8 @@ impl PolicyHandler for PolicyService {
             }
             data.subject.clone()
         } else {
-            ctx.subject().to_string()
+            // Use bare username from the envelope identity.
+            ctx.user().to_string()
         };
 
         // Validate TTL
@@ -192,6 +223,16 @@ impl PolicyHandler for PolicyService {
         Ok(PolicyResponseVariant::TokenSuccess(TokenInfo {
             token,
             expires_at: claims.exp,
+        }))
+    }
+
+    async fn handle_list_scopes(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+    ) -> Result<PolicyResponseVariant> {
+        Ok(PolicyResponseVariant::ListScopesResult(ScopeList {
+            scopes: self.supported_scopes.clone(),
         }))
     }
 }
@@ -300,6 +341,12 @@ impl PolicyClient {
             }
             _ => Err(anyhow!("Unexpected response type for policy check")),
         }
+    }
+
+    /// Get all supported authorization scopes.
+    pub async fn supported_scopes(&self) -> Result<Vec<String>> {
+        let data = self.list_scopes().await?;
+        Ok(data.scopes)
     }
 
     /// Issue a JWT token with requested scopes

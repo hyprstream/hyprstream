@@ -94,7 +94,6 @@ async fn oauth_protected_resource_metadata() -> impl IntoResponse {
     Json(crate::services::oauth::protected_resource_metadata(
         &oai_url,
         &oauth_issuer,
-        &["read:*:*", "infer:model:*"],
     ))
 }
 

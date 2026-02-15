@@ -897,7 +897,7 @@ pub fn authorize(attr: TokenStream, item: TokenStream) -> TokenStream {
             );
 
             // Check Casbin policy (scope used as resource)
-            let subject = claims.casbin_subject();
+            let subject = claims.sub.clone();
             let allowed = tokio::task::block_in_place(|| {
                 let handle = tokio::runtime::Handle::current();
                 handle.block_on(self.policy_manager.check(
@@ -1109,27 +1109,44 @@ pub fn service_factory(attr: TokenStream, item: TokenStream) -> TokenStream {
     let func_name = &func.sig.ident;
     let name = &args.name;
 
-    let expanded = if let Some(schema_path) = &args.schema {
-        quote! {
-            #func
+    let expanded = match (&args.schema, &args.metadata) {
+        (Some(schema_path), Some(metadata_path)) => {
+            quote! {
+                #func
 
-            inventory::submit! {
-                hyprstream_rpc::service::factory::ServiceFactory::with_schema(
-                    #name,
-                    #func_name,
-                    include_bytes!(#schema_path)
-                )
+                inventory::submit! {
+                    hyprstream_rpc::service::factory::ServiceFactory::with_metadata(
+                        #name,
+                        #func_name,
+                        include_bytes!(#schema_path),
+                        #metadata_path
+                    )
+                }
             }
         }
-    } else {
-        quote! {
-            #func
+        (Some(schema_path), None) => {
+            quote! {
+                #func
 
-            inventory::submit! {
-                hyprstream_rpc::service::factory::ServiceFactory::new(
-                    #name,
-                    #func_name
-                )
+                inventory::submit! {
+                    hyprstream_rpc::service::factory::ServiceFactory::with_schema(
+                        #name,
+                        #func_name,
+                        include_bytes!(#schema_path)
+                    )
+                }
+            }
+        }
+        _ => {
+            quote! {
+                #func
+
+                inventory::submit! {
+                    hyprstream_rpc::service::factory::ServiceFactory::new(
+                        #name,
+                        #func_name
+                    )
+                }
             }
         }
     };
@@ -1142,15 +1159,18 @@ pub fn service_factory(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Supports:
 /// - `#[service_factory("name")]` — no schema
 /// - `#[service_factory("name", schema = "path/to/schema.capnp")]` — with schema
+/// - `#[service_factory("name", schema = "...", metadata = path::to::schema_metadata)]` — with metadata
 struct ServiceFactoryArgs {
     name: syn::LitStr,
     schema: Option<syn::LitStr>,
+    metadata: Option<syn::Path>,
 }
 
 impl syn::parse::Parse for ServiceFactoryArgs {
     fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
         let name: syn::LitStr = input.parse()?;
         let mut schema = None;
+        let mut metadata = None;
 
         while input.peek(syn::Token![,]) {
             input.parse::<syn::Token![,]>()?;
@@ -1163,13 +1183,16 @@ impl syn::parse::Parse for ServiceFactoryArgs {
                 "schema" => {
                     schema = Some(input.parse::<syn::LitStr>()?);
                 }
+                "metadata" => {
+                    metadata = Some(input.parse::<syn::Path>()?);
+                }
                 other => {
                     return Err(syn::Error::new(ident.span(), format!("unknown attribute: {other}")));
                 }
             }
         }
 
-        Ok(ServiceFactoryArgs { name, schema })
+        Ok(ServiceFactoryArgs { name, schema, metadata })
     }
 }
 

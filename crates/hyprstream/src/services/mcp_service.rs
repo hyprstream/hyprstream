@@ -28,7 +28,7 @@ use crate::services::generated::mcp_client::{
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures::future::BoxFuture;
-use hyprstream_rpc::auth::{jwt, Claims};
+use hyprstream_rpc::auth::jwt;
 use hyprstream_rpc::envelope::RequestIdentity;
 use hyprstream_rpc::service::factory::ServiceContext;
 use hyprstream_rpc::service::ZmqService;
@@ -180,7 +180,7 @@ fn register_schema_tools(reg: &mut ToolRegistry) {
                 let required_scope = if !method.scope.is_empty() {
                     method.scope.to_string()
                 } else {
-                    format!("read:{service_name}:*")
+                    format!("query:{service_name}:*")
                 };
 
                 if method.is_streaming {
@@ -225,7 +225,7 @@ fn register_schema_tools(reg: &mut ToolRegistry) {
             let required_scope = if !method.scope.is_empty() {
                 method.scope.to_string()
             } else {
-                "read:registry:*".into()
+                "query:registry:*".into()
             };
             reg.register(ToolEntry {
                 uuid: Uuid::new_v5(&MCP_NS, tool_name.as_bytes()),
@@ -286,7 +286,7 @@ fn register_schema_tools(reg: &mut ToolRegistry) {
                 let required_scope = if !method.scope.is_empty() {
                     method.scope.to_string()
                 } else {
-                    "read:model:*".into()
+                    "query:model:*".into()
                 };
 
                 if method.is_streaming {
@@ -535,8 +535,8 @@ async fn dispatch_schema_call(service: &str, method: &str, ctx: &ToolCallContext
 pub struct McpService {
     /// UUID-keyed tool registry
     registry: Arc<ToolRegistry>,
-    /// JWT claims from HYPRSTREAM_TOKEN env var (stdio transport fallback)
-    claims: Option<Claims>,
+    /// Raw HYPRSTREAM_TOKEN from env (stdio transport — decoded per-request)
+    stdio_token: Option<String>,
     /// Verifying key for JWT validation
     verifying_key: VerifyingKey,
     // === ZmqService infrastructure ===
@@ -553,24 +553,7 @@ pub struct McpService {
 impl McpService {
     /// Create a new McpService with JWT authentication
     pub fn new(config: McpConfig) -> anyhow::Result<Self> {
-        let claims = match std::env::var("HYPRSTREAM_TOKEN") {
-            Ok(token) => {
-                jwt::decode(&token, &config.verifying_key)
-                    .map(Some)
-                    .map_err(|e| anyhow::anyhow!("Invalid HYPRSTREAM_TOKEN: {}", e))?
-            }
-            Err(_) => {
-                tracing::warn!("No HYPRSTREAM_TOKEN provided - tools will require authentication");
-                None
-            }
-        };
-
-        if let Some(ref claims) = claims {
-            tracing::info!(
-                "McpService authenticated as: {}",
-                claims.sub
-            );
-        }
+        let stdio_token = std::env::var("HYPRSTREAM_TOKEN").ok();
 
         let mut tool_reg = ToolRegistry::new();
         register_schema_tools(&mut tool_reg);
@@ -582,7 +565,7 @@ impl McpService {
 
         Ok(Self {
             registry: Arc::new(tool_reg),
-            claims,
+            stdio_token,
             verifying_key: config.verifying_key,
             context: config.zmq_context.clone(),
             transport: config.transport,
@@ -607,8 +590,8 @@ impl McpService {
                 output_schema: None,
                 annotations: Some(ToolAnnotations {
                     title: Some(entry.name.clone()),
-                    read_only_hint: Some(entry.required_scope.starts_with("read:")),
-                    destructive_hint: Some(!entry.required_scope.starts_with("read:")),
+                    read_only_hint: Some(entry.required_scope.starts_with("query:")),
+                    destructive_hint: Some(!entry.required_scope.starts_with("query:")),
                     open_world_hint: Some(false),
                     idempotent_hint: Some(true),
                 }),
@@ -658,9 +641,17 @@ impl McpService {
                 }
             }
         } else {
-            // Stdio/ZMQ transport — use env var claims or local identity
-            match &self.claims {
-                Some(claims) => RequestIdentity::api_token(&claims.sub, "mcp"),
+            // Stdio/ZMQ transport — decode env token per-request
+            match &self.stdio_token {
+                Some(token) => {
+                    match jwt::decode(token, &self.verifying_key) {
+                        Ok(claims) => RequestIdentity::api_token(&claims.sub, "mcp"),
+                        Err(e) => {
+                            trace!("MCP stdio auth: token invalid ({}), using local identity", e);
+                            RequestIdentity::local()
+                        }
+                    }
+                }
                 None => RequestIdentity::local(),
             }
         }
@@ -735,8 +726,8 @@ impl ServerHandler for McpService {
             },
             instructions: Some(
                 "Hyprstream AI inference service. \
-                 Set HYPRSTREAM_TOKEN environment variable to enable tools. \
-                 Get a token: hyprstream policy token create --user <user> --scopes '<scopes>' --expires 90d"
+                 Connect via HTTP transport (url-based) for automatic OAuth authentication. \
+                 For stdio transport, set HYPRSTREAM_TOKEN env var if needed."
                     .into(),
             ),
         }
@@ -797,9 +788,10 @@ impl McpHandler for McpService {
         Ok(McpResponseVariant::GetStatusResult(ServiceStatus {
             is_running: true,
             loaded_model_count,
-            is_authenticated: self.claims.is_some(),
-            authenticated_user: self.claims.as_ref()
-                .map(|c| c.sub.clone())
+            is_authenticated: self.stdio_token.is_some(),
+            authenticated_user: self.stdio_token.as_ref()
+                .and_then(|t| jwt::decode(t, &self.verifying_key).ok())
+                .map(|c| c.sub)
                 .unwrap_or_default(),
             scopes: vec![],  // Scopes no longer in JWT; authorization via Casbin
         }))
@@ -814,8 +806,8 @@ impl McpHandler for McpService {
             ToolDefinition {
                 name: entry.uuid.to_string(),
                 description: entry.description.clone(),
-                is_read_only: entry.required_scope.starts_with("read:"),
-                is_destructive: !entry.required_scope.starts_with("read:"),
+                is_read_only: entry.required_scope.starts_with("query:"),
+                is_destructive: !entry.required_scope.starts_with("query:"),
                 required_scope: entry.required_scope.clone(),
                 argument_schema: entry.args_schema.to_string(),
             }
@@ -853,7 +845,7 @@ impl McpHandler for McpService {
         };
 
         // ZMQ transport: use envelope identity (already authenticated by ZMQ layer)
-        let identity = RequestIdentity::api_token(ctx.subject().to_string(), "mcp");
+        let identity = RequestIdentity::api_token(ctx.user(), "mcp");
         let result = self.dispatch_tool(&uuid, args, identity).await;
 
         match result {

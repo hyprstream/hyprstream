@@ -460,19 +460,18 @@ pub async fn handle_token_create(
         format!("token-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"))
     });
 
-    // Create JWT claims with prefixed subject (token:user)
-    // Scopes are not embedded in JWT - Casbin enforces authorization server-side
+    // Create JWT claims with bare username as subject.
+    // Scopes are not embedded in JWT - Casbin enforces authorization server-side.
     let now = chrono::Utc::now().timestamp();
     let exp = (chrono::Utc::now() + duration).timestamp();
-    let prefixed_subject = format!("token:{user}");
-    let claims = Claims::new(prefixed_subject.clone(), now, exp);
+    let claims = Claims::new(user.to_string(), now, exp);
 
     // Encode and sign the JWT
     let token = jwt::encode(&claims, signing_key);
 
     // Display the token (only shown once)
     println!();
-    println!("JWT token created for subject '{prefixed_subject}':");
+    println!("JWT token created for subject '{user}':");
     println!();
     println!("  {token}");
     println!();
@@ -612,7 +611,22 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 pub struct PolicyTemplate {
     pub name: &'static str,
     pub description: &'static str,
-    pub rules: &'static str,
+    /// Static rules, or None if rules are generated dynamically.
+    pub rules: Option<&'static str>,
+}
+
+impl PolicyTemplate {
+    /// Get the rules content, expanding dynamic templates.
+    pub fn expanded_rules(&self) -> String {
+        if let Some(rules) = self.rules {
+            rules.to_owned()
+        } else if self.name == "local" {
+            let user = hyprstream_rpc::envelope::RequestIdentity::local().user().to_string();
+            format!("# Full access for {user}\np, {user}, *, *, *, allow\n")
+        } else {
+            String::new()
+        }
+    }
 }
 
 /// Get all available policy templates
@@ -620,25 +634,23 @@ pub fn get_templates() -> &'static [PolicyTemplate] {
     &[
         PolicyTemplate {
             name: "local",
-            description: "Full access for local:* users (default for local execution)",
-            rules: r#"# Local user full access
-p, local:*, *, *, *, allow
-"#,
+            description: "Full access for the current local user",
+            rules: None, // Dynamic: expands to current OS username
         },
         PolicyTemplate {
             name: "public-inference",
             description: "Anonymous users can infer and query models",
-            rules: r#"# Public inference access
+            rules: Some(r#"# Public inference access
 p, anonymous, *, model:*, infer, allow
 p, anonymous, *, model:*, query, allow
-"#,
+"#),
         },
         PolicyTemplate {
             name: "public-read",
             description: "Anonymous users can query the registry (read-only)",
-            rules: r#"# Public read access (registry only)
+            rules: Some(r#"# Public read access (registry only)
 p, anonymous, *, registry:*, query, allow
-"#,
+"#),
         },
     ]
 }
@@ -688,13 +700,13 @@ pub async fn handle_policy_apply_template(
     let existing_content = tokio::fs::read_to_string(&policy_path).await?;
 
     // Full overwrite — templates are idempotent
-    let new_content = template.rules.to_owned();
+    let new_content = template.expanded_rules();
 
     println!("Applying template: {template_name}");
     println!("Description: {}", template.description);
     println!();
     println!("Rules:");
-    for line in template.rules.lines() {
+    for line in new_content.lines() {
         if !line.trim().is_empty() && !line.starts_with('#') {
             println!("  {line}");
         }

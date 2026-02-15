@@ -401,8 +401,7 @@ pub async fn handle_list(
     }
 
     // Get current user for permission checks (OS user for CLI)
-    // Prefix with "local:" for Casbin subject format alignment
-    let current_user = hyprstream_rpc::envelope::RequestIdentity::local().casbin_subject();
+    let current_user = hyprstream_rpc::envelope::RequestIdentity::local().user().to_string();
 
     // Get archetype registry for capability detection
     let archetype_registry = crate::archetypes::global_registry();
@@ -1058,13 +1057,14 @@ pub async fn apply_policy_template_to_model(
     };
 
     // Check if template rules already exist
-    if existing_content.contains(template.rules.trim()) {
+    let rules = template.expanded_rules();
+    if existing_content.contains(rules.trim()) {
         println!("✓ Policy template '{template_name}' already applied");
         return Ok(());
     }
 
     // Append the template rules
-    let new_content = format!("{}\n{}", existing_content.trim_end(), template.rules);
+    let new_content = format!("{}\n{}", existing_content.trim_end(), rules);
 
     // Write the updated policy
     tokio::fs::write(&policy_path, &new_content).await?;

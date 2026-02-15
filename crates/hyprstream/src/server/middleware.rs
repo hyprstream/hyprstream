@@ -23,7 +23,7 @@ pub struct AuthenticatedUser {
 /// Validates JWT tokens (hypr_eyJ...) via Ed25519 signature verification.
 ///
 /// On success, inserts `AuthenticatedUser` into request extensions.
-/// JWT `sub` claim should contain prefixed subject (e.g., "token:alice").
+/// JWT `sub` claim contains bare username (e.g., "alice").
 pub async fn auth_middleware(
     State(state): State<ServerState>,
     mut request: Request,
