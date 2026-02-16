@@ -13,7 +13,7 @@ use tch::Device;
 
 use super::tenant_delta::{TenantDelta, TenantDeltaConfig, serialize_state_dict_to_bytes};
 use crate::runtime::kv_cache::KVCacheRegistry;
-use crate::services::FsOps;
+use crate::services::WorktreeClient;
 use hyprstream_rpc::Subject;
 
 /// Registry managing per-tenant LoRA deltas for isolated TTT adaptation
@@ -38,8 +38,8 @@ pub struct DeltaPool {
     kv_registry: Option<Arc<KVCacheRegistry>>,
     /// Directory for eviction snapshots
     snapshots_dir: PathBuf,
-    /// Optional FsOps for worktree-scoped file operations
-    fs: Option<Arc<dyn FsOps>>,
+    /// Optional WorktreeClient for worktree-scoped file operations
+    fs: Option<WorktreeClient>,
     /// Number of model layers for per-layer delta creation
     num_layers: usize,
 }
@@ -53,14 +53,14 @@ impl DeltaPool {
     /// * `device` - Device for tensor allocation
     /// * `kv_registry` - Optional KV cache registry for dependency-aware eviction
     /// * `snapshots_dir` - Directory to write eviction snapshots
-    /// * `fs` - Optional FsOps for worktree-scoped file operations
+    /// * `fs` - Optional WorktreeClient for worktree-scoped file operations
     pub fn new(
         config: TenantDeltaConfig,
         module_dims: HashMap<String, (usize, usize)>,
         device: Device,
         kv_registry: Option<Arc<KVCacheRegistry>>,
         snapshots_dir: PathBuf,
-        fs: Option<Arc<dyn FsOps>>,
+        fs: Option<WorktreeClient>,
         num_layers: usize,
     ) -> Self {
         Self {

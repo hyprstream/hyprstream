@@ -20,7 +20,7 @@
 //! 3. Backend services enforce authorization via Casbin policies
 
 use async_trait::async_trait;
-use crate::services::{ModelZmqClient, RegistryZmqClient, PolicyClient, InferenceZmqClient};
+use crate::services::{ModelZmqClient, GenRegistryClient, PolicyClient, InferenceZmqClient};
 use http::header::AUTHORIZATION;
 use crate::services::generated::mcp_client::{
     McpHandler, McpResponseVariant, ToolDefinition, ServiceStatus,
@@ -239,8 +239,11 @@ fn register_schema_tools(reg: &mut ToolRegistry) {
                     Box::pin(async move {
                         let repo_id = ctx.args["repo_id"].as_str()
                             .ok_or_else(|| anyhow::anyhow!("missing repo_id"))?;
-                        let client = RegistryZmqClient::new(ctx.signing_key, ctx.identity.clone());
-                        let gen_repo = client.gen.repo(repo_id);
+                        let client: GenRegistryClient = crate::services::core::create_service_client(
+                            &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
+                            ctx.signing_key, ctx.identity.clone(),
+                        );
+                        let gen_repo = client.repo(repo_id);
                         let result = gen_repo.call_method(&method, &ctx.args).await?;
                         Ok(ToolResult::Sync(result))
                     })
@@ -415,8 +418,11 @@ fn register_streaming_tool(
 
                 let stream_info_json = match service.as_str() {
                     "registry" => {
-                        let client = RegistryZmqClient::new(ctx.signing_key, ctx.identity.clone());
-                        client.gen.call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?
+                        let client: GenRegistryClient = crate::services::core::create_service_client(
+                            &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
+                            ctx.signing_key, ctx.identity.clone(),
+                        );
+                        client.call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?
                     }
                     "model" => {
                         let client = ModelZmqClient::new(ctx.signing_key, ctx.identity.clone());
@@ -512,8 +518,11 @@ async fn dispatch_schema_call(service: &str, method: &str, ctx: &ToolCallContext
             client.gen.call_method(method, &ctx.args).await
         }
         "registry" => {
-            let client = RegistryZmqClient::new(signing_key, identity);
-            client.gen.call_method(method, &ctx.args).await
+            let client: GenRegistryClient = crate::services::core::create_service_client(
+                &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
+                signing_key, identity,
+            );
+            client.call_method(method, &ctx.args).await
         }
         "policy" => {
             let client = PolicyClient::new(signing_key, identity);

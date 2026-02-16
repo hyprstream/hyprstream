@@ -33,7 +33,6 @@
 //! Uses `InferenceHandler::authorize()` via generated dispatch for policy-backed
 //! authorization on all requests. The handler delegates to PolicyClient.
 
-use crate::auth::Operation;
 use crate::services::PolicyClient;
 use crate::config::{FinishReason, GenerationRequest, GenerationResult, ModelInfo, TrainingMode};
 use crate::inference_capnp;
@@ -42,7 +41,7 @@ use crate::runtime::model_config::ModelConfig;
 use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
 use crate::services::rpc_types::StreamInfo;
 use crate::services::EnvelopeContext;
-use crate::services::FsOps;
+use crate::services::WorktreeClient;
 use crate::training::{DeltaPool, TenantDeltaConfig, TTTConfig, TestTimeTrainer};
 use hyprstream_rpc::Subject;
 use crate::training::serialize_state_dict_to_bytes;
@@ -180,9 +179,9 @@ pub struct InferenceServiceInner {
     base_delta: Mutex<Option<Arc<Mutex<crate::training::TenantDelta>>>>,
     /// Pending adaptations awaiting client commit/rollback
     pending_adaptations: Mutex<std::collections::HashMap<Subject, PendingAdaptation>>,
-    /// Optional FsOps for worktree-scoped file operations.
+    /// Optional WorktreeClient for worktree-scoped file operations.
     /// When present, adapter/snapshot writes use contained-root access.
-    fs: Option<Arc<dyn FsOps>>,
+    fs: Option<WorktreeClient>,
 }
 
 /// ZMQ-based inference service
@@ -267,7 +266,7 @@ impl InferenceService {
         signing_key: SigningKey,
         policy_client: PolicyClient,
         endpoint: &str,
-        fs: Option<Arc<dyn FsOps>>,
+        fs: Option<WorktreeClient>,
     ) -> Result<hyprstream_rpc::service::SpawnedService> {
         let model_path = model_path.as_ref().to_path_buf();
         let endpoint_owned = endpoint.to_owned();
@@ -572,7 +571,7 @@ impl InferenceService {
         signing_key: SigningKey,
         nonce_cache: Arc<InMemoryNonceCache>,
         policy_client: PolicyClient,
-        fs: Option<Arc<dyn FsOps>>,
+        fs: Option<WorktreeClient>,
     ) -> Result<Self> {
         // Capture runtime handle for reuse in handlers
         let runtime_handle = Handle::current();
@@ -1464,7 +1463,7 @@ impl InferenceService {
             if let Some(ref fs) = self.fs {
                 match fs.read_file(&rel_path).await {
                     Ok(bytes) => {
-                        crate::training::load_state_dict_from_bytes(&bytes)
+                        crate::training::load_state_dict_from_bytes(&bytes.data)
                             .map_err(|e| {
                                 tracing::debug!("Could not load existing adapter '{}': {}", existing.name, e);
                                 e
@@ -1700,7 +1699,7 @@ impl InferenceService {
         let rel_path = path.to_string_lossy();
         let bytes = fs.read_file(&rel_path).await
             .map_err(|e| anyhow!("Failed to read LoRA adapter via FsOps: {}", e))?;
-        let delta = crate::training::TenantDelta::load_from_safetensors_bytes(&bytes, device)?;
+        let delta = crate::training::TenantDelta::load_from_safetensors_bytes(&bytes.data, device)?;
         *self.base_delta.lock() = Some(Arc::new(Mutex::new(delta)));
         tracing::info!("Loaded LoRA adapter as base delta from {}", path.display());
         Ok(())
@@ -1791,9 +1790,8 @@ use crate::services::generated::inference_client::{
 #[async_trait::async_trait(?Send)]
 impl InferenceHandler for InferenceService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
-        let op = Operation::from_str(operation)?;
         let subject = ctx.subject();
-        let allowed = self.policy_client.check_policy(&subject, resource, op).await.unwrap_or_else(|e| {
+        let allowed = self.policy_client.check(&subject.to_string(), "*", resource, operation).await.unwrap_or_else(|e| {
             warn!("Policy check failed for {} on {}: {} - denying access", subject, resource, e);
             false
         });

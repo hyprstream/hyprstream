@@ -9,9 +9,39 @@
 //! - **Non-Linux**: Uses `canonicalize` + prefix check. Best-effort (TOCTOU-vulnerable),
 //!   acceptable for development/macOS.
 
-use crate::services::traits::{FsDirEntry, FsServiceError};
+use crate::services::generated::registry_client::FsDirEntryInfo;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
+use thiserror::Error;
+
+/// Filesystem service error type.
+#[derive(Debug, Error)]
+pub enum FsServiceError {
+    /// Bad file descriptor.
+    #[error("Bad file descriptor: {0}")]
+    BadFd(u32),
+    /// Path or file not found.
+    #[error("Not found: {0}")]
+    NotFound(String),
+    /// Permission denied (FD not owned by caller, or access denied).
+    #[error("Permission denied: {0}")]
+    PermissionDenied(String),
+    /// Underlying I/O error.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// Path escaped containment root (symlink or traversal attack).
+    #[error("Path containment violation: {0}")]
+    PathEscape(String),
+    /// Resource limit exceeded (too many FDs, IO size too large).
+    #[error("Resource limit exceeded: {0}")]
+    ResourceLimit(String),
+    /// Transport / communication error.
+    #[error("Transport error: {0}")]
+    Transport(String),
+    /// Service is unavailable.
+    #[error("Service unavailable")]
+    Unavailable,
+}
 
 /// Trait abstracting path-contained filesystem operations.
 ///
@@ -48,7 +78,7 @@ pub trait ContainedRoot: Send + Sync {
     fn rename(&self, src: &str, dst: &str) -> Result<(), FsServiceError>;
 
     /// List directory entries.
-    fn list_dir(&self, relative: &str) -> Result<Vec<FsDirEntry>, FsServiceError>;
+    fn list_dir(&self, relative: &str) -> Result<Vec<FsDirEntryInfo>, FsServiceError>;
 
     /// Copy a file (uses reflink/COW when available).
     fn copy_file(&self, src: &str, dst: &str) -> Result<(), FsServiceError>;
@@ -213,7 +243,7 @@ mod linux {
                 .map_err(pathrs_to_fs_error)
         }
 
-        fn list_dir(&self, relative: &str) -> Result<Vec<FsDirEntry>, FsServiceError> {
+        fn list_dir(&self, relative: &str) -> Result<Vec<FsDirEntryInfo>, FsServiceError> {
             let handle = self.root.resolve(relative).map_err(pathrs_to_fs_error)?;
             let dir_file: File = handle
                 .reopen(OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY | OpenFlags::O_CLOEXEC)
@@ -232,7 +262,7 @@ mod linux {
                     continue;
                 }
                 let meta = entry.metadata().map_err(FsServiceError::Io)?;
-                entries.push(FsDirEntry {
+                entries.push(FsDirEntryInfo {
                     name,
                     is_dir: meta.is_dir(),
                     size: meta.len(),
@@ -375,7 +405,7 @@ impl ContainedRoot for CanonicalContainedRoot {
         fs::rename(&src_path, &dst_path).map_err(FsServiceError::Io)
     }
 
-    fn list_dir(&self, relative: &str) -> Result<Vec<FsDirEntry>, FsServiceError> {
+    fn list_dir(&self, relative: &str) -> Result<Vec<FsDirEntryInfo>, FsServiceError> {
         let path = self.resolve(relative)?;
         let mut entries = Vec::new();
         for entry in fs::read_dir(&path).map_err(FsServiceError::Io)? {
@@ -385,7 +415,7 @@ impl ContainedRoot for CanonicalContainedRoot {
                 continue;
             }
             let meta = entry.metadata().map_err(FsServiceError::Io)?;
-            entries.push(FsDirEntry {
+            entries.push(FsDirEntryInfo {
                 name,
                 is_dir: meta.is_dir(),
                 size: meta.len(),

@@ -5,18 +5,17 @@
 //!
 //! Two modes of operation:
 //! - **Direct**: Uses `PathBuf` and `tokio::fs` (when `fs` field is None).
-//! - **FsOps**: Uses `Arc<dyn FsOps>` for worktree-scoped, path-contained access.
+//! - **FsOps**: Uses `WorktreeClient` for worktree-scoped, path-contained access.
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::services::{FsOps, RepositoryClient};
+use crate::services::{WorktreeClient, RepositoryClient};
 
 /// Checkpoint request sent to background worker
 #[derive(Debug, Clone)]
@@ -83,14 +82,14 @@ pub struct CheckpointManager {
     #[allow(dead_code)]
     max_checkpoints: usize,
     /// Repository client for git operations (None = git disabled)
-    repo_client: Option<Arc<dyn RepositoryClient>>,
+    repo_client: Option<RepositoryClient>,
     #[allow(dead_code)]
     branch_name: Option<String>, // Track which branch we're on
     /// Target adapter to update on each checkpoint (e.g., "01_coding")
     /// When set, checkpoints will also update adapters/{target_adapter}.safetensors
     target_adapter: Option<String>,
-    /// FsOps for worktree-scoped file operations (None = direct access)
-    fs: Option<Arc<dyn FsOps>>,
+    /// WorktreeClient for worktree-scoped file operations (None = direct access)
+    fs: Option<WorktreeClient>,
 }
 
 impl CheckpointManager {
@@ -102,7 +101,7 @@ impl CheckpointManager {
     /// Create checkpoint manager with a repository client for git operations
     pub fn with_repo_client(
         model_path: PathBuf,
-        repo_client: Arc<dyn RepositoryClient>,
+        repo_client: RepositoryClient,
     ) -> Result<Self> {
         Self::with_config(
             model_path,
@@ -116,7 +115,7 @@ impl CheckpointManager {
     pub fn for_adapter(
         model_path: PathBuf,
         branch_name: String,
-        repo_client: Option<Arc<dyn RepositoryClient>>,
+        repo_client: Option<RepositoryClient>,
     ) -> Result<Self> {
         Self::with_config(
             model_path,
@@ -131,13 +130,13 @@ impl CheckpointManager {
         model_path: PathBuf,
         config: CheckpointConfig,
         branch_name: Option<String>,
-        repo_client: Option<Arc<dyn RepositoryClient>>,
+        repo_client: Option<RepositoryClient>,
     ) -> Result<Self> {
         let checkpoint_dir = model_path.join(".checkpoints");
         std::fs::create_dir_all(&checkpoint_dir)?;
 
         // Derive FsOps from repo_client if available
-        let fs: Option<Arc<dyn FsOps>> = repo_client.as_ref().and_then(|client| {
+        let fs: Option<WorktreeClient> = repo_client.as_ref().and_then(|client| {
             let branch = branch_name.as_deref().unwrap_or("main");
             Some(client.worktree(branch))
         });
@@ -382,9 +381,9 @@ impl CheckpointManager {
         // Switch branch if specified
         if let Some(ref branch_name) = branch {
             // create_branch may fail if it already exists — that's fine
-            let _ = repo_client.create_branch(branch_name, None).await;
+            let _ = repo_client.create_branch(branch_name, "").await;
             repo_client
-                .checkout(branch_name)
+                .checkout(branch_name, false)
                 .await
                 .map_err(|e| anyhow!("Failed to checkout branch '{}': {}", branch_name, e))?;
         }
@@ -404,7 +403,7 @@ impl CheckpointManager {
                 .unwrap_or(&metadata_path)
                 .to_string_lossy()
                 .to_string();
-            fs.exists(&rel).await.unwrap_or(false)
+            fs.stat(&rel).await.map(|s| s.exists).unwrap_or(false)
         } else {
             metadata_path.exists()
         };
@@ -418,8 +417,9 @@ impl CheckpointManager {
             files_to_stage.push(&relative_metadata);
         }
 
+        let files_owned: Vec<String> = files_to_stage.iter().map(|s| s.to_string()).collect();
         repo_client
-            .stage_files(&files_to_stage)
+            .stage_files(&files_owned)
             .await
             .map_err(|e| anyhow!("Failed to stage files: {}", e))?;
 
@@ -434,7 +434,7 @@ impl CheckpointManager {
         });
 
         let oid = repo_client
-            .commit(&commit_message)
+            .commit(&commit_message, "", "")
             .await
             .map_err(|e| anyhow!("Failed to commit: {}", e))?;
 
@@ -502,10 +502,10 @@ impl CheckpointManager {
     /// Get current checkpoint info (single file, git handles history)
     pub async fn get_checkpoint(&self) -> Result<Option<CheckpointInfo>> {
         if let Some(fs) = &self.fs {
-            if !fs.exists(".checkpoints/checkpoint.json").await? {
+            if !fs.stat(".checkpoints/checkpoint.json").await.map(|s| s.exists).unwrap_or(false) {
                 return Ok(None);
             }
-            let json = fs.read_to_string(".checkpoints/checkpoint.json").await?;
+            let json = String::from_utf8(fs.read_file(".checkpoints/checkpoint.json").await?.data)?;
             let metadata: CheckpointMetadata = serde_json::from_str(&json)?;
             Ok(Some(CheckpointInfo {
                 step: metadata.step,
@@ -532,7 +532,7 @@ impl CheckpointManager {
         let checkpoint_path = self.checkpoint_dir.join("checkpoint.safetensors");
 
         if let Some(fs) = &self.fs {
-            if !fs.exists(".checkpoints/checkpoint.safetensors").await? {
+            if !fs.stat(".checkpoints/checkpoint.safetensors").await.map(|s| s.exists).unwrap_or(false) {
                 anyhow::bail!("No checkpoint found at {:?}", checkpoint_path);
             }
         } else if !checkpoint_path.exists() {
@@ -548,9 +548,9 @@ impl CheckpointManager {
         checkpoint_dir: PathBuf,
         _max_checkpoints: usize,
         _git_interval: usize,
-        repo_client: Option<Arc<dyn RepositoryClient>>,
+        repo_client: Option<RepositoryClient>,
         branch_name: Option<String>,
-        fs: Option<Arc<dyn FsOps>>,
+        fs: Option<WorktreeClient>,
     ) {
         while let Some(request) = rx.recv().await {
             // Skip sentinel values
@@ -561,7 +561,7 @@ impl CheckpointManager {
             if let Err(e) = Self::process_checkpoint(
                 &checkpoint_dir,
                 request,
-                repo_client.as_deref(),
+                repo_client.as_ref(),
                 &branch_name,
                 fs.as_ref(),
             )
@@ -576,9 +576,9 @@ impl CheckpointManager {
     async fn process_checkpoint(
         checkpoint_dir: &Path,
         request: CheckpointRequest,
-        repo_client: Option<&dyn RepositoryClient>,
+        repo_client: Option<&RepositoryClient>,
         branch_name: &Option<String>,
-        fs: Option<&Arc<dyn FsOps>>,
+        fs: Option<&WorktreeClient>,
     ) -> Result<()> {
         if let Some(fs) = fs {
             // FsOps path
@@ -703,16 +703,16 @@ impl CheckpointManager {
 
     /// Commit checkpoint to Git branch via RepositoryClient
     async fn git_commit_checkpoint(
-        repo_client: &dyn RepositoryClient,
+        repo_client: &RepositoryClient,
         step: usize,
         branch_name: &Option<String>,
     ) -> Result<()> {
         // Ensure we're on the right branch
         if let Some(branch) = branch_name {
             // create_branch may fail if it already exists — that's fine
-            let _ = repo_client.create_branch(branch, None).await;
+            let _ = repo_client.create_branch(branch, "").await;
             repo_client
-                .checkout(branch)
+                .checkout(branch, false)
                 .await
                 .map_err(|e| anyhow!("Failed to checkout branch '{}': {}", branch, e))?;
         }
@@ -720,8 +720,8 @@ impl CheckpointManager {
         // Stage checkpoint files
         repo_client
             .stage_files(&[
-                ".checkpoints/checkpoint.safetensors",
-                ".checkpoints/checkpoint.json",
+                ".checkpoints/checkpoint.safetensors".to_string(),
+                ".checkpoints/checkpoint.json".to_string(),
             ])
             .await
             .map_err(|e| anyhow!("Failed to stage checkpoint files: {}", e))?;
@@ -734,7 +734,7 @@ impl CheckpointManager {
         };
 
         repo_client
-            .commit(&message)
+            .commit(&message, "", "")
             .await
             .map_err(|e| anyhow!("Failed to commit: {}", e))?;
 
@@ -746,7 +746,7 @@ impl CheckpointManager {
                 format!("checkpoint-step-{step}")
             };
 
-            let _ = repo_client.create_tag(&tag_name, None).await;
+            let _ = repo_client.create_tag(&tag_name, "").await;
         }
 
         Ok(())

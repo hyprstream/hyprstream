@@ -36,7 +36,7 @@ use crate::services::{
     rpc_types::StreamInfo, EnvelopeContext, InferenceService, InferenceZmqClient,
     PolicyClient,
 };
-use crate::services::RegistryClient;
+use crate::services::GenRegistryClient;
 use crate::storage::ModelRef;
 use anyhow::{anyhow, Result};
 use hyprstream_rpc::prelude::*;
@@ -48,7 +48,6 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
-use crate::auth::Operation;
 use tracing::{debug, info, warn};
 
 /// Default endpoint for the model service
@@ -140,7 +139,7 @@ pub struct ModelService {
     /// Policy client for authorization checks in InferenceService
     policy_client: PolicyClient,
     /// Registry client for resolving model paths
-    registry: Arc<dyn RegistryClient>,
+    registry: GenRegistryClient,
     /// Callback router for spawned mode (None for in-process)
     #[allow(dead_code)]
     callback_router: Option<crate::services::callback::CallbackRouter>,
@@ -158,7 +157,7 @@ impl ModelService {
         config: ModelServiceConfig,
         signing_key: SigningKey,
         policy_client: PolicyClient,
-        registry: Arc<dyn RegistryClient>,
+        registry: GenRegistryClient,
         context: Arc<zmq::Context>,
         transport: TransportConfig,
     ) -> Self {
@@ -187,7 +186,7 @@ impl ModelService {
         config: ModelServiceConfig,
         signing_key: SigningKey,
         policy_client: PolicyClient,
-        registry: Arc<dyn RegistryClient>,
+        registry: GenRegistryClient,
         callback_router: crate::services::callback::CallbackRouter,
         context: Arc<zmq::Context>,
         transport: TransportConfig,
@@ -227,7 +226,21 @@ impl ModelService {
         let model_ref = ModelRef::parse(model_ref_str)?;
 
         // Get model path from registry
-        let model_path = self.registry.get_model_path(&model_ref).await?;
+        let tracked = self.registry.get_by_name(&model_ref.model).await
+            .map_err(|e| anyhow!("Model '{}' not found in registry: {}", model_ref.model, e))?;
+        let repo_client = self.registry.repo(&tracked.id);
+
+        let branch_name = match &model_ref.git_ref {
+            crate::storage::GitRef::Branch(name) => name.clone(),
+            _ => repo_client.get_head().await.unwrap_or_else(|_| "main".to_owned()),
+        };
+        let worktrees = repo_client.list_worktrees().await?;
+        let model_path = std::path::PathBuf::from(
+            &worktrees.iter()
+                .find(|wt| wt.branch_name == branch_name)
+                .ok_or_else(|| anyhow!("worktree for {}:{} not found", model_ref.model, branch_name))?
+                .path,
+        );
 
         if !model_path.exists() {
             return Err(anyhow!(
@@ -252,16 +265,7 @@ impl ModelService {
         runtime_config.kv_quant_type = load_config.kv_quant.unwrap_or(self.config.kv_quant);
 
         // Obtain FsOps from the registry for path-contained adapter I/O
-        let branch_name = match &model_ref.git_ref {
-            crate::storage::GitRef::Branch(name) => name.clone(),
-            _ => "main".to_owned(),
-        };
-        let repo_client = self.registry.repo(&model_ref.model).await
-            .map_err(|e| anyhow::anyhow!(
-                "Could not get repository client for {}: {} — FsOps required for path containment",
-                model_ref_str, e
-            ))?;
-        let fs: Option<std::sync::Arc<dyn crate::services::FsOps>> = Some(repo_client.worktree(&branch_name));
+        let fs: Option<crate::services::WorktreeClient> = Some(repo_client.worktree(&branch_name));
 
         // Start InferenceService for this model
         let service_handle = InferenceService::start_at(
@@ -781,9 +785,8 @@ impl InferHandler for ModelService {
 #[async_trait::async_trait(?Send)]
 impl ModelHandler for ModelService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
-        let op = Operation::from_str(operation)?;
         let subject = ctx.subject();
-        let allowed = self.policy_client.check_policy(&subject, resource, op).await.unwrap_or_else(|e| {
+        let allowed = self.policy_client.check(&subject.to_string(), "*", resource, operation).await.unwrap_or_else(|e| {
             warn!("Policy check failed for {} on {}: {} - denying access", subject, resource, e);
             false
         });

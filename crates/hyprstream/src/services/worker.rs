@@ -49,7 +49,6 @@ const SERVICE_NAME: &str = "worker";
 // ============================================================================
 
 use crate::services::PolicyClient;
-use crate::auth::Operation;
 
 /// Build an `AuthorizeFn` backed by a `PolicyClient`.
 ///
@@ -59,8 +58,7 @@ pub fn build_authorize_fn(policy_client: PolicyClient) -> AuthorizeFn {
     Arc::new(move |subject: String, resource: String, operation: String| {
         let client = policy_client.clone();
         Box::pin(async move {
-            let op = Operation::from_str(&operation)?;
-            client.check_policy_str(&subject, &resource, op).await
+            client.check(&subject, "*", &resource, &operation).await
         })
     })
 }

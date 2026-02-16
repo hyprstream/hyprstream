@@ -8,7 +8,7 @@ use anyhow::{anyhow, Result};
 use git2::Repository;
 use std::path::Path;
 
-use crate::services::generated::registry_client::{DetailedStatusInfo, FileStatusInfo};
+use crate::services::generated::registry_client::{DetailedStatusInfo, FileChangeTypeEnum, FileStatusInfo};
 
 // === Commit Operations ===
 
@@ -176,40 +176,40 @@ pub fn detailed_status(repo: &Repository) -> Result<DetailedStatusInfo> {
 
             // Index status
             let index_status = if status.contains(git2::Status::INDEX_NEW) {
-                "A"
+                FileChangeTypeEnum::Added
             } else if status.contains(git2::Status::INDEX_MODIFIED) {
-                "M"
+                FileChangeTypeEnum::Modified
             } else if status.contains(git2::Status::INDEX_DELETED) {
-                "D"
+                FileChangeTypeEnum::Deleted
             } else if status.contains(git2::Status::INDEX_RENAMED) {
-                "R"
+                FileChangeTypeEnum::Renamed
             } else if status.contains(git2::Status::INDEX_TYPECHANGE) {
-                "T"
+                FileChangeTypeEnum::TypeChanged
             } else {
-                ""
+                FileChangeTypeEnum::None
             };
 
             // Worktree status
             let worktree_status = if status.contains(git2::Status::WT_NEW) {
-                "?"
+                FileChangeTypeEnum::Untracked
             } else if status.contains(git2::Status::WT_MODIFIED) {
-                "M"
+                FileChangeTypeEnum::Modified
             } else if status.contains(git2::Status::WT_DELETED) {
-                "D"
+                FileChangeTypeEnum::Deleted
             } else if status.contains(git2::Status::WT_RENAMED) {
-                "R"
+                FileChangeTypeEnum::Renamed
             } else if status.contains(git2::Status::WT_TYPECHANGE) {
-                "T"
+                FileChangeTypeEnum::TypeChanged
             } else if status.contains(git2::Status::CONFLICTED) {
-                "U"
+                FileChangeTypeEnum::Conflicted
             } else {
-                ""
+                FileChangeTypeEnum::None
             };
 
             files.push(FileStatusInfo {
                 path: path.to_owned(),
-                index_status: index_status.to_owned(),
-                worktree_status: worktree_status.to_owned(),
+                index_status,
+                worktree_status,
             });
         }
     }

@@ -63,15 +63,17 @@ struct PolicyResponse {
   requestId @0 :UInt64;
 
   # Response payload
+  # Convention: response variant = request name + "Result"
+  # This enables codegen to auto-unwrap typed returns.
   union {
     # Authorization result (for check)
-    allowed @1 :Bool;
+    checkResult @1 :Bool;
 
     # Error occurred
     error @2 :ErrorInfo;
 
     # Token issuance result (for issueToken)
-    tokenSuccess @3 :TokenInfo;
+    issueTokenResult @3 :TokenInfo;
 
     # Supported scopes list (for listScopes)
     listScopesResult @4 :ScopeList;

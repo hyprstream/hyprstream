@@ -11,12 +11,9 @@ use crate::services::generated::policy_client::{
     PolicyCheck, IssueToken,
     dispatch_policy,
 };
-use crate::zmq::global_context;
 use anyhow::{anyhow, Result};
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::{global as registry, SocketKind};
-use hyprstream_rpc::service::ZmqClient as ZmqClientBase;
-use hyprstream_rpc::service::factory::ServiceClient;
 use hyprstream_rpc::transport::TransportConfig;
 use std::sync::Arc;
 use tracing::{debug, trace};
@@ -140,7 +137,7 @@ impl PolicyHandler for PolicyService {
         ).await;
 
         debug!("Policy check result: allowed={}", allowed);
-        Ok(PolicyResponseVariant::Allowed(allowed))
+        Ok(PolicyResponseVariant::CheckResult(allowed))
     }
 
     async fn handle_issue_token(
@@ -220,7 +217,7 @@ impl PolicyHandler for PolicyService {
 
         let token = crate::auth::jwt::encode(&claims, &self.signing_key);
 
-        Ok(PolicyResponseVariant::TokenSuccess(TokenInfo {
+        Ok(PolicyResponseVariant::IssueTokenResult(TokenInfo {
             token,
             expires_at: claims.exp,
         }))
@@ -266,133 +263,14 @@ impl ZmqService for PolicyService {
 }
 
 // ============================================================================
-// PolicyClient convenience methods (extends generated client)
+// PolicyClient construction (uses create_service_client pattern)
 // ============================================================================
 
 impl PolicyClient {
     /// Create a new policy client (endpoint from registry)
     pub fn new(signing_key: SigningKey, identity: RequestIdentity) -> Self {
         let endpoint = registry().endpoint(SERVICE_NAME, SocketKind::Rep).to_zmq_string();
-        Self::with_endpoint(&endpoint, signing_key, identity)
-    }
-
-    /// Create a new policy client at a specific endpoint
-    pub fn with_endpoint(endpoint: &str, signing_key: SigningKey, identity: RequestIdentity) -> Self {
-        let server_verifying_key = signing_key.verifying_key();
-        let zmq_client = ZmqClientBase::new(endpoint, global_context(), signing_key, server_verifying_key, identity);
-        Self::from_zmq(zmq_client)
-    }
-
-    /// Check if subject is allowed to perform operation on resource.
-    ///
-    /// Accepts a typed `Subject` for type safety. The string conversion
-    /// for Casbin happens internally.
-    pub async fn check_policy(
-        &self,
-        subject: &hyprstream_rpc::Subject,
-        resource: &str,
-        operation: Operation,
-    ) -> Result<bool> {
-        self.check_with_domain_policy(subject, "*", resource, operation).await
-    }
-
-    /// Check policy with a string subject (for HTTP route callers).
-    ///
-    /// Parses the string as a Subject, falling back to anonymous on parse failure.
-    pub async fn check_policy_str(
-        &self,
-        subject: &str,
-        resource: &str,
-        operation: Operation,
-    ) -> Result<bool> {
-        self.check_with_domain_policy_str(subject, "*", resource, operation).await
-    }
-
-    /// Check with explicit domain
-    pub async fn check_with_domain_policy(
-        &self,
-        subject: &hyprstream_rpc::Subject,
-        domain: &str,
-        resource: &str,
-        operation: Operation,
-    ) -> Result<bool> {
-        let subject_str = subject.to_string();
-        match self.check(&subject_str, domain, resource, operation.as_str()).await? {
-            PolicyResponseVariant::Allowed(allowed) => Ok(allowed),
-            PolicyResponseVariant::Error(ref e) => {
-                Err(anyhow!("Policy check failed: {} ({})", e.message, e.code))
-            }
-            _ => Err(anyhow!("Unexpected response type for policy check")),
-        }
-    }
-
-    /// Check with explicit domain (string subject variant for HTTP routes)
-    pub async fn check_with_domain_policy_str(
-        &self,
-        subject: &str,
-        domain: &str,
-        resource: &str,
-        operation: Operation,
-    ) -> Result<bool> {
-        match self.check(subject, domain, resource, operation.as_str()).await? {
-            PolicyResponseVariant::Allowed(allowed) => Ok(allowed),
-            PolicyResponseVariant::Error(ref e) => {
-                Err(anyhow!("Policy check failed: {} ({})", e.message, e.code))
-            }
-            _ => Err(anyhow!("Unexpected response type for policy check")),
-        }
-    }
-
-    /// Get all supported authorization scopes.
-    pub async fn supported_scopes(&self) -> Result<Vec<String>> {
-        let data = self.list_scopes().await?;
-        Ok(data.scopes)
-    }
-
-    /// Issue a JWT token with requested scopes
-    pub async fn issue_jwt_token(
-        &self,
-        scopes: Vec<String>,
-        ttl: Option<u32>,
-    ) -> Result<(String, i64)> {
-        self.issue_jwt_token_with_audience(scopes, ttl, None).await
-    }
-
-    /// Issue a JWT token with requested scopes and optional audience (RFC 8707)
-    pub async fn issue_jwt_token_with_audience(
-        &self,
-        scopes: Vec<String>,
-        ttl: Option<u32>,
-        audience: Option<String>,
-    ) -> Result<(String, i64)> {
-        self.issue_jwt_token_full(scopes, ttl, audience, None).await
-    }
-
-    /// Issue a JWT token with all options including explicit subject.
-    ///
-    /// When `subject` is `Some(...)`, the token is issued on behalf of that subject.
-    /// Requires caller to have `manage` permission on `policy:issue-token`.
-    pub async fn issue_jwt_token_full(
-        &self,
-        scopes: Vec<String>,
-        ttl: Option<u32>,
-        audience: Option<String>,
-        subject: Option<String>,
-    ) -> Result<(String, i64)> {
-        match self.issue_token(
-            &scopes,
-            ttl.unwrap_or(0),
-            &audience.unwrap_or_default(),
-            &subject.unwrap_or_default(),
-        ).await? {
-            PolicyResponseVariant::TokenSuccess(ref data) => {
-                Ok((data.token.clone(), data.expires_at))
-            }
-            PolicyResponseVariant::Error(ref e) => {
-                Err(anyhow!("Token issuance failed: {} ({})", e.message, e.code))
-            }
-            _ => Err(anyhow!("Unexpected response type for issue_token")),
-        }
+        crate::services::core::create_service_client(&endpoint, signing_key, identity)
     }
 }
 

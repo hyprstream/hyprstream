@@ -5,21 +5,17 @@
 
 use crate::auth::Operation;
 use crate::services::PolicyClient;
-use crate::registry_capnp;
-
-use crate::services::traits::{CloneOptions, DetailedStatus, FileChangeType, FileStatus};
-use crate::services::traits::{FsDirEntry, FsServiceError, FsStatInfo, SeekWhence, MAX_FDS_GLOBAL, MAX_FDS_PER_CLIENT, MAX_FS_IO_SIZE};
-use crate::services::contained_root::{self, ContainedRoot};
-use crate::services::{CallOptions, EnvelopeContext, ZmqService};
+use crate::services::types::{MAX_FDS_GLOBAL, MAX_FDS_PER_CLIENT, MAX_FS_IO_SIZE};
+use crate::services::contained_root::{self, ContainedRoot, FsServiceError};
+use crate::services::{EnvelopeContext, ZmqService};
 use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::{global as endpoint_registry, SocketKind};
-use hyprstream_rpc::serialize_message;
 use hyprstream_rpc::{StreamChannel, StreamContext};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use dashmap::DashMap;
-use git2db::{CloneBuilder, Git2DB, GitRef, RepoId, RepositoryStatus, TrackedRepository};
+use git2db::{CloneBuilder, Git2DB, GitRef, RepoId, TrackedRepository};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _, Seek as _, SeekFrom};
@@ -52,9 +48,9 @@ use crate::services::generated::registry_client::{
     FsWriteRequest, FsWriteResponse,
     FsPreadRequest, FsPwriteRequest, FsSeekRequest, FsSeekResponse,
     FsTruncateRequest, FsSyncRequest, FsPathRequest, FsMkdirRequest,
-    FsRenameRequest, FsCopyRequest,
+    FsRenameRequest, FsCopyRequest, FsWriteFileRequest,
     FsStatResponse, FsDirEntryInfo, FsStreamInfoResponse,
-    SeekWhenceEnum,
+    SeekWhenceEnum, EnsureWorktreeRequest,
 };
 // Conflicting names — use canonical path at usage sites:
 //   registry_client::TrackedRepository, registry_client::RepositoryStatus, registry_client::WorktreeInfo
@@ -109,192 +105,6 @@ fn variant_to_tracked_repository(
     })
 }
 
-// ============================================================================
-// RegistryZmqClient - Wrapper implementing RegistryClient trait
-// ============================================================================
-
-/// ZMQ-based registry client wrapping the generated `RegistryClient`.
-///
-/// Simple methods delegate to `gen`; `list()` and `clone_stream()` use manual
-/// parsing (List(TrackedRepository) placeholder and custom CallOptions respectively).
-pub struct RegistryZmqClient {
-    /// Generated typed client (handles all transport including streaming via call_with_options)
-    pub(crate) gen: GenRegistryClient,
-}
-
-impl RegistryZmqClient {
-    /// Create a new registry client with signing credentials.
-    pub fn new(signing_key: SigningKey, identity: RequestIdentity) -> Self {
-        let endpoint = endpoint_registry().endpoint(SERVICE_NAME, SocketKind::Rep).to_zmq_string();
-        Self::with_endpoint(&endpoint, signing_key, identity)
-    }
-
-    /// Create a registry client connected to a specific endpoint.
-    pub fn with_endpoint(endpoint: &str, signing_key: SigningKey, identity: RequestIdentity) -> Self {
-        Self {
-            gen: crate::services::core::create_service_client(endpoint, signing_key, identity),
-        }
-    }
-
-    /// Get a `TrackedRepository` by name (internal helper for repo() and MetricsRegistryClient).
-    async fn get_by_name_internal(&self, name: &str) -> Result<Option<TrackedRepository>> {
-        let r = self.gen.get_by_name(name).await?;
-        Ok(Some(variant_to_tracked_repository(
-            &r.id, &r.name, &r.url, &r.worktree_path, &r.tracking_ref, &r.current_oid, r.registered_at,
-        )?))
-    }
-}
-
-use crate::services::traits::{RegistryClient, RegistryServiceError, RepositoryClient, WorktreeInfo};
-
-#[async_trait]
-impl RegistryClient for RegistryZmqClient {
-    async fn list(&self) -> Result<Vec<TrackedRepository>, RegistryServiceError> {
-        let repos = self.gen.list().await
-            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
-        repos.into_iter().map(|r| {
-            variant_to_tracked_repository(
-                &r.id, &r.name, &r.url, &r.worktree_path,
-                &r.tracking_ref, &r.current_oid, r.registered_at,
-            ).map_err(|e| RegistryServiceError::transport(e.to_string()))
-        }).collect()
-    }
-
-    async fn get(&self, id: &RepoId) -> Result<Option<TrackedRepository>, RegistryServiceError> {
-        let r = self.gen.get(&id.to_string()).await
-            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
-        Ok(Some(variant_to_tracked_repository(
-            &r.id, &r.name, &r.url, &r.worktree_path, &r.tracking_ref, &r.current_oid, r.registered_at,
-        ).map_err(|e| RegistryServiceError::transport(e.to_string()))?))
-    }
-
-    async fn get_by_name(
-        &self,
-        name: &str,
-    ) -> Result<Option<TrackedRepository>, RegistryServiceError> {
-        self.get_by_name_internal(name).await
-            .map_err(|e| RegistryServiceError::transport(e.to_string()))
-    }
-
-    async fn clone_repo(
-        &self,
-        url: &str,
-        name: Option<&str>,
-        options: &CloneOptions,
-    ) -> Result<RepoId, RegistryServiceError> {
-        let r = self.gen.clone(
-            url,
-            name.unwrap_or(""),
-            options.shallow,
-            options.depth,
-            options.branch.as_deref().unwrap_or(""),
-        ).await.map_err(|e| RegistryServiceError::transport(e.to_string()))?;
-        let uuid = Uuid::parse_str(&r.id)
-            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
-        Ok(RepoId::from_uuid(uuid))
-    }
-
-    async fn clone_stream(
-        &self,
-        url: &str,
-        name: Option<&str>,
-        options: &CloneOptions,
-        ephemeral_pubkey: Option<[u8; 32]>,
-    ) -> Result<crate::services::rpc_types::StreamInfo, RegistryServiceError> {
-        // Manual: needs custom CallOptions for ephemeral pubkey
-        let id = self.gen.next_id();
-        let payload = serialize_message(|msg| {
-            let mut req = msg.init_root::<registry_capnp::registry_request::Builder>();
-            req.set_id(id);
-            let mut clone_req = req.init_clone_stream();
-            clone_req.set_url(url);
-            if let Some(n) = name {
-                clone_req.set_name(n);
-            }
-            clone_req.set_shallow(options.shallow);
-            clone_req.set_depth(options.depth);
-            if let Some(ref branch) = options.branch {
-                clone_req.set_branch(branch);
-            }
-        }).map_err(|e| RegistryServiceError::transport(e.to_string()))?;
-
-        let opts = match ephemeral_pubkey {
-            Some(pk) => CallOptions::default().ephemeral_pubkey(pk),
-            None => CallOptions::default(),
-        };
-
-        let response = self.gen.call_with_options(payload, opts).await
-            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
-        parse_stream_started_response(&response)
-            .map_err(|e| RegistryServiceError::transport(e.to_string()))
-    }
-
-    async fn register(
-        &self,
-        _id: &RepoId,
-        name: Option<&str>,
-        path: &Path,
-    ) -> Result<(), RegistryServiceError> {
-        let path_str = path
-            .to_str()
-            .ok_or_else(|| RegistryServiceError::transport("Invalid path encoding"))?;
-        let _r = self.gen.register(path_str, name.unwrap_or(""), "").await
-            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
-        Ok(())
-    }
-
-    async fn upsert(&self, _name: &str, _url: &str) -> Result<RepoId, RegistryServiceError> {
-        Err(RegistryServiceError::transport(
-            "Upsert operation not yet supported via ZMQ",
-        ))
-    }
-
-    async fn remove(&self, id: &RepoId) -> Result<(), RegistryServiceError> {
-        self.gen.remove(&id.to_string()).await
-            .map_err(|e| RegistryServiceError::transport(e.to_string()))
-    }
-
-    async fn health_check(&self) -> Result<(), RegistryServiceError> {
-        let _r = self.gen.health_check().await
-            .map_err(|e| RegistryServiceError::transport(e.to_string()))?;
-        Ok(())
-    }
-
-    async fn repo(
-        &self,
-        name: &str,
-    ) -> Result<Arc<dyn RepositoryClient>, RegistryServiceError> {
-        let repo = self.get_by_name_internal(name).await
-            .map_err(|e| RegistryServiceError::transport(e.to_string()))?
-            .ok_or_else(|| RegistryServiceError::transport(format!("Repository '{name}' not found")))?;
-
-        Ok(Arc::new(RepositoryZmqClient::new(
-            self.gen.endpoint().to_owned(),
-            repo.id,
-            name.to_owned(),
-            self.gen.signing_key().clone(),
-            self.gen.identity().clone(),
-        )))
-    }
-
-    async fn repo_by_id(
-        &self,
-        id: &RepoId,
-    ) -> Result<Arc<dyn RepositoryClient>, RegistryServiceError> {
-        let repo = self.get(id).await?
-            .ok_or_else(|| RegistryServiceError::transport(format!("Repository '{id}' not found")))?;
-
-        let name = repo.name.unwrap_or_else(|| id.to_string());
-
-        Ok(Arc::new(RepositoryZmqClient::new(
-            self.gen.endpoint().to_owned(),
-            id.clone(),
-            name,
-            self.gen.signing_key().clone(),
-            self.gen.identity().clone(),
-        )))
-    }
-}
 
 // ============================================================================
 // Registry Service (server-side)
@@ -631,7 +441,7 @@ impl RegistryService {
     /// Check if a request is authorized (returns bool for generated handler methods).
     async fn is_authorized(&self, ctx: &EnvelopeContext, resource: &str, operation: Operation) -> bool {
         let subject = ctx.subject();
-        self.policy_client.check_policy(&subject, resource, operation)
+        self.policy_client.check(&subject.to_string(), "*", resource, operation.as_str())
             .await
             .unwrap_or_else(|e| {
                 warn!("Policy check failed for {} on {}: {} - denying access", subject, resource, e);
@@ -1534,14 +1344,14 @@ impl RegistryService {
         ctx: &EnvelopeContext,
         fd: u32,
         offset: i64,
-        whence: crate::services::traits::SeekWhence,
+        whence: SeekWhenceEnum,
     ) -> Result<u64, FsServiceError> {
         let entry = self.fd_table.get_verified(fd, &ctx.subject().to_string())?;
         let mut file = entry.file.lock();
         let seek_from = match whence {
-            crate::services::traits::SeekWhence::Set => SeekFrom::Start(offset as u64),
-            crate::services::traits::SeekWhence::Cur => SeekFrom::Current(offset),
-            crate::services::traits::SeekWhence::End => SeekFrom::End(offset),
+            SeekWhenceEnum::Set => SeekFrom::Start(offset as u64),
+            SeekWhenceEnum::Cur => SeekFrom::Current(offset),
+            SeekWhenceEnum::End => SeekFrom::End(offset),
         };
         let pos = file.seek(seek_from).map_err(FsServiceError::Io)?;
         Ok(pos)
@@ -1584,7 +1394,7 @@ impl RegistryService {
         repo_id: &str,
         worktree: &str,
         path: &str,
-    ) -> Result<FsStatInfo, FsServiceError> {
+    ) -> Result<FsStatResponse, FsServiceError> {
         let root = self.get_contained_root(repo_id, worktree).await?;
         match root.stat(path) {
             Ok(meta) => {
@@ -1594,7 +1404,7 @@ impl RegistryService {
                     .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
-                Ok(FsStatInfo {
+                Ok(FsStatResponse {
                     exists: true,
                     is_dir: meta.is_dir(),
                     size: meta.len(),
@@ -1603,7 +1413,7 @@ impl RegistryService {
             }
             Err(FsServiceError::NotFound(_)) | Err(FsServiceError::Io(_)) => {
                 // For stat, NotFound is not an error — it means the file doesn't exist
-                Ok(FsStatInfo {
+                Ok(FsStatResponse {
                     exists: false,
                     is_dir: false,
                     size: 0,
@@ -1682,7 +1492,7 @@ impl RegistryService {
         repo_id: &str,
         worktree: &str,
         path: &str,
-    ) -> Result<Vec<FsDirEntry>, FsServiceError> {
+    ) -> Result<Vec<FsDirEntryInfo>, FsServiceError> {
         let root = self.get_contained_root(repo_id, worktree).await?;
         root.list_dir(path)
     }
@@ -2016,6 +1826,34 @@ impl RepoHandler for RegistryService {
         let r = if data.refspec.is_empty() { None } else { Some(data.refspec.as_str()) };
         self.handle_update(repo_id, r).await
     }
+
+    async fn handle_ensure_worktree(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, data: &EnsureWorktreeRequest,
+    ) -> Result<String> {
+        let id = Self::parse_repo_id(repo_id)?;
+        let registry = self.registry.read().await;
+        let handle = registry.repo(&id)?;
+
+        // Check if a worktree for this branch already exists
+        let worktrees = handle.get_worktrees().await?;
+        for wt in &worktrees {
+            let wt_branch = wt
+                .path()
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            if wt_branch == data.branch {
+                return Ok(wt.path().to_string_lossy().to_string());
+            }
+        }
+
+        // Not found — create it
+        let worktree = handle.create_worktree(
+            &PathBuf::from(&data.branch),
+            &data.branch,
+        ).await?;
+        Ok(worktree.path().to_string_lossy().to_string())
+    }
 }
 
 // ============================================================================
@@ -2073,12 +1911,7 @@ impl WorktreeHandler for RegistryService {
     async fn handle_seek(&self, ctx: &EnvelopeContext, _request_id: u64,
         _repo_id: &str, _name: &str, data: &FsSeekRequest,
     ) -> Result<FsSeekResponse> {
-        let whence = match data.whence {
-            SeekWhenceEnum::Set => SeekWhence::Set,
-            SeekWhenceEnum::Cur => SeekWhence::Cur,
-            SeekWhenceEnum::End => SeekWhence::End,
-        };
-        let position = self.handle_fs_seek(ctx, data.fd, data.offset, whence).await?;
+        let position = self.handle_fs_seek(ctx, data.fd, data.offset, data.whence).await?;
         Ok(FsSeekResponse { position })
     }
 
@@ -2099,13 +1932,7 @@ impl WorktreeHandler for RegistryService {
     async fn handle_stat(&self, _ctx: &EnvelopeContext, _request_id: u64,
         repo_id: &str, name: &str, data: &FsPathRequest,
     ) -> Result<FsStatResponse> {
-        let stat = self.handle_fs_stat(repo_id, name, &data.path).await?;
-        Ok(FsStatResponse {
-            exists: stat.exists,
-            is_dir: stat.is_dir,
-            size: stat.size,
-            modified_at: stat.modified_at,
-        })
+        Ok(self.handle_fs_stat(repo_id, name, &data.path).await?)
     }
 
     async fn handle_mkdir(&self, _ctx: &EnvelopeContext, _request_id: u64,
@@ -2146,18 +1973,40 @@ impl WorktreeHandler for RegistryService {
     async fn handle_list_dir(&self, _ctx: &EnvelopeContext, _request_id: u64,
         repo_id: &str, name: &str, data: &FsPathRequest,
     ) -> Result<Vec<FsDirEntryInfo>> {
-        let entries = self.handle_fs_list_dir(repo_id, name, &data.path).await?;
-        Ok(entries.into_iter().map(|e| FsDirEntryInfo {
-            name: e.name,
-            is_dir: e.is_dir,
-            size: e.size,
-        }).collect())
+        Ok(self.handle_fs_list_dir(repo_id, name, &data.path).await?)
     }
 
     async fn handle_open_stream(&self, _ctx: &EnvelopeContext, _request_id: u64,
         _repo_id: &str, _name: &str, _data: &FsOpenRequest,
     ) -> Result<FsStreamInfoResponse> {
         anyhow::bail!("FS streaming not yet implemented")
+    }
+
+    async fn handle_read_file(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str, data: &FsPathRequest,
+    ) -> Result<FsReadResponse> {
+        use std::io::Read;
+        let root = self.get_contained_root(repo_id, name).await
+            .map_err(|e| anyhow!("{}", e))?;
+        let mut file = root.open_file(&data.path, false, false, false, false, false)
+            .map_err(|e| anyhow!("{}", e))?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)?;
+        Ok(FsReadResponse { data: buf })
+    }
+
+    async fn handle_write_file(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str, data: &FsWriteFileRequest,
+    ) -> Result<FsWriteResponse> {
+        use std::io::Write;
+        let root = self.get_contained_root(repo_id, name).await
+            .map_err(|e| anyhow!("{}", e))?;
+        // write=true, create=true, truncate=true
+        let mut file = root.open_file(&data.path, true, true, true, false, false)
+            .map_err(|e| anyhow!("{}", e))?;
+        file.write_all(&data.data)?;
+        file.flush()?;
+        Ok(FsWriteResponse { bytes_written: data.data.len() as u64 })
     }
 }
 
@@ -2185,7 +2034,7 @@ impl ZmqService for RegistryService {
 }
 
 // ============================================================================
-// MetricsRegistryClient Implementation
+// MetricsRegistryClient Implementation (on generated RegistryClient)
 // ============================================================================
 
 use hyprstream_metrics::checkpoint::manager::{
@@ -2193,541 +2042,39 @@ use hyprstream_metrics::checkpoint::manager::{
 };
 
 #[async_trait]
-impl MetricsRegistryClient for RegistryZmqClient {
+impl MetricsRegistryClient for GenRegistryClient {
     async fn get_by_name(
         &self,
         name: &str,
     ) -> Result<Option<TrackedRepository>, MetricsRegistryError> {
-        self.get_by_name_internal(name)
+        let r = self.get_by_name(name)
             .await
-            .map_err(|e| MetricsRegistryError::Operation(e.to_string()))
+            .map_err(|e| MetricsRegistryError::Operation(e.to_string()))?;
+        Ok(Some(variant_to_tracked_repository(
+            &r.id, &r.name, &r.url, &r.worktree_path, &r.tracking_ref, &r.current_oid, r.registered_at,
+        ).map_err(|e| MetricsRegistryError::Operation(e.to_string()))?))
     }
 
     async fn register(
         &self,
-        id: &RepoId,
+        _id: &RepoId,
         name: Option<&str>,
         path: &std::path::Path,
     ) -> Result<(), MetricsRegistryError> {
-        RegistryClient::register(self, id, name, path)
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| MetricsRegistryError::Operation("Invalid path encoding".to_owned()))?;
+        self.register(path_str, name.unwrap_or(""), "")
             .await
+            .map(|_| ())
             .map_err(|e| MetricsRegistryError::Operation(e.to_string()))
     }
 }
 
 
-// ============================================================================
-// Repository-Level Client (Adapter over Generated Client)
-// ============================================================================
 
-/// ZMQ client for repository-level operations.
-///
-/// Wraps the auto-generated `RepositoryClient` from build.rs and implements
-/// the `RepositoryClient` trait with domain type conversions.
-pub struct RepositoryZmqClient {
-    gen: crate::services::generated::registry_client::RepositoryClient,
-    repo_id: RepoId,
-    repo_name: String,
-}
 
-impl RepositoryZmqClient {
-    /// Create a new repository client with signing credentials
-    pub fn new(
-        endpoint: String,
-        repo_id: RepoId,
-        repo_name: String,
-        signing_key: SigningKey,
-        identity: RequestIdentity,
-    ) -> Self {
-        let registry_client: crate::services::generated::registry_client::RegistryClient =
-            crate::services::core::create_service_client(&endpoint, signing_key, identity);
-        let gen = registry_client.repo(&repo_id.to_string());
-        Self {
-            gen,
-            repo_id,
-            repo_name,
-        }
-    }
 
-    /// Convert anyhow::Error to RegistryServiceError.
-    fn transport_err(e: anyhow::Error) -> RegistryServiceError {
-        RegistryServiceError::transport(e.to_string())
-    }
-}
-
-/// Parse a single-character file change type.
-fn parse_file_change_type(s: &str) -> Option<FileChangeType> {
-    match s.chars().next()? {
-        'A' => Some(FileChangeType::Added),
-        'M' => Some(FileChangeType::Modified),
-        'D' => Some(FileChangeType::Deleted),
-        'R' => Some(FileChangeType::Renamed),
-        '?' => Some(FileChangeType::Untracked),
-        'T' => Some(FileChangeType::TypeChanged),
-        'U' => Some(FileChangeType::Conflicted),
-        _ => None,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// WorktreeZmqClient — wraps generated WorktreeClient, implements FsOps trait
-// ---------------------------------------------------------------------------
-
-use crate::services::traits::FsOps;
-
-/// ZMQ client for worktree-scoped filesystem operations.
-///
-/// Wraps the auto-generated `WorktreeClient` from the proc macro and implements
-/// the `FsOps` trait with domain type conversions.
-pub struct WorktreeZmqClient {
-    gen: crate::services::generated::registry_client::WorktreeClient,
-}
-
-impl WorktreeZmqClient {
-    fn transport_err(e: anyhow::Error) -> FsServiceError {
-        FsServiceError::Transport(e.to_string())
-    }
-}
-
-#[async_trait]
-impl FsOps for WorktreeZmqClient {
-    async fn open(
-        &self,
-        path: &str,
-        write: bool,
-        create: bool,
-        truncate: bool,
-    ) -> Result<u32, FsServiceError> {
-        // Map simplified FsOps params to full schema fields:
-        // read=true unless write-only, append=false, exclusive=false
-        let r = self.gen.open(path, true, write, create, truncate, false, false)
-            .await
-            .map_err(Self::transport_err)?;
-        Ok(r.fd)
-    }
-
-    async fn close(&self, fd: u32) -> Result<(), FsServiceError> {
-        self.gen.close(fd).await.map_err(Self::transport_err)
-    }
-
-    async fn read(&self, fd: u32, len: u64) -> Result<Vec<u8>, FsServiceError> {
-        let r = self.gen.read(fd, len).await.map_err(Self::transport_err)?;
-        Ok(r.data)
-    }
-
-    async fn write(&self, fd: u32, data: &[u8]) -> Result<u64, FsServiceError> {
-        let r = self.gen.write(fd, data).await.map_err(Self::transport_err)?;
-        Ok(r.bytes_written)
-    }
-
-    async fn pread(&self, fd: u32, offset: u64, len: u64) -> Result<Vec<u8>, FsServiceError> {
-        let r = self.gen.pread(fd, offset, len).await.map_err(Self::transport_err)?;
-        Ok(r.data)
-    }
-
-    async fn pwrite(&self, fd: u32, offset: u64, data: &[u8]) -> Result<u64, FsServiceError> {
-        let r = self.gen.pwrite(fd, offset, data).await.map_err(Self::transport_err)?;
-        Ok(r.bytes_written)
-    }
-
-    async fn seek(&self, fd: u32, offset: i64, whence: SeekWhence) -> Result<u64, FsServiceError> {
-        let whence_str = match whence {
-            SeekWhence::Set => "set",
-            SeekWhence::Cur => "cur",
-            SeekWhence::End => "end",
-        };
-        let r = self.gen.seek(fd, offset, whence_str).await.map_err(Self::transport_err)?;
-        Ok(r.position)
-    }
-
-    async fn truncate(&self, fd: u32, len: u64) -> Result<(), FsServiceError> {
-        self.gen.truncate(fd, len).await.map_err(Self::transport_err)
-    }
-
-    async fn fsync(&self, fd: u32, data_only: bool) -> Result<(), FsServiceError> {
-        self.gen.fsync(fd, data_only).await.map_err(Self::transport_err)
-    }
-
-    async fn stat(&self, path: &str) -> Result<FsStatInfo, FsServiceError> {
-        let r = self.gen.stat(path).await.map_err(Self::transport_err)?;
-        Ok(FsStatInfo {
-            exists: r.exists,
-            is_dir: r.is_dir,
-            size: r.size,
-            modified_at: r.modified_at,
-        })
-    }
-
-    async fn mkdir(&self, path: &str, recursive: bool) -> Result<(), FsServiceError> {
-        self.gen.mkdir(path, recursive).await.map_err(Self::transport_err)
-    }
-
-    async fn remove(&self, path: &str) -> Result<(), FsServiceError> {
-        self.gen.remove(path).await.map_err(Self::transport_err)
-    }
-
-    async fn rmdir(&self, path: &str) -> Result<(), FsServiceError> {
-        self.gen.rmdir(path).await.map_err(Self::transport_err)
-    }
-
-    async fn rename(&self, src: &str, dst: &str) -> Result<(), FsServiceError> {
-        self.gen.rename(src, dst).await.map_err(Self::transport_err)
-    }
-
-    async fn copy(&self, src: &str, dst: &str) -> Result<(), FsServiceError> {
-        self.gen.copy(src, dst).await.map_err(Self::transport_err)
-    }
-
-    async fn list_dir(&self, path: &str) -> Result<Vec<FsDirEntry>, FsServiceError> {
-        let entries = self.gen.list_dir(path).await.map_err(Self::transport_err)?;
-        Ok(entries
-            .into_iter()
-            .map(|e| FsDirEntry {
-                name: e.name,
-                is_dir: e.is_dir,
-                size: e.size,
-            })
-            .collect())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Trait implementation — delegates to generated client
-// ---------------------------------------------------------------------------
-
-/// Helper macro: delegate to generated typed client method.
-/// The generated method already returns Result<T> with Error variant handling.
-macro_rules! delegate_void {
-    ($self:ident, $method:ident ( $($arg:expr),* ), $variant:ident) => {{
-        $self.gen.$method( $($arg),* ).await.map_err(RepositoryZmqClient::transport_err)
-    }};
-}
-
-/// Helper macro: delegate to generated typed client method returning String.
-macro_rules! delegate_string {
-    ($self:ident, $method:ident ( $($arg:expr),* ), $variant:ident) => {{
-        $self.gen.$method( $($arg),* ).await.map_err(RepositoryZmqClient::transport_err)
-    }};
-}
-
-/// Helper macro: delegate to generated typed client method returning Vec<String>.
-macro_rules! delegate_string_list {
-    ($self:ident, $method:ident ( $($arg:expr),* ), $variant:ident) => {{
-        $self.gen.$method( $($arg),* ).await.map_err(RepositoryZmqClient::transport_err)
-    }};
-}
-
-#[async_trait]
-impl RepositoryClient for RepositoryZmqClient {
-    fn name(&self) -> &str {
-        &self.repo_name
-    }
-
-    fn id(&self) -> &RepoId {
-        &self.repo_id
-    }
-
-    // ========================================================================
-    // Worktree Operations
-    // ========================================================================
-
-    async fn create_worktree(
-        &self,
-        path: &Path,
-        branch: &str,
-    ) -> Result<PathBuf, RegistryServiceError> {
-        let p = self
-            .gen
-            .create_worktree(path.to_string_lossy().as_ref(), branch, false)
-            .await
-            .map_err(Self::transport_err)?;
-        Ok(PathBuf::from(p))
-    }
-
-    async fn list_worktrees(&self) -> Result<Vec<WorktreeInfo>, RegistryServiceError> {
-        let wts = self.gen.list_worktrees().await.map_err(Self::transport_err)?;
-        Ok(wts.into_iter().map(|wt| {
-            let branch = if wt.branch_name.is_empty() { None } else { Some(wt.branch_name) };
-            WorktreeInfo {
-                path: PathBuf::from(wt.path),
-                branch,
-                driver: "zmq".to_owned(),
-                is_dirty: wt.is_dirty,
-            }
-        }).collect())
-    }
-
-    async fn worktree_path(
-        &self,
-        branch: &str,
-    ) -> Result<Option<PathBuf>, RegistryServiceError> {
-        let worktrees = self.list_worktrees().await?;
-        Ok(worktrees
-            .into_iter()
-            .find(|wt| wt.branch.as_deref() == Some(branch))
-            .map(|wt| wt.path))
-    }
-
-    async fn remove_worktree(&self, path: &Path) -> Result<(), RegistryServiceError> {
-        delegate_void!(
-            self,
-            remove_worktree(path.to_string_lossy().as_ref(), false),
-            RemoveWorktree
-        )
-    }
-
-    // ========================================================================
-    // Branch Operations
-    // ========================================================================
-
-    async fn create_branch(
-        &self,
-        name: &str,
-        from: Option<&str>,
-    ) -> Result<(), RegistryServiceError> {
-        delegate_void!(
-            self,
-            create_branch(name, from.unwrap_or("")),
-            CreateBranch
-        )
-    }
-
-    async fn checkout(&self, ref_spec: &str) -> Result<(), RegistryServiceError> {
-        delegate_void!(self, checkout(ref_spec, false), Checkout)
-    }
-
-    async fn default_branch(&self) -> Result<String, RegistryServiceError> {
-        // Not yet supported via ZMQ, return "main" as default
-        Ok("main".to_owned())
-    }
-
-    async fn list_branches(&self) -> Result<Vec<String>, RegistryServiceError> {
-        delegate_string_list!(self, list_branches(), ListBranches)
-    }
-
-    async fn merge(
-        &self,
-        source: &str,
-        message: Option<&str>,
-    ) -> Result<String, RegistryServiceError> {
-        // Schema response is Void — return empty string
-        delegate_void!(self, merge(source, message.unwrap_or("")), Merge)?;
-        Ok(String::new())
-    }
-
-    // ========================================================================
-    // Staging / Commit Operations
-    // ========================================================================
-
-    async fn stage_all(&self) -> Result<(), RegistryServiceError> {
-        delegate_void!(self, stage_all(), StageAll)
-    }
-
-    async fn stage_files(&self, files: &[&str]) -> Result<(), RegistryServiceError> {
-        let owned: Vec<String> = files.iter().map(|s| s.to_string()).collect();
-        delegate_void!(self, stage_files(&owned), StageFiles)
-    }
-
-    async fn commit(&self, message: &str) -> Result<String, RegistryServiceError> {
-        delegate_string!(self, commit(message, "", ""), Commit)
-    }
-
-    async fn status(&self) -> Result<RepositoryStatus, RegistryServiceError> {
-        let r = self
-            .gen
-            .status()
-            .await
-            .map_err(Self::transport_err)?;
-        let branch_opt = if r.branch.is_empty() {
-            None
-        } else {
-            Some(r.branch)
-        };
-        let head = if r.head_oid.is_empty() {
-            None
-        } else {
-            Some(
-                git2db::Oid::from_str(&r.head_oid)
-                    .map_err(|e| RegistryServiceError::transport(e.to_string()))?,
-            )
-        };
-        Ok(RepositoryStatus {
-            branch: branch_opt,
-            head,
-            ahead: r.ahead as usize,
-            behind: r.behind as usize,
-            is_clean: r.is_clean,
-            modified_files: r.modified_files.into_iter().map(PathBuf::from).collect(),
-        })
-    }
-
-    // ========================================================================
-    // Reference Operations
-    // ========================================================================
-
-    async fn get_head(&self) -> Result<String, RegistryServiceError> {
-        delegate_string!(self, get_head(), GetHead)
-    }
-
-    async fn get_ref(&self, ref_name: &str) -> Result<String, RegistryServiceError> {
-        delegate_string!(self, get_ref(ref_name), GetRef)
-    }
-
-    async fn update(&self, refspec: Option<&str>) -> Result<(), RegistryServiceError> {
-        delegate_void!(self, update(refspec.unwrap_or("")), Update)
-    }
-
-    // ========================================================================
-    // Remote Operations
-    // ========================================================================
-
-    async fn list_remotes(&self) -> Result<Vec<RemoteInfo>, RegistryServiceError> {
-        self.gen.list_remotes().await.map_err(Self::transport_err)
-    }
-
-    async fn add_remote(&self, name: &str, url: &str) -> Result<(), RegistryServiceError> {
-        delegate_void!(self, add_remote(name, url), AddRemote)
-    }
-
-    async fn remove_remote(&self, name: &str) -> Result<(), RegistryServiceError> {
-        delegate_void!(self, remove_remote(name), RemoveRemote)
-    }
-
-    async fn set_remote_url(&self, name: &str, url: &str) -> Result<(), RegistryServiceError> {
-        delegate_void!(self, set_remote_url(name, url), SetRemoteUrl)
-    }
-
-    async fn rename_remote(
-        &self,
-        old_name: &str,
-        new_name: &str,
-    ) -> Result<(), RegistryServiceError> {
-        delegate_void!(self, rename_remote(old_name, new_name), RenameRemote)
-    }
-
-    // ========================================================================
-    // Push Operations
-    // ========================================================================
-
-    async fn push(
-        &self,
-        remote: &str,
-        refspec: &str,
-        force: bool,
-    ) -> Result<(), RegistryServiceError> {
-        delegate_void!(self, push(remote, refspec, force), Push)
-    }
-
-    // ========================================================================
-    // Advanced Commit Operations
-    // ========================================================================
-
-    async fn amend_commit(&self, message: &str) -> Result<String, RegistryServiceError> {
-        delegate_string!(self, amend_commit(message), AmendCommit)
-    }
-
-    async fn commit_with_author(
-        &self,
-        message: &str,
-        author_name: &str,
-        author_email: &str,
-    ) -> Result<String, RegistryServiceError> {
-        delegate_string!(
-            self,
-            commit_with_author(message, author_name, author_email),
-            CommitWithAuthor
-        )
-    }
-
-    async fn stage_all_including_untracked(&self) -> Result<(), RegistryServiceError> {
-        delegate_void!(
-            self,
-            stage_all_including_untracked(),
-            StageAllIncludingUntracked
-        )
-    }
-
-    // ========================================================================
-    // Merge Conflict Resolution
-    // ========================================================================
-
-    async fn abort_merge(&self) -> Result<(), RegistryServiceError> {
-        delegate_void!(self, abort_merge(), AbortMerge)
-    }
-
-    async fn continue_merge(
-        &self,
-        message: Option<&str>,
-    ) -> Result<String, RegistryServiceError> {
-        // Schema response is Void — return empty string
-        delegate_void!(
-            self,
-            continue_merge(message.unwrap_or("")),
-            ContinueMerge
-        )?;
-        Ok(String::new())
-    }
-
-    async fn quit_merge(&self) -> Result<(), RegistryServiceError> {
-        delegate_void!(self, quit_merge(), QuitMerge)
-    }
-
-    // ========================================================================
-    // Tag Operations
-    // ========================================================================
-
-    async fn list_tags(&self) -> Result<Vec<String>, RegistryServiceError> {
-        delegate_string_list!(self, list_tags(), ListTags)
-    }
-
-    async fn create_tag(
-        &self,
-        name: &str,
-        target: Option<&str>,
-    ) -> Result<(), RegistryServiceError> {
-        delegate_void!(self, create_tag(name, target.unwrap_or("")), CreateTag)
-    }
-
-    async fn delete_tag(&self, name: &str) -> Result<(), RegistryServiceError> {
-        delegate_void!(self, delete_tag(name), DeleteTag)
-    }
-
-    // ========================================================================
-    // Detailed Status
-    // ========================================================================
-
-    async fn detailed_status(&self) -> Result<DetailedStatus, RegistryServiceError> {
-        let r = self.gen.detailed_status().await.map_err(Self::transport_err)?;
-        let branch = if r.branch.is_empty() { None } else { Some(r.branch) };
-        let head = if r.head_oid.is_empty() { None } else { Some(r.head_oid) };
-        let files = r.files.into_iter().map(|f| {
-            FileStatus {
-                path: f.path,
-                index_status: if f.index_status.is_empty() { None } else { parse_file_change_type(&f.index_status) },
-                worktree_status: if f.worktree_status.is_empty() { None } else { parse_file_change_type(&f.worktree_status) },
-            }
-        }).collect();
-        Ok(DetailedStatus {
-            branch,
-            head,
-            merge_in_progress: r.merge_in_progress,
-            rebase_in_progress: r.rebase_in_progress,
-            files,
-            ahead: r.ahead as usize,
-            behind: r.behind as usize,
-        })
-    }
-
-    // ========================================================================
-    // Filesystem Operations
-    // ========================================================================
-
-    fn worktree(&self, name: &str) -> Arc<dyn FsOps> {
-        Arc::new(WorktreeZmqClient {
-            gen: self.gen.worktree(name),
-        })
-    }
-}
 
 
 #[cfg(test)]
@@ -2764,7 +2111,7 @@ mod tests {
         let _policy_handle = manager.spawn(Box::new(policy_service)).await.expect("test: start policy service");
 
         // Create policy client for RegistryService
-        let policy_client = PolicyClient::with_endpoint(
+        let policy_client: PolicyClient = crate::services::core::create_service_client(
             "inproc://test-policy-health",
             signing_key.clone(),
             RequestIdentity::local(),
@@ -2782,7 +2129,7 @@ mod tests {
         let mut handle = manager.spawn(Box::new(registry_service)).await.expect("test: start registry service");
 
         // Create signed client with matching key and local identity
-        let client = RegistryZmqClient::with_endpoint(
+        let client: GenRegistryClient = crate::services::core::create_service_client(
             "inproc://test-registry-health",
             signing_key,
             RequestIdentity::local(),

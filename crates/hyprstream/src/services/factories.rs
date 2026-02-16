@@ -33,7 +33,7 @@ use tracing::info;
 
 use crate::auth::PolicyManager;
 use crate::config::TokenConfig;
-use crate::services::{McpService, McpConfig, PolicyService, PolicyClient, RegistryClient, RegistryService, RegistryZmqClient};
+use crate::services::{McpService, McpConfig, PolicyService, PolicyClient, RegistryService, GenRegistryClient};
 use crate::zmq::global_context;
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -168,10 +168,11 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::local());
 
     // Create registry client
-    let registry_client: Arc<dyn RegistryClient> = Arc::new(RegistryZmqClient::new(
+    let registry_client: GenRegistryClient = crate::services::core::create_service_client(
+        &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
         ctx.signing_key().clone(),
         RequestIdentity::local(),
-    ));
+    );
 
     // Service includes infrastructure - directly Spawnable via blanket impl
     let model_service = ModelService::new(
@@ -278,10 +279,11 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::local());
 
     // Create registry client
-    let registry_client: Arc<dyn RegistryClient> = Arc::new(RegistryZmqClient::new(
+    let registry_client: GenRegistryClient = crate::services::core::create_service_client(
+        &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
         ctx.signing_key().clone(),
         RequestIdentity::local(),
-    ));
+    );
 
     // Create server state (blocking since we're in sync context)
     let resource_url = config.oai.resource_url();
@@ -328,10 +330,11 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     let config = HyprConfig::load().unwrap_or_default();
 
     // Create registry client for dataset lookup (if default_dataset is configured)
-    // RegistryZmqClient already implements hyprstream_metrics::RegistryClient
+    // GenRegistryClient already implements hyprstream_metrics::RegistryClient
     let registry_client: Option<Arc<dyn hyprstream_metrics::RegistryClient>> =
         if config.flight.default_dataset.is_some() {
-            let zmq_client = RegistryZmqClient::new(
+            let zmq_client: GenRegistryClient = crate::services::core::create_service_client(
+                &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
                 ctx.signing_key().clone(),
                 RequestIdentity::local(),
             );

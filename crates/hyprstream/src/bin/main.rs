@@ -43,7 +43,7 @@ use hyprstream_core::config::HyprConfig;
 use hyprstream_core::storage::{GitRef, ModelRef};
 
 // Registry and policy services - uses ZMQ-based services from hyprstream_core
-use hyprstream_core::services::{PolicyClient, RegistryClient, RegistryZmqClient};
+use hyprstream_core::services::{PolicyClient, GenRegistryClient};
 // Worker service for Kata-based workload execution
 use hyprstream_workers::runtime::WorkerService;
 use hyprstream_workers::workflow::WorkflowService;
@@ -346,7 +346,7 @@ fn handle_quick_command(
             },
             || async move {
                 handle_clone(
-                    ctx.registry().as_ref(),
+                    ctx.registry(),
                     &repo_url,
                     name,
                     branch,
@@ -369,7 +369,7 @@ fn handle_quick_command(
                 let registry_path = ctx.models_dir().join(".registry");
                 let policies_dir = registry_path.join("policies");
                 let policy_manager = PolicyManager::new(&policies_dir).await.ok();
-                handle_list(ctx.registry().as_ref(), policy_manager.as_ref()).await
+                handle_list(ctx.registry(), policy_manager.as_ref()).await
             },
         ),
 
@@ -383,7 +383,7 @@ fn handle_quick_command(
                 multi_threaded: true,
             },
             || async move {
-                match handle_info(ctx.registry().as_ref(), &model, verbose, adapters_only).await {
+                match handle_info(ctx.registry(), &model, verbose, adapters_only).await {
                     Ok(()) => Ok(()),
                     Err(e) => {
                         eprintln!("Warning: Some operations failed: {}", e);
@@ -398,7 +398,7 @@ fn handle_quick_command(
                 device: DeviceConfig::request_cpu(),
                 multi_threaded: true,
             },
-            || async move { handle_status(ctx.registry().as_ref(), model, verbose).await },
+            || async move { handle_status(ctx.registry(), model, verbose).await },
         ),
 
         QuickCommand::Branch {
@@ -412,7 +412,7 @@ fn handle_quick_command(
                 multi_threaded: true,
             },
             || async move {
-                handle_branch(ctx.registry().as_ref(), &model, &name, from, policy).await
+                handle_branch(ctx.registry(), &model, &name, from, policy).await
             },
         ),
 
@@ -433,7 +433,7 @@ fn handle_quick_command(
                 };
                 let model_ref = ModelRef::with_ref(model, git_ref_parsed);
                 handle_checkout(
-                    ctx.registry().as_ref(),
+                    ctx.registry(),
                     &model_ref.to_string(),
                     create_branch,
                     force,
@@ -453,7 +453,7 @@ fn handle_quick_command(
                 multi_threaded: true,
             },
             || async move {
-                handle_pull(ctx.registry().as_ref(), &model, remote, branch, rebase).await
+                handle_pull(ctx.registry(), &model, remote, branch, rebase).await
             },
         ),
 
@@ -469,7 +469,7 @@ fn handle_quick_command(
             },
             || async move {
                 handle_remove(
-                    ctx.registry().as_ref(),
+                    ctx.registry(),
                     &model,
                     force,
                     registry_only,
@@ -511,20 +511,20 @@ fn handle_quick_command(
                         branch,
                         policy,
                     } => {
-                        handle_worktree_add(ctx.registry().as_ref(), &model, &branch, policy).await
+                        handle_worktree_add(ctx.registry(), &model, &branch, policy).await
                     }
                     WorktreeQuickCommand::List { model, all } => {
-                        handle_worktree_list(ctx.registry().as_ref(), &model, all).await
+                        handle_worktree_list(ctx.registry(), &model, all).await
                     }
                     WorktreeQuickCommand::Info { model, branch } => {
-                        handle_worktree_info(ctx.registry().as_ref(), &model, &branch).await
+                        handle_worktree_info(ctx.registry(), &model, &branch).await
                     }
                     WorktreeQuickCommand::Remove {
                         model,
                         branch,
                         force,
                     } => {
-                        handle_worktree_remove(ctx.registry().as_ref(), &model, &branch, force)
+                        handle_worktree_remove(ctx.registry(), &model, &branch, force)
                             .await
                     }
                 }
@@ -551,7 +551,7 @@ fn handle_quick_command(
             },
             || async move {
                 handle_commit(
-                    ctx.registry().as_ref(),
+                    ctx.registry(),
                     &model,
                     &message,
                     all,
@@ -582,7 +582,7 @@ fn handle_quick_command(
             },
             || async move {
                 handle_push(
-                    ctx.registry().as_ref(),
+                    ctx.registry(),
                     &model,
                     remote,
                     branch,
@@ -637,7 +637,7 @@ fn handle_quick_command(
                     allow_unrelated_histories,
                     no_verify,
                 };
-                handle_merge(ctx.registry().as_ref(), &target, &source, options).await
+                handle_merge(ctx.registry(), &target, &source, options).await
             },
         ),
 
@@ -660,7 +660,7 @@ fn handle_quick_command(
                         learning_rate,
                     } => {
                         handle_training_init(
-                            registry.as_ref(),
+                            registry,
                             &model,
                             branch,
                             adapter,
@@ -695,7 +695,7 @@ fn handle_quick_command(
                             }
                         };
                         handle_training_infer(
-                            registry.as_ref(),
+                            registry,
                             &model,
                             &prompt_text,
                             image,
@@ -729,7 +729,7 @@ fn handle_quick_command(
                         kv_quant,
                     } => {
                         handle_training_batch(
-                            registry.as_ref(),
+                            registry,
                             &model,
                             input,
                             input_dir,
@@ -756,7 +756,7 @@ fn handle_quick_command(
                         remote,
                     } => {
                         handle_training_checkpoint(
-                            registry.as_ref(),
+                            registry,
                             &model,
                             message,
                             push,
@@ -1078,23 +1078,23 @@ fn handle_quick_command(
             || async move {
                 match command {
                     RemoteQuickCommand::Add { model, name, url } => {
-                        handle_remote_add(ctx.registry().as_ref(), &model, &name, &url).await
+                        handle_remote_add(ctx.registry(), &model, &name, &url).await
                     }
                     RemoteQuickCommand::List { model, verbose } => {
-                        handle_remote_list(ctx.registry().as_ref(), &model, verbose).await
+                        handle_remote_list(ctx.registry(), &model, verbose).await
                     }
                     RemoteQuickCommand::Remove { model, name } => {
-                        handle_remote_remove(ctx.registry().as_ref(), &model, &name).await
+                        handle_remote_remove(ctx.registry(), &model, &name).await
                     }
                     RemoteQuickCommand::SetUrl { model, name, url } => {
-                        handle_remote_set_url(ctx.registry().as_ref(), &model, &name, &url).await
+                        handle_remote_set_url(ctx.registry(), &model, &name, &url).await
                     }
                     RemoteQuickCommand::Rename {
                         model,
                         old_name,
                         new_name,
                     } => {
-                        handle_remote_rename(ctx.registry().as_ref(), &model, &old_name, &new_name)
+                        handle_remote_rename(ctx.registry(), &model, &old_name, &new_name)
                             .await
                     }
                 }
@@ -1267,7 +1267,7 @@ fn main() -> Result<()> {
 
     // Start ZMQ-based services and create keypair
     let (registry_client, mut _service_handles, _workflow_service, signing_key, verifying_key): (
-        Arc<dyn RegistryClient>,
+        GenRegistryClient,
         Vec<SpawnedService>,
         Option<Arc<WorkflowService>>,
         SigningKey,
@@ -1336,10 +1336,11 @@ fn main() -> Result<()> {
                         None
                     };
 
-                let client = Arc::new(RegistryZmqClient::new(
+                let client = hyprstream_core::services::create_service_client(
+                    &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
                     signing_key.clone(),
                     RequestIdentity::local(),
-                )) as Arc<dyn RegistryClient>;
+                );
 
                 Ok::<_, anyhow::Error>((
                     client,
@@ -1358,10 +1359,11 @@ fn main() -> Result<()> {
                 let signing_key = load_or_generate_signing_key(&keys_dir).await?;
                 let verifying_key = signing_key.verifying_key();
 
-                let client = Arc::new(RegistryZmqClient::new(
+                let client = hyprstream_core::services::create_service_client(
+                    &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
                     signing_key.clone(),
                     RequestIdentity::local(),
-                )) as Arc<dyn RegistryClient>;
+                );
 
                 Ok::<_, anyhow::Error>((client, Vec::new(), None, signing_key, verifying_key))
             })
@@ -1370,7 +1372,7 @@ fn main() -> Result<()> {
 
     // Create application context with shared registry client
     let config_for_service = config.clone();
-    let ctx = AppContext::with_client(config, registry_client.clone());
+    let ctx = AppContext::with_client(config, Clone::clone(&registry_client));
 
     // ========== TOP-LEVEL COMMAND DISPATCH ==========
     match matches.subcommand() {

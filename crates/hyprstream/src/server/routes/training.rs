@@ -84,7 +84,7 @@ async fn start_training(
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{lora_id}");
-    if !state.policy_client.check_policy_str(&user, &resource, Operation::Train).await.unwrap_or(false) {
+    if !state.policy_client.check(&user, "*", &resource, Operation::Train.as_str()).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -121,7 +121,7 @@ async fn stop_training(
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{lora_id}");
-    if !state.policy_client.check_policy_str(&user, &resource, Operation::Train).await.unwrap_or(false) {
+    if !state.policy_client.check(&user, "*", &resource, Operation::Train.as_str()).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -154,7 +154,7 @@ async fn get_status(
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{lora_id}");
-    if !state.policy_client.check_policy_str(&user, &resource, Operation::Query).await.unwrap_or(false) {
+    if !state.policy_client.check(&user, "*", &resource, Operation::Query.as_str()).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -185,7 +185,7 @@ async fn submit_samples(
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{lora_id}");
-    if !state.policy_client.check_policy_str(&user, &resource, Operation::Train).await.unwrap_or(false) {
+    if !state.policy_client.check(&user, "*", &resource, Operation::Train.as_str()).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -230,7 +230,7 @@ async fn write_checkpoint(
 
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{}", req.model_id);
-    if !state.policy_client.check_policy_str(&user, &resource, Operation::Write).await.unwrap_or(false) {
+    if !state.policy_client.check(&user, "*", &resource, Operation::Write.as_str()).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -253,7 +253,19 @@ async fn write_checkpoint(
         }
     };
 
-    let model_path = match state.registry.get_model_path(&model_ref).await {
+    let model_path = match async {
+        let tracked = state.registry.get_by_name(&model_ref.model).await?;
+        let repo = state.registry.repo(&tracked.id);
+        let branch = match &model_ref.git_ref {
+            crate::storage::GitRef::Branch(name) => name.clone(),
+            _ => repo.get_head().await?,
+        };
+        let wts = repo.list_worktrees().await?;
+        wts.iter()
+            .find(|wt| wt.branch_name == branch)
+            .map(|wt| std::path::PathBuf::from(&wt.path))
+            .ok_or_else(|| anyhow::anyhow!("worktree not found"))
+    }.await {
         Ok(p) => p,
         Err(e) => {
             return (
@@ -335,7 +347,7 @@ async fn commit_checkpoint(
 
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{model_id}");
-    if !state.policy_client.check_policy_str(&user, &resource, Operation::Write).await.unwrap_or(false) {
+    if !state.policy_client.check(&user, "*", &resource, Operation::Write.as_str()).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -372,8 +384,8 @@ async fn commit_checkpoint(
     };
 
     // Get RepositoryClient from registry for git operations
-    let repo_client = match state.registry.repo(&model_id).await {
-        Ok(client) => Some(client),
+    let repo_client = match state.registry.get_by_name(&model_id).await {
+        Ok(tracked) => Some(state.registry.repo(&tracked.id)),
         Err(e) => {
             tracing::warn!("Could not get RepositoryClient for '{}': {} — git commit disabled", model_id, e);
             None
@@ -423,7 +435,7 @@ async fn start_pretraining(
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{}", req.model_id);
-    if !state.policy_client.check_policy_str(&user, &resource, Operation::Train).await.unwrap_or(false) {
+    if !state.policy_client.check(&user, "*", &resource, Operation::Train.as_str()).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({

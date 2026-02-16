@@ -220,13 +220,13 @@ async fn issue_token(
 
     let result = state
         .policy_client
-        .issue_jwt_token_with_audience(scopes, Some(state.token_ttl), resource)
+        .issue_token(&scopes, state.token_ttl, &resource.unwrap_or_default(), "")
         .await;
 
     match result {
-        Ok((token, expires_at)) => {
+        Ok(token_info) => {
             let now = chrono::Utc::now().timestamp();
-            let expires_in = (expires_at - now).max(0);
+            let expires_in = (token_info.expires_at - now).max(0);
 
             (
                 StatusCode::OK,
@@ -235,7 +235,7 @@ async fn issue_token(
                     (header::PRAGMA, "no-cache"),
                 ],
                 Json(serde_json::json!({
-                    "access_token": token,
+                    "access_token": token_info.token,
                     "token_type": "Bearer",
                     "expires_in": expires_in,
                     "scope": scope_str,

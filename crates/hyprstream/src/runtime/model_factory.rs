@@ -6,7 +6,6 @@
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 use tch::{Device, Kind as DType, Tensor};
 use tracing::{debug, info, instrument};
 
@@ -14,7 +13,7 @@ use super::architectures::{gemma::GemmaModel, llama::LlamaModel, ModelOperations
 use super::kv_quant::KVQuantType;
 use super::model_config::{ModelArchitecture, ModelConfig};
 use super::torch_utils::{safe_to_device, estimate_tensor_size_mb};
-use crate::services::FsOps;
+use crate::services::WorktreeClient;
 
 /// Factory for creating models with proper configuration management
 pub struct ModelFactory;
@@ -702,7 +701,7 @@ impl ModelFactory {
         dtype: DType,
         max_context: Option<usize>,
         kv_quant_type: KVQuantType,
-        fs: &Arc<dyn FsOps>,
+        fs: &WorktreeClient,
     ) -> Result<Box<dyn ModelOperations>> {
         info!("Loading model via FsOps: {}", model_path.display());
 
@@ -720,13 +719,13 @@ impl ModelFactory {
     }
 
     /// Detect model dtype using FsOps for file reading.
-    pub async fn detect_model_dtype_fs(fs: &Arc<dyn FsOps>) -> Result<DType> {
+    pub async fn detect_model_dtype_fs(fs: &WorktreeClient) -> Result<DType> {
         let shard_names = Self::find_shard_names_fs(fs).await?;
         if shard_names.is_empty() {
             return Err(anyhow!("No model weights found"));
         }
 
-        let file_content = fs.read_file(&shard_names[0]).await?;
+        let file_content = fs.read_file(&shard_names[0]).await?.data;
         let tensors = safetensors::SafeTensors::deserialize(&file_content)?;
 
         let mut f16_count = 0;
@@ -758,9 +757,9 @@ impl ModelFactory {
     }
 
     /// Find shard file names via FsOps (returns relative paths).
-    async fn find_shard_names_fs(fs: &Arc<dyn FsOps>) -> Result<Vec<String>> {
+    async fn find_shard_names_fs(fs: &WorktreeClient) -> Result<Vec<String>> {
         // Check for single file first
-        if fs.exists("model.safetensors").await? {
+        if fs.stat("model.safetensors").await.map(|s| s.exists).unwrap_or(false) {
             return Ok(vec!["model.safetensors".to_owned()]);
         }
 
@@ -780,7 +779,7 @@ impl ModelFactory {
 
     /// Load weights from safetensors files via FsOps.
     async fn load_weights_fs(
-        fs: &Arc<dyn FsOps>,
+        fs: &WorktreeClient,
         shard_names: &[String],
         device: &Device,
         dtype: DType,
@@ -796,7 +795,7 @@ impl ModelFactory {
                 info!("Loading shard {}/{} via FsOps: {}", idx + 1, shard_names.len(), name);
             }
 
-            let data = fs.read_file(name).await?;
+            let data = fs.read_file(name).await?.data;
             let tensors = safetensors::SafeTensors::deserialize(&data)?;
             Self::create_tensors_from_safetensors(tensors, &mut all_weights, device, dtype)?;
         }

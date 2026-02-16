@@ -5,15 +5,14 @@
 //!
 //! Two modes of operation:
 //! - **Direct** (sync): Uses `PathBuf` and `std::fs` for standalone/test use.
-//! - **FsOps** (async): Uses `Arc<dyn FsOps>` for worktree-scoped, path-contained access.
+//! - **FsOps** (async): Uses `WorktreeClient` for worktree-scoped, path-contained access.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use crate::services::FsOps;
+use crate::services::WorktreeClient;
 
 /// Information about a discovered adapter
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,7 +67,7 @@ pub struct AdapterManager {
     /// Optional FsOps for worktree-scoped file operations.
     /// When present, async methods use contained-root access.
     /// When absent, sync methods use direct filesystem access.
-    fs: Option<Arc<dyn FsOps>>,
+    fs: Option<WorktreeClient>,
 }
 
 impl AdapterManager {
@@ -81,8 +80,8 @@ impl AdapterManager {
         }
     }
 
-    /// Create a new adapter manager with FsOps for worktree-scoped access
-    pub fn with_fs(fs: Arc<dyn FsOps>) -> Self {
+    /// Create a new adapter manager with WorktreeClient for worktree-scoped access
+    pub fn with_fs(fs: WorktreeClient) -> Self {
         // adapters_dir is kept for backward compat but not used when fs is Some
         Self {
             adapters_dir: PathBuf::from("adapters"),
@@ -312,7 +311,7 @@ impl AdapterManager {
         let mut adapters = Vec::new();
 
         // Check if adapters dir exists
-        if !fs.exists("adapters").await? {
+        if !fs.stat("adapters").await.map(|s| s.exists).unwrap_or(false) {
             return Ok(adapters);
         }
 
@@ -342,7 +341,7 @@ impl AdapterManager {
             };
 
             let rel_config = format!("adapters/{base_name}.config.json");
-            let config_exists = fs.exists(&rel_config).await?;
+            let config_exists = fs.stat(&rel_config).await.map(|s| s.exists).unwrap_or(false);
 
             adapters.push(AdapterInfo {
                 filename: name_str.clone(),
@@ -431,7 +430,7 @@ impl AdapterManager {
         };
 
         let rel_config = format!("adapters/{adapter_name}.config.json");
-        let config_str = fs.read_to_string(&rel_config).await?;
+        let config_str = String::from_utf8(fs.read_file(&rel_config).await?.data)?;
         let config: AdapterConfig = serde_json::from_str(&config_str)?;
         Ok(config)
     }
@@ -443,7 +442,7 @@ impl AdapterManager {
             None => return Ok(self.has_adapters()),
         };
 
-        if !fs.exists("adapters").await? {
+        if !fs.stat("adapters").await.map(|s| s.exists).unwrap_or(false) {
             return Ok(false);
         }
 
@@ -476,7 +475,7 @@ impl AdapterManager {
             // Remove config if exists
             if let Some(config_path) = &adapter.config_path {
                 let rel_config = config_path.to_string_lossy();
-                if fs.exists(&rel_config).await? {
+                if fs.stat(&rel_config).await.map(|s| s.exists).unwrap_or(false) {
                     fs.remove(&rel_config).await?;
                 }
             }
@@ -538,7 +537,7 @@ impl AdapterManager {
         };
 
         let rel_path = format!("adapters/{adapter_name}.safetensors");
-        Ok(fs.read_file(&rel_path).await?)
+        Ok(fs.read_file(&rel_path).await?.data)
     }
 }
 

@@ -110,6 +110,8 @@ struct RepositoryRequest {
     update @30 :UpdateRequest $mcpScope(write);
     # Worktree-scoped filesystem operations
     worktree @31 :WorktreeRequest;
+    # Ensure a worktree exists for a branch (create if needed, return path)
+    ensureWorktree @32 :EnsureWorktreeRequest $mcpScope(write) $mcpDescription("Ensure a worktree exists for a branch, creating if needed");
   }
 }
 
@@ -167,6 +169,7 @@ struct RepositoryResponse {
     deleteTag @29 :Void;
     update @30 :Void;
     worktreeResult @31 :WorktreeResponse;
+    ensureWorktree @32 :Text;
   }
 }
 
@@ -206,6 +209,10 @@ struct WorktreeRequest {
     listDir @16 :FsPathRequest $mcpScope(query);
     # Streaming (bulk transfer via StreamService)
     openStream @17 :FsOpenRequest $mcpScope(write);
+    # Read entire file (single RPC, 16 MiB cap)
+    readFile @18 :FsPathRequest $mcpScope(query) $mcpDescription("Read entire file contents (16 MiB cap)");
+    # Write entire file (single RPC, 16 MiB cap)
+    writeFile @19 :FsWriteFileRequest $mcpScope(write) $mcpDescription("Write data to a file, creating it if needed");
   }
 }
 
@@ -232,6 +239,13 @@ struct FsPathRequest { path @0 :Text; }
 struct FsMkdirRequest { path @0 :Text; recursive @1 :Bool; }
 struct FsRenameRequest { src @0 :Text; dst @1 :Text; }
 struct FsCopyRequest { src @0 :Text; dst @1 :Text; }
+struct FsWriteFileRequest { path @0 :Text; data @1 :Data; }
+
+# Ensure Worktree Request (repoId removed — curried)
+
+struct EnsureWorktreeRequest {
+  branch @0 :Text;
+}
 
 # --- WorktreeResponse ---
 
@@ -255,6 +269,8 @@ struct WorktreeResponse {
     copy @15 :Void;
     listDir @16 :List(FsDirEntryInfo);
     openStream @17 :FsStreamInfoResponse;
+    readFile @18 :FsReadResponse;
+    writeFile @19 :FsWriteResponse;
   }
 }
 
@@ -471,6 +487,19 @@ struct UpdateRequest {
   refspec @0 :Text;
 }
 
+# File Change Type Enum
+
+enum FileChangeType {
+  none @0;
+  added @1;
+  modified @2;
+  deleted @3;
+  renamed @4;
+  untracked @5;
+  typeChanged @6;
+  conflicted @7;
+}
+
 # Detailed Status Info
 
 struct DetailedStatusInfo {
@@ -485,6 +514,6 @@ struct DetailedStatusInfo {
 
 struct FileStatusInfo {
   path @0 :Text;
-  indexStatus @1 :Text;        # Single char: A, M, D, R, ?, T, U, or empty
-  worktreeStatus @2 :Text;     # Single char: A, M, D, R, ?, T, U, or empty
+  indexStatus @1 :FileChangeType;
+  worktreeStatus @2 :FileChangeType;
 }

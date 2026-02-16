@@ -15,7 +15,7 @@ use crate::services::generated::{
 };
 use hyprstream_workers::generated::{worker_client, workflow_client};
 use crate::services::{
-    InferenceZmqClient, ModelZmqClient, PolicyClient, RegistryZmqClient, WorkerZmqClient,
+    InferenceZmqClient, ModelZmqClient, PolicyClient, GenRegistryClient, WorkerZmqClient,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -318,8 +318,11 @@ async fn dispatch_top_level(
 
     match service {
         "registry" => {
-            let client = RegistryZmqClient::new(signing_key, identity);
-            client.gen.call_method(method, args).await
+            let client: GenRegistryClient = crate::services::create_service_client(
+                &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
+                signing_key, identity,
+            );
+            client.call_method(method, args).await
         }
         "model" => {
             let client = ModelZmqClient::new(signing_key, identity);
@@ -356,8 +359,11 @@ async fn dispatch_scoped(
 
     match (service, scope_name) {
         ("registry", "repo") => {
-            let client = RegistryZmqClient::new(signing_key, identity);
-            client.gen.repo(scope_id).call_method(method, args).await
+            let client: GenRegistryClient = crate::services::create_service_client(
+                &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
+                signing_key, identity,
+            );
+            client.repo(scope_id).call_method(method, args).await
         }
         ("model", "ttt") => {
             let client = ModelZmqClient::new(signing_key, identity);

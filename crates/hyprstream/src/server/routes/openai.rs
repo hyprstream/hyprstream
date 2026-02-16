@@ -154,7 +154,22 @@ async fn resolve_model_path(
         }
     };
 
-    match state.registry.get_model_path(&model_ref).await {
+    // Inline model path resolution
+    let path_result: Result<std::path::PathBuf, _> = async {
+        let tracked = state.registry.get_by_name(&model_ref.model).await?;
+        let repo = state.registry.repo(&tracked.id);
+        let branch = match &model_ref.git_ref {
+            crate::storage::GitRef::Branch(name) => name.clone(),
+            _ => repo.get_head().await?,
+        };
+        let wts = repo.list_worktrees().await?;
+        wts.iter()
+            .find(|wt| wt.branch_name == branch)
+            .map(|wt| std::path::PathBuf::from(&wt.path))
+            .ok_or_else(|| anyhow::anyhow!("worktree for {}:{} not found", model_ref.model, branch))
+    }.await;
+
+    match path_result {
         Ok(path) => {
             // Check if model has INFERENCE capability
             let archetype_registry = crate::archetypes::global_registry();
@@ -227,7 +242,7 @@ async fn chat_completions(
     let resource = format!("model:{}", request.model);
     match state
         .policy_client
-        .check_policy_str(&user, &resource, Operation::Infer)
+        .check(&user, "*", &resource, Operation::Infer.as_str())
         .await
     {
         Ok(allowed) if !allowed => {
@@ -441,7 +456,19 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
             }
         };
 
-        let model_path = match state.registry.get_model_path(&model_ref).await {
+        let model_path = match async {
+            let tracked = state.registry.get_by_name(&model_ref.model).await?;
+            let repo = state.registry.repo(&tracked.id);
+            let branch = match &model_ref.git_ref {
+                crate::storage::GitRef::Branch(name) => name.clone(),
+                _ => repo.get_head().await?,
+            };
+            let wts = repo.list_worktrees().await?;
+            wts.iter()
+                .find(|wt| wt.branch_name == branch)
+                .map(|wt| std::path::PathBuf::from(&wt.path))
+                .ok_or_else(|| anyhow::anyhow!("worktree not found"))
+        }.await {
             Ok(path) => path,
             Err(e) => {
                 let _ = tx.send(Err(anyhow::anyhow!("Could not get model path: {}", e))).await;
@@ -695,7 +722,7 @@ async fn completions(
     let resource = format!("model:{}", request.model);
     match state
         .policy_client
-        .check_policy_str(&user, &resource, Operation::Infer)
+        .check(&user, "*", &resource, Operation::Infer.as_str())
         .await
     {
         Ok(allowed) if !allowed => {
@@ -852,33 +879,34 @@ async fn list_models(State(state): State<ServerState>) -> impl IntoResponse {
     let mut models = vec![];
 
     // Get all worktrees from registry (formatted as model:branch)
-    match state.registry.list_models().await {
-        Ok(model_list) => {
-            for model_info in model_list {
-                // Build owned_by field with worktree metadata
-                let mut owned_by_parts = vec!["system".to_owned()];
-
-                // Add driver info
-                if !model_info.driver.is_empty() {
-                    owned_by_parts.push(format!("driver:{}", model_info.driver));
+    let result: Result<(), anyhow::Error> = async {
+        let repos = state.registry.list().await?;
+        for repo in repos {
+            if repo.name.is_empty() { continue; }
+            let name = &repo.name;
+            match state.registry.repo(&repo.id).list_worktrees().await {
+                Ok(worktrees) => {
+                    for wt in worktrees {
+                        if wt.branch_name.is_empty() { continue; }
+                        let display = format!("{}:{}", name, wt.branch_name);
+                        models.push(Model {
+                            id: display,
+                            object: "model".to_owned(),
+                            created: chrono::Utc::now().timestamp(),
+                            owned_by: "system".to_owned(),
+                        });
+                    }
                 }
-
-                // Note: Model caching is now handled by ModelService internally
-                // The "cached" status is no longer exposed at the HTTP layer
-
-                let owned_by = owned_by_parts.join(" ");
-
-                models.push(Model {
-                    id: model_info.display_name,
-                    object: "model".to_owned(),
-                    created: chrono::Utc::now().timestamp(),
-                    owned_by,
-                });
+                Err(e) => {
+                    error!("Failed to list worktrees for {}: {}", name, e);
+                }
             }
         }
-        Err(e) => {
-            error!("Failed to list models from storage: {}", e);
-        }
+        Ok(())
+    }.await;
+
+    if let Err(e) = result {
+        error!("Failed to list models from storage: {}", e);
     }
 
     // Add no-cache headers

@@ -16,7 +16,7 @@
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │  hyprstream/src/services/                                   │
 //! │  ├── core.rs      ← ZmqService trait, runners, clients     │
-//! │  ├── traits.rs    ← RegistryClient, RepositoryClient traits│
+//! │  ├── types.rs     ← Shared types (FsDirEntry, ModelInfo, etc.)│
 //! │  ├── registry.rs  ← Registry service (REP) + client (REQ)  │
 //! │  └── inference.rs ← Inference service (REP) + client (REQ) │
 //! └─────────────────────────────────────────────────────────────┘
@@ -68,7 +68,7 @@
 //! ```
 
 mod core;
-mod traits;
+mod types;
 pub mod contained_root;
 pub mod callback;
 pub mod factories;
@@ -87,19 +87,25 @@ pub mod worker;
 
 pub use core::{
     CallOptions, Continuation, EnvelopeContext, ZmqClient, ZmqService,
+    create_service_client,
 };
 
-pub use traits::{
-    CloneOptions, DetailedStatus, FsDirEntry, FsOps, FsServiceError, FsStatInfo,
-    FileChangeType, FileStatus, ModelInfo, RegistryClient,
-    RegistryServiceError, RemoteInfo, RepositoryClient, SeekWhence, WorktreeInfo,
-    MAX_FDS_GLOBAL, MAX_FDS_PER_CLIENT, MAX_FS_IO_SIZE,
+// Generated client types — the public API
+pub use generated::registry_client::{
+    RegistryClient as GenRegistryClient,
+    RepositoryClient, WorktreeClient,
+    TrackedRepository as GenTrackedRepository,
+    WorktreeInfo as GenWorktreeInfo,
+    RepositoryStatus as GenRepositoryStatus,
+    FsStatResponse, FsDirEntryInfo, RemoteInfo,
+    SeekWhenceEnum,
 };
+
+// Remaining domain types
+pub use types::{MAX_FDS_GLOBAL, MAX_FDS_PER_CLIENT, MAX_FS_IO_SIZE};
 
 pub use inference::{InferenceService, InferenceZmqClient, INFERENCE_ENDPOINT};
-pub use registry::{
-    RegistryService, RegistryZmqClient, RepositoryZmqClient,
-};
+pub use registry::RegistryService;
 pub use policy::PolicyService;
 pub use generated::policy_client::PolicyClient;
 pub use model::{
