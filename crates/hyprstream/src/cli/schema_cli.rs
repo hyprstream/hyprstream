@@ -149,6 +149,8 @@ fn build_service_command(
         let sn: &'static str = scope_name.clone().leak();
         let mut scope_cmd = Command::new(sn)
             .about(format!("{} scoped commands", scope_name))
+            .subcommand_required(true)
+            .arg_required_else_help(true)
             .arg(
                 Arg::new("scope_id")
                     .required(true)
