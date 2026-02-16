@@ -30,7 +30,7 @@ use uuid::Uuid;
 // Generated client types
 use crate::services::generated::registry_client::{
     RegistryClient as GenRegistryClient, RegistryResponseVariant,
-    RegistryHandler, RepoHandler, WorktreeHandler, dispatch_registry,
+    RegistryHandler, RepoHandler, WorktreeHandler, dispatch_registry, serialize_response,
     StreamInfo, ErrorInfo, HealthStatus, DetailedStatusInfo, RemoteInfo,
     CloneRequest, RegisterRequest,
     CreateWorktreeRequest, RemoveWorktreeRequest,
@@ -2014,6 +2014,15 @@ impl ZmqService for RegistryService {
 
     fn signing_key(&self) -> SigningKey {
         self.signing_key.clone()
+    }
+
+    fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
+        let variant = RegistryResponseVariant::Error(ErrorInfo {
+            message: error.to_owned(),
+            code: "INTERNAL".to_string(),
+            details: String::new(),
+        });
+        serialize_response(request_id, &variant).unwrap_or_default()
     }
 }
 

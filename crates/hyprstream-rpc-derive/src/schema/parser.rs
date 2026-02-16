@@ -70,9 +70,6 @@ pub fn parse_capnp_schema(text: &str, service_name: &str) -> Option<ParsedSchema
                             inner_response_variants: inner_resp_variants,
                             capnp_inner_response: to_snake_case(&resp_variant.type_name),
                             nested_clients: Vec::new(),
-                            parent_scope_fields: Vec::new(),
-                            parent_factory_name: None,
-                            parent_capnp_inner_response: None,
                         });
                     }
                 }
@@ -157,9 +154,6 @@ fn detect_nested_scoped_clients(
                             inner_response_variants: inner_resp_variants,
                             capnp_inner_response: to_snake_case(&resp_variant.type_name),
                             nested_clients: Vec::new(),
-                            parent_scope_fields: parent.scope_fields.clone(),
-                            parent_factory_name: Some(parent.factory_name.clone()),
-                            parent_capnp_inner_response: Some(parent.capnp_inner_response.clone()),
                         });
                     }
                 }
@@ -177,6 +171,11 @@ fn detect_nested_scoped_clients(
     }
 
     parent.nested_clients = nested;
+
+    // Recurse into newly detected nested clients for deeper nesting
+    for nested_client in &mut parent.nested_clients {
+        detect_nested_scoped_clients(text, nested_client, all_structs);
+    }
 }
 
 pub fn parse_all_structs(text: &str) -> Vec<StructDef> {
@@ -517,7 +516,38 @@ pub fn collect_list_struct_types(schema: &ParsedSchema) -> Vec<String> {
             }
         }
     }
-    for sc in &schema.scoped_clients {
+    // Recursively collect types from scoped clients at all nesting levels
+    fn collect_from_scoped(sc: &ScopedClient, schema: &ParsedSchema, types: &mut Vec<String>) {
+        let is_primitive = |name: &str| {
+            matches!(
+                name,
+                "Text" | "Data" | "Bool" | "Void"
+                    | "UInt8" | "UInt16" | "UInt32" | "UInt64"
+                    | "Int8" | "Int16" | "Int32" | "Int64"
+                    | "Float32" | "Float64"
+            )
+        };
+        let mut add_type = |type_name: &str| {
+            if type_name.starts_with("List(") {
+                let inner = &type_name[5..type_name.len() - 1];
+                if !is_primitive(inner)
+                    && !types.contains(&inner.to_string())
+                    && schema.enums.iter().all(|e| e.name != inner)
+                {
+                    types.push(inner.to_string());
+                }
+            } else if !is_primitive(type_name)
+                && !type_name.starts_with("List(")
+                && schema.enums.iter().all(|e| e.name != type_name)
+                && schema.structs.iter().any(|s| s.name == type_name)
+                && !types.contains(&type_name.to_string())
+            {
+                types.push(type_name.to_string());
+            }
+        };
+        for v in &sc.inner_response_variants {
+            add_type(&v.type_name);
+        }
         for v in &sc.inner_request_variants {
             add_type(&v.type_name);
             if let Some(s) = schema.structs.iter().find(|s| s.name == v.type_name) {
@@ -526,20 +556,12 @@ pub fn collect_list_struct_types(schema: &ParsedSchema) -> Vec<String> {
                 }
             }
         }
-        // Nested scoped clients
         for nested in &sc.nested_clients {
-            for v in &nested.inner_response_variants {
-                add_type(&v.type_name);
-            }
-            for v in &nested.inner_request_variants {
-                add_type(&v.type_name);
-                if let Some(s) = schema.structs.iter().find(|s| s.name == v.type_name) {
-                    for f in &s.fields {
-                        add_type(&f.type_name);
-                    }
-                }
-            }
+            collect_from_scoped(nested, schema, types);
         }
+    }
+    for sc in &schema.scoped_clients {
+        collect_from_scoped(sc, schema, &mut types);
     }
 
     types
@@ -897,10 +919,7 @@ struct ErrorInfo {
         assert_eq!(fs.inner_request_variants[0].name, "open");
         assert_eq!(fs.inner_request_variants[1].name, "stat");
 
-        // Check parent linkage
-        assert_eq!(fs.parent_factory_name.as_deref(), Some("repo"));
-        assert_eq!(fs.parent_scope_fields.len(), 1);
-        assert_eq!(fs.parent_scope_fields[0].name, "repoId");
+        // Nested clients no longer carry parent linkage (ancestors pattern used instead)
     }
 
     #[test]
@@ -1081,8 +1100,11 @@ pub fn merge_annotations_from_metadata(
         }
     }
 
-    // Merge into scoped client variants
-    for scoped in &mut schema.scoped_clients {
+    // Merge into scoped client variants (recursively)
+    fn merge_scoped_annotations(
+        scoped: &mut ScopedClient,
+        merge_variant: &dyn Fn(&mut super::types::UnionVariant, &str),
+    ) {
         let req_name = format!("{}Request", to_pascal_case(&scoped.factory_name));
         let resp_name = format!("{}Response", to_pascal_case(&scoped.factory_name));
         for variant in &mut scoped.inner_request_variants {
@@ -1091,18 +1113,12 @@ pub fn merge_annotations_from_metadata(
         for variant in &mut scoped.inner_response_variants {
             merge_variant(variant, &resp_name);
         }
-
-        // Nested scoped clients
         for nested in &mut scoped.nested_clients {
-            let nested_req = format!("{}Request", to_pascal_case(&nested.factory_name));
-            let nested_resp = format!("{}Response", to_pascal_case(&nested.factory_name));
-            for variant in &mut nested.inner_request_variants {
-                merge_variant(variant, &nested_req);
-            }
-            for variant in &mut nested.inner_response_variants {
-                merge_variant(variant, &nested_resp);
-            }
+            merge_scoped_annotations(nested, merge_variant);
         }
+    }
+    for scoped in &mut schema.scoped_clients {
+        merge_scoped_annotations(scoped, &merge_variant);
     }
 
     Ok(())

@@ -24,7 +24,8 @@ use crate::services::{ModelZmqClient, GenRegistryClient, PolicyClient, Inference
 use http::header::AUTHORIZATION;
 use crate::services::generated::mcp_client::{
     McpHandler, McpResponseVariant, ToolDefinition, ServiceStatus,
-    ToolList, ServiceMetrics, CallTool, dispatch_mcp,
+    ToolList, ServiceMetrics, CallTool, dispatch_mcp, serialize_response,
+    ErrorInfo,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures::future::BoxFuture;
@@ -912,5 +913,14 @@ impl ZmqService for McpService {
 
     fn signing_key(&self) -> SigningKey {
         self.signing_key.clone()
+    }
+
+    fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
+        let variant = McpResponseVariant::Error(ErrorInfo {
+            message: error.to_owned(),
+            code: "INTERNAL".to_string(),
+            details: String::new(),
+        });
+        serialize_response(request_id, &variant).unwrap_or_default()
     }
 }

@@ -203,6 +203,16 @@ pub trait ZmqService: Send + Sync + 'static {
     fn verifying_key(&self) -> VerifyingKey {
         self.signing_key().verifying_key()
     }
+
+    /// Build a generic error response payload for unexpected errors.
+    ///
+    /// Default implementation returns an empty vec (backwards compat).
+    /// Generated services should override with schema-correct error payloads
+    /// so clients receive proper `Error(ErrorInfo{...})` instead of parse failures.
+    fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
+        let _ = (request_id, error);
+        vec![]
+    }
 }
 
 /// REQ/REP message loop for ZmqService.
@@ -428,8 +438,9 @@ impl RequestLoop {
                                 service.name(),
                                 e
                             );
-                            // Send error response
-                            let msg: Multipart = vec![vec![]].into();
+                            // Send error response (request_id=0 since envelope is invalid)
+                            let error_payload = service.build_error_payload(0, &format!("envelope verification failed: {}", e));
+                            let msg: Multipart = vec![error_payload].into();
                             receiver = sender
                                 .send(msg)
                                 .await
@@ -453,7 +464,7 @@ impl RequestLoop {
                         Ok((resp, cont)) => (resp, cont),
                         Err(e) => {
                             error!("{} request handling error: {}", service.name(), e);
-                            (vec![], None) // Error response, no continuation
+                            (service.build_error_payload(request_id, &e.to_string()), None)
                         }
                     };
 

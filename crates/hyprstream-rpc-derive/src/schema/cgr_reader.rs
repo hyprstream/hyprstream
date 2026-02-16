@@ -866,9 +866,6 @@ fn detect_scoped_clients(
             inner_response_variants: inner_resp_variants,
             capnp_inner_response: to_snake_case(&resp_variant.type_name),
             nested_clients: Vec::new(),
-            parent_scope_fields: Vec::new(),
-            parent_factory_name: None,
-            parent_capnp_inner_response: None,
         });
     }
 
@@ -951,9 +948,6 @@ fn detect_nested_scoped_clients_cgr(
             inner_response_variants: inner_resp_variants,
             capnp_inner_response: to_snake_case(&resp_variant.type_name),
             nested_clients: Vec::new(),
-            parent_scope_fields: parent.scope_fields.clone(),
-            parent_factory_name: Some(parent.factory_name.clone()),
-            parent_capnp_inner_response: Some(parent.capnp_inner_response.clone()),
         });
     }
 
@@ -969,6 +963,21 @@ fn detect_nested_scoped_clients_cgr(
     }
 
     parent.nested_clients = nested;
+
+    // Recurse into newly detected nested clients for deeper nesting
+    for nested_client in &mut parent.nested_clients {
+        detect_nested_scoped_clients_cgr(
+            nested_client,
+            all_structs,
+            nodes,
+            node_map,
+            mcp_desc_id,
+            param_desc_id,
+            mcp_scope_id,
+            cli_hidden_id,
+        )?;
+    }
+
     Ok(())
 }
 

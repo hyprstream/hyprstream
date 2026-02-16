@@ -10,6 +10,7 @@ use anyhow::{bail, Result};
 use clap::{Arg, ArgMatches, Command};
 use ed25519_dalek::SigningKey;
 use hyprstream_rpc::RequestIdentity;
+use hyprstream_rpc::service::metadata::ScopedClientTreeNode;
 use serde_json::Value;
 
 use crate::services::generated::{
@@ -68,67 +69,52 @@ pub struct ParamView {
 macro_rules! extract_methods {
     ($schema_fn:expr) => {{
         let (_service_name, methods) = $schema_fn;
-        methods
-            .iter()
-            .map(|m| MethodView {
-                name: m.name.to_string(),
-                params: m
-                    .params
-                    .iter()
-                    .map(|p| ParamView {
-                        name: p.name.to_string(),
-                        type_name: p.type_name.to_string(),
-                        required: p.required,
-                        description: p.description.to_string(),
-                    })
-                    .collect(),
-                is_scoped: m.is_scoped,
-                scope_field: m.scope_field.to_string(),
-                description: m.description.to_string(),
-                is_streaming: m.is_streaming,
-                cli_hidden: m.hidden,
-            })
-            .collect::<Vec<_>>()
+        methods_to_views(methods)
     }};
 }
 
-macro_rules! extract_scoped_methods {
-    ($schema_fn:expr) => {{
-        let (service_name, scope_name, methods) = $schema_fn;
-        let views: Vec<MethodView> = methods
-            .iter()
-            .map(|m| MethodView {
-                name: m.name.to_string(),
-                params: m
-                    .params
-                    .iter()
-                    .map(|p| ParamView {
-                        name: p.name.to_string(),
-                        type_name: p.type_name.to_string(),
-                        required: p.required,
-                        description: p.description.to_string(),
-                    })
-                    .collect(),
-                is_scoped: m.is_scoped,
-                scope_field: m.scope_field.to_string(),
-                description: m.description.to_string(),
-                is_streaming: m.is_streaming,
-                cli_hidden: m.hidden,
-            })
-            .collect();
-        (service_name.to_string(), scope_name.to_string(), views)
-    }};
+/// Convert a slice of MethodMeta into MethodView values.
+fn methods_to_views(methods: &[hyprstream_rpc::service::metadata::MethodMeta]) -> Vec<MethodView> {
+    methods
+        .iter()
+        .map(|m| MethodView {
+            name: m.name.to_string(),
+            params: m
+                .params
+                .iter()
+                .map(|p| ParamView {
+                    name: p.name.to_string(),
+                    type_name: p.type_name.to_string(),
+                    required: p.required,
+                    description: p.description.to_string(),
+                })
+                .collect(),
+            is_scoped: m.is_scoped,
+            scope_field: m.scope_field.to_string(),
+            description: m.description.to_string(),
+            is_streaming: m.is_streaming,
+            cli_hidden: m.hidden,
+        })
+        .collect()
+}
+
+/// Convert scoped metadata (service, scope, methods) into MethodView values.
+fn scoped_methods_to_views(
+    metadata_fn: hyprstream_rpc::service::metadata::ScopedSchemaMetadataFn,
+) -> Vec<MethodView> {
+    let (_service_name, _scope_name, methods) = metadata_fn();
+    methods_to_views(methods)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Build clap Commands from schema metadata
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Build a clap `Command` for a service from its methods and scoped sub-services.
+/// Build a clap `Command` for a service from its methods and scoped client tree.
 fn build_service_command(
     service_name: &str,
     methods: &[MethodView],
-    scoped: &[(String, String, Vec<MethodView>)],
+    tree: &'static [ScopedClientTreeNode],
 ) -> Command {
     // Leak service_name to get 'static lifetime required by clap
     let name: &'static str = service_name.to_owned().leak();
@@ -144,26 +130,43 @@ fn build_service_command(
         cmd = cmd.subcommand(build_method_command(method));
     }
 
-    // Add scoped subcommands (e.g., "repo <id> <method>")
-    for (_, scope_name, scope_methods) in scoped {
-        let sn: &'static str = scope_name.clone().leak();
-        let mut scope_cmd = Command::new(sn)
-            .about(format!("{} scoped commands", scope_name))
-            .subcommand_required(true)
-            .arg_required_else_help(true)
-            .arg(
-                Arg::new("scope_id")
-                    .required(true)
-                    .help("Scope identifier (e.g., model name, repo ID)"),
-            );
+    // Add scoped subcommands from tree (recursive)
+    for node in tree {
+        cmd = cmd.subcommand(build_scoped_command_from_node(node));
+    }
 
-        for method in scope_methods {
-            if method.cli_hidden || method.is_streaming {
-                continue;
-            }
-            scope_cmd = scope_cmd.subcommand(build_method_command(method));
+    cmd
+}
+
+/// Recursively build a scoped command from a tree node.
+fn build_scoped_command_from_node(node: &ScopedClientTreeNode) -> Command {
+    let sn: &'static str = node.scope_name;
+    let methods = scoped_methods_to_views(node.metadata_fn);
+
+    let mut cmd = Command::new(sn)
+        .about(format!("{} scoped commands", node.scope_name))
+        .subcommand_required(true)
+        .arg_required_else_help(true);
+
+    // Only add scope_id positional arg if there's a scope field
+    if !node.scope_field.is_empty() {
+        cmd = cmd.arg(
+            Arg::new("scope_id")
+                .required(true)
+                .help("Scope identifier (e.g., model name, repo ID)"),
+        );
+    }
+
+    for method in &methods {
+        if method.cli_hidden || method.is_streaming {
+            continue;
         }
-        cmd = cmd.subcommand(scope_cmd);
+        cmd = cmd.subcommand(build_method_command(method));
+    }
+
+    // Recursively add nested scoped commands
+    for nested in node.nested {
+        cmd = cmd.subcommand(build_scoped_command_from_node(nested));
     }
 
     cmd
@@ -205,45 +208,35 @@ pub fn build_tool_command() -> Command {
     let mut tool = Command::new("tool")
         .about("Direct RPC tool access (schema-driven, mirrors MCP tools)");
 
-    // Registry service + scoped repo
+    // Registry service
     let registry_methods = extract_methods!(registry_client::schema_metadata());
-    let repo_scoped = extract_scoped_methods!(registry_client::repo_schema_metadata());
-    tool = tool.subcommand(build_service_command("registry", &registry_methods, &[repo_scoped]));
+    let registry_tree = registry_client::scoped_client_tree();
+    tool = tool.subcommand(build_service_command("registry", &registry_methods, registry_tree));
 
-    // Model service + scoped ttt, peft, infer
+    // Model service
     let model_methods = extract_methods!(model_client::schema_metadata());
-    let ttt_scoped = extract_scoped_methods!(model_client::ttt_schema_metadata());
-    let peft_scoped = extract_scoped_methods!(model_client::peft_schema_metadata());
-    let infer_scoped = extract_scoped_methods!(model_client::infer_schema_metadata());
-    tool = tool.subcommand(build_service_command(
-        "model",
-        &model_methods,
-        &[ttt_scoped, peft_scoped, infer_scoped],
-    ));
+    let model_tree = model_client::scoped_client_tree();
+    tool = tool.subcommand(build_service_command("model", &model_methods, model_tree));
 
     // Inference service (standalone, no scoped)
     let inference_methods = extract_methods!(inference_client::schema_metadata());
-    tool = tool.subcommand(build_service_command("inference", &inference_methods, &[]));
+    let inference_tree = inference_client::scoped_client_tree();
+    tool = tool.subcommand(build_service_command("inference", &inference_methods, inference_tree));
 
     // Policy service (standalone, no scoped)
     let policy_methods = extract_methods!(policy_client::schema_metadata());
-    tool = tool.subcommand(build_service_command("policy", &policy_methods, &[]));
+    let policy_tree = policy_client::scoped_client_tree();
+    tool = tool.subcommand(build_service_command("policy", &policy_methods, policy_tree));
 
-    // Worker service + 4 CRI-aligned scoped resources
+    // Worker service + CRI-aligned scoped resources
     let worker_methods = extract_methods!(worker_client::schema_metadata());
-    let runtime_scoped = extract_scoped_methods!(worker_client::runtime_schema_metadata());
-    let sandbox_scoped = extract_scoped_methods!(worker_client::sandbox_schema_metadata());
-    let container_scoped = extract_scoped_methods!(worker_client::container_schema_metadata());
-    let image_scoped = extract_scoped_methods!(worker_client::image_schema_metadata());
-    tool = tool.subcommand(build_service_command(
-        "worker",
-        &worker_methods,
-        &[runtime_scoped, sandbox_scoped, container_scoped, image_scoped],
-    ));
+    let worker_tree = worker_client::scoped_client_tree();
+    tool = tool.subcommand(build_service_command("worker", &worker_methods, worker_tree));
 
-    // Workflow service (independent, flat — no scoped clients)
+    // Workflow service
     let workflow_methods = extract_methods!(workflow_client::schema_metadata());
-    tool = tool.subcommand(build_service_command("workflow", &workflow_methods, &[]));
+    let workflow_tree = workflow_client::scoped_client_tree();
+    tool = tool.subcommand(build_service_command("workflow", &workflow_methods, workflow_tree));
 
     tool
 }
@@ -264,9 +257,22 @@ pub async fn handle_tool_command(matches: &ArgMatches, signing_key: SigningKey) 
 // Dispatch schema commands
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Get the scoped client tree for a service.
+fn get_service_tree(service: &str) -> &'static [ScopedClientTreeNode] {
+    match service {
+        "registry" => registry_client::scoped_client_tree(),
+        "model" => model_client::scoped_client_tree(),
+        "inference" => inference_client::scoped_client_tree(),
+        "policy" => policy_client::scoped_client_tree(),
+        "worker" => worker_client::scoped_client_tree(),
+        "workflow" => workflow_client::scoped_client_tree(),
+        _ => &[],
+    }
+}
+
 /// Dispatch a schema-driven CLI command based on matched subcommands.
 ///
-/// Returns Ok(()) after printing the result, or Err on failure.
+/// Supports recursive scoped commands (e.g., `registry repo <id> worktree <name> <method>`).
 pub async fn handle_schema_command(
     service_name: &str,
     matches: &ArgMatches,
@@ -277,28 +283,58 @@ pub async fn handle_schema_command(
         .subcommand()
         .ok_or_else(|| anyhow::anyhow!("No subcommand provided for {}", service_name))?;
 
-    // Check if this is a scoped command (the subcommand has a scope_id positional arg)
-    if let Some(scope_id) = sub_matches.get_one::<String>("scope_id") {
-        // Scoped: e.g., "registry repo <id> <method>"
-        let (method_name, method_matches) = sub_matches
-            .subcommand()
-            .ok_or_else(|| anyhow::anyhow!("No method provided for {} {}", service_name, sub_name))?;
+    let tree = get_service_tree(service_name);
 
-        let method_snake = method_name.replace('-', "_");
-        let methods = get_scoped_methods(service_name, sub_name);
-        let args = matches_to_json(method_matches, &methods, &method_snake);
+    // Check if this is a scoped command by looking up the sub_name in the tree
+    if let Some(node) = tree.iter().find(|n| n.scope_name == sub_name) {
+        // Scoped: recursively walk scope chain
+        let mut scope_chain: Vec<(&str, &str)> = Vec::new();
+        let mut current_node = node;
+        let mut current_matches = sub_matches;
 
-        let result = dispatch_scoped(
-            service_name,
-            sub_name,
-            scope_id,
-            &method_snake,
-            &args,
-            signing_key,
-        )
-        .await?;
+        // Collect scope_id if this node has scope fields
+        if !current_node.scope_field.is_empty() {
+            let scope_id = current_matches
+                .get_one::<String>("scope_id")
+                .ok_or_else(|| anyhow::anyhow!("Missing scope ID for {}", sub_name))?;
+            scope_chain.push((current_node.scope_name, scope_id.as_str()));
+        } else {
+            scope_chain.push((current_node.scope_name, ""));
+        }
 
-        println!("{}", format_response(&result));
+        loop {
+            let (next_name, next_matches) = current_matches
+                .subcommand()
+                .ok_or_else(|| anyhow::anyhow!("No method provided"))?;
+
+            // Check if next_name is a nested scope
+            if let Some(nested_node) = current_node.nested.iter().find(|n| n.scope_name == next_name) {
+                // It's a deeper scope level
+                if !nested_node.scope_field.is_empty() {
+                    let nested_id = next_matches
+                        .get_one::<String>("scope_id")
+                        .ok_or_else(|| anyhow::anyhow!("Missing scope ID for {}", next_name))?;
+                    scope_chain.push((nested_node.scope_name, nested_id.as_str()));
+                } else {
+                    scope_chain.push((nested_node.scope_name, ""));
+                }
+                current_node = nested_node;
+                current_matches = next_matches;
+            } else {
+                // Reached the method — dispatch
+                let method_snake = next_name.replace('-', "_");
+                let methods = find_methods_in_tree(tree, &scope_chain);
+                let args = matches_to_json(next_matches, &methods, &method_snake);
+
+                let result = dispatch_scoped_dynamic(
+                    service_name, &scope_chain, &method_snake, &args, signing_key,
+                )
+                .await?;
+
+                println!("{}", format_response(&result));
+                break;
+            }
+        }
     } else {
         // Top-level: e.g., "registry list"
         let method_snake = sub_name.replace('-', "_");
@@ -342,7 +378,7 @@ async fn dispatch_top_level(
             client.call_method(method, args).await
         }
         "worker" => {
-            bail!("Worker service has no top-level methods. Use: tool worker <runtime|sandbox|container|image> <node> <method>")
+            bail!("Worker service has no top-level methods. Use: tool worker <runtime|sandbox|container|image> <method>")
         }
         "workflow" => {
             bail!("Workflow service is not yet registered. Service factory needs to be implemented.")
@@ -351,54 +387,33 @@ async fn dispatch_top_level(
     }
 }
 
-/// Dispatch a scoped method call (e.g., registry repo <id> <method>).
-async fn dispatch_scoped(
+/// Dispatch a scoped method call via `call_scoped_method` through the scope chain.
+async fn dispatch_scoped_dynamic(
     service: &str,
-    scope_name: &str,
-    scope_id: &str,
+    scope_chain: &[(&str, &str)],
     method: &str,
     args: &Value,
     signing_key: SigningKey,
 ) -> Result<Value> {
     let identity = RequestIdentity::local();
 
-    match (service, scope_name) {
-        ("registry", "repo") => {
+    match service {
+        "registry" => {
             let client: GenRegistryClient = crate::services::create_service_client(
                 &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
                 signing_key, identity,
             );
-            client.repo(scope_id).call_method(method, args).await
+            client.call_scoped_method(scope_chain, method, args).await
         }
-        ("model", "ttt") => {
+        "model" => {
             let client = ModelZmqClient::new(signing_key, identity);
-            client.gen.ttt(scope_id).call_method(method, args).await
+            client.gen.call_scoped_method(scope_chain, method, args).await
         }
-        ("model", "peft") => {
-            let client = ModelZmqClient::new(signing_key, identity);
-            client.gen.peft(scope_id).call_method(method, args).await
-        }
-        ("model", "infer") => {
-            let client = ModelZmqClient::new(signing_key, identity);
-            client.gen.infer(scope_id).call_method(method, args).await
-        }
-        ("worker", "runtime") => {
+        "worker" => {
             let client = WorkerZmqClient::new(signing_key, identity);
-            client.gen().runtime().call_method(method, args).await
+            client.gen().call_scoped_method(scope_chain, method, args).await
         }
-        ("worker", "sandbox") => {
-            let client = WorkerZmqClient::new(signing_key, identity);
-            client.gen().sandbox().call_method(method, args).await
-        }
-        ("worker", "container") => {
-            let client = WorkerZmqClient::new(signing_key, identity);
-            client.gen().container().call_method(method, args).await
-        }
-        ("worker", "image") => {
-            let client = WorkerZmqClient::new(signing_key, identity);
-            client.gen().image().call_method(method, args).await
-        }
-        _ => bail!("Unknown scoped service: {}.{}", service, scope_name),
+        _ => bail!("Service '{}' has no scoped methods", service),
     }
 }
 
@@ -418,19 +433,23 @@ fn get_top_level_methods(service: &str) -> Vec<MethodView> {
     }
 }
 
-/// Get scoped methods for a service scope (used for type conversion).
-fn get_scoped_methods(service: &str, scope: &str) -> Vec<MethodView> {
-    match (service, scope) {
-        ("registry", "repo") => extract_scoped_methods!(registry_client::repo_schema_metadata()).2,
-        ("model", "ttt") => extract_scoped_methods!(model_client::ttt_schema_metadata()).2,
-        ("model", "peft") => extract_scoped_methods!(model_client::peft_schema_metadata()).2,
-        ("model", "infer") => extract_scoped_methods!(model_client::infer_schema_metadata()).2,
-        ("worker", "runtime") => extract_scoped_methods!(worker_client::runtime_schema_metadata()).2,
-        ("worker", "sandbox") => extract_scoped_methods!(worker_client::sandbox_schema_metadata()).2,
-        ("worker", "container") => extract_scoped_methods!(worker_client::container_schema_metadata()).2,
-        ("worker", "image") => extract_scoped_methods!(worker_client::image_schema_metadata()).2,
-        _ => Vec::new(),
+/// Find methods for a scope chain by walking the tree.
+fn find_methods_in_tree(
+    tree: &[ScopedClientTreeNode],
+    scope_chain: &[(&str, &str)],
+) -> Vec<MethodView> {
+    if scope_chain.is_empty() {
+        return vec![];
     }
+    for node in tree {
+        if node.scope_name == scope_chain[0].0 {
+            if scope_chain.len() == 1 {
+                return scoped_methods_to_views(node.metadata_fn);
+            }
+            return find_methods_in_tree(node.nested, &scope_chain[1..]);
+        }
+    }
+    vec![]
 }
 
 /// Convert clap `ArgMatches` into a JSON object, using MethodView params for type coercion.
@@ -610,5 +629,3 @@ fn format_cell(value: Option<&Value>) -> String {
         }
     }
 }
-
-

@@ -781,8 +781,14 @@ impl InferenceService {
                 Ok((ctx, payload)) => (ctx, payload),
                 Err(e) => {
                     warn!("inference envelope verification failed: {}", e);
-                    // No valid request_id, send empty response (like RequestLoop does)
-                    let msg: Multipart = vec![vec![]].into();
+                    // Build proper error response (request_id=0 since envelope is invalid)
+                    let err_variant = InferenceResponseVariant::Error(ErrorInfo {
+                        message: format!("envelope verification failed: {}", e),
+                        code: "UNAUTHORIZED".to_string(),
+                        details: String::new(),
+                    });
+                    let error_payload = serialize_response(0, &err_variant).unwrap_or_default();
+                    let msg: Multipart = vec![error_payload].into();
                     receiver = match sender.send(msg).await {
                         Ok(r) => r,
                         Err(e) => {
@@ -807,7 +813,12 @@ impl InferenceService {
                 Ok((resp, cont)) => (resp, cont),
                 Err(e) => {
                     error!("inference request handling error: {}", e);
-                    (vec![], None)
+                    let err_variant = InferenceResponseVariant::Error(ErrorInfo {
+                        message: e.to_string(),
+                        code: "INTERNAL".to_string(),
+                        details: String::new(),
+                    });
+                    (serialize_response(request_id, &err_variant).unwrap_or_default(), None)
                 }
             };
 
@@ -1777,8 +1788,8 @@ fn sanitize_adapter_name(name: &str) -> Result<String> {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 use crate::services::generated::inference_client::{
-    InferenceHandler, dispatch_inference,
-    InferenceResponseVariant,
+    InferenceHandler, dispatch_inference, serialize_response,
+    InferenceResponseVariant, ErrorInfo,
     HealthStatus, TrainStepResult, DeltaStatusResult, ModuleNormRatio,
     SaveAdaptationResult, SnapshotDeltaResult, ExportPeftResult,
     OnlineTrainingMetrics, QualityMetrics, FinishReasonEnum,

@@ -3,6 +3,7 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
+use crate::resolve::ResolvedSchema;
 use crate::schema::collect_list_struct_types;
 use crate::schema::types::*;
 use crate::util::*;
@@ -23,36 +24,36 @@ fn resolve_capnp_mod(
 
 /// Generate Rust data structs with ToCapnp/FromCapnp impls, and enum types.
 pub fn generate_data_structs(
-    schema: &ParsedSchema,
+    resolved: &ResolvedSchema,
     service_name: &str,
     types_crate: Option<&syn::Path>,
 ) -> TokenStream {
     let mut tokens = TokenStream::new();
 
     // Generate enum types
-    for e in &schema.enums {
-        tokens.extend(generate_enum_type(e));
+    for e in &resolved.raw.enums {
+        tokens.extend(generate_enum_type(e, resolved));
     }
 
     // Generate data structs with trait impls
-    let list_struct_types = collect_list_struct_types(schema);
+    let list_struct_types = collect_list_struct_types(resolved.raw);
     for type_name in &list_struct_types {
-        if let Some(s) = schema.structs.iter().find(|s| s.name == *type_name) {
+        if let Some(s) = resolved.find_struct(type_name) {
             let capnp_mod = resolve_capnp_mod(
                 s.origin_file.as_deref(),
                 service_name,
                 types_crate,
             );
-            tokens.extend(generate_data_struct(type_name, s, &schema.enums, &schema.structs));
-            tokens.extend(generate_to_capnp_impl(type_name, s, &schema.enums, &schema.structs, &capnp_mod, service_name, types_crate));
-            tokens.extend(generate_from_capnp_impl(type_name, s, &schema.enums, &schema.structs, &capnp_mod, service_name, types_crate));
+            tokens.extend(generate_data_struct(type_name, s, resolved));
+            tokens.extend(generate_to_capnp_impl(type_name, s, resolved, &capnp_mod, service_name, types_crate));
+            tokens.extend(generate_from_capnp_impl(type_name, s, resolved, &capnp_mod, service_name, types_crate));
         }
     }
 
     tokens
 }
 
-fn generate_enum_type(e: &EnumDef) -> TokenStream {
+fn generate_enum_type(e: &EnumDef, resolved: &ResolvedSchema) -> TokenStream {
     let enum_name = format_ident!("{}Enum", e.name);
     let doc = format!("Generated from Cap'n Proto enum {}", e.name);
 
@@ -61,7 +62,7 @@ fn generate_enum_type(e: &EnumDef) -> TokenStream {
         .iter()
         .enumerate()
         .map(|(i, (variant_name, _ordinal))| {
-            let variant_ident = format_ident!("{}", to_pascal_case(variant_name));
+            let variant_ident = resolved.name(variant_name).pascal_ident.clone();
             if i == 0 {
                 quote! { #[default] #variant_ident }
             } else {
@@ -82,8 +83,7 @@ fn generate_enum_type(e: &EnumDef) -> TokenStream {
 fn generate_data_struct(
     type_name: &str,
     s: &StructDef,
-    enums: &[EnumDef],
-    structs: &[StructDef],
+    resolved: &ResolvedSchema,
 ) -> TokenStream {
     let data_name = format_ident!("{}", type_name);
     let doc = format!("Generated from Cap'n Proto struct {type_name}");
@@ -92,13 +92,13 @@ fn generate_data_struct(
         .fields
         .iter()
         .map(|field| {
-            let rust_name = format_ident!("{}", to_snake_case(&field.name));
+            let rust_name = resolved.name(&field.name).snake_ident.clone();
             let rust_type = if field.type_name == "Data" && field.fixed_size.is_some() {
                 let n = field.fixed_size.unwrap_or(0) as usize;
                 let ts: TokenStream = format!("[u8; {n}]").parse().unwrap_or_else(|_| quote! { Vec<u8> });
                 ts
             } else {
-                rust_type_tokens(&CapnpType::classify(&field.type_name, structs, enums).rust_owned_type())
+                rust_type_tokens(&resolved.resolve_type(&field.type_name).rust_owned)
             };
             quote! { pub #rust_name: #rust_type }
         })
@@ -120,8 +120,7 @@ fn generate_data_struct(
 fn generate_to_capnp_impl(
     type_name: &str,
     s: &StructDef,
-    enums: &[EnumDef],
-    structs: &[StructDef],
+    resolved: &ResolvedSchema,
     capnp_mod: &TokenStream,
     service_name: &str,
     types_crate: Option<&syn::Path>,
@@ -130,7 +129,7 @@ fn generate_to_capnp_impl(
     let capnp_struct = format_ident!("{}", to_capnp_module_name(type_name));
 
     let field_setters: Vec<TokenStream> = s.fields.iter().map(|field| {
-        generate_data_field_setter(field, enums, structs, service_name, types_crate)
+        generate_data_field_setter(field, resolved, service_name, types_crate)
     }).collect();
 
     quote! {
@@ -148,13 +147,12 @@ fn generate_to_capnp_impl(
 /// Look up a referenced type's origin_file from the structs/enums lists.
 fn lookup_origin_file<'a>(
     type_name: &str,
-    structs: &'a [StructDef],
-    enums: &'a [EnumDef],
+    resolved: &'a ResolvedSchema,
 ) -> Option<&'a str> {
-    if let Some(s) = structs.iter().find(|s| s.name == type_name) {
+    if let Some(s) = resolved.find_struct(type_name) {
         return s.origin_file.as_deref();
     }
-    if let Some(e) = enums.iter().find(|e| e.name == type_name) {
+    if let Some(e) = resolved.find_enum(type_name) {
         return e.origin_file.as_deref();
     }
     None
@@ -162,15 +160,14 @@ fn lookup_origin_file<'a>(
 
 fn generate_data_field_setter(
     field: &FieldDef,
-    enums: &[EnumDef],
-    structs: &[StructDef],
+    resolved: &ResolvedSchema,
     service_name: &str,
     types_crate: Option<&syn::Path>,
 ) -> TokenStream {
-    let rust_name = format_ident!("{}", to_snake_case(&field.name));
-    let field_snake = to_snake_case(&field.name);
-    let setter_name = format_ident!("set_{}", &field_snake);
-    let ct = CapnpType::classify(&field.type_name, structs, enums);
+    let rust_name = resolved.name(&field.name).snake_ident.clone();
+    let field_snake = &resolved.name(&field.name).snake;
+    let setter_name = format_ident!("set_{}", field_snake);
+    let ct = resolved.resolve_type(&field.type_name).capnp_type.clone();
 
     match ct {
         CapnpType::Text | CapnpType::Data => {
@@ -182,16 +179,16 @@ fn generate_data_field_setter(
             quote! { builder.#setter_name(self.#rust_name); }
         }
         CapnpType::Enum(ref name) => {
-            if let Some(e) = enums.iter().find(|e| e.name == *name) {
+            if let Some(e) = resolved.find_enum(name) {
                 let field_capnp_mod = resolve_capnp_mod(
-                    lookup_origin_file(name, structs, enums),
+                    lookup_origin_file(name, resolved),
                     service_name,
                     types_crate,
                 );
                 let enum_rust_name = format_ident!("{}Enum", name);
                 let type_ident = format_ident!("{}", name);
                 let match_arms: Vec<TokenStream> = e.variants.iter().map(|(vname, _)| {
-                    let v_pascal = format_ident!("{}", to_pascal_case(vname));
+                    let v_pascal = resolved.name(vname).pascal_ident.clone();
                     quote! { #enum_rust_name::#v_pascal => #field_capnp_mod::#type_ident::#v_pascal }
                 }).collect();
                 quote! {
@@ -204,13 +201,13 @@ fn generate_data_field_setter(
             }
         }
         CapnpType::Struct(_) => {
-            let init_name = format_ident!("init_{}", &field_snake);
+            let init_name = format_ident!("init_{}", field_snake);
             quote! {
                 hyprstream_rpc::capnp::ToCapnp::write_to(&self.#rust_name, &mut builder.reborrow().#init_name());
             }
         }
         CapnpType::ListText => {
-            let init_name = format_ident!("init_{}", &field_snake);
+            let init_name = format_ident!("init_{}", field_snake);
             quote! {
                 {
                     let mut list = builder.reborrow().#init_name(self.#rust_name.len() as u32);
@@ -221,7 +218,7 @@ fn generate_data_field_setter(
             }
         }
         CapnpType::ListData => {
-            let init_name = format_ident!("init_{}", &field_snake);
+            let init_name = format_ident!("init_{}", field_snake);
             quote! {
                 {
                     let mut list = builder.reborrow().#init_name(self.#rust_name.len() as u32);
@@ -232,7 +229,7 @@ fn generate_data_field_setter(
             }
         }
         CapnpType::ListPrimitive(_) => {
-            let init_name = format_ident!("init_{}", &field_snake);
+            let init_name = format_ident!("init_{}", field_snake);
             quote! {
                 {
                     let mut list = builder.reborrow().#init_name(self.#rust_name.len() as u32);
@@ -243,7 +240,7 @@ fn generate_data_field_setter(
             }
         }
         CapnpType::ListStruct(_) => {
-            let init_name = format_ident!("init_{}", &field_snake);
+            let init_name = format_ident!("init_{}", field_snake);
             quote! {
                 {
                     let mut list = builder.reborrow().#init_name(self.#rust_name.len() as u32);
@@ -264,8 +261,7 @@ fn generate_data_field_setter(
 fn generate_from_capnp_impl(
     type_name: &str,
     s: &StructDef,
-    enums: &[EnumDef],
-    structs: &[StructDef],
+    resolved: &ResolvedSchema,
     capnp_mod: &TokenStream,
     service_name: &str,
     types_crate: Option<&syn::Path>,
@@ -274,7 +270,7 @@ fn generate_from_capnp_impl(
     let capnp_struct = format_ident!("{}", to_capnp_module_name(type_name));
 
     let field_readers: Vec<TokenStream> = s.fields.iter().map(|field| {
-        generate_data_field_reader(field, enums, structs, service_name, types_crate)
+        generate_data_field_reader(field, resolved, service_name, types_crate)
     }).collect();
 
     quote! {
@@ -293,14 +289,13 @@ fn generate_from_capnp_impl(
 
 fn generate_data_field_reader(
     field: &FieldDef,
-    enums: &[EnumDef],
-    structs: &[StructDef],
+    resolved: &ResolvedSchema,
     service_name: &str,
     types_crate: Option<&syn::Path>,
 ) -> TokenStream {
-    let rust_name = format_ident!("{}", to_snake_case(&field.name));
-    let getter_name = format_ident!("get_{}", to_snake_case(&field.name));
-    let ct = CapnpType::classify(&field.type_name, structs, enums);
+    let rust_name = resolved.name(&field.name).snake_ident.clone();
+    let getter_name = format_ident!("get_{}", resolved.name(&field.name).snake);
+    let ct = resolved.resolve_type(&field.type_name).capnp_type.clone();
 
     match ct {
         CapnpType::Void => quote! { #rust_name: (), },
@@ -331,16 +326,16 @@ fn generate_data_field_reader(
             quote! { #rust_name: reader.#getter_name(), }
         }
         CapnpType::Enum(ref name) => {
-            if let Some(e) = enums.iter().find(|e| e.name == *name) {
+            if let Some(e) = resolved.find_enum(name) {
                 let field_capnp_mod = resolve_capnp_mod(
-                    lookup_origin_file(name, structs, enums),
+                    lookup_origin_file(name, resolved),
                     service_name,
                     types_crate,
                 );
                 let enum_rust_name = format_ident!("{}Enum", name);
                 let type_ident = format_ident!("{}", name);
                 let match_arms: Vec<TokenStream> = e.variants.iter().map(|(vname, _)| {
-                    let v_pascal = format_ident!("{}", to_pascal_case(vname));
+                    let v_pascal = resolved.name(vname).pascal_ident.clone();
                     quote! { #field_capnp_mod::#type_ident::#v_pascal => #enum_rust_name::#v_pascal }
                 }).collect();
                 quote! {

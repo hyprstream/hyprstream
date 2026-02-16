@@ -29,6 +29,7 @@ use syn::{parse_macro_input, DeriveInput, Data, Fields, Attribute, Meta, Expr, E
 
 mod schema;
 mod codegen;
+mod resolve;
 mod util;
 
 /// Derive macro for serializing Rust types to Cap'n Proto.

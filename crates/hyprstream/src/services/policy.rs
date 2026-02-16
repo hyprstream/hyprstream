@@ -9,7 +9,7 @@ use crate::services::{EnvelopeContext, ZmqService};
 use crate::services::generated::policy_client::{
     ErrorInfo, PolicyClient, PolicyHandler, PolicyResponseVariant, TokenInfo, ScopeList,
     PolicyCheck, IssueToken,
-    dispatch_policy,
+    dispatch_policy, serialize_response,
 };
 use anyhow::{anyhow, Result};
 use hyprstream_rpc::prelude::*;
@@ -259,6 +259,15 @@ impl ZmqService for PolicyService {
 
     fn signing_key(&self) -> SigningKey {
         (*self.signing_key).clone()
+    }
+
+    fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
+        let variant = PolicyResponseVariant::Error(ErrorInfo {
+            message: error.to_owned(),
+            code: "INTERNAL".to_string(),
+            details: String::new(),
+        });
+        serialize_response(request_id, &variant).unwrap_or_default()
     }
 }
 

@@ -71,15 +71,6 @@ pub struct ScopedClient {
     pub inner_response_variants: Vec<UnionVariant>,
     /// Cap'n Proto module name for the inner response struct (snake_case)
     pub capnp_inner_response: String,
-    /// Nested scoped clients detected within this scope (3rd level, e.g., Fs within Repository)
+    /// Nested scoped clients detected within this scope (e.g., Fs within Repository)
     pub nested_clients: Vec<ScopedClient>,
-    /// Parent scope fields (empty for top-level scoped clients)
-    #[allow(dead_code)]
-    pub parent_scope_fields: Vec<FieldDef>,
-    /// Parent factory name (None for top-level scoped clients)
-    #[allow(dead_code)]
-    pub parent_factory_name: Option<String>,
-    /// Parent capnp inner response module (None for top-level scoped clients)
-    #[allow(dead_code)]
-    pub parent_capnp_inner_response: Option<String>,
 }

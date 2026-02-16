@@ -522,7 +522,7 @@ impl ModelService {
 
 use crate::services::generated::model_client::{
     ModelHandler, TttHandler, PeftHandler, InferHandler,
-    dispatch_model, ModelResponseVariant,
+    dispatch_model, serialize_response, ModelResponseVariant,
     LoadedModelResponse, ErrorInfo, ModelListResponse, ModelHealthStatus,
     // Top-level request types
     LoadModelRequest, UnloadModelRequest, KVQuantTypeEnum,
@@ -906,6 +906,15 @@ impl crate::services::ZmqService for ModelService {
 
     fn signing_key(&self) -> SigningKey {
         self.signing_key.clone()
+    }
+
+    fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
+        let variant = ModelResponseVariant::Error(ErrorInfo {
+            message: error.to_owned(),
+            code: "INTERNAL".to_string(),
+            details: String::new(),
+        });
+        serialize_response(request_id, &variant).unwrap_or_default()
     }
 }
 

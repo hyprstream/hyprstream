@@ -3,6 +3,7 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
+use crate::resolve::ResolvedSchema;
 use crate::schema::types::*;
 use crate::util::*;
 
@@ -11,10 +12,6 @@ use crate::util::*;
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Resolve a domain type path from a `$domainType` annotation value.
-///
-/// The annotation value is a crate-relative Rust path (e.g., `"runtime::VersionResponse"`).
-/// When `types_crate` is `Some`, the path is resolved through the external crate;
-/// otherwise it is resolved through `crate::`.
 fn resolve_domain_type(domain_path: &str, types_crate: Option<&syn::Path>) -> TokenStream {
     let path: TokenStream = domain_path.parse().unwrap_or_else(|_| quote! { Vec<u8> });
     match types_crate {
@@ -27,14 +24,13 @@ fn resolve_domain_type(domain_path: &str, types_crate: Option<&syn::Path>) -> To
 // Response Enum
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub fn generate_response_enum(service_name: &str, schema: &ParsedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
+pub fn generate_response_enum(service_name: &str, resolved: &ResolvedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
     let pascal = to_pascal_case(service_name);
     let enum_name_str = format!("{pascal}ResponseVariant");
     generate_response_enum_from_variants(
         &enum_name_str,
-        &schema.response_variants,
-        &schema.structs,
-        &schema.enums,
+        &resolved.raw.response_variants,
+        resolved,
         types_crate,
     )
 }
@@ -42,8 +38,7 @@ pub fn generate_response_enum(service_name: &str, schema: &ParsedSchema, types_c
 pub fn generate_response_enum_from_variants(
     enum_name_str: &str,
     variants: &[UnionVariant],
-    structs: &[StructDef],
-    enums: &[EnumDef],
+    resolved: &ResolvedSchema,
     types_crate: Option<&syn::Path>,
 ) -> TokenStream {
     let enum_name = format_ident!("{}", enum_name_str);
@@ -51,7 +46,7 @@ pub fn generate_response_enum_from_variants(
 
     let variant_tokens: Vec<TokenStream> = variants
         .iter()
-        .map(|v| generate_enum_variant(v, structs, enums, types_crate))
+        .map(|v| generate_enum_variant(v, resolved, types_crate))
         .collect();
 
     quote! {
@@ -65,11 +60,10 @@ pub fn generate_response_enum_from_variants(
 
 fn generate_enum_variant(
     v: &UnionVariant,
-    structs: &[StructDef],
-    enums: &[EnumDef],
+    resolved: &ResolvedSchema,
     types_crate: Option<&syn::Path>,
 ) -> TokenStream {
-    let variant_pascal = format_ident!("{}", to_pascal_case(&v.name));
+    let variant_pascal = resolved.name(&v.name).pascal_ident.clone();
 
     match v.type_name.as_str() {
         "Void" => quote! { #variant_pascal },
@@ -87,11 +81,11 @@ fn generate_enum_variant(
                 "Text" => quote! { #variant_pascal(Vec<String>) },
                 "Data" => quote! { #variant_pascal(Vec<Vec<u8>>) },
                 _ => {
-                    let inner_ct = CapnpType::classify(inner, structs, enums);
-                    if inner_ct.is_numeric() {
-                        let rust_inner = rust_type_tokens(&inner_ct.rust_owned_type());
+                    let rt = resolved.resolve_type(inner);
+                    if rt.is_numeric {
+                        let rust_inner = rust_type_tokens(&rt.rust_owned);
                         quote! { #variant_pascal(Vec<#rust_inner>) }
-                    } else if structs.iter().any(|s| s.name == inner) {
+                    } else if resolved.is_struct(inner) {
                         let inner_data = format_ident!("{}", inner);
                         quote! { #variant_pascal(Vec<#inner_data>) }
                     } else {
@@ -101,7 +95,7 @@ fn generate_enum_variant(
             }
         }
         struct_name => {
-            if let Some(s) = structs.iter().find(|s| s.name == struct_name) {
+            if let Some(s) = resolved.find_struct(struct_name) {
                 if let Some(ref dt) = s.domain_type {
                     let domain_path = resolve_domain_type(dt, types_crate);
                     quote! { #variant_pascal(#domain_path) }
@@ -120,7 +114,7 @@ fn generate_enum_variant(
 // Client Struct + Impl
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub fn generate_client(service_name: &str, schema: &ParsedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
+pub fn generate_client(service_name: &str, resolved: &ResolvedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
     let pascal = to_pascal_case(service_name);
     let client_name = format_ident!("{}Client", pascal);
     let response_type = format_ident!("{}ResponseVariant", pascal);
@@ -132,14 +126,14 @@ pub fn generate_client(service_name: &str, schema: &ParsedSchema, types_crate: O
     let req_type = format_ident!("{}", to_snake_case(&format!("{pascal}Request")));
     let doc = format!("Auto-generated client for the {pascal} service.");
 
-    let scoped_variant_names: Vec<&str> = schema
+    let scoped_variant_names: Vec<&str> = resolved.raw
         .scoped_clients
         .iter()
         .map(|sc| sc.factory_name.as_str())
         .collect();
 
     // Request methods (skip scoped variants)
-    let request_methods: Vec<TokenStream> = schema
+    let request_methods: Vec<TokenStream> = resolved.raw
         .request_variants
         .iter()
         .filter(|v| !scoped_variant_names.contains(&v.name.as_str()))
@@ -149,10 +143,9 @@ pub fn generate_client(service_name: &str, schema: &ParsedSchema, types_crate: O
                 &req_type,
                 &response_type,
                 v,
-                &schema.structs,
-                &schema.enums,
+                resolved,
                 None,
-                Some(&schema.response_variants),
+                Some(&resolved.raw.response_variants),
                 false,
                 types_crate,
             )
@@ -164,17 +157,16 @@ pub fn generate_client(service_name: &str, schema: &ParsedSchema, types_crate: O
         &response_type,
         &capnp_mod,
         &format_ident!("{}", to_snake_case(&format!("{pascal}Response"))),
-        &schema.response_variants,
-        &schema.structs,
-        &schema.enums,
+        &resolved.raw.response_variants,
+        resolved,
         types_crate,
     );
 
     // Factory methods for scoped clients
-    let factory_methods: Vec<TokenStream> = schema
+    let factory_methods: Vec<TokenStream> = resolved.raw
         .scoped_clients
         .iter()
-        .map(|sc| generate_scoped_factory_method(sc))
+        .map(generate_scoped_factory_method)
         .collect();
 
     // ServiceClient impl
@@ -240,19 +232,12 @@ pub fn generate_client(service_name: &str, schema: &ParsedSchema, types_crate: O
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Generate a single request method. Used for both top-level and scoped clients.
-///
-/// When `response_variants` is provided, the method returns a typed result
-/// (e.g., `Result<TrainStepResponseData>`) instead of the full response enum.
-/// The pairing convention is:
-/// - Top-level (`is_scoped=false`): request `foo` → response `fooResult`
-/// - Scoped (`is_scoped=true`): request `foo` → response `foo`
 pub fn generate_request_method(
     capnp_mod: &TokenStream,
     req_type: &syn::Ident,
     response_type: &syn::Ident,
     variant: &UnionVariant,
-    structs: &[StructDef],
-    enums: &[EnumDef],
+    resolved: &ResolvedSchema,
     scope: Option<&ScopedMethodContext>,
     response_variants: Option<&[UnionVariant]>,
     is_scoped: bool,
@@ -261,74 +246,49 @@ pub fn generate_request_method(
     let method_name = format_ident!("{}", to_snake_case(&variant.name));
     let doc = format!("{} ({} variant)", to_snake_case(&variant.name), variant.type_name);
 
-    // For scoped methods, we wrap in the outer init
-    let (outer_req_setup, inner_accessor, parse_call) = if let Some(sc) = scope {
-        if let Some(ref parent_ctx) = sc.parent {
-            // 3-level nested: parent init -> parent setters -> nested init -> nested setters
-            let parent_init = format_ident!("init_{}", to_snake_case(&parent_ctx.factory_name));
-            let parent_setters: Vec<TokenStream> = parent_ctx.scope_fields.iter().map(|f| {
-                let setter_name = format_ident!("set_{}", to_snake_case(&f.name));
-                let field_name = format_ident!("{}", to_snake_case(&f.name));
-                match f.type_name.as_str() {
-                    "Text" => quote! { mid.#setter_name(&self.#field_name); },
-                    _ => quote! { mid.#setter_name(self.#field_name); },
-                }
-            }).collect();
-
-            let nested_init = format_ident!("init_{}", to_snake_case(&sc.factory_name));
-            let nested_setters: Vec<TokenStream> = sc.scope_fields.iter().map(|f| {
-                let setter_name = format_ident!("set_{}", to_snake_case(&f.name));
-                let field_name = format_ident!("{}", to_snake_case(&f.name));
-                match f.type_name.as_str() {
-                    "Text" => quote! { inner.#setter_name(&self.#field_name); },
-                    _ => quote! { inner.#setter_name(self.#field_name); },
-                }
-            }).collect();
-
-            let factory_snake = format_ident!("{}", to_snake_case(&sc.factory_name));
-
-            (
-                quote! {
-                    let mut mid = req.#parent_init();
-                    #(#parent_setters)*
-                    let mut inner = mid.#nested_init();
-                    #(#nested_setters)*
-                },
-                Some(factory_snake),
-                quote! { Self::parse_scoped_response(&response) },
-            )
-        } else {
-            // 2-level scoped (existing behavior)
-            let factory_snake = format_ident!("{}", to_snake_case(&sc.factory_name));
-            let factory_init = format_ident!("init_{}", to_snake_case(&sc.factory_name));
-            let scope_setters: Vec<TokenStream> = sc.scope_fields.iter().map(|f| {
-                let setter_name = format_ident!("set_{}", to_snake_case(&f.name));
-                let field_name = format_ident!("{}", to_snake_case(&f.name));
-                match f.type_name.as_str() {
-                    "Text" => quote! { inner.#setter_name(&self.#field_name); },
-                    _ => quote! { inner.#setter_name(self.#field_name); },
-                }
-            }).collect();
-
-            (
-                quote! {
-                    let mut inner = req.#factory_init();
-                    #(#scope_setters)*
-                },
-                Some(factory_snake),
-                quote! { Self::parse_scoped_response(&response) },
-            )
+    // For scoped methods, walk the ScopedMethodContext chain and shadow `req`
+    let (outer_req_setup, parse_call) = if let Some(sc) = scope {
+        let mut chain = Vec::new();
+        let mut cur = Some(sc);
+        while let Some(c) = cur {
+            chain.push(c);
+            cur = c.parent.as_deref();
         }
+        chain.reverse();
+
+        let mut setup = TokenStream::new();
+        let mut prev_var = format_ident!("req");
+
+        for (i, level) in chain.iter().enumerate() {
+            let init_fn = format_ident!("init_{}", to_snake_case(&level.factory_name));
+            let tmp = format_ident!("__s{}", i);
+
+            setup.extend(quote! { let mut #tmp = #prev_var.#init_fn(); });
+
+            for f in &level.scope_fields {
+                let setter = format_ident!("set_{}", to_snake_case(&f.name));
+                let field = format_ident!("{}", to_snake_case(&f.name));
+                setup.extend(match f.type_name.as_str() {
+                    "Text" => quote! { #tmp.#setter(&self.#field); },
+                    _ => quote! { #tmp.#setter(self.#field); },
+                });
+            }
+            prev_var = tmp;
+        }
+
+        setup.extend(quote! { let mut req = #prev_var; });
+
+        (setup, quote! { Self::parse_scoped_response(&response) })
     } else {
-        (TokenStream::new(), None, quote! { Self::parse_response(&response) })
+        (TokenStream::new(), quote! { Self::parse_response(&response) })
     };
 
     // Determine typed return info if response_variants are available
     let typed_info = response_variants.and_then(|resp_vars| {
-        find_typed_return_info(&variant.name, resp_vars, structs, enums, is_scoped, response_type, &parse_call, types_crate)
+        find_typed_return_info(&variant.name, resp_vars, resolved, is_scoped, response_type, &parse_call, types_crate)
     });
 
-    // Detect if this method returns StreamInfo (requires streaming call with ephemeral pubkey)
+    // Detect if this method returns StreamInfo
     let is_streaming = response_variants
         .and_then(|resp_vars| {
             let expected_name = if is_scoped {
@@ -341,7 +301,6 @@ pub fn generate_request_method(
         .map(|v| v.type_name == "StreamInfo")
         .unwrap_or(false);
 
-    // Generate return type and response handling
     let (return_type, response_handling) = if let Some(ref info) = typed_info {
         let ret = &info.return_type;
         let match_body = &info.match_body;
@@ -350,7 +309,6 @@ pub fn generate_request_method(
         (quote! { #response_type }, quote! { #parse_call })
     };
 
-    // For streaming methods, add ephemeral_pubkey parameter and use call_with_options
     let (extra_param, call_expr) = if is_streaming {
         (
             quote! { , ephemeral_pubkey: [u8; 32] },
@@ -369,11 +327,7 @@ pub fn generate_request_method(
     match variant.type_name.as_str() {
         "Void" => {
             let set_method = format_ident!("set_{}", to_snake_case(&variant.name));
-            let setter = if inner_accessor.is_some() {
-                quote! { inner.#set_method(()); }
-            } else {
-                quote! { req.#set_method(()); }
-            };
+            let setter = quote! { req.#set_method(()); };
             quote! {
                 #[doc = #doc]
                 pub async fn #method_name(&self #extra_param) -> anyhow::Result<#return_type> {
@@ -391,11 +345,7 @@ pub fn generate_request_method(
         }
         "Text" => {
             let set_method = format_ident!("set_{}", to_snake_case(&variant.name));
-            let setter = if inner_accessor.is_some() {
-                quote! { inner.#set_method(value); }
-            } else {
-                quote! { req.#set_method(value); }
-            };
+            let setter = quote! { req.#set_method(value); };
             quote! {
                 #[doc = #doc]
                 pub async fn #method_name(&self, value: &str #extra_param) -> anyhow::Result<#return_type> {
@@ -413,11 +363,7 @@ pub fn generate_request_method(
         }
         "Data" => {
             let set_method = format_ident!("set_{}", to_snake_case(&variant.name));
-            let setter = if inner_accessor.is_some() {
-                quote! { inner.#set_method(value); }
-            } else {
-                quote! { req.#set_method(value); }
-            };
+            let setter = quote! { req.#set_method(value); };
             quote! {
                 #[doc = #doc]
                 pub async fn #method_name(&self, value: &[u8] #extra_param) -> anyhow::Result<#return_type> {
@@ -435,11 +381,7 @@ pub fn generate_request_method(
         }
         "Bool" => {
             let set_method = format_ident!("set_{}", to_snake_case(&variant.name));
-            let setter = if inner_accessor.is_some() {
-                quote! { inner.#set_method(value); }
-            } else {
-                quote! { req.#set_method(value); }
-            };
+            let setter = quote! { req.#set_method(value); };
             quote! {
                 #[doc = #doc]
                 pub async fn #method_name(&self, value: bool #extra_param) -> anyhow::Result<#return_type> {
@@ -456,17 +398,13 @@ pub fn generate_request_method(
             }
         }
         struct_name => {
-            if let Some(s) = structs.iter().find(|s| s.name == struct_name) {
+            if let Some(s) = resolved.find_struct(struct_name) {
                 let is_void_wrapper = s.fields.is_empty()
                     || (s.fields.len() == 1 && s.fields[0].type_name == "Void");
 
                 if is_void_wrapper {
                     let init_method = format_ident!("init_{}", to_snake_case(&variant.name));
-                    let setter = if inner_accessor.is_some() {
-                        quote! { inner.#init_method(); }
-                    } else {
-                        quote! { req.#init_method(); }
-                    };
+                    let setter = quote! { req.#init_method(); };
                     quote! {
                         #[doc = #doc]
                         pub async fn #method_name(&self #extra_param) -> anyhow::Result<#return_type> {
@@ -482,15 +420,12 @@ pub fn generate_request_method(
                         }
                     }
                 } else {
-                    let params = generate_method_params(&s.fields, enums, structs);
+                    let params = generate_method_params(&s.fields, resolved);
                     let init_method = format_ident!("init_{}", to_snake_case(&variant.name));
-                    let setters = generate_struct_setters(&s.fields, enums, structs, capnp_mod);
+                    let builder_var = format_ident!("req");
+                    let setters = generate_struct_setters(&s.fields, resolved, capnp_mod, &builder_var);
 
-                    let inner_init = if inner_accessor.is_some() {
-                        quote! { let mut inner = inner.#init_method(); }
-                    } else {
-                        quote! { let mut inner = req.#init_method(); }
-                    };
+                    let inner_init = quote! { let mut req = req.#init_method(); };
 
                     quote! {
                         #[doc = #doc]
@@ -523,42 +458,30 @@ pub fn generate_request_method(
 // Typed Return Info
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Information for generating a typed return from a request method.
 struct TypedReturnInfo {
-    /// The return type tokens (e.g., `()`, `bool`, `TrainStepResponseData`)
     return_type: TokenStream,
-    /// The match body that extracts the typed value from the parse result
     match_body: TokenStream,
 }
 
-/// Find the paired response variant and generate typed return info.
-///
-/// Returns `None` if the pairing is ambiguous or the response variant isn't found,
-/// in which case the method falls back to returning the full response enum.
 fn find_typed_return_info(
     request_name: &str,
     response_variants: &[UnionVariant],
-    structs: &[StructDef],
-    enums: &[EnumDef],
+    resolved: &ResolvedSchema,
     is_scoped: bool,
     response_type: &syn::Ident,
     parse_call: &TokenStream,
     types_crate: Option<&syn::Path>,
 ) -> Option<TypedReturnInfo> {
-    // Find the expected response variant name
     let expected_name = if is_scoped {
-        // Scoped: request `foo` → response `foo`
-        request_name.to_string()
+        request_name.to_owned()
     } else {
-        // Top-level: request `foo` → response `fooResult`
         format!("{}Result", request_name)
     };
 
     let resp_variant = response_variants.iter().find(|v| v.name == expected_name)?;
-    let variant_pascal = format_ident!("{}", to_pascal_case(&resp_variant.name));
-    let ct = CapnpType::classify(&resp_variant.type_name, structs, enums);
+    let variant_pascal = resolved.name(&resp_variant.name).pascal_ident.clone();
+    let ct = resolved.resolve_type(&resp_variant.type_name).capnp_type.clone();
 
-    // Check if there's an Error variant in the response (for the error arm)
     let has_error = response_variants.iter().any(|v| v.name == "error");
 
     let error_arm = if has_error {
@@ -676,7 +599,7 @@ fn find_typed_return_info(
             })
         }
         CapnpType::Struct(ref name) => {
-            if let Some(s) = structs.iter().find(|s| s.name == *name) {
+            if let Some(s) = resolved.find_struct(name) {
                 let return_type = if let Some(ref dt) = s.domain_type {
                     resolve_domain_type(dt, types_crate)
                 } else {
@@ -694,40 +617,30 @@ fn find_typed_return_info(
                     },
                 })
             } else {
-                None // Fallback to full enum
+                None
             }
         }
-        _ => None, // Fallback to full enum for unknown types
+        _ => None,
     }
 }
 
 /// Context for scoped method generation.
-///
-/// For nested (3-level) scoping, `parent` is `Some(...)` and contains the
-/// outer scope context. The request builder will chain: parent init -> parent setters ->
-/// nested init -> nested setters -> operation init.
 pub struct ScopedMethodContext {
     pub factory_name: String,
     pub scope_fields: Vec<FieldDef>,
-    /// Parent scope context for 3-level nesting (e.g., Repository is parent of Fs).
     pub parent: Option<Box<ScopedMethodContext>>,
 }
 
 /// Generate method parameter tokens for a struct's fields.
-///
-/// Union-only struct fields (e.g., `EventTrigger`) are skipped since they have
-/// no regular fields to parameterize — the setter just calls `init_*()`.
 fn generate_method_params(
     fields: &[FieldDef],
-    enums: &[EnumDef],
-    structs: &[StructDef],
+    resolved: &ResolvedSchema,
 ) -> Vec<TokenStream> {
     fields
         .iter()
         .filter(|field| {
-            // Skip union-only struct fields (no settable fields to parameterize)
-            if let CapnpType::Struct(ref name) = CapnpType::classify(&field.type_name, structs, enums) {
-                if let Some(s) = structs.iter().find(|s| s.name == *name) {
+            if let CapnpType::Struct(ref name) = resolved.resolve_type(&field.type_name).capnp_type {
+                if let Some(s) = resolved.find_struct(name) {
                     if s.has_union && s.fields.is_empty() {
                         return false;
                     }
@@ -737,8 +650,8 @@ fn generate_method_params(
         })
         .map(|field| {
             let rust_name = format_ident!("{}", to_snake_case(&field.name));
-            let type_str = CapnpType::classify(&field.type_name, structs, enums).rust_param_type();
-            let rust_type = rust_type_tokens(&type_str);
+            let type_str = &resolved.resolve_type(&field.type_name).rust_param;
+            let rust_type = rust_type_tokens(type_str);
             quote! { #rust_name: #rust_type }
         })
         .collect()
@@ -747,16 +660,16 @@ fn generate_method_params(
 /// Generate setter calls for fields when building a request struct.
 fn generate_struct_setters(
     fields: &[FieldDef],
-    enums: &[EnumDef],
-    structs: &[StructDef],
+    resolved: &ResolvedSchema,
     capnp_mod: &TokenStream,
+    builder_var: &syn::Ident,
 ) -> Vec<TokenStream> {
     fields
         .iter()
         .map(|field| {
             let rust_name = format_ident!("{}", to_snake_case(&field.name));
             let setter_name = format_ident!("set_{}", to_snake_case(&field.name));
-            generate_field_setter(&rust_name, &setter_name, &field.type_name, enums, structs, capnp_mod)
+            generate_field_setter(&rust_name, &setter_name, &field.type_name, resolved, capnp_mod, builder_var)
         })
         .collect()
 }
@@ -765,21 +678,21 @@ fn generate_field_setter(
     rust_name: &syn::Ident,
     setter_name: &syn::Ident,
     type_name: &str,
-    enums: &[EnumDef],
-    structs: &[StructDef],
+    resolved: &ResolvedSchema,
     capnp_mod: &TokenStream,
+    builder_var: &syn::Ident,
 ) -> TokenStream {
     match type_name {
-        "Text" | "Data" => quote! { inner.#setter_name(#rust_name); },
+        "Text" | "Data" => quote! { #builder_var.#setter_name(#rust_name); },
         "Bool" | "UInt32" | "UInt64" | "Int32" | "Int64" | "Float32" | "Float64" => {
-            quote! { inner.#setter_name(#rust_name); }
+            quote! { #builder_var.#setter_name(#rust_name); }
         }
         t if t.starts_with("List(") => {
             let inner_type = &t[5..t.len() - 1];
-            generate_list_setter(rust_name, setter_name, inner_type, enums, structs, capnp_mod)
+            generate_list_setter(rust_name, setter_name, inner_type, resolved, capnp_mod, builder_var)
         }
         t => {
-            if let Some(e) = enums.iter().find(|e| e.name == t) {
+            if let Some(e) = resolved.find_enum(t) {
                 let type_ident = format_ident!("{}", t);
                 let match_arms: Vec<TokenStream> = e.variants.iter().map(|(vname, _)| {
                     let snake = to_snake_case(vname);
@@ -793,23 +706,22 @@ fn generate_field_setter(
                     TokenStream::new()
                 };
                 quote! {
-                    inner.#setter_name(match #rust_name {
+                    #builder_var.#setter_name(match #rust_name {
                         #(#match_arms,)*
                         #default_arm,
                     });
                 }
-            } else if let Some(s) = structs.iter().find(|s| s.name == t) {
+            } else if let Some(s) = resolved.find_struct(t) {
                 let field_snake = to_snake_case(
                     setter_name.to_string().strip_prefix("set_").unwrap_or(&setter_name.to_string())
                 );
                 if s.has_union && s.fields.is_empty() {
-                    // Union-only struct (e.g., EventTrigger) — init without setting fields
                     let init_name = format_ident!("init_{}", &field_snake);
-                    quote! { inner.reborrow().#init_name(); }
+                    quote! { #builder_var.reborrow().#init_name(); }
                 } else {
                     let init_name = format_ident!("init_{}", &field_snake);
                     quote! {
-                        hyprstream_rpc::capnp::ToCapnp::write_to(&#rust_name, &mut inner.reborrow().#init_name());
+                        hyprstream_rpc::capnp::ToCapnp::write_to(&#rust_name, &mut #builder_var.reborrow().#init_name());
                     }
                 }
             } else {
@@ -824,11 +736,10 @@ fn generate_list_setter(
     rust_name: &syn::Ident,
     setter_name: &syn::Ident,
     inner_type: &str,
-    _enums: &[EnumDef],
-    structs: &[StructDef],
+    resolved: &ResolvedSchema,
     _capnp_mod: &TokenStream,
+    builder_var: &syn::Ident,
 ) -> TokenStream {
-    // For List fields, capnp uses init_* to allocate the list, not set_*
     let init_name = format_ident!(
         "init_{}",
         setter_name
@@ -841,7 +752,7 @@ fn generate_list_setter(
         "Text" => {
             quote! {
                 {
-                    let mut list = inner.reborrow().#init_name(#rust_name.len() as u32);
+                    let mut list = #builder_var.reborrow().#init_name(#rust_name.len() as u32);
                     for (i, item) in #rust_name.iter().enumerate() {
                         list.set(i as u32, item.as_str());
                     }
@@ -851,18 +762,18 @@ fn generate_list_setter(
         "Data" => {
             quote! {
                 {
-                    let mut list = inner.reborrow().#init_name(#rust_name.len() as u32);
+                    let mut list = #builder_var.reborrow().#init_name(#rust_name.len() as u32);
                     for (i, item) in #rust_name.iter().enumerate() {
                         list.set(i as u32, item.as_slice());
                     }
                 }
             }
         }
-        prim if matches!(prim, "Bool" | "UInt8" | "UInt16" | "UInt32" | "UInt64"
-            | "Int8" | "Int16" | "Int32" | "Int64" | "Float32" | "Float64") => {
+        "Bool" | "UInt8" | "UInt16" | "UInt32" | "UInt64"
+            | "Int8" | "Int16" | "Int32" | "Int64" | "Float32" | "Float64" => {
             quote! {
                 {
-                    let mut list = inner.reborrow().#init_name(#rust_name.len() as u32);
+                    let mut list = #builder_var.reborrow().#init_name(#rust_name.len() as u32);
                     for (i, item) in #rust_name.iter().enumerate() {
                         list.set(i as u32, *item);
                     }
@@ -870,25 +781,22 @@ fn generate_list_setter(
             }
         }
         struct_name => {
-            if structs.iter().any(|s| s.name == struct_name) {
+            if resolved.is_struct(struct_name) {
                 quote! {
                     {
-                        let mut list = inner.reborrow().#init_name(#rust_name.len() as u32);
+                        let mut list = #builder_var.reborrow().#init_name(#rust_name.len() as u32);
                         for (i, item) in #rust_name.iter().enumerate() {
                             hyprstream_rpc::capnp::ToCapnp::write_to(item, &mut list.reborrow().get(i as u32));
                         }
                     }
                 }
             } else {
-                let _comment = format!("List({struct_name}) — struct not found in schema");
                 quote! { }
             }
         }
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Nested Struct Setter Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 // parse_response
 // ─────────────────────────────────────────────────────────────────────────────
@@ -898,14 +806,13 @@ pub fn generate_parse_response_fn(
     capnp_mod: &TokenStream,
     resp_type: &syn::Ident,
     variants: &[UnionVariant],
-    structs: &[StructDef],
-    enums: &[EnumDef],
+    resolved: &ResolvedSchema,
     types_crate: Option<&syn::Path>,
 ) -> TokenStream {
     let which_ident = format_ident!("Which");
     let match_arms: Vec<TokenStream> = variants
         .iter()
-        .map(|v| generate_parse_match_arm(response_type, capnp_mod, v, structs, enums, &which_ident, types_crate))
+        .map(|v| generate_parse_match_arm(response_type, capnp_mod, v, resolved, &which_ident, types_crate))
         .collect();
 
     quote! {
@@ -924,21 +831,16 @@ pub fn generate_parse_response_fn(
     }
 }
 
-/// Generate a single parse match arm.
-///
-/// The `which_ident` parameter allows this to be shared between top-level
-/// (`Which`) and scoped (`InnerWhich`) parse contexts.
 pub fn generate_parse_match_arm(
     response_type: &syn::Ident,
     capnp_mod: &TokenStream,
     v: &UnionVariant,
-    structs: &[StructDef],
-    enums: &[EnumDef],
+    resolved: &ResolvedSchema,
     which_ident: &syn::Ident,
     types_crate: Option<&syn::Path>,
 ) -> TokenStream {
-    let variant_pascal = format_ident!("{}", to_pascal_case(&v.name));
-    let ct = CapnpType::classify(&v.type_name, structs, enums);
+    let variant_pascal = resolved.name(&v.name).pascal_ident.clone();
+    let ct = resolved.resolve_type(&v.type_name).capnp_type.clone();
 
     match ct {
         CapnpType::Void => quote! {
@@ -957,10 +859,10 @@ pub fn generate_parse_match_arm(
             #which_ident::#variant_pascal(v) => Ok(#response_type::#variant_pascal(v?.to_vec())),
         },
         CapnpType::ListText | CapnpType::ListData | CapnpType::ListPrimitive(_) | CapnpType::ListStruct(_) => {
-            generate_list_parse_arm(&variant_pascal, response_type, &v.type_name, structs, enums, capnp_mod, which_ident)
+            generate_list_parse_arm(&variant_pascal, response_type, &v.type_name, resolved, capnp_mod, which_ident)
         }
         CapnpType::Struct(ref name) => {
-            if let Some(s) = structs.iter().find(|s| s.name == *name) {
+            if let Some(s) = resolved.find_struct(name) {
                 let data_type = if let Some(ref dt) = s.domain_type {
                     resolve_domain_type(dt, types_crate)
                 } else {
@@ -995,12 +897,11 @@ fn generate_list_parse_arm(
     variant_pascal: &syn::Ident,
     response_type: &syn::Ident,
     type_name: &str,
-    structs: &[StructDef],
-    enums: &[EnumDef],
+    resolved: &ResolvedSchema,
     _capnp_mod: &TokenStream,
     which_ident: &syn::Ident,
 ) -> TokenStream {
-    let ct = CapnpType::classify(type_name, structs, enums);
+    let ct = resolved.resolve_type(type_name).capnp_type.clone();
     match ct {
         CapnpType::ListText => quote! {
             #which_ident::#variant_pascal(v) => {
@@ -1020,7 +921,7 @@ fn generate_list_parse_arm(
             }
         },
         CapnpType::ListStruct(ref inner) => {
-            if structs.iter().any(|s| s.name == *inner) {
+            if resolved.is_struct(inner) {
                 quote! {
                     #which_ident::#variant_pascal(v) => {
                         let list = v?;
