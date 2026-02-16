@@ -133,7 +133,8 @@ fn build_service_command(
     // Leak service_name to get 'static lifetime required by clap
     let name: &'static str = service_name.to_owned().leak();
     let mut cmd = Command::new(name)
-        .about(format!("{} service commands", service_name));
+        .about(format!("{} service commands", service_name))
+        .arg_required_else_help(true);
 
     // Add top-level methods as subcommands (filtering cli_hidden and streaming)
     for method in methods {
