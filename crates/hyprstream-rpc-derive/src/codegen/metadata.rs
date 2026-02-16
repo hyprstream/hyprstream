@@ -104,8 +104,11 @@ fn generate_method_schema_entry(
                         let fname = to_snake_case(&f.name);
                         let ftype = &f.type_name;
                         let fdesc = &f.description;
+                        let is_bool = ftype == "Bool";
+                        let required = !is_bool;
+                        let default_val = if is_bool { "false" } else { "" };
                         quote! {
-                            ParamSchema { name: #fname, type_name: #ftype, required: true, description: #fdesc }
+                            ParamSchema { name: #fname, type_name: #ftype, required: #required, description: #fdesc, default_value: #default_val }
                         }
                     })
                     .collect()
@@ -116,7 +119,7 @@ fn generate_method_schema_entry(
         _ => {
             let type_str = &v.type_name;
             vec![quote! {
-                ParamSchema { name: "value", type_name: #type_str, required: true, description: "" }
+                ParamSchema { name: "value", type_name: #type_str, required: true, description: "", default_value: "" }
             }]
         }
     };
@@ -700,8 +703,7 @@ fn json_field_extraction_token(
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid string field '{}'", #fname_str))?;
         },
         CapnpType::Bool => quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_bool())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid bool field '{}'", #fname_str))?;
+            let #fname = args.get(#fname_str).and_then(|v| v.as_bool()).unwrap_or(false);
         },
         CapnpType::UInt8 => quote! {
             let #fname: u8 = args.get(#fname_str).and_then(|v| v.as_u64())

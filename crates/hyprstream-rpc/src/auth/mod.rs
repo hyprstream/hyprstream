@@ -12,9 +12,8 @@ pub mod scope;
 pub mod scope_registry;
 
 pub use claims::Claims;
-pub use jwt::{decode, encode, has_valid_prefix, JwtError};
+pub use jwt::{decode, encode, JwtError};
 #[cfg(test)]
 pub use jwt::decode_unverified;
-pub use jwt::TOKEN_PREFIX;
 pub use scope::Scope;
 pub use scope_registry::ScopeDefinition;

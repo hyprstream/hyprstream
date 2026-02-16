@@ -20,7 +20,7 @@ pub struct AuthenticatedUser {
 
 /// JWT authentication middleware
 ///
-/// Validates JWT tokens (hypr_eyJ...) via Ed25519 signature verification.
+/// Validates JWT tokens (eyJ...) via Ed25519 signature verification.
 ///
 /// On success, inserts `AuthenticatedUser` into request extensions.
 /// JWT `sub` claim contains bare username (e.g., "alice").
@@ -46,7 +46,7 @@ pub async fn auth_middleware(
     let www_authenticate = build_www_authenticate(&state);
 
     // Try JWT validation (stateless)
-    if jwt::has_valid_prefix(token) && token.contains('.') {
+    if token.contains('.') {
         match jwt::decode(token, &state.verifying_key) {
             Ok(claims) => {
                 debug!("JWT validated for user: {}", claims.sub);

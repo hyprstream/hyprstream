@@ -201,30 +201,13 @@ This allows you to work with multiple versions of the same model simultaneously,
 
 HyprStream includes a built-in [Model Context Protocol](https://modelcontextprotocol.io/) server that exposes inference, model management, and repository operations as tools for AI coding assistants.
 
-**1. Issue a token:**
+**1. Configure Claude Code:**
 
-```bash
-# Issue a token with the scopes your MCP session needs
-hyprstream token issue --scopes "infer:model:*,read:registry:*,write:model:*" --ttl 3600
+```claude mcp add --transport http hyprstream http://localhost:6790/mcp```
 
-# Output:
-# Token: hypr_eyJhbGciOiJFZDI1NTE5...
-# Expires: 2026-02-06T20:00:00Z
-```
+**2. Authenticate
 
-**2. Configure Claude Code:**
-
-Add to your `~/.claude/claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "hyprstream": {
-      "url": "http://localhost:6790/mcp"
-    }
-  }
-}
-```
+Use `/mcp`, select `hyprstream`, and select `Authenticate` or `Re-authenticate`.
 
 **3. Available tools:**
 
@@ -365,7 +348,7 @@ hyprstream policy rollback HEAD~1
 hyprstream policy token create --user alice --name "my-token" --expires 1d
 
 # Use with API requests
-curl -H "Authorization: Bearer hypr_eyJ..." http://localhost:6789/v1/models
+curl -H "Authorization: Bearer eyJ..." http://localhost:6789/v1/models
 ```
 
 See [docs/rpc-architecture.md](docs/rpc-architecture.md) for detailed RPC and service infrastructure documentation.

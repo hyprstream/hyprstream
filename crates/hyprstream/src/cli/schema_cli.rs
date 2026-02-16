@@ -62,6 +62,7 @@ pub struct ParamView {
     pub type_name: String,
     pub required: bool,
     pub description: String,
+    pub default_value: String,
 }
 
 /// Extract a portable MethodView list from any generated module's schema_metadata.
@@ -87,6 +88,7 @@ fn methods_to_views(methods: &[hyprstream_rpc::service::metadata::MethodMeta]) -
                     type_name: p.type_name.to_string(),
                     required: p.required,
                     description: p.description.to_string(),
+                    default_value: p.default_value.to_string(),
                 })
                 .collect(),
             is_scoped: m.is_scoped,
@@ -187,9 +189,14 @@ fn build_method_command(method: &MethodView) -> Command {
     for param in &method.params {
         let arg_name: &'static str = param.name.replace('_', "-").leak();
         let param_id: &'static str = param.name.clone().leak();
-        let mut arg = Arg::new(param_id)
-            .long(arg_name)
-            .required(param.required);
+        let mut arg = Arg::new(param_id).long(arg_name);
+
+        if param.type_name == "Bool" {
+            // Bool params are flags: --read (present=true, absent=false)
+            arg = arg.action(clap::ArgAction::SetTrue);
+        } else {
+            arg = arg.required(param.required);
+        }
 
         if !param.description.is_empty() {
             let help: &'static str = param.description.clone().leak();
@@ -459,7 +466,11 @@ fn matches_to_json(matches: &ArgMatches, methods: &[MethodView], method_name: &s
 
     if let Some(method) = method {
         for param in &method.params {
-            if let Some(val) = matches.get_one::<String>(&param.name) {
+            if param.type_name == "Bool" {
+                // Bool flags use get_flag() (ArgAction::SetTrue)
+                let val = matches.get_flag(&param.name);
+                map.insert(param.name.clone(), Value::Bool(val));
+            } else if let Some(val) = matches.get_one::<String>(&param.name) {
                 let json_val = coerce_value(val, &param.type_name);
                 map.insert(param.name.clone(), json_val);
             }

@@ -48,7 +48,7 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::trace;
+use tracing::{debug, trace};
 use uuid::Uuid;
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -625,6 +625,11 @@ impl McpService {
         // Check for HTTP transport by looking for http::request::Parts in extensions
         if let Some(parts) = context.extensions.get::<http::request::Parts>() {
             // HTTP transport — extract Bearer token from Authorization header
+            trace!(
+                "MCP HTTP auth: has Authorization header: {}, all headers: {:?}",
+                parts.headers.contains_key(AUTHORIZATION),
+                parts.headers.keys().collect::<Vec<_>>()
+            );
             let token = parts
                 .headers
                 .get(AUTHORIZATION)
@@ -633,6 +638,7 @@ impl McpService {
 
             match token {
                 Some(token) => {
+                    trace!("MCP HTTP auth: Bearer token present, len={}", token.len());
                     match jwt::decode(token, &self.verifying_key) {
                         Ok(claims) => {
                             trace!("MCP HTTP auth: token validated for {}", claims.sub);
@@ -645,18 +651,19 @@ impl McpService {
                     }
                 }
                 None => {
-                    trace!("MCP HTTP auth: no Bearer token, using anonymous");
+                    trace!("MCP HTTP auth: no Bearer token found in Authorization header");
                     RequestIdentity::anonymous()
                 }
             }
         } else {
+            trace!("MCP HTTP auth: no http::request::Parts in extensions (stdio/zmq transport)");
             // Stdio/ZMQ transport — decode env token per-request
             match &self.stdio_token {
                 Some(token) => {
                     match jwt::decode(token, &self.verifying_key) {
                         Ok(claims) => RequestIdentity::api_token(&claims.sub, "mcp"),
                         Err(e) => {
-                            trace!("MCP stdio auth: token invalid ({}), using local identity", e);
+                            debug!("MCP stdio auth: token invalid ({}), using local identity", e);
                             RequestIdentity::local()
                         }
                     }

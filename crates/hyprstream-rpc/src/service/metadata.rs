@@ -14,6 +14,8 @@ pub struct ParamMeta {
     pub type_name: &'static str,
     pub required: bool,
     pub description: &'static str,
+    /// Default value hint (empty = no default). For Bool fields this is "false".
+    pub default_value: &'static str,
 }
 
 /// Schema metadata for a single RPC method.

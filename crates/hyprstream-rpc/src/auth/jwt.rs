@@ -5,11 +5,7 @@
 //!
 //! # Token Format
 //!
-//! ```text
-//! hypr_eyJ...  (standard token)
-//! ```
-//!
-//! The JWT itself follows RFC 7519:
+//! Standard RFC 7519 JWT:
 //! - Header: `{"alg":"EdDSA","typ":"JWT"}`
 //! - Payload: Claims (sub, exp, iat)
 //! - Signature: Ed25519 over `base64url(header).base64url(payload)`
@@ -21,10 +17,6 @@ use thiserror::Error;
 
 use super::Claims;
 
-/// Token prefix for standard API keys
-pub const TOKEN_PREFIX: &str = "hypr_";
-
-
 /// JWT header (static for EdDSA)
 const JWT_HEADER: &str = r#"{"alg":"EdDSA","typ":"JWT"}"#;
 
@@ -33,9 +25,6 @@ const JWT_HEADER: &str = r#"{"alg":"EdDSA","typ":"JWT"}"#;
 pub enum JwtError {
     #[error("Invalid token format")]
     InvalidFormat,
-
-    #[error("Invalid token prefix")]
-    InvalidPrefix,
 
     #[error("Invalid base64 encoding")]
     InvalidBase64,
@@ -58,7 +47,7 @@ pub enum JwtError {
 
 /// Encode and sign a JWT token
 ///
-/// Returns a token with the `hypr_` prefix.
+/// Returns a standard RFC 7519 JWT (no prefix).
 pub fn encode(claims: &Claims, signing_key: &SigningKey) -> String {
     // Encode header and payload
     let header_b64 = URL_SAFE_NO_PAD.encode(JWT_HEADER);
@@ -76,20 +65,15 @@ pub fn encode(claims: &Claims, signing_key: &SigningKey) -> String {
     let signature_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
 
     // Combine into JWT
-    let jwt = format!("{signing_input}.{signature_b64}");
-
-    format!("{TOKEN_PREFIX}{jwt}")
+    format!("{signing_input}.{signature_b64}")
 }
 
 /// Decode and verify a JWT token
 ///
-/// Returns the claims if the token is valid and not expired.
+/// Accepts a raw RFC 7519 JWT. Returns the claims if valid and not expired.
 pub fn decode(token: &str, verifying_key: &VerifyingKey) -> Result<Claims, JwtError> {
-    let jwt = token.strip_prefix(TOKEN_PREFIX)
-        .ok_or(JwtError::InvalidPrefix)?;
-
     // Split into parts
-    let parts: Vec<&str> = jwt.split('.').collect();
+    let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return Err(JwtError::InvalidFormat);
     }
@@ -144,11 +128,8 @@ pub fn decode(token: &str, verifying_key: &VerifyingKey) -> Result<Claims, JwtEr
 /// Restricted to test and debug builds to prevent misuse in production.
 #[cfg(test)]
 pub fn decode_unverified(token: &str) -> Result<Claims, JwtError> {
-    let jwt = token.strip_prefix(TOKEN_PREFIX)
-        .ok_or(JwtError::InvalidPrefix)?;
-
     // Split into parts
-    let parts: Vec<&str> = jwt.split('.').collect();
+    let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return Err(JwtError::InvalidFormat);
     }
@@ -160,9 +141,4 @@ pub fn decode_unverified(token: &str) -> Result<Claims, JwtError> {
 
     serde_json::from_slice(&payload_bytes)
         .map_err(|e| JwtError::InvalidJson(e.to_string()))
-}
-
-/// Check if a token string has a valid prefix
-pub fn has_valid_prefix(token: &str) -> bool {
-    token.starts_with(TOKEN_PREFIX)
 }
