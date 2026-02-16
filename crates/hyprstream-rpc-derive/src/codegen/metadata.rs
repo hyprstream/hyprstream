@@ -214,7 +214,7 @@ fn generate_json_dispatcher(
         .iter()
         .filter(|v| !scoped_names.contains(&v.name.as_str()))
         .filter(|v| !is_streaming_variant(&v.name, response_variants, false))
-        .map(|v| generate_json_method_dispatch_arm(v, structs, enums))
+        .map(|v| generate_json_method_dispatch_arm(v, response_variants, false, structs, enums))
         .collect();
 
     // Streaming dispatch arms for call_streaming_method
@@ -250,7 +250,7 @@ fn generate_json_dispatcher(
                 .inner_request_variants
                 .iter()
                 .filter(|v| !is_streaming_variant(&v.name, &sc.inner_response_variants, true))
-                .map(|v| generate_json_method_dispatch_arm(v, structs, enums))
+                .map(|v| generate_json_method_dispatch_arm(v, &sc.inner_response_variants, true, structs, enums))
                 .collect();
 
             // Streaming dispatch arms for scoped clients
@@ -301,7 +301,7 @@ fn generate_json_dispatcher(
                 .inner_request_variants
                 .iter()
                 .filter(|v| !is_streaming_variant(&v.name, &nested.inner_response_variants, true))
-                .map(|v| generate_json_method_dispatch_arm(v, structs, enums))
+                .map(|v| generate_json_method_dispatch_arm(v, &nested.inner_response_variants, true, structs, enums))
                 .collect();
 
             scoped_dispatchers.push(quote! {
@@ -338,6 +338,8 @@ fn generate_json_dispatcher(
 
 fn generate_json_method_dispatch_arm(
     v: &UnionVariant,
+    response_variants: &[UnionVariant],
+    is_scoped: bool,
     structs: &[StructDef],
     enums: &[EnumDef],
 ) -> TokenStream {
@@ -346,12 +348,33 @@ fn generate_json_method_dispatch_arm(
     let ct = CapnpType::classify(&v.type_name, structs, enums);
 
     match ct {
-        CapnpType::Void => quote! {
-            #method_name_str => {
-                self.#method_name().await?;
-                Ok(serde_json::Value::Null)
+        CapnpType::Void => {
+            // Check if the response is also void by looking up the matching response variant.
+            // Convention: non-scoped uses "{name}Result", scoped uses "{name}" directly.
+            let result_name = if is_scoped {
+                v.name.clone()
+            } else {
+                format!("{}Result", v.name)
+            };
+            let resp = response_variants.iter().find(|r| r.name == result_name);
+            let resp_is_void = resp.map_or(true, |r| r.type_name == "Void");
+
+            if resp_is_void {
+                quote! {
+                    #method_name_str => {
+                        self.#method_name().await?;
+                        Ok(serde_json::Value::Null)
+                    }
+                }
+            } else {
+                quote! {
+                    #method_name_str => {
+                        let result = self.#method_name().await?;
+                        Ok(serde_json::to_value(&result)?)
+                    }
+                }
             }
-        },
+        }
         CapnpType::Text => quote! {
             #method_name_str => {
                 let value = args[#method_name_str].as_str().or_else(|| args["value"].as_str()).unwrap_or_default();
