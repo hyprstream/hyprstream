@@ -1,3 +1,5 @@
+// CLI module — prints to stdout for user interaction
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 //! Schema-driven CLI command builder and dispatcher.
 //!
 //! Builds clap `Command` objects at runtime from `MethodSchema` metadata
@@ -586,8 +588,7 @@ fn format_object_as_kv(obj: &serde_json::Map<String, Value>) -> String {
 /// Format a single cell value for table output.
 fn format_cell(value: Option<&Value>) -> String {
     match value {
-        None => "-".to_string(),
-        Some(Value::Null) => "-".to_string(),
+        None | Some(Value::Null) => "-".to_string(),
         Some(Value::String(s)) => s.clone(),
         Some(Value::Bool(b)) => b.to_string(),
         Some(Value::Number(n)) => n.to_string(),

@@ -290,7 +290,7 @@ async fn download_model(
         id: crate::storage::ModelId::new().to_string(),
         name: model_name,
         status: "downloaded".to_owned(),
-        path: model_path.to_string(),
+        path: model_path.clone(),
     })
     .into_response()
 }

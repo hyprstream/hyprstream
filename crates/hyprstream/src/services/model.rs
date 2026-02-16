@@ -1252,8 +1252,7 @@ fn parse_finish_reason_str(s: &str) -> crate::config::FinishReason {
         match s {
             "max_tokens" => crate::config::FinishReason::MaxTokens,
             "end_of_sequence" => crate::config::FinishReason::EndOfSequence,
-            "stop" => crate::config::FinishReason::Stop,
-            _ => crate::config::FinishReason::Stop,
+            "stop" | _ => crate::config::FinishReason::Stop,
         }
     }
 }

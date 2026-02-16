@@ -488,7 +488,7 @@ impl TenantDelta {
         // Composed delta is non-trainable — dummy optimizer
         let optimizer = tch::nn::AdamW {
             beta1: 0.9, beta2: 0.999, wd: 0.0, eps: 1e-8, amsgrad: false,
-        }.build(&vs, 0.0).expect("dummy optimizer for composed delta");
+        }.build(&vs, 0.0).unwrap_or_else(|_| unreachable!("AdamW::build with valid VarStore"));
         let now = Instant::now();
 
         std::sync::Arc::new(parking_lot::Mutex::new(TenantDelta {
@@ -549,9 +549,8 @@ fn tensor_to_safetensors_data(tensor: &Tensor) -> Result<(safetensors::Dtype, Ve
 /// Map module name to PEFT subpath
 fn module_to_peft_subpath(module: &str) -> &str {
     match module {
-        "q_proj" | "k_proj" | "v_proj" | "o_proj" => "self_attn",
         "gate_proj" | "up_proj" | "down_proj" => "mlp",
-        _ => "self_attn", // default
+        _ => "self_attn", // q_proj, k_proj, v_proj, o_proj, and others
     }
 }
 
@@ -735,7 +734,7 @@ fn serialize_tensor_pairs_to_bytes(
         .iter()
         .map(|(key, dtype, shape, bytes)| {
             let view = TensorView::new(*dtype, shape.clone(), bytes)
-                .expect("TensorView construction should not fail for valid data");
+                .unwrap_or_else(|_| unreachable!("TensorView construction with valid dtype/shape/bytes"));
             (key.clone(), view)
         })
         .collect();
@@ -778,9 +777,8 @@ fn tensor_bytes(t: &Tensor) -> usize {
     let numel = t.numel();
     let elem_size = match t.kind() {
         Kind::Half | Kind::BFloat16 => 2,
-        Kind::Float => 4,
         Kind::Double => 8,
-        _ => 4,
+        _ => 4, // Float and others
     };
     numel * elem_size
 }

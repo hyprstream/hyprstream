@@ -219,19 +219,9 @@ impl LocalInferenceService {
                 let _ = reply.send(result);
             }
 
-            InferenceRequest::LoadLora { path: _, reply } => {
-                let _ = reply.send(Err(InferenceError::LoRA(
-                    "LoRA operations are handled by InferenceService (RPC mode)".to_owned(),
-                )));
-            }
-
-            InferenceRequest::SaveLora { path: _, reply } => {
-                let _ = reply.send(Err(InferenceError::LoRA(
-                    "LoRA operations are handled by InferenceService (RPC mode)".to_owned(),
-                )));
-            }
-
-            InferenceRequest::UnloadLora { reply } => {
+            InferenceRequest::LoadLora { reply, .. }
+            | InferenceRequest::SaveLora { reply, .. }
+            | InferenceRequest::UnloadLora { reply } => {
                 let _ = reply.send(Err(InferenceError::LoRA(
                     "LoRA operations are handled by InferenceService (RPC mode)".to_owned(),
                 )));

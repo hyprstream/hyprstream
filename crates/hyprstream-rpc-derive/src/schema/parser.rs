@@ -189,8 +189,8 @@ pub fn parse_all_structs(text: &str) -> Vec<StructDef> {
 
         if line.starts_with("struct ") && line.contains('{') && line.contains('}') {
             // Single-line struct: struct Foo { field @0 :Type; ... }
-            let brace_open = line.find('{').unwrap();
-            let brace_close = line.rfind('}').unwrap();
+            let Some(brace_open) = line.find('{') else { i += 1; continue; };
+            let Some(brace_close) = line.rfind('}') else { i += 1; continue; };
             let name = line["struct ".len()..brace_open].trim().to_string();
             let body = line[brace_open + 1..brace_close].trim();
 

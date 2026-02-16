@@ -462,11 +462,10 @@ fn params_to_json_schema(params: &[(&str, &str, bool, &str)]) -> Value {
 
     for &(name, type_name, is_required, description) in params {
         let json_type = match type_name {
-            "Text" => "string",
+            "Text" | "Data" => "string",
             "Bool" => "boolean",
             "UInt32" | "UInt64" | "Int32" | "Int64" => "integer",
             "Float32" | "Float64" => "number",
-            "Data" => "string",
             t if t.starts_with("List(") => "array",
             _ => "string",
         };

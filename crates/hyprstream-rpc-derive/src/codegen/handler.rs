@@ -653,7 +653,7 @@ fn generate_dispatch_fn(
         // Extract discriminant to avoid holding Which across awaits
         let discriminant_arms: Vec<TokenStream> = request_variants.iter().map(|v| {
             let variant_pascal = format_ident!("{}", to_pascal_case(&v.name));
-            let disc = syn::Index::from(request_variants.iter().position(|rv| rv.name == v.name).unwrap());
+            let disc = syn::Index::from(request_variants.iter().position(|rv| rv.name == v.name).unwrap_or(0));
             quote! {
                 Which::#variant_pascal(_) => #disc,
             }
@@ -818,15 +818,7 @@ fn generate_serializer_arm(
                 }
             }
         }
-        CapnpType::ListText => quote! {
-            #response_type::#variant_pascal(ref v) => {
-                let mut list = resp.#init_name(v.len() as u32);
-                for (i, item) in v.iter().enumerate() {
-                    list.set(i as u32, item);
-                }
-            }
-        },
-        CapnpType::ListData => quote! {
+        CapnpType::ListText | CapnpType::ListData => quote! {
             #response_type::#variant_pascal(ref v) => {
                 let mut list = resp.#init_name(v.len() as u32);
                 for (i, item) in v.iter().enumerate() {
@@ -1296,12 +1288,7 @@ fn generate_scope_serializer_arm(
                 inner.#setter_name(());
             }
         },
-        CapnpType::Text => quote! {
-            #response_type::#variant_pascal(v) => {
-                inner.#setter_name(v);
-            }
-        },
-        CapnpType::Data => quote! {
+        CapnpType::Text | CapnpType::Data => quote! {
             #response_type::#variant_pascal(v) => {
                 inner.#setter_name(v);
             }
@@ -1341,15 +1328,7 @@ fn generate_scope_serializer_arm(
                 }
             }
         }
-        CapnpType::ListText => quote! {
-            #response_type::#variant_pascal(ref items) => {
-                let mut list = inner.#init_name(items.len() as u32);
-                for (i, item) in items.iter().enumerate() {
-                    list.set(i as u32, item);
-                }
-            }
-        },
-        CapnpType::ListData => quote! {
+        CapnpType::ListText | CapnpType::ListData => quote! {
             #response_type::#variant_pascal(ref items) => {
                 let mut list = inner.#init_name(items.len() as u32);
                 for (i, item) in items.iter().enumerate() {

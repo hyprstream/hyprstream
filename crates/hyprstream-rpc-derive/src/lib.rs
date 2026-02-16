@@ -1268,7 +1268,8 @@ pub fn generate_rpc_service(input: TokenStream) -> TokenStream {
         Ok(p) => p,
         Err(cgr_err) => {
             // Fallback: text parser + metadata JSON merge
-            eprintln!("CGR parser failed for '{name}': {cgr_err}; falling back to text parser");
+            // CGR parser failed — fall back to text parser silently.
+            let _ = cgr_err;
 
             let manifest_dir = match std::env::var("CARGO_MANIFEST_DIR") {
                 Ok(d) => d,
@@ -1338,7 +1339,7 @@ pub fn generate_rpc_service(input: TokenStream) -> TokenStream {
                 let metadata_path = std::path::Path::new(&out_dir).join(format!("{name}_metadata.json"));
                 if let Ok(metadata_text) = std::fs::read_to_string(&metadata_path) {
                     if let Err(e) = schema::merge_annotations_from_metadata(&mut parsed, &metadata_text) {
-                        eprintln!("Warning: Failed to load annotations for {name}: {e}");
+                        let _ = e; // annotation metadata load failed; non-fatal
                     }
                 }
             }

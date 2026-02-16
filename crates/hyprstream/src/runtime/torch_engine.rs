@@ -226,10 +226,9 @@ impl TorchEngine {
                         let numel = t.numel();
                         let elem_size = match t.kind() {
                             tch::Kind::Half | tch::Kind::BFloat16 => 2,
-                            tch::Kind::Float => 4,
                             tch::Kind::Double => 8,
                             tch::Kind::Int8 | tch::Kind::Uint8 => 1,
-                            _ => 4,
+                            _ => 4, // Float and others
                         };
                         numel * elem_size
                     })

@@ -27,9 +27,6 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
-/// Service name for endpoint registry
-const SERVICE_NAME: &str = "registry";
-
 // Generated client types
 use crate::services::generated::registry_client::{
     RegistryClient as GenRegistryClient, RegistryResponseVariant,
@@ -58,19 +55,6 @@ use crate::services::generated::registry_client::{
 // ============================================================================
 // Parsing Helper Functions
 // ============================================================================
-
-/// Parse a stream started response — uses generated response parser
-fn parse_stream_started_response(response: &[u8]) -> Result<crate::services::rpc_types::StreamInfo> {
-    match GenRegistryClient::parse_response(response)? {
-        RegistryResponseVariant::CloneStreamResult(data) => Ok(crate::services::rpc_types::StreamInfo {
-            stream_id: data.stream_id,
-            endpoint: data.endpoint,
-            server_pubkey: data.server_pubkey,
-        }),
-        RegistryResponseVariant::Error(ref e) => Err(anyhow!("{}", e.message)),
-        _ => Err(anyhow!("Expected clone_stream_result response")),
-    }
-}
 
 /// Convert generated variant fields into a TrackedRepository.
 fn variant_to_tracked_repository(

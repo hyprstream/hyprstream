@@ -94,8 +94,8 @@ fn generate_data_struct(
         .map(|field| {
             let rust_name = format_ident!("{}", to_snake_case(&field.name));
             let rust_type = if field.type_name == "Data" && field.fixed_size.is_some() {
-                let n = field.fixed_size.unwrap() as usize;
-                let ts: TokenStream = format!("[u8; {n}]").parse().unwrap();
+                let n = field.fixed_size.unwrap_or(0) as usize;
+                let ts: TokenStream = format!("[u8; {n}]").parse().unwrap_or_else(|_| quote! { Vec<u8> });
                 ts
             } else {
                 rust_type_tokens(&CapnpType::classify(&field.type_name, structs, enums).rust_owned_type())
@@ -173,7 +173,6 @@ fn generate_data_field_setter(
     let ct = CapnpType::classify(&field.type_name, structs, enums);
 
     match ct {
-        CapnpType::Void => TokenStream::new(),
         CapnpType::Text | CapnpType::Data => {
             quote! { builder.#setter_name(&self.#rust_name); }
         }
@@ -307,7 +306,7 @@ fn generate_data_field_reader(
         CapnpType::Void => quote! { #rust_name: (), },
         CapnpType::Text => quote! { #rust_name: reader.#getter_name()?.to_str()?.to_string(), },
         CapnpType::Data if field.fixed_size.is_some() => {
-            let n = field.fixed_size.unwrap() as usize;
+            let n = field.fixed_size.unwrap_or(0) as usize;
             let n_lit = proc_macro2::Literal::usize_unsuffixed(n);
             let field_name_str = field.name.as_str();
             quote! {

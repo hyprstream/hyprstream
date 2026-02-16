@@ -100,7 +100,7 @@ impl CapnpType {
             Self::Void => "()".into(),
             Self::Bool => "bool".into(),
             Self::Text => "String".into(),
-            Self::Data => "Vec<u8>".into(),
+            Self::Data | Self::Unknown(_) => "Vec<u8>".into(),
             Self::UInt8 => "u8".into(),
             Self::UInt16 => "u16".into(),
             Self::UInt32 => "u32".into(),
@@ -117,20 +117,18 @@ impl CapnpType {
             Self::ListStruct(inner) => format!("Vec<{inner}>"),
             Self::Struct(name) => format!("{name}"),
             Self::Enum(name) => format!("{name}Enum"),
-            Self::Unknown(_) => "Vec<u8>".into(),
         }
     }
 
     /// The Rust parameter type string (borrowed where appropriate).
     pub fn rust_param_type(&self) -> String {
         match self {
-            Self::Text => "&str".into(),
+            Self::Text | Self::Enum(_) => "&str".into(),
             Self::Data => "&[u8]".into(),
             Self::ListText => "&[String]".into(),
             Self::ListData => "&[Vec<u8>]".into(),
             Self::ListPrimitive(inner) => format!("&[{}]", inner.rust_owned_type()),
             Self::ListStruct(inner) => format!("&[{inner}]"),
-            Self::Enum(_) => "&str".into(),
             _ => self.rust_owned_type(),
         }
     }

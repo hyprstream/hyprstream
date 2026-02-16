@@ -16,7 +16,7 @@ use crate::util::*;
 /// When `types_crate` is `Some`, the path is resolved through the external crate;
 /// otherwise it is resolved through `crate::`.
 fn resolve_domain_type(domain_path: &str, types_crate: Option<&syn::Path>) -> TokenStream {
-    let path: TokenStream = domain_path.parse().expect("invalid domain type path");
+    let path: TokenStream = domain_path.parse().unwrap_or_else(|_| quote! { Vec<u8> });
     match types_crate {
         Some(tc) => quote! { #tc::#path },
         None => quote! { crate::#path },

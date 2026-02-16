@@ -1181,8 +1181,8 @@ impl SandboxHandler for WorkerService {
     async fn handle_list_stats(&self, _ctx: &EnvelopeContext, _request_id: u64, filter: &PodSandboxStatsFilter) -> AnyhowResult<Vec<PodSandboxStats>> {
         // Convert generated Filter to internal Filter
         let internal_filter = super::client::PodSandboxStatsFilter {
-            id: if filter.id.is_empty() { None } else { Some(filter.id.to_string()) },
-            label_selector: filter.label_selector.to_vec(),
+            id: if filter.id.is_empty() { None } else { Some(filter.id.clone()) },
+            label_selector: filter.label_selector.clone(),
         };
         let stats = self.list_pod_sandbox_stats(Some(&internal_filter)).await?;
         Ok(stats)
