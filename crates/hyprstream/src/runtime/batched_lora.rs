@@ -277,10 +277,6 @@ mod tests {
         assert_eq!(results[0].size(), vec![1, 5, 64]);
         assert_eq!(results[1].size(), vec![1, 5, 64]);
 
-        // Results should be different (different deltas, different inputs)
-        let diff: f64 = (&results[0] - &results[1]).abs().sum(Kind::Float).double_value(&[]);
-        // Note: both have random init, so they should differ
-        // (unless both produce zeros, which is possible with zero B init)
     }
 
     #[test]
@@ -301,7 +297,7 @@ mod tests {
 
         // Batched path with batch_size=1
         let batch_results = batched
-            .batched_lora_forward(&[&x], "q_proj", &[tenant.clone()], 0)
+            .batched_lora_forward(&[&x], "q_proj", std::slice::from_ref(&tenant), 0)
             .unwrap();
 
         // Should be identical

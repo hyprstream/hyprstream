@@ -1147,6 +1147,7 @@ pub fn unwrap_response(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::crypto::signing::generate_signing_keypair;
@@ -1481,7 +1482,7 @@ mod tests {
 
         for subject in cases {
             let s = subject.to_string();
-            let parsed: Subject = s.parse().unwrap();
+            let parsed: Subject = s.parse().expect("parse subject roundtrip");
             assert_eq!(subject, parsed, "Roundtrip failed for {s}");
         }
     }
@@ -1496,16 +1497,16 @@ mod tests {
     #[test]
     fn test_subject_legacy_prefix_parsing() {
         // Legacy prefixed formats should strip the prefix
-        assert_eq!("local:alice".parse::<Subject>().unwrap(), Subject::new("alice"));
-        assert_eq!("token:bob".parse::<Subject>().unwrap(), Subject::new("bob"));
-        assert_eq!("peer:gpu-1".parse::<Subject>().unwrap(), Subject::new("gpu-1"));
-        assert_eq!("user:charlie".parse::<Subject>().unwrap(), Subject::new("charlie"));
+        assert_eq!("local:alice".parse::<Subject>().expect("parse local:alice"), Subject::new("alice"));
+        assert_eq!("token:bob".parse::<Subject>().expect("parse token:bob"), Subject::new("bob"));
+        assert_eq!("peer:gpu-1".parse::<Subject>().expect("parse peer:gpu-1"), Subject::new("gpu-1"));
+        assert_eq!("user:charlie".parse::<Subject>().expect("parse user:charlie"), Subject::new("charlie"));
 
         // Bare names pass through
-        assert_eq!("alice".parse::<Subject>().unwrap(), Subject::new("alice"));
+        assert_eq!("alice".parse::<Subject>().expect("parse alice"), Subject::new("alice"));
 
         // Unknown prefixes are treated as bare names (contain ':')
-        assert_eq!("unknown:foo".parse::<Subject>().unwrap(), Subject::new("unknown:foo"));
+        assert_eq!("unknown:foo".parse::<Subject>().expect("parse unknown:foo"), Subject::new("unknown:foo"));
     }
 
     #[test]
