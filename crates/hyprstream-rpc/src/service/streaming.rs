@@ -51,7 +51,6 @@
 //! - **Per-topic limit**: Max 1000 messages per topic (oldest dropped on overflow)
 //! - **Retransmit buffer**: Chunks retained for resume requests (HMAC-indexed)
 
-use crate::auth::Scope;
 use crate::capnp::FromCapnp;
 use crate::common_capnp;
 use crate::streaming_capnp;
@@ -96,7 +95,7 @@ struct StreamState {
 
 impl StreamState {
     /// Find position in buffer matching the given MAC
-    /// Supports both 32-byte legacy HMAC and 16-byte StreamBlock MAC
+    /// Matches MAC by length (16-byte truncated StreamBlock MAC)
     fn find_mac_position(&self, mac: &[u8]) -> Option<usize> {
         self.messages.iter().position(|msg| {
             if msg.mac.len() == mac.len() {
@@ -254,22 +253,8 @@ impl StreamService {
         let (topic, exp) = parse_stream_register(&signed.envelope.payload)
             .ok_or_else(|| anyhow!("Invalid StreamRegister payload"))?;
 
-        // Check claims allow publishing to this topic
-        if let Some(claims) = &signed.envelope.claims {
-            let required = Scope::new(
-                "publish".to_owned(),
-                "stream".to_owned(),
-                topic.clone(),
-            );
-            let has_scope = claims.admin || claims.scopes.iter().any(|s| s.grants(&required));
-
-            if !has_scope {
-                return Err(anyhow!(
-                    "Claims do not authorize publishing to stream: {}",
-                    topic
-                ));
-            }
-        }
+        // Authorization is enforced via Casbin policies server-side.
+        // The signed envelope verification above ensures authenticity.
 
         // Register the stream (blind forwarder - no HMAC key needed)
         streams.insert(topic.clone(), StreamState {

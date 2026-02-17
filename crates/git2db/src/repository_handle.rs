@@ -63,6 +63,44 @@ impl<'a> RepositoryHandle<'a> {
         Ok(&self.metadata()?.tracking_ref)
     }
 
+    /// Resolve a working tree path suitable for git operations.
+    ///
+    /// For bare repositories (e.g. cloned models stored as `name.git`),
+    /// `worktree()` returns the bare repo path, which cannot be used for
+    /// operations requiring a working tree (status, staging, etc.).
+    /// This method finds the actual worktree for the tracking ref.
+    pub async fn resolve_worktree_path(&self) -> Git2DBResult<PathBuf> {
+        let base_path = self.worktree()?.to_path_buf();
+
+        // Detect bare repo: path ends in .git or has HEAD but no .git subdir
+        let is_bare = base_path.extension().is_some_and(|ext| ext == "git")
+            || (base_path.join("HEAD").exists() && !base_path.join(".git").exists());
+
+        if !is_bare {
+            return Ok(base_path);
+        }
+
+        // Try the tracking ref's worktree
+        let tracked = self.metadata()?;
+        if let GitRef::Branch(ref branch) = tracked.tracking_ref {
+            if let Ok(Some(wt)) = self.get_worktree(branch).await {
+                return Ok(wt.path().to_path_buf());
+            }
+        }
+
+        // Fallback: try any available worktree
+        if let Ok(worktrees) = self.get_worktrees().await {
+            if let Some(wt) = worktrees.into_iter().next() {
+                return Ok(wt.path().to_path_buf());
+            }
+        }
+
+        Err(Git2DBError::repository(
+            &base_path,
+            "No worktrees found for bare repository",
+        ))
+    }
+
     /// Get the current OID (commit hash)
     pub fn current_oid(&self) -> Git2DBResult<Option<Oid>> {
         match &self.metadata()?.current_oid {
@@ -344,7 +382,7 @@ impl<'a> RepositoryHandle<'a> {
     /// - The repository cannot be opened
     /// - The status cannot be retrieved
     pub async fn status(&self) -> Git2DBResult<RepositoryStatus> {
-        let repo_path = self.worktree()?.to_path_buf();
+        let repo_path = self.resolve_worktree_path().await?;
 
         tokio::task::spawn_blocking(move || {
             let repo = crate::manager::GitManager::global()

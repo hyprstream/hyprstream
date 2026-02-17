@@ -7,14 +7,7 @@
 //! - `worker rm` - Remove a sandbox or container
 //! - `worker images` - Image management subcommands
 
-use clap::{Args, Subcommand};
-
-/// Worker management commands
-#[derive(Args)]
-pub struct WorkerCommand {
-    #[command(subcommand)]
-    pub action: WorkerAction,
-}
+use clap::Subcommand;
 
 /// Worker actions
 #[derive(Subcommand)]

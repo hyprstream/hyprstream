@@ -90,29 +90,33 @@ impl RoPE {
     }
 
     /// Generate sin/cos embeddings for the given sequence length
+    ///
+    /// CRITICAL: Always computed in FP32 regardless of model dtype, then cast to target dtype.
+    /// BF16 computation causes catastrophic precision loss:
+    /// - Position indices > 256 get quantized (BF16 can't represent all integers)
+    /// - inv_freq computation with large base (e.g., 1000000) loses significant precision
+    /// - Compounding errors in angles → sin/cos cause progressive generation corruption
+    ///   This matches HuggingFace/vLLM/llama.cpp which all compute RoPE in FP32.
     fn generate_embeddings(&self, seq_len: i64) -> Result<(Tensor, Tensor)> {
-        // Create frequency bands: 1 / (base ^ (2i / dim)) for i in [0, dim/2)
+        // Create frequency bands in FP32: 1 / (base ^ (2i / dim)) for i in [0, dim/2)
         let half_dim = self.dim / 2;
         let inv_freq = {
-            let positions = Tensor::arange(half_dim, (self.dtype, self.device));
+            let positions = Tensor::arange(half_dim, (Kind::Float, self.device));
             let exponents = &positions * 2.0 / (self.dim as f64);
-            // Correct: base^(-2i/dim) = 1 / (base^(2i/dim))
-            // Create a tensor filled with the base value that matches the shape of exponents
-            let base_tensor = Tensor::full([half_dim], self.base, (self.dtype, self.device));
-            // Now both tensors have the same shape [half_dim], so pow will work
+            let base_tensor = Tensor::full([half_dim], self.base, (Kind::Float, self.device));
             base_tensor.pow(&(-exponents))
         };
 
-        // Create position indices [0, 1, 2, ..., seq_len-1]
-        let positions = Tensor::arange(seq_len, (self.dtype, self.device));
+        // Create position indices in FP32 [0, 1, 2, ..., seq_len-1]
+        let positions = Tensor::arange(seq_len, (Kind::Float, self.device));
 
-        // Compute angles: position[i] * inv_freq[j] for all i, j
+        // Compute angles in FP32: position[i] * inv_freq[j] for all i, j
         // Result shape: [seq_len, dim/2]
         let angles = positions.unsqueeze(-1).matmul(&inv_freq.unsqueeze(0));
 
-        // Compute sin and cos
-        let sin_vals = angles.sin();
-        let cos_vals = angles.cos();
+        // Compute sin and cos in FP32, then cast to target dtype
+        let sin_vals = angles.sin().to_kind(self.dtype);
+        let cos_vals = angles.cos().to_kind(self.dtype);
 
         Ok((sin_vals, cos_vals))
     }

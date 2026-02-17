@@ -126,7 +126,7 @@ Services can enforce user-level authorization via JWT tokens embedded in request
 │    │                             │                            │             │
 │    │ 2. Make RPC call with JWT   │                            │             │
 │    │ RequestEnvelope {           │                            │             │
-│    │   jwt_token: "hypr_eyJ..."  │                            │             │
+│    │   jwt_token: "eyJ..."       │                            │             │
 │    │   payload: GenerateRequest  │                            │             │
 │    │   ... (signed envelope)     │                            │             │
 │    │ }                           │                            │             │

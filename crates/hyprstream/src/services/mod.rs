@@ -8,7 +8,7 @@
 //! All requests are wrapped in `SignedEnvelope` for authentication:
 //! - `RequestLoop` verifies Ed25519 signatures before dispatching
 //! - Handlers receive `EnvelopeContext` with verified identity
-//! - Services use `ctx.casbin_subject()` for policy checks
+//! - Services use `ctx.subject()` for policy checks and resource isolation
 //!
 //! # Architecture
 //!
@@ -16,7 +16,7 @@
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │  hyprstream/src/services/                                   │
 //! │  ├── core.rs      ← ZmqService trait, runners, clients     │
-//! │  ├── traits.rs    ← RegistryClient, RepositoryClient traits│
+//! │  ├── types.rs     ← Shared types (FsDirEntry, ModelInfo, etc.)│
 //! │  ├── registry.rs  ← Registry service (REP) + client (REQ)  │
 //! │  └── inference.rs ← Inference service (REP) + client (REQ) │
 //! └─────────────────────────────────────────────────────────────┘
@@ -42,10 +42,10 @@
 //! }
 //!
 //! impl ZmqService for MyService {
-//!     fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<Vec<u8>> {
+//!     fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<Continuation>)> {
 //!         // ctx.identity is already verified
-//!         println!("Request from: {}", ctx.casbin_subject());
-//!         Ok(vec![])
+//!         println!("Request from: {}", ctx.subject());
+//!         Ok((vec![], None))
 //!     }
 //!
 //!     fn name(&self) -> &str { "my-service" }
@@ -68,12 +68,18 @@
 //! ```
 
 mod core;
-mod traits;
+mod types;
+mod worktree_helpers;
+pub use worktree_helpers::StatResult;
+pub mod contained_root;
 pub mod callback;
 pub mod factories;
 pub mod flight;
+pub mod generated;
 pub mod inference;
+pub mod mcp_service;
 pub mod model;
+pub mod oauth;
 pub mod oai;
 pub mod policy;
 pub mod registry;
@@ -82,25 +88,42 @@ pub mod stream;
 pub mod worker;
 
 pub use core::{
-    CallOptions, EnvelopeContext, ZmqClient, ZmqService,
+    CallOptions, Continuation, EnvelopeContext, ZmqClient, ZmqService,
+    create_service_client,
 };
 
-pub use traits::{
-    CloneOptions, DetailedStatus, FileChangeType, FileStatus, ModelInfo, RegistryClient,
-    RegistryServiceError, RemoteInfo, RepositoryClient, WorktreeInfo,
+// Generated client types — the public API
+pub use generated::registry_client::{
+    RegistryClient as GenRegistryClient,
+    RepositoryClient, WorktreeClient,
+    TrackedRepository as GenTrackedRepository,
+    WorktreeInfo as GenWorktreeInfo,
+    RepositoryStatus as GenRepositoryStatus,
+    RemoteInfo,
+    RWalk, ROpen, RRead, RWrite, RStat,
+    NpStat as NpStatData, Qid as QidData,
+};
+
+// Remaining domain types
+pub use types::{
+    MAX_FDS_GLOBAL, MAX_FDS_PER_CLIENT, MAX_FS_IO_SIZE,
+    DEFAULT_IOUNIT, MAX_IOUNIT,
+    QTDIR, QTFILE, OREAD, OWRITE, ORDWR, OTRUNC, ORCLOSE, DMDIR,
+    FsDirEntryInfo,
 };
 
 pub use inference::{InferenceService, InferenceZmqClient, INFERENCE_ENDPOINT};
-pub use registry::{
-    RegistryOps, RegistryService, RegistryZmq, RegistryZmqClient, RepositoryZmqClient,
-};
-pub use policy::{PolicyService, PolicyZmqClient};
+pub use registry::RegistryService;
+pub use policy::PolicyService;
+pub use generated::policy_client::PolicyClient;
 pub use model::{
     LoadedModelInfo, ModelHealthInfo, ModelService, ModelServiceConfig, ModelStatusInfo,
     ModelZmqClient, MODEL_ENDPOINT,
 };
 pub use stream::StreamService;
-pub use worker::WorkerClient;
+pub use worker::{WorkerZmqClient, WorkflowZmqClient, build_authorize_fn};
+pub use oauth::OAuthService;
 pub use oai::OAIService;
 pub use flight::FlightService;
 pub use callback::{CallbackRouter, Instance};
+pub use mcp_service::{McpConfig, McpService};

@@ -1,5 +1,7 @@
 @0xa8c9e2f1d3b5a7c0;
 
+using import "/streaming.capnp".StreamInfo;
+
 # Cap'n Proto schema for inference service
 #
 # The inference service uses REQ/REP pattern for request handling.
@@ -7,8 +9,8 @@
 #
 # Streaming Architecture:
 #   - Wire format types are in hyprstream-rpc/schema/streaming.capnp
-#   - This file defines inference-specific payload types
-#   - InferencePayload gets serialized into streaming.capnp::StreamBlock.payloads
+#   - Streaming payloads use generic StreamPayload (data/complete/error/heartbeat)
+#   - Completion metadata serialized as JSON InferenceComplete (see rpc_types.rs)
 
 struct InferenceRequest {
   # Request ID for tracking
@@ -38,10 +40,22 @@ struct InferenceRequest {
     healthCheck @14 :Void;
     shutdown @15 :Void;
 
-    # Stream authorization handshake
-    # Client calls this after generateStream to authorize subscription
-    # Future: will include client public key for DH key exchange
-    startStream @16 :StartStreamRequest;
+    # Training loop control — tenant-aware TTT (identity from auth envelope)
+    commitAdaptation @16 :Void;
+    rollbackAdaptation @17 :Void;
+    trainStep @18 :TrainStepRequest;
+    resetDelta @19 :Void;
+
+    # Persistence operations (identity from auth envelope)
+    getDeltaStatus @20 :Void;
+    saveAdaptation @21 :SaveAdaptationRequest;
+    snapshotDelta @22 :Void;
+
+    # Streaming training (returns immediately, results via PUB/SUB)
+    trainStepStream @23 :TrainStepRequest;
+
+    # Export delta as PEFT adapter directory (identity from auth envelope)
+    exportPeftAdapter @24 :ExportPeftRequest;
   }
 }
 
@@ -50,27 +64,41 @@ struct InferenceResponse {
   requestId @0 :UInt64;
 
   # Response payload (union of response types)
+  # Convention: response variant name = request variant name + "Result"
   union {
     success @1 :Void;
     error @2 :ErrorInfo;
-    generationResult @3 :GenerationResult;
-    streamStarted @4 :StreamInfo;
-    modelInfo @5 :ModelInfo;
-    ready @6 :Bool;
-    templateResult @7 :Text;
-    loraCreated @8 :Void;
-    loraLoaded @9 :Void;
-    loraSaved @10 :Void;
-    loraUnloaded @11 :Void;
+    generateResult @3 :GenerationResult;
+    generateStreamResult @4 :StreamInfo;
+    modelInfoResult @5 :ModelInfo;
+    isReadyResult @6 :Bool;
+    applyChatTemplateResult @7 :Text;
+    createLoraResult @8 :Void;
+    loadLoraResult @9 :Void;
+    saveLoraResult @10 :Void;
+    unloadLoraResult @11 :Void;
     hasLoraResult @12 :Bool;
-    sessionSet @13 :Void;
-    sessionCleared @14 :Void;
-    sessionReleased @15 :Void;
-    health @16 :HealthStatus;
+    setSessionResult @13 :Void;
+    clearSessionResult @14 :Void;
+    releaseSessionResult @15 :Void;
+    healthCheckResult @16 :HealthStatus;
 
-    # Stream authorization response
-    # Future: will include server public key for DH key exchange
-    streamAuthorized @17 :StreamAuthResponse;
+    # Training loop control responses
+    commitAdaptationResult @17 :Void;
+    rollbackAdaptationResult @18 :Void;
+    trainStepResult @19 :TrainStepResult;
+    resetDeltaResult @20 :Void;
+
+    # Persistence responses
+    getDeltaStatusResult @21 :DeltaStatusResult;
+    saveAdaptationResult @22 :SaveAdaptationResult;
+    snapshotDeltaResult @23 :SnapshotDeltaResult;
+
+    # Streaming training response
+    trainStepStreamResult @24 :StreamInfo;
+
+    # Export PEFT adapter response
+    exportPeftAdapterResult @25 :ExportPeftResult;
   }
 }
 
@@ -103,6 +131,9 @@ struct GenerationResult {
   inferenceTokens @9 :UInt32;
   inferenceTimeMs @10 :UInt64;
   inferenceTokensPerSec @11 :Float32;
+
+  # Online training adaptation metrics (optional)
+  onlineTrainingMetrics @12 :OnlineTrainingMetrics;
 }
 
 # Quality metrics for self-supervised training
@@ -111,6 +142,39 @@ struct QualityMetrics {
   avgEntropy @1 :Float32;
   entropyVariance @2 :Float32;
   repetitionRatio @3 :Float32;
+}
+
+# Online Training Metrics
+#
+# Online training adapts the model to input context BEFORE generation
+# using next-token prediction loss. Metrics show adaptation effectiveness.
+#
+# Populated when:
+# - Online training enabled in model config (mode = "test_time_training")
+# - Input length >= min_input_length (default: 32 tokens)
+# - LoRA adapter is loaded
+struct OnlineTrainingMetrics {
+  avgLoss @0 :Float32;              # Average loss across gradient steps
+  lossImprovement @1 :Float32;       # Loss reduction (initial - final)
+  stepsPerformed @2 :UInt32;         # Gradient steps executed
+  adaptationTimeMs @3 :UInt64;       # Time spent on adaptation (ms)
+  skipped @4 :Bool;                  # Whether adaptation was skipped
+  skipReason @5 :Text;               # Why skipped (if applicable)
+
+  # Advanced metrics for ML practitioners (expert recommendation)
+  avgGradNorm @6 :Float32;           # Average gradient norm across steps
+  maxGradNorm @7 :Float32;           # Maximum gradient norm observed
+  gradientClipped @8 :Bool;          # Whether gradients were clipped
+  tokensUsed @9 :UInt32;             # Tokens actually used for adaptation
+  tokensProvided @10 :UInt32;        # Total tokens in input
+  wasTruncated @11 :Bool;            # Whether input was truncated (>max_ttt_context)
+
+  # Tenant-aware TTT metrics
+  initialPerplexity @12 :Float32;    # Perplexity before adaptation
+  finalPerplexity @13 :Float32;      # Perplexity after adaptation
+  recommendation @14 :Bool;          # Server's commit/rollback recommendation
+  gatedSteps @15 :UInt32;            # Steps determined by perplexity gating
+  pending @16 :Bool;                 # Whether adaptation awaits client commit/rollback
 }
 
 enum FinishReason {
@@ -122,81 +186,12 @@ enum FinishReason {
 }
 
 # =============================================================================
-# Stream Setup (aligns with streaming.capnp::StreamInfo)
+# Legacy types removed:
+#   - InferencePayload: Replaced by generic StreamPayload (streaming.capnp)
+#   - InferenceComplete (capnp): The Rust/JSON version in rpc_types.rs is the
+#     actual wire format, serialized into StreamPayload::Complete as JSON bytes.
+#   - InferenceStats: Legacy, was replaced by InferenceComplete.
 # =============================================================================
-
-# Response when starting a stream - contains info needed to subscribe
-# Note: Matches streaming.capnp::StreamInfo for consistency
-struct StreamInfo {
-  streamId @0 :Text;
-  endpoint @1 :Text;
-  serverPubkey @2 :Data;  # Server's ephemeral Ristretto255 public key (32 bytes) for DH
-}
-
-# Stream authorization handshake
-# Note: Matches streaming.capnp::StreamStartRequest/StreamAuthResponse
-
-struct StartStreamRequest {
-  streamId @0 :Text;
-  clientPubkey @1 :Data;  # Client's ephemeral Ristretto255 public key (32 bytes)
-}
-
-struct StreamAuthResponse {
-  streamId @0 :Text;
-  serverPubkey @1 :Data;  # Server's ephemeral Ristretto255 public key (if not in StreamInfo)
-}
-
-# =============================================================================
-# Inference Payload (serialized into streaming.capnp::StreamBlock.payloads)
-# =============================================================================
-
-# The actual inference payload - gets serialized into wire format StreamBlock.payloads
-# This is the application-layer content, not the wire format.
-struct InferencePayload {
-  streamId @0 :Text;
-
-  union {
-    token @1 :Text;                   # Generated token text
-    complete @2 :InferenceStats;      # Generation complete with stats
-    error @3 :ErrorInfo;              # Error during generation
-  }
-}
-
-# Inference-specific completion statistics
-#
-# Serialized into StreamPayload.complete (streaming.capnp) as raw bytes.
-# Contains full generation metrics including prefill and inference breakdown.
-struct InferenceComplete {
-  # Overall metrics
-  tokensGenerated @0 :UInt32;
-  finishReason @1 :Text;          # "stop", "length", "eos", "error"
-  generationTimeMs @2 :UInt64;
-  tokensPerSecond @3 :Float32;
-
-  # Prefill metrics (processing the prompt)
-  prefillTokens @4 :UInt32;
-  prefillTimeMs @5 :UInt64;
-  prefillTokensPerSec @6 :Float32;
-
-  # Inference metrics (generating new tokens, excluding prefill)
-  inferenceTokens @7 :UInt32;
-  inferenceTimeMs @8 :UInt64;
-  inferenceTokensPerSec @9 :Float32;
-  inferenceTokensPerSecEma @10 :Float32;  # EMA for adaptive batching
-
-  # Optional quality metrics (0.0 means not set)
-  perplexity @11 :Float32;
-  avgEntropy @12 :Float32;
-}
-
-# Legacy inference stats (kept for backwards compatibility)
-struct InferenceStats {
-  tokensGenerated @0 :UInt32;
-  finishReason @1 :FinishReason;
-  generationTimeMs @2 :UInt64;
-  tokensPerSecond @3 :Float32;
-  qualityMetrics @4 :QualityMetrics;  # Inference-specific quality metrics
-}
 
 # Chat Template
 
@@ -217,6 +212,7 @@ struct LoraConfig {
   alpha @1 :Float32;
   dropout @2 :Float32;
   targetModules @3 :List(Text);
+  learningRate @4 :Float32;
 }
 
 # Model Info
@@ -242,6 +238,79 @@ struct HealthStatus {
   kvCacheUsagePercent @2 :Float32;
   gpuMemoryUsedMb @3 :UInt32;
   gpuMemoryTotalMb @4 :UInt32;
+}
+
+# =============================================================================
+# Training Loop Control (TTT operations)
+# =============================================================================
+
+struct TrainStepRequest {
+  input @0 :Text;
+  gradientSteps @1 :UInt32;
+  learningRate @2 :Float32;
+  autoCommit @3 :Bool;
+}
+
+struct TrainStepResult {
+  avgLoss @0 :Float32;
+  lossImprovement @1 :Float32;
+  stepsPerformed @2 :UInt32;
+  adaptationTimeMs @3 :UInt64;
+  initialPerplexity @4 :Float32;
+  finalPerplexity @5 :Float32;
+  recommendation @6 :Bool;
+  committed @7 :Bool;
+  gradientClipped @8 :Bool;
+}
+
+struct SaveAdaptationRequest {
+  name @0 :Text;
+  mergeStrategy @1 :Text;
+  mergeWeight @2 :Float32;
+  commitMessage @3 :Text;
+}
+
+struct SaveAdaptationResult {
+  adapterName @0 :Text;
+  adapterPath @1 :Text;
+  contentHash @2 :Text;
+  mergeStrategy @3 :Text;
+}
+
+struct DeltaStatusResult {
+  exists @0 :Bool;
+  accumulatedSteps @1 :UInt64;
+  maxAccumulatedSteps @2 :UInt64;
+  requestCount @3 :UInt64;
+  avgLossImprovement @4 :Float32;
+  memoryBytes @5 :UInt64;
+  lastSnapshotHash @6 :Text;
+  deltaNormRatios @7 :List(ModuleNormRatio);
+  hasPending @8 :Bool;
+}
+
+struct ModuleNormRatio {
+  moduleName @0 :Text;
+  ratio @1 :Float32;
+}
+
+struct SnapshotDeltaResult {
+  contentHash @0 :Text;
+  sizeBytes @1 :UInt64;
+  accumulatedSteps @2 :UInt64;
+  requestCount @3 :UInt64;
+}
+
+# Export PEFT Adapter
+
+struct ExportPeftRequest {
+  name @0 :Text;
+  commitMessage @1 :Text;
+}
+
+struct ExportPeftResult {
+  adapterPath @0 :Text;
+  contentHash @1 :Text;
 }
 
 # Error Information

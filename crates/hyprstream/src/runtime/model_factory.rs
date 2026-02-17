@@ -13,6 +13,7 @@ use super::architectures::{gemma::GemmaModel, llama::LlamaModel, ModelOperations
 use super::kv_quant::KVQuantType;
 use super::model_config::{ModelArchitecture, ModelConfig};
 use super::torch_utils::{safe_to_device, estimate_tensor_size_mb};
+use crate::services::WorktreeClient;
 
 /// Factory for creating models with proper configuration management
 pub struct ModelFactory;
@@ -682,5 +683,123 @@ impl ModelFactory {
             *device,
             dtype,
         )?))
+    }
+
+    // =========================================================================
+    // FsOps-aware methods (worktree-scoped, path-contained access)
+    // =========================================================================
+
+    /// Create a model using FsOps for weight loading.
+    ///
+    /// Uses FsOps::read_file() instead of direct filesystem access.
+    /// The `model_path` is still needed for ModelConfig and architecture detection
+    /// (which parse config.json), but weight data is read through FsOps.
+    #[instrument(name = "model_factory.create_with_fs", skip(device, dtype, fs), fields(model_path = %model_path.display()))]
+    pub async fn create_with_fs(
+        model_path: &Path,
+        device: &Device,
+        dtype: DType,
+        max_context: Option<usize>,
+        kv_quant_type: KVQuantType,
+        fs: &WorktreeClient,
+    ) -> Result<Box<dyn ModelOperations>> {
+        info!("Loading model via FsOps: {}", model_path.display());
+
+        let shard_names = Self::find_shard_names_fs(fs).await?;
+
+        if shard_names.len() > 1 {
+            info!("Loading {} weight shards via FsOps", shard_names.len());
+        }
+
+        let weights = Self::load_weights_fs(fs, &shard_names, device, dtype).await?;
+        let config = ModelConfig::load(model_path, &weights)?;
+        let model = Self::create_model_from_config(config, weights, device, dtype, max_context, kv_quant_type)?;
+        info!("Model created successfully via FsOps");
+        Ok(model)
+    }
+
+    /// Detect model dtype using FsOps for file reading.
+    pub async fn detect_model_dtype_fs(fs: &WorktreeClient) -> Result<DType> {
+        let shard_names = Self::find_shard_names_fs(fs).await?;
+        if shard_names.is_empty() {
+            return Err(anyhow!("No model weights found"));
+        }
+
+        let file_content = fs.read_file_chunked(&shard_names[0]).await?;
+        let tensors = safetensors::SafeTensors::deserialize(&file_content)?;
+
+        let mut f16_count = 0;
+        let mut bf16_count = 0;
+        let mut f32_count = 0;
+
+        for (_, tensor) in tensors.tensors().into_iter().take(10) {
+            match tensor.dtype() {
+                safetensors::Dtype::F16 => f16_count += 1,
+                safetensors::Dtype::BF16 => bf16_count += 1,
+                safetensors::Dtype::F32 => f32_count += 1,
+                _ => {},
+            }
+        }
+
+        if f16_count > bf16_count && f16_count > f32_count {
+            info!("Detected F16 model (via FsOps)");
+            Ok(tch::Kind::Half)
+        } else if bf16_count >= f16_count && bf16_count >= f32_count {
+            info!("Detected BF16 model (via FsOps)");
+            Ok(tch::Kind::BFloat16)
+        } else if f32_count > 0 {
+            info!("Detected F32 model (via FsOps)");
+            Ok(tch::Kind::Float)
+        } else {
+            info!("Could not detect model dtype via FsOps, defaulting to BF16");
+            Ok(tch::Kind::BFloat16)
+        }
+    }
+
+    /// Find shard file names via FsOps (returns relative paths).
+    async fn find_shard_names_fs(fs: &WorktreeClient) -> Result<Vec<String>> {
+        // Check for single file first
+        if fs.stat_path("model.safetensors").await.map(|s| s.exists).unwrap_or(false) {
+            return Ok(vec!["model.safetensors".to_owned()]);
+        }
+
+        // Look for sharded files
+        let entries = fs.list_dir_path(".").await?;
+        let mut shard_names: Vec<String> = entries
+            .into_iter()
+            .filter(|e| {
+                e.name.starts_with("model-") && e.name.ends_with(".safetensors")
+            })
+            .map(|e| e.name)
+            .collect();
+
+        shard_names.sort();
+        Ok(shard_names)
+    }
+
+    /// Load weights from safetensors files via FsOps.
+    async fn load_weights_fs(
+        fs: &WorktreeClient,
+        shard_names: &[String],
+        device: &Device,
+        dtype: DType,
+    ) -> Result<HashMap<String, Tensor>> {
+        let mut all_weights = HashMap::new();
+
+        if shard_names.is_empty() {
+            return Err(anyhow!("No safetensors files found"));
+        }
+
+        for (idx, name) in shard_names.iter().enumerate() {
+            if shard_names.len() > 1 {
+                info!("Loading shard {}/{} via FsOps: {}", idx + 1, shard_names.len(), name);
+            }
+
+            let data = fs.read_file_chunked(name).await?;
+            let tensors = safetensors::SafeTensors::deserialize(&data)?;
+            Self::create_tensors_from_safetensors(tensors, &mut all_weights, device, dtype)?;
+        }
+
+        Ok(all_weights)
     }
 }

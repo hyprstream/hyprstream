@@ -1,9 +1,18 @@
 @0xd4e6f8a2b1c3d5e7;
 
+using import "/annotations.capnp".mcpScope;
+using import "/annotations.capnp".mcpDescription;
+using import "/streaming.capnp".StreamInfo;
+
 # Cap'n Proto schema for registry service
 #
 # The registry service manages git repositories (models).
 # Uses REQ/REP pattern for all operations.
+#
+# Convention: Request variants use camelCase names. Response variants
+# use the same name suffixed with "Result" to avoid Cap'n Proto naming
+# collisions. The code generator strips "Result" to pair them.
+# Repo-scoped ops are nested under `repo`/`repoResult`.
 
 struct RegistryRequest {
   # Request ID for tracking
@@ -11,75 +20,98 @@ struct RegistryRequest {
 
   # Request payload (union of request types)
   union {
-    # Repository queries
-    list @1 :Void;
-    get @2 :Text;           # repo_id
-    getByName @3 :Text;     # name
+    # List all models available in the registry
+    list @1 :Void $mcpScope(query);
+    # Get repository information by ID
+    get @2 :Text $mcpScope(query);
+    # Get repository information by name
+    getByName @3 :Text $mcpScope(query);
+    # Clone a model repository from a URL
+    clone @4 :CloneRequest $mcpScope(write);
+    # Register an existing local repository
+    register @5 :RegisterRequest $mcpScope(write);
+    # Remove a repository from the registry
+    remove @6 :Text $mcpScope(manage);
+    # Check registry service health
+    healthCheck @7 :Void;
+    # Clone a model repository from a URL (streaming progress)
+    cloneStream @8 :CloneRequest $mcpScope(write) $mcpDescription("Clone a model repository from a URL (streaming progress)");
 
-    # Repository operations
-    clone @4 :CloneRequest;
-    register @5 :RegisterRequest;
-    remove @6 :Text;        # repo_id
-    update @7 :UpdateRequest;
+    # Repository-scoped operations (requires repoId)
+    repo @9 :RepositoryRequest;
+  }
+}
 
-    # Worktree operations
-    createWorktree @8 :WorktreeRequest;
-    listWorktrees @9 :Text; # repo_id
-    removeWorktree @10 :RemoveWorktreeRequest;
-
-    # Branch operations
-    createBranch @11 :BranchRequest;
-    listBranches @12 :Text; # repo_id
-    checkout @13 :CheckoutRequest;
-
-    # Staging operations
-    stageAll @14 :Text;     # repo_id
-    stageFiles @15 :StageFilesRequest;
-    commit @16 :CommitRequest;
-
-    # Merge operations
-    merge @25 :MergeRequest;
-
-    # Status operations
-    status @26 :Text;      # repo_id
-
-    # Reference operations
-    getHead @17 :Text;      # repo_id
-    getRef @18 :GetRefRequest;
-
-    # Health/Lifecycle
-    healthCheck @19 :Void;
-
-    # Remote operations
-    listRemotes @20 :Text;  # repo_id
-    addRemote @21 :AddRemoteRequest;
-    removeRemote @22 :RemoveRemoteRequest;
-    setRemoteUrl @23 :SetRemoteUrlRequest;
-    renameRemote @24 :RenameRemoteRequest;
-
-    # Streaming operations
-    cloneStream @27 :CloneRequest;  # Clone with streaming progress
-
-    # Push operations
-    push @28 :PushRequest;
-
-    # Advanced commit operations
-    amendCommit @29 :AmendCommitRequest;
-    commitWithAuthor @30 :CommitWithAuthorRequest;
-    stageAllIncludingUntracked @31 :Text;  # repo_id
-
-    # Merge conflict resolution
-    abortMerge @32 :Text;    # repo_id
-    continueMerge @33 :ContinueMergeRequest;
-    quitMerge @34 :Text;     # repo_id
-
-    # Tag operations
-    listTags @35 :Text;      # repo_id
-    createTag @36 :CreateTagRequest;
-    deleteTag @37 :DeleteTagRequest;
-
-    # Detailed status
-    detailedStatus @38 :Text; # repo_id
+# Repository-scoped request: operations on a specific repository.
+# Generator detects the non-union field (repoId) + inner union pattern
+# and produces a RepositoryClient with repoId curried in.
+struct RepositoryRequest {
+  repoId @0 :Text;
+  union {
+    # Create a new worktree for the repository
+    createWorktree @1 :CreateWorktreeRequest $mcpScope(write);
+    # List all worktrees for the repository
+    listWorktrees @2 :Void $mcpScope(query);
+    # Remove a worktree from the repository
+    removeWorktree @3 :RemoveWorktreeRequest $mcpScope(manage);
+    # Create a new branch in the repository
+    createBranch @4 :BranchRequest $mcpScope(write);
+    # List all branches in the repository
+    listBranches @5 :Void $mcpScope(query);
+    # Checkout a branch or reference
+    checkout @6 :CheckoutRequest $mcpScope(write);
+    # Stage all modified files
+    stageAll @7 :Void $mcpScope(write);
+    # Stage specific files
+    stageFiles @8 :StageFilesRequest $mcpScope(write);
+    # Create a commit with staged changes
+    commit @9 :CommitRequest $mcpScope(write);
+    # Merge a branch into current branch
+    merge @10 :MergeRequest $mcpScope(write);
+    # Abort an in-progress merge
+    abortMerge @11 :Void $mcpScope(write);
+    # Continue a merge after resolving conflicts
+    continueMerge @12 :ContinueMergeRequest $mcpScope(write);
+    # Exit merge state without committing
+    quitMerge @13 :Void $mcpScope(write);
+    # Get the current HEAD reference
+    getHead @14 :Void $mcpScope(query);
+    # Get information about a specific reference
+    getRef @15 :GetRefRequest $mcpScope(query);
+    # Get repository status (short format)
+    status @16 :Void $mcpScope(query);
+    # Get detailed repository status with file changes
+    detailedStatus @17 :Void $mcpScope(query);
+    # List all remotes for the repository
+    listRemotes @18 :Void $mcpScope(query);
+    # Add a new remote to the repository
+    addRemote @19 :AddRemoteRequest $mcpScope(write);
+    # Remove a remote from the repository
+    removeRemote @20 :RemoveRemoteRequest $mcpScope(manage);
+    # Set the URL for a remote
+    setRemoteUrl @21 :SetRemoteUrlRequest $mcpScope(write);
+    # Rename a remote
+    renameRemote @22 :RenameRemoteRequest $mcpScope(write);
+    # Push commits to a remote repository
+    push @23 :PushRequest $mcpScope(write);
+    # Amend the last commit with new changes
+    amendCommit @24 :AmendCommitRequest $mcpScope(write);
+    # Create a commit with specified author information
+    commitWithAuthor @25 :CommitWithAuthorRequest $mcpScope(write);
+    # Stage all files including untracked files
+    stageAllIncludingUntracked @26 :Void $mcpScope(write);
+    # List all tags in the repository
+    listTags @27 :Void $mcpScope(query);
+    # Create a new tag
+    createTag @28 :CreateTagRequest $mcpScope(write);
+    # Delete a tag from the repository
+    deleteTag @29 :DeleteTagRequest $mcpScope(manage);
+    # Pull and update from remote repository
+    update @30 :UpdateRequest $mcpScope(write);
+    # Worktree-scoped filesystem operations
+    worktree @31 :WorktreeRequest;
+    # Ensure a worktree exists for a branch (create if needed, return path)
+    ensureWorktree @32 :EnsureWorktreeRequest $mcpScope(write) $mcpDescription("Ensure a worktree exists for a branch, creating if needed");
   }
 }
 
@@ -87,32 +119,192 @@ struct RegistryResponse {
   # Request ID this response corresponds to
   requestId @0 :UInt64;
 
-  # Response payload (union of response types)
+  # Response payload — variants suffixed with "Result" to pair with request
   union {
-    success @1 :Void;
-    error @2 :ErrorInfo;
-    repository @3 :TrackedRepository;
-    repositories @4 :List(TrackedRepository);
-    worktrees @5 :List(WorktreeInfo);
-    branches @6 :List(Text);
-    path @7 :Text;
-    commitOid @8 :Text;
-    refOid @9 :Text;
-    health @10 :HealthStatus;
-    remotes @11 :List(RemoteInfo);
-    repositoryStatus @12 :RepositoryStatus;
-    streamStarted @13 :StreamStartedInfo;  # For streaming operations
-    tags @14 :List(Text);
-    detailedStatus @15 :DetailedStatusInfo;
+    error @1 :ErrorInfo;
+    listResult @2 :List(TrackedRepository);
+    getResult @3 :TrackedRepository;
+    getByNameResult @4 :TrackedRepository;
+    cloneResult @5 :TrackedRepository;
+    registerResult @6 :TrackedRepository;
+    removeResult @7 :Void;
+    healthCheckResult @8 :HealthStatus;
+    cloneStreamResult @9 :StreamInfo;
+    repoResult @10 :RepositoryResponse;
   }
 }
 
-# Stream Started Info (for cloneStream)
-struct StreamStartedInfo {
-  streamId @0 :Text;
-  streamEndpoint @1 :Text;
-  serverPubkey @2 :Data;  # 32-byte DH public key for key derivation
+# Repository-scoped response: inner union variants match request names exactly.
+struct RepositoryResponse {
+  union {
+    error @0 :ErrorInfo;
+    createWorktree @1 :Text;
+    listWorktrees @2 :List(WorktreeInfo);
+    removeWorktree @3 :Void;
+    createBranch @4 :Void;
+    listBranches @5 :List(Text);
+    checkout @6 :Void;
+    stageAll @7 :Void;
+    stageFiles @8 :Void;
+    commit @9 :Text;
+    merge @10 :Void;
+    abortMerge @11 :Void;
+    continueMerge @12 :Void;
+    quitMerge @13 :Void;
+    getHead @14 :Text;
+    getRef @15 :Text;
+    status @16 :RepositoryStatus;
+    detailedStatus @17 :DetailedStatusInfo;
+    listRemotes @18 :List(RemoteInfo);
+    addRemote @19 :Void;
+    removeRemote @20 :Void;
+    setRemoteUrl @21 :Void;
+    renameRemote @22 :Void;
+    push @23 :Void;
+    amendCommit @24 :Text;
+    commitWithAuthor @25 :Text;
+    stageAllIncludingUntracked @26 :Void;
+    listTags @27 :List(Text);
+    createTag @28 :Void;
+    deleteTag @29 :Void;
+    update @30 :Void;
+    worktreeResult @31 :WorktreeResponse;
+    ensureWorktree @32 :Text;
+  }
 }
+
+# --- 9P2000-inspired types ---
+# Qid uniquely identifies a file version (inode + ctime).
+struct Qid {
+  qtype @0 :UInt8;      # QTDIR=0x80 QTAPPEND=0x40 QTEXCL=0x20 QTFILE=0x00
+  version @1 :UInt32;   # st_ctime (seconds)
+  path @2 :UInt64;      # st_ino (unique file id)
+}
+
+# File metadata (9P stat structure).
+struct NpStat {
+  qid @0 :Qid;
+  mode @1 :UInt32;
+  atime @2 :UInt32;
+  mtime @3 :UInt32;
+  length @4 :UInt64;
+  name @5 :Text;
+  uid @6 :Text;
+  gid @7 :Text;
+  muid @8 :Text;
+}
+
+# --- WorktreeRequest: 9P2000-inspired worktree filesystem protocol ---
+# 10 operations replacing 19 POSIX ops. Read is always offset+count,
+# bounded by iounit — no unbounded readFile convenience method.
+# Generator detects non-union field (name) + inner union
+# and produces WorktreeClient with name curried in.
+
+struct WorktreeRequest {
+  name @0 :Text;
+  union {
+    # Walk: resolve path components to get a fid (like 9P Twalk)
+    walk @1 :NpWalk $mcpScope(query);
+    # Open: open a walked fid for I/O (like 9P Topen)
+    open @2 :NpOpen $mcpScope(write);
+    # Create: create a file/dir under a walked directory fid (like 9P Tcreate)
+    create @3 :NpCreate $mcpScope(write);
+    # Read: offset+count read, server clamps to iounit (like 9P Tread)
+    read @4 :NpRead;
+    # Write: offset+data write, server rejects if > iounit (like 9P Twrite)
+    write @5 :NpWrite;
+    # Clunk: release a fid (like 9P Tclunk)
+    clunk @6 :NpClunk;
+    # Remove: clunk + delete file/dir (like 9P Tremove)
+    remove @7 :NpRemove $mcpScope(manage);
+    # Stat: get file metadata (like 9P Tstat)
+    npStat @8 :NpStatReq $mcpScope(query);
+    # Wstat: modify file metadata (like 9P Twstat)
+    wstat @9 :NpWstat $mcpScope(write);
+    # Flush: cancel pending operation (like 9P Tflush)
+    flush @10 :NpFlush;
+  }
+}
+
+# 9P Request structs
+
+struct NpWalk {
+  fid @0 :UInt32;          # source fid (0 = root, auto-attached per worktree)
+  newfid @1 :UInt32;       # fid to assign to walked path
+  wnames @2 :List(Text);   # path components (empty = clone fid)
+}
+
+struct NpOpen {
+  fid @0 :UInt32;
+  mode @1 :UInt8;          # OREAD=0 OWRITE=1 ORDWR=2; OTRUNC=0x10 ORCLOSE=0x40
+}
+
+struct NpCreate {
+  fid @0 :UInt32;          # must be a walked directory fid
+  name @1 :Text;           # name of file/dir to create
+  perm @2 :UInt32;         # DMDIR=0x80000000 for dirs, otherwise file mode
+  mode @3 :UInt8;          # open mode for the new file (same as NpOpen.mode)
+}
+
+struct NpRead {
+  fid @0 :UInt32;
+  offset @1 :UInt64;
+  count @2 :UInt32;        # server clamps to iounit
+}
+
+struct NpWrite {
+  fid @0 :UInt32;
+  offset @1 :UInt64;
+  data @2 :Data;           # server rejects if > iounit
+}
+
+struct NpClunk   { fid @0 :UInt32; }
+struct NpRemove  { fid @0 :UInt32; }
+struct NpStatReq { fid @0 :UInt32; }
+struct NpWstat   { fid @0 :UInt32; stat @1 :NpStat; }
+struct NpFlush   { oldtag @0 :UInt64; }
+
+# Ensure Worktree Request (repoId removed — curried)
+
+struct EnsureWorktreeRequest {
+  branch @0 :Text;
+}
+
+# --- WorktreeResponse: 9P2000-inspired responses ---
+
+struct WorktreeResponse {
+  union {
+    error @0 :ErrorInfo;
+    # Walk response: qid of the walked-to file
+    walk @1 :RWalk;
+    # Open response: qid + iounit (max I/O per message)
+    open @2 :ROpen;
+    # Create response: same shape as open (qid + iounit)
+    create @3 :ROpen;
+    # Read response: data (len < count means EOF)
+    read @4 :RRead;
+    # Write response: bytes actually written
+    write @5 :RWrite;
+    # Clunk response: success (void)
+    clunk @6 :Void;
+    # Remove response: success (void)
+    remove @7 :Void;
+    # Stat response: full file metadata
+    npStat @8 :RStat;
+    # Wstat response: success (void)
+    wstat @9 :Void;
+    # Flush response: success (void)
+    flush @10 :Void;
+  }
+}
+
+# 9P Response structs
+
+struct RWalk  { qid @0 :Qid; }
+struct ROpen  { qid @0 :Qid; iounit @1 :UInt32; }
+struct RRead  { data @0 :Data; }
+struct RWrite { count @0 :UInt32; }
+struct RStat  { stat @0 :NpStat; }
 
 # Clone Request
 
@@ -132,26 +324,17 @@ struct RegisterRequest {
   trackingRef @2 :Text;
 }
 
-# Update Request
+# Create Worktree Request (repoId removed — curried into RepositoryClient)
 
-struct UpdateRequest {
-  repoId @0 :Text;
-  refspec @1 :Text;
-}
-
-# Worktree Request
-
-struct WorktreeRequest {
-  repoId @0 :Text;
-  path @1 :Text;
-  branchName @2 :Text;
-  createBranch @3 :Bool;
+struct CreateWorktreeRequest {
+  path @0 :Text;
+  branchName @1 :Text;
+  createBranch @2 :Bool;
 }
 
 struct RemoveWorktreeRequest {
-  repoId @0 :Text;
-  worktreePath @1 :Text;
-  force @2 :Bool;
+  worktreePath @0 :Text;
+  force @1 :Bool;
 }
 
 struct WorktreeInfo {
@@ -162,43 +345,38 @@ struct WorktreeInfo {
   isDirty @4 :Bool;
 }
 
-# Branch Request
+# Branch Request (repoId removed — curried)
 
 struct BranchRequest {
-  repoId @0 :Text;
-  branchName @1 :Text;
-  startPoint @2 :Text;
+  branchName @0 :Text;
+  startPoint @1 :Text;
 }
 
-# Checkout Request
+# Checkout Request (repoId removed — curried)
 
 struct CheckoutRequest {
-  repoId @0 :Text;
-  refName @1 :Text;
-  createBranch @2 :Bool;
+  refName @0 :Text;
+  createBranch @1 :Bool;
 }
 
-# Stage Files Request
+# Stage Files Request (repoId removed — curried)
 
 struct StageFilesRequest {
-  repoId @0 :Text;
-  files @1 :List(Text);
+  files @0 :List(Text);
 }
 
-# Commit Request
+# Commit Request (repoId removed — curried)
 
 struct CommitRequest {
-  repoId @0 :Text;
-  message @1 :Text;
-  author @2 :Text;
-  email @3 :Text;
+  message @0 :Text;
+  author @1 :Text;
+  email @2 :Text;
 }
 
-# Get Ref Request
+# Get Ref Request (repoId removed — curried)
 
 struct GetRefRequest {
-  repoId @0 :Text;
-  refName @1 :Text;
+  refName @0 :Text;
 }
 
 # Tracked Repository
@@ -240,34 +418,29 @@ struct RemoteInfo {
 }
 
 struct AddRemoteRequest {
-  repoId @0 :Text;
-  name @1 :Text;
-  url @2 :Text;
+  name @0 :Text;
+  url @1 :Text;
 }
 
 struct RemoveRemoteRequest {
-  repoId @0 :Text;
-  name @1 :Text;
+  name @0 :Text;
 }
 
 struct SetRemoteUrlRequest {
-  repoId @0 :Text;
-  name @1 :Text;
-  url @2 :Text;
+  name @0 :Text;
+  url @1 :Text;
 }
 
 struct RenameRemoteRequest {
-  repoId @0 :Text;
-  oldName @1 :Text;
-  newName @2 :Text;
+  oldName @0 :Text;
+  newName @1 :Text;
 }
 
-# Merge Request
+# Merge Request (repoId removed — curried)
 
 struct MergeRequest {
-  repoId @0 :Text;
-  source @1 :Text;
-  message @2 :Text;           # Optional merge message
+  source @0 :Text;
+  message @1 :Text;           # Optional merge message
 }
 
 # Repository Status
@@ -281,51 +454,64 @@ struct RepositoryStatus {
   modifiedFiles @5 :List(Text); # Paths of modified files
 }
 
-# Push Request
+# Push Request (repoId removed — curried)
 
 struct PushRequest {
-  repoId @0 :Text;
-  remote @1 :Text;
-  refspec @2 :Text;
-  force @3 :Bool;
+  remote @0 :Text;
+  refspec @1 :Text;
+  force @2 :Bool;
 }
 
-# Amend Commit Request
+# Amend Commit Request (repoId removed — curried)
 
 struct AmendCommitRequest {
-  repoId @0 :Text;
-  message @1 :Text;
+  message @0 :Text;
 }
 
-# Commit with Author Request
+# Commit with Author Request (repoId removed — curried)
 
 struct CommitWithAuthorRequest {
-  repoId @0 :Text;
-  message @1 :Text;
-  authorName @2 :Text;
-  authorEmail @3 :Text;
+  message @0 :Text;
+  authorName @1 :Text;
+  authorEmail @2 :Text;
 }
 
-# Continue Merge Request
+# Continue Merge Request (repoId removed — curried)
 
 struct ContinueMergeRequest {
-  repoId @0 :Text;
-  message @1 :Text;  # Optional merge message
+  message @0 :Text;  # Optional merge message
 }
 
-# Create Tag Request
+# Create Tag Request (repoId removed — curried)
 
 struct CreateTagRequest {
-  repoId @0 :Text;
-  name @1 :Text;
-  target @2 :Text;  # Optional target (defaults to HEAD)
+  name @0 :Text;
+  target @1 :Text;  # Optional target (defaults to HEAD)
 }
 
-# Delete Tag Request
+# Delete Tag Request (repoId removed — curried)
 
 struct DeleteTagRequest {
-  repoId @0 :Text;
-  name @1 :Text;
+  name @0 :Text;
+}
+
+# Update Request (repoId removed — curried)
+
+struct UpdateRequest {
+  refspec @0 :Text;
+}
+
+# File Change Type Enum
+
+enum FileChangeType {
+  none @0;
+  added @1;
+  modified @2;
+  deleted @3;
+  renamed @4;
+  untracked @5;
+  typeChanged @6;
+  conflicted @7;
 }
 
 # Detailed Status Info
@@ -342,6 +528,6 @@ struct DetailedStatusInfo {
 
 struct FileStatusInfo {
   path @0 :Text;
-  indexStatus @1 :Text;        # Single char: A, M, D, R, ?, T, U, or empty
-  worktreeStatus @2 :Text;     # Single char: A, M, D, R, ?, T, U, or empty
+  indexStatus @1 :FileChangeType;
+  worktreeStatus @2 :FileChangeType;
 }

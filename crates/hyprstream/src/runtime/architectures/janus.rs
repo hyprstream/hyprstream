@@ -1000,16 +1000,6 @@ impl ModelOperations for JanusModel {
         self.language_model.forward(input, past_kv)
     }
 
-    fn forward_with_lora_hooks(
-        &self,
-        input: &Tensor,
-        _lora_model: Option<&crate::lora::torch_adapter::LoRAModel>,
-        _training: bool,
-    ) -> Result<(Tensor, Vec<(String, Tensor)>)> {
-        // Delegate to language model
-        self.language_model.forward_with_lora_hooks(input, _lora_model, _training)
-    }
-
     fn embed_tokens(&self, input_ids: &Tensor) -> Result<Tensor> {
         self.language_model.embed_tokens(input_ids)
     }
@@ -1079,12 +1069,6 @@ impl ModelOperations for JanusModel {
 
     fn get_attention_mask(&self, seq_len: usize, past_kv_len: usize) -> Result<Tensor> {
         self.language_model.get_attention_mask(seq_len, past_kv_len)
-    }
-
-    fn apply_lora(&mut self, _adapter: &crate::lora::torch_adapter::LoRAModel) -> Result<()> {
-        // For now, delegate to language model if it supports it
-        // In future, we might apply LoRA to vision components too
-        Ok(())  // TODO: Implement proper LoRA application
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

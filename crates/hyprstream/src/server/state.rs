@@ -2,7 +2,7 @@
 
 use crate::{
     api::training_service::TrainingService,
-    services::{ModelZmqClient, PolicyZmqClient, RegistryClient},
+    services::{GenRegistryClient, ModelZmqClient, PolicyClient},
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::sync::Arc;
@@ -21,10 +21,10 @@ pub struct ServerState {
     pub model_client: ModelZmqClient,
 
     /// Policy client for authorization checks via ZMQ
-    pub policy_client: PolicyZmqClient,
+    pub policy_client: PolicyClient,
 
     /// Registry client for model operations
-    pub registry: Arc<dyn RegistryClient>,
+    pub registry: GenRegistryClient,
 
     /// Training service for supervised learning
     pub training_service: Arc<TrainingService>,
@@ -43,6 +43,9 @@ pub struct ServerState {
 
     /// Context store for RAG/CAG (optional)
     pub context_store: Option<Arc<ContextStore<hyprstream_metrics::storage::duckdb::DuckDbBackend>>>,
+
+    /// Cached resource URL for WWW-Authenticate headers (avoids per-request config reload)
+    pub resource_url: String,
 }
 
 /// Metrics collector
@@ -80,9 +83,10 @@ impl ServerState {
     pub async fn new(
         config: ServerConfig,
         model_client: ModelZmqClient,
-        policy_client: PolicyZmqClient,
-        registry: Arc<dyn RegistryClient>,
+        policy_client: PolicyClient,
+        registry: GenRegistryClient,
         signing_key: SigningKey,
+        resource_url: String,
     ) -> Result<Self, anyhow::Error> {
         let verifying_key = signing_key.verifying_key();
         let signing_key = Arc::new(signing_key);
@@ -116,6 +120,7 @@ impl ServerState {
             signing_key,
             verifying_key,
             context_store: None, // Initialize via enable_context_store() if needed
+            resource_url,
         })
     }
 

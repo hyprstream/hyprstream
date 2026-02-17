@@ -8,11 +8,12 @@
 //! All requests are wrapped in `SignedEnvelope` for authentication:
 //! - `RequestLoop` unwraps and verifies signatures before dispatching
 //! - Handlers receive `EnvelopeContext` with verified identity
-//! - Services use `ctx.casbin_subject()` for policy checks
+//! - Services use `ctx.subject()` for policy checks
 
 use crate::prelude::*;
 use crate::transport::TransportConfig;
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
 use chrono::Utc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -20,21 +21,38 @@ use tmq::{FromZmqSocket, Multipart, RequestReceiver, RequestSender};
 use tokio::sync::Notify;
 use tracing::{debug, error, info, trace, warn};
 
+/// Authorization callback for policy checks.
+///
+/// Parameters: (subject, resource, operation) -> allowed.
+/// Services store this and call it from their `authorize()` handler method.
+/// The concrete implementation typically wraps `PolicyClient::check_policy()`.
+///
+/// Returns a boxed future to support async policy checks on single-threaded runtimes.
+pub type AuthorizeFn = Arc<dyn Fn(String, String, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send>> + Send + Sync>;
+
+/// Work to execute after the REP response is sent (e.g., stream publishing).
+///
+/// Built by streaming handlers, spawned by `RequestLoop` after the response
+/// is sent to the client. This ensures the client has the `StreamInfo`
+/// (with `stream_id`) before any data flows on the PUB/SUB channel.
+pub type Continuation = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>;
+
 /// Context extracted from a verified SignedEnvelope.
 ///
 /// This struct is passed to service handlers after the `RequestLoop`
 /// has verified the envelope signature. Handlers use this for:
-/// - Authorization checks via `casbin_subject()`
+/// - Authorization checks via `subject()`
 /// - Correlation via `request_id`
 /// - Stream HMAC key derivation via `ephemeral_pubkey`
 ///
 /// # Example
 ///
 /// ```ignore
-/// fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<Vec<u8>> {
+/// fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<Continuation>)> {
 ///     // Check authorization
-///     if !policy_manager.check(&ctx.casbin_subject(), "Model", "infer") {
-///         return Err(anyhow!("unauthorized: {}", ctx.casbin_subject()));
+///     let sub = ctx.subject().to_string();
+///     if !policy_manager.check(&sub, "Model", "infer") {
+///         return Err(anyhow!("unauthorized: {}", sub));
 ///     }
 ///     // Process request...
 /// }
@@ -68,14 +86,18 @@ impl EnvelopeContext {
         }
     }
 
-    /// Get the namespaced Casbin subject for policy checks.
+    /// Get the typed authorization subject.
     ///
-    /// Returns prefixed identities like `"local:alice"`, `"token:bob"`, etc.
-    pub fn casbin_subject(&self) -> String {
-        self.identity.casbin_subject()
+    /// Prefers Claims subject (gateway forwarding scenario) over transport identity.
+    /// This is the single source of truth for "who is this request from?" for
+    /// both authorization checks and resource isolation.
+    pub fn subject(&self) -> Subject {
+        self.claims.as_ref()
+            .map(Subject::from)
+            .unwrap_or_else(|| Subject::from(&self.identity))
     }
 
-    /// Get the raw user string (without namespace prefix).
+    /// Get the bare username string.
     pub fn user(&self) -> &str {
         self.identity.user()
     }
@@ -92,32 +114,9 @@ impl EnvelopeContext {
         self.claims.as_ref()
     }
 
-    /// Get user subject for Casbin checks (if claims present)
-    pub fn user_subject(&self) -> Option<String> {
-        self.claims.as_ref().map(super::super::auth::claims::Claims::casbin_subject)
-    }
-
-    /// Get effective subject (user if present, otherwise service identity)
-    pub fn effective_subject(&self) -> String {
-        self.user_subject().unwrap_or_else(|| self.casbin_subject())
-    }
-
     /// Check if request has user context
     pub fn has_user_context(&self) -> bool {
         self.claims.is_some()
-    }
-
-    /// Get user scopes (if claims present)
-    pub fn user_scopes(&self) -> Option<Vec<String>> {
-        self.claims.as_ref().map(|c| c.scopes.iter().map(super::super::auth::scope::Scope::to_string).collect())
-    }
-
-    /// Check if user has specific scope (if claims present)
-    pub fn has_scope(&self, required_scope: &crate::auth::Scope) -> bool {
-        self.claims
-            .as_ref()
-            .map(|c| c.has_scope(required_scope))
-            .unwrap_or(false)
     }
 
     /// Get the client's ephemeral public key for DH key exchange (if provided).
@@ -156,10 +155,10 @@ impl EnvelopeContext {
 /// }
 ///
 /// impl ZmqService for MyService {
-///     fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<Vec<u8>> {
+///     fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<Continuation>)> {
 ///         // ctx.identity is already verified
-///         info!("Request from {} (id={})", ctx.casbin_subject(), ctx.request_id);
-///         Ok(vec![])
+///         info!("Request from {} (id={})", ctx.subject(), ctx.request_id);
+///         Ok((vec![], None))
 ///     }
 ///
 ///     fn name(&self) -> &str { "my-service" }
@@ -171,18 +170,22 @@ impl EnvelopeContext {
 /// // MyService is now automatically Spawnable!
 /// manager.spawn(Box::new(my_service)).await?;
 /// ```
+#[async_trait(?Send)]
 pub trait ZmqService: Send + Sync + 'static {
-    /// Process a request and return a response.
+    /// Process a request and return a response with optional continuation.
     ///
     /// # Arguments
     ///
     /// * `ctx` - Verified envelope context with identity
     /// * `payload` - Raw inner request bytes (Cap'n Proto encoded)
     ///
-    /// Returns raw bytes for the response (Cap'n Proto encoded).
+    /// Returns `(response_bytes, optional_continuation)`:
+    /// - `response_bytes`: Cap'n Proto encoded response sent as REP
+    /// - `continuation`: Optional future spawned AFTER the REP is sent
+    ///   (used for streaming: ensures client has stream_id before data flows)
     ///
-    /// This runs in a blocking task to avoid blocking the async runtime.
-    fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<Vec<u8>>;
+    /// Non-streaming services always return `None` for the continuation.
+    async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<Continuation>)>;
 
     /// Service name (for logging and registry).
     fn name(&self) -> &str;
@@ -199,6 +202,16 @@ pub trait ZmqService: Send + Sync + 'static {
     /// Ed25519 verifying key for envelope signature verification.
     fn verifying_key(&self) -> VerifyingKey {
         self.signing_key().verifying_key()
+    }
+
+    /// Build a generic error response payload for unexpected errors.
+    ///
+    /// Default implementation returns an empty vec (backwards compat).
+    /// Generated services should override with schema-correct error payloads
+    /// so clients receive proper `Error(ErrorInfo{...})` instead of parse failures.
+    fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
+        let _ = (request_id, error);
+        vec![]
     }
 }
 
@@ -297,7 +310,7 @@ impl RequestLoop {
         let service = Arc::new(service);
 
         // Spawn async task (not spawn_blocking - TMQ provides async I/O)
-        let handle = tokio::spawn(async move {
+        let handle = tokio::task::spawn_local(async move {
             if let Err(e) = Self::service_loop_async(
                 transport,
                 context,
@@ -425,8 +438,9 @@ impl RequestLoop {
                                 service.name(),
                                 e
                             );
-                            // Send error response
-                            let msg: Multipart = vec![vec![]].into();
+                            // Send error response (request_id=0 since envelope is invalid)
+                            let error_payload = service.build_error_payload(0, &format!("envelope verification failed: {}", e));
+                            let msg: Multipart = vec![error_payload].into();
                             receiver = sender
                                 .send(msg)
                                 .await
@@ -439,23 +453,18 @@ impl RequestLoop {
                     debug!(
                         "{} verified request from {} (id={})",
                         service.name(),
-                        ctx.casbin_subject(),
+                        ctx.subject(),
                         request_id
                     );
 
-                    // Process request in spawn_blocking (handler may do blocking work)
-                    let service_clone = Arc::clone(&service);
-                    let response_payload = tokio::task::spawn_blocking(move || {
-                        service_clone.handle_request(&ctx, &payload)
-                    })
-                    .await
-                    .map_err(|e| anyhow!("spawn_blocking join error: {}", e))?;
+                    // Process request directly (handlers are now async)
+                    let result = service.handle_request(&ctx, &payload).await;
 
-                    let response_payload = match response_payload {
-                        Ok(resp) => resp,
+                    let (response_payload, continuation) = match result {
+                        Ok((resp, cont)) => (resp, cont),
                         Err(e) => {
                             error!("{} request handling error: {}", service.name(), e);
-                            vec![] // Error response
+                            (service.build_error_payload(request_id, &e.to_string()), None)
                         }
                     };
 
@@ -487,6 +496,13 @@ impl RequestLoop {
                         .send(msg)
                         .await
                         .map_err(|e| anyhow!("send error: {}", e))?;
+
+                    // Spawn continuation AFTER REP is sent.
+                    // This guarantees the client has the StreamInfo (stream_id)
+                    // before any data flows on the PUB/SUB channel.
+                    if let Some(future) = continuation {
+                        tokio::task::spawn_local(future);
+                    }
                 }
             }
         }
@@ -986,13 +1002,14 @@ mod tests {
         }
     }
 
+    #[async_trait(?Send)]
     impl ZmqService for EchoService {
-        fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<Vec<u8>> {
+        async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<Continuation>)> {
             // Echo back the payload, but prepend the user
             let user = ctx.user();
             let mut response = format!("from {user}:").into_bytes();
             response.extend_from_slice(payload);
-            Ok(response)
+            Ok((response, None))
         }
 
         fn name(&self) -> &str {
@@ -1012,112 +1029,121 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_request_loop() -> Result<(), Box<dyn std::error::Error>> {
-        let context = Arc::new(zmq::Context::new());
-        let transport = TransportConfig::inproc("test-echo-service-rpc");
-        let endpoint = transport.zmq_endpoint();
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let context = Arc::new(zmq::Context::new());
+            let transport = TransportConfig::inproc("test-echo-service-rpc");
+            let endpoint = transport.zmq_endpoint();
 
-        // Generate keypair for this test (same key for client and server)
-        let (signing_key, verifying_key) = generate_signing_keypair();
+            // Generate keypair for this test (same key for client and server)
+            let (signing_key, verifying_key) = generate_signing_keypair();
 
-        // Create service with infrastructure
-        let service = EchoService::new(Arc::clone(&context), transport.clone(), signing_key.clone());
+            // Create service with infrastructure
+            let service = EchoService::new(Arc::clone(&context), transport.clone(), signing_key.clone());
 
-        // Start the service (waits for socket binding)
-        let runner = RequestLoop::new(transport, Arc::clone(&context), signing_key.clone());
-        let mut handle = runner.run(service).await?;
+            // Start the service (waits for socket binding)
+            let runner = RequestLoop::new(transport, Arc::clone(&context), signing_key.clone());
+            let mut handle = runner.run(service).await?;
 
-        // Use ZmqClient with server's verifying key for response verification
-        let client = ZmqClient::new(&endpoint, context, signing_key, verifying_key, RequestIdentity::local());
-        let response = client.call(b"hello".to_vec(), CallOptions::default()).await?;
+            // Use ZmqClient with server's verifying key for response verification
+            let client = ZmqClient::new(&endpoint, context, signing_key, verifying_key, RequestIdentity::local());
+            let response = client.call(b"hello".to_vec(), CallOptions::default()).await?;
 
-        // Response should start with "from <user>:"
-        let response_str = String::from_utf8_lossy(&response);
-        assert!(
-            response_str.contains("hello"),
-            "Response should contain 'hello': {response_str}"
-        );
+            // Response should start with "from <user>:"
+            let response_str = String::from_utf8_lossy(&response);
+            assert!(
+                response_str.contains("hello"),
+                "Response should contain 'hello': {response_str}"
+            );
 
-        // Stop the service
-        handle.stop().await;
-        Ok(())
+            // Stop the service
+            handle.stop().await;
+            Ok(())
+        }).await
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_invalid_request_signature_rejected() -> Result<(), Box<dyn std::error::Error>> {
-        let context = Arc::new(zmq::Context::new());
-        let transport = TransportConfig::inproc("test-invalid-req-sig-rpc");
-        let endpoint = transport.zmq_endpoint();
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let context = Arc::new(zmq::Context::new());
+            let transport = TransportConfig::inproc("test-invalid-req-sig-rpc");
+            let endpoint = transport.zmq_endpoint();
 
-        // Generate two keypairs - service uses one, client uses other
-        let (server_signing_key, server_verifying_key) = generate_signing_keypair();
-        let (client_signing_key, _client_verifying_key) = generate_signing_keypair();
+            // Generate two keypairs - service uses one, client uses other
+            let (server_signing_key, server_verifying_key) = generate_signing_keypair();
+            let (client_signing_key, _client_verifying_key) = generate_signing_keypair();
 
-        // Create service with server's key
-        let service = EchoService::new(Arc::clone(&context), transport.clone(), server_signing_key.clone());
+            // Create service with server's key
+            let service = EchoService::new(Arc::clone(&context), transport.clone(), server_signing_key.clone());
 
-        // Start the service (waits for socket binding)
-        let runner = RequestLoop::new(transport, Arc::clone(&context), server_signing_key);
-        let mut handle = runner.run(service).await?;
+            // Start the service (waits for socket binding)
+            let runner = RequestLoop::new(transport, Arc::clone(&context), server_signing_key);
+            let mut handle = runner.run(service).await?;
 
-        // Sign request with different key than service expects
-        // But verify responses with server's key
-        let client = ZmqClient::new(&endpoint, context, client_signing_key, server_verifying_key, RequestIdentity::local());
-        let result = client
-            .call(b"should fail".to_vec(), CallOptions::default())
-            .await;
+            // Sign request with different key than service expects
+            // But verify responses with server's key
+            let client = ZmqClient::new(&endpoint, context, client_signing_key, server_verifying_key, RequestIdentity::local());
+            let result = client
+                .call(b"should fail".to_vec(), CallOptions::default())
+                .await;
 
-        // Request should be rejected by server (empty response or error)
-        // The response is still signed, but empty
-        match result {
-            Ok(response) => {
-                // Empty response from server means request was rejected
-                assert!(
-                    response.is_empty(),
-                    "Invalid request signature should return empty response"
-                );
+            // Request should be rejected by server (empty response or error)
+            // The response is still signed, but empty
+            match result {
+                Ok(response) => {
+                    // Empty response from server means request was rejected
+                    assert!(
+                        response.is_empty(),
+                        "Invalid request signature should return empty response"
+                    );
+                }
+                Err(_) => {
+                    // Error is also acceptable (deserialization of empty response may fail)
+                }
             }
-            Err(_) => {
-                // Error is also acceptable (deserialization of empty response may fail)
-            }
-        }
 
-        handle.stop().await;
-        Ok(())
+            handle.stop().await;
+            Ok(())
+        }).await
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_invalid_response_signature_rejected() -> Result<(), Box<dyn std::error::Error>> {
-        let context = Arc::new(zmq::Context::new());
-        let transport = TransportConfig::inproc("test-invalid-resp-sig-rpc");
-        let endpoint = transport.zmq_endpoint();
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let context = Arc::new(zmq::Context::new());
+            let transport = TransportConfig::inproc("test-invalid-resp-sig-rpc");
+            let endpoint = transport.zmq_endpoint();
 
-        // Generate two keypairs - server signs with one, client expects other
-        let (server_signing_key, _server_verifying_key) = generate_signing_keypair();
-        let (_different_signing_key, different_verifying_key) = generate_signing_keypair();
+            // Generate two keypairs - server signs with one, client expects other
+            let (server_signing_key, _server_verifying_key) = generate_signing_keypair();
+            let (_different_signing_key, different_verifying_key) = generate_signing_keypair();
 
-        // Create service with server's signing key
-        let service = EchoService::new(Arc::clone(&context), transport.clone(), server_signing_key.clone());
+            // Create service with server's signing key
+            let service = EchoService::new(Arc::clone(&context), transport.clone(), server_signing_key.clone());
 
-        // Start the service (waits for socket binding)
-        let runner = RequestLoop::new(transport, Arc::clone(&context), server_signing_key.clone());
-        let mut handle = runner.run(service).await?;
+            // Start the service (waits for socket binding)
+            let runner = RequestLoop::new(transport, Arc::clone(&context), server_signing_key.clone());
+            let mut handle = runner.run(service).await?;
 
-        // Client expects responses signed by a DIFFERENT key than server uses
-        // This simulates a MITM attack or misconfigured client
-        let client = ZmqClient::new(&endpoint, context, server_signing_key, different_verifying_key, RequestIdentity::local());
-        let result = client
-            .call(b"should fail verification".to_vec(), CallOptions::default())
-            .await;
+            // Client expects responses signed by a DIFFERENT key than server uses
+            // This simulates a MITM attack or misconfigured client
+            let client = ZmqClient::new(&endpoint, context, server_signing_key, different_verifying_key, RequestIdentity::local());
+            let result = client
+                .call(b"should fail verification".to_vec(), CallOptions::default())
+                .await;
 
-        // Response signature verification should fail
-        assert!(
-            result.is_err(),
-            "Response with wrong signature should be rejected: {result:?}"
-        );
+            // Response signature verification should fail
+            assert!(
+                result.is_err(),
+                "Response with wrong signature should be rejected: {result:?}"
+            );
 
-        handle.stop().await;
-        Ok(())
+            handle.stop().await;
+            Ok(())
+        }).await
     }
 }

@@ -1,6 +1,6 @@
 //! CLI handlers for adaptive ML inference server
 
-use crate::services::RegistryClient;
+use crate::services::GenRegistryClient;
 use crate::training::{CheckpointManager, WeightFormat, WeightSnapshot};
 use ::config::{Config, File};
 use reqwest::Client;
@@ -346,7 +346,7 @@ pub async fn handle_pretrain(
 
 /// Handle checkpoint write command
 pub async fn handle_write_checkpoint(
-    registry: &dyn RegistryClient,
+    registry: &GenRegistryClient,
     model_id: String,
     _name: Option<String>,
     step: Option<usize>,
@@ -355,8 +355,20 @@ pub async fn handle_write_checkpoint(
 
     // Resolve model path via registry
     let model_ref = crate::storage::ModelRef::parse(&model_id)?;
-    let branch = model_ref.git_ref_str();
-    let model_path = registry.model_path(&model_ref.model, branch.as_deref()).await?;
+    let branch_override = model_ref.git_ref_str();
+    let tracked = registry.get_by_name(&model_ref.model).await?;
+    let repo_client = registry.repo(&tracked.id);
+    let branch_name = match branch_override.as_deref() {
+        Some(b) => b.to_owned(),
+        None => repo_client.get_head().await?,
+    };
+    let worktrees = repo_client.list_worktrees().await?;
+    let model_path = std::path::PathBuf::from(
+        &worktrees.iter()
+            .find(|wt| wt.branch_name == branch_name)
+            .ok_or_else(|| anyhow::anyhow!("worktree for {}:{} not found", model_ref.model, branch_name))?
+            .path,
+    );
 
     // Create checkpoint manager
     let checkpoint_mgr = CheckpointManager::new(model_path.clone())?;
@@ -386,6 +398,7 @@ pub async fn handle_write_checkpoint(
 
 /// Handle checkpoint commit command
 pub async fn handle_commit_checkpoint(
+    registry: &GenRegistryClient,
     checkpoint_path: String,
     message: Option<String>,
     branch: Option<String>,
@@ -407,8 +420,29 @@ pub async fn handle_commit_checkpoint(
         })
         .ok_or("Invalid checkpoint path")?;
 
-    // Create checkpoint manager
-    let checkpoint_mgr = CheckpointManager::new(model_path.to_path_buf())?;
+    // Get model name from path for registry lookup
+    let model_name = model_path
+        .file_name()
+        .ok_or("Invalid model path")?
+        .to_string_lossy()
+        .to_string();
+
+    // Get RepositoryClient from registry for git operations
+    let repo_client = match registry.get_by_name(&model_name).await {
+        Ok(tracked) => Some(registry.repo(&tracked.id)),
+        Err(e) => {
+            error!("Could not get RepositoryClient for '{}': {} — git commit disabled", model_name, e);
+            None
+        }
+    };
+
+    // Create checkpoint manager with repo client
+    let checkpoint_mgr = CheckpointManager::with_config(
+        model_path.to_path_buf(),
+        Default::default(),
+        None,
+        repo_client.clone(),
+    )?;
 
     // Commit checkpoint
     let commit_id = checkpoint_mgr
@@ -419,8 +453,15 @@ pub async fn handle_commit_checkpoint(
 
     // Create tag if requested
     if let Some(tag_name) = tag {
-        crate::git::helpers::create_tag(model_path, &tag_name)?;
-        info!("✅ Tag created: {}", tag_name);
+        if let Some(client) = &repo_client {
+            client.create_tag(&tag_name, "").await.map_err(|e| {
+                error!("Failed to create tag '{}': {}", tag_name, e);
+                e
+            })?;
+            info!("✅ Tag created: {}", tag_name);
+        } else {
+            error!("Cannot create tag: no RepositoryClient available");
+        }
     }
 
     Ok(())

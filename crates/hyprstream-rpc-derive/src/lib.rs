@@ -27,6 +27,11 @@ use proc_macro::TokenStream;
 use quote::{quote, format_ident};
 use syn::{parse_macro_input, DeriveInput, Data, Fields, Attribute, Meta, Expr, ExprPath};
 
+mod schema;
+mod codegen;
+mod resolve;
+mod util;
+
 /// Derive macro for serializing Rust types to Cap'n Proto.
 ///
 /// Generates an implementation of `ToCapnp` trait that writes struct fields
@@ -77,6 +82,15 @@ pub fn derive_to_capnp(input: TokenStream) -> TokenStream {
                 Fields::Named(fields) => {
                     fields.named.iter().filter_map(|f| {
                         let field_name = f.ident.as_ref()?;
+
+                        // Check for enum_type (must come before skip check)
+                        if let Some(capnp_enum_path) = get_enum_type(&f.attrs) {
+                            let capnp_name = get_rename(&f.attrs)
+                                .unwrap_or_else(|| to_accessor_name(&field_name.to_string()));
+                            let setter = format_ident!("set_{}", capnp_name);
+                            let ty = &f.ty;
+                            return Some(generate_enum_setter(field_name, &setter, ty, &capnp_enum_path));
+                        }
 
                         // Check for skip
                         if has_skip_attr(&f.attrs) {
@@ -175,6 +189,14 @@ pub fn derive_from_capnp(input: TokenStream) -> TokenStream {
                 Fields::Named(fields) => {
                     fields.named.iter().filter_map(|f| {
                         let field_name = f.ident.as_ref()?;
+
+                        // Check for enum_type (must come before skip check)
+                        if let Some(_capnp_enum_path) = get_enum_type(&f.attrs) {
+                            let capnp_name = get_rename(&f.attrs)
+                                .unwrap_or_else(|| to_accessor_name(&field_name.to_string()));
+                            let getter = format_ident!("get_{}", capnp_name);
+                            return Some(generate_enum_getter(field_name, &getter));
+                        }
 
                         // Check for skip - use Default
                         if has_skip_attr(&f.attrs) {
@@ -293,6 +315,32 @@ fn get_rename(attrs: &[Attribute]) -> Option<String> {
     None
 }
 
+/// Get enum_type path from #[capnp(enum_type = "path::to::CapnpEnum")] attribute.
+///
+/// When present on a field, the derive macros generate enum conversion code
+/// using `Into` trait instead of skipping the field. Requires the user to
+/// implement `From<RustEnum> for CapnpEnum` and `From<CapnpEnum> for RustEnum`.
+fn get_enum_type(attrs: &[Attribute]) -> Option<syn::Path> {
+    for attr in attrs {
+        if attr.path().is_ident("capnp") {
+            if let Meta::List(list) = &attr.meta {
+                if let Ok(Expr::Assign(assign)) = syn::parse2::<Expr>(list.tokens.clone()) {
+                    if let Expr::Path(path) = &*assign.left {
+                        if path.path.is_ident("enum_type") {
+                            if let Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) = &*assign.right {
+                                if let Ok(p) = syn::parse_str::<syn::Path>(&s.value()) {
+                                    return Some(p);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Cap'n Proto Rust uses snake_case for accessors.
 /// This function simply returns the name as-is.
 fn to_accessor_name(s: &str) -> String {
@@ -309,83 +357,9 @@ fn is_option_type(ty: &syn::Type) -> bool {
     false
 }
 
-/// Generate setter code for a field
-fn generate_setter(
-    field_name: &syn::Ident,
-    setter: &syn::Ident,
-    ty: &syn::Type,
-) -> proc_macro2::TokenStream {
-    // Check if type is String
-    if is_string_type(ty) {
-        quote! {
-            builder.#setter(&self.#field_name);
-        }
-    } else if is_option_type(ty) {
-        // For Option<String>, only set if Some
-        quote! {
-            if let Some(ref v) = self.#field_name {
-                builder.#setter(v);
-            }
-        }
-    } else if is_vec_type(ty) {
-        // For Vec<T>, need to initialize a list
-        quote! {
-            {
-                let mut list = builder.reborrow().#setter(self.#field_name.len() as u32);
-                for (i, item) in self.#field_name.iter().enumerate() {
-                    list.set(i as u32, item);
-                }
-            }
-        }
-    } else {
-        // Primitive types - direct set
-        quote! {
-            builder.#setter(self.#field_name);
-        }
-    }
-}
-
-/// Generate getter code for a field
-fn generate_getter(
-    field_name: &syn::Ident,
-    getter: &syn::Ident,
-    ty: &syn::Type,
-    is_optional: bool,
-) -> proc_macro2::TokenStream {
-    if is_string_type(ty) {
-        quote! {
-            #field_name: reader.#getter()?.to_str()?.to_string(),
-        }
-    } else if is_pathbuf_type(ty) {
-        quote! {
-            #field_name: std::path::PathBuf::from(reader.#getter()?.to_str()?),
-        }
-    } else if is_option_type(ty) || is_optional {
-        // For Option<String>
-        quote! {
-            #field_name: {
-                let s = reader.#getter()?.to_str()?;
-                if s.is_empty() { None } else { Some(s.to_string()) }
-            },
-        }
-    } else if is_vec_string_type(ty) {
-        quote! {
-            #field_name: {
-                let list = reader.#getter()?;
-                let mut v = Vec::with_capacity(list.len() as usize);
-                for i in 0..list.len() {
-                    v.push(list.get(i)?.to_str()?.to_string());
-                }
-                v
-            },
-        }
-    } else {
-        // Primitive types - direct get
-        quote! {
-            #field_name: reader.#getter(),
-        }
-    }
-}
+// ═══════════════════════════════════════════════════════════════════════════════
+// Type detection helpers
+// ═══════════════════════════════════════════════════════════════════════════════
 
 /// Check if type is String
 fn is_string_type(ty: &syn::Type) -> bool {
@@ -402,6 +376,16 @@ fn is_pathbuf_type(ty: &syn::Type) -> bool {
     if let syn::Type::Path(type_path) = ty {
         if let Some(segment) = type_path.path.segments.last() {
             return segment.ident == "PathBuf";
+        }
+    }
+    false
+}
+
+/// Check if type is DateTime (from chrono::DateTime<Utc>)
+fn is_datetime_type(ty: &syn::Type) -> bool {
+    if let syn::Type::Path(type_path) = ty {
+        if let Some(segment) = type_path.path.segments.last() {
+            return segment.ident == "DateTime";
         }
     }
     false
@@ -433,265 +417,410 @@ fn is_vec_string_type(ty: &syn::Type) -> bool {
     false
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// RPC Method Macro - Generates client method implementations
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Attribute macro that generates RPC client method implementations.
-///
-/// This macro reduces boilerplate by auto-generating the serialize→call→parse pattern
-/// used in ZMQ RPC clients.
-///
-/// # Attributes
-///
-/// - `request` - Path to the Cap'n Proto request schema (e.g., `workers_capnp::runtime_request`)
-/// - `response` - Path to the Cap'n Proto response schema (e.g., `workers_capnp::runtime_response`)
-/// - `variant` - Name of the request union variant to set (e.g., `"version"`)
-/// - `returns` - Name of the response union variant to match (e.g., `"Version"`)
-///
-/// # Simple Variants (no nested builder)
-///
-/// For variants that take a simple value (Text, Void, primitive):
-/// ```ignore
-/// #[rpc_method(
-///     request = workers_capnp::runtime_request,
-///     response = workers_capnp::runtime_response,
-///     variant = "version",         // Maps to set_version(arg)
-///     returns = "Version"          // Maps to Which::Version(v)
-/// )]
-/// async fn worker_version(&self, version: &str) -> Result<VersionResponse>;
-/// ```
-///
-/// For Void variants (no arguments beyond &self):
-/// ```ignore
-/// #[rpc_method(
-///     request = workers_capnp::image_request,
-///     response = workers_capnp::image_response,
-///     variant = "image_fs_info",   // Maps to set_image_fs_info(())
-///     returns = "FsInfo"
-/// )]
-/// async fn image_fs_info(&self) -> Result<Vec<FilesystemUsage>>;
-/// ```
-///
-/// # Complex Variants (nested builder with ToCapnp)
-///
-/// For variants that take a struct (uses `init_*` and ToCapnp::write_to):
-/// ```ignore
-/// #[rpc_method(
-///     request = workers_capnp::runtime_request,
-///     response = workers_capnp::runtime_response,
-///     variant = "run_pod_sandbox", // Maps to init_run_pod_sandbox()
-///     returns = "SandboxId",
-///     complex = true               // Uses init_* instead of set_*
-/// )]
-/// async fn run_pod_sandbox(&self, config: &PodSandboxConfig) -> Result<String>;
-/// ```
-#[proc_macro_attribute]
-pub fn rpc_method(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let args = parse_macro_input!(attr as RpcMethodArgs);
-    let input = parse_macro_input!(item as syn::TraitItemFn);
-
-    let method_name = &input.sig.ident;
-    let return_type = &input.sig.output;
-    let inputs = &input.sig.inputs;
-
-    // Extract request/response schema paths
-    let request_schema = &args.request;
-    let response_schema = &args.response;
-    let variant_name = &args.variant;
-    let returns_variant = &args.returns;
-    let is_complex = args.complex;
-
-    // Generate setter name (snake_case)
-    let setter_name = if is_complex {
-        format_ident!("init_{}", variant_name)
-    } else {
-        format_ident!("set_{}", variant_name)
-    };
-
-    // Generate response variant (PascalCase)
-    let response_variant = format_ident!("{}", returns_variant);
-
-    // Collect non-self arguments
-    let args_list: Vec<_> = inputs.iter().filter_map(|arg| {
-        if let syn::FnArg::Typed(pat_type) = arg {
-            Some(pat_type)
-        } else {
-            None
+/// Check if type is Vec<u8> (maps to Cap'n Proto Data)
+fn is_vec_u8_type(ty: &syn::Type) -> bool {
+    if let syn::Type::Path(type_path) = ty {
+        if let Some(segment) = type_path.path.segments.last() {
+            if segment.ident == "Vec" {
+                if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                    if let Some(syn::GenericArgument::Type(syn::Type::Path(inner_path))) = args.args.first() {
+                        if let Some(inner_seg) = inner_path.path.segments.last() {
+                            return inner_seg.ident == "u8";
+                        }
+                    }
+                }
+            }
         }
-    }).collect();
+    }
+    false
+}
 
-    // Generate request building code based on argument count and complexity
-    let request_builder = if args_list.is_empty() {
-        // Void variant - no arguments
-        quote! {
-            req.#setter_name(());
+/// Extract the inner type from Vec<T> or Option<T>
+fn extract_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
+    if let syn::Type::Path(type_path) = ty {
+        if let Some(segment) = type_path.path.segments.last() {
+            if segment.ident == "Vec" || segment.ident == "Option" {
+                if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                    if let Some(syn::GenericArgument::Type(inner)) = args.args.first() {
+                        return Some(inner);
+                    }
+                }
+            }
         }
-    } else if is_complex && args_list.len() == 1 {
-        // Complex variant with single struct argument - use ToCapnp
-        let arg_name = &args_list[0].pat;
-        quote! {
+    }
+    None
+}
+
+/// Check if type is a known primitive (not a struct requiring FromCapnp/ToCapnp)
+fn is_known_primitive(ty: &syn::Type) -> bool {
+    if let syn::Type::Path(type_path) = ty {
+        if let Some(segment) = type_path.path.segments.last() {
+            let name = segment.ident.to_string();
+            return matches!(
+                name.as_str(),
+                "String" | "bool" | "u8" | "u16" | "u32" | "u64"
+                    | "i8" | "i16" | "i32" | "i64" | "f32" | "f64" | "PathBuf"
+            );
+        }
+    }
+    false
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Code generation: setters (ToCapnp) and getters (FromCapnp)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Generate setter code for a field (ToCapnp)
+///
+/// Dispatch order:
+/// 1. String              → set_field(&str)
+/// 2. PathBuf             → set_field(path.to_str())
+/// 3. DateTime<Utc>       → init Timestamp, set seconds + nanos
+/// 4. Vec<String>         → init list, set text items
+/// 5. Option<String>      → if let Some, set_field
+///    Option<DateTime>    → if let Some, init Timestamp
+/// 6. Option<T> (struct)  → if let Some, init + write_to
+/// 7. Vec<T> (struct)     → init list, loop write_to
+/// 8. Vec<T> (primitive)  → init list, loop set
+/// 9. Known primitive     → direct set_field(value)
+/// 10. Fallback (struct)  → init + write_to
+fn generate_setter(
+    field_name: &syn::Ident,
+    setter: &syn::Ident,
+    ty: &syn::Type,
+) -> proc_macro2::TokenStream {
+    // Derive init_field ident from set_field ident
+    let setter_str = setter.to_string();
+    let field_suffix = &setter_str["set_".len()..];
+    let initter = format_ident!("init_{}", field_suffix);
+
+    // 1. String
+    if is_string_type(ty) {
+        return quote! {
+            builder.#setter(&self.#field_name);
+        };
+    }
+
+    // 2. PathBuf
+    if is_pathbuf_type(ty) {
+        return quote! {
+            if let Some(s) = self.#field_name.to_str() {
+                builder.#setter(s);
+            }
+        };
+    }
+
+    // 3. DateTime<Utc> → Timestamp struct (seconds + nanos)
+    if is_datetime_type(ty) {
+        return quote! {
             {
-                let mut builder = req.#setter_name();
-                hyprstream_rpc::capnp::ToCapnp::write_to(#arg_name, &mut builder);
+                let mut ts = builder.reborrow().#initter();
+                ts.set_seconds(self.#field_name.timestamp());
+                ts.set_nanos(self.#field_name.timestamp_subsec_nanos() as i32);
             }
-        }
-    } else if args_list.len() == 1 {
-        // Simple variant with single argument
-        let arg_name = &args_list[0].pat;
-        let _arg_type = &args_list[0].ty;
+        };
+    }
 
-        // Set the argument on the request builder
-        quote! {
-            req.#setter_name(#arg_name);
-        }
-    } else {
-        // Multiple arguments - need custom handling or init_* with multiple setters
-        // For now, generate a compile error asking for manual implementation
-        return syn::Error::new_spanned(
-            &input.sig,
-            "rpc_method with multiple arguments requires manual implementation or complex=true with a single struct"
-        ).to_compile_error().into();
-    };
-
-    // Generate response parsing
-    let response_parser = generate_response_parser(response_schema, &response_variant, return_type);
-
-    // Generate the full method implementation
-    let expanded = quote! {
-        async fn #method_name(#inputs) #return_type {
-            let id = self.next_id();
-            let payload = hyprstream_rpc::serialize_message(|msg| {
-                let mut req = msg.init_root::<#request_schema::Builder>();
-                req.set_id(id);
-                #request_builder
-            })?;
-            let response = self.call(payload).await?;
-            #response_parser
-        }
-    };
-
-    expanded.into()
-}
-
-/// Arguments for the rpc_method attribute
-struct RpcMethodArgs {
-    request: syn::Path,
-    response: syn::Path,
-    variant: String,
-    returns: String,
-    complex: bool,
-}
-
-impl syn::parse::Parse for RpcMethodArgs {
-    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
-        let mut request = None;
-        let mut response = None;
-        let mut variant = None;
-        let mut returns = None;
-        let mut complex = false;
-
-        while !input.is_empty() {
-            let ident: syn::Ident = input.parse()?;
-            input.parse::<syn::Token![=]>()?;
-
-            match ident.to_string().as_str() {
-                "request" => {
-                    request = Some(input.parse::<syn::Path>()?);
-                }
-                "response" => {
-                    response = Some(input.parse::<syn::Path>()?);
-                }
-                "variant" => {
-                    let lit: syn::LitStr = input.parse()?;
-                    variant = Some(lit.value());
-                }
-                "returns" => {
-                    let lit: syn::LitStr = input.parse()?;
-                    returns = Some(lit.value());
-                }
-                "complex" => {
-                    let lit: syn::LitBool = input.parse()?;
-                    complex = lit.value();
-                }
-                other => {
-                    return Err(syn::Error::new(ident.span(), format!("unknown attribute: {other}")));
+    // 4. Vec<String>
+    if is_vec_string_type(ty) {
+        return quote! {
+            {
+                let mut list = builder.reborrow().#initter(self.#field_name.len() as u32);
+                for (i, item) in self.#field_name.iter().enumerate() {
+                    list.set(i as u32, item);
                 }
             }
+        };
+    }
 
-            // Consume optional comma
-            if input.peek(syn::Token![,]) {
-                input.parse::<syn::Token![,]>()?;
+    // 4b. Vec<u8> → Data (capnp set_field takes &[u8])
+    if is_vec_u8_type(ty) {
+        return quote! {
+            builder.#setter(&self.#field_name);
+        };
+    }
+
+    // 5. Option<T>
+    if is_option_type(ty) {
+        if let Some(inner) = extract_inner_type(ty) {
+            if is_string_type(inner) {
+                // Option<String>
+                return quote! {
+                    if let Some(ref v) = self.#field_name {
+                        builder.#setter(v);
+                    }
+                };
+            } else if is_datetime_type(inner) {
+                // Option<DateTime<Utc>> → Timestamp pointer (null = not set)
+                return quote! {
+                    if let Some(ref dt) = self.#field_name {
+                        let mut ts = builder.reborrow().#initter();
+                        ts.set_seconds(dt.timestamp());
+                        ts.set_nanos(dt.timestamp_subsec_nanos() as i32);
+                    }
+                };
+            } else if is_known_primitive(inner) {
+                // Option<primitive> — set if Some
+                return quote! {
+                    if let Some(v) = self.#field_name {
+                        builder.#setter(v);
+                    }
+                };
+            } else {
+                // Option<struct> — init + write_to
+                return quote! {
+                    if let Some(ref v) = self.#field_name {
+                        hyprstream_rpc::capnp::ToCapnp::write_to(v, &mut builder.reborrow().#initter());
+                    }
+                };
             }
         }
+        // Fallback for Option without extractable inner type
+        return quote! {
+            if let Some(ref v) = self.#field_name {
+                builder.#setter(v);
+            }
+        };
+    }
 
-        Ok(RpcMethodArgs {
-            request: request.ok_or_else(|| syn::Error::new(input.span(), "missing 'request' attribute"))?,
-            response: response.ok_or_else(|| syn::Error::new(input.span(), "missing 'response' attribute"))?,
-            variant: variant.ok_or_else(|| syn::Error::new(input.span(), "missing 'variant' attribute"))?,
-            returns: returns.ok_or_else(|| syn::Error::new(input.span(), "missing 'returns' attribute"))?,
-            complex,
-        })
+    // 7 & 8. Vec<T>
+    if is_vec_type(ty) {
+        if let Some(inner) = extract_inner_type(ty) {
+            if is_known_primitive(inner) {
+                // 8. Vec<primitive> — init list, set items
+                return quote! {
+                    {
+                        let mut list = builder.reborrow().#initter(self.#field_name.len() as u32);
+                        for (i, item) in self.#field_name.iter().enumerate() {
+                            list.set(i as u32, *item);
+                        }
+                    }
+                };
+            } else {
+                // 7. Vec<struct> — init list, write_to items
+                return quote! {
+                    {
+                        let mut list = builder.reborrow().#initter(self.#field_name.len() as u32);
+                        for (i, item) in self.#field_name.iter().enumerate() {
+                            hyprstream_rpc::capnp::ToCapnp::write_to(item, &mut list.reborrow().get(i as u32));
+                        }
+                    }
+                };
+            }
+        }
+    }
+
+    // 9. Known primitive — direct set
+    if is_known_primitive(ty) {
+        return quote! {
+            builder.#setter(self.#field_name);
+        };
+    }
+
+    // 10. Fallback: nested struct — init + write_to
+    quote! {
+        hyprstream_rpc::capnp::ToCapnp::write_to(&self.#field_name, &mut builder.reborrow().#initter());
     }
 }
 
-/// Generate response parsing code based on return type
-fn generate_response_parser(
-    response_schema: &syn::Path,
-    variant: &syn::Ident,
-    return_type: &syn::ReturnType,
+/// Generate setter code for a field with `#[capnp(enum_type)]` (ToCapnp).
+///
+/// Converts the Rust enum to the capnp enum via `Into`, then calls the setter.
+/// For `Option<Enum>`, only sets if `Some`.
+fn generate_enum_setter(
+    field_name: &syn::Ident,
+    setter: &syn::Ident,
+    ty: &syn::Type,
+    _capnp_enum_path: &syn::Path,
 ) -> proc_macro2::TokenStream {
-    // Extract the inner type from Result<T> (reserved for future use with typed responses)
-    let _inner_type = match return_type {
-        syn::ReturnType::Type(_, ty) => {
-            if let syn::Type::Path(type_path) = ty.as_ref() {
-                if let Some(segment) = type_path.path.segments.last() {
-                    if segment.ident == "Result" {
-                        if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
-                            if let Some(syn::GenericArgument::Type(inner)) = args.args.first() {
-                                Some(inner.clone())
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
+    if is_option_type(ty) {
+        quote! {
+            if let Some(ref v) = self.#field_name {
+                builder.#setter((*v).into());
+            }
+        }
+    } else {
+        quote! {
+            builder.#setter(self.#field_name.into());
+        }
+    }
+}
+
+/// Generate getter code for a field with `#[capnp(enum_type)]` (FromCapnp).
+///
+/// Reads the capnp enum and converts to the Rust enum via `Into`.
+/// Falls back to `Default::default()` if the enum value is not recognized.
+fn generate_enum_getter(
+    field_name: &syn::Ident,
+    getter: &syn::Ident,
+) -> proc_macro2::TokenStream {
+    quote! {
+        #field_name: reader.#getter().ok().map(Into::into).unwrap_or_default(),
+    }
+}
+
+/// Generate getter code for a field (FromCapnp)
+///
+/// Dispatch order:
+/// 1. String              → reader.get_field()?.to_str()?.to_string()
+/// 2. PathBuf             → PathBuf::from(reader.get_field()?.to_str()?)
+/// 3. DateTime<Utc>       → read Timestamp struct → from_timestamp
+/// 4. Vec<String>         → iterate text list
+/// 5. Option<String>      → empty string → None
+///    Option<DateTime>    → has_field() check + Timestamp read
+/// 6. Option<T> (struct)  → has_field() check + read_from
+/// 7. Vec<T> (struct)     → iterate struct list with read_from
+/// 8. Vec<T> (primitive)  → iterate primitive list
+/// 9. Known primitive     → direct reader.get_field()
+/// 10. Fallback (struct)  → read_from
+fn generate_getter(
+    field_name: &syn::Ident,
+    getter: &syn::Ident,
+    ty: &syn::Type,
+    is_optional: bool,
+) -> proc_macro2::TokenStream {
+    // Derive has_field ident from get_field ident
+    let getter_str = getter.to_string();
+    let field_suffix = &getter_str["get_".len()..];
+    let has_ident = format_ident!("has_{}", field_suffix);
+
+    // 1. String
+    if is_string_type(ty) {
+        return quote! {
+            #field_name: reader.#getter()?.to_str()?.to_string(),
+        };
+    }
+
+    // 2. PathBuf
+    if is_pathbuf_type(ty) {
+        return quote! {
+            #field_name: std::path::PathBuf::from(reader.#getter()?.to_str()?),
+        };
+    }
+
+    // 3. DateTime<Utc> → read Timestamp struct (seconds + nanos)
+    if is_datetime_type(ty) {
+        return quote! {
+            #field_name: {
+                let ts = reader.#getter()?;
+                chrono::DateTime::from_timestamp(ts.get_seconds(), ts.get_nanos() as u32)
+                    .unwrap_or_default()
+            },
+        };
+    }
+
+    // 4. Vec<String>
+    if is_vec_string_type(ty) {
+        return quote! {
+            #field_name: {
+                let list = reader.#getter()?;
+                let mut v = Vec::with_capacity(list.len() as usize);
+                for i in 0..list.len() {
+                    v.push(list.get(i)?.to_str()?.to_string());
+                }
+                v
+            },
+        };
+    }
+
+    // 4b. Vec<u8> → Data (capnp get_field returns Result<&[u8]>)
+    if is_vec_u8_type(ty) {
+        return quote! {
+            #field_name: reader.#getter()?.to_vec(),
+        };
+    }
+
+    // 5 & 6. Option<T>
+    if is_option_type(ty) || is_optional {
+        if let Some(inner) = extract_inner_type(ty) {
+            if is_string_type(inner) {
+                // Option<String> — empty string → None
+                return quote! {
+                    #field_name: {
+                        let s = reader.#getter()?.to_str()?;
+                        if s.is_empty() { None } else { Some(s.to_string()) }
+                    },
+                };
+            } else if is_datetime_type(inner) {
+                // Option<DateTime<Utc>> — has_field() check + Timestamp read
+                return quote! {
+                    #field_name: if reader.#has_ident() {
+                        let ts = reader.#getter()?;
+                        Some(chrono::DateTime::from_timestamp(ts.get_seconds(), ts.get_nanos() as u32)
+                            .unwrap_or_default())
                     } else {
                         None
-                    }
-                } else {
-                    None
-                }
+                    },
+                };
+            } else if is_known_primitive(inner) {
+                // Option<primitive> — treat 0/false/default as None
+                return quote! {
+                    #field_name: {
+                        let s = reader.#getter()?.to_str()?;
+                        if s.is_empty() { None } else { Some(s.to_string()) }
+                    },
+                };
             } else {
-                None
+                // Option<struct> — has_field() check + read_from
+                return quote! {
+                    #field_name: if reader.#has_ident() {
+                        Some(hyprstream_rpc::capnp::FromCapnp::read_from(reader.#getter()?)?)
+                    } else {
+                        None
+                    },
+                };
             }
         }
-        _ => None,
-    };
+        // Fallback for #[capnp(optional)] on non-Option type
+        return quote! {
+            #field_name: {
+                let s = reader.#getter()?.to_str()?;
+                if s.is_empty() { None } else { Some(s.to_string()) }
+            },
+        };
+    }
 
-    // Generate parsing code
+    // 7 & 8. Vec<T>
+    if is_vec_type(ty) {
+        if let Some(inner) = extract_inner_type(ty) {
+            if is_known_primitive(inner) {
+                // 8. Vec<primitive> — iterate primitive list
+                return quote! {
+                    #field_name: {
+                        let list = reader.#getter()?;
+                        let mut v = Vec::with_capacity(list.len() as usize);
+                        for i in 0..list.len() {
+                            v.push(list.get(i));
+                        }
+                        v
+                    },
+                };
+            } else {
+                // 7. Vec<struct> — iterate struct list with read_from
+                return quote! {
+                    #field_name: {
+                        let list = reader.#getter()?;
+                        let mut v = Vec::with_capacity(list.len() as usize);
+                        for i in 0..list.len() {
+                            v.push(hyprstream_rpc::capnp::FromCapnp::read_from(list.get(i))?);
+                        }
+                        v
+                    },
+                };
+            }
+        }
+    }
+
+    // 9. Known primitive — direct get (no ? needed, returns value directly)
+    if is_known_primitive(ty) {
+        return quote! {
+            #field_name: reader.#getter(),
+        };
+    }
+
+    // 10. Fallback: nested struct — read_from
     quote! {
-        {
-            let reader = capnp::serialize::read_message(
-                &mut std::io::Cursor::new(&response),
-                capnp::message::ReaderOptions::new()
-            )?;
-            let resp = reader.get_root::<#response_schema::Reader>()?;
-
-            // Check for error first
-            match resp.which()? {
-                #response_schema::Which::Error(err) => {
-                    let err = err?;
-                    let msg = err.get_message()?.to_str()?;
-                    return Err(anyhow::anyhow!("{}", msg));
-                }
-                #response_schema::Which::#variant(v) => {
-                    let v = v?;
-                    hyprstream_rpc::capnp::FromCapnp::read_from(v)
-                }
-                _ => Err(anyhow::anyhow!(concat!("Expected ", stringify!(#variant), " response"))),
-            }
-        }
+        #field_name: hyprstream_rpc::capnp::FromCapnp::read_from(reader.#getter()?)?,
     }
 }
 
@@ -728,9 +857,8 @@ fn generate_response_parser(
 /// The macro generates:
 /// 1. JWT token validation via `ctx.validate_jwt()`
 /// 2. Structured scope construction: `Scope::new(action, resource, request.identifier_field)`
-/// 3. Casbin policy check (optional, based on service configuration)
-/// 4. JWT scope check via `claims.has_scope(&required_scope)`
-/// 5. Original method call if all checks pass
+/// 3. Casbin policy check (single source of truth for authorization)
+/// 4. Original method call if all checks pass
 ///
 /// # Security
 ///
@@ -770,7 +898,7 @@ pub fn authorize(attr: TokenStream, item: TokenStream) -> TokenStream {
             );
 
             // Check Casbin policy (scope used as resource)
-            let subject = claims.casbin_subject();
+            let subject = claims.sub.clone();
             let allowed = tokio::task::block_in_place(|| {
                 let handle = tokio::runtime::Handle::current();
                 handle.block_on(self.policy_manager.check(
@@ -787,15 +915,8 @@ pub fn authorize(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ));
             }
 
-            // Check claims scope (uses Scope::grants() with safe wildcard matching)
-            if !claims.has_scope(&required_scope) {
-                return Err(anyhow::anyhow!(
-                    "Forbidden: Missing scope '{}'",
-                    required_scope.to_string()
-                ));
-            }
-
-            // Authorization passed - execute original function body
+            // Authorization passed (Casbin is the single source of truth)
+            // JWT scope checks removed - Casbin enforces all authorization
             #fn_block
         }
     };
@@ -984,23 +1105,249 @@ pub fn register_scopes(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// - ✅ Matches existing patterns: Same as `#[register_scopes]` and `DriverFactory`
 #[proc_macro_attribute]
 pub fn service_factory(attr: TokenStream, item: TokenStream) -> TokenStream {
-    use syn::LitStr;
-
-    let name = parse_macro_input!(attr as LitStr);
+    let args = parse_macro_input!(attr as ServiceFactoryArgs);
     let func = parse_macro_input!(item as syn::ItemFn);
     let func_name = &func.sig.ident;
+    let name = &args.name;
 
-    let expanded = quote! {
-        #func
+    let expanded = match (&args.schema, &args.metadata) {
+        (Some(schema_path), Some(metadata_path)) => {
+            quote! {
+                #func
 
-        inventory::submit! {
-            hyprstream_rpc::service::factory::ServiceFactory::new(
-                #name,
-                #func_name
-            )
+                inventory::submit! {
+                    hyprstream_rpc::service::factory::ServiceFactory::with_metadata(
+                        #name,
+                        #func_name,
+                        include_bytes!(#schema_path),
+                        #metadata_path
+                    )
+                }
+            }
+        }
+        (Some(schema_path), None) => {
+            quote! {
+                #func
+
+                inventory::submit! {
+                    hyprstream_rpc::service::factory::ServiceFactory::with_schema(
+                        #name,
+                        #func_name,
+                        include_bytes!(#schema_path)
+                    )
+                }
+            }
+        }
+        _ => {
+            quote! {
+                #func
+
+                inventory::submit! {
+                    hyprstream_rpc::service::factory::ServiceFactory::new(
+                        #name,
+                        #func_name
+                    )
+                }
+            }
         }
     };
 
     expanded.into()
 }
 
+/// Arguments for the #[service_factory] attribute.
+///
+/// Supports:
+/// - `#[service_factory("name")]` — no schema
+/// - `#[service_factory("name", schema = "path/to/schema.capnp")]` — with schema
+/// - `#[service_factory("name", schema = "...", metadata = path::to::schema_metadata)]` — with metadata
+struct ServiceFactoryArgs {
+    name: syn::LitStr,
+    schema: Option<syn::LitStr>,
+    metadata: Option<syn::Path>,
+}
+
+impl syn::parse::Parse for ServiceFactoryArgs {
+    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
+        let name: syn::LitStr = input.parse()?;
+        let mut schema = None;
+        let mut metadata = None;
+
+        while input.peek(syn::Token![,]) {
+            input.parse::<syn::Token![,]>()?;
+            if input.is_empty() {
+                break;
+            }
+            let ident: syn::Ident = input.parse()?;
+            input.parse::<syn::Token![=]>()?;
+            match ident.to_string().as_str() {
+                "schema" => {
+                    schema = Some(input.parse::<syn::LitStr>()?);
+                }
+                "metadata" => {
+                    metadata = Some(input.parse::<syn::Path>()?);
+                }
+                other => {
+                    return Err(syn::Error::new(ident.span(), format!("unknown attribute: {other}")));
+                }
+            }
+        }
+
+        Ok(ServiceFactoryArgs { name, schema, metadata })
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RPC Service Code Generation Macro
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Proc macro that generates a complete RPC client + handler + metadata from a Cap'n Proto schema.
+///
+/// Reads the schema file from `$CARGO_MANIFEST_DIR/schema/{name}.capnp`, parses it,
+/// and generates all client code using `quote!` AST generation.
+///
+/// # Usage
+///
+/// ```ignore
+/// pub mod policy_client {
+///     #![allow(dead_code, unused_imports, unused_variables)]
+///     #![allow(clippy::all)]
+///     hyprstream_rpc_derive::generate_rpc_service!("policy");
+/// }
+/// ```
+/// Arguments for `generate_rpc_service!` macro.
+///
+/// Supports:
+/// - `generate_rpc_service!("name")` — standard (server-side, handler included)
+/// - `generate_rpc_service!("name", types_crate = some_crate)` — client-only, domain types from external crate
+/// - `generate_rpc_service!("name", scope_handlers)` — generate typed scope sub-traits for inner dispatch
+struct RpcServiceArgs {
+    name: syn::LitStr,
+    types_crate: Option<syn::Path>,
+    scope_handlers: bool,
+}
+
+impl syn::parse::Parse for RpcServiceArgs {
+    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
+        let name: syn::LitStr = input.parse()?;
+        let mut types_crate = None;
+        let mut scope_handlers = false;
+
+        while input.peek(syn::Token![,]) {
+            input.parse::<syn::Token![,]>()?;
+            if input.is_empty() {
+                break;
+            }
+            let ident: syn::Ident = input.parse()?;
+            if ident == "types_crate" {
+                input.parse::<syn::Token![=]>()?;
+                types_crate = Some(input.parse::<syn::Path>()?);
+            } else if ident == "scope_handlers" {
+                scope_handlers = true;
+            } else {
+                return Err(syn::Error::new(ident.span(), format!("unknown option: {ident}")));
+            }
+        }
+
+        Ok(RpcServiceArgs { name, types_crate, scope_handlers })
+    }
+}
+
+#[proc_macro]
+pub fn generate_rpc_service(input: TokenStream) -> TokenStream {
+    let args: RpcServiceArgs = match syn::parse(input) {
+        Ok(a) => a,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let service_name = &args.name;
+    let name = service_name.value();
+    let types_crate = args.types_crate.as_ref();
+
+    // Try CGR-based parser first (reads binary from OUT_DIR, includes full type
+    // resolution and annotations). Falls back to text parser if CGR unavailable.
+    let parsed = match schema::parse_from_cgr(&name) {
+        Ok(p) => p,
+        Err(cgr_err) => {
+            // Fallback: text parser + metadata JSON merge
+            // CGR parser failed — fall back to text parser silently.
+            let _ = cgr_err;
+
+            let manifest_dir = match std::env::var("CARGO_MANIFEST_DIR") {
+                Ok(d) => d,
+                Err(_) => {
+                    return syn::Error::new(service_name.span(), "CARGO_MANIFEST_DIR not set")
+                        .to_compile_error()
+                        .into()
+                }
+            };
+
+            let schema_dir = match std::fs::canonicalize(format!("{manifest_dir}/schema")) {
+                Ok(d) => d,
+                Err(e) => {
+                    return syn::Error::new(
+                        service_name.span(),
+                        format!("Cannot resolve schema directory: {e}"),
+                    )
+                    .to_compile_error()
+                    .into()
+                }
+            };
+            let schema_path = match std::fs::canonicalize(schema_dir.join(format!("{name}.capnp"))) {
+                Ok(p) if p.starts_with(&schema_dir) => p,
+                Ok(p) => {
+                    return syn::Error::new(
+                        service_name.span(),
+                        format!("Schema path escapes build environment: {}", p.display()),
+                    )
+                    .to_compile_error()
+                    .into()
+                }
+                Err(e) => {
+                    return syn::Error::new(
+                        service_name.span(),
+                        format!("Cannot resolve schema '{name}.capnp': {e}"),
+                    )
+                    .to_compile_error()
+                    .into()
+                }
+            };
+            let schema_text = match std::fs::read_to_string(&schema_path) {
+                Ok(t) => t,
+                Err(e) => {
+                    return syn::Error::new(
+                        service_name.span(),
+                        format!("Cannot read {}: {e}", schema_path.display()),
+                    )
+                    .to_compile_error()
+                    .into()
+                }
+            };
+
+            let mut parsed = match schema::parse_capnp_schema(&schema_text, &name) {
+                Some(p) => p,
+                None => {
+                    return syn::Error::new(
+                        service_name.span(),
+                        format!("Failed to parse schema for '{name}'"),
+                    )
+                    .to_compile_error()
+                    .into()
+                }
+            };
+
+            // Try to load annotation metadata from OUT_DIR (generated by build.rs)
+            if let Ok(out_dir) = std::env::var("OUT_DIR") {
+                let metadata_path = std::path::Path::new(&out_dir).join(format!("{name}_metadata.json"));
+                if let Ok(metadata_text) = std::fs::read_to_string(&metadata_path) {
+                    if let Err(e) = schema::merge_annotations_from_metadata(&mut parsed, &metadata_text) {
+                        let _ = e; // annotation metadata load failed; non-fatal
+                    }
+                }
+            }
+
+            parsed
+        }
+    };
+
+    codegen::generate_service(&name, &parsed, types_crate, args.scope_handlers).into()
+}

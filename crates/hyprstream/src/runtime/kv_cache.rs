@@ -139,6 +139,9 @@ pub struct KVCacheRegistry {
     default_config: CacheConfig,
     /// Memory budget in bytes (None = unlimited)
     memory_budget_bytes: Option<usize>,
+    /// Maps cache owners to the subject delta that was active when the cache was computed.
+    /// When a delta is evicted or reset, dependent caches must be invalidated.
+    delta_dependencies: DashMap<CacheOwner, Option<String>>,
 }
 
 impl KVCacheRegistry {
@@ -156,6 +159,7 @@ impl KVCacheRegistry {
             caches: DashMap::new(),
             default_config,
             memory_budget_bytes: memory_budget,
+            delta_dependencies: DashMap::new(),
         }
     }
 
@@ -266,7 +270,52 @@ impl KVCacheRegistry {
     /// Clear all caches (useful for cleanup)
     pub fn clear_all(&self) {
         self.caches.clear();
+        self.delta_dependencies.clear();
         tracing::info!("Cleared all KV caches from registry");
+    }
+
+    /// Register a dependency between a cache owner and a subject's delta.
+    ///
+    /// When the subject's delta is later evicted or reset, all dependent caches
+    /// will be invalidated since they were computed with stale weights.
+    pub fn register_delta_dependency(&self, owner: &CacheOwner, tenant_id: Option<String>) {
+        self.delta_dependencies
+            .insert(owner.clone(), tenant_id);
+    }
+
+    /// Invalidate all KV caches that depend on a specific subject's delta.
+    ///
+    /// Called when a subject's delta is evicted, reset, or significantly modified.
+    /// Returns the number of caches invalidated.
+    pub fn invalidate_for_tenant(&self, tenant_id: &str) -> usize {
+        let mut invalidated = 0;
+        let to_remove: Vec<CacheOwner> = self
+            .delta_dependencies
+            .iter()
+            .filter_map(|entry| {
+                if entry.value().as_deref() == Some(tenant_id) {
+                    Some(entry.key().clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for owner in to_remove {
+            self.caches.remove(&owner);
+            self.delta_dependencies.remove(&owner);
+            invalidated += 1;
+        }
+
+        if invalidated > 0 {
+            tracing::info!(
+                "Invalidated {} KV caches dependent on subject delta '{}'",
+                invalidated,
+                tenant_id
+            );
+        }
+
+        invalidated
     }
 }
 

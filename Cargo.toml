@@ -8,6 +8,7 @@ members = [
     "crates/hyprstream-flight",
     "crates/cas-serve",
     "crates/hyprstream-rpc",
+    "crates/hyprstream-rpc-build",
     "crates/hyprstream-rpc-derive",
     "crates/hyprstream-workers",
 ]
@@ -72,7 +73,7 @@ opentelemetry-semantic-conventions = { version = "0.30" }
 opentelemetry-stdout = { version = "0.30", features = ["trace"] }
 
 # Utilities
-uuid = { version = "1.0", features = ["v4", "serde"] }
+uuid = { version = "1.0", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3.9"
 which = "7"
@@ -195,6 +196,9 @@ version = "1.0"
 
 [workspace.dependencies.pkg-config]
 version = "0.3"
+
+[workspace.dependencies.hyprstream-rpc-build]
+path = "crates/hyprstream-rpc-build"
 
 [workspace.dependencies.capnpc]
 version = "0.20"

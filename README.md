@@ -142,10 +142,10 @@ HyprStream provides an OpenAI-compatible API endpoint for easy integration with 
 
 ```bash
 # Start API server
-hyprstream server --port 50051
+hyprstream server --port 6789
 
 # List available models (worktree-based)
-curl http://localhost:50051/oai/v1/models
+curl http://localhost:6789/oai/v1/models
 
 # Example response shows models as model:branch format
 # {
@@ -168,7 +168,7 @@ curl http://localhost:50051/oai/v1/models
 
 # Make chat completions request (OpenAI-compatible)
 # NOTE: Models must be referenced with branch (model:branch format)
-curl -X POST http://localhost:50051/oai/v1/chat/completions \
+curl -X POST http://localhost:6789/oai/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3-small:main",
@@ -181,7 +181,7 @@ curl -X POST http://localhost:50051/oai/v1/chat/completions \
 
 # Or use with any OpenAI-compatible client
 export OPENAI_API_KEY="dummy"
-export OPENAI_BASE_URL="http://localhost:50051/oai/v1"
+export OPENAI_BASE_URL="http://localhost:6789/oai/v1"
 # Now use any OpenAI client library
 # Note: Specify model as "qwen3-small:main" not just "qwen3-small"
 ```
@@ -205,6 +205,44 @@ HyprStream uses Git worktrees for model management. The `/v1/models` endpoint li
 
 This allows you to work with multiple versions of the same model simultaneously, each in its own worktree with isolated changes.
 
+### MCP Integration (Claude Code, Cursor, etc.)
+
+HyprStream includes a built-in [Model Context Protocol](https://modelcontextprotocol.io/) server that exposes inference, model management, and repository operations as tools for AI coding assistants.
+
+**1. Configure Claude Code:**
+
+```claude mcp add --transport http hyprstream http://localhost:6790/mcp```
+
+**2. Authenticate
+
+Use `/mcp`, select `hyprstream`, and select `Authenticate` or `Re-authenticate`.
+
+**3. Available tools:**
+
+Once connected, Claude Code can use hyprstream tools directly:
+
+| Tool | Description |
+|------|-------------|
+| `model.load` | Load a model for inference |
+| `model.list` | List loaded models |
+| `model.status` | Get model status and memory usage |
+| `registry.list` | List all cloned repositories |
+| `registry.clone` | Clone a model from HuggingFace/GitHub |
+| `repo.*` | Branch, worktree, merge, and tag operations |
+| `policy.*` | Policy checks and token management |
+
+**Configuration:**
+
+The MCP server listens on port 6790 by default. To change it, set in your hyprstream config:
+
+```toml
+[mcp]
+host = "127.0.0.1"
+http_port = 6790
+```
+
+Or configure via the [OAI-compatible API](#openai-compatible-rest-api) on port 6789 for non-MCP clients.
+
 ### Advanced deployments
 
 HyprStream can be configured via environment variables with the `HYPRSTREAM_` prefix:
@@ -212,7 +250,7 @@ HyprStream can be configured via environment variables with the `HYPRSTREAM_` pr
 ```bash
 # Server configuration
 export HYPRSTREAM_SERVER_HOST=0.0.0.0
-export HYPRSTREAM_SERVER_PORT=8080
+export HYPRSTREAM_SERVER_PORT=6789
 export HYPRSTREAM_API_KEY=your-api-key
 
 # CORS settings
@@ -318,7 +356,7 @@ hyprstream policy rollback HEAD~1
 hyprstream policy token create --user alice --name "my-token" --expires 1d
 
 # Use with API requests
-curl -H "Authorization: Bearer hypr_eyJ..." http://localhost:8080/v1/models
+curl -H "Authorization: Bearer eyJ..." http://localhost:6789/v1/models
 ```
 
 See [docs/rpc-architecture.md](docs/rpc-architecture.md) for detailed RPC and service infrastructure documentation.
@@ -352,7 +390,7 @@ cargo build --no-default-features --features tch-cuda,otel --release
 ```bash
 export HYPRSTREAM_OTEL_ENABLE=true
 export RUST_LOG=hyprstream=debug
-hyprstream server --port 8080
+hyprstream server --port 6789
 # Spans printed to console
 ```
 
@@ -361,13 +399,13 @@ hyprstream server --port 8080
 export HYPRSTREAM_OTEL_ENABLE=true
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
 export OTEL_SERVICE_NAME=hyprstream-prod
-hyprstream server --port 8080
+hyprstream server --port 6789
 ```
 
 **File logging (separate from OTEL):**
 ```bash
 export HYPRSTREAM_LOG_DIR=/var/log/hyprstream
-hyprstream server --port 8080
+hyprstream server --port 6789
 # Creates daily-rotated logs at /var/log/hyprstream/hyprstream.log
 ```
 

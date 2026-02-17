@@ -1,22 +1,60 @@
 //! RuntimeClient trait and ZMQ client
 //!
 //! Client-side trait for CRI RuntimeService (`runtime.v1`) for future kubelet compatibility.
+//! Response types use generated `*Data` types from the Cap'n Proto schema directly,
+//! eliminating redundant domain type wrappers and cross-crate conversion.
 
 use crate::error::Result;
-use crate::workers_capnp;
+use crate::worker_capnp;
 use async_trait::async_trait;
 use hyprstream_rpc::{FromCapnp, ToCapnp};
-use std::collections::HashMap;
+use std::collections::HashMap; // Only for StatusResponse.info (local-only, not serialized)
 
-use super::{
-    PodSandbox, PodSandboxConfig, PodSandboxStatus,
-    Container, ContainerConfig, ContainerStatus,
+// Re-export generated wire types as the canonical response/stats types.
+// These are produced by `generate_rpc_service!("worker")` in crate::generated::worker_client.
+pub use crate::generated::worker_client::{
+    // Generated client
+    WorkerClient as GenWorkerClient,
+    // Response types
+    VersionInfo, RuntimeStatus, RuntimeCondition,
+    PodSandboxStatusResponse, ContainerStatusResponse,
+    ExecSyncResult,
+    // Stats types
+    PodSandboxStats, PodSandboxAttributes,
+    LinuxPodSandboxStats,
+    ContainerStats, ContainerAttributes,
+    CpuUsage, MemoryUsage, NetworkUsage,
+    NetworkInterfaceUsage, ProcessUsage,
+    FilesystemUsage, FilesystemIdentifier,
+    // Common types
+    KeyValue as GenKeyValue, Timestamp,
+    // Info types for list responses
+    PodSandboxInfo, ContainerInfo,
+    // Scoped status types (generated)
+    PodSandboxStatus, ContainerStatus,
+    PodSandboxNetworkStatus,
+    // Generated enum types
+    PodSandboxStateEnum, ContainerStateEnum,
+    // Request config types (for client RPC calls)
+    PodSandboxConfig, ContainerConfig, ImageSpec,
+    DNSConfig, PortMapping, LinuxPodSandboxConfig,
+    LinuxSandboxSecurityContext,
+    Mount, Device, LinuxContainerConfig,
+    LinuxContainerSecurityContext, Capability,
+    AuthConfig, StreamInfo,
+    ImageInfo, ImageStatusResult,
 };
+// Note: PodSandboxMetadata, ContainerMetadata, KeyValue, and Filter types
+// are hand-written below with extra functionality (serde, #[capnp(skip)], etc.)
+
 
 /// CRI-aligned RuntimeClient trait
 ///
 /// Client-side interface for CRI RuntimeService (`runtime.v1`) for future kubelet/crictl compatibility.
 /// PodSandbox = Kata VM, Container = OCI container within VM.
+///
+/// Response types use generated `*Data` types directly for zero-conversion
+/// cross-crate interoperability.
 #[async_trait]
 pub trait RuntimeClient: Send + Sync {
     // ─────────────────────────────────────────────────────────────────────
@@ -24,7 +62,7 @@ pub trait RuntimeClient: Send + Sync {
     // ─────────────────────────────────────────────────────────────────────
 
     /// Get runtime version information
-    async fn version(&self, version: &str) -> Result<VersionResponse>;
+    async fn version(&self, version: &str) -> Result<VersionInfo>;
 
     /// Get runtime status
     async fn status(&self, verbose: bool) -> Result<StatusResponse>;
@@ -53,7 +91,7 @@ pub trait RuntimeClient: Send + Sync {
     async fn list_pod_sandbox(
         &self,
         filter: Option<&PodSandboxFilter>,
-    ) -> Result<Vec<PodSandbox>>;
+    ) -> Result<Vec<PodSandboxInfo>>;
 
     // ─────────────────────────────────────────────────────────────────────
     // Container Lifecycle
@@ -87,7 +125,7 @@ pub trait RuntimeClient: Send + Sync {
     async fn list_containers(
         &self,
         filter: Option<&ContainerFilter>,
-    ) -> Result<Vec<Container>>;
+    ) -> Result<Vec<ContainerInfo>>;
 
     // ─────────────────────────────────────────────────────────────────────
     // Exec
@@ -99,7 +137,7 @@ pub trait RuntimeClient: Send + Sync {
         container_id: &str,
         cmd: &[String],
         timeout: i64,
-    ) -> Result<ExecSyncResponse>;
+    ) -> Result<ExecSyncResult>;
 
     // ─────────────────────────────────────────────────────────────────────
     // Stats
@@ -125,163 +163,28 @@ pub trait RuntimeClient: Send + Sync {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Response Types
+// Local Composite Types (not in schema, used internally)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Runtime version response
-#[derive(Debug, Clone, ToCapnp, FromCapnp)]
-#[capnp(workers_capnp::version_info)]
-pub struct VersionResponse {
-    /// Version of the CRI spec
-    pub version: String,
-    /// Name of the runtime
-    #[capnp(rename = "runtime_name")]
-    pub runtime_name: String,
-    /// Version of the runtime
-    #[capnp(rename = "runtime_version")]
-    pub runtime_version: String,
-    /// API version of the runtime
-    #[capnp(rename = "runtime_api_version")]
-    pub runtime_api_version: String,
-}
-
-/// Runtime status response
+/// Runtime status response (local composite, not in schema).
+///
+/// Bundles the generated RuntimeStatus with verbose diagnostic info.
+/// The `info` HashMap is NOT serialized over the wire — it's only used locally.
 #[derive(Debug, Clone)]
 pub struct StatusResponse {
-    /// Overall runtime status
+    /// Overall runtime status (generated wire type)
     pub status: RuntimeStatus,
-    /// Additional info (if verbose)
+    /// Additional info (if verbose) — local only, not serialized
     pub info: HashMap<String, String>,
 }
 
-/// Runtime status
-#[derive(Debug, Clone)]
-pub struct RuntimeStatus {
-    /// Runtime conditions
-    pub conditions: Vec<RuntimeCondition>,
-}
-
-/// Runtime condition
-#[derive(Debug, Clone, ToCapnp, FromCapnp)]
-#[capnp(workers_capnp::runtime_condition)]
-pub struct RuntimeCondition {
-    /// Type of condition
-    #[capnp(rename = "condition_type")]
-    pub condition_type: String,
-    /// Status of condition
-    pub status: bool,
-    /// Reason for condition
-    pub reason: String,
-    /// Human-readable message
-    pub message: String,
-}
-
-/// Pod sandbox status response
-#[derive(Debug, Clone)]
-pub struct PodSandboxStatusResponse {
-    /// Status of the pod sandbox
-    pub status: PodSandboxStatus,
-    /// Additional info (if verbose)
-    pub info: HashMap<String, String>,
-}
-
-/// Container status response
-#[derive(Debug, Clone)]
-pub struct ContainerStatusResponse {
-    /// Status of the container
-    pub status: ContainerStatus,
-    /// Additional info (if verbose)
-    pub info: HashMap<String, String>,
-}
-
-/// Exec sync response
-#[derive(Debug, Clone)]
-pub struct ExecSyncResponse {
-    /// Stdout output
-    pub stdout: Vec<u8>,
-    /// Stderr output
-    pub stderr: Vec<u8>,
-    /// Exit code
-    pub exit_code: i32,
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
-// Filter Types
+// Metadata Types (used in runtime state — need serde derives)
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Filter for listing pod sandboxes
-#[derive(Debug, Clone, Default)]
-pub struct PodSandboxFilter {
-    /// Filter by sandbox ID
-    pub id: Option<String>,
-    /// Filter by state
-    pub state: Option<super::PodSandboxState>,
-    /// Filter by labels
-    pub label_selector: HashMap<String, String>,
-}
-
-/// Filter for listing containers
-#[derive(Debug, Clone, Default)]
-pub struct ContainerFilter {
-    /// Filter by container ID
-    pub id: Option<String>,
-    /// Filter by pod sandbox ID
-    pub pod_sandbox_id: Option<String>,
-    /// Filter by state
-    pub state: Option<super::ContainerState>,
-    /// Filter by labels
-    pub label_selector: HashMap<String, String>,
-}
-
-/// Filter for pod sandbox stats
-#[derive(Debug, Clone, Default)]
-pub struct PodSandboxStatsFilter {
-    /// Filter by sandbox ID
-    pub id: Option<String>,
-    /// Filter by labels
-    pub label_selector: HashMap<String, String>,
-}
-
-/// Filter for container stats
-#[derive(Debug, Clone, Default)]
-pub struct ContainerStatsFilter {
-    /// Filter by container ID
-    pub id: Option<String>,
-    /// Filter by pod sandbox ID
-    pub pod_sandbox_id: Option<String>,
-    /// Filter by labels
-    pub label_selector: HashMap<String, String>,
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Stats Types
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Pod sandbox stats
-#[derive(Debug, Clone)]
-pub struct PodSandboxStats {
-    /// Sandbox attributes
-    pub attributes: PodSandboxAttributes,
-    /// Linux-specific stats
-    pub linux: Option<LinuxPodSandboxStats>,
-}
-
-/// Pod sandbox attributes for stats
-#[derive(Debug, Clone)]
-pub struct PodSandboxAttributes {
-    /// Sandbox ID
-    pub id: String,
-    /// Sandbox metadata
-    pub metadata: PodSandboxMetadata,
-    /// Labels
-    pub labels: HashMap<String, String>,
-    /// Annotations
-    pub annotations: HashMap<String, String>,
-}
 
 /// Pod sandbox metadata
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, ToCapnp, FromCapnp)]
-#[capnp(workers_capnp::pod_sandbox_metadata)]
+#[capnp(worker_capnp::pod_sandbox_metadata)]
 pub struct PodSandboxMetadata {
     /// Pod name
     pub name: String,
@@ -293,48 +196,9 @@ pub struct PodSandboxMetadata {
     pub attempt: u32,
 }
 
-/// Linux-specific pod sandbox stats
-#[derive(Debug, Clone)]
-pub struct LinuxPodSandboxStats {
-    /// CPU stats
-    pub cpu: Option<CpuUsage>,
-    /// Memory stats
-    pub memory: Option<MemoryUsage>,
-    /// Network stats
-    pub network: Option<NetworkUsage>,
-    /// Process count
-    pub process: Option<ProcessUsage>,
-}
-
-/// Container stats
-#[derive(Debug, Clone)]
-pub struct ContainerStats {
-    /// Container attributes
-    pub attributes: ContainerAttributes,
-    /// CPU stats
-    pub cpu: Option<CpuUsage>,
-    /// Memory stats
-    pub memory: Option<MemoryUsage>,
-    /// Writable layer stats
-    pub writable_layer: Option<FilesystemUsage>,
-}
-
-/// Container attributes for stats
-#[derive(Debug, Clone)]
-pub struct ContainerAttributes {
-    /// Container ID
-    pub id: String,
-    /// Container metadata
-    pub metadata: ContainerMetadata,
-    /// Labels
-    pub labels: HashMap<String, String>,
-    /// Annotations
-    pub annotations: HashMap<String, String>,
-}
-
 /// Container metadata
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, ToCapnp, FromCapnp)]
-#[capnp(workers_capnp::container_metadata)]
+#[capnp(worker_capnp::container_metadata)]
 pub struct ContainerMetadata {
     /// Container name
     pub name: String,
@@ -342,213 +206,65 @@ pub struct ContainerMetadata {
     pub attempt: u32,
 }
 
-/// CPU usage stats
-#[derive(Debug, Clone)]
-pub struct CpuUsage {
-    /// Timestamp in nanoseconds
-    pub timestamp: i64,
-    /// Total CPU usage in nanoseconds
-    pub usage_core_nano_seconds: u64,
-    /// Per-core CPU usage
-    pub usage_nano_cores: u64,
-}
-
-/// Memory usage stats
-#[derive(Debug, Clone)]
-pub struct MemoryUsage {
-    /// Timestamp in nanoseconds
-    pub timestamp: i64,
-    /// Working set in bytes
-    pub working_set_bytes: u64,
-    /// Available bytes
-    pub available_bytes: u64,
-    /// Usage bytes
-    pub usage_bytes: u64,
-    /// RSS bytes
-    pub rss_bytes: u64,
-    /// Page faults
-    pub page_faults: u64,
-    /// Major page faults
-    pub major_page_faults: u64,
-}
-
-/// Network usage stats
-#[derive(Debug, Clone)]
-pub struct NetworkUsage {
-    /// Timestamp in nanoseconds
-    pub timestamp: i64,
-    /// Default interface stats
-    pub default_interface: Option<NetworkInterfaceUsage>,
-    /// All interfaces
-    pub interfaces: Vec<NetworkInterfaceUsage>,
-}
-
-/// Network interface usage
-#[derive(Debug, Clone)]
-pub struct NetworkInterfaceUsage {
-    /// Interface name
-    pub name: String,
-    /// Bytes received
-    pub rx_bytes: u64,
-    /// Bytes transmitted
-    pub tx_bytes: u64,
-    /// Receive errors
-    pub rx_errors: u64,
-    /// Transmit errors
-    pub tx_errors: u64,
-}
-
-/// Process usage stats
-#[derive(Debug, Clone)]
-pub struct ProcessUsage {
-    /// Timestamp in nanoseconds
-    pub timestamp: i64,
-    /// Process count
-    pub process_count: u64,
-}
-
-/// Filesystem usage stats
-#[derive(Debug, Clone)]
-pub struct FilesystemUsage {
-    /// Timestamp in nanoseconds
-    pub timestamp: i64,
-    /// Filesystem ID
-    pub fs_id: Option<FilesystemIdentifier>,
-    /// Used bytes
-    pub used_bytes: u64,
-    /// Inode usage
-    pub inodes_used: u64,
-}
-
-/// Filesystem identifier
-#[derive(Debug, Clone)]
-pub struct FilesystemIdentifier {
-    /// Mountpoint
-    pub mountpoint: String,
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
-// ZMQ Client Implementation
+// Shared Domain Types
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// ZMQ client for RuntimeClient
-///
-/// Implements RuntimeClient trait via ZMQ REQ/REP to WorkerService.
-pub struct RuntimeZmq {
-    // TODO: Add ZmqClient from hyprstream core
-    _endpoint: String,
+/// Key-value pair — alias for generated KeyValue (now has ToCapnp/FromCapnp).
+pub type KeyValue = GenKeyValue;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Filter Types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Filter for listing pod sandboxes
+#[derive(Debug, Clone, Default, FromCapnp)]
+#[capnp(worker_capnp::pod_sandbox_filter)]
+pub struct PodSandboxFilter {
+    /// Filter by sandbox ID
+    pub id: Option<String>,
+    /// Filter by state
+    #[capnp(skip)]
+    pub state: Option<super::PodSandboxState>,
+    /// Filter by labels
+    pub label_selector: Vec<KeyValue>,
 }
 
-impl RuntimeZmq {
-    /// Create a new RuntimeZmq client
-    pub fn new(endpoint: &str) -> Self {
-        Self {
-            _endpoint: endpoint.to_owned(),
-        }
-    }
+/// Filter for listing containers
+#[derive(Debug, Clone, Default, FromCapnp)]
+#[capnp(worker_capnp::container_filter)]
+pub struct ContainerFilter {
+    /// Filter by container ID
+    pub id: Option<String>,
+    /// Filter by pod sandbox ID
+    pub pod_sandbox_id: Option<String>,
+    /// Filter by state
+    #[capnp(skip)]
+    pub state: Option<super::ContainerState>,
+    /// Filter by labels
+    pub label_selector: Vec<KeyValue>,
 }
 
-#[async_trait]
-impl RuntimeClient for RuntimeZmq {
-    async fn version(&self, _version: &str) -> Result<VersionResponse> {
-        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
-    }
-
-    async fn status(&self, _verbose: bool) -> Result<StatusResponse> {
-        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
-    }
-
-    async fn run_pod_sandbox(&self, _config: &PodSandboxConfig) -> Result<String> {
-        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
-    }
-
-    async fn stop_pod_sandbox(&self, _pod_sandbox_id: &str) -> Result<()> {
-        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
-    }
-
-    async fn remove_pod_sandbox(&self, _pod_sandbox_id: &str) -> Result<()> {
-        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
-    }
-
-    async fn pod_sandbox_status(
-        &self,
-        _pod_sandbox_id: &str,
-        _verbose: bool,
-    ) -> Result<PodSandboxStatusResponse> {
-        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
-    }
-
-    async fn list_pod_sandbox(
-        &self,
-        _filter: Option<&PodSandboxFilter>,
-    ) -> Result<Vec<PodSandbox>> {
-        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
-    }
-
-    async fn create_container(
-        &self,
-        _pod_sandbox_id: &str,
-        _config: &ContainerConfig,
-        _sandbox_config: &PodSandboxConfig,
-    ) -> Result<String> {
-        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
-    }
-
-    async fn start_container(&self, _container_id: &str) -> Result<()> {
-        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
-    }
-
-    async fn stop_container(&self, _container_id: &str, _timeout: i64) -> Result<()> {
-        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
-    }
-
-    async fn remove_container(&self, _container_id: &str) -> Result<()> {
-        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
-    }
-
-    async fn container_status(
-        &self,
-        _container_id: &str,
-        _verbose: bool,
-    ) -> Result<ContainerStatusResponse> {
-        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
-    }
-
-    async fn list_containers(
-        &self,
-        _filter: Option<&ContainerFilter>,
-    ) -> Result<Vec<Container>> {
-        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
-    }
-
-    async fn exec_sync(
-        &self,
-        _container_id: &str,
-        _cmd: &[String],
-        _timeout: i64,
-    ) -> Result<ExecSyncResponse> {
-        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
-    }
-
-    async fn pod_sandbox_stats(&self, _pod_sandbox_id: &str) -> Result<PodSandboxStats> {
-        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
-    }
-
-    async fn list_pod_sandbox_stats(
-        &self,
-        _filter: Option<&PodSandboxStatsFilter>,
-    ) -> Result<Vec<PodSandboxStats>> {
-        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
-    }
-
-    async fn container_stats(&self, _container_id: &str) -> Result<ContainerStats> {
-        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
-    }
-
-    async fn list_container_stats(
-        &self,
-        _filter: Option<&ContainerStatsFilter>,
-    ) -> Result<Vec<ContainerStats>> {
-        Err(anyhow::anyhow!("RuntimeZmq: ZMQ transport not yet implemented").into())
-    }
+/// Filter for pod sandbox stats
+#[derive(Debug, Clone, Default, FromCapnp)]
+#[capnp(worker_capnp::pod_sandbox_stats_filter)]
+pub struct PodSandboxStatsFilter {
+    /// Filter by sandbox ID
+    pub id: Option<String>,
+    /// Filter by labels
+    pub label_selector: Vec<KeyValue>,
 }
+
+/// Filter for container stats
+#[derive(Debug, Clone, Default, FromCapnp)]
+#[capnp(worker_capnp::container_stats_filter)]
+pub struct ContainerStatsFilter {
+    /// Filter by container ID
+    pub id: Option<String>,
+    /// Filter by pod sandbox ID
+    pub pod_sandbox_id: Option<String>,
+    /// Filter by labels
+    pub label_selector: Vec<KeyValue>,
+}
+
+

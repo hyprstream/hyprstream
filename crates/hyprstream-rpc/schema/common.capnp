@@ -78,12 +78,18 @@ struct ResponseEnvelope {
   signerPubkey @3 :Data;   # Ed25519 public key (32 bytes)
 }
 
+# Authorization subject — bare username or "anonymous".
+# All identity types produce bare usernames (no prefix).
+struct Subject {
+  name @0 :Text;  # Username, empty string = anonymous
+}
+
 # =============================================================================
 # Streaming types moved to streaming.capnp
 # =============================================================================
 #
 # The following types are now defined in streaming.capnp:
-#   - StreamInfo, StreamRegister, StreamStartRequest, StreamAuthResponse
+#   - StreamInfo, StreamRegister, StartStreamRequest, StreamAuthResponse
 #   - StreamBlock, StreamPayload, StreamStats, StreamError, StreamResume
 #
 # Import with: using Streaming = import "streaming.capnp";
@@ -98,9 +104,9 @@ struct ResponseEnvelope {
 #   infer:model:qwen-7b     - Specific model inference
 #   subscribe:stream:abc    - Specific stream subscription
 #   read:model:*            - Read any model (explicit wildcard)
-#   admin:*:*               - Admin wildcard
+#   manage:*:*              - Manage all resources
 struct Scope {
-  action @0 :Text;       # read, write, infer, subscribe, admin
+  action @0 :Text;       # read, write, infer, subscribe, manage
   resource @1 :Text;     # model, stream, policy
   identifier @2 :Text;   # specific ID or "*" for wildcard
 }
@@ -111,5 +117,12 @@ struct Claims {
   exp @1 :Int64;         # Expiration timestamp
   iat @2 :Int64;         # Issued at timestamp
   scopes @3 :List(Scope); # Structured scopes
-  admin @4 :Bool;        # Admin override
+  admin @4 :Bool;        # Deprecated: always false. Use Casbin policies.
+  aud @5 :Text;          # RFC 8707 audience (resource indicator)
+}
+
+# UTC timestamp with nanosecond precision
+struct Timestamp {
+  seconds @0 :Int64;   # Seconds since Unix epoch (1970-01-01T00:00:00Z)
+  nanos @1 :Int32;     # Nanosecond offset [0, 999999999]
 }

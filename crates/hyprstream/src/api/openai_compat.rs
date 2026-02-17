@@ -189,6 +189,49 @@ pub struct Usage {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub total_tokens: usize,
+    /// Online training details (hyprstream extension, follows OpenAI's *_details pattern)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub online_training_details: Option<OnlineTrainingDetails>,
+}
+
+/// Online training (TTT) adaptation summary for usage reporting.
+///
+/// Nested inside `usage` following OpenAI's `completion_tokens_details` pattern.
+/// Contains the essential metrics identified by TTT literature:
+/// - Loss trajectory (avg_loss, loss_improvement) -- convergence signal
+/// - Perplexity change (initial/final) -- primary quality metric
+/// - Compute budget (steps, time) -- overhead transparency
+/// - Action signal (pending, recommendation) -- commit/rollback decision
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OnlineTrainingDetails {
+    pub avg_loss: f32,
+    pub loss_improvement: f32,
+    pub initial_perplexity: f32,
+    pub final_perplexity: f32,
+    pub steps_performed: usize,
+    pub adaptation_time_ms: u64,
+    pub pending: bool,
+    pub recommendation: bool,
+    pub skipped: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+}
+
+impl From<&crate::config::TTTMetrics> for OnlineTrainingDetails {
+    fn from(m: &crate::config::TTTMetrics) -> Self {
+        Self {
+            avg_loss: m.avg_loss,
+            loss_improvement: m.loss_improvement,
+            initial_perplexity: m.initial_perplexity,
+            final_perplexity: m.final_perplexity,
+            steps_performed: m.steps_performed,
+            adaptation_time_ms: m.adaptation_time_ms,
+            pending: m.pending,
+            recommendation: m.recommendation,
+            skipped: m.skipped,
+            skip_reason: m.skip_reason.clone(),
+        }
+    }
 }
 
 /// List Models Response

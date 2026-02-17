@@ -1,5 +1,7 @@
 //! Build script for Hyprstream
 
+#![allow(clippy::expect_used, clippy::print_stderr)]
+
 use std::env;
 use std::path::Path;
 use std::process::Command;
@@ -11,6 +13,7 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=schema/");
+    println!("cargo:rerun-if-changed=../hyprstream-rpc/schema/streaming.capnp");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");
 
@@ -45,6 +48,9 @@ fn main() {
 
 fn compile_capnp_schemas() {
     let schema_dir = Path::new("schema");
+    let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+    let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-rpc/schema");
 
     // Skip if schema directory doesn't exist
     if !schema_dir.exists() {
@@ -52,64 +58,26 @@ fn compile_capnp_schemas() {
     }
 
     // Note: common.capnp (identity, envelope) is in hyprstream-rpc crate
+    for name in ["events", "inference", "registry", "policy", "model", "mcp", "worker"] {
+        let path = schema_dir.join(format!("{name}.capnp"));
+        if path.exists() {
+            let cgr_path = Path::new(&out_dir).join(format!("{name}.cgr"));
+            let metadata_path = Path::new(&out_dir).join(format!("{name}_metadata.json"));
 
-    // Compile events schema
-    let events_schema = schema_dir.join("events.capnp");
-    if events_schema.exists() {
-        if let Err(e) = capnpc::CompilerCommand::new()
-            .src_prefix("schema")
-            .file(&events_schema)
-            .run()
-        {
-            panic!("failed to compile events.capnp: {e}");
-        }
-    }
+            // 1. Compile to Rust AND save raw CodeGeneratorRequest
+            capnpc::CompilerCommand::new()
+                .src_prefix("schema")
+                .import_path(&rpc_schema_dir)
+                .file(&path)
+                .raw_code_generator_request_path(&cgr_path)  // ← Save CGR!
+                .run()
+                .unwrap_or_else(|e| panic!("failed to compile {name}.capnp: {e}"));
 
-    // Compile inference schema
-    let inference_schema = schema_dir.join("inference.capnp");
-    if inference_schema.exists() {
-        if let Err(e) = capnpc::CompilerCommand::new()
-            .src_prefix("schema")
-            .file(&inference_schema)
-            .run()
-        {
-            panic!("failed to compile inference.capnp: {e}");
-        }
-    }
-
-    // Compile registry schema
-    let registry_schema = schema_dir.join("registry.capnp");
-    if registry_schema.exists() {
-        if let Err(e) = capnpc::CompilerCommand::new()
-            .src_prefix("schema")
-            .file(&registry_schema)
-            .run()
-        {
-            panic!("failed to compile registry.capnp: {e}");
-        }
-    }
-
-    // Compile policy schema
-    let policy_schema = schema_dir.join("policy.capnp");
-    if policy_schema.exists() {
-        if let Err(e) = capnpc::CompilerCommand::new()
-            .src_prefix("schema")
-            .file(&policy_schema)
-            .run()
-        {
-            panic!("failed to compile policy.capnp: {e}");
-        }
-    }
-
-    // Compile model schema
-    let model_schema = schema_dir.join("model.capnp");
-    if model_schema.exists() {
-        if let Err(e) = capnpc::CompilerCommand::new()
-            .src_prefix("schema")
-            .file(&model_schema)
-            .run()
-        {
-            panic!("failed to compile model.capnp: {e}");
+            // 2. Parse CGR and extract schema metadata with annotations
+            if let Err(e) = hyprstream_rpc_build::parse_schema_and_extract_annotations(&cgr_path, &metadata_path, name) {
+                println!("cargo:warning=Failed to parse schema for {name}: {e}");
+                println!("cargo:warning=Falling back to text parsing (annotations not available)");
+            }
         }
     }
 }

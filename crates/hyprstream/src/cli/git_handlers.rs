@@ -4,7 +4,9 @@
 
 use crate::config::GenerationRequest;
 use crate::api::openai_compat::ChatMessage;
-use crate::services::{CloneOptions, ModelZmqClient, RegistryClient};
+use crate::services::{ModelZmqClient, GenRegistryClient};
+#[cfg(feature = "experimental")]
+use crate::services::generated::registry_client::FileChangeTypeEnum;
 use crate::zmq::global_context;
 use crate::storage::ModelRef;
 #[cfg(feature = "experimental")]
@@ -19,7 +21,7 @@ use tracing::{debug, info, warn};
 
 /// Handle branch command
 pub async fn handle_branch(
-    registry: &dyn RegistryClient,
+    registry: &GenRegistryClient,
     model: &str,
     branch_name: &str,
     from_ref: Option<String>,
@@ -27,11 +29,12 @@ pub async fn handle_branch(
 ) -> Result<()> {
     info!("Creating branch {} for model {}", branch_name, model);
 
-    let repo_client = registry.repo(model).await
+    let tracked = registry.get_by_name(model).await
         .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
+    let repo_client = registry.repo(&tracked.id);
 
     // Create branch via service
-    repo_client.create_branch(branch_name, from_ref.as_deref()).await
+    repo_client.create_branch(branch_name, from_ref.as_deref().unwrap_or("")).await
         .map_err(|e| anyhow::anyhow!("Failed to create branch '{}': {}", branch_name, e))?;
 
     println!("✓ Created branch {branch_name}");
@@ -41,9 +44,9 @@ pub async fn handle_branch(
     }
 
     // Create worktree for the branch via service
-    let worktree_path = repo_client.create_worktree(&PathBuf::new(), branch_name).await
+    let worktree_path = repo_client.create_worktree("", branch_name, false).await
         .map_err(|e| anyhow::anyhow!("Failed to create worktree: {}", e))?;
-    println!("✓ Created worktree at {}", worktree_path.display());
+    println!("✓ Created worktree at {}", worktree_path);
 
     // Apply policy template if specified
     if let Some(ref template_name) = policy_template {
@@ -52,7 +55,7 @@ pub async fn handle_branch(
 
     // Show helpful next steps
     println!("\n→ Next steps:");
-    println!("  cd {}", worktree_path.display());
+    println!("  cd {}", worktree_path);
     println!("  hyprstream status {model}:{branch_name}");
     println!("  hyprstream lt {model}:{branch_name} --adapter my-adapter");
 
@@ -61,7 +64,7 @@ pub async fn handle_branch(
 
 /// Handle checkout command
 pub async fn handle_checkout(
-    registry: &dyn RegistryClient,
+    registry: &GenRegistryClient,
     model_ref_str: &str,
     create_branch: bool,
     force: bool,
@@ -76,8 +79,9 @@ pub async fn handle_checkout(
     );
 
     // Get repository client
-    let repo_client = registry.repo(&model_ref.model).await
+    let tracked = registry.get_by_name(&model_ref.model).await
         .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
+    let repo_client = registry.repo(&tracked.id);
 
     // Check for uncommitted changes if not forcing
     if !force {
@@ -105,13 +109,13 @@ pub async fn handle_checkout(
     // If create_branch, create branch first
     if create_branch {
         if let crate::storage::GitRef::Branch(name) = &model_ref.git_ref {
-            repo_client.create_branch(name, Some(&previous_oid)).await
+            repo_client.create_branch(name, &previous_oid).await
                 .map_err(|e| anyhow::anyhow!("Failed to create branch: {}", e))?;
         }
     }
 
     // Checkout via service layer
-    repo_client.checkout(&ref_spec).await
+    repo_client.checkout(&ref_spec, false).await
         .map_err(|e| anyhow::anyhow!("Failed to checkout '{}': {}", ref_spec, e))?;
 
     // Get new HEAD
@@ -130,15 +134,16 @@ pub async fn handle_checkout(
 
 /// Handle status command
 pub async fn handle_status(
-    registry: &dyn RegistryClient,
+    registry: &GenRegistryClient,
     model: Option<String>,
     verbose: bool,
 ) -> Result<()> {
     if let Some(model_ref_str) = model {
         // Status for specific model with full ModelRef support
         let model_ref = ModelRef::parse(&model_ref_str)?;
-        let repo_client = registry.repo(&model_ref.model).await
+        let tracked = registry.get_by_name(&model_ref.model).await
             .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
+        let repo_client = registry.repo(&tracked.id);
         let status = repo_client.status().await
             .map_err(|e| anyhow::anyhow!("Failed to get status: {}", e))?;
         print_model_status(&model_ref.model, &status, verbose);
@@ -153,11 +158,9 @@ pub async fn handle_status(
         }
 
         for tracked in repos {
-            if let Some(name) = &tracked.name {
-                let repo_client = match registry.repo(name).await {
-                    Ok(client) => client,
-                    Err(_) => continue,
-                };
+            if !tracked.name.is_empty() {
+                let name = &tracked.name;
+                let repo_client = registry.repo(&tracked.id);
                 if let Ok(status) = repo_client.status().await {
                     print_model_status(name, &status, verbose);
                     println!(); // Add spacing between models
@@ -171,10 +174,25 @@ pub async fn handle_status(
 
 /// Handle commit command
 ///
+/// Git status --short style single-character indicator.
+#[cfg(feature = "experimental")]
+fn status_char(s: FileChangeTypeEnum) -> char {
+    match s {
+        FileChangeTypeEnum::None => ' ',
+        FileChangeTypeEnum::Added => 'A',
+        FileChangeTypeEnum::Modified => 'M',
+        FileChangeTypeEnum::Deleted => 'D',
+        FileChangeTypeEnum::Renamed => 'R',
+        FileChangeTypeEnum::Untracked => '?',
+        FileChangeTypeEnum::TypeChanged => 'T',
+        FileChangeTypeEnum::Conflicted => 'U',
+    }
+}
+
 /// **EXPERIMENTAL**: This feature is behind the `experimental` flag.
 #[cfg(feature = "experimental")]
 pub async fn handle_commit(
-    registry: &dyn RegistryClient,
+    registry: &GenRegistryClient,
     model_ref_str: &str,
     message: &str,
     all: bool,
@@ -193,29 +211,30 @@ pub async fn handle_commit(
     let model_ref = ModelRef::parse(model_ref_str)?;
 
     // Get repository client
-    let repo_client = registry.repo(&model_ref.model).await
+    let tracked = registry.get_by_name(&model_ref.model).await
         .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
+    let repo_client = registry.repo(&tracked.id);
 
     // Determine which branch to commit to
     let branch_name = match &model_ref.git_ref {
-        git2db::GitRef::Branch(name) => name.clone(),
-        git2db::GitRef::DefaultBranch => {
-            repo_client.default_branch().await
+        crate::storage::GitRef::Branch(name) => name.clone(),
+        crate::storage::GitRef::DefaultBranch => {
+            repo_client.get_head().await
                 .map_err(|e| anyhow::anyhow!("Failed to get default branch: {}", e))?
         }
-        git2db::GitRef::Tag(tag) => {
+        crate::storage::GitRef::Tag(tag) => {
             anyhow::bail!(
                 "Cannot commit to a tag reference. Tags are immutable.\nTag: {}\nUse a branch instead: {}:main",
                 tag, model_ref.model
             );
         }
-        git2db::GitRef::Commit(oid) => {
+        crate::storage::GitRef::Commit(oid) => {
             anyhow::bail!(
                 "Cannot commit to a detached HEAD (commit reference).\nCommit: {}\nCheckout a branch first: hyprstream checkout {}:main",
                 oid, model_ref.model
             );
         }
-        git2db::GitRef::Revspec(spec) => {
+        crate::storage::GitRef::Revspec(spec) => {
             anyhow::bail!(
                 "Cannot commit to a revspec reference. Revspecs are for querying history.\nRevspec: {}\nUse a branch instead: {}:main",
                 spec, model_ref.model
@@ -224,7 +243,8 @@ pub async fn handle_commit(
     };
 
     // Check if worktree exists
-    let _worktree_path = repo_client.worktree_path(&branch_name).await?
+    let wts = repo_client.list_worktrees().await?;
+    let _worktree_path = wts.iter().find(|wt| wt.branch_name == branch_name).map(|wt| wt.path.clone())
         .ok_or_else(|| anyhow::anyhow!(
             "Worktree '{}' does not exist for model '{}'.\n\nCreate it first with:\n  hyprstream branch {} {}",
             branch_name, model_ref.model, model_ref.model, branch_name
@@ -232,7 +252,7 @@ pub async fn handle_commit(
 
     // Use RepositoryClient.detailed_status() for file-level change information
     let detailed_status = repo_client.detailed_status().await?;
-    let has_changes = !detailed_status.is_clean();
+    let has_changes = !detailed_status.files.is_empty();
 
     if !allow_empty && !amend && !has_changes && !all_untracked {
         println!("No changes to commit for {}:{}", model_ref.model, branch_name);
@@ -247,16 +267,12 @@ pub async fn handle_commit(
         if all || all_untracked {
             // Show all working tree changes
             for file in &detailed_status.files {
-                let status_char = file.format_short();
-                println!("  {} {}", status_char, file.path);
+                println!("  {}{} {}", status_char(file.index_status), status_char(file.worktree_status), file.path);
             }
         } else {
             // Show only staged files (index)
-            for file in detailed_status.staged_files() {
-                let status_char = file.index_status
-                    .map(|s| s.as_char().to_string())
-                    .unwrap_or_else(|| " ".to_owned());
-                println!("  {}  {}", status_char, file.path);
+            for file in detailed_status.files.iter().filter(|f| !matches!(f.index_status, FileChangeTypeEnum::None)) {
+                println!("  {}  {}", status_char(file.index_status), file.path);
             }
         }
         println!();
@@ -343,19 +359,19 @@ pub async fn handle_commit(
     Ok(())
 }
 
-/// Print model status in a nice format using git2db's RepositoryStatus
-fn print_model_status(model_name: &str, status: &git2db::RepositoryStatus, verbose: bool) {
+/// Print model status in a nice format using generated RepositoryStatus
+fn print_model_status(model_name: &str, status: &crate::services::GenRepositoryStatus, verbose: bool) {
     println!("Model: {model_name}");
 
     // Show current branch/commit
-    if let Some(branch) = &status.branch {
-        if let Some(head) = status.head {
-            println!("Current ref: {branch} ({head})");
+    if !status.branch.is_empty() {
+        if !status.head_oid.is_empty() {
+            println!("Current ref: {} ({})", status.branch, status.head_oid);
         } else {
-            println!("Current ref: {branch}");
+            println!("Current ref: {}", status.branch);
         }
-    } else if let Some(head) = status.head {
-        println!("Current ref: detached HEAD ({head})");
+    } else if !status.head_oid.is_empty() {
+        println!("Current ref: detached HEAD ({})", status.head_oid);
     } else {
         println!("Current ref: unknown");
     }
@@ -375,7 +391,7 @@ fn print_model_status(model_name: &str, status: &git2db::RepositoryStatus, verbo
         if verbose || !status.modified_files.is_empty() {
             println!("\n  Modified files:");
             for file in &status.modified_files {
-                println!("    M {}", file.display());
+                println!("    M {}", file);
             }
         }
     } else {
@@ -385,7 +401,7 @@ fn print_model_status(model_name: &str, status: &git2db::RepositoryStatus, verbo
 
 /// Handle list command
 pub async fn handle_list(
-    registry: &dyn RegistryClient,
+    registry: &GenRegistryClient,
     policy_manager: Option<&crate::auth::PolicyManager>,
 ) -> Result<()> {
     info!("Listing models");
@@ -401,9 +417,7 @@ pub async fn handle_list(
     }
 
     // Get current user for permission checks (OS user for CLI)
-    let current_user = users::get_current_username()
-        .map(|u| u.to_string_lossy().to_string())
-        .unwrap_or_else(|| "anonymous".to_owned());
+    let current_user = hyprstream_rpc::envelope::RequestIdentity::local().user().to_owned();
 
     // Get archetype registry for capability detection
     let archetype_registry = crate::archetypes::global_registry();
@@ -422,14 +436,9 @@ pub async fn handle_list(
     let mut models_with_info = Vec::new();
 
     for tracked in repos {
-        if let Some(name) = &tracked.name {
-            let repo_client = match registry.repo(name).await {
-                Ok(client) => client,
-                Err(e) => {
-                    warn!("Failed to get repository client for '{}': {}", name, e);
-                    continue;
-                }
-            };
+        if !tracked.name.is_empty() {
+            let name = &tracked.name;
+            let repo_client = registry.repo(&tracked.id);
 
             // Get worktrees for this model
             let worktrees = match repo_client.list_worktrees().await {
@@ -447,11 +456,12 @@ pub async fn handle_list(
             };
 
             for wt in worktrees {
-                let branch_name = wt.branch.clone().unwrap_or_else(|| "detached".to_owned());
+                let branch_name = if wt.branch_name.is_empty() { "detached".to_owned() } else { wt.branch_name.clone() };
                 let display_name = format!("{}:{}", name, branch_name);
 
                 // Detect capabilities from worktree path (from service)
-                let detected = archetype_registry.detect(&wt.path);
+                let wt_path = std::path::Path::new(&wt.path);
+                let detected = archetype_registry.detect(wt_path);
                 let domains = detected.to_detected_domains();
 
                 // Compute access string based on user permissions
@@ -510,7 +520,7 @@ pub async fn handle_list(
 
 /// Handle clone command with streaming progress
 pub async fn handle_clone(
-    registry: &dyn RegistryClient,
+    registry: &GenRegistryClient,
     repo_url: &str,
     name: Option<String>,
     branch: Option<String>,
@@ -558,54 +568,45 @@ pub async fn handle_clone(
         extracted
     };
 
-    // Build clone options from CLI parameters
-    let clone_options = if full {
-        CloneOptions::full()
-    } else if depth > 0 {
-        CloneOptions::shallow(depth)
-    } else {
-        CloneOptions::default()
-    };
-    let clone_options = if let Some(ref b) = branch {
-        clone_options.with_branch(b)
-    } else {
-        clone_options
-    };
+    // Determine clone parameters
+    let shallow = !full;
+    let clone_depth = if full { 0 } else { depth };
 
     // Try streaming clone with progress display
-    let clone_result = clone_with_streaming(registry, repo_url, &model_name, &clone_options, quiet, verbose).await;
+    let clone_result = clone_with_streaming(registry, repo_url, &model_name, shallow, clone_depth, branch.as_deref(), quiet, verbose).await;
 
     // If streaming fails, fall back to non-streaming clone
     if let Err(e) = clone_result {
         if verbose {
             warn!("Streaming clone failed, falling back to non-streaming: {}", e);
         }
-        registry.clone_repo(repo_url, Some(&model_name), &clone_options).await
+        registry.clone(repo_url, &model_name, shallow, clone_depth, branch.as_deref().unwrap_or("")).await
             .map_err(|e| anyhow::anyhow!("Failed to clone model: {}", e))?;
     }
 
     // Get repo client for worktree creation
-    let repo_client = registry.repo(&model_name).await
+    let tracked = registry.get_by_name(&model_name).await
         .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
+    let repo_client = registry.repo(&tracked.id);
 
     // Create default worktree so the model appears in list
     // Use requested branch or fall back to default branch (usually "main")
     let worktree_branch = if let Some(ref b) = branch {
         b.clone()
     } else {
-        repo_client.default_branch().await
+        repo_client.get_head().await
             .unwrap_or_else(|_| "main".to_owned())
     };
 
     if !quiet {
         println!("   Creating worktree for branch: {worktree_branch}");
     }
-    let worktree_path = repo_client.create_worktree(&PathBuf::new(), &worktree_branch).await
+    let worktree_path = repo_client.create_worktree("", &worktree_branch, false).await
         .map_err(|e| anyhow::anyhow!("Failed to create worktree: {}", e))?;
 
     if !quiet {
         println!("✅ Model '{}' cloned successfully!", model_name);
-        println!("   Location: {}", worktree_path.display());
+        println!("   Location: {}", worktree_path);
     }
 
     // Apply policy template if specified
@@ -620,10 +621,12 @@ pub async fn handle_clone(
 ///
 /// Uses DH-authenticated streaming to receive clone progress updates.
 async fn clone_with_streaming(
-    registry: &dyn RegistryClient,
+    registry: &GenRegistryClient,
     repo_url: &str,
     model_name: &str,
-    options: &CloneOptions,
+    shallow: bool,
+    depth: u32,
+    branch: Option<&str>,
     quiet: bool,
     verbose: bool,
 ) -> Result<()> {
@@ -633,7 +636,7 @@ async fn clone_with_streaming(
 
     // Call clone_stream to initiate streaming clone
     let stream_info = registry
-        .clone_stream(repo_url, Some(model_name), options, Some(client_pubkey_bytes))
+        .clone_stream(repo_url, model_name, shallow, depth, branch.unwrap_or(""), client_pubkey_bytes)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to start streaming clone: {}", e))?;
 
@@ -716,7 +719,7 @@ async fn clone_with_streaming(
 ///
 /// TODO: Adapter listing still uses local filesystem access. Consider moving to ModelService.
 pub async fn handle_info(
-    registry: &dyn RegistryClient,
+    registry: &GenRegistryClient,
     model: &str,
     verbose: bool,
     adapters_only: bool,
@@ -726,8 +729,9 @@ pub async fn handle_info(
     let model_ref = ModelRef::parse(model)?;
 
     // Get repository client from service layer
-    let repo_client = registry.repo(&model_ref.model).await
+    let tracked_repo = registry.get_by_name(&model_ref.model).await
         .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
+    let repo_client = registry.repo(&tracked_repo.id);
 
     // Get repository metadata via RepositoryClient
     let repo_metadata = {
@@ -757,19 +761,19 @@ pub async fn handle_info(
     // Find the worktree matching the requested branch/ref
     let branch_name = match &model_ref.git_ref {
         crate::storage::GitRef::DefaultBranch => {
-            repo_client.default_branch().await.unwrap_or_else(|_| "main".to_owned())
+            repo_client.get_head().await.unwrap_or_else(|_| "main".to_owned())
         }
         crate::storage::GitRef::Branch(b) => b.clone(),
         _ => "main".to_owned(),
     };
 
     let model_path = worktrees.iter()
-        .find(|wt| wt.branch.as_deref() == Some(&branch_name))
-        .map(|wt| wt.path.clone())
+        .find(|wt| wt.branch_name == branch_name)
+        .map(|wt| PathBuf::from(&wt.path))
         .unwrap_or_else(|| {
             // Fallback: use first available worktree
             worktrees.first()
-                .map(|wt| wt.path.clone())
+                .map(|wt| PathBuf::from(&wt.path))
                 .unwrap_or_else(|| PathBuf::from("."))
         });
 
@@ -794,7 +798,7 @@ pub async fn handle_info(
         // Get display ref using RepositoryClient
         let display_ref = match &model_ref.git_ref {
             crate::storage::GitRef::DefaultBranch => {
-                repo_client.default_branch().await.unwrap_or_else(|_| "unknown".to_owned())
+                repo_client.get_head().await.unwrap_or_else(|_| "unknown".to_owned())
             }
             _ => model_ref.git_ref.to_string(),
         };
@@ -844,11 +848,8 @@ pub async fn handle_info(
     }
 
     // Size calculation - this could be moved to RepositoryClient as get_repo_size()
-    // Get bare repo path from TrackedRepository
-    let bare_repo_path = registry.get_by_name(&model_ref.model).await
-        .ok()
-        .flatten()
-        .map(|t| PathBuf::from(&t.worktree_path));
+    // Get bare repo path from TrackedRepository (already fetched above)
+    let bare_repo_path = Some(PathBuf::from(&tracked_repo.worktree_path));
 
     if let Some(ref bare_repo_path) = bare_repo_path {
         if bare_repo_path.exists() {
@@ -880,11 +881,11 @@ pub async fn handle_info(
         Ok(status) => {
             println!(
                 "  Current branch/ref: {}",
-                status.branch.as_deref().unwrap_or("detached")
+                if status.branch.is_empty() { "detached" } else { &status.branch }
             );
 
-            if let Some(head_oid) = status.head {
-                println!("  HEAD commit: {}", &head_oid.to_string()[..8]);
+            if !status.head_oid.is_empty() {
+                println!("  HEAD commit: {}", &status.head_oid[..8.min(status.head_oid.len())]);
             }
 
             if !status.is_clean {
@@ -894,7 +895,7 @@ pub async fn handle_info(
                     // TODO: RepositoryStatus should include detailed file change types (A/M/D)
                     // For now we just show M for all modified files
                     for file in &status.modified_files {
-                        println!("    M {}", file.display());
+                        println!("    M {}", file);
                     }
                 }
             } else {
@@ -1014,7 +1015,7 @@ pub async fn handle_info(
 /// This is a helper used by branch, clone, and worktree commands to apply
 /// policy templates when the --policy flag is specified.
 pub async fn apply_policy_template_to_model(
-    registry: &dyn RegistryClient,
+    registry: &GenRegistryClient,
     model: &str,
     template_name: &str,
 ) -> Result<()> {
@@ -1030,8 +1031,7 @@ pub async fn apply_policy_template_to_model(
 
     // Get the policies directory - derive models_dir from TrackedRepository
     let tracked = registry.get_by_name(model).await
-        .map_err(|e| anyhow::anyhow!("Failed to get repository: {}", e))?
-        .ok_or_else(|| anyhow::anyhow!("Model '{}' not found in registry", model))?;
+        .map_err(|e| anyhow::anyhow!("Failed to get repository: {}", e))?;
 
     // TrackedRepository.worktree_path is bare repo: models/{name}/{name}.git
     // Navigate up 2 levels to get models_dir
@@ -1059,13 +1059,14 @@ pub async fn apply_policy_template_to_model(
     };
 
     // Check if template rules already exist
-    if existing_content.contains(template.rules.trim()) {
+    let rules = template.expanded_rules();
+    if existing_content.contains(rules.trim()) {
         println!("✓ Policy template '{template_name}' already applied");
         return Ok(());
     }
 
     // Append the template rules
-    let new_content = format!("{}\n{}", existing_content.trim_end(), template.rules);
+    let new_content = format!("{}\n{}", existing_content.trim_end(), rules);
 
     // Write the updated policy
     tokio::fs::write(&policy_path, &new_content).await?;
@@ -1350,7 +1351,7 @@ pub async fn handle_unload(
 /// **EXPERIMENTAL**: This feature is behind the `experimental` flag.
 #[cfg(feature = "experimental")]
 pub async fn handle_push(
-    registry: &dyn RegistryClient,
+    registry: &GenRegistryClient,
     model: &str,
     remote: Option<String>,
     branch: Option<String>,
@@ -1363,15 +1364,16 @@ pub async fn handle_push(
     let model_ref = ModelRef::new(model.to_string());
 
     // Get repository client from service layer
-    let repo_client = registry.repo(&model_ref.model).await
+    let tracked = registry.get_by_name(&model_ref.model).await
         .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
+    let repo_client = registry.repo(&tracked.id);
 
     // Get current branch or specified branch
     let push_branch = if let Some(b) = &branch {
         b.clone()
     } else {
         // Get default branch from repository client
-        repo_client.default_branch().await?
+        repo_client.get_head().await?
     };
 
     // Build refspec
@@ -1400,7 +1402,7 @@ pub async fn handle_push(
 /// - fetch_remote(remote, refspec)
 /// - merge_with_strategy(ref, strategy)
 pub async fn handle_pull(
-    registry: &dyn RegistryClient,
+    registry: &GenRegistryClient,
     model: &str,
     remote: Option<String>,
     branch: Option<String>,
@@ -1412,15 +1414,16 @@ pub async fn handle_pull(
     let model_ref = ModelRef::new(model.to_owned());
 
     // Get repository client from service layer
-    let repo_client = registry.repo(&model_ref.model).await
+    let tracked = registry.get_by_name(&model_ref.model).await
         .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
+    let repo_client = registry.repo(&tracked.id);
 
     // Build refspec for fetch
     let refspec = branch.as_ref().map(|branch_name| format!("refs/heads/{branch_name}"));
 
     // Use RepositoryClient.update() to fetch and merge
     // Note: This does a basic fetch+merge, doesn't expose merge analysis or fast-forward control
-    repo_client.update(refspec.as_deref()).await?;
+    repo_client.update(refspec.as_deref().unwrap_or("")).await?;
 
     println!("✓ Pulled latest changes for model {model}");
     println!("  Remote: {remote_name}");
@@ -1467,7 +1470,7 @@ pub struct MergeOptions {
 /// resolution (--abort, --continue, --quit) still needs service layer implementation.
 #[cfg(feature = "experimental")]
 pub async fn handle_merge(
-    registry: &dyn RegistryClient,
+    registry: &GenRegistryClient,
     target: &str,
     source: &str,
     options: MergeOptions,
@@ -1485,8 +1488,9 @@ pub async fn handle_merge(
     }
 
     // Get repository client from service layer
-    let repo_client = registry.repo(&target_ref.model).await
+    let tracked = registry.get_by_name(&target_ref.model).await
         .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
+    let repo_client = registry.repo(&tracked.id);
 
     // Build merge message
     let message = if let Some(msg) = &options.message {
@@ -1545,29 +1549,32 @@ pub async fn handle_merge(
 /// **EXPERIMENTAL**: This is behind the `experimental` flag.
 #[cfg(feature = "experimental")]
 async fn handle_merge_conflict_resolution(
-    registry: &dyn RegistryClient,
+    registry: &GenRegistryClient,
     target: &str,
     options: MergeOptions,
 ) -> Result<()> {
     let target_ref = ModelRef::parse(target)?;
 
     // Get repository client from service layer
-    let repo_client = registry.repo(&target_ref.model).await
+    let tracked = registry.get_by_name(&target_ref.model).await
         .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
+    let repo_client = registry.repo(&tracked.id);
 
     // Get target branch
     let target_branch = match &target_ref.git_ref {
         GitRef::Branch(b) => b.clone(),
-        GitRef::DefaultBranch => repo_client.default_branch().await?,
+        GitRef::DefaultBranch => repo_client.get_head().await?,
         _ => bail!("Target must be a branch reference"),
     };
 
     // Verify worktree exists
-    let worktree_path = repo_client.worktree_path(&target_branch).await?
+    let wts = repo_client.list_worktrees().await?;
+    let worktree_path = wts.iter().find(|wt| wt.branch_name == target_branch).map(|wt| wt.path.clone())
         .ok_or_else(|| anyhow::anyhow!("Worktree not found for branch {}", target_branch))?;
 
-    if !worktree_path.exists() {
-        bail!("Worktree not found: {}", worktree_path.display());
+    let worktree_path_buf = PathBuf::from(&worktree_path);
+    if !worktree_path_buf.exists() {
+        bail!("Worktree not found: {}", worktree_path);
     }
 
     if options.abort {
@@ -1617,7 +1624,7 @@ async fn handle_merge_conflict_resolution(
 /// Removal is handled by the RegistryService which manages both
 /// registry entries and file cleanup.
 pub async fn handle_remove(
-    registry: &dyn RegistryClient,
+    registry: &GenRegistryClient,
     model: &str,
     force: bool,
     _registry_only: bool,
@@ -1636,14 +1643,15 @@ pub async fn handle_remove(
         let branch = model_ref.git_ref.display_name();
         info!("Removing worktree {} for model {}", branch, model_ref.model);
 
-        let repo_client = registry.repo(&model_ref.model).await
+        let tracked = registry.get_by_name(&model_ref.model).await
             .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
+        let repo_client = registry.repo(&tracked.id);
 
         // Check if the worktree exists via service
         let worktrees = repo_client.list_worktrees().await
             .map_err(|e| anyhow::anyhow!("Failed to list worktrees: {}", e))?;
 
-        let wt = match worktrees.iter().find(|wt| wt.branch.as_deref() == Some(&branch)) {
+        let wt = match worktrees.iter().find(|wt| wt.branch_name == branch) {
             Some(wt) => wt,
             None => {
                 println!("❌ Worktree '{}' not found for model '{}'", branch, model_ref.model);
@@ -1653,7 +1661,7 @@ pub async fn handle_remove(
 
         // Show what will be removed
         println!("Worktree '{}:{}' removal plan:", model_ref.model, branch);
-        println!("  📁 Remove worktree at: {}", wt.path.display());
+        println!("  📁 Remove worktree at: {}", wt.path);
 
         // Confirmation prompt unless forced
         if !force {
@@ -1671,7 +1679,7 @@ pub async fn handle_remove(
         }
 
         // Remove the worktree via service
-        repo_client.remove_worktree(&wt.path).await
+        repo_client.remove_worktree(&wt.path, false).await
             .map_err(|e| anyhow::anyhow!("Failed to remove worktree: {}", e))?;
 
         println!("✓ Worktree '{}:{}' removed successfully", model_ref.model, branch);
@@ -1681,12 +1689,13 @@ pub async fn handle_remove(
     // Removing the entire model (no branch specified)
     // Check if model exists in registry
     let tracked = match registry.get_by_name(&model_ref.model).await {
-        Ok(Some(t)) => t,
-        Ok(None) => {
-            println!("❌ Model '{}' not found in registry", model_ref.model);
-            return Ok(());
-        }
+        Ok(t) => t,
         Err(e) => {
+            let err_msg = e.to_string();
+            if err_msg.contains("not found") || err_msg.contains("Not found") {
+                println!("❌ Model '{}' not found in registry", model_ref.model);
+                return Ok(());
+            }
             return Err(anyhow::anyhow!("Failed to query registry: {}", e));
         }
     };

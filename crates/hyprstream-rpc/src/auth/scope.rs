@@ -5,7 +5,7 @@
 //!   infer:model:qwen-7b     - Specific model inference
 //!   subscribe:stream:abc    - Specific stream subscription
 //!   read:model:*            - Read any model (explicit wildcard)
-//!   admin:*:*               - Admin wildcard
+//!   manage:*:*              - Manage all resources
 
 use crate::common_capnp;
 use crate::capnp::{ToCapnp, FromCapnp};
@@ -20,7 +20,7 @@ use std::fmt;
 ///   infer:model:qwen-7b     - Specific model inference
 ///   subscribe:stream:abc    - Specific stream subscription
 ///   read:model:*            - Read any model (explicit wildcard)
-///   admin:*:*               - Admin wildcard
+///   manage:*:*              - Manage all resources
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scope {
     pub action: String,
@@ -79,29 +79,6 @@ impl Scope {
         ))
     }
 
-    /// Check if this scope grants permission for the required scope.
-    ///
-    /// Safe wildcard matching with action/resource isolation:
-    /// - Actions must match exactly (no wildcards)
-    /// - Resources must match exactly (no wildcards)
-    /// - Identifier: "*" grants all, otherwise exact match
-    pub fn grants(&self, required: &Scope) -> bool {
-        // Action must match exactly (no wildcards for actions)
-        if self.action != required.action {
-            return false;
-        }
-
-        // Resource must match exactly (no wildcards for resource types)
-        if self.resource != required.resource {
-            return false;
-        }
-
-        // Identifier matching: "*" grants all, otherwise exact match
-        match self.identifier.as_str() {
-            "*" => true,
-            id => id == required.identifier,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -123,35 +100,4 @@ mod tests {
         assert_eq!(scope.to_string(), "infer:model:qwen-7b");
     }
 
-    #[test]
-    fn test_scope_grants_exact_match() -> Result<()> {
-        let granted = Scope::parse("infer:model:qwen-7b")?;
-        let required = Scope::parse("infer:model:qwen-7b")?;
-        assert!(granted.grants(&required));
-        Ok(())
-    }
-
-    #[test]
-    fn test_scope_grants_wildcard() -> Result<()> {
-        let granted = Scope::parse("infer:model:*")?;
-        let required = Scope::parse("infer:model:qwen-7b")?;
-        assert!(granted.grants(&required));
-        Ok(())
-    }
-
-    #[test]
-    fn test_scope_action_isolation() -> Result<()> {
-        let granted = Scope::parse("read:model:*")?;
-        let required = Scope::parse("write:model:qwen-7b")?;
-        assert!(!granted.grants(&required));
-        Ok(())
-    }
-
-    #[test]
-    fn test_scope_resource_isolation() -> Result<()> {
-        let granted = Scope::parse("infer:model:*")?;
-        let required = Scope::parse("infer:stream:abc")?;
-        assert!(!granted.grants(&required));
-        Ok(())
-    }
 }

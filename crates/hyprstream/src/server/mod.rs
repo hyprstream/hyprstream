@@ -40,7 +40,11 @@ pub fn create_app(state: ServerState) -> Router {
     // Public routes (no auth required)
     let public_routes = Router::new()
         .route("/", get(health_check))
-        .route("/health", get(health_check));
+        .route("/health", get(health_check))
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(oauth_protected_resource_metadata),
+        );
 
     // Protected routes (auth required)
     let protected_routes = Router::new()
@@ -77,6 +81,20 @@ async fn health_check() -> impl IntoResponse {
         "service": "hyprstream",
         "version": env!("CARGO_PKG_VERSION")
     }))
+}
+
+/// Protected Resource Metadata (RFC 9728) for the OAI server.
+///
+/// Advertises the OAuth authorization server that protects this resource.
+async fn oauth_protected_resource_metadata() -> impl IntoResponse {
+    let config = crate::config::HyprConfig::load().unwrap_or_default();
+    let oai_url = config.oai.resource_url();
+    let oauth_issuer = config.oauth.issuer_url();
+
+    Json(crate::services::oauth::protected_resource_metadata(
+        &oai_url,
+        &oauth_issuer,
+    ))
 }
 
 /// Start the HTTP server

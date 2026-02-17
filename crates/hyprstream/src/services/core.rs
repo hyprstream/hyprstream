@@ -8,7 +8,7 @@
 //! All requests are wrapped in `SignedEnvelope` for authentication:
 //! - Service infrastructure unwraps and verifies signatures before dispatching
 //! - Handlers receive `EnvelopeContext` with verified identity
-//! - Services use `ctx.casbin_subject()` for policy checks
+//! - Services use `ctx.subject()` for policy checks and resource isolation
 //!
 //! # Note
 //!
@@ -22,7 +22,22 @@ use anyhow::Result;
 use hyprstream_rpc::prelude::*;
 
 // Re-export core types from hyprstream-rpc
-pub use hyprstream_rpc::service::{CallOptions, EnvelopeContext, ZmqClient as ZmqClientBase, ZmqService};
+pub use hyprstream_rpc::service::{CallOptions, Continuation, EnvelopeContext, ZmqClient as ZmqClientBase, ZmqService};
+
+/// Create a generated service client with standard ZMQ boilerplate.
+///
+/// Uses the global ZMQ context and derives the server verifying key from the signing key.
+pub fn create_service_client<C: hyprstream_rpc::service::factory::ServiceClient>(
+    endpoint: &str,
+    signing_key: SigningKey,
+    identity: RequestIdentity,
+) -> C {
+    let server_verifying_key = signing_key.verifying_key();
+    let base = ZmqClientBase::new(
+        endpoint, global_context(), signing_key, server_verifying_key, identity,
+    );
+    C::from_zmq(base)
+}
 
 /// Authenticated ZMQ client with automatic request signing and response verification.
 ///
@@ -136,13 +151,14 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl ZmqService for EchoService {
-        fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<Vec<u8>> {
+        async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {
             // Echo back the payload, but prepend the user
             let user = ctx.user();
             let mut response = format!("from {}:", user).into_bytes();
             response.extend_from_slice(payload);
-            Ok(response)
+            Ok((response, None))
         }
 
         fn name(&self) -> &str {
@@ -162,64 +178,70 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_request_loop() {
-        let transport = TransportConfig::inproc("test-echo-service-core");
-        let endpoint = transport.zmq_endpoint();
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let transport = TransportConfig::inproc("test-echo-service-core");
+            let endpoint = transport.zmq_endpoint();
 
-        // Generate keypair for this test
-        let (signing_key, verifying_key) = generate_signing_keypair();
+            // Generate keypair for this test
+            let (signing_key, verifying_key) = generate_signing_keypair();
 
-        // Create service with infrastructure
-        let service = EchoService::new(global_context(), transport.clone(), signing_key.clone());
+            // Create service with infrastructure
+            let service = EchoService::new(global_context(), transport.clone(), signing_key.clone());
 
-        // Start the service using RequestLoop from hyprstream-rpc
-        let runner = RequestLoop::new(transport, global_context(), signing_key.clone());
-        let mut handle = runner.run(service).await.expect("test: start service");
+            // Start the service using RequestLoop from hyprstream-rpc
+            let runner = RequestLoop::new(transport, global_context(), signing_key.clone());
+            let mut handle = runner.run(service).await.expect("test: start service");
 
-        // Use ZmqClient with server's verifying key for response verification
-        let client = ZmqClient::new(&endpoint, signing_key, verifying_key, RequestIdentity::local());
-        let response = client.call(b"hello".to_vec(), CallOptions::default()).await.expect("test: call");
+            // Use ZmqClient with server's verifying key for response verification
+            let client = ZmqClient::new(&endpoint, signing_key, verifying_key, RequestIdentity::local());
+            let response = client.call(b"hello".to_vec(), CallOptions::default()).await.expect("test: call");
 
-        // Response should start with "from <user>:"
-        let response_str = String::from_utf8_lossy(&response);
-        assert!(response_str.contains("hello"), "Response should contain 'hello': {}", response_str);
+            // Response should start with "from <user>:"
+            let response_str = String::from_utf8_lossy(&response);
+            assert!(response_str.contains("hello"), "Response should contain 'hello': {}", response_str);
 
-        // Stop the service
-        handle.stop().await;
+            // Stop the service
+            handle.stop().await;
+        }).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_invalid_request_signature_rejected() {
-        let transport = TransportConfig::inproc("test-invalid-req-sig-core");
-        let endpoint = transport.zmq_endpoint();
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let transport = TransportConfig::inproc("test-invalid-req-sig-core");
+            let endpoint = transport.zmq_endpoint();
 
-        // Generate two keypairs - service uses one, client uses other
-        let (server_signing_key, server_verifying_key) = generate_signing_keypair();
-        let (client_signing_key, _client_verifying_key) = generate_signing_keypair();
+            // Generate two keypairs - service uses one, client uses other
+            let (server_signing_key, server_verifying_key) = generate_signing_keypair();
+            let (client_signing_key, _client_verifying_key) = generate_signing_keypair();
 
-        // Create service with server's key
-        let service = EchoService::new(global_context(), transport.clone(), server_signing_key.clone());
+            // Create service with server's key
+            let service = EchoService::new(global_context(), transport.clone(), server_signing_key.clone());
 
-        // Start the service
-        let runner = RequestLoop::new(transport, global_context(), server_signing_key);
-        let mut handle = runner.run(service).await.expect("test: start service");
+            // Start the service
+            let runner = RequestLoop::new(transport, global_context(), server_signing_key);
+            let mut handle = runner.run(service).await.expect("test: start service");
 
-        // Sign request with different key than service expects
-        // But verify responses with server's key
-        let client = ZmqClient::new(&endpoint, client_signing_key, server_verifying_key, RequestIdentity::local());
-        let result = client.call(b"should fail".to_vec(), CallOptions::default()).await;
+            // Sign request with different key than service expects
+            // But verify responses with server's key
+            let client = ZmqClient::new(&endpoint, client_signing_key, server_verifying_key, RequestIdentity::local());
+            let result = client.call(b"should fail".to_vec(), CallOptions::default()).await;
 
-        // Request should be rejected by server
-        match result {
-            Ok(response) => {
-                assert!(response.is_empty(), "Invalid request signature should return empty response");
+            // Request should be rejected by server
+            match result {
+                Ok(response) => {
+                    assert!(response.is_empty(), "Invalid request signature should return empty response");
+                }
+                Err(_) => {
+                    // Error is also acceptable
+                }
             }
-            Err(_) => {
-                // Error is also acceptable
-            }
-        }
 
-        handle.stop().await;
+            handle.stop().await;
+        }).await;
     }
 }

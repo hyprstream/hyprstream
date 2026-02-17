@@ -14,15 +14,15 @@
 //! | Transport | CURVE | Encrypts connection, authenticates immediate peer |
 //! | Application | Signed envelope | Authenticates request originator, survives forwarding |
 //!
-//! # Identity → Casbin Subject Mapping
+//! # Identity → Subject Mapping
 //!
-//! Each identity type extracts a **namespaced** subject for Casbin policy checks:
+//! All identity types produce bare username subjects for Casbin policy checks:
 //!
-//! | Identity | Casbin Subject | Example |
-//! |----------|----------------|---------|
-//! | Local | `local:<username>` | `"local:alice"` |
-//! | ApiToken | `token:<username>` | `"token:bob"` |
-//! | Peer | `peer:<name>` | `"peer:gpu-server-1"` |
+//! | Identity | Subject | Example |
+//! |----------|---------|---------|
+//! | Local | `<username>` | `"alice"` |
+//! | ApiToken | `<username>` | `"bob"` |
+//! | Peer | `<name>` | `"gpu-server-1"` |
 //! | Anonymous | `anonymous` | `"anonymous"` |
 //!
 //! # Nested Envelope Structure
@@ -47,6 +47,8 @@ use crate::crypto::{SigningKey, VerifyingKey};
 use crate::error::{EnvelopeError, EnvelopeResult};
 use anyhow::{anyhow, Result};
 use ed25519_dalek::{Signature, Signer, Verifier};
+use std::fmt;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -113,45 +115,16 @@ impl RequestIdentity {
         Self::Anonymous
     }
 
-    /// Extract the raw user string (without namespace prefix).
+    /// Extract the bare username string.
     ///
-    /// For Casbin policy checks, use `casbin_subject()` instead which
-    /// includes the namespace prefix to prevent collisions.
+    /// This is the canonical form used for Casbin policy checks.
+    /// All identity types produce bare usernames (no prefix).
     pub fn user(&self) -> &str {
         match self {
             // Both Local and ApiToken have a user field
             Self::Local { user } | Self::ApiToken { user, .. } => user,
             Self::Peer { name, .. } => name,
             Self::Anonymous => "anonymous",
-        }
-    }
-
-    /// Get the namespaced Casbin subject for policy checks.
-    ///
-    /// Subjects are prefixed to prevent collisions between different
-    /// identity types. A peer named "admin" must NOT match policies
-    /// for local user "admin".
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use hyprstream_rpc::envelope::RequestIdentity;
-    ///
-    /// let local = RequestIdentity::Local { user: "alice".into() };
-    /// assert_eq!(local.casbin_subject(), "local:alice");
-    ///
-    /// let token = RequestIdentity::ApiToken {
-    ///     user: "bob".into(),
-    ///     token_name: "ci".into()
-    /// };
-    /// assert_eq!(token.casbin_subject(), "token:bob");
-    /// ```
-    pub fn casbin_subject(&self) -> String {
-        match self {
-            Self::Local { user } => format!("local:{user}"),
-            Self::ApiToken { user, .. } => format!("token:{user}"),
-            Self::Peer { name, .. } => format!("peer:{name}"),
-            Self::Anonymous => "anonymous".to_owned(),
         }
     }
 
@@ -180,6 +153,136 @@ impl std::fmt::Display for RequestIdentity {
             Self::Peer { name, .. } => write!(f, "peer:{name}"),
             Self::Anonymous => write!(f, "anonymous"),
         }
+    }
+}
+
+/// Authorization subject for Casbin policy checks and resource isolation.
+///
+/// A simple newtype over `Option<String>`:
+/// - `Some(name)` = authenticated user with bare username
+/// - `None` = anonymous (unauthenticated)
+///
+/// All identity types (Local, ApiToken, Peer, Claims) produce bare usernames.
+/// There are no namespace prefixes — a user named "alice" is just "alice"
+/// regardless of how they authenticated.
+///
+/// # Display
+///
+/// `Subject::new("alice")` displays as `"alice"`, used directly
+/// as the Casbin subject string. Anonymous displays as `"anonymous"`.
+///
+/// # Validation
+///
+/// `validate()` ensures names contain only `[a-zA-Z0-9._-]`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Subject(Option<String>);
+
+impl Subject {
+    /// Create an authenticated subject with the given username.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(Some(name.into()))
+    }
+
+    /// Create an anonymous (unauthenticated) subject.
+    pub fn anonymous() -> Self {
+        Self(None)
+    }
+
+    /// Get the username, if authenticated.
+    pub fn name(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+
+    /// Check if this subject is anonymous.
+    pub fn is_anonymous(&self) -> bool {
+        self.0.is_none()
+    }
+
+    /// Validate that the name contains only safe characters `[a-zA-Z0-9._-]`.
+    ///
+    /// This prevents path traversal and other injection attacks when the
+    /// subject is used in filesystem paths or policy strings.
+    pub fn validate(&self) -> Result<()> {
+        let name = match &self.0 {
+            Some(n) => n.as_str(),
+            None => return Ok(()),
+        };
+
+        if name.is_empty() {
+            return Err(anyhow!("Subject name must not be empty"));
+        }
+
+        for c in name.chars() {
+            if !c.is_ascii_alphanumeric() && c != '.' && c != '_' && c != '-' {
+                return Err(anyhow!(
+                    "Subject name contains invalid character '{}': only [a-zA-Z0-9._-] allowed",
+                    c
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl fmt::Display for Subject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            Some(name) => write!(f, "{name}"),
+            None => write!(f, "anonymous"),
+        }
+    }
+}
+
+impl FromStr for Subject {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        if s == "anonymous" {
+            return Ok(Self::anonymous());
+        }
+
+        // Legacy compatibility: strip known prefixes
+        if let Some((prefix, name)) = s.split_once(':') {
+            if matches!(prefix, "local" | "token" | "peer" | "user") {
+                return Ok(Self::new(name));
+            }
+        }
+
+        Ok(Self::new(s))
+    }
+}
+
+impl From<&RequestIdentity> for Subject {
+    fn from(id: &RequestIdentity) -> Self {
+        match id {
+            RequestIdentity::Anonymous => Subject::anonymous(),
+            other => Subject::new(other.user()),
+        }
+    }
+}
+
+impl From<&Claims> for Subject {
+    fn from(claims: &Claims) -> Self {
+        Subject::new(claims.sub.clone())
+    }
+}
+
+// Cap'n Proto implementation for Subject (simple text field)
+impl ToCapnp for Subject {
+    type Builder<'a> = common_capnp::subject::Builder<'a>;
+
+    fn write_to(&self, builder: &mut Self::Builder<'_>) {
+        builder.set_name(self.to_string());
+    }
+}
+
+impl FromCapnp for Subject {
+    type Reader<'a> = common_capnp::subject::Reader<'a>;
+
+    fn read_from(reader: Self::Reader<'_>) -> Result<Self> {
+        let name = reader.get_name()?.to_str()?;
+        name.parse()
     }
 }
 
@@ -342,14 +445,14 @@ impl RequestEnvelope {
         Self::new(RequestIdentity::anonymous(), payload)
     }
 
-    /// Get the raw user string (without namespace prefix).
+    /// Get the bare username string.
     pub fn user(&self) -> &str {
         self.identity.user()
     }
 
-    /// Get the namespaced Casbin subject for policy checks.
-    pub fn casbin_subject(&self) -> String {
-        self.identity.casbin_subject()
+    /// Get the authorization subject.
+    pub fn subject(&self) -> Subject {
+        Subject::from(&self.identity)
     }
 
     /// Serialize this envelope to canonical Cap'n Proto bytes for signing.
@@ -692,9 +795,9 @@ impl SignedEnvelope {
         &self.envelope.identity
     }
 
-    /// Get the Casbin subject for policy checks.
-    pub fn casbin_subject(&self) -> String {
-        self.envelope.casbin_subject()
+    /// Get the authorization subject.
+    pub fn subject(&self) -> Subject {
+        self.envelope.subject()
     }
 
     /// Get the payload from the inner envelope.
@@ -1044,6 +1147,7 @@ pub fn unwrap_response(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::crypto::signing::generate_signing_keypair;
@@ -1101,40 +1205,40 @@ mod tests {
     }
 
     #[test]
-    fn test_casbin_subject_namespacing() {
+    fn test_identity_user_extraction() {
         // Local identity
         let local = RequestIdentity::Local {
             user: "alice".into(),
         };
-        assert_eq!(local.casbin_subject(), "local:alice");
+        assert_eq!(local.user(), "alice");
 
         // API token identity
         let token = RequestIdentity::ApiToken {
             user: "bob".into(),
             token_name: "ci".into(),
         };
-        assert_eq!(token.casbin_subject(), "token:bob");
+        assert_eq!(token.user(), "bob");
 
         // Peer identity
         let peer = RequestIdentity::Peer {
             name: "gpu-server-1".into(),
             curve_key: [0u8; 32],
         };
-        assert_eq!(peer.casbin_subject(), "peer:gpu-server-1");
+        assert_eq!(peer.user(), "gpu-server-1");
 
         // Anonymous
         let anon = RequestIdentity::Anonymous;
-        assert_eq!(anon.casbin_subject(), "anonymous");
+        assert_eq!(anon.user(), "anonymous");
 
-        // Verify namespacing prevents collisions
-        let admin_local = RequestIdentity::Local {
-            user: "admin".into(),
+        // All identity types for the same user produce equal subjects
+        let alice_local = RequestIdentity::Local {
+            user: "alice".into(),
         };
-        let admin_peer = RequestIdentity::Peer {
-            name: "admin".into(),
+        let alice_peer = RequestIdentity::Peer {
+            name: "alice".into(),
             curve_key: [0u8; 32],
         };
-        assert_ne!(admin_local.casbin_subject(), admin_peer.casbin_subject());
+        assert_eq!(Subject::from(&alice_local), Subject::from(&alice_peer));
     }
 
     #[test]
@@ -1224,7 +1328,7 @@ mod tests {
 
         assert!(signed.request_id() > 0);
         assert_eq!(signed.identity().user(), "alice");
-        assert_eq!(signed.casbin_subject(), "token:alice");
+        assert_eq!(signed.subject().to_string(), "alice");
         assert_eq!(signed.payload(), &[5, 6, 7]);
         assert_eq!(signed.ephemeral_pubkey(), Some(&[99u8; 32]));
     }
@@ -1346,5 +1450,125 @@ mod tests {
         // Verify the decoded envelope still has valid signature
         decoded.verify_signature_only(&verifying_key)?;
         Ok(())
+    }
+
+    // =========================================================================
+    // Subject tests
+    // =========================================================================
+
+    #[test]
+    fn test_subject_from_identity() {
+        let local = RequestIdentity::Local { user: "alice".into() };
+        assert_eq!(Subject::from(&local), Subject::new("alice"));
+
+        let token = RequestIdentity::ApiToken { user: "bob".into(), token_name: "ci".into() };
+        assert_eq!(Subject::from(&token), Subject::new("bob"));
+
+        let peer = RequestIdentity::Peer { name: "gpu-1".into(), curve_key: [0u8; 32] };
+        assert_eq!(Subject::from(&peer), Subject::new("gpu-1"));
+
+        assert_eq!(Subject::from(&RequestIdentity::Anonymous), Subject::anonymous());
+    }
+
+    #[test]
+    fn test_subject_display_roundtrip() {
+        let cases = vec![
+            Subject::new("alice"),
+            Subject::new("bob"),
+            Subject::new("gpu-1"),
+            Subject::new("charlie"),
+            Subject::anonymous(),
+        ];
+
+        for subject in cases {
+            let s = subject.to_string();
+            let parsed: Subject = s.parse().expect("parse subject roundtrip");
+            assert_eq!(subject, parsed, "Roundtrip failed for {s}");
+        }
+    }
+
+    #[test]
+    fn test_subject_display_format() {
+        assert_eq!(Subject::new("alice").to_string(), "alice");
+        assert_eq!(Subject::new("bob").to_string(), "bob");
+        assert_eq!(Subject::anonymous().to_string(), "anonymous");
+    }
+
+    #[test]
+    fn test_subject_legacy_prefix_parsing() {
+        // Legacy prefixed formats should strip the prefix
+        assert_eq!("local:alice".parse::<Subject>().expect("parse local:alice"), Subject::new("alice"));
+        assert_eq!("token:bob".parse::<Subject>().expect("parse token:bob"), Subject::new("bob"));
+        assert_eq!("peer:gpu-1".parse::<Subject>().expect("parse peer:gpu-1"), Subject::new("gpu-1"));
+        assert_eq!("user:charlie".parse::<Subject>().expect("parse user:charlie"), Subject::new("charlie"));
+
+        // Bare names pass through
+        assert_eq!("alice".parse::<Subject>().expect("parse alice"), Subject::new("alice"));
+
+        // Unknown prefixes are treated as bare names (contain ':')
+        assert_eq!("unknown:foo".parse::<Subject>().expect("parse unknown:foo"), Subject::new("unknown:foo"));
+    }
+
+    #[test]
+    fn test_subject_validate() {
+        // Valid names
+        assert!(Subject::new("alice").validate().is_ok());
+        assert!(Subject::new("bob_123").validate().is_ok());
+        assert!(Subject::new("gpu-server.1").validate().is_ok());
+        assert!(Subject::anonymous().validate().is_ok());
+
+        // Invalid names
+        assert!(Subject::new("../evil").validate().is_err());
+        assert!(Subject::new("bob/root").validate().is_err());
+        assert!(Subject::new("").validate().is_err());
+        assert!(Subject::new("alice:bob").validate().is_err());
+    }
+
+    #[test]
+    fn test_subject_hash_eq() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(Subject::new("alice"));
+        set.insert(Subject::new("alice")); // duplicate
+        set.insert(Subject::new("bob"));
+        assert_eq!(set.len(), 2);
+
+        // Same user from different identity types produces equal subjects
+        let from_local = Subject::from(&RequestIdentity::Local { user: "alice".into() });
+        let from_token = Subject::from(&RequestIdentity::ApiToken { user: "alice".into(), token_name: "ci".into() });
+        assert_eq!(from_local, from_token);
+    }
+
+    #[test]
+    fn test_subject_capnp_roundtrip() -> anyhow::Result<()> {
+        use capnp::message::Builder;
+
+        let cases = vec![
+            Subject::new("alice"),
+            Subject::new("bob"),
+            Subject::new("gpu-1"),
+            Subject::anonymous(),
+        ];
+
+        for subject in cases {
+            let mut message = Builder::new_default();
+            let mut builder = message.init_root::<common_capnp::subject::Builder>();
+            subject.write_to(&mut builder);
+
+            let reader = builder.into_reader();
+            let decoded = Subject::read_from(reader)?;
+            assert_eq!(subject, decoded, "Cap'n Proto roundtrip failed");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_subject_from_claims() {
+        let claims = crate::auth::Claims::new(
+            "charlie".to_owned(),
+            1000,
+            2000,
+        );
+        assert_eq!(Subject::from(&claims), Subject::new("charlie"));
     }
 }

@@ -6,7 +6,7 @@
 //! device parameter provided during construction.
 
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::HashSet;
 use tch::{Device, Tensor};
 
 /// Device-agnostic token sampler operating on tensors
@@ -35,26 +35,52 @@ impl TensorSampler {
     /// Sample next token directly from logits tensor
     pub fn sample_token(
         &self,
-        logits_tensor: &Tensor, // [1, vocab_size] or [batch, seq_len, vocab_size] tensor on GPU
+        logits_tensor: &Tensor,
         temperature: f32,
         top_p: f32,
         top_k: Option<usize>,
         repeat_penalty: f32,
         previous_tokens: &[i64],
     ) -> Result<usize> {
-        // Ensure logits are on the correct device and squeezed to 1D
-        // Preserve native precision (BF16/FP16) for GPU performance
-        // For multimodal models, logits might be [batch, seq_len, vocab_size]
-        // We need to take the last token's logits: [-1, :] -> [vocab_size]
+        let logits = self.squeeze_logits(logits_tensor);
+        let penalized_logits =
+            self.apply_repetition_penalty(logits, repeat_penalty, previous_tokens)?;
+        self.sample_from_logits(penalized_logits, temperature, top_p, top_k)
+    }
+
+    /// Sample a token with reduced repeat penalty for single-character tokens.
+    ///
+    /// Exempt tokens (digits, punctuation) receive `sqrt(penalty)` instead of
+    /// the full penalty, preventing digit suppression in year generation while
+    /// still discouraging runaway single-character repetition.
+    pub fn sample_token_with_penalty_exemptions(
+        &self,
+        logits_tensor: &Tensor,
+        temperature: f32,
+        top_p: f32,
+        top_k: Option<usize>,
+        repeat_penalty: f32,
+        previous_tokens: &[i64],
+        exempt_tokens: &HashSet<i64>,
+    ) -> Result<usize> {
+        let logits = self.squeeze_logits(logits_tensor);
+        let penalized_logits = self.apply_repetition_penalty_tiered(
+            logits, repeat_penalty, previous_tokens, exempt_tokens,
+        )?;
+        self.sample_from_logits(penalized_logits, temperature, top_p, top_k)
+    }
+
+    // ── Shared pipeline helpers ──────────────────────────────────────────
+
+    /// Extract last-token logits from a potentially batched tensor, yielding a 1-D vector.
+    fn squeeze_logits(&self, logits_tensor: &Tensor) -> Tensor {
         let logits = if logits_tensor.dim() > 1 {
-            // Get the shape
             let shape = logits_tensor.size();
             if shape.len() == 3 {
-                // [batch, seq_len, vocab_size] -> take last position's logits
-                logits_tensor.select(1, shape[1] - 1).squeeze_dim(0) // [vocab_size]
+                // [batch, seq_len, vocab_size] → last position
+                logits_tensor.select(1, shape[1] - 1).squeeze_dim(0)
             } else if shape.len() == 2 {
-                // [batch, vocab_size] or [seq_len, vocab_size] -> squeeze first dim
-                logits_tensor.squeeze_dim(0) // [vocab_size]
+                logits_tensor.squeeze_dim(0)
             } else {
                 logits_tensor.shallow_clone()
             }
@@ -63,30 +89,29 @@ impl TensorSampler {
         }
         .to_device(self.device);
 
-        // Validate logits shape (no GPU sync - just checks dimensions)
         if logits.dim() != 1 {
             tracing::warn!(
-                "⚠️ Logits not 1D after squeeze: shape={:?}",
+                "Logits not 1D after squeeze: shape={:?}",
                 logits.size()
             );
         }
+        logits
+    }
 
-        // NOTE: Debug stats removed to eliminate GPU-CPU sync overhead
-        // Previous code extracted min/max/mean which forced 3 sync points per token
-
-        // Step 1: Apply repetition penalty to logits
-        // PERF: Pass ownership - enables smart copy in apply_repetition_penalty
-        let penalized_logits =
-            self.apply_repetition_penalty(logits, repeat_penalty, previous_tokens)?;
-
+    /// Run the sampling pipeline (greedy / top-k / temperature / softmax / top-p / multinomial)
+    /// on already-penalized logits.
+    fn sample_from_logits(
+        &self,
+        penalized_logits: Tensor,
+        temperature: f32,
+        top_p: f32,
+        top_k: Option<usize>,
+    ) -> Result<usize> {
         // PERF: Greedy path - bypass softmax/multinomial when temperature is very low
-        // This eliminates expensive GPU sync in multinomial sampling for deterministic generation
         if temperature <= 0.01 || temperature.is_nan() || temperature.is_infinite() {
-            // Greedy decoding: just take argmax of logits (still has GPU sync, but faster than multinomial)
             let vocab_size = penalized_logits.size()[0] as usize;
             let (_, max_idx) = penalized_logits.max_dim(0, false);
             let token_id = max_idx.int64_value(&[]) as usize;
-
             if token_id >= vocab_size {
                 tracing::error!("Greedy: token_id {} >= vocab_size {}", token_id, vocab_size);
                 return Ok(0);
@@ -94,118 +119,175 @@ impl TensorSampler {
             return Ok(token_id);
         }
 
-        // Step 2: Apply top-k filtering to logits (more efficient than after softmax)
+        // Top-k filtering (more efficient before softmax)
         let filtered_logits = if let Some(k) = top_k {
             self.apply_top_k_to_logits(&penalized_logits, k)?
         } else {
             penalized_logits
         };
 
-        // Step 3: Apply temperature scaling
-        // Use scalar division directly - tch-rs handles precision correctly with f64
+        // Temperature scaling
         let scaled_logits = if (temperature - 1.0).abs() < 1e-6 {
-            // Temperature is effectively 1.0, no scaling needed
             filtered_logits
         } else {
-            // Scalar division avoids tensor allocation per token
             filtered_logits / (temperature as f64)
         };
 
-        // Step 4: Convert to probabilities with numerical stability
+        // Softmax → probabilities (always FP32 for numerical stability)
         let probs = self.softmax_stable(&scaled_logits)?;
 
-        // Step 5: Apply top-p (nucleus) sampling
+        // Top-p (nucleus) sampling
         let final_probs = if top_p < 1.0 {
             self.apply_top_p(&probs, top_p)?
         } else {
             probs
         };
 
-        // Step 6: Sample from distribution
         self.multinomial_sample(&final_probs)
     }
 
-    /// Apply repetition penalty (fully GPU-accelerated, no CPU transfers)
-    /// PERF: Takes ownership of logits to enable smart copy - only copies if tensor is a view
+    // ── Repetition penalty ──────────────────────────────────────────────
+
+    /// Apply uniform repetition penalty to all tokens in the recent window.
+    ///
+    /// PERF: Takes ownership of logits to enable smart copy — only copies if
+    /// the tensor is a view.
     fn apply_repetition_penalty(
         &self,
-        logits: Tensor,  // Take ownership for in-place modification
+        logits: Tensor,
         repeat_penalty: f32,
         previous_tokens: &[i64],
     ) -> Result<Tensor> {
-        // PERF: Early return if no penalty needed - no copy at all
         if (repeat_penalty - 1.0).abs() < 1e-6 || previous_tokens.is_empty() {
-            return Ok(logits);  // Return owned tensor, no copy
+            return Ok(logits);
         }
 
         let vocab_size = logits.size()[0] as usize;
         let logits_kind = logits.kind();
 
-        // Build frequency map on CPU (small data, cheap operation)
-        let mut token_counts = HashMap::new();
+        // Deduplicate tokens (penalty is applied once per token, not per occurrence)
+        let mut seen = HashSet::new();
+        let unique_ids: Vec<usize> = previous_tokens
+            .iter()
+            .rev()
+            .filter_map(|&tid| {
+                let uid = tid as usize;
+                (tid >= 0 && uid < vocab_size && seen.insert(uid)).then_some(uid)
+            })
+            .collect();
+
+        if unique_ids.is_empty() {
+            return Ok(logits);
+        }
+
+        let mut result = logits.contiguous();
+        self.apply_penalty_to_indices(&mut result, &unique_ids, repeat_penalty, logits_kind)?;
+        Ok(result)
+    }
+
+    /// Apply tiered repetition penalty: full penalty for normal tokens,
+    /// `sqrt(penalty)` for exempt tokens (single-character tokens like digits).
+    ///
+    /// This prevents digit suppression in year generation ("1917" → "209")
+    /// while still discouraging runaway digit repetition ("1822222…").
+    fn apply_repetition_penalty_tiered(
+        &self,
+        logits: Tensor,
+        repeat_penalty: f32,
+        previous_tokens: &[i64],
+        exempt_tokens: &HashSet<i64>,
+    ) -> Result<Tensor> {
+        if (repeat_penalty - 1.0).abs() < 1e-6 || previous_tokens.is_empty() {
+            return Ok(logits);
+        }
+
+        let vocab_size = logits.size()[0] as usize;
+        let logits_kind = logits.kind();
+
+        // Partition tokens into full-penalty and reduced-penalty groups
+        let mut full_penalty_ids = Vec::new();
+        let mut reduced_penalty_ids = Vec::new();
+        let mut seen = HashSet::new();
+
         for &token_id in previous_tokens.iter().rev() {
-            if token_id >= 0 && (token_id as usize) < vocab_size {
-                *token_counts.entry(token_id as usize).or_insert(0) += 1;
+            let uid = token_id as usize;
+            if token_id >= 0 && uid < vocab_size && seen.insert(uid) {
+                if exempt_tokens.contains(&token_id) {
+                    reduced_penalty_ids.push(uid);
+                } else {
+                    full_penalty_ids.push(uid);
+                }
             }
         }
 
-        if token_counts.is_empty() {
-            return Ok(logits);  // Return owned tensor, no copy
+        if full_penalty_ids.is_empty() && reduced_penalty_ids.is_empty() {
+            return Ok(logits);
         }
 
-        // PERF: Smart copy - contiguous() is a no-op if tensor already owns its memory,
-        // only copies if logits is a view (from select/squeeze). This replaces the
-        // unconditional copy() which always copied 600KB.
         let mut result = logits.contiguous();
 
-        // Prepare data for GPU operations
-        let token_ids: Vec<i64> = token_counts.keys().map(|&id| id as i64).collect();
-        let counts: Vec<f32> = token_counts.values().map(|&c| c as f32).collect();
+        if !full_penalty_ids.is_empty() {
+            self.apply_penalty_to_indices(&mut result, &full_penalty_ids, repeat_penalty, logits_kind)?;
+        }
 
-        // === ALL OPERATIONS BELOW HAPPEN ON GPU ===
-
-        // 1. Create index and count tensors on device
-        let indices = Tensor::from_slice(&token_ids).to_device(self.device);
-        let penalty_counts = Tensor::from_slice(&counts)
-            .to_kind(logits_kind)  // Match logits precision (BF16)
-            .to_device(self.device);
-
-        // 2. Extract current logit values for penalized tokens (GPU gather)
-        let current_logits = result.index_select(0, &indices);
-
-        // 3. Apply penalty once per token (not exponential based on count)
-        // Standard implementation: penalty is applied uniformly to any token that appeared,
-        // regardless of how many times it appeared in the context window.
-        // This prevents catastrophic penalty accumulation for frequently-used tokens (like digits).
-        // FIX: Create penalty tensor with same precision as logits to prevent precision loss
-        let penalty_tensor = Tensor::from_slice(&[repeat_penalty])
-            .to_device(self.device)
-            .to_kind(logits_kind);  // Match logits precision exactly
-        let penalties = Tensor::ones_like(&penalty_counts) * penalty_tensor;
-
-        // 4. Apply conditional penalty using GPU masking
-        // If logit > 0: divide by penalty, else: multiply by penalty
-        let penalized_positive = &current_logits / &penalties;
-        let penalized_negative = &current_logits * &penalties;
-
-        // Vectorized conditional select using mask multiplication
-        // positive_mask: 1.0 where current_logits > 0, else 0.0
-        let positive_mask = current_logits.gt(0.0).to_kind(logits_kind);
-        let negative_mask = &Tensor::ones_like(&positive_mask) - &positive_mask;
-
-        let new_values = &penalized_positive * &positive_mask + &penalized_negative * &negative_mask;
-
-        // 5. Update in-place (safe because we own result via contiguous())
-        let _ = result.index_put_(&[Some(indices)], &new_values, false);
+        if !reduced_penalty_ids.is_empty() {
+            // sqrt(penalty) gives a much gentler nudge: e.g. 1.1 → 1.049
+            let reduced = repeat_penalty.sqrt();
+            self.apply_penalty_to_indices(&mut result, &reduced_penalty_ids, reduced, logits_kind)?;
+        }
 
         Ok(result)
     }
 
-    /// Softmax computation using PyTorch's optimized fused kernel
+    /// Apply a scalar penalty to specific token indices in a logits tensor.
+    ///
+    /// For positive logits the value is divided by `penalty`;
+    /// for negative logits the value is multiplied by `penalty`.
+    fn apply_penalty_to_indices(
+        &self,
+        result: &mut Tensor,
+        token_ids: &[usize],
+        penalty: f32,
+        logits_kind: tch::Kind,
+    ) -> Result<()> {
+        let indices_vec: Vec<i64> = token_ids.iter().map(|&id| id as i64).collect();
+        let indices = Tensor::from_slice(&indices_vec).to_device(self.device);
+        let current_logits = result.index_select(0, &indices);
+
+        let penalty_tensor = Tensor::from_slice(&[penalty])
+            .to_device(self.device)
+            .to_kind(logits_kind);
+        let penalties = Tensor::ones([indices_vec.len() as i64], (logits_kind, self.device))
+            * penalty_tensor;
+
+        let penalized_positive = &current_logits / &penalties;
+        let penalized_negative = &current_logits * &penalties;
+
+        let positive_mask = current_logits.gt(0.0).to_kind(logits_kind);
+        let negative_mask = Tensor::ones_like(&positive_mask) - &positive_mask;
+
+        let new_values =
+            &penalized_positive * &positive_mask + &penalized_negative * &negative_mask;
+
+        let _ = result.index_put_(&[Some(indices)], &new_values, false);
+        Ok(())
+    }
+
+    // ── Softmax / top-k / top-p / multinomial ───────────────────────────
+
+    /// Softmax in FP32 for numerical stability.
+    ///
+    /// BF16 softmax over ~150K vocabulary causes significant precision loss
+    /// (many small probabilities underflow to zero). This matches
+    /// HuggingFace/vLLM standard practice.
     fn softmax_stable(&self, logits: &Tensor) -> Result<Tensor> {
-        // Use PyTorch's native softmax - it's a single fused kernel that handles
-        // numerical stability internally (subtracts max before exp)
-        Ok(logits.softmax(-1, logits.kind()))
+        let logits_fp32 = if logits.kind() != tch::Kind::Float {
+            logits.to_kind(tch::Kind::Float)
+        } else {
+            logits.shallow_clone()
+        };
+        // Keep FP32 for accurate multinomial sampling
+        Ok(logits_fp32.softmax(-1, tch::Kind::Float))
     }
 
     /// Apply top-k filtering to logits (before softmax)
@@ -305,7 +387,6 @@ impl TensorSampler {
             Ok(token_id)
         }
     }
-
 }
 
 #[cfg(test)]

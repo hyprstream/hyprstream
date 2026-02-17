@@ -110,7 +110,8 @@ impl<S: ZmqService> Spawnable for S {
             .build()
             .map_err(|e| crate::error::RpcError::SpawnFailed(format!("runtime: {e}")))?;
 
-        rt.block_on(async move {
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async move {
             let runner = RequestLoop::new(transport, context, signing_key);
 
             match runner.run(*self).await {
@@ -235,6 +236,9 @@ impl Spawnable for ProxyService {
         if let Some(tx) = on_ready {
             let _ = tx.send(());
         }
+
+        // Notify systemd that service is ready (for Type=notify services)
+        let _ = crate::notify::ready();
 
         // Spawn shutdown listener
         let ctrl_sender = self.context.socket(zmq::PAIR)
@@ -803,13 +807,14 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl ZmqService for EchoService {
-        fn handle_request(
+        async fn handle_request(
             &self,
             _ctx: &crate::service::EnvelopeContext,
             payload: &[u8],
-        ) -> AnyhowResult<Vec<u8>> {
-            Ok(payload.to_vec())
+        ) -> AnyhowResult<(Vec<u8>, Option<crate::service::Continuation>)> {
+            Ok((payload.to_vec(), None))
         }
 
         fn name(&self) -> &str {

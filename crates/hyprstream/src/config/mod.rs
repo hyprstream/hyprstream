@@ -41,7 +41,7 @@ pub struct HyprConfig {
 
     /// LoRA adapter settings
     #[serde(default)]
-    pub lora: LoRAConfig,
+    pub lora: LoraAppConfig,
 
     /// Storage paths configuration
     #[serde(default)]
@@ -75,6 +75,14 @@ pub struct HyprConfig {
     /// Arrow Flight SQL server configuration
     #[serde(default)]
     pub flight: FlightConfig,
+
+    /// MCP service configuration (HTTP/SSE for Model Context Protocol)
+    #[serde(default)]
+    pub mcp: MCPConfig,
+
+    /// OAuth 2.1 authorization server configuration
+    #[serde(default)]
+    pub oauth: OAuthConfig,
 
     /// StreamService configuration (buffer sizes, TTL, etc.)
     #[serde(default)]
@@ -114,6 +122,11 @@ pub struct OAIConfig {
     #[serde(default = "default_oai_port")]
     pub port: u16,
 
+    /// External URL for this server (used in OAuth metadata and WWW-Authenticate headers).
+    /// Auto-derived from host:port if not set.
+    #[serde(default)]
+    pub external_url: Option<String>,
+
     /// TLS certificate path (optional)
     #[serde(default)]
     pub tls_cert: Option<PathBuf>,
@@ -136,6 +149,7 @@ impl Default for OAIConfig {
         Self {
             host: default_oai_host(),
             port: default_oai_port(),
+            external_url: None,
             tls_cert: None,
             tls_key: None,
             request_timeout_secs: default_oai_timeout(),
@@ -144,8 +158,20 @@ impl Default for OAIConfig {
     }
 }
 
+impl OAIConfig {
+    /// Get the resource URL, using external_url if set, otherwise deriving from host:port.
+    pub fn resource_url(&self) -> String {
+        if let Some(ref url) = self.external_url {
+            url.clone()
+        } else {
+            let host = if self.host == "0.0.0.0" { "localhost" } else { &self.host };
+            format!("http://{}:{}", host, self.port)
+        }
+    }
+}
+
 fn default_oai_host() -> String { "0.0.0.0".to_owned() }
-fn default_oai_port() -> u16 { 8080 }
+fn default_oai_port() -> u16 { 6789 }
 fn default_oai_timeout() -> u64 { 300 }
 
 /// Arrow Flight SQL server configuration
@@ -186,6 +212,121 @@ impl Default for FlightConfig {
 
 fn default_flight_host() -> String { "0.0.0.0".to_owned() }
 fn default_flight_port() -> u16 { 50051 }
+
+/// MCP service configuration (Model Context Protocol)
+///
+/// This service provides an MCP-compliant interface for AI coding assistants
+/// (Claude Code, Cursor, etc.) to interact with hyprstream via HTTP/SSE.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MCPConfig {
+    /// Host address for HTTP/SSE server
+    #[serde(default = "default_mcp_host")]
+    pub host: String,
+
+    /// Port for HTTP/SSE server
+    #[serde(default = "default_mcp_port")]
+    pub http_port: u16,
+
+    /// External URL for this server (used in OAuth metadata).
+    /// Auto-derived from host:http_port if not set.
+    #[serde(default)]
+    pub external_url: Option<String>,
+}
+
+impl Default for MCPConfig {
+    fn default() -> Self {
+        Self {
+            host: default_mcp_host(),
+            http_port: default_mcp_port(),
+            external_url: None,
+        }
+    }
+}
+
+impl MCPConfig {
+    /// Get the resource URL, using external_url if set, otherwise deriving from host:http_port.
+    pub fn resource_url(&self) -> String {
+        if let Some(ref url) = self.external_url {
+            url.clone()
+        } else {
+            let host = if self.host == "0.0.0.0" { "localhost" } else { &self.host };
+            format!("http://{}:{}", host, self.http_port)
+        }
+    }
+}
+
+fn default_mcp_host() -> String { "0.0.0.0".to_owned() }
+fn default_mcp_port() -> u16 { 6790 }
+
+/// OAuth 2.1 authorization server configuration
+///
+/// Provides OAuth 2.1 (draft-ietf-oauth-v2-1-13) authorization for MCP and OAI services.
+/// Supports RFC 7591 (Dynamic Client Registration), RFC 8414 (AS Metadata),
+/// RFC 8707 (Resource Indicators), and Client ID Metadata Documents.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthConfig {
+    /// Host address for OAuth server
+    #[serde(default = "default_oauth_host")]
+    pub host: String,
+
+    /// Port for OAuth server
+    #[serde(default = "default_oauth_port")]
+    pub port: u16,
+
+    /// External URL for this server (used in metadata responses).
+    /// Auto-derived from host:port if not set.
+    #[serde(default)]
+    pub external_url: Option<String>,
+
+    /// Default scopes granted to new clients
+    #[serde(default = "default_oauth_scopes")]
+    pub default_scopes: Vec<String>,
+
+    /// Access token TTL in seconds
+    #[serde(default = "default_oauth_token_ttl")]
+    pub token_ttl_seconds: u32,
+
+    /// Refresh token TTL in seconds (default: 72 hours)
+    #[serde(default = "default_refresh_token_ttl")]
+    pub refresh_token_ttl_seconds: u32,
+}
+
+impl Default for OAuthConfig {
+    fn default() -> Self {
+        Self {
+            host: default_oauth_host(),
+            port: default_oauth_port(),
+            external_url: None,
+            default_scopes: default_oauth_scopes(),
+            token_ttl_seconds: default_oauth_token_ttl(),
+            refresh_token_ttl_seconds: default_refresh_token_ttl(),
+        }
+    }
+}
+
+impl OAuthConfig {
+    /// Get the issuer URL, using external_url if set, otherwise deriving from host:port.
+    pub fn issuer_url(&self) -> String {
+        if let Some(ref url) = self.external_url {
+            url.clone()
+        } else {
+            let host = if self.host == "0.0.0.0" { "localhost" } else { &self.host };
+            format!("http://{}:{}", host, self.port)
+        }
+    }
+}
+
+fn default_oauth_host() -> String { "0.0.0.0".to_owned() }
+fn default_oauth_port() -> u16 { 6791 }
+fn default_oauth_scopes() -> Vec<String> {
+    vec![
+        "read:*:*".to_owned(),
+        "infer:model:*".to_owned(),
+        "write:*:*".to_owned(),
+    ]
+}
+fn default_oauth_token_ttl() -> u32 { 3600 }
+fn default_refresh_token_ttl() -> u32 { 259_200 } // 72 hours
 
 /// StreamService configuration
 ///
@@ -304,8 +445,10 @@ fn default_startup_services() -> Vec<String> {
         "streams".to_owned(),   // Streaming proxy with JWT validation
         "worker".to_owned(),    // Container workloads
         "model".to_owned(),     // Model management
+        "oauth".to_owned(),     // OAuth 2.1 authorization server
         "oai".to_owned(),       // OpenAI-compatible HTTP API
         "flight".to_owned(),    // Arrow Flight SQL server
+        "mcp".to_owned(),       // Model Context Protocol service
     ]
 }
 
@@ -449,9 +592,11 @@ impl Default for GenerationConfig {
     }
 }
 
-/// LoRA adapter configuration
+/// Application-level LoRA settings (TOML config: enabled, max_adapters, etc.)
+///
+/// This is distinct from `TenantDeltaConfig` which configures LoRA weight parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LoRAConfig {
+pub struct LoraAppConfig {
     /// Enable LoRA adapters
     pub enabled: bool,
     /// Maximum number of active adapters
@@ -462,7 +607,7 @@ pub struct LoRAConfig {
     pub sparsity: f32,
 }
 
-impl Default for LoRAConfig {
+impl Default for LoraAppConfig {
     fn default() -> Self {
         Self {
             enabled: true,
@@ -480,7 +625,7 @@ pub struct HyprConfigBuilder {
     model: ModelConfig,
     runtime: RuntimeConfig,
     generation: GenerationConfig,
-    lora: LoRAConfig,
+    lora: LoraAppConfig,
     storage: StorageConfig,
     git2db: git2db::config::Git2DBConfig,
     worker: Option<hyprstream_workers::config::WorkerConfig>,
@@ -488,6 +633,8 @@ pub struct HyprConfigBuilder {
     token: TokenConfig,
     oai: OAIConfig,
     flight: FlightConfig,
+    mcp: MCPConfig,
+    oauth: OAuthConfig,
     streaming: StreamingConfig,
 }
 
@@ -499,7 +646,7 @@ impl HyprConfigBuilder {
             model: ModelConfig::default(),
             runtime: RuntimeConfig::default(),
             generation: GenerationConfig::default(),
-            lora: LoRAConfig::default(),
+            lora: LoraAppConfig::default(),
             storage: StorageConfig::default(),
             git2db: git2db::config::Git2DBConfig::default(),
             worker: None,
@@ -507,6 +654,8 @@ impl HyprConfigBuilder {
             token: TokenConfig::default(),
             oai: OAIConfig::default(),
             flight: FlightConfig::default(),
+            mcp: MCPConfig::default(),
+            oauth: OAuthConfig::default(),
             streaming: StreamingConfig::default(),
         }
     }
@@ -526,6 +675,8 @@ impl HyprConfigBuilder {
             token: config.token,
             oai: config.oai,
             flight: config.flight,
+            mcp: config.mcp,
+            oauth: config.oauth,
             streaming: config.streaming,
         }
     }
@@ -557,6 +708,8 @@ impl HyprConfigBuilder {
             token: self.token,
             oai: self.oai,
             flight: self.flight,
+            mcp: self.mcp,
+            oauth: self.oauth,
             streaming: self.streaming,
         }
     }
@@ -756,6 +909,8 @@ pub struct ModelInfo {
     pub hidden_size: usize,
     pub intermediate_size: Option<usize>,
     pub num_attention_heads: Option<usize>,
+    pub num_key_value_heads: Option<usize>,
+    pub head_dim: Option<usize>,
     pub num_hidden_layers: Option<usize>,
     pub architecture: String,
     pub quantization: Option<String>,
@@ -1280,6 +1435,73 @@ pub struct GenerationResult {
     pub inference_time_ms: u64,
     #[serde(default)]
     pub inference_tokens_per_sec: f32,
+
+    /// Online training (TTT) adaptation metrics
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttt_metrics: Option<TTTMetrics>,
+}
+
+/// TTT adaptation metrics (mirrors training::ttt::TTTResult)
+///
+/// Exposed as "Online Training" metrics in user-facing APIs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TTTMetrics {
+    pub avg_loss: f32,
+    pub loss_improvement: f32,
+    pub steps_performed: usize,
+    pub adaptation_time_ms: u64,
+    pub skipped: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+
+    // Advanced metrics (expert recommendation)
+    pub avg_grad_norm: f32,
+    pub max_grad_norm: f32,
+    pub gradient_clipped: bool,
+    pub tokens_used: usize,
+    pub tokens_provided: usize,
+    pub was_truncated: bool,
+
+    // Tenant-aware TTT metrics
+    /// Initial perplexity before adaptation
+    #[serde(default)]
+    pub initial_perplexity: f32,
+    /// Final perplexity after adaptation
+    #[serde(default)]
+    pub final_perplexity: f32,
+    /// Server's recommendation: true = commit, false = rollback
+    #[serde(default)]
+    pub recommendation: bool,
+    /// Number of steps determined by perplexity gating
+    #[serde(default)]
+    pub gated_steps: usize,
+    /// Whether adaptation is pending client commit/rollback
+    #[serde(default)]
+    pub pending: bool,
+}
+
+impl From<crate::training::ttt::TTTResult> for TTTMetrics {
+    fn from(r: crate::training::ttt::TTTResult) -> Self {
+        Self {
+            avg_loss: r.avg_loss,
+            loss_improvement: r.loss_improvement,
+            steps_performed: r.steps_performed,
+            adaptation_time_ms: r.adaptation_time_ms,
+            skipped: r.skipped,
+            skip_reason: r.skip_reason,
+            avg_grad_norm: r.avg_grad_norm,
+            max_grad_norm: r.max_grad_norm,
+            gradient_clipped: r.gradient_clipped,
+            tokens_used: r.tokens_used,
+            tokens_provided: r.tokens_provided,
+            was_truncated: r.was_truncated,
+            initial_perplexity: r.initial_perplexity,
+            final_perplexity: r.final_perplexity,
+            recommendation: r.recommendation,
+            gated_steps: r.gated_steps,
+            pending: r.pending,
+        }
+    }
 }
 
 /// Why generation stopped
@@ -1332,6 +1554,18 @@ pub struct HyprstreamTrainingConfig {
     /// TTT-specific configuration (for TestTimeTraining mode)
     #[serde(default)]
     pub ttt: TTTTrainingConfig,
+
+    /// LoRA rank for TTT delta (default: 8)
+    #[serde(default = "default_lora_rank")]
+    pub lora_rank: usize,
+
+    /// LoRA alpha scaling factor (default: None, which means alpha = rank)
+    #[serde(default)]
+    pub lora_alpha: Option<f32>,
+
+    /// Target modules for LoRA adaptation (default: ["q_proj", "v_proj"])
+    #[serde(default = "default_target_modules")]
+    pub target_modules: Vec<String>,
 }
 
 /// TTT-specific configuration
@@ -1404,6 +1638,9 @@ impl Default for HyprstreamTrainingConfig {
             min_quality_threshold: default_training_min_quality(),
             train_base_model: false,
             ttt: TTTTrainingConfig::default(),
+            lora_rank: default_lora_rank(),
+            lora_alpha: None,
+            target_modules: default_target_modules(),
         }
     }
 }
@@ -1423,6 +1660,12 @@ pub enum TrainingMode {
 }
 
 // Default functions for HyprstreamTrainingConfig
+pub fn default_lora_rank() -> usize {
+    8
+}
+pub fn default_target_modules() -> Vec<String> {
+    vec!["q_proj".to_owned(), "v_proj".to_owned()]
+}
 fn default_training_learning_rate() -> f64 {
     1e-5
 }

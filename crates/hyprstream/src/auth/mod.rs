@@ -8,7 +8,7 @@
 pub mod jwt;
 mod policy_manager;
 
-pub use jwt::{Claims, JwtError, TOKEN_PREFIX, ADMIN_TOKEN_PREFIX};
+pub use jwt::{Claims, JwtError};
 pub use policy_manager::{PolicyManager, PolicyError};
 
 /// Operation types that can be controlled via policies
@@ -71,6 +71,14 @@ impl Operation {
         }
     }
 
+    /// Parse from operation name string (e.g., "write", "query").
+    ///
+    /// Used by generated `authorize()` overrides to convert the string action
+    /// from `$mcpScope` annotations into an `Operation` enum value.
+    pub fn parse_operation(s: &str) -> anyhow::Result<Self> {
+        s.parse().map_err(|e: anyhow::Error| e)
+    }
+
     /// All operations
     pub fn all() -> &'static [Operation] {
         &[
@@ -82,6 +90,23 @@ impl Operation {
             Operation::Manage,
             Operation::Context,
         ]
+    }
+}
+
+impl std::str::FromStr for Operation {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "infer" => Ok(Operation::Infer),
+            "train" => Ok(Operation::Train),
+            "query" => Ok(Operation::Query),
+            "write" => Ok(Operation::Write),
+            "serve" => Ok(Operation::Serve),
+            "manage" => Ok(Operation::Manage),
+            "context" => Ok(Operation::Context),
+            other => anyhow::bail!("Unknown operation: {}", other),
+        }
     }
 }
 
@@ -138,6 +163,7 @@ pub fn capabilities_to_access_string(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     fn test_operation_codes() {
@@ -164,6 +190,18 @@ mod tests {
         assert_eq!(Operation::Train.as_str(), "train");
         assert_eq!(Operation::Manage.as_str(), "manage");
         assert_eq!(Operation::Context.as_str(), "context");
+    }
+
+    #[test]
+    fn test_operation_from_str() {
+        assert!(matches!(Operation::from_str("infer"), Ok(Operation::Infer)));
+        assert!(matches!(Operation::from_str("train"), Ok(Operation::Train)));
+        assert!(matches!(Operation::from_str("query"), Ok(Operation::Query)));
+        assert!(matches!(Operation::from_str("write"), Ok(Operation::Write)));
+        assert!(matches!(Operation::from_str("serve"), Ok(Operation::Serve)));
+        assert!(matches!(Operation::from_str("manage"), Ok(Operation::Manage)));
+        assert!(matches!(Operation::from_str("context"), Ok(Operation::Context)));
+        assert!(Operation::from_str("foo").is_err());
     }
 
     #[test]

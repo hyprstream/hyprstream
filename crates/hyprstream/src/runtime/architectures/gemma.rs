@@ -1134,12 +1134,6 @@ impl ModelOperations for GemmaModel {
         Ok(mask)
     }
 
-    fn apply_lora(&mut self, _adapter: &crate::lora::torch_adapter::LoRAModel) -> Result<()> {
-        // Apply LoRA weights with Gemma-specific adaptations
-        // The adapter will handle shape conversions for MQA
-        Ok(())
-    }
-
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

@@ -4,7 +4,7 @@
 //! LocalInferenceClient and LocalInferenceService via channels.
 
 use crate::config::{GenerationRequest, GenerationResult, ModelInfo};
-use crate::lora::LoRAConfig;
+use crate::training::TenantDeltaConfig;
 use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot};
 
@@ -61,7 +61,7 @@ pub enum InferenceRequest {
 
     /// Create LoRA adapter structure.
     CreateLora {
-        config: LoRAConfig,
+        config: TenantDeltaConfig,
         reply: oneshot::Sender<Result<(), InferenceError>>,
     },
 

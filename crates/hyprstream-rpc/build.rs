@@ -50,4 +50,16 @@ fn main() {
             panic!("failed to compile events.capnp: {e}");
         }
     }
+
+    // Compile annotations schema (ScopeAction enum used by all service schemas)
+    let annotations_schema = schema_dir.join("annotations.capnp");
+    if annotations_schema.exists() {
+        if let Err(e) = capnpc::CompilerCommand::new()
+            .src_prefix("schema")
+            .file(&annotations_schema)
+            .run()
+        {
+            panic!("failed to compile annotations.capnp: {e}");
+        }
+    }
 }

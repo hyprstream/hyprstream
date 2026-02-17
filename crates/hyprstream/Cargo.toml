@@ -46,6 +46,7 @@ serde_yaml.workspace = true
 git2.workspace = true  # Still needed by git2db internally
 git2db = { path = "../git2db", features = ["overlayfs"] }  # High-level git library with overlayfs
 hyprstream-rpc = { path = "../hyprstream-rpc" }  # RPC infrastructure (Cap'n Proto + ZMQ)
+hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }  # RPC code generation proc macros
 hyprstream-flight = { path = "../hyprstream-flight" }  # Flight SQL server and client
 hyprstream-metrics = { path = "../hyprstream-metrics" }  # Metrics storage (for RegistryClient trait)
 hyprstream-workers = { path = "../hyprstream-workers" }  # Worker runtime (Kata containers)
@@ -63,6 +64,10 @@ parking_lot.workspace = true
 num_cpus.workspace = true
 once_cell.workspace = true  # For global GitService singleton
 dirs = "5"  # User directory paths for CLI
+
+rmcp = { version = "0.14", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+http = "1"  # HTTP types (request::Parts) for MCP identity extraction
+schemars = "1.2"
 
 tracing-log.workspace = true
 tracing-appender.workspace = true
@@ -114,13 +119,19 @@ capnp-futures.workspace = true  # Cap'n Proto async support
 glob.workspace = true
 walkdir.workspace = true
 reqwest.workspace = true
+notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
 libc = "0.2"  # For system calls in overlay2 driver
+reflink-copy = "0.1"  # COW file copying (reflink when available)
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pathrs = "0.2"  # Kernel-enforced path containment via openat2(RESOLVE_IN_ROOT)
 lru.workspace = true  # LRU cache for model caching and Git repository handles
 dashmap.workspace = true  # Concurrent HashMap for thread-safe repository caching
 bitflags = "2.4"  # Capability flags for archetype detection
 casbin = "2"  # Access control library for RBAC/ABAC
 indicatif.workspace = true              # Progress bars
 fastrand.workspace = true                # Fast random number generation for sampling
+rand.workspace = true                    # Cryptographic random for OAuth auth codes
 xdg.workspace = true                     # XDG Base Directory specification
 blake3.workspace = true                  # Fast cryptographic hashing for checksums
 tempfile.workspace = true                # Temporary files for model conversion
@@ -152,6 +163,9 @@ experimental = []  # EXPERIMENTAL: Enable git write operations (commit/push/merg
 
 [build-dependencies]
 capnpc.workspace = true  # Cap'n Proto schema compiler
+capnp.workspace = true   # Cap'n Proto runtime for schema parsing
+serde_json.workspace = true  # JSON output for metadata
+hyprstream-rpc-build.workspace = true  # Shared annotation extraction
 
 [dev-dependencies]
 criterion.workspace = true

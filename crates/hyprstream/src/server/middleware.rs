@@ -4,7 +4,7 @@ use crate::auth::jwt;
 use crate::server::state::ServerState;
 use axum::{
     extract::{Request, State},
-    http::{header, StatusCode},
+    http::{header, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -16,18 +16,14 @@ use tracing::{debug, info, warn};
 pub struct AuthenticatedUser {
     /// Username (from JWT sub claim)
     pub user: String,
-    /// Whether this is an admin token
-    pub is_admin: bool,
-    /// Resource scopes
-    pub scopes: Vec<String>,
 }
 
 /// JWT authentication middleware
 ///
-/// Validates JWT tokens (hypr_eyJ...) via Ed25519 signature verification.
+/// Validates JWT tokens (eyJ...) via Ed25519 signature verification.
 ///
 /// On success, inserts `AuthenticatedUser` into request extensions.
-/// JWT `sub` claim should contain prefixed subject (e.g., "token:alice").
+/// JWT `sub` claim contains bare username (e.g., "alice").
 pub async fn auth_middleware(
     State(state): State<ServerState>,
     mut request: Request,
@@ -38,43 +34,45 @@ pub async fn auth_middleware(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "));
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .map(str::trim);
 
     // If no token provided, allow anonymous access
     let Some(token) = token else {
         return next.run(request).await;
     };
 
+    // Build WWW-Authenticate header for 401 responses (RFC 9728)
+    let www_authenticate = build_www_authenticate(&state);
+
     // Try JWT validation (stateless)
-    if jwt::has_valid_prefix(token) && token.contains('.') {
+    if token.contains('.') {
         match jwt::decode(token, &state.verifying_key) {
             Ok(claims) => {
                 debug!("JWT validated for user: {}", claims.sub);
                 let user = AuthenticatedUser {
                     user: claims.sub.clone(),
-                    is_admin: claims.admin,
-                    scopes: claims.scopes.iter().map(hyprstream_rpc::auth::Scope::to_string).collect(),
                 };
                 request.extensions_mut().insert(user);
                 return next.run(request).await;
             }
             Err(jwt::JwtError::Expired) => {
                 debug!("JWT expired");
-                return (StatusCode::UNAUTHORIZED, "Token expired").into_response();
+                return unauthorized_response("Token expired", &www_authenticate);
             }
             Err(jwt::JwtError::InvalidSignature) => {
                 debug!("JWT signature invalid");
-                return (StatusCode::UNAUTHORIZED, "Invalid token signature").into_response();
+                return unauthorized_response("Invalid token signature", &www_authenticate);
             }
             Err(e) => {
                 debug!("JWT validation failed: {}", e);
-                return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
+                return unauthorized_response("Invalid token", &www_authenticate);
             }
         }
     }
 
     warn!("Invalid token format");
-    (StatusCode::UNAUTHORIZED, "Invalid token format").into_response()
+    unauthorized_response("Invalid token format", &www_authenticate)
 }
 
 /// Request logging middleware
@@ -104,6 +102,30 @@ pub async fn rate_limit_middleware(
     next: Next,
 ) -> Response {
     next.run(request).await
+}
+
+/// Build WWW-Authenticate header value with resource_metadata URL (RFC 9728).
+fn build_www_authenticate(state: &ServerState) -> String {
+    let resource_metadata_url = format!(
+        "{}/.well-known/oauth-protected-resource",
+        state.resource_url
+    );
+    format!(
+        "Bearer resource_metadata=\"{}\"",
+        resource_metadata_url,
+    )
+}
+
+/// Return a 401 response with WWW-Authenticate header.
+fn unauthorized_response(message: &str, www_authenticate: &str) -> Response {
+    let mut response = (StatusCode::UNAUTHORIZED, message.to_owned()).into_response();
+    if let Ok(val) = HeaderValue::from_str(www_authenticate) {
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            val,
+        );
+    }
+    response
 }
 
 /// CORS middleware configuration

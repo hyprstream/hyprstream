@@ -33,7 +33,7 @@ use tracing::info;
 
 use crate::auth::PolicyManager;
 use crate::config::TokenConfig;
-use crate::services::{PolicyService, PolicyZmqClient, RegistryClient, RegistryService, RegistryZmqClient};
+use crate::services::{McpService, McpConfig, PolicyService, PolicyClient, RegistryService, GenRegistryClient};
 use crate::zmq::global_context;
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -62,7 +62,7 @@ fn create_event_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Factory for PolicyService (Casbin policy management)
-#[service_factory("policy")]
+#[service_factory("policy", schema = "../../schema/policy.capnp", metadata = crate::services::generated::policy_client::schema_metadata)]
 fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating PolicyService");
 
@@ -76,6 +76,16 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         })
         .context("Failed to initialize policy manager")?,
     );
+
+    // Spawn file watcher for policy hot-reload
+    let pm_clone = Arc::clone(&policy_manager);
+    let policy_csv = policies_dir.join("policy.csv");
+    tokio::task::block_in_place(|| {
+        let rt = tokio::runtime::Handle::current();
+        rt.spawn(async move {
+            super::policy::watch_policy_file(pm_clone, policy_csv).await;
+        });
+    });
 
     // Service includes infrastructure - directly Spawnable via blanket impl
     let policy_service = PolicyService::new(
@@ -94,12 +104,12 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Factory for RegistryService (git2db model registry)
-#[service_factory("registry")]
+#[service_factory("registry", schema = "../../schema/registry.capnp", metadata = crate::services::generated::registry_client::schema_metadata)]
 fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating RegistryService");
 
     // Create policy client for authorization checks
-    let policy_client = PolicyZmqClient::new(ctx.signing_key().clone(), RequestIdentity::local());
+    let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::local());
 
     // Create registry service with infrastructure (blocking since we're in sync context)
     let registry_service = tokio::task::block_in_place(|| {
@@ -148,20 +158,21 @@ fn create_streams_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Factory for ModelService (model lifecycle management)
-#[service_factory("model")]
+#[service_factory("model", schema = "../../schema/model.capnp", metadata = crate::services::generated::model_client::schema_metadata)]
 fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating ModelService");
 
     use crate::services::{ModelService, ModelServiceConfig};
 
     // Create policy client for authorization checks
-    let policy_client = PolicyZmqClient::new(ctx.signing_key().clone(), RequestIdentity::local());
+    let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::local());
 
     // Create registry client
-    let registry_client: Arc<dyn RegistryClient> = Arc::new(RegistryZmqClient::new(
+    let registry_client: GenRegistryClient = crate::services::core::create_service_client(
+        &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
         ctx.signing_key().clone(),
         RequestIdentity::local(),
-    ));
+    );
 
     // Service includes infrastructure - directly Spawnable via blanket impl
     let model_service = ModelService::new(
@@ -225,7 +236,7 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
 
     // Service includes infrastructure - directly Spawnable via blanket impl
-    let worker_service = WorkerService::new(
+    let mut worker_service = WorkerService::new(
         pool_config,
         image_config,
         rafs_store,
@@ -233,6 +244,13 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         ctx.transport("worker", SocketKind::Rep),
         ctx.signing_key().clone(),
     )?;
+
+    // Wire up policy-backed authorization
+    let policy_client = crate::services::PolicyClient::new(
+        ctx.signing_key().clone(),
+        hyprstream_rpc::RequestIdentity::local(),
+    );
+    worker_service.set_authorize_fn(super::worker::build_authorize_fn(policy_client));
 
     Ok(Box::new(worker_service))
 }
@@ -258,15 +276,17 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 
     // Create ZMQ clients for Model and Policy services
     let model_client = ModelZmqClient::new(ctx.signing_key().clone(), RequestIdentity::local());
-    let policy_client = PolicyZmqClient::new(ctx.signing_key().clone(), RequestIdentity::local());
+    let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::local());
 
     // Create registry client
-    let registry_client: Arc<dyn RegistryClient> = Arc::new(RegistryZmqClient::new(
+    let registry_client: GenRegistryClient = crate::services::core::create_service_client(
+        &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
         ctx.signing_key().clone(),
         RequestIdentity::local(),
-    ));
+    );
 
     // Create server state (blocking since we're in sync context)
+    let resource_url = config.oai.resource_url();
     let server_state = tokio::task::block_in_place(|| {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(ServerState::new(
@@ -275,6 +295,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
             policy_client,
             registry_client,
             ctx.signing_key().clone(),
+            resource_url,
         ))
     })
     .context("Failed to create server state")?;
@@ -309,10 +330,11 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     let config = HyprConfig::load().unwrap_or_default();
 
     // Create registry client for dataset lookup (if default_dataset is configured)
-    // RegistryZmqClient already implements hyprstream_metrics::RegistryClient
+    // GenRegistryClient already implements hyprstream_metrics::RegistryClient
     let registry_client: Option<Arc<dyn hyprstream_metrics::RegistryClient>> =
         if config.flight.default_dataset.is_some() {
-            let zmq_client = RegistryZmqClient::new(
+            let zmq_client: GenRegistryClient = crate::services::core::create_service_client(
+                &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
                 ctx.signing_key().clone(),
                 RequestIdentity::local(),
             );
@@ -330,4 +352,127 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     );
 
     Ok(Box::new(flight_service))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// OAuth Service Factory
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Factory for OAuthService (OAuth 2.1 Authorization Server)
+///
+/// This service provides OAuth 2.1 authorization for MCP and OAI services.
+/// It delegates token issuance to PolicyService over ZMQ.
+#[service_factory("oauth")]
+fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+    info!("Creating OAuthService");
+
+    use crate::config::HyprConfig;
+    use crate::services::OAuthService;
+
+    let config = HyprConfig::load().unwrap_or_default();
+
+    let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::local());
+
+    let oauth_service = OAuthService::new(
+        config.oauth.clone(),
+        policy_client,
+        global_context(),
+        ctx.transport("oauth", SocketKind::Rep),
+        ctx.verifying_key(),
+    );
+
+    Ok(Box::new(oauth_service))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MCP Service Factory
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Factory for McpService (Model Context Protocol)
+///
+/// This service provides an MCP-compliant interface for AI coding assistants
+/// (Claude Code, Cursor, etc.) to interact with hyprstream via:
+/// - ZMQ control plane (for internal service communication)
+/// - HTTP/SSE (for external MCP clients)
+///
+/// Note: The HTTP/SSE server is spawned as a background task in the factory.
+#[service_factory("mcp", schema = "../../schema/mcp.capnp", metadata = crate::services::generated::mcp_client::schema_metadata)]
+fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+    info!("Creating McpService");
+
+    use crate::config::HyprConfig;
+
+    // Load full config for MCP settings
+    let config = HyprConfig::load().unwrap_or_default();
+
+    // Create McpConfig for the service
+    let mcp_config = McpConfig {
+        verifying_key: ctx.verifying_key(),
+        zmq_context: global_context(),
+        signing_key: ctx.signing_key().clone(),
+        transport: ctx.transport("mcp", SocketKind::Rep),
+        ctx: None, // ServiceContext not yet available as Arc — handlers use signing_key directly
+        expected_audience: Some(config.mcp.resource_url()),
+    };
+
+    // Clone config for HTTP/SSE server before consuming it for ZMQ service
+    let mcp_config_clone = mcp_config.clone();
+
+    // Create the service (includes ZMQ infrastructure)
+    let mcp_service = McpService::new(mcp_config)?;
+
+    // Spawn rmcp HTTP/SSE server as background task
+    let mcp_host = config.mcp.host.clone();
+    let http_port = config.mcp.http_port;
+    tokio::task::block_in_place(|| {
+        let rt = tokio::runtime::Handle::current();
+        rt.spawn(async move {
+            use rmcp::transport::streamable_http_server::{
+                StreamableHttpServerConfig, StreamableHttpService,
+            };
+
+            use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+
+            let session_mgr = std::sync::Arc::new(LocalSessionManager::default());
+            let service: StreamableHttpService<McpService, LocalSessionManager> =
+                StreamableHttpService::new(
+                    move || McpService::new(mcp_config_clone.clone()).map_err(|e| {
+                        std::io::Error::other(e.to_string())
+                    }),
+                    session_mgr,
+                    StreamableHttpServerConfig::default(),
+                );
+            // Add protected resource metadata (RFC 9728) for OAuth discovery
+            let mcp_full_config = crate::config::HyprConfig::load().unwrap_or_default();
+            let mcp_resource_url = mcp_full_config.mcp.resource_url();
+            let mcp_oauth_issuer = mcp_full_config.oauth.issuer_url();
+            let router = axum::Router::new()
+                .route(
+                    "/.well-known/oauth-protected-resource",
+                    axum::routing::get(move || async move {
+                        axum::Json(crate::services::oauth::protected_resource_metadata(
+                            &mcp_resource_url,
+                            &mcp_oauth_issuer,
+                        ))
+                    }),
+                )
+                .nest_service("/mcp", service);
+
+            let addr = format!("{}:{}", mcp_host, http_port);
+            let listener = match tokio::net::TcpListener::bind(&addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!("Failed to bind MCP HTTP/SSE on {}: {}", addr, e);
+                    return;
+                }
+            };
+            tracing::info!("MCP HTTP/SSE server listening on {}", addr);
+            if let Err(e) = axum::serve(listener, router).await {
+                tracing::error!("MCP HTTP/SSE server error: {}", e);
+            }
+        });
+    });
+    info!("McpService created (HTTP/SSE on {}:{})", config.mcp.host, http_port);
+
+    Ok(Box::new(mcp_service))  // Gets auto-Spawnable via ZmqService
 }

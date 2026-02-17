@@ -40,31 +40,38 @@ pub async fn handle_policy_show(
 
         if policies.is_empty() && groupings.is_empty() {
             println!("No policies defined.");
-            println!("\nTo create policies, run:");
+            println!("\nTo get started, apply a template:");
+            println!("  hyprstream policy apply-template local    # local CLI full access");
+            println!("\nOr edit manually:");
             println!("  hyprstream policy edit");
             return Ok(());
         }
 
         // Print policy rules as a table
+        // Casbin model: p = sub, dom, obj, act, eft
         if !policies.is_empty() {
-            println!("┌──────────────────────────────────────────────────────────────┐");
-            println!("│ Policy Rules                                                 │");
-            println!("├────────────────────┬────────────────────┬────────────────────┤");
-            println!("│ Subject            │ Resource           │ Action             │");
-            println!("├────────────────────┼────────────────────┼────────────────────┤");
+            println!("┌──────────────────────────────────────────────────────────────────────────────┐");
+            println!("│ Policy Rules                                                                 │");
+            println!("├────────────────┬────────────────┬────────────────┬────────────────┬──────────┤");
+            println!("│ Subject        │ Domain         │ Resource       │ Action         │ Effect   │");
+            println!("├────────────────┼────────────────┼────────────────┼────────────────┼──────────┤");
 
             for p in &policies {
                 let sub = p.first().map(std::string::String::as_str).unwrap_or("");
-                let obj = p.get(1).map(std::string::String::as_str).unwrap_or("");
-                let act = p.get(2).map(std::string::String::as_str).unwrap_or("");
+                let dom = p.get(1).map(std::string::String::as_str).unwrap_or("");
+                let obj = p.get(2).map(std::string::String::as_str).unwrap_or("");
+                let act = p.get(3).map(std::string::String::as_str).unwrap_or("");
+                let eft = p.get(4).map(std::string::String::as_str).unwrap_or("");
                 println!(
-                    "│ {:18} │ {:18} │ {:18} │",
-                    truncate_str(sub, 18),
-                    truncate_str(obj, 18),
-                    truncate_str(act, 18)
+                    "│ {:14} │ {:14} │ {:14} │ {:14} │ {:8} │",
+                    truncate_str(sub, 14),
+                    truncate_str(dom, 14),
+                    truncate_str(obj, 14),
+                    truncate_str(act, 14),
+                    truncate_str(eft, 8)
                 );
             }
-            println!("└────────────────────┴────────────────────┴────────────────────┘");
+            println!("└────────────────┴────────────────┴────────────────┴────────────────┴──────────┘");
         }
 
         // Print role assignments
@@ -145,12 +152,6 @@ pub async fn handle_policy_history(
 /// Handle `policy edit` - Open policy in $VISUAL/$EDITOR
 pub async fn handle_policy_edit(policy_manager: &PolicyManager) -> Result<()> {
     let policy_path = policy_manager.policy_csv_path();
-
-    // Ensure policy file exists
-    if !policy_path.exists() {
-        info!("Creating policy file at {:?}", policy_path);
-        tokio::fs::write(&policy_path, default_policy_template()).await?;
-    }
 
     // Get editor from environment
     let editor = std::env::var("VISUAL")
@@ -447,7 +448,6 @@ pub async fn handle_token_create(
     name: Option<String>,
     expires: &str,
     scopes: Vec<String>,
-    admin: bool,
 ) -> Result<()> {
     // Parse expiration
     let expires_duration = parse_duration(expires)?;
@@ -460,26 +460,18 @@ pub async fn handle_token_create(
         format!("token-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"))
     });
 
-    // Parse scopes into structured Scope objects
-    use hyprstream_rpc::auth::Scope;
-    let parsed_scopes: Result<Vec<Scope>> = scopes
-        .iter()
-        .map(|s| Scope::parse(s))
-        .collect();
-    let parsed_scopes = parsed_scopes.context("Invalid scope format. Expected 'action:resource:identifier'")?;
-
-    // Create JWT claims with prefixed subject (token:user)
+    // Create JWT claims with bare username as subject.
+    // Scopes are not embedded in JWT - Casbin enforces authorization server-side.
     let now = chrono::Utc::now().timestamp();
     let exp = (chrono::Utc::now() + duration).timestamp();
-    let prefixed_subject = format!("token:{user}");
-    let claims = Claims::new(prefixed_subject.clone(), now, exp, parsed_scopes, admin);
+    let claims = Claims::new(user.to_owned(), now, exp);
 
     // Encode and sign the JWT
     let token = jwt::encode(&claims, signing_key);
 
     // Display the token (only shown once)
     println!();
-    println!("JWT token created for subject '{prefixed_subject}':");
+    println!("JWT token created for subject '{user}':");
     println!();
     println!("  {token}");
     println!();
@@ -498,10 +490,6 @@ pub async fn handle_token_create(
         println!("  Scopes:  * (all resources)");
     } else {
         println!("  Scopes:  {}", scopes.join(", "));
-    }
-
-    if admin {
-        println!("  Admin:   yes");
     }
 
     println!();
@@ -601,43 +589,44 @@ fn has_uncommitted_changes(policies_dir: &Path) -> Result<bool> {
     Ok(!output.stdout.is_empty())
 }
 
-/// Truncate a string to max length, adding "..." if truncated
+/// Truncate a string to max length, adding "..." if truncated.
+/// Uses char_indices for O(n) slicing without intermediate allocation.
 fn truncate_str(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_owned()
     } else if max_len > 3 {
-        format!("{}...", &s[..max_len - 3])
+        let end = s.char_indices()
+            .nth(max_len - 3)
+            .map_or(s.len(), |(i, _)| i);
+        format!("{}...", &s[..end])
     } else {
-        s[..max_len].to_string()
+        let end = s.char_indices()
+            .nth(max_len)
+            .map_or(s.len(), |(i, _)| i);
+        s[..end].to_owned()
     }
-}
-
-/// Default policy template for new policy files (header only, no rules)
-fn default_policy_template() -> &'static str {
-    r#"# Hyprstream Access Control Policy
-# Format: p, subject, resource, action
-#
-# Subjects: user names or role names
-# Resources: model:<name>, data:<name>, or * for all
-# Actions: infer, train, query, write, serve, manage, or * for all
-#
-# Examples:
-# p, admin, *, *                    # Admin can do anything
-# p, trainer, model:*, infer        # Trainers can infer any model
-# p, trainer, model:*, train        # Trainers can train any model
-# p, analyst, data:*, query         # Analysts can query data
-#
-# Role assignments (g, user, role):
-# g, alice, trainer                 # Alice has the trainer role
-# g, bob, analyst                   # Bob has the analyst role
-"#
 }
 
 /// Built-in policy template
 pub struct PolicyTemplate {
     pub name: &'static str,
     pub description: &'static str,
-    pub rules: &'static str,
+    /// Static rules, or None if rules are generated dynamically.
+    pub rules: Option<&'static str>,
+}
+
+impl PolicyTemplate {
+    /// Get the rules content, expanding dynamic templates.
+    pub fn expanded_rules(&self) -> String {
+        if let Some(rules) = self.rules {
+            rules.to_owned()
+        } else if self.name == "local" {
+            let user = hyprstream_rpc::envelope::RequestIdentity::local().user().to_owned();
+            format!("# Full access for {user}\np, {user}, *, *, *, allow\n")
+        } else {
+            String::new()
+        }
+    }
 }
 
 /// Get all available policy templates
@@ -645,25 +634,23 @@ pub fn get_templates() -> &'static [PolicyTemplate] {
     &[
         PolicyTemplate {
             name: "local",
-            description: "Full access for local:* users (default for local execution)",
-            rules: r#"# Local user full access
-p, local:*, *, *, *, allow
-"#,
+            description: "Full access for the current local user",
+            rules: None, // Dynamic: expands to current OS username
         },
         PolicyTemplate {
             name: "public-inference",
             description: "Anonymous users can infer and query models",
-            rules: r#"# Public inference access
+            rules: Some(r#"# Public inference access
 p, anonymous, *, model:*, infer, allow
 p, anonymous, *, model:*, query, allow
-"#,
+"#),
         },
         PolicyTemplate {
             name: "public-read",
             description: "Anonymous users can query the registry (read-only)",
-            rules: r#"# Public read access (registry only)
+            rules: Some(r#"# Public read access (registry only)
 p, anonymous, *, registry:*, query, allow
-"#,
+"#),
         },
     ]
 }
@@ -709,29 +696,19 @@ pub async fn handle_policy_apply_template(
         .parent()
         .context("Could not find .registry directory")?;
 
-    // Read existing policy content
-    let existing_content = if policy_path.exists() {
-        tokio::fs::read_to_string(&policy_path).await?
-    } else {
-        default_policy_template().to_owned()
-    };
+    // Read existing policy content for rollback (PolicyManager::new() guarantees file exists)
+    let existing_content = tokio::fs::read_to_string(&policy_path).await?;
 
-    // Check if template rules already exist
-    if existing_content.contains(template.rules.trim()) {
-        println!("Template '{template_name}' is already applied.");
-        return Ok(());
-    }
-
-    // Append the template rules
-    let new_content = format!("{}\n{}", existing_content.trim_end(), template.rules);
+    // Full overwrite — templates are idempotent
+    let new_content = template.expanded_rules();
 
     println!("Applying template: {template_name}");
     println!("Description: {}", template.description);
     println!();
-    println!("Rules to add:");
-    for line in template.rules.lines() {
+    println!("Rules:");
+    for line in new_content.lines() {
         if !line.trim().is_empty() && !line.starts_with('#') {
-            println!("  + {line}");
+            println!("  {line}");
         }
     }
     println!();

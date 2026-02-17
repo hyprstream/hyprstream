@@ -25,9 +25,9 @@
 //!
 //! ```text
 //! # policy.csv defines the actual rules
-//! p, admin, *, *
-//! p, trainer, model:*, infer
-//! p, trainer, model:*, train
+//! p, operator, *, *, *, allow
+//! p, trainer, *, model:*, infer, allow
+//! p, trainer, *, model:*, train, allow
 //! g, alice, trainer
 //! ```
 
@@ -124,32 +124,29 @@ m = (g(r.sub, p.sub) || keyMatch(r.sub, p.sub)) && \
     (p.act == "*" || r.act == p.act)
 "#;
 
-/// Default policy rules (deny-all by default for security)
-/// Add explicit policies for access grants
+/// Default policy rules: deny-by-default (no allow rules)
+///
+/// All access is denied until the operator explicitly configures policy via:
+///   hyprstream policy apply-template local    # grant local CLI full access
+///   hyprstream policy apply-template public-inference  # open inference API
 ///
 /// Policy format: p, subject, domain, resource, action, effect
-const DEFAULT_POLICY_CSV: &str = r#"# Default policy (secure default with local user access)
-# Add explicit policies below to grant additional access.
+const DEFAULT_POLICY_CSV: &str = r#"# Hyprstream Access Control Policy — deny-by-default
 #
-# Policy format: p, subject, domain, resource, action, effect
+# No access is granted until you apply a policy template:
 #
-# Default policies for local users (CLI operations):
-p, local:*, *, registry, query, allow
-p, local:*, *, registry:*, query, allow
-p, local:*, *, registry:*, write, allow
-p, local:*, *, model:*, infer, allow
+#   hyprstream policy apply-template local             # local CLI full access
+#   hyprstream policy apply-template public-inference  # anonymous inference
+#   hyprstream policy apply-template public-read       # anonymous registry browse
 #
-# Examples for additional policies:
-#   p, admin, *, *, *, allow             # Admin has full access to all domains
-#   p, trainer, HfModel, model:*, train, allow  # Trainer can train HfModel domain
-#   p, user, HfModel, model:*, infer, allow     # User can infer in HfModel domain
-#   p, analyst, HfDataset, data:*, query, allow # Analyst can query datasets
-#   p, *, *, *, manage, deny             # Nobody can manage (explicit deny)
+# Or add rules manually:
+#   p, alice, *, *, *, allow                           # Alice full access
+#   p, alice, *, model:*, infer, allow                 # Alice can infer
+#   p, anonymous, *, inference:*, infer, allow         # public inference
 #
 # Role assignments:
-#   g, alice, trainer        # Assign alice to trainer role
-#
-# IMPORTANT: Add policies above to grant access to specific users/roles.
+#   g, alice, trainer
+#   p, trainer, *, model:*, train, allow
 "#;
 
 /// Validate policy.csv format before loading
@@ -175,7 +172,7 @@ fn validate_policy_csv(policy_path: &Path) -> Result<(), PolicyError> {
                     "Invalid policy format at line {}:\n\
                     Found:    {}\n\
                     Expected: p, subject, domain, resource, action, effect\n\
-                    Example:  p, admin, *, *, *, allow\n\n\
+                    Example:  p, alice, *, *, *, allow\n\n\
                     Your policy has {} fields but 6 are required.\n\
                     Edit {} to fix the format.",
                     line_num + 1, line, fields.len(), policy_path.display()
@@ -191,7 +188,7 @@ fn validate_policy_csv(policy_path: &Path) -> Result<(), PolicyError> {
                     "Invalid role format at line {}:\n\
                     Found:    {}\n\
                     Expected: g, user, role\n\
-                    Example:  g, alice, admin",
+                    Example:  g, alice, trainer",
                     line_num + 1, line
                 )));
             }
@@ -232,7 +229,7 @@ impl PolicyManager {
 
         // Create default policy.csv if not exists
         if !policy_path.exists() {
-            info!("Creating default policy.csv (deny-all - add policies to grant access)");
+            info!("Creating default policy.csv (deny-by-default — run `hyprstream policy apply-template local` to grant access)");
             tokio::fs::write(&policy_path, DEFAULT_POLICY_CSV).await?;
         }
 
@@ -262,9 +259,10 @@ impl PolicyManager {
         })
     }
 
-    /// Create a PolicyManager with default permissive policies (no file storage)
+    /// Create a PolicyManager with allow-all policies (for tests only).
     ///
-    /// Useful for testing or when policies aren't configured.
+    /// WARNING: Not for production use. Production uses `new()` which loads
+    /// deny-by-default policies from disk.
     pub async fn permissive() -> Result<Self, PolicyError> {
         // Use the same model as DEFAULT_MODEL_CONF for consistency
         let model = DefaultModel::from_str(DEFAULT_MODEL_CONF)
@@ -586,73 +584,6 @@ impl PolicyManager {
         self.policies_dir.join("policy.csv")
     }
 
-    // ========================================================================
-    // Convenience Methods for Common Policy Configurations
-    // ========================================================================
-
-    /// Enable full access for local users (local:*)
-    ///
-    /// This is the default secure configuration that allows local users
-    /// to access all resources while still requiring authentication.
-    pub async fn enable_local_full_access(&self) -> Result<(), PolicyError> {
-        let policies = [
-            // Registry access
-            ("local:*", "*", "registry", "query", "allow"),
-            ("local:*", "*", "registry", "write", "allow"),
-            ("local:*", "*", "registry:*", "query", "allow"),
-            ("local:*", "*", "registry:*", "write", "allow"),
-            ("local:*", "*", "registry:*", "manage", "allow"),
-            // Inference access
-            ("local:*", "*", "inference", "manage", "allow"),
-            ("local:*", "*", "inference:*", "infer", "allow"),
-            ("local:*", "*", "inference:*", "query", "allow"),
-            ("local:*", "*", "inference:*", "write", "allow"),
-        ];
-
-        for (sub, dom, obj, act, eft) in policies {
-            self.add_policy_with_domain(sub, dom, obj, act, eft).await?;
-        }
-
-        info!("Enabled full access for local users");
-        Ok(())
-    }
-
-    /// Enable public inference access for anonymous users
-    ///
-    /// Use this when exposing an OpenAI-compatible API publicly.
-    /// Only allows inference and query operations, not write or manage.
-    pub async fn enable_public_inference(&self) -> Result<(), PolicyError> {
-        let policies = [
-            ("anonymous", "*", "inference:*", "infer", "allow"),
-            ("anonymous", "*", "inference:*", "query", "allow"),
-        ];
-
-        for (sub, dom, obj, act, eft) in policies {
-            self.add_policy_with_domain(sub, dom, obj, act, eft).await?;
-        }
-
-        info!("Enabled public inference access for anonymous users");
-        Ok(())
-    }
-
-    /// Enable public read-only registry access for anonymous users
-    ///
-    /// Use this when you want to allow anonymous users to browse
-    /// available models without authentication.
-    pub async fn enable_public_read(&self) -> Result<(), PolicyError> {
-        let policies = [
-            ("anonymous", "*", "registry", "query", "allow"),
-            ("anonymous", "*", "registry:*", "query", "allow"),
-        ];
-
-        for (sub, dom, obj, act, eft) in policies {
-            self.add_policy_with_domain(sub, dom, obj, act, eft).await?;
-        }
-
-        info!("Enabled public read access for anonymous users");
-        Ok(())
-    }
-
     /// Format policies as a human-readable string for display
     pub async fn format_policy(&self) -> String {
         let policies = self.get_policy().await;
@@ -708,8 +639,9 @@ mod tests {
         // Create policy manager (should create default files)
         let pm = PolicyManager::new(&policies_dir).await?;
 
-        // Default policy is deny-all (secure default)
+        // Default policy is deny-all — no access until explicitly configured
         assert!(!pm.check("user", "model:test", Operation::Infer).await);
+        assert!(!pm.check("local:alice", "model:test", Operation::Infer).await);
 
         // Verify files were created
         assert!(policies_dir.join("model.conf").exists());
@@ -768,12 +700,12 @@ mod tests {
     async fn test_format_policy() -> Result<(), PolicyError> {
         let pm = PolicyManager::permissive().await?;
 
-        pm.add_policy("admin", "*", "*").await?;
-        pm.add_role_for_user("alice", "admin").await?;
+        pm.add_policy("operator", "*", "*").await?;
+        pm.add_role_for_user("alice", "operator").await?;
 
         let formatted = pm.format_policy().await;
         assert!(formatted.contains("Policy Rules"));
-        assert!(formatted.contains("admin"));
+        assert!(formatted.contains("operator"));
         assert!(formatted.contains("Role Assignments"));
         assert!(formatted.contains("alice"));
         Ok(())
@@ -800,7 +732,7 @@ mod tests {
         let result = pm.add_policy("user\np, evil, *, *", "model:test", "infer").await;
         assert!(matches!(result, Err(PolicyError::ValidationError(_))));
 
-        let result = pm.add_role_for_user("user\revil", "admin").await;
+        let result = pm.add_role_for_user("user\revil", "operator").await;
         assert!(matches!(result, Err(PolicyError::ValidationError(_))));
         Ok(())
     }
