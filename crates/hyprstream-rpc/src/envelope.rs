@@ -273,7 +273,7 @@ impl ToCapnp for Subject {
     type Builder<'a> = common_capnp::subject::Builder<'a>;
 
     fn write_to(&self, builder: &mut Self::Builder<'_>) {
-        builder.set_name(&self.to_string());
+        builder.set_name(self.to_string());
     }
 }
 

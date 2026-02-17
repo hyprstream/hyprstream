@@ -136,7 +136,7 @@ pub async fn authorize_get(
     // Extract redirect hostname for display
     let redirect_host = url::Url::parse(&params.redirect_uri)
         .ok()
-        .and_then(|u| u.host_str().map(|h| h.to_owned()))
+        .and_then(|u| u.host_str().map(std::borrow::ToOwned::to_owned))
         .unwrap_or_else(|| params.redirect_uri.clone());
 
     // Render consent page
@@ -174,7 +174,7 @@ pub async fn authorize_post(
     rand::thread_rng().fill_bytes(&mut code_bytes);
     let code = URL_SAFE_NO_PAD.encode(code_bytes);
 
-    let scopes: Vec<String> = form.scope.split_whitespace().map(|s| s.to_owned()).collect();
+    let scopes: Vec<String> = form.scope.split_whitespace().map(std::borrow::ToOwned::to_owned).collect();
     let resource = form.resource.as_ref().filter(|s| !s.is_empty()).cloned();
 
     let pending = PendingAuthCode {

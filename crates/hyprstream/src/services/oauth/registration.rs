@@ -157,10 +157,7 @@ pub(crate) fn is_loopback_uri(uri: &str) -> bool {
         if url.scheme() != "http" {
             return false;
         }
-        match url.host_str() {
-            Some("127.0.0.1") | Some("localhost") | Some("[::1]") => true,
-            _ => false,
-        }
+        matches!(url.host_str(), Some("127.0.0.1") | Some("localhost") | Some("[::1]"))
     } else {
         false
     }

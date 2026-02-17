@@ -136,9 +136,9 @@ impl CheckpointManager {
         std::fs::create_dir_all(&checkpoint_dir)?;
 
         // Derive FsOps from repo_client if available
-        let fs: Option<WorktreeClient> = repo_client.as_ref().and_then(|client| {
+        let fs: Option<WorktreeClient> = repo_client.as_ref().map(|client| {
             let branch = branch_name.as_deref().unwrap_or("main");
-            Some(client.worktree(branch))
+            client.worktree(branch)
         });
 
         let (tx, rx) = mpsc::channel(config.queue_size);
@@ -236,7 +236,7 @@ impl CheckpointManager {
                     ref data,
                     format: _,
                 } => {
-                    fs.write_file(".checkpoints/checkpoint.safetensors", data).await?;
+                    fs.write_file_chunked(".checkpoints/checkpoint.safetensors", data).await?;
                 }
                 WeightSnapshot::FilePath {
                     ref source,
@@ -247,11 +247,11 @@ impl CheckpointManager {
                     // Otherwise fall back to reading the source and writing via FsOps.
                     if let Ok(rel) = source.strip_prefix(&self.model_path) {
                         let rel_str = rel.to_string_lossy();
-                        fs.copy(&rel_str, ".checkpoints/checkpoint.safetensors").await?;
+                        fs.copy_path(&rel_str, ".checkpoints/checkpoint.safetensors").await?;
                     } else {
                         // Source outside worktree - read it directly and write via FsOps
                         let data = tokio::fs::read(source).await?;
-                        fs.write_file(".checkpoints/checkpoint.safetensors", &data).await?;
+                        fs.write_file_chunked(".checkpoints/checkpoint.safetensors", &data).await?;
                     }
                 }
                 WeightSnapshot::Diff {
@@ -259,7 +259,7 @@ impl CheckpointManager {
                     ref changes,
                 } => {
                     let rel_diff = format!(".checkpoints/diff_from_{base_step}_to_{step}.bin");
-                    fs.write_file(&rel_diff, changes).await?;
+                    fs.write_file_chunked(&rel_diff, changes).await?;
                     return Ok(self.checkpoint_dir.join(format!("diff_from_{base_step}_to_{step}.bin")));
                 }
             }
@@ -275,14 +275,14 @@ impl CheckpointManager {
                     parent_checkpoint: None,
                 };
                 let metadata_json = serde_json::to_string_pretty(&ckpt_meta)?;
-                fs.write_file(".checkpoints/checkpoint.json", metadata_json.as_bytes()).await?;
+                fs.write_file_chunked(".checkpoints/checkpoint.json", metadata_json.as_bytes()).await?;
             }
 
             // Update target adapter if configured
             if let Some(ref adapter_name) = self.target_adapter {
-                fs.mkdir("adapters", true).await?;
+                fs.mkdir_p("adapters").await?;
                 let rel_adapter = format!("adapters/{adapter_name}.safetensors");
-                fs.copy(".checkpoints/checkpoint.safetensors", &rel_adapter).await?;
+                fs.copy_path(".checkpoints/checkpoint.safetensors", &rel_adapter).await?;
                 tracing::info!("Updated target adapter via FsOps: {}", rel_adapter);
             }
         } else {
@@ -403,7 +403,7 @@ impl CheckpointManager {
                 .unwrap_or(&metadata_path)
                 .to_string_lossy()
                 .to_string();
-            fs.stat(&rel).await.map(|s| s.exists).unwrap_or(false)
+            fs.stat_path(&rel).await.map(|s| s.exists).unwrap_or(false)
         } else {
             metadata_path.exists()
         };
@@ -417,7 +417,7 @@ impl CheckpointManager {
             files_to_stage.push(&relative_metadata);
         }
 
-        let files_owned: Vec<String> = files_to_stage.iter().map(|s| s.to_string()).collect();
+        let files_owned: Vec<String> = files_to_stage.iter().map(|s| (*s).to_owned()).collect();
         repo_client
             .stage_files(&files_owned)
             .await
@@ -502,10 +502,10 @@ impl CheckpointManager {
     /// Get current checkpoint info (single file, git handles history)
     pub async fn get_checkpoint(&self) -> Result<Option<CheckpointInfo>> {
         if let Some(fs) = &self.fs {
-            if !fs.stat(".checkpoints/checkpoint.json").await.map(|s| s.exists).unwrap_or(false) {
+            if !fs.stat_path(".checkpoints/checkpoint.json").await.map(|s| s.exists).unwrap_or(false) {
                 return Ok(None);
             }
-            let json = String::from_utf8(fs.read_file(".checkpoints/checkpoint.json").await?.data)?;
+            let json = String::from_utf8(fs.read_file_chunked(".checkpoints/checkpoint.json").await?)?;
             let metadata: CheckpointMetadata = serde_json::from_str(&json)?;
             Ok(Some(CheckpointInfo {
                 step: metadata.step,
@@ -532,7 +532,7 @@ impl CheckpointManager {
         let checkpoint_path = self.checkpoint_dir.join("checkpoint.safetensors");
 
         if let Some(fs) = &self.fs {
-            if !fs.stat(".checkpoints/checkpoint.safetensors").await.map(|s| s.exists).unwrap_or(false) {
+            if !fs.stat_path(".checkpoints/checkpoint.safetensors").await.map(|s| s.exists).unwrap_or(false) {
                 anyhow::bail!("No checkpoint found at {:?}", checkpoint_path);
             }
         } else if !checkpoint_path.exists() {
@@ -582,7 +582,7 @@ impl CheckpointManager {
     ) -> Result<()> {
         if let Some(fs) = fs {
             // FsOps path
-            fs.mkdir(".checkpoints", true).await?;
+            fs.mkdir_p(".checkpoints").await?;
 
             // Save weights
             match request.weights {
@@ -593,7 +593,7 @@ impl CheckpointManager {
                         WeightFormat::AdapterBin => "checkpoint_adapter.bin",
                     };
                     let rel_path = format!(".checkpoints/{filename}");
-                    fs.write_file(&rel_path, data).await?;
+                    fs.write_file_chunked(&rel_path, data).await?;
                 }
                 WeightSnapshot::FilePath { ref source, format } => {
                     let filename = match format {
@@ -604,13 +604,13 @@ impl CheckpointManager {
                     let rel_dest = format!(".checkpoints/{filename}");
                     // Source may be outside worktree; read and write if so
                     let data = tokio::fs::read(source).await?;
-                    fs.write_file(&rel_dest, &data).await?;
+                    fs.write_file_chunked(&rel_dest, &data).await?;
                 }
                 WeightSnapshot::Diff {
                     base_step: _,
                     ref changes,
                 } => {
-                    fs.write_file(".checkpoints/checkpoint_diff.bin", changes).await?;
+                    fs.write_file_chunked(".checkpoints/checkpoint_diff.bin", changes).await?;
                 }
             }
 
@@ -628,7 +628,7 @@ impl CheckpointManager {
                 parent_checkpoint: None,
             };
             let metadata_json = serde_json::to_string_pretty(&metadata)?;
-            fs.write_file(".checkpoints/checkpoint.json", metadata_json.as_bytes()).await?;
+            fs.write_file_chunked(".checkpoints/checkpoint.json", metadata_json.as_bytes()).await?;
         } else {
             // Direct path (original behavior)
             tokio::fs::create_dir_all(checkpoint_dir).await?;
@@ -720,8 +720,8 @@ impl CheckpointManager {
         // Stage checkpoint files
         repo_client
             .stage_files(&[
-                ".checkpoints/checkpoint.safetensors".to_string(),
-                ".checkpoints/checkpoint.json".to_string(),
+                ".checkpoints/checkpoint.safetensors".to_owned(),
+                ".checkpoints/checkpoint.json".to_owned(),
             ])
             .await
             .map_err(|e| anyhow!("Failed to stage checkpoint files: {}", e))?;

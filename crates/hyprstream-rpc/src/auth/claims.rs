@@ -46,7 +46,7 @@ impl FromCapnp for Claims {
         // Scopes on the wire are ignored - authorization is via Casbin
         let aud = reader.get_aud().ok()
             .and_then(|s| s.to_str().ok())
-            .map(|s| s.to_owned())
+            .map(std::borrow::ToOwned::to_owned)
             .filter(|s| !s.is_empty());
 
         Ok(Self {

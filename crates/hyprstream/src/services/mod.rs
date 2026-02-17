@@ -69,6 +69,8 @@
 
 mod core;
 mod types;
+mod worktree_helpers;
+pub use worktree_helpers::StatResult;
 pub mod contained_root;
 pub mod callback;
 pub mod factories;
@@ -97,12 +99,18 @@ pub use generated::registry_client::{
     TrackedRepository as GenTrackedRepository,
     WorktreeInfo as GenWorktreeInfo,
     RepositoryStatus as GenRepositoryStatus,
-    FsStatResponse, FsDirEntryInfo, RemoteInfo,
-    SeekWhenceEnum,
+    RemoteInfo,
+    RWalk, ROpen, RRead, RWrite, RStat,
+    NpStat as NpStatData, Qid as QidData,
 };
 
 // Remaining domain types
-pub use types::{MAX_FDS_GLOBAL, MAX_FDS_PER_CLIENT, MAX_FS_IO_SIZE};
+pub use types::{
+    MAX_FDS_GLOBAL, MAX_FDS_PER_CLIENT, MAX_FS_IO_SIZE,
+    DEFAULT_IOUNIT, MAX_IOUNIT,
+    QTDIR, QTFILE, OREAD, OWRITE, ORDWR, OTRUNC, ORCLOSE, DMDIR,
+    FsDirEntryInfo,
+};
 
 pub use inference::{InferenceService, InferenceZmqClient, INFERENCE_ENDPOINT};
 pub use registry::RegistryService;

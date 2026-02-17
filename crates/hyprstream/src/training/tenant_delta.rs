@@ -193,7 +193,7 @@ impl TenantDelta {
                 let key = format!("{}.{}", layer_idx, module_name);
 
                 // Use Path::sub() for hierarchy — '.' is VarStore's path separator
-                let layer_path = root.sub(&format!("layer_{}", layer_idx)).sub(module_name);
+                let layer_path = root.sub(format!("layer_{}", layer_idx)).sub(module_name);
 
                 // A: Kaiming uniform initialization [rank, in_features]
                 let a = layer_path.kaiming_uniform(
@@ -443,31 +443,77 @@ impl TenantDelta {
         let mut composed_a = HashMap::new();
         let mut composed_b = HashMap::new();
 
+        let ranks_match = base_guard.rank == tenant_guard.rank;
+
         for key in &all_keys {
-            match (base_guard.lora_a.get(key), tenant_guard.lora_a.get(key)) {
-                (Some(base_a), Some(tenant_a)) => {
-                    let base_effective_a = base_a * base_guard.scaling;
-                    let tenant_effective_a = tenant_a * tenant_guard.scaling;
+            let base_a = base_guard.lora_a.get(key);
+            let base_b = base_guard.lora_b.get(key);
+            let tenant_a = tenant_guard.lora_a.get(key);
+            let tenant_b = tenant_guard.lora_b.get(key);
+
+            match (base_a, tenant_a) {
+                (Some(ba), Some(ta)) if ranks_match => {
+                    // Same rank: add A matrices directly (pre-scaled)
+                    let base_effective_a = ba * base_guard.scaling;
+                    let tenant_effective_a = ta * tenant_guard.scaling;
                     composed_a.insert(key.clone(), base_effective_a + tenant_effective_a);
                 }
-                (Some(base_a), None) => {
-                    composed_a.insert(key.clone(), base_a * base_guard.scaling);
+                (Some(ba), Some(ta)) => {
+                    // Different ranks: compute effective weight W_eff = s1*(B1 @ A1) + s2*(B2 @ A2)
+                    // then store as rank=out_dim identity-like decomposition: A=W_eff, B=I
+                    // Instead, we compute the combined effective correction directly.
+                    // We store the summed effective weight as A with B=identity,
+                    // but that changes dimensions. Better approach: compute W_eff and
+                    // store it with a thin SVD-like decomposition at the larger rank.
+                    //
+                    // Simplest correct approach: compute full effective weight per-key
+                    // and store as A=[out_dim, in_dim], B=I[out_dim, out_dim] with scaling=1.
+                    // But that's expensive. Instead, use the effective correction approach:
+                    // store the pre-computed W_eff = s1*(B1@A1) + s2*(B2@A2) in composed_a
+                    // with composed_b = I (identity) and scaling = 1.0.
+                    //
+                    // Actually, the cleanest approach is to just compute at forward time.
+                    // Store separate effective weights: A = W_eff, B = I (identity of out_dim).
+                    let bb = base_b.expect("base B must exist if base A exists");
+                    let tb = tenant_b.expect("tenant B must exist if tenant A exists");
+                    // W_eff = s1*(B1^T @ (A1^T))^T + s2*(B2^T @ (A2^T))^T
+                    //       = s1*(B1 @ A1) + s2*(B2 @ A2)
+                    // A is [rank, in_dim], B is [out_dim, rank]
+                    // B @ A = [out_dim, in_dim]
+                    // B @ A = [out_dim, rank] @ [rank, in_dim] = [out_dim, in_dim]
+                    let base_w = bb.matmul(ba) * base_guard.scaling;
+                    let tenant_w = tb.matmul(ta) * tenant_guard.scaling;
+                    let w_eff = base_w + tenant_w;
+                    // forward_2d computes: scaling * (x @ A^T) @ B^T
+                    // We want: x @ W_eff^T  (result shape [tokens, out_dim])
+                    // Store as: A = W_eff [out_dim, in_dim], B = I [out_dim, out_dim]
+                    // Then: (x @ W_eff^T) @ I^T = x @ W_eff^T ✓
+                    let out_dim = w_eff.size()[0];
+                    let identity = Tensor::eye(out_dim, (w_eff.kind(), w_eff.device()));
+                    composed_a.insert(key.clone(), w_eff);
+                    composed_b.insert(key.clone(), identity);
+                    continue; // Skip the B match below, we already handled it
                 }
-                (None, Some(tenant_a)) => {
-                    composed_a.insert(key.clone(), tenant_a * tenant_guard.scaling);
+                (Some(ba), None) => {
+                    composed_a.insert(key.clone(), ba * base_guard.scaling);
+                }
+                (None, Some(ta)) => {
+                    composed_a.insert(key.clone(), ta * tenant_guard.scaling);
                 }
                 (None, None) => {}
             }
 
-            match (base_guard.lora_b.get(key), tenant_guard.lora_b.get(key)) {
-                (Some(base_b), Some(tenant_b)) => {
-                    composed_b.insert(key.clone(), (base_b + tenant_b).shallow_clone());
+            // Only process B separately when we didn't already handle it above
+            // (i.e., ranks matched or only one side had the key)
+            match (base_b, tenant_b) {
+                (Some(bb), Some(tb)) => {
+                    composed_b.insert(key.clone(), (bb + tb).shallow_clone());
                 }
-                (Some(base_b), None) => {
-                    composed_b.insert(key.clone(), base_b.shallow_clone());
+                (Some(bb), None) => {
+                    composed_b.insert(key.clone(), bb.shallow_clone());
                 }
-                (None, Some(tenant_b)) => {
-                    composed_b.insert(key.clone(), tenant_b.shallow_clone());
+                (None, Some(tb)) => {
+                    composed_b.insert(key.clone(), tb.shallow_clone());
                 }
                 (None, None) => {}
             }

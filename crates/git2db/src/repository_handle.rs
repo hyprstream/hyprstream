@@ -73,7 +73,7 @@ impl<'a> RepositoryHandle<'a> {
         let base_path = self.worktree()?.to_path_buf();
 
         // Detect bare repo: path ends in .git or has HEAD but no .git subdir
-        let is_bare = base_path.extension().map_or(false, |ext| ext == "git")
+        let is_bare = base_path.extension().is_some_and(|ext| ext == "git")
             || (base_path.join("HEAD").exists() && !base_path.join(".git").exists());
 
         if !is_bare {

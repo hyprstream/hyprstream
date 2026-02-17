@@ -437,7 +437,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
             let service: StreamableHttpService<McpService, LocalSessionManager> =
                 StreamableHttpService::new(
                     move || McpService::new(mcp_config_clone.clone()).map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                        std::io::Error::other(e.to_string())
                     }),
                     session_mgr,
                     StreamableHttpServerConfig::default(),

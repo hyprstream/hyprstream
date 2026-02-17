@@ -158,15 +158,14 @@ where
     Fut: std::future::Future<Output = Result<()>>,
 {
     // Check GPU availability early if required
-    if matches!(config.device.preference, DevicePreference::RequireGPU) {
-        if std::env::var("CUDA_VISIBLE_DEVICES").is_err()
+    if matches!(config.device.preference, DevicePreference::RequireGPU)
+        && std::env::var("CUDA_VISIBLE_DEVICES").is_err()
             && std::env::var("HIP_VISIBLE_DEVICES").is_err()
             && !std::path::Path::new("/usr/local/cuda").exists()
             && !std::path::Path::new("/opt/rocm").exists()
         {
             anyhow::bail!("GPU required but no CUDA or ROCm installation detected. Set CUDA_VISIBLE_DEVICES or HIP_VISIBLE_DEVICES, or install CUDA/ROCm.");
         }
-    }
 
     // Set environment hints for the runtime config
     match config.device.preference {
@@ -1129,7 +1128,7 @@ fn main() -> Result<()> {
     // Extract global args
     let config_path = matches
         .get_one::<std::path::PathBuf>("config")
-        .map(|p| p.as_path());
+        .map(std::path::PathBuf::as_path);
 
     // Load configuration early
     let config = load_config(config_path)?;

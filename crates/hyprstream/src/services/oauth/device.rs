@@ -80,7 +80,7 @@ pub async fn device_authorize(
         .as_deref()
         .unwrap_or(&state.default_scopes.join(" "))
         .split_whitespace()
-        .map(|s| s.to_owned())
+        .map(std::borrow::ToOwned::to_owned)
         .collect();
 
     let resource = params.resource.filter(|s| !s.is_empty());

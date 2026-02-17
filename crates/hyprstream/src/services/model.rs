@@ -757,7 +757,7 @@ impl InferHandler for ModelService {
             function_call: None,
         }).collect();
         let templated = self.apply_chat_template(model_ref, chat_messages, data.add_generation_prompt).await?;
-        Ok(templated.as_str().to_string())
+        Ok(templated.as_str().to_owned())
     }
 
     async fn handle_status(
@@ -911,7 +911,7 @@ impl crate::services::ZmqService for ModelService {
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
         let variant = ModelResponseVariant::Error(ErrorInfo {
             message: error.to_owned(),
-            code: "INTERNAL".to_string(),
+            code: "INTERNAL".to_owned(),
             details: String::new(),
         });
         serialize_response(request_id, &variant).unwrap_or_default()
@@ -1137,7 +1137,7 @@ impl ModelZmqClient {
     ) -> Result<TemplatedPrompt> {
         let msg_data: Vec<crate::services::generated::model_client::ChatMessage> = messages.iter().map(|m| crate::services::generated::model_client::ChatMessage {
             role: m.role.clone(),
-            content: m.content.as_deref().unwrap_or("").to_string(),
+            content: m.content.as_deref().unwrap_or("").to_owned(),
         }).collect();
         let prompt_str = self.gen.infer(model_ref).apply_chat_template(&msg_data, add_generation_prompt).await?;
         Ok(TemplatedPrompt::new(prompt_str))
@@ -1261,7 +1261,7 @@ fn parse_finish_reason_str(s: &str) -> crate::config::FinishReason {
         match s {
             "max_tokens" => crate::config::FinishReason::MaxTokens,
             "end_of_sequence" => crate::config::FinishReason::EndOfSequence,
-            "stop" | _ => crate::config::FinishReason::Stop,
+            _ => crate::config::FinishReason::Stop,
         }
     }
 }

@@ -417,7 +417,7 @@ pub async fn handle_list(
     }
 
     // Get current user for permission checks (OS user for CLI)
-    let current_user = hyprstream_rpc::envelope::RequestIdentity::local().user().to_string();
+    let current_user = hyprstream_rpc::envelope::RequestIdentity::local().user().to_owned();
 
     // Get archetype registry for capability detection
     let archetype_registry = crate::archetypes::global_registry();

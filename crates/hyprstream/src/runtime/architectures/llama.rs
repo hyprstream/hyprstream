@@ -361,7 +361,11 @@ impl LlamaAttention {
                             proj.norm().double_value(&[]),
                             correction.norm().double_value(&[]) / (proj.norm().double_value(&[]) + 1e-10));
                     }
-                    *proj = &*proj + correction.to_kind(kind);
+                    *proj = proj.f_add(&correction.to_kind(kind))
+                        .map_err(|e| anyhow::anyhow!(
+                            "Delta correction shape mismatch at layer {} {}: proj {:?} vs correction {:?}: {}",
+                            self.layer_idx, name, proj.size(), correction.size(), e
+                        ))?;
                 }
             }
         }
@@ -491,7 +495,7 @@ impl LlamaAttention {
             if delta.has_module("o_proj", self.layer_idx) {
                 let correction = delta.forward_2d(&attn_output_2d, "o_proj", self.layer_idx)?;
                 let kind = attn_output.kind();
-                attn_output = attn_output + correction.to_kind(kind);
+                attn_output += correction.to_kind(kind);
             }
         }
 
@@ -777,12 +781,12 @@ impl LlamaMLP {
             if delta.has_module("gate_proj", self.layer_idx) {
                 let correction = delta.forward_2d(&hidden_2d, "gate_proj", self.layer_idx)?;
                 let kind = gate_pre.kind();
-                gate_pre = gate_pre + correction.to_kind(kind);
+                gate_pre += correction.to_kind(kind);
             }
             if delta.has_module("up_proj", self.layer_idx) {
                 let correction = delta.forward_2d(&hidden_2d, "up_proj", self.layer_idx)?;
                 let kind = up.kind();
-                up = up + correction.to_kind(kind);
+                up += correction.to_kind(kind);
             }
         }
 
@@ -794,7 +798,7 @@ impl LlamaMLP {
             if delta.has_module("down_proj", self.layer_idx) {
                 let correction = delta.forward_2d(&gated, "down_proj", self.layer_idx)?;
                 let kind = output.kind();
-                output = output + correction.to_kind(kind);
+                output += correction.to_kind(kind);
             }
         }
 
@@ -816,12 +820,12 @@ impl LlamaMLP {
             if delta.has_module("gate_proj", self.layer_idx) {
                 let correction = delta.forward_2d(hidden_states, "gate_proj", self.layer_idx)?;
                 let kind = gate_pre.kind();
-                gate_pre = gate_pre + correction.to_kind(kind);
+                gate_pre += correction.to_kind(kind);
             }
             if delta.has_module("up_proj", self.layer_idx) {
                 let correction = delta.forward_2d(hidden_states, "up_proj", self.layer_idx)?;
                 let kind = up.kind();
-                up = up + correction.to_kind(kind);
+                up += correction.to_kind(kind);
             }
         }
 
@@ -833,7 +837,7 @@ impl LlamaMLP {
             if delta.has_module("down_proj", self.layer_idx) {
                 let correction = delta.forward_2d(&gated, "down_proj", self.layer_idx)?;
                 let kind = output.kind();
-                output = output + correction.to_kind(kind);
+                output += correction.to_kind(kind);
             }
         }
 

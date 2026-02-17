@@ -72,18 +72,18 @@ impl CapnpType {
                         if inner_type.is_numeric() {
                             Self::ListPrimitive(Box::new(inner_type))
                         } else {
-                            Self::ListStruct(inner.to_string())
+                            Self::ListStruct(inner.to_owned())
                         }
                     }
                 }
             }
             t => {
                 if enums.iter().any(|e| e.name == t) {
-                    Self::Enum(t.to_string())
+                    Self::Enum(t.to_owned())
                 } else if structs.iter().any(|s| s.name == t) {
-                    Self::Struct(t.to_string())
+                    Self::Struct(t.to_owned())
                 } else {
-                    Self::Unknown(t.to_string())
+                    Self::Unknown(t.to_owned())
                 }
             }
         }
@@ -115,7 +115,7 @@ impl CapnpType {
             Self::ListData => "Vec<Vec<u8>>".into(),
             Self::ListPrimitive(inner) => format!("Vec<{}>", inner.rust_owned_type()),
             Self::ListStruct(inner) => format!("Vec<{inner}>"),
-            Self::Struct(name) => format!("{name}"),
+            Self::Struct(name) => name.clone(),
             Self::Enum(name) => format!("{name}Enum"),
         }
     }

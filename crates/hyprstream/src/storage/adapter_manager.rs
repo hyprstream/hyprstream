@@ -294,7 +294,7 @@ impl AdapterManager {
     /// Ensure the adapters directory exists (async, via FsOps)
     pub async fn ensure_adapters_dir_async(&self) -> Result<()> {
         if let Some(fs) = &self.fs {
-            fs.mkdir("adapters", true).await?;
+            fs.mkdir_p("adapters").await?;
             Ok(())
         } else {
             self.ensure_adapters_dir()
@@ -311,11 +311,11 @@ impl AdapterManager {
         let mut adapters = Vec::new();
 
         // Check if adapters dir exists
-        if !fs.stat("adapters").await.map(|s| s.exists).unwrap_or(false) {
+        if !fs.stat_path("adapters").await.map(|s| s.exists).unwrap_or(false) {
             return Ok(adapters);
         }
 
-        let entries = fs.list_dir("adapters").await?;
+        let entries = fs.list_dir_path("adapters").await?;
 
         for entry in entries {
             let name_str = &entry.name;
@@ -341,7 +341,7 @@ impl AdapterManager {
             };
 
             let rel_config = format!("adapters/{base_name}.config.json");
-            let config_exists = fs.stat(&rel_config).await.map(|s| s.exists).unwrap_or(false);
+            let config_exists = fs.stat_path(&rel_config).await.map(|s| s.exists).unwrap_or(false);
 
             adapters.push(AdapterInfo {
                 filename: name_str.clone(),
@@ -399,7 +399,7 @@ impl AdapterManager {
             }
         };
 
-        fs.mkdir("adapters", true).await?;
+        fs.mkdir_p("adapters").await?;
 
         let idx = if let Some(i) = index {
             i
@@ -413,11 +413,11 @@ impl AdapterManager {
         let rel_config = format!("adapters/{adapter_name}.config.json");
         let config_json = serde_json::to_string_pretty(&config)
             .with_context(|| "Failed to serialize adapter config")?;
-        fs.write_file(&rel_config, config_json.as_bytes()).await?;
+        fs.write_file_chunked(&rel_config, config_json.as_bytes()).await?;
 
         // Create empty adapter file
         let rel_adapter = format!("adapters/{adapter_name}.safetensors");
-        fs.write_file(&rel_adapter, &[]).await?;
+        fs.write_file_chunked(&rel_adapter, &[]).await?;
 
         Ok(rel_adapter)
     }
@@ -430,7 +430,7 @@ impl AdapterManager {
         };
 
         let rel_config = format!("adapters/{adapter_name}.config.json");
-        let config_str = String::from_utf8(fs.read_file(&rel_config).await?.data)?;
+        let config_str = String::from_utf8(fs.read_file_chunked(&rel_config).await?)?;
         let config: AdapterConfig = serde_json::from_str(&config_str)?;
         Ok(config)
     }
@@ -442,7 +442,7 @@ impl AdapterManager {
             None => return Ok(self.has_adapters()),
         };
 
-        if !fs.stat("adapters").await.map(|s| s.exists).unwrap_or(false) {
+        if !fs.stat_path("adapters").await.map(|s| s.exists).unwrap_or(false) {
             return Ok(false);
         }
 
@@ -470,13 +470,13 @@ impl AdapterManager {
         if let Some(adapter) = to_remove {
             // Remove adapter file (path is relative for FsOps)
             let rel_path = adapter.path.to_string_lossy();
-            fs.remove(&rel_path).await?;
+            fs.remove_path(&rel_path).await?;
 
             // Remove config if exists
             if let Some(config_path) = &adapter.config_path {
                 let rel_config = config_path.to_string_lossy();
-                if fs.stat(&rel_config).await.map(|s| s.exists).unwrap_or(false) {
-                    fs.remove(&rel_config).await?;
+                if fs.stat_path(&rel_config).await.map(|s| s.exists).unwrap_or(false) {
+                    fs.remove_path(&rel_config).await?;
                 }
             }
 
@@ -502,7 +502,7 @@ impl AdapterManager {
 
         let rel_config = format!("adapters/{adapter_name}.config.json");
         let config_json = serde_json::to_string_pretty(config)?;
-        fs.write_file(&rel_config, config_json.as_bytes()).await?;
+        fs.write_file_chunked(&rel_config, config_json.as_bytes()).await?;
         Ok(())
     }
 
@@ -520,7 +520,7 @@ impl AdapterManager {
         };
 
         let rel_path = format!("adapters/{adapter_name}.safetensors");
-        fs.write_file(&rel_path, data).await?;
+        fs.write_file_chunked(&rel_path, data).await?;
         Ok(())
     }
 
@@ -537,7 +537,7 @@ impl AdapterManager {
         };
 
         let rel_path = format!("adapters/{adapter_name}.safetensors");
-        Ok(fs.read_file(&rel_path).await?.data)
+        fs.read_file_chunked(&rel_path).await
     }
 }
 

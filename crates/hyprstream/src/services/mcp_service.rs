@@ -217,14 +217,14 @@ fn register_schema_tools(reg: &mut ToolRegistry) {
                 }
             }
 
-            let method_name = method.name.to_string();
+            let method_name = method.name.to_owned();
             let description = if method.description.is_empty() {
                 format!("registry.repo::{}", method.name)
             } else {
-                method.description.to_string()
+                method.description.to_owned()
             };
             let required_scope = if !method.scope.is_empty() {
-                method.scope.to_string()
+                method.scope.to_owned()
             } else {
                 "query:registry:*".into()
             };
@@ -280,15 +280,15 @@ fn register_schema_tools(reg: &mut ToolRegistry) {
                     }
                 }
 
-                let method_name = method.name.to_string();
-                let scope = scope_name.to_string();
+                let method_name = method.name.to_owned();
+                let scope = scope_name.to_owned();
                 let description = if method.description.is_empty() {
                     format!("model.{scope_name}::{}", method.name)
                 } else {
-                    method.description.to_string()
+                    method.description.to_owned()
                 };
                 let required_scope = if !method.scope.is_empty() {
-                    method.scope.to_string()
+                    method.scope.to_owned()
                 } else {
                     "query:model:*".into()
                 };
@@ -378,7 +378,7 @@ fn register_sync_tool(
 ) {
     reg.register(ToolEntry {
         uuid: Uuid::new_v5(&MCP_NS, tool_name.as_bytes()),
-        name: tool_name.to_string(),
+        name: tool_name.to_owned(),
         description,
         args_schema: json_schema,
         required_scope,
@@ -405,7 +405,7 @@ fn register_streaming_tool(
 ) {
     reg.register(ToolEntry {
         uuid: Uuid::new_v5(&MCP_NS, tool_name.as_bytes()),
-        name: tool_name.to_string(),
+        name: tool_name.to_owned(),
         description,
         args_schema: json_schema,
         required_scope,
@@ -472,14 +472,14 @@ fn params_to_json_schema(params: &[(&str, &str, bool, &str)]) -> Value {
         };
 
         let mut param_schema = serde_json::Map::new();
-        param_schema.insert("type".to_string(), Value::String(json_type.to_string()));
+        param_schema.insert("type".to_owned(), Value::String(json_type.to_owned()));
         if !description.is_empty() {
-            param_schema.insert("description".to_string(), Value::String(description.to_string()));
+            param_schema.insert("description".to_owned(), Value::String(description.to_owned()));
         }
 
-        properties.insert(name.to_string(), Value::Object(param_schema));
+        properties.insert(name.to_owned(), Value::Object(param_schema));
         if is_required {
-            required.push(Value::String(name.to_string()));
+            required.push(Value::String(name.to_owned()));
         }
     }
 
@@ -493,12 +493,10 @@ fn params_to_json_schema(params: &[(&str, &str, bool, &str)]) -> Value {
 /// Parse stream_id, endpoint, and server_pubkey from a streaming response JSON.
 fn parse_stream_info(json: &Value) -> anyhow::Result<(String, String, Vec<u8>)> {
     let stream_id = json["stream_id"].as_str()
-        .ok_or_else(|| anyhow::anyhow!("missing stream_id in streaming response"))?
-        .to_string();
+        .ok_or_else(|| anyhow::anyhow!("missing stream_id in streaming response"))?.to_owned();
     let endpoint = json["endpoint"].as_str()
         .or_else(|| json["stream_endpoint"].as_str())
-        .ok_or_else(|| anyhow::anyhow!("missing endpoint in streaming response"))?
-        .to_string();
+        .ok_or_else(|| anyhow::anyhow!("missing endpoint in streaming response"))?.to_owned();
     let server_pubkey: Vec<u8> = json["server_pubkey"].as_array()
         .ok_or_else(|| anyhow::anyhow!("missing server_pubkey in streaming response"))?
         .iter()
@@ -883,7 +881,7 @@ impl McpHandler for McpService {
             Err(e) => {
                 Ok(McpResponseVariant::CallToolResult(crate::services::generated::mcp_client::ToolResult {
                     success: false,
-                    result: "null".to_string(),
+                    result: "null".to_owned(),
                     error_message: format!("{}", e),
                 }))
             }
@@ -925,7 +923,7 @@ impl ZmqService for McpService {
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
         let variant = McpResponseVariant::Error(ErrorInfo {
             message: error.to_owned(),
-            code: "INTERNAL".to_string(),
+            code: "INTERNAL".to_owned(),
             details: String::new(),
         });
         serialize_response(request_id, &variant).unwrap_or_default()

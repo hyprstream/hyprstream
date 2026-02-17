@@ -75,17 +75,8 @@ impl Operation {
     ///
     /// Used by generated `authorize()` overrides to convert the string action
     /// from `$mcpScope` annotations into an `Operation` enum value.
-    pub fn from_str(s: &str) -> anyhow::Result<Self> {
-        match s {
-            "infer" => Ok(Operation::Infer),
-            "train" => Ok(Operation::Train),
-            "query" => Ok(Operation::Query),
-            "write" => Ok(Operation::Write),
-            "serve" => Ok(Operation::Serve),
-            "manage" => Ok(Operation::Manage),
-            "context" => Ok(Operation::Context),
-            other => anyhow::bail!("Unknown operation: {}", other),
-        }
+    pub fn parse_operation(s: &str) -> anyhow::Result<Self> {
+        s.parse().map_err(|e: anyhow::Error| e)
     }
 
     /// All operations
@@ -99,6 +90,23 @@ impl Operation {
             Operation::Manage,
             Operation::Context,
         ]
+    }
+}
+
+impl std::str::FromStr for Operation {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "infer" => Ok(Operation::Infer),
+            "train" => Ok(Operation::Train),
+            "query" => Ok(Operation::Query),
+            "write" => Ok(Operation::Write),
+            "serve" => Ok(Operation::Serve),
+            "manage" => Ok(Operation::Manage),
+            "context" => Ok(Operation::Context),
+            other => anyhow::bail!("Unknown operation: {}", other),
+        }
     }
 }
 
@@ -155,6 +163,7 @@ pub fn capabilities_to_access_string(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     fn test_operation_codes() {

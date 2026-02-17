@@ -464,7 +464,7 @@ pub async fn handle_token_create(
     // Scopes are not embedded in JWT - Casbin enforces authorization server-side.
     let now = chrono::Utc::now().timestamp();
     let exp = (chrono::Utc::now() + duration).timestamp();
-    let claims = Claims::new(user.to_string(), now, exp);
+    let claims = Claims::new(user.to_owned(), now, exp);
 
     // Encode and sign the JWT
     let token = jwt::encode(&claims, signing_key);
@@ -621,7 +621,7 @@ impl PolicyTemplate {
         if let Some(rules) = self.rules {
             rules.to_owned()
         } else if self.name == "local" {
-            let user = hyprstream_rpc::envelope::RequestIdentity::local().user().to_string();
+            let user = hyprstream_rpc::envelope::RequestIdentity::local().user().to_owned();
             format!("# Full access for {user}\np, {user}, *, *, *, allow\n")
         } else {
             String::new()

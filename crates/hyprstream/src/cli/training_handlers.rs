@@ -749,7 +749,7 @@ pub async fn handle_training_checkpoint(
         // Also stage config if exists (check via FsOps)
         let base_name = adapter.filename.trim_end_matches(".safetensors");
         let rel_config = format!("adapters/{base_name}.config.json");
-        if fs.stat(&rel_config).await.map(|s| s.exists).unwrap_or(false) {
+        if fs.stat_path(&rel_config).await.map(|s| s.exists).unwrap_or(false) {
             files_to_stage.push(rel_config);
         }
     }

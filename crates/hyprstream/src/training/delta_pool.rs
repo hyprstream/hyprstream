@@ -167,6 +167,11 @@ impl DeltaPool {
         self.default_config.lock().clone()
     }
 
+    /// Get the LoRA rank used by this pool's deltas
+    pub fn rank(&self) -> usize {
+        self.default_config.lock().rank
+    }
+
     /// Get module dimensions reference
     pub fn module_dims(&self) -> &HashMap<String, (usize, usize)> {
         &self.module_dims
@@ -232,10 +237,10 @@ impl DeltaPool {
                                 Err(anyhow::anyhow!("Delta too large for snapshot"))
                             } else {
                                 futures::executor::block_on(async {
-                                    fs.mkdir("adapters/.snapshots", true).await
+                                    fs.mkdir_p("adapters/.snapshots").await
                                         .map_err(|e| anyhow::anyhow!("FsOps mkdir failed: {}", e))?;
                                     let bytes = serialize_state_dict_to_bytes(&state_dict)?;
-                                    fs.write_file(&rel_path, &bytes).await
+                                    fs.write_file_chunked(&rel_path, &bytes).await
                                         .map_err(|e| anyhow::anyhow!("FsOps write_file failed: {}", e))?;
                                     Ok::<(), anyhow::Error>(())
                                 })

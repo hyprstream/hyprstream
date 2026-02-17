@@ -9,10 +9,67 @@
 //! - **Non-Linux**: Uses `canonicalize` + prefix check. Best-effort (TOCTOU-vulnerable),
 //!   acceptable for development/macOS.
 
-use crate::services::generated::registry_client::FsDirEntryInfo;
+use crate::services::types::FsDirEntryInfo;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
+
+/// Handle returned by `resolve_handle` for 9P walk state.
+///
+/// On Linux: wraps a pathrs::Handle (O_PATH fd from openat2).
+/// On non-Linux: wraps a validated PathBuf.
+pub enum WalkHandle {
+    /// Linux: pathrs O_PATH handle (kernel-enforced containment).
+    #[cfg(target_os = "linux")]
+    Pathrs(pathrs::Handle),
+    /// Validated path within the contained root.
+    Path(PathBuf),
+}
+
+impl WalkHandle {
+    /// Get file metadata from this handle.
+    pub fn metadata(&self) -> Result<fs::Metadata, FsServiceError> {
+        match self {
+            #[cfg(target_os = "linux")]
+            WalkHandle::Pathrs(handle) => {
+                use pathrs::flags::OpenFlags;
+                let file: File = handle
+                    .reopen(OpenFlags::O_RDONLY | OpenFlags::O_CLOEXEC)
+                    .map_err(|e| FsServiceError::Io(std::io::Error::other(e.to_string())))?;
+                file.metadata().map_err(FsServiceError::Io)
+            }
+            WalkHandle::Path(path) => {
+                fs::metadata(path).map_err(FsServiceError::Io)
+            }
+        }
+    }
+
+    /// Open this handle as a real file for I/O.
+    pub fn open_file(&self, write: bool) -> Result<File, FsServiceError> {
+        match self {
+            #[cfg(target_os = "linux")]
+            WalkHandle::Pathrs(handle) => {
+                use pathrs::flags::OpenFlags;
+                let mut flags = OpenFlags::O_CLOEXEC;
+                if write {
+                    flags |= OpenFlags::O_RDWR;
+                } else {
+                    flags |= OpenFlags::O_RDONLY;
+                }
+                handle.reopen(flags)
+                    .map_err(|e| FsServiceError::Io(std::io::Error::other(e.to_string())))
+            }
+            WalkHandle::Path(path) => {
+                let mut opts = OpenOptions::new();
+                opts.read(true);
+                if write {
+                    opts.write(true);
+                }
+                opts.open(path).map_err(FsServiceError::Io)
+            }
+        }
+    }
+}
 
 /// Filesystem service error type.
 #[derive(Debug, Error)]
@@ -82,6 +139,12 @@ pub trait ContainedRoot: Send + Sync {
 
     /// Copy a file (uses reflink/COW when available).
     fn copy_file(&self, src: &str, dst: &str) -> Result<(), FsServiceError>;
+
+    /// Resolve a relative path and return a WalkHandle for 9P walk state.
+    ///
+    /// On Linux: returns a pathrs Handle (O_PATH fd from openat2).
+    /// On non-Linux: returns a validated PathBuf.
+    fn resolve_handle(&self, relative: &str) -> Result<WalkHandle, FsServiceError>;
 }
 
 /// Create a ContainedRoot for the given worktree path.
@@ -137,7 +200,7 @@ mod linux {
         } else if msg.contains("EACCES") || msg.contains("EPERM") || msg.contains("Permission denied") {
             FsServiceError::PermissionDenied(msg)
         } else {
-            FsServiceError::Io(std::io::Error::new(std::io::ErrorKind::Other, msg))
+            FsServiceError::Io(std::io::Error::other(msg))
         }
     }
 
@@ -287,7 +350,12 @@ mod linux {
 
             reflink_copy::reflink_or_copy(&src_path, &dst_full)
                 .map(|_| ())
-                .map_err(|e| FsServiceError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))
+                .map_err(|e| FsServiceError::Io(std::io::Error::other(e)))
+        }
+
+        fn resolve_handle(&self, relative: &str) -> Result<WalkHandle, FsServiceError> {
+            let handle = self.root.resolve(relative).map_err(pathrs_to_fs_error)?;
+            Ok(WalkHandle::Pathrs(handle))
         }
     }
 }
@@ -429,7 +497,12 @@ impl ContainedRoot for CanonicalContainedRoot {
         let dst_path = self.resolve(dst)?;
         reflink_copy::reflink_or_copy(&src_path, &dst_path)
             .map(|_| ())
-            .map_err(|e| FsServiceError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))
+            .map_err(|e| FsServiceError::Io(std::io::Error::other(e)))
+    }
+
+    fn resolve_handle(&self, relative: &str) -> Result<WalkHandle, FsServiceError> {
+        let path = self.resolve(relative)?;
+        Ok(WalkHandle::Path(path))
     }
 }
 

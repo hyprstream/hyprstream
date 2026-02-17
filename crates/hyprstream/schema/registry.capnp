@@ -173,73 +173,96 @@ struct RepositoryResponse {
   }
 }
 
-# --- Seek direction enum ---
-
-enum SeekWhence {
-  set @0;    # SEEK_SET — from beginning
-  cur @1;    # SEEK_CUR — from current position
-  end @2;    # SEEK_END — from end of file
+# --- 9P2000-inspired types ---
+# Qid uniquely identifies a file version (inode + ctime).
+struct Qid {
+  qtype @0 :UInt8;      # QTDIR=0x80 QTAPPEND=0x40 QTEXCL=0x20 QTFILE=0x00
+  version @1 :UInt32;   # st_ctime (seconds)
+  path @2 :UInt64;      # st_ino (unique file id)
 }
 
-# --- WorktreeRequest: worktree-scoped filesystem operations ---
+# File metadata (9P stat structure).
+struct NpStat {
+  qid @0 :Qid;
+  mode @1 :UInt32;
+  atime @2 :UInt32;
+  mtime @3 :UInt32;
+  length @4 :UInt64;
+  name @5 :Text;
+  uid @6 :Text;
+  gid @7 :Text;
+  muid @8 :Text;
+}
+
+# --- WorktreeRequest: 9P2000-inspired worktree filesystem protocol ---
+# 10 operations replacing 19 POSIX ops. Read is always offset+count,
+# bounded by iounit — no unbounded readFile convenience method.
 # Generator detects non-union field (name) + inner union
 # and produces WorktreeClient with name curried in.
 
 struct WorktreeRequest {
   name @0 :Text;
   union {
-    # FD lifecycle (authorized at open, no per-op auth)
-    open @1 :FsOpenRequest $mcpScope(write);
-    close @2 :FsCloseRequest;
-    # FD I/O (capability-based, authorized at open)
-    read @3 :FsReadRequest;
-    write @4 :FsWriteRequest;
-    pread @5 :FsPreadRequest;
-    pwrite @6 :FsPwriteRequest;
-    seek @7 :FsSeekRequest;
-    truncate @8 :FsTruncateRequest;
-    fsync @9 :FsSyncRequest;
-    # Path operations (stateless)
-    stat @10 :FsPathRequest $mcpScope(query);
-    mkdir @11 :FsMkdirRequest $mcpScope(write);
-    remove @12 :FsPathRequest $mcpScope(write);
-    rmdir @13 :FsPathRequest $mcpScope(write);
-    rename @14 :FsRenameRequest $mcpScope(write);
-    copy @15 :FsCopyRequest $mcpScope(write);
-    listDir @16 :FsPathRequest $mcpScope(query);
-    # Streaming (bulk transfer via StreamService)
-    openStream @17 :FsOpenRequest $mcpScope(write);
-    # Read entire file (single RPC, 16 MiB cap)
-    readFile @18 :FsPathRequest $mcpScope(query) $mcpDescription("Read entire file contents (16 MiB cap)");
-    # Write entire file (single RPC, 16 MiB cap)
-    writeFile @19 :FsWriteFileRequest $mcpScope(write) $mcpDescription("Write data to a file, creating it if needed");
+    # Walk: resolve path components to get a fid (like 9P Twalk)
+    walk @1 :NpWalk $mcpScope(query);
+    # Open: open a walked fid for I/O (like 9P Topen)
+    open @2 :NpOpen $mcpScope(write);
+    # Create: create a file/dir under a walked directory fid (like 9P Tcreate)
+    create @3 :NpCreate $mcpScope(write);
+    # Read: offset+count read, server clamps to iounit (like 9P Tread)
+    read @4 :NpRead;
+    # Write: offset+data write, server rejects if > iounit (like 9P Twrite)
+    write @5 :NpWrite;
+    # Clunk: release a fid (like 9P Tclunk)
+    clunk @6 :NpClunk;
+    # Remove: clunk + delete file/dir (like 9P Tremove)
+    remove @7 :NpRemove $mcpScope(manage);
+    # Stat: get file metadata (like 9P Tstat)
+    npStat @8 :NpStatReq $mcpScope(query);
+    # Wstat: modify file metadata (like 9P Twstat)
+    wstat @9 :NpWstat $mcpScope(write);
+    # Flush: cancel pending operation (like 9P Tflush)
+    flush @10 :NpFlush;
   }
 }
 
-# Open: explicit bool fields instead of platform-specific flag bits
-struct FsOpenRequest {
-  path @0 :Text;
-  read @1 :Bool;        # default true
-  write @2 :Bool;       # default false
-  create @3 :Bool;      # create if not exists
-  truncate @4 :Bool;    # truncate to zero on open
-  append @5 :Bool;      # writes always at end
-  exclusive @6 :Bool;   # fail if exists + create
+# 9P Request structs
+
+struct NpWalk {
+  fid @0 :UInt32;          # source fid (0 = root, auto-attached per worktree)
+  newfid @1 :UInt32;       # fid to assign to walked path
+  wnames @2 :List(Text);   # path components (empty = clone fid)
 }
 
-struct FsCloseRequest { fd @0 :UInt32; }
-struct FsReadRequest { fd @0 :UInt32; length @1 :UInt64; }
-struct FsWriteRequest { fd @0 :UInt32; data @1 :Data; }
-struct FsPreadRequest { fd @0 :UInt32; offset @1 :UInt64; length @2 :UInt64; }
-struct FsPwriteRequest { fd @0 :UInt32; offset @1 :UInt64; data @2 :Data; }
-struct FsSeekRequest { fd @0 :UInt32; offset @1 :Int64; whence @2 :SeekWhence; }
-struct FsTruncateRequest { fd @0 :UInt32; length @1 :UInt64; }
-struct FsSyncRequest { fd @0 :UInt32; dataOnly @1 :Bool; }
-struct FsPathRequest { path @0 :Text; }
-struct FsMkdirRequest { path @0 :Text; recursive @1 :Bool; }
-struct FsRenameRequest { src @0 :Text; dst @1 :Text; }
-struct FsCopyRequest { src @0 :Text; dst @1 :Text; }
-struct FsWriteFileRequest { path @0 :Text; data @1 :Data; }
+struct NpOpen {
+  fid @0 :UInt32;
+  mode @1 :UInt8;          # OREAD=0 OWRITE=1 ORDWR=2; OTRUNC=0x10 ORCLOSE=0x40
+}
+
+struct NpCreate {
+  fid @0 :UInt32;          # must be a walked directory fid
+  name @1 :Text;           # name of file/dir to create
+  perm @2 :UInt32;         # DMDIR=0x80000000 for dirs, otherwise file mode
+  mode @3 :UInt8;          # open mode for the new file (same as NpOpen.mode)
+}
+
+struct NpRead {
+  fid @0 :UInt32;
+  offset @1 :UInt64;
+  count @2 :UInt32;        # server clamps to iounit
+}
+
+struct NpWrite {
+  fid @0 :UInt32;
+  offset @1 :UInt64;
+  data @2 :Data;           # server rejects if > iounit
+}
+
+struct NpClunk   { fid @0 :UInt32; }
+struct NpRemove  { fid @0 :UInt32; }
+struct NpStatReq { fid @0 :UInt32; }
+struct NpWstat   { fid @0 :UInt32; stat @1 :NpStat; }
+struct NpFlush   { oldtag @0 :UInt64; }
 
 # Ensure Worktree Request (repoId removed — curried)
 
@@ -247,50 +270,41 @@ struct EnsureWorktreeRequest {
   branch @0 :Text;
 }
 
-# --- WorktreeResponse ---
+# --- WorktreeResponse: 9P2000-inspired responses ---
 
 struct WorktreeResponse {
   union {
-    error @0 :ErrorInfo;   # Default variant (fail-closed)
-    open @1 :FsOpenResponse;
-    close @2 :Void;
-    read @3 :FsReadResponse;
-    write @4 :FsWriteResponse;
-    pread @5 :FsReadResponse;
-    pwrite @6 :FsWriteResponse;
-    seek @7 :FsSeekResponse;
-    truncate @8 :Void;
-    fsync @9 :Void;
-    stat @10 :FsStatResponse;
-    mkdir @11 :Void;
-    remove @12 :Void;
-    rmdir @13 :Void;
-    rename @14 :Void;
-    copy @15 :Void;
-    listDir @16 :List(FsDirEntryInfo);
-    openStream @17 :FsStreamInfoResponse;
-    readFile @18 :FsReadResponse;
-    writeFile @19 :FsWriteResponse;
+    error @0 :ErrorInfo;
+    # Walk response: qid of the walked-to file
+    walk @1 :RWalk;
+    # Open response: qid + iounit (max I/O per message)
+    open @2 :ROpen;
+    # Create response: same shape as open (qid + iounit)
+    create @3 :ROpen;
+    # Read response: data (len < count means EOF)
+    read @4 :RRead;
+    # Write response: bytes actually written
+    write @5 :RWrite;
+    # Clunk response: success (void)
+    clunk @6 :Void;
+    # Remove response: success (void)
+    remove @7 :Void;
+    # Stat response: full file metadata
+    npStat @8 :RStat;
+    # Wstat response: success (void)
+    wstat @9 :Void;
+    # Flush response: success (void)
+    flush @10 :Void;
   }
 }
 
-struct FsOpenResponse { fd @0 :UInt32; }
-struct FsReadResponse { data @0 :Data; }
-struct FsWriteResponse { bytesWritten @0 :UInt64; }
-struct FsSeekResponse { position @0 :UInt64; }
-struct FsStatResponse {
-  exists @0 :Bool;
-  isDir @1 :Bool;
-  size @2 :UInt64;
-  modifiedAt @3 :Int64;
-}
-struct FsDirEntryInfo { name @0 :Text; isDir @1 :Bool; size @2 :UInt64; }
-struct FsStreamInfoResponse {
-  fd @0 :UInt32;
-  streamId @1 :Text;
-  streamEndpoint @2 :Text;
-  serverPubkey @3 :Data;
-}
+# 9P Response structs
+
+struct RWalk  { qid @0 :Qid; }
+struct ROpen  { qid @0 :Qid; iounit @1 :UInt32; }
+struct RRead  { data @0 :Data; }
+struct RWrite { count @0 :UInt32; }
+struct RStat  { stat @0 :NpStat; }
 
 # Clone Request
 

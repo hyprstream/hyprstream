@@ -220,9 +220,7 @@ impl TorchEngine {
         {
             if let Some(vs) = vs_guard.as_ref() {
                 return vs
-                    .variables()
-                    .iter()
-                    .map(|(_, t)| {
+                    .variables().values().map(|t| {
                         let numel = t.numel();
                         let elem_size = match t.kind() {
                             tch::Kind::Half | tch::Kind::BFloat16 => 2,
@@ -1457,18 +1455,18 @@ impl TorchEngine {
         let mut dims = std::collections::HashMap::new();
         // Self-attention projections with correct dimensions
         // q_proj: in=hidden_size, out=num_heads * head_dim
-        dims.insert("q_proj".to_string(), (hidden_size, q_out));
+        dims.insert("q_proj".to_owned(), (hidden_size, q_out));
         // k_proj/v_proj: in=hidden_size, out=num_kv_heads * head_dim (GQA support)
-        dims.insert("k_proj".to_string(), (hidden_size, kv_out));
-        dims.insert("v_proj".to_string(), (hidden_size, kv_out));
+        dims.insert("k_proj".to_owned(), (hidden_size, kv_out));
+        dims.insert("v_proj".to_owned(), (hidden_size, kv_out));
         // o_proj: in=num_heads * head_dim, out=hidden_size
-        dims.insert("o_proj".to_string(), (q_out, hidden_size));
+        dims.insert("o_proj".to_owned(), (q_out, hidden_size));
         // MLP projections (expand)
         for name in &["gate_proj", "up_proj"] {
-            dims.insert(name.to_string(), (hidden_size, intermediate_size));
+            dims.insert((*name).to_owned(), (hidden_size, intermediate_size));
         }
         // MLP projection (contract)
-        dims.insert("down_proj".to_string(), (intermediate_size, hidden_size));
+        dims.insert("down_proj".to_owned(), (intermediate_size, hidden_size));
 
         Ok(dims)
     }

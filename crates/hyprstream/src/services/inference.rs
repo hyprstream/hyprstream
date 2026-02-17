@@ -142,6 +142,7 @@ pub const INFERENCE_ENDPOINT: &str = "inproc://hyprstream/inference";
 /// - StreamService validates JWT at subscription (prevents hijacking)
 /// - InferenceService just publishes chunks (no authorization logic)
 /// - Clients subscribe via StreamService with JWT tokens
+///
 /// Inner state of InferenceService, shared via Arc for continuations.
 ///
 /// All methods are defined on this inner type. `InferenceService` wraps it
@@ -492,7 +493,7 @@ impl InferenceService {
             }
             Which::Shutdown(()) => {
                 info!("Received Shutdown command, returning");
-                return Err(anyhow!("Shutdown requested"));
+                Err(anyhow!("Shutdown requested"))
             }
             Which::Infer(infer_data) => {
                 let infer_data = infer_data?;
@@ -784,7 +785,7 @@ impl InferenceService {
                     // Build proper error response (request_id=0 since envelope is invalid)
                     let err_variant = InferenceResponseVariant::Error(ErrorInfo {
                         message: format!("envelope verification failed: {}", e),
-                        code: "UNAUTHORIZED".to_string(),
+                        code: "UNAUTHORIZED".to_owned(),
                         details: String::new(),
                     });
                     let error_payload = serialize_response(0, &err_variant).unwrap_or_default();
@@ -815,7 +816,7 @@ impl InferenceService {
                     error!("inference request handling error: {}", e);
                     let err_variant = InferenceResponseVariant::Error(ErrorInfo {
                         message: e.to_string(),
-                        code: "INTERNAL".to_string(),
+                        code: "INTERNAL".to_owned(),
                         details: String::new(),
                     });
                     (serialize_response(request_id, &err_variant).unwrap_or_default(), None)
@@ -973,7 +974,7 @@ impl InferenceService {
         })?;
 
         // Attach TTT metrics to response
-        result.ttt_metrics = ttt_result.map(|r| r.into());
+        result.ttt_metrics = ttt_result.map(std::convert::Into::into);
 
         Ok(result)
     }
@@ -1128,7 +1129,7 @@ impl InferenceService {
                         let mut complete = crate::services::rpc_types::InferenceComplete::from(&stats);
 
                         // Attach TTT metrics to completion (captured in prepare_stream)
-                        complete.ttt_metrics = ttt_result.map(|r| r.into());
+                        complete.ttt_metrics = ttt_result.map(std::convert::Into::into);
 
                         publisher.complete_ref(&complete.to_bytes()).await?;
                     }
@@ -1449,9 +1450,10 @@ impl InferenceService {
 
         let delta_arc = pool.get(subject)
             .ok_or_else(|| anyhow!("No delta for subject '{}'", subject))?;
-        let delta = delta_arc.lock();
-
-        let new_state_dict = delta.extract_state_dict();
+        let new_state_dict = {
+            let delta = delta_arc.lock();
+            delta.extract_state_dict()
+        };
 
         // Parse merge strategy (default to DO-Merge)
         let strategy_name = if merge_strategy_name.is_empty() { "do_merge" } else { merge_strategy_name };
@@ -1461,7 +1463,7 @@ impl InferenceService {
         // Save as adapter file
         let adapter_mgr = crate::storage::AdapterManager::new(&self.model_path);
         let adapter_name = if name.is_empty() {
-            format!("ttt_{}", subject.to_string())
+            format!("ttt_{}", subject)
         } else {
             name.to_owned()
         };
@@ -1472,9 +1474,9 @@ impl InferenceService {
             let rel_path = format!("adapters/{}", existing.path.file_name()
                 .and_then(|f| f.to_str()).unwrap_or(""));
             if let Some(ref fs) = self.fs {
-                match fs.read_file(&rel_path).await {
+                match fs.read_file_chunked(&rel_path).await {
                     Ok(bytes) => {
-                        crate::training::load_state_dict_from_bytes(&bytes.data)
+                        crate::training::load_state_dict_from_bytes(&bytes)
                             .map_err(|e| {
                                 tracing::debug!("Could not load existing adapter '{}': {}", existing.name, e);
                                 e
@@ -1515,10 +1517,10 @@ impl InferenceService {
         let fs = self.fs.as_ref()
             .ok_or_else(|| anyhow!("FsOps not available — cannot write without path containment"))?;
         let rel_path = format!("adapters/{}", adapter_filename);
-        fs.mkdir("adapters", true).await
+        fs.mkdir_p("adapters").await
             .map_err(|e| anyhow!("FsOps mkdir failed: {}", e))?;
         let bytes = serialize_state_dict_to_bytes(&final_state)?;
-        fs.write_file(&rel_path, &bytes).await
+        fs.write_file_chunked(&rel_path, &bytes).await
             .map_err(|e| anyhow!("FsOps write_file failed: {}", e))?;
         let result_path = rel_path;
 
@@ -1544,23 +1546,27 @@ impl InferenceService {
 
         let delta_arc = pool.get(subject)
             .ok_or_else(|| anyhow!("No delta for subject '{}'", subject))?;
-        let mut delta = delta_arc.lock();
 
         let filename = subject.to_string();
-        let state_dict = delta.extract_state_dict();
+        let state_dict = {
+            let delta = delta_arc.lock();
+            delta.extract_state_dict()
+        };
 
         // Write snapshot through FsOps (path-contained)
         let fs = self.fs.as_ref()
             .ok_or_else(|| anyhow!("FsOps not available — cannot write without path containment"))?;
         let rel_snapshot = format!("adapters/.snapshots/{}.safetensors", filename);
-        fs.mkdir("adapters/.snapshots", true).await
+        fs.mkdir_p("adapters/.snapshots").await
             .map_err(|e| anyhow!("FsOps mkdir failed: {}", e))?;
         let bytes = serialize_state_dict_to_bytes(&state_dict)?;
         let size_bytes = bytes.len() as u64;
-        fs.write_file(&rel_snapshot, &bytes).await
+        fs.write_file_chunked(&rel_snapshot, &bytes).await
             .map_err(|e| anyhow!("FsOps write_file failed: {}", e))?;
         let path_str = rel_snapshot;
 
+        // Re-acquire lock to update delta state
+        let mut delta = delta_arc.lock();
         delta.last_snapshot_hash = Some(path_str.clone());
 
         Ok(SnapshotDeltaInfo {
@@ -1586,54 +1592,59 @@ impl InferenceService {
 
         let delta_arc = pool.get(subject)
             .ok_or_else(|| anyhow!("No delta for subject '{}'", subject))?;
-        let delta = delta_arc.lock();
 
         let adapter_name = if name.is_empty() {
-            format!("ttt_{}", subject.to_string())
+            format!("ttt_{}", subject)
         } else {
             name.to_owned()
         };
 
-        // Serialize as PEFT-compatible safetensors (with HuggingFace key naming)
-        let safetensors_bytes = delta.serialize_to_safetensors_bytes()?;
+        // Extract all data from delta under lock, then drop lock before await
+        let (safetensors_bytes, config_bytes) = {
+            let delta = delta_arc.lock();
 
-        // Generate PEFT adapter_config.json
-        let adapter_config = serde_json::json!({
-            "peft_type": "LORA",
-            "auto_mapping": null,
-            "base_model_name_or_path": "",
-            "bias": "none",
-            "fan_in_fan_out": false,
-            "inference_mode": true,
-            "init_lora_weights": true,
-            "layers_to_transform": null,
-            "layers_pattern": null,
-            "lora_alpha": delta.scaling * delta.rank as f64,
-            "lora_dropout": 0.0,
-            "modules_to_save": null,
-            "r": delta.rank,
-            "rank_pattern": {},
-            "alpha_pattern": {},
-            "revision": null,
-            "target_modules": delta.target_modules.clone(),
-            "task_type": "CAUSAL_LM"
-        });
-        let config_bytes = serde_json::to_vec_pretty(&adapter_config)?;
+            // Serialize as PEFT-compatible safetensors (with HuggingFace key naming)
+            let safetensors_bytes = delta.serialize_to_safetensors_bytes()?;
+
+            // Generate PEFT adapter_config.json
+            let adapter_config = serde_json::json!({
+                "peft_type": "LORA",
+                "auto_mapping": null,
+                "base_model_name_or_path": "",
+                "bias": "none",
+                "fan_in_fan_out": false,
+                "inference_mode": true,
+                "init_lora_weights": true,
+                "layers_to_transform": null,
+                "layers_pattern": null,
+                "lora_alpha": delta.scaling * delta.rank as f64,
+                "lora_dropout": 0.0,
+                "modules_to_save": null,
+                "r": delta.rank,
+                "rank_pattern": {},
+                "alpha_pattern": {},
+                "revision": null,
+                "target_modules": delta.target_modules.clone(),
+                "task_type": "CAUSAL_LM"
+            });
+            let config_bytes = serde_json::to_vec_pretty(&adapter_config)?;
+            (safetensors_bytes, config_bytes)
+        };
 
         // Write through FsOps (path-contained)
         let fs = self.fs.as_ref()
             .ok_or_else(|| anyhow!("FsOps not available — cannot write without path containment"))?;
 
         let dir_path = format!("adapters/{}", adapter_name);
-        fs.mkdir(&dir_path, true).await
+        fs.mkdir_p(&dir_path).await
             .map_err(|e| anyhow!("FsOps mkdir failed: {}", e))?;
 
         let safetensors_path = format!("{}/adapter_model.safetensors", dir_path);
-        fs.write_file(&safetensors_path, &safetensors_bytes).await
+        fs.write_file_chunked(&safetensors_path, &safetensors_bytes).await
             .map_err(|e| anyhow!("FsOps write adapter_model.safetensors failed: {}", e))?;
 
         let config_path = format!("{}/adapter_config.json", dir_path);
-        fs.write_file(&config_path, &config_bytes).await
+        fs.write_file_chunked(&config_path, &config_bytes).await
             .map_err(|e| anyhow!("FsOps write adapter_config.json failed: {}", e))?;
 
         info!(
@@ -1708,9 +1719,24 @@ impl InferenceService {
         let fs = self.fs.as_ref()
             .ok_or_else(|| anyhow!("FsOps not available — cannot read without path containment"))?;
         let rel_path = path.to_string_lossy();
-        let bytes = fs.read_file(&rel_path).await
+        let bytes = fs.read_file_chunked(&rel_path).await
             .map_err(|e| anyhow!("Failed to read LoRA adapter via FsOps: {}", e))?;
-        let delta = crate::training::TenantDelta::load_from_safetensors_bytes(&bytes.data, device)?;
+        let delta = crate::training::TenantDelta::load_from_safetensors_bytes(&bytes, device)?;
+
+        // Warn if the adapter rank differs from the delta pool rank —
+        // compose() now handles this via effective-weight decomposition,
+        // but it's worth logging for visibility.
+        if let Some(pool) = self.delta_pool.as_ref() {
+            let pool_rank = pool.rank();
+            if delta.rank != pool_rank {
+                tracing::warn!(
+                    "LoRA adapter rank ({}) differs from delta pool rank ({}). \
+                     Composition will use effective-weight decomposition (slower but correct).",
+                    delta.rank, pool_rank
+                );
+            }
+        }
+
         *self.base_delta.lock() = Some(Arc::new(Mutex::new(delta)));
         tracing::info!("Loaded LoRA adapter as base delta from {}", path.display());
         Ok(())
@@ -1720,16 +1746,18 @@ impl InferenceService {
     pub async fn save_lora(&self, path: &str) -> Result<()> {
         let base = self.base_delta.lock().clone();
         if let Some(delta_arc) = base {
-            let delta = delta_arc.lock();
+            let bytes = {
+                let delta = delta_arc.lock();
+                delta.serialize_to_safetensors_bytes()?
+            };
             // Sanitize name and write via FsOps (path-contained)
             let fs = self.fs.as_ref()
                 .ok_or_else(|| anyhow!("FsOps not available — cannot write without path containment"))?;
             let safe_name = sanitize_adapter_name(path)?;
             let rel_path = format!("adapters/{}.safetensors", safe_name);
-            fs.mkdir("adapters", true).await
+            fs.mkdir_p("adapters").await
                 .map_err(|e| anyhow!("FsOps mkdir failed: {}", e))?;
-            let bytes = delta.serialize_to_safetensors_bytes()?;
-            fs.write_file(&rel_path, &bytes).await
+            fs.write_file_chunked(&rel_path, &bytes).await
                 .map_err(|e| anyhow!("FsOps write_file failed: {}", e))?;
             Ok(())
         } else {
@@ -2220,7 +2248,7 @@ impl InferenceZmqClient {
 
     /// Convert generated FinishReasonEnum to domain FinishReason
     fn parse_finish_reason_enum(
-        reason: &crate::services::generated::inference_client::FinishReasonEnum,
+        reason: crate::services::generated::inference_client::FinishReasonEnum,
     ) -> FinishReason {
         use crate::services::generated::inference_client::FinishReasonEnum;
         match reason {
@@ -2250,7 +2278,7 @@ impl InferenceZmqClient {
         Ok(GenerationResult {
             text: r.text,
             tokens_generated: r.tokens_generated as usize,
-            finish_reason: Self::parse_finish_reason_enum(&r.finish_reason),
+            finish_reason: Self::parse_finish_reason_enum(r.finish_reason),
             generation_time_ms: r.generation_time_ms,
             tokens_per_second: r.tokens_per_second,
             quality_metrics: None,

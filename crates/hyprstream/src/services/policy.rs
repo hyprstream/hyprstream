@@ -122,7 +122,7 @@ impl PolicyHandler for PolicyService {
             Err(_) => {
                 return Ok(PolicyResponseVariant::Error(ErrorInfo {
                     message: format!("Invalid operation: {}", data.operation),
-                    code: "INVALID_OPERATION".to_string(),
+                    code: "INVALID_OPERATION".to_owned(),
                     details: String::new(),
                 }));
             }
@@ -166,14 +166,14 @@ impl PolicyHandler for PolicyService {
                         "Subject '{}' is not authorized to issue tokens on behalf of '{}'",
                         caller, data.subject
                     ),
-                    code: "UNAUTHORIZED_SUBJECT".to_string(),
-                    details: "Requires 'manage' permission on 'policy:issue-token'".to_string(),
+                    code: "UNAUTHORIZED_SUBJECT".to_owned(),
+                    details: "Requires 'manage' permission on 'policy:issue-token'".to_owned(),
                 }));
             }
             data.subject.clone()
         } else {
             // Use bare username from the envelope identity.
-            ctx.user().to_string()
+            ctx.user().to_owned()
         };
 
         // Validate TTL
@@ -187,7 +187,7 @@ impl PolicyHandler for PolicyService {
         if requested_ttl < MIN_TTL_SECONDS {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: format!("TTL too short: {} < {} seconds minimum", requested_ttl, MIN_TTL_SECONDS),
-                code: "TTL_TOO_SHORT".to_string(),
+                code: "TTL_TOO_SHORT".to_owned(),
                 details: String::new(),
             }));
         }
@@ -195,7 +195,7 @@ impl PolicyHandler for PolicyService {
         if requested_ttl > self.token_config.max_ttl_seconds {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: format!("TTL exceeds maximum: {} > {}", requested_ttl, self.token_config.max_ttl_seconds),
-                code: "TTL_EXCEEDED".to_string(),
+                code: "TTL_EXCEEDED".to_owned(),
                 details: String::new(),
             }));
         }
@@ -264,7 +264,7 @@ impl ZmqService for PolicyService {
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
         let variant = PolicyResponseVariant::Error(ErrorInfo {
             message: error.to_owned(),
-            code: "INTERNAL".to_string(),
+            code: "INTERNAL".to_owned(),
             details: String::new(),
         });
         serialize_response(request_id, &variant).unwrap_or_default()

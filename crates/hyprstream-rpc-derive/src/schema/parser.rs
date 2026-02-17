@@ -166,7 +166,7 @@ fn detect_nested_scoped_clients(
         parent.inner_request_variants.retain(|v| !nested_factory_names.contains(&v.name));
         parent.inner_response_variants.retain(|v| {
             let result_name = v.name.strip_suffix("Result").unwrap_or(&v.name);
-            !nested_factory_names.contains(&result_name.to_string())
+            !nested_factory_names.contains(&result_name.to_owned())
         });
     }
 
@@ -190,7 +190,7 @@ pub fn parse_all_structs(text: &str) -> Vec<StructDef> {
             // Single-line struct: struct Foo { field @0 :Type; ... }
             let Some(brace_open) = line.find('{') else { i += 1; continue; };
             let Some(brace_close) = line.rfind('}') else { i += 1; continue; };
-            let name = line["struct ".len()..brace_open].trim().to_string();
+            let name = line["struct ".len()..brace_open].trim().to_owned();
             let body = line[brace_open + 1..brace_close].trim();
 
             let mut fields = Vec::new();
@@ -211,7 +211,7 @@ pub fn parse_all_structs(text: &str) -> Vec<StructDef> {
             i += 1;
         } else if line.starts_with("struct ") && line.ends_with('{') {
             // Multi-line struct
-            let name = line["struct ".len()..line.len() - 1].trim().to_string();
+            let name = line["struct ".len()..line.len() - 1].trim().to_owned();
 
             let mut fields = Vec::new();
             let mut has_union = false;
@@ -275,7 +275,7 @@ pub fn parse_all_enums(text: &str) -> Vec<EnumDef> {
         let line = lines[i].trim();
 
         if line.starts_with("enum ") && line.ends_with('{') {
-            let name = line["enum ".len()..line.len() - 1].trim().to_string();
+            let name = line["enum ".len()..line.len() - 1].trim().to_owned();
 
             let mut variants = Vec::new();
             i += 1;
@@ -294,7 +294,7 @@ pub fn parse_all_enums(text: &str) -> Vec<EnumDef> {
                         .trim_end_matches(';')
                         .trim();
                     if let Some(at_pos) = inner.find('@') {
-                        let variant_name = inner[..at_pos].trim().to_string();
+                        let variant_name = inner[..at_pos].trim().to_owned();
                         let ordinal_str = inner[at_pos + 1..].trim();
                         if let Ok(ordinal) = ordinal_str.parse::<u32>() {
                             variants.push((variant_name, ordinal));
@@ -316,7 +316,7 @@ pub fn parse_field_line(line: &str) -> Option<FieldDef> {
     // Extract inline comment if present
     let (field_part, comment) = if let Some(hash_pos) = line.find('#') {
         let field = &line[..hash_pos];
-        let comment = line[hash_pos + 1..].trim().to_string();
+        let comment = line[hash_pos + 1..].trim().to_owned();
         (field, comment)
     } else {
         (line, String::new())
@@ -350,10 +350,10 @@ pub fn parse_field_line(line: &str) -> Option<FieldDef> {
         return None;
     }
 
-    let name = field_part[..at_pos].trim().to_string();
+    let name = field_part[..at_pos].trim().to_owned();
     let ordinal_str = field_part[at_pos + 1..colon_pos].trim();
     let _ordinal: u32 = ordinal_str.parse().ok()?;
-    let type_name = field_part[colon_pos + 1..].trim().to_string();
+    let type_name = field_part[colon_pos + 1..].trim().to_owned();
 
     Some(FieldDef { name, type_name, description: comment, fixed_size })
 }
@@ -396,7 +396,7 @@ pub fn parse_union_variants(text: &str, struct_name: &str) -> Vec<UnionVariant> 
 
                 // Collect comment lines
                 if inner.starts_with('#') {
-                    let comment_text = inner[1..].trim();
+                    let comment_text = inner.strip_prefix('#').unwrap_or(inner).trim();
                     if !pending_comment.is_empty() {
                         pending_comment.push(' ');
                     }
@@ -445,10 +445,10 @@ pub fn parse_variant_line(line: &str) -> Option<UnionVariant> {
     let at_pos = line.find('@')?;
     let colon_pos = line.find(':')?;
 
-    let name = line[..at_pos].trim().to_string();
+    let name = line[..at_pos].trim().to_owned();
     let ordinal_str = line[at_pos + 1..colon_pos].trim();
     let _ordinal: u32 = ordinal_str.parse().ok()?;
-    let type_name = line[colon_pos + 1..].trim().to_string();
+    let type_name = line[colon_pos + 1..].trim().to_owned();
 
     Some(UnionVariant { name, type_name, description: String::new(), scope: String::new(), cli_hidden: false })
 }
@@ -480,18 +480,18 @@ pub fn collect_list_struct_types(schema: &ParsedSchema) -> Vec<String> {
         if type_name.starts_with("List(") {
             let inner = &type_name[5..type_name.len() - 1];
             if !is_primitive(inner)
-                && !types.contains(&inner.to_string())
+                && !types.contains(&inner.to_owned())
                 && schema.enums.iter().all(|e| e.name != inner)
             {
-                types.push(inner.to_string());
+                types.push(inner.to_owned());
             }
         } else if !is_primitive(type_name)
             && !type_name.starts_with("List(")
             && schema.enums.iter().all(|e| e.name != type_name)
             && schema.structs.iter().any(|s| s.name == type_name)
-            && !types.contains(&type_name.to_string())
+            && !types.contains(&type_name.to_owned())
         {
-            types.push(type_name.to_string());
+            types.push(type_name.to_owned());
         }
     };
 
@@ -531,18 +531,18 @@ pub fn collect_list_struct_types(schema: &ParsedSchema) -> Vec<String> {
             if type_name.starts_with("List(") {
                 let inner = &type_name[5..type_name.len() - 1];
                 if !is_primitive(inner)
-                    && !types.contains(&inner.to_string())
+                    && !types.contains(&inner.to_owned())
                     && schema.enums.iter().all(|e| e.name != inner)
                 {
-                    types.push(inner.to_string());
+                    types.push(inner.to_owned());
                 }
             } else if !is_primitive(type_name)
                 && !type_name.starts_with("List(")
                 && schema.enums.iter().all(|e| e.name != type_name)
                 && schema.structs.iter().any(|s| s.name == type_name)
-                && !types.contains(&type_name.to_string())
+                && !types.contains(&type_name.to_owned())
             {
-                types.push(type_name.to_string());
+                types.push(type_name.to_owned());
             }
         };
         for v in &sc.inner_response_variants {
@@ -1008,7 +1008,7 @@ pub fn merge_annotations_from_metadata(
     let mut fixed_size_map: HashMap<(String, String), u32> = HashMap::new();
 
     for struct_meta in &metadata.structs {
-        let struct_name = struct_meta.name.split(':').last().unwrap_or(&struct_meta.name).to_string();
+        let struct_name = struct_meta.name.split(':').next_back().unwrap_or(&struct_meta.name).to_owned();
 
         for field_meta in &struct_meta.fields {
             for ann in &field_meta.annotations {
@@ -1056,7 +1056,7 @@ pub fn merge_annotations_from_metadata(
 
     // Helper to merge annotations into a variant
     let merge_variant = |variant: &mut super::types::UnionVariant, struct_name: &str| {
-        let key = (struct_name.to_string(), variant.name.clone());
+        let key = (struct_name.to_owned(), variant.name.clone());
         if let Some(desc) = desc_map.get(&key) {
             variant.description = desc.clone();
         }
@@ -1068,7 +1068,7 @@ pub fn merge_annotations_from_metadata(
     // Merge into request variants
     for variant in &mut schema.request_variants {
         for struct_meta in &metadata.structs {
-            let struct_name = struct_meta.name.split(':').last().unwrap_or(&struct_meta.name);
+            let struct_name = struct_meta.name.split(':').next_back().unwrap_or(&struct_meta.name);
             if struct_name.ends_with("Request") {
                 merge_variant(variant, struct_name);
             }
@@ -1078,7 +1078,7 @@ pub fn merge_annotations_from_metadata(
     // Merge into response variants
     for variant in &mut schema.response_variants {
         for struct_meta in &metadata.structs {
-            let struct_name = struct_meta.name.split(':').last().unwrap_or(&struct_meta.name);
+            let struct_name = struct_meta.name.split(':').next_back().unwrap_or(&struct_meta.name);
             if struct_name.ends_with("Response") {
                 merge_variant(variant, struct_name);
             }

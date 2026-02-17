@@ -79,21 +79,21 @@ fn methods_to_views(methods: &[hyprstream_rpc::service::metadata::MethodMeta]) -
     methods
         .iter()
         .map(|m| MethodView {
-            name: m.name.to_string(),
+            name: m.name.to_owned(),
             params: m
                 .params
                 .iter()
                 .map(|p| ParamView {
-                    name: p.name.to_string(),
-                    type_name: p.type_name.to_string(),
+                    name: p.name.to_owned(),
+                    type_name: p.type_name.to_owned(),
                     required: p.required,
-                    description: p.description.to_string(),
-                    default_value: p.default_value.to_string(),
+                    description: p.description.to_owned(),
+                    default_value: p.default_value.to_owned(),
                 })
                 .collect(),
             is_scoped: m.is_scoped,
-            scope_field: m.scope_field.to_string(),
-            description: m.description.to_string(),
+            scope_field: m.scope_field.to_owned(),
+            description: m.description.to_owned(),
             is_streaming: m.is_streaming,
             cli_hidden: m.hidden,
         })
@@ -492,19 +492,19 @@ fn coerce_value(s: &str, type_name: &str) -> Value {
     match type_name {
         "Bool" => Value::Bool(s.parse().unwrap_or(false)),
         "UInt8" | "UInt16" | "UInt32" | "UInt64" => {
-            s.parse::<u64>().map(Value::from).unwrap_or(Value::String(s.to_string()))
+            s.parse::<u64>().map(Value::from).unwrap_or_else(|_| Value::String(s.to_owned()))
         }
         "Int8" | "Int16" | "Int32" | "Int64" => {
-            s.parse::<i64>().map(Value::from).unwrap_or(Value::String(s.to_string()))
+            s.parse::<i64>().map(Value::from).unwrap_or_else(|_| Value::String(s.to_owned()))
         }
         "Float32" | "Float64" => {
-            s.parse::<f64>().map(Value::from).unwrap_or(Value::String(s.to_string()))
+            s.parse::<f64>().map(Value::from).unwrap_or_else(|_| Value::String(s.to_owned()))
         }
         _ if type_name.starts_with("List(") => {
             // Split comma-separated values into a JSON array
-            Value::Array(s.split(',').map(|v| Value::String(v.trim().to_string())).collect())
+            Value::Array(s.split(',').map(|v| Value::String(v.trim().to_owned())).collect())
         }
-        _ => Value::String(s.to_string()),
+        _ => Value::String(s.to_owned()),
     }
 }
 
@@ -515,13 +515,13 @@ fn coerce_value(s: &str, type_name: &str) -> Value {
 /// Format a JSON value as a human-readable string for CLI output.
 pub fn format_response(value: &Value) -> String {
     match value {
-        Value::Null => "OK".to_string(),
+        Value::Null => "OK".to_owned(),
         Value::String(s) => s.clone(),
         Value::Bool(b) => b.to_string(),
         Value::Number(n) => n.to_string(),
-        Value::Array(arr) if arr.is_empty() => "(empty)".to_string(),
+        Value::Array(arr) if arr.is_empty() => "(empty)".to_owned(),
         Value::Array(arr) => format_array_as_table(arr),
-        Value::Object(obj) if obj.is_empty() => "OK".to_string(),
+        Value::Object(obj) if obj.is_empty() => "OK".to_owned(),
         Value::Object(obj) => format_object_as_kv(obj),
     }
 }
@@ -533,7 +533,7 @@ fn format_array_as_table(arr: &[Value]) -> String {
         let keys: Vec<String> = first.keys().cloned().collect();
 
         // Calculate column widths
-        let mut widths: Vec<usize> = keys.iter().map(|k| k.len()).collect();
+        let mut widths: Vec<usize> = keys.iter().map(std::string::String::len).collect();
         for item in arr {
             if let Value::Object(obj) = item {
                 for (i, key) in keys.iter().enumerate() {
@@ -584,7 +584,7 @@ fn format_array_as_table(arr: &[Value]) -> String {
             }
         }
 
-        out.trim_end().to_string()
+        out.trim_end().to_owned()
     } else {
         // Array of primitives
         arr.iter()
@@ -600,10 +600,10 @@ fn format_array_as_table(arr: &[Value]) -> String {
 /// Format a JSON object as aligned key-value pairs.
 fn format_object_as_kv(obj: &serde_json::Map<String, Value>) -> String {
     if obj.is_empty() {
-        return "OK".to_string();
+        return "OK".to_owned();
     }
 
-    let max_key_len = obj.keys().map(|k| k.len()).max().unwrap_or(0);
+    let max_key_len = obj.keys().map(std::string::String::len).max().unwrap_or(0);
     let mut out = String::new();
 
     for (key, value) in obj {
@@ -615,13 +615,13 @@ fn format_object_as_kv(obj: &serde_json::Map<String, Value>) -> String {
         ));
     }
 
-    out.trim_end().to_string()
+    out.trim_end().to_owned()
 }
 
 /// Format a single cell value for table output.
 fn format_cell(value: Option<&Value>) -> String {
     match value {
-        None | Some(Value::Null) => "-".to_string(),
+        None | Some(Value::Null) => "-".to_owned(),
         Some(Value::String(s)) => s.clone(),
         Some(Value::Bool(b)) => b.to_string(),
         Some(Value::Number(n)) => n.to_string(),
@@ -636,7 +636,7 @@ fn format_cell(value: Option<&Value>) -> String {
             items.join(", ")
         }
         Some(Value::Object(obj)) => {
-            serde_json::to_string(obj).unwrap_or_else(|_| "{}".to_string())
+            serde_json::to_string(obj).unwrap_or_else(|_| "{}".to_owned())
         }
     }
 }

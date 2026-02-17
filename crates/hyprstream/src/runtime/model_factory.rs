@@ -725,7 +725,7 @@ impl ModelFactory {
             return Err(anyhow!("No model weights found"));
         }
 
-        let file_content = fs.read_file(&shard_names[0]).await?.data;
+        let file_content = fs.read_file_chunked(&shard_names[0]).await?;
         let tensors = safetensors::SafeTensors::deserialize(&file_content)?;
 
         let mut f16_count = 0;
@@ -759,12 +759,12 @@ impl ModelFactory {
     /// Find shard file names via FsOps (returns relative paths).
     async fn find_shard_names_fs(fs: &WorktreeClient) -> Result<Vec<String>> {
         // Check for single file first
-        if fs.stat("model.safetensors").await.map(|s| s.exists).unwrap_or(false) {
+        if fs.stat_path("model.safetensors").await.map(|s| s.exists).unwrap_or(false) {
             return Ok(vec!["model.safetensors".to_owned()]);
         }
 
         // Look for sharded files
-        let entries = fs.list_dir(".").await?;
+        let entries = fs.list_dir_path(".").await?;
         let mut shard_names: Vec<String> = entries
             .into_iter()
             .filter(|e| {
@@ -795,7 +795,7 @@ impl ModelFactory {
                 info!("Loading shard {}/{} via FsOps: {}", idx + 1, shard_names.len(), name);
             }
 
-            let data = fs.read_file(name).await?.data;
+            let data = fs.read_file_chunked(name).await?;
             let tensors = safetensors::SafeTensors::deserialize(&data)?;
             Self::create_tensors_from_safetensors(tensors, &mut all_weights, device, dtype)?;
         }
