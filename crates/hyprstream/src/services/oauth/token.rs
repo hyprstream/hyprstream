@@ -1,12 +1,15 @@
 //! OAuth 2.1 Token Endpoint.
 //!
-//! POST /oauth/token — exchanges authorization code or device code for access token.
+//! POST /oauth/token — exchanges authorization code, device code, or refresh token
+//! for an access token.
+//!
 //! Supports:
 //! - `grant_type=authorization_code` — PKCE + PolicyClient delegation
 //! - `grant_type=urn:ietf:params:oauth:grant-type:device_code` — RFC 8628 device flow
+//! - `grant_type=refresh_token` — OAuth 2.1 token refresh with rotation
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::State,
@@ -18,7 +21,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use super::state::{DeviceCodeStatus, OAuthState};
+use super::state::{DeviceCodeStatus, OAuthState, RefreshTokenEntry};
 
 /// Device code grant type URN (RFC 8628).
 const DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
@@ -40,6 +43,9 @@ pub struct TokenRequest {
     // device_code field
     #[serde(default)]
     pub device_code: Option<String>,
+    // refresh_token field
+    #[serde(default)]
+    pub refresh_token: Option<String>,
 }
 
 /// POST /oauth/token — token exchange
@@ -49,11 +55,12 @@ pub async fn exchange_token(
 ) -> Response {
     match params.grant_type.as_str() {
         "authorization_code" => exchange_authorization_code(state, params).await,
+        "refresh_token" => exchange_refresh_token(state, params).await,
         gt if gt == DEVICE_CODE_GRANT_TYPE => exchange_device_code(state, params).await,
         _ => token_error(
             StatusCode::BAD_REQUEST,
             "unsupported_grant_type",
-            "Supported grant types: authorization_code, urn:ietf:params:oauth:grant-type:device_code",
+            "Supported: authorization_code, refresh_token, device_code",
         ),
     }
 }
@@ -131,7 +138,54 @@ async fn exchange_authorization_code(
         );
     }
 
-    issue_token(&state, pending.scopes, pending.resource).await
+    issue_token_with_refresh(&state, &params.client_id, pending.scopes, pending.resource).await
+}
+
+/// Handle refresh_token grant type (OAuth 2.1 with rotation).
+async fn exchange_refresh_token(
+    state: Arc<OAuthState>,
+    params: TokenRequest,
+) -> Response {
+    let refresh_token = match params.refresh_token {
+        Some(rt) => rt,
+        None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", "refresh_token is required"),
+    };
+
+    // Look up and remove refresh token (single-use rotation)
+    let entry = {
+        let mut tokens = state.refresh_tokens.write().await;
+        tokens.remove(&refresh_token)
+    };
+
+    let entry = match entry {
+        Some(e) => e,
+        None => {
+            return token_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                "Refresh token not found or already used",
+            );
+        }
+    };
+
+    if entry.is_expired() {
+        return token_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "Refresh token has expired",
+        );
+    }
+
+    if params.client_id != entry.client_id {
+        return token_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "client_id does not match",
+        );
+    }
+
+    // Issue new access token + rotated refresh token with the stored scopes/resource
+    issue_token_with_refresh(&state, &entry.client_id, entry.scopes, entry.resource).await
 }
 
 /// Handle urn:ietf:params:oauth:grant-type:device_code grant type (RFC 8628 Section 3.4).
@@ -196,6 +250,7 @@ async fn exchange_device_code(
             token_error(StatusCode::BAD_REQUEST, "access_denied", "The user denied the authorization request")
         }
         DeviceCodeStatus::Approved => {
+            let client_id = pending.client_id.clone();
             let scopes = pending.scopes.clone();
             let resource = pending.resource.clone();
             let user_code = pending.user_code.clone();
@@ -204,29 +259,49 @@ async fn exchange_device_code(
             let mut user_code_map = state.device_code_by_user_code.write().await;
             user_code_map.remove(&user_code);
             drop(user_code_map);
-            issue_token(&state, scopes, resource).await
+            issue_token_with_refresh(&state, &client_id, scopes, resource).await
         }
     }
 }
 
-/// Issue a JWT token via PolicyService.
-async fn issue_token(
+/// Generate a cryptographically random refresh token string.
+fn generate_refresh_token() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Issue a JWT access token via PolicyService, plus a rotated refresh token.
+async fn issue_token_with_refresh(
     state: &OAuthState,
+    client_id: &str,
     scopes: Vec<String>,
     resource: Option<String>,
 ) -> Response {
-    // Compute scope_str before passing scopes to the client call
     let scope_str = scopes.join(" ");
 
     let result = state
         .policy_client
-        .issue_token(&scopes, state.token_ttl, &resource.unwrap_or_default(), "")
+        .issue_token(&scopes, state.token_ttl, &resource.as_deref().unwrap_or_default(), "")
         .await;
 
     match result {
         Ok(token_info) => {
             let now = chrono::Utc::now().timestamp();
             let expires_in = (token_info.expires_at - now).max(0);
+
+            // Generate and store a refresh token
+            let refresh_token = generate_refresh_token();
+            {
+                let mut tokens = state.refresh_tokens.write().await;
+                tokens.insert(refresh_token.clone(), RefreshTokenEntry {
+                    client_id: client_id.to_owned(),
+                    scopes,
+                    resource,
+                    expires_at: Instant::now() + Duration::from_secs(state.refresh_token_ttl as u64),
+                });
+            }
 
             (
                 StatusCode::OK,
@@ -239,6 +314,7 @@ async fn issue_token(
                     "token_type": "Bearer",
                     "expires_in": expires_in,
                     "scope": scope_str,
+                    "refresh_token": refresh_token,
                 })),
             )
                 .into_response()

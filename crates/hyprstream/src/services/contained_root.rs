@@ -21,24 +21,46 @@ use thiserror::Error;
 pub enum WalkHandle {
     /// Linux: pathrs O_PATH handle (kernel-enforced containment).
     #[cfg(target_os = "linux")]
-    Pathrs(pathrs::Handle),
+    Pathrs { handle: pathrs::Handle, rel_path: String },
     /// Validated path within the contained root.
-    Path(PathBuf),
+    Path { path: PathBuf, rel_path: String },
 }
 
 impl WalkHandle {
+    /// Get the relative path from the contained root to this handle.
+    pub fn rel_path(&self) -> &str {
+        match self {
+            #[cfg(target_os = "linux")]
+            WalkHandle::Pathrs { rel_path, .. } => rel_path,
+            WalkHandle::Path { rel_path, .. } => rel_path,
+        }
+    }
+
+    /// Compute the relative path for a child entry under this directory.
+    ///
+    /// Returns `name` if this handle is at the root (`.` or empty),
+    /// otherwise returns `"{rel_path}/{name}"`.
+    pub fn child_rel_path(&self, name: &str) -> String {
+        let parent = self.rel_path();
+        if parent == "." || parent.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{}/{}", parent, name)
+        }
+    }
+
     /// Get file metadata from this handle.
     pub fn metadata(&self) -> Result<fs::Metadata, FsServiceError> {
         match self {
             #[cfg(target_os = "linux")]
-            WalkHandle::Pathrs(handle) => {
+            WalkHandle::Pathrs { handle, .. } => {
                 use pathrs::flags::OpenFlags;
                 let file: File = handle
                     .reopen(OpenFlags::O_RDONLY | OpenFlags::O_CLOEXEC)
                     .map_err(|e| FsServiceError::Io(std::io::Error::other(e.to_string())))?;
                 file.metadata().map_err(FsServiceError::Io)
             }
-            WalkHandle::Path(path) => {
+            WalkHandle::Path { path, .. } => {
                 fs::metadata(path).map_err(FsServiceError::Io)
             }
         }
@@ -48,7 +70,7 @@ impl WalkHandle {
     pub fn open_file(&self, write: bool) -> Result<File, FsServiceError> {
         match self {
             #[cfg(target_os = "linux")]
-            WalkHandle::Pathrs(handle) => {
+            WalkHandle::Pathrs { handle, .. } => {
                 use pathrs::flags::OpenFlags;
                 let mut flags = OpenFlags::O_CLOEXEC;
                 if write {
@@ -59,7 +81,7 @@ impl WalkHandle {
                 handle.reopen(flags)
                     .map_err(|e| FsServiceError::Io(std::io::Error::other(e.to_string())))
             }
-            WalkHandle::Path(path) => {
+            WalkHandle::Path { path, .. } => {
                 let mut opts = OpenOptions::new();
                 opts.read(true);
                 if write {
@@ -355,7 +377,7 @@ mod linux {
 
         fn resolve_handle(&self, relative: &str) -> Result<WalkHandle, FsServiceError> {
             let handle = self.root.resolve(relative).map_err(pathrs_to_fs_error)?;
-            Ok(WalkHandle::Pathrs(handle))
+            Ok(WalkHandle::Pathrs { handle, rel_path: relative.to_owned() })
         }
     }
 }
@@ -502,7 +524,7 @@ impl ContainedRoot for CanonicalContainedRoot {
 
     fn resolve_handle(&self, relative: &str) -> Result<WalkHandle, FsServiceError> {
         let path = self.resolve(relative)?;
-        Ok(WalkHandle::Path(path))
+        Ok(WalkHandle::Path { path, rel_path: relative.to_owned() })
     }
 }
 

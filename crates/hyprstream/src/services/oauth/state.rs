@@ -1,7 +1,7 @@
 //! OAuth 2.1 server state management.
 //!
-//! Manages registered clients, pending authorization codes, and delegates
-//! token issuance to PolicyService via ZMQ.
+//! Manages registered clients, pending authorization codes, refresh tokens,
+//! and delegates token issuance to PolicyService via ZMQ.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -77,6 +77,21 @@ impl PendingDeviceCode {
     }
 }
 
+/// A stored refresh token entry (OAuth 2.1 rotation).
+#[derive(Debug, Clone)]
+pub struct RefreshTokenEntry {
+    pub client_id: String,
+    pub scopes: Vec<String>,
+    pub resource: Option<String>,
+    pub expires_at: Instant,
+}
+
+impl RefreshTokenEntry {
+    pub fn is_expired(&self) -> bool {
+        Instant::now() > self.expires_at
+    }
+}
+
 /// Shared OAuth server state.
 pub struct OAuthState {
     /// Registered clients (dynamic + CIMD)
@@ -87,14 +102,18 @@ pub struct OAuthState {
     pub pending_device_codes: RwLock<HashMap<String, PendingDeviceCode>>,
     /// Reverse lookup: user_code -> device_code
     pub device_code_by_user_code: RwLock<HashMap<String, String>>,
+    /// Refresh tokens (keyed by opaque token string, rotated on use)
+    pub refresh_tokens: RwLock<HashMap<String, RefreshTokenEntry>>,
     /// PolicyClient for JWT token issuance via ZMQ
     pub policy_client: PolicyClient,
     /// Issuer URL (e.g., "http://localhost:6791")
     pub issuer_url: String,
     /// Default scopes for new clients
     pub default_scopes: Vec<String>,
-    /// Token TTL in seconds
+    /// Access token TTL in seconds
     pub token_ttl: u32,
+    /// Refresh token TTL in seconds
+    pub refresh_token_ttl: u32,
     /// HTTP client for fetching Client ID Metadata Documents
     pub http_client: reqwest::Client,
 }
@@ -106,10 +125,12 @@ impl OAuthState {
             pending_codes: RwLock::new(HashMap::new()),
             pending_device_codes: RwLock::new(HashMap::new()),
             device_code_by_user_code: RwLock::new(HashMap::new()),
+            refresh_tokens: RwLock::new(HashMap::new()),
             policy_client,
             issuer_url: config.issuer_url(),
             default_scopes: config.default_scopes.clone(),
             token_ttl: config.token_ttl_seconds,
+            refresh_token_ttl: config.refresh_token_ttl_seconds,
             http_client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
                 .build()
@@ -142,6 +163,12 @@ impl OAuthState {
                             true
                         }
                     });
+                }
+
+                // Sweep expired refresh tokens
+                {
+                    let mut tokens = state.refresh_tokens.write().await;
+                    tokens.retain(|_, entry| !entry.is_expired());
                 }
             }
         });

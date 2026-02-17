@@ -282,9 +282,13 @@ pub struct OAuthConfig {
     #[serde(default = "default_oauth_scopes")]
     pub default_scopes: Vec<String>,
 
-    /// Token TTL in seconds
+    /// Access token TTL in seconds
     #[serde(default = "default_oauth_token_ttl")]
     pub token_ttl_seconds: u32,
+
+    /// Refresh token TTL in seconds (default: 72 hours)
+    #[serde(default = "default_refresh_token_ttl")]
+    pub refresh_token_ttl_seconds: u32,
 }
 
 impl Default for OAuthConfig {
@@ -295,6 +299,7 @@ impl Default for OAuthConfig {
             external_url: None,
             default_scopes: default_oauth_scopes(),
             token_ttl_seconds: default_oauth_token_ttl(),
+            refresh_token_ttl_seconds: default_refresh_token_ttl(),
         }
     }
 }
@@ -321,6 +326,7 @@ fn default_oauth_scopes() -> Vec<String> {
     ]
 }
 fn default_oauth_token_ttl() -> u32 { 3600 }
+fn default_refresh_token_ttl() -> u32 { 259_200 } // 72 hours
 
 /// StreamService configuration
 ///

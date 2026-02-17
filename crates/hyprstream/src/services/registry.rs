@@ -1782,39 +1782,59 @@ impl WorktreeHandler for RegistryService {
     ) -> Result<ROpen> {
         let subject = ctx.subject().to_string();
 
-        // The fid must be a walked directory — get the contained root for it
-        let root = self.get_contained_root(repo_id, name).await
-            .map_err(|e| anyhow!("{}", e))?;
+        // Take the fid to get ownership of the WalkHandle (directory we're creating in)
+        let entry = self.fid_table.take(data.fid)
+            .ok_or_else(|| anyhow!("fid {} not found", data.fid))?;
+        if entry.owner_identity != subject {
+            self.fid_table.replace(data.fid, entry);
+            anyhow::bail!("fid {} not owned by caller", data.fid);
+        }
 
-        // Get the directory path from the fid
-        let entry = self.fid_table.get_verified(data.fid, &subject)
-            .map_err(|e| anyhow!("{}", e))?;
-        let _dir_qid = match &entry.state {
-            FidState::Walked { qid, .. } => {
+        let (dir_handle, _dir_qid) = match entry.state {
+            FidState::Walked { walk_handle, qid } => {
                 if qid.qtype & QTDIR == 0 {
+                    // Put it back and bail
+                    self.fid_table.replace(data.fid, FidEntry {
+                        state: FidState::Walked { walk_handle, qid },
+                        owner_identity: entry.owner_identity,
+                        last_accessed: entry.last_accessed,
+                    });
                     anyhow::bail!("fid {} is not a directory", data.fid);
                 }
-                qid.clone()
+                (walk_handle, qid)
             }
-            _ => anyhow::bail!("fid {} must be a walked (not opened) directory", data.fid),
+            other => {
+                self.fid_table.replace(data.fid, FidEntry {
+                    state: other,
+                    owner_identity: entry.owner_identity,
+                    last_accessed: entry.last_accessed,
+                });
+                anyhow::bail!("fid {} must be a walked (not opened) directory", data.fid);
+            }
         };
-        drop(entry);
 
         let is_dir = (data.perm & DMDIR) != 0;
 
+        // Compute the child's path relative to the contained root
+        let child_path = dir_handle.child_rel_path(&data.name);
+        let root = self.get_contained_root(repo_id, name).await
+            .map_err(|e| anyhow!("{}", e))?;
+
         if is_dir {
-            root.mkdir(&data.name)
+            // Create child directory via ContainedRoot (kernel-enforced containment)
+            root.mkdir(&child_path)
                 .map_err(|e| anyhow!("{}", e))?;
 
-            let meta = root.stat(&data.name)
+            // Resolve a handle to the new child directory
+            let child_handle = root.resolve_handle(&child_path)
+                .map_err(|e| anyhow!("{}", e))?;
+            let meta = child_handle.metadata()
                 .map_err(|e| anyhow!("{}", e))?;
             let qid = qid_from_metadata(&meta);
 
             // Replace the fid with the new directory as Walked (no count change)
-            let walk_handle = root.resolve_handle(&data.name)
-                .map_err(|e| anyhow!("{}", e))?;
             self.fid_table.replace(data.fid, FidEntry {
-                state: FidState::Walked { walk_handle, qid: qid.clone() },
+                state: FidState::Walked { walk_handle: child_handle, qid: qid.clone() },
                 owner_identity: subject,
                 last_accessed: AtomicU64::new(now_epoch_secs()),
             });
@@ -1824,15 +1844,16 @@ impl WorktreeHandler for RegistryService {
                 iounit: DEFAULT_IOUNIT,
             })
         } else {
-            // Create file: open with create+truncate
-            // Create always opens for writing
-            let write = true;
-            let file = root.open_file(&data.name, write, true, true, false, false)
+            // Create file via ContainedRoot (kernel-enforced containment)
+            let file = root.open_file(&child_path, /*write*/true, /*create*/true, /*truncate*/true, /*append*/false, /*excl*/false)
                 .map_err(|e| anyhow!("{}", e))?;
 
             let meta = file.metadata()?;
             let qid = qid_from_metadata(&meta);
             let iounit = DEFAULT_IOUNIT;
+
+            // Force ORDWR since create always opens writable
+            let mode = data.mode | ORDWR;
 
             // Replace the fid with the opened file (no count change)
             self.fid_table.replace(data.fid, FidEntry {
@@ -1840,7 +1861,7 @@ impl WorktreeHandler for RegistryService {
                     file: Mutex::new(file),
                     qid: qid.clone(),
                     iounit,
-                    mode: data.mode,
+                    mode,
                 },
                 owner_identity: subject,
                 last_accessed: AtomicU64::new(now_epoch_secs()),

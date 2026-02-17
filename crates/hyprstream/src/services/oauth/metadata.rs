@@ -21,7 +21,7 @@ pub async fn authorization_server_metadata(
         "registration_endpoint": format!("{}/oauth/register", issuer),
         "device_authorization_endpoint": format!("{}/oauth/device", issuer),
         "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code", "urn:ietf:params:oauth:grant-type:device_code"],
+        "grant_types_supported": ["authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
         "scopes_supported": state.default_scopes,
