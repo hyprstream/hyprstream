@@ -12,7 +12,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use json_threat_protection as jtp;
 use serde_json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicU32, AtomicUsize, Ordering},
@@ -938,20 +938,22 @@ impl TorchEngine {
         }
     }
 
-    /// Sample next token using bundled parameters
+    /// Sample next token using bundled parameters with tiered repeat penalty.
     fn sample_token_with_params(
         &self,
         logits_tensor: &Tensor,
         params: &SamplingParams,
         previous_tokens: &[i64],
+        penalty_exempt_tokens: &HashSet<i64>,
     ) -> Result<usize> {
-        self.sampler.sample_token(
+        self.sampler.sample_token_with_penalty_exemptions(
             logits_tensor,
             params.temperature,
             params.top_p,
             params.top_k,
             params.repeat_penalty,
             previous_tokens,
+            penalty_exempt_tokens,
         )
     }
 }
@@ -1775,6 +1777,10 @@ pub struct TextStream<'a> {
     model_vocab_size: usize,
     /// Reusable buffer for recent_tokens when VecDeque wraps around
     recent_tokens_buffer: Vec<i64>,
+    /// Token IDs exempt from repeat penalty (single-character tokens like digits 0-9,
+    /// punctuation, etc.) These tokens appear frequently in number generation and
+    /// should not be penalized just for reoccurring.
+    penalty_exempt_tokens: HashSet<i64>,
 
     // Timing for prefill/inference separation
     /// Time spent on prefill (processing prompt), set after first forward pass
@@ -1851,6 +1857,26 @@ impl<'a> TextStream<'a> {
             tokenizer_ref.decode_stream(false) // skip_special_tokens=false
         };
 
+        // Build set of token IDs exempt from repeat penalty.
+        // Single-character tokens (digits, punctuation, single letters) appear frequently
+        // in number generation. Penalizing them causes digit suppression: "1917" → "209" → "41".
+        // We exempt any token whose decoded form is a single character.
+        let penalty_exempt_tokens = {
+            let vocab = tokenizer_arc.get_vocab(true);
+            let mut exempt = HashSet::new();
+            for (token_str, &id) in &vocab {
+                // Check if this token decodes to a single character
+                // Token strings in the vocab may have special prefixes (like Ġ for space+char)
+                // We want to exempt raw single characters: digits, punctuation, single letters
+                let clean = token_str.trim();
+                if clean.chars().count() == 1 {
+                    exempt.insert(id as i64);
+                }
+            }
+            tracing::debug!("Built penalty-exempt token set: {} single-char tokens", exempt.len());
+            exempt
+        };
+
         // PERF: Pre-create sampling params to avoid struct allocation per token
         let sampling_params = SamplingParams {
             temperature: request.temperature,
@@ -1888,6 +1914,7 @@ impl<'a> TextStream<'a> {
             vocab_size,
             model_vocab_size: 0, // Set after first forward pass from logits shape
             recent_tokens_buffer: Vec::with_capacity(repeat_last_n),
+            penalty_exempt_tokens,
             prefill_time_ms: None,
             first_token_time: None,
             last_token_time: None,
@@ -2114,16 +2141,18 @@ impl<'a> TextStream<'a> {
         let params = &self.sampling_params;
 
         // PERF: Optimize VecDeque slice handling
+        // Pass penalty_exempt_tokens to sampler for reduced penalty on single-char tokens
         let (slice1, slice2) = self.recent_tokens.as_slices();
-        let next_token = if slice2.is_empty() {
-            // Fast path: VecDeque is contiguous, use slice directly
-            self.engine.sample_token_with_params(&logits, params, slice1)?
+        let recent_tokens_slice = if slice2.is_empty() {
+            slice1
         } else {
-            // Slow path: VecDeque wrapped around, use pre-allocated buffer
             self.recent_tokens_buffer.clear();
             self.recent_tokens_buffer.extend(self.recent_tokens.iter().copied());
-            self.engine.sample_token_with_params(&logits, params, &self.recent_tokens_buffer)?
+            &self.recent_tokens_buffer
         };
+        let next_token = self.engine.sample_token_with_params(
+            &logits, params, recent_tokens_slice, &self.penalty_exempt_tokens
+        )?;
 
         // Validate sampled token is within model vocabulary
         if model_vocab_size > 0 && next_token >= model_vocab_size {

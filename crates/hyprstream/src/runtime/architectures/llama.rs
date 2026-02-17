@@ -660,8 +660,14 @@ impl LlamaAttention {
     }
 
     /// Compute scaled dot-product attention scores with causal masking
+    ///
+    /// Entire computation (Q*K matmul, masking, softmax) is performed in FP32
+    /// for numerical stability. BF16 attention causes progressive precision loss
+    /// in long sequences, leading to corrupted number generation.
+    /// This matches HuggingFace/vLLM standard practice.
     fn compute_attention_scores(&self, q: &Tensor, k: &Tensor) -> Result<Tensor> {
         let scale = 1.0 / (self.head_dim as f32).sqrt();
+        let original_kind = q.kind();
 
         // Q: [batch, seq, heads, dim] -> [batch, heads, seq, dim]
         // PERF: .contiguous() required for optimal batched matmul on ROCm/AMD
@@ -669,41 +675,49 @@ impl LlamaAttention {
         // K: [batch, seq, heads, dim] -> [batch, heads, seq, dim] -> [batch, heads, dim, seq]
         let k = k.transpose(1, 2).transpose(2, 3).contiguous();
 
-        // Compute attention scores: [batch, heads, seq, seq]
-        let mut scores = q.matmul(&k) * (scale as f64);
+        // Upcast Q and K to FP32 for precise attention score computation
+        let q_fp32 = if original_kind != tch::Kind::Float {
+            q.to_kind(tch::Kind::Float)
+        } else {
+            q
+        };
+        let k_fp32 = if original_kind != tch::Kind::Float {
+            k.to_kind(tch::Kind::Float)
+        } else {
+            k
+        };
+
+        // Compute attention scores in FP32: [batch, heads, seq, seq]
+        let mut scores = q_fp32.matmul(&k_fp32) * (scale as f64);
 
         // Apply causal mask - CRITICAL for autoregressive generation
-        // Get sequence lengths from tensor dimensions
         let score_shape = scores.size();
-        let q_len = score_shape[2]; // query sequence length
-        let k_len = score_shape[3]; // key sequence length
+        let q_len = score_shape[2];
+        let k_len = score_shape[3];
 
         // Apply causal mask only when processing multiple query tokens (prompt phase)
         // For autoregressive generation (q_len=1), all past positions are valid - no mask needed
         if q_len > 1 {
-            // Standard causal mask for multiple queries (e.g., processing prompt)
-            // Lower triangular: 1s at and below diagonal, 0s above
-            let mask = Tensor::ones([q_len, k_len], (scores.kind(), scores.device())).tril(0);
-
-            // Expand mask to match scores dimensions [batch, heads, q_len, k_len]
+            let mask = Tensor::ones([q_len, k_len], (tch::Kind::Float, scores.device())).tril(0);
             let mask = mask.unsqueeze(0).unsqueeze(0).expand_as(&scores);
-
-            // Apply mask: set future positions (where mask=0) to -inf
             let mask_value = -10000.0f64;
             scores = scores.masked_fill(&mask.eq(0.0), mask_value);
         }
-        // When q_len=1 (KV cache autoregressive), skip mask - all past positions valid
 
         // Apply sliding window mask if configured (Gemma3)
         if let Some(window_size) = self.sliding_window {
             if self.layer_type == "local" {
                 scores = self.apply_sliding_window_mask(&scores, window_size)?;
             }
-            // Global layers use full attention (no mask)
         }
 
-        // Apply softmax along last dimension, preserving dtype
-        Ok(scores.softmax(-1, scores.kind()))
+        // Softmax in FP32, then cast back to original dtype for V multiplication
+        let attn_weights = scores.softmax(-1, tch::Kind::Float);
+        Ok(if original_kind != tch::Kind::Float {
+            attn_weights.to_kind(original_kind)
+        } else {
+            attn_weights
+        })
     }
 
     /// Apply sliding window mask for local attention layers
