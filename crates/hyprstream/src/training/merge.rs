@@ -103,14 +103,13 @@ pub fn additive_merge(existing: &Tensor, new: &Tensor, weight: f64) -> Result<Te
             new.size()
         ));
     }
-    if existing.device() != new.device() {
-        return Err(anyhow!(
-            "Device mismatch in additive merge: {:?} vs {:?}",
-            existing.device(),
-            new.device()
-        ));
-    }
-    Ok(existing * (1.0 - weight) + new * weight)
+    // Move existing to new's device if needed (e.g. existing loaded from CPU, new on GPU)
+    let existing = if existing.device() != new.device() {
+        existing.to_device(new.device())
+    } else {
+        existing.shallow_clone()
+    };
+    Ok(&existing * (1.0 - weight) + new * weight)
 }
 
 /// Direction-Only Merge (DO-Merge) from Yang et al. 2025.
@@ -133,13 +132,12 @@ pub fn do_merge(existing: &Tensor, new: &Tensor, weight: f64) -> Result<Tensor> 
             new.size()
         ));
     }
-    if existing.device() != new.device() {
-        return Err(anyhow!(
-            "Device mismatch in DO-merge: {:?} vs {:?}",
-            existing.device(),
-            new.device()
-        ));
-    }
+    // Move existing to new's device if needed (e.g. existing loaded from CPU, new on GPU)
+    let existing = if existing.device() != new.device() {
+        existing.to_device(new.device())
+    } else {
+        existing.shallow_clone()
+    };
 
     // Compute magnitudes (Frobenius norms)
     let mag_existing: f64 = existing.norm().double_value(&[]);
