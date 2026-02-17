@@ -283,7 +283,7 @@ async fn issue_token_with_refresh(
 
     let result = state
         .policy_client
-        .issue_token(&scopes, state.token_ttl, &resource.as_deref().unwrap_or_default(), "")
+        .issue_token(&scopes, state.token_ttl, resource.as_deref().unwrap_or_default(), "")
         .await;
 
     match result {

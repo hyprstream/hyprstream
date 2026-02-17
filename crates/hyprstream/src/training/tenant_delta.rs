@@ -474,7 +474,9 @@ impl TenantDelta {
                     //
                     // Actually, the cleanest approach is to just compute at forward time.
                     // Store separate effective weights: A = W_eff, B = I (identity of out_dim).
+                    #[allow(clippy::expect_used)] // invariant: B must exist when A exists
                     let bb = base_b.expect("base B must exist if base A exists");
+                    #[allow(clippy::expect_used)]
                     let tb = tenant_b.expect("tenant B must exist if tenant A exists");
                     // W_eff = s1*(B1^T @ (A1^T))^T + s2*(B2^T @ (A2^T))^T
                     //       = s1*(B1 @ A1) + s2*(B2 @ A2)
