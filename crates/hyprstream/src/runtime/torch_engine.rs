@@ -1059,6 +1059,10 @@ impl RuntimeEngine for TorchEngine {
             images: Vec::new(),
             timeout: None,
             collect_metrics: false, // Default: off for performance
+            ttt_enabled: false,
+            ttt_gradient_steps: 0,
+            ttt_learning_rate: 0.0,
+            auto_commit: false,
         };
 
         let result = self.generate_with_params(request).await?;

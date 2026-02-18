@@ -1252,6 +1252,10 @@ impl GenerationRequestBuilder {
             images: self.images,
             timeout: Some(resolved.timeout_ms),
             collect_metrics: self.collect_metrics,
+            ttt_enabled: false,
+            ttt_gradient_steps: 0,
+            ttt_learning_rate: 0.0,
+            auto_commit: false,
         }
     }
 }
@@ -1304,6 +1308,10 @@ impl From<&GenerationConfig> for GenerationRequest {
             seed: config.seed,
             timeout: None, // Not in GenerationConfig
             collect_metrics: false, // Default: off for performance
+            ttt_enabled: false,
+            ttt_gradient_steps: 0,
+            ttt_learning_rate: 0.0,
+            auto_commit: false,
         }
     }
 }

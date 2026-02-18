@@ -1860,6 +1860,10 @@ impl InferenceHandler for InferenceService {
             images: vec![],
             timeout: if data.timeout_ms == 0 { None } else { Some(data.timeout_ms) },
             collect_metrics: false,
+            ttt_enabled: false,
+            ttt_gradient_steps: 0,
+            ttt_learning_rate: 0.0,
+            auto_commit: false,
         };
         let result = InferenceService::handle_generate(self, request, &subject)?;
         Ok(InferenceResponseVariant::GenerateResult(generation_result_to_data(&result)))
@@ -1883,6 +1887,10 @@ impl InferenceHandler for InferenceService {
             images: vec![],
             timeout: if data.timeout_ms == 0 { None } else { Some(data.timeout_ms) },
             collect_metrics: false,
+            ttt_enabled: false,
+            ttt_gradient_steps: 0,
+            ttt_learning_rate: 0.0,
+            auto_commit: false,
         };
 
         // Calculate expiry from claims
