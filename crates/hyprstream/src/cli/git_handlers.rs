@@ -1160,7 +1160,7 @@ pub async fn handle_infer(
         tool_call_id: None,
     }];
 
-    let formatted_prompt = match model_client.apply_chat_template(model_ref_str, &messages, true).await {
+    let formatted_prompt = match model_client.apply_chat_template(model_ref_str, &messages, true, None).await {
         Ok(formatted) => formatted,
         Err(e) => {
             tracing::warn!("Could not apply chat template: {}. Using raw prompt.", e);

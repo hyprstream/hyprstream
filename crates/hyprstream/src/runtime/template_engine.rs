@@ -6,11 +6,21 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Chat message structure for template rendering
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Chat message structure for template rendering.
+///
+/// Fields match what HuggingFace chat templates expect:
+/// - `content` is Optional (can be null for tool-call-only assistant messages)
+/// - `tool_calls` carries tool call objects on assistant messages
+/// - `tool_call_id` identifies which tool call a "tool" role message responds to
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 /// Template configuration loaded from tokenizer_config.json
@@ -92,17 +102,26 @@ impl TemplateEngine {
             value.ends_with(suffix)
         });
 
+        // Register raise_exception() — used by Mistral templates for validation
+        env.add_function("raise_exception", raise_exception_fn);
+
         // We'll add the template dynamically when applying it
         // to avoid lifetime issues
 
         Ok(Self { env, config })
     }
 
-    /// Apply chat template to messages
+    /// Apply chat template to messages.
+    ///
+    /// `tools` is an optional JSON value (array of tool definitions) that will be
+    /// passed to the template as the `tools` variable. HuggingFace chat templates
+    /// for tool-calling models (Qwen3, Llama 3.1, Mistral, etc.) use this variable
+    /// to format tool descriptions natively.
     pub fn apply_chat_template(
         &self,
         messages: &[ChatMessage],
         add_generation_prompt: Option<bool>,
+        tools: Option<&serde_json::Value>,
     ) -> Result<String> {
         // Use provided template or fall back to a default
         let template_str = self
@@ -131,9 +150,16 @@ impl TemplateEngine {
         // Prepare context with all special tokens and variables
         let add_gen = add_generation_prompt.unwrap_or(self.config.add_generation_prompt);
 
+        // Convert tools to minijinja Value (or undefined if None)
+        let tools_value = match tools {
+            Some(t) => Value::from_serialize(t),
+            None => Value::UNDEFINED,
+        };
+
         // Render the template
         let rendered = tmpl.render(context! {
             messages => messages,
+            tools => tools_value,
             bos_token => self.config.bos_token.as_deref().unwrap_or(""),
             eos_token => self.config.eos_token.as_deref().unwrap_or(""),
             pad_token => self.config.pad_token.as_deref().unwrap_or(""),
@@ -313,15 +339,58 @@ fn length_filter(value: &Value) -> Result<Value, minijinja::Error> {
     }
 }
 
-/// Custom filter for JSON serialization
-fn tojson_filter(value: &Value) -> Result<Value, minijinja::Error> {
-    let json_str = serde_json::to_string(&value).map_err(|e| {
-        minijinja::Error::new(
-            minijinja::ErrorKind::InvalidOperation,
-            format!("Failed to serialize to JSON: {e}"),
+/// Custom filter for JSON serialization.
+///
+/// Supports optional `indent` keyword argument for pretty-printing, matching
+/// Jinja2's `tojson(indent=4)` syntax used by Llama 3.1 templates.
+fn tojson_filter(value: &Value, kwargs: minijinja::value::Kwargs) -> Result<Value, minijinja::Error> {
+    let indent: Option<usize> = kwargs.get("indent")?;
+    kwargs.assert_all_used()?;
+
+    let json_str = if let Some(n) = indent {
+        // Pretty-print with the requested indentation
+        let v: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&value).map_err(|e| {
+                minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    format!("Failed to serialize to JSON: {e}"),
+                )
+            })?,
         )
-    })?;
+        .map_err(|e| {
+            minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                format!("Failed to re-parse JSON for indentation: {e}"),
+            )
+        })?;
+        let indent_bytes = b" ".repeat(n);
+        let formatter = serde_json::ser::PrettyFormatter::with_indent(&indent_bytes);
+        let mut buf = Vec::new();
+        let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
+        serde::Serialize::serialize(&v, &mut ser).map_err(|e| {
+            minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                format!("Failed to pretty-print JSON: {e}"),
+            )
+        })?;
+        String::from_utf8(buf).unwrap_or_default()
+    } else {
+        serde_json::to_string(&value).map_err(|e| {
+            minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                format!("Failed to serialize to JSON: {e}"),
+            )
+        })?
+    };
     Ok(Value::from(json_str))
+}
+
+/// Custom function: `raise_exception(message)` — used by Mistral templates for validation.
+fn raise_exception_fn(msg: String) -> Result<Value, minijinja::Error> {
+    Err(minijinja::Error::new(
+        minijinja::ErrorKind::InvalidOperation,
+        msg,
+    ))
 }
 
 /// Custom filter for Python's .strip() / .strip(chars)
@@ -434,12 +503,9 @@ mod tests {
         };
 
         let engine = TemplateEngine::new(config)?;
-        let messages = vec![ChatMessage {
-            role: "user".to_owned(),
-            content: "Hello".to_owned(),
-        }];
+        let messages = vec![ChatMessage { role: "user".into(), content: Some("Hello".into()), ..Default::default() }];
 
-        let result = engine.apply_chat_template(&messages, Some(true))?;
+        let result = engine.apply_chat_template(&messages, Some(true), None)?;
         assert!(result.contains("<|im_start|>user"));
         assert!(result.contains("Hello"));
         assert!(result.contains("<|im_start|>assistant"));
@@ -470,21 +536,12 @@ mod tests {
 
         let engine = TemplateEngine::new(config)?;
         let messages = vec![
-            ChatMessage {
-                role: "system".to_owned(),
-                content: "You are a helpful assistant.".to_owned(),
-            },
-            ChatMessage {
-                role: "user".to_owned(),
-                content: "Hello!".to_owned(),
-            },
-            ChatMessage {
-                role: "assistant".to_owned(),
-                content: "Hi there!".to_owned(),
-            },
+            ChatMessage { role: "system".into(), content: Some("You are a helpful assistant.".into()), ..Default::default() },
+            ChatMessage { role: "user".into(), content: Some("Hello!".into()), ..Default::default() },
+            ChatMessage { role: "assistant".into(), content: Some("Hi there!".into()), ..Default::default() },
         ];
 
-        let result = engine.apply_chat_template(&messages, Some(true))?;
+        let result = engine.apply_chat_template(&messages, Some(true), None)?;
 
         // Verify the template was processed correctly
         assert!(result.contains("System: You are a helpful assistant."));
@@ -514,21 +571,12 @@ mod tests {
 
         let engine = TemplateEngine::new(config)?;
         let messages = vec![
-            ChatMessage {
-                role: "system".to_owned(),
-                content: "Configure the model".to_owned(),
-            },
-            ChatMessage {
-                role: "user".to_owned(),
-                content: "What's 2+2?".to_owned(),
-            },
-            ChatMessage {
-                role: "assistant".to_owned(),
-                content: "4".to_owned(),
-            },
+            ChatMessage { role: "system".into(), content: Some("Configure the model".into()), ..Default::default() },
+            ChatMessage { role: "user".into(), content: Some("What's 2+2?".into()), ..Default::default() },
+            ChatMessage { role: "assistant".into(), content: Some("4".into()), ..Default::default() },
         ];
 
-        let result = engine.apply_chat_template(&messages, Some(false))?;
+        let result = engine.apply_chat_template(&messages, Some(false), None)?;
         assert!(result.contains("[SYSTEM] Configure the model"));
         assert!(result.contains("[USER] What's 2+2?"));
         assert!(result.contains("[ASSISTANT] 4"));
@@ -548,14 +596,9 @@ mod tests {
         };
 
         let engine = TemplateEngine::new(config)?;
-        let messages = vec![
-            ChatMessage {
-                role: "user".to_owned(),
-                content: "  Hello World  ".to_owned(),
-            },
-        ];
+        let messages = vec![ChatMessage { role: "user".into(), content: Some("  Hello World  ".into()), ..Default::default() }];
 
-        let result = engine.apply_chat_template(&messages, Some(false))?;
+        let result = engine.apply_chat_template(&messages, Some(false), None)?;
         assert!(result.contains("Hello World"));
         assert!(!result.contains("  Hello World  "));
         Ok(())
@@ -587,21 +630,19 @@ CONTENT:{{ content }}
 
         // Message with think tags
         let messages = vec![ChatMessage {
-            role: "assistant".to_owned(),
-            content: "<think>\nI should search.\n</think>\nHere is the answer.".to_owned(),
+            role: "assistant".into(),
+            content: Some("<think>\nI should search.\n</think>\nHere is the answer.".into()),
+            ..Default::default()
         }];
 
-        let result = engine.apply_chat_template(&messages, Some(false)).expect("test: apply template");
+        let result = engine.apply_chat_template(&messages, Some(false), None).expect("test: apply template");
         assert!(result.contains("THINK:I should search."));
         assert!(result.contains("CONTENT:Here is the answer."));
 
         // Message without think tags
-        let messages_no_think = vec![ChatMessage {
-            role: "user".to_owned(),
-            content: "Hello".to_owned(),
-        }];
+        let messages_no_think = vec![ChatMessage { role: "user".into(), content: Some("Hello".into()), ..Default::default() }];
 
-        let result = engine.apply_chat_template(&messages_no_think, Some(false)).expect("test: apply no-think");
+        let result = engine.apply_chat_template(&messages_no_think, Some(false), None).expect("test: apply no-think");
         assert!(result.contains("CONTENT:Hello"));
     }
 

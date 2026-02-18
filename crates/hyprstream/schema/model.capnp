@@ -293,16 +293,27 @@ struct ModelHealthStatus {
   totalMemoryBytes @3 :UInt64;
 }
 
+# Tool call data for threading through RPC
+struct ToolCallData {
+  id @0 :Text;
+  callType @1 :Text;        # "function"
+  functionName @2 :Text;
+  arguments @3 :Text;        # JSON string (opaque, deserialized at consumption point)
+}
+
 # Chat message for template application
 struct ChatMessage {
-  role @0 :Text;     # "system", "user", "assistant"
-  content @1 :Text;  # Message content
+  role @0 :Text;     # "system", "user", "assistant", "tool"
+  content @1 :Text;  # Message content (empty string = None)
+  toolCalls @2 :List(ToolCallData);
+  toolCallId @3 :Text;  # For "tool" role messages (empty string = None)
 }
 
 # Apply chat template request
 struct ApplyChatTemplateRequest {
   messages @0 :List(ChatMessage);
   addGenerationPrompt @1 :Bool;  # Whether to add assistant prompt at end
+  toolsJson @2 :Text;  # JSON-serialized tools array (empty string = no tools)
 }
 
 # LoRA adapter configuration for creation

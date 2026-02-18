@@ -202,11 +202,12 @@ impl LocalInferenceService {
             InferenceRequest::ApplyChatTemplate {
                 messages,
                 add_generation_prompt,
+                tools,
                 reply,
             } => {
                 let result = self
                     .engine
-                    .apply_chat_template(&messages, add_generation_prompt)
+                    .apply_chat_template(&messages, add_generation_prompt, tools.as_ref())
                     .map_err(|e| InferenceError::Internal(e.to_string()));
                 let _ = reply.send(result);
             }
@@ -382,12 +383,14 @@ impl InferenceClient for LocalInferenceClient {
         &self,
         messages: &[crate::runtime::template_engine::ChatMessage],
         add_generation_prompt: bool,
+        tools: Option<serde_json::Value>,
     ) -> Result<String, InferenceError> {
         let (tx, rx) = oneshot::channel();
         self.sender
             .send(InferenceRequest::ApplyChatTemplate {
                 messages: messages.to_vec(),
                 add_generation_prompt,
+                tools,
                 reply: tx,
             })
             .map_err(|_| InferenceError::Unavailable)?;

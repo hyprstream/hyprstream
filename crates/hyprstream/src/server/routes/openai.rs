@@ -319,36 +319,25 @@ async fn chat_completions(
 
     // Apply chat template via ZMQ ModelService
     info!("Applying chat template via ModelService...");
-    
-    // Prepare messages with tool definitions if tools are provided
-    let mut messages_to_template = request.messages.clone();
-    let has_tools = request.tools.is_some();
-    
-    // If tools are provided, inject them into the system message or add a new system message
-    if let Some(ref tools) = request.tools {
-        let tools_xml = tools::tools_to_qwen3_xml(tools);
-        info!("Adding {} tools to prompt", tools.len());
-        
-        // Find or create system message
-        if let Some(system_msg) = messages_to_template.iter_mut().find(|m| m.role == "system") {
-            // Append tools to existing system message
-            let existing_content = system_msg.content.as_deref().unwrap_or("");
-            system_msg.content = Some(format!("{}\n\n{}", existing_content, tools_xml));
-        } else {
-            // Insert new system message at the beginning
-            messages_to_template.insert(0, ChatMessage {
-                role: "system".to_string(),
-                content: Some(tools_xml),
-                function_call: None,
-                tool_calls: None,
-                tool_call_id: None,
-            });
-        }
-    }
-    
+
+    // Serialize tools to JSON Value for the template engine (if provided)
+    let tools_json: Option<serde_json::Value> = request.tools.as_ref().map(|t| {
+        info!("Passing {} tools to template engine", t.len());
+        serde_json::to_value(t).unwrap_or_default()
+    });
+
+    // Determine tool call format from model architecture (for response parsing)
+    let tool_call_format = if request.tools.is_some() {
+        tools::ToolCallFormat::from_architecture(
+            &crate::runtime::model_config::ModelConfig::detect_architecture(&model_path),
+        )
+    } else {
+        tools::ToolCallFormat::None
+    };
+
     let templated_prompt = match state
         .model_client
-        .apply_chat_template(&request.model, &messages_to_template, true)
+        .apply_chat_template(&request.model, &request.messages, true, tools_json.as_ref())
         .await
     {
         Ok(prompt) => prompt,
@@ -404,25 +393,22 @@ async fn chat_completions(
             let mut avg_latency = state.metrics.avg_latency_ms.write().await;
             *avg_latency = (*avg_latency * 0.9) + (latency_ms * 0.1);
 
-            // Parse tool calls from response if tools were provided
-            let (content, tool_calls, finish_reason) = if has_tools && tools::has_tool_calls(&generation.text) {
-                info!("Detected tool calls in response");
-                match tools::parse_qwen3_tool_calls(&generation.text) {
-                    Ok(parsed_tool_calls) => {
-                        let content_text = tools::extract_text_content(&generation.text);
+            // Parse tool calls from response using format-aware detection
+            let (content, tool_calls, finish_reason) = if tools::has_tool_calls_for_format(tool_call_format, &generation.text) {
+                info!("Detected tool calls in response (format: {:?})", tool_call_format);
+                match tools::parse_tool_calls_for_format(tool_call_format, &generation.text) {
+                    Ok(parsed_tool_calls) if !parsed_tool_calls.is_empty() => {
+                        let content_text = tools::extract_text_content_for_format(tool_call_format, &generation.text);
                         let content = if content_text.is_empty() { None } else { Some(content_text) };
                         info!("Parsed {} tool calls", parsed_tool_calls.len());
                         (content, Some(parsed_tool_calls), "tool_calls")
                     }
-                    Err(e) => {
-                        error!("Failed to parse tool calls: {}", e);
-                        // Fall back to treating as normal content
+                    Ok(_) | Err(_) => {
+                        // No parseable tool calls or parse error — return as normal content
                         (Some(generation.text), None, match generation.finish_reason {
                             FinishReason::MaxTokens => "length",
-                            FinishReason::StopToken(_) => "stop",
-                            FinishReason::EndOfSequence => "stop",
-                            FinishReason::Stop => "stop",
-                            FinishReason::Error(_) => "stop",
+                            FinishReason::StopToken(_) | FinishReason::EndOfSequence
+                            | FinishReason::Stop | FinishReason::Error(_) => "stop",
                         })
                     }
                 }
@@ -430,10 +416,8 @@ async fn chat_completions(
                 // No tool calls, return content as-is
                 (Some(generation.text), None, match generation.finish_reason {
                     FinishReason::MaxTokens => "length",
-                    FinishReason::StopToken(_) => "stop",
-                    FinishReason::EndOfSequence => "stop",
-                    FinishReason::Stop => "stop",
-                    FinishReason::Error(_) => "stop",
+                    FinishReason::StopToken(_) | FinishReason::EndOfSequence
+                    | FinishReason::Stop | FinishReason::Error(_) => "stop",
                 })
             };
 
@@ -496,7 +480,6 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
     let messages = request.messages.clone();
     let stop_sequences = request.stop.clone().unwrap_or_default();
     let tools = request.tools.clone();
-    let has_tools = tools.is_some();
 
     // Track active request for proper cleanup
     state_clone
@@ -537,35 +520,25 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
             }
         };
 
-        // Prepare messages with tool definitions if tools are provided
-        let mut messages_to_template = messages.clone();
-        
-        // If tools are provided, inject them into the system message or add a new system message
-        if let Some(ref tools) = tools {
-            let tools_xml = tools::tools_to_qwen3_xml(tools);
-            info!("Adding {} tools to streaming prompt", tools.len());
-            
-            // Find or create system message
-            if let Some(system_msg) = messages_to_template.iter_mut().find(|m| m.role == "system") {
-                // Append tools to existing system message
-                let existing_content = system_msg.content.as_deref().unwrap_or("");
-                system_msg.content = Some(format!("{}\n\n{}", existing_content, tools_xml));
-            } else {
-                // Insert new system message at the beginning
-                messages_to_template.insert(0, ChatMessage {
-                    role: "system".to_string(),
-                    content: Some(tools_xml),
-                    function_call: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                });
-            }
-        }
-        
-        // Apply chat template via ZMQ ModelService
+        // Serialize tools to JSON Value for the template engine
+        let tools_json: Option<serde_json::Value> = tools.as_ref().map(|t| {
+            info!("Passing {} tools to streaming template engine", t.len());
+            serde_json::to_value(t).unwrap_or_default()
+        });
+
+        // Determine tool call format from model architecture
+        let tool_call_format = if tools.is_some() {
+            tools::ToolCallFormat::from_architecture(
+                &crate::runtime::model_config::ModelConfig::detect_architecture(&model_path),
+            )
+        } else {
+            tools::ToolCallFormat::None
+        };
+
+        // Apply chat template via ZMQ ModelService (tools passed to template)
         info!("Applying chat template for streaming...");
         let templated_prompt = match state.model_client
-            .apply_chat_template(&model_name, &messages_to_template, true)
+            .apply_chat_template(&model_name, &messages, true, tools_json.as_ref())
             .await
         {
             Ok(prompt) => {
@@ -714,13 +687,12 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                                     .map(OnlineTrainingDetails::from),
                             };
 
-                            // Check if response contains tool calls
-                            let oai_finish_reason = if has_tools && tools::has_tool_calls(&accumulated_text) {
-                                info!("Detected tool calls in streaming response");
-                                match tools::parse_qwen3_tool_calls(&accumulated_text) {
-                                    Ok(parsed_tool_calls) => {
+                            // Check if response contains tool calls (format-aware)
+                            let oai_finish_reason = if tools::has_tool_calls_for_format(tool_call_format, &accumulated_text) {
+                                info!("Detected tool calls in streaming response (format: {:?})", tool_call_format);
+                                match tools::parse_tool_calls_for_format(tool_call_format, &accumulated_text) {
+                                    Ok(parsed_tool_calls) if !parsed_tool_calls.is_empty() => {
                                         info!("Parsed {} tool calls", parsed_tool_calls.len());
-                                        // Send tool calls in a delta
                                         let tool_calls_chunk = serde_json::json!({
                                             "id": sse_stream_id,
                                             "object": "chat.completion.chunk",
@@ -737,10 +709,7 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                                         let _ = tx.send(Ok(tool_calls_chunk)).await;
                                         "tool_calls"
                                     }
-                                    Err(e) => {
-                                        error!("Failed to parse tool calls in streaming: {}", e);
-                                        oai_finish_reason
-                                    }
+                                    _ => oai_finish_reason,
                                 }
                             } else {
                                 oai_finish_reason
@@ -903,7 +872,7 @@ async fn completions(
 
     let templated_prompt = match state
         .model_client
-        .apply_chat_template(&request.model, &messages, true)
+        .apply_chat_template(&request.model, &messages, true, None)
         .await
     {
         Ok(prompt) => prompt,

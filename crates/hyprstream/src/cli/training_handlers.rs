@@ -380,10 +380,7 @@ pub async fn handle_training_infer(
     let client = InferenceZmqClient::new(signing_key, RequestIdentity::local());
 
     // Apply chat template
-    let messages = vec![ChatMessage {
-        role: "user".to_owned(),
-        content: prompt.to_owned(),
-    }];
+    let messages = vec![ChatMessage { role: "user".into(), content: Some(prompt.into()), ..Default::default() }];
 
     let formatted_prompt = match client.apply_chat_template(&messages, true).await {
         Ok(formatted) => formatted,

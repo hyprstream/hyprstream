@@ -1216,10 +1216,11 @@ impl InferenceService {
         &self,
         messages: Vec<crate::runtime::template_engine::ChatMessage>,
         add_generation_prompt: bool,
+        tools: Option<&serde_json::Value>,
     ) -> Result<String> {
         self.engine
             .read()
-            .apply_chat_template(&messages, add_generation_prompt)
+            .apply_chat_template(&messages, add_generation_prompt, tools)
     }
 
     /// Handle create LoRA
@@ -1945,12 +1946,36 @@ impl InferenceHandler for InferenceService {
     ) -> Result<InferenceResponseVariant> {
         let chat_messages: Vec<crate::runtime::template_engine::ChatMessage> = data.messages
             .iter()
-            .map(|m| crate::runtime::template_engine::ChatMessage {
-                role: m.role.clone(),
-                content: m.content.clone(),
+            .map(|m| {
+                let tool_calls = if m.tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(m.tool_calls.iter().map(|tc| serde_json::json!({
+                        "id": tc.id,
+                        "type": tc.call_type,
+                        "function": {
+                            "name": tc.function_name,
+                            "arguments": tc.arguments,
+                        }
+                    })).collect())
+                };
+                crate::runtime::template_engine::ChatMessage {
+                    role: m.role.clone(),
+                    content: if m.content.is_empty() { None } else { Some(m.content.clone()) },
+                    tool_calls,
+                    tool_call_id: if m.tool_call_id.is_empty() { None } else { Some(m.tool_call_id.clone()) },
+                }
             })
             .collect();
-        let result = InferenceService::handle_apply_chat_template(self, chat_messages, data.add_generation_prompt)?;
+        // tools_json is passed as a JSON string via the schema; parse it here
+        let tools: Option<serde_json::Value> = if data.tools_json.is_empty() {
+            None
+        } else {
+            serde_json::from_str(&data.tools_json).ok()
+        };
+        let result = InferenceService::handle_apply_chat_template(
+            self, chat_messages, data.add_generation_prompt, tools.as_ref(),
+        )?;
         Ok(InferenceResponseVariant::ApplyChatTemplateResult(result))
     }
 
@@ -2386,12 +2411,34 @@ impl InferenceZmqClient {
         messages: &[crate::runtime::template_engine::ChatMessage],
         add_generation_prompt: bool,
     ) -> Result<String> {
-        use crate::services::generated::inference_client::ChatMessage;
-        let msg_data: Vec<ChatMessage> = messages.iter().map(|m| ChatMessage {
-            role: m.role.clone(),
-            content: m.content.clone(),
+        self.apply_chat_template_with_tools(messages, add_generation_prompt, "").await
+    }
+
+    /// Apply chat template with tools — delegates to generated client
+    pub async fn apply_chat_template_with_tools(
+        &self,
+        messages: &[crate::runtime::template_engine::ChatMessage],
+        add_generation_prompt: bool,
+        tools_json: &str,
+    ) -> Result<String> {
+        use crate::services::generated::inference_client::{ChatMessage as CapnpMsg, ToolCallData};
+        let msg_data: Vec<CapnpMsg> = messages.iter().map(|m| {
+            let tool_calls: Vec<ToolCallData> = m.tool_calls.as_ref().map(|tcs| tcs.iter().map(|tc| {
+                ToolCallData {
+                    id: tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_owned(),
+                    call_type: tc.get("type").and_then(|v| v.as_str()).unwrap_or("function").to_owned(),
+                    function_name: tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_owned(),
+                    arguments: tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("").to_owned(),
+                }
+            }).collect()).unwrap_or_default();
+            CapnpMsg {
+                role: m.role.clone(),
+                content: m.content.clone().unwrap_or_default(),
+                tool_calls,
+                tool_call_id: m.tool_call_id.clone().unwrap_or_default(),
+            }
         }).collect();
-        self.gen.apply_chat_template(&msg_data, add_generation_prompt).await
+        self.gen.apply_chat_template(&msg_data, add_generation_prompt, tools_json).await
     }
 
     /// Create a new LoRA adapter

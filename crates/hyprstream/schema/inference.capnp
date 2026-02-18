@@ -198,11 +198,21 @@ enum FinishReason {
 struct ChatTemplateRequest {
   messages @0 :List(ChatMessage);
   addGenerationPrompt @1 :Bool;
+  toolsJson @2 :Text;  # JSON-serialized tools array (empty string = no tools)
+}
+
+struct ToolCallData {
+  id @0 :Text;
+  callType @1 :Text;        # "function"
+  functionName @2 :Text;
+  arguments @3 :Text;        # JSON string (opaque, deserialized at consumption point)
 }
 
 struct ChatMessage {
   role @0 :Text;
   content @1 :Text;
+  toolCalls @2 :List(ToolCallData);
+  toolCallId @3 :Text;
 }
 
 # LoRA Configuration

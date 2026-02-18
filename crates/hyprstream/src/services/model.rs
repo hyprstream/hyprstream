@@ -417,6 +417,7 @@ impl ModelService {
         model_ref_str: &str,
         messages: Vec<ChatMessage>,
         add_generation_prompt: bool,
+        tools: Option<&serde_json::Value>,
     ) -> Result<TemplatedPrompt> {
         let client = self.get_inference_client(model_ref_str).await?;
 
@@ -425,12 +426,22 @@ impl ModelService {
             .iter()
             .map(|m| crate::runtime::template_engine::ChatMessage {
                 role: m.role.clone(),
-                content: m.content.clone().unwrap_or_default(),
+                content: m.content.clone(),
+                tool_calls: m.tool_calls.as_ref().map(|tcs| {
+                    tcs.iter().map(|tc| serde_json::to_value(tc).unwrap_or_default()).collect()
+                }),
+                tool_call_id: m.tool_call_id.clone(),
             })
             .collect();
 
+        // Serialize tools to JSON string for transport over Cap'n Proto
+        let tools_json = tools.map(|t| serde_json::to_string(t).unwrap_or_default())
+            .unwrap_or_default();
+
         // Call InferenceService's apply_chat_template
-        let prompt_str = client.apply_chat_template(&template_messages, add_generation_prompt).await?;
+        let prompt_str = client.apply_chat_template_with_tools(
+            &template_messages, add_generation_prompt, &tools_json,
+        ).await?;
 
         Ok(TemplatedPrompt::new(prompt_str))
     }
@@ -751,14 +762,36 @@ impl InferHandler for ModelService {
         &self, _ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &ApplyChatTemplateRequest,
     ) -> Result<String> {
-        let chat_messages: Vec<ChatMessage> = data.messages.iter().map(|m| ChatMessage {
-            role: m.role.clone(),
-            content: Some(m.content.clone()),
-            function_call: None,
-            tool_calls: None,
-            tool_call_id: None,
+        let chat_messages: Vec<ChatMessage> = data.messages.iter().map(|m| {
+            let tool_calls = if m.tool_calls.is_empty() {
+                None
+            } else {
+                Some(m.tool_calls.iter().map(|tc| crate::api::openai_compat::ToolCall {
+                    id: tc.id.clone(),
+                    tool_type: tc.call_type.clone(),
+                    function: crate::api::openai_compat::ToolCallFunction {
+                        name: tc.function_name.clone(),
+                        arguments: tc.arguments.clone(),
+                    },
+                }).collect())
+            };
+            ChatMessage {
+                role: m.role.clone(),
+                content: if m.content.is_empty() { None } else { Some(m.content.clone()) },
+                function_call: None,
+                tool_calls,
+                tool_call_id: if m.tool_call_id.is_empty() { None } else { Some(m.tool_call_id.clone()) },
+            }
         }).collect();
-        let templated = self.apply_chat_template(model_ref, chat_messages, data.add_generation_prompt).await?;
+        // Parse tools from JSON string
+        let tools: Option<serde_json::Value> = if data.tools_json.is_empty() {
+            None
+        } else {
+            serde_json::from_str(&data.tools_json).ok()
+        };
+        let templated = self.apply_chat_template(
+            model_ref, chat_messages, data.add_generation_prompt, tools.as_ref(),
+        ).await?;
         Ok(templated.as_str().to_owned())
     }
 
@@ -1136,12 +1169,25 @@ impl ModelZmqClient {
         model_ref: &str,
         messages: &[ChatMessage],
         add_generation_prompt: bool,
+        tools: Option<&serde_json::Value>,
     ) -> Result<TemplatedPrompt> {
-        let msg_data: Vec<crate::services::generated::model_client::ChatMessage> = messages.iter().map(|m| crate::services::generated::model_client::ChatMessage {
-            role: m.role.clone(),
-            content: m.content.as_deref().unwrap_or("").to_owned(),
+        let msg_data: Vec<crate::services::generated::model_client::ChatMessage> = messages.iter().map(|m| {
+            use crate::services::generated::model_client::{ChatMessage as CapnpMsg, ToolCallData};
+            CapnpMsg {
+                role: m.role.clone(),
+                content: m.content.as_deref().unwrap_or("").to_owned(),
+                tool_calls: m.tool_calls.as_ref().map(|tcs| tcs.iter().map(|tc| ToolCallData {
+                    id: tc.id.clone(),
+                    call_type: tc.tool_type.clone(),
+                    function_name: tc.function.name.clone(),
+                    arguments: tc.function.arguments.clone(),
+                }).collect()).unwrap_or_default(),
+                tool_call_id: m.tool_call_id.as_deref().unwrap_or("").to_owned(),
+            }
         }).collect();
-        let prompt_str = self.gen.infer(model_ref).apply_chat_template(&msg_data, add_generation_prompt).await?;
+        let tools_json = tools.map(|t| serde_json::to_string(t).unwrap_or_default())
+            .unwrap_or_default();
+        let prompt_str = self.gen.infer(model_ref).apply_chat_template(&msg_data, add_generation_prompt, &tools_json).await?;
         Ok(TemplatedPrompt::new(prompt_str))
     }
 
