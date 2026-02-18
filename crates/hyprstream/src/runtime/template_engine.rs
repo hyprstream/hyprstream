@@ -2,6 +2,7 @@
 
 use anyhow::{anyhow, Result};
 use minijinja::{context, Environment, Value};
+use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -452,8 +453,16 @@ fn split_last_filter(value: &Value, sep: &str) -> Result<Value, minijinja::Error
 /// - `.split('sep')[-1]` → `|split_last('sep')`
 fn transform_split_calls(template: &str) -> String {
     // Rust regex doesn't support backreferences, so handle single and double quotes separately
-    let re_single = Regex::new(r"\.split\('([^']*)'\)\[(-?\d+)\]").unwrap();
-    let re_double = Regex::new(r#"\.split\("([^"]*)"\)\[(-?\d+)\]"#).unwrap();
+    static RE_SINGLE: Lazy<Regex> = Lazy::new(|| {
+        #[allow(clippy::expect_used)]
+        Regex::new(r"\.split\('([^']*)'\)\[(-?\d+)\]").expect("valid regex")
+    });
+    static RE_DOUBLE: Lazy<Regex> = Lazy::new(|| {
+        #[allow(clippy::expect_used)]
+        Regex::new(r#"\.split\("([^"]*)"\)\[(-?\d+)\]"#).expect("valid regex")
+    });
+    let re_single = &*RE_SINGLE;
+    let re_double = &*RE_DOUBLE;
 
     let result = re_single.replace_all(template, |caps: &regex::Captures| {
         split_replacement(&caps[1], &caps[2])
@@ -487,6 +496,7 @@ fn split_replacement(sep: &str, idx_str: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

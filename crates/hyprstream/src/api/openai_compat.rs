@@ -141,7 +141,7 @@ pub struct ChatChoice {
 impl ChatChoice {
     /// Check if this choice contains tool calls
     pub fn has_tool_calls(&self) -> bool {
-        self.message.tool_calls.as_ref().map_or(false, |tc| !tc.is_empty())
+        self.message.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty())
     }
 }
 

@@ -38,8 +38,7 @@ impl ToolCallFormat {
             ModelArchitecture::Qwen => Self::Qwen3Xml,
             ModelArchitecture::Llama => Self::LlamaJson,
             ModelArchitecture::Mistral => Self::MistralJson,
-            ModelArchitecture::Gemma | ModelArchitecture::Janus => Self::None,
-            ModelArchitecture::Unknown(_) => Self::None,
+            ModelArchitecture::Gemma | ModelArchitecture::Janus | ModelArchitecture::Unknown(_) => Self::None,
         }
     }
 
@@ -84,7 +83,7 @@ pub fn extract_text_content_for_format(format: ToolCallFormat, text: &str) -> St
         ToolCallFormat::Qwen3Xml => extract_qwen3_text_content(text),
         ToolCallFormat::LlamaJson => extract_llama_text_content(text),
         ToolCallFormat::MistralJson => extract_mistral_text_content(text),
-        ToolCallFormat::None => text.to_string(),
+        ToolCallFormat::None => text.to_owned(),
     }
 }
 
@@ -121,11 +120,8 @@ pub fn parse_qwen3_tool_calls(text: &str) -> Result<Vec<ToolCall>, anyhow::Error
     let mut tool_calls = Vec::new();
     let mut search_from = 0;
 
-    loop {
-        let close_tag = match text[search_from..].find("</tool_call>") {
-            Some(pos) => search_from + pos,
-            None => break,
-        };
+    while let Some(pos) = text[search_from..].find("</tool_call>") {
+        let close_tag = search_from + pos;
 
         let region = &text[search_from..close_tag];
         let open_tag = match region.rfind("<tool_call>") {
@@ -149,7 +145,7 @@ pub fn parse_qwen3_tool_calls(text: &str) -> Result<Vec<ToolCall>, anyhow::Error
         };
 
         let name = match call_data["name"].as_str() {
-            Some(n) => n.to_string(),
+            Some(n) => n.to_owned(),
             None => continue,
         };
 
@@ -158,7 +154,7 @@ pub fn parse_qwen3_tool_calls(text: &str) -> Result<Vec<ToolCall>, anyhow::Error
 
         tool_calls.push(ToolCall {
             id: format!("call_{}", uuid::Uuid::new_v4()),
-            tool_type: "function".to_string(),
+            tool_type: "function".to_owned(),
             function: ToolCallFunction {
                 name,
                 arguments: arguments_str,
@@ -172,9 +168,10 @@ pub fn parse_qwen3_tool_calls(text: &str) -> Result<Vec<ToolCall>, anyhow::Error
 /// Extract text content from Qwen3 response, removing `<tool_call>…</tool_call>` blocks.
 fn extract_qwen3_text_content(text: &str) -> String {
     static TOOL_CALL_REGEX: Lazy<Regex> = Lazy::new(|| {
+        #[allow(clippy::unwrap_used)]
         Regex::new(r#"(?s)<tool_call>.*?</tool_call>"#).unwrap()
     });
-    TOOL_CALL_REGEX.replace_all(text, "").trim().to_string()
+    TOOL_CALL_REGEX.replace_all(text, "").trim().to_owned()
 }
 
 // =============================================================================
@@ -207,7 +204,7 @@ pub fn parse_llama_tool_calls(text: &str) -> Result<Vec<ToolCall>, anyhow::Error
         };
 
         let name = match call_data["name"].as_str() {
-            Some(n) => n.to_string(),
+            Some(n) => n.to_owned(),
             None => continue,
         };
 
@@ -221,7 +218,7 @@ pub fn parse_llama_tool_calls(text: &str) -> Result<Vec<ToolCall>, anyhow::Error
 
         tool_calls.push(ToolCall {
             id: format!("call_{}", uuid::Uuid::new_v4()),
-            tool_type: "function".to_string(),
+            tool_type: "function".to_owned(),
             function: ToolCallFunction {
                 name,
                 arguments: arguments_str,
@@ -235,8 +232,8 @@ pub fn parse_llama_tool_calls(text: &str) -> Result<Vec<ToolCall>, anyhow::Error
 /// Extract text content from Llama response, removing everything after `<|python_tag|>`.
 fn extract_llama_text_content(text: &str) -> String {
     match text.find("<|python_tag|>") {
-        Some(pos) => text[..pos].trim().to_string(),
-        None => text.to_string(),
+        Some(pos) => text[..pos].trim().to_owned(),
+        None => text.to_owned(),
     }
 }
 
@@ -264,7 +261,7 @@ pub fn parse_mistral_tool_calls(text: &str) -> Result<Vec<ToolCall>, anyhow::Err
 
     for call_data in calls {
         let name = match call_data["name"].as_str() {
-            Some(n) => n.to_string(),
+            Some(n) => n.to_owned(),
             None => continue,
         };
 
@@ -273,7 +270,7 @@ pub fn parse_mistral_tool_calls(text: &str) -> Result<Vec<ToolCall>, anyhow::Err
 
         tool_calls.push(ToolCall {
             id: format!("call_{}", uuid::Uuid::new_v4()),
-            tool_type: "function".to_string(),
+            tool_type: "function".to_owned(),
             function: ToolCallFunction {
                 name,
                 arguments: arguments_str,
@@ -287,8 +284,8 @@ pub fn parse_mistral_tool_calls(text: &str) -> Result<Vec<ToolCall>, anyhow::Err
 /// Extract text content from Mistral response, removing everything after `[TOOL_CALLS]`.
 fn extract_mistral_text_content(text: &str) -> String {
     match text.find("[TOOL_CALLS]") {
-        Some(pos) => text[..pos].trim().to_string(),
-        None => text.to_string(),
+        Some(pos) => text[..pos].trim().to_owned(),
+        None => text.to_owned(),
     }
 }
 
@@ -297,6 +294,7 @@ fn extract_mistral_text_content(text: &str) -> String {
 // =============================================================================
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

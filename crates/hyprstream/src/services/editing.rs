@@ -16,7 +16,8 @@ use automerge::AutoCommit;
 use automerge::transaction::Transactable;
 use dashmap::DashMap;
 use sha2::{Sha256, Digest};
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use tracing::{debug, warn};
 
 /// Document format for parsing/serialization.
@@ -50,6 +51,12 @@ pub struct EditingTable {
     docs: DashMap<DocKey, Arc<Mutex<SharedDoc>>>,
     /// Maps (client_identity, fid) → DocKey for session lookup and cleanup.
     sessions: DashMap<(String, u32), DocKey>,
+}
+
+impl Default for EditingTable {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EditingTable {
@@ -107,7 +114,7 @@ impl EditingTable {
 
         // Increment client count
         {
-            let mut sd = shared.lock().unwrap();
+            let mut sd = shared.lock();
             sd.client_count += 1;
         }
 
@@ -154,7 +161,7 @@ impl EditingTable {
 
         let should_remove = {
             if let Some(shared) = self.docs.get(&doc_key) {
-                let mut sd = shared.lock().unwrap();
+                let mut sd = shared.lock();
                 sd.client_count = sd.client_count.saturating_sub(1);
                 sd.client_count == 0
             } else {
@@ -177,7 +184,7 @@ impl EditingTable {
         if let Some((_, doc_key)) = self.sessions.remove(&session_key) {
             let should_remove = {
                 if let Some(shared) = self.docs.get(&doc_key) {
-                    let mut sd = shared.lock().unwrap();
+                    let mut sd = shared.lock();
                     if sd.dirty {
                         warn!(
                             "Reaping fid {} with dirty editing session for {:?}",

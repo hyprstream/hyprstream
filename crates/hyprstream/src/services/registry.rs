@@ -1712,7 +1712,7 @@ impl RegistryService {
     }
 
     /// Convert generated DocFormatEnum to our editing DocFormat.
-    fn to_doc_format(fmt: &DocFormatEnum) -> DocFormat {
+    fn to_doc_format(fmt: DocFormatEnum) -> DocFormat {
         match fmt {
             DocFormatEnum::Toml => DocFormat::Toml,
             DocFormatEnum::Json => DocFormat::Json,
@@ -1798,8 +1798,8 @@ impl CtlHandler for RegistryService {
                     None,
                 )?;
                 diff.deltas().any(|d| {
-                    d.new_file().path().map_or(false, |p| p == std::path::Path::new(&rel_path))
-                    || d.old_file().path().map_or(false, |p| p == std::path::Path::new(&rel_path))
+                    d.new_file().path().is_some_and(|p| p == std::path::Path::new(&rel_path))
+                    || d.old_file().path().is_some_and(|p| p == std::path::Path::new(&rel_path))
                 })
             };
 
@@ -1992,7 +1992,7 @@ impl CtlHandler for RegistryService {
         let editing = self.editing_table.fid_has_session(&subject, fid);
         let dirty = if editing {
             if let Some(shared) = self.editing_table.get_session(&subject, fid) {
-                shared.lock().unwrap().dirty
+                shared.lock().dirty
             } else {
                 false
             }
@@ -2016,7 +2016,7 @@ impl CtlHandler for RegistryService {
         let subject = ctx.subject().to_string();
         let rel_path = self.fid_rel_path(fid, &subject)?;
         let content = self.read_fid_content(repo_id, name, fid, &subject).await?;
-        let format = Self::to_doc_format(&data.format);
+        let format = Self::to_doc_format(data.format);
 
         self.editing_table.open(
             &subject, fid, repo_id, name, &rel_path, format, &content,
@@ -2033,7 +2033,7 @@ impl CtlHandler for RegistryService {
         let shared = self.editing_table.get_session(&subject, fid)
             .ok_or_else(|| anyhow!("no active editing session for fid {}", fid))?;
 
-        let sd = shared.lock().unwrap();
+        let sd = shared.lock();
         // Get the content value from the automerge document
         let content = sd.doc.get(automerge::ROOT, "content")
             .ok()
@@ -2058,7 +2058,7 @@ impl CtlHandler for RegistryService {
         let shared = self.editing_table.get_session(&subject, fid)
             .ok_or_else(|| anyhow!("no active editing session for fid {}", fid))?;
 
-        let mut sd = shared.lock().unwrap();
+        let mut sd = shared.lock();
         sd.doc.load_incremental(&data.change_bytes)?;
         sd.dirty = true;
 
@@ -2096,7 +2096,7 @@ impl CtlHandler for RegistryService {
             editing::sha256_hash(&data)
         };
 
-        let mut sd = shared.lock().unwrap();
+        let mut sd = shared.lock();
 
         // Check for external modifications
         if current_hash != sd.file_hash {
