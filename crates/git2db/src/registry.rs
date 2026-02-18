@@ -18,6 +18,14 @@ use crate::repository_handle::RepositoryHandle;
 use crate::storage::{Driver, StorageDriver};
 use tracing::{debug, info, trace, warn};
 
+/// UUID v5 namespace for the registry's own self-tracking entry.
+const REGISTRY_SELF_NS: Uuid = uuid::uuid!("6ba7b810-9dad-11d1-80b4-00c04fd430c8");
+
+/// Deterministic UUID for the `.registry` self-tracked entry.
+pub fn registry_self_uuid() -> Uuid {
+    Uuid::new_v5(&REGISTRY_SELF_NS, b".registry")
+}
+
 /// Repository identifier using UUID
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RepoId(pub Uuid);
@@ -348,6 +356,25 @@ impl Git2DB {
             }
         }
 
+        // Self-track .registry as a repository (bypasses submodule registration)
+        let self_uuid = registry_self_uuid();
+        if !registry.metadata.repositories.contains_key(&self_uuid) {
+            info!("Registering .registry as self-tracked repository");
+            registry.metadata.repositories.insert(self_uuid, TrackedRepository {
+                id: RepoId::from_uuid(self_uuid),
+                name: Some(".registry".to_owned()),
+                url: format!("file://{}", registry.registry_path.display()),
+                worktree_path: registry.registry_path.clone(),
+                tracking_ref: GitRef::DefaultBranch,
+                remotes: Vec::new(),
+                registered_at: Utc::now().timestamp(),
+                current_oid: None,
+                metadata: HashMap::new(),
+            });
+            registry.save_metadata().await?;
+            registry.commit_changes("Register .registry as self-tracked repository")?;
+        }
+
         Ok(registry)
     }
 
@@ -616,6 +643,11 @@ impl Git2DB {
     /// # }
     /// ```
     pub async fn remove_repository(&mut self, id: &RepoId) -> Git2DBResult<()> {
+        // Guard: cannot remove the self-tracked .registry entry
+        if id.0 == registry_self_uuid() {
+            return Err(Git2DBError::internal("Cannot remove the self-tracked .registry entry"));
+        }
+
         // Get repository info before removal
         let repo_info = self
             .get_by_id(id)

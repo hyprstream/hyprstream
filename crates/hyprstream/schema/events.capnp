@@ -31,6 +31,7 @@ enum EventSource {
   training @2;
   git2db @3;
   system @4;
+  editor @5;
 }
 
 struct EventPayload {
@@ -60,6 +61,9 @@ struct EventPayload {
     serverStarted @13 :ServerStarted;
     serverStopping @14 :ServerStopping;
     healthCheck @15 :HealthCheck;
+
+    # Editor/CRDT events
+    crdtSync @16 :CrdtSync;
   }
 }
 
@@ -192,4 +196,12 @@ struct HealthCheck {
   uptimeMs @1 :UInt64;
   activeRequests @2 :UInt32;
   memoryUsageMb @3 :UInt32;
+}
+
+# Editor/CRDT Events
+
+struct CrdtSync {
+  docId @0 :Text;        # "{repo_id}:{worktree}:{path}"
+  actorId @1 :Data;
+  changeBytes @2 :Data;
 }

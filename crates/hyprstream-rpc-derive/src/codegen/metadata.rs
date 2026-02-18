@@ -503,11 +503,25 @@ fn generate_scoped_dispatcher_block(
 }
 
 /// Generate a factory call expression for a scoped client.
+/// Handles type conversion for non-string scope fields (e.g., UInt32 → parse from &str).
 fn generate_scoped_factory_call(sc: &ScopedClient) -> TokenStream {
     let factory_snake = format_ident!("{}", to_snake_case(&sc.factory_name));
     if sc.scope_fields.is_empty() {
         quote! { self.#factory_snake() }
+    } else if sc.scope_fields.len() == 1 {
+        // Check if scope field needs parsing from string
+        let field = &sc.scope_fields[0];
+        match field.type_name.as_str() {
+            "UInt8" | "UInt16" | "UInt32" | "UInt64" | "Int8" | "Int16" | "Int32" | "Int64"
+            | "Float32" | "Float64" => {
+                quote! { self.#factory_snake(scope_id.parse()?) }
+            }
+            _ => {
+                quote! { self.#factory_snake(scope_id) }
+            }
+        }
     } else {
+        // Multiple scope fields — not supported in call_scoped_method yet
         quote! { self.#factory_snake(scope_id) }
     }
 }

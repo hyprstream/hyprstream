@@ -1097,10 +1097,10 @@ impl ModelZmqClient {
             request.seed.unwrap_or(0),
             &images,
             request.timeout.unwrap_or(0),
-            false,  // tttEnabled: use server default
-            0,      // tttGradientSteps: use server default
-            0.0,    // tttLearningRate: use server default
-            false,  // autoCommit: default false
+            request.ttt_enabled,
+            request.ttt_gradient_steps,
+            request.ttt_learning_rate,
+            request.auto_commit,
         ).await?;
         Ok(GenerationResult {
             text: data.text,
@@ -1139,10 +1139,10 @@ impl ModelZmqClient {
             request.seed.unwrap_or(0),
             &images,
             request.timeout.unwrap_or(0),
-            false,  // ttt_enabled
-            0,      // ttt_gradient_steps
-            0.0,    // ttt_learning_rate
-            false,  // auto_commit
+            request.ttt_enabled,
+            request.ttt_gradient_steps,
+            request.ttt_learning_rate,
+            request.auto_commit,
             client_ephemeral_pubkey,
         ).await?;
         Ok(StreamInfo {
@@ -1285,6 +1285,10 @@ fn generate_request_from_data(data: &GenerateRequest) -> GenerationRequest {
         timeout: if data.timeout_ms > 0 { Some(data.timeout_ms) } else { None },
         images: Vec::new(),
         collect_metrics: false,
+        ttt_enabled: data.ttt_enabled,
+        ttt_gradient_steps: data.ttt_gradient_steps,
+        ttt_learning_rate: data.ttt_learning_rate,
+        auto_commit: data.auto_commit,
     }
 }
 

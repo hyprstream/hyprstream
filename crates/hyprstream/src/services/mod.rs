@@ -73,6 +73,7 @@ mod worktree_helpers;
 pub use worktree_helpers::StatResult;
 pub mod contained_root;
 pub mod callback;
+pub mod editing;
 pub mod factories;
 pub mod flight;
 pub mod generated;
@@ -95,13 +96,15 @@ pub use core::{
 // Generated client types — the public API
 pub use generated::registry_client::{
     RegistryClient as GenRegistryClient,
-    RepositoryClient, WorktreeClient,
+    RepositoryClient, WorktreeClient, CtlClient,
     TrackedRepository as GenTrackedRepository,
     WorktreeInfo as GenWorktreeInfo,
     RepositoryStatus as GenRepositoryStatus,
     RemoteInfo,
     RWalk, ROpen, RRead, RWrite, RStat,
     NpStat as NpStatData, Qid as QidData,
+    FileStatus, LogEntry, ValidationResult, FileInfo,
+    DocFormatEnum,
 };
 
 // Remaining domain types

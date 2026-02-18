@@ -684,7 +684,7 @@ fn generate_field_setter(
 ) -> TokenStream {
     match type_name {
         "Text" | "Data" => quote! { #builder_var.#setter_name(#rust_name); },
-        "Bool" | "UInt32" | "UInt64" | "Int32" | "Int64" | "Float32" | "Float64" => {
+        "Bool" | "UInt8" | "UInt16" | "UInt32" | "UInt64" | "Int8" | "Int16" | "Int32" | "Int64" | "Float32" | "Float64" => {
             quote! { #builder_var.#setter_name(#rust_name); }
         }
         t if t.starts_with("List(") => {

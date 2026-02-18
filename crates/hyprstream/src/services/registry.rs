@@ -30,7 +30,8 @@ use uuid::Uuid;
 // Generated client types
 use crate::services::generated::registry_client::{
     RegistryClient as GenRegistryClient, RegistryResponseVariant,
-    RegistryHandler, RepoHandler, WorktreeHandler, dispatch_registry, serialize_response,
+    RegistryHandler, RepoHandler, WorktreeHandler, CtlHandler,
+    dispatch_registry, serialize_response,
     StreamInfo, ErrorInfo, HealthStatus, DetailedStatusInfo, RemoteInfo,
     CloneRequest, RegisterRequest,
     CreateWorktreeRequest, RemoveWorktreeRequest,
@@ -45,7 +46,13 @@ use crate::services::generated::registry_client::{
     RWalk, ROpen, RRead, RWrite, RStat,
     NpStat as NpStatData, Qid as QidData,
     EnsureWorktreeRequest,
+    FileStatus, LogEntry, ValidationResult, FileInfo,
+    CtlLogRequest, CtlDiffRequest, CtlCheckoutRequest,
+    EditOpenRequest, EditApplyRequest,
+    DocFormatEnum,
 };
+use crate::services::editing::{self, EditingTable, DocFormat};
+use automerge::ReadDoc as _;
 // Conflicting names — use canonical path at usage sites:
 //   registry_client::TrackedRepository, registry_client::RepositoryStatus, registry_client::WorktreeInfo
 
@@ -305,6 +312,8 @@ pub struct RegistryService {
     fid_table: Arc<FidTable>,
     /// Cached contained roots for worktrees: (repo_id, worktree_name) → ContainedRoot.
     contained_roots: DashMap<(String, String), Arc<dyn ContainedRoot>>,
+    /// CRDT editing sessions for collaborative file editing.
+    editing_table: Arc<EditingTable>,
 }
 
 /// Progress reporter that sends updates via a tokio mpsc channel.
@@ -353,11 +362,13 @@ impl RegistryService {
 
         let worker_registry = Arc::new(RwLock::new(registry));
 
-        // Create fid table and spawn reaper
+        // Create fid table and editing table, spawn reaper
         let fid_table = Arc::new(FidTable::new());
+        let editing_table = Arc::new(EditingTable::new());
         let reaper_fid_table = Arc::clone(&fid_table);
+        let reaper_editing_table = Arc::clone(&editing_table);
         tokio::spawn(async move {
-            Self::fid_reaper(reaper_fid_table).await;
+            Self::fid_reaper(reaper_fid_table, reaper_editing_table).await;
         });
 
         let service = Self {
@@ -369,20 +380,23 @@ impl RegistryService {
             signing_key,
             fid_table,
             contained_roots: DashMap::new(),
+            editing_table,
         };
 
         Ok(service)
     }
 
     /// Background task that reaps idle fids.
-    async fn fid_reaper(fid_table: Arc<FidTable>) {
+    async fn fid_reaper(fid_table: Arc<FidTable>, editing_table: Arc<EditingTable>) {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
             interval.tick().await;
             let now = now_epoch_secs();
-            fid_table.fids.retain(|_fid, entry| {
+            fid_table.fids.retain(|fid, entry| {
                 let idle = now.saturating_sub(entry.last_accessed.load(Relaxed));
                 if idle > FID_IDLE_TIMEOUT.as_secs() {
+                    // Clean up any editing sessions associated with this fid
+                    editing_table.on_reap(&entry.owner_identity, *fid);
                     // Decrement client fid count
                     if let Some(count) = fid_table.client_fid_counts.get(&entry.owner_identity) {
                         count.fetch_sub(1, Relaxed);
@@ -1667,6 +1681,456 @@ impl RepoHandler for RegistryService {
 }
 
 // ============================================================================
+// Generated CtlHandler Implementation — per-file git introspection + CRDT editing
+// ============================================================================
+
+impl RegistryService {
+    /// Resolve a fid to its relative path within the worktree.
+    fn fid_rel_path(&self, fid: u32, client_id: &str) -> Result<String> {
+        let entry = self.fid_table.get_verified(fid, client_id)
+            .map_err(|e| anyhow!("{}", e))?;
+        match &entry.state {
+            FidState::Walked { walk_handle, .. } => Ok(walk_handle.rel_path().to_owned()),
+            FidState::Opened { .. } => {
+                // Opened fids don't carry the path — walk_handle was consumed.
+                // For ctl operations, the fid should be in Walked state.
+                anyhow::bail!("fid {} is opened for I/O; ctl operations require a walked (not opened) fid", fid)
+            }
+        }
+    }
+
+    /// Read file content via contained root for a given fid's path.
+    async fn read_fid_content(&self, repo_id: &str, worktree: &str, fid: u32, client_id: &str) -> Result<String> {
+        let rel_path = self.fid_rel_path(fid, client_id)?;
+        let root = self.get_contained_root(repo_id, worktree).await
+            .map_err(|e| anyhow!("{}", e))?;
+        let file = root.open_file(&rel_path, false, false, false, false, false)
+            .map_err(|e| anyhow!("{}", e))?;
+        let mut content = String::new();
+        std::io::BufReader::new(file).read_to_string(&mut content)?;
+        Ok(content)
+    }
+
+    /// Convert generated DocFormatEnum to our editing DocFormat.
+    fn to_doc_format(fmt: &DocFormatEnum) -> DocFormat {
+        match fmt {
+            DocFormatEnum::Toml => DocFormat::Toml,
+            DocFormatEnum::Json => DocFormat::Json,
+            DocFormatEnum::Yaml => DocFormat::Yaml,
+            DocFormatEnum::Csv => DocFormat::Csv,
+            DocFormatEnum::Text => DocFormat::Text,
+        }
+    }
+
+    /// Convert editing DocFormat to generated DocFormatEnum.
+    #[allow(dead_code)]
+    fn from_doc_format(fmt: DocFormat) -> DocFormatEnum {
+        match fmt {
+            DocFormat::Toml => DocFormatEnum::Toml,
+            DocFormat::Json => DocFormatEnum::Json,
+            DocFormat::Yaml => DocFormatEnum::Yaml,
+            DocFormat::Csv => DocFormatEnum::Csv,
+            DocFormat::Text => DocFormatEnum::Text,
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl CtlHandler for RegistryService {
+    /// Git status of this file.
+    async fn handle_status(&self, ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, _name: &str, fid: u32,
+    ) -> Result<FileStatus> {
+        let subject = ctx.subject().to_string();
+        let rel_path = self.fid_rel_path(fid, &subject)?;
+
+        let id = Self::parse_repo_id(repo_id)?;
+        let registry = self.registry.read().await;
+        let handle = registry.repo(&id)?;
+        let repo = handle.open_repo()?;
+
+        let status = repo.status_file(std::path::Path::new(&rel_path))?;
+        let state = format!("{:?}", status);
+        Ok(FileStatus { state })
+    }
+
+    /// Commits touching this file.
+    async fn handle_log(&self, ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, _name: &str, fid: u32, data: &CtlLogRequest,
+    ) -> Result<Vec<LogEntry>> {
+        let subject = ctx.subject().to_string();
+        let rel_path = self.fid_rel_path(fid, &subject)?;
+
+        let id = Self::parse_repo_id(repo_id)?;
+        let registry = self.registry.read().await;
+        let handle = registry.repo(&id)?;
+        let repo = handle.open_repo()?;
+
+        let max_count = if data.max_count == 0 { 20 } else { data.max_count as usize };
+
+        // Set up revwalk
+        let mut revwalk = repo.revwalk()?;
+        if data.ref_name.is_empty() {
+            revwalk.push_head()?;
+        } else {
+            let obj = repo.revparse_single(&data.ref_name)?;
+            revwalk.push(obj.id())?;
+        }
+        revwalk.set_sorting(git2::Sort::TIME)?;
+
+        let mut entries = Vec::new();
+        for oid_result in revwalk {
+            if entries.len() >= max_count {
+                break;
+            }
+            let oid = oid_result?;
+            let commit = repo.find_commit(oid)?;
+
+            // Check if this commit touches our file
+            let dominated = if commit.parent_count() == 0 {
+                // Initial commit — check if tree contains the file
+                commit.tree()?.get_path(std::path::Path::new(&rel_path)).is_ok()
+            } else {
+                let parent = commit.parent(0)?;
+                let diff = repo.diff_tree_to_tree(
+                    Some(&parent.tree()?),
+                    Some(&commit.tree()?),
+                    None,
+                )?;
+                diff.deltas().any(|d| {
+                    d.new_file().path().map_or(false, |p| p == std::path::Path::new(&rel_path))
+                    || d.old_file().path().map_or(false, |p| p == std::path::Path::new(&rel_path))
+                })
+            };
+
+            if dominated {
+                let author = commit.author();
+                entries.push(LogEntry {
+                    oid: oid.to_string(),
+                    message: commit.message().unwrap_or("").to_owned(),
+                    author: author.name().unwrap_or("").to_owned(),
+                    timestamp: commit.time().seconds() as u64,
+                });
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Diff this file against a ref.
+    async fn handle_diff(&self, ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, _name: &str, fid: u32, data: &CtlDiffRequest,
+    ) -> Result<String> {
+        let subject = ctx.subject().to_string();
+        let rel_path = self.fid_rel_path(fid, &subject)?;
+
+        let id = Self::parse_repo_id(repo_id)?;
+        let registry = self.registry.read().await;
+        let handle = registry.repo(&id)?;
+        let repo = handle.open_repo()?;
+
+        let ref_name = if data.ref_name.is_empty() { "HEAD" } else { &data.ref_name };
+        let obj = repo.revparse_single(ref_name)?;
+        let commit = obj.peel_to_commit()?;
+        let tree = commit.tree()?;
+
+        let mut diff_opts = git2::DiffOptions::new();
+        diff_opts.pathspec(&rel_path);
+
+        let diff = repo.diff_tree_to_workdir_with_index(
+            Some(&tree),
+            Some(&mut diff_opts),
+        )?;
+
+        let mut output = String::new();
+        diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
+            let origin = line.origin();
+            if origin == '+' || origin == '-' || origin == ' ' {
+                output.push(origin);
+            }
+            if let Ok(s) = std::str::from_utf8(line.content()) {
+                output.push_str(s);
+            }
+            true
+        })?;
+
+        Ok(output)
+    }
+
+    /// Git blame for this file.
+    async fn handle_blame(&self, ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, _name: &str, fid: u32,
+    ) -> Result<String> {
+        let subject = ctx.subject().to_string();
+        let rel_path = self.fid_rel_path(fid, &subject)?;
+
+        let id = Self::parse_repo_id(repo_id)?;
+        let registry = self.registry.read().await;
+        let handle = registry.repo(&id)?;
+        let repo = handle.open_repo()?;
+
+        let blame = repo.blame_file(std::path::Path::new(&rel_path), None)?;
+
+        let mut output = String::new();
+        for i in 0..blame.len() {
+            if let Some(hunk) = blame.get_index(i) {
+                let sig = hunk.final_signature();
+                let name = sig.name().unwrap_or("?");
+                let oid = hunk.final_commit_id();
+                let line_start = hunk.final_start_line();
+                let line_count = hunk.lines_in_hunk();
+                use std::fmt::Write;
+                writeln!(output, "{:.8} ({} L{}-{}) ",
+                    oid, name, line_start, line_start + line_count - 1)?;
+            }
+        }
+        Ok(output)
+    }
+
+    /// Restore file content from a ref.
+    async fn handle_checkout(&self, ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str, fid: u32, data: &CtlCheckoutRequest,
+    ) -> Result<()> {
+        let subject = ctx.subject().to_string();
+        let rel_path = self.fid_rel_path(fid, &subject)?;
+
+        let id = Self::parse_repo_id(repo_id)?;
+        let registry = self.registry.read().await;
+        let handle = registry.repo(&id)?;
+        let repo = handle.open_repo()?;
+
+        let ref_name = if data.ref_name.is_empty() { "HEAD" } else { &data.ref_name };
+        let obj = repo.revparse_single(ref_name)?;
+        let commit = obj.peel_to_commit()?;
+        let tree = commit.tree()?;
+        let entry = tree.get_path(std::path::Path::new(&rel_path))?;
+        let blob = repo.find_blob(entry.id())?;
+
+        // Write blob content to the worktree file
+        let root = self.get_contained_root(repo_id, name).await
+            .map_err(|e| anyhow!("{}", e))?;
+        let mut file = root.open_file(&rel_path, true, false, true, false, false)
+            .map_err(|e| anyhow!("{}", e))?;
+        use std::io::Write as _;
+        file.write_all(blob.content())?;
+        file.flush()?;
+
+        Ok(())
+    }
+
+    /// Validate file format.
+    async fn handle_validate(&self, ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str, fid: u32,
+    ) -> Result<ValidationResult> {
+        let subject = ctx.subject().to_string();
+        let rel_path = self.fid_rel_path(fid, &subject)?;
+
+        // Read the file content
+        let content = self.read_fid_content(repo_id, name, fid, &subject).await?;
+
+        // Detect format from extension
+        let ext = std::path::Path::new(&rel_path)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+
+        let mut errors = Vec::new();
+        match ext {
+            "toml" => {
+                if let Err(e) = content.parse::<toml::Value>() {
+                    errors.push(e.to_string());
+                }
+            }
+            "json" => {
+                if let Err(e) = serde_json::from_str::<serde_json::Value>(&content) {
+                    errors.push(e.to_string());
+                }
+            }
+            "yaml" | "yml" => {
+                if let Err(e) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
+                    errors.push(e.to_string());
+                }
+            }
+            _ => {
+                // Text files are always valid
+            }
+        }
+
+        Ok(ValidationResult {
+            valid: errors.is_empty(),
+            errors,
+        })
+    }
+
+    /// File metadata and git state.
+    async fn handle_info(&self, ctx: &EnvelopeContext, _request_id: u64,
+        _repo_id: &str, _name: &str, fid: u32,
+    ) -> Result<FileInfo> {
+        let subject = ctx.subject().to_string();
+        let rel_path = self.fid_rel_path(fid, &subject)?;
+
+        let entry = self.fid_table.get_verified(fid, &subject)
+            .map_err(|e| anyhow!("{}", e))?;
+        let meta = match &entry.state {
+            FidState::Walked { walk_handle, .. } => {
+                walk_handle.metadata().map_err(|e| anyhow!("{}", e))?
+            }
+            FidState::Opened { file, .. } => file.lock().metadata()?,
+        };
+
+        let ext = std::path::Path::new(&rel_path)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        let format = match ext {
+            "toml" => DocFormatEnum::Toml,
+            "json" => DocFormatEnum::Json,
+            "yaml" | "yml" => DocFormatEnum::Yaml,
+            "csv" => DocFormatEnum::Csv,
+            _ => DocFormatEnum::Text,
+        };
+
+        let editing = self.editing_table.fid_has_session(&subject, fid);
+        let dirty = if editing {
+            if let Some(shared) = self.editing_table.get_session(&subject, fid) {
+                shared.lock().unwrap().dirty
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        Ok(FileInfo {
+            path: rel_path,
+            size: meta.len(),
+            format,
+            editing,
+            dirty,
+        })
+    }
+
+    /// Open file for CRDT editing.
+    async fn handle_edit_open(&self, ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str, fid: u32, data: &EditOpenRequest,
+    ) -> Result<()> {
+        let subject = ctx.subject().to_string();
+        let rel_path = self.fid_rel_path(fid, &subject)?;
+        let content = self.read_fid_content(repo_id, name, fid, &subject).await?;
+        let format = Self::to_doc_format(&data.format);
+
+        self.editing_table.open(
+            &subject, fid, repo_id, name, &rel_path, format, &content,
+        ).map_err(|e| anyhow!("{}", e))?;
+
+        Ok(())
+    }
+
+    /// Get current CRDT document state.
+    async fn handle_edit_state(&self, ctx: &EnvelopeContext, _request_id: u64,
+        _repo_id: &str, _name: &str, fid: u32,
+    ) -> Result<String> {
+        let subject = ctx.subject().to_string();
+        let shared = self.editing_table.get_session(&subject, fid)
+            .ok_or_else(|| anyhow!("no active editing session for fid {}", fid))?;
+
+        let sd = shared.lock().unwrap();
+        // Get the content value from the automerge document
+        let content = sd.doc.get(automerge::ROOT, "content")
+            .ok()
+            .flatten()
+            .map(|(val, _)| match val {
+                automerge::Value::Scalar(s) => match s.as_ref() {
+                    automerge::ScalarValue::Str(s) => s.to_string(),
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            })
+            .unwrap_or_default();
+
+        Ok(content)
+    }
+
+    /// Apply automerge CRDT change.
+    async fn handle_edit_apply(&self, ctx: &EnvelopeContext, _request_id: u64,
+        _repo_id: &str, _name: &str, fid: u32, data: &EditApplyRequest,
+    ) -> Result<()> {
+        let subject = ctx.subject().to_string();
+        let shared = self.editing_table.get_session(&subject, fid)
+            .ok_or_else(|| anyhow!("no active editing session for fid {}", fid))?;
+
+        let mut sd = shared.lock().unwrap();
+        sd.doc.load_incremental(&data.change_bytes)?;
+        sd.dirty = true;
+
+        Ok(())
+    }
+
+    /// Close CRDT editing session.
+    async fn handle_edit_close(&self, ctx: &EnvelopeContext, _request_id: u64,
+        _repo_id: &str, _name: &str, fid: u32,
+    ) -> Result<()> {
+        let subject = ctx.subject().to_string();
+        if !self.editing_table.close(&subject, fid) {
+            anyhow::bail!("no active editing session for fid {}", fid);
+        }
+        Ok(())
+    }
+
+    /// Write CRDT state to disk file.
+    async fn handle_ctl_flush(&self, ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str, fid: u32,
+    ) -> Result<()> {
+        let subject = ctx.subject().to_string();
+        let rel_path = self.fid_rel_path(fid, &subject)?;
+        let shared = self.editing_table.get_session(&subject, fid)
+            .ok_or_else(|| anyhow!("no active editing session for fid {}", fid))?;
+
+        // Read current file hash and compare with stored hash
+        let root = self.get_contained_root(repo_id, name).await
+            .map_err(|e| anyhow!("{}", e))?;
+        let current_hash = {
+            let file = root.open_file(&rel_path, false, false, false, false, false)
+                .map_err(|e| anyhow!("{}", e))?;
+            let mut data = Vec::new();
+            std::io::BufReader::new(file).read_to_end(&mut data)?;
+            editing::sha256_hash(&data)
+        };
+
+        let mut sd = shared.lock().unwrap();
+
+        // Check for external modifications
+        if current_hash != sd.file_hash {
+            anyhow::bail!("file modified externally since editOpen; cannot flush");
+        }
+
+        // Get content from CRDT doc
+        let content = sd.doc.get(automerge::ROOT, "content")
+            .ok()
+            .flatten()
+            .map(|(val, _)| match val {
+                automerge::Value::Scalar(s) => match s.as_ref() {
+                    automerge::ScalarValue::Str(s) => s.to_string(),
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            })
+            .unwrap_or_default();
+
+        // Write to disk (write=true, truncate=true)
+        let mut file = root.open_file(&rel_path, true, false, true, false, false)
+            .map_err(|e| anyhow!("{}", e))?;
+        use std::io::Write as _;
+        file.write_all(content.as_bytes())?;
+        file.flush()?;
+
+        // Update stored hash and clear dirty flag
+        sd.file_hash = editing::sha256_hash(content.as_bytes());
+        sd.dirty = false;
+
+        Ok(())
+    }
+}
+
 // Generated WorktreeHandler Implementation — 9P2000-inspired protocol
 // ============================================================================
 
@@ -1903,6 +2367,10 @@ impl WorktreeHandler for RegistryService {
         _repo_id: &str, _name: &str, data: &NpWrite,
     ) -> Result<RWrite> {
         let subject = ctx.subject().to_string();
+        // Guard: reject direct writes to files with active CRDT editing sessions
+        if self.editing_table.fid_has_session(&subject, data.fid) {
+            anyhow::bail!("fid {} is open for CRDT editing, use ctl edit-apply instead", data.fid);
+        }
         let entry = self.fid_table.get_verified(data.fid, &subject)
             .map_err(|e| anyhow!("{}", e))?;
 
@@ -1931,6 +2399,8 @@ impl WorktreeHandler for RegistryService {
         _repo_id: &str, _name: &str, data: &NpClunk,
     ) -> Result<()> {
         let subject = ctx.subject().to_string();
+        // Clean up any CRDT editing session for this fid
+        self.editing_table.on_clunk(&subject, data.fid);
         let _entry = self.fid_table.remove(data.fid, &subject)
             .ok_or_else(|| anyhow!("fid {} not found or not owned", data.fid))?;
         // File is dropped here, closing the fd

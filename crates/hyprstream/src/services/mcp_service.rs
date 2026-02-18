@@ -154,12 +154,12 @@ impl ToolRegistry {
 /// Register all tools discovered from schema metadata.
 ///
 /// Each service's schema_metadata() + scoped variants are iterated.
+/// Scoped tools are discovered by recursively walking `scoped_client_tree()`.
 /// Scope and streaming flags are read from MethodSchema.
 fn register_schema_tools(reg: &mut ToolRegistry) {
     use crate::services::generated::{
         model_client, registry_client, policy_client, inference_client,
     };
-
     // Each service generates its own MethodSchema type, so we use a macro
     // to iterate each service's methods with the correct type.
     macro_rules! register_top_level {
@@ -198,36 +198,108 @@ fn register_schema_tools(reg: &mut ToolRegistry) {
     register_top_level!(reg, policy_client::schema_metadata());
     register_top_level!(reg, inference_client::schema_metadata());
 
-    // Scoped: registry.repo.*
-    {
-        let (_, _, repo_methods) = registry_client::repo_schema_metadata();
-        for method in repo_methods {
-            let tool_name = format!("registry.repo.{}", method.name);
+    // Scoped tools: recursive tree walk for all services with nested scopes
+    register_scoped_tools_recursive(reg, "registry", registry_client::scoped_client_tree(), "registry", &[]);
+    register_scoped_tools_recursive(reg, "model", model_client::scoped_client_tree(), "model", &[]);
+}
 
+/// Accumulated scope info: (scope_name, field_name, capnp_type) for building the
+/// `call_scoped_method` scope chain and injecting scope fields into JSON schemas.
+type ScopeInfo = (&'static str, &'static str, &'static str); // (scope_name, field_name, type)
+
+/// Recursively walk the scoped client tree, registering MCP tools at every level.
+///
+/// Each tree node represents a scope (e.g., `repo`, `worktree`, `ctl`) with a scope
+/// field that gets injected into the JSON schema and extracted in the handler to build
+/// the scope chain for `call_scoped_method`.
+fn register_scoped_tools_recursive(
+    reg: &mut ToolRegistry,
+    service_name: &str,
+    nodes: &'static [hyprstream_rpc::service::metadata::ScopedClientTreeNode],
+    prefix: &str,
+    parent_scopes: &[ScopeInfo],
+) {
+    for node in nodes {
+        let new_prefix = format!("{}.{}", prefix, node.scope_name);
+        let (_, _, methods) = (node.metadata_fn)();
+
+        // Accumulate: parents + this node's (scope_name, field_name, type)
+        let mut scopes: Vec<ScopeInfo> = parent_scopes.to_vec();
+        if !node.scope_field.is_empty() {
+            let field_type = match node.scope_field {
+                "fid" => "UInt32",
+                _ => "Text",
+            };
+            scopes.push((node.scope_name, node.scope_field, field_type));
+        }
+
+        for method in methods {
+            // Skip streaming methods — call_scoped_method has no streaming path yet
+            if method.is_streaming {
+                continue;
+            }
+
+            let tool_name = format!("{}.{}", new_prefix, method.name);
+
+            // Build JSON schema: method params + all scope fields from ancestors
             let params: Vec<(&str, &str, bool, &str)> = method.params.iter()
                 .map(|p| (p.name, p.type_name, p.required, p.description))
                 .collect();
             let mut json_schema = params_to_json_schema(&params);
             if let Value::Object(ref mut map) = json_schema {
+                let existing_props: Vec<String> = map.get("properties")
+                    .and_then(|p| p.as_object())
+                    .map(|p| p.keys().cloned().collect())
+                    .unwrap_or_default();
+
                 if let Some(Value::Object(ref mut props)) = map.get_mut("properties") {
-                    props.insert("repo_id".into(), serde_json::json!({"type": "string", "description": "Repository ID"}));
+                    for &(_, field_name, field_type) in &scopes {
+                        // Skip scope fields that collide with method params
+                        if existing_props.contains(&field_name.to_owned()) {
+                            continue;
+                        }
+                        let json_type = match field_type {
+                            "UInt8" | "UInt16" | "UInt32" | "UInt64" |
+                            "Int8" | "Int16" | "Int32" | "Int64" => "integer",
+                            "Float32" | "Float64" => "number",
+                            "Bool" => "boolean",
+                            _ => "string",
+                        };
+                        props.insert(field_name.into(), serde_json::json!({
+                            "type": json_type,
+                            "description": field_name,
+                        }));
+                    }
                 }
                 if let Some(Value::Array(ref mut req)) = map.get_mut("required") {
-                    req.insert(0, Value::String("repo_id".into()));
+                    for (i, &(_, field_name, _)) in scopes.iter().enumerate() {
+                        // Avoid duplicate required entries
+                        let field_str = Value::String(field_name.into());
+                        if !req.contains(&field_str) {
+                            req.insert(i, field_str);
+                        }
+                    }
                 }
             }
 
             let method_name = method.name.to_owned();
+            let service = service_name.to_owned();
             let description = if method.description.is_empty() {
-                format!("registry.repo::{}", method.name)
+                format!("{}::{}", new_prefix, method.name)
             } else {
                 method.description.to_owned()
             };
             let required_scope = if !method.scope.is_empty() {
                 method.scope.to_owned()
             } else {
-                "query:registry:*".into()
+                format!("query:{}:*", service_name)
             };
+
+            // Capture (scope_name, field_name) pairs for the handler closure
+            let scope_pairs: Vec<(String, String)> = scopes.iter()
+                .map(|&(scope_name, field_name, _)| (scope_name.to_owned(), field_name.to_owned()))
+                .collect();
+
             reg.register(ToolEntry {
                 uuid: Uuid::new_v5(&MCP_NS, tool_name.as_bytes()),
                 name: tool_name.clone(),
@@ -237,134 +309,64 @@ fn register_schema_tools(reg: &mut ToolRegistry) {
                 streaming: false,
                 handler: Arc::new(move |ctx| {
                     let method = method_name.clone();
+                    let service = service.clone();
+                    let scope_pairs = scope_pairs.clone();
                     Box::pin(async move {
-                        let repo_id = ctx.args["repo_id"].as_str()
-                            .ok_or_else(|| anyhow::anyhow!("missing repo_id"))?;
-                        let client: GenRegistryClient = crate::services::core::create_service_client(
-                            &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
-                            ctx.signing_key, ctx.identity.clone(),
-                        );
-                        let gen_repo = client.repo(repo_id);
-                        let result = gen_repo.call_method(&method, &ctx.args).await?;
-                        Ok(ToolResult::Sync(result))
+                        // Build scope chain from args: [("repo", repo_id_val), ("worktree", name_val), ...]
+                        let scope_chain: Vec<(String, String)> = scope_pairs.iter()
+                            .map(|(scope_name, field_name)| {
+                                // Extract value — handle both string and numeric JSON values
+                                let val_str = ctx.args.get(field_name.as_str())
+                                    .map(|v| match v {
+                                        Value::String(s) => s.clone(),
+                                        Value::Number(n) => n.to_string(),
+                                        _ => v.to_string(),
+                                    })
+                                    .unwrap_or_default();
+                                (scope_name.clone(), val_str)
+                            })
+                            .collect();
+
+                        let scope_refs: Vec<(&str, &str)> = scope_chain.iter()
+                            .map(|(s, v)| (s.as_str(), v.as_str()))
+                            .collect();
+
+                        dispatch_scoped_call(&service, &scope_refs, &method, &ctx).await
                     })
                 }),
             });
         }
+
+        // Recurse into nested scopes
+        register_scoped_tools_recursive(reg, service_name, node.nested, &new_prefix, &scopes);
     }
+}
 
-    // Scoped: model.ttt.*, model.peft.*, model.infer.*
-    {
-        let scoped_metadata: &[(&str, fn() -> (&'static str, &'static str, &'static [model_client::MethodSchema]))] = &[
-            ("ttt", model_client::ttt_schema_metadata),
-            ("peft", model_client::peft_schema_metadata),
-            ("infer", model_client::infer_schema_metadata),
-        ];
-
-        for &(scope_name, metadata_fn) in scoped_metadata {
-            let (_, _, methods) = metadata_fn();
-
-            for method in methods {
-                let tool_name = format!("model.{scope_name}.{}", method.name);
-
-                let params: Vec<(&str, &str, bool, &str)> = method.params.iter()
-                    .map(|p| (p.name, p.type_name, p.required, p.description))
-                    .collect();
-                let mut json_schema = params_to_json_schema(&params);
-                if let Value::Object(ref mut map) = json_schema {
-                    if let Some(Value::Object(ref mut props)) = map.get_mut("properties") {
-                        props.insert("model_ref".into(), serde_json::json!({"type": "string", "description": "Model reference"}));
-                    }
-                    if let Some(Value::Array(ref mut req)) = map.get_mut("required") {
-                        req.insert(0, Value::String("model_ref".into()));
-                    }
-                }
-
-                let method_name = method.name.to_owned();
-                let scope = scope_name.to_owned();
-                let description = if method.description.is_empty() {
-                    format!("model.{scope_name}::{}", method.name)
-                } else {
-                    method.description.to_owned()
-                };
-                let required_scope = if !method.scope.is_empty() {
-                    method.scope.to_owned()
-                } else {
-                    "query:model:*".into()
-                };
-
-                if method.is_streaming {
-                    // Streaming handler: DH keypair + call_streaming_method on scoped client + StreamHandle
-                    reg.register(ToolEntry {
-                        uuid: Uuid::new_v5(&MCP_NS, tool_name.as_bytes()),
-                        name: tool_name.clone(),
-                        description,
-                        args_schema: json_schema,
-                        required_scope,
-                        streaming: true,
-                        handler: Arc::new(move |ctx| {
-                            let method = method_name.clone();
-                            let scope = scope.clone();
-                            Box::pin(async move {
-                                let model_ref = ctx.args["model_ref"].as_str()
-                                    .ok_or_else(|| anyhow::anyhow!("missing model_ref"))?;
-
-                                let (client_secret, client_pubkey) = hyprstream_rpc::generate_ephemeral_keypair();
-                                let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
-
-                                let client = ModelZmqClient::new(ctx.signing_key, ctx.identity.clone());
-                                let stream_info_json = match scope.as_str() {
-                                    "ttt" => client.gen.ttt(model_ref).call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?,
-                                    "peft" => client.gen.peft(model_ref).call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?,
-                                    "infer" => client.gen.infer(model_ref).call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?,
-                                    _ => anyhow::bail!("Unknown scope: {}", scope),
-                                };
-
-                                let (stream_id, endpoint, server_pubkey) = parse_stream_info(&stream_info_json)?;
-
-                                let handle = StreamHandle::new(
-                                    &ctx.zmq_context,
-                                    stream_id,
-                                    &endpoint,
-                                    &server_pubkey,
-                                    &client_secret,
-                                    &client_pubkey_bytes,
-                                )?;
-
-                                Ok(ToolResult::Stream(handle))
-                            })
-                        }),
-                    });
-                } else {
-                    // Sync handler: call method via the appropriate scoped client
-                    reg.register(ToolEntry {
-                        uuid: Uuid::new_v5(&MCP_NS, tool_name.as_bytes()),
-                        name: tool_name.clone(),
-                        description,
-                        args_schema: json_schema,
-                        required_scope,
-                        streaming: false,
-                        handler: Arc::new(move |ctx| {
-                            let method = method_name.clone();
-                            let scope = scope.clone();
-                            Box::pin(async move {
-                                let model_ref = ctx.args["model_ref"].as_str()
-                                    .ok_or_else(|| anyhow::anyhow!("missing model_ref"))?;
-                                let client = ModelZmqClient::new(ctx.signing_key, ctx.identity.clone());
-                                let result = match scope.as_str() {
-                                    "ttt" => client.gen.ttt(model_ref).call_method(&method, &ctx.args).await?,
-                                    "peft" => client.gen.peft(model_ref).call_method(&method, &ctx.args).await?,
-                                    "infer" => client.gen.infer(model_ref).call_method(&method, &ctx.args).await?,
-                                    _ => anyhow::bail!("Unknown scope: {}", scope),
-                                };
-                                Ok(ToolResult::Sync(result))
-                            })
-                        }),
-                    });
-                }
-            }
+/// Dispatch a scoped method call to the appropriate service client.
+///
+/// Builds the service-specific client and calls `call_scoped_method` with the
+/// scope chain (e.g., `[("repo", "abc-123"), ("worktree", "main")]`).
+async fn dispatch_scoped_call(
+    service: &str,
+    scopes: &[(&str, &str)],
+    method: &str,
+    ctx: &ToolCallContext,
+) -> anyhow::Result<ToolResult> {
+    let result = match service {
+        "registry" => {
+            let client: GenRegistryClient = crate::services::core::create_service_client(
+                &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
+                ctx.signing_key.clone(), ctx.identity.clone(),
+            );
+            client.call_scoped_method(scopes, method, &ctx.args).await?
         }
-    }
+        "model" => {
+            let client = ModelZmqClient::new(ctx.signing_key.clone(), ctx.identity.clone());
+            client.gen.call_scoped_method(scopes, method, &ctx.args).await?
+        }
+        _ => anyhow::bail!("No scoped dispatch for service: {service}"),
+    };
+    Ok(ToolResult::Sync(result))
 }
 
 fn register_sync_tool(
@@ -465,7 +467,8 @@ fn params_to_json_schema(params: &[(&str, &str, bool, &str)]) -> Value {
         let json_type = match type_name {
             "Text" | "Data" => "string",
             "Bool" => "boolean",
-            "UInt32" | "UInt64" | "Int32" | "Int64" => "integer",
+            "UInt8" | "UInt16" | "UInt32" | "UInt64" |
+            "Int8" | "Int16" | "Int32" | "Int64" => "integer",
             "Float32" | "Float64" => "number",
             t if t.starts_with("List(") => "array",
             _ => "string",

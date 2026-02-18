@@ -859,13 +859,31 @@ fn generate_scope_handler_traits(
 ) -> TokenStream {
     let mut tokens = TokenStream::new();
     for sc in scoped_clients {
-        // Generate nested traits FIRST (so super-trait bounds resolve)
-        for nc in &sc.nested_clients {
-            tokens.extend(generate_nested_scope_handler_trait(nc, sc, resolved));
-        }
-        tokens.extend(generate_scope_handler_trait(sc, resolved));
+        walk_scope_handler_traits(&mut tokens, sc, &[], resolved);
     }
     tokens
+}
+
+/// Recursively walk the scope tree generating handler traits (deepest first).
+fn walk_scope_handler_traits(
+    tokens: &mut TokenStream,
+    sc: &ScopedClient,
+    ancestors: &[&ScopedClient],
+    resolved: &ResolvedSchema,
+) {
+    // Generate nested traits FIRST (so super-trait bounds resolve)
+    let mut next_ancestors: Vec<&ScopedClient> = ancestors.to_vec();
+    next_ancestors.push(sc);
+    for nc in &sc.nested_clients {
+        walk_scope_handler_traits(tokens, nc, &next_ancestors, resolved);
+    }
+
+    // Then generate this level's trait
+    if ancestors.is_empty() {
+        tokens.extend(generate_scope_handler_trait(sc, resolved));
+    } else {
+        tokens.extend(generate_nested_scope_handler_trait(sc, ancestors, resolved));
+    }
 }
 
 /// Generate a single scope handler trait (e.g., `RepoHandler`).
@@ -930,25 +948,28 @@ fn generate_scope_handler_trait(
     }
 }
 
-/// Generate a nested scope handler trait (e.g., `WorktreeHandler`).
+/// Generate a nested scope handler trait (e.g., `WorktreeHandler`, `CtlHandler`).
 ///
-/// Nested scope handler methods receive BOTH parent scope fields AND own scope fields.
+/// Nested scope handler methods receive ALL ancestor scope fields AND own scope fields.
+/// `ancestors` contains all scopes above this one (e.g., for CtlHandler: [RepoScope, WorktreeScope]).
 fn generate_nested_scope_handler_trait(
     nc: &ScopedClient,
-    parent: &ScopedClient,
+    ancestors: &[&ScopedClient],
     resolved: &ResolvedSchema,
 ) -> TokenStream {
     let trait_name = format_ident!("{}Handler", to_pascal_case(&nc.factory_name));
     let doc = format!("Generated handler trait for the nested {} scope.", nc.factory_name);
 
-    // Parent scope field params (e.g., `repo_id: &str`)
-    let parent_scope_field_params: Vec<TokenStream> = parent.scope_fields.iter().map(|f| {
-        let name = resolved.name(&f.name).snake_ident.clone();
-        let ty = rust_type_tokens(&resolved.resolve_type(&f.type_name).rust_param);
-        quote! { #name: #ty }
-    }).collect();
+    // All ancestor scope field params (e.g., `repo_id: &str, name: &str`)
+    let ancestor_scope_field_params: Vec<TokenStream> = ancestors.iter()
+        .flat_map(|a| &a.scope_fields)
+        .map(|f| {
+            let name = resolved.name(&f.name).snake_ident.clone();
+            let ty = rust_type_tokens(&resolved.resolve_type(&f.type_name).rust_param);
+            quote! { #name: #ty }
+        }).collect();
 
-    // Own scope field params (e.g., `name: &str`)
+    // Own scope field params (e.g., `fid: u32`)
     let own_scope_field_params: Vec<TokenStream> = nc.scope_fields.iter().map(|f| {
         let name = resolved.name(&f.name).snake_ident.clone();
         let ty = rust_type_tokens(&resolved.resolve_type(&f.type_name).rust_param);
@@ -968,16 +989,32 @@ fn generate_nested_scope_handler_trait(
             };
             quote! {
                 #[doc = #doc_str]
-                async fn #method_name(&self, ctx: &hyprstream_rpc::service::EnvelopeContext, request_id: u64 #(, #parent_scope_field_params)* #(, #own_scope_field_params)* #(, #params)*) -> anyhow::Result<#return_type>;
+                async fn #method_name(&self, ctx: &hyprstream_rpc::service::EnvelopeContext, request_id: u64 #(, #ancestor_scope_field_params)* #(, #own_scope_field_params)* #(, #params)*) -> anyhow::Result<#return_type>;
             }
         })
         .collect();
 
-    quote! {
-        #[doc = #doc]
-        #[async_trait::async_trait(?Send)]
-        pub trait #trait_name {
-            #(#methods)*
+    // If this nested scope itself has nested clients, add super-trait bounds
+    if nc.nested_clients.is_empty() {
+        quote! {
+            #[doc = #doc]
+            #[async_trait::async_trait(?Send)]
+            pub trait #trait_name {
+                #(#methods)*
+            }
+        }
+    } else {
+        let nested_bounds: Vec<TokenStream> = nc.nested_clients.iter().map(|inner_nc| {
+            let nested_trait = format_ident!("{}Handler", to_pascal_case(&inner_nc.factory_name));
+            quote! { #nested_trait }
+        }).collect();
+
+        quote! {
+            #[doc = #doc]
+            #[async_trait::async_trait(?Send)]
+            pub trait #trait_name: #(#nested_bounds)+* {
+                #(#methods)*
+            }
         }
     }
 }
@@ -1055,13 +1092,33 @@ fn generate_scope_dispatch_fns(
 ) -> TokenStream {
     let mut tokens = TokenStream::new();
     for sc in scoped_clients {
-        // Generate nested dispatch functions FIRST
-        for nc in &sc.nested_clients {
-            tokens.extend(generate_nested_scope_dispatch_fn(pascal, capnp_mod, sc, nc, resolved));
-        }
-        tokens.extend(generate_scope_dispatch_fn(pascal, capnp_mod, sc, resolved));
+        walk_scope_dispatch_fns(&mut tokens, pascal, capnp_mod, sc, &[], resolved);
     }
     tokens
+}
+
+/// Recursively walk the scope tree generating dispatch functions (deepest first).
+fn walk_scope_dispatch_fns(
+    tokens: &mut TokenStream,
+    pascal: &str,
+    capnp_mod: &syn::Ident,
+    sc: &ScopedClient,
+    ancestors: &[&ScopedClient],
+    resolved: &ResolvedSchema,
+) {
+    // Generate nested dispatch functions FIRST
+    let mut next_ancestors: Vec<&ScopedClient> = ancestors.to_vec();
+    next_ancestors.push(sc);
+    for nc in &sc.nested_clients {
+        walk_scope_dispatch_fns(tokens, pascal, capnp_mod, nc, &next_ancestors, resolved);
+    }
+
+    // Then generate this level's dispatch function
+    if ancestors.is_empty() {
+        tokens.extend(generate_scope_dispatch_fn(pascal, capnp_mod, sc, resolved));
+    } else {
+        tokens.extend(generate_nested_scope_dispatch_fn(pascal, capnp_mod, ancestors, sc, resolved));
+    }
 }
 
 /// Generate a single scope dispatch function (e.g., `dispatch_runtime()`).
@@ -1130,17 +1187,17 @@ fn generate_scope_dispatch_fn(
     }
 }
 
-/// Generate a nested scope dispatch function (e.g., `dispatch_worktree()`).
+/// Generate a nested scope dispatch function (e.g., `dispatch_worktree()`, `dispatch_ctl()`).
 ///
-/// This handles 3-level dispatch: receives raw bytes from the parent scope dispatch,
-/// re-reads the outer request, navigates outer → parent → nested scope, extracts
-/// both parent + own scope fields, then dispatches the nested inner union.
+/// This handles N-level dispatch: receives raw bytes from the parent scope dispatch,
+/// re-reads the outer request, navigates outer → ancestor[0] → ... → nested scope,
+/// extracts all ancestor + own scope fields, then dispatches the nested inner union.
 ///
-/// The serializer wraps 3 levels: outer response → parent_result → nested_result → variant.
+/// `ancestors` contains all scopes above this one (e.g., for ctl: [repo, worktree]).
 fn generate_nested_scope_dispatch_fn(
     pascal: &str,
     capnp_mod: &syn::Ident,
-    parent: &ScopedClient,
+    ancestors: &[&ScopedClient],
     nc: &ScopedClient,
     resolved: &ResolvedSchema,
 ) -> TokenStream {
@@ -1148,15 +1205,17 @@ fn generate_nested_scope_dispatch_fn(
     let parent_trait = format_ident!("{}Handler", pascal);
     let nested_trait = format_ident!("{}Handler", to_pascal_case(&nc.factory_name));
     let serializer_fn = format_ident!("serialize_{}_response", to_snake_case(&nc.factory_name));
+    let depth = ancestors.len() + 1; // +1 for the nested scope itself
     let doc = format!(
-        "Dispatch a nested {} scope request: 3-level extraction, async handler (two-phase for Send safety).",
-        nc.factory_name
+        "Dispatch a nested {} scope request: {}-level extraction, async handler (two-phase for Send safety).",
+        nc.factory_name, depth + 1 // +1 for outer request
     );
 
-    // Parent and nested scope field idents
-    let parent_scope_idents: Vec<syn::Ident> = parent.scope_fields.iter().map(|f| {
-        resolved.name(&f.name).snake_ident.clone()
-    }).collect();
+    // All ancestor scope field idents (for dispatch phase)
+    let all_ancestor_scope_idents: Vec<syn::Ident> = ancestors.iter()
+        .flat_map(|a| &a.scope_fields)
+        .map(|f| resolved.name(&f.name).snake_ident.clone())
+        .collect();
 
     let nested_scope_idents: Vec<syn::Ident> = nc.scope_fields.iter().map(|f| {
         resolved.name(&f.name).snake_ident.clone()
@@ -1164,21 +1223,23 @@ fn generate_nested_scope_dispatch_fn(
 
     let service_name_lower = to_snake_case(pascal);
 
-    // The dispatch function receives parent_scope_idents from its parent dispatch function
-    let parent_scope_params: Vec<TokenStream> = parent.scope_fields.iter().map(|f| {
-        let name = resolved.name(&f.name).snake_ident.clone();
-        let ty = rust_type_tokens(&resolved.resolve_type(&f.type_name).rust_param);
-        quote! { #name: #ty }
-    }).collect();
+    // The dispatch function receives all ancestor scope fields from its parent dispatch function
+    let all_ancestor_scope_params: Vec<TokenStream> = ancestors.iter()
+        .flat_map(|a| &a.scope_fields)
+        .map(|f| {
+            let name = resolved.name(&f.name).snake_ident.clone();
+            let ty = rust_type_tokens(&resolved.resolve_type(&f.type_name).rust_param);
+            quote! { #name: #ty }
+        }).collect();
 
     // Generate helper types and phases
     let variant_tag_enum = generate_scope_variant_tag_enum(nc, resolved);
     let params_enum = generate_scope_params_enum(nc, resolved);
-    let extraction_phase = generate_nested_scope_extraction_phase(pascal, capnp_mod, parent, nc, resolved);
+    let extraction_phase = generate_nested_scope_extraction_phase(pascal, capnp_mod, ancestors, nc, resolved);
     let dispatch_phase = generate_nested_scope_dispatch_phase(
         nc,
         resolved,
-        &parent_scope_idents,
+        &all_ancestor_scope_idents,
         &nested_scope_idents,
         &parent_trait,
         &nested_trait,
@@ -1192,7 +1253,7 @@ fn generate_nested_scope_dispatch_fn(
             handler: &H,
             ctx: &hyprstream_rpc::service::EnvelopeContext,
             request_id: u64,
-            #(#parent_scope_params,)*
+            #(#all_ancestor_scope_params,)*
             payload: &[u8],
         ) -> anyhow::Result<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
             // Phase 1: Extract all Cap'n Proto data to owned types
@@ -1223,13 +1284,33 @@ fn generate_scope_response_serializers(
 ) -> TokenStream {
     let mut tokens = TokenStream::new();
     for sc in scoped_clients {
-        // Generate nested serializers FIRST
-        for nc in &sc.nested_clients {
-            tokens.extend(generate_nested_scope_response_serializer(pascal, capnp_mod, sc, nc, resolved));
-        }
-        tokens.extend(generate_scope_response_serializer(pascal, capnp_mod, sc, resolved));
+        walk_scope_response_serializers(&mut tokens, pascal, capnp_mod, sc, &[], resolved);
     }
     tokens
+}
+
+/// Recursively walk the scope tree generating response serializers (deepest first).
+fn walk_scope_response_serializers(
+    tokens: &mut TokenStream,
+    pascal: &str,
+    capnp_mod: &syn::Ident,
+    sc: &ScopedClient,
+    ancestors: &[&ScopedClient],
+    resolved: &ResolvedSchema,
+) {
+    // Generate nested serializers FIRST
+    let mut next_ancestors: Vec<&ScopedClient> = ancestors.to_vec();
+    next_ancestors.push(sc);
+    for nc in &sc.nested_clients {
+        walk_scope_response_serializers(tokens, pascal, capnp_mod, nc, &next_ancestors, resolved);
+    }
+
+    // Then generate this level's serializer
+    if ancestors.is_empty() {
+        tokens.extend(generate_scope_response_serializer(pascal, capnp_mod, sc, resolved));
+    } else {
+        tokens.extend(generate_nested_scope_response_serializer(pascal, capnp_mod, ancestors, sc, resolved));
+    }
 }
 
 /// Generate a single scope response serializer (e.g., `serialize_runtime_response()`).
@@ -1344,29 +1425,50 @@ fn generate_scope_serializer_arm(
     }
 }
 
-/// Generate a nested scope response serializer (e.g., `serialize_worktree_response()`).
+/// Generate a nested scope response serializer (e.g., `serialize_worktree_response()`,
+/// `serialize_ctl_response()`).
 ///
-/// Wraps 3 levels: outer response → parent_result → nested_result → variant.
+/// Wraps N+1 levels: outer response → ancestor[0]_result → ... → nc_result → variant.
+/// `ancestors` contains all scopes above this one.
 fn generate_nested_scope_response_serializer(
     pascal: &str,
     capnp_mod: &syn::Ident,
-    parent: &ScopedClient,
+    ancestors: &[&ScopedClient],
     nc: &ScopedClient,
     resolved: &ResolvedSchema,
 ) -> TokenStream {
     let fn_name = format_ident!("serialize_{}_response", to_snake_case(&nc.factory_name));
     let response_type = format_ident!("{}ResponseVariant", nc.client_name);
     let resp_snake = format_ident!("{}", to_snake_case(&format!("{pascal}Response")));
-    let parent_result_init = format_ident!("init_{}", to_snake_case(&format!("{}Result", parent.factory_name)));
-    let nested_result_init = format_ident!("init_{}", to_snake_case(&format!("{}Result", nc.factory_name)));
+    let depth = ancestors.len() + 1;
     let doc = format!(
-        "Serialize a nested {} scope response variant to Cap'n Proto bytes (3-level wrap).",
-        nc.factory_name
+        "Serialize a nested {} scope response variant to Cap'n Proto bytes ({}-level wrap).",
+        nc.factory_name, depth + 1 // +1 for outer response
     );
 
     let match_arms: Vec<TokenStream> = nc.inner_response_variants.iter()
         .map(|v| generate_scope_serializer_arm(&response_type, v, resolved))
         .collect();
+
+    // Build the chain of init_ calls: resp.init_ancestor[0]_result().init_ancestor[1]_result()...init_nc_result()
+    // All ancestors + nc itself form the full chain of scopes to wrap
+    let full_chain: Vec<&ScopedClient> = ancestors.iter().copied().chain(std::iter::once(nc)).collect();
+
+    // Generate the init chain as sequential let bindings
+    let mut init_stmts = Vec::new();
+    for (i, scope) in full_chain.iter().enumerate() {
+        let init_fn = format_ident!("init_{}", to_snake_case(&format!("{}Result", scope.factory_name)));
+        if i == 0 {
+            // First level: init from resp
+            init_stmts.push(quote! { let __lvl = resp.#init_fn(); });
+        } else if i == full_chain.len() - 1 {
+            // Last level: bind to `inner` (mutable)
+            init_stmts.push(quote! { let mut inner = __lvl.#init_fn(); });
+        } else {
+            // Intermediate levels: chain through __lvl
+            init_stmts.push(quote! { let __lvl = __lvl.#init_fn(); });
+        }
+    }
 
     quote! {
         #[doc = #doc]
@@ -1374,8 +1476,7 @@ fn generate_nested_scope_response_serializer(
             hyprstream_rpc::serialize_message(|msg| {
                 let mut resp = msg.init_root::<crate::#capnp_mod::#resp_snake::Builder>();
                 resp.set_request_id(request_id);
-                let mid = resp.#parent_result_init();
-                let mut inner = mid.#nested_result_init();
+                #(#init_stmts)*
                 match variant {
                     #(#match_arms)*
                 }
@@ -1838,26 +1939,18 @@ fn generate_scope_dispatch_phase(
     }
 }
 
-/// Generate extraction phase for nested scope dispatch (3rd level).
+/// Generate extraction phase for nested scope dispatch (N-level).
+///
+/// Navigates outer → ancestor[0] → ancestor[1] → ... → nc, extracts nc's scope fields
+/// and inner union variant. `ancestors` contains all scopes above nc.
 fn generate_nested_scope_extraction_phase(
     pascal: &str,
     capnp_mod: &syn::Ident,
-    parent: &ScopedClient,
+    ancestors: &[&ScopedClient],
     nc: &ScopedClient,
     resolved: &ResolvedSchema,
 ) -> TokenStream {
     let outer_req_snake = format_ident!("{}", to_snake_case(&format!("{pascal}Request")));
-    let parent_variant_pascal = format_ident!("{}", to_pascal_case(&parent.factory_name));
-    let nested_variant_pascal = format_ident!("{}", to_pascal_case(&nc.factory_name));
-
-    let parent_base_name = parent.client_name.trim_end_matches("Client");
-    let parent_inner_req_mod = format_ident!("{}_request", to_capnp_module_name(parent_base_name));
-
-    let nested_base_name = nc.client_name.trim_end_matches("Client");
-    let nested_inner_req_mod = format_ident!("{}_request", to_capnp_module_name(nested_base_name));
-
-    let bail_parent_msg = format!("expected {} scope in request", parent.factory_name);
-    let bail_nested_msg = format!("expected {} scope in {} request", nc.factory_name, parent.factory_name);
 
     let tag_enum = format_ident!("{}VariantTag", to_pascal_case(&nc.factory_name));
     let params_enum = format_ident!("{}Params", to_pascal_case(&nc.factory_name));
@@ -1867,7 +1960,57 @@ fn generate_nested_scope_extraction_phase(
         resolved.name(&f.name).snake_ident.clone()
     }).collect();
 
-    // Nested scope field extractions
+    // Build the navigation chain: outer → ancestor[0] → ancestor[1] → ... → nc
+    // The full chain of scopes to navigate through (ancestors + nc)
+    let full_chain: Vec<&ScopedClient> = ancestors.iter().copied().chain(std::iter::once(nc)).collect();
+
+    // Generate navigation statements to drill down to nc's inner request
+    let mut nav_stmts = Vec::new();
+
+    for (i, scope) in full_chain.iter().enumerate() {
+        let variant_pascal = format_ident!("{}", to_pascal_case(&scope.factory_name));
+
+        if i == 0 {
+            // First level: navigate from outer request
+            let bail_msg = format!("expected {} scope in request", scope.factory_name);
+            nav_stmts.push(quote! {
+                let __nav = match req.which()? {
+                    crate::#capnp_mod::#outer_req_snake::Which::#variant_pascal(r) => r?,
+                    _ => anyhow::bail!(#bail_msg),
+                };
+            });
+        } else if i < full_chain.len() - 1 {
+            // Intermediate levels: navigate through parent's inner union
+            let prev = full_chain[i - 1];
+            let prev_base = prev.client_name.trim_end_matches("Client");
+            let prev_req_mod = format_ident!("{}_request", to_capnp_module_name(prev_base));
+            let which_alias = format_ident!("__NavW{}", i);
+            let bail_msg = format!("expected {} scope in {} request", scope.factory_name, prev.factory_name);
+            nav_stmts.push(quote! {
+                use crate::#capnp_mod::#prev_req_mod::Which as #which_alias;
+                let __nav = match __nav.which()? {
+                    #which_alias::#variant_pascal(r) => r?,
+                    _ => anyhow::bail!(#bail_msg),
+                };
+            });
+        } else {
+            // Last level (nc): navigate to nc's inner request
+            let prev = full_chain[i - 1];
+            let prev_base = prev.client_name.trim_end_matches("Client");
+            let prev_req_mod = format_ident!("{}_request", to_capnp_module_name(prev_base));
+            let which_alias = format_ident!("__NavW{}", i);
+            let bail_msg = format!("expected {} scope in {} request", scope.factory_name, prev.factory_name);
+            nav_stmts.push(quote! {
+                use crate::#capnp_mod::#prev_req_mod::Which as #which_alias;
+                let nested_inner = match __nav.which()? {
+                    #which_alias::#variant_pascal(r) => r?,
+                    _ => anyhow::bail!(#bail_msg),
+                };
+            });
+        }
+    }
+
+    // Nested scope field extractions from nested_inner
     let nested_scope_extractions: Vec<TokenStream> = nc.scope_fields.iter().map(|f| {
         let name = resolved.name(&f.name).snake_ident.clone();
         let getter = format_ident!("get_{}", resolved.name(&f.name).snake);
@@ -1882,6 +2025,10 @@ fn generate_nested_scope_extraction_phase(
             },
         }
     }).collect();
+
+    // nc's inner request module for variant extraction
+    let nested_base_name = nc.client_name.trim_end_matches("Client");
+    let nested_inner_req_mod = format_ident!("{}_request", to_capnp_module_name(nested_base_name));
 
     // Extraction arms for each nested variant
     let extraction_arms: Vec<TokenStream> = nc.inner_request_variants.iter()
@@ -1957,6 +2104,16 @@ fn generate_nested_scope_extraction_phase(
         })
         .collect();
 
+    // Nested extraction arms for nc's own nested clients (if any)
+    let nested_extraction_arms: Vec<TokenStream> = nc.nested_clients.iter().map(|inner_nc| {
+        let variant_pascal = format_ident!("{}", to_pascal_case(&inner_nc.factory_name));
+        quote! {
+            Which::#variant_pascal(_) => {
+                (#tag_enum::#variant_pascal, #params_enum::#variant_pascal)
+            }
+        }
+    }).collect();
+
     quote! {
         let (variant_tag, nested_scope_fields, params) = {
             let reader = capnp::serialize::read_message(
@@ -1965,18 +2122,8 @@ fn generate_nested_scope_extraction_phase(
             )?;
             let req = reader.get_root::<crate::#capnp_mod::#outer_req_snake::Reader>()?;
 
-            // Navigate: outer → parent scope
-            let parent_inner = match req.which()? {
-                crate::#capnp_mod::#outer_req_snake::Which::#parent_variant_pascal(r) => r?,
-                _ => anyhow::bail!(#bail_parent_msg),
-            };
-
-            // Navigate: parent scope → nested scope
-            use crate::#capnp_mod::#parent_inner_req_mod::Which as ParentWhich;
-            let nested_inner = match parent_inner.which()? {
-                ParentWhich::#nested_variant_pascal(r) => r?,
-                _ => anyhow::bail!(#bail_nested_msg),
-            };
+            // Navigate through ancestor scopes to reach nc
+            #(#nav_stmts)*
 
             // Extract nested scope fields
             #(#nested_scope_extractions)*
@@ -1985,6 +2132,7 @@ fn generate_nested_scope_extraction_phase(
             use crate::#capnp_mod::#nested_inner_req_mod::Which;
             let (tag, params) = match nested_inner.which()? {
                 #(#extraction_arms)*
+                #(#nested_extraction_arms)*
                 #[allow(unreachable_patterns)]
                 _ => anyhow::bail!("Unknown request variant"),
             };
@@ -1995,10 +2143,12 @@ fn generate_nested_scope_extraction_phase(
 }
 
 /// Generate dispatch phase for nested scope dispatch.
+///
+/// `ancestor_scope_idents` contains ALL ancestor scope field idents (flattened).
 fn generate_nested_scope_dispatch_phase(
     nc: &ScopedClient,
     resolved: &ResolvedSchema,
-    parent_scope_idents: &[syn::Ident],
+    ancestor_scope_idents: &[syn::Ident],
     nested_scope_idents: &[syn::Ident],
     parent_trait: &syn::Ident,
     nested_trait: &syn::Ident,
@@ -2009,10 +2159,10 @@ fn generate_nested_scope_dispatch_phase(
     let params_enum = format_ident!("{}Params", to_pascal_case(&nc.factory_name));
     let response_type = format_ident!("{}ResponseVariant", nc.client_name);
 
-    // Parent scope fields are already by-ref (function params have &str type),
+    // Ancestor scope fields are already by-ref (function params have &str type),
     // so pass them as-is. Nested scope fields are extracted as owned String,
     // so pass by-ref for Text/Data, by-value for numeric.
-    let parent_scope_args: Vec<TokenStream> = parent_scope_idents.iter().map(|ident| {
+    let parent_scope_args: Vec<TokenStream> = ancestor_scope_idents.iter().map(|ident| {
         quote! { #ident }
     }).collect();
 
@@ -2034,7 +2184,7 @@ fn generate_nested_scope_dispatch_phase(
             // Generate auth check — returns Error(ErrorInfo) on failure instead of propagating via ?
             let auth_stmt = if let Some(action) = parse_scope_for_auth(&v.scope) {
                 let action_str = action.to_owned();
-                let auth_call = if let Some(first_parent_field) = parent_scope_idents.first() {
+                let auth_call = if let Some(first_parent_field) = ancestor_scope_idents.first() {
                     let svc = service_name.to_owned();
                     quote! {
                         #parent_trait::authorize(handler, ctx, &format!("{}:{}", #svc, #first_parent_field), #action_str).await
@@ -2195,10 +2345,23 @@ fn generate_nested_scope_dispatch_phase(
         })
         .collect();
 
+    // Nested client dispatch arms: delegate to nc's own nested dispatch functions
+    let nested_dispatch_arms: Vec<TokenStream> = nc.nested_clients.iter().map(|inner_nc| {
+        let variant_pascal = format_ident!("{}", to_pascal_case(&inner_nc.factory_name));
+        let nested_dispatch_fn = format_ident!("dispatch_{}", to_snake_case(&inner_nc.factory_name));
+        // Pass all ancestor scope args + nc's own scope args
+        quote! {
+            #tag_enum::#variant_pascal => {
+                return #nested_dispatch_fn(handler, ctx, request_id, #(#parent_scope_args,)* #(#nested_scope_args,)* payload).await;
+            }
+        }
+    }).collect();
+
     quote! {
         use #tag_enum::*;
         let result = match variant_tag {
             #(#dispatch_arms)*
+            #(#nested_dispatch_arms)*
         };
 
         Ok((#serializer_fn(request_id, &result)?, None))
