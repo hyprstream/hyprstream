@@ -107,6 +107,7 @@ impl Container {
     /// Create a container from RPC response info
     ///
     /// Used when parsing list_containers response from WorkerService.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_info(
         id: String,
         pod_sandbox_id: String,

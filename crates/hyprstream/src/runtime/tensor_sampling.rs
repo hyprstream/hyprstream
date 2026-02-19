@@ -53,6 +53,7 @@ impl TensorSampler {
     /// Exempt tokens (digits, punctuation) receive `sqrt(penalty)` instead of
     /// the full penalty, preventing digit suppression in year generation while
     /// still discouraging runaway single-character repetition.
+    #[allow(clippy::too_many_arguments)]
     pub fn sample_token_with_penalty_exemptions(
         &self,
         logits_tensor: &Tensor,

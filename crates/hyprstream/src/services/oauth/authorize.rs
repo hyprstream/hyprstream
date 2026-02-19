@@ -216,6 +216,7 @@ fn error_response(status: StatusCode, error: &str, description: &str) -> Respons
 }
 
 /// Render the minimal consent page HTML.
+#[allow(clippy::too_many_arguments)]
 fn render_consent_page(
     client_name: &str,
     scopes: &str,

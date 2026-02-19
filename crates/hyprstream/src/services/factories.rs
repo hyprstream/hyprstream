@@ -483,7 +483,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                         let auth_value = req.headers()
                             .get(header::AUTHORIZATION)
                             .and_then(|v| v.to_str().ok())
-                            .map(|s| s.to_owned());
+                            .map(str::to_owned);
                         // RFC 6750: Bearer scheme is case-insensitive
                         let token = auth_value.as_deref()
                             .and_then(|h| {

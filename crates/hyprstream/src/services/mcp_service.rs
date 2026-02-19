@@ -20,7 +20,7 @@
 //! 3. Backend services enforce authorization via Casbin policies
 
 use async_trait::async_trait;
-use crate::services::{ModelZmqClient, GenRegistryClient, PolicyClient, InferenceZmqClient};
+use crate::services::{ModelZmqClient, GenRegistryClient, PolicyClient};
 use http::header::AUTHORIZATION;
 use crate::services::generated::mcp_client::{
     McpHandler, McpResponseVariant, ToolDefinition, ServiceStatus,
@@ -158,7 +158,7 @@ impl ToolRegistry {
 /// Scope and streaming flags are read from MethodSchema.
 fn register_schema_tools(reg: &mut ToolRegistry) {
     use crate::services::generated::{
-        model_client, registry_client, policy_client, inference_client,
+        model_client, registry_client, policy_client,
     };
     // Each service generates its own MethodSchema type, so we use a macro
     // to iterate each service's methods with the correct type.
@@ -196,8 +196,6 @@ fn register_schema_tools(reg: &mut ToolRegistry) {
     register_top_level!(reg, model_client::schema_metadata());
     register_top_level!(reg, registry_client::schema_metadata());
     register_top_level!(reg, policy_client::schema_metadata());
-    register_top_level!(reg, inference_client::schema_metadata());
-
     // Scoped tools: recursive tree walk for all services with nested scopes
     register_scoped_tools_recursive(reg, "registry", registry_client::scoped_client_tree(), "registry", &[]);
     register_scoped_tools_recursive(reg, "model", model_client::scoped_client_tree(), "model", &[]);
@@ -234,11 +232,6 @@ fn register_scoped_tools_recursive(
         }
 
         for method in methods {
-            // Skip streaming methods — call_scoped_method has no streaming path yet
-            if method.is_streaming {
-                continue;
-            }
-
             let tool_name = format!("{}.{}", new_prefix, method.name);
 
             // Build JSON schema: method params + all scope fields from ancestors
@@ -300,41 +293,108 @@ fn register_scoped_tools_recursive(
                 .map(|&(scope_name, field_name, _)| (scope_name.to_owned(), field_name.to_owned()))
                 .collect();
 
-            reg.register(ToolEntry {
-                uuid: Uuid::new_v5(&MCP_NS, tool_name.as_bytes()),
-                name: tool_name.clone(),
-                description,
-                args_schema: json_schema,
-                required_scope,
-                streaming: false,
-                handler: Arc::new(move |ctx| {
-                    let method = method_name.clone();
-                    let service = service.clone();
-                    let scope_pairs = scope_pairs.clone();
-                    Box::pin(async move {
-                        // Build scope chain from args: [("repo", repo_id_val), ("worktree", name_val), ...]
-                        let scope_chain: Vec<(String, String)> = scope_pairs.iter()
-                            .map(|(scope_name, field_name)| {
-                                // Extract value — handle both string and numeric JSON values
-                                let val_str = ctx.args.get(field_name.as_str())
-                                    .map(|v| match v {
-                                        Value::String(s) => s.clone(),
-                                        Value::Number(n) => n.to_string(),
-                                        _ => v.to_string(),
-                                    })
-                                    .unwrap_or_default();
-                                (scope_name.clone(), val_str)
-                            })
-                            .collect();
+            if method.is_streaming {
+                // Streaming scoped tool — uses call_scoped_streaming_method with DH key exchange
+                reg.register(ToolEntry {
+                    uuid: Uuid::new_v5(&MCP_NS, tool_name.as_bytes()),
+                    name: tool_name.clone(),
+                    description,
+                    args_schema: json_schema,
+                    required_scope,
+                    streaming: true,
+                    handler: Arc::new(move |ctx| {
+                        let method = method_name.clone();
+                        let service = service.clone();
+                        let scope_pairs = scope_pairs.clone();
+                        Box::pin(async move {
+                            // Build scope chain from args BEFORE moving ctx fields
+                            let scope_chain: Vec<(String, String)> = scope_pairs.iter()
+                                .map(|(scope_name, field_name)| {
+                                    let val_str = ctx.args.get(field_name.as_str())
+                                        .map(|v| match v {
+                                            Value::String(s) => s.clone(),
+                                            Value::Number(n) => n.to_string(),
+                                            _ => v.to_string(),
+                                        })
+                                        .unwrap_or_default();
+                                    (scope_name.clone(), val_str)
+                                })
+                                .collect();
 
-                        let scope_refs: Vec<(&str, &str)> = scope_chain.iter()
-                            .map(|(s, v)| (s.as_str(), v.as_str()))
-                            .collect();
+                            let scope_refs: Vec<(&str, &str)> = scope_chain.iter()
+                                .map(|(s, v)| (s.as_str(), v.as_str()))
+                                .collect();
 
-                        dispatch_scoped_call(&service, &scope_refs, &method, &ctx).await
-                    })
-                }),
-            });
+                            let (client_secret, client_pubkey) = hyprstream_rpc::generate_ephemeral_keypair();
+                            let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
+
+                            let stream_info_json = match service.as_str() {
+                                "registry" => {
+                                    let client: GenRegistryClient = crate::services::core::create_service_client(
+                                        &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
+                                        ctx.signing_key, ctx.identity.clone(),
+                                    );
+                                    client.call_scoped_streaming_method(&scope_refs, &method, &ctx.args, client_pubkey_bytes).await?
+                                }
+                                "model" => {
+                                    let client = ModelZmqClient::new(ctx.signing_key, ctx.identity.clone());
+                                    client.gen.call_scoped_streaming_method(&scope_refs, &method, &ctx.args, client_pubkey_bytes).await?
+                                }
+                                _ => anyhow::bail!("No scoped streaming dispatch for service: {service}"),
+                            };
+
+                            let (stream_id, endpoint, server_pubkey) = parse_stream_info(&stream_info_json)?;
+
+                            let handle = StreamHandle::new(
+                                &ctx.zmq_context,
+                                stream_id,
+                                &endpoint,
+                                &server_pubkey,
+                                &client_secret,
+                                &client_pubkey_bytes,
+                            )?;
+
+                            Ok(ToolResult::Stream(Box::new(handle)))
+                        })
+                    }),
+                });
+            } else {
+                // Sync scoped tool — uses call_scoped_method
+                reg.register(ToolEntry {
+                    uuid: Uuid::new_v5(&MCP_NS, tool_name.as_bytes()),
+                    name: tool_name.clone(),
+                    description,
+                    args_schema: json_schema,
+                    required_scope,
+                    streaming: false,
+                    handler: Arc::new(move |ctx| {
+                        let method = method_name.clone();
+                        let service = service.clone();
+                        let scope_pairs = scope_pairs.clone();
+                        Box::pin(async move {
+                            // Build scope chain from args: [("repo", repo_id_val), ("worktree", name_val), ...]
+                            let scope_chain: Vec<(String, String)> = scope_pairs.iter()
+                                .map(|(scope_name, field_name)| {
+                                    let val_str = ctx.args.get(field_name.as_str())
+                                        .map(|v| match v {
+                                            Value::String(s) => s.clone(),
+                                            Value::Number(n) => n.to_string(),
+                                            _ => v.to_string(),
+                                        })
+                                        .unwrap_or_default();
+                                    (scope_name.clone(), val_str)
+                                })
+                                .collect();
+
+                            let scope_refs: Vec<(&str, &str)> = scope_chain.iter()
+                                .map(|(s, v)| (s.as_str(), v.as_str()))
+                                .collect();
+
+                            dispatch_scoped_call(&service, &scope_refs, &method, &ctx).await
+                        })
+                    }),
+                });
+            }
         }
 
         // Recurse into nested scopes
@@ -431,10 +491,6 @@ fn register_streaming_tool(
                         let client = ModelZmqClient::new(ctx.signing_key, ctx.identity.clone());
                         client.gen.call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?
                     }
-                    "inference" => {
-                        let client = InferenceZmqClient::new(ctx.signing_key, ctx.identity.clone());
-                        client.gen.call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?
-                    }
                     _ => anyhow::bail!("No streaming support for service: {}", service),
                 };
 
@@ -528,10 +584,6 @@ async fn dispatch_schema_call(service: &str, method: &str, ctx: &ToolCallContext
         "policy" => {
             let client = PolicyClient::new(signing_key, identity);
             client.call_method(method, &ctx.args).await
-        }
-        "inference" => {
-            let client = InferenceZmqClient::new(signing_key, identity);
-            client.gen.call_method(method, &ctx.args).await
         }
         _ => anyhow::bail!("Unknown service: {service}"),
     }

@@ -52,9 +52,9 @@ pub enum QuickCommand {
         #[arg(long)]
         seed: Option<u32>,
 
-        /// Stream output tokens as they're generated
-        #[arg(short = 's', long)]
-        stream: bool,
+        /// Collect full response before printing (default: stream tokens live)
+        #[arg(long)]
+        sync: bool,
     },
 
     /// Clone a model repository (with progress, policy support)

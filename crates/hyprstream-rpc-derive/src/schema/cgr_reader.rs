@@ -475,6 +475,7 @@ fn extract_union_variants(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Extract a single struct definition from a CGR node.
+#[allow(clippy::too_many_arguments)]
 fn extract_struct_from_node(
     node: capnp::schema_capnp::node::Reader,
     info: &NodeInfo,
@@ -575,6 +576,7 @@ fn extract_struct_from_node(
 /// Two-pass extraction:
 /// 1. First pass: extract local types from this schema file
 /// 2. Second pass: find imported types referenced by variants/fields but not in the local set
+#[allow(clippy::too_many_arguments)]
 fn extract_all_structs(
     nodes: &capnp::struct_list::Reader<capnp::schema_capnp::node::Owned>,
     node_map: &BTreeMap<u64, NodeInfo>,
@@ -785,6 +787,7 @@ fn extract_all_enums(
 /// A scoped client is detected when:
 /// - A request variant points to a struct with both non-union fields (scope) and a union
 /// - A corresponding `{name}Result` response variant exists
+#[allow(clippy::too_many_arguments)]
 fn detect_scoped_clients(
     request_variants: &[UnionVariant],
     response_variants: &[UnionVariant],
@@ -873,6 +876,7 @@ fn detect_scoped_clients(
 }
 
 /// Recursively detect nested scoped clients within a scoped client.
+#[allow(clippy::too_many_arguments)]
 fn detect_nested_scoped_clients_cgr(
     parent: &mut ScopedClient,
     all_structs: &[StructDef],

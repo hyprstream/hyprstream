@@ -415,6 +415,7 @@ impl RegistryService {
     /// Uses git2db's callback_config to receive progress updates during clone,
     /// which are forwarded to the client via StreamChannel in real-time.
     /// Called as a Continuation after the REP response is sent.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_clone_stream(
         stream_channel: StreamChannel,
         registry: Arc<RwLock<Git2DB>>,

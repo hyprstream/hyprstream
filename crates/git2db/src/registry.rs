@@ -541,6 +541,7 @@ impl Git2DB {
     ///
     /// Used by both CloneBuilder and RegistrationBuilder.
     /// External callers should use `registry.register(repo_id)` builder.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn register_repository_internal(
         &mut self,
         repo_id: RepoId,

@@ -25,7 +25,7 @@ use crate::{
     archetypes::capabilities::Infer,
     auth::Operation,
     config::GenerationRequest,
-    runtime::{CacheOwner, FinishReason},
+    runtime::CacheOwner,
     server::{state::ServerState, AuthenticatedUser},
     services::ModelZmqClient,
 };
@@ -90,6 +90,71 @@ impl ErrorResponse {
         }
     }
 
+}
+
+/// Result of collecting a stream into a single response.
+struct CollectedResult {
+    text: String,
+    stats: crate::services::rpc_types::InferenceComplete,
+}
+
+/// Collect a stream to a single result for non-streaming endpoints.
+///
+/// This replaces the removed sync `infer()` method. Using streaming internally
+/// fixes the bug where `infer()` hardcoded `ttt_metrics: None` — the completion
+/// metadata from the stream includes all fields including TTT metrics.
+async fn collect_stream_to_result(
+    model_client: &ModelZmqClient,
+    model_ref: &str,
+    request: &GenerationRequest,
+) -> anyhow::Result<CollectedResult> {
+    let (client_secret, client_pubkey) = generate_ephemeral_keypair();
+    let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
+    let stream_info = model_client.infer_stream(model_ref, request, client_pubkey_bytes).await?;
+    let ctx = crate::zmq::global_context();
+    let mut handle = StreamHandle::new(
+        &ctx,
+        stream_info.stream_id,
+        &stream_info.endpoint,
+        &stream_info.server_pubkey,
+        &client_secret,
+        &client_pubkey_bytes,
+    )?;
+
+    let mut text = String::new();
+    loop {
+        match handle.try_next() {
+            Ok(Some(payload)) => {
+                use hyprstream_rpc::streaming::StreamPayload;
+                match payload {
+                    StreamPayload::Data(data) => {
+                        text.push_str(&String::from_utf8_lossy(&data));
+                    }
+                    StreamPayload::Complete(meta) => {
+                        let stats: crate::services::rpc_types::InferenceComplete =
+                            serde_json::from_slice(&meta)
+                                .unwrap_or_else(|e| {
+                                    tracing::warn!("Failed to parse InferenceComplete: {e}");
+                                    crate::services::rpc_types::InferenceComplete::empty()
+                                });
+                        return Ok(CollectedResult { text, stats });
+                    }
+                    StreamPayload::Error(msg) => {
+                        anyhow::bail!("Generation error: {msg}");
+                    }
+                }
+            }
+            Ok(None) if handle.is_completed() => {
+                anyhow::bail!("Stream ended without completion");
+            }
+            Ok(None) => {
+                tokio::task::yield_now().await;
+            }
+            Err(e) => {
+                anyhow::bail!("Stream error: {e}");
+            }
+        }
+    }
 }
 
 // validate_chat_request removed - validation now handled by streaming pipeline
@@ -398,18 +463,19 @@ async fn chat_completions(
         gen_request.prompt.len()
     );
 
-    // Call inference via per-request ZMQ client (preserves caller identity for TTT delta routing)
+    // Call inference via collect-stream (per-request ZMQ client preserves caller identity for TTT delta routing)
     let identity = identity_from_user(&user);
     let model_client = ModelZmqClient::new((*state.signing_key).clone(), identity);
     let claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
-    let result = model_client.with_claims(claims).infer(&request.model, &gen_request).await;
+    let result = collect_stream_to_result(&model_client.with_claims(claims), &request.model, &gen_request).await;
 
     info!("Generation completed - success: {}", result.is_ok());
 
     match result {
-        Ok(generation) => {
+        Ok(collected) => {
+            let tokens_generated = collected.stats.tokens_generated;
             state.metrics.total_tokens.fetch_add(
-                generation.tokens_generated as u64,
+                tokens_generated as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
 
@@ -417,32 +483,26 @@ async fn chat_completions(
             let mut avg_latency = state.metrics.avg_latency_ms.write().await;
             *avg_latency = (*avg_latency * 0.9) + (latency_ms * 0.1);
 
+            let finish_reason_str = &collected.stats.finish_reason;
+
             // Parse tool calls from response using format-aware detection
-            let (content, tool_calls, finish_reason) = if tools::has_tool_calls_for_format(tool_call_format, &generation.text) {
+            let (content, tool_calls, finish_reason) = if tools::has_tool_calls_for_format(tool_call_format, &collected.text) {
                 info!("Detected tool calls in response (format: {:?})", tool_call_format);
-                match tools::parse_tool_calls_for_format(tool_call_format, &generation.text) {
+                match tools::parse_tool_calls_for_format(tool_call_format, &collected.text) {
                     Ok(parsed_tool_calls) if !parsed_tool_calls.is_empty() => {
-                        let content_text = tools::extract_text_content_for_format(tool_call_format, &generation.text);
+                        let content_text = tools::extract_text_content_for_format(tool_call_format, &collected.text);
                         let content = if content_text.is_empty() { None } else { Some(content_text) };
                         info!("Parsed {} tool calls", parsed_tool_calls.len());
                         (content, Some(parsed_tool_calls), "tool_calls")
                     }
                     Ok(_) | Err(_) => {
-                        // No parseable tool calls or parse error — return as normal content
-                        (Some(generation.text), None, match generation.finish_reason {
-                            FinishReason::MaxTokens => "length",
-                            FinishReason::StopToken(_) | FinishReason::EndOfSequence
-                            | FinishReason::Stop | FinishReason::Error(_) => "stop",
-                        })
+                        let fr = if finish_reason_str == "max_tokens" { "length" } else { "stop" };
+                        (Some(collected.text), None, fr)
                     }
                 }
             } else {
-                // No tool calls, return content as-is
-                (Some(generation.text), None, match generation.finish_reason {
-                    FinishReason::MaxTokens => "length",
-                    FinishReason::StopToken(_) | FinishReason::EndOfSequence
-                    | FinishReason::Stop | FinishReason::Error(_) => "stop",
-                })
+                let fr = if finish_reason_str == "max_tokens" { "length" } else { "stop" };
+                (Some(collected.text), None, fr)
             };
 
             let response = ChatCompletionResponse {
@@ -463,9 +523,9 @@ async fn chat_completions(
                 }],
                 usage: Some(Usage {
                     prompt_tokens: 0,
-                    completion_tokens: generation.tokens_generated,
-                    total_tokens: generation.tokens_generated,
-                    online_training_details: generation.ttt_metrics.as_ref().map(OnlineTrainingDetails::from),
+                    completion_tokens: tokens_generated,
+                    total_tokens: tokens_generated,
+                    online_training_details: collected.stats.ttt_metrics.as_ref().map(OnlineTrainingDetails::from),
                 }),
             };
 
@@ -929,32 +989,32 @@ async fn completions(
         gen_request.max_tokens, gen_request.temperature, gen_request.top_p, gen_request.top_k, gen_request.repeat_penalty
     );
 
-    // Call inference via per-request ZMQ client (preserves caller identity for TTT delta routing)
+    // Call inference via collect-stream (per-request ZMQ client preserves caller identity for TTT delta routing)
     let identity = identity_from_user(&user);
     let model_client = ModelZmqClient::new((*state.signing_key).clone(), identity);
     let claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
-    let result = model_client.with_claims(claims).infer(&request.model, &gen_request).await;
+    let result = collect_stream_to_result(&model_client.with_claims(claims), &request.model, &gen_request).await;
 
     // Metrics automatically decremented by MetricsGuard on drop
 
     match result {
-        Ok(generation) => {
+        Ok(collected) => {
             let response = CompletionResponse {
                 id: format!("cmpl-{}", uuid::Uuid::new_v4()),
                 object: "text_completion".to_owned(),
                 created: chrono::Utc::now().timestamp(),
                 model: request.model.clone(),
                 choices: vec![CompletionChoice {
-                    text: generation.text,
+                    text: collected.text,
                     index: 0,
                     logprobs: None,
-                    finish_reason: Some("stop".to_owned()),
+                    finish_reason: Some(if collected.stats.finish_reason == "max_tokens" { "length" } else { "stop" }.to_owned()),
                 }],
                 usage: Some(Usage {
                     prompt_tokens: request.prompt.len() / 4, // Rough estimate: 4 chars per token
-                    completion_tokens: generation.tokens_generated,
-                    total_tokens: request.prompt.len() / 4 + generation.tokens_generated,
-                    online_training_details: generation.ttt_metrics.as_ref().map(OnlineTrainingDetails::from),
+                    completion_tokens: collected.stats.tokens_generated,
+                    total_tokens: request.prompt.len() / 4 + collected.stats.tokens_generated,
+                    online_training_details: collected.stats.ttt_metrics.as_ref().map(OnlineTrainingDetails::from),
                 }),
             };
 

@@ -519,6 +519,7 @@ pub async fn handle_list(
 }
 
 /// Handle clone command with streaming progress
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_clone(
     registry: &GenRegistryClient,
     repo_url: &str,
@@ -620,6 +621,7 @@ pub async fn handle_clone(
 /// Clone with streaming progress display.
 ///
 /// Uses DH-authenticated streaming to receive clone progress updates.
+#[allow(clippy::too_many_arguments)]
 async fn clone_with_streaming(
     registry: &GenRegistryClient,
     repo_url: &str,
@@ -1126,6 +1128,7 @@ fn default_policy_header() -> &'static str {
 ///
 /// # Parameters
 /// - `signing_key`: Ed25519 signing key for request authentication
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_infer(
     model_ref_str: &str,
     prompt: &str,
@@ -1136,7 +1139,7 @@ pub async fn handle_infer(
     top_k: Option<usize>,
     repeat_penalty: Option<f32>,
     seed: Option<u32>,
-    stream: bool,
+    sync: bool,
     signing_key: SigningKey,
 ) -> Result<()> {
     info!(
@@ -1203,7 +1206,7 @@ pub async fn handle_infer(
     );
 
     // Generate via ModelService (handles model loading, adapter loading, training collection, auth)
-    if stream {
+    if !sync {
         // Generate client ephemeral keypair for DH key exchange
         let (client_secret, client_pubkey) = generate_ephemeral_keypair();
         let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
@@ -1257,28 +1260,62 @@ pub async fn handle_infer(
 
         println!();
     } else {
-        // Non-streaming: get full response via ModelService
-        let result = model_client.infer(model_ref_str, &request).await?;
+        // Non-streaming: collect stream into full response
+        let (client_secret, client_pubkey) = generate_ephemeral_keypair();
+        let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
+        let stream_info = model_client.infer_stream(model_ref_str, &request, client_pubkey_bytes).await?;
+        let ctx = global_context();
+        let mut handle = StreamHandle::new(
+            &ctx,
+            stream_info.stream_id.clone(),
+            &stream_info.endpoint,
+            &stream_info.server_pubkey,
+            &client_secret,
+            &client_pubkey_bytes,
+        )?;
 
-        println!("\n{}", result.text);
-        info!(
-            "Generated {} tokens in {}ms ({:.2} tokens/sec overall)",
-            result.tokens_generated, result.generation_time_ms, result.tokens_per_second
-        );
-        info!(
-            "  Prefill: {} tokens in {}ms ({:.2} tokens/sec)",
-            result.prefill_tokens, result.prefill_time_ms, result.prefill_tokens_per_sec
-        );
-        info!(
-            "  Inference: {} tokens in {}ms ({:.2} tokens/sec)",
-            result.inference_tokens, result.inference_time_ms, result.inference_tokens_per_sec
-        );
-
-        if let Some(ref qm) = result.quality_metrics {
-            info!(
-                "Quality metrics: perplexity={:.2}, entropy={:.2}, entropy_var={:.4}, repetition={:.3}",
-                qm.perplexity, qm.avg_entropy, qm.entropy_variance, qm.repetition_ratio
-            );
+        let mut text = String::new();
+        loop {
+            match handle.try_next() {
+                Ok(Some(payload)) => match payload {
+                    StreamPayload::Data(data) => {
+                        text.push_str(&String::from_utf8_lossy(&data));
+                    }
+                    StreamPayload::Complete(meta) => {
+                        let stats: crate::services::rpc_types::InferenceComplete =
+                            serde_json::from_slice(&meta).unwrap_or_else(|e| {
+                                warn!("Failed to parse InferenceComplete: {e}");
+                                crate::services::rpc_types::InferenceComplete::empty()
+                            });
+                        println!("\n{}", text);
+                        info!(
+                            "Generated {} tokens in {}ms ({:.2} tokens/sec overall)",
+                            stats.tokens_generated, stats.generation_time_ms, stats.tokens_per_second
+                        );
+                        info!(
+                            "  Prefill: {} tokens in {}ms ({:.2} tokens/sec)",
+                            stats.prefill_tokens, stats.prefill_time_ms, stats.prefill_tokens_per_sec
+                        );
+                        info!(
+                            "  Inference: {} tokens in {}ms ({:.2} tokens/sec)",
+                            stats.inference_tokens, stats.inference_time_ms, stats.inference_tokens_per_sec
+                        );
+                        break;
+                    }
+                    StreamPayload::Error(msg) => {
+                        bail!("Generation error: {msg}");
+                    }
+                },
+                Ok(None) if handle.is_completed() => {
+                    bail!("Stream ended without completion");
+                }
+                Ok(None) => {
+                    tokio::task::yield_now().await;
+                }
+                Err(e) => {
+                    bail!("Stream error: {e}");
+                }
+            }
         }
     }
 

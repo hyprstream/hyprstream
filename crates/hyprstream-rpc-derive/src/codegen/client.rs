@@ -248,6 +248,7 @@ pub fn generate_client(service_name: &str, resolved: &ResolvedSchema, types_crat
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Generate a single request method. Used for both top-level and scoped clients.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_request_method(
     capnp_mod: &TokenStream,
     req_type: &syn::Ident,

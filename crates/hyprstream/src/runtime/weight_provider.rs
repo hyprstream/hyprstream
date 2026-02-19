@@ -87,6 +87,7 @@ unsafe impl Sync for StreamingWeightProvider {}
 
 impl StreamingWeightProvider {
     /// Create a new streaming weight provider
+    #[allow(clippy::arc_with_non_send_sync)] // parking_lot::RwLock is !Sync but we impl Send+Sync manually above
     pub async fn new(shard_files: Vec<PathBuf>, device: Device, dtype: DType) -> Result<Self> {
         // Build tensor -> shard mapping by reading headers
         let mut tensor_shard_map = HashMap::new();

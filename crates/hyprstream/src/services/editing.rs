@@ -73,6 +73,7 @@ impl EditingTable {
     /// If one already exists, increments client_count and returns it.
     ///
     /// Returns error if `(client_id, fid)` already has an active session.
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         &self,
         client_id: &str,

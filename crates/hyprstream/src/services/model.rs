@@ -29,7 +29,7 @@
 
 use async_trait::async_trait;
 use crate::api::openai_compat::ChatMessage;
-use crate::config::{GenerationRequest, GenerationResult, TemplatedPrompt};
+use crate::config::{GenerationRequest, TemplatedPrompt};
 use crate::runtime::kv_quant::KVQuantType;
 use crate::runtime::RuntimeConfig;
 use crate::services::{
@@ -260,9 +260,11 @@ impl ModelService {
 
         // Create runtime config - use per-model config if provided, otherwise service defaults
         let load_config = config.unwrap_or_default();
-        let mut runtime_config = RuntimeConfig::default();
-        runtime_config.max_context = load_config.max_context.or(self.config.max_context);
-        runtime_config.kv_quant_type = load_config.kv_quant.unwrap_or(self.config.kv_quant);
+        let runtime_config = RuntimeConfig {
+            max_context: load_config.max_context.or(self.config.max_context),
+            kv_quant_type: load_config.kv_quant.unwrap_or(self.config.kv_quant),
+            ..Default::default()
+        };
 
         // Obtain FsOps from the registry for path-contained adapter I/O
         let fs: Option<crate::services::WorktreeClient> = Some(repo_client.worktree(&branch_name));
@@ -465,6 +467,7 @@ impl ModelService {
         client.rollback_adaptation().await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn train_step_stream(
         &self,
         model_ref_str: &str,
@@ -533,7 +536,7 @@ use crate::services::generated::model_client::{
     // PEFT types
     PeftAdapterInfo, PeftMergeRequest,
     // Infer types
-    GenerateRequest, ApplyChatTemplateRequest, InferResult, ModelStatusResponse, OnlineTrainingConfig,
+    GenerateRequest, ApplyChatTemplateRequest, ModelStatusResponse, OnlineTrainingConfig,
 };
 // Conflicting names — use canonical path at usage sites:
 //   model_client::LoadedModelInfo, model_client::StreamInfo,
@@ -709,28 +712,6 @@ impl PeftHandler for ModelService {
 
 #[async_trait::async_trait(?Send)]
 impl InferHandler for ModelService {
-    async fn handle_generate(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
-        model_ref: &str, data: &GenerateRequest,
-    ) -> Result<InferResult> {
-        let request = generate_request_from_data(data);
-        let client = self.get_inference_client(model_ref, ctx).await?;
-        let result = client.generate(&request).await?;
-        Ok(InferResult {
-            text: result.text,
-            tokens_generated: result.tokens_generated as u32,
-            finish_reason: finish_reason_to_str(&result.finish_reason),
-            generation_time_ms: result.generation_time_ms,
-            tokens_per_second: result.tokens_per_second,
-            prefill_tokens: result.prefill_tokens as u32,
-            prefill_time_ms: result.prefill_time_ms,
-            prefill_tokens_per_sec: result.prefill_tokens_per_sec,
-            inference_tokens: result.inference_tokens as u32,
-            inference_time_ms: result.inference_time_ms,
-            inference_tokens_per_sec: result.inference_tokens_per_sec,
-        })
-    }
-
     async fn handle_generate_stream(
         &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &GenerateRequest,
@@ -1074,44 +1055,6 @@ impl ModelZmqClient {
         })
     }
 
-    /// Run inference on a model (infer-scoped)
-    pub async fn infer(&self, model_ref: &str, request: &GenerationRequest) -> Result<GenerationResult> {
-        // Images are file paths in GenerationRequest but raw bytes in schema — not yet used over wire
-        let images: Vec<Vec<u8>> = Vec::new();
-        let data = self.gen.infer(model_ref).generate(
-            request.prompt.as_str(),
-            request.max_tokens as u32,
-            request.temperature,
-            request.top_p,
-            request.top_k.unwrap_or(0) as u32,
-            request.repeat_penalty,
-            request.repeat_last_n as u32,
-            &request.stop_tokens,
-            request.seed.unwrap_or(0),
-            &images,
-            request.timeout.unwrap_or(0),
-            request.ttt_enabled,
-            request.ttt_gradient_steps,
-            request.ttt_learning_rate,
-            request.auto_commit,
-        ).await?;
-        Ok(GenerationResult {
-            text: data.text,
-            tokens_generated: data.tokens_generated as usize,
-            finish_reason: parse_finish_reason_str(&data.finish_reason),
-            generation_time_ms: data.generation_time_ms,
-            tokens_per_second: data.tokens_per_second,
-            quality_metrics: None,
-            prefill_tokens: data.prefill_tokens as usize,
-            prefill_time_ms: data.prefill_time_ms,
-            prefill_tokens_per_sec: data.prefill_tokens_per_sec,
-            inference_tokens: data.inference_tokens as usize,
-            inference_time_ms: data.inference_time_ms,
-            inference_tokens_per_sec: data.inference_tokens_per_sec,
-            ttt_metrics: None,  // TODO: Extract from response when available
-        })
-    }
-
     /// Start streaming inference with E2E authentication
     pub async fn infer_stream(
         &self,
@@ -1285,31 +1228,6 @@ fn generate_request_from_data(data: &GenerateRequest) -> GenerationRequest {
     }
 }
 
-/// Convert FinishReason to string for InferResult.finishReason field
-fn finish_reason_to_str(reason: &crate::config::FinishReason) -> String {
-    match reason {
-        crate::config::FinishReason::MaxTokens => "max_tokens".to_owned(),
-        crate::config::FinishReason::StopToken(t) => format!("stop_token:{}", t),
-        crate::config::FinishReason::EndOfSequence => "end_of_sequence".to_owned(),
-        crate::config::FinishReason::Error(e) => format!("error:{}", e),
-        crate::config::FinishReason::Stop => "stop".to_owned(),
-    }
-}
-
-/// Parse a finish reason string back into FinishReason enum
-fn parse_finish_reason_str(s: &str) -> crate::config::FinishReason {
-    if s.starts_with("stop_token:") {
-        crate::config::FinishReason::StopToken(s.strip_prefix("stop_token:").unwrap_or("").to_owned())
-    } else if s.starts_with("error:") {
-        crate::config::FinishReason::Error(s.strip_prefix("error:").unwrap_or("").to_owned())
-    } else {
-        match s {
-            "max_tokens" => crate::config::FinishReason::MaxTokens,
-            "end_of_sequence" => crate::config::FinishReason::EndOfSequence,
-            _ => crate::config::FinishReason::Stop,
-        }
-    }
-}
 
 
 #[cfg(test)]

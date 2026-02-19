@@ -227,6 +227,7 @@ impl ModelConfig {
     }
 
     /// Detect configuration from weights only (fallback)
+    #[allow(clippy::field_reassign_with_default)]
     fn detect_from_weights(weights: &HashMap<String, Tensor>) -> Result<Self> {
         // Start with defaults
         let mut config = Self::default();

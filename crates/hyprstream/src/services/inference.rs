@@ -34,7 +34,7 @@
 //! authorization on all requests. The handler delegates to PolicyClient.
 
 use crate::services::PolicyClient;
-use crate::config::{FinishReason, GenerationRequest, GenerationResult, ModelInfo, TrainingMode};
+use crate::config::{GenerationRequest, ModelInfo, TrainingMode};
 use crate::inference_capnp;
 use crate::runtime::kv_cache::CacheOwner;
 use crate::runtime::model_config::ModelConfig;
@@ -1008,36 +1008,6 @@ impl InferenceService {
         }
     }
 
-    /// Handle non-streaming generation
-    fn handle_generate(&self, request: GenerationRequest, subject: &Subject) -> Result<GenerationResult> {
-        // Apply TTT adaptation BEFORE generation (if enabled) and capture metrics
-        let ttt_result = match self.apply_ttt_adaptation(request.prompt.as_str(), subject) {
-            Ok(Some(result)) => Some(result),
-            Ok(None) => None,  // TTT not configured/applicable
-            Err(e) => {
-                // Log error but continue with generation
-                warn!("TTT adaptation failed, continuing without: {}", e);
-                None
-            }
-        };
-
-        // Look up tenant's delta and/or base delta for delta-aware inference
-        let delta = self.resolve_delta(subject);
-        info!("[TTT-DEBUG] handle_generate: subject={}, delta_resolved={}, pool_exists={}, pool_subjects={:?}",
-              subject, delta.is_some(), self.delta_pool.is_some(),
-              self.delta_pool.as_ref().map(|p| p.list_subjects()));
-
-        let engine = self.engine.read();
-        let mut result = futures::executor::block_on(async {
-            engine.generate_with_delta_params(request, delta).await
-        })?;
-
-        // Attach TTT metrics to response
-        result.ttt_metrics = ttt_result.map(std::convert::Into::into);
-
-        Ok(result)
-    }
-
     /// Prepare for streaming generation with DH-based key derivation.
     ///
     /// This is the first phase of streaming that runs BEFORE the REP response is sent.
@@ -1893,7 +1863,6 @@ use crate::services::generated::inference_client::{
     InferenceResponseVariant, ErrorInfo,
     HealthStatus, TrainStepResult, DeltaStatusResult, ModuleNormRatio,
     SaveAdaptationResult, SnapshotDeltaResult, ExportPeftResult,
-    OnlineTrainingMetrics, QualityMetrics, FinishReasonEnum,
     ChatTemplateRequest, LoraConfig, TrainStepRequest, SaveAdaptationRequest, ExportPeftRequest,
 };
 // Conflicting names — use canonical path at usage sites:
@@ -1912,33 +1881,6 @@ impl InferenceHandler for InferenceService {
         } else {
             anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource)
         }
-    }
-
-    async fn handle_generate(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
-        data: &crate::services::generated::inference_client::GenerationRequest,
-    ) -> Result<InferenceResponseVariant> {
-        let subject = ctx.subject();
-        let request = GenerationRequest {
-            prompt: crate::config::TemplatedPrompt::new(data.prompt.clone()),
-            max_tokens: data.max_tokens as usize,
-            temperature: data.temperature,
-            top_p: data.top_p,
-            top_k: if data.top_k == 0 { None } else { Some(data.top_k as usize) },
-            repeat_penalty: data.repeat_penalty,
-            repeat_last_n: data.repeat_last_n as usize,
-            stop_tokens: data.stop_tokens.clone(),
-            seed: if data.seed == 0 { None } else { Some(data.seed) },
-            images: vec![],
-            timeout: if data.timeout_ms == 0 { None } else { Some(data.timeout_ms) },
-            collect_metrics: false,
-            ttt_enabled: false,
-            ttt_gradient_steps: 0,
-            ttt_learning_rate: 0.0,
-            auto_commit: false,
-        };
-        let result = InferenceService::handle_generate(self, request, &subject)?;
-        Ok(InferenceResponseVariant::GenerateResult(generation_result_to_data(&result)))
     }
 
     async fn handle_generate_stream(
@@ -2271,52 +2213,6 @@ impl InferenceHandler for InferenceService {
     }
 }
 
-/// Convert a GenerationResult to the generated data type.
-fn generation_result_to_data(result: &GenerationResult) -> crate::services::generated::inference_client::GenerationResult {
-    let finish_reason = match &result.finish_reason {
-        FinishReason::MaxTokens => FinishReasonEnum::MaxTokens,
-        FinishReason::StopToken(_) => FinishReasonEnum::StopToken,
-        FinishReason::EndOfSequence => FinishReasonEnum::EndOfSequence,
-        FinishReason::Error(_) => FinishReasonEnum::Error,
-        FinishReason::Stop => FinishReasonEnum::Stop,
-    };
-    crate::services::generated::inference_client::GenerationResult {
-        text: result.text.clone(),
-        tokens_generated: result.tokens_generated as u32,
-        finish_reason,
-        generation_time_ms: result.generation_time_ms,
-        tokens_per_second: result.tokens_per_second,
-        quality_metrics: QualityMetrics::default(),
-        prefill_tokens: result.prefill_tokens as u32,
-        prefill_time_ms: result.prefill_time_ms,
-        prefill_tokens_per_sec: result.prefill_tokens_per_sec,
-        inference_tokens: result.inference_tokens as u32,
-        inference_time_ms: result.inference_time_ms,
-        inference_tokens_per_sec: result.inference_tokens_per_sec,
-        online_training_metrics: result.ttt_metrics.as_ref()
-            .map(|m| OnlineTrainingMetrics {
-                avg_loss: m.avg_loss,
-                loss_improvement: m.loss_improvement,
-                steps_performed: m.steps_performed as u32,
-                adaptation_time_ms: m.adaptation_time_ms,
-                skipped: m.skipped,
-                skip_reason: m.skip_reason.clone().unwrap_or_default(),
-                avg_grad_norm: m.avg_grad_norm,
-                max_grad_norm: m.max_grad_norm,
-                gradient_clipped: m.gradient_clipped,
-                tokens_used: m.tokens_used as u32,
-                tokens_provided: m.tokens_provided as u32,
-                was_truncated: m.was_truncated,
-                initial_perplexity: m.initial_perplexity,
-                final_perplexity: m.final_perplexity,
-                recommendation: m.recommendation,
-                gated_steps: m.gated_steps as u32,
-                pending: m.pending,
-            })
-            .unwrap_or_default(),
-    }
-}
-
 // Note: InferenceService does NOT implement ZmqService because it uses a custom
 // single-threaded tokio runtime in `run_service_loop` (not RequestLoop).
 // Both `run_service_loop` and `handle_callback_infer` call `dispatch_inference` directly.
@@ -2354,52 +2250,6 @@ impl InferenceZmqClient {
     /// Attach claims for e2e verification. All subsequent calls include these claims.
     pub fn with_claims(self, claims: hyprstream_rpc::auth::Claims) -> Self {
         Self { gen: self.gen.with_claims(claims) }
-    }
-
-    /// Convert generated FinishReasonEnum to domain FinishReason
-    fn parse_finish_reason_enum(
-        reason: crate::services::generated::inference_client::FinishReasonEnum,
-    ) -> FinishReason {
-        use crate::services::generated::inference_client::FinishReasonEnum;
-        match reason {
-            FinishReasonEnum::MaxTokens => FinishReason::MaxTokens,
-            FinishReasonEnum::StopToken => FinishReason::StopToken(String::new()),
-            FinishReasonEnum::EndOfSequence => FinishReason::EndOfSequence,
-            FinishReasonEnum::Error => FinishReason::Error(String::new()),
-            FinishReasonEnum::Stop => FinishReason::Stop,
-        }
-    }
-
-    /// Generate text (non-streaming) — delegates to generated client
-    pub async fn generate(&self, request: &GenerationRequest) -> Result<GenerationResult> {
-        let r = self.gen.generate(
-            request.prompt.as_str(),
-            request.max_tokens as u32,
-            request.temperature,
-            request.top_p,
-            request.top_k.unwrap_or(0) as u32,
-            request.repeat_penalty,
-            request.repeat_last_n as u32,
-            &request.stop_tokens,
-            request.seed.unwrap_or(0),
-            &[], // images
-            request.timeout.unwrap_or(0),
-        ).await?;
-        Ok(GenerationResult {
-            text: r.text,
-            tokens_generated: r.tokens_generated as usize,
-            finish_reason: Self::parse_finish_reason_enum(r.finish_reason),
-            generation_time_ms: r.generation_time_ms,
-            tokens_per_second: r.tokens_per_second,
-            quality_metrics: None,
-            prefill_tokens: r.prefill_tokens as usize,
-            prefill_time_ms: r.prefill_time_ms,
-            prefill_tokens_per_sec: r.prefill_tokens_per_sec,
-            inference_tokens: r.inference_tokens as usize,
-            inference_time_ms: r.inference_time_ms,
-            inference_tokens_per_sec: r.inference_tokens_per_sec,
-            ttt_metrics: None,  // TODO: Extract from response when available
-        })
     }
 
     /// Check if model is ready

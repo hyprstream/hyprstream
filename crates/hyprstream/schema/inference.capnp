@@ -19,44 +19,43 @@ struct InferenceRequest {
 
   # Request payload (union of request types)
   union {
-    generate @1 :GenerationRequest;
-    generateStream @2 :GenerationRequest;
-    modelInfo @3 :Void;
-    isReady @4 :Void;
-    applyChatTemplate @5 :ChatTemplateRequest;
+    generateStream @1 :GenerationRequest;
+    modelInfo @2 :Void;
+    isReady @3 :Void;
+    applyChatTemplate @4 :ChatTemplateRequest;
 
     # LoRA operations
-    createLora @6 :LoraConfig;
-    loadLora @7 :Text;       # path
-    saveLora @8 :Text;       # path
-    unloadLora @9 :Void;
-    hasLora @10 :Void;
+    createLora @5 :LoraConfig;
+    loadLora @6 :Text;       # path
+    saveLora @7 :Text;       # path
+    unloadLora @8 :Void;
+    hasLora @9 :Void;
 
     # Session operations
-    setSession @11 :Text;    # session_id
-    clearSession @12 :Void;
-    releaseSession @13 :Text;
+    setSession @10 :Text;    # session_id
+    clearSession @11 :Void;
+    releaseSession @12 :Text;
 
     # Health/Lifecycle
-    healthCheck @14 :Void;
-    shutdown @15 :Void;
+    healthCheck @13 :Void;
+    shutdown @14 :Void;
 
     # Training loop control — tenant-aware TTT (identity from auth envelope)
-    commitAdaptation @16 :Void;
-    rollbackAdaptation @17 :Void;
-    trainStep @18 :TrainStepRequest;
-    resetDelta @19 :Void;
+    commitAdaptation @15 :Void;
+    rollbackAdaptation @16 :Void;
+    trainStep @17 :TrainStepRequest;
+    resetDelta @18 :Void;
 
     # Persistence operations (identity from auth envelope)
-    getDeltaStatus @20 :Void;
-    saveAdaptation @21 :SaveAdaptationRequest;
-    snapshotDelta @22 :Void;
+    getDeltaStatus @19 :Void;
+    saveAdaptation @20 :SaveAdaptationRequest;
+    snapshotDelta @21 :Void;
 
     # Streaming training (returns immediately, results via PUB/SUB)
-    trainStepStream @23 :TrainStepRequest;
+    trainStepStream @22 :TrainStepRequest;
 
     # Export delta as PEFT adapter directory (identity from auth envelope)
-    exportPeftAdapter @24 :ExportPeftRequest;
+    exportPeftAdapter @23 :ExportPeftRequest;
   }
 }
 
@@ -69,37 +68,36 @@ struct InferenceResponse {
   union {
     success @1 :Void;
     error @2 :ErrorInfo;
-    generateResult @3 :GenerationResult;
-    generateStreamResult @4 :StreamInfo;
-    modelInfoResult @5 :ModelInfo;
-    isReadyResult @6 :Bool;
-    applyChatTemplateResult @7 :Text;
-    createLoraResult @8 :Void;
-    loadLoraResult @9 :Void;
-    saveLoraResult @10 :Void;
-    unloadLoraResult @11 :Void;
-    hasLoraResult @12 :Bool;
-    setSessionResult @13 :Void;
-    clearSessionResult @14 :Void;
-    releaseSessionResult @15 :Void;
-    healthCheckResult @16 :HealthStatus;
+    generateStreamResult @3 :StreamInfo;
+    modelInfoResult @4 :ModelInfo;
+    isReadyResult @5 :Bool;
+    applyChatTemplateResult @6 :Text;
+    createLoraResult @7 :Void;
+    loadLoraResult @8 :Void;
+    saveLoraResult @9 :Void;
+    unloadLoraResult @10 :Void;
+    hasLoraResult @11 :Bool;
+    setSessionResult @12 :Void;
+    clearSessionResult @13 :Void;
+    releaseSessionResult @14 :Void;
+    healthCheckResult @15 :HealthStatus;
 
     # Training loop control responses
-    commitAdaptationResult @17 :Void;
-    rollbackAdaptationResult @18 :Void;
-    trainStepResult @19 :TrainStepResult;
-    resetDeltaResult @20 :Void;
+    commitAdaptationResult @16 :Void;
+    rollbackAdaptationResult @17 :Void;
+    trainStepResult @18 :TrainStepResult;
+    resetDeltaResult @19 :Void;
 
     # Persistence responses
-    getDeltaStatusResult @21 :DeltaStatusResult;
-    saveAdaptationResult @22 :SaveAdaptationResult;
-    snapshotDeltaResult @23 :SnapshotDeltaResult;
+    getDeltaStatusResult @20 :DeltaStatusResult;
+    saveAdaptationResult @21 :SaveAdaptationResult;
+    snapshotDeltaResult @22 :SnapshotDeltaResult;
 
     # Streaming training response
-    trainStepStreamResult @24 :StreamInfo;
+    trainStepStreamResult @23 :StreamInfo;
 
     # Export PEFT adapter response
-    exportPeftAdapterResult @25 :ExportPeftResult;
+    exportPeftAdapterResult @24 :ExportPeftResult;
   }
 }
 
@@ -115,26 +113,6 @@ struct GenerationRequest {
   seed @8 :UInt32 $optional;
   images @9 :List(Data) $optional;
   timeoutMs @10 :UInt64 $optional;
-}
-
-struct GenerationResult {
-  text @0 :Text;
-  tokensGenerated @1 :UInt32;
-  finishReason @2 :FinishReason;
-  generationTimeMs @3 :UInt64;
-  tokensPerSecond @4 :Float32;
-  qualityMetrics @5 :QualityMetrics;
-  # Prefill metrics (processing prompt)
-  prefillTokens @6 :UInt32;
-  prefillTimeMs @7 :UInt64;
-  prefillTokensPerSec @8 :Float32;
-  # Inference metrics (generating tokens)
-  inferenceTokens @9 :UInt32;
-  inferenceTimeMs @10 :UInt64;
-  inferenceTokensPerSec @11 :Float32;
-
-  # Online training adaptation metrics (optional)
-  onlineTrainingMetrics @12 :OnlineTrainingMetrics;
 }
 
 # Quality metrics for self-supervised training

@@ -101,13 +101,11 @@ struct PeftRequest {
 struct InferRequest {
   modelRef @0 :Text;
   union {
-    generate @1 :GenerateRequest
+    generateStream @1 :GenerateRequest
       $mcpDescription("Run inference with automatic domain adaptation. When TTT is enabled, the model adapts to your prompt before responding. If autoCommit is false (default), the adaptation is PENDING — check onlineTrainingMetrics.recommendation in the response, then call commitAdaptation (if true) or rollbackAdaptation (if false). Pending adaptations auto-rollback after 30 seconds.");
-    generateStream @2 :GenerateRequest
-      $mcpDescription("Stream inference with automatic domain adaptation. The final SSE chunk includes usage.online_training metrics. If autoCommit is false, the adaptation is PENDING — call commitAdaptation or rollbackAdaptation based on the recommendation field. Pending adaptations auto-rollback after 30 seconds.");
-    applyChatTemplate @3 :ApplyChatTemplateRequest
+    applyChatTemplate @2 :ApplyChatTemplateRequest
       $mcpDescription("Apply chat template to messages for a loaded model");
-    status @4 :Void
+    status @3 :Void
       $mcpDescription("Get detailed status information about a model including online training configuration");
   }
 }
@@ -166,30 +164,10 @@ struct PeftResponse {
 struct InferResponse {
   union {
     error @0 :ErrorInfo;
-    generate @1 :InferResult;
-    generateStream @2 :StreamInfo;
-    applyChatTemplate @3 :Text;
-    status @4 :ModelStatusResponse;
+    generateStream @1 :StreamInfo;
+    applyChatTemplate @2 :Text;
+    status @3 :ModelStatusResponse;
   }
-}
-
-# =============================================================================
-# Inference result — flattened from inference.capnp::GenerationResult
-# for transparent MCP/JSON bridging.
-# =============================================================================
-
-struct InferResult {
-  text @0 :Text;
-  tokensGenerated @1 :UInt32;
-  finishReason @2 :Text;         # "max_tokens", "stop_token", "end_of_sequence", "error", "stop"
-  generationTimeMs @3 :UInt64;
-  tokensPerSecond @4 :Float32;
-  prefillTokens @5 :UInt32;
-  prefillTimeMs @6 :UInt64;
-  prefillTokensPerSec @7 :Float32;
-  inferenceTokens @8 :UInt32;
-  inferenceTimeMs @9 :UInt64;
-  inferenceTokensPerSec @10 :Float32;
 }
 
 # Error information

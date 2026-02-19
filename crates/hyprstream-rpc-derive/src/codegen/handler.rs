@@ -2145,6 +2145,7 @@ fn generate_nested_scope_extraction_phase(
 /// Generate dispatch phase for nested scope dispatch.
 ///
 /// `ancestor_scope_idents` contains ALL ancestor scope field idents (flattened).
+#[allow(clippy::too_many_arguments)]
 fn generate_nested_scope_dispatch_phase(
     nc: &ScopedClient,
     resolved: &ResolvedSchema,

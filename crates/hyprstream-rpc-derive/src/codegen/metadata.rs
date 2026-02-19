@@ -244,6 +244,13 @@ fn generate_json_dispatcher(
     let mut nested_scoped_dispatch = Vec::new();
     collect_call_scoped_method_recursive(scoped_clients, &mut nested_scoped_dispatch);
 
+    // Generate call_scoped_streaming_method on the top-level client
+    let top_scoped_streaming = generate_call_scoped_streaming_method_for_client(scoped_clients);
+
+    // Generate call_scoped_streaming_method on scoped clients that have children
+    let mut nested_scoped_streaming = Vec::new();
+    collect_call_scoped_streaming_method_recursive(scoped_clients, &mut nested_scoped_streaming);
+
     quote! {
         impl #client_name {
             /// Dispatch a method call by name with JSON arguments.
@@ -258,11 +265,15 @@ fn generate_json_dispatcher(
             #streaming_method
 
             #top_scoped_dispatch
+
+            #top_scoped_streaming
         }
 
         #(#scoped_dispatchers)*
 
         #(#nested_scoped_dispatch)*
+
+        #(#nested_scoped_streaming)*
     }
 }
 
@@ -624,6 +635,110 @@ fn collect_call_scoped_method_recursive(
             });
         }
         collect_call_scoped_method_recursive(&sc.nested_clients, out);
+    }
+}
+
+/// Generate `call_scoped_streaming_method` on the top-level client.
+fn generate_call_scoped_streaming_method_for_client(
+    scoped_clients: &[ScopedClient],
+) -> TokenStream {
+    if scoped_clients.is_empty() {
+        return TokenStream::new();
+    }
+
+    let match_arms: Vec<TokenStream> = scoped_clients.iter().map(|sc| {
+        let scope_name_str = to_snake_case(&sc.factory_name);
+        let factory_call = generate_scoped_factory_call(sc);
+
+        quote! {
+            #scope_name_str => #factory_call.call_scoped_streaming_method(remaining, method, args, ephemeral_pubkey).await,
+        }
+    }).collect();
+
+    quote! {
+        /// Dispatch a scoped streaming method call through nested scope chain.
+        #[allow(unused_variables)]
+        pub async fn call_scoped_streaming_method(
+            &self,
+            scopes: &[(&str, &str)],
+            method: &str,
+            args: &serde_json::Value,
+            ephemeral_pubkey: [u8; 32],
+        ) -> anyhow::Result<serde_json::Value> {
+            if scopes.is_empty() {
+                return self.call_streaming_method(method, args, ephemeral_pubkey).await;
+            }
+            let (scope_name, scope_id) = scopes[0];
+            let remaining = &scopes[1..];
+            match scope_name {
+                #(#match_arms)*
+                _ => anyhow::bail!("Unknown scope: {}", scope_name),
+            }
+        }
+    }
+}
+
+/// Recursively generate `call_scoped_streaming_method` on all scoped clients.
+fn collect_call_scoped_streaming_method_recursive(
+    clients: &[ScopedClient],
+    out: &mut Vec<TokenStream>,
+) {
+    for sc in clients {
+        let client_name = format_ident!("{}", sc.client_name);
+
+        if sc.nested_clients.is_empty() {
+            out.push(quote! {
+                impl #client_name {
+                    /// Dispatch a scoped streaming method call through nested scope chain.
+                    pub async fn call_scoped_streaming_method(
+                        &self,
+                        scopes: &[(&str, &str)],
+                        method: &str,
+                        args: &serde_json::Value,
+                        ephemeral_pubkey: [u8; 32],
+                    ) -> anyhow::Result<serde_json::Value> {
+                        if scopes.is_empty() {
+                            return self.call_streaming_method(method, args, ephemeral_pubkey).await;
+                        }
+                        anyhow::bail!("No nested scopes available for '{}'", scopes[0].0)
+                    }
+                }
+            });
+        } else {
+            let match_arms: Vec<TokenStream> = sc.nested_clients.iter().map(|nested| {
+                let scope_name_str = to_snake_case(&nested.factory_name);
+                let factory_call = generate_scoped_factory_call(nested);
+
+                quote! {
+                    #scope_name_str => #factory_call.call_scoped_streaming_method(remaining, method, args, ephemeral_pubkey).await,
+                }
+            }).collect();
+
+            out.push(quote! {
+                impl #client_name {
+                    /// Dispatch a scoped streaming method call through nested scope chain.
+                    #[allow(unused_variables)]
+                    pub async fn call_scoped_streaming_method(
+                        &self,
+                        scopes: &[(&str, &str)],
+                        method: &str,
+                        args: &serde_json::Value,
+                        ephemeral_pubkey: [u8; 32],
+                    ) -> anyhow::Result<serde_json::Value> {
+                        if scopes.is_empty() {
+                            return self.call_streaming_method(method, args, ephemeral_pubkey).await;
+                        }
+                        let (scope_name, scope_id) = scopes[0];
+                        let remaining = &scopes[1..];
+                        match scope_name {
+                            #(#match_arms)*
+                            _ => anyhow::bail!("Unknown scope: {}", scope_name),
+                        }
+                    }
+                }
+            });
+        }
+        collect_call_scoped_streaming_method_recursive(&sc.nested_clients, out);
     }
 }
 

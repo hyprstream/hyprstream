@@ -292,7 +292,7 @@ fn handle_quick_command(
             top_k,
             repeat_penalty,
             seed,
-            stream,
+            sync,
         } => {
             // Read prompt from stdin if not provided via --prompt
             let prompt = match prompt {
@@ -321,7 +321,7 @@ fn handle_quick_command(
                         top_k,
                         repeat_penalty,
                         seed,
-                        stream,
+                        sync,
                         signing_key,
                     )
                     .await
@@ -680,7 +680,7 @@ fn handle_quick_command(
                         top_p,
                         top_k,
                         repeat_penalty,
-                        stream,
+                        sync,
                         max_context,
                         kv_quant,
                     } => {
@@ -703,7 +703,7 @@ fn handle_quick_command(
                             top_p,
                             top_k,
                             repeat_penalty,
-                            stream,
+                            sync,
                             max_context,
                             kv_quant,
                             signing_key,

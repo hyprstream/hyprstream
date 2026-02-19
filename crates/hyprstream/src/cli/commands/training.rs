@@ -95,9 +95,9 @@ pub enum TrainingAction {
         #[arg(short = 'r', long)]
         repeat_penalty: Option<f32>,
 
-        /// Stream output tokens as they're generated
-        #[arg(short = 's', long)]
-        stream: bool,
+        /// Collect full response before printing (default: stream tokens live)
+        #[arg(long)]
+        sync: bool,
 
         /// Maximum context length for KV cache allocation
         #[arg(long, env = "HYPRSTREAM_MAX_CONTEXT")]

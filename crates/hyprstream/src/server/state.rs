@@ -1,9 +1,6 @@
 //! Server state management
 
-use crate::{
-    api::training_service::TrainingService,
-    services::{GenRegistryClient, ModelZmqClient, PolicyClient},
-};
+use crate::services::{GenRegistryClient, ModelZmqClient, PolicyClient};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -25,9 +22,6 @@ pub struct ServerState {
 
     /// Registry client for model operations
     pub registry: GenRegistryClient,
-
-    /// Training service for supervised learning
-    pub training_service: Arc<TrainingService>,
 
     /// Server configuration (from unified config system)
     pub config: Arc<ServerConfig>,
@@ -92,9 +86,6 @@ impl ServerState {
         let signing_key = Arc::new(signing_key);
         let verifying_key = Arc::new(verifying_key);
 
-        // Initialize training service
-        let training_service = Arc::new(TrainingService::new());
-
         // Preload models for faster first request
         if !config.preload_models.is_empty() {
             tracing::info!("Preloading {} models", config.preload_models.len());
@@ -114,7 +105,6 @@ impl ServerState {
             model_client,
             policy_client,
             registry,
-            training_service,
             config: Arc::new(config),
             metrics,
             signing_key,

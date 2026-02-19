@@ -107,6 +107,7 @@ pub async fn handle_worker_list(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Handle `worker run` command
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_worker_run(
     client: &WorkerZmqClient,
     image: &str,
