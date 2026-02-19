@@ -53,6 +53,14 @@ pub async fn exchange_token(
     State(state): State<Arc<OAuthState>>,
     Form(params): Form<TokenRequest>,
 ) -> Response {
+    tracing::info!(
+        grant_type = %params.grant_type,
+        client_id = %params.client_id,
+        has_code = params.code.is_some(),
+        has_redirect_uri = params.redirect_uri.is_some(),
+        has_code_verifier = params.code_verifier.is_some(),
+        "Token exchange request received"
+    );
     match params.grant_type.as_str() {
         "authorization_code" => exchange_authorization_code(state, params).await,
         "refresh_token" => exchange_refresh_token(state, params).await,
@@ -138,6 +146,7 @@ async fn exchange_authorization_code(
         );
     }
 
+    tracing::info!(client_id = %params.client_id, "PKCE verified, issuing token");
     issue_token_with_refresh(&state, &params.client_id, pending.scopes, pending.resource).await
 }
 
@@ -288,6 +297,7 @@ async fn issue_token_with_refresh(
 
     match result {
         Ok(token_info) => {
+            tracing::info!(client_id = %client_id, "Token issued successfully");
             let now = chrono::Utc::now().timestamp();
             let expires_in = (token_info.expires_at - now).max(0);
 
@@ -320,7 +330,7 @@ async fn issue_token_with_refresh(
                 .into_response()
         }
         Err(e) => {
-            tracing::error!("Token issuance failed: {}", e);
+            tracing::error!(client_id = %client_id, error = %e, "Token issuance failed");
             token_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "server_error",

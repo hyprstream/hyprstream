@@ -190,6 +190,12 @@ pub async fn authorize_post(
 
     state.pending_codes.write().await.insert(code.clone(), pending);
 
+    tracing::info!(
+        client_id = %form.client_id,
+        redirect_uri = %form.redirect_uri,
+        "Authorization code issued, redirecting"
+    );
+
     // Redirect with code
     let mut redirect_url = format!("{}?code={}", form.redirect_uri, code);
     if let Some(ref s) = form.state {

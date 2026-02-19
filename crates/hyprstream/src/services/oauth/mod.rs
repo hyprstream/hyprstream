@@ -68,6 +68,12 @@ pub fn create_app(state: Arc<OAuthState>) -> Router {
             "/oauth/device/verify",
             get(device::verify_get).post(device::verify_post),
         )
+        .layer(axum::middleware::from_fn(|req: axum::extract::Request, next: axum::middleware::Next| async move {
+            let method = req.method().clone();
+            let uri = req.uri().clone();
+            tracing::info!(%method, %uri, "OAuth request");
+            next.run(req).await
+        }))
         .with_state(state)
 }
 
@@ -75,9 +81,16 @@ pub fn create_app(state: Arc<OAuthState>) -> Router {
 ///
 /// Runs an Axum HTTP server with OAuth endpoints. Token issuance is delegated
 /// to PolicyService via ZMQ.
+///
+/// **Important**: The PolicyClient is created lazily inside `run()` rather than
+/// in the factory. This is because OAuthService runs in its own tokio runtime
+/// (separate thread), and ZMQ async I/O (TMQ) registers socket file descriptors
+/// with the current runtime's epoll. A PolicyClient created in the main runtime
+/// would hang when polled from the OAuth runtime.
 pub struct OAuthService {
     config: OAuthConfig,
-    policy_client: PolicyClient,
+    /// Signing key for creating the PolicyClient inside `run()`.
+    signing_key: hyprstream_rpc::prelude::SigningKey,
     context: Arc<zmq::Context>,
     control_transport: TransportConfig,
     #[allow(dead_code)]
@@ -87,14 +100,14 @@ pub struct OAuthService {
 impl OAuthService {
     pub fn new(
         config: OAuthConfig,
-        policy_client: PolicyClient,
+        signing_key: hyprstream_rpc::prelude::SigningKey,
         context: Arc<zmq::Context>,
         control_transport: TransportConfig,
         verifying_key: ed25519_dalek::VerifyingKey,
     ) -> Self {
         Self {
             config,
-            policy_client,
+            signing_key,
             context,
             control_transport,
             verifying_key,
@@ -131,8 +144,16 @@ impl Spawnable for OAuthService {
                 hyprstream_rpc::error::RpcError::SpawnFailed(format!("Invalid address: {e}"))
             })?;
 
+            // Create PolicyClient HERE, inside the OAuth runtime, so that ZMQ
+            // async I/O (TMQ) registers socket FDs with THIS runtime's epoll.
+            // Creating it in the factory (main runtime) would cause hangs.
+            let policy_client = PolicyClient::new(
+                self.signing_key,
+                hyprstream_rpc::RequestIdentity::local(),
+            );
+
             // Create shared state
-            let state = Arc::new(OAuthState::new(&self.config, self.policy_client));
+            let state = Arc::new(OAuthState::new(&self.config, policy_client));
             state.spawn_code_sweeper();
 
             // Create router
