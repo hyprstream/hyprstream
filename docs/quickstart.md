@@ -2,6 +2,8 @@
 
 This guide walks you from prerequisites through your first inference. It is derived from the codebase, not from other documentation.
 
+**Platform:** Linux only (AppImage, systemd, and all features).
+
 ---
 
 ## Prerequisites
@@ -10,37 +12,47 @@ This guide walks you from prerequisites through your first inference. It is deri
 
 Hyprstream requires Git for model management. Install:
 
+**Linux (Debian/Ubuntu):**
 ```bash
-# Debian/Ubuntu
 sudo apt-get install git git-lfs
+```
 
-# Fedora
+**Linux (Fedora):**
+```bash
 sudo dnf install git git-lfs
+```
 
-# Arch
+**Linux (Arch):**
+```bash
 sudo pacman -S git git-lfs
 ```
 
 ### For building from source
 
-- **Rust** 1.75 or later
+- **Rust** 1.75 or later (`rustup` recommended)
 - **LibTorch** (PyTorch C++ library) — see [Installation](#installation) for options
 - **Cap'n Proto** compiler (`capnp`)
 - **pkg-config** and **OpenSSL** dev headers
 
+**Linux (Debian/Ubuntu):**
 ```bash
-# Debian/Ubuntu
 sudo apt-get install build-essential pkg-config libssl-dev libsystemd-dev capnproto ca-certificates
-sudo apt install rustup cmake
+```
+
+**Linux (Fedora):**
+```bash
+sudo dnf install gcc gcc-c++ pkg-config openssl-devel systemd-devel capnproto
 ```
 
 ---
 
 ## Installation
 
-### Option A: AppImage (recommended)
+### Option A: AppImage
 
-1. Download the [Universal AppImage](https://github.com/hyprstream/hyprstream/releases) for your platform.
+AppImages are pre-built for Linux x86_64. Download from [releases](https://github.com/hyprstream/hyprstream/releases).
+
+1. Download the [Universal AppImage](https://github.com/hyprstream/hyprstream/releases) or a variant (cpu, cuda128, cuda130, rocm71).
 2. Make it executable and install:
 
 ```bash
@@ -67,7 +79,7 @@ cd hyprstream
 
 2. Install LibTorch (choose one):
 
-**Automatic download** (simplest):
+**Automatic download** (simplest; CPU-only):
 
 ```bash
 cargo build --release --features download-libtorch
@@ -75,9 +87,12 @@ cargo build --release --features download-libtorch
 
 **Manual download** — pick the variant for your hardware:
 
-- CPU: https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-2.10.0%2Bcpu.zip
-- CUDA 12.8: https://download.pytorch.org/libtorch/cu128/libtorch-shared-with-deps-2.10.0%2Bcu128.zip
-- ROCm 7.1: https://download.pytorch.org/libtorch/rocm7.1/libtorch-shared-with-deps-2.10.0%2Brocm7.1.zip
+| Variant | URL |
+|---------|-----|
+| CPU | https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-2.10.0%2Bcpu.zip |
+| CUDA 12.8 | https://download.pytorch.org/libtorch/cu128/libtorch-shared-with-deps-2.10.0%2Bcu128.zip |
+| CUDA 13.0 | https://download.pytorch.org/libtorch/cu130/libtorch-shared-with-deps-2.10.0%2Bcu130.zip |
+| ROCm 7.1 | https://download.pytorch.org/libtorch/rocm7.1/libtorch-shared-with-deps-2.10.0%2Brocm7.1.zip |
 
 Then:
 
@@ -94,11 +109,24 @@ cargo build --release
 ./target/release/hyprstream --help
 ```
 
+### Option C: AppImage build script
+
+For a reproducible build with the correct libtorch (CUDA, ROCm, etc.):
+
+```bash
+./appimage/build-appimage.sh build cuda130    # CUDA 13.0
+./appimage/build-appimage.sh build cuda128    # CUDA 12.8
+./appimage/build-appimage.sh build rocm71     # ROCm 7.1
+./appimage/build-appimage.sh build cpu        # CPU only
+```
+
+Output: `appimage/output/hyprstream-dev-<variant>-x86_64.AppImage`
+
 ---
 
 ## First-time setup
 
-### 1. Install the service (if using AppImage)
+### 1. Install the service (AppImage only)
 
 If you used the AppImage, run:
 
@@ -106,7 +134,7 @@ If you used the AppImage, run:
 hyprstream service install
 ```
 
-This installs the `hyprstream` command and systemd units.
+This installs the `hyprstream` command and systemd units. For source builds, run the binary from `target/release/` or add it to your PATH manually.
 
 ### 2. Apply a policy template
 
@@ -316,16 +344,18 @@ Then run the template again.
 
 ### CUDA / GPU not detected
 
-For CUDA, ensure `LD_PRELOAD` is set:
+Ensure `LD_PRELOAD` is set (systemd):
 
 ```bash
 systemctl --user set-environment LD_PRELOAD=libtorch_cuda.so
 systemctl --user restart hyprstream-model
 ```
 
+Ensure libtorch CUDA/ROCm libraries are in your library path (see [Libtorch not found](#libtorch-not-found-source-build)).
+
 ### Services not starting
 
-Check systemd (if used):
+Check systemd:
 
 ```bash
 systemctl --user status hyprstream-*
@@ -333,8 +363,6 @@ journalctl --user -u hyprstream-oai -f
 ```
 
 ### Libtorch not found (source build)
-
-Set `LIBTORCH` and `LD_LIBRARY_PATH` before running:
 
 ```bash
 export LIBTORCH=/path/to/libtorch

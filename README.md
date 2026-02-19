@@ -10,7 +10,7 @@ HyprStream is an agentic cloud infrastructure for applications that learn, build
 
 Users may communicate with open weight and custom LLMs via Hyprstream with an OpenAI API.
 
-Easy to get started, just down [Download](https://github.com/hyprstream/hyprstream/releases/tag/v0.2.0) and it auto-detects your NVIDIA or ROCm GPU.
+Easy to get started: [download](https://github.com/hyprstream/hyprstream/releases/tag/v0.2.0) the AppImage and it auto-detects your NVIDIA or ROCm GPU. See [docs/quickstart.md](docs/quickstart.md) for a full walkthrough.
 
 ### Core Features
 
@@ -28,27 +28,27 @@ Easy to get started, just down [Download](https://github.com/hyprstream/hyprstre
 
 ## Installation
 
-### Quick Install (AppImage)
+### Quick Install (AppImage, Linux)
 
-NOTE: Hyprstream requires the `git` and `git-lfs` packages, which are available in all major distros.
+Hyprstream requires `git` and `git-lfs` (available in all major Linux distros).
 
-Download the [Universal AppImage](https://github.com/hyprstream/hyprstream/releases/). We have published AppImages for each supported CPU and GPU configuration, but recommend the Universal image for easy-of-use and GPU auto-detection.
+Download the [Universal AppImage](https://github.com/hyprstream/hyprstream/releases/). We publish AppImages for each CPU/GPU configuration; the Universal image is recommended for ease-of-use and GPU auto-detection.
 
 ```bash
 # Download and install (Universal recommended)
 chmod +x hyprstream-v0.2.0-x86_64.AppImage
-
-# Install
 ./hyprstream-v0.2.0-x86_64.AppImage service install
 
-# The following commands should use the installed copy
-export PATH="$HOME/.local/bin;$PATH"
+# Add to PATH
+export PATH="$HOME/.local/bin:$PATH"
 
-# Apply policy template - make local users admin; hyprstream is deny by default
-hyprstream policy apply-template local
+# Apply policy template (hyprstream is deny-by-default)
+hyprstream quick policy apply-template local
 
 hyprstream service start
 ```
+
+See [docs/quickstart.md](docs/quickstart.md) for prerequisites, source build, and first-time setup.
 
 NOTE: For CUDA systems, make sure you have installed [CUDA Toolkit](https://developer.nvidia.com/cuda/toolkit) and set `LD_PRELOAD`:
 
@@ -58,72 +58,55 @@ systemctl --user set-environment LD_PRELOAD=libtorch_cuda.so && systemctl --user
 
 The installed files will be located in `$HOME/.local/hyprstream/` and `$HOME/.local/bin/`.
 
-### Expert installation: Linux Container Engines
-
-Hyprstream is able to run and manage secure containers independently, and can run inside of containers. _A container engine is optional with Hyprstream_, but may be useful for deployment to Enterprise systems based on Docker or Kubernetes.
-
-See [README-Docker.md](README-Docker.md) for more information on running in containers.
-
-#### Building from source
+### Building from source
 
 ```bash
-# Set LIBTORCH= to your libtorch libraries, or set `--feature download-libtorch`
+# Set LIBTORCH to your libtorch path, or use --features download-libtorch
 cargo build --release
 ```
 
-See [DEVELOP.md](DEVELOP.md) for more information on building from source.
+See [docs/quickstart.md](docs/quickstart.md) for prerequisites and [DEVELOP.md](DEVELOP.md) for detailed build instructions.
+
+### Container deployment
+
+Hyprstream can run inside containers. See [README-Docker.md](README-Docker.md) for Docker/Kubernetes deployment.
 
 ## Quick Start
 
 ### Clone a model
 
-Hyprstream supports Qwen3 model inference from Git repositories.
-
-Users may also manage standard source code repositories and datasets.
+Hyprstream supports Qwen3 model inference from Git repositories (HuggingFace, GitHub, etc.).
 
 ```bash
-# Clone a model from Git repository (HuggingFace, GitHub, etc.)
-hyprstream clone https://huggingface.co/Qwen/Qwen3-0.6B
+# Clone a model
+hyprstream quick clone https://huggingface.co/Qwen/Qwen3-0.6B
 
 # Clone with a custom name
-hyprstream clone https://huggingface.co/Qwen/Qwen3-0.6B --name qwen3-small
+hyprstream quick clone https://huggingface.co/Qwen/Qwen3-0.6B --name qwen3-small
 ```
 
-### Managing Repositories
+### Managing models
 
-Worktrees are automatically managed by hyprstream, allowing efficient operations on multiple branches.
+Worktrees are automatically managed by hyprstream.
 
 ```bash
-# List all cached models (shows names and UUIDs)
-hyprstream list
+# List all cached models
+hyprstream quick list
 
-# Get detailed model information using Model:Ref syntax
-hyprstream inspect qwen3-small           # By name
-hyprstream inspect qwen3-small:main      # Specific branch
-hyprstream inspect qwen3-small:v1.0      # Specific tag
-hyprstream inspect qwen3-small:abc123    # Specific commit
-
-# Pull latest updates for a model
-hyprstream pull qwen3-small           # Update to latest
-hyprstream pull qwen3-small main      # Update specific branch
-
-# Push changes to remote
-hyprstream push qwen3-small origin main
+# Get detailed model information (model:branch format)
+hyprstream quick info qwen3-small
+hyprstream quick info qwen3-small:main
 ```
 
-### Run Inference
+### Run inference
 
 ```bash
-# Basic inference using ModelRef syntax
-hyprstream infer qwen3-small \
+# Basic inference
+hyprstream quick infer qwen3-small:main \
     --prompt "Explain quantum computing in simple terms"
 
-# Inference with specific model version
-hyprstream infer qwen3-small:v1.0 \
-    --prompt "Explain quantum computing"
-
-# Inference with specific branch
-hyprstream infer qwen3-small:main \
+# With options
+hyprstream quick infer qwen3-small:main \
     --prompt "Write a Python function to sort a list" \
     --temperature 0.7 \
     --top-p 0.9 \
@@ -211,9 +194,11 @@ HyprStream includes a built-in [Model Context Protocol](https://modelcontextprot
 
 **1. Configure Claude Code:**
 
-```claude mcp add --transport http hyprstream http://localhost:6790/mcp```
+```
+claude mcp add --transport http hyprstream http://localhost:6790/mcp
+```
 
-**2. Authenticate
+**2. Authenticate**
 
 Use `/mcp`, select `hyprstream`, and select `Authenticate` or `Re-authenticate`.
 
@@ -431,10 +416,7 @@ HYPRSTREAM_BACKEND=cuda130 ./hyprstream-v0.2.0-x86_64.AppImage server
 
 ### System Requirements
 
-- **Operating System**:
-  - Linux: x86_64, ARM64
-  - Windows: Supporting wsl2.
-  - macOS: Not currently supported
+- **Operating System**: Linux (x86_64, ARM64)
 - **Inference Service Requirements (optional):**
   - **CPU**: Full support (x86_64, ARM64)
   - **CUDA**: NVIDIA host kernel modules (`nvidia-smi` works)
