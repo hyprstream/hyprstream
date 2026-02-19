@@ -42,9 +42,11 @@ use std::sync::Arc;
 use anyhow::Result;
 use capnp::message::Builder;
 use capnp::serialize;
+use dashmap::DashMap;
 use futures::SinkExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::OnceCell;
+use tokio_util::sync::CancellationToken;
 
 use crate::auth::Claims;
 use crate::prelude::SigningKey;
@@ -466,6 +468,12 @@ pub struct StreamContext {
     mac_key: [u8; 32],
     /// Server's ephemeral public key - client needs this for DH
     server_pubkey: [u8; 32],
+    /// DH-derived control channel topic (64 hex chars)
+    ctrl_topic: String,
+    /// DH-derived control channel HMAC key
+    ctrl_mac_key: [u8; 32],
+    /// Cancellation token — fired by control listener or JWT expiry
+    cancel_token: CancellationToken,
 }
 
 impl StreamContext {
@@ -481,6 +489,9 @@ impl StreamContext {
             topic,
             mac_key,
             server_pubkey,
+            ctrl_topic: String::new(),
+            ctrl_mac_key: [0u8; 32],
+            cancel_token: CancellationToken::new(),
         }
     }
 
@@ -513,6 +524,9 @@ impl StreamContext {
             topic: keys.topic,
             mac_key: *keys.mac_key,
             server_pubkey: server_pubkey_bytes,
+            ctrl_topic: keys.ctrl_topic,
+            ctrl_mac_key: *keys.ctrl_mac_key,
+            cancel_token: CancellationToken::new(),
         })
     }
 
@@ -534,6 +548,21 @@ impl StreamContext {
     /// Get the server's ephemeral public key (client needs this for DH).
     pub fn server_pubkey(&self) -> &[u8; 32] {
         &self.server_pubkey
+    }
+
+    /// Get the control channel topic.
+    pub fn ctrl_topic(&self) -> &str {
+        &self.ctrl_topic
+    }
+
+    /// Get the control channel MAC key.
+    pub fn ctrl_mac_key(&self) -> &[u8; 32] {
+        &self.ctrl_mac_key
+    }
+
+    /// Get the cancellation token.
+    pub fn cancel_token(&self) -> &CancellationToken {
+        &self.cancel_token
     }
 }
 
@@ -566,6 +595,7 @@ impl StreamContext {
 pub struct StreamPublisher {
     builder: StreamBuilder,
     socket: Arc<tokio::sync::Mutex<tmq::push::Push>>,
+    cancel_token: CancellationToken,
 }
 
 impl StreamPublisher {
@@ -581,7 +611,11 @@ impl StreamPublisher {
         config: BatchingConfig,
     ) -> Self {
         let builder = StreamBuilder::new(config, ctx.mac_key, ctx.topic.clone());
-        Self { builder, socket }
+        Self {
+            builder,
+            socket,
+            cancel_token: ctx.cancel_token.clone(),
+        }
     }
 
     /// Publish binary data with automatic batching.
@@ -597,6 +631,10 @@ impl StreamPublisher {
     /// Higher rates result in larger batches (more efficient).
     /// Lower rates result in smaller batches (lower latency).
     pub async fn publish_data_with_rate(&mut self, data: &[u8], rate: f32) -> Result<()> {
+        if self.cancel_token.is_cancelled() {
+            self.publish_error("cancelled").await?;
+            anyhow::bail!("stream cancelled");
+        }
         if let Some(frames) = self.builder.add_data(data, rate)? {
             let mut socket = self.socket.lock().await;
             frames.send_async(&mut socket).await?;
@@ -656,6 +694,11 @@ impl StreamPublisher {
     /// Get the topic being published to.
     pub fn topic(&self) -> &str {
         self.builder.topic()
+    }
+
+    /// Check if this stream has been cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel_token.is_cancelled()
     }
 }
 
@@ -925,6 +968,12 @@ pub struct StreamHandle {
     verifier: StreamVerifier,
     pending: VecDeque<StreamPayload>,
     completed: bool,
+    /// PUSH socket for sending control messages (lazy, consumer → StreamService)
+    ctrl_push: Option<zmq::Socket>,
+    /// Control channel topic (DH-derived)
+    ctrl_topic: String,
+    /// Control channel MAC key
+    ctrl_mac_key: [u8; 32],
 }
 
 impl StreamHandle {
@@ -966,6 +1015,16 @@ impl StreamHandle {
 
         let verifier = StreamVerifier::new(*keys.mac_key, keys.topic.clone());
 
+        // Set up control channel PUSH socket (consumer → StreamService → producer)
+        let ctrl_push = context.socket(zmq::PUSH).ok();
+        if let Some(ref sock) = ctrl_push {
+            let push_endpoint = endpoint_registry()
+                .endpoint("streams", SocketKind::Push)
+                .to_zmq_string();
+            // Best-effort connect — cancel is not critical path
+            let _ = sock.connect(&push_endpoint);
+        }
+
         Ok(Self {
             subscriber,
             stream_id,
@@ -973,6 +1032,9 @@ impl StreamHandle {
             verifier,
             pending: VecDeque::new(),
             completed: false,
+            ctrl_push,
+            ctrl_topic: keys.ctrl_topic,
+            ctrl_mac_key: *keys.ctrl_mac_key,
         })
     }
 
@@ -1061,6 +1123,35 @@ impl StreamHandle {
     pub fn is_completed(&self) -> bool {
         self.completed
     }
+
+    /// Send a cancel control message to the producer via the control channel.
+    ///
+    /// Best-effort: if the PUSH socket is unavailable or send fails, the
+    /// JWT expiry timeout will still stop the stream.
+    pub fn cancel(&self) {
+        let Some(ref sock) = self.ctrl_push else { return };
+
+        // Build StreamControl::Cancel capnp message
+        let mut builder = Builder::new_default();
+        {
+            let mut ctrl = builder.init_root::<crate::streaming_capnp::stream_control::Builder>();
+            ctrl.set_cancel(());
+        }
+        let mut buf = Vec::new();
+        if serialize::write_message(&mut buf, &builder).is_err() {
+            return;
+        }
+
+        // Compute HMAC over the capnp payload using ctrl_mac_key
+        let mac = keyed_mac_truncated(&self.ctrl_mac_key, &buf);
+
+        // Send [ctrl_topic, capnp, mac] — best effort, non-blocking
+        let _ = sock.send(self.ctrl_topic.as_bytes(), zmq::SNDMORE | zmq::DONTWAIT);
+        let _ = sock.send(&buf, zmq::SNDMORE | zmq::DONTWAIT);
+        let _ = sock.send(mac.as_slice(), zmq::DONTWAIT);
+
+        tracing::debug!(stream_id = %self.stream_id, "sent cancel on control channel");
+    }
 }
 
 // ============================================================================
@@ -1101,6 +1192,10 @@ pub struct StreamChannel {
     signing_key: SigningKey,
     /// Lazy-initialized async PUSH socket to StreamService (wrapped in Arc for sharing)
     push_socket: OnceCell<Arc<tokio::sync::Mutex<tmq::push::Push>>>,
+    /// Shared SUB socket for control channel messages (one FD for all streams)
+    ctrl_sub: OnceCell<Arc<tokio::sync::Mutex<tmq::subscribe::Subscribe>>>,
+    /// Active cancel tokens keyed by ctrl_topic
+    cancel_tokens: Arc<DashMap<String, CancellationToken>>,
 }
 
 impl StreamChannel {
@@ -1110,6 +1205,8 @@ impl StreamChannel {
             context,
             signing_key,
             push_socket: OnceCell::new(),
+            ctrl_sub: OnceCell::new(),
+            cancel_tokens: Arc::new(DashMap::new()),
         }
     }
 
@@ -1154,9 +1251,32 @@ impl StreamChannel {
         // 1. DH key exchange
         let stream_ctx = StreamContext::from_dh(client_ephemeral_pubkey)?;
 
-        // 2. Pre-authorize with StreamService
+        // 2. Pre-authorize data + control topics with StreamService
         let exp = chrono::Utc::now().timestamp() + expiry_secs;
-        self.pre_authorize(&stream_ctx, exp, claims).await?;
+        self.pre_authorize(&stream_ctx, exp, claims.clone()).await?;
+        self.register_topic(stream_ctx.ctrl_topic(), exp, claims).await?;
+
+        // 3. Subscribe control channel and register cancel token
+        let ctrl_sub = self.get_or_init_ctrl_sub().await?;
+        {
+            let mut sub = ctrl_sub.lock().await;
+            sub.subscribe(stream_ctx.ctrl_topic().as_bytes())
+                .map_err(|e| anyhow::anyhow!("Failed to subscribe ctrl topic: {}", e))?;
+        }
+        self.cancel_tokens.insert(
+            stream_ctx.ctrl_topic().to_owned(),
+            stream_ctx.cancel_token().clone(),
+        );
+
+        // 4. Spawn JWT expiry timeout as universal backstop
+        let token = stream_ctx.cancel_token().clone();
+        let ctrl_topic = stream_ctx.ctrl_topic().to_owned();
+        let tokens_map = Arc::clone(&self.cancel_tokens);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(expiry_secs.max(0) as u64)).await;
+            token.cancel();
+            tokens_map.remove(&ctrl_topic);
+        });
 
         Ok(stream_ctx)
     }
@@ -1222,6 +1342,66 @@ impl StreamChannel {
             Ok::<_, anyhow::Error>(Arc::new(tokio::sync::Mutex::new(socket)))
         }).await?;
         Ok(Arc::clone(socket_arc))
+    }
+
+    /// Get or initialize the shared control channel SUB socket.
+    async fn get_or_init_ctrl_sub(&self) -> Result<Arc<tokio::sync::Mutex<tmq::subscribe::Subscribe>>> {
+        let sub_arc = self.ctrl_sub.get_or_try_init(|| async {
+            let endpoint = endpoint_registry()
+                .endpoint("streams", SocketKind::Sub)
+                .to_zmq_string();
+
+            let without_topic = tmq::subscribe::subscribe(&self.context)
+                .connect(&endpoint)
+                .map_err(|e| anyhow::anyhow!("Failed to connect ctrl SUB: {}", e))?;
+
+            // Subscribe to a NUL-prefixed topic that will never match real hex topics
+            let sub = without_topic.subscribe(b"\x00__ctrl_init__")
+                .map_err(|e| anyhow::anyhow!("Failed to init ctrl SUB: {}", e))?;
+
+            let sub = Arc::new(tokio::sync::Mutex::new(sub));
+
+            // Spawn the control listener task
+            self.spawn_ctrl_listener(Arc::clone(&sub));
+
+            Ok::<_, anyhow::Error>(sub)
+        }).await?;
+        Ok(Arc::clone(sub_arc))
+    }
+
+    /// Spawn a background task that listens for control messages and fires cancel tokens.
+    fn spawn_ctrl_listener(&self, sub: Arc<tokio::sync::Mutex<tmq::subscribe::Subscribe>>) {
+        use futures::StreamExt;
+
+        let tokens = Arc::clone(&self.cancel_tokens);
+        tokio::spawn(async move {
+            loop {
+                let msg = {
+                    let mut sub = sub.lock().await;
+                    sub.next().await
+                };
+                let multipart = match msg {
+                    Some(Ok(m)) => m,
+                    Some(Err(e)) => {
+                        tracing::warn!("ctrl SUB error: {}", e);
+                        continue;
+                    }
+                    None => break, // socket closed
+                };
+
+                // Wire format: [ctrl_topic, capnp, mac]
+                if multipart.is_empty() {
+                    continue;
+                }
+                let topic = String::from_utf8_lossy(&multipart[0]);
+
+                // Fire the cancel token if we have one for this topic
+                if let Some((_, token)) = tokens.remove(topic.as_ref()) {
+                    tracing::debug!(ctrl_topic = %topic, "control cancel received");
+                    token.cancel();
+                }
+            }
+        });
     }
 
     /// Create a publisher for the given stream context.

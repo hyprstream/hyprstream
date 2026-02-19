@@ -20,6 +20,7 @@ zmq-sys = { workspace = true }  # Raw FFI for ZMQ_USE_FD socket option
 
 # Async runtime
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 

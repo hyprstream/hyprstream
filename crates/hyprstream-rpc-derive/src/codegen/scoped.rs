@@ -197,6 +197,7 @@ fn generate_scoped_client_recursive(
         #[derive(Clone)]
         pub struct #client_name {
             client: Arc<ZmqClientBase>,
+            claims: Option<std::sync::Arc<hyprstream_rpc::auth::Claims>>,
             #(#all_scope_field_defs,)*
         }
 
@@ -206,13 +207,28 @@ fn generate_scoped_client_recursive(
                 self.client.next_id()
             }
 
+            /// Attach claims for e2e verification. All subsequent calls include these claims.
+            pub fn with_claims(mut self, claims: hyprstream_rpc::auth::Claims) -> Self {
+                self.claims = Some(std::sync::Arc::new(claims));
+                self
+            }
+
             /// Send a raw request and return the raw response bytes.
             pub async fn call(&self, payload: Vec<u8>) -> anyhow::Result<Vec<u8>> {
-                self.client.call(payload, CallOptions::default()).await
+                let opts = match &self.claims {
+                    Some(c) => CallOptions::default().claims((**c).clone()),
+                    None => CallOptions::default(),
+                };
+                self.client.call(payload, opts).await
             }
 
             /// Send a raw request with custom options and return the raw response bytes.
-            pub async fn call_with_options(&self, payload: Vec<u8>, opts: CallOptions) -> anyhow::Result<Vec<u8>> {
+            pub async fn call_with_options(&self, payload: Vec<u8>, mut opts: CallOptions) -> anyhow::Result<Vec<u8>> {
+                if opts.claims.is_none() {
+                    if let Some(ref c) = self.claims {
+                        opts = opts.claims((**c).clone());
+                    }
+                }
                 self.client.call(payload, opts).await
             }
 
@@ -272,6 +288,7 @@ fn generate_nested_factory_method(
         pub fn #method_name(&self #(, #params)*) -> #client_name_ident {
             #client_name_ident {
                 client: Arc::clone(&self.client),
+                claims: self.claims.clone(),
                 #(#all_parent_field_inits,)*
                 #(#own_field_inits,)*
             }

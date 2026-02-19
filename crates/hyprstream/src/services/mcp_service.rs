@@ -94,7 +94,7 @@ pub enum ToolResult {
     /// Immediate JSON result (REQ/REP tools)
     Sync(Value),
     /// Streaming result — StreamHandle encapsulates DH, SUB, HMAC verification
-    Stream(StreamHandle),
+    Stream(Box<StreamHandle>),
 }
 
 /// Context passed to handler — carries auth + ZMQ infra + optional ServiceContext
@@ -449,7 +449,7 @@ fn register_streaming_tool(
                     &client_pubkey_bytes,
                 )?;
 
-                Ok(ToolResult::Stream(handle))
+                Ok(ToolResult::Stream(Box::new(handle)))
             })
         }),
     });

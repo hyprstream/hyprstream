@@ -380,46 +380,30 @@ impl ModelService {
             }
         }
     }
-
-    /// Route inference request to the appropriate InferenceService
-    async fn infer(&self, model_ref_str: &str, request: GenerationRequest) -> Result<GenerationResult> {
-        let client = self.get_inference_client(model_ref_str).await?;
-        client.generate(&request).await
-    }
-
-    /// Route streaming inference request with E2E authentication.
-    ///
-    /// The ephemeral pubkey from the client's envelope is passed through to InferenceService.
-    async fn infer_stream(
-        &self,
-        model_ref_str: &str,
-        request: GenerationRequest,
-        client_ephemeral_pubkey: Option<[u8; 32]>,
-    ) -> Result<StreamInfo> {
-        let client = self.get_inference_client(model_ref_str).await?;
-        client.generate_stream(&request, client_ephemeral_pubkey).await
-    }
-
-    /// Helper: Get inference client for a model (ensures loaded, updates last_used)
-    async fn get_inference_client(&self, model_ref_str: &str) -> Result<InferenceZmqClient> {
+    async fn get_inference_client(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<InferenceZmqClient> {
         let _endpoint = self.load_model(model_ref_str, None).await?;
         let mut cache = self.loaded_models.write().await;
         let model = cache
             .get_mut(model_ref_str)
             .ok_or_else(|| anyhow!("Model {} not found after loading", model_ref_str))?;
         model.last_used = Instant::now();
-        Ok(model.client.clone())
+        let client = model.client.clone();
+        match ctx.claims() {
+            Some(claims) => Ok(client.with_claims(claims.clone())),
+            None => Ok(client),
+        }
     }
 
     /// Apply chat template via the model's InferenceService
     async fn apply_chat_template(
         &self,
         model_ref_str: &str,
+        ctx: &EnvelopeContext,
         messages: Vec<ChatMessage>,
         add_generation_prompt: bool,
         tools: Option<&serde_json::Value>,
     ) -> Result<TemplatedPrompt> {
-        let client = self.get_inference_client(model_ref_str).await?;
+        let client = self.get_inference_client(model_ref_str, ctx).await?;
 
         // Convert ChatMessage to the template engine's format
         let template_messages: Vec<crate::runtime::template_engine::ChatMessage> = messages
@@ -447,81 +431,85 @@ impl ModelService {
     }
 
     /// Create a new LoRA adapter on the loaded model
-    async fn create_lora(&self, model_ref_str: &str, config: crate::training::TenantDeltaConfig) -> Result<()> {
-        let client = self.get_inference_client(model_ref_str).await?;
+    async fn create_lora(&self, model_ref_str: &str, ctx: &EnvelopeContext, config: crate::training::TenantDeltaConfig) -> Result<()> {
+        let client = self.get_inference_client(model_ref_str, ctx).await?;
         client.create_lora(&config).await
     }
 
     /// Load a LoRA adapter from a file
-    async fn load_lora(&self, model_ref_str: &str, path: &str) -> Result<()> {
-        let client = self.get_inference_client(model_ref_str).await?;
+    async fn load_lora(&self, model_ref_str: &str, ctx: &EnvelopeContext, path: &str) -> Result<()> {
+        let client = self.get_inference_client(model_ref_str, ctx).await?;
         client.load_lora(path).await
     }
 
     /// Unload the current LoRA adapter
-    async fn unload_lora(&self, model_ref_str: &str) -> Result<()> {
-        let client = self.get_inference_client(model_ref_str).await?;
+    async fn unload_lora(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
+        let client = self.get_inference_client(model_ref_str, ctx).await?;
         client.unload_lora().await
     }
 
     /// Check if a LoRA adapter is loaded
-    async fn has_lora(&self, model_ref_str: &str) -> Result<bool> {
-        let client = self.get_inference_client(model_ref_str).await?;
+    async fn has_lora(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<bool> {
+        let client = self.get_inference_client(model_ref_str, ctx).await?;
         client.has_lora().await
     }
 
     // Training loop control - forward to InferenceService via ZMQ
-    async fn commit_adaptation(&self, model_ref_str: &str) -> Result<()> {
-        let client = self.get_inference_client(model_ref_str).await?;
+    async fn commit_adaptation(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
+        let client = self.get_inference_client(model_ref_str, ctx).await?;
         client.commit_adaptation().await
     }
 
-    async fn rollback_adaptation(&self, model_ref_str: &str) -> Result<()> {
-        let client = self.get_inference_client(model_ref_str).await?;
+    async fn rollback_adaptation(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
+        let client = self.get_inference_client(model_ref_str, ctx).await?;
         client.rollback_adaptation().await
     }
 
     async fn train_step_stream(
         &self,
         model_ref_str: &str,
+        ctx: &EnvelopeContext,
         input: &str,
         gradient_steps: u32,
         learning_rate: f32,
         auto_commit: bool,
         client_ephemeral_pubkey: Option<[u8; 32]>,
     ) -> Result<StreamInfo> {
-        let client = self.get_inference_client(model_ref_str).await?;
+        let client = self.get_inference_client(model_ref_str, ctx).await?;
         client.train_step_stream(input, gradient_steps, learning_rate, auto_commit, client_ephemeral_pubkey).await
     }
 
-    async fn reset_delta(&self, model_ref_str: &str) -> Result<()> {
-        let client = self.get_inference_client(model_ref_str).await?;
+    async fn reset_delta(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
+        let client = self.get_inference_client(model_ref_str, ctx).await?;
         client.reset_delta().await
     }
 
     async fn get_delta_status_forward(
         &self,
         model_ref_str: &str,
+        ctx: &EnvelopeContext,
     ) -> Result<crate::services::generated::inference_client::DeltaStatusResult> {
-        let client = self.get_inference_client(model_ref_str).await?;
+        let client = self.get_inference_client(model_ref_str, ctx).await?;
         client.gen.get_delta_status().await
     }
 
     async fn snapshot_delta_forward(
         &self,
         model_ref_str: &str,
+        ctx: &EnvelopeContext,
     ) -> Result<crate::services::generated::inference_client::SnapshotDeltaResult> {
-        let client = self.get_inference_client(model_ref_str).await?;
+        let client = self.get_inference_client(model_ref_str, ctx).await?;
         client.gen.snapshot_delta().await
     }
 
     async fn export_peft_adapter_forward(
         &self,
         model_ref_str: &str,
+        ctx: &EnvelopeContext,
         name: &str,
         commit_message: &str,
     ) -> Result<crate::services::generated::inference_client::ExportPeftResult> {
-        let client = self.get_inference_client(model_ref_str).await?;
+        let client = self.get_inference_client(model_ref_str, ctx).await?;
         client.gen.export_peft_adapter(name, commit_message).await
     }
 
@@ -554,7 +542,7 @@ use crate::services::generated::model_client::{
 #[async_trait::async_trait(?Send)]
 impl TttHandler for ModelService {
     async fn handle_create(
-        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &CreateLoraRequest,
     ) -> Result<()> {
         let config = crate::training::TenantDeltaConfig {
@@ -565,14 +553,14 @@ impl TttHandler for ModelService {
             learning_rate: data.learning_rate as f64,
             ..crate::training::TenantDeltaConfig::default()
         };
-        self.create_lora(model_ref, config).await
+        self.create_lora(model_ref, ctx, config).await
     }
 
     async fn handle_train(
-        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &TrainStepRequest,
     ) -> Result<TrainStepResponse> {
-        let client = self.get_inference_client(model_ref).await?;
+        let client = self.get_inference_client(model_ref, ctx).await?;
         let r = client.gen.train_step(
             &data.input, data.gradient_steps, data.learning_rate, data.auto_commit,
         ).await?;
@@ -594,10 +582,9 @@ impl TttHandler for ModelService {
         model_ref: &str, data: &TrainStepRequest,
     ) -> Result<(crate::services::generated::model_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
         let info = self.train_step_stream(
-                model_ref, &data.input, data.gradient_steps, data.learning_rate,
+                model_ref, ctx, &data.input, data.gradient_steps, data.learning_rate,
                 data.auto_commit, ctx.ephemeral_pubkey,
             ).await?;
-        // Convert inference_client::crate::services::generated::model_client::StreamInfo to model_client::crate::services::generated::model_client::StreamInfo
         let stream_info = crate::services::generated::model_client::StreamInfo {
             stream_id: info.stream_id,
             endpoint: info.endpoint,
@@ -607,27 +594,27 @@ impl TttHandler for ModelService {
     }
 
     async fn handle_commit(
-        &self, _ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
+        &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
     ) -> Result<()> {
-        self.commit_adaptation(model_ref).await
+        self.commit_adaptation(model_ref, ctx).await
     }
 
     async fn handle_rollback(
-        &self, _ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
+        &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
     ) -> Result<()> {
-        self.rollback_adaptation(model_ref).await
+        self.rollback_adaptation(model_ref, ctx).await
     }
 
     async fn handle_reset(
-        &self, _ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
+        &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
     ) -> Result<()> {
-        self.reset_delta(model_ref).await
+        self.reset_delta(model_ref, ctx).await
     }
 
     async fn handle_status(
-        &self, _ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
+        &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
     ) -> Result<GetDeltaStatusResponse> {
-        let r = self.get_delta_status_forward(model_ref).await?;
+        let r = self.get_delta_status_forward(model_ref, ctx).await?;
                 Ok(GetDeltaStatusResponse {
                     exists: r.exists,
                     accumulated_steps: r.accumulated_steps,
@@ -645,10 +632,10 @@ impl TttHandler for ModelService {
     }
 
     async fn handle_save(
-        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &SaveAdaptationRequest,
     ) -> Result<SaveAdaptationResponse> {
-        let client = self.get_inference_client(model_ref).await?;
+        let client = self.get_inference_client(model_ref, ctx).await?;
         let r = client.gen.save_adaptation(
             &data.name, &data.merge_strategy, data.merge_weight, &data.commit_message,
         ).await?;
@@ -661,9 +648,9 @@ impl TttHandler for ModelService {
     }
 
     async fn handle_snapshot(
-        &self, _ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
+        &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
     ) -> Result<SnapshotDeltaResponse> {
-        let r = self.snapshot_delta_forward(model_ref).await?;
+        let r = self.snapshot_delta_forward(model_ref, ctx).await?;
         Ok(SnapshotDeltaResponse {
             content_hash: r.content_hash,
             size_bytes: r.size_bytes,
@@ -673,10 +660,10 @@ impl TttHandler for ModelService {
     }
 
     async fn handle_export(
-        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &TttExportRequest,
     ) -> Result<TttExportResponse> {
-        let r = self.export_peft_adapter_forward(model_ref, &data.name, &data.commit_message).await?;
+        let r = self.export_peft_adapter_forward(model_ref, ctx, &data.name, &data.commit_message).await?;
         Ok(TttExportResponse {
             adapter_path: r.adapter_path,
             content_hash: r.content_hash,
@@ -687,22 +674,22 @@ impl TttHandler for ModelService {
 #[async_trait::async_trait(?Send)]
 impl PeftHandler for ModelService {
     async fn handle_load(
-        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, value: &str,
     ) -> Result<()> {
-        self.load_lora(model_ref, value).await
+        self.load_lora(model_ref, ctx, value).await
     }
 
     async fn handle_unload(
-        &self, _ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
+        &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
     ) -> Result<()> {
-        self.unload_lora(model_ref).await
+        self.unload_lora(model_ref, ctx).await
     }
 
     async fn handle_has(
-        &self, _ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
+        &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
     ) -> Result<bool> {
-        self.has_lora(model_ref).await
+        self.has_lora(model_ref, ctx).await
     }
 
     async fn handle_check(
@@ -723,11 +710,12 @@ impl PeftHandler for ModelService {
 #[async_trait::async_trait(?Send)]
 impl InferHandler for ModelService {
     async fn handle_generate(
-        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &GenerateRequest,
     ) -> Result<InferResult> {
         let request = generate_request_from_data(data);
-        let result = self.infer(model_ref, request).await?;
+        let client = self.get_inference_client(model_ref, ctx).await?;
+        let result = client.generate(&request).await?;
         Ok(InferResult {
             text: result.text,
             tokens_generated: result.tokens_generated as u32,
@@ -748,8 +736,8 @@ impl InferHandler for ModelService {
         model_ref: &str, data: &GenerateRequest,
     ) -> Result<(crate::services::generated::model_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
         let request = generate_request_from_data(data);
-        let info = self.infer_stream(model_ref, request, ctx.ephemeral_pubkey).await?;
-        // Convert inference_client::crate::services::generated::model_client::StreamInfo to model_client::crate::services::generated::model_client::StreamInfo
+        let client = self.get_inference_client(model_ref, ctx).await?;
+        let info = client.generate_stream(&request, ctx.ephemeral_pubkey).await?;
         let stream_info = crate::services::generated::model_client::StreamInfo {
             stream_id: info.stream_id,
             endpoint: info.endpoint,
@@ -759,7 +747,7 @@ impl InferHandler for ModelService {
     }
 
     async fn handle_apply_chat_template(
-        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &ApplyChatTemplateRequest,
     ) -> Result<String> {
         let chat_messages: Vec<ChatMessage> = data.messages.iter().map(|m| {
@@ -790,7 +778,7 @@ impl InferHandler for ModelService {
             serde_json::from_str(&data.tools_json).ok()
         };
         let templated = self.apply_chat_template(
-            model_ref, chat_messages, data.add_generation_prompt, tools.as_ref(),
+            model_ref, ctx, chat_messages, data.add_generation_prompt, tools.as_ref(),
         ).await?;
         Ok(templated.as_str().to_owned())
     }
@@ -1023,6 +1011,11 @@ impl ModelZmqClient {
         Self {
             gen: crate::services::core::create_service_client(endpoint, signing_key, identity),
         }
+    }
+
+    /// Attach claims for e2e verification. All subsequent calls include these claims.
+    pub fn with_claims(self, claims: hyprstream_rpc::auth::Claims) -> Self {
+        Self { gen: self.gen.with_claims(claims) }
     }
 
     /// Load a model — delegates to generated client

@@ -177,13 +177,14 @@ pub fn generate_client(service_name: &str, resolved: &ResolvedSchema, types_crat
         #[derive(Clone)]
         pub struct #client_name {
             client: Arc<ZmqClientBase>,
+            claims: Option<std::sync::Arc<hyprstream_rpc::auth::Claims>>,
         }
 
         impl ServiceClient for #client_name {
             const SERVICE_NAME: &'static str = #service_name_lit;
 
             fn from_zmq(client: ZmqClientBase) -> Self {
-                Self { client: Arc::new(client) }
+                Self { client: Arc::new(client), claims: None }
             }
         }
 
@@ -193,13 +194,28 @@ pub fn generate_client(service_name: &str, resolved: &ResolvedSchema, types_crat
                 self.client.next_id()
             }
 
+            /// Attach claims for e2e verification. All subsequent calls include these claims.
+            pub fn with_claims(mut self, claims: hyprstream_rpc::auth::Claims) -> Self {
+                self.claims = Some(std::sync::Arc::new(claims));
+                self
+            }
+
             /// Send a raw request and return the raw response bytes.
             pub async fn call(&self, payload: Vec<u8>) -> anyhow::Result<Vec<u8>> {
-                self.client.call(payload, CallOptions::default()).await
+                let opts = match &self.claims {
+                    Some(c) => CallOptions::default().claims((**c).clone()),
+                    None => CallOptions::default(),
+                };
+                self.client.call(payload, opts).await
             }
 
             /// Send a raw request with custom options and return the raw response bytes.
-            pub async fn call_with_options(&self, payload: Vec<u8>, opts: CallOptions) -> anyhow::Result<Vec<u8>> {
+            pub async fn call_with_options(&self, payload: Vec<u8>, mut opts: CallOptions) -> anyhow::Result<Vec<u8>> {
+                if opts.claims.is_none() {
+                    if let Some(ref c) = self.claims {
+                        opts = opts.claims((**c).clone());
+                    }
+                }
                 self.client.call(payload, opts).await
             }
 
@@ -976,6 +992,7 @@ fn generate_scoped_factory_method(sc: &ScopedClient) -> TokenStream {
         pub fn #method_name(&self #(, #params)*) -> #client_name_ident {
             #client_name_ident {
                 client: Arc::clone(&self.client),
+                claims: self.claims.clone(),
                 #(#field_inits,)*
             }
         }

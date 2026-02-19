@@ -125,3 +125,20 @@ struct StreamResume {
   resumeFromHmac @1 :Data;  # Last verified HMAC (server resends chunks after this)
 }
 
+# =============================================================================
+# Control Channel (Consumer -> Producer)
+# =============================================================================
+
+# Control message sent on the DH-derived control channel.
+#
+# Wire format (ZMQ multipart):
+#   Frame 0: ctrl_topic (64 hex chars, DH-derived)
+#   Frame 1: capnp segments (this struct)
+#   Frame 2: mac (16 bytes HMAC-SHA256 truncated, using ctrl_mac_key)
+struct StreamControl {
+  union {
+    cancel @0 :Void;        # Request stream cancellation
+    ping @1 :Void;          # Keep-alive probe (reserved)
+  }
+}
+

@@ -27,7 +27,10 @@ use crate::{
     config::GenerationRequest,
     runtime::{CacheOwner, FinishReason},
     server::{state::ServerState, AuthenticatedUser},
+    services::ModelZmqClient,
 };
+
+use hyprstream_rpc::RequestIdentity;
 
 // E2E authenticated streaming via Ristretto255 DH key exchange
 use hyprstream_rpc::crypto::generate_ephemeral_keypair;
@@ -123,18 +126,36 @@ fn extract_cache_owner(headers: &HeaderMap) -> CacheOwner {
     }
 }
 
-/// Extract user identity from authenticated user.
-///
-/// JWT `sub` claim should already contain prefixed subject (e.g., "token:alice").
-/// Returns "anonymous" if no authentication provided.
-fn extract_user_from_auth(auth_user: Option<&AuthenticatedUser>) -> String {
+/// Extract auth info: (username, jwt_token, jwt_exp)
+fn extract_auth(auth_user: Option<&AuthenticatedUser>) -> (String, Option<String>, Option<i64>) {
     if let Some(user) = auth_user {
         trace!("Using authenticated user: {}", user.user);
-        return user.user.clone();
+        (user.user.clone(), user.token.clone(), user.exp)
+    } else {
+        trace!("No authentication provided, using anonymous identity");
+        ("anonymous".to_owned(), None, None)
     }
+}
 
-    trace!("No authentication provided, using anonymous identity");
-    "anonymous".to_owned()
+/// Build Claims from auth info, using the JWT's real exp for timeout enforcement.
+fn claims_from_auth(user: &str, jwt_token: Option<&str>, jwt_exp: Option<i64>) -> hyprstream_rpc::auth::Claims {
+    let now = chrono::Utc::now().timestamp();
+    let exp = jwt_exp.unwrap_or(now + 3600);
+    let mut claims = hyprstream_rpc::auth::Claims::new(user.to_owned(), now, exp);
+    if let Some(token) = jwt_token {
+        claims = claims.with_token(token.to_owned());
+    }
+    claims
+}
+
+/// Build RequestIdentity from extracted auth user string.
+/// Unauthenticated = anonymous (NEVER local server identity).
+fn identity_from_user(user: &str) -> RequestIdentity {
+    if user == "anonymous" {
+        RequestIdentity::anonymous()
+    } else {
+        RequestIdentity::api_token(user, "openai")
+    }
 }
 
 /// Helper: Resolve model name to filesystem path (also validates inference capability)
@@ -239,7 +260,7 @@ async fn chat_completions(
     Json(request): Json<ChatCompletionRequest>,
 ) -> impl IntoResponse {
     // Extract user identity from JWT (via middleware)
-    let user = extract_user_from_auth(auth_user.as_ref().map(|Extension(u)| u));
+    let (user, jwt_token, jwt_exp) = extract_auth(auth_user.as_ref().map(|Extension(u)| u));
 
     // Check permission for inference on this model via ZMQ
     let resource = format!("model:{}", request.model);
@@ -295,7 +316,7 @@ async fn chat_completions(
 
     if is_streaming {
         info!("Handling streaming request");
-        return stream_chat(state, headers, request).await.into_response();
+        return stream_chat(state, headers, request, user, jwt_token, jwt_exp).await.into_response();
     }
     info!("Handling non-streaming request");
 
@@ -377,8 +398,11 @@ async fn chat_completions(
         gen_request.prompt.len()
     );
 
-    // Call inference via ZMQ ModelService
-    let result = state.model_client.infer(&request.model, &gen_request).await;
+    // Call inference via per-request ZMQ client (preserves caller identity for TTT delta routing)
+    let identity = identity_from_user(&user);
+    let model_client = ModelZmqClient::new((*state.signing_key).clone(), identity);
+    let claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
+    let result = model_client.with_claims(claims).infer(&request.model, &gen_request).await;
 
     info!("Generation completed - success: {}", result.is_ok());
 
@@ -467,7 +491,7 @@ async fn chat_completions(
 }
 
 /// Handle streaming chat completions via ZMQ PUB/SUB
-async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompletionRequest) -> impl IntoResponse {
+async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompletionRequest, user: String, jwt_token: Option<String>, jwt_exp: Option<i64>) -> impl IntoResponse {
     // Create channel for SSE events
     let (tx, rx) = mpsc::channel::<Result<serde_json::Value, anyhow::Error>>(100);
 
@@ -569,8 +593,11 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
         let (client_secret, client_pubkey) = generate_ephemeral_keypair();
         let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
 
-        // Start ZMQ stream - returns StreamInfo with stream_id, endpoint, server_pubkey
-        let stream_info = match state.model_client.infer_stream(&model_name, &gen_request, client_pubkey_bytes).await {
+        // Start ZMQ stream with per-request client (preserves caller identity for TTT delta routing)
+        let identity = identity_from_user(&user);
+        let model_client = ModelZmqClient::new((*state.signing_key).clone(), identity);
+        let claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
+        let stream_info = match model_client.with_claims(claims).infer_stream(&model_name, &gen_request, client_pubkey_bytes).await {
             Ok(info) => {
                 info!("ZMQ stream started: id={}, endpoint={}", info.stream_id, info.endpoint);
                 info
@@ -630,6 +657,7 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
             // Check if client disconnected (channel closed)
             if tx.is_closed() {
                 info!("Client disconnected, stopping stream");
+                stream_handle.cancel();
                 break;
             }
 
@@ -808,7 +836,7 @@ async fn completions(
     Json(request): Json<CompletionRequest>,
 ) -> impl IntoResponse {
     // Extract user identity from JWT (via middleware)
-    let user = extract_user_from_auth(auth_user.as_ref().map(|Extension(u)| u));
+    let (user, jwt_token, jwt_exp) = extract_auth(auth_user.as_ref().map(|Extension(u)| u));
 
     // Check permission for inference on this model
     let resource = format!("model:{}", request.model);
@@ -901,8 +929,11 @@ async fn completions(
         gen_request.max_tokens, gen_request.temperature, gen_request.top_p, gen_request.top_k, gen_request.repeat_penalty
     );
 
-    // Call inference via ZMQ ModelService
-    let result = state.model_client.infer(&request.model, &gen_request).await;
+    // Call inference via per-request ZMQ client (preserves caller identity for TTT delta routing)
+    let identity = identity_from_user(&user);
+    let model_client = ModelZmqClient::new((*state.signing_key).clone(), identity);
+    let claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
+    let result = model_client.with_claims(claims).infer(&request.model, &gen_request).await;
 
     // Metrics automatically decremented by MetricsGuard on drop
 

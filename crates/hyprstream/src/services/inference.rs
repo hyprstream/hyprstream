@@ -807,6 +807,65 @@ impl InferenceService {
                 envelope_ctx.request_id
             );
 
+            // E2E JWT verification with downgrade protection
+            if let Some(claims) = envelope_ctx.claims() {
+                let verify_result = claims.verify_token(&service.server_pubkey);
+                match verify_result {
+                    Ok(Some(verified)) => {
+                        if verified.sub != claims.sub {
+                            warn!("Claims sub mismatch: envelope={} jwt={}", claims.sub, verified.sub);
+                            let err_variant = InferenceResponseVariant::Error(ErrorInfo {
+                                message: "Claims subject mismatch".to_owned(),
+                                code: "UNAUTHORIZED".to_owned(),
+                                details: String::new(),
+                            });
+                            let error_payload = serialize_response(envelope_ctx.request_id, &err_variant).unwrap_or_default();
+                            let msg: Multipart = vec![error_payload].into();
+                            receiver = match sender.send(msg).await {
+                                Ok(r) => r,
+                                Err(e) => { error!("failed to send error response: {}", e); return; }
+                            };
+                            continue;
+                        }
+                    }
+                    Ok(None) => {
+                        if !envelope_ctx.identity.is_local() {
+                            warn!(
+                                "Non-local request with claims but no JWT token: sub={}, identity={:?}",
+                                claims.sub, envelope_ctx.identity
+                            );
+                            let err_variant = InferenceResponseVariant::Error(ErrorInfo {
+                                message: "JWT token required for non-local requests".to_owned(),
+                                code: "UNAUTHORIZED".to_owned(),
+                                details: String::new(),
+                            });
+                            let error_payload = serialize_response(envelope_ctx.request_id, &err_variant).unwrap_or_default();
+                            let msg: Multipart = vec![error_payload].into();
+                            receiver = match sender.send(msg).await {
+                                Ok(r) => r,
+                                Err(e) => { error!("failed to send error response: {}", e); return; }
+                            };
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("E2E JWT verification failed: {}", e);
+                        let err_variant = InferenceResponseVariant::Error(ErrorInfo {
+                            message: "JWT verification failed".to_owned(),
+                            code: "UNAUTHORIZED".to_owned(),
+                            details: String::new(),
+                        });
+                        let error_payload = serialize_response(envelope_ctx.request_id, &err_variant).unwrap_or_default();
+                        let msg: Multipart = vec![error_payload].into();
+                        receiver = match sender.send(msg).await {
+                            Ok(r) => r,
+                            Err(e) => { error!("failed to send error response: {}", e); return; }
+                        };
+                        continue;
+                    }
+                }
+            }
+
             // Handle request - may return pending work (now async for policy checks)
             // Handle request via generated dispatch
             let request_id = envelope_ctx.request_id;
@@ -1099,13 +1158,23 @@ impl InferenceService {
             match stream_result {
                 Ok(mut stream) => {
                     let mut had_error = false;
-                    while let Some(chunk_result) = stream.next().await {
+                    let cancel = stream_ctx.cancel_token();
+                    loop {
+                        let chunk_result = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => {
+                                let _ = publisher.publish_error("cancelled").await;
+                                had_error = true;
+                                break;
+                            }
+                            next = stream.next() => match next {
+                                Some(r) => r,
+                                None => break,
+                            },
+                        };
                         match chunk_result {
                             Ok(text) => {
-                                // Get live generation rate from stream stats (EMA for smooth batching)
                                 let rate = stream.stats().inference_tokens_per_sec_ema;
-
-                                // Publish with adaptive batching
                                 if let Err(e) = publisher.publish_data_with_rate(text.as_bytes(), rate).await {
                                     warn!("Failed to publish stream data: {}", e);
                                     had_error = true;
@@ -1113,7 +1182,6 @@ impl InferenceService {
                                 }
                             }
                             Err(e) => {
-                                // Publish error and stop
                                 if let Err(send_err) = publisher.publish_error(&e.to_string()).await {
                                     error!("Failed to publish stream error: {}", send_err);
                                 }
@@ -1177,6 +1245,10 @@ impl InferenceService {
         );
 
         let result = stream_channel.with_publisher(stream_ctx, |mut publisher| async move {
+            if stream_ctx.cancel_token().is_cancelled() {
+                publisher.publish_error("cancelled").await?;
+                return Ok(());
+            }
             match self.handle_train_step(&subject, &input, gradient_steps, learning_rate, auto_commit) {
                 Ok(result) => {
                     // Serialize training result as JSON for the completion payload
@@ -2277,6 +2349,11 @@ impl InferenceZmqClient {
         Self {
             gen: crate::services::core::create_service_client(endpoint, signing_key, identity),
         }
+    }
+
+    /// Attach claims for e2e verification. All subsequent calls include these claims.
+    pub fn with_claims(self, claims: hyprstream_rpc::auth::Claims) -> Self {
+        Self { gen: self.gen.with_claims(claims) }
     }
 
     /// Convert generated FinishReasonEnum to domain FinishReason
