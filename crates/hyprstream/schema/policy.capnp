@@ -7,6 +7,7 @@
 
 using import "/annotations.capnp".mcpScope;
 using import "/annotations.capnp".mcpDescription;
+using import "/annotations.capnp".optional;
 
 # Unified policy request with union discriminator (follows RegistryRequest pattern)
 struct PolicyRequest {
@@ -44,17 +45,17 @@ struct PolicyCheck {
 # JWT token issuance parameters
 struct IssueToken {
   # Structured scopes: action:resource:identifier
-  requestedScopes @0 :List(Text);
+  requestedScopes @0 :List(Text) $optional;
 
   # Optional TTL in seconds (0 = use default)
-  ttl @1 :UInt32;
+  ttl @1 :UInt32 $optional;
 
   # RFC 8707 resource indicator for audience binding (empty = no binding)
-  audience @2 :Text;
+  audience @2 :Text $optional;
 
   # Explicit subject for token (empty = use envelope identity).
   # Requires caller to have `manage` permission on `policy:issue-token`.
-  subject @3 :Text;
+  subject @3 :Text $optional;
 }
 
 # Unified policy response (covers both check and token issuance)

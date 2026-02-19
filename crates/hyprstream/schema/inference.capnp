@@ -1,6 +1,7 @@
 @0xa8c9e2f1d3b5a7c0;
 
 using import "/streaming.capnp".StreamInfo;
+using import "/annotations.capnp".optional;
 
 # Cap'n Proto schema for inference service
 #
@@ -104,16 +105,16 @@ struct InferenceResponse {
 
 struct GenerationRequest {
   prompt @0 :Text;
-  maxTokens @1 :UInt32;
-  temperature @2 :Float32;
-  topP @3 :Float32;
-  topK @4 :UInt32;
-  repeatPenalty @5 :Float32;
-  repeatLastN @6 :UInt32;
-  stopTokens @7 :List(Text);
-  seed @8 :UInt32;
-  images @9 :List(Data);
-  timeoutMs @10 :UInt64;
+  maxTokens @1 :UInt32 $optional;
+  temperature @2 :Float32 $optional;
+  topP @3 :Float32 $optional;
+  topK @4 :UInt32 $optional;
+  repeatPenalty @5 :Float32 $optional;
+  repeatLastN @6 :UInt32 $optional;
+  stopTokens @7 :List(Text) $optional;
+  seed @8 :UInt32 $optional;
+  images @9 :List(Data) $optional;
+  timeoutMs @10 :UInt64 $optional;
 }
 
 struct GenerationResult {
@@ -198,7 +199,7 @@ enum FinishReason {
 struct ChatTemplateRequest {
   messages @0 :List(ChatMessage);
   addGenerationPrompt @1 :Bool;
-  toolsJson @2 :Text;  # JSON-serialized tools array (empty string = no tools)
+  toolsJson @2 :Text $optional;  # JSON-serialized tools array (empty string = no tools)
 }
 
 struct ToolCallData {
@@ -256,8 +257,8 @@ struct HealthStatus {
 
 struct TrainStepRequest {
   input @0 :Text;
-  gradientSteps @1 :UInt32;
-  learningRate @2 :Float32;
+  gradientSteps @1 :UInt32 $optional;
+  learningRate @2 :Float32 $optional;
   autoCommit @3 :Bool;
 }
 
@@ -275,9 +276,9 @@ struct TrainStepResult {
 
 struct SaveAdaptationRequest {
   name @0 :Text;
-  mergeStrategy @1 :Text;
-  mergeWeight @2 :Float32;
-  commitMessage @3 :Text;
+  mergeStrategy @1 :Text $optional;
+  mergeWeight @2 :Float32 $optional;
+  commitMessage @3 :Text $optional;
 }
 
 struct SaveAdaptationResult {
@@ -315,7 +316,7 @@ struct SnapshotDeltaResult {
 
 struct ExportPeftRequest {
   name @0 :Text;
-  commitMessage @1 :Text;
+  commitMessage @1 :Text $optional;
 }
 
 struct ExportPeftResult {

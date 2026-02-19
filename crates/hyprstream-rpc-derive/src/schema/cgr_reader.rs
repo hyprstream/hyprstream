@@ -96,6 +96,7 @@ fn parse_cgr(
     let cli_hidden_id = find_annotation_id(&nodes, &node_map, "cliHidden");
     let domain_type_id = find_annotation_id(&nodes, &node_map, "domainType");
     let fixed_size_id = find_annotation_id(&nodes, &node_map, "fixedSize");
+    let optional_id = find_annotation_id(&nodes, &node_map, "optional");
 
     let pascal = to_pascal_case(service_name);
     let request_name = format!("{pascal}Request");
@@ -145,6 +146,7 @@ fn parse_cgr(
         param_desc_id,
         domain_type_id,
         fixed_size_id,
+        optional_id,
     )?;
 
     // Extract all enums (pass all_structs for imported type resolution)
@@ -481,6 +483,7 @@ fn extract_struct_from_node(
     param_desc_id: Option<u64>,
     domain_type_id: Option<u64>,
     fixed_size_id: Option<u64>,
+    optional_id: Option<u64>,
     origin_file: Option<String>,
 ) -> Result<Option<StructDef>, String> {
     let struct_reader = match node.which() {
@@ -540,11 +543,17 @@ fn extract_struct_from_node(
             fixed_size_id,
         );
 
+        let optional = has_annotation(
+            field.get_annotations().map_err(|e| format!("{e}"))?,
+            optional_id,
+        );
+
         fields.push(FieldDef {
             name: field_name,
             type_name,
             description,
             fixed_size,
+            optional,
         });
     }
 
@@ -574,6 +583,7 @@ fn extract_all_structs(
     param_desc_id: Option<u64>,
     domain_type_id: Option<u64>,
     fixed_size_id: Option<u64>,
+    optional_id: Option<u64>,
 ) -> Result<Vec<StructDef>, String> {
     let file_prefix = format!("{service_name}.capnp:");
     let mut structs = Vec::new();
@@ -586,7 +596,7 @@ fn extract_all_structs(
 
         let node = nodes.get(info.index);
         if let Some(s) = extract_struct_from_node(
-            node, info, node_map, mcp_desc_id, param_desc_id, domain_type_id, fixed_size_id, None,
+            node, info, node_map, mcp_desc_id, param_desc_id, domain_type_id, fixed_size_id, optional_id, None,
         )? {
             structs.push(s);
         }
@@ -643,7 +653,7 @@ fn extract_all_structs(
                 let node = nodes.get(info.index);
                 if let Some(s) = extract_struct_from_node(
                     node, info, node_map, mcp_desc_id, param_desc_id, domain_type_id,
-                    fixed_size_id, Some(origin),
+                    fixed_size_id, optional_id, Some(origin),
                 )? {
                     structs.push(s);
                 }

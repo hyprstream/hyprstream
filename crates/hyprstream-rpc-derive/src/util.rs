@@ -250,8 +250,8 @@ mod tests {
         vec![StructDef {
             name: "ModelInfo".into(),
             fields: vec![
-                FieldDef { name: "name".into(), type_name: "Text".into(), description: String::new(), fixed_size: None },
-                FieldDef { name: "size".into(), type_name: "UInt64".into(), description: String::new(), fixed_size: None },
+                FieldDef { name: "name".into(), type_name: "Text".into(), description: String::new(), fixed_size: None, optional: false },
+                FieldDef { name: "size".into(), type_name: "UInt64".into(), description: String::new(), fixed_size: None, optional: false },
             ],
             has_union: false,
             domain_type: None,

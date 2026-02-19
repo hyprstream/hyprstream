@@ -2253,7 +2253,7 @@ impl<'a> Stream for TextStream<'a> {
 
             
             // Check max tokens
-            if self.tokens_generated >= self.max_tokens {
+            if self.max_tokens > 0 && self.tokens_generated >= self.max_tokens {
                 tracing::debug!("Reached max tokens: {}", self.max_tokens);
                 self.finished = true;
                 self.finish_reason = Some(FinishReason::MaxTokens);

@@ -104,9 +104,9 @@ fn generate_method_schema_entry(
                         let fname = to_snake_case(&f.name);
                         let ftype = &f.type_name;
                         let fdesc = &f.description;
-                        let is_bool = ftype == "Bool";
-                        let required = !is_bool;
-                        let default_val = if is_bool { "false" } else { "" };
+                        let is_optional = f.optional || ftype == "Bool";
+                        let required = !is_optional;
+                        let default_val = if ftype == "Bool" { "false" } else { "" };
                         quote! {
                             ParamSchema { name: #fname, type_name: #ftype, required: #required, description: #fdesc, default_value: #default_val }
                         }
@@ -322,7 +322,7 @@ fn generate_json_method_dispatch_arm(
                     .map(|f| {
                         let fname = format_ident!("{}", to_snake_case(&f.name));
                         let fname_str = to_snake_case(&f.name);
-                        json_field_extraction_token(&fname, &fname_str, &f.type_name, resolved)
+                        json_field_extraction_token(&fname, &fname_str, &f.type_name, f.optional, resolved)
                     })
                     .collect();
 
@@ -391,7 +391,7 @@ fn generate_json_streaming_dispatch_arm(
                     .map(|f| {
                         let fname = format_ident!("{}", to_snake_case(&f.name));
                         let fname_str = to_snake_case(&f.name);
-                        json_field_extraction_token(&fname, &fname_str, &f.type_name, resolved)
+                        json_field_extraction_token(&fname, &fname_str, &f.type_name, f.optional, resolved)
                     })
                     .collect();
 
@@ -708,82 +708,122 @@ fn json_field_extraction_token(
     fname: &syn::Ident,
     fname_str: &str,
     type_name: &str,
+    optional: bool,
     resolved: &ResolvedSchema,
 ) -> TokenStream {
     let ct = resolved.resolve_type(type_name).capnp_type.clone();
     match ct {
-        CapnpType::Text => quote! {
+        CapnpType::Text => if optional { quote! {
+            let #fname = args.get(#fname_str).and_then(|v| v.as_str()).unwrap_or("");
+        }} else { quote! {
             let #fname = args.get(#fname_str).and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid string field '{}'", #fname_str))?;
-        },
+        }},
         CapnpType::Bool => quote! {
             let #fname = args.get(#fname_str).and_then(|v| v.as_bool()).unwrap_or(false);
         },
-        CapnpType::UInt8 => quote! {
+        CapnpType::UInt8 => if optional { quote! {
+            let #fname: u8 = args.get(#fname_str).and_then(|v| v.as_u64())
+                .unwrap_or(0).try_into().unwrap_or(0);
+        }} else { quote! {
             let #fname: u8 = args.get(#fname_str).and_then(|v| v.as_u64())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid u8 field '{}'", #fname_str))?
                 .try_into().map_err(|_| anyhow::anyhow!("u8 overflow for field '{}'", #fname_str))?;
-        },
-        CapnpType::UInt16 => quote! {
+        }},
+        CapnpType::UInt16 => if optional { quote! {
+            let #fname: u16 = args.get(#fname_str).and_then(|v| v.as_u64())
+                .unwrap_or(0).try_into().unwrap_or(0);
+        }} else { quote! {
             let #fname: u16 = args.get(#fname_str).and_then(|v| v.as_u64())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid u16 field '{}'", #fname_str))?
                 .try_into().map_err(|_| anyhow::anyhow!("u16 overflow for field '{}'", #fname_str))?;
-        },
-        CapnpType::UInt32 => quote! {
+        }},
+        CapnpType::UInt32 => if optional { quote! {
+            let #fname: u32 = args.get(#fname_str).and_then(|v| v.as_u64())
+                .unwrap_or(0).try_into().unwrap_or(0);
+        }} else { quote! {
             let #fname: u32 = args.get(#fname_str).and_then(|v| v.as_u64())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid u32 field '{}'", #fname_str))?
                 .try_into().map_err(|_| anyhow::anyhow!("u32 overflow for field '{}'", #fname_str))?;
-        },
-        CapnpType::UInt64 => quote! {
+        }},
+        CapnpType::UInt64 => if optional { quote! {
+            let #fname = args.get(#fname_str).and_then(|v| v.as_u64()).unwrap_or(0);
+        }} else { quote! {
             let #fname = args.get(#fname_str).and_then(|v| v.as_u64())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid u64 field '{}'", #fname_str))?;
-        },
-        CapnpType::Int8 => quote! {
+        }},
+        CapnpType::Int8 => if optional { quote! {
+            let #fname: i8 = args.get(#fname_str).and_then(|v| v.as_i64())
+                .unwrap_or(0).try_into().unwrap_or(0);
+        }} else { quote! {
             let #fname: i8 = args.get(#fname_str).and_then(|v| v.as_i64())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid i8 field '{}'", #fname_str))?
                 .try_into().map_err(|_| anyhow::anyhow!("i8 overflow for field '{}'", #fname_str))?;
-        },
-        CapnpType::Int16 => quote! {
+        }},
+        CapnpType::Int16 => if optional { quote! {
+            let #fname: i16 = args.get(#fname_str).and_then(|v| v.as_i64())
+                .unwrap_or(0).try_into().unwrap_or(0);
+        }} else { quote! {
             let #fname: i16 = args.get(#fname_str).and_then(|v| v.as_i64())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid i16 field '{}'", #fname_str))?
                 .try_into().map_err(|_| anyhow::anyhow!("i16 overflow for field '{}'", #fname_str))?;
-        },
-        CapnpType::Int32 => quote! {
+        }},
+        CapnpType::Int32 => if optional { quote! {
+            let #fname: i32 = args.get(#fname_str).and_then(|v| v.as_i64())
+                .unwrap_or(0).try_into().unwrap_or(0);
+        }} else { quote! {
             let #fname: i32 = args.get(#fname_str).and_then(|v| v.as_i64())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid i32 field '{}'", #fname_str))?
                 .try_into().map_err(|_| anyhow::anyhow!("i32 overflow for field '{}'", #fname_str))?;
-        },
-        CapnpType::Int64 => quote! {
+        }},
+        CapnpType::Int64 => if optional { quote! {
+            let #fname = args.get(#fname_str).and_then(|v| v.as_i64()).unwrap_or(0);
+        }} else { quote! {
             let #fname = args.get(#fname_str).and_then(|v| v.as_i64())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid i64 field '{}'", #fname_str))?;
-        },
-        CapnpType::Float32 => quote! {
+        }},
+        CapnpType::Float32 => if optional { quote! {
+            let #fname = args.get(#fname_str).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        }} else { quote! {
             let #fname = args.get(#fname_str).and_then(|v| v.as_f64())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid f32 field '{}'", #fname_str))? as f32;
-        },
-        CapnpType::Float64 => quote! {
+        }},
+        CapnpType::Float64 => if optional { quote! {
+            let #fname = args.get(#fname_str).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        }} else { quote! {
             let #fname = args.get(#fname_str).and_then(|v| v.as_f64())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid f64 field '{}'", #fname_str))?;
-        },
-        CapnpType::Data => quote! {
+        }},
+        CapnpType::Data => if optional { quote! {
+            let #fname: Vec<u8> = args.get(#fname_str).and_then(|v| v.as_str())
+                .map(|s| s.as_bytes().to_vec()).unwrap_or_default();
+        }} else { quote! {
             let #fname: Vec<u8> = args.get(#fname_str).and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid data field '{}'", #fname_str))?
                 .as_bytes().to_vec();
-        },
-        CapnpType::ListText => quote! {
+        }},
+        CapnpType::ListText => if optional { quote! {
+            let #fname: Vec<String> = args.get(#fname_str).and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+        }} else { quote! {
             let #fname: Vec<String> = args.get(#fname_str).and_then(|v| v.as_array())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid array field '{}'", #fname_str))?
                 .iter().map(|v| v.as_str().map(String::from)
                     .ok_or_else(|| anyhow::anyhow!("non-string element in array field '{}'", #fname_str)))
                 .collect::<Result<Vec<_>, _>>()?;
-        },
-        CapnpType::ListData => quote! {
+        }},
+        CapnpType::ListData => if optional { quote! {
+            let #fname: Vec<Vec<u8>> = args.get(#fname_str).and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.as_bytes().to_vec())).collect())
+                .unwrap_or_default();
+        }} else { quote! {
             let #fname: Vec<Vec<u8>> = args.get(#fname_str).and_then(|v| v.as_array())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid array field '{}'", #fname_str))?
                 .iter().map(|v| v.as_str().map(|s| s.as_bytes().to_vec())
                     .ok_or_else(|| anyhow::anyhow!("non-string element in array field '{}'", #fname_str)))
                 .collect::<Result<Vec<_>, _>>()?;
-        },
+        }},
         CapnpType::ListPrimitive(_) => {
             let rust_type = rust_type_tokens(&ct.rust_owned_type());
             quote! {
@@ -808,15 +848,17 @@ fn json_field_extraction_token(
                 ).unwrap_or_default();
             }
         }
-        CapnpType::Enum(_) => {
-            quote! {
-                let #fname = args.get(#fname_str).and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("missing or invalid enum field '{}'", #fname_str))?;
-            }
-        }
-        _ => quote! {
+        CapnpType::Enum(_) => if optional { quote! {
+            let #fname = args.get(#fname_str).and_then(|v| v.as_str()).unwrap_or("");
+        }} else { quote! {
+            let #fname = args.get(#fname_str).and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("missing or invalid enum field '{}'", #fname_str))?;
+        }},
+        _ => if optional { quote! {
+            let #fname = args.get(#fname_str).and_then(|v| v.as_str()).unwrap_or("");
+        }} else { quote! {
             let #fname = args.get(#fname_str).and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid field '{}'", #fname_str))?;
-        },
+        }},
     }
 }

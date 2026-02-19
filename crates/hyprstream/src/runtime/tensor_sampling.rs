@@ -158,7 +158,7 @@ impl TensorSampler {
         repeat_penalty: f32,
         previous_tokens: &[i64],
     ) -> Result<Tensor> {
-        if (repeat_penalty - 1.0).abs() < 1e-6 || previous_tokens.is_empty() {
+        if repeat_penalty <= 0.0 || (repeat_penalty - 1.0).abs() < 1e-6 || previous_tokens.is_empty() {
             return Ok(logits);
         }
 
@@ -197,7 +197,7 @@ impl TensorSampler {
         previous_tokens: &[i64],
         exempt_tokens: &HashSet<i64>,
     ) -> Result<Tensor> {
-        if (repeat_penalty - 1.0).abs() < 1e-6 || previous_tokens.is_empty() {
+        if repeat_penalty <= 0.0 || (repeat_penalty - 1.0).abs() < 1e-6 || previous_tokens.is_empty() {
             return Ok(logits);
         }
 
@@ -318,7 +318,7 @@ impl TensorSampler {
     /// Apply top-p (nucleus) sampling
     /// Keeps tokens where cumulative probability BEFORE adding them is < top_p
     fn apply_top_p(&self, probs: &Tensor, top_p: f32) -> Result<Tensor> {
-        if top_p >= 1.0 {
+        if top_p <= 0.0 || top_p >= 1.0 {
             return Ok(probs.shallow_clone());
         }
 
