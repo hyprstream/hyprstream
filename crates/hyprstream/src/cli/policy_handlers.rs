@@ -18,6 +18,20 @@ use std::path::Path;
 use std::process::Command;
 use tracing::info;
 
+/// Ensure .registry is a git repository. Policy versioning requires git commits,
+/// but .registry is only initialized by Git2DB when the registry is first used
+/// (e.g. clone, list). Users may run policy apply-template before any registry
+/// operation, so we must init here if needed.
+fn ensure_registry_is_git_repo(registry_dir: &Path) -> Result<()> {
+    let git_dir = registry_dir.join(".git");
+    if git_dir.exists() {
+        return Ok(());
+    }
+    git2::Repository::init(registry_dir)
+        .context("Failed to initialize .registry as git repository for policy versioning")?;
+    Ok(())
+}
+
 /// Handle `policy show` - Display the running policy
 pub async fn handle_policy_show(
     policy_manager: &PolicyManager,
@@ -743,6 +757,10 @@ pub async fn handle_policy_apply_template(
     // Commit the change
     let commit_msg = format!("policy: apply {template_name} template");
 
+    // Ensure .registry is a git repo (it may not exist if user runs policy
+    // apply-template before any clone/list/registry operation)
+    ensure_registry_is_git_repo(registry_dir)?;
+
     Command::new("git")
         .current_dir(registry_dir)
         .args(["add", "policies/"])
@@ -757,9 +775,18 @@ pub async fn handle_policy_apply_template(
 
     if !commit_result.status.success() {
         let stderr = String::from_utf8_lossy(&commit_result.stderr);
-        // Ignore "nothing to commit" errors
+        let stdout = String::from_utf8_lossy(&commit_result.stdout);
+        // Ignore "nothing to commit" errors (template already applied)
         if !stderr.contains("nothing to commit") {
-            anyhow::bail!("Commit failed: {}", stderr);
+            let mut msg = format!("Commit failed: {}", stderr.trim());
+            if !stdout.is_empty() {
+                msg.push_str("\nstdout: ");
+                msg.push_str(stdout.trim());
+            }
+            if stderr.trim().is_empty() && stdout.trim().is_empty() {
+                msg.push_str(" (git may need user.name and user.email: git config --global user.name \"Your Name\"; git config --global user.email \"you@example.com\")");
+            }
+            anyhow::bail!("{}", msg);
         }
     }
 

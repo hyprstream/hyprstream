@@ -992,6 +992,18 @@ impl<'a> RepositoryHandle<'a> {
     pub async fn create_worktree(&self, worktree_path: &Path, branch: &str) -> Git2DBResult<WorktreeHandle> {
         let tracked_repo = self.metadata()?;
 
+        // When path is empty, derive from worktrees/{branch} (CLI passes "" to mean "use default")
+        let worktree_path = if worktree_path.as_os_str().is_empty() {
+            let worktrees_dir = tracked_repo
+                .worktree_path
+                .parent()
+                .ok_or_else(|| Git2DBError::internal("Invalid base repository path"))?
+                .join("worktrees");
+            worktrees_dir.join(branch)
+        } else {
+            worktree_path.to_path_buf()
+        };
+
         // Use pre-loaded storage driver from registry
         let driver = self.registry.storage_driver().clone();
 
@@ -1006,7 +1018,7 @@ impl<'a> RepositoryHandle<'a> {
         // Create driver options
         let opts = DriverOpts {
             base_repo: tracked_repo.worktree_path.clone(),
-            worktree_path: worktree_path.to_path_buf(),
+            worktree_path: worktree_path.clone(),
             ref_spec: branch.to_owned(),
         };
 
@@ -1040,7 +1052,7 @@ impl<'a> RepositoryHandle<'a> {
 
         match result {
             Ok(mut handle) => {
-                if let Err(e) = Self::fetch_lfs_files(worktree_path).await {
+                if let Err(e) = Self::fetch_lfs_files(&worktree_path).await {
                     tracing::error!(
                         "Failed to fetch LFS files for worktree at {}: {}",
                         worktree_path.display(),
