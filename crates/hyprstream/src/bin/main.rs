@@ -832,7 +832,7 @@ fn handle_quick_command(
                             println!();
                             println!("Tokens are validated by signature and expiry time.");
                             println!("To see who has access, review the policy:");
-                            println!("  hyprstream policy show");
+                            println!("  hyprstream quick policy show");
                             Ok(())
                         }
                         TokenCommand::Revoke {
@@ -852,7 +852,7 @@ fn handle_quick_command(
                                 "     rm ~/.local/share/hyprstream/.registry/keys/signing.key"
                             );
                             println!("  3. Remove user permissions via policy:");
-                            println!("     hyprstream policy edit");
+                            println!("     hyprstream quick policy edit");
                             println!();
                             println!(
                                 "A token blocklist feature may be added in the future."

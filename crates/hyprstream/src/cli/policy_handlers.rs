@@ -49,9 +49,9 @@ pub async fn handle_policy_show(
         if policy_info.rules.is_empty() && policy_info.groupings.is_empty() {
             println!("No policies defined.");
             println!("\nTo get started, apply a template:");
-            println!("  hyprstream policy apply-template local    # local CLI full access");
+            println!("  hyprstream quick policy apply-template local    # local CLI full access");
             println!("\nOr edit manually:");
-            println!("  hyprstream policy edit");
+            println!("  hyprstream quick policy edit");
             return Ok(());
         }
 
@@ -137,8 +137,8 @@ pub async fn handle_policy_edit(
     println!("Opening {} in {}", policy_csv_path.display(), editor);
     println!();
     println!("After editing, use:");
-    println!("  hyprstream policy diff     # Preview changes");
-    println!("  hyprstream policy apply    # Commit changes");
+    println!("  hyprstream quick policy diff     # Preview changes");
+    println!("  hyprstream quick policy apply    # Commit changes");
     println!();
 
     // Run editor
@@ -156,13 +156,13 @@ pub async fn handle_policy_edit(
     match client.get_draft_status().await {
         Ok(draft) if draft.has_changes => {
             println!();
-            println!("✏️  Draft changes detected ({}). Run 'hyprstream policy diff' to review.", draft.summary);
+            println!("✏️  Draft changes detected ({}). Run 'hyprstream quick policy diff' to review.", draft.summary);
         }
         Ok(_) => {} // No changes
         Err(_) => {
             // Service may not be running; just suggest the commands
             println!();
-            println!("Run 'hyprstream policy diff' to review changes.");
+            println!("Run 'hyprstream quick policy diff' to review changes.");
         }
     }
 
@@ -499,7 +499,7 @@ pub async fn handle_policy_list_templates() -> Result<()> {
     }
 
     println!();
-    println!("Apply with: hyprstream policy apply-template <name>");
+    println!("Apply with: hyprstream quick policy apply-template <name>");
 
     Ok(())
 }
@@ -512,7 +512,7 @@ pub async fn handle_policy_apply_template(
 ) -> Result<()> {
     let template = get_template(template_name)
         .ok_or_else(|| anyhow::anyhow!(
-            "Unknown template: '{}'. Use 'hyprstream policy list-templates' to see available templates.",
+            "Unknown template: '{}'. Use 'hyprstream quick policy list-templates' to see available templates.",
             template_name
         ))?;
 

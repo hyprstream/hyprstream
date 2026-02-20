@@ -582,7 +582,7 @@ async fn run_repair_checks(
                         print_check(label, CheckStatus::Ok, &format!("{rule_count} allow rule(s) ({first_subject})"));
                     } else {
                         print_check(label, CheckStatus::Warn, "no allow rules (deny-by-default)");
-                        warnings.push("Apply a template: hyprstream policy apply-template local".to_owned());
+                        warnings.push("Apply a template: hyprstream quick policy apply-template local".to_owned());
                     }
                 }
                 Err(e) => {
