@@ -32,8 +32,9 @@ use hyprstream_core::cli::{
     handle_worker_run, handle_worker_start, handle_worker_stats, handle_worker_status,
     handle_worker_terminal, handle_worker_stop,
     // Service handlers
-    handle_service_install, handle_service_reinstall, handle_service_start, handle_service_status,
-    handle_service_stop, handle_service_uninstall, handle_service_upgrade,
+    handle_service_install,
+    handle_service_start, handle_service_status,
+    handle_service_stop, handle_service_uninstall,
 };
 use hyprstream_core::cli::commands::{PolicyCommand, TokenCommand};
 
@@ -775,34 +776,38 @@ fn handle_quick_command(
             || async move {
                 let registry_path = ctx.models_dir().join(".registry");
                 let policies_dir = registry_path.join("policies");
+                let keys_dir = registry_path.join("keys");
 
-                let policy_manager = PolicyManager::new(&policies_dir)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to initialize policy manager: {}", e))?;
+                // Load signing key for RPC authentication
+                let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+
+                // Ensure policies directory exists for the editor path
+                tokio::fs::create_dir_all(&policies_dir).await?;
+                let policy_csv_path = policies_dir.join("policy.csv");
 
                 match command {
                     PolicyCommand::Show { raw } => {
-                        handle_policy_show(&policy_manager, raw).await
+                        handle_policy_show(&signing_key, raw).await
                     }
                     PolicyCommand::History { count, oneline } => {
-                        handle_policy_history(&policy_manager, count, oneline).await
+                        handle_policy_history(&signing_key, count, oneline).await
                     }
-                    PolicyCommand::Edit => handle_policy_edit(&policy_manager).await,
+                    PolicyCommand::Edit => handle_policy_edit(&signing_key, &policy_csv_path).await,
                     PolicyCommand::Diff { against } => {
-                        handle_policy_diff(&policy_manager, against).await
+                        handle_policy_diff(&signing_key, against).await
                     }
                     PolicyCommand::Apply { dry_run, message } => {
-                        handle_policy_apply(&policy_manager, dry_run, message).await
+                        handle_policy_apply(&signing_key, dry_run, message).await
                     }
                     PolicyCommand::Rollback { git_ref, dry_run } => {
-                        handle_policy_rollback(&policy_manager, &git_ref, dry_run).await
+                        handle_policy_rollback(&signing_key, &git_ref, dry_run).await
                     }
                     PolicyCommand::Check {
                         user,
                         resource,
                         action,
                     } => {
-                        handle_policy_check(&policy_manager, &user, &resource, &action).await
+                        handle_policy_check(&signing_key, &user, &resource, &action).await
                     }
                     PolicyCommand::Token {
                         command: token_cmd,
@@ -813,9 +818,6 @@ fn handle_quick_command(
                             expires,
                             scope,
                         } => {
-                            let keys_dir = registry_path.join("keys");
-                            let signing_key =
-                                load_or_generate_signing_key(&keys_dir).await?;
                             handle_token_create(
                                 &signing_key,
                                 &user,
@@ -859,7 +861,7 @@ fn handle_quick_command(
                         }
                     },
                     PolicyCommand::ApplyTemplate { template, dry_run } => {
-                        handle_policy_apply_template(&policy_manager, &template, dry_run).await
+                        handle_policy_apply_template(&signing_key, &template, dry_run).await
                     }
                     PolicyCommand::ListTemplates => handle_policy_list_templates().await,
                 }
@@ -1403,33 +1405,16 @@ fn main() -> Result<()> {
             let services = config_for_service.services.startup.clone();
 
             match action {
-                ServiceAction::Install { services: filter } => {
+                ServiceAction::Install { services: filter, start, verbose } => {
+                    let models_dir = config_for_service.models_dir().clone();
                     with_runtime(
                         RuntimeConfig {
                             device: DeviceConfig::request_cpu(),
-                            multi_threaded: false,
+                            multi_threaded: true,
                         },
-                        || async move { handle_service_install(&services, filter).await },
-                    )?;
-                }
-
-                ServiceAction::Upgrade { services: filter } => {
-                    with_runtime(
-                        RuntimeConfig {
-                            device: DeviceConfig::request_cpu(),
-                            multi_threaded: false,
+                        || async move {
+                            handle_service_install(&models_dir, &services, filter, start, verbose).await
                         },
-                        || async move { handle_service_upgrade(&services, filter).await },
-                    )?;
-                }
-
-                ServiceAction::Reinstall { services: filter } => {
-                    with_runtime(
-                        RuntimeConfig {
-                            device: DeviceConfig::request_cpu(),
-                            multi_threaded: false,
-                        },
-                        || async move { handle_service_reinstall(&services, filter).await },
                     )?;
                 }
 
@@ -1650,6 +1635,19 @@ fn main() -> Result<()> {
                             multi_threaded: false,
                         },
                         || async move { handle_service_status(&services, verbose).await },
+                    )?;
+                }
+
+                ServiceAction::Repair { verbose } => {
+                    let models_dir = config_for_service.models_dir().clone();
+                    with_runtime(
+                        RuntimeConfig {
+                            device: DeviceConfig::request_cpu(),
+                            multi_threaded: true,
+                        },
+                        || async move {
+                            handle_service_install(&models_dir, &services, None, false, verbose).await
+                        },
                     )?;
                 }
             }

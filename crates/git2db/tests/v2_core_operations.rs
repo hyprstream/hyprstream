@@ -116,10 +116,10 @@ async fn test_upsert_repository_idempotent() -> Result<(), Box<dyn std::error::E
         .upsert_repository("test-project", &url)
         .await?;
 
-    // Verify repository exists
+    // Verify repository exists (2 = .registry self-track + test-project)
     let repos: Vec<_> = registry.list().collect();
-    assert_eq!(repos.len(), 1);
-    assert_eq!(repos[0].name.as_deref(), Some("test-project"));
+    assert_eq!(repos.len(), 2);
+    assert!(repos.iter().any(|r| r.name.as_deref() == Some("test-project")));
 
     // Second upsert - should return existing
     let id2 = registry
@@ -129,9 +129,9 @@ async fn test_upsert_repository_idempotent() -> Result<(), Box<dyn std::error::E
     // Should be the same ID
     assert_eq!(id1, id2);
 
-    // Still only one repository
+    // Still only one user repository (+ .registry)
     let repos: Vec<_> = registry.list().collect();
-    assert_eq!(repos.len(), 1);
+    assert_eq!(repos.len(), 2);
     Ok(())
 }
 
@@ -382,8 +382,8 @@ async fn test_list_repositories() -> Result<(), Box<dyn std::error::Error>> {
     let registry_path = temp_dir.path();
     let mut registry = Git2DB::open(registry_path).await?;
 
-    // Initially empty
-    assert_eq!(registry.list().count(), 0);
+    // Only the self-tracked .registry entry
+    assert_eq!(registry.list().count(), 1);
 
     // Create test repositories
     for i in 1..=3 {
@@ -397,9 +397,9 @@ async fn test_list_repositories() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
     }
 
-    // Should have 3 repositories
+    // Should have 3 repositories + .registry self-tracking entry
     let repos: Vec<_> = registry.list().collect();
-    assert_eq!(repos.len(), 3);
+    assert_eq!(repos.len(), 4);
 
     // Check display names
     let names: Vec<_> = repos.iter().map(|r| r.display_name()).collect();

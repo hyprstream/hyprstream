@@ -6,53 +6,47 @@
 //! - **Running** = Current active (HEAD of .registry/policies/)
 //! - **Draft** = Uncommitted changes
 //! - **History** = Previous versions (HEAD~n)
+//!
+//! All commands route through PolicyService RPCs except `edit` which opens
+//! a local editor (but still uses RPC for draft status detection afterward).
 // CLI handlers intentionally print to stdout/stderr for user interaction
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
-use crate::auth::{jwt, Claims, Operation, PolicyManager};
+use crate::auth::{jwt, Claims};
+use crate::services::generated::policy_client::PolicyClient;
 use anyhow::{Context, Result};
 use chrono::Duration;
 use ed25519_dalek::SigningKey;
+use hyprstream_rpc::prelude::*;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
 use tracing::info;
 
-/// Ensure .registry is a git repository. Policy versioning requires git commits,
-/// but .registry is only initialized by Git2DB when the registry is first used
-/// (e.g. clone, list). Users may run policy apply-template before any registry
-/// operation, so we must init here if needed.
-fn ensure_registry_is_git_repo(registry_dir: &Path) -> Result<()> {
-    let git_dir = registry_dir.join(".git");
-    if git_dir.exists() {
-        return Ok(());
-    }
-    git2::Repository::init(registry_dir)
-        .context("Failed to initialize .registry as git repository for policy versioning")?;
-    Ok(())
+/// Create a PolicyClient for RPC calls.
+fn create_policy_client(signing_key: &SigningKey) -> PolicyClient {
+    PolicyClient::new(signing_key.clone(), RequestIdentity::local())
 }
 
-/// Handle `policy show` - Display the running policy
+/// Handle `policy show` - Display the running policy via RPC
 pub async fn handle_policy_show(
-    policy_manager: &PolicyManager,
+    signing_key: &SigningKey,
     raw: bool,
 ) -> Result<()> {
-    let policy_path = policy_manager.policy_csv_path();
+    let client = create_policy_client(signing_key);
+    let policy_info = client.get_policy().await
+        .context("Failed to get policy from PolicyService. Are services running?")?;
 
     if raw {
-        // Show raw CSV content
-        if policy_path.exists() {
-            let content = tokio::fs::read_to_string(&policy_path).await?;
-            println!("{content}");
-        } else {
-            println!("# No policy file exists");
+        // Reconstruct CSV from structured data
+        for rule in &policy_info.rules {
+            println!("p, {}, {}, {}, {}, {}", rule.subject, rule.domain, rule.resource, rule.action, rule.effect);
+        }
+        for grouping in &policy_info.groupings {
+            println!("g, {}, {}", grouping.user, grouping.role);
         }
     } else {
-        // Show formatted table
-        let policies = policy_manager.get_policy().await;
-        let groupings = policy_manager.get_grouping_policy().await;
-
-        if policies.is_empty() && groupings.is_empty() {
+        if policy_info.rules.is_empty() && policy_info.groupings.is_empty() {
             println!("No policies defined.");
             println!("\nTo get started, apply a template:");
             println!("  hyprstream policy apply-template local    # local CLI full access");
@@ -62,34 +56,28 @@ pub async fn handle_policy_show(
         }
 
         // Print policy rules as a table
-        // Casbin model: p = sub, dom, obj, act, eft
-        if !policies.is_empty() {
+        if !policy_info.rules.is_empty() {
             println!("┌──────────────────────────────────────────────────────────────────────────────┐");
             println!("│ Policy Rules                                                                 │");
             println!("├────────────────┬────────────────┬────────────────┬────────────────┬──────────┤");
             println!("│ Subject        │ Domain         │ Resource       │ Action         │ Effect   │");
             println!("├────────────────┼────────────────┼────────────────┼────────────────┼──────────┤");
 
-            for p in &policies {
-                let sub = p.first().map(std::string::String::as_str).unwrap_or("");
-                let dom = p.get(1).map(std::string::String::as_str).unwrap_or("");
-                let obj = p.get(2).map(std::string::String::as_str).unwrap_or("");
-                let act = p.get(3).map(std::string::String::as_str).unwrap_or("");
-                let eft = p.get(4).map(std::string::String::as_str).unwrap_or("");
+            for rule in &policy_info.rules {
                 println!(
                     "│ {:14} │ {:14} │ {:14} │ {:14} │ {:8} │",
-                    truncate_str(sub, 14),
-                    truncate_str(dom, 14),
-                    truncate_str(obj, 14),
-                    truncate_str(act, 14),
-                    truncate_str(eft, 8)
+                    truncate_str(&rule.subject, 14),
+                    truncate_str(&rule.domain, 14),
+                    truncate_str(&rule.resource, 14),
+                    truncate_str(&rule.action, 14),
+                    truncate_str(&rule.effect, 8)
                 );
             }
             println!("└────────────────┴────────────────┴────────────────┴────────────────┴──────────┘");
         }
 
         // Print role assignments
-        if !groupings.is_empty() {
+        if !policy_info.groupings.is_empty() {
             println!();
             println!("┌────────────────────────────────────────────┐");
             println!("│ Role Assignments                           │");
@@ -97,13 +85,11 @@ pub async fn handle_policy_show(
             println!("│ User               │ Role                  │");
             println!("├────────────────────┼───────────────────────┤");
 
-            for g in &groupings {
-                let user = g.first().map(std::string::String::as_str).unwrap_or("");
-                let role = g.get(1).map(std::string::String::as_str).unwrap_or("");
+            for g in &policy_info.groupings {
                 println!(
                     "│ {:18} │ {:21} │",
-                    truncate_str(user, 18),
-                    truncate_str(role, 21)
+                    truncate_str(&g.user, 18),
+                    truncate_str(&g.role, 21)
                 );
             }
             println!("└────────────────────┴───────────────────────┘");
@@ -113,66 +99,42 @@ pub async fn handle_policy_show(
     Ok(())
 }
 
-/// Handle `policy history` - Show policy commit history
+/// Handle `policy history` - Show policy commit history via RPC
 pub async fn handle_policy_history(
-    policy_manager: &PolicyManager,
+    signing_key: &SigningKey,
     count: usize,
-    oneline: bool,
+    _oneline: bool,
 ) -> Result<()> {
-    let policies_dir = policy_manager.policies_dir();
+    let client = create_policy_client(signing_key);
+    let history = client.get_history(count as u32).await
+        .context("Failed to get policy history from PolicyService. Are services running?")?;
 
-    // Find the .registry directory (parent of policies/)
-    let registry_dir = policies_dir
-        .parent()
-        .context("Could not find .registry directory")?;
-
-    // Run git log on the policies directory
-    let mut cmd = Command::new("git");
-    cmd.current_dir(registry_dir);
-    cmd.args(["log", "-n", &count.to_string()]);
-
-    if oneline {
-        cmd.args(["--oneline"]);
-    } else {
-        cmd.args([
-            "--pretty=format:%C(yellow)%h%Creset %C(green)%ad%Creset %s%n%C(dim)  by %an%Creset%n",
-            "--date=relative",
-        ]);
-    }
-
-    cmd.args(["--", "policies/"]);
-
-    let output = cmd.output().context("Failed to run git log")?;
-
-    if output.stdout.is_empty() {
+    if history.entries.is_empty() {
         println!("No policy history found.");
         println!("\nPolicies are versioned using git commits in .registry/");
         return Ok(());
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    println!("{stdout}");
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.is_empty() {
-            eprintln!("{stderr}");
-        }
+    for entry in &history.entries {
+        println!("\x1b[33m{}\x1b[0m \x1b[32m{}\x1b[0m {}", entry.hash, entry.date, entry.message);
     }
 
     Ok(())
 }
 
 /// Handle `policy edit` - Open policy in $VISUAL/$EDITOR
-pub async fn handle_policy_edit(policy_manager: &PolicyManager) -> Result<()> {
-    let policy_path = policy_manager.policy_csv_path();
-
+///
+/// The editor itself must be local, but draft detection uses PolicyService RPC.
+pub async fn handle_policy_edit(
+    signing_key: &SigningKey,
+    policy_csv_path: &Path,
+) -> Result<()> {
     // Get editor from environment
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| "vi".to_owned());
 
-    println!("Opening {} in {}", policy_path.display(), editor);
+    println!("Opening {} in {}", policy_csv_path.display(), editor);
     println!();
     println!("After editing, use:");
     println!("  hyprstream policy diff     # Preview changes");
@@ -181,7 +143,7 @@ pub async fn handle_policy_edit(policy_manager: &PolicyManager) -> Result<()> {
 
     // Run editor
     let status = Command::new(&editor)
-        .arg(&policy_path)
+        .arg(policy_csv_path)
         .status()
         .context(format!("Failed to run editor: {editor}"))?;
 
@@ -189,71 +151,87 @@ pub async fn handle_policy_edit(policy_manager: &PolicyManager) -> Result<()> {
         anyhow::bail!("Editor exited with non-zero status");
     }
 
-    // Check if there are uncommitted changes
-    if has_uncommitted_changes(policy_manager.policies_dir())? {
-        println!();
-        println!("✏️  Draft changes detected. Run 'hyprstream policy diff' to review.");
+    // Check for draft changes via PolicyService RPC
+    let client = create_policy_client(signing_key);
+    match client.get_draft_status().await {
+        Ok(draft) if draft.has_changes => {
+            println!();
+            println!("✏️  Draft changes detected ({}). Run 'hyprstream policy diff' to review.", draft.summary);
+        }
+        Ok(_) => {} // No changes
+        Err(_) => {
+            // Service may not be running; just suggest the commands
+            println!();
+            println!("Run 'hyprstream policy diff' to review changes.");
+        }
     }
 
     Ok(())
 }
 
-/// Handle `policy diff` - Show diff between draft and running policy
+/// Handle `policy diff` - Show diff between draft and running policy via RPC
 pub async fn handle_policy_diff(
-    policy_manager: &PolicyManager,
+    signing_key: &SigningKey,
     against: Option<String>,
 ) -> Result<()> {
-    let policies_dir = policy_manager.policies_dir();
-    let registry_dir = policies_dir
-        .parent()
-        .context("Could not find .registry directory")?;
+    let client = create_policy_client(signing_key);
+    let git_ref = against.as_deref().unwrap_or("");
 
-    let git_ref = against.as_deref().unwrap_or("HEAD");
+    let diff_text = client.get_diff(git_ref).await
+        .context("Failed to get diff from PolicyService. Are services running?")?;
 
-    // Run git diff
-    let output = Command::new("git")
-        .current_dir(registry_dir)
-        .args(["diff", "--color=always", git_ref, "--", "policies/"])
-        .output()
-        .context("Failed to run git diff")?;
-
-    if output.stdout.is_empty() {
-        println!("No changes from {git_ref} policy.");
+    if diff_text.is_empty() {
+        let ref_display = if git_ref.is_empty() { "HEAD" } else { git_ref };
+        println!("No changes from {ref_display} policy.");
         return Ok(());
     }
 
-    println!("Changes vs {git_ref}:\n");
-    print!("{}", String::from_utf8_lossy(&output.stdout));
+    let ref_display = if git_ref.is_empty() { "HEAD" } else { git_ref };
+    println!("Changes vs {ref_display}:\n");
+
+    // Colorize the diff output
+    for line in diff_text.lines() {
+        if let Some(rest) = line.strip_prefix('+') {
+            println!("\x1b[32m+{rest}\x1b[0m");
+        } else if let Some(rest) = line.strip_prefix('-') {
+            println!("\x1b[31m-{rest}\x1b[0m");
+        } else {
+            println!("{line}");
+        }
+    }
 
     Ok(())
 }
 
-/// Handle `policy apply` - Commit draft changes to running policy
+/// Handle `policy apply` - Commit draft changes via RPC
 pub async fn handle_policy_apply(
-    policy_manager: &PolicyManager,
+    signing_key: &SigningKey,
     dry_run: bool,
     message: Option<String>,
 ) -> Result<()> {
-    let policies_dir = policy_manager.policies_dir();
-    let registry_dir = policies_dir
-        .parent()
-        .context("Could not find .registry directory")?;
+    let client = create_policy_client(signing_key);
 
-    // Check for uncommitted changes
-    if !has_uncommitted_changes(policies_dir)? {
+    // Check for uncommitted changes via RPC
+    let draft = client.get_draft_status().await
+        .context("Failed to check draft status from PolicyService. Are services running?")?;
+
+    if !draft.has_changes {
         println!("No changes to apply.");
         return Ok(());
     }
 
     // Show what would be committed
-    let diff_output = Command::new("git")
-        .current_dir(registry_dir)
-        .args(["diff", "--stat", "--", "policies/"])
-        .output()
-        .context("Failed to get diff")?;
+    let diff_text = client.get_diff("").await
+        .context("Failed to get diff from PolicyService.")?;
 
-    println!("Changes to be applied:");
-    print!("{}", String::from_utf8_lossy(&diff_output.stdout));
+    println!("Changes to be applied ({}):", draft.summary);
+    for line in diff_text.lines() {
+        if let Some(rest) = line.strip_prefix('+') {
+            println!("  \x1b[32m+{rest}\x1b[0m");
+        } else if let Some(rest) = line.strip_prefix('-') {
+            println!("  \x1b[31m-{rest}\x1b[0m");
+        }
+    }
     println!();
 
     if dry_run {
@@ -261,97 +239,47 @@ pub async fn handle_policy_apply(
         return Ok(());
     }
 
-    // Generate commit message
+    // Use PolicyService RPC to validate, stage, and commit
     let commit_msg = message.unwrap_or_else(|| {
         let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
         format!("policy: update access control rules ({timestamp})")
     });
 
-    // Validate the new policy before committing
-    print!("Validating policy... ");
-    io::stdout().flush()?;
+    let result_msg = client.apply_draft(&commit_msg).await
+        .context("Failed to apply draft via PolicyService.")?;
 
-    match policy_manager.reload().await {
-        Ok(_) => println!("✓ valid"),
-        Err(e) => {
-            println!("✗ invalid");
-            anyhow::bail!("Policy validation failed: {}. Fix errors before applying.", e);
-        }
-    }
-
-    // Stage and commit
-    Command::new("git")
-        .current_dir(registry_dir)
-        .args(["add", "policies/"])
-        .output()
-        .context("Failed to stage changes")?;
-
-    let commit_result = Command::new("git")
-        .current_dir(registry_dir)
-        .args(["commit", "-m", &commit_msg])
-        .output()
-        .context("Failed to commit")?;
-
-    if !commit_result.status.success() {
-        let stderr = String::from_utf8_lossy(&commit_result.stderr);
-        anyhow::bail!("Commit failed: {}", stderr);
-    }
-
-    // Reload the policy
-    policy_manager.reload().await?;
-
-    println!();
     println!("✓ Policy applied successfully.");
-    println!("  {commit_msg}");
+    println!("  {result_msg}");
 
     Ok(())
 }
 
-/// Handle `policy rollback [ref]` - Revert to a previous policy version
+/// Handle `policy rollback [ref]` - Revert to a previous policy version via RPC
 pub async fn handle_policy_rollback(
-    policy_manager: &PolicyManager,
+    signing_key: &SigningKey,
     git_ref: &str,
     dry_run: bool,
 ) -> Result<()> {
-    let policies_dir = policy_manager.policies_dir();
-    let registry_dir = policies_dir
-        .parent()
-        .context("Could not find .registry directory")?;
-
-    // Show what we're rolling back to
-    let log_output = Command::new("git")
-        .current_dir(registry_dir)
-        .args(["log", "-1", "--oneline", git_ref])
-        .output()
-        .context("Failed to get commit info")?;
-
-    let target_commit = String::from_utf8_lossy(&log_output.stdout)
-        .trim().to_owned();
-
-    if target_commit.is_empty() {
-        anyhow::bail!("Invalid git ref: {}", git_ref);
-    }
-
-    println!("Rolling back to: {target_commit}");
-
-    // Show diff
-    let diff_output = Command::new("git")
-        .current_dir(registry_dir)
-        .args(["diff", "--stat", "HEAD", git_ref, "--", "policies/"])
-        .output()
-        .context("Failed to get diff")?;
-
-    println!("\nChanges:");
-    print!("{}", String::from_utf8_lossy(&diff_output.stdout));
-    println!();
+    let client = create_policy_client(signing_key);
 
     if dry_run {
-        println!("--dry-run specified, no changes applied.");
+        // Use history RPC to show what we'd be rolling back to
+        let history = client.get_history(20).await
+            .context("Failed to get history from PolicyService. Are services running?")?;
+
+        // Find the matching entry
+        let target = history.entries.iter().find(|e| e.hash.starts_with(git_ref) || git_ref.contains('~'));
+        if let Some(entry) = target {
+            println!("Rolling back to: {} {}", entry.hash, entry.message);
+        } else {
+            println!("Rolling back to: {git_ref}");
+        }
+        println!("\n--dry-run specified, no changes applied.");
         return Ok(());
     }
 
     // Confirm
-    print!("Apply rollback? [y/N] ");
+    print!("Roll back policy to {git_ref}? [y/N] ");
     io::stdout().flush()?;
 
     let mut input = String::new();
@@ -362,72 +290,28 @@ pub async fn handle_policy_rollback(
         return Ok(());
     }
 
-    // Checkout the policy files from the target ref
-    let checkout_result = Command::new("git")
-        .current_dir(registry_dir)
-        .args(["checkout", git_ref, "--", "policies/"])
-        .output()
-        .context("Failed to checkout files")?;
-
-    if !checkout_result.status.success() {
-        let stderr = String::from_utf8_lossy(&checkout_result.stderr);
-        anyhow::bail!("Checkout failed: {}", stderr);
-    }
-
-    // Commit the rollback
-    let commit_msg = format!("policy: rollback to {git_ref}");
-
-    Command::new("git")
-        .current_dir(registry_dir)
-        .args(["add", "policies/"])
-        .output()
-        .context("Failed to stage changes")?;
-
-    let commit_result = Command::new("git")
-        .current_dir(registry_dir)
-        .args(["commit", "-m", &commit_msg])
-        .output()
-        .context("Failed to commit")?;
-
-    if !commit_result.status.success() {
-        let stderr = String::from_utf8_lossy(&commit_result.stderr);
-        // If nothing to commit, that's okay
-        if !stderr.contains("nothing to commit") {
-            anyhow::bail!("Commit failed: {}", stderr);
-        }
-    }
-
-    // Reload policy
-    policy_manager.reload().await?;
+    // Use PolicyService RPC
+    let result_msg = client.rollback(git_ref).await
+        .context("Failed to rollback via PolicyService. Are services running?")?;
 
     println!();
     println!("✓ Policy rolled back to {git_ref}");
+    println!("  {result_msg}");
 
     Ok(())
 }
 
-/// Handle `policy check <user> <resource> <action>` - Test permission
+/// Handle `policy check <user> <resource> <action>` - Test permission via RPC
 pub async fn handle_policy_check(
-    policy_manager: &PolicyManager,
+    signing_key: &SigningKey,
     user: &str,
     resource: &str,
     action: &str,
 ) -> Result<()> {
-    // Parse the action
-    let operation = match action.to_lowercase().as_str() {
-        "infer" | "i" => Operation::Infer,
-        "train" | "t" => Operation::Train,
-        "query" | "q" => Operation::Query,
-        "write" | "w" => Operation::Write,
-        "serve" | "s" => Operation::Serve,
-        "manage" | "m" => Operation::Manage,
-        _ => anyhow::bail!(
-            "Unknown action: {}. Valid actions: infer, train, query, write, serve, manage",
-            action
-        ),
-    };
+    let client = create_policy_client(signing_key);
 
-    let allowed = policy_manager.check(user, resource, operation).await;
+    let allowed = client.check(user, "*", resource, action).await
+        .context("Failed to check policy via PolicyService. Are services running?")?;
 
     println!("User:     {user}");
     println!("Resource: {resource}");
@@ -438,13 +322,6 @@ pub async fn handle_policy_check(
         println!("Result:   ✓ ALLOWED");
     } else {
         println!("Result:   ✗ DENIED");
-    }
-
-    // Show user's roles if any
-    let roles = policy_manager.get_roles_for_user(user).await;
-    if !roles.is_empty() {
-        println!();
-        println!("User roles: {}", roles.join(", "));
     }
 
     Ok(())
@@ -588,21 +465,6 @@ fn parse_duration(s: &str) -> Result<Option<Duration>> {
 
 // === Helper functions ===
 
-/// Check if there are uncommitted changes in the policies directory
-fn has_uncommitted_changes(policies_dir: &Path) -> Result<bool> {
-    let registry_dir = policies_dir
-        .parent()
-        .context("Could not find .registry directory")?;
-
-    let output = Command::new("git")
-        .current_dir(registry_dir)
-        .args(["status", "--porcelain", "--", "policies/"])
-        .output()
-        .context("Failed to check git status")?;
-
-    Ok(!output.stdout.is_empty())
-}
-
 /// Truncate a string to max length, adding "..." if truncated.
 /// Uses char_indices for O(n) slicing without intermediate allocation.
 fn truncate_str(s: &str, max_len: usize) -> String {
@@ -621,58 +483,8 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     }
 }
 
-/// Built-in policy template
-pub struct PolicyTemplate {
-    pub name: &'static str,
-    pub description: &'static str,
-    /// Static rules, or None if rules are generated dynamically.
-    pub rules: Option<&'static str>,
-}
-
-impl PolicyTemplate {
-    /// Get the rules content, expanding dynamic templates.
-    pub fn expanded_rules(&self) -> String {
-        if let Some(rules) = self.rules {
-            rules.to_owned()
-        } else if self.name == "local" {
-            let user = hyprstream_rpc::envelope::RequestIdentity::local().user().to_owned();
-            format!("# Full access for {user}\np, {user}, *, *, *, allow\n")
-        } else {
-            String::new()
-        }
-    }
-}
-
-/// Get all available policy templates
-pub fn get_templates() -> &'static [PolicyTemplate] {
-    &[
-        PolicyTemplate {
-            name: "local",
-            description: "Full access for the current local user",
-            rules: None, // Dynamic: expands to current OS username
-        },
-        PolicyTemplate {
-            name: "public-inference",
-            description: "Anonymous users can infer and query models",
-            rules: Some(r#"# Public inference access
-p, anonymous, *, model:*, infer, allow
-p, anonymous, *, model:*, query, allow
-"#),
-        },
-        PolicyTemplate {
-            name: "public-read",
-            description: "Anonymous users can query the registry (read-only)",
-            rules: Some(r#"# Public read access (registry only)
-p, anonymous, *, registry:*, query, allow
-"#),
-        },
-    ]
-}
-
-/// Get a template by name
-pub fn get_template(name: &str) -> Option<&'static PolicyTemplate> {
-    get_templates().iter().find(|t| t.name == name)
-}
+// Re-export policy templates from shared location
+pub use crate::auth::policy_templates::{PolicyTemplate, get_template, get_templates};
 
 /// Handle `policy list-templates` - List available templates
 pub async fn handle_policy_list_templates() -> Result<()> {
@@ -692,9 +504,9 @@ pub async fn handle_policy_list_templates() -> Result<()> {
     Ok(())
 }
 
-/// Handle `policy apply-template <name>` - Apply a built-in template
+/// Handle `policy apply-template <name>` - Apply a built-in template via RPC
 pub async fn handle_policy_apply_template(
-    policy_manager: &PolicyManager,
+    signing_key: &SigningKey,
     template_name: &str,
     dry_run: bool,
 ) -> Result<()> {
@@ -704,16 +516,6 @@ pub async fn handle_policy_apply_template(
             template_name
         ))?;
 
-    let policy_path = policy_manager.policy_csv_path();
-    let policies_dir = policy_manager.policies_dir();
-    let registry_dir = policies_dir
-        .parent()
-        .context("Could not find .registry directory")?;
-
-    // Read existing policy content for rollback (PolicyManager::new() guarantees file exists)
-    let existing_content = tokio::fs::read_to_string(&policy_path).await?;
-
-    // Full overwrite — templates are idempotent
     let new_content = template.expanded_rules();
 
     println!("Applying template: {template_name}");
@@ -732,66 +534,14 @@ pub async fn handle_policy_apply_template(
         return Ok(());
     }
 
-    // Ensure policies directory exists
-    if !policies_dir.exists() {
-        tokio::fs::create_dir_all(&policies_dir).await?;
-    }
-
-    // Write the updated policy
-    tokio::fs::write(&policy_path, &new_content).await?;
-
-    // Validate the new policy
-    print!("Validating policy... ");
-    io::stdout().flush()?;
-
-    match policy_manager.reload().await {
-        Ok(_) => println!("✓ valid"),
-        Err(e) => {
-            // Rollback on validation failure
-            tokio::fs::write(&policy_path, &existing_content).await?;
-            println!("✗ invalid");
-            anyhow::bail!("Policy validation failed: {}. Template not applied.", e);
-        }
-    }
-
-    // Commit the change
-    let commit_msg = format!("policy: apply {template_name} template");
-
-    // Ensure .registry is a git repo (it may not exist if user runs policy
-    // apply-template before any clone/list/registry operation)
-    ensure_registry_is_git_repo(registry_dir)?;
-
-    Command::new("git")
-        .current_dir(registry_dir)
-        .args(["add", "policies/"])
-        .output()
-        .context("Failed to stage changes")?;
-
-    let commit_result = Command::new("git")
-        .current_dir(registry_dir)
-        .args(["commit", "-m", &commit_msg])
-        .output()
-        .context("Failed to commit")?;
-
-    if !commit_result.status.success() {
-        let stderr = String::from_utf8_lossy(&commit_result.stderr);
-        let stdout = String::from_utf8_lossy(&commit_result.stdout);
-        // Ignore "nothing to commit" errors (template already applied)
-        if !stderr.contains("nothing to commit") {
-            let mut msg = format!("Commit failed: {}", stderr.trim());
-            if !stdout.is_empty() {
-                msg.push_str("\nstdout: ");
-                msg.push_str(stdout.trim());
-            }
-            if stderr.trim().is_empty() && stdout.trim().is_empty() {
-                msg.push_str(" (git may need user.name and user.email: git config --global user.name \"Your Name\"; git config --global user.email \"you@example.com\")");
-            }
-            anyhow::bail!("{}", msg);
-        }
-    }
+    // Use PolicyService RPC to apply the template (writes file, validates, stages, commits)
+    let client = create_policy_client(signing_key);
+    let result_msg = client.apply_template(template_name).await
+        .context("Failed to apply template via PolicyService. Are services running?")?;
 
     println!();
     println!("✓ Template '{template_name}' applied successfully.");
+    println!("  {result_msg}");
 
     Ok(())
 }

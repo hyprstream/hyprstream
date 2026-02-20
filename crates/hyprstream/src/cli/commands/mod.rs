@@ -155,33 +155,23 @@ pub enum Commands {
 /// Service management actions
 #[derive(Subcommand)]
 pub enum ServiceAction {
-    /// Install systemd units and start all services
+    /// Install, repair, and update hyprstream services
     ///
-    /// Creates systemd user unit files and starts all configured services.
-    /// Idempotent - safe to run multiple times.
+    /// Idempotent setup: bootstraps directories, registry, policy files, and
+    /// signing key; installs command alias and systemd units.
+    /// With --start: also stops and restarts services to pick up changes.
     Install {
         /// Operate on specific services only (comma-separated)
         #[arg(long, short = 's', value_delimiter = ',')]
         services: Option<Vec<String>>,
-    },
 
-    /// Upgrade units with current binary path and restart services
-    ///
-    /// Useful after updating the hyprstream binary or moving the AppImage.
-    /// Updates unit files to point to the current executable location.
-    Upgrade {
-        /// Operate on specific services only
-        #[arg(long, short = 's', value_delimiter = ',')]
-        services: Option<Vec<String>>,
-    },
+        /// Stop and start services after installing/updating units
+        #[arg(long)]
+        start: bool,
 
-    /// Full reset: stop, uninstall, reinstall, and start services
-    ///
-    /// Use this when services are in a broken state or after major changes.
-    Reinstall {
-        /// Operate on specific services only
-        #[arg(long, short = 's', value_delimiter = ',')]
-        services: Option<Vec<String>>,
+        /// Show verbose output for repair checks
+        #[arg(long, short = 'v')]
+        verbose: bool,
     },
 
     /// Stop and remove systemd units
@@ -233,6 +223,16 @@ pub enum ServiceAction {
     /// Displays running services, unit file locations, and execution mode.
     Status {
         /// Show verbose output including unit file contents
+        #[arg(long, short = 'v')]
+        verbose: bool,
+    },
+
+    /// Diagnose, initialize, and repair hyprstream installation
+    ///
+    /// Alias for `service install --verbose`. Runs all setup checks and fixes
+    /// without starting services.
+    Repair {
+        /// Show verbose output for each check
         #[arg(long, short = 'v')]
         verbose: bool,
     },

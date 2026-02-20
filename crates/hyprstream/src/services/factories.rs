@@ -23,18 +23,40 @@
 use std::sync::Arc;
 
 use anyhow::Context;
+use git2db::Git2DB;
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::{global as global_registry, SocketKind};
 use hyprstream_rpc::service::factory::ServiceContext;
 use hyprstream_rpc::service::spawner::{ProxyService, Spawnable};
 use hyprstream_rpc::service_factory;
 use hyprstream_workers::endpoints;
+use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::auth::PolicyManager;
 use crate::config::TokenConfig;
 use crate::services::{McpService, McpConfig, PolicyService, PolicyClient, RegistryService, GenRegistryClient};
 use crate::zmq::global_context;
+
+/// Shared Git2DB registry instance. Lazily initialized by the first factory
+/// that needs it. Both PolicyService and RegistryService share this instance.
+static SHARED_GIT2DB: std::sync::OnceLock<Arc<RwLock<Git2DB>>> = std::sync::OnceLock::new();
+
+/// Get or initialize the shared Git2DB registry for the given models directory.
+fn get_or_init_git2db(models_dir: &std::path::Path) -> anyhow::Result<Arc<RwLock<Git2DB>>> {
+    if let Some(existing) = SHARED_GIT2DB.get() {
+        return Ok(Arc::clone(existing));
+    }
+
+    let registry = tokio::task::block_in_place(|| {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(Git2DB::open(models_dir))
+    }).context("Failed to initialize shared Git2DB registry")?;
+
+    let shared = Arc::new(RwLock::new(registry));
+    // If another thread beat us, that's fine — use theirs
+    Ok(Arc::clone(SHARED_GIT2DB.get_or_init(|| shared)))
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Event Service Factory
@@ -68,6 +90,9 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 
     let policies_dir = ctx.models_dir().join(".registry").join("policies");
 
+    // Get shared Git2DB instance (initializes .registry as git repo if needed)
+    let git2db = get_or_init_git2db(ctx.models_dir())?;
+
     // Create policy manager (blocking since we're in sync context)
     let policy_manager = Arc::new(
         tokio::task::block_in_place(|| {
@@ -92,6 +117,7 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         policy_manager,
         Arc::new(ctx.signing_key().clone()),
         TokenConfig::default(),
+        git2db,
         global_context(),
         ctx.transport("policy", SocketKind::Rep),
     );

@@ -2587,10 +2587,14 @@ mod tests {
         // Create a permissive policy manager and start PolicyService first
         let policy_manager = Arc::new(PolicyManager::permissive().await.expect("test: create policy manager"));
         let policy_transport = TransportConfig::inproc("test-policy-health");
+        let git2db = Arc::new(tokio::sync::RwLock::new(
+            git2db::Git2DB::open(temp_dir.path()).await.expect("test: open git2db"),
+        ));
         let policy_service = PolicyService::new(
             policy_manager,
             Arc::new(signing_key.clone()),
             crate::config::TokenConfig::default(),
+            git2db,
             context.clone(),
             policy_transport,
         );

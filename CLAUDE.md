@@ -915,9 +915,7 @@ cargo clippy --all-targets --all-features
 
 # AppImage update (build + reinstall service)
 ./build-appimage.sh build rocm71 \
-  && ./output/hyprstream-dev-rocm71-x86_64.AppImage service uninstall \
-  && ./output/hyprstream-dev-rocm71-x86_64.AppImage service install \
-  && hyprstream service start
+  && ./output/hyprstream-dev-rocm71-x86_64.AppImage service install --start
 ```
 
 ---
