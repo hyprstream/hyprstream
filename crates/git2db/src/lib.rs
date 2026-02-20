@@ -56,6 +56,9 @@ pub mod xet {
 #[cfg(feature = "xet-storage")]
 pub mod lfs;
 
+#[cfg(test)]
+mod security_tests;
+
 // Re-export main types
 pub use config::{Git2DBConfig, GitSignature, WorktreeConfig};
 pub use errors::{Git2DBError, Git2DBResult, LfsErrorKind};

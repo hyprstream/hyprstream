@@ -719,6 +719,8 @@ impl Git2DB {
                 .join("modules")
                 .join(id.to_string());
             if modules_dir.exists() {
+                // I4 fix: Containment check before remove_dir_all
+                self.validate_within_base(&modules_dir)?;
                 debug!("Removing git modules directory: {:?}", modules_dir);
                 fs::remove_dir_all(&modules_dir).await.map_err(|e| {
                     Git2DBError::internal(format!("Failed to remove .git/modules/{id}: {e}"))
@@ -774,6 +776,8 @@ impl Git2DB {
             // Remove submodule working directory from registry
             let submodule_work_path = self.registry_path.join(&submodule_path);
             if submodule_work_path.exists() {
+                // I4 fix: Containment check before remove_dir_all
+                self.validate_within_base(&submodule_work_path)?;
                 debug!(
                     "Removing submodule working directory: {:?}",
                     submodule_work_path
@@ -795,6 +799,8 @@ impl Git2DB {
 
         // 2. Remove actual repository working directory
         if worktree_path.exists() {
+            // I4 fix: Containment check before remove_dir_all
+            self.validate_within_base(&worktree_path)?;
             debug!("Removing repository working directory: {:?}", worktree_path);
             fs::remove_dir_all(&worktree_path).await.map_err(|e| {
                 Git2DBError::repository(
@@ -973,6 +979,25 @@ impl Git2DB {
     /// Get registry path
     pub fn registry_path(&self) -> &Path {
         &self.registry_path
+    }
+
+    /// Validate that a path is within the base directory (I4 fix).
+    ///
+    /// Prevents `remove_dir_all` from being tricked into deleting outside the registry.
+    fn validate_within_base(&self, path: &Path) -> Git2DBResult<()> {
+        let canonical_target = path.canonicalize().map_err(|e| {
+            Git2DBError::internal(format!("Failed to canonicalize target {:?}: {e}", path))
+        })?;
+        let canonical_base = self.base_dir.canonicalize().map_err(|e| {
+            Git2DBError::internal(format!("Failed to canonicalize base {:?}: {e}", self.base_dir))
+        })?;
+        if !canonical_target.starts_with(&canonical_base) {
+            return Err(Git2DBError::internal(format!(
+                "Path {:?} is outside base directory {:?}",
+                canonical_target, canonical_base
+            )));
+        }
+        Ok(())
     }
 
   
