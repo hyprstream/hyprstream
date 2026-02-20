@@ -194,6 +194,20 @@ impl Git2DB {
                 )
             })?;
 
+            // Restrict registry directory — may contain URLs with embedded tokens
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&registry_path, std::fs::Permissions::from_mode(0o700))
+                    .await
+                    .map_err(|e| {
+                        Git2DBError::repository(
+                            &registry_path,
+                            format!("Failed to set directory permissions: {e}"),
+                        )
+                    })?;
+            }
+
             let repo = Repository::init(&registry_path).map_err(|e| {
                 Git2DBError::repository(&registry_path, format!("Failed to init repository: {e}"))
             })?;
@@ -221,7 +235,7 @@ impl Git2DB {
             let json = serde_json::to_string_pretty(&metadata).map_err(|e| {
                 Git2DBError::internal(format!("Failed to serialize metadata: {e}"))
             })?;
-            fs::write(registry_path.join("registry.json"), json)
+            fs::write(registry_path.join("registry.json"), &json)
                 .await
                 .map_err(|e| {
                     Git2DBError::repository(
@@ -229,6 +243,23 @@ impl Git2DB {
                         format!("Failed to write registry.json: {e}"),
                     )
                 })?;
+
+            // Restrict registry.json — contains repo URLs that may embed credentials
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(
+                    registry_path.join("registry.json"),
+                    std::fs::Permissions::from_mode(0o600),
+                )
+                .await
+                .map_err(|e| {
+                    Git2DBError::repository(
+                        &registry_path,
+                        format!("Failed to set registry.json permissions: {e}"),
+                    )
+                })?;
+            }
 
             // Initial commit using standardized signature
             let sig = git_manager
@@ -1015,12 +1046,23 @@ impl Git2DB {
 
         let json = serde_json::to_string_pretty(&self.metadata)
             .map_err(|e| Git2DBError::internal(format!("Failed to serialize metadata: {e}")))?;
-        fs::write(metadata_path, json).await.map_err(|e| {
+        fs::write(&metadata_path, json).await.map_err(|e| {
             Git2DBError::repository(
                 &self.registry_path,
                 format!("Failed to write registry.json: {e}"),
             )
         })?;
+
+        // Ensure restrictive permissions after every write (write resets to umask)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(
+                &metadata_path,
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .await;
+        }
 
         Ok(())
     }
