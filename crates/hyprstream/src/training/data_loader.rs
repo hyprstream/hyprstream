@@ -168,27 +168,18 @@ impl ChatTemplateDataLoader {
             let mut messages = Vec::new();
 
             if let Some(ref system) = sample.system {
-                messages.push(ChatMessage {
-                    role: "system".to_owned(),
-                    content: system.clone(),
-                });
+                messages.push(ChatMessage { role: "system".into(), content: Some(system.clone()), ..Default::default() });
             }
 
-            messages.push(ChatMessage {
-                role: "user".to_owned(),
-                content: sample.input.clone(),
-            });
+            messages.push(ChatMessage { role: "user".into(), content: Some(sample.input.clone()), ..Default::default() });
 
             // Format input (without assistant response)
-            let formatted_input = template.apply_chat_template(&messages, Some(true))?;
+            let formatted_input = template.apply_chat_template(&messages, Some(true), None)?;
 
             // Add assistant response for target
-            messages.push(ChatMessage {
-                role: "assistant".to_owned(),
-                content: sample.output.clone(),
-            });
+            messages.push(ChatMessage { role: "assistant".into(), content: Some(sample.output.clone()), ..Default::default() });
 
-            let full_formatted = template.apply_chat_template(&messages, Some(false))?;
+            let full_formatted = template.apply_chat_template(&messages, Some(false), None)?;
 
             Ok((formatted_input, full_formatted))
         } else {

@@ -29,7 +29,7 @@
 
 use async_trait::async_trait;
 use crate::api::openai_compat::ChatMessage;
-use crate::config::{GenerationRequest, GenerationResult, TemplatedPrompt};
+use crate::config::{GenerationRequest, TemplatedPrompt};
 use crate::runtime::kv_quant::KVQuantType;
 use crate::runtime::RuntimeConfig;
 use crate::services::{
@@ -260,9 +260,11 @@ impl ModelService {
 
         // Create runtime config - use per-model config if provided, otherwise service defaults
         let load_config = config.unwrap_or_default();
-        let mut runtime_config = RuntimeConfig::default();
-        runtime_config.max_context = load_config.max_context.or(self.config.max_context);
-        runtime_config.kv_quant_type = load_config.kv_quant.unwrap_or(self.config.kv_quant);
+        let runtime_config = RuntimeConfig {
+            max_context: load_config.max_context.or(self.config.max_context),
+            kv_quant_type: load_config.kv_quant.unwrap_or(self.config.kv_quant),
+            ..Default::default()
+        };
 
         // Obtain FsOps from the registry for path-contained adapter I/O
         let fs: Option<crate::services::WorktreeClient> = Some(repo_client.worktree(&branch_name));
@@ -380,137 +382,137 @@ impl ModelService {
             }
         }
     }
-
-    /// Route inference request to the appropriate InferenceService
-    async fn infer(&self, model_ref_str: &str, request: GenerationRequest) -> Result<GenerationResult> {
-        let client = self.get_inference_client(model_ref_str).await?;
-        client.generate(&request).await
-    }
-
-    /// Route streaming inference request with E2E authentication.
-    ///
-    /// The ephemeral pubkey from the client's envelope is passed through to InferenceService.
-    async fn infer_stream(
-        &self,
-        model_ref_str: &str,
-        request: GenerationRequest,
-        client_ephemeral_pubkey: Option<[u8; 32]>,
-    ) -> Result<StreamInfo> {
-        let client = self.get_inference_client(model_ref_str).await?;
-        client.generate_stream(&request, client_ephemeral_pubkey).await
-    }
-
-    /// Helper: Get inference client for a model (ensures loaded, updates last_used)
-    async fn get_inference_client(&self, model_ref_str: &str) -> Result<InferenceZmqClient> {
+    async fn get_inference_client(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<InferenceZmqClient> {
         let _endpoint = self.load_model(model_ref_str, None).await?;
         let mut cache = self.loaded_models.write().await;
         let model = cache
             .get_mut(model_ref_str)
             .ok_or_else(|| anyhow!("Model {} not found after loading", model_ref_str))?;
         model.last_used = Instant::now();
-        Ok(model.client.clone())
+        let client = model.client.clone();
+        match ctx.claims() {
+            Some(claims) => Ok(client.with_claims(claims.clone())),
+            None => Ok(client),
+        }
     }
 
     /// Apply chat template via the model's InferenceService
     async fn apply_chat_template(
         &self,
         model_ref_str: &str,
+        ctx: &EnvelopeContext,
         messages: Vec<ChatMessage>,
         add_generation_prompt: bool,
+        tools: Option<&serde_json::Value>,
     ) -> Result<TemplatedPrompt> {
-        let client = self.get_inference_client(model_ref_str).await?;
+        let client = self.get_inference_client(model_ref_str, ctx).await?;
 
         // Convert ChatMessage to the template engine's format
         let template_messages: Vec<crate::runtime::template_engine::ChatMessage> = messages
             .iter()
             .map(|m| crate::runtime::template_engine::ChatMessage {
                 role: m.role.clone(),
-                content: m.content.clone().unwrap_or_default(),
+                content: m.content.clone(),
+                tool_calls: m.tool_calls.as_ref().map(|tcs| {
+                    tcs.iter().map(|tc| serde_json::to_value(tc).unwrap_or_default()).collect()
+                }),
+                tool_call_id: m.tool_call_id.clone(),
             })
             .collect();
 
+        // Serialize tools to JSON string for transport over Cap'n Proto
+        let tools_json = tools.map(|t| serde_json::to_string(t).unwrap_or_default())
+            .unwrap_or_default();
+
         // Call InferenceService's apply_chat_template
-        let prompt_str = client.apply_chat_template(&template_messages, add_generation_prompt).await?;
+        let prompt_str = client.apply_chat_template_with_tools(
+            &template_messages, add_generation_prompt, &tools_json,
+        ).await?;
 
         Ok(TemplatedPrompt::new(prompt_str))
     }
 
     /// Create a new LoRA adapter on the loaded model
-    async fn create_lora(&self, model_ref_str: &str, config: crate::training::TenantDeltaConfig) -> Result<()> {
-        let client = self.get_inference_client(model_ref_str).await?;
+    async fn create_lora(&self, model_ref_str: &str, ctx: &EnvelopeContext, config: crate::training::TenantDeltaConfig) -> Result<()> {
+        let client = self.get_inference_client(model_ref_str, ctx).await?;
         client.create_lora(&config).await
     }
 
     /// Load a LoRA adapter from a file
-    async fn load_lora(&self, model_ref_str: &str, path: &str) -> Result<()> {
-        let client = self.get_inference_client(model_ref_str).await?;
+    async fn load_lora(&self, model_ref_str: &str, ctx: &EnvelopeContext, path: &str) -> Result<()> {
+        let client = self.get_inference_client(model_ref_str, ctx).await?;
         client.load_lora(path).await
     }
 
     /// Unload the current LoRA adapter
-    async fn unload_lora(&self, model_ref_str: &str) -> Result<()> {
-        let client = self.get_inference_client(model_ref_str).await?;
+    async fn unload_lora(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
+        let client = self.get_inference_client(model_ref_str, ctx).await?;
         client.unload_lora().await
     }
 
     /// Check if a LoRA adapter is loaded
-    async fn has_lora(&self, model_ref_str: &str) -> Result<bool> {
-        let client = self.get_inference_client(model_ref_str).await?;
+    async fn has_lora(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<bool> {
+        let client = self.get_inference_client(model_ref_str, ctx).await?;
         client.has_lora().await
     }
 
     // Training loop control - forward to InferenceService via ZMQ
-    async fn commit_adaptation(&self, model_ref_str: &str) -> Result<()> {
-        let client = self.get_inference_client(model_ref_str).await?;
+    async fn commit_adaptation(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
+        let client = self.get_inference_client(model_ref_str, ctx).await?;
         client.commit_adaptation().await
     }
 
-    async fn rollback_adaptation(&self, model_ref_str: &str) -> Result<()> {
-        let client = self.get_inference_client(model_ref_str).await?;
+    async fn rollback_adaptation(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
+        let client = self.get_inference_client(model_ref_str, ctx).await?;
         client.rollback_adaptation().await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn train_step_stream(
         &self,
         model_ref_str: &str,
+        ctx: &EnvelopeContext,
         input: &str,
         gradient_steps: u32,
         learning_rate: f32,
         auto_commit: bool,
         client_ephemeral_pubkey: Option<[u8; 32]>,
     ) -> Result<StreamInfo> {
-        let client = self.get_inference_client(model_ref_str).await?;
+        let client = self.get_inference_client(model_ref_str, ctx).await?;
         client.train_step_stream(input, gradient_steps, learning_rate, auto_commit, client_ephemeral_pubkey).await
     }
 
-    async fn reset_delta(&self, model_ref_str: &str) -> Result<()> {
-        let client = self.get_inference_client(model_ref_str).await?;
+    async fn reset_delta(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
+        let client = self.get_inference_client(model_ref_str, ctx).await?;
         client.reset_delta().await
     }
 
     async fn get_delta_status_forward(
         &self,
         model_ref_str: &str,
+        ctx: &EnvelopeContext,
     ) -> Result<crate::services::generated::inference_client::DeltaStatusResult> {
-        let client = self.get_inference_client(model_ref_str).await?;
+        let client = self.get_inference_client(model_ref_str, ctx).await?;
         client.gen.get_delta_status().await
     }
 
     async fn snapshot_delta_forward(
         &self,
         model_ref_str: &str,
+        ctx: &EnvelopeContext,
     ) -> Result<crate::services::generated::inference_client::SnapshotDeltaResult> {
-        let client = self.get_inference_client(model_ref_str).await?;
+        let client = self.get_inference_client(model_ref_str, ctx).await?;
         client.gen.snapshot_delta().await
     }
 
     async fn export_peft_adapter_forward(
         &self,
         model_ref_str: &str,
+        ctx: &EnvelopeContext,
         name: &str,
         commit_message: &str,
     ) -> Result<crate::services::generated::inference_client::ExportPeftResult> {
-        let client = self.get_inference_client(model_ref_str).await?;
+        let client = self.get_inference_client(model_ref_str, ctx).await?;
         client.gen.export_peft_adapter(name, commit_message).await
     }
 
@@ -534,7 +536,7 @@ use crate::services::generated::model_client::{
     // PEFT types
     PeftAdapterInfo, PeftMergeRequest,
     // Infer types
-    GenerateRequest, ApplyChatTemplateRequest, InferResult, ModelStatusResponse, OnlineTrainingConfig,
+    GenerateRequest, ApplyChatTemplateRequest, ModelStatusResponse, OnlineTrainingConfig,
 };
 // Conflicting names — use canonical path at usage sites:
 //   model_client::LoadedModelInfo, model_client::StreamInfo,
@@ -543,7 +545,7 @@ use crate::services::generated::model_client::{
 #[async_trait::async_trait(?Send)]
 impl TttHandler for ModelService {
     async fn handle_create(
-        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &CreateLoraRequest,
     ) -> Result<()> {
         let config = crate::training::TenantDeltaConfig {
@@ -554,14 +556,14 @@ impl TttHandler for ModelService {
             learning_rate: data.learning_rate as f64,
             ..crate::training::TenantDeltaConfig::default()
         };
-        self.create_lora(model_ref, config).await
+        self.create_lora(model_ref, ctx, config).await
     }
 
     async fn handle_train(
-        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &TrainStepRequest,
     ) -> Result<TrainStepResponse> {
-        let client = self.get_inference_client(model_ref).await?;
+        let client = self.get_inference_client(model_ref, ctx).await?;
         let r = client.gen.train_step(
             &data.input, data.gradient_steps, data.learning_rate, data.auto_commit,
         ).await?;
@@ -583,10 +585,9 @@ impl TttHandler for ModelService {
         model_ref: &str, data: &TrainStepRequest,
     ) -> Result<(crate::services::generated::model_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
         let info = self.train_step_stream(
-                model_ref, &data.input, data.gradient_steps, data.learning_rate,
+                model_ref, ctx, &data.input, data.gradient_steps, data.learning_rate,
                 data.auto_commit, ctx.ephemeral_pubkey,
             ).await?;
-        // Convert inference_client::crate::services::generated::model_client::StreamInfo to model_client::crate::services::generated::model_client::StreamInfo
         let stream_info = crate::services::generated::model_client::StreamInfo {
             stream_id: info.stream_id,
             endpoint: info.endpoint,
@@ -596,27 +597,27 @@ impl TttHandler for ModelService {
     }
 
     async fn handle_commit(
-        &self, _ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
+        &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
     ) -> Result<()> {
-        self.commit_adaptation(model_ref).await
+        self.commit_adaptation(model_ref, ctx).await
     }
 
     async fn handle_rollback(
-        &self, _ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
+        &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
     ) -> Result<()> {
-        self.rollback_adaptation(model_ref).await
+        self.rollback_adaptation(model_ref, ctx).await
     }
 
     async fn handle_reset(
-        &self, _ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
+        &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
     ) -> Result<()> {
-        self.reset_delta(model_ref).await
+        self.reset_delta(model_ref, ctx).await
     }
 
     async fn handle_status(
-        &self, _ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
+        &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
     ) -> Result<GetDeltaStatusResponse> {
-        let r = self.get_delta_status_forward(model_ref).await?;
+        let r = self.get_delta_status_forward(model_ref, ctx).await?;
                 Ok(GetDeltaStatusResponse {
                     exists: r.exists,
                     accumulated_steps: r.accumulated_steps,
@@ -634,10 +635,10 @@ impl TttHandler for ModelService {
     }
 
     async fn handle_save(
-        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &SaveAdaptationRequest,
     ) -> Result<SaveAdaptationResponse> {
-        let client = self.get_inference_client(model_ref).await?;
+        let client = self.get_inference_client(model_ref, ctx).await?;
         let r = client.gen.save_adaptation(
             &data.name, &data.merge_strategy, data.merge_weight, &data.commit_message,
         ).await?;
@@ -650,9 +651,9 @@ impl TttHandler for ModelService {
     }
 
     async fn handle_snapshot(
-        &self, _ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
+        &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
     ) -> Result<SnapshotDeltaResponse> {
-        let r = self.snapshot_delta_forward(model_ref).await?;
+        let r = self.snapshot_delta_forward(model_ref, ctx).await?;
         Ok(SnapshotDeltaResponse {
             content_hash: r.content_hash,
             size_bytes: r.size_bytes,
@@ -662,10 +663,10 @@ impl TttHandler for ModelService {
     }
 
     async fn handle_export(
-        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &TttExportRequest,
     ) -> Result<TttExportResponse> {
-        let r = self.export_peft_adapter_forward(model_ref, &data.name, &data.commit_message).await?;
+        let r = self.export_peft_adapter_forward(model_ref, ctx, &data.name, &data.commit_message).await?;
         Ok(TttExportResponse {
             adapter_path: r.adapter_path,
             content_hash: r.content_hash,
@@ -676,22 +677,22 @@ impl TttHandler for ModelService {
 #[async_trait::async_trait(?Send)]
 impl PeftHandler for ModelService {
     async fn handle_load(
-        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, value: &str,
     ) -> Result<()> {
-        self.load_lora(model_ref, value).await
+        self.load_lora(model_ref, ctx, value).await
     }
 
     async fn handle_unload(
-        &self, _ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
+        &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
     ) -> Result<()> {
-        self.unload_lora(model_ref).await
+        self.unload_lora(model_ref, ctx).await
     }
 
     async fn handle_has(
-        &self, _ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
+        &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
     ) -> Result<bool> {
-        self.has_lora(model_ref).await
+        self.has_lora(model_ref, ctx).await
     }
 
     async fn handle_check(
@@ -711,34 +712,13 @@ impl PeftHandler for ModelService {
 
 #[async_trait::async_trait(?Send)]
 impl InferHandler for ModelService {
-    async fn handle_generate(
-        &self, _ctx: &EnvelopeContext, _request_id: u64,
-        model_ref: &str, data: &GenerateRequest,
-    ) -> Result<InferResult> {
-        let request = generate_request_from_data(data);
-        let result = self.infer(model_ref, request).await?;
-        Ok(InferResult {
-            text: result.text,
-            tokens_generated: result.tokens_generated as u32,
-            finish_reason: finish_reason_to_str(&result.finish_reason),
-            generation_time_ms: result.generation_time_ms,
-            tokens_per_second: result.tokens_per_second,
-            prefill_tokens: result.prefill_tokens as u32,
-            prefill_time_ms: result.prefill_time_ms,
-            prefill_tokens_per_sec: result.prefill_tokens_per_sec,
-            inference_tokens: result.inference_tokens as u32,
-            inference_time_ms: result.inference_time_ms,
-            inference_tokens_per_sec: result.inference_tokens_per_sec,
-        })
-    }
-
     async fn handle_generate_stream(
         &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &GenerateRequest,
     ) -> Result<(crate::services::generated::model_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
         let request = generate_request_from_data(data);
-        let info = self.infer_stream(model_ref, request, ctx.ephemeral_pubkey).await?;
-        // Convert inference_client::crate::services::generated::model_client::StreamInfo to model_client::crate::services::generated::model_client::StreamInfo
+        let client = self.get_inference_client(model_ref, ctx).await?;
+        let info = client.generate_stream(&request, ctx.ephemeral_pubkey).await?;
         let stream_info = crate::services::generated::model_client::StreamInfo {
             stream_id: info.stream_id,
             endpoint: info.endpoint,
@@ -748,15 +728,39 @@ impl InferHandler for ModelService {
     }
 
     async fn handle_apply_chat_template(
-        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &ApplyChatTemplateRequest,
     ) -> Result<String> {
-        let chat_messages: Vec<ChatMessage> = data.messages.iter().map(|m| ChatMessage {
-            role: m.role.clone(),
-            content: Some(m.content.clone()),
-            function_call: None,
+        let chat_messages: Vec<ChatMessage> = data.messages.iter().map(|m| {
+            let tool_calls = if m.tool_calls.is_empty() {
+                None
+            } else {
+                Some(m.tool_calls.iter().map(|tc| crate::api::openai_compat::ToolCall {
+                    id: tc.id.clone(),
+                    tool_type: tc.call_type.clone(),
+                    function: crate::api::openai_compat::ToolCallFunction {
+                        name: tc.function_name.clone(),
+                        arguments: tc.arguments.clone(),
+                    },
+                }).collect())
+            };
+            ChatMessage {
+                role: m.role.clone(),
+                content: if m.content.is_empty() { None } else { Some(m.content.clone()) },
+                function_call: None,
+                tool_calls,
+                tool_call_id: if m.tool_call_id.is_empty() { None } else { Some(m.tool_call_id.clone()) },
+            }
         }).collect();
-        let templated = self.apply_chat_template(model_ref, chat_messages, data.add_generation_prompt).await?;
+        // Parse tools from JSON string
+        let tools: Option<serde_json::Value> = if data.tools_json.is_empty() {
+            None
+        } else {
+            serde_json::from_str(&data.tools_json).ok()
+        };
+        let templated = self.apply_chat_template(
+            model_ref, ctx, chat_messages, data.add_generation_prompt, tools.as_ref(),
+        ).await?;
         Ok(templated.as_str().to_owned())
     }
 
@@ -990,6 +994,11 @@ impl ModelZmqClient {
         }
     }
 
+    /// Attach claims for e2e verification. All subsequent calls include these claims.
+    pub fn with_claims(self, claims: hyprstream_rpc::auth::Claims) -> Self {
+        Self { gen: self.gen.with_claims(claims) }
+    }
+
     /// Load a model — delegates to generated client
     pub async fn load(&self, model_ref: &str, config: Option<&ModelLoadConfig>) -> Result<String> {
         let (max_context, kv_quant_str) = match config {
@@ -1046,44 +1055,6 @@ impl ModelZmqClient {
         })
     }
 
-    /// Run inference on a model (infer-scoped)
-    pub async fn infer(&self, model_ref: &str, request: &GenerationRequest) -> Result<GenerationResult> {
-        // Images are file paths in GenerationRequest but raw bytes in schema — not yet used over wire
-        let images: Vec<Vec<u8>> = Vec::new();
-        let data = self.gen.infer(model_ref).generate(
-            request.prompt.as_str(),
-            request.max_tokens as u32,
-            request.temperature,
-            request.top_p,
-            request.top_k.unwrap_or(0) as u32,
-            request.repeat_penalty,
-            request.repeat_last_n as u32,
-            &request.stop_tokens,
-            request.seed.unwrap_or(0),
-            &images,
-            request.timeout.unwrap_or(0),
-            false,  // tttEnabled: use server default
-            0,      // tttGradientSteps: use server default
-            0.0,    // tttLearningRate: use server default
-            false,  // autoCommit: default false
-        ).await?;
-        Ok(GenerationResult {
-            text: data.text,
-            tokens_generated: data.tokens_generated as usize,
-            finish_reason: parse_finish_reason_str(&data.finish_reason),
-            generation_time_ms: data.generation_time_ms,
-            tokens_per_second: data.tokens_per_second,
-            quality_metrics: None,
-            prefill_tokens: data.prefill_tokens as usize,
-            prefill_time_ms: data.prefill_time_ms,
-            prefill_tokens_per_sec: data.prefill_tokens_per_sec,
-            inference_tokens: data.inference_tokens as usize,
-            inference_time_ms: data.inference_time_ms,
-            inference_tokens_per_sec: data.inference_tokens_per_sec,
-            ttt_metrics: None,  // TODO: Extract from response when available
-        })
-    }
-
     /// Start streaming inference with E2E authentication
     pub async fn infer_stream(
         &self,
@@ -1104,10 +1075,10 @@ impl ModelZmqClient {
             request.seed.unwrap_or(0),
             &images,
             request.timeout.unwrap_or(0),
-            false,  // ttt_enabled
-            0,      // ttt_gradient_steps
-            0.0,    // ttt_learning_rate
-            false,  // auto_commit
+            request.ttt_enabled,
+            request.ttt_gradient_steps,
+            request.ttt_learning_rate,
+            request.auto_commit,
             client_ephemeral_pubkey,
         ).await?;
         Ok(StreamInfo {
@@ -1134,12 +1105,25 @@ impl ModelZmqClient {
         model_ref: &str,
         messages: &[ChatMessage],
         add_generation_prompt: bool,
+        tools: Option<&serde_json::Value>,
     ) -> Result<TemplatedPrompt> {
-        let msg_data: Vec<crate::services::generated::model_client::ChatMessage> = messages.iter().map(|m| crate::services::generated::model_client::ChatMessage {
-            role: m.role.clone(),
-            content: m.content.as_deref().unwrap_or("").to_owned(),
+        let msg_data: Vec<crate::services::generated::model_client::ChatMessage> = messages.iter().map(|m| {
+            use crate::services::generated::model_client::{ChatMessage as CapnpMsg, ToolCallData};
+            CapnpMsg {
+                role: m.role.clone(),
+                content: m.content.as_deref().unwrap_or("").to_owned(),
+                tool_calls: m.tool_calls.as_ref().map(|tcs| tcs.iter().map(|tc| ToolCallData {
+                    id: tc.id.clone(),
+                    call_type: tc.tool_type.clone(),
+                    function_name: tc.function.name.clone(),
+                    arguments: tc.function.arguments.clone(),
+                }).collect()).unwrap_or_default(),
+                tool_call_id: m.tool_call_id.as_deref().unwrap_or("").to_owned(),
+            }
         }).collect();
-        let prompt_str = self.gen.infer(model_ref).apply_chat_template(&msg_data, add_generation_prompt).await?;
+        let tools_json = tools.map(|t| serde_json::to_string(t).unwrap_or_default())
+            .unwrap_or_default();
+        let prompt_str = self.gen.infer(model_ref).apply_chat_template(&msg_data, add_generation_prompt, &tools_json).await?;
         Ok(TemplatedPrompt::new(prompt_str))
     }
 
@@ -1237,34 +1221,13 @@ fn generate_request_from_data(data: &GenerateRequest) -> GenerationRequest {
         timeout: if data.timeout_ms > 0 { Some(data.timeout_ms) } else { None },
         images: Vec::new(),
         collect_metrics: false,
+        ttt_enabled: data.ttt_enabled,
+        ttt_gradient_steps: data.ttt_gradient_steps,
+        ttt_learning_rate: data.ttt_learning_rate,
+        auto_commit: data.auto_commit,
     }
 }
 
-/// Convert FinishReason to string for InferResult.finishReason field
-fn finish_reason_to_str(reason: &crate::config::FinishReason) -> String {
-    match reason {
-        crate::config::FinishReason::MaxTokens => "max_tokens".to_owned(),
-        crate::config::FinishReason::StopToken(t) => format!("stop_token:{}", t),
-        crate::config::FinishReason::EndOfSequence => "end_of_sequence".to_owned(),
-        crate::config::FinishReason::Error(e) => format!("error:{}", e),
-        crate::config::FinishReason::Stop => "stop".to_owned(),
-    }
-}
-
-/// Parse a finish reason string back into FinishReason enum
-fn parse_finish_reason_str(s: &str) -> crate::config::FinishReason {
-    if s.starts_with("stop_token:") {
-        crate::config::FinishReason::StopToken(s.strip_prefix("stop_token:").unwrap_or("").to_owned())
-    } else if s.starts_with("error:") {
-        crate::config::FinishReason::Error(s.strip_prefix("error:").unwrap_or("").to_owned())
-    } else {
-        match s {
-            "max_tokens" => crate::config::FinishReason::MaxTokens,
-            "end_of_sequence" => crate::config::FinishReason::EndOfSequence,
-            _ => crate::config::FinishReason::Stop,
-        }
-    }
-}
 
 
 #[cfg(test)]

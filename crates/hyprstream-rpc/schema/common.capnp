@@ -119,6 +119,7 @@ struct Claims {
   scopes @3 :List(Scope); # Structured scopes
   admin @4 :Bool;        # Deprecated: always false. Use Casbin policies.
   aud @5 :Text;          # RFC 8707 audience (resource indicator)
+  token @6 :Text;        # Original JWT for e2e verification by downstream services
 }
 
 # UTC timestamp with nanosecond precision

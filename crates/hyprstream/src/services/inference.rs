@@ -34,7 +34,7 @@
 //! authorization on all requests. The handler delegates to PolicyClient.
 
 use crate::services::PolicyClient;
-use crate::config::{FinishReason, GenerationRequest, GenerationResult, ModelInfo, TrainingMode};
+use crate::config::{GenerationRequest, ModelInfo, TrainingMode};
 use crate::inference_capnp;
 use crate::runtime::kv_cache::CacheOwner;
 use crate::runtime::model_config::ModelConfig;
@@ -807,6 +807,65 @@ impl InferenceService {
                 envelope_ctx.request_id
             );
 
+            // E2E JWT verification with downgrade protection
+            if let Some(claims) = envelope_ctx.claims() {
+                let verify_result = claims.verify_token(&service.server_pubkey);
+                match verify_result {
+                    Ok(Some(verified)) => {
+                        if verified.sub != claims.sub {
+                            warn!("Claims sub mismatch: envelope={} jwt={}", claims.sub, verified.sub);
+                            let err_variant = InferenceResponseVariant::Error(ErrorInfo {
+                                message: "Claims subject mismatch".to_owned(),
+                                code: "UNAUTHORIZED".to_owned(),
+                                details: String::new(),
+                            });
+                            let error_payload = serialize_response(envelope_ctx.request_id, &err_variant).unwrap_or_default();
+                            let msg: Multipart = vec![error_payload].into();
+                            receiver = match sender.send(msg).await {
+                                Ok(r) => r,
+                                Err(e) => { error!("failed to send error response: {}", e); return; }
+                            };
+                            continue;
+                        }
+                    }
+                    Ok(None) => {
+                        if !envelope_ctx.identity.is_local() {
+                            warn!(
+                                "Non-local request with claims but no JWT token: sub={}, identity={:?}",
+                                claims.sub, envelope_ctx.identity
+                            );
+                            let err_variant = InferenceResponseVariant::Error(ErrorInfo {
+                                message: "JWT token required for non-local requests".to_owned(),
+                                code: "UNAUTHORIZED".to_owned(),
+                                details: String::new(),
+                            });
+                            let error_payload = serialize_response(envelope_ctx.request_id, &err_variant).unwrap_or_default();
+                            let msg: Multipart = vec![error_payload].into();
+                            receiver = match sender.send(msg).await {
+                                Ok(r) => r,
+                                Err(e) => { error!("failed to send error response: {}", e); return; }
+                            };
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("E2E JWT verification failed: {}", e);
+                        let err_variant = InferenceResponseVariant::Error(ErrorInfo {
+                            message: "JWT verification failed".to_owned(),
+                            code: "UNAUTHORIZED".to_owned(),
+                            details: String::new(),
+                        });
+                        let error_payload = serialize_response(envelope_ctx.request_id, &err_variant).unwrap_or_default();
+                        let msg: Multipart = vec![error_payload].into();
+                        receiver = match sender.send(msg).await {
+                            Ok(r) => r,
+                            Err(e) => { error!("failed to send error response: {}", e); return; }
+                        };
+                        continue;
+                    }
+                }
+            }
+
             // Handle request - may return pending work (now async for policy checks)
             // Handle request via generated dispatch
             let request_id = envelope_ctx.request_id;
@@ -949,36 +1008,6 @@ impl InferenceService {
         }
     }
 
-    /// Handle non-streaming generation
-    fn handle_generate(&self, request: GenerationRequest, subject: &Subject) -> Result<GenerationResult> {
-        // Apply TTT adaptation BEFORE generation (if enabled) and capture metrics
-        let ttt_result = match self.apply_ttt_adaptation(request.prompt.as_str(), subject) {
-            Ok(Some(result)) => Some(result),
-            Ok(None) => None,  // TTT not configured/applicable
-            Err(e) => {
-                // Log error but continue with generation
-                warn!("TTT adaptation failed, continuing without: {}", e);
-                None
-            }
-        };
-
-        // Look up tenant's delta and/or base delta for delta-aware inference
-        let delta = self.resolve_delta(subject);
-        info!("[TTT-DEBUG] handle_generate: subject={}, delta_resolved={}, pool_exists={}, pool_subjects={:?}",
-              subject, delta.is_some(), self.delta_pool.is_some(),
-              self.delta_pool.as_ref().map(|p| p.list_subjects()));
-
-        let engine = self.engine.read();
-        let mut result = futures::executor::block_on(async {
-            engine.generate_with_delta_params(request, delta).await
-        })?;
-
-        // Attach TTT metrics to response
-        result.ttt_metrics = ttt_result.map(std::convert::Into::into);
-
-        Ok(result)
-    }
-
     /// Prepare for streaming generation with DH-based key derivation.
     ///
     /// This is the first phase of streaming that runs BEFORE the REP response is sent.
@@ -1099,13 +1128,23 @@ impl InferenceService {
             match stream_result {
                 Ok(mut stream) => {
                     let mut had_error = false;
-                    while let Some(chunk_result) = stream.next().await {
+                    let cancel = stream_ctx.cancel_token();
+                    loop {
+                        let chunk_result = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => {
+                                let _ = publisher.publish_error("cancelled").await;
+                                had_error = true;
+                                break;
+                            }
+                            next = stream.next() => match next {
+                                Some(r) => r,
+                                None => break,
+                            },
+                        };
                         match chunk_result {
                             Ok(text) => {
-                                // Get live generation rate from stream stats (EMA for smooth batching)
                                 let rate = stream.stats().inference_tokens_per_sec_ema;
-
-                                // Publish with adaptive batching
                                 if let Err(e) = publisher.publish_data_with_rate(text.as_bytes(), rate).await {
                                     warn!("Failed to publish stream data: {}", e);
                                     had_error = true;
@@ -1113,7 +1152,6 @@ impl InferenceService {
                                 }
                             }
                             Err(e) => {
-                                // Publish error and stop
                                 if let Err(send_err) = publisher.publish_error(&e.to_string()).await {
                                     error!("Failed to publish stream error: {}", send_err);
                                 }
@@ -1177,6 +1215,10 @@ impl InferenceService {
         );
 
         let result = stream_channel.with_publisher(stream_ctx, |mut publisher| async move {
+            if stream_ctx.cancel_token().is_cancelled() {
+                publisher.publish_error("cancelled").await?;
+                return Ok(());
+            }
             match self.handle_train_step(&subject, &input, gradient_steps, learning_rate, auto_commit) {
                 Ok(result) => {
                     // Serialize training result as JSON for the completion payload
@@ -1216,10 +1258,11 @@ impl InferenceService {
         &self,
         messages: Vec<crate::runtime::template_engine::ChatMessage>,
         add_generation_prompt: bool,
+        tools: Option<&serde_json::Value>,
     ) -> Result<String> {
         self.engine
             .read()
-            .apply_chat_template(&messages, add_generation_prompt)
+            .apply_chat_template(&messages, add_generation_prompt, tools)
     }
 
     /// Handle create LoRA
@@ -1820,7 +1863,6 @@ use crate::services::generated::inference_client::{
     InferenceResponseVariant, ErrorInfo,
     HealthStatus, TrainStepResult, DeltaStatusResult, ModuleNormRatio,
     SaveAdaptationResult, SnapshotDeltaResult, ExportPeftResult,
-    OnlineTrainingMetrics, QualityMetrics, FinishReasonEnum,
     ChatTemplateRequest, LoraConfig, TrainStepRequest, SaveAdaptationRequest, ExportPeftRequest,
 };
 // Conflicting names — use canonical path at usage sites:
@@ -1841,29 +1883,6 @@ impl InferenceHandler for InferenceService {
         }
     }
 
-    async fn handle_generate(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
-        data: &crate::services::generated::inference_client::GenerationRequest,
-    ) -> Result<InferenceResponseVariant> {
-        let subject = ctx.subject();
-        let request = GenerationRequest {
-            prompt: crate::config::TemplatedPrompt::new(data.prompt.clone()),
-            max_tokens: data.max_tokens as usize,
-            temperature: data.temperature,
-            top_p: data.top_p,
-            top_k: if data.top_k == 0 { None } else { Some(data.top_k as usize) },
-            repeat_penalty: data.repeat_penalty,
-            repeat_last_n: data.repeat_last_n as usize,
-            stop_tokens: data.stop_tokens.clone(),
-            seed: if data.seed == 0 { None } else { Some(data.seed) },
-            images: vec![],
-            timeout: if data.timeout_ms == 0 { None } else { Some(data.timeout_ms) },
-            collect_metrics: false,
-        };
-        let result = InferenceService::handle_generate(self, request, &subject)?;
-        Ok(InferenceResponseVariant::GenerateResult(generation_result_to_data(&result)))
-    }
-
     async fn handle_generate_stream(
         &self, ctx: &EnvelopeContext, _request_id: u64,
         data: &crate::services::generated::inference_client::GenerationRequest,
@@ -1882,6 +1901,10 @@ impl InferenceHandler for InferenceService {
             images: vec![],
             timeout: if data.timeout_ms == 0 { None } else { Some(data.timeout_ms) },
             collect_metrics: false,
+            ttt_enabled: false,
+            ttt_gradient_steps: 0,
+            ttt_learning_rate: 0.0,
+            auto_commit: false,
         };
 
         // Calculate expiry from claims
@@ -1945,12 +1968,36 @@ impl InferenceHandler for InferenceService {
     ) -> Result<InferenceResponseVariant> {
         let chat_messages: Vec<crate::runtime::template_engine::ChatMessage> = data.messages
             .iter()
-            .map(|m| crate::runtime::template_engine::ChatMessage {
-                role: m.role.clone(),
-                content: m.content.clone(),
+            .map(|m| {
+                let tool_calls = if m.tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(m.tool_calls.iter().map(|tc| serde_json::json!({
+                        "id": tc.id,
+                        "type": tc.call_type,
+                        "function": {
+                            "name": tc.function_name,
+                            "arguments": tc.arguments,
+                        }
+                    })).collect())
+                };
+                crate::runtime::template_engine::ChatMessage {
+                    role: m.role.clone(),
+                    content: if m.content.is_empty() { None } else { Some(m.content.clone()) },
+                    tool_calls,
+                    tool_call_id: if m.tool_call_id.is_empty() { None } else { Some(m.tool_call_id.clone()) },
+                }
             })
             .collect();
-        let result = InferenceService::handle_apply_chat_template(self, chat_messages, data.add_generation_prompt)?;
+        // tools_json is passed as a JSON string via the schema; parse it here
+        let tools: Option<serde_json::Value> = if data.tools_json.is_empty() {
+            None
+        } else {
+            serde_json::from_str(&data.tools_json).ok()
+        };
+        let result = InferenceService::handle_apply_chat_template(
+            self, chat_messages, data.add_generation_prompt, tools.as_ref(),
+        )?;
         Ok(InferenceResponseVariant::ApplyChatTemplateResult(result))
     }
 
@@ -2166,52 +2213,6 @@ impl InferenceHandler for InferenceService {
     }
 }
 
-/// Convert a GenerationResult to the generated data type.
-fn generation_result_to_data(result: &GenerationResult) -> crate::services::generated::inference_client::GenerationResult {
-    let finish_reason = match &result.finish_reason {
-        FinishReason::MaxTokens => FinishReasonEnum::MaxTokens,
-        FinishReason::StopToken(_) => FinishReasonEnum::StopToken,
-        FinishReason::EndOfSequence => FinishReasonEnum::EndOfSequence,
-        FinishReason::Error(_) => FinishReasonEnum::Error,
-        FinishReason::Stop => FinishReasonEnum::Stop,
-    };
-    crate::services::generated::inference_client::GenerationResult {
-        text: result.text.clone(),
-        tokens_generated: result.tokens_generated as u32,
-        finish_reason,
-        generation_time_ms: result.generation_time_ms,
-        tokens_per_second: result.tokens_per_second,
-        quality_metrics: QualityMetrics::default(),
-        prefill_tokens: result.prefill_tokens as u32,
-        prefill_time_ms: result.prefill_time_ms,
-        prefill_tokens_per_sec: result.prefill_tokens_per_sec,
-        inference_tokens: result.inference_tokens as u32,
-        inference_time_ms: result.inference_time_ms,
-        inference_tokens_per_sec: result.inference_tokens_per_sec,
-        online_training_metrics: result.ttt_metrics.as_ref()
-            .map(|m| OnlineTrainingMetrics {
-                avg_loss: m.avg_loss,
-                loss_improvement: m.loss_improvement,
-                steps_performed: m.steps_performed as u32,
-                adaptation_time_ms: m.adaptation_time_ms,
-                skipped: m.skipped,
-                skip_reason: m.skip_reason.clone().unwrap_or_default(),
-                avg_grad_norm: m.avg_grad_norm,
-                max_grad_norm: m.max_grad_norm,
-                gradient_clipped: m.gradient_clipped,
-                tokens_used: m.tokens_used as u32,
-                tokens_provided: m.tokens_provided as u32,
-                was_truncated: m.was_truncated,
-                initial_perplexity: m.initial_perplexity,
-                final_perplexity: m.final_perplexity,
-                recommendation: m.recommendation,
-                gated_steps: m.gated_steps as u32,
-                pending: m.pending,
-            })
-            .unwrap_or_default(),
-    }
-}
-
 // Note: InferenceService does NOT implement ZmqService because it uses a custom
 // single-threaded tokio runtime in `run_service_loop` (not RequestLoop).
 // Both `run_service_loop` and `handle_callback_infer` call `dispatch_inference` directly.
@@ -2246,50 +2247,9 @@ impl InferenceZmqClient {
         }
     }
 
-    /// Convert generated FinishReasonEnum to domain FinishReason
-    fn parse_finish_reason_enum(
-        reason: crate::services::generated::inference_client::FinishReasonEnum,
-    ) -> FinishReason {
-        use crate::services::generated::inference_client::FinishReasonEnum;
-        match reason {
-            FinishReasonEnum::MaxTokens => FinishReason::MaxTokens,
-            FinishReasonEnum::StopToken => FinishReason::StopToken(String::new()),
-            FinishReasonEnum::EndOfSequence => FinishReason::EndOfSequence,
-            FinishReasonEnum::Error => FinishReason::Error(String::new()),
-            FinishReasonEnum::Stop => FinishReason::Stop,
-        }
-    }
-
-    /// Generate text (non-streaming) — delegates to generated client
-    pub async fn generate(&self, request: &GenerationRequest) -> Result<GenerationResult> {
-        let r = self.gen.generate(
-            request.prompt.as_str(),
-            request.max_tokens as u32,
-            request.temperature,
-            request.top_p,
-            request.top_k.unwrap_or(0) as u32,
-            request.repeat_penalty,
-            request.repeat_last_n as u32,
-            &request.stop_tokens,
-            request.seed.unwrap_or(0),
-            &[], // images
-            request.timeout.unwrap_or(0),
-        ).await?;
-        Ok(GenerationResult {
-            text: r.text,
-            tokens_generated: r.tokens_generated as usize,
-            finish_reason: Self::parse_finish_reason_enum(r.finish_reason),
-            generation_time_ms: r.generation_time_ms,
-            tokens_per_second: r.tokens_per_second,
-            quality_metrics: None,
-            prefill_tokens: r.prefill_tokens as usize,
-            prefill_time_ms: r.prefill_time_ms,
-            prefill_tokens_per_sec: r.prefill_tokens_per_sec,
-            inference_tokens: r.inference_tokens as usize,
-            inference_time_ms: r.inference_time_ms,
-            inference_tokens_per_sec: r.inference_tokens_per_sec,
-            ttt_metrics: None,  // TODO: Extract from response when available
-        })
+    /// Attach claims for e2e verification. All subsequent calls include these claims.
+    pub fn with_claims(self, claims: hyprstream_rpc::auth::Claims) -> Self {
+        Self { gen: self.gen.with_claims(claims) }
     }
 
     /// Check if model is ready
@@ -2386,12 +2346,34 @@ impl InferenceZmqClient {
         messages: &[crate::runtime::template_engine::ChatMessage],
         add_generation_prompt: bool,
     ) -> Result<String> {
-        use crate::services::generated::inference_client::ChatMessage;
-        let msg_data: Vec<ChatMessage> = messages.iter().map(|m| ChatMessage {
-            role: m.role.clone(),
-            content: m.content.clone(),
+        self.apply_chat_template_with_tools(messages, add_generation_prompt, "").await
+    }
+
+    /// Apply chat template with tools — delegates to generated client
+    pub async fn apply_chat_template_with_tools(
+        &self,
+        messages: &[crate::runtime::template_engine::ChatMessage],
+        add_generation_prompt: bool,
+        tools_json: &str,
+    ) -> Result<String> {
+        use crate::services::generated::inference_client::{ChatMessage as CapnpMsg, ToolCallData};
+        let msg_data: Vec<CapnpMsg> = messages.iter().map(|m| {
+            let tool_calls: Vec<ToolCallData> = m.tool_calls.as_ref().map(|tcs| tcs.iter().map(|tc| {
+                ToolCallData {
+                    id: tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_owned(),
+                    call_type: tc.get("type").and_then(|v| v.as_str()).unwrap_or("function").to_owned(),
+                    function_name: tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_owned(),
+                    arguments: tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("").to_owned(),
+                }
+            }).collect()).unwrap_or_default();
+            CapnpMsg {
+                role: m.role.clone(),
+                content: m.content.clone().unwrap_or_default(),
+                tool_calls,
+                tool_call_id: m.tool_call_id.clone().unwrap_or_default(),
+            }
         }).collect();
-        self.gen.apply_chat_template(&msg_data, add_generation_prompt).await
+        self.gen.apply_chat_template(&msg_data, add_generation_prompt, tools_json).await
     }
 
     /// Create a new LoRA adapter

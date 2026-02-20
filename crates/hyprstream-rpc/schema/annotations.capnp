@@ -38,3 +38,7 @@ annotation cliHidden(field) :Void;
 # Fixed-size constraint for Data fields — generates [u8; N] instead of Vec<u8>.
 # Usage: serverPubkey @2 :Data $fixedSize(32);
 annotation fixedSize(field) :UInt32;
+
+# Mark a field as optional in MCP tool schemas.
+# Optional fields use type-appropriate defaults when absent (0 for numbers, "" for text, [] for lists).
+annotation optional(field) :Void;

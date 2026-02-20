@@ -127,17 +127,17 @@ m = (g(r.sub, p.sub) || keyMatch(r.sub, p.sub)) && \
 /// Default policy rules: deny-by-default (no allow rules)
 ///
 /// All access is denied until the operator explicitly configures policy via:
-///   hyprstream policy apply-template local    # grant local CLI full access
-///   hyprstream policy apply-template public-inference  # open inference API
+///   hyprstream quick policy apply-template local    # grant local CLI full access
+///   hyprstream quick policy apply-template public-inference  # open inference API
 ///
 /// Policy format: p, subject, domain, resource, action, effect
 const DEFAULT_POLICY_CSV: &str = r#"# Hyprstream Access Control Policy — deny-by-default
 #
 # No access is granted until you apply a policy template:
 #
-#   hyprstream policy apply-template local             # local CLI full access
-#   hyprstream policy apply-template public-inference  # anonymous inference
-#   hyprstream policy apply-template public-read       # anonymous registry browse
+#   hyprstream quick policy apply-template local             # local CLI full access
+#   hyprstream quick policy apply-template public-inference  # anonymous inference
+#   hyprstream quick policy apply-template public-read       # anonymous registry browse
 #
 # Or add rules manually:
 #   p, alice, *, *, *, allow                           # Alice full access
@@ -229,7 +229,7 @@ impl PolicyManager {
 
         // Create default policy.csv if not exists
         if !policy_path.exists() {
-            info!("Creating default policy.csv (deny-by-default — run `hyprstream policy apply-template local` to grant access)");
+            info!("Creating default policy.csv (deny-by-default — run `hyprstream quick policy apply-template local` to grant access)");
             tokio::fs::write(&policy_path, DEFAULT_POLICY_CSV).await?;
         }
 

@@ -112,6 +112,7 @@ minijinja.workspace = true
 # hf-hub removed - using Git for all model downloads
 
 uuid.workspace = true
+automerge = "0.5"  # CRDT collaborative editing
 tmq.workspace = true  # Tokio ZeroMQ bindings for event bus
 zmq.workspace = true  # Underlying libzmq bindings
 capnp.workspace = true  # Cap'n Proto runtime

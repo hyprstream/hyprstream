@@ -12,10 +12,25 @@ use std::time::Instant;
 use tracing::{debug, info, warn};
 
 /// Authenticated identity extracted from token
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AuthenticatedUser {
     /// Username (from JWT sub claim)
     pub user: String,
+    /// Original JWT token for e2e verification through service chain.
+    /// SECURITY: Never logged — custom Debug impl redacts this field.
+    pub token: Option<String>,
+    /// JWT expiration timestamp (from the validated JWT claims).
+    pub exp: Option<i64>,
+}
+
+impl std::fmt::Debug for AuthenticatedUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthenticatedUser")
+            .field("user", &self.user)
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .field("exp", &self.exp)
+            .finish()
+    }
 }
 
 /// JWT authentication middleware
@@ -52,6 +67,8 @@ pub async fn auth_middleware(
                 debug!("JWT validated for user: {}", claims.sub);
                 let user = AuthenticatedUser {
                     user: claims.sub.clone(),
+                    token: Some(token.to_owned()),
+                    exp: Some(claims.exp),
                 };
                 request.extensions_mut().insert(user);
                 return next.run(request).await;

@@ -104,9 +104,9 @@ fn generate_method_schema_entry(
                         let fname = to_snake_case(&f.name);
                         let ftype = &f.type_name;
                         let fdesc = &f.description;
-                        let is_bool = ftype == "Bool";
-                        let required = !is_bool;
-                        let default_val = if is_bool { "false" } else { "" };
+                        let is_optional = f.optional || ftype == "Bool";
+                        let required = !is_optional;
+                        let default_val = if ftype == "Bool" { "false" } else { "" };
                         quote! {
                             ParamSchema { name: #fname, type_name: #ftype, required: #required, description: #fdesc, default_value: #default_val }
                         }
@@ -244,6 +244,13 @@ fn generate_json_dispatcher(
     let mut nested_scoped_dispatch = Vec::new();
     collect_call_scoped_method_recursive(scoped_clients, &mut nested_scoped_dispatch);
 
+    // Generate call_scoped_streaming_method on the top-level client
+    let top_scoped_streaming = generate_call_scoped_streaming_method_for_client(scoped_clients);
+
+    // Generate call_scoped_streaming_method on scoped clients that have children
+    let mut nested_scoped_streaming = Vec::new();
+    collect_call_scoped_streaming_method_recursive(scoped_clients, &mut nested_scoped_streaming);
+
     quote! {
         impl #client_name {
             /// Dispatch a method call by name with JSON arguments.
@@ -258,11 +265,15 @@ fn generate_json_dispatcher(
             #streaming_method
 
             #top_scoped_dispatch
+
+            #top_scoped_streaming
         }
 
         #(#scoped_dispatchers)*
 
         #(#nested_scoped_dispatch)*
+
+        #(#nested_scoped_streaming)*
     }
 }
 
@@ -322,7 +333,7 @@ fn generate_json_method_dispatch_arm(
                     .map(|f| {
                         let fname = format_ident!("{}", to_snake_case(&f.name));
                         let fname_str = to_snake_case(&f.name);
-                        json_field_extraction_token(&fname, &fname_str, &f.type_name, resolved)
+                        json_field_extraction_token(&fname, &fname_str, &f.type_name, f.optional, resolved)
                     })
                     .collect();
 
@@ -391,7 +402,7 @@ fn generate_json_streaming_dispatch_arm(
                     .map(|f| {
                         let fname = format_ident!("{}", to_snake_case(&f.name));
                         let fname_str = to_snake_case(&f.name);
-                        json_field_extraction_token(&fname, &fname_str, &f.type_name, resolved)
+                        json_field_extraction_token(&fname, &fname_str, &f.type_name, f.optional, resolved)
                     })
                     .collect();
 
@@ -503,11 +514,25 @@ fn generate_scoped_dispatcher_block(
 }
 
 /// Generate a factory call expression for a scoped client.
+/// Handles type conversion for non-string scope fields (e.g., UInt32 → parse from &str).
 fn generate_scoped_factory_call(sc: &ScopedClient) -> TokenStream {
     let factory_snake = format_ident!("{}", to_snake_case(&sc.factory_name));
     if sc.scope_fields.is_empty() {
         quote! { self.#factory_snake() }
+    } else if sc.scope_fields.len() == 1 {
+        // Check if scope field needs parsing from string
+        let field = &sc.scope_fields[0];
+        match field.type_name.as_str() {
+            "UInt8" | "UInt16" | "UInt32" | "UInt64" | "Int8" | "Int16" | "Int32" | "Int64"
+            | "Float32" | "Float64" => {
+                quote! { self.#factory_snake(scope_id.parse()?) }
+            }
+            _ => {
+                quote! { self.#factory_snake(scope_id) }
+            }
+        }
     } else {
+        // Multiple scope fields — not supported in call_scoped_method yet
         quote! { self.#factory_snake(scope_id) }
     }
 }
@@ -613,6 +638,110 @@ fn collect_call_scoped_method_recursive(
     }
 }
 
+/// Generate `call_scoped_streaming_method` on the top-level client.
+fn generate_call_scoped_streaming_method_for_client(
+    scoped_clients: &[ScopedClient],
+) -> TokenStream {
+    if scoped_clients.is_empty() {
+        return TokenStream::new();
+    }
+
+    let match_arms: Vec<TokenStream> = scoped_clients.iter().map(|sc| {
+        let scope_name_str = to_snake_case(&sc.factory_name);
+        let factory_call = generate_scoped_factory_call(sc);
+
+        quote! {
+            #scope_name_str => #factory_call.call_scoped_streaming_method(remaining, method, args, ephemeral_pubkey).await,
+        }
+    }).collect();
+
+    quote! {
+        /// Dispatch a scoped streaming method call through nested scope chain.
+        #[allow(unused_variables)]
+        pub async fn call_scoped_streaming_method(
+            &self,
+            scopes: &[(&str, &str)],
+            method: &str,
+            args: &serde_json::Value,
+            ephemeral_pubkey: [u8; 32],
+        ) -> anyhow::Result<serde_json::Value> {
+            if scopes.is_empty() {
+                return self.call_streaming_method(method, args, ephemeral_pubkey).await;
+            }
+            let (scope_name, scope_id) = scopes[0];
+            let remaining = &scopes[1..];
+            match scope_name {
+                #(#match_arms)*
+                _ => anyhow::bail!("Unknown scope: {}", scope_name),
+            }
+        }
+    }
+}
+
+/// Recursively generate `call_scoped_streaming_method` on all scoped clients.
+fn collect_call_scoped_streaming_method_recursive(
+    clients: &[ScopedClient],
+    out: &mut Vec<TokenStream>,
+) {
+    for sc in clients {
+        let client_name = format_ident!("{}", sc.client_name);
+
+        if sc.nested_clients.is_empty() {
+            out.push(quote! {
+                impl #client_name {
+                    /// Dispatch a scoped streaming method call through nested scope chain.
+                    pub async fn call_scoped_streaming_method(
+                        &self,
+                        scopes: &[(&str, &str)],
+                        method: &str,
+                        args: &serde_json::Value,
+                        ephemeral_pubkey: [u8; 32],
+                    ) -> anyhow::Result<serde_json::Value> {
+                        if scopes.is_empty() {
+                            return self.call_streaming_method(method, args, ephemeral_pubkey).await;
+                        }
+                        anyhow::bail!("No nested scopes available for '{}'", scopes[0].0)
+                    }
+                }
+            });
+        } else {
+            let match_arms: Vec<TokenStream> = sc.nested_clients.iter().map(|nested| {
+                let scope_name_str = to_snake_case(&nested.factory_name);
+                let factory_call = generate_scoped_factory_call(nested);
+
+                quote! {
+                    #scope_name_str => #factory_call.call_scoped_streaming_method(remaining, method, args, ephemeral_pubkey).await,
+                }
+            }).collect();
+
+            out.push(quote! {
+                impl #client_name {
+                    /// Dispatch a scoped streaming method call through nested scope chain.
+                    #[allow(unused_variables)]
+                    pub async fn call_scoped_streaming_method(
+                        &self,
+                        scopes: &[(&str, &str)],
+                        method: &str,
+                        args: &serde_json::Value,
+                        ephemeral_pubkey: [u8; 32],
+                    ) -> anyhow::Result<serde_json::Value> {
+                        if scopes.is_empty() {
+                            return self.call_streaming_method(method, args, ephemeral_pubkey).await;
+                        }
+                        let (scope_name, scope_id) = scopes[0];
+                        let remaining = &scopes[1..];
+                        match scope_name {
+                            #(#match_arms)*
+                            _ => anyhow::bail!("Unknown scope: {}", scope_name),
+                        }
+                    }
+                }
+            });
+        }
+        collect_call_scoped_streaming_method_recursive(&sc.nested_clients, out);
+    }
+}
+
 /// Generate `scoped_client_tree()` metadata function.
 fn generate_scoped_client_tree(
     scoped_clients: &[ScopedClient],
@@ -694,82 +823,122 @@ fn json_field_extraction_token(
     fname: &syn::Ident,
     fname_str: &str,
     type_name: &str,
+    optional: bool,
     resolved: &ResolvedSchema,
 ) -> TokenStream {
     let ct = resolved.resolve_type(type_name).capnp_type.clone();
     match ct {
-        CapnpType::Text => quote! {
+        CapnpType::Text => if optional { quote! {
+            let #fname = args.get(#fname_str).and_then(|v| v.as_str()).unwrap_or("");
+        }} else { quote! {
             let #fname = args.get(#fname_str).and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid string field '{}'", #fname_str))?;
-        },
+        }},
         CapnpType::Bool => quote! {
             let #fname = args.get(#fname_str).and_then(|v| v.as_bool()).unwrap_or(false);
         },
-        CapnpType::UInt8 => quote! {
+        CapnpType::UInt8 => if optional { quote! {
+            let #fname: u8 = args.get(#fname_str).and_then(|v| v.as_u64())
+                .unwrap_or(0).try_into().unwrap_or(0);
+        }} else { quote! {
             let #fname: u8 = args.get(#fname_str).and_then(|v| v.as_u64())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid u8 field '{}'", #fname_str))?
                 .try_into().map_err(|_| anyhow::anyhow!("u8 overflow for field '{}'", #fname_str))?;
-        },
-        CapnpType::UInt16 => quote! {
+        }},
+        CapnpType::UInt16 => if optional { quote! {
+            let #fname: u16 = args.get(#fname_str).and_then(|v| v.as_u64())
+                .unwrap_or(0).try_into().unwrap_or(0);
+        }} else { quote! {
             let #fname: u16 = args.get(#fname_str).and_then(|v| v.as_u64())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid u16 field '{}'", #fname_str))?
                 .try_into().map_err(|_| anyhow::anyhow!("u16 overflow for field '{}'", #fname_str))?;
-        },
-        CapnpType::UInt32 => quote! {
+        }},
+        CapnpType::UInt32 => if optional { quote! {
+            let #fname: u32 = args.get(#fname_str).and_then(|v| v.as_u64())
+                .unwrap_or(0).try_into().unwrap_or(0);
+        }} else { quote! {
             let #fname: u32 = args.get(#fname_str).and_then(|v| v.as_u64())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid u32 field '{}'", #fname_str))?
                 .try_into().map_err(|_| anyhow::anyhow!("u32 overflow for field '{}'", #fname_str))?;
-        },
-        CapnpType::UInt64 => quote! {
+        }},
+        CapnpType::UInt64 => if optional { quote! {
+            let #fname = args.get(#fname_str).and_then(|v| v.as_u64()).unwrap_or(0);
+        }} else { quote! {
             let #fname = args.get(#fname_str).and_then(|v| v.as_u64())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid u64 field '{}'", #fname_str))?;
-        },
-        CapnpType::Int8 => quote! {
+        }},
+        CapnpType::Int8 => if optional { quote! {
+            let #fname: i8 = args.get(#fname_str).and_then(|v| v.as_i64())
+                .unwrap_or(0).try_into().unwrap_or(0);
+        }} else { quote! {
             let #fname: i8 = args.get(#fname_str).and_then(|v| v.as_i64())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid i8 field '{}'", #fname_str))?
                 .try_into().map_err(|_| anyhow::anyhow!("i8 overflow for field '{}'", #fname_str))?;
-        },
-        CapnpType::Int16 => quote! {
+        }},
+        CapnpType::Int16 => if optional { quote! {
+            let #fname: i16 = args.get(#fname_str).and_then(|v| v.as_i64())
+                .unwrap_or(0).try_into().unwrap_or(0);
+        }} else { quote! {
             let #fname: i16 = args.get(#fname_str).and_then(|v| v.as_i64())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid i16 field '{}'", #fname_str))?
                 .try_into().map_err(|_| anyhow::anyhow!("i16 overflow for field '{}'", #fname_str))?;
-        },
-        CapnpType::Int32 => quote! {
+        }},
+        CapnpType::Int32 => if optional { quote! {
+            let #fname: i32 = args.get(#fname_str).and_then(|v| v.as_i64())
+                .unwrap_or(0).try_into().unwrap_or(0);
+        }} else { quote! {
             let #fname: i32 = args.get(#fname_str).and_then(|v| v.as_i64())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid i32 field '{}'", #fname_str))?
                 .try_into().map_err(|_| anyhow::anyhow!("i32 overflow for field '{}'", #fname_str))?;
-        },
-        CapnpType::Int64 => quote! {
+        }},
+        CapnpType::Int64 => if optional { quote! {
+            let #fname = args.get(#fname_str).and_then(|v| v.as_i64()).unwrap_or(0);
+        }} else { quote! {
             let #fname = args.get(#fname_str).and_then(|v| v.as_i64())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid i64 field '{}'", #fname_str))?;
-        },
-        CapnpType::Float32 => quote! {
+        }},
+        CapnpType::Float32 => if optional { quote! {
+            let #fname = args.get(#fname_str).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        }} else { quote! {
             let #fname = args.get(#fname_str).and_then(|v| v.as_f64())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid f32 field '{}'", #fname_str))? as f32;
-        },
-        CapnpType::Float64 => quote! {
+        }},
+        CapnpType::Float64 => if optional { quote! {
+            let #fname = args.get(#fname_str).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        }} else { quote! {
             let #fname = args.get(#fname_str).and_then(|v| v.as_f64())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid f64 field '{}'", #fname_str))?;
-        },
-        CapnpType::Data => quote! {
+        }},
+        CapnpType::Data => if optional { quote! {
+            let #fname: Vec<u8> = args.get(#fname_str).and_then(|v| v.as_str())
+                .map(|s| s.as_bytes().to_vec()).unwrap_or_default();
+        }} else { quote! {
             let #fname: Vec<u8> = args.get(#fname_str).and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid data field '{}'", #fname_str))?
                 .as_bytes().to_vec();
-        },
-        CapnpType::ListText => quote! {
+        }},
+        CapnpType::ListText => if optional { quote! {
+            let #fname: Vec<String> = args.get(#fname_str).and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+        }} else { quote! {
             let #fname: Vec<String> = args.get(#fname_str).and_then(|v| v.as_array())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid array field '{}'", #fname_str))?
                 .iter().map(|v| v.as_str().map(String::from)
                     .ok_or_else(|| anyhow::anyhow!("non-string element in array field '{}'", #fname_str)))
                 .collect::<Result<Vec<_>, _>>()?;
-        },
-        CapnpType::ListData => quote! {
+        }},
+        CapnpType::ListData => if optional { quote! {
+            let #fname: Vec<Vec<u8>> = args.get(#fname_str).and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.as_bytes().to_vec())).collect())
+                .unwrap_or_default();
+        }} else { quote! {
             let #fname: Vec<Vec<u8>> = args.get(#fname_str).and_then(|v| v.as_array())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid array field '{}'", #fname_str))?
                 .iter().map(|v| v.as_str().map(|s| s.as_bytes().to_vec())
                     .ok_or_else(|| anyhow::anyhow!("non-string element in array field '{}'", #fname_str)))
                 .collect::<Result<Vec<_>, _>>()?;
-        },
+        }},
         CapnpType::ListPrimitive(_) => {
             let rust_type = rust_type_tokens(&ct.rust_owned_type());
             quote! {
@@ -794,15 +963,17 @@ fn json_field_extraction_token(
                 ).unwrap_or_default();
             }
         }
-        CapnpType::Enum(_) => {
-            quote! {
-                let #fname = args.get(#fname_str).and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("missing or invalid enum field '{}'", #fname_str))?;
-            }
-        }
-        _ => quote! {
+        CapnpType::Enum(_) => if optional { quote! {
+            let #fname = args.get(#fname_str).and_then(|v| v.as_str()).unwrap_or("");
+        }} else { quote! {
+            let #fname = args.get(#fname_str).and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("missing or invalid enum field '{}'", #fname_str))?;
+        }},
+        _ => if optional { quote! {
+            let #fname = args.get(#fname_str).and_then(|v| v.as_str()).unwrap_or("");
+        }} else { quote! {
             let #fname = args.get(#fname_str).and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("missing or invalid field '{}'", #fname_str))?;
-        },
+        }},
     }
 }

@@ -41,6 +41,8 @@ use crate::error::{EnvelopeError, EnvelopeResult};
 /// Contains:
 /// - `topic`: 64-char hex string derived from DH, used as ZMQ subscription prefix
 /// - `mac_key`: 32-byte HMAC key for MAC chain verification
+/// - `ctrl_topic`: 64-char hex string for control channel (consumer → producer)
+/// - `ctrl_mac_key`: 32-byte HMAC key for control channel authentication
 ///
 /// Both client and server derive identical keys from their DH shared secret.
 #[derive(Clone)]
@@ -49,6 +51,10 @@ pub struct StreamKeys {
     pub topic: String,
     /// HMAC key for MAC chain (zeroized on drop).
     pub mac_key: Zeroizing<[u8; 32]>,
+    /// Control channel topic (64 hex chars, derived from same DH secret).
+    pub ctrl_topic: String,
+    /// Control channel HMAC key (zeroized on drop).
+    pub ctrl_mac_key: Zeroizing<[u8; 32]>,
 }
 
 impl StreamKeys {
@@ -57,6 +63,23 @@ impl StreamKeys {
         Self {
             topic,
             mac_key: Zeroizing::new(mac_key),
+            ctrl_topic: String::new(),
+            ctrl_mac_key: Zeroizing::new([0u8; 32]),
+        }
+    }
+
+    /// Create with both data and control channel keys.
+    pub fn with_ctrl(
+        topic: String,
+        mac_key: [u8; 32],
+        ctrl_topic: String,
+        ctrl_mac_key: [u8; 32],
+    ) -> Self {
+        Self {
+            topic,
+            mac_key: Zeroizing::new(mac_key),
+            ctrl_topic,
+            ctrl_mac_key: Zeroizing::new(ctrl_mac_key),
         }
     }
 
@@ -144,7 +167,14 @@ pub fn derive_stream_keys(
     // Derive mac_key (32 bytes)
     let mac_key = derive_key("hyprstream stream-keys v1 mac", &ikm);
 
-    Ok(StreamKeys::new(topic, mac_key))
+    // Derive control channel topic (32 bytes -> 64 hex chars)
+    let ctrl_topic_bytes = derive_key("hyprstream stream-keys v1 ctrl-topic", &ikm);
+    let ctrl_topic = hex::encode(ctrl_topic_bytes);
+
+    // Derive control channel mac_key (32 bytes)
+    let ctrl_mac_key = derive_key("hyprstream stream-keys v1 ctrl-mac", &ikm);
+
+    Ok(StreamKeys::with_ctrl(topic, mac_key, ctrl_topic, ctrl_mac_key))
 }
 
 /// Shared secret from DH key exchange.
@@ -781,6 +811,94 @@ mod tests {
         verifier.verify_next(b"token 1", &mac1)?;
         verifier.verify_next(b"token 2", &mac2)?;
         verifier.verify_next(b"[DONE]", &mac3)?;
+        Ok(())
+    }
+
+    // =========================================================================
+    // Control channel key derivation tests (Part 7)
+    // =========================================================================
+
+    #[test]
+    fn test_ctrl_keys_differ_from_data_keys() -> Result<(), Box<dyn std::error::Error>> {
+        let shared_secret = [0x42u8; 32];
+        let client_pub = [0x01u8; 32];
+        let server_pub = [0x02u8; 32];
+
+        let keys = derive_stream_keys(&shared_secret, &client_pub, &server_pub)?;
+
+        assert_ne!(keys.topic, keys.ctrl_topic, "ctrl_topic must differ from data topic");
+        assert_ne!(*keys.mac_key, *keys.ctrl_mac_key, "ctrl_mac_key must differ from data mac_key");
+        Ok(())
+    }
+
+    #[test]
+    fn test_ctrl_keys_deterministic() -> Result<(), Box<dyn std::error::Error>> {
+        let shared_secret = [0x42u8; 32];
+        let client_pub = [0x01u8; 32];
+        let server_pub = [0x02u8; 32];
+
+        let keys1 = derive_stream_keys(&shared_secret, &client_pub, &server_pub)?;
+        let keys2 = derive_stream_keys(&shared_secret, &client_pub, &server_pub)?;
+
+        assert_eq!(keys1.ctrl_topic, keys2.ctrl_topic);
+        assert_eq!(*keys1.ctrl_mac_key, *keys2.ctrl_mac_key);
+        Ok(())
+    }
+
+    #[test]
+    fn test_ctrl_keys_symmetric() -> Result<(), Box<dyn std::error::Error>> {
+        let shared_secret = [0x42u8; 32];
+        let client_pub = [0x01u8; 32];
+        let server_pub = [0x02u8; 32];
+
+        let keys1 = derive_stream_keys(&shared_secret, &client_pub, &server_pub)?;
+        let keys2 = derive_stream_keys(&shared_secret, &server_pub, &client_pub)?;
+
+        assert_eq!(keys1.ctrl_topic, keys2.ctrl_topic);
+        assert_eq!(*keys1.ctrl_mac_key, *keys2.ctrl_mac_key);
+        Ok(())
+    }
+
+    #[test]
+    fn test_ctrl_topic_is_hex() -> Result<(), Box<dyn std::error::Error>> {
+        let shared_secret = [0x42u8; 32];
+        let client_pub = [0x01u8; 32];
+        let server_pub = [0x02u8; 32];
+
+        let keys = derive_stream_keys(&shared_secret, &client_pub, &server_pub)?;
+
+        assert_eq!(keys.ctrl_topic.len(), 64);
+        assert!(keys.ctrl_topic.chars().all(|c| c.is_ascii_hexdigit()));
+        Ok(())
+    }
+
+    #[cfg(not(feature = "fips"))]
+    #[test]
+    fn test_ctrl_keys_with_real_dh() -> Result<(), Box<dyn std::error::Error>> {
+        let (client_secret, client_pubkey) = generate_ephemeral_keypair();
+        let (server_secret, server_pubkey) = generate_ephemeral_keypair();
+
+        let client_shared = ristretto_dh(&client_secret, &server_pubkey);
+        let server_shared = ristretto_dh(&server_secret, &client_pubkey);
+
+        let client_keys = derive_stream_keys(
+            &client_shared,
+            &client_pubkey.to_bytes(),
+            &server_pubkey.to_bytes(),
+        )?;
+        let server_keys = derive_stream_keys(
+            &server_shared,
+            &client_pubkey.to_bytes(),
+            &server_pubkey.to_bytes(),
+        )?;
+
+        // Both sides derive identical control keys
+        assert_eq!(client_keys.ctrl_topic, server_keys.ctrl_topic);
+        assert_eq!(*client_keys.ctrl_mac_key, *server_keys.ctrl_mac_key);
+
+        // Control keys differ from data keys
+        assert_ne!(client_keys.topic, client_keys.ctrl_topic);
+        assert_ne!(*client_keys.mac_key, *client_keys.ctrl_mac_key);
         Ok(())
     }
 }

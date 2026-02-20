@@ -9,8 +9,8 @@ async fn test_transaction_commit_clone() -> Result<(), Box<dyn std::error::Error
     let temp_dir = TempDir::new()?;
     let mut registry = Git2DB::open(temp_dir.path()).await?;
 
-    // Verify empty registry
-    assert_eq!(registry.list().count(), 0);
+    // Capture baseline count (.registry self-entry exists on fresh open)
+    let baseline = registry.list().count();
 
     // Start transaction with optimistic mode (fastest for testing)
     let tx = registry
@@ -27,7 +27,7 @@ async fn test_transaction_commit_clone() -> Result<(), Box<dyn std::error::Error
     // Repository shouldn't exist yet
     assert_eq!(
         registry.list().count(),
-        0,
+        baseline,
         "Repository shouldn't exist before commit"
     );
 
@@ -37,9 +37,12 @@ async fn test_transaction_commit_clone() -> Result<(), Box<dyn std::error::Error
 
     // Now repository should exist
     let repos: Vec<_> = registry.list().collect();
-    assert_eq!(repos.len(), 1, "Repository should exist after commit");
-    assert_eq!(repos[0].id, id, "ID should match");
-    assert_eq!(repos[0].name.as_deref(), Some("git"), "Name should match");
+    assert_eq!(repos.len(), baseline + 1, "Repository should exist after commit");
+    assert!(repos.iter().any(|r| r.id == id), "ID should match");
+    assert!(
+        repos.iter().any(|r| r.name.as_deref() == Some("git")),
+        "Name should match"
+    );
 
     println!("✓ Transaction committed successfully");
     Ok(())
@@ -49,6 +52,8 @@ async fn test_transaction_commit_clone() -> Result<(), Box<dyn std::error::Error
 async fn test_transaction_rollback() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = TempDir::new()?;
     let registry = Git2DB::open(temp_dir.path()).await?;
+
+    let baseline = registry.list().count();
 
     // Start transaction
     let tx = registry
@@ -68,7 +73,7 @@ async fn test_transaction_rollback() -> Result<(), Box<dyn std::error::Error>> {
     // Repository should NOT exist
     assert_eq!(
         registry.list().count(),
-        0,
+        baseline,
         "Repository should not exist after rollback"
     );
 
@@ -80,6 +85,8 @@ async fn test_transaction_rollback() -> Result<(), Box<dyn std::error::Error>> {
 async fn test_transaction_multiple_operations() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = TempDir::new()?;
     let mut registry = Git2DB::open(temp_dir.path()).await?;
+
+    let baseline = registry.list().count();
 
     // Start transaction
     let tx = registry
@@ -103,7 +110,7 @@ async fn test_transaction_multiple_operations() -> Result<(), Box<dyn std::error
 
     // Both should exist
     let repos: Vec<_> = registry.list().collect();
-    assert_eq!(repos.len(), 2, "Should have 2 repositories");
+    assert_eq!(repos.len(), baseline + 2, "Should have 2 new repositories");
 
     assert!(repos.iter().any(|r| r.id == id1), "First repo should exist");
     assert!(
@@ -119,6 +126,8 @@ async fn test_transaction_multiple_operations() -> Result<(), Box<dyn std::error
 async fn test_transaction_ensure_idempotent() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = TempDir::new()?;
     let mut registry = Git2DB::open(temp_dir.path()).await?;
+
+    let baseline = registry.list().count();
 
     // First transaction: add repository
     let tx1 = registry
@@ -146,11 +155,11 @@ async fn test_transaction_ensure_idempotent() -> Result<(), Box<dyn std::error::
     // Commit should be no-op
     tx2.commit_to(&mut registry).await?;
 
-    // Still only one repository
+    // Still only one user repository added
     assert_eq!(
         registry.list().count(),
-        1,
-        "Should still have only 1 repository"
+        baseline + 1,
+        "Should still have only 1 new repository"
     );
 
     println!("✓ ensure() is idempotent");

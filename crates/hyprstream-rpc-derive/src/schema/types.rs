@@ -45,6 +45,9 @@ pub struct FieldDef {
     pub description: String,
     /// From `$fixedSize(N)` annotation: generates `[u8; N]` instead of `Vec<u8>` for Data fields.
     pub fixed_size: Option<u32>,
+    /// From `$optional` annotation: field is optional in MCP tool schemas and uses
+    /// type-appropriate zero-value defaults when absent at runtime.
+    pub optional: bool,
 }
 
 #[derive(Debug)]

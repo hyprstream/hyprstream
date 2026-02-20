@@ -65,6 +65,26 @@ pub struct InferenceComplete {
 }
 
 impl InferenceComplete {
+    /// Create an empty/default instance for fallback when deserialization fails.
+    pub fn empty() -> Self {
+        Self {
+            tokens_generated: 0,
+            generation_time_ms: 0,
+            tokens_per_second: 0.0,
+            finish_reason: "unknown".to_owned(),
+            prefill_tokens: 0,
+            prefill_time_ms: 0,
+            prefill_tokens_per_sec: 0.0,
+            inference_tokens: 0,
+            inference_time_ms: 0,
+            inference_tokens_per_sec: 0.0,
+            inference_tokens_per_sec_ema: 0.0,
+            perplexity: None,
+            avg_entropy: None,
+            ttt_metrics: None,
+        }
+    }
+
     /// Serialize to bytes for StreamPayload.complete.
     pub fn to_bytes(&self) -> Vec<u8> {
         serde_json::to_vec(self).unwrap_or_default()

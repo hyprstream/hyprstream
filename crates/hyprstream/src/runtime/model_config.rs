@@ -227,6 +227,7 @@ impl ModelConfig {
     }
 
     /// Detect configuration from weights only (fallback)
+    #[allow(clippy::field_reassign_with_default)]
     fn detect_from_weights(weights: &HashMap<String, Tensor>) -> Result<Self> {
         // Start with defaults
         let mut config = Self::default();
@@ -254,6 +255,23 @@ impl ModelConfig {
         config.apply_architecture_defaults();
 
         Ok(config)
+    }
+
+    /// Detect the model architecture from a model directory's `config.json`.
+    ///
+    /// Returns `ModelArchitecture::Unknown` if the file is missing or unparseable.
+    /// This is a lightweight operation (reads only config.json, not weights).
+    pub fn detect_architecture(model_path: &Path) -> ModelArchitecture {
+        let config_path = model_path.join("config.json");
+        let content = match std::fs::read_to_string(&config_path) {
+            Ok(c) => c,
+            Err(_) => return ModelArchitecture::Unknown("unknown".to_owned()),
+        };
+        let json: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => return ModelArchitecture::Unknown("unknown".to_owned()),
+        };
+        Self::detect_architecture_from_json(&json)
     }
 
     fn detect_architecture_from_json(json: &serde_json::Value) -> ModelArchitecture {

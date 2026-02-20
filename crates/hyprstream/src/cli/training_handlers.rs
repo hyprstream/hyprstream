@@ -26,6 +26,7 @@ use std::path::PathBuf;
 /// Handle `training init` command
 ///
 /// Initializes a LoRA adapter for training. Optionally creates a new branch/worktree.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_training_init(
     registry: &GenRegistryClient,
     model_ref_str: &str,
@@ -156,6 +157,7 @@ pub async fn handle_training_init(
 /// Initialize adapter at a specific path
 ///
 /// When `fs` is provided, uses worktree-scoped FsOps for config writes.
+#[allow(clippy::too_many_arguments)]
 async fn init_adapter_at_path(
     model_path: &std::path::Path,
     adapter_name: Option<&str>,
@@ -305,6 +307,7 @@ fn save_training_config(
 /// Handle `training infer` command
 ///
 /// Runs inference with TTT enabled, making dirty writes to adapter weights.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_training_infer(
     registry: &GenRegistryClient,
     model_ref_str: &str,
@@ -315,7 +318,7 @@ pub async fn handle_training_infer(
     top_p: Option<f32>,
     top_k: Option<usize>,
     repeat_penalty: Option<f32>,
-    stream: bool,
+    sync: bool,
     max_context: Option<usize>,
     kv_quant: KVQuantArg,
     signing_key: SigningKey,
@@ -360,9 +363,11 @@ pub async fn handle_training_infer(
     let policy_client = PolicyClient::new(signing_key.clone(), RequestIdentity::local());
 
     // Configure runtime
-    let mut runtime_config = RuntimeConfig::default();
-    runtime_config.max_context = max_context;
-    runtime_config.kv_quant_type = kv_quant.into();
+    let runtime_config = RuntimeConfig {
+        max_context,
+        kv_quant_type: kv_quant.into(),
+        ..Default::default()
+    };
 
     // Start InferenceService with TTT enabled
     let mut service_handle = InferenceService::start_at(
@@ -380,10 +385,7 @@ pub async fn handle_training_infer(
     let client = InferenceZmqClient::new(signing_key, RequestIdentity::local());
 
     // Apply chat template
-    let messages = vec![ChatMessage {
-        role: "user".to_owned(),
-        content: prompt.to_owned(),
-    }];
+    let messages = vec![ChatMessage { role: "user".into(), content: Some(prompt.into()), ..Default::default() }];
 
     let formatted_prompt = match client.apply_chat_template(&messages, true).await {
         Ok(formatted) => formatted,
@@ -425,14 +427,30 @@ pub async fn handle_training_infer(
     let request = request_builder.build();
 
     // Generate with TTT
-    // Note: For training inference, we use non-streaming mode to simplify
-    // and ensure TTT adaptation is applied fully before output
-    if stream {
-        warn!("Streaming mode not fully supported for training infer, using non-streaming");
+    if sync {
+        // Collect full response before printing
+        let response = collect_inference_stream(&client, &request).await?;
+        println!("{}", response.text);
+    } else {
+        // Stream tokens live to stdout
+        use hyprstream_rpc::streaming::StreamPayload;
+        use std::io::Write;
+        let mut handle = client.generate_stream_handle(&request).await?;
+        println!();
+        loop {
+            match handle.recv_next()? {
+                Some(StreamPayload::Data(data)) => {
+                    if let Ok(text) = String::from_utf8(data) {
+                        print!("{text}");
+                        std::io::stdout().flush()?;
+                    }
+                }
+                Some(StreamPayload::Complete(_)) | None => break,
+                Some(StreamPayload::Error(msg)) => bail!("Generation error: {msg}"),
+            }
+        }
+        println!();
     }
-
-    let response = client.generate(&request).await?;
-    println!("{}", response.text);
 
     println!("\n[TTT applied - adapter weights modified]");
     println!("Run 'hyprstream training checkpoint {model_ref}' to commit changes");
@@ -461,10 +479,68 @@ fn ensure_ttt_enabled(model_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Collect an inference stream into a GenerationResult.
+///
+/// Replaces the removed `InferenceZmqClient::generate()` sync method.
+async fn collect_inference_stream(
+    client: &InferenceZmqClient,
+    request: &crate::runtime::GenerationRequest,
+) -> Result<crate::config::GenerationResult> {
+    use hyprstream_rpc::streaming::StreamPayload;
+
+    let mut handle = client.generate_stream_handle(request).await?;
+    let mut text = String::new();
+
+    loop {
+        match handle.try_next() {
+            Ok(Some(payload)) => match payload {
+                StreamPayload::Data(data) => {
+                    text.push_str(&String::from_utf8_lossy(&data));
+                }
+                StreamPayload::Complete(meta) => {
+                    let stats: crate::services::rpc_types::InferenceComplete =
+                        serde_json::from_slice(&meta).unwrap_or_else(|e| {
+                            tracing::warn!("Failed to parse InferenceComplete: {e}");
+                            crate::services::rpc_types::InferenceComplete::empty()
+                        });
+                    return Ok(crate::config::GenerationResult {
+                        text,
+                        tokens_generated: stats.tokens_generated,
+                        finish_reason: crate::config::FinishReason::Stop,
+                        generation_time_ms: stats.generation_time_ms,
+                        tokens_per_second: stats.tokens_per_second,
+                        quality_metrics: None,
+                        prefill_tokens: stats.prefill_tokens,
+                        prefill_time_ms: stats.prefill_time_ms,
+                        prefill_tokens_per_sec: stats.prefill_tokens_per_sec,
+                        inference_tokens: stats.inference_tokens,
+                        inference_time_ms: stats.inference_time_ms,
+                        inference_tokens_per_sec: stats.inference_tokens_per_sec,
+                        ttt_metrics: stats.ttt_metrics,
+                    });
+                }
+                StreamPayload::Error(msg) => {
+                    bail!("Generation error: {msg}");
+                }
+            },
+            Ok(None) if handle.is_completed() => {
+                bail!("Stream ended without completion");
+            }
+            Ok(None) => {
+                tokio::task::yield_now().await;
+            }
+            Err(e) => {
+                bail!("Stream error: {e}");
+            }
+        }
+    }
+}
+
 /// Handle `training batch` command
 ///
 /// Batch training: starts InferenceService once and processes all files with TTT.
 /// Each file's content is sent as a generation request, triggering TTT adaptation.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_training_batch(
     registry: &GenRegistryClient,
     model_ref_str: &str,
@@ -575,9 +651,11 @@ pub async fn handle_training_batch(
 
     // Start InferenceService with TTT enabled
     println!("Starting InferenceService for {model_ref_str}...");
-    let mut runtime_config = RuntimeConfig::default();
-    runtime_config.max_context = max_context;
-    runtime_config.kv_quant_type = kv_quant.into();
+    let runtime_config = RuntimeConfig {
+        max_context,
+        kv_quant_type: kv_quant.into(),
+        ..Default::default()
+    };
 
     let policy_client = PolicyClient::new(signing_key.clone(), RequestIdentity::local());
     // Start InferenceService with TTT enabled
@@ -637,8 +715,8 @@ pub async fn handle_training_batch(
             .temperature(0.7)
             .build();
 
-        // Send generation request - InferenceService applies TTT during this call
-        match client.generate(&request).await {
+        // Send generation request via collect-stream — InferenceService applies TTT during this call
+        match collect_inference_stream(&client, &request).await {
             Ok(response) => {
                 // Track tokens from response
                 total_input_tokens += response.prefill_tokens;

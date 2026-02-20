@@ -11,14 +11,26 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use tracing::info;
 
-/// Handle `service install` - Install units and start services
+/// Handle `service install` - Idempotent setup and optional restart
+///
+/// 1. Run repair checks (dirs, registry, policy, signing key, git identity)
+/// 2. Install command alias (~/.local/bin/hyprstream)
+/// 3. Install/update systemd units (if systemd available)
+/// 4. If `start`: stop → start all target services
 pub async fn handle_service_install(
+    models_dir: &Path,
     config_services: &[String],
     services_filter: Option<Vec<String>>,
+    start: bool,
+    verbose: bool,
 ) -> Result<()> {
     let target_services = services_filter.unwrap_or_else(|| config_services.to_vec());
 
     println!("Installing hyprstream...\n");
+
+    // 1. Run repair checks to bootstrap the environment
+    run_repair_checks(models_dir, verbose).await?;
+    println!();
 
     // Show executable path being used
     if let Ok(appimage) = std::env::var("APPIMAGE") {
@@ -28,7 +40,7 @@ pub async fn handle_service_install(
     }
     println!();
 
-    // Install command alias to user's executable directory
+    // 2. Install command alias to user's executable directory
     println!("  Installing command...");
     match install_command_alias() {
         Ok((bin_dir, version_dir, is_appimage, updated_profiles)) => {
@@ -50,9 +62,17 @@ pub async fn handle_service_install(
     }
     println!();
 
-    // Install systemd units if available
+    // 3. Install/update systemd units if available
     if hyprstream_rpc::has_systemd() {
         let manager = hyprstream_rpc::detect_service_manager().await?;
+
+        // If --start, stop all target services first so they pick up changes
+        if start {
+            println!("  Stopping services...");
+            for service in &target_services {
+                let _ = manager.stop(service).await;
+            }
+        }
 
         println!("  Installing systemd units...");
         for service in &target_services {
@@ -62,114 +82,51 @@ pub async fn handle_service_install(
                 Err(e) => println!("\u{2717} {}", e),
             }
         }
+
+        // 4. If --start, start all target services
+        if start {
+            println!("  Starting services...");
+            for service in &target_services {
+                print!("    \u{25CB} {}... ", service);
+                match manager.start(service).await {
+                    Ok(_) => println!("\u{2713}"),
+                    Err(e) => println!("\u{2717} {}", e),
+                }
+            }
+        }
+    } else if start {
+        // Standalone mode: use installed binary to spawn processes
+        println!("  Starting services (standalone)...\n");
+
+        let exe = hyprstream_rpc::paths::installed_executable_path()
+            .unwrap_or_else(|| hyprstream_rpc::paths::executable_path().unwrap_or_default());
+
+        let spawner = hyprstream_rpc::ProcessSpawner::standalone();
+
+        for service in &target_services {
+            print!("    \u{25CB} {}... ", service);
+
+            let config = hyprstream_rpc::ProcessConfig::new(service, &exe)
+                .args(["service", "start", service, "--foreground", "--ipc"]);
+
+            match spawner.spawn(config).await {
+                Ok(process) => {
+                    info!("Spawned {} service: {:?}", service, process.kind);
+                    println!("\u{2713}");
+                }
+                Err(e) => println!("\u{2717} {}", e),
+            }
+        }
     }
 
     println!("\n\u{2713} Install complete");
-    println!();
-    println!("Next steps:");
-    println!("  1. Open a new shell to use the 'hyprstream' command");
-    println!("  2. Start services with: hyprstream service start");
-    println!("     Check status with:   hyprstream service status");
-    Ok(())
-}
-
-/// Handle `service upgrade` - Reinstall units with current binary path
-pub async fn handle_service_upgrade(
-    config_services: &[String],
-    services_filter: Option<Vec<String>>,
-) -> Result<()> {
-    let target_services = services_filter.unwrap_or_else(|| config_services.to_vec());
-
-    if !hyprstream_rpc::has_systemd() {
-        println!("Systemd not available. No units to upgrade.");
-        return Ok(());
+    if !start {
+        println!();
+        println!("Next steps:");
+        println!("  1. Open a new shell to use the 'hyprstream' command");
+        println!("  2. Start services with: hyprstream service start");
+        println!("     Or reinstall with:   hyprstream service install --start");
     }
-
-    let manager = hyprstream_rpc::detect_service_manager().await?;
-
-    println!("Upgrading hyprstream services...\n");
-
-    if let Ok(appimage) = std::env::var("APPIMAGE") {
-        println!("  New executable: {} (AppImage)", appimage);
-    } else if let Ok(exe) = std::env::current_exe() {
-        println!("  New executable: {}", exe.display());
-    }
-    println!();
-
-    for service in &target_services {
-        print!("  \u{25CB} {}... ", service);
-
-        // Reinstall unit (will update ExecStart path)
-        if let Err(e) = manager.install(service).await {
-            println!("\u{2717} install failed: {}", e);
-            continue;
-        }
-
-        // Stop and restart to pick up new binary
-        let _ = manager.stop(service).await; // Ignore stop errors
-
-        match manager.start(service).await {
-            Ok(_) => println!("\u{2713}"),
-            Err(e) => println!("\u{2717} start failed: {}", e),
-        }
-    }
-
-    println!("\n\u{2713} Upgrade complete");
-    Ok(())
-}
-
-/// Handle `service reinstall` - Full reset
-pub async fn handle_service_reinstall(
-    config_services: &[String],
-    services_filter: Option<Vec<String>>,
-) -> Result<()> {
-    let target_services = services_filter.unwrap_or_else(|| config_services.to_vec());
-
-    if !hyprstream_rpc::has_systemd() {
-        println!("Systemd not available. No units to reinstall.");
-        return Ok(());
-    }
-
-    let manager = hyprstream_rpc::detect_service_manager().await?;
-
-    println!("Reinstalling hyprstream services (full reset)...\n");
-
-    // Stop all first
-    println!("  Stopping services...");
-    for service in &target_services {
-        let _ = manager.stop(service).await;
-    }
-
-    // Uninstall
-    println!("  Removing unit files...");
-    for service in &target_services {
-        let _ = manager.uninstall(service).await;
-    }
-
-    // Reload daemon
-    manager.reload().await?;
-
-    // Reinstall
-    println!("  Installing unit files...");
-    for service in &target_services {
-        print!("    \u{25CB} {}... ", service);
-        match manager.install(service).await {
-            Ok(_) => println!("\u{2713}"),
-            Err(e) => println!("\u{2717} {}", e),
-        }
-    }
-
-    // Start all
-    println!("  Starting services...");
-    for service in &target_services {
-        print!("    \u{25CB} {}... ", service);
-        match manager.start(service).await {
-            Ok(_) => println!("\u{2713}"),
-            Err(e) => println!("\u{2717} {}", e),
-        }
-    }
-
-    println!("\n\u{2713} Reinstall complete");
     Ok(())
 }
 
@@ -423,6 +380,258 @@ pub async fn handle_service_status(
     }
 
     Ok(())
+}
+
+/// Run repair checks: directories, registry, policy, signing key, git identity.
+///
+/// Extracted from the old `handle_service_repair` so it can be called as part
+/// of `handle_service_install` without the surrounding summary chrome.
+async fn run_repair_checks(
+    models_dir: &Path,
+    verbose: bool,
+) -> Result<()> {
+    use crate::auth::PolicyManager;
+    use crate::cli::policy_handlers::load_or_generate_signing_key;
+
+    println!("  Repair checks\n");
+
+    let mut all_passed = true;
+    let mut warnings = Vec::new();
+
+    // 1. Directories
+    {
+        let label = "Directories";
+        let registry_path = models_dir.join(".registry");
+        let policies_dir = registry_path.join("policies");
+        let keys_dir = registry_path.join("keys");
+
+        let dirs_to_create = [
+            models_dir,
+            registry_path.as_path(),
+            policies_dir.as_path(),
+            keys_dir.as_path(),
+        ];
+
+        let mut fixed = false;
+        for dir in &dirs_to_create {
+            if !dir.exists() {
+                std::fs::create_dir_all(dir)
+                    .with_context(|| format!("Failed to create directory: {}", dir.display()))?;
+                fixed = true;
+            }
+        }
+
+        if fixed {
+            print_check(label, CheckStatus::Fixed, &format!("created missing directories under {}", models_dir.display()));
+        } else {
+            print_check(label, CheckStatus::Ok, &format!("{}", models_dir.display()));
+        }
+
+        if verbose {
+            for dir in &dirs_to_create {
+                println!("      {}", dir.display());
+            }
+        }
+    }
+
+    // 2. Registry initialized
+    {
+        let label = "Registry";
+        let git_dir = models_dir.join(".registry").join(".git");
+
+        if git_dir.exists() {
+            // Verify it's a valid git repo
+            match git2::Repository::open(models_dir.join(".registry")) {
+                Ok(repo) => {
+                    let count = match repo.revwalk() {
+                        Ok(mut walk) => {
+                            let _ = walk.push_head();
+                            walk.count()
+                        }
+                        Err(_) => 0,
+                    };
+                    print_check(label, CheckStatus::Ok, &format!(".registry initialized ({count} commits)"));
+                }
+                Err(e) => {
+                    print_check(label, CheckStatus::Fail, &format!(".registry git repo corrupt: {e}"));
+                    all_passed = false;
+                }
+            }
+        } else {
+            // Initialize via Git2DB
+            match git2db::Git2DB::open(models_dir).await {
+                Ok(_) => {
+                    print_check(label, CheckStatus::Fixed, ".registry initialized via Git2DB");
+                }
+                Err(e) => {
+                    // Fall back to raw git init
+                    match git2::Repository::init(models_dir.join(".registry")) {
+                        Ok(_) => print_check(label, CheckStatus::Fixed, ".registry initialized (git init)"),
+                        Err(e2) => {
+                            print_check(label, CheckStatus::Fail, &format!("failed to init: Git2DB: {e}, git init: {e2}"));
+                            all_passed = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Policy files
+    {
+        let label = "Policy files";
+        let policies_dir = models_dir.join(".registry").join("policies");
+
+        let model_conf = policies_dir.join("model.conf");
+        let policy_csv = policies_dir.join("policy.csv");
+
+        if model_conf.exists() && policy_csv.exists() {
+            print_check(label, CheckStatus::Ok, "model.conf + policy.csv present");
+        } else {
+            // PolicyManager::new creates defaults
+            match PolicyManager::new(&policies_dir).await {
+                Ok(_) => print_check(label, CheckStatus::Fixed, "created default policy files"),
+                Err(e) => {
+                    print_check(label, CheckStatus::Fail, &format!("failed to create: {e}"));
+                    all_passed = false;
+                }
+            }
+        }
+    }
+
+    // 4. Signing key
+    {
+        let label = "Signing key";
+        let keys_dir = models_dir.join(".registry").join("keys");
+        let key_path = keys_dir.join("signing.key");
+
+        if key_path.exists() {
+            match tokio::fs::read(&key_path).await {
+                Ok(bytes) if bytes.len() == 32 => {
+                    print_check(label, CheckStatus::Ok, "Ed25519 key loaded (32 bytes)");
+                }
+                Ok(bytes) => {
+                    print_check(label, CheckStatus::Fail, &format!("invalid key: {} bytes (expected 32)", bytes.len()));
+                    all_passed = false;
+                }
+                Err(e) => {
+                    print_check(label, CheckStatus::Fail, &format!("read error: {e}"));
+                    all_passed = false;
+                }
+            }
+        } else {
+            match load_or_generate_signing_key(&keys_dir).await {
+                Ok(_) => print_check(label, CheckStatus::Fixed, "generated new Ed25519 key"),
+                Err(e) => {
+                    print_check(label, CheckStatus::Fail, &format!("failed to generate: {e}"));
+                    all_passed = false;
+                }
+            }
+        }
+    }
+
+    // 5. Git config (warning only, don't modify)
+    {
+        let label = "Git identity";
+        match git2::Config::open_default() {
+            Ok(config) => {
+                let has_name = config.get_string("user.name").is_ok();
+                let has_email = config.get_string("user.email").is_ok();
+
+                if has_name && has_email {
+                    let name = config.get_string("user.name").unwrap_or_default();
+                    print_check(label, CheckStatus::Ok, &name);
+                } else {
+                    let mut missing = Vec::new();
+                    if !has_name { missing.push("user.name"); }
+                    if !has_email { missing.push("user.email"); }
+                    let msg = format!("{} not set", missing.join(", "));
+                    print_check(label, CheckStatus::Warn, &msg);
+                    warnings.push(
+                        "Set git identity: git config --global user.name \"Your Name\" && git config --global user.email \"you@example.com\"".to_owned()
+                    );
+                }
+            }
+            Err(_) => {
+                print_check(label, CheckStatus::Warn, "could not read git config");
+                warnings.push("Set git identity for policy versioning".to_owned());
+            }
+        }
+    }
+
+    // 6. Policy active
+    {
+        let label = "Policy active";
+        let policies_dir = models_dir.join(".registry").join("policies");
+        let policy_csv = policies_dir.join("policy.csv");
+
+        if policy_csv.exists() {
+            match tokio::fs::read_to_string(&policy_csv).await {
+                Ok(content) => {
+                    let rule_count = content.lines()
+                        .filter(|l| l.starts_with("p,") || l.starts_with("p "))
+                        .count();
+
+                    if rule_count > 0 {
+                        // Get first subject for display
+                        let first_subject = content.lines()
+                            .find(|l| l.starts_with("p,") || l.starts_with("p "))
+                            .and_then(|l| l.split(',').nth(1))
+                            .map(|s| s.trim().to_owned())
+                            .unwrap_or_default();
+                        print_check(label, CheckStatus::Ok, &format!("{rule_count} allow rule(s) ({first_subject})"));
+                    } else {
+                        print_check(label, CheckStatus::Warn, "no allow rules (deny-by-default)");
+                        warnings.push("Apply a template: hyprstream quick policy apply-template local".to_owned());
+                    }
+                }
+                Err(e) => {
+                    print_check(label, CheckStatus::Fail, &format!("read error: {e}"));
+                    all_passed = false;
+                }
+            }
+        } else {
+            print_check(label, CheckStatus::Warn, "policy.csv not found");
+            warnings.push("Run 'hyprstream service install' again after fixing policy files".to_owned());
+        }
+    }
+
+    // Summary
+    println!();
+    if !warnings.is_empty() {
+        println!("  Suggestions:");
+        for w in &warnings {
+            println!("    {w}");
+        }
+        println!();
+    }
+
+    if all_passed && warnings.is_empty() {
+        println!("    All checks passed.");
+    } else if all_passed {
+        println!("    All checks passed (with warnings).");
+    } else {
+        println!("    Some checks failed. Review output above.");
+    }
+
+    Ok(())
+}
+
+enum CheckStatus {
+    Ok,
+    Fixed,
+    Warn,
+    Fail,
+}
+
+fn print_check(label: &str, status: CheckStatus, detail: &str) {
+    let (icon, color) = match status {
+        CheckStatus::Ok => ("\u{2713}", "\x1b[32m"),    // green checkmark
+        CheckStatus::Fixed => ("\u{2713}", "\x1b[33m"),  // yellow checkmark (fixed)
+        CheckStatus::Warn => ("\u{26A0}", "\x1b[33m"),   // yellow warning
+        CheckStatus::Fail => ("\u{2717}", "\x1b[31m"),   // red X
+    };
+    println!("  {color}{icon}\x1b[0m {:<20} {detail}", label);
 }
 
 // =============================================================================

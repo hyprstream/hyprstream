@@ -687,20 +687,14 @@ impl TorchEngine {
 
                 // Add system message if provided
                 if let Some(system_msg) = system {
-                    messages.push(ChatMessage {
-                        role: "system".to_owned(),
-                        content: system_msg.to_owned(),
-                    });
+                    messages.push(ChatMessage { role: "system".into(), content: Some(system_msg.into()), ..Default::default() });
                 }
 
                 // Add user message
-                messages.push(ChatMessage {
-                    role: "user".to_owned(),
-                    content: user.to_owned(),
-                });
+                messages.push(ChatMessage { role: "user".into(), content: Some(user.into()), ..Default::default() });
 
-                // Apply template
-                if let Ok(formatted) = engine.apply_chat_template(&messages, Some(true)) {
+                // Apply template (no tools in this code path)
+                if let Ok(formatted) = engine.apply_chat_template(&messages, Some(true), None) {
                     return formatted;
                 }
             }
@@ -1065,6 +1059,10 @@ impl RuntimeEngine for TorchEngine {
             images: Vec::new(),
             timeout: None,
             collect_metrics: false, // Default: off for performance
+            ttt_enabled: false,
+            ttt_gradient_steps: 0,
+            ttt_learning_rate: 0.0,
+            auto_commit: false,
         };
 
         let result = self.generate_with_params(request).await?;
@@ -1120,18 +1118,19 @@ impl RuntimeEngine for TorchEngine {
         &self,
         messages: &[ChatMessage],
         add_generation_prompt: bool,
+        tools: Option<&serde_json::Value>,
     ) -> Result<String> {
         // Use our template engine if available
         let template_guard = self.template_engine.lock();
 
         if let Some(ref engine) = *template_guard {
             // Use the template engine
-            engine.apply_chat_template(messages, Some(add_generation_prompt))
+            engine.apply_chat_template(messages, Some(add_generation_prompt), tools)
         } else {
             // Fallback to simple formatting
             let mut formatted = String::new();
             for msg in messages {
-                formatted.push_str(&format!("{}: {}\n", msg.role, msg.content));
+                formatted.push_str(&format!("{}: {}\n", msg.role, msg.content.as_deref().unwrap_or("")));
             }
             if add_generation_prompt {
                 formatted.push_str("assistant: ");
@@ -2254,7 +2253,7 @@ impl<'a> Stream for TextStream<'a> {
 
             
             // Check max tokens
-            if self.tokens_generated >= self.max_tokens {
+            if self.max_tokens > 0 && self.tokens_generated >= self.max_tokens {
                 tracing::debug!("Reached max tokens: {}", self.max_tokens);
                 self.finished = true;
                 self.finish_reason = Some(FinishReason::MaxTokens);

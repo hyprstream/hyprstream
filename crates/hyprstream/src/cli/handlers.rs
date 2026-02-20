@@ -237,61 +237,6 @@ pub async fn get_lora_info_via_api(
     }
 }
 
-/// Start LoRA training via REST API
-pub async fn start_training_via_api(
-    base_url: &str,
-    lora_id: &str,
-    learning_rate: f32,
-    batch_size: usize,
-) -> Result<Value, Box<dyn std::error::Error>> {
-    let client = create_http_client();
-    let url = format!("{base_url}/v1/training/{lora_id}/start");
-
-    let request_body = json!({
-        "learning_rate": learning_rate,
-        "batch_size": batch_size,
-        "gradient_accumulation": true,
-        "mixed_precision": true
-    });
-
-    let response = client.post(&url).json(&request_body).send().await?;
-
-    if response.status().is_success() {
-        let result: Value = response.json().await?;
-        Ok(result)
-    } else {
-        let status_code = response.status();
-        let error_text = response.text().await?;
-        Err(format!(
-            "Failed to start training: HTTP {status_code} - {error_text}"
-        )
-        .into())
-    }
-}
-
-/// Get training status via REST API
-pub async fn get_training_status_via_api(
-    base_url: &str,
-    lora_id: &str,
-) -> Result<Value, Box<dyn std::error::Error>> {
-    let client = create_http_client();
-    let url = format!("{base_url}/v1/training/{lora_id}/status");
-
-    let response = client.get(&url).send().await?;
-
-    if response.status().is_success() {
-        let result: Value = response.json().await?;
-        Ok(result)
-    } else {
-        let status_code = response.status();
-        let error_text = response.text().await?;
-        Err(format!(
-            "Failed to get training status: HTTP {status_code} - {error_text}"
-        )
-        .into())
-    }
-}
-
 /// Perform chat completion via REST API
 pub async fn chat_completion_via_api(
     base_url: &str,

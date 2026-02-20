@@ -7,9 +7,11 @@
 
 pub mod jwt;
 mod policy_manager;
+pub mod policy_templates;
 
 pub use jwt::{Claims, JwtError};
 pub use policy_manager::{PolicyManager, PolicyError};
+pub use policy_templates::{PolicyTemplate, get_template, get_templates};
 
 /// Operation types that can be controlled via policies
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

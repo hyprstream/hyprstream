@@ -54,6 +54,7 @@ pub enum InferenceRequest {
     ApplyChatTemplate {
         messages: Vec<crate::runtime::template_engine::ChatMessage>,
         add_generation_prompt: bool,
+        tools: Option<serde_json::Value>,
         reply: oneshot::Sender<Result<String, InferenceError>>,
     },
 

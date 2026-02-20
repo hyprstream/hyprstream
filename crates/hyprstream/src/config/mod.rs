@@ -978,6 +978,19 @@ pub struct GenerationRequest {
     /// Default: false (disabled for performance - metrics add ~10x overhead)
     #[serde(default)]
     pub collect_metrics: bool,
+    // TTT (test-time training) overrides
+    /// Override: enable/disable TTT for this request
+    #[serde(default)]
+    pub ttt_enabled: bool,
+    /// Override: number of gradient steps (0 = use server default)
+    #[serde(default)]
+    pub ttt_gradient_steps: u32,
+    /// Override: learning rate (0.0 = use server default)
+    #[serde(default)]
+    pub ttt_learning_rate: f32,
+    /// If true, auto-commit adaptation based on quality gate
+    #[serde(default)]
+    pub auto_commit: bool,
 }
 
 /// Unified sampling parameters with Option fields for clean precedence merging.
@@ -1239,6 +1252,10 @@ impl GenerationRequestBuilder {
             images: self.images,
             timeout: Some(resolved.timeout_ms),
             collect_metrics: self.collect_metrics,
+            ttt_enabled: false,
+            ttt_gradient_steps: 0,
+            ttt_learning_rate: 0.0,
+            auto_commit: false,
         }
     }
 }
@@ -1291,6 +1308,10 @@ impl From<&GenerationConfig> for GenerationRequest {
             seed: config.seed,
             timeout: None, // Not in GenerationConfig
             collect_metrics: false, // Default: off for performance
+            ttt_enabled: false,
+            ttt_gradient_steps: 0,
+            ttt_learning_rate: 0.0,
+            auto_commit: false,
         }
     }
 }

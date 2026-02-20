@@ -324,6 +324,9 @@ pub fn parse_field_line(line: &str) -> Option<FieldDef> {
 
     let mut field_part = field_part.trim().trim_end_matches(';').trim();
 
+    // Extract $optional before stripping annotations
+    let optional = field_part.contains("$optional");
+
     // Extract $fixedSize(N) before stripping annotations
     let fixed_size = if let Some(dollar_pos) = field_part.find("$fixedSize(") {
         let start = dollar_pos + "$fixedSize(".len();
@@ -355,7 +358,7 @@ pub fn parse_field_line(line: &str) -> Option<FieldDef> {
     let _ordinal: u32 = ordinal_str.parse().ok()?;
     let type_name = field_part[colon_pos + 1..].trim().to_owned();
 
-    Some(FieldDef { name, type_name, description: comment, fixed_size })
+    Some(FieldDef { name, type_name, description: comment, fixed_size, optional })
 }
 
 pub fn parse_union_variants(text: &str, struct_name: &str) -> Vec<UnionVariant> {
@@ -576,7 +579,7 @@ pub fn merge_annotations_from_metadata(
     schema: &mut ParsedSchema,
     metadata_json: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     #[derive(serde::Deserialize)]
     struct MetadataJson {
@@ -611,6 +614,7 @@ pub fn merge_annotations_from_metadata(
     let mut scope_map: HashMap<(String, String), String> = HashMap::new();
     let mut param_desc_map: HashMap<(String, String), String> = HashMap::new();
     let mut fixed_size_map: HashMap<(String, String), u32> = HashMap::new();
+    let mut optional_set: HashSet<(String, String)> = HashSet::new();
 
     for struct_meta in &metadata.structs {
         let struct_name = struct_meta.name.split(':').next_back().unwrap_or(&struct_meta.name).to_owned();
@@ -618,6 +622,13 @@ pub fn merge_annotations_from_metadata(
         for field_meta in &struct_meta.fields {
             for ann in &field_meta.annotations {
                 let key = (struct_name.clone(), field_meta.name.clone());
+
+                // Handle Void annotations (e.g., $optional) before value extraction
+                // Void annotations serialize as null or true in JSON metadata
+                if ann.name == "optional" {
+                    optional_set.insert(key);
+                    continue;
+                }
 
                 // Handle fixedSize (UInt32 value) before string extraction
                 if ann.name == "fixedSize" {
@@ -701,6 +712,9 @@ pub fn merge_annotations_from_metadata(
             }
             if let Some(&n) = fixed_size_map.get(&key) {
                 field.fixed_size = Some(n);
+            }
+            if optional_set.contains(&key) {
+                field.optional = true;
             }
         }
     }

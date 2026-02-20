@@ -41,6 +41,7 @@ pub trait InferenceClient: Send + Sync {
         &self,
         messages: &[crate::runtime::template_engine::ChatMessage],
         add_generation_prompt: bool,
+        tools: Option<serde_json::Value>,
     ) -> Result<String, InferenceError>;
 
     // === LoRA Operations ===

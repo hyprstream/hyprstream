@@ -223,6 +223,8 @@ struct WorktreeRequest {
     wstat @9 :NpWstat $mcpScope(write);
     # Flush: cancel pending operation (like 9P Tflush)
     flush @10 :NpFlush;
+    # Per-file control operations, scoped by fid
+    ctl @11 :CtlRequest;
   }
 }
 
@@ -295,6 +297,8 @@ struct WorktreeResponse {
     wstat @9 :Void;
     # Flush response: success (void)
     flush @10 :Void;
+    # Per-file control response
+    ctlResult @11 :CtlResponse;
   }
 }
 
@@ -531,3 +535,66 @@ struct FileStatusInfo {
   indexStatus @1 :FileChangeType;
   worktreeStatus @2 :FileChangeType;
 }
+
+# --- CtlRequest: per-file control operations, scoped by fid ---
+# Generator detects non-union field (fid) + inner union pattern
+# and produces CtlClient with fid curried in.
+
+struct CtlRequest {
+  fid @0 :UInt32;           # scope field (curried in generated CtlClient)
+  union {
+    # ── Git introspection ──
+    status    @1 :Void               $mcpScope(query)  $mcpDescription("Git status of this file");
+    log       @2 :CtlLogRequest      $mcpScope(query)  $mcpDescription("Commits touching this file");
+    diff      @3 :CtlDiffRequest     $mcpScope(query)  $mcpDescription("Diff this file against a ref");
+    blame     @4 :Void               $mcpScope(query)  $mcpDescription("Git blame for this file");
+    checkout  @5 :CtlCheckoutRequest $mcpScope(write)  $mcpDescription("Restore file content from a ref");
+
+    # ── File control ──
+    validate  @6 :Void               $mcpScope(query)  $mcpDescription("Validate file format");
+    info      @7 :Void               $mcpScope(query)  $mcpDescription("File metadata and git state");
+
+    # ── CRDT editing ──
+    editOpen  @8  :EditOpenRequest   $mcpScope(write)  $mcpDescription("Open file for CRDT editing");
+    editState @9  :Void              $mcpScope(query)  $mcpDescription("Get current CRDT document state");
+    editApply @10 :EditApplyRequest  $mcpScope(write)  $mcpDescription("Apply automerge CRDT change");
+    editClose @11 :Void              $mcpScope(write)  $mcpDescription("Close CRDT editing session");
+    # Flush: serialize CRDT state to disk (does NOT stage or commit)
+    ctlFlush  @12 :Void              $mcpScope(write)  $mcpDescription("Write CRDT state to disk file");
+  }
+}
+
+# ── ctl supporting structs ──
+
+struct CtlLogRequest { maxCount @0 :UInt32; refName @1 :Text; }
+struct CtlDiffRequest { refName @0 :Text; }
+struct CtlCheckoutRequest { refName @0 :Text; }
+
+enum DocFormat { toml @0; json @1; yaml @2; csv @3; text @4; }
+struct EditOpenRequest { format @0 :DocFormat; }
+struct EditApplyRequest { changeBytes @0 :Data; }
+
+# ── ctl response ──
+
+struct CtlResponse {
+  union {
+    error          @0 :ErrorInfo;
+    status         @1 :FileStatus;
+    log            @2 :List(LogEntry);
+    diff           @3 :Text;
+    blame          @4 :Text;
+    checkout       @5 :Void;
+    validate       @6 :ValidationResult;
+    info           @7 :FileInfo;
+    editOpen       @8 :Void;
+    editState      @9 :Text;             # serialized doc (TOML/JSON/etc.)
+    editApply      @10 :Void;
+    editClose      @11 :Void;
+    ctlFlush       @12 :Void;
+  }
+}
+
+struct FileStatus { state @0 :Text; }
+struct LogEntry { oid @0 :Text; message @1 :Text; author @2 :Text; timestamp @3 :UInt64; }
+struct ValidationResult { valid @0 :Bool; errors @1 :List(Text); }
+struct FileInfo { path @0 :Text; size @1 :UInt64; format @2 :DocFormat; editing @3 :Bool; dirty @4 :Bool; }

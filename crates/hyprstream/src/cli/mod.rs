@@ -41,8 +41,9 @@ pub use policy_handlers::{
     handle_policy_apply, handle_policy_apply_template, handle_policy_check, handle_policy_diff,
     handle_policy_edit, handle_policy_history, handle_policy_list_templates, handle_policy_rollback,
     handle_policy_show, handle_token_create,
-    get_template, get_templates, load_or_generate_signing_key, PolicyTemplate,
+    load_or_generate_signing_key,
 };
+pub use crate::auth::policy_templates::{PolicyTemplate, get_template, get_templates};
 pub use remote_handlers::{
     handle_remote_add, handle_remote_list, handle_remote_remove, handle_remote_rename,
     handle_remote_set_url,
@@ -54,7 +55,7 @@ pub use worker_handlers::{
     handle_worker_stop, handle_worker_terminal,
 };
 pub use service_handlers::{
-    handle_service_install, handle_service_upgrade, handle_service_reinstall,
+    handle_service_install,
     handle_service_uninstall, handle_service_start, handle_service_stop, handle_service_status,
 };
 

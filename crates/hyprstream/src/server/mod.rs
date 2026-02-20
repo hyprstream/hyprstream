@@ -2,9 +2,7 @@
 //!
 //! This module provides the main HTTP server with:
 //! - OpenAI-compatible API endpoints at /oai/v1
-//! - LoRA adapter management at /lora
 //! - Model management at /models
-//! - Training service at /training
 
 use anyhow::Result;
 use axum::{middleware as axum_middleware, response::IntoResponse, routing::get, Json, Router};
@@ -52,8 +50,6 @@ pub fn create_app(state: ServerState) -> Router {
         .nest("/oai/v1", routes::openai::create_router())
         // Model management routes
         .nest("/models", routes::models::create_router())
-        // Training service routes
-        .nest("/training", routes::training::create_router())
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
             middleware::auth_middleware,

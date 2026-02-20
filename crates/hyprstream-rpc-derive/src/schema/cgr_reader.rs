@@ -96,6 +96,7 @@ fn parse_cgr(
     let cli_hidden_id = find_annotation_id(&nodes, &node_map, "cliHidden");
     let domain_type_id = find_annotation_id(&nodes, &node_map, "domainType");
     let fixed_size_id = find_annotation_id(&nodes, &node_map, "fixedSize");
+    let optional_id = find_annotation_id(&nodes, &node_map, "optional");
 
     let pascal = to_pascal_case(service_name);
     let request_name = format!("{pascal}Request");
@@ -145,6 +146,7 @@ fn parse_cgr(
         param_desc_id,
         domain_type_id,
         fixed_size_id,
+        optional_id,
     )?;
 
     // Extract all enums (pass all_structs for imported type resolution)
@@ -473,6 +475,7 @@ fn extract_union_variants(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Extract a single struct definition from a CGR node.
+#[allow(clippy::too_many_arguments)]
 fn extract_struct_from_node(
     node: capnp::schema_capnp::node::Reader,
     info: &NodeInfo,
@@ -481,6 +484,7 @@ fn extract_struct_from_node(
     param_desc_id: Option<u64>,
     domain_type_id: Option<u64>,
     fixed_size_id: Option<u64>,
+    optional_id: Option<u64>,
     origin_file: Option<String>,
 ) -> Result<Option<StructDef>, String> {
     let struct_reader = match node.which() {
@@ -540,11 +544,17 @@ fn extract_struct_from_node(
             fixed_size_id,
         );
 
+        let optional = has_annotation(
+            field.get_annotations().map_err(|e| format!("{e}"))?,
+            optional_id,
+        );
+
         fields.push(FieldDef {
             name: field_name,
             type_name,
             description,
             fixed_size,
+            optional,
         });
     }
 
@@ -566,6 +576,7 @@ fn extract_struct_from_node(
 /// Two-pass extraction:
 /// 1. First pass: extract local types from this schema file
 /// 2. Second pass: find imported types referenced by variants/fields but not in the local set
+#[allow(clippy::too_many_arguments)]
 fn extract_all_structs(
     nodes: &capnp::struct_list::Reader<capnp::schema_capnp::node::Owned>,
     node_map: &BTreeMap<u64, NodeInfo>,
@@ -574,6 +585,7 @@ fn extract_all_structs(
     param_desc_id: Option<u64>,
     domain_type_id: Option<u64>,
     fixed_size_id: Option<u64>,
+    optional_id: Option<u64>,
 ) -> Result<Vec<StructDef>, String> {
     let file_prefix = format!("{service_name}.capnp:");
     let mut structs = Vec::new();
@@ -586,7 +598,7 @@ fn extract_all_structs(
 
         let node = nodes.get(info.index);
         if let Some(s) = extract_struct_from_node(
-            node, info, node_map, mcp_desc_id, param_desc_id, domain_type_id, fixed_size_id, None,
+            node, info, node_map, mcp_desc_id, param_desc_id, domain_type_id, fixed_size_id, optional_id, None,
         )? {
             structs.push(s);
         }
@@ -643,7 +655,7 @@ fn extract_all_structs(
                 let node = nodes.get(info.index);
                 if let Some(s) = extract_struct_from_node(
                     node, info, node_map, mcp_desc_id, param_desc_id, domain_type_id,
-                    fixed_size_id, Some(origin),
+                    fixed_size_id, optional_id, Some(origin),
                 )? {
                     structs.push(s);
                 }
@@ -775,6 +787,7 @@ fn extract_all_enums(
 /// A scoped client is detected when:
 /// - A request variant points to a struct with both non-union fields (scope) and a union
 /// - A corresponding `{name}Result` response variant exists
+#[allow(clippy::too_many_arguments)]
 fn detect_scoped_clients(
     request_variants: &[UnionVariant],
     response_variants: &[UnionVariant],
@@ -863,6 +876,7 @@ fn detect_scoped_clients(
 }
 
 /// Recursively detect nested scoped clients within a scoped client.
+#[allow(clippy::too_many_arguments)]
 fn detect_nested_scoped_clients_cgr(
     parent: &mut ScopedClient,
     all_structs: &[StructDef],

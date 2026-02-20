@@ -3,6 +3,7 @@
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".paramDescription;
 using import "/annotations.capnp".mcpScope;
+using import "/annotations.capnp".optional;
 using import "/streaming.capnp".StreamInfo;
 
 # Cap'n Proto schema for model service
@@ -100,13 +101,11 @@ struct PeftRequest {
 struct InferRequest {
   modelRef @0 :Text;
   union {
-    generate @1 :GenerateRequest
+    generateStream @1 :GenerateRequest
       $mcpDescription("Run inference with automatic domain adaptation. When TTT is enabled, the model adapts to your prompt before responding. If autoCommit is false (default), the adaptation is PENDING — check onlineTrainingMetrics.recommendation in the response, then call commitAdaptation (if true) or rollbackAdaptation (if false). Pending adaptations auto-rollback after 30 seconds.");
-    generateStream @2 :GenerateRequest
-      $mcpDescription("Stream inference with automatic domain adaptation. The final SSE chunk includes usage.online_training metrics. If autoCommit is false, the adaptation is PENDING — call commitAdaptation or rollbackAdaptation based on the recommendation field. Pending adaptations auto-rollback after 30 seconds.");
-    applyChatTemplate @3 :ApplyChatTemplateRequest
+    applyChatTemplate @2 :ApplyChatTemplateRequest
       $mcpDescription("Apply chat template to messages for a loaded model");
-    status @4 :Void
+    status @3 :Void
       $mcpDescription("Get detailed status information about a model including online training configuration");
   }
 }
@@ -165,30 +164,10 @@ struct PeftResponse {
 struct InferResponse {
   union {
     error @0 :ErrorInfo;
-    generate @1 :InferResult;
-    generateStream @2 :StreamInfo;
-    applyChatTemplate @3 :Text;
-    status @4 :ModelStatusResponse;
+    generateStream @1 :StreamInfo;
+    applyChatTemplate @2 :Text;
+    status @3 :ModelStatusResponse;
   }
-}
-
-# =============================================================================
-# Inference result — flattened from inference.capnp::GenerationResult
-# for transparent MCP/JSON bridging.
-# =============================================================================
-
-struct InferResult {
-  text @0 :Text;
-  tokensGenerated @1 :UInt32;
-  finishReason @2 :Text;         # "max_tokens", "stop_token", "end_of_sequence", "error", "stop"
-  generationTimeMs @3 :UInt64;
-  tokensPerSecond @4 :Float32;
-  prefillTokens @5 :UInt32;
-  prefillTimeMs @6 :UInt64;
-  prefillTokensPerSec @7 :Float32;
-  inferenceTokens @8 :UInt32;
-  inferenceTimeMs @9 :UInt64;
-  inferenceTokensPerSec @10 :Float32;
 }
 
 # Error information
@@ -209,8 +188,8 @@ enum KVQuantType {
 # Load model request with optional runtime configuration
 struct LoadModelRequest {
   modelRef @0 :Text $paramDescription("Model reference in format name:branch (e.g., 'qwen3-small:main')");
-  maxContext @1 :UInt32 $paramDescription("Maximum context length (0 = use default)");
-  kvQuant @2 :KVQuantType $paramDescription("KV cache quantization type");
+  maxContext @1 :UInt32 $optional $paramDescription("Maximum context length (0 = use default)");
+  kvQuant @2 :KVQuantType $optional $paramDescription("KV cache quantization type");
 }
 
 # Unload model request
@@ -222,21 +201,21 @@ struct UnloadModelRequest {
 # Fields match inference.capnp::GenerationRequest for transparent MCP/JSON bridging.
 struct GenerateRequest {
   prompt @0 :Text;
-  maxTokens @1 :UInt32;
-  temperature @2 :Float32;
-  topP @3 :Float32;
-  topK @4 :UInt32;
-  repeatPenalty @5 :Float32;
-  repeatLastN @6 :UInt32;
-  stopTokens @7 :List(Text);
-  seed @8 :UInt32;
-  images @9 :List(Data);
-  timeoutMs @10 :UInt64;
+  maxTokens @1 :UInt32 $optional;
+  temperature @2 :Float32 $optional;
+  topP @3 :Float32 $optional;
+  topK @4 :UInt32 $optional;
+  repeatPenalty @5 :Float32 $optional;
+  repeatLastN @6 :UInt32 $optional;
+  stopTokens @7 :List(Text) $optional;
+  seed @8 :UInt32 $optional;
+  images @9 :List(Data) $optional;
+  timeoutMs @10 :UInt64 $optional;
 
   # Per-request TTT control (all optional — omit for server defaults)
   tttEnabled @11 :Bool $paramDescription("Override: enable/disable TTT for this request");
-  tttGradientSteps @12 :UInt32 $paramDescription("Override: number of gradient steps (0 = skip)");
-  tttLearningRate @13 :Float32 $paramDescription("Override: learning rate");
+  tttGradientSteps @12 :UInt32 $optional $paramDescription("Override: number of gradient steps (0 = skip)");
+  tttLearningRate @13 :Float32 $optional $paramDescription("Override: learning rate");
   autoCommit @14 :Bool $paramDescription("If true, server auto-commits based on its recommendation. If false (default), adaptation is pending until client commits.");
 }
 
@@ -293,25 +272,36 @@ struct ModelHealthStatus {
   totalMemoryBytes @3 :UInt64;
 }
 
+# Tool call data for threading through RPC
+struct ToolCallData {
+  id @0 :Text;
+  callType @1 :Text;        # "function"
+  functionName @2 :Text;
+  arguments @3 :Text;        # JSON string (opaque, deserialized at consumption point)
+}
+
 # Chat message for template application
 struct ChatMessage {
-  role @0 :Text;     # "system", "user", "assistant"
-  content @1 :Text;  # Message content
+  role @0 :Text;     # "system", "user", "assistant", "tool"
+  content @1 :Text;  # Message content (empty string = None)
+  toolCalls @2 :List(ToolCallData);
+  toolCallId @3 :Text;  # For "tool" role messages (empty string = None)
 }
 
 # Apply chat template request
 struct ApplyChatTemplateRequest {
   messages @0 :List(ChatMessage);
   addGenerationPrompt @1 :Bool;  # Whether to add assistant prompt at end
+  toolsJson @2 :Text $optional;  # JSON-serialized tools array (empty string = no tools)
 }
 
 # LoRA adapter configuration for creation
 struct CreateLoraRequest {
   rank @0 :UInt32 $paramDescription("LoRA rank (e.g., 8, 16, 32)");
-  alpha @1 :Float32 $paramDescription("LoRA alpha scaling factor");
-  dropout @2 :Float32 $paramDescription("Dropout rate during training");
+  alpha @1 :Float32 $optional $paramDescription("LoRA alpha scaling factor");
+  dropout @2 :Float32 $optional $paramDescription("Dropout rate during training");
   targetModules @3 :List(Text) $paramDescription("Model layers to apply LoRA (e.g., ['q_proj','v_proj'])");
-  learningRate @4 :Float32 $paramDescription("Learning rate for training (default: 1e-4)");
+  learningRate @4 :Float32 $optional $paramDescription("Learning rate for training (default: 1e-4)");
 }
 
 # =============================================================================
@@ -320,8 +310,8 @@ struct CreateLoraRequest {
 
 struct TrainStepRequest {
   input @0 :Text $paramDescription("Text to train on (NTP loss)");
-  gradientSteps @1 :UInt32 $paramDescription("Number of gradient steps (default: 3)");
-  learningRate @2 :Float32 $paramDescription("Learning rate override (0 = use default)");
+  gradientSteps @1 :UInt32 $optional $paramDescription("Number of gradient steps (default: 3)");
+  learningRate @2 :Float32 $optional $paramDescription("Learning rate override (0 = use default)");
   autoCommit @3 :Bool $paramDescription("If true, auto-commit if quality gate passes");
 }
 
@@ -360,9 +350,9 @@ struct ModuleNormRatio {
 
 struct SaveAdaptationRequest {
   name @0 :Text $paramDescription("Adapter name for the saved file");
-  mergeStrategy @1 :Text $paramDescription("Merge strategy: 'replace', 'additive', 'do_merge' (default)");
-  mergeWeight @2 :Float32 $paramDescription("Merge weight 0.0-1.0 (default: 0.3)");
-  commitMessage @3 :Text $paramDescription("Non-empty triggers git commit");
+  mergeStrategy @1 :Text $optional $paramDescription("Merge strategy: 'replace', 'additive', 'do_merge' (default)");
+  mergeWeight @2 :Float32 $optional $paramDescription("Merge weight 0.0-1.0 (default: 0.3)");
+  commitMessage @3 :Text $optional $paramDescription("Non-empty triggers git commit");
 }
 
 struct SaveAdaptationResponse {
@@ -385,7 +375,7 @@ struct SnapshotDeltaResponse {
 
 struct TttExportRequest {
   name @0 :Text $paramDescription("PEFT adapter directory name");
-  commitMessage @1 :Text $paramDescription("Git commit message (optional)");
+  commitMessage @1 :Text $optional $paramDescription("Git commit message (optional)");
 }
 
 struct TttExportResponse {
@@ -408,7 +398,7 @@ struct PeftAdapterInfo {
 
 struct PeftMergeRequest {
   adapterName @0 :Text $paramDescription("Adapter directory name to merge");
-  weight @1 :Float32 $paramDescription("Merge weight 0.0-1.0 (default: 1.0 = full merge)");
+  weight @1 :Float32 $optional $paramDescription("Merge weight 0.0-1.0 (default: 1.0 = full merge)");
 }
 
 # =============================================================================

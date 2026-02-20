@@ -27,6 +27,8 @@ pub struct ChatCompletionRequest {
     pub top_k: Option<usize>,
     pub logit_bias: Option<std::collections::HashMap<String, f32>>,
     pub user: Option<String>,
+    pub tools: Option<Vec<Tool>>,
+    pub tool_choice: Option<ToolChoice>,
 }
 
 /// Chat message
@@ -35,6 +37,8 @@ pub struct ChatMessage {
     pub role: String,
     pub content: Option<String>,
     pub function_call: Option<FunctionCall>,
+    pub tool_calls: Option<Vec<ToolCall>>,
+    pub tool_call_id: Option<String>,
 }
 
 impl From<&ChatCompletionRequest> for crate::config::SamplingParams {
@@ -65,6 +69,56 @@ pub struct FunctionCall {
     pub arguments: String,
 }
 
+/// Tool definition (OpenAI format)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tool {
+    #[serde(rename = "type")]
+    pub tool_type: String, // "function"
+    pub function: ToolFunction,
+}
+
+/// Tool function definition
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolFunction {
+    pub name: String,
+    pub description: Option<String>,
+    pub parameters: serde_json::Value, // JSON Schema
+}
+
+/// Tool choice parameter
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    String(String), // "none", "auto", "required"
+    Specific { 
+        #[serde(rename = "type")]
+        tool_type: String, // "function"
+        function: ToolChoiceFunction 
+    },
+}
+
+/// Specific tool choice
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolChoiceFunction {
+    pub name: String,
+}
+
+/// Tool call made by the model (in response)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub tool_type: String, // "function"
+    pub function: ToolCallFunction,
+}
+
+/// Tool call function details
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallFunction {
+    pub name: String,
+    pub arguments: String, // JSON string
+}
+
 /// Chat Completion Response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionResponse {
@@ -82,6 +136,13 @@ pub struct ChatChoice {
     pub index: i32,
     pub message: ChatMessage,
     pub finish_reason: Option<String>,
+}
+
+impl ChatChoice {
+    /// Check if this choice contains tool calls
+    pub fn has_tool_calls(&self) -> bool {
+        self.message.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty())
+    }
 }
 
 /// Text Completion Request
@@ -289,3 +350,7 @@ pub struct ErrorDetail {
     pub param: Option<String>,
     pub code: Option<String>,
 }
+
+
+
+

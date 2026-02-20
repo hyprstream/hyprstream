@@ -343,6 +343,7 @@ impl RequestLoop {
     /// The `ready_tx` channel signals when the socket is bound and ready.
     /// Uses raw ZMQ socket creation + TransportConfig::bind() for SystemdFd support,
     /// then converts to TMQ via from_zmq_socket for async I/O.
+    #[allow(clippy::too_many_arguments)]
     async fn service_loop_async<S: ZmqService>(
         transport: TransportConfig,
         context: Arc<zmq::Context>,

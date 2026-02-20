@@ -328,6 +328,7 @@ impl RoPEManager {
     }
 
     /// Apply RoPE to a tensor using the appropriate layer configuration
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_rope(
         &mut self,
         layer_name: &str,

@@ -14,17 +14,23 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, trace};
 
 use crate::{
-    api::openai_compat::{
-        ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, CompletionChoice,
-        CompletionRequest, CompletionResponse, EmbeddingRequest, ListModelsResponse, Model,
-        OnlineTrainingDetails, Usage,
+    api::{
+        openai_compat::{
+            ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, CompletionChoice,
+            CompletionRequest, CompletionResponse, EmbeddingRequest, ListModelsResponse, Model,
+            OnlineTrainingDetails, Usage,
+        },
+        tools,
     },
     archetypes::capabilities::Infer,
     auth::Operation,
     config::GenerationRequest,
-    runtime::{CacheOwner, FinishReason},
+    runtime::CacheOwner,
     server::{state::ServerState, AuthenticatedUser},
+    services::ModelZmqClient,
 };
+
+use hyprstream_rpc::RequestIdentity;
 
 // E2E authenticated streaming via Ristretto255 DH key exchange
 use hyprstream_rpc::crypto::generate_ephemeral_keypair;
@@ -86,6 +92,71 @@ impl ErrorResponse {
 
 }
 
+/// Result of collecting a stream into a single response.
+struct CollectedResult {
+    text: String,
+    stats: crate::services::rpc_types::InferenceComplete,
+}
+
+/// Collect a stream to a single result for non-streaming endpoints.
+///
+/// This replaces the removed sync `infer()` method. Using streaming internally
+/// fixes the bug where `infer()` hardcoded `ttt_metrics: None` — the completion
+/// metadata from the stream includes all fields including TTT metrics.
+async fn collect_stream_to_result(
+    model_client: &ModelZmqClient,
+    model_ref: &str,
+    request: &GenerationRequest,
+) -> anyhow::Result<CollectedResult> {
+    let (client_secret, client_pubkey) = generate_ephemeral_keypair();
+    let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
+    let stream_info = model_client.infer_stream(model_ref, request, client_pubkey_bytes).await?;
+    let ctx = crate::zmq::global_context();
+    let mut handle = StreamHandle::new(
+        &ctx,
+        stream_info.stream_id,
+        &stream_info.endpoint,
+        &stream_info.server_pubkey,
+        &client_secret,
+        &client_pubkey_bytes,
+    )?;
+
+    let mut text = String::new();
+    loop {
+        match handle.try_next() {
+            Ok(Some(payload)) => {
+                use hyprstream_rpc::streaming::StreamPayload;
+                match payload {
+                    StreamPayload::Data(data) => {
+                        text.push_str(&String::from_utf8_lossy(&data));
+                    }
+                    StreamPayload::Complete(meta) => {
+                        let stats: crate::services::rpc_types::InferenceComplete =
+                            serde_json::from_slice(&meta)
+                                .unwrap_or_else(|e| {
+                                    tracing::warn!("Failed to parse InferenceComplete: {e}");
+                                    crate::services::rpc_types::InferenceComplete::empty()
+                                });
+                        return Ok(CollectedResult { text, stats });
+                    }
+                    StreamPayload::Error(msg) => {
+                        anyhow::bail!("Generation error: {msg}");
+                    }
+                }
+            }
+            Ok(None) if handle.is_completed() => {
+                anyhow::bail!("Stream ended without completion");
+            }
+            Ok(None) => {
+                tokio::task::yield_now().await;
+            }
+            Err(e) => {
+                anyhow::bail!("Stream error: {e}");
+            }
+        }
+    }
+}
+
 // validate_chat_request removed - validation now handled by streaming pipeline
 // The TextStream and sampling code handle all parameter edge cases safely:
 // - Empty messages → empty response (safe)
@@ -120,18 +191,36 @@ fn extract_cache_owner(headers: &HeaderMap) -> CacheOwner {
     }
 }
 
-/// Extract user identity from authenticated user.
-///
-/// JWT `sub` claim should already contain prefixed subject (e.g., "token:alice").
-/// Returns "anonymous" if no authentication provided.
-fn extract_user_from_auth(auth_user: Option<&AuthenticatedUser>) -> String {
+/// Extract auth info: (username, jwt_token, jwt_exp)
+fn extract_auth(auth_user: Option<&AuthenticatedUser>) -> (String, Option<String>, Option<i64>) {
     if let Some(user) = auth_user {
         trace!("Using authenticated user: {}", user.user);
-        return user.user.clone();
+        (user.user.clone(), user.token.clone(), user.exp)
+    } else {
+        trace!("No authentication provided, using anonymous identity");
+        ("anonymous".to_owned(), None, None)
     }
+}
 
-    trace!("No authentication provided, using anonymous identity");
-    "anonymous".to_owned()
+/// Build Claims from auth info, using the JWT's real exp for timeout enforcement.
+fn claims_from_auth(user: &str, jwt_token: Option<&str>, jwt_exp: Option<i64>) -> hyprstream_rpc::auth::Claims {
+    let now = chrono::Utc::now().timestamp();
+    let exp = jwt_exp.unwrap_or(now + 3600);
+    let mut claims = hyprstream_rpc::auth::Claims::new(user.to_owned(), now, exp);
+    if let Some(token) = jwt_token {
+        claims = claims.with_token(token.to_owned());
+    }
+    claims
+}
+
+/// Build RequestIdentity from extracted auth user string.
+/// Unauthenticated = anonymous (NEVER local server identity).
+fn identity_from_user(user: &str) -> RequestIdentity {
+    if user == "anonymous" {
+        RequestIdentity::anonymous()
+    } else {
+        RequestIdentity::api_token(user, "openai")
+    }
 }
 
 /// Helper: Resolve model name to filesystem path (also validates inference capability)
@@ -236,7 +325,7 @@ async fn chat_completions(
     Json(request): Json<ChatCompletionRequest>,
 ) -> impl IntoResponse {
     // Extract user identity from JWT (via middleware)
-    let user = extract_user_from_auth(auth_user.as_ref().map(|Extension(u)| u));
+    let (user, jwt_token, jwt_exp) = extract_auth(auth_user.as_ref().map(|Extension(u)| u));
 
     // Check permission for inference on this model via ZMQ
     let resource = format!("model:{}", request.model);
@@ -292,7 +381,7 @@ async fn chat_completions(
 
     if is_streaming {
         info!("Handling streaming request");
-        return stream_chat(state, headers, request).await.into_response();
+        return stream_chat(state, headers, request, user, jwt_token, jwt_exp).await.into_response();
     }
     info!("Handling non-streaming request");
 
@@ -316,9 +405,25 @@ async fn chat_completions(
 
     // Apply chat template via ZMQ ModelService
     info!("Applying chat template via ModelService...");
+
+    // Serialize tools to JSON Value for the template engine (if provided)
+    let tools_json: Option<serde_json::Value> = request.tools.as_ref().map(|t| {
+        info!("Passing {} tools to template engine", t.len());
+        serde_json::to_value(t).unwrap_or_default()
+    });
+
+    // Determine tool call format from model architecture (for response parsing)
+    let tool_call_format = if request.tools.is_some() {
+        tools::ToolCallFormat::from_architecture(
+            &crate::runtime::model_config::ModelConfig::detect_architecture(&model_path),
+        )
+    } else {
+        tools::ToolCallFormat::None
+    };
+
     let templated_prompt = match state
         .model_client
-        .apply_chat_template(&request.model, &request.messages, true)
+        .apply_chat_template(&request.model, &request.messages, true, tools_json.as_ref())
         .await
     {
         Ok(prompt) => prompt,
@@ -358,21 +463,47 @@ async fn chat_completions(
         gen_request.prompt.len()
     );
 
-    // Call inference via ZMQ ModelService
-    let result = state.model_client.infer(&request.model, &gen_request).await;
+    // Call inference via collect-stream (per-request ZMQ client preserves caller identity for TTT delta routing)
+    let identity = identity_from_user(&user);
+    let model_client = ModelZmqClient::new((*state.signing_key).clone(), identity);
+    let claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
+    let result = collect_stream_to_result(&model_client.with_claims(claims), &request.model, &gen_request).await;
 
     info!("Generation completed - success: {}", result.is_ok());
 
     match result {
-        Ok(generation) => {
+        Ok(collected) => {
+            let tokens_generated = collected.stats.tokens_generated;
             state.metrics.total_tokens.fetch_add(
-                generation.tokens_generated as u64,
+                tokens_generated as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
 
             let latency_ms = start_time.elapsed().as_millis() as f64;
             let mut avg_latency = state.metrics.avg_latency_ms.write().await;
             *avg_latency = (*avg_latency * 0.9) + (latency_ms * 0.1);
+
+            let finish_reason_str = &collected.stats.finish_reason;
+
+            // Parse tool calls from response using format-aware detection
+            let (content, tool_calls, finish_reason) = if tools::has_tool_calls_for_format(tool_call_format, &collected.text) {
+                info!("Detected tool calls in response (format: {:?})", tool_call_format);
+                match tools::parse_tool_calls_for_format(tool_call_format, &collected.text) {
+                    Ok(parsed_tool_calls) if !parsed_tool_calls.is_empty() => {
+                        let content_text = tools::extract_text_content_for_format(tool_call_format, &collected.text);
+                        let content = if content_text.is_empty() { None } else { Some(content_text) };
+                        info!("Parsed {} tool calls", parsed_tool_calls.len());
+                        (content, Some(parsed_tool_calls), "tool_calls")
+                    }
+                    Ok(_) | Err(_) => {
+                        let fr = if finish_reason_str == "max_tokens" { "length" } else { "stop" };
+                        (Some(collected.text), None, fr)
+                    }
+                }
+            } else {
+                let fr = if finish_reason_str == "max_tokens" { "length" } else { "stop" };
+                (Some(collected.text), None, fr)
+            };
 
             let response = ChatCompletionResponse {
                 id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
@@ -383,22 +514,18 @@ async fn chat_completions(
                     index: 0,
                     message: ChatMessage {
                         role: "assistant".to_owned(),
-                        content: Some(generation.text),
+                        content,
                         function_call: None,
+                        tool_calls,
+                        tool_call_id: None,
                     },
-                    finish_reason: Some(
-                        match generation.finish_reason {
-                            FinishReason::MaxTokens => "length",
-                            // All other reasons map to "stop" per OpenAI API spec
-                            _ => "stop",
-                        }.to_owned(),
-                    ),
+                    finish_reason: Some(finish_reason.to_owned()),
                 }],
                 usage: Some(Usage {
                     prompt_tokens: 0,
-                    completion_tokens: generation.tokens_generated,
-                    total_tokens: generation.tokens_generated,
-                    online_training_details: generation.ttt_metrics.as_ref().map(OnlineTrainingDetails::from),
+                    completion_tokens: tokens_generated,
+                    total_tokens: tokens_generated,
+                    online_training_details: collected.stats.ttt_metrics.as_ref().map(OnlineTrainingDetails::from),
                 }),
             };
 
@@ -424,7 +551,7 @@ async fn chat_completions(
 }
 
 /// Handle streaming chat completions via ZMQ PUB/SUB
-async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompletionRequest) -> impl IntoResponse {
+async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompletionRequest, user: String, jwt_token: Option<String>, jwt_exp: Option<i64>) -> impl IntoResponse {
     // Create channel for SSE events
     let (tx, rx) = mpsc::channel::<Result<serde_json::Value, anyhow::Error>>(100);
 
@@ -436,6 +563,7 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
     let model_name = request.model.clone();
     let messages = request.messages.clone();
     let stop_sequences = request.stop.clone().unwrap_or_default();
+    let tools = request.tools.clone();
 
     // Track active request for proper cleanup
     state_clone
@@ -476,10 +604,25 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
             }
         };
 
-        // Apply chat template via ZMQ ModelService
+        // Serialize tools to JSON Value for the template engine
+        let tools_json: Option<serde_json::Value> = tools.as_ref().map(|t| {
+            info!("Passing {} tools to streaming template engine", t.len());
+            serde_json::to_value(t).unwrap_or_default()
+        });
+
+        // Determine tool call format from model architecture
+        let tool_call_format = if tools.is_some() {
+            tools::ToolCallFormat::from_architecture(
+                &crate::runtime::model_config::ModelConfig::detect_architecture(&model_path),
+            )
+        } else {
+            tools::ToolCallFormat::None
+        };
+
+        // Apply chat template via ZMQ ModelService (tools passed to template)
         info!("Applying chat template for streaming...");
         let templated_prompt = match state.model_client
-            .apply_chat_template(&model_name, &messages, true)
+            .apply_chat_template(&model_name, &messages, true, tools_json.as_ref())
             .await
         {
             Ok(prompt) => {
@@ -510,8 +653,11 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
         let (client_secret, client_pubkey) = generate_ephemeral_keypair();
         let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
 
-        // Start ZMQ stream - returns StreamInfo with stream_id, endpoint, server_pubkey
-        let stream_info = match state.model_client.infer_stream(&model_name, &gen_request, client_pubkey_bytes).await {
+        // Start ZMQ stream with per-request client (preserves caller identity for TTT delta routing)
+        let identity = identity_from_user(&user);
+        let model_client = ModelZmqClient::new((*state.signing_key).clone(), identity);
+        let claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
+        let stream_info = match model_client.with_claims(claims).infer_stream(&model_name, &gen_request, client_pubkey_bytes).await {
             Ok(info) => {
                 info!("ZMQ stream started: id={}, endpoint={}", info.stream_id, info.endpoint);
                 info
@@ -563,11 +709,15 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
 
         // ZMQ receive loop - forward StreamBlock payloads to SSE
         info!("Starting ZMQ streaming receive loop (StreamBlock format)...");
+        
+        // Accumulate full response text for tool call parsing
+        let mut accumulated_text = String::new();
 
         'outer: loop {
             // Check if client disconnected (channel closed)
             if tx.is_closed() {
                 info!("Client disconnected, stopping stream");
+                stream_handle.cancel();
                 break;
             }
 
@@ -577,6 +727,8 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                     use crate::services::rpc_types::{InferenceStreamPayload, StreamPayloadExt};
                     match payload.to_inference() {
                         Ok(InferenceStreamPayload::Token(text)) => {
+                            // Accumulate text for tool call parsing
+                            accumulated_text.push_str(&text);
                             let sse_chunk = serde_json::json!({
                                 "id": sse_stream_id,
                                 "object": "chat.completion.chunk",
@@ -621,6 +773,34 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                                 total_tokens: stats.prefill_tokens + stats.tokens_generated,
                                 online_training_details: stats.ttt_metrics.as_ref()
                                     .map(OnlineTrainingDetails::from),
+                            };
+
+                            // Check if response contains tool calls (format-aware)
+                            let oai_finish_reason = if tools::has_tool_calls_for_format(tool_call_format, &accumulated_text) {
+                                info!("Detected tool calls in streaming response (format: {:?})", tool_call_format);
+                                match tools::parse_tool_calls_for_format(tool_call_format, &accumulated_text) {
+                                    Ok(parsed_tool_calls) if !parsed_tool_calls.is_empty() => {
+                                        info!("Parsed {} tool calls", parsed_tool_calls.len());
+                                        let tool_calls_chunk = serde_json::json!({
+                                            "id": sse_stream_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": chrono::Utc::now().timestamp(),
+                                            "model": model_name,
+                                            "choices": [{
+                                                "index": 0,
+                                                "delta": {
+                                                    "tool_calls": parsed_tool_calls
+                                                },
+                                                "finish_reason": null
+                                            }]
+                                        });
+                                        let _ = tx.send(Ok(tool_calls_chunk)).await;
+                                        "tool_calls"
+                                    }
+                                    _ => oai_finish_reason,
+                                }
+                            } else {
+                                oai_finish_reason
                             };
 
                             let completion_msg = serde_json::json!({
@@ -716,7 +896,7 @@ async fn completions(
     Json(request): Json<CompletionRequest>,
 ) -> impl IntoResponse {
     // Extract user identity from JWT (via middleware)
-    let user = extract_user_from_auth(auth_user.as_ref().map(|Extension(u)| u));
+    let (user, jwt_token, jwt_exp) = extract_auth(auth_user.as_ref().map(|Extension(u)| u));
 
     // Check permission for inference on this model
     let resource = format!("model:{}", request.model);
@@ -774,11 +954,13 @@ async fn completions(
         role: "user".to_owned(),
         content: Some(request.prompt.clone()),
         function_call: None,
+        tool_calls: None,
+        tool_call_id: None,
     }];
 
     let templated_prompt = match state
         .model_client
-        .apply_chat_template(&request.model, &messages, true)
+        .apply_chat_template(&request.model, &messages, true, None)
         .await
     {
         Ok(prompt) => prompt,
@@ -807,29 +989,32 @@ async fn completions(
         gen_request.max_tokens, gen_request.temperature, gen_request.top_p, gen_request.top_k, gen_request.repeat_penalty
     );
 
-    // Call inference via ZMQ ModelService
-    let result = state.model_client.infer(&request.model, &gen_request).await;
+    // Call inference via collect-stream (per-request ZMQ client preserves caller identity for TTT delta routing)
+    let identity = identity_from_user(&user);
+    let model_client = ModelZmqClient::new((*state.signing_key).clone(), identity);
+    let claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
+    let result = collect_stream_to_result(&model_client.with_claims(claims), &request.model, &gen_request).await;
 
     // Metrics automatically decremented by MetricsGuard on drop
 
     match result {
-        Ok(generation) => {
+        Ok(collected) => {
             let response = CompletionResponse {
                 id: format!("cmpl-{}", uuid::Uuid::new_v4()),
                 object: "text_completion".to_owned(),
                 created: chrono::Utc::now().timestamp(),
                 model: request.model.clone(),
                 choices: vec![CompletionChoice {
-                    text: generation.text,
+                    text: collected.text,
                     index: 0,
                     logprobs: None,
-                    finish_reason: Some("stop".to_owned()),
+                    finish_reason: Some(if collected.stats.finish_reason == "max_tokens" { "length" } else { "stop" }.to_owned()),
                 }],
                 usage: Some(Usage {
                     prompt_tokens: request.prompt.len() / 4, // Rough estimate: 4 chars per token
-                    completion_tokens: generation.tokens_generated,
-                    total_tokens: request.prompt.len() / 4 + generation.tokens_generated,
-                    online_training_details: generation.ttt_metrics.as_ref().map(OnlineTrainingDetails::from),
+                    completion_tokens: collected.stats.tokens_generated,
+                    total_tokens: request.prompt.len() / 4 + collected.stats.tokens_generated,
+                    online_training_details: collected.stats.ttt_metrics.as_ref().map(OnlineTrainingDetails::from),
                 }),
             };
 
@@ -920,3 +1105,11 @@ async fn list_models(State(state): State<ServerState>) -> impl IntoResponse {
 }
 
 // REMOVED: format_messages_with_template - replaced by model_client.apply_chat_template()
+
+
+
+
+
+
+
+

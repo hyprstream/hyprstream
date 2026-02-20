@@ -23,6 +23,7 @@ pub struct QwenAdapter;
 impl QwenAdapter {
     /// Create a Qwen model from weights and config.json, using Llama as the base implementation
     /// Takes mutable reference to weights to enable incremental tensor freeing during construction
+    #[allow(clippy::too_many_arguments)]
     pub fn from_weights(
         weights: &mut HashMap<String, Tensor>,
         config_json: &str,

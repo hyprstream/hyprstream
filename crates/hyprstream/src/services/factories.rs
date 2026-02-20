@@ -23,18 +23,40 @@
 use std::sync::Arc;
 
 use anyhow::Context;
+use git2db::Git2DB;
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::{global as global_registry, SocketKind};
 use hyprstream_rpc::service::factory::ServiceContext;
 use hyprstream_rpc::service::spawner::{ProxyService, Spawnable};
 use hyprstream_rpc::service_factory;
 use hyprstream_workers::endpoints;
+use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::auth::PolicyManager;
 use crate::config::TokenConfig;
 use crate::services::{McpService, McpConfig, PolicyService, PolicyClient, RegistryService, GenRegistryClient};
 use crate::zmq::global_context;
+
+/// Shared Git2DB registry instance. Lazily initialized by the first factory
+/// that needs it. Both PolicyService and RegistryService share this instance.
+static SHARED_GIT2DB: std::sync::OnceLock<Arc<RwLock<Git2DB>>> = std::sync::OnceLock::new();
+
+/// Get or initialize the shared Git2DB registry for the given models directory.
+fn get_or_init_git2db(models_dir: &std::path::Path) -> anyhow::Result<Arc<RwLock<Git2DB>>> {
+    if let Some(existing) = SHARED_GIT2DB.get() {
+        return Ok(Arc::clone(existing));
+    }
+
+    let registry = tokio::task::block_in_place(|| {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(Git2DB::open(models_dir))
+    }).context("Failed to initialize shared Git2DB registry")?;
+
+    let shared = Arc::new(RwLock::new(registry));
+    // If another thread beat us, that's fine — use theirs
+    Ok(Arc::clone(SHARED_GIT2DB.get_or_init(|| shared)))
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Event Service Factory
@@ -68,6 +90,9 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 
     let policies_dir = ctx.models_dir().join(".registry").join("policies");
 
+    // Get shared Git2DB instance (initializes .registry as git repo if needed)
+    let git2db = get_or_init_git2db(ctx.models_dir())?;
+
     // Create policy manager (blocking since we're in sync context)
     let policy_manager = Arc::new(
         tokio::task::block_in_place(|| {
@@ -92,6 +117,7 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         policy_manager,
         Arc::new(ctx.signing_key().clone()),
         TokenConfig::default(),
+        git2db,
         global_context(),
         ctx.transport("policy", SocketKind::Rep),
     );
@@ -371,11 +397,12 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
 
     let config = HyprConfig::load().unwrap_or_default();
 
-    let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::local());
-
+    // Pass signing key instead of a pre-created PolicyClient.
+    // OAuthService runs in its own tokio runtime (separate thread), so the
+    // PolicyClient must be created inside that runtime for ZMQ async I/O to work.
     let oauth_service = OAuthService::new(
         config.oauth.clone(),
-        policy_client,
+        ctx.signing_key().clone(),
         global_context(),
         ctx.transport("oauth", SocketKind::Rep),
         ctx.verifying_key(),
@@ -434,6 +461,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
             use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 
             let session_mgr = std::sync::Arc::new(LocalSessionManager::default());
+            let verifying_key = mcp_config_clone.verifying_key;
             let service: StreamableHttpService<McpService, LocalSessionManager> =
                 StreamableHttpService::new(
                     move || McpService::new(mcp_config_clone.clone()).map_err(|e| {
@@ -446,17 +474,79 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
             let mcp_full_config = crate::config::HyprConfig::load().unwrap_or_default();
             let mcp_resource_url = mcp_full_config.mcp.resource_url();
             let mcp_oauth_issuer = mcp_full_config.oauth.issuer_url();
+            let www_authenticate = format!(
+                "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource\"",
+                mcp_resource_url
+            );
             let router = axum::Router::new()
                 .route(
                     "/.well-known/oauth-protected-resource",
-                    axum::routing::get(move || async move {
-                        axum::Json(crate::services::oauth::protected_resource_metadata(
-                            &mcp_resource_url,
-                            &mcp_oauth_issuer,
-                        ))
+                    axum::routing::get({
+                        let mcp_resource_url = mcp_resource_url.clone();
+                        let mcp_oauth_issuer = mcp_oauth_issuer.clone();
+                        move || async move {
+                            axum::Json(crate::services::oauth::protected_resource_metadata(
+                                &mcp_resource_url,
+                                &mcp_oauth_issuer,
+                            ))
+                        }
                     }),
                 )
-                .nest_service("/mcp", service);
+                .nest_service("/mcp", service)
+                .layer(axum::middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
+                    let www_authenticate = www_authenticate.clone();
+                    async move {
+                        use axum::http::{header, StatusCode};
+                        use axum::response::IntoResponse;
+                        let method = req.method().clone();
+                        let uri = req.uri().clone();
+                        // Allow OAuth discovery endpoint without auth
+                        if req.uri().path().starts_with("/.well-known/") {
+                            tracing::debug!(%method, %uri, "MCP discovery request (no auth required)");
+                            return next.run(req).await;
+                        }
+                        let has_auth_header = req.headers().contains_key(header::AUTHORIZATION);
+                        let auth_value = req.headers()
+                            .get(header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned);
+                        // RFC 6750: Bearer scheme is case-insensitive
+                        let token = auth_value.as_deref()
+                            .and_then(|h| {
+                                if h.len() > 7 && h[..7].eq_ignore_ascii_case("bearer ") {
+                                    Some(h[7..].trim())
+                                } else {
+                                    None
+                                }
+                            });
+                        match token {
+                            Some(t) => {
+                                match crate::auth::jwt::decode(t, &verifying_key) {
+                                    Ok(claims) => {
+                                        tracing::debug!(%method, %uri, sub = %claims.sub, "MCP auth OK");
+                                        next.run(req).await
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(%method, %uri, error = %e, "MCP auth REJECTED");
+                                        let mut res = (StatusCode::UNAUTHORIZED, "Invalid or expired token").into_response();
+                                        if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
+                                            res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
+                                        }
+                                        res
+                                    }
+                                }
+                            },
+                            None => {
+                                tracing::info!(%method, %uri, has_auth_header, "MCP auth MISSING token");
+                                let mut res = (StatusCode::UNAUTHORIZED, "Authentication required").into_response();
+                                if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
+                                    res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
+                                }
+                                res
+                            }
+                        }
+                    }
+                }));
 
             let addr = format!("{}:{}", mcp_host, http_port);
             let listener = match tokio::net::TcpListener::bind(&addr).await {

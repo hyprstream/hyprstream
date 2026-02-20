@@ -8,7 +8,7 @@
 //! future multimodal support. They are currently unused but retained for the
 //! upcoming Janus VLM integration.
 
-#![allow(dead_code)]
+#![allow(dead_code, clippy::type_complexity)]
 
 use super::{ArchitectureConfig, ModelArchitecture, ModelOperations, VisionEncoderType};
 use super::config::AttentionType;
