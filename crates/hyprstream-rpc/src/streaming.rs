@@ -1376,9 +1376,30 @@ impl StreamChannel {
         let tokens = Arc::clone(&self.cancel_tokens);
         tokio::spawn(async move {
             loop {
+                // Poll for the next message, releasing the mutex between
+                // iterations so other tasks (e.g. prepare_stream_with_claims)
+                // can subscribe new topics.  We use poll_next via a short
+                // select! with a sleep to avoid holding the lock across a
+                // long-lived .next().await which would deadlock any caller
+                // of ctrl_sub.lock().
                 let msg = {
-                    let mut sub = sub.lock().await;
-                    sub.next().await
+                    let mut guard = sub.lock().await;
+                    // Try to get one message with a brief timeout.
+                    // If nothing arrives, release the lock and sleep
+                    // before retrying so other tasks can acquire it.
+                    let result = tokio::time::timeout(
+                        std::time::Duration::from_millis(50),
+                        guard.next(),
+                    ).await;
+                    match result {
+                        Ok(msg) => msg,
+                        Err(_) => {
+                            // Timeout — no message, release lock and retry
+                            drop(guard);
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            continue;
+                        }
+                    }
                 };
                 let multipart = match msg {
                     Some(Ok(m)) => m,

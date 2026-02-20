@@ -11,7 +11,7 @@ use futures::stream::StreamExt;
 use std::convert::Infallible;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
 
 use crate::{
     api::{
@@ -709,9 +709,12 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
 
         // ZMQ receive loop - forward StreamBlock payloads to SSE
         info!("Starting ZMQ streaming receive loop (StreamBlock format)...");
-        
+
         // Accumulate full response text for tool call parsing
         let mut accumulated_text = String::new();
+
+        // Filter tool-call markers out of SSE content chunks
+        let mut tool_filter = tools::StreamingToolCallFilter::new(tool_call_format);
 
         'outer: loop {
             // Check if client disconnected (channel closed)
@@ -727,25 +730,31 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                     use crate::services::rpc_types::{InferenceStreamPayload, StreamPayloadExt};
                     match payload.to_inference() {
                         Ok(InferenceStreamPayload::Token(text)) => {
-                            // Accumulate text for tool call parsing
+                            // Accumulate raw text for end-of-stream tool call parsing
                             accumulated_text.push_str(&text);
-                            let sse_chunk = serde_json::json!({
-                                "id": sse_stream_id,
-                                "object": "chat.completion.chunk",
-                                "created": chrono::Utc::now().timestamp(),
-                                "model": model_name,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {
-                                        "content": text
-                                    },
-                                    "finish_reason": null
-                                }]
-                            });
 
-                            if tx.send(Ok(sse_chunk)).await.is_err() {
-                                info!("Client disconnected during streaming");
-                                break 'outer;
+                            // Filter: only emit content tokens (suppress tool-call markers)
+                            if let Some(content) = tool_filter.feed(&text) {
+                                if !content.is_empty() {
+                                    let sse_chunk = serde_json::json!({
+                                        "id": sse_stream_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": chrono::Utc::now().timestamp(),
+                                        "model": model_name,
+                                        "choices": [{
+                                            "index": 0,
+                                            "delta": {
+                                                "content": content
+                                            },
+                                            "finish_reason": null
+                                        }]
+                                    });
+
+                                    if tx.send(Ok(sse_chunk)).await.is_err() {
+                                        info!("Client disconnected during streaming");
+                                        break 'outer;
+                                    }
+                                }
                             }
                         }
                         Ok(InferenceStreamPayload::Complete(stats)) => {
@@ -775,12 +784,46 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                                     .map(OnlineTrainingDetails::from),
                             };
 
+                            // Flush any buffered non-tool-call content
+                            if let Some(remaining) = tool_filter.flush() {
+                                if !remaining.is_empty() {
+                                    let flush_chunk = serde_json::json!({
+                                        "id": sse_stream_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": chrono::Utc::now().timestamp(),
+                                        "model": model_name,
+                                        "choices": [{
+                                            "index": 0,
+                                            "delta": {
+                                                "content": remaining
+                                            },
+                                            "finish_reason": null
+                                        }]
+                                    });
+                                    let _ = tx.send(Ok(flush_chunk)).await;
+                                }
+                            }
+
                             // Check if response contains tool calls (format-aware)
                             let oai_finish_reason = if tools::has_tool_calls_for_format(tool_call_format, &accumulated_text) {
                                 info!("Detected tool calls in streaming response (format: {:?})", tool_call_format);
                                 match tools::parse_tool_calls_for_format(tool_call_format, &accumulated_text) {
                                     Ok(parsed_tool_calls) if !parsed_tool_calls.is_empty() => {
                                         info!("Parsed {} tool calls", parsed_tool_calls.len());
+                                        // Add required `index` field for streaming delta format
+                                        let indexed_tool_calls: Vec<serde_json::Value> = parsed_tool_calls
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(i, tc)| {
+                                                let mut v = serde_json::to_value(tc).unwrap_or_default();
+                                                if let Some(o) = v.as_object_mut() {
+                                                    o.insert("index".to_owned(), serde_json::json!(i));
+                                                } else {
+                                                    warn!("tool call serialized to non-object: {:?}", v);
+                                                }
+                                                v
+                                            })
+                                            .collect();
                                         let tool_calls_chunk = serde_json::json!({
                                             "id": sse_stream_id,
                                             "object": "chat.completion.chunk",
@@ -789,7 +832,7 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                                             "choices": [{
                                                 "index": 0,
                                                 "delta": {
-                                                    "tool_calls": parsed_tool_calls
+                                                    "tool_calls": indexed_tool_calls
                                                 },
                                                 "finish_reason": null
                                             }]
