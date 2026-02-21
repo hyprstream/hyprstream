@@ -1,0 +1,29 @@
+# Maintainer: DagoRed
+pkgname=hyprstream
+pkgver=0.2.0
+pkgrel=1
+pkgdesc="Agentic infrastructure for continuously learning applications"
+arch=('x86_64')
+url="https://github.com/hyprstream/hyprstream"
+license=('AGPL3' 'MIT')
+depends=('capnproto' 'cuda' 'python-pytorch-opt-cuda')
+makedepends=('base-devel' 'rustup')
+source=("hyprstream::git+https://github.com/hyprstream/hyprstream.git#branch=main")
+sha256sums=("SKIP")     
+
+prepare() {
+  cd 'hyprstream'
+  rustup default stable
+}
+
+build() {
+  cd "$pkgname"
+  cargo build --bin hyprstream --release
+}
+
+package() {
+  cd "$pkgname"
+  install -Dm755 "target/release/hyprstream" "$pkgdir/usr/bin/hyprstream"
+  install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+  install -Dm644 LICENSE-AGPLV3 "$pkgdir/usr/share/licenses/$pkgname/LICENSE-AGPLV3"
+}
