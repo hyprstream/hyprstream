@@ -272,7 +272,7 @@ impl FidTable {
         let entry = self
             .fids
             .get(&fid)
-            .ok_or(FsError::NotFound(format!("bad fid: {}", fid)))?;
+            .ok_or_else(|| FsError::NotFound(format!("bad fid: {}", fid)))?;
         if entry.owner_identity != client_id {
             return Err(FsError::PermissionDenied(
                 "fid not owned by caller".into(),

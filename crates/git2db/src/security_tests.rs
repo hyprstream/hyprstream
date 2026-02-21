@@ -3,10 +3,11 @@
 //! This module contains security-focused tests to verify that all
 //! critical security fixes are working correctly.
 
+#![allow(clippy::unwrap_used)]
+
 use crate::config::Git2DBConfig;
 use crate::errors::Git2DBError;
 use crate::transport_registry::TransportRegistry;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::tempdir;
 
@@ -178,7 +179,7 @@ mod integration_tests {
 
     #[test]
     fn test_path_validation_integration() {
-        let config = Git2DBConfig::default();
+        let _config = Git2DBConfig::default();
         let temp_dir = tempdir().unwrap();
 
         // Test that path validation works with real file operations using safe_path
@@ -271,7 +272,7 @@ mod performance_tests {
                 std::thread::spawn(move || {
                     for j in 0..100 {
                         let path = format!("thread_{}_path_{}", i, j);
-                        let _ = hyprstream_containedfs::contained_join(&*base, &path);
+                        let _ = hyprstream_containedfs::contained_join(&base, &path);
                     }
                 })
             })
@@ -286,34 +287,30 @@ mod performance_tests {
 #[cfg(test)]
 mod fuzz_tests {
     use super::*;
+    use quickcheck::{Arbitrary, Gen};
+    use quickcheck_macros::quickcheck;
 
-    #[test]
-    fn test_path_validation_fuzz() {
-        use quickcheck::{Arbitrary, Gen};
-        use quickcheck_macros::quickcheck;
+    #[derive(Clone, Debug)]
+    struct FuzzPath(Vec<u8>);
 
-        #[derive(Clone, Debug)]
-        struct FuzzPath(Vec<u8>);
+    impl Arbitrary for FuzzPath {
+        fn arbitrary(g: &mut Gen) -> Self {
+            let size = g.size();
+            let bytes: Vec<u8> = (0..size).map(|_| u8::arbitrary(g)).collect();
+            FuzzPath(bytes)
+        }
+    }
 
-        impl Arbitrary for FuzzPath {
-            fn arbitrary(g: &mut Gen) -> Self {
-                let size = g.size();
-                let bytes: Vec<u8> = (0..size).map(|_| u8::arbitrary(g)).collect();
-                FuzzPath(bytes)
-            }
+    #[quickcheck]
+    fn path_validation_doesnt_panic(fuzz_path: FuzzPath) -> bool {
+        let temp_dir = tempdir().unwrap();
+
+        if let Ok(path_str) = std::str::from_utf8(&fuzz_path.0) {
+            let _ = hyprstream_containedfs::contained_join(temp_dir.path(), path_str);
         }
 
-        #[quickcheck]
-        fn path_validation_doesnt_panic(fuzz_path: FuzzPath) -> bool {
-            let temp_dir = tempdir().unwrap();
-
-            if let Ok(path_str) = std::str::from_utf8(&fuzz_path.0) {
-                let _ = hyprstream_containedfs::contained_join(temp_dir.path(), path_str);
-            }
-
-            // Should never panic, regardless of input
-            true
-        }
+        // Should never panic, regardless of input
+        true
     }
 }
 
