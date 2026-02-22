@@ -113,6 +113,12 @@ struct GenerationRequest {
   seed @8 :UInt32 $optional;
   images @9 :List(Data) $optional;
   timeoutMs @10 :UInt64 $optional;
+
+  # Per-request TTT control (all optional — omit for server defaults)
+  tttEnabled @11 :Bool;
+  tttGradientSteps @12 :UInt32 $optional;
+  tttLearningRate @13 :Float32 $optional;
+  autoCommit @14 :Bool;
 }
 
 # Quality metrics for self-supervised training

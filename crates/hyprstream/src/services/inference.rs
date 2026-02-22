@@ -73,10 +73,10 @@ enum PendingWork {
         stream_ctx: hyprstream_rpc::StreamContext,
         /// Generation request to execute
         request: GenerationRequest,
-        /// TTT adaptation metrics (if TTT was run in prepare_stream)
-        ttt_result: Option<crate::training::ttt::TTTResult>,
-        /// Per-tenant delta for delta-aware inference (looked up in prepare_stream)
-        delta: Option<Arc<Mutex<crate::training::TenantDelta>>>,
+        /// Subject identity for tenant-aware TTT (deferred to execute_stream)
+        subject: Subject,
+        /// Per-request TTT overrides (deferred to execute_stream)
+        ttt_overrides: crate::training::ttt::TTTOverrides,
     },
     /// Streaming training step (avoids REQ/REP timeout on backward pass compilation)
     Training {
@@ -657,10 +657,6 @@ impl InferenceService {
     /// - Ok(Some(result)) if TTT was configured and ran (or was skipped)
     /// - Ok(None) if TTT is not configured
     /// - Err(e) if TTT failed unexpectedly
-    async fn apply_ttt_adaptation(&self, prompt: &str, subject: &Subject) -> Result<Option<crate::training::ttt::TTTResult>> {
-        self.apply_ttt_adaptation_with_overrides(prompt, subject, &crate::training::ttt::TTTOverrides::default()).await
-    }
-
     /// Apply TTT adaptation with per-request overrides.
     ///
     /// Uses subject-specific delta pool for isolated per-session adaptation.
@@ -760,17 +756,10 @@ impl InferenceService {
         claims: Option<hyprstream_rpc::auth::Claims>,
         expiry_secs: i64,
         subject: &Subject,
+        ttt_overrides: crate::training::ttt::TTTOverrides,
     ) -> Result<(String, [u8; 32], PendingWork)> {
-        // Apply TTT adaptation BEFORE streaming (capture metrics for completion)
-        let ttt_result = match self.apply_ttt_adaptation(request.prompt.as_str(), subject).await {
-            Ok(Some(result)) => Some(result),
-            Ok(None) => None,  // TTT not configured/applicable
-            Err(e) => {
-                // Log error but continue with streaming
-                warn!("TTT adaptation failed, continuing without: {}", e);
-                None
-            }
-        };
+        // TTT adaptation is deferred to execute_stream (runs in continuation after REP
+        // is sent) to avoid blocking the ZMQ REQ/REP handler with GPU-intensive work.
 
         // DH key derivation is required - no legacy fallback
         let client_pub_bytes = client_ephemeral_pubkey
@@ -793,14 +782,12 @@ impl InferenceService {
         let stream_id = stream_ctx.stream_id().to_owned();
         let server_pubkey = *stream_ctx.server_pubkey();
 
-        // Look up tenant's delta and/or base delta for delta-aware inference
-        let delta = self.resolve_delta(subject);
-
+        // Delta lookup deferred to execute_stream (after TTT may modify it)
         let pending = PendingWork::Generation {
             stream_ctx,
             request,
-            ttt_result,
-            delta,
+            subject: subject.clone(),
+            ttt_overrides,
         };
 
         Ok((stream_id, server_pubkey, pending))
@@ -822,12 +809,13 @@ impl InferenceService {
     /// 7. StreamService is blind forwarder (no HMAC verification)
     ///
     /// Note: The read lock must be held across await because TextStream<'_> borrows from the engine.
-    /// With tokio::sync::RwLock, the lock yields instead of blocking the OS thread, preventing
-    /// deadlocks with concurrent write-lock requests (e.g., createLora during streaming).
+    /// tokio::sync::RwLock allows concurrent readers, but write-lock requests (createLora) will
+    /// block until all active streams complete. GPU-intensive TTT is deferred to this continuation
+    /// to avoid blocking the ZMQ REQ/REP handler.
     async fn execute_stream(&self, pending: PendingWork) {
         use futures::StreamExt;
 
-        let PendingWork::Generation { stream_ctx, request, ttt_result, delta } = pending else {
+        let PendingWork::Generation { stream_ctx, request, subject, ttt_overrides } = pending else {
             error!("execute_stream called with non-Generation PendingWork");
             return;
         };
@@ -842,10 +830,56 @@ impl InferenceService {
             }
         };
 
+        // TTT runs HERE (in continuation, after REP sent — ZMQ loop unblocked).
+        // If the user explicitly enabled TTT (ttt_enabled=true), failures are stream errors.
+        // If TTT is only from server config, failures are non-fatal (warn + continue).
+        let ttt_result = match self.apply_ttt_adaptation_with_overrides(
+            request.prompt.as_str(), &subject, &ttt_overrides
+        ).await {
+            Ok(Some(result)) => Some(result),
+            Ok(None) => {
+                // TTT not available on this server (no trainer/pool/tokenizer configured)
+                if ttt_overrides.enabled == Some(true) {
+                    // User explicitly requested TTT — this is an error
+                    error!(stream_id = %stream_ctx.stream_id(), subject = %subject, "TTT explicitly enabled but not available on server");
+                    let sc = stream_channel;
+                    if let Err(send_err) = sc.with_publisher(stream_ctx, |mut publisher| async move {
+                        publisher.publish_error("TTT explicitly enabled but not configured on this server").await
+                    }).await {
+                        error!(stream_id = %stream_ctx.stream_id(), error = %send_err,
+                            "Failed to publish TTT error to stream");
+                    }
+                    return;
+                }
+                None  // TTT not requested or not configured — proceed without
+            }
+            Err(e) => {
+                if ttt_overrides.enabled == Some(true) {
+                    // User explicitly requested TTT — adaptation failure is a stream error
+                    error!(stream_id = %stream_ctx.stream_id(), subject = %subject, error = %e, "TTT adaptation failed");
+                    let sc = stream_channel;
+                    if let Err(send_err) = sc.with_publisher(stream_ctx, |mut publisher| async move {
+                        publisher.publish_error(&format!("TTT adaptation failed: {}", e)).await
+                    }).await {
+                        error!(stream_id = %stream_ctx.stream_id(), error = %send_err,
+                            "Failed to publish TTT error to stream");
+                    }
+                    return;
+                }
+                // TTT running from server config only — warn and continue
+                warn!("TTT adaptation failed (server-config), continuing without: {}", e);
+                None
+            }
+        };
+
+        // Re-resolve delta after TTT (may have been updated by adaptation)
+        let delta = self.resolve_delta(&subject);
+
         trace!(
             stream_id = %stream_ctx.stream_id(),
             topic = %stream_ctx.topic(),
             has_delta = delta.is_some(),
+            has_ttt = ttt_result.is_some(),
             "Starting E2E authenticated stream via StreamChannel"
         );
 
@@ -895,7 +929,7 @@ impl InferenceService {
                         let stats = stream.stats();
                         let mut complete = crate::services::rpc_types::InferenceComplete::from(&stats);
 
-                        // Attach TTT metrics to completion (captured in prepare_stream)
+                        // Attach TTT metrics to completion (from deferred TTT in execute_stream)
                         complete.ttt_metrics = ttt_result.map(std::convert::Into::into);
 
                         publisher.complete_ref(&complete.to_bytes()).await?;
@@ -1617,10 +1651,18 @@ impl InferenceHandler for InferenceService {
             images: vec![],
             timeout: if data.timeout_ms == 0 { None } else { Some(data.timeout_ms) },
             collect_metrics: false,
-            ttt_enabled: false,
-            ttt_gradient_steps: 0,
-            ttt_learning_rate: 0.0,
-            auto_commit: false,
+            ttt_enabled: data.ttt_enabled,
+            ttt_gradient_steps: data.ttt_gradient_steps,
+            ttt_learning_rate: data.ttt_learning_rate,
+            auto_commit: data.auto_commit,
+        };
+
+        // Build per-request TTT overrides from RPC fields
+        let ttt_overrides = crate::training::ttt::TTTOverrides {
+            enabled: if data.ttt_enabled { Some(true) } else { None },
+            gradient_steps: if data.ttt_gradient_steps > 0 { Some(data.ttt_gradient_steps) } else { None },
+            learning_rate: if data.ttt_learning_rate > 0.0 { Some(data.ttt_learning_rate) } else { None },
+            auto_commit: data.auto_commit,
         };
 
         // Calculate expiry from claims
@@ -1631,7 +1673,7 @@ impl InferenceHandler for InferenceService {
 
         let client_ephemeral_pubkey = ctx.ephemeral_pubkey();
         let claims = ctx.claims().cloned();
-        let (stream_id, server_pubkey, pending) = self.prepare_stream(request, client_ephemeral_pubkey, claims, expiry_secs, &subject).await?;
+        let (stream_id, server_pubkey, pending) = self.prepare_stream(request, client_ephemeral_pubkey, claims, expiry_secs, &subject, ttt_overrides).await?;
 
         let stream_sub_endpoint = hyprstream_rpc::registry::global()
             .endpoint("streams", hyprstream_rpc::registry::SocketKind::Sub)
@@ -2226,6 +2268,10 @@ impl InferenceZmqClient {
             request.seed.unwrap_or(0),
             &[], // images
             request.timeout.unwrap_or(0),
+            request.ttt_enabled,
+            request.ttt_gradient_steps,
+            request.ttt_learning_rate,
+            request.auto_commit,
             ephemeral_pubkey.unwrap_or([0u8; 32]),
         ).await
     }
