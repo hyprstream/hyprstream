@@ -525,8 +525,9 @@ pub async fn handle_worker_terminal(
 
     // 5. Main I/O loop — StreamHandle handles HMAC-verified receive
     let running_recv = running.clone();
+    let cancel_recv = cancel.clone();
     let recv_handle = std::thread::spawn(move || {
-        // Drop guard ensures main thread is always unblocked, even on panic
+        // Drop guard ensures `running` is set to false on all exit paths (normal, break, panic)
         struct RunGuard(Arc<AtomicBool>);
         impl Drop for RunGuard {
             fn drop(&mut self) {
@@ -566,6 +567,7 @@ pub async fn handle_worker_terminal(
                 }
             }
         });
+        cancel_recv.cancel();  // notify server promptly on all exit paths
         // _guard drops here, storing false into running
     });
 
