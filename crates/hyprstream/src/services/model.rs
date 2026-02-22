@@ -33,7 +33,7 @@ use crate::config::{GenerationRequest, TemplatedPrompt};
 use crate::runtime::kv_quant::KVQuantType;
 use crate::runtime::RuntimeConfig;
 use crate::services::{
-    rpc_types::StreamInfo, EnvelopeContext, InferenceService, InferenceZmqClient,
+    rpc_types::StreamInfo, EnvelopeContext, InferenceZmqClient,
     PolicyClient,
 };
 use crate::services::GenRegistryClient;
@@ -269,17 +269,21 @@ impl ModelService {
         // Obtain FsOps from the registry for path-contained adapter I/O
         let fs: Option<crate::services::WorktreeClient> = Some(repo_client.worktree(&branch_name));
 
-        // Start InferenceService for this model
-        let service_handle = InferenceService::start_at(
+        // Start InferenceService for this model via standard Spawnable infrastructure
+        let transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(&endpoint);
+        let service_config = crate::services::InferenceServiceConfig::new(
             &model_path,
             runtime_config,
             self.signing_key.verifying_key(),
             self.signing_key.clone(),
             self.policy_client.clone(),
-            &endpoint,
+            Arc::clone(hyprstream_rpc::ZmqService::context(self)),
+            transport,
             fs,
-        )
-        .await?;
+        );
+        let spawner = hyprstream_rpc::service::spawner::ServiceSpawner::threaded();
+        let service_handle = spawner.spawn(service_config).await
+            .map_err(|e| anyhow!("Failed to spawn inference service: {}", e))?;
 
         // Create client for this service
         let client = InferenceZmqClient::with_endpoint(

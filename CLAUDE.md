@@ -1,6 +1,6 @@
 # hyprstream Development Guide
 
-**Claude AI Assistant Guide** - Updated Oct 31, 2025
+**Claude AI Assistant Guide** - Updated Feb 22, 2026
 
 ---
 
@@ -73,37 +73,58 @@ hyprstream is a high-performance LLM inference and training engine built on PyTo
 ```
 hyprstream/
 ├── crates/
-│   ├── hyprstream/          # Main application
+│   ├── hyprstream/              # Main application (MIT OR AGPL-3.0)
 │   │   ├── src/
-│   │   │   ├── runtime/     # PyTorch inference engine
-│   │   │   ├── storage/     # Model & adapter storage (file-based)
-│   │   │   ├── git/         # git2db integration & helpers
-│   │   │   ├── training/    # LoRA training system
-│   │   │   ├── lora/        # LoRA implementation
-│   │   │   ├── api/         # REST API (OpenAI-compatible)
-│   │   │   ├── cli/         # CLI commands
-│   │   │   └── server/      # HTTP server & state management
+│   │   │   ├── runtime/         # PyTorch inference engine
+│   │   │   ├── storage/         # Model & adapter storage (file-based)
+│   │   │   ├── git/             # git2db integration & helpers
+│   │   │   ├── training/        # LoRA training system
+│   │   │   ├── lora/            # LoRA implementation
+│   │   │   ├── api/             # REST API (OpenAI-compatible)
+│   │   │   ├── cli/             # CLI commands
+│   │   │   └── server/          # HTTP server & state management
 │   │   └── Cargo.toml
 │   │
-│   ├── git2db/              # Git repository management library ⭐
+│   ├── git2db/                  # Git repository management library ⭐
 │   │   ├── src/
-│   │   │   ├── manager.rs   # Global repository cache
-│   │   │   ├── registry.rs  # Repository tracking (Git2DB)
-│   │   │   ├── branch.rs    # Branch operations
-│   │   │   ├── storage/     # Storage drivers (overlay2, vfs)
+│   │   │   ├── manager.rs       # Global repository cache
+│   │   │   ├── registry.rs      # Repository tracking (Git2DB)
+│   │   │   ├── branch.rs        # Branch operations
+│   │   │   ├── storage/         # Storage drivers (overlay2, vfs)
 │   │   │   └── ...
-│   │   ├── CLAUDE.md        # git2db AI guide
+│   │   ├── CLAUDE.md            # git2db AI guide
 │   │   └── Cargo.toml
 │   │
-│   └── git-xet-filter/      # XET large file storage
-│       └── ...
+│   ├── git-xet-filter/          # XET large file storage (experimental)
+│   ├── gittorrent/              # P2P model distribution via GitTorrent
+│   ├── cas-serve/               # Content-addressable storage server
+│   ├── hyprstream-flight/       # Arrow Flight SQL server
+│   ├── hyprstream-metrics/      # Metrics storage & query engine (DuckDB/DataFusion)
+│   ├── hyprstream-rpc/          # Cap'n Proto RPC definitions
+│   ├── hyprstream-rpc-build/    # RPC build tooling
+│   ├── hyprstream-rpc-derive/   # RPC derive macros
+│   ├── hyprstream-workers/      # Kata-based worker isolation
+│   ├── hyprstream-containedfs/  # Contained filesystem operations
+│   └── bitsandbytes-sys/        # bitsandbytes FFI bindings (standalone)
 │
-├── README.md                # User-facing documentation
-├── CLAUDE.md                # This file - AI assistant guide
-└── docs/                    # Architecture & planning docs
-    ├── COW_ARCHITECTURE.md
-    ├── GIT2DB-*.md
-    └── ...
+├── appimage/                    # AppImage build system
+│   └── build-appimage.sh        # Build script for all variants
+├── install.sh                   # curl|bash installer for AppImage
+├── README.md                    # User-facing documentation
+├── CLAUDE.md                    # This file - AI assistant guide
+├── CONTRIBUTING.md              # Contribution guidelines
+├── DEVELOP.md                   # Developer setup guide
+├── LICENSE-MIT                  # MIT license
+├── LICENSE-AGPLV3               # AGPL-3.0 license
+└── docs/                        # Architecture & design docs
+    ├── quickstart.md            # Prerequisites & first-time setup
+    ├── TOOL_CALLING.md          # Tool calling implementation
+    ├── KV-CACHE-ARCHITECTURE.md # KV cache design
+    ├── rpc-architecture.md      # Cap'n Proto RPC design
+    ├── workers-architecture.md  # Kata worker isolation
+    ├── streaming-service-architecture.md
+    ├── eventservice-architecture.md
+    └── cryptography-architecture.md
 ```
 
 ---
@@ -877,17 +898,28 @@ Filter Layer (git-xet-filter)
 
 ---
 
+## Licensing
+
+- **hyprstream** crate: Dual-licensed under **MIT OR AGPL-3.0** (user's choice)
+- **All other crates**: **MIT**
+- License files: `LICENSE-MIT`, `LICENSE-AGPLV3` at repository root
+
+---
+
 ## Additional Resources
 
 - **README.md** - User-facing documentation
-- **ARCHITECTURE.md** - Visual architecture diagrams and component relationships
-- **TOKEN_STREAM_EXAMPLES.md** - Future TokenStream API design (WIP - not yet implemented)
+- **DEVELOP.md** - Developer setup guide
+- **CONTRIBUTING.md** - Contribution guidelines
 - **crates/git2db/CLAUDE.md** - git2db AI guide
-- **docs/COW_ARCHITECTURE.md** - Worktree CoW mechanisms
-- **docs/GIT2DB-*.md** - git2db design documents
-- **docs/** - Historical planning documents
-
-**Note on TOKEN_STREAM_EXAMPLES.md**: This file contains the original design documentation for the Stream-based API. The Stream API has been fully implemented in `torch_engine.rs` (see `TextStream`). The examples file remains as historical reference for the design process.
+- **docs/quickstart.md** - Prerequisites, installation, and first-time setup
+- **docs/TOOL_CALLING.md** - Tool calling implementation
+- **docs/KV-CACHE-ARCHITECTURE.md** - KV cache design
+- **docs/rpc-architecture.md** - Cap'n Proto RPC architecture
+- **docs/workers-architecture.md** - Kata-based worker isolation
+- **docs/streaming-service-architecture.md** - Streaming service design
+- **docs/eventservice-architecture.md** - Event service design
+- **docs/cryptography-architecture.md** - Cryptography design
 
 ---
 
@@ -895,8 +927,9 @@ Filter Layer (git-xet-filter)
 
 ```bash
 # Build
-export LIBTORCH=/mnt/hyprstream/libtorch
-cargo build --features otel
+export LIBTORCH=/path/to/libtorch
+export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
+cargo build --release
 
 # Test
 cargo test --workspace
@@ -913,9 +946,13 @@ cargo fmt --all
 # Check code
 cargo clippy --all-targets --all-features
 
-# AppImage update (build + reinstall service)
-./build-appimage.sh build rocm71 \
-  && ./output/hyprstream-dev-rocm71-x86_64.AppImage service install --start
+# AppImage build + reinstall service
+./appimage/build-appimage.sh build rocm71 \
+  && ./appimage/output/hyprstream-dev-rocm71-x86_64.AppImage service install --start
+
+# Install via script
+bash install.sh
+# Or: curl -fsSL https://install.hyprstream.dev | bash
 ```
 
 ---

@@ -18,8 +18,10 @@ use crate::config::{
 };
 use crate::runtime::model_config::ModelConfig;
 use crate::runtime::template_engine::ChatMessage;
-use crate::services::{InferenceZmqClient, PolicyClient, GenRegistryClient, WorktreeClient, INFERENCE_ENDPOINT};
+use crate::services::{InferenceServiceConfig, InferenceZmqClient, PolicyClient, GenRegistryClient, WorktreeClient, INFERENCE_ENDPOINT};
 use crate::storage::ModelRef;
+use crate::zmq::global_context;
+use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::{RequestIdentity, SigningKey, VerifyingKey};
 use std::path::PathBuf;
 
@@ -325,7 +327,6 @@ pub async fn handle_training_infer(
     verifying_key: VerifyingKey,
 ) -> Result<()> {
     use crate::runtime::RuntimeConfig;
-    use crate::services::InferenceService;
 
     info!(
         "Training inference: model={}, prompt_len={}",
@@ -370,16 +371,20 @@ pub async fn handle_training_infer(
     };
 
     // Start InferenceService with TTT enabled
-    let mut service_handle = InferenceService::start_at(
+    let transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(INFERENCE_ENDPOINT);
+    let service_config = InferenceServiceConfig::new(
         &model_path,
         runtime_config,
         verifying_key,
         signing_key.clone(),
         policy_client,
-        INFERENCE_ENDPOINT,
+        global_context(),
+        transport,
         None, // CLI: no FsOps
-    )
-    .await?;
+    );
+    let spawner = ServiceSpawner::threaded();
+    let mut service_handle = spawner.spawn(service_config).await
+        .map_err(|e| anyhow::anyhow!("Failed to spawn inference service: {}", e))?;
 
     // Create client for service communication
     let client = InferenceZmqClient::new(signing_key, RequestIdentity::local());
@@ -527,7 +532,7 @@ async fn collect_inference_stream(
                 bail!("Stream ended without completion");
             }
             Ok(None) => {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
             Err(e) => {
                 bail!("Stream error: {e}");
@@ -561,7 +566,6 @@ pub async fn handle_training_batch(
     verifying_key: VerifyingKey,
 ) -> Result<()> {
     use crate::runtime::RuntimeConfig;
-    use crate::services::{InferenceService, INFERENCE_ENDPOINT};
     use crate::storage::AdapterManager;
     use glob::glob;
 
@@ -659,16 +663,20 @@ pub async fn handle_training_batch(
 
     let policy_client = PolicyClient::new(signing_key.clone(), RequestIdentity::local());
     // Start InferenceService with TTT enabled
-    let mut service_handle = InferenceService::start_at(
+    let transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(INFERENCE_ENDPOINT);
+    let service_config = InferenceServiceConfig::new(
         &model_path,
         runtime_config,
         verifying_key,
         signing_key.clone(),
         policy_client,
-        INFERENCE_ENDPOINT,
+        global_context(),
+        transport,
         None, // CLI: no FsOps
-    )
-    .await?;
+    );
+    let spawner = ServiceSpawner::threaded();
+    let mut service_handle = spawner.spawn(service_config).await
+        .map_err(|e| anyhow::anyhow!("Failed to spawn inference service: {}", e))?;
 
     let client = InferenceZmqClient::new(signing_key, RequestIdentity::local());
 

@@ -16,6 +16,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::rc::Rc;
 use std::sync::Arc;
 use tmq::{FromZmqSocket, Multipart, RequestReceiver, RequestSender};
 use tokio::sync::Notify;
@@ -171,7 +172,7 @@ impl EnvelopeContext {
 /// manager.spawn(Box::new(my_service)).await?;
 /// ```
 #[async_trait(?Send)]
-pub trait ZmqService: Send + Sync + 'static {
+pub trait ZmqService: 'static {
     /// Process a request and return a response with optional continuation.
     ///
     /// # Arguments
@@ -204,13 +205,30 @@ pub trait ZmqService: Send + Sync + 'static {
         self.signing_key().verifying_key()
     }
 
+    /// Optional pre-handler claims verification.
+    ///
+    /// Called by `RequestLoop` after envelope signature verification, before `handle_request`.
+    /// Return `Err` to reject the request before dispatch.
+    ///
+    /// Use this for E2E JWT verification (e.g., downgrade attack prevention).
+    /// Default: no additional verification.
+    fn verify_claims(&self, ctx: &EnvelopeContext) -> anyhow::Result<()> {
+        let _ = ctx;
+        Ok(())
+    }
+
     /// Build a generic error response payload for unexpected errors.
     ///
     /// Default implementation returns an empty vec (backwards compat).
     /// Generated services should override with schema-correct error payloads
     /// so clients receive proper `Error(ErrorInfo{...})` instead of parse failures.
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
-        let _ = (request_id, error);
+        warn!(
+            service = self.name(),
+            request_id,
+            error,
+            "build_error_payload not overridden — sending empty error response"
+        );
         vec![]
     }
 }
@@ -306,8 +324,8 @@ impl RequestLoop {
         // Create oneshot channel for ready signal
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
 
-        // Wrap service in Arc for sharing with spawn_blocking handlers
-        let service = Arc::new(service);
+        // Wrap service in Rc for sharing within single-threaded local set
+        let service = Rc::new(service);
 
         // Spawn async task (not spawn_blocking - TMQ provides async I/O)
         let handle = tokio::task::spawn_local(async move {
@@ -347,7 +365,7 @@ impl RequestLoop {
     async fn service_loop_async<S: ZmqService>(
         transport: TransportConfig,
         context: Arc<zmq::Context>,
-        service: Arc<S>,
+        service: Rc<S>,
         server_pubkey: VerifyingKey,
         signing_key: SigningKey,
         nonce_cache: Arc<InMemoryNonceCache>,
@@ -457,6 +475,21 @@ impl RequestLoop {
                         ctx.subject(),
                         request_id
                     );
+
+                    // Pre-handler claims verification (E2E JWT, downgrade protection)
+                    if let Err(e) = service.verify_claims(&ctx) {
+                        warn!(
+                            "{} claims verification failed for {} (id={}): {}",
+                            service.name(), ctx.subject(), request_id, e
+                        );
+                        let error_payload = service.build_error_payload(request_id, &e.to_string());
+                        let msg: Multipart = vec![error_payload].into();
+                        receiver = sender
+                            .send(msg)
+                            .await
+                            .map_err(|e| anyhow!("send error: {}", e))?;
+                        continue;
+                    }
 
                     // Process request directly (handlers are now async)
                     let result = service.handle_request(&ctx, &payload).await;

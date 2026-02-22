@@ -54,8 +54,7 @@ use capnp::serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-use parking_lot::{Mutex, RwLock};
-use tmq::{reply, Multipart};
+use parking_lot::Mutex;
 use tokio::runtime::Handle;
 use tokenizers::Tokenizer;
 use tracing::{debug, error, info, trace, warn};
@@ -96,27 +95,6 @@ enum PendingWork {
     },
 }
 
-/// Wraps a `!Send` future to satisfy the `Send` bound on [`Continuation`].
-///
-/// # Safety
-///
-/// This is safe because InferenceService's continuations only run on its
-/// dedicated single-threaded tokio runtime (`run_service_loop`). They are
-/// never sent between threads. The `Send` bound comes from the [`Continuation`]
-/// type alias (`Pin<Box<dyn Future + Send>>`), which exists for services that
-/// use `RequestLoop` (which requires `Send`). InferenceService uses a custom loop.
-///
-/// The specific `!Send` type is `parking_lot::RwLockReadGuard` held across an
-/// `.await` in `execute_stream`, protecting the `TorchEngine` during streaming
-/// token generation.
-struct UnsafeSendFuture(std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>);
-unsafe impl Send for UnsafeSendFuture {}
-impl std::future::Future for UnsafeSendFuture {
-    type Output = ();
-    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
-        self.0.as_mut().poll(cx)
-    }
-}
 
 /// Default endpoint for the inference service
 pub const INFERENCE_ENDPOINT: &str = "inproc://hyprstream/inference";
@@ -149,12 +127,12 @@ pub const INFERENCE_ENDPOINT: &str = "inproc://hyprstream/inference";
 /// in `Arc` and implements `Deref` so all field/method access is transparent.
 /// Streaming continuations clone the `Arc` to own the state across await points.
 pub struct InferenceServiceInner {
-    engine: RwLock<TorchEngine>,
+    engine: tokio::sync::RwLock<TorchEngine>,
     /// Model path for checkpoint management
     #[allow(dead_code)] // Future: checkpoint management
     model_path: PathBuf,
     /// Current session ID for events
-    session_id: RwLock<Option<String>>,
+    session_id: parking_lot::RwLock<Option<String>>,
     /// Runtime handle for async operations (reused instead of creating new runtimes)
     #[allow(dead_code)] // Reserved for future async operations
     runtime_handle: Handle,
@@ -164,8 +142,10 @@ pub struct InferenceServiceInner {
     /// Server's Ed25519 verifying key for signature verification
     server_pubkey: VerifyingKey,
     /// Service signing key for stream registration (generated at init)
+    #[allow(dead_code)] // Used by callback mode; standard mode passes key to InferenceZmqAdapter
     signing_key: SigningKey,
     /// Nonce cache for replay protection
+    #[allow(dead_code)] // Standard mode uses RequestLoop's nonce cache; kept for callback mode
     nonce_cache: Arc<InMemoryNonceCache>,
     /// Policy client for authorization checks (async via TMQ)
     policy_client: PolicyClient,
@@ -183,6 +163,12 @@ pub struct InferenceServiceInner {
     /// Optional WorktreeClient for worktree-scoped file operations.
     /// When present, adapter/snapshot writes use contained-root access.
     fs: Option<WorktreeClient>,
+    /// ZMQ context for socket creation
+    #[allow(dead_code)] // Standard mode passes context to InferenceZmqAdapter
+    zmq_context: Arc<zmq::Context>,
+    /// Transport configuration for the service endpoint
+    #[allow(dead_code)] // Standard mode passes transport to InferenceZmqAdapter
+    transport: hyprstream_rpc::transport::TransportConfig,
 }
 
 /// ZMQ-based inference service
@@ -259,61 +245,6 @@ pub struct ExportPeftInfo {
 }
 
 impl InferenceService {
-    /// Start the inference service at a specific endpoint
-    pub async fn start_at(
-        model_path: impl AsRef<Path>,
-        config: RuntimeConfig,
-        server_pubkey: VerifyingKey,
-        signing_key: SigningKey,
-        policy_client: PolicyClient,
-        endpoint: &str,
-        fs: Option<WorktreeClient>,
-    ) -> Result<hyprstream_rpc::service::SpawnedService> {
-        let model_path = model_path.as_ref().to_path_buf();
-        let endpoint_owned = endpoint.to_owned();
-        let nonce_cache = Arc::new(InMemoryNonceCache::new());
-
-        // Use oneshot to get initialization result
-        let (init_tx, init_rx) = tokio::sync::oneshot::channel();
-
-        // Spawn service on dedicated thread
-        std::thread::spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build() {
-                    Ok(rt) => rt,
-                    Err(e) => {
-                        let _ = init_tx.send(Err(anyhow!("Failed to create service runtime: {}", e)));
-                        return;
-                    }
-                };
-
-            rt.block_on(async move {
-                match Self::initialize(model_path, config, server_pubkey, signing_key, nonce_cache, policy_client, fs).await {
-                    Ok(service) => {
-                        // Pass init_tx to run_service_loop - it signals AFTER socket binding
-                        Self::run_service_loop(service, &endpoint_owned, Some(init_tx)).await;
-                    }
-                    Err(e) => {
-                        if init_tx.send(Err(e)).is_err() {
-                            tracing::warn!("Failed to send initialization error - receiver dropped");
-                        }
-                    }
-                }
-            });
-        });
-
-        // Wait for initialization
-        init_rx
-            .await
-            .map_err(|_| anyhow!("Service init channel closed"))??;
-
-        info!("Inference service started at {}", endpoint);
-
-        // Return a dummy handle (the service manages its own lifecycle)
-        Ok(hyprstream_rpc::service::SpawnedService::dummy())
-    }
-
     /// Start inference service in callback mode
     ///
     /// This mode is used when InferenceService is spawned as a separate process.
@@ -345,7 +276,8 @@ impl InferenceService {
             .enable_all()
             .build()?;
 
-        rt.block_on(async move {
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async move {
             Self::run_callback_mode(instance_id, callback_endpoint, config, policy_client).await
         })
     }
@@ -462,8 +394,14 @@ impl InferenceService {
         loop {
             match dealer.recv_bytes(0) {
                 Ok(data) => {
-                    let response = service.handle_callback_command(&data).await?;
+                    let (response, continuation) = service.handle_callback_command(&data).await?;
                     dealer.send(&response, 0)?;
+                    // Spawn continuation after response (mirrors RequestLoop's spawn_local behavior).
+                    // Using spawn_local (not inline await) so the DEALER loop isn't blocked
+                    // while streaming completes.
+                    if let Some(future) = continuation {
+                        tokio::task::spawn_local(future);
+                    }
                 }
                 Err(zmq::Error::EAGAIN) => {
                     // Timeout, continue
@@ -478,7 +416,9 @@ impl InferenceService {
     }
 
     /// Handle a command from the callback channel
-    async fn handle_callback_command(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+    async fn handle_callback_command(&mut self, data: &[u8])
+        -> Result<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)>
+    {
         let reader = serialize::read_message(
             &mut std::io::Cursor::new(data),
             ReaderOptions::new(),
@@ -489,7 +429,7 @@ impl InferenceService {
         match cmd.which()? {
             Which::LoadModel(_) => {
                 // Already loaded, return success
-                Self::build_load_model_response(true, "")
+                Ok((Self::build_load_model_response(true, "")?, None))
             }
             Which::Shutdown(()) => {
                 info!("Received Shutdown command, returning");
@@ -504,7 +444,9 @@ impl InferenceService {
     }
 
     /// Handle inference request from callback channel
-    async fn handle_callback_infer(&mut self, request_data: &[u8]) -> Result<Vec<u8>> {
+    async fn handle_callback_infer(&mut self, request_data: &[u8])
+        -> Result<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)>
+    {
         // Parse InferenceRequest
         let reader = serialize::read_message(
             &mut std::io::Cursor::new(request_data),
@@ -533,9 +475,8 @@ impl InferenceService {
         let signed = hyprstream_rpc::envelope::SignedEnvelope::new_signed(envelope, &signing_key);
         let ctx = EnvelopeContext::from_verified(&signed);
 
-        // Dispatch via generated handler
-        let (response, _continuation) = dispatch_inference(self, &ctx, request_data).await?;
-        Ok(response)
+        // Dispatch via generated handler — propagate continuation
+        dispatch_inference(self, &ctx, request_data).await
     }
 
     /// Build Register message
@@ -667,9 +608,9 @@ impl InferenceService {
 
         Ok(InferenceService {
             inner: Arc::new(InferenceServiceInner {
-                engine: RwLock::new(engine),
+                engine: tokio::sync::RwLock::new(engine),
                 model_path,
-                session_id: RwLock::new(None),
+                session_id: parking_lot::RwLock::new(None),
                 runtime_handle,
                 stream_channel: Some(stream_channel),
                 server_pubkey,
@@ -682,6 +623,8 @@ impl InferenceService {
                 base_delta: Mutex::new(None),
                 pending_adaptations: Mutex::new(std::collections::HashMap::new()),
                 fs,
+                zmq_context: global_context(),
+                transport: hyprstream_rpc::transport::TransportConfig::inproc("inference-unset"),
             }),
         })
     }
@@ -708,234 +651,20 @@ impl InferenceService {
         }
     }
 
-    /// Run the service loop (async with TMQ)
-    ///
-    /// The `ready_tx` channel signals when sockets are bound and the service is ready.
-    /// This ensures callers wait for actual readiness, not just initialization.
-    async fn run_service_loop(
-        service: Self,
-        endpoint: &str,
-        ready_tx: Option<tokio::sync::oneshot::Sender<Result<()>>>,
-    ) {
-        let ctx = global_context();
-
-        // Helper to signal error
-        let signal_error = |tx: Option<tokio::sync::oneshot::Sender<Result<()>>>, err: anyhow::Error| {
-            if let Some(tx) = tx {
-                let _ = tx.send(Err(err));
-            }
-        };
-
-        // Create REP socket with TMQ for async I/O
-        let mut receiver = match reply(&ctx).set_linger(0).bind(endpoint) {
-            Ok(r) => r,
-            Err(e) => {
-                let err = anyhow!("failed to bind REP to {}: {}", endpoint, e);
-                error!("{}", err);
-                signal_error(ready_tx, err);
-                return;
-            }
-        };
-
-        // StreamChannel already created in initialize()
-
-        let stream_endpoint = hyprstream_rpc::registry::global()
-            .endpoint("streams", hyprstream_rpc::registry::SocketKind::Push)
-            .to_zmq_string();
-        info!("inference service bound to {} (RPC), streaming via {}", endpoint, stream_endpoint);
-
-        // Signal ready - ZMQ connection will establish asynchronously
-        // With immediate=false, messages queue until connection is ready
-        // execute_stream handles connection errors gracefully
-        if let Some(tx) = ready_tx {
-            if tx.send(Ok(())).is_err() {
-                warn!("Failed to signal service ready - receiver dropped");
-            }
-        }
-
-        // Main service loop (async with TMQ)
-        loop {
-            let result = receiver.recv().await;
-            let (request_msg, sender) = match result {
-                Ok((msg, sender)) => (msg, sender),
-                Err(e) => {
-                    // recv() consumes the receiver, so on error we must exit
-                    // A recv error typically means socket/context problem
-                    error!("inference recv error (fatal): {}", e);
-                    return;
-                }
-            };
-
-            // Extract bytes from multipart message
-            let request: Vec<u8> = request_msg
-                .into_iter()
-                .flat_map(|frame| frame.to_vec())
-                .collect();
-
-            trace!("inference received request ({} bytes)", request.len());
-
-            // Clean up expired pending adaptations on each request
-            service.cleanup_expired_adaptations();
-
-            // Unwrap and verify SignedEnvelope
-            let (envelope_ctx, payload) = match hyprstream_rpc::unwrap_envelope(&request, &service.server_pubkey, &*service.nonce_cache) {
-                Ok((ctx, payload)) => (ctx, payload),
-                Err(e) => {
-                    warn!("inference envelope verification failed: {}", e);
-                    // Build proper error response (request_id=0 since envelope is invalid)
-                    let err_variant = InferenceResponseVariant::Error(ErrorInfo {
-                        message: format!("envelope verification failed: {}", e),
-                        code: "UNAUTHORIZED".to_owned(),
-                        details: String::new(),
-                    });
-                    let error_payload = serialize_response(0, &err_variant).unwrap_or_default();
-                    let msg: Multipart = vec![error_payload].into();
-                    receiver = match sender.send(msg).await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            error!("failed to send error response: {}", e);
-                            return;
-                        }
-                    };
-                    continue;
-                }
-            };
-
-            debug!(
-                "Inference request from {} (envelope_id={})",
-                envelope_ctx.subject(),
-                envelope_ctx.request_id
-            );
-
-            // E2E JWT verification with downgrade protection
-            if let Some(claims) = envelope_ctx.claims() {
-                let verify_result = claims.verify_token(&service.server_pubkey);
-                match verify_result {
-                    Ok(Some(verified)) => {
-                        if verified.sub != claims.sub {
-                            warn!("Claims sub mismatch: envelope={} jwt={}", claims.sub, verified.sub);
-                            let err_variant = InferenceResponseVariant::Error(ErrorInfo {
-                                message: "Claims subject mismatch".to_owned(),
-                                code: "UNAUTHORIZED".to_owned(),
-                                details: String::new(),
-                            });
-                            let error_payload = serialize_response(envelope_ctx.request_id, &err_variant).unwrap_or_default();
-                            let msg: Multipart = vec![error_payload].into();
-                            receiver = match sender.send(msg).await {
-                                Ok(r) => r,
-                                Err(e) => { error!("failed to send error response: {}", e); return; }
-                            };
-                            continue;
-                        }
-                    }
-                    Ok(None) => {
-                        if !envelope_ctx.identity.is_local() {
-                            warn!(
-                                "Non-local request with claims but no JWT token: sub={}, identity={:?}",
-                                claims.sub, envelope_ctx.identity
-                            );
-                            let err_variant = InferenceResponseVariant::Error(ErrorInfo {
-                                message: "JWT token required for non-local requests".to_owned(),
-                                code: "UNAUTHORIZED".to_owned(),
-                                details: String::new(),
-                            });
-                            let error_payload = serialize_response(envelope_ctx.request_id, &err_variant).unwrap_or_default();
-                            let msg: Multipart = vec![error_payload].into();
-                            receiver = match sender.send(msg).await {
-                                Ok(r) => r,
-                                Err(e) => { error!("failed to send error response: {}", e); return; }
-                            };
-                            continue;
-                        }
-                    }
-                    Err(e) => {
-                        warn!("E2E JWT verification failed: {}", e);
-                        let err_variant = InferenceResponseVariant::Error(ErrorInfo {
-                            message: "JWT verification failed".to_owned(),
-                            code: "UNAUTHORIZED".to_owned(),
-                            details: String::new(),
-                        });
-                        let error_payload = serialize_response(envelope_ctx.request_id, &err_variant).unwrap_or_default();
-                        let msg: Multipart = vec![error_payload].into();
-                        receiver = match sender.send(msg).await {
-                            Ok(r) => r,
-                            Err(e) => { error!("failed to send error response: {}", e); return; }
-                        };
-                        continue;
-                    }
-                }
-            }
-
-            // Handle request - may return pending work (now async for policy checks)
-            // Handle request via generated dispatch
-            let request_id = envelope_ctx.request_id;
-            let (response_payload, continuation) = match dispatch_inference(&service, &envelope_ctx, &payload).await {
-                Ok((resp, cont)) => (resp, cont),
-                Err(e) => {
-                    error!("inference request handling error: {}", e);
-                    let err_variant = InferenceResponseVariant::Error(ErrorInfo {
-                        message: e.to_string(),
-                        code: "INTERNAL".to_owned(),
-                        details: String::new(),
-                    });
-                    (serialize_response(request_id, &err_variant).unwrap_or_default(), None)
-                }
-            };
-
-            // Wrap response in signed envelope
-            let response_bytes = {
-                let signed_response = ResponseEnvelope::new_signed(
-                    request_id,
-                    response_payload,
-                    &service.signing_key,
-                );
-
-                let mut message = capnp::message::Builder::new_default();
-                let mut builder = message.init_root::<hyprstream_rpc::common_capnp::response_envelope::Builder>();
-                signed_response.write_to(&mut builder);
-
-                let mut bytes = Vec::new();
-                if let Err(e) = capnp::serialize::write_message(&mut bytes, &message) {
-                    error!("Failed to serialize signed response: {}", e);
-                    vec![]
-                } else {
-                    bytes
-                }
-            };
-
-            // Send signed response via TMQ
-            let msg: Multipart = vec![response_bytes].into();
-            receiver = match sender.send(msg).await {
-                Ok(r) => r,
-                Err(e) => {
-                    error!("failed to send response: {}", e);
-                    return;
-                }
-            };
-
-            // Execute continuation AFTER REP is sent.
-            // This guarantees the client has the StreamInfo (stream_id)
-            // before any data flows on the PUB/SUB channel.
-            if let Some(future) = continuation {
-                future.await;
-            }
-        }
-    }
-
     /// Apply TTT adaptation if enabled (adapts model to input BEFORE generation)
     ///
     /// Returns:
     /// - Ok(Some(result)) if TTT was configured and ran (or was skipped)
     /// - Ok(None) if TTT is not configured
     /// - Err(e) if TTT failed unexpectedly
-    fn apply_ttt_adaptation(&self, prompt: &str, subject: &Subject) -> Result<Option<crate::training::ttt::TTTResult>> {
-        self.apply_ttt_adaptation_with_overrides(prompt, subject, &crate::training::ttt::TTTOverrides::default())
+    async fn apply_ttt_adaptation(&self, prompt: &str, subject: &Subject) -> Result<Option<crate::training::ttt::TTTResult>> {
+        self.apply_ttt_adaptation_with_overrides(prompt, subject, &crate::training::ttt::TTTOverrides::default()).await
     }
 
     /// Apply TTT adaptation with per-request overrides.
     ///
     /// Uses subject-specific delta pool for isolated per-session adaptation.
-    fn apply_ttt_adaptation_with_overrides(
+    async fn apply_ttt_adaptation_with_overrides(
         &self,
         prompt: &str,
         subject: &Subject,
@@ -962,7 +691,7 @@ impl InferenceService {
             .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
         let input_tokens: Vec<u32> = encoding.get_ids().to_vec();
 
-        let engine = self.engine.read();
+        let engine = self.engine.read().await;
 
         // Ensure delta exists for this subject
         let delta_arc = pool.get_or_create(subject)?;
@@ -1033,7 +762,7 @@ impl InferenceService {
         subject: &Subject,
     ) -> Result<(String, [u8; 32], PendingWork)> {
         // Apply TTT adaptation BEFORE streaming (capture metrics for completion)
-        let ttt_result = match self.apply_ttt_adaptation(request.prompt.as_str(), subject) {
+        let ttt_result = match self.apply_ttt_adaptation(request.prompt.as_str(), subject).await {
             Ok(Some(result)) => Some(result),
             Ok(None) => None,  // TTT not configured/applicable
             Err(e) => {
@@ -1093,8 +822,8 @@ impl InferenceService {
     /// 7. StreamService is blind forwarder (no HMAC verification)
     ///
     /// Note: The read lock must be held across await because TextStream<'_> borrows from the engine.
-    /// This triggers clippy::await_holding_lock, but is necessary for the streaming API.
-    #[allow(clippy::await_holding_lock)]
+    /// With tokio::sync::RwLock, the lock yields instead of blocking the OS thread, preventing
+    /// deadlocks with concurrent write-lock requests (e.g., createLora during streaming).
     async fn execute_stream(&self, pending: PendingWork) {
         use futures::StreamExt;
 
@@ -1121,7 +850,7 @@ impl InferenceService {
         );
 
         // Run the stream with StreamChannel's async publisher callback
-        let engine = self.engine.read();
+        let engine = self.engine.read().await;
         let stream_result = engine.generate_with_delta(request, delta);
 
         let result = stream_channel.with_publisher(stream_ctx, |mut publisher| async move {
@@ -1219,7 +948,7 @@ impl InferenceService {
                 publisher.publish_error("cancelled").await?;
                 return Ok(());
             }
-            match self.handle_train_step(&subject, &input, gradient_steps, learning_rate, auto_commit) {
+            match self.handle_train_step(&subject, &input, gradient_steps, learning_rate, auto_commit).await {
                 Ok(result) => {
                     // Serialize training result as JSON for the completion payload
                     let payload = serde_json::to_vec(&result)
@@ -1244,17 +973,17 @@ impl InferenceService {
     }
 
     /// Handle model info request
-    fn handle_model_info(&self) -> ModelInfo {
-        RuntimeEngine::model_info(&*self.engine.read())
+    async fn handle_model_info(&self) -> ModelInfo {
+        RuntimeEngine::model_info(&*self.engine.read().await)
     }
 
     /// Handle is ready request
-    fn handle_is_ready(&self) -> bool {
-        self.engine.read().is_loaded()
+    async fn handle_is_ready(&self) -> bool {
+        self.engine.read().await.is_loaded()
     }
 
     /// Handle apply chat template
-    fn handle_apply_chat_template(
+    async fn handle_apply_chat_template(
         &self,
         messages: Vec<crate::runtime::template_engine::ChatMessage>,
         add_generation_prompt: bool,
@@ -1262,11 +991,12 @@ impl InferenceService {
     ) -> Result<String> {
         self.engine
             .read()
+            .await
             .apply_chat_template(&messages, add_generation_prompt, tools)
     }
 
     /// Handle create LoRA
-    fn handle_create_lora(&self, config: TenantDeltaConfig) -> Result<()> {
+    async fn handle_create_lora(&self, config: TenantDeltaConfig) -> Result<()> {
         // Propagate target modules to the delta pool so new deltas
         // create A/B matrices for ALL configured modules, not just the default q_proj/v_proj
         if let Some(pool) = &self.delta_pool {
@@ -1276,7 +1006,7 @@ impl InferenceService {
             );
             pool.update_config(config.clone());
         }
-        self.engine.write().create_lora(config)
+        self.engine.write().await.create_lora(config)
     }
 
     // =========================================================================
@@ -1357,7 +1087,7 @@ impl InferenceService {
     }
 
     /// Run pure training steps without generation
-    fn handle_train_step(
+    async fn handle_train_step(
         &self,
         subject: &Subject,
         input: &str,
@@ -1373,23 +1103,29 @@ impl InferenceService {
             .ok_or_else(|| anyhow!("Delta pool not initialized"))?;
 
         let delta_arc = pool.get_or_create(subject)?;
-        let mut delta = delta_arc.lock();
 
-        let encoding = tokenizer.encode(input, false)
-            .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
-        let input_tokens: Vec<u32> = encoding.get_ids().to_vec();
+        // Phase 1: Sync work under scoped lock — tokenize and snapshot
+        let (input_tokens, pre_snapshot) = {
+            let delta = delta_arc.lock();
+            let encoding = tokenizer.encode(input, false)
+                .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
+            let input_tokens: Vec<u32> = encoding.get_ids().to_vec();
+            let pre_snapshot = if !auto_commit {
+                delta.extract_state_dict()
+            } else {
+                std::collections::HashMap::new()
+            };
+            (input_tokens, pre_snapshot)
+        }; // guard dropped
 
         let steps = if gradient_steps > 0 { gradient_steps as usize } else { ttt_trainer.config.gradient_steps };
         let lr = if learning_rate > 0.0 { Some(learning_rate as f64) } else { None };
 
-        // Snapshot delta state before training (for rollback if not auto-committing)
-        let pre_snapshot = if !auto_commit {
-            delta.extract_state_dict()
-        } else {
-            std::collections::HashMap::new()
-        };
+        // Phase 2: Await engine (no lock held — safe for spawn_local concurrency)
+        let engine = self.engine.read().await;
 
-        let engine = self.engine.read();
+        // Phase 3: Reacquire delta lock for train_step
+        let mut delta = delta_arc.lock();
         let mut result = ttt_trainer.train_step(&engine, &mut delta, &input_tokens, steps, lr)?;
 
         // If auto_commit and recommendation is positive, commit immediately.
@@ -1701,28 +1437,6 @@ impl InferenceService {
         })
     }
 
-    /// Clean up timed-out pending adaptations
-    fn cleanup_pending_adaptations(&self) {
-        let mut pending = self.pending_adaptations.lock();
-        let now = Instant::now();
-        pending.retain(|tenant_id, adaptation| {
-            let elapsed = now.duration_since(adaptation.created_at).as_millis() as u64;
-            if elapsed > adaptation.timeout_ms {
-                // Auto-rollback: restore pre-adaptation state
-                if let Some(pool) = &self.delta_pool {
-                    if let Some(delta_arc) = pool.get(tenant_id) {
-                        let mut delta = delta_arc.lock();
-                        let _ = delta.load_state_dict(&adaptation.pre_adaptation_state);
-                    }
-                }
-                debug!("Auto-rolled back timed-out adaptation for subject '{}'", tenant_id);
-                false
-            } else {
-                true
-            }
-        });
-    }
-
     /// Get TTT configuration (for status queries)
     #[allow(dead_code)]
     fn get_ttt_config(&self) -> Option<crate::training::ttt::TTTConfig> {
@@ -1730,24 +1444,26 @@ impl InferenceService {
     }
 
     /// Handle set session
-    fn handle_set_session(&self, session_id: String) -> Result<()> {
+    async fn handle_set_session(&self, session_id: String) -> Result<()> {
         // Track session ID for events
         *self.session_id.write() = Some(session_id.clone());
         self.engine
             .write()
+            .await
             .set_session(CacheOwner::Session(session_id))
     }
 
     /// Handle clear session
-    fn handle_clear_session(&self) {
+    async fn handle_clear_session(&self) {
         *self.session_id.write() = None;
-        self.engine.write().clear_kv_cache();
+        self.engine.write().await.clear_kv_cache();
     }
 
     /// Handle release session
-    fn handle_release_session(&self, session_id: &str) -> Result<()> {
+    async fn handle_release_session(&self, session_id: &str) -> Result<()> {
         self.engine
             .write()
+            .await
             .release_session(&CacheOwner::Session(session_id.to_owned()))
     }
 
@@ -1757,7 +1473,7 @@ impl InferenceService {
     /// requests. If a per-tenant TTT delta also exists, the two are composed
     /// (corrections summed) during inference via `resolve_delta()`.
     pub async fn load_lora(&self, path: &Path) -> Result<()> {
-        let device = self.engine.read().device();
+        let device = self.engine.read().await.device();
         // Read via FsOps (path-contained)
         let fs = self.fs.as_ref()
             .ok_or_else(|| anyhow!("FsOps not available — cannot read without path containment"))?;
@@ -1928,20 +1644,18 @@ impl InferenceHandler for InferenceService {
         };
 
         // Build continuation that executes the stream after REP is sent.
-        // Uses UnsafeSendFuture because execute_stream holds a parking_lot::RwLockReadGuard
-        // (which is !Send) across an .await during streaming token generation.
-        // This is safe because the continuation only runs on InferenceService's
-        // single-threaded tokio runtime.
+        // With tokio::sync::RwLock, the read guard is Send-safe, so no
+        // UnsafeSendFuture wrapper is needed.
         let service = self.clone();
-        let continuation: hyprstream_rpc::service::Continuation = Box::pin(UnsafeSendFuture(Box::pin(async move {
+        let continuation: hyprstream_rpc::service::Continuation = Box::pin(async move {
             service.execute_stream(pending).await;
-        })));
+        });
 
         Ok((stream_info, continuation))
     }
 
     async fn handle_model_info(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
-        let info = InferenceService::handle_model_info(self);
+        let info = InferenceService::handle_model_info(self).await;
         let has_lora = self.base_delta.lock().is_some();
         Ok(InferenceResponseVariant::ModelInfoResult(crate::services::generated::inference_client::ModelInfo {
             model_id: info.name,
@@ -1958,7 +1672,7 @@ impl InferenceHandler for InferenceService {
     }
 
     async fn handle_is_ready(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
-        let ready = InferenceService::handle_is_ready(self);
+        let ready = InferenceService::handle_is_ready(self).await;
         Ok(InferenceResponseVariant::IsReadyResult(ready))
     }
 
@@ -1997,7 +1711,7 @@ impl InferenceHandler for InferenceService {
         };
         let result = InferenceService::handle_apply_chat_template(
             self, chat_messages, data.add_generation_prompt, tools.as_ref(),
-        )?;
+        ).await?;
         Ok(InferenceResponseVariant::ApplyChatTemplateResult(result))
     }
 
@@ -2013,7 +1727,7 @@ impl InferenceHandler for InferenceService {
             learning_rate: data.learning_rate as f64,
             ..crate::training::TenantDeltaConfig::default()
         };
-        InferenceService::handle_create_lora(self, config)?;
+        InferenceService::handle_create_lora(self, config).await?;
         Ok(InferenceResponseVariant::CreateLoraResult)
     }
 
@@ -2038,22 +1752,22 @@ impl InferenceHandler for InferenceService {
     }
 
     async fn handle_set_session(&self, _ctx: &EnvelopeContext, _request_id: u64, value: &str) -> Result<InferenceResponseVariant> {
-        InferenceService::handle_set_session(self, value.to_owned())?;
+        InferenceService::handle_set_session(self, value.to_owned()).await?;
         Ok(InferenceResponseVariant::SetSessionResult)
     }
 
     async fn handle_clear_session(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
-        InferenceService::handle_clear_session(self);
+        InferenceService::handle_clear_session(self).await;
         Ok(InferenceResponseVariant::ClearSessionResult)
     }
 
     async fn handle_release_session(&self, _ctx: &EnvelopeContext, _request_id: u64, value: &str) -> Result<InferenceResponseVariant> {
-        InferenceService::handle_release_session(self, value)?;
+        InferenceService::handle_release_session(self, value).await?;
         Ok(InferenceResponseVariant::ReleaseSessionResult)
     }
 
     async fn handle_health_check(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
-        let model_loaded = self.engine.read().is_loaded();
+        let model_loaded = self.engine.read().await.is_loaded();
         Ok(InferenceResponseVariant::HealthCheckResult(HealthStatus {
             status: if model_loaded { "ok".into() } else { "not_loaded".into() },
             model_loaded,
@@ -2070,7 +1784,7 @@ impl InferenceHandler for InferenceService {
 
     async fn handle_commit_adaptation(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
         let subject = ctx.subject();
-        self.cleanup_pending_adaptations();
+        self.cleanup_expired_adaptations();
         InferenceService::handle_commit_adaptation(self, &subject)?;
         Ok(InferenceResponseVariant::CommitAdaptationResult)
     }
@@ -2086,7 +1800,7 @@ impl InferenceHandler for InferenceService {
         data: &TrainStepRequest,
     ) -> Result<InferenceResponseVariant> {
         let subject = ctx.subject();
-        let result = InferenceService::handle_train_step(self, &subject, &data.input, data.gradient_steps, data.learning_rate, data.auto_commit)?;
+        let result = InferenceService::handle_train_step(self, &subject, &data.input, data.gradient_steps, data.learning_rate, data.auto_commit).await?;
         Ok(InferenceResponseVariant::TrainStepResult(TrainStepResult {
             avg_loss: result.avg_loss,
             loss_improvement: result.loss_improvement,
@@ -2213,9 +1927,221 @@ impl InferenceHandler for InferenceService {
     }
 }
 
-// Note: InferenceService does NOT implement ZmqService because it uses a custom
-// single-threaded tokio runtime in `run_service_loop` (not RequestLoop).
-// Both `run_service_loop` and `handle_callback_infer` call `dispatch_inference` directly.
+// ═══════════════════════════════════════════════════════════════════════════════
+// ZmqService adapter and Spawnable implementation
+// ═══════════════════════════════════════════════════════════════════════════════
+
+impl InferenceService {
+    /// E2E JWT verification with downgrade attack protection.
+    ///
+    /// This is the shared implementation used by `InferenceZmqAdapter::verify_claims()`.
+    /// Moved from the custom REP loop to the standard `ZmqService` hook.
+    fn verify_claims_impl(&self, ctx: &EnvelopeContext) -> anyhow::Result<()> {
+        if let Some(claims) = ctx.claims() {
+            match claims.verify_token(&self.server_pubkey) {
+                Ok(Some(verified)) => {
+                    if verified.sub != claims.sub {
+                        warn!("Claims sub mismatch: envelope={} jwt={}", claims.sub, verified.sub);
+                        anyhow::bail!("Claims subject mismatch");
+                    }
+                }
+                Ok(None) => {
+                    // SECURITY: Non-local requests MUST have JWT token
+                    // to prevent subject impersonation via fabricated claims
+                    if !ctx.identity.is_local() {
+                        warn!(
+                            "Non-local request with claims but no JWT token: sub={}, identity={:?}",
+                            claims.sub, ctx.identity
+                        );
+                        anyhow::bail!("JWT token required for non-local requests");
+                    }
+                }
+                Err(e) => {
+                    warn!("E2E JWT verification failed: {}", e);
+                    anyhow::bail!("JWT verification failed");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// ZmqService adapter for InferenceService.
+///
+/// Wraps `InferenceService` to implement `ZmqService` for use with `RequestLoop`.
+/// This adapter is created inside `Spawnable::run()` on the service thread —
+/// it never crosses thread boundaries.
+struct InferenceZmqAdapter {
+    service: InferenceService,
+    zmq_context: Arc<zmq::Context>,
+    transport: hyprstream_rpc::transport::TransportConfig,
+    signing_key: SigningKey,
+}
+
+#[async_trait::async_trait(?Send)]
+impl hyprstream_rpc::service::ZmqService for InferenceZmqAdapter {
+    async fn handle_request(
+        &self,
+        ctx: &EnvelopeContext,
+        payload: &[u8],
+    ) -> anyhow::Result<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
+        self.service.cleanup_expired_adaptations();
+        dispatch_inference(&self.service, ctx, payload).await
+    }
+
+    fn verify_claims(&self, ctx: &EnvelopeContext) -> anyhow::Result<()> {
+        self.service.verify_claims_impl(ctx)
+    }
+
+    fn name(&self) -> &str {
+        "inference"
+    }
+
+    fn context(&self) -> &Arc<zmq::Context> {
+        &self.zmq_context
+    }
+
+    fn transport(&self) -> &hyprstream_rpc::transport::TransportConfig {
+        &self.transport
+    }
+
+    fn signing_key(&self) -> SigningKey {
+        self.signing_key.clone()
+    }
+
+    fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
+        let variant = InferenceResponseVariant::Error(ErrorInfo {
+            message: error.to_owned(),
+            code: "INTERNAL".to_owned(),
+            details: String::new(),
+        });
+        serialize_response(request_id, &variant).unwrap_or_else(|e| {
+            error!("Failed to serialize error payload: {}", e);
+            vec![]
+        })
+    }
+}
+
+/// Configuration for spawning an InferenceService.
+///
+/// This struct holds all parameters needed to initialize an InferenceService.
+/// It is `Send` and can be moved to a dedicated thread via `Spawnable::run()`.
+/// The actual GPU initialization happens on the service thread.
+pub struct InferenceServiceConfig {
+    model_path: PathBuf,
+    config: RuntimeConfig,
+    server_pubkey: VerifyingKey,
+    signing_key: SigningKey,
+    policy_client: PolicyClient,
+    zmq_context: Arc<zmq::Context>,
+    transport: hyprstream_rpc::transport::TransportConfig,
+    fs: Option<WorktreeClient>,
+}
+
+impl InferenceServiceConfig {
+    /// Create a new InferenceServiceConfig.
+    ///
+    /// No GPU work is done here — all heavy initialization is deferred
+    /// to the service thread via `Spawnable::run()`.
+    pub fn new(
+        model_path: impl AsRef<Path>,
+        config: RuntimeConfig,
+        server_pubkey: VerifyingKey,
+        signing_key: SigningKey,
+        policy_client: PolicyClient,
+        zmq_context: Arc<zmq::Context>,
+        transport: hyprstream_rpc::transport::TransportConfig,
+        fs: Option<WorktreeClient>,
+    ) -> Self {
+        Self {
+            model_path: model_path.as_ref().to_path_buf(),
+            config,
+            server_pubkey,
+            signing_key,
+            policy_client,
+            zmq_context,
+            transport,
+            fs,
+        }
+    }
+}
+
+impl hyprstream_rpc::service::spawner::Spawnable for InferenceServiceConfig {
+    fn name(&self) -> &str {
+        "inference"
+    }
+
+    fn context(&self) -> &Arc<zmq::Context> {
+        &self.zmq_context
+    }
+
+    fn registrations(&self) -> Vec<(hyprstream_rpc::registry::SocketKind, hyprstream_rpc::transport::TransportConfig)> {
+        vec![(hyprstream_rpc::registry::SocketKind::Rep, self.transport.clone())]
+    }
+
+    fn run(
+        self: Box<Self>,
+        shutdown: Arc<tokio::sync::Notify>,
+        on_ready: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> hyprstream_rpc::error::Result<()> {
+        let transport = self.transport.clone();
+        let context = Arc::clone(&self.zmq_context);
+        let signing_key = self.signing_key.clone();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("runtime: {e}")))?;
+
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async move {
+            // Create nonce cache (shared between service and RequestLoop)
+            let nonce_cache = Arc::new(InMemoryNonceCache::new());
+
+            // GPU initialization happens HERE, on the service thread
+            let service = InferenceService::initialize(
+                self.model_path,
+                self.config,
+                self.server_pubkey,
+                self.signing_key.clone(),
+                Arc::clone(&nonce_cache),
+                self.policy_client,
+                self.fs,
+            )
+            .await
+            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("init: {e}")))?;
+
+            // Create ZmqService adapter for RequestLoop
+            let adapter = InferenceZmqAdapter {
+                service,
+                zmq_context: context.clone(),
+                transport: transport.clone(),
+                signing_key: signing_key.clone(),
+            };
+
+            // Use shared nonce cache between service and RequestLoop
+            let runner = RequestLoop::with_nonce_cache(
+                transport,
+                context,
+                signing_key,
+                nonce_cache,
+            );
+            let mut handle = runner.run(adapter).await
+                .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("loop: {e}")))?;
+
+            if let Some(tx) = on_ready {
+                let _ = tx.send(());
+            }
+
+            // Notify systemd that service is ready (for Type=notify services)
+            let _ = hyprstream_rpc::notify::ready();
+
+            shutdown.notified().await;
+            handle.stop().await;
+            Ok::<_, hyprstream_rpc::error::RpcError>(())
+        })
+    }
+}
 
 /// Client for the inference service
 ///

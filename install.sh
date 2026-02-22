@@ -31,7 +31,8 @@ log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 
 GITHUB_REPO="hyprstream/hyprstream"
-LICENSE_URL="https://github.com/hyprstream/hyprstream/blob/main/LICENSE-AGPLV3"
+LICENSE_URL="https://github.com/hyprstream/hyprstream/blob/main/LICENSE-MIT"
+AGPL_LICENSE_URL="https://github.com/hyprstream/hyprstream/blob/main/LICENSE-AGPLV3"
 TMPDIR_PATH=""
 AUTO_INSTALL="${HYPRSTREAM_AUTO_INSTALL:-0}"
 
@@ -352,8 +353,9 @@ main() {
     resolve_version
 
     echo ""
-    log_info "Hyprstream is dual-licensed under AGPL-3.0 and MIT."
-    log_info "License: ${LICENSE_URL}"
+    log_info "Hyprstream is dual-licensed under MIT and AGPL-3.0."
+    log_info "  MIT:      ${LICENSE_URL}"
+    log_info "  AGPL-3.0: ${AGPL_LICENSE_URL}"
     echo ""
     if ! confirm "Do you accept the license terms?"; then
         log_error "License not accepted. Aborting."

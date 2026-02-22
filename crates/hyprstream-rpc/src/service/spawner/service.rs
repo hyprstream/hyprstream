@@ -59,11 +59,14 @@ pub trait Spawnable: Send + 'static {
 // Blanket Spawnable impl for ZmqService
 // ============================================================================
 
-/// Every `ZmqService` is automatically `Spawnable`.
+/// Every `ZmqService + Send + Sync` is automatically `Spawnable`.
 ///
 /// This blanket implementation eliminates the need for wrapper types.
 /// Services that implement `ZmqService` include their infrastructure
 /// (context, transport, verifying_key) and can be spawned directly.
+///
+/// Services not satisfying `Send + Sync` (e.g., those using `Rc` or `!Send` fields)
+/// must implement `Spawnable` directly (as `InferenceServiceConfig` does).
 ///
 /// # Example
 ///
@@ -81,7 +84,7 @@ pub trait Spawnable: Send + 'static {
 /// // Spawn directly - no wrapping needed!
 /// manager.spawn(Box::new(service)).await?;
 /// ```
-impl<S: ZmqService> Spawnable for S {
+impl<S: ZmqService + Send + Sync> Spawnable for S {
     fn name(&self) -> &str {
         ZmqService::name(self)
     }
@@ -412,15 +415,32 @@ impl ServiceSpawner {
     ) -> Result<SpawnedService> {
         let name = service.name().to_owned();
         let name_for_spawn = name.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
         let shutdown = Arc::new(Notify::new());
         let shutdown_clone = shutdown.clone();
 
-        // Spawn task that runs the service
-        let join_handle = tokio::spawn(async move {
-            if let Err(e) = Box::new(service).run(shutdown_clone, None) {
+        // Spawn on the blocking thread pool.
+        // Spawnable::run() creates a new_current_thread runtime and calls block_on(),
+        // which would block a worker thread (or panic) if called directly in tokio::spawn.
+        let blocking_handle = tokio::task::spawn_blocking(move || {
+            if let Err(e) = Box::new(service).run(shutdown_clone, Some(ready_tx)) {
                 tracing::error!("Service {} failed: {}", name_for_spawn, e);
             }
         });
+
+        // Wrap in tokio::spawn so ServiceHandle gets a JoinHandle<()> (not JoinHandle<Result<(), JoinError>>)
+        let join_handle = tokio::spawn(async move {
+            if let Err(e) = blocking_handle.await {
+                tracing::error!("Service blocking task panicked: {}", e);
+            }
+        });
+
+        // Wait for socket to bind before returning
+        if ready_rx.await.is_err() {
+            return Err(crate::error::RpcError::SpawnFailed(
+                "service task exited before ready".to_owned(),
+            ));
+        }
 
         // Create a handle wrapper
         let handle = crate::service::ServiceHandle::from_task(join_handle, shutdown);
