@@ -14,8 +14,8 @@
 - Proper UTF-8 streaming (emojis, multi-byte characters)
 
 **Experimental Features** ⚠️
-- XET large file storage (disabled by default, filter needs refactoring)
-- LoRA training system (functional but evolving)
+- XET large file storage (enabled by default, fully implemented)
+- Test-Time Training (TTT) system with per-tenant LoRA deltas (functional but evolving)
 
 ---
 
@@ -26,33 +26,48 @@
 export LIBTORCH=/path/to/libtorch
 export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
 
-# CPU backend (default)
+# Standard build (includes xet, gittorrent, systemd, otel by default)
 cargo build --release
 
-# CUDA backend
-cargo build --no-default-features --features tch-cuda --release
+# With CUDA marker (empty feature, backend selected by tch-rs dependency)
+cargo build --features cuda --release
 
-# ROCm backend (uses tch-rs fork with HIP support)
-cargo build --no-default-features --features tch-rocm --release
+# With bitsandbytes quantization support
+cargo build --features bnb --release
 
-# With OpenTelemetry support
-cargo build --features otel --release
+# With overlayfs storage driver
+cargo build --features overlayfs --release
 
-# With XET support (EXPERIMENTAL - disabled by default)
-cargo build --features xet --release
+# Without systemd (e.g., for container builds)
+cargo build --no-default-features --features "gittorrent,xet,otel" --release
+
+# Auto-download libtorch during build
+cargo build --features download-libtorch --release
 
 # Run tests
 cargo test --workspace --release
-
-# Run examples (used for GPU testing)
-cargo run --example test_cuda --release
 ```
 
 **Note**: Building requires libtorch (PyTorch C++ library). See README.md for download/installation instructions.
 
+**Feature Flags** (from `crates/hyprstream/Cargo.toml`):
+```
+default = ["gittorrent", "xet", "systemd", "otel"]
+cuda = []                           # Empty marker feature
+bnb = ["dep:bitsandbytes-sys"]      # bitsandbytes quantization
+xet = ["git2db/xet-storage"]        # XET large file storage
+otel = [tracing-opentelemetry...]   # OpenTelemetry tracing
+gittorrent = [gittorrent deps]      # P2P model distribution
+download-libtorch = ["tch/download-libtorch"]
+overlayfs = ["git2db/overlayfs"]    # overlayfs storage driver
+systemd = [rpc+workers systemd]     # systemd integration
+experimental = []                   # Git write operations
+```
+
 **Backend Selection**:
-- CPU and CUDA use standard tch-rs
-- ROCm uses tch-rs fork from github.com/hyprstream/tch-rs (branch: hip) for HIP support
+- CPU/CUDA/ROCm is controlled by the `tch-rs` dependency, NOT cargo features
+- Currently uses tch-rs fork from github.com/hyprstream/tch-rs (branch: hip) for HIP/ROCm support
+- The `cuda` feature is an empty marker — actual GPU support comes from the libtorch build linked at runtime
 
 ---
 
@@ -78,7 +93,7 @@ hyprstream/
 │   │   │   ├── runtime/         # PyTorch inference engine
 │   │   │   ├── storage/         # Model & adapter storage (file-based)
 │   │   │   ├── git/             # git2db integration & helpers
-│   │   │   ├── training/        # LoRA training system
+│   │   │   ├── training/        # TTT + LoRA training system
 │   │   │   ├── lora/            # LoRA implementation
 │   │   │   ├── api/             # REST API (OpenAI-compatible)
 │   │   │   ├── cli/             # CLI commands
@@ -111,6 +126,12 @@ hyprstream/
 │
 ├── appimage/                    # AppImage build system
 │   └── build-appimage.sh        # Build script for all variants
+├── archlinux/                   # Arch Linux packaging (PKGBUILD)
+├── architecture.png             # Visual architecture diagram
+├── clippy.toml                  # Clippy configuration
+├── Dockerfile                   # Docker build
+├── docker-compose.yml           # Docker Compose config
+├── README-Docker.md             # Docker documentation
 ├── install.sh                   # curl|bash installer for AppImage
 ├── README.md                    # User-facing documentation
 ├── CLAUDE.md                    # This file - AI assistant guide
@@ -137,9 +158,10 @@ hyprstream/
 
 #### **Models** - Git Repositories via git2db
 **Key Files**:
-- `model_storage.rs` - Model lifecycle management
-- `model_registry.rs` - Wraps git2db's Git2DB registry
+- `mod.rs` - Compatibility types (ModelId, ModelMetadata, ClonedModel, CheckoutOptions)
 - `model_ref.rs` - ModelRef syntax parsing (name:branch:commit)
+- `paths.rs` - Path utilities (StoragePaths)
+- `errors.rs` - Storage error types
 
 **Design**:
 ```
@@ -206,44 +228,40 @@ for adapter in adapters {
 
 ---
 
-#### **XET Large File Storage** - Optional Feature (Disabled by Default)
+#### **XET Large File Storage** - Enabled by Default
 **Key Files**:
-- `git-xet-filter/` - Libgit2 filter integration for automatic LFS/XET smudging
-- `storage/lfs_xet.rs` - LFS to XET bridge for non-git file operations (requires `xet` feature)
-- `git2db/src/xet_filter.rs` - XET filter initialization and management
+- `crates/git-xet-filter/src/storage.rs` - `XetStorage` (clean/smudge implementation)
+- `crates/git-xet-filter/src/filter.rs` + `callbacks.rs` - Complete libgit2 filter
+- `crates/git2db/src/lfs.rs` (941 lines) - `LfsStorage`: LFS pointer parsing, detection, smudge via XET
+- `crates/git2db/src/xet_filter.rs` - Thin re-export of `git_xet_filter::*`
 
 **Feature Flag Policy**:
-- **git2db**: Optional (`xet-storage` feature), not enabled by default
-- **hyprstream**: Optional (`xet` feature), **disabled by default** for stability
+- **git2db**: Optional (`xet-storage` feature)
+- **hyprstream**: Optional (`xet` feature), **enabled by default** (in `default` feature set)
 
-**Current Status**: ⚠️ **Experimental - Under Development**
-- Architecture designed and implemented
+**Current Status**: ✅ **Fully Implemented**
+- Architecture designed, implemented, and working
 - LFS pointer detection working (with graceful fallback when XET disabled)
-- Filter callbacks need refactoring to use `git_filter_buffered_stream_new()` API
-- See `docs/XET-FILTER-FIXED.md` for implementation roadmap
+- Libgit2 filter fully implemented (filter.rs + callbacks.rs)
 
-**Architecture** (Automatic + Fallback):
+**Architecture** (3-tier):
 ```
-Git Operations (clone, checkout)
-    ↓ automatic
-git-xet-filter (Libgit2 Filter)
-    ↓ smudges LFS/XET
-    ↓ validates SHA256
-Models ready to use
-
-Non-Git Files (explicit loads)
-    ↓ manual
-LfsXetBridge::load_file()
-    ↓ detects pointers
-    ↓ smudges if needed
-File ready to use
+Hyprstream (runtime/model_factory.rs)
+    ↓ uses git2db::LfsStorage when xet feature enabled
+git2db::lfs::LfsStorage (lfs.rs, 941 lines)
+    ├─ LFS pointer parsing & detection
+    └─ smudge via XetStorage ↓
+git-xet-filter (standalone crate)
+    ├─ storage.rs — XetStorage (clean/smudge)
+    ├─ filter.rs + callbacks.rs — complete libgit2 filter
+    └─ lib.rs — initialize() for global registration
 ```
 
 **How It Works** ✅:
-1. **Filter initialization** - `main.rs` registers git-xet-filter globally
-2. **Automatic smudging** - Git operations transparently handle LFS/XET
+1. **Filter initialization** - `main.rs` registers git-xet-filter globally via `git2db::xet_filter::initialize()`
+2. **Automatic smudging** - Git operations (clone, checkout, worktree) transparently handle LFS/XET
 3. **SHA256 validation** - Defense-in-depth (XET client doesn't verify)
-4. **Fallback** - `load_file()` for files outside git operations
+4. **Fallback** - `git2db::LfsStorage` for explicit LFS pointer resolution outside git operations
 
 **Automatic Usage** (Primary - via git-xet-filter):
 ```rust
@@ -262,19 +280,15 @@ let worktree = GitManager::global()
 // All LFS/XET files are ready to use immediately
 ```
 
-**Fallback Usage** (For non-git files):
+**Fallback Usage** (For explicit LFS resolution — used in model_factory.rs):
 ```rust
-use crate::storage::LfsXetBridge;
+use git2db::LfsStorage;
 
-let bridge = LfsXetBridge::new(config).await?;
+// Create LFS storage with XET config
+let storage = git2db::LfsStorage::new(&config).await?;
 
-// Load file with automatic pointer detection
-// (LFS spec-compliant: metadata check → 100-byte header → smudge if needed)
-let weights = bridge.load_file(&model_file_path).await?;
-
-// Or explicit smudging
-let lfs_pointer = bridge.parse_lfs_pointer(&pointer_text)?;
-let data = bridge.smudge_lfs_pointer(&lfs_pointer).await?;
+// Used in runtime/model_factory.rs for LFS pointer resolution
+// when loading model files that may be LFS pointers
 ```
 
 **Why git-xet-filter**:
@@ -284,7 +298,7 @@ let data = bridge.smudge_lfs_pointer(&lfs_pointer).await?;
 - ✅ Registered once, works everywhere
 - ✅ LFS spec-compliant detection
 
-**When to use load_file()**:
+**When to use LfsStorage directly**:
 - Files outside git repositories
 - Explicit pointer resolution needed
 - Testing/debugging
@@ -335,10 +349,20 @@ let repo = Repository::open(path)?;   // ❌ Use GitManager::global()
 **Key Files**:
 - `torch_engine.rs` - Main PyTorch inference engine with Stream-based generation
 - `architectures/` - Model architectures (Qwen, Llama, Gemma, etc.)
+- `model_factory.rs` - Model loading and initialization (includes LFS fallback)
 - `kv_cache.rs` - KV cache management
+- `kv_quant.rs` - KV cache quantization
 - `tensor_sampling.rs` - Device-agnostic tensor sampling
 - `template_engine.rs` - Chat template formatting
-- `model_factory.rs` - Model loading and initialization
+- `batched_lora.rs` - Batched LoRA operations
+- `generation_metrics.rs` - Generation statistics
+- `model_config.rs` - Model configuration parsing
+- `tokenizer_config.rs` - Tokenizer configuration
+- `weight_provider.rs` - Weight loading abstraction
+- `rope.rs` - Rotary position embeddings
+- `image_utils.rs` - Image processing utilities
+- `tensor_helpers.rs` - Tensor utility functions
+- `torch_utils.rs` - PyTorch utility functions
 
 **Design**: PyTorch (libtorch) via tch-rs bindings
 
@@ -352,8 +376,9 @@ pub struct TorchEngine {
 }
 
 impl TorchEngine {
-    pub fn generate(&self, request: GenerationRequest) -> Result<TextStream>;
-    pub async fn generate_with_params(&self, request: GenerationRequest) -> Result<GenerationResult>;
+    pub fn generate(&self, request: GenerationRequest) -> Result<TextStream<'_>>;
+    pub fn generate_with_delta(&self, request: GenerationRequest, delta: ...) -> Result<TextStream<'_>>;
+    pub async fn generate_with_delta_params(&self, request: GenerationRequest, ...) -> Result<GenerationResult>;
 }
 ```
 
@@ -411,25 +436,53 @@ match self.decode_stream.step(next_token) {
 ### **4. Training System** (`crates/hyprstream/src/training/`)
 
 **Key Files**:
-- `lora_trainer.rs` - LoRA training implementation
+- `ttt.rs` - Test-Time Training (`TestTimeTrainer`, `TTTConfig`, `TTTResult`, `TTTOverrides`)
+- `tenant_delta.rs` - Per-tenant LoRA delta (`TenantDelta`, `TenantDeltaConfig`, `SharedTenantDelta`)
+- `delta_pool.rs` - Delta registry with LRU eviction (`DeltaPool`)
+- `merge.rs` - LoRA adapter merging strategies (DO-Merge, additive, replace)
+- `quality_filter.rs` - Heuristic-based output quality filtering (`QualityFilter`)
 - `checkpoint.rs` - Checkpoint management with git integration
-- `data_loader.rs` - Training data loading
+- `data_loader.rs` - Training data loading (`ChatTemplateDataLoader`, `TrainingDataset`)
 
-**Design**: Create adapter files in `model/adapters/`, commit to git
+**Design**: Test-Time Training (TTT) with per-tenant LoRA deltas
 
-**Workflow**:
+The training system adapts models at inference time using gradient-based LoRA updates.
+Each tenant gets an isolated `TenantDelta` containing their accumulated LoRA weights.
+Deltas are managed in a `DeltaPool` with LRU eviction.
+
+**Core Workflow**:
 ```rust
-// 1. Train LoRA adapter
-let trainer = LoRATrainer::new(model, config);
-trainer.train(dataset).await?;
+use crate::training::{TestTimeTrainer, TTTConfig, TTTOverrides, TenantDelta};
 
-// 2. Save adapter to model/adapters/
-let adapter_path = model_path.join("adapters/01_new_adapter.safetensors");
-trainer.save_adapter(&adapter_path)?;
+// 1. Create trainer with config
+let trainer = TestTimeTrainer::new(TTTConfig::default(), device);
 
-// 3. Commit to git
-let repo = GitManager::global().get_repository(model_path)?.open()?;
-// ... stage and commit adapter files ...
+// 2. Adapt tenant delta during inference (TTT)
+let (result, merged_weights) = trainer.adapt_tenant(
+    &engine, &mut delta, &input_tokens, &overrides
+)?;
+
+// 3. Or run explicit training steps
+let result = trainer.train_step(
+    &engine, &mut delta, &input_tokens,
+    gradient_steps, learning_rate
+)?;
+
+// 4. Check result quality
+if result.recommendation {
+    // Adaptation improved the model for this input
+}
+```
+
+**Per-Tenant Deltas**:
+```rust
+use crate::training::{DeltaPool, TenantDelta};
+
+// DeltaPool manages per-tenant LoRA deltas with LRU eviction
+let pool = DeltaPool::new(max_tenants);
+
+// Get or create delta for a tenant
+let delta = pool.get_or_create("tenant-123", config)?;
 ```
 
 **Checkpoints**:
@@ -452,7 +505,10 @@ create_tag(model_path, "checkpoint-1000")?;
 **Key Files**:
 - `server/state.rs` - Server state management
 - `server/routes/openai.rs` - OpenAI-compatible API (worktree-based listing)
-- `api/training_service.rs` - Training service (experimental)
+- `server/routes/models.rs` - Model listing endpoint
+- `api/mod.rs` - API module root
+- `api/openai_compat.rs` - OpenAI compatibility types
+- `api/tools.rs` - Tool calling support
 
 **Design**: Axum-based REST API, OpenAI compatibility
 
@@ -460,11 +516,6 @@ create_tag(model_path, "checkpoint-1000")?;
 - `/v1/models` endpoint lists **worktrees only**, not base models
 - Models shown as `model:branch` format (e.g., `qwen3-small:main`)
 - Multiple worktrees per model appear as separate entries
-- Metadata enrichment in `owned_by` field:
-  - Storage driver: `driver:overlay2`
-  - Space saved: `saved:2.3GB`
-  - Worktree age: `age:2h`
-  - Cache status: `cached`
 
 **Example Response**:
 ```json
@@ -475,13 +526,13 @@ create_tag(model_path, "checkpoint-1000")?;
       "id": "qwen3-small:main",
       "object": "model",
       "created": 1762974327,
-      "owned_by": "system driver:overlay2, saved:2.3GB, age:2h cached"
+      "owned_by": "system"
     },
     {
       "id": "qwen3-small:experiment-1",
       "object": "model",
       "created": 1762975000,
-      "owned_by": "system driver:overlay2, saved:1.8GB, age:30m"
+      "owned_by": "system"
     }
   ]
 }
@@ -489,7 +540,7 @@ create_tag(model_path, "checkpoint-1000")?;
 
 **Implementation**:
 ```rust
-// ModelStorage::list_models() enumerates all worktrees
+// Model listing enumerates all worktrees via git2db
 pub async fn list_models(&self) -> Result<Vec<(ModelRef, ModelMetadata)>> {
     let mut result = Vec::new();
     let registry = self.registry.read().await;
@@ -544,17 +595,32 @@ The RPC system provides typed, secure inter-service communication using Cap'n Pr
 
 #### **Services**
 
-| Service | Endpoint | ZMQ Pattern | Purpose |
-|---------|----------|-------------|---------|
-| **RegistryService** | `inproc://hyprstream/registry` | REQ/REP | Git model management |
-| **ModelService** | `inproc://hyprstream/model` | REQ/REP | Model lifecycle (load/unload, TTT, PEFT) |
-| **InferenceService** | `inproc://hyprstream/inference` | REQ/REP + XPUB | Token generation & streaming |
-| **PolicyService** | (auto-register) | REQ/REP | Casbin policy + JWT issuance |
-| **WorkerService** | (auto-register) | REQ/REP | CRI-aligned container management |
-| **StreamService** | PULL + XPUB | PUSH/PULL→XPUB | Streaming proxy (zero message loss) |
-| **EventProxy** | `inproc://hyprstream/events` | XSUB/XPUB | Event fan-out |
+**ZMQ RPC Services** (Cap'n Proto over ZMQ):
 
-Service implementations live in `crates/hyprstream/src/services/`.
+| Service | Factory name | ZMQ Pattern | Purpose |
+|---------|-------------|-------------|---------|
+| **RegistryService** | `registry` | REQ/REP | Git model management (git2db) |
+| **ModelService** | `model` | REQ/REP | Model lifecycle (load/unload, TTT, PEFT) |
+| **PolicyService** | `policy` | REQ/REP | Casbin policy + JWT issuance |
+| **WorkerService** | `worker` | REQ/REP | CRI-aligned Kata container management |
+| **McpService** | `mcp` | REQ/REP + HTTP/SSE | Model Context Protocol for AI assistants |
+
+**HTTP Services** (Axum-based, spawned as `Spawnable`):
+
+| Service | Factory name | Protocol | Purpose |
+|---------|-------------|----------|---------|
+| **OAIService** | `oai` | HTTP (OpenAI-compatible) | `/v1/chat/completions`, `/v1/models` |
+| **OAuthService** | `oauth` | HTTP (OAuth 2.1) | Authorization server for MCP/OAI |
+| **FlightService** | `flight` | Arrow Flight SQL | Dataset queries via Flight protocol |
+
+**Proxy Services** (ZMQ proxies):
+
+| Service | Factory name | ZMQ Pattern | Purpose |
+|---------|-------------|-------------|---------|
+| **StreamService** | `streams` | PULL→XPUB | Queuing proxy (zero message loss) |
+| **EventProxy** | `event` | XSUB→XPUB | Event fan-out |
+
+All 10 services are registered via `#[service_factory]` in `crates/hyprstream/src/services/factories.rs`.
 
 #### **Security Model** (3 layers)
 
@@ -588,7 +654,7 @@ Uses PUSH/PULL→XPUB/SUB (not plain PUB/SUB) to prevent message loss during sub
 | `FromCapnp` | Derive | Cap'n Proto deserialization |
 | `#[authorize]` | Attribute | Declarative JWT + Casbin authorization on handlers |
 | `#[register_scopes]` | Attribute | Compile-time scope registration |
-| `#[service_factory]` | Attribute | Factory pattern for scoped clients |
+| `#[service_factory]` | Attribute | Inventory-based service registration (see Service Management) |
 | `generate_rpc_service!` | Macro | Full client/handler/dispatch from CGR metadata |
 
 #### **Schema Locations**
@@ -597,6 +663,97 @@ Uses PUSH/PULL→XPUB/SUB (not plain PUB/SUB) to prevent message loss during sub
 |----------|---------|
 | `crates/hyprstream-rpc/schema/` | `common.capnp` (envelopes, identity, claims), `streaming.capnp` (stream primitives), `events.capnp`, `annotations.capnp` |
 | `crates/hyprstream/schema/` | `registry.capnp`, `inference.capnp`, `model.capnp`, `policy.capnp`, `worker.capnp`, `events.capnp`, `mcp.capnp` |
+
+#### **Service Spawner & Lifecycle**
+
+**Spawnable trait** (`crates/hyprstream-rpc/src/service/spawner/service.rs`):
+
+Interface for anything the spawner can run:
+- `name()` — service name (for logging and registry)
+- `context()` — shared ZMQ context
+- `registrations()` — endpoints to register with `EndpointRegistry` (as `(SocketKind, TransportConfig)` tuples)
+- `run(shutdown, on_ready)` — blocking execution; signals `on_ready` after socket binds, blocks until `shutdown`
+
+Blanket impl: every `ZmqService + Send + Sync` is automatically `Spawnable`. Services with `!Send` types (e.g., `InferenceServiceConfig` with tch-rs tensors) implement `Spawnable` directly.
+
+**ServiceSpawner modes**:
+
+| Mode | Constructor | Use case | Implementation |
+|------|-------------|----------|----------------|
+| Tokio | `ServiceSpawner::tokio()` | Async-safe services | `tokio::task::spawn_blocking()` |
+| Thread | `ServiceSpawner::threaded()` | `!Send` types (tch-rs tensors) | `std::thread` + single-threaded tokio runtime |
+| Subprocess | `ServiceSpawner::subprocess(binary)` | Process isolation | `ProcessSpawner` (systemd or standalone) |
+
+**InprocManager** — default manager for daemon mode (`InprocManager::new()` uses Thread mode). Implements `ServiceManager` trait. Handles:
+- Endpoint registration (RAII via `ServiceRegistration` — auto-cleanup on drop)
+- Ready signaling (oneshot channel from `run()`)
+- Shutdown (via `Arc<Notify>`)
+- `sd_notify(READY=1)` after socket bind
+
+**SpawnedService** — handle returned by spawner:
+- `ServiceKind` enum: `TokioTask` | `Thread` | `Subprocess`
+- `is_running()` — checks task/thread state or PID file (signal 0)
+- `stop()` — idempotent: signals shutdown, joins thread, or sends SIGTERM + cleans PID file
+
+**ProxyService** — XSUB/XPUB proxy implementing `Spawnable` directly. Used by EventProxy and StreamService. Uses `zmq::proxy_steerable` with a PAIR control socket for clean shutdown.
+
+#### **Service Management & Deployment**
+
+**Service factory system** (`crates/hyprstream/src/services/factories.rs`):
+
+The `#[service_factory("name")]` attribute macro (from `hyprstream-rpc-derive`) + `inventory` crate provides auto-discovery:
+
+```rust
+#[service_factory("policy", schema = "../../schema/policy.capnp", metadata = ...)]
+fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+    let service = PolicyService::new(...);
+    Ok(Box::new(service))  // Auto-Spawnable via blanket impl
+}
+```
+
+`ServiceContext` provides shared state for all factories:
+- ZMQ context, signing/verifying keys
+- `models_dir` path
+- `transport(name, SocketKind)` — generates transport config based on `EndpointMode`
+- `is_ipc()` — whether running in IPC mode (systemd) vs inproc (daemon)
+
+Factory lookup: `get_factory("policy")` → iterates `inventory::iter::<ServiceFactory>()`.
+
+**Boot sequence** (simplified):
+
+```
+CLI: hyprstream service start {name} --foreground [--ipc]
+  → init_registry(mode, runtime_dir)          # EndpointMode::Inproc or Ipc
+  → ServiceContext::new(zmq_ctx, keys, models_dir, mode)
+  → get_factory(name) → factory(&ctx) → Box<dyn Spawnable>
+  → InprocManager::spawn(service)
+      → thread::spawn → service.run(shutdown, on_ready)
+      → RequestLoop::new().run(service) → socket bind
+      → on_ready.send(()) + sd_notify(READY=1)
+  → wait for SIGTERM/SIGINT → handle.stop()
+```
+
+**ProcessSpawner** (`crates/hyprstream-rpc/src/service/spawner/process.rs`) — auto-detects backend:
+
+| Backend | Detection | Features |
+|---------|-----------|----------|
+| **SystemdBackend** | `/run/systemd/system` exists + `systemd-run` in PATH | Transient units via `systemd-run`, `hyprstream-workers.slice` isolation, memory/CPU limits, `CollectMode=inactive-or-failed`, user/system mode auto-detect |
+| **StandaloneBackend** | Fallback | `tokio::process::Command`, PID file tracking in `$XDG_RUNTIME_DIR/hyprstream/`, SIGTERM with cleanup |
+
+**Systemd unit generation** (`crates/hyprstream-rpc/src/service/manager/units.rs`):
+
+`hyprstream service install` generates per-service unit files:
+- **Service unit**: `Type=notify` (sd_notify after socket bind), `Restart=on-failure`
+- **Socket unit**: `ListenStream=%t/hyprstream/{service}.sock`, `SocketMode=0600`
+- Forwards `LD_LIBRARY_PATH` and `LIBTORCH` env vars from current environment
+- Executable priority: `~/.local/bin/hyprstream` > `$APPIMAGE` > `current_exe()`
+
+**Endpoint modes** (`crates/hyprstream-rpc/src/registry/mod.rs`):
+
+| Mode | Use case | Transport |
+|------|----------|-----------|
+| `EndpointMode::Inproc` | Daemon (all services in one process) | `inproc://hyprstream/{service}` — zero-copy |
+| `EndpointMode::Ipc` | Systemd (services as separate units) | `ipc://$XDG_RUNTIME_DIR/hyprstream/{service}.sock` — supports socket activation |
 
 See `docs/rpc-architecture.md` for the full deep-dive including message flow diagrams.
 
@@ -607,11 +764,11 @@ See `docs/rpc-architecture.md` for the full deep-dive including message flow dia
 ### **Pattern 1: Working with Models**
 
 ```rust
-use crate::storage::{ModelStorage, ModelRef};
+use crate::storage::ModelRef;
+use git2db::Git2DB;
 
-// Initialize storage
-let storage = ModelStorage::create(models_dir).await?;
-let registry = storage.registry();  // git2db Git2DB
+// Initialize git2db registry directly
+let registry = Git2DB::open(models_dir).await?;
 
 // Clone a model
 let repo_id = registry.clone("https://huggingface.co/Qwen/Qwen3-0.6B")
@@ -619,8 +776,8 @@ let repo_id = registry.clone("https://huggingface.co/Qwen/Qwen3-0.6B")
     .shallow(true)
     .exec().await?;
 
-// Get model path
-let model_path = registry.repo(&repo_id)?.worktree();
+// Get repository handle for operations
+let handle = registry.repo(&repo_id)?;
 
 // Parse ModelRef
 let model_ref = ModelRef::parse("qwen3-small:main")?;
@@ -648,10 +805,10 @@ for adapter in &adapters {
 // Get next available index
 let next_index = adapter_mgr.get_next_index()?;
 
-// Save new adapter
+// Save new adapter (e.g., from a TenantDelta merge)
 let adapter_path = adapter_mgr.adapters_dir
     .join(format!("{:02}_{}.safetensors", next_index, "my_adapter"));
-trainer.save_adapter(&adapter_path)?;
+// Write adapter weights via tch::Tensor::save or safetensors serialization
 ```
 
 ---
@@ -724,6 +881,36 @@ create_tag(model_path, "v1.0-release")?;
 
 ---
 
+### **Pattern 6: Adding a New Service**
+
+```
+1. Create service struct implementing ZmqService (or Spawnable directly for !Send types)
+   - Include infrastructure: context, transport, signing_key fields
+   - Implement handle_request() for Cap'n Proto dispatch
+
+2. Add factory function in crates/hyprstream/src/services/factories.rs:
+
+   #[service_factory("myservice", schema = "../../schema/myservice.capnp")]
+   fn create_my_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+       let service = MyService::new(
+           global_context(),
+           ctx.transport("myservice", SocketKind::Rep),
+           ctx.signing_key().clone(),
+       );
+       Ok(Box::new(service))
+   }
+
+3. Service is auto-discoverable via inventory — no manual registration needed
+   - get_factory("myservice") finds it at runtime
+   - hyprstream service start myservice --foreground works immediately
+
+4. Systemd unit auto-generated on: hyprstream service install
+   - Creates hyprstream-myservice.service (Type=notify)
+   - Creates hyprstream-myservice.socket (IPC endpoint)
+```
+
+---
+
 ## Testing
 
 ```bash
@@ -742,13 +929,7 @@ cargo test -p hyprstream storage::adapter_manager
 
 # Integration tests (git2db)
 cargo test -p git2db --test '*'
-
-# Examples (used for GPU/inference testing)
-cargo run --example test_cuda
-cargo run --example qwen_chat
 ```
-
-**Note**: Main hyprstream application uses examples for GPU/inference testing rather than unit tests in tests/ directory.
 
 ---
 
@@ -962,7 +1143,7 @@ impl<'a> Stream for TextStream<'a> {
 
 ### **Oct 2025: XET Storage Consolidation**
 
-**Decision**: Consolidate XET operations into git2db, use LfsXetBridge for ML workflows
+**Decision**: Consolidate XET operations into git2db, use `LfsStorage` for ML workflows
 
 **Removed/Refactored**:
 - `storage/xet_native.rs` (863 lines) - **Completely removed**
@@ -970,39 +1151,78 @@ impl<'a> Stream for TextStream<'a> {
 - Total: **~1,003 lines deleted**
 
 **Added**:
-- `storage/lfs_xet.rs` (520 lines) - LFS-specific ML workflows
-- `git2db::xet::XetStorage` - Core XET operations
+- `git2db/src/lfs.rs` (941 lines) - `LfsStorage`: LFS pointer parsing, detection, smudge via XET
+- `git-xet-filter/src/storage.rs` - `XetStorage`: core clean/smudge implementation
+- `git2db/src/xet_filter.rs` - Re-export of `git_xet_filter::*`
 - Hash-based downloads for LFS pointer resolution
 - All async I/O (was mixed blocking/async)
 
 **Rationale**:
-1. **Single source of truth**: Core XET operations now in git2db
-2. **Better layering**: hyprstream = ML workflows, git2db = git + XET primitives
-3. **Reusability**: Other projects can use git2db's XET without ML dependencies
+1. **Single source of truth**: Core XET operations now in git-xet-filter, exposed via git2db
+2. **Better layering**: hyprstream uses `git2db::LfsStorage`, git2db wraps git-xet-filter
+3. **Reusability**: Other projects can use git2db's LFS/XET without ML dependencies
 4. **Efficiency**: Direct file writes, async I/O, hash-based downloads
 5. **Consistency**: Matches storage drivers pattern (overlay2, vfs)
 
 **Architecture** (3-tier):
 ```
-Application Layer (hyprstream)
-    ├── LfsXetBridge - LFS translation for Hugging Face models
-    └── Uses git2db::xet
+Application Layer (hyprstream/runtime/model_factory.rs)
+    └── Uses git2db::LfsStorage for LFS pointer resolution
              ↓
-Core Layer (git2db)
-    ├── XetStorage - Core XET operations (clean, smudge, hash downloads)
-    └── Uses git-xet-filter
-             ↓
+Core Layer (git2db/src/lfs.rs)
+    ├── LfsStorage - LFS pointer parsing, detection, smudge
+    └── Delegates to XetStorage ↓
 Filter Layer (git-xet-filter)
-    └── Libgit2 filter integration (automatic git operations)
+    ├── storage.rs — XetStorage (clean/smudge)
+    ├── filter.rs + callbacks.rs — libgit2 filter (automatic)
+    └── lib.rs — initialize() for global registration
 ```
 
 **Impact**:
 - Net: **-1,003 lines** of redundant/duplicated code
-- API clarity: `git2db::xet` for core, `LfsXetBridge` for ML
+- API clarity: `git2db::LfsStorage` for LFS, `git-xet-filter::XetStorage` for core
 - Performance: Async I/O, direct file writes, hash-based downloads
 - Maintainability: Single implementation to fix bugs
 - **Complete migration**: No compatibility shims remaining
-- Future: Can enable automatic smudge/clean via libgit2 filter
+- Libgit2 filter fully operational for automatic smudge/clean
+
+---
+
+### **2025-2026: Test-Time Training (TTT) System**
+
+**Decision**: Replace standalone `LoRATrainer` with Test-Time Training architecture
+
+**Added**:
+- `training/ttt.rs` - `TestTimeTrainer` with adaptive gradient steps
+- `training/tenant_delta.rs` - Per-tenant LoRA delta isolation (`TenantDelta`)
+- `training/delta_pool.rs` - LRU-evicted delta registry (`DeltaPool`)
+- `training/merge.rs` - LoRA merge strategies (DO-Merge, additive, replace)
+- `training/quality_filter.rs` - Heuristic output quality filtering
+
+**Removed**:
+- `training/lora_trainer.rs` - Standalone LoRA trainer
+
+**Rationale**:
+1. **Online adaptation**: Models improve at inference time, not just offline
+2. **Tenant isolation**: Each tenant gets independent LoRA deltas
+3. **Quality gating**: Adaptations only committed if they improve output quality
+4. **Composable**: TTT deltas can be merged into permanent adapters via DO-Merge
+
+**Architecture**:
+- `TestTimeTrainer` runs gradient steps on input before generating response
+- `TenantDelta` stores per-tenant LoRA weight updates
+- `DeltaPool` manages delta lifecycle with LRU eviction
+- `MergeStrategy` (DO-Merge) saves accumulated deltas as permanent PEFT adapters
+
+---
+
+### **2025-2026: Service Spawner Infrastructure**
+
+**Decision**: Add multi-mode service spawner for flexible deployment
+
+**Impact**: 10 services (5 ZMQ, 3 HTTP, 2 proxy) all use unified `Spawnable` trait with Tokio, Thread, and Subprocess spawning modes. Systemd unit generation for production deployment.
+
+See "Service Spawner & Lifecycle" section above for full details.
 
 ---
 
