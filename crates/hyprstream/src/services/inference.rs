@@ -2233,8 +2233,8 @@ impl InferenceZmqClient {
     /// Start streaming generation with E2E authenticated handle.
     ///
     /// Returns the canonical `StreamHandle` from hyprstream-rpc which provides:
-    /// - `recv_next()` for blocking receive with HMAC verification
-    /// - `try_next()` for non-blocking receive
+    /// - `recv_next().await` for async receive with HMAC verification
+    /// - `futures::Stream` impl for composability with `StreamExt::next().await`
     ///
     /// Use `StreamChunkMessage::from_stream_payload()` to convert received
     /// `StreamPayload` values to inference-specific message types.

@@ -749,7 +749,7 @@ impl McpService {
             ToolResult::Stream(mut handle) => {
                 // Consume StreamHandle — DH, SUB, HMAC all handled internally
                 let mut contents = Vec::new();
-                while let Some(payload) = handle.recv_next()
+                while let Some(payload) = handle.recv_next().await
                     .map_err(|e| ErrorData::internal_error(format!("Stream error: {}", e), None))?
                 {
                     match payload {

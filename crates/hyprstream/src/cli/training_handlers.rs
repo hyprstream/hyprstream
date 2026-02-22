@@ -443,7 +443,7 @@ pub async fn handle_training_infer(
         let mut handle = client.generate_stream_handle(&request).await?;
         println!();
         loop {
-            match handle.recv_next()? {
+            match handle.recv_next().await? {
                 Some(StreamPayload::Data(data)) => {
                     if let Ok(text) = String::from_utf8(data) {
                         print!("{text}");
@@ -497,8 +497,8 @@ async fn collect_inference_stream(
     let mut text = String::new();
 
     loop {
-        match handle.try_next() {
-            Ok(Some(payload)) => match payload {
+        match handle.recv_next().await? {
+            Some(payload) => match payload {
                 StreamPayload::Data(data) => {
                     text.push_str(&String::from_utf8_lossy(&data));
                 }
@@ -528,14 +528,8 @@ async fn collect_inference_stream(
                     bail!("Generation error: {msg}");
                 }
             },
-            Ok(None) if handle.is_completed() => {
+            None => {
                 bail!("Stream ended without completion");
-            }
-            Ok(None) => {
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            }
-            Err(e) => {
-                bail!("Stream error: {e}");
             }
         }
     }

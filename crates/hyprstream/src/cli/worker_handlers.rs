@@ -505,14 +505,17 @@ pub async fn handle_worker_terminal(
         detach_keys,
     );
 
-    // 5. Set up terminal control
+    // 4. Set up terminal control
     let running = Arc::new(AtomicBool::new(true));
-    let running_signal = running.clone();
+    let cancel = stream_handle.cancel_token().clone();
 
     // Spawn task to handle Ctrl-C
+    let running_signal = running.clone();
+    let cancel_signal = cancel.clone();
     tokio::spawn(async move {
         let _ = signal::ctrl_c().await;
         running_signal.store(false, Ordering::SeqCst);
+        cancel_signal.cancel();
     });
 
     // Parse detach key sequence
@@ -520,34 +523,50 @@ pub async fn handle_worker_terminal(
 
     println!("\n--- Terminal attached. Press {detach_keys} to detach ---\n");
 
-    // 6. Main I/O loop — StreamHandle handles HMAC-verified receive
+    // 5. Main I/O loop — StreamHandle handles HMAC-verified receive
     let running_recv = running.clone();
-
     let recv_handle = std::thread::spawn(move || {
-        while running_recv.load(Ordering::SeqCst) {
-            match stream_handle.try_next() {
-                Ok(Some(StreamPayload::Data(data))) => {
-                    // Worker FD data is raw bytes (terminal output)
-                    print!("{}", String::from_utf8_lossy(&data));
-                    let _ = io::stdout().flush();
-                }
-                Ok(Some(StreamPayload::Complete(_))) => {
-                    println!("\n--- Stream complete ---");
-                    return;
-                }
-                Ok(Some(StreamPayload::Error(message))) => {
-                    eprintln!("\n--- Stream error: {message} ---");
-                    return;
-                }
-                Ok(None) => {
-                    // No data available, brief sleep to avoid busy-wait
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(e) => {
-                    tracing::warn!("Stream receive error: {}", e);
-                }
+        // Drop guard ensures main thread is always unblocked, even on panic
+        struct RunGuard(Arc<AtomicBool>);
+        impl Drop for RunGuard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
             }
         }
+        let _guard = RunGuard(running_recv);
+
+        // Mini tokio runtime for async TMQ subscriber on this dedicated thread.
+        // We use std::thread (not tokio::spawn) because the outer function blocks
+        // on stdin which would starve the tokio runtime.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("stream recv runtime");
+        rt.block_on(async move {
+            use futures::StreamExt;
+            while let Some(payload) = stream_handle.next().await {
+                match payload {
+                    Ok(StreamPayload::Data(data)) => {
+                        // Worker FD data is raw bytes (terminal output)
+                        print!("{}", String::from_utf8_lossy(&data));
+                        let _ = io::stdout().flush();
+                    }
+                    Ok(StreamPayload::Complete(_)) => {
+                        println!("\n--- Stream complete ---");
+                        break;
+                    }
+                    Ok(StreamPayload::Error(message)) => {
+                        eprintln!("\n--- Stream error: {message} ---");
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Stream receive error: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+        // _guard drops here, storing false into running
     });
 
     // Read stdin (stdin streaming via StreamBuilder would be implemented here)
@@ -572,6 +591,7 @@ pub async fn handle_worker_terminal(
         }
     }
 
+    cancel.cancel();              // fires token → wakes poll_next → returns None → loop exits
     running.store(false, Ordering::SeqCst);
     let _ = recv_handle.join();
 

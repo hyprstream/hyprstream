@@ -668,7 +668,7 @@ async fn clone_with_streaming(
 
     // Receive and display progress
     loop {
-        match stream_handle.recv_next()? {
+        match stream_handle.recv_next().await? {
             Some(StreamPayload::Data(data)) => {
                 // Parse progress message (format: "stage:current:total")
                 if let Ok(text) = String::from_utf8(data) {
@@ -1236,7 +1236,7 @@ pub async fn handle_infer(
 
         // Receive and print tokens
         loop {
-            match stream_handle.recv_next()? {
+            match stream_handle.recv_next().await? {
                 Some(StreamPayload::Data(data)) => {
                     // Token data is UTF-8 text
                     if let Ok(text) = String::from_utf8(data) {
@@ -1277,8 +1277,8 @@ pub async fn handle_infer(
 
         let mut text = String::new();
         loop {
-            match handle.try_next() {
-                Ok(Some(payload)) => match payload {
+            match handle.recv_next().await? {
+                Some(payload) => match payload {
                     StreamPayload::Data(data) => {
                         text.push_str(&String::from_utf8_lossy(&data));
                     }
@@ -1307,14 +1307,8 @@ pub async fn handle_infer(
                         bail!("Generation error: {msg}");
                     }
                 },
-                Ok(None) if handle.is_completed() => {
+                None => {
                     bail!("Stream ended without completion");
-                }
-                Ok(None) => {
-                    tokio::task::yield_now().await;
-                }
-                Err(e) => {
-                    bail!("Stream error: {e}");
                 }
             }
         }

@@ -37,13 +37,15 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 
 use anyhow::Result;
 use capnp::message::Builder;
 use capnp::serialize;
 use dashmap::DashMap;
-use futures::SinkExt;
+use futures::{SinkExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
@@ -51,6 +53,8 @@ use tokio_util::sync::CancellationToken;
 use crate::auth::Claims;
 use crate::prelude::SigningKey;
 use crate::registry::{global as endpoint_registry, SocketKind};
+
+use tmq::SocketExt;
 
 use crate::crypto::{derive_stream_keys, keyed_mac_truncated};
 
@@ -953,28 +957,40 @@ impl StreamVerifier {
 ///     &client_pubkey,
 /// )?;
 ///
-/// while let Some(payload) = handle.recv_next()? {
-///     match payload {
-///         StreamPayload::Data { data, .. } => process(data),
-///         StreamPayload::Complete { .. } => break,
-///         StreamPayload::Error { message, .. } => return Err(message.into()),
+/// use futures::StreamExt;
+/// while let Some(payload) = handle.next().await {
+///     match payload? {
+///         StreamPayload::Data(data) => process(data),
+///         StreamPayload::Complete(_) => break,
+///         StreamPayload::Error(message) => return Err(message.into()),
 ///     }
 /// }
 /// ```
 pub struct StreamHandle {
-    subscriber: zmq::Socket,
+    subscriber: tmq::subscribe::Subscribe,
     stream_id: String,
     topic: String,
     verifier: StreamVerifier,
     pending: VecDeque<StreamPayload>,
     completed: bool,
     /// PUSH socket for sending control messages (lazy, consumer → StreamService)
+    /// Kept as sync zmq::Socket — cancel is best-effort fire-and-forget with DONTWAIT.
     ctrl_push: Option<zmq::Socket>,
     /// Control channel topic (DH-derived)
     ctrl_topic: String,
     /// Control channel MAC key
     ctrl_mac_key: [u8; 32],
+    /// Cancellation token — consumer-side; fired by cancel() to unblock poll_next
+    cancel_token: CancellationToken,
 }
+
+// StreamHandle must be Send for ToolResult::Stream(Box<StreamHandle>)
+const _: () = {
+    fn _assert_send<T: Send>() {}
+    fn _check() {
+        _assert_send::<StreamHandle>();
+    }
+};
 
 impl StreamHandle {
     /// Create with DH key derivation (encapsulated).
@@ -1001,10 +1017,15 @@ impl StreamHandle {
         let server_pub_32 = pubkey_to_32(server_pubkey);
         let keys = derive_stream_keys(&shared_secret, &client_pub_32, &server_pub_32)?;
 
-        // Create subscriber
-        let subscriber = context.socket(zmq::SUB)?;
-        subscriber.connect(endpoint)?;
-        subscriber.set_subscribe(keys.topic.as_bytes())?;
+        // Create async TMQ subscriber
+        let subscriber = tmq::subscribe::subscribe(context)
+            .connect(endpoint)
+            .map_err(|e| anyhow::anyhow!("SUB connect to {}: {}", endpoint, e))?
+            .subscribe(keys.topic.as_bytes())
+            .map_err(|e| anyhow::anyhow!("SUB subscribe to topic: {}", e))?;
+
+        subscriber.set_linger(0)
+            .map_err(|e| anyhow::anyhow!("Failed to set linger on SUB: {}", e))?;
 
         tracing::debug!(
             stream_id = %stream_id,
@@ -1035,78 +1056,16 @@ impl StreamHandle {
             ctrl_push,
             ctrl_topic: keys.ctrl_topic,
             ctrl_mac_key: *keys.ctrl_mac_key,
+            cancel_token: CancellationToken::new(),
         })
     }
 
-    /// Receive next payload (blocking).
+    /// Receive next payload (async).
     ///
-    /// Returns `None` when stream is complete.
-    pub fn recv_next(&mut self) -> Result<Option<StreamPayload>> {
-        // Return buffered payloads first
-        if let Some(payload) = self.pending.pop_front() {
-            return Ok(Some(payload));
-        }
-
-        if self.completed {
-            return Ok(None);
-        }
-
-        // Receive and verify
-        let frames = self.subscriber.recv_multipart(0)?;
-
-        if frames.len() != 3 || frames[2].len() != 16 {
-            anyhow::bail!(
-                "Invalid StreamBlock format: expected 3 frames with 16-byte MAC, got {} frames",
-                frames.len()
-            );
-        }
-
-        let payloads = self.verifier.verify(&frames)?;
-
-        // Buffer payloads
-        for payload in payloads {
-            if matches!(payload, StreamPayload::Complete { .. } | StreamPayload::Error { .. }) {
-                self.completed = true;
-            }
-            self.pending.push_back(payload);
-        }
-
-        // Return first
-        Ok(self.pending.pop_front())
-    }
-
-    /// Try to receive next payload (non-blocking).
-    pub fn try_next(&mut self) -> Result<Option<StreamPayload>> {
-        // Return buffered payloads first
-        if let Some(payload) = self.pending.pop_front() {
-            return Ok(Some(payload));
-        }
-
-        if self.completed {
-            return Ok(None);
-        }
-
-        // Non-blocking receive
-        match self.subscriber.recv_multipart(zmq::DONTWAIT) {
-            Ok(frames) => {
-                if frames.len() != 3 || frames[2].len() != 16 {
-                    anyhow::bail!("Invalid StreamBlock format");
-                }
-
-                let payloads = self.verifier.verify(&frames)?;
-
-                for payload in payloads {
-                    if matches!(payload, StreamPayload::Complete { .. } | StreamPayload::Error { .. }) {
-                        self.completed = true;
-                    }
-                    self.pending.push_back(payload);
-                }
-
-                Ok(self.pending.pop_front())
-            }
-            Err(zmq::Error::EAGAIN) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+    /// Returns `None` when stream is complete or socket closed.
+    /// Prefer using `StreamExt::next()` directly for composability.
+    pub async fn recv_next(&mut self) -> Result<Option<StreamPayload>> {
+        self.next().await.transpose()
     }
 
     /// Get the stream ID.
@@ -1124,11 +1083,19 @@ impl StreamHandle {
         self.completed
     }
 
+    /// Get the cancellation token (clone to trigger from another context).
+    pub fn cancel_token(&self) -> &CancellationToken {
+        &self.cancel_token
+    }
+
     /// Send a cancel control message to the producer via the control channel.
     ///
+    /// Also fires the cancellation token to unblock `poll_next` immediately.
     /// Best-effort: if the PUSH socket is unavailable or send fails, the
     /// JWT expiry timeout will still stop the stream.
     pub fn cancel(&self) {
+        self.cancel_token.cancel();  // Unblock poll_next (waker fires)
+
         let Some(ref sock) = self.ctrl_push else { return };
 
         // Build StreamControl::Cancel capnp message
@@ -1151,6 +1118,78 @@ impl StreamHandle {
         let _ = sock.send(mac.as_slice(), zmq::DONTWAIT);
 
         tracing::debug!(stream_id = %self.stream_id, "sent cancel on control channel");
+    }
+}
+
+impl Stream for StreamHandle {
+    type Item = Result<StreamPayload>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        loop {
+            // Fast path: drain buffered payloads
+            if let Some(payload) = self.pending.pop_front() {
+                return Poll::Ready(Some(Ok(payload)));
+            }
+            if self.completed {
+                return Poll::Ready(None);
+            }
+
+            // Poll cancellation token — registers cx.waker() with the token.
+            // When cancel() fires, the waker is invoked and poll_next re-runs.
+            let is_cancelled = {
+                let cancel_fut = std::pin::pin!(self.cancel_token.cancelled());
+                cancel_fut.poll(cx).is_ready()
+            };
+            if is_cancelled {
+                self.completed = true;
+                return Poll::Ready(None);
+            }
+
+            // Poll TMQ subscriber — registers cx.waker() with epoll.
+            // Now the SAME waker is registered with BOTH token AND epoll.
+            match Pin::new(&mut self.subscriber).poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    self.completed = true;
+                    return Poll::Ready(None);
+                }
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e.into()))),
+                Poll::Ready(Some(Ok(multipart))) => {
+                    let frames: Vec<Vec<u8>> =
+                        multipart.into_iter().map(|m| m.to_vec()).collect();
+
+                    if frames.len() != 3 || frames[2].len() != 16 {
+                        return Poll::Ready(Some(Err(anyhow::anyhow!(
+                            "Invalid StreamBlock format: expected 3 frames with 16-byte MAC, got {} frames",
+                            frames.len()
+                        ))));
+                    }
+
+                    match self.verifier.verify(&frames) {
+                        Err(e) => return Poll::Ready(Some(Err(e))),
+                        Ok(payloads) => {
+                            for p in payloads {
+                                if matches!(
+                                    p,
+                                    StreamPayload::Complete(..) | StreamPayload::Error(..)
+                                ) {
+                                    self.completed = true;
+                                }
+                                self.pending.push_back(p);
+                            }
+                            // Loop back: if payloads is non-empty, pop_front
+                            // returns the first one. If empty (heartbeat-only),
+                            // we re-poll the TMQ subscriber which will return
+                            // Poll::Pending and register the waker via epoll.
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
