@@ -288,7 +288,8 @@ impl InferenceService {
                     }
                 };
 
-            rt.block_on(async move {
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, async move {
                 match Self::initialize(model_path, config, server_pubkey, signing_key, nonce_cache, policy_client, fs).await {
                     Ok(service) => {
                         // Pass init_tx to run_service_loop - it signals AFTER socket binding
@@ -913,11 +914,15 @@ impl InferenceService {
                 }
             };
 
-            // Execute continuation AFTER REP is sent.
-            // This guarantees the client has the StreamInfo (stream_id)
-            // before any data flows on the PUB/SUB channel.
+            // Spawn continuation AFTER REP is sent.
+            // spawn_local keeps it on this single-threaded runtime (required
+            // because the continuation holds a !Send RwLockReadGuard on
+            // TorchEngine across await points).  Spawning instead of awaiting
+            // lets the service loop accept new requests (e.g. apply_chat_template)
+            // while generation is in progress, and avoids a race where the
+            // synchronous generation blocks tokio before ZMQ flushes the REP.
             if let Some(future) = continuation {
-                future.await;
+                tokio::task::spawn_local(future);
             }
         }
     }
@@ -1130,17 +1135,23 @@ impl InferenceService {
                     let mut had_error = false;
                     let cancel = stream_ctx.cancel_token();
                     loop {
-                        let chunk_result = tokio::select! {
-                            biased;
-                            _ = cancel.cancelled() => {
-                                let _ = publisher.publish_error("cancelled").await;
-                                had_error = true;
-                                break;
-                            }
-                            next = stream.next() => match next {
-                                Some(r) => r,
-                                None => break,
-                            },
+                        // Sleep(0) forces the tokio reactor to run, driving
+                        // pending I/O (ZMQ recv, stream channel setup) before
+                        // the next synchronous token generation.  yield_now()
+                        // is insufficient because it only yields to other ready
+                        // tasks without driving the reactor — keeping async
+                        // operations (like prepare_stream_with_claims) starved.
+                        tokio::time::sleep(std::time::Duration::ZERO).await;
+
+                        if cancel.is_cancelled() {
+                            let _ = publisher.publish_error("cancelled").await;
+                            had_error = true;
+                            break;
+                        }
+
+                        let chunk_result = match stream.next().await {
+                            Some(r) => r,
+                            None => break,
                         };
                         match chunk_result {
                             Ok(text) => {

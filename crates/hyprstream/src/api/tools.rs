@@ -51,6 +51,133 @@ impl ToolCallFormat {
             _ => Self::None,
         }
     }
+
+    /// Return the opening marker string that signals the start of a tool call,
+    /// or `None` if this format does not support tool calling.
+    pub fn open_marker(&self) -> Option<&'static str> {
+        match self {
+            Self::Qwen3Xml => Some("<tool_call>"),
+            Self::LlamaJson => Some("<|python_tag|>"),
+            Self::MistralJson => Some("[TOOL_CALLS]"),
+            Self::None => None,
+        }
+    }
+}
+
+// =============================================================================
+// StreamingToolCallFilter — suppress tool-call XML/markers from SSE content
+// =============================================================================
+
+/// State-machine filter that intercepts streaming tokens and suppresses tool-call
+/// markers (e.g. `<tool_call>…`) so clients only receive plain text content in
+/// SSE `delta.content` chunks.  The raw tokens are still accumulated separately
+/// for end-of-stream tool-call parsing.
+///
+/// Usage:
+/// ```ignore
+/// let mut filter = StreamingToolCallFilter::new(format);
+/// for token in tokens {
+///     if let Some(text) = filter.feed(&token) {
+///         send_sse_content(text);
+///     }
+/// }
+/// if let Some(remaining) = filter.flush() {
+///     send_sse_content(remaining);
+/// }
+/// ```
+pub struct StreamingToolCallFilter {
+    marker: Option<&'static str>,
+    pending: String,
+    in_tool_call: bool,
+}
+
+impl StreamingToolCallFilter {
+    /// Create a new filter for the given tool-call format.
+    pub fn new(format: ToolCallFormat) -> Self {
+        Self {
+            marker: format.open_marker(),
+            pending: String::new(),
+            in_tool_call: false,
+        }
+    }
+
+    /// Feed the next token into the filter.
+    ///
+    /// Returns `Some(text)` with content to emit to the client, or `None` if the
+    /// token was buffered or suppressed (inside a tool call).
+    pub fn feed(&mut self, token: &str) -> Option<String> {
+        let marker = match self.marker {
+            Some(m) => m,
+            None => return Some(token.to_owned()),
+        };
+
+        // Once inside a tool call, suppress everything
+        if self.in_tool_call {
+            return None;
+        }
+
+        self.pending.push_str(token);
+
+        // Check if the full marker appears in pending
+        if let Some(pos) = self.pending.find(marker) {
+            self.in_tool_call = true;
+            let before = &self.pending[..pos];
+            let result = if before.is_empty() {
+                None
+            } else {
+                Some(before.to_owned())
+            };
+            self.pending.clear();
+            return result;
+        }
+
+        // Find how much of pending is safe to flush (cannot be a partial marker prefix)
+        let safe = self.safe_flush_point(marker);
+        if safe > 0 {
+            let flushed: String = self.pending.drain(..safe).collect();
+            Some(flushed)
+        } else {
+            // Entire pending could be a partial marker — keep buffering
+            None
+        }
+    }
+
+    /// Flush any remaining buffered content.
+    ///
+    /// Call this at stream end.  Returns `None` if there is nothing to flush
+    /// or if we are inside a tool call.
+    pub fn flush(&mut self) -> Option<String> {
+        if self.in_tool_call || self.pending.is_empty() {
+            return None;
+        }
+        Some(std::mem::take(&mut self.pending))
+    }
+
+    /// Find the position up to which `self.pending` is safe to emit — i.e. no
+    /// suffix of `pending[..pos]` matches a prefix of `marker`.
+    fn safe_flush_point(&self, marker: &str) -> usize {
+        let pending = self.pending.as_bytes();
+        let marker = marker.as_bytes();
+        let len = pending.len();
+
+        // We want the largest `safe` such that no suffix of pending[..safe]
+        // is a prefix of marker.  Equivalently: the longest suffix of
+        // pending that is also a prefix of marker must start at >= safe.
+        //
+        // Walk backwards: for each possible suffix start position i (from
+        // len-1 down to 0), check if pending[i..] is a prefix of marker.
+        // The first (rightmost) match tells us the keep-point.
+
+        for i in (0..len).rev() {
+            let suffix = &pending[i..];
+            if marker.starts_with(suffix) {
+                // pending[i..] matches the start of marker — keep from i
+                return i;
+            }
+        }
+        // No suffix matches — everything is safe
+        len
+    }
 }
 
 // =============================================================================
@@ -437,5 +564,105 @@ mod tests {
     fn test_dispatch_has_tool_calls() {
         assert!(has_tool_calls_for_format(ToolCallFormat::Qwen3Xml, "<tool_call>...</tool_call>"));
         assert!(!has_tool_calls_for_format(ToolCallFormat::None, "<tool_call>...</tool_call>"));
+    }
+
+    // --- StreamingToolCallFilter tests ---
+
+    #[test]
+    fn test_filter_passthrough_when_none() {
+        let mut f = StreamingToolCallFilter::new(ToolCallFormat::None);
+        assert_eq!(f.feed("hello"), Some("hello".to_owned()));
+        assert_eq!(f.feed(" world"), Some(" world".to_owned()));
+        assert_eq!(f.flush(), None);
+    }
+
+    #[test]
+    fn test_filter_qwen_suppresses_tool_call() {
+        let mut f = StreamingToolCallFilter::new(ToolCallFormat::Qwen3Xml);
+        // Feed the marker in one shot
+        assert_eq!(f.feed("<tool_call>"), None);
+        // After marker, everything is suppressed
+        assert_eq!(f.feed("{\"name\":\"x\"}"), None);
+        assert_eq!(f.feed("</tool_call>"), None);
+        assert_eq!(f.flush(), None);
+    }
+
+    #[test]
+    fn test_filter_content_before_tool_call() {
+        let mut f = StreamingToolCallFilter::new(ToolCallFormat::Qwen3Xml);
+        // Content tokens before the marker should be emitted
+        assert_eq!(f.feed("Hello"), Some("Hello".to_owned()));
+        assert_eq!(f.feed(" world"), Some(" world".to_owned()));
+        // Now the marker arrives — nothing emitted
+        assert_eq!(f.feed("<tool_call>"), None);
+        assert_eq!(f.feed("{\"name\":\"x\"}"), None);
+        assert_eq!(f.flush(), None);
+    }
+
+    #[test]
+    fn test_filter_partial_marker_across_tokens() {
+        let mut f = StreamingToolCallFilter::new(ToolCallFormat::Qwen3Xml);
+        // "<" could be start of "<tool_call>" — buffered
+        assert_eq!(f.feed("<"), None);
+        // "tool_call>" completes the marker — suppressed
+        assert_eq!(f.feed("tool_call>"), None);
+        // Now in tool_call mode
+        assert_eq!(f.feed("body"), None);
+        assert_eq!(f.flush(), None);
+    }
+
+    #[test]
+    fn test_filter_false_partial_flushes() {
+        let mut f = StreamingToolCallFilter::new(ToolCallFormat::Qwen3Xml);
+        // "<think>" starts with "<" which matches marker prefix, so "<" is buffered...
+        assert_eq!(f.feed("<"), None);
+        // "think>" doesn't complete the marker and no suffix matches marker prefix
+        // so the whole "<think>" is flushed
+        let result = f.feed("think>");
+        assert_eq!(result, Some("<think>".to_owned()));
+        assert_eq!(f.flush(), None);
+    }
+
+    #[test]
+    fn test_filter_content_and_marker_in_same_token() {
+        let mut f = StreamingToolCallFilter::new(ToolCallFormat::Qwen3Xml);
+        // Token contains text then marker
+        let result = f.feed("Sure!<tool_call>");
+        assert_eq!(result, Some("Sure!".to_owned()));
+        assert_eq!(f.feed("body"), None);
+    }
+
+    #[test]
+    fn test_filter_flush_returns_pending_when_no_tool_call() {
+        let mut f = StreamingToolCallFilter::new(ToolCallFormat::Qwen3Xml);
+        // Buffer a partial that looks like it could be a marker
+        assert_eq!(f.feed("<"), None);
+        // Stream ends without completing the marker — flush the buffer
+        assert_eq!(f.flush(), Some("<".to_owned()));
+    }
+
+    #[test]
+    fn test_filter_llama_marker() {
+        let mut f = StreamingToolCallFilter::new(ToolCallFormat::LlamaJson);
+        assert_eq!(f.feed("Answer: "), Some("Answer: ".to_owned()));
+        assert_eq!(f.feed("<|python_tag|>"), None);
+        assert_eq!(f.feed("{\"name\":\"f\"}"), None);
+        assert_eq!(f.flush(), None);
+    }
+
+    #[test]
+    fn test_filter_mistral_marker() {
+        let mut f = StreamingToolCallFilter::new(ToolCallFormat::MistralJson);
+        assert_eq!(f.feed("Here: "), Some("Here: ".to_owned()));
+        assert_eq!(f.feed("[TOOL_CALLS]"), None);
+        assert_eq!(f.feed(" [{\"name\":\"f\"}]"), None);
+    }
+
+    #[test]
+    fn test_filter_open_marker_values() {
+        assert_eq!(ToolCallFormat::Qwen3Xml.open_marker(), Some("<tool_call>"));
+        assert_eq!(ToolCallFormat::LlamaJson.open_marker(), Some("<|python_tag|>"));
+        assert_eq!(ToolCallFormat::MistralJson.open_marker(), Some("[TOOL_CALLS]"));
+        assert_eq!(ToolCallFormat::None.open_marker(), None);
     }
 }
