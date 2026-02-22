@@ -82,7 +82,9 @@ hyprstream/
 │   │   │   ├── lora/            # LoRA implementation
 │   │   │   ├── api/             # REST API (OpenAI-compatible)
 │   │   │   ├── cli/             # CLI commands
-│   │   │   └── server/          # HTTP server & state management
+│   │   │   ├── server/          # HTTP server & state management
+│   │   │   ├── services/        # RPC service implementations
+│   │   │   └── schema/          # Cap'n Proto service schemas
 │   │   └── Cargo.toml
 │   │
 │   ├── git2db/                  # Git repository management library ⭐
@@ -518,6 +520,88 @@ pub async fn list_models(&self) -> Result<Vec<(ModelRef, ModelMetadata)>> {
 
 ---
 
+### **6. RPC System** (`crates/hyprstream-rpc/`, `hyprstream-rpc-derive/`, `hyprstream-rpc-build/`)
+
+The RPC system provides typed, secure inter-service communication using Cap'n Proto schemas over ZeroMQ transports.
+
+#### **Crate Structure**
+
+| Crate | Purpose |
+|-------|---------|
+| **hyprstream-rpc** | Runtime library: ZMQ transport, crypto (Ed25519, CURVE, ECDH), signed envelopes, streaming, JWT auth |
+| **hyprstream-rpc-derive** | Proc macros: code generation from Cap'n Proto schemas (clients, handlers, dispatch) |
+| **hyprstream-rpc-build** | Build helper: extracts annotations from CGR files into JSON metadata for macros |
+
+#### **Code Generation Pipeline**
+
+```
+.capnp schema → capnpc → CGR binary → hyprstream-rpc-build → JSON metadata
+                                                                    ↓
+                                          generate_rpc_service! macro (hyprstream-rpc-derive)
+                                                                    ↓
+                                          Typed client stubs + request handlers + dispatch
+```
+
+#### **Services**
+
+| Service | Endpoint | ZMQ Pattern | Purpose |
+|---------|----------|-------------|---------|
+| **RegistryService** | `inproc://hyprstream/registry` | REQ/REP | Git model management |
+| **ModelService** | `inproc://hyprstream/model` | REQ/REP | Model lifecycle (load/unload, TTT, PEFT) |
+| **InferenceService** | `inproc://hyprstream/inference` | REQ/REP + XPUB | Token generation & streaming |
+| **PolicyService** | (auto-register) | REQ/REP | Casbin policy + JWT issuance |
+| **WorkerService** | (auto-register) | REQ/REP | CRI-aligned container management |
+| **StreamService** | PULL + XPUB | PUSH/PULL→XPUB | Streaming proxy (zero message loss) |
+| **EventProxy** | `inproc://hyprstream/events` | XSUB/XPUB | Event fan-out |
+
+Service implementations live in `crates/hyprstream/src/services/`.
+
+#### **Security Model** (3 layers)
+
+1. **Transport**: CURVE encryption (Curve25519) on TCP sockets via `CurveConfig`
+2. **Application**: Ed25519 signed `SignedEnvelope` — survives message forwarding
+3. **Authorization**: Casbin policy + JWT scopes (`action:resource:identifier`)
+
+**Envelope flow**: Client builds `RequestEnvelope` (identity, payload, nonce, timestamp, claims) → signs with Ed25519 → wraps in `SignedEnvelope` → server verifies signature → extracts `EnvelopeContext` with verified identity → handler checks authorization.
+
+**Key types** (`crates/hyprstream-rpc/src/`):
+- `service/zmq.rs` — `ZmqService` trait, `RequestLoop`, `EnvelopeContext`
+- `envelope.rs` — `SignedEnvelope`, `RequestIdentity` (Local/ApiToken/Peer/Anonymous)
+- `capnp/traits.rs` — `ToCapnp`, `FromCapnp` serialization traits
+- `crypto/mod.rs` — Ed25519 signing, Ristretto255 ECDH, `ChainedStreamHmac`
+- `streaming.rs` — `StreamPublisher`, `ResponseStream` (PUSH/PULL→XPUB)
+- `auth/` — JWT `Claims`, `Scope`, `ScopeRegistry`
+
+#### **Streaming Architecture**
+
+Uses PUSH/PULL→XPUB/SUB (not plain PUB/SUB) to prevent message loss during subscriber setup:
+- Publishers send via PUSH (buffers at HWM)
+- `StreamService` queues per-topic via PULL
+- Clients subscribe via XPUB; queued messages flush immediately
+- E2E authentication: DH key exchange → derived topic + HMAC key → `ChainedStreamHmac` on each `StreamBlock`
+
+#### **Derive Macros** (`crates/hyprstream-rpc-derive/`)
+
+| Macro | Type | Purpose |
+|-------|------|---------|
+| `ToCapnp` | Derive | Cap'n Proto serialization |
+| `FromCapnp` | Derive | Cap'n Proto deserialization |
+| `#[authorize]` | Attribute | Declarative JWT + Casbin authorization on handlers |
+| `#[register_scopes]` | Attribute | Compile-time scope registration |
+| `#[service_factory]` | Attribute | Factory pattern for scoped clients |
+| `generate_rpc_service!` | Macro | Full client/handler/dispatch from CGR metadata |
+
+#### **Schema Locations**
+
+| Location | Schemas |
+|----------|---------|
+| `crates/hyprstream-rpc/schema/` | `common.capnp` (envelopes, identity, claims), `streaming.capnp` (stream primitives), `events.capnp`, `annotations.capnp` |
+| `crates/hyprstream/schema/` | `registry.capnp`, `inference.capnp`, `model.capnp`, `policy.capnp`, `worker.capnp`, `events.capnp`, `mcp.capnp` |
+
+See `docs/rpc-architecture.md` for the full deep-dive including message flow diagrams.
+
+---
+
 ## Common Development Patterns
 
 ### **Pattern 1: Working with Models**
@@ -612,6 +696,30 @@ create_tag(model_path, "v1.0-release")?;
 // 2. Get HEAD commit
 // 3. Create lightweight tag
 // 4. Overwrites if exists
+```
+
+---
+
+### **Pattern 5: Adding an RPC Method**
+
+```
+1. Define in .capnp schema (e.g., crates/hyprstream/schema/model.capnp)
+   - Add request/response structs and method variant to the service union
+
+2. Rebuild to regenerate CGR metadata
+   cargo build -p hyprstream
+
+3. Implement handler in the service (e.g., src/services/model.rs)
+   - Match the new variant in the dispatch function
+   - Use #[authorize] for access control:
+
+   #[authorize(action = "manage", resource = "model")]
+   async fn handle_my_method(&self, ctx: &EnvelopeContext, req: MyRequest) -> Result<MyResponse> {
+       // Implementation
+   }
+
+4. Client code is auto-generated by generate_rpc_service! macro
+   - Typed client methods available immediately after rebuild
 ```
 
 ---
