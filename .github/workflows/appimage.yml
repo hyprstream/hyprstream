@@ -182,7 +182,19 @@ jobs:
           files: |
             appimages/*.AppImage
             appimages/SHA256SUMS.txt
+            install.sh
           body: |
+            ## Quick Install
+
+            ```bash
+            curl -fsSL https://github.com/hyprstream/hyprstream/releases/download/v${{ steps.version.outputs.version }}/install.sh | bash
+            ```
+
+            Or non-interactive:
+            ```bash
+            curl -fsSL https://github.com/hyprstream/hyprstream/releases/download/v${{ steps.version.outputs.version }}/install.sh | bash -s -- --auto
+            ```
+
             ## AppImage Downloads
 
             | File | Description |
@@ -193,7 +205,7 @@ jobs:
             | `hyprstream-${{ steps.version.outputs.version }}-cuda130-x86_64.AppImage` | NVIDIA CUDA 13.0 |
             | `hyprstream-${{ steps.version.outputs.version }}-rocm71-x86_64.AppImage` | AMD ROCm 7.1 |
 
-            ### Usage
+            ### Manual Install
 
             ```bash
             # Download and make executable
