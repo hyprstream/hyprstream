@@ -7,7 +7,7 @@ arch=('x86_64')
 url="https://github.com/hyprstream/hyprstream"
 license=('AGPL3' 'MIT')
 depends=('capnproto' 'cuda' 'python-pytorch-opt-cuda')
-makedepends=('base-devel' 'rustup')
+makedepends=('base-devel' 'rustup' 'cmake')
 source=("hyprstream::git+https://github.com/hyprstream/hyprstream.git#branch=main")
 sha256sums=("SKIP")     
 
