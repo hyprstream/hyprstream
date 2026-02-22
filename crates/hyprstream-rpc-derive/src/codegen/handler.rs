@@ -452,8 +452,9 @@ fn generate_dispatch_fn(
                             Which::#variant_pascal(()) => {
                                 #streaming_auth_stmt
                                 let (stream_info, continuation) = #call?;
+                                let guarded = hyprstream_rpc::streaming::StreamGuard::wrap(continuation);
                                 let variant = #response_type::#resp_variant_pascal(stream_info);
-                                return Ok((serialize_response(request_id, &variant)?, Some(continuation)));
+                                return Ok((serialize_response(request_id, &variant)?, Some(guarded)));
                             }
                         }
                     },
@@ -479,8 +480,9 @@ fn generate_dispatch_fn(
                                         let data = hyprstream_rpc::capnp::FromCapnp::read_from(v)?;
                                         #streaming_auth_stmt
                                         let (stream_info, continuation) = #call?;
+                                        let guarded = hyprstream_rpc::streaming::StreamGuard::wrap(continuation);
                                         let variant = #response_type::#resp_variant_pascal(stream_info);
-                                        return Ok((serialize_response(request_id, &variant)?, Some(continuation)));
+                                        return Ok((serialize_response(request_id, &variant)?, Some(guarded)));
                                     }
                                 }
                             }

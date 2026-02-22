@@ -464,7 +464,7 @@ impl RegistryService {
             .with_progress(git2db::callback_config::ProgressConfig::Channel(reporter));
 
         // Execute clone and stream progress concurrently
-        let result = stream_channel.with_publisher(&stream_ctx, |mut publisher| async move {
+        let result = stream_channel.run_stream(&stream_ctx, |mut publisher| async move {
             // Spawn clone task - runs concurrently with progress streaming
             let registry_clone = Arc::clone(&registry);
 
@@ -489,31 +489,26 @@ impl RegistryService {
             // (Ignore Complete/Error from channel - we'll send our own based on clone_result)
             while let Some(update) = progress_rx.recv().await {
                 if let ProgressUpdate::Progress { stage, current, total } = update {
-                    publisher.publish_progress(&stage, current, total).await?;
+                    if let Err(e) = publisher.publish_progress(&stage, current, total).await {
+                        return (publisher, Err(e));
+                    }
                 }
             }
 
             // Wait for clone to complete and send final status
-            match clone_handle.await {
+            let result = match clone_handle.await {
                 Ok(Ok(repo)) => {
                     let metadata = serde_json::json!({
                         "repo_id": repo.id.to_string(),
                         "name": repo.name,
                         "url": repo.url,
                     });
-                    publisher.complete_ref(metadata.to_string().as_bytes()).await?;
-                    Ok(())
+                    publisher.complete_ref(metadata.to_string().as_bytes()).await.map(|()| ())
                 }
-                Ok(Err(e)) => {
-                    publisher.publish_error(&e.to_string()).await?;
-                    Err(e)
-                }
-                Err(e) => {
-                    let err = anyhow!("Clone task panicked: {}", e);
-                    publisher.publish_error(&err.to_string()).await?;
-                    Err(err)
-                }
-            }
+                Ok(Err(e)) => Err(e),  // framework sends Error frame automatically
+                Err(e) => Err(anyhow!("Clone task panicked: {}", e)),  // framework sends Error frame
+            };
+            (publisher, result)
         }).await;
 
         if let Err(e) = result {

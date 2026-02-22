@@ -843,8 +843,8 @@ impl InferenceService {
                     // User explicitly requested TTT — this is an error
                     error!(stream_id = %stream_ctx.stream_id(), subject = %subject, "TTT explicitly enabled but not available on server");
                     let sc = stream_channel;
-                    if let Err(send_err) = sc.with_publisher(stream_ctx, |mut publisher| async move {
-                        publisher.publish_error("TTT explicitly enabled but not configured on this server").await
+                    if let Err(send_err) = sc.run_stream(stream_ctx, |publisher| async move {
+                        (publisher, Err::<(), _>(anyhow::anyhow!("TTT explicitly enabled but not configured on this server")))
                     }).await {
                         error!(stream_id = %stream_ctx.stream_id(), error = %send_err,
                             "Failed to publish TTT error to stream");
@@ -858,8 +858,8 @@ impl InferenceService {
                     // User explicitly requested TTT — adaptation failure is a stream error
                     error!(stream_id = %stream_ctx.stream_id(), subject = %subject, error = %e, "TTT adaptation failed");
                     let sc = stream_channel;
-                    if let Err(send_err) = sc.with_publisher(stream_ctx, |mut publisher| async move {
-                        publisher.publish_error(&format!("TTT adaptation failed: {}", e)).await
+                    if let Err(send_err) = sc.run_stream(stream_ctx, |publisher| async move {
+                        (publisher, Err::<(), _>(anyhow::anyhow!("TTT adaptation failed: {}", e)))
                     }).await {
                         error!(stream_id = %stream_ctx.stream_id(), error = %send_err,
                             "Failed to publish TTT error to stream");
@@ -887,18 +887,16 @@ impl InferenceService {
         let engine = self.engine.read().await;
         let stream_result = engine.generate_with_delta(request, delta);
 
-        let result = stream_channel.with_publisher(stream_ctx, |mut publisher| async move {
-            match stream_result {
+        let result = stream_channel.run_stream(stream_ctx, |mut publisher| async move {
+            let result = match stream_result {
                 Ok(mut stream) => {
-                    let mut had_error = false;
                     let cancel = stream_ctx.cancel_token();
                     loop {
                         let chunk_result = tokio::select! {
                             biased;
                             _ = cancel.cancelled() => {
                                 let _ = publisher.publish_error("cancelled").await;
-                                had_error = true;
-                                break;
+                                return (publisher, Ok(()));
                             }
                             next = stream.next() => match next {
                                 Some(r) => r,
@@ -909,39 +907,31 @@ impl InferenceService {
                             Ok(text) => {
                                 let rate = stream.stats().inference_tokens_per_sec_ema;
                                 if let Err(e) = publisher.publish_data_with_rate(text.as_bytes(), rate).await {
-                                    warn!("Failed to publish stream data: {}", e);
-                                    had_error = true;
-                                    break;
+                                    return (publisher, Err(e));
                                 }
                             }
                             Err(e) => {
-                                if let Err(send_err) = publisher.publish_error(&e.to_string()).await {
-                                    error!("Failed to publish stream error: {}", send_err);
-                                }
-                                had_error = true;
-                                break;
+                                let _ = publisher.publish_error(&e.to_string()).await;
+                                return (publisher, Ok(()));
                             }
                         }
                     }
 
-                    // Complete the stream if no errors occurred
-                    if !had_error {
-                        let stats = stream.stats();
-                        let mut complete = crate::services::rpc_types::InferenceComplete::from(&stats);
+                    // Normal completion with stats
+                    let stats = stream.stats();
+                    let mut complete = crate::services::rpc_types::InferenceComplete::from(&stats);
 
-                        // Attach TTT metrics to completion (from deferred TTT in execute_stream)
-                        complete.ttt_metrics = ttt_result.map(std::convert::Into::into);
+                    // Attach TTT metrics to completion (from deferred TTT in execute_stream)
+                    complete.ttt_metrics = ttt_result.map(std::convert::Into::into);
 
-                        publisher.complete_ref(&complete.to_bytes()).await?;
+                    match publisher.complete_ref(&complete.to_bytes()).await {
+                        Ok(()) => Ok(()),
+                        Err(e) => Err(e),
                     }
-                    Ok(())
                 }
-                Err(e) => {
-                    // Initial error - publish and return
-                    publisher.publish_error(&e.to_string()).await?;
-                    Err(e)
-                }
-            }
+                Err(e) => Err(e),  // framework sends Error frame automatically
+            };
+            (publisher, result)
         }).await;
 
         if let Err(e) = result {
@@ -977,24 +967,21 @@ impl InferenceService {
             "Starting training stream via StreamChannel"
         );
 
-        let result = stream_channel.with_publisher(stream_ctx, |mut publisher| async move {
+        let result = stream_channel.run_stream(stream_ctx, |mut publisher| async move {
             if stream_ctx.cancel_token().is_cancelled() {
-                publisher.publish_error("cancelled").await?;
-                return Ok(());
+                let _ = publisher.publish_error("cancelled").await;
+                return (publisher, Ok(()));
             }
-            match self.handle_train_step(&subject, &input, gradient_steps, learning_rate, auto_commit).await {
+            let result = match self.handle_train_step(&subject, &input, gradient_steps, learning_rate, auto_commit).await {
                 Ok(result) => {
                     // Serialize training result as JSON for the completion payload
                     let payload = serde_json::to_vec(&result)
                         .unwrap_or_else(|e| format!("{{\"error\":\"serialize failed: {e}\"}}").into_bytes());
-                    publisher.complete_ref(&payload).await?;
-                    Ok(())
+                    publisher.complete_ref(&payload).await.map(|()| ())
                 }
-                Err(e) => {
-                    publisher.publish_error(&e.to_string()).await?;
-                    Err(e)
-                }
-            }
+                Err(e) => Err(e),  // framework sends Error frame automatically
+            };
+            (publisher, result)
         }).await;
 
         if let Err(e) = result {

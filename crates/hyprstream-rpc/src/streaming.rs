@@ -220,7 +220,7 @@ impl StreamFrames {
     /// Send frames via raw ZMQ socket (sync).
     ///
     /// Use this for low-level streaming code that manages its own zmq sockets.
-    /// For service-level code, prefer `StreamChannel::with_publisher()`.
+    /// For service-level code, prefer `StreamChannel::run_stream()`.
     pub fn send(&self, socket: &zmq::Socket) -> Result<()> {
         socket.send(&self.topic, zmq::SNDMORE)?;
         socket.send(&self.capnp, zmq::SNDMORE)?;
@@ -600,6 +600,7 @@ pub struct StreamPublisher {
     builder: StreamBuilder,
     socket: Arc<tokio::sync::Mutex<tmq::push::Push>>,
     cancel_token: CancellationToken,
+    terminated: bool,
 }
 
 impl StreamPublisher {
@@ -619,6 +620,7 @@ impl StreamPublisher {
             builder,
             socket,
             cancel_token: ctx.cancel_token.clone(),
+            terminated: false,
         }
     }
 
@@ -636,7 +638,6 @@ impl StreamPublisher {
     /// Lower rates result in smaller batches (lower latency).
     pub async fn publish_data_with_rate(&mut self, data: &[u8], rate: f32) -> Result<()> {
         if self.cancel_token.is_cancelled() {
-            self.publish_error("cancelled").await?;
             anyhow::bail!("stream cancelled");
         }
         if let Some(frames) = self.builder.add_data(data, rate)? {
@@ -657,6 +658,7 @@ impl StreamPublisher {
 
     /// Publish an error and flush immediately.
     pub async fn publish_error(&mut self, message: &str) -> Result<()> {
+        self.terminated = true; // Before await — cancellation-safe
         if let Some(frames) = self.builder.add_error(message)? {
             let mut socket = self.socket.lock().await;
             frames.send_async(&mut socket).await?;
@@ -674,8 +676,9 @@ impl StreamPublisher {
     /// Complete the stream with metadata and flush (by reference).
     ///
     /// Same as `complete()` but doesn't consume self, allowing use in
-    /// callback-based APIs like `StreamChannel::with_publisher()`.
+    /// callback-based APIs like `StreamChannel::run_stream()`.
     pub async fn complete_ref(&mut self, metadata: &[u8]) -> Result<()> {
+        self.terminated = true; // Before await — cancellation-safe
         let mut socket = self.socket.lock().await;
         if let Some(frames) = self.builder.add_complete(metadata)? {
             frames.send_async(&mut socket).await?;
@@ -703,6 +706,68 @@ impl StreamPublisher {
     /// Check if this stream has been cancelled.
     pub fn is_cancelled(&self) -> bool {
         self.cancel_token.is_cancelled()
+    }
+
+    /// Whether a terminal frame (Error or Complete) has been sent.
+    pub fn is_terminated(&self) -> bool {
+        self.terminated
+    }
+}
+
+impl Drop for StreamPublisher {
+    fn drop(&mut self) {
+        if self.terminated || self.cancel_token.is_cancelled() {
+            return;
+        }
+
+        // Take the original builder to preserve HMAC chain state.
+        // The replacement is a dummy that will never be used (we're being dropped).
+        let mut builder = std::mem::replace(
+            &mut self.builder,
+            StreamBuilder::new(BatchingConfig::default(), [0u8; 32], String::new()),
+        );
+
+        let frames = match builder.add_error("publisher dropped without terminal frame") {
+            Ok(Some(f)) => f,
+            _ => return,
+        };
+
+        let socket = Arc::clone(&self.socket);
+
+        // Spawn async send — the spawned task yields to the runtime, so Drop
+        // itself returns immediately. Bounded 200ms wait covers brief lock
+        // contention from concurrent publishers or register_topic() on the
+        // same StreamChannel. If the lock cannot be acquired, log an error
+        // so the failure is observable rather than silent.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(200),
+                        socket.lock(),
+                    )
+                    .await
+                    {
+                        Ok(mut sock) => {
+                            let _ = frames.send_async(&mut sock).await;
+                        }
+                        Err(_) => {
+                            tracing::error!(
+                                "StreamPublisher::drop: could not acquire socket lock \
+                                 within 200ms; terminal error frame not sent — \
+                                 client will hang until JWT expiry"
+                            );
+                        }
+                    }
+                });
+            }
+            Err(_) => {
+                tracing::error!(
+                    "StreamPublisher::drop: no tokio runtime; \
+                     terminal error frame not sent"
+                );
+            }
+        }
     }
 }
 
@@ -1464,32 +1529,42 @@ impl StreamChannel {
         Ok(StreamPublisher::new(socket_arc, ctx))
     }
 
-    /// Execute streaming work with a publisher (convenience wrapper).
+    /// Run a streaming operation with framework-guaranteed terminal frame.
     ///
-    /// This is a convenience method that creates a publisher and passes it to the callback.
-    /// The callback receives the publisher by value, so it can be used in async blocks.
+    /// The closure receives `StreamPublisher` by value and **must return it**
+    /// alongside its result. This preserves the HMAC chain so the framework
+    /// can send a valid terminal frame if the closure didn't.
     ///
-    /// # Arguments
-    /// * `ctx` - Stream context from `prepare_stream()`
-    /// * `f` - Async callback that receives the publisher
+    /// After the closure returns:
+    /// - If `Ok` and not terminated → framework sends `Complete` (empty metadata)
+    /// - If `Err` and not terminated → framework sends `Error` with the error message
+    /// - If already terminated → no-op (closure handled it)
     ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// stream_channel.with_publisher(&stream_ctx, |mut publisher| async move {
-    ///     publisher.publish_progress("cloning", 0, 1).await?;
-    ///     // ... perform operation ...
-    ///     publisher.complete(&result_bytes).await?;
-    ///     Ok(())
-    /// }).await?;
-    /// ```
-    pub async fn with_publisher<F, Fut, R>(&self, ctx: &StreamContext, f: F) -> Result<R>
+    /// Drop remains as a panic-only safety net.
+    pub async fn run_stream<F, Fut, R>(&self, ctx: &StreamContext, f: F) -> Result<R>
     where
         F: FnOnce(StreamPublisher) -> Fut,
-        Fut: Future<Output = Result<R>>,
+        Fut: Future<Output = (StreamPublisher, Result<R>)>,
     {
         let publisher = self.publisher(ctx).await?;
-        f(publisher).await
+        let (mut publisher, result) = f(publisher).await;
+
+        if !publisher.is_terminated() && !publisher.is_cancelled() {
+            match &result {
+                Ok(_) => {
+                    if let Err(e) = publisher.complete_ref(b"").await {
+                        tracing::error!("run_stream: failed to send Complete: {}", e);
+                    }
+                }
+                Err(e) => {
+                    if let Err(send_err) = publisher.publish_error(&e.to_string()).await {
+                        tracing::error!("run_stream: failed to send Error: {}", send_err);
+                    }
+                }
+            }
+        }
+
+        result
     }
 
     /// Get the stream endpoint for clients to subscribe to.
@@ -1554,6 +1629,30 @@ impl<T> ResponseStream<T> {
     /// Get the server's public key for client DH.
     pub fn server_pubkey(&self) -> &[u8; 32] {
         self.stream_ctx.server_pubkey()
+    }
+}
+
+// ============================================================================
+// StreamGuard (Codegen hook for dispatch-level terminal frame enforcement)
+// ============================================================================
+
+/// Codegen hook point for dispatch-level streaming continuation wrapping.
+///
+/// Currently a **no-op pass-through**. The real terminal-frame guarantee
+/// lives in [`StreamChannel::run_stream()`], which service handlers call
+/// directly. This struct exists so generated dispatch code has a single
+/// place to wrap continuations — a future iteration can extend `wrap()`
+/// to inject `run_stream` automatically (removing the need for handlers
+/// to call it themselves).
+pub struct StreamGuard;
+
+impl StreamGuard {
+    /// Wrap a continuation (currently no-op pass-through).
+    ///
+    /// Terminal frame enforcement is provided by `StreamChannel::run_stream()`,
+    /// not by this wrapper. See struct-level docs for roadmap.
+    pub fn wrap(continuation: crate::service::Continuation) -> crate::service::Continuation {
+        continuation
     }
 }
 
