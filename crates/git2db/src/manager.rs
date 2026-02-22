@@ -8,7 +8,7 @@ use dashmap::DashMap;
 use git2::{build::RepoBuilder, Repository, Signature};
 use once_cell::sync::OnceCell;
 use parking_lot::RwLock;
-use safe_path::scoped_join;
+use hyprstream_containedfs::contained_join;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -292,7 +292,7 @@ impl GitManager {
             Ok(path.to_path_buf())
         } else {
             // If relative, safely join with base_dir
-            scoped_join(base_dir, path)
+            contained_join(base_dir, &path.to_string_lossy())
                 .map_err(|e| anyhow::anyhow!("Path traversal attempt detected: {}", e))
         }
     }
@@ -476,7 +476,7 @@ impl GitManager {
         } else {
             // Relative path - join with current dir and validate
             let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            scoped_join(&current_dir, &target_path).map_err(|e| {
+            contained_join(&current_dir, &target_path.to_string_lossy()).map_err(|e| {
                 Git2DBError::invalid_path(&target_path, format!("Path validation failed: {e}"))
             })?
         };

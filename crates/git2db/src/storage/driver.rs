@@ -11,6 +11,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 use inventory;
 
@@ -167,6 +168,9 @@ pub struct WorktreeHandle {
 
     /// Cached repository instance (to avoid reopening)
     repo: Option<git2::Repository>,
+
+    /// Lazy-initialized contained filesystem for this worktree
+    contained_fs: OnceCell<Arc<dyn hyprstream_containedfs::ContainedFs>>,
 }
 
 impl WorktreeHandle {
@@ -177,6 +181,7 @@ impl WorktreeHandle {
             driver_name,
             cleanup: None,
             repo: None,
+            contained_fs: OnceCell::new(),
         }
     }
 
@@ -196,6 +201,7 @@ impl WorktreeHandle {
             driver_name,
             cleanup: Some(Arc::new(Mutex::new(Some(cleanup_fn)))),
             repo: None,
+            contained_fs: OnceCell::new(),
         }
     }
 
@@ -214,6 +220,16 @@ impl WorktreeHandle {
     /// Get the worktree path
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Get a contained filesystem for this worktree (lazy-initialized).
+    ///
+    /// Returns a kernel-enforced (Linux) or canonicalize-based (other) filesystem
+    /// rooted at this worktree's path.
+    pub fn fs(&self) -> Result<&Arc<dyn hyprstream_containedfs::ContainedFs>, hyprstream_containedfs::FsError> {
+        self.contained_fs.get_or_try_init(|| {
+            hyprstream_containedfs::open(&self.path)
+        })
     }
 
     /// Get the git repository with lazy loading and caching

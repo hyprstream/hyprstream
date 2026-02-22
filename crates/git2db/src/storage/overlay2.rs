@@ -197,10 +197,11 @@ impl Driver for Overlay2Driver {
 
     #[cfg(feature = "overlayfs")]
     async fn get_worktree(&self, base_repo: &Path, branch: &str) -> Git2DBResult<Option<WorktreeHandle>> {
-        let worktree_path = base_repo.parent()
+        let worktrees_dir = base_repo.parent()
             .ok_or_else(|| Git2DBError::invalid_path(base_repo.to_path_buf(), "Invalid base repository path"))?
-            .join("worktrees")
-            .join(branch);
+            .join("worktrees");
+        let worktree_path = hyprstream_containedfs::contained_join(&worktrees_dir, branch)
+            .map_err(|e| Git2DBError::invalid_path(worktrees_dir, format!("Path containment: {e}")))?;
 
         if worktree_path.exists() && self.is_overlay2_worktree(&worktree_path) {
             Ok(Some(WorktreeHandle::new(worktree_path, "overlay2".to_owned())))
@@ -239,6 +240,22 @@ impl Overlay2Driver {
         work: &Path,
         target: &Path,
     ) -> Git2DBResult<String> {
+        // S1 fix: Validate paths don't contain characters that could inject mount options
+        for (name, path) in &[("lower", lower), ("upper", upper), ("work", work), ("target", target)] {
+            if let Some(s) = path.to_str() {
+                if s.contains(',') || s.contains('=') || s.contains('\n') || s.contains('\0') {
+                    return Err(Git2DBError::internal(format!(
+                        "{} path contains characters unsafe for mount options: {:?}",
+                        name, path
+                    )));
+                }
+            } else {
+                return Err(Git2DBError::internal(format!(
+                    "{} path is not valid UTF-8: {:?}", name, path
+                )));
+            }
+        }
+
         // Build common mount options
         let mount_opts = format!(
             "lowerdir={},upperdir={},workdir={}",

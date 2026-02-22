@@ -249,7 +249,7 @@ impl CloneBuilder {
         }; // Read lock released
 
         // Build paths
-        let repo_dir = safe_path::scoped_join(&models_dir, &repo_name)
+        let repo_dir = hyprstream_containedfs::contained_join(&models_dir, &repo_name)
             .map_err(|e| Git2DBError::configuration(format!("Invalid repository name: {e}")))?;
         let bare_repo_name = format!("{}.git", &repo_name);
         let bare_repo_path = repo_dir.join(&bare_repo_name);
@@ -328,7 +328,12 @@ impl CloneBuilder {
         let default_branch = get_default_branch(&bare_repo)?;
         tracing::debug!("Default branch detected: {}", default_branch);
 
-        let initial_worktree = worktrees_dir.join(&default_branch);
+        // Validate branch name for path safety (C2 fix)
+        hyprstream_containedfs::validate_ref_name(&default_branch)
+            .map_err(|e| Git2DBError::configuration(format!("Unsafe default branch name: {e}")))?;
+
+        let initial_worktree = hyprstream_containedfs::contained_join(&worktrees_dir, &default_branch)
+            .map_err(|e| Git2DBError::configuration(format!("Invalid worktree path: {e}")))?;
         if let Some(parent) = initial_worktree.parent() {
             if parent != worktrees_dir {
                 std::fs::create_dir_all(parent).map_err(|e| {
@@ -350,7 +355,11 @@ impl CloneBuilder {
         };
 
         if checkout_ref != default_branch && !matches!(self.reference, GitRef::DefaultBranch) {
-            let ref_worktree_path = worktrees_dir.join(&checkout_ref);
+            // Validate checkout ref for path safety (C2 fix)
+            hyprstream_containedfs::validate_ref_name(&checkout_ref)
+                .map_err(|e| Git2DBError::configuration(format!("Unsafe checkout ref name: {e}")))?;
+            let ref_worktree_path = hyprstream_containedfs::contained_join(&worktrees_dir, &checkout_ref)
+                .map_err(|e| Git2DBError::configuration(format!("Invalid worktree path: {e}")))?;
             if let Some(parent) = ref_worktree_path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
                     Git2DBError::configuration(format!("Failed to create worktree parent directories: {e}"))

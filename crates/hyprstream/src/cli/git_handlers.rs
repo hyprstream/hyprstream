@@ -1070,8 +1070,9 @@ pub async fn apply_policy_template_to_model(
     // Append the template rules
     let new_content = format!("{}\n{}", existing_content.trim_end(), rules);
 
-    // Write the updated policy
-    tokio::fs::write(&policy_path, &new_content).await?;
+    // Write the updated policy with restrictive permissions
+    crate::auth::write_policy_file(&policy_path, &new_content).await
+        .map_err(|e| anyhow::anyhow!("Failed to write policy: {}", e))?;
 
     // Validate the new policy
     let policy_manager = PolicyManager::new(&policies_dir)
@@ -1081,7 +1082,7 @@ pub async fn apply_policy_template_to_model(
     // Reload to validate
     if let Err(e) = policy_manager.reload().await {
         // Rollback on validation failure
-        tokio::fs::write(&policy_path, &existing_content).await?;
+        let _ = crate::auth::write_policy_file(&policy_path, &existing_content).await;
         bail!("Policy validation failed: {}. Template not applied.", e);
     }
 

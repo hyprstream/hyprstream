@@ -71,7 +71,7 @@ mod core;
 mod types;
 mod worktree_helpers;
 pub use worktree_helpers::StatResult;
-pub mod contained_root;
+// contained_root replaced by hyprstream-containedfs crate
 pub mod callback;
 pub mod editing;
 pub mod factories;

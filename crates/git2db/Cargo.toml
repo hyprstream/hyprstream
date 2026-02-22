@@ -25,7 +25,7 @@ lru.workspace = true
 once_cell.workspace = true
 
 # Path handling and security
-safe-path.workspace = true
+hyprstream-containedfs.workspace = true
 
 # Serialization
 serde.workspace = true

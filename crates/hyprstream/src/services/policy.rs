@@ -334,15 +334,15 @@ impl PolicyHandler for PolicyService {
         let existing_content = tokio::fs::read_to_string(&policy_path).await
             .unwrap_or_default();
 
-        // Write the new policy
-        tokio::fs::write(&policy_path, &new_content).await
+        // Write the new policy with restrictive permissions
+        crate::auth::write_policy_file(&policy_path, &new_content).await
             .map_err(|e| anyhow!("Failed to write policy file: {}", e))?;
 
         // Validate by reloading
         if let Err(e) = self.policy_manager.reload().await {
             // Rollback on validation failure
             warn!("Template validation failed, rolling back: {}", e);
-            let _ = tokio::fs::write(&policy_path, &existing_content).await;
+            let _ = crate::auth::write_policy_file(&policy_path, &existing_content).await;
             let _ = self.policy_manager.reload().await;
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: format!("Policy validation failed: {}", e),

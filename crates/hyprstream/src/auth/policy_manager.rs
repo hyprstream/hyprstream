@@ -197,6 +197,21 @@ fn validate_policy_csv(policy_path: &Path) -> Result<(), PolicyError> {
     Ok(())
 }
 
+/// Write a policy file with restrictive permissions (0o640 on Unix).
+///
+/// Policy files contain authorization rules and should not be world-readable.
+/// Uses tokio::fs::write then sets permissions afterward. The policies directory
+/// itself should already be 0o750, limiting the window where the file is exposed.
+pub async fn write_policy_file(path: &Path, content: impl AsRef<[u8]>) -> Result<(), PolicyError> {
+    tokio::fs::write(path, content).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640)).await?;
+    }
+    Ok(())
+}
+
 /// Policy manager wrapping Casbin enforcer
 pub struct PolicyManager {
     /// Casbin enforcer
@@ -212,10 +227,15 @@ impl PolicyManager {
     pub async fn new(policies_dir: impl AsRef<Path>) -> Result<Self, PolicyError> {
         let policies_dir = policies_dir.as_ref().to_path_buf();
 
-        // Ensure policies directory exists
+        // Ensure policies directory exists with restricted permissions
         if !policies_dir.exists() {
             info!("Creating policies directory at {:?}", policies_dir);
             tokio::fs::create_dir_all(&policies_dir).await?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                tokio::fs::set_permissions(&policies_dir, std::fs::Permissions::from_mode(0o750)).await?;
+            }
         }
 
         let model_path = policies_dir.join("model.conf");
@@ -224,13 +244,13 @@ impl PolicyManager {
         // Create default model.conf if not exists
         if !model_path.exists() {
             info!("Creating default model.conf");
-            tokio::fs::write(&model_path, DEFAULT_MODEL_CONF).await?;
+            write_policy_file(&model_path, DEFAULT_MODEL_CONF).await?;
         }
 
         // Create default policy.csv if not exists
         if !policy_path.exists() {
             info!("Creating default policy.csv (deny-by-default — run `hyprstream quick policy apply-template local` to grant access)");
-            tokio::fs::write(&policy_path, DEFAULT_POLICY_CSV).await?;
+            write_policy_file(&policy_path, DEFAULT_POLICY_CSV).await?;
         }
 
         // Validate policy.csv format before loading

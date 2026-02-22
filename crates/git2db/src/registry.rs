@@ -194,6 +194,20 @@ impl Git2DB {
                 )
             })?;
 
+            // Restrict registry directory — may contain URLs with embedded tokens
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&registry_path, std::fs::Permissions::from_mode(0o700))
+                    .await
+                    .map_err(|e| {
+                        Git2DBError::repository(
+                            &registry_path,
+                            format!("Failed to set directory permissions: {e}"),
+                        )
+                    })?;
+            }
+
             let repo = Repository::init(&registry_path).map_err(|e| {
                 Git2DBError::repository(&registry_path, format!("Failed to init repository: {e}"))
             })?;
@@ -221,7 +235,7 @@ impl Git2DB {
             let json = serde_json::to_string_pretty(&metadata).map_err(|e| {
                 Git2DBError::internal(format!("Failed to serialize metadata: {e}"))
             })?;
-            fs::write(registry_path.join("registry.json"), json)
+            fs::write(registry_path.join("registry.json"), &json)
                 .await
                 .map_err(|e| {
                     Git2DBError::repository(
@@ -229,6 +243,23 @@ impl Git2DB {
                         format!("Failed to write registry.json: {e}"),
                     )
                 })?;
+
+            // Restrict registry.json — contains repo URLs that may embed credentials
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(
+                    registry_path.join("registry.json"),
+                    std::fs::Permissions::from_mode(0o600),
+                )
+                .await
+                .map_err(|e| {
+                    Git2DBError::repository(
+                        &registry_path,
+                        format!("Failed to set registry.json permissions: {e}"),
+                    )
+                })?;
+            }
 
             // Initial commit using standardized signature
             let sig = git_manager
@@ -688,6 +719,8 @@ impl Git2DB {
                 .join("modules")
                 .join(id.to_string());
             if modules_dir.exists() {
+                // I4 fix: Containment check before remove_dir_all
+                self.validate_within_base(&modules_dir)?;
                 debug!("Removing git modules directory: {:?}", modules_dir);
                 fs::remove_dir_all(&modules_dir).await.map_err(|e| {
                     Git2DBError::internal(format!("Failed to remove .git/modules/{id}: {e}"))
@@ -743,6 +776,8 @@ impl Git2DB {
             // Remove submodule working directory from registry
             let submodule_work_path = self.registry_path.join(&submodule_path);
             if submodule_work_path.exists() {
+                // I4 fix: Containment check before remove_dir_all
+                self.validate_within_base(&submodule_work_path)?;
                 debug!(
                     "Removing submodule working directory: {:?}",
                     submodule_work_path
@@ -764,6 +799,8 @@ impl Git2DB {
 
         // 2. Remove actual repository working directory
         if worktree_path.exists() {
+            // I4 fix: Containment check before remove_dir_all
+            self.validate_within_base(&worktree_path)?;
             debug!("Removing repository working directory: {:?}", worktree_path);
             fs::remove_dir_all(&worktree_path).await.map_err(|e| {
                 Git2DBError::repository(
@@ -944,6 +981,25 @@ impl Git2DB {
         &self.registry_path
     }
 
+    /// Validate that a path is within the base directory (I4 fix).
+    ///
+    /// Prevents `remove_dir_all` from being tricked into deleting outside the registry.
+    fn validate_within_base(&self, path: &Path) -> Git2DBResult<()> {
+        let canonical_target = path.canonicalize().map_err(|e| {
+            Git2DBError::internal(format!("Failed to canonicalize target {:?}: {e}", path))
+        })?;
+        let canonical_base = self.base_dir.canonicalize().map_err(|e| {
+            Git2DBError::internal(format!("Failed to canonicalize base {:?}: {e}", self.base_dir))
+        })?;
+        if !canonical_target.starts_with(&canonical_base) {
+            return Err(Git2DBError::internal(format!(
+                "Path {:?} is outside base directory {:?}",
+                canonical_target, canonical_base
+            )));
+        }
+        Ok(())
+    }
+
   
     /// Initialize and update all submodules
     ///
@@ -1015,12 +1071,23 @@ impl Git2DB {
 
         let json = serde_json::to_string_pretty(&self.metadata)
             .map_err(|e| Git2DBError::internal(format!("Failed to serialize metadata: {e}")))?;
-        fs::write(metadata_path, json).await.map_err(|e| {
+        fs::write(&metadata_path, json).await.map_err(|e| {
             Git2DBError::repository(
                 &self.registry_path,
                 format!("Failed to write registry.json: {e}"),
             )
         })?;
+
+        // Ensure restrictive permissions after every write (write resets to umask)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(
+                &metadata_path,
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .await;
+        }
 
         Ok(())
     }

@@ -105,10 +105,11 @@ impl Driver for VfsDriver {
     }
 
     async fn get_worktree(&self, base_repo: &Path, branch: &str) -> Git2DBResult<Option<WorktreeHandle>> {
-        let worktree_path = base_repo.parent()
+        let worktrees_dir = base_repo.parent()
             .ok_or_else(|| Git2DBError::invalid_path(base_repo.to_path_buf(), "Invalid base repository path"))?
-            .join("worktrees")
-            .join(branch);
+            .join("worktrees");
+        let worktree_path = hyprstream_containedfs::contained_join(&worktrees_dir, branch)
+            .map_err(|e| Git2DBError::invalid_path(worktrees_dir, format!("Path containment: {e}")))?;
 
         if worktree_path.exists() && worktree_path.join(".git").exists() {
             Ok(Some(WorktreeHandle::new(worktree_path, "vfs".to_owned())))

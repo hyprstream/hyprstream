@@ -6,7 +6,7 @@
 use crate::auth::Operation;
 use crate::services::PolicyClient;
 use crate::services::types::{MAX_FDS_GLOBAL, MAX_FDS_PER_CLIENT};
-use crate::services::contained_root::{self, ContainedRoot, FsServiceError};
+use hyprstream_containedfs::{ContainedFs, FsError, FsHandle};
 use crate::services::{EnvelopeContext, ZmqService};
 use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_rpc::prelude::*;
@@ -102,7 +102,7 @@ fn variant_to_tracked_repository(
 // 9P Fid Table for Filesystem Operations
 // ============================================================================
 
-use crate::services::contained_root::WalkHandle;
+// FsHandle imported from hyprstream_containedfs above
 use crate::services::types::{DEFAULT_IOUNIT, QTDIR, QTFILE, OWRITE, ORDWR, OTRUNC, DMDIR};
 
 /// 9P Qid — uniquely identifies a file version.
@@ -117,7 +117,7 @@ struct Qid {
 enum FidState {
     /// After walk: handle for metadata/open, not yet opened for I/O.
     Walked {
-        walk_handle: WalkHandle,
+        walk_handle: FsHandle,
         qid: Qid,
     },
     /// After open: real fd for I/O.
@@ -194,18 +194,18 @@ impl FidTable {
     }
 
     /// Allocate a new fid for a client, checking per-client and global limits.
-    fn alloc_fid(&self, client_id: &str) -> Result<u32, FsServiceError> {
+    fn alloc_fid(&self, client_id: &str) -> Result<u32, FsError> {
         let count = self
             .client_fid_counts
             .entry(client_id.to_owned())
             .or_insert_with(|| AtomicU32::new(0));
         if count.load(Relaxed) >= MAX_FDS_PER_CLIENT {
-            return Err(FsServiceError::ResourceLimit(
+            return Err(FsError::ResourceLimit(
                 "too many open fids for client".into(),
             ));
         }
         if self.fids.len() >= MAX_FDS_GLOBAL as usize {
-            return Err(FsServiceError::ResourceLimit(
+            return Err(FsError::ResourceLimit(
                 "too many open fids globally".into(),
             ));
         }
@@ -216,7 +216,7 @@ impl FidTable {
                 return Ok(fid);
             }
         }
-        Err(FsServiceError::ResourceLimit(
+        Err(FsError::ResourceLimit(
             "failed to allocate fid after retries".into(),
         ))
     }
@@ -268,13 +268,13 @@ impl FidTable {
         &self,
         fid: u32,
         client_id: &str,
-    ) -> Result<dashmap::mapref::one::Ref<'_, u32, FidEntry>, FsServiceError> {
+    ) -> Result<dashmap::mapref::one::Ref<'_, u32, FidEntry>, FsError> {
         let entry = self
             .fids
             .get(&fid)
-            .ok_or(FsServiceError::BadFd(fid))?;
+            .ok_or_else(|| FsError::NotFound(format!("bad fid: {}", fid)))?;
         if entry.owner_identity != client_id {
-            return Err(FsServiceError::PermissionDenied(
+            return Err(FsError::PermissionDenied(
                 "fid not owned by caller".into(),
             ));
         }
@@ -310,8 +310,8 @@ pub struct RegistryService {
     signing_key: SigningKey,
     /// 9P fid table for filesystem operations.
     fid_table: Arc<FidTable>,
-    /// Cached contained roots for worktrees: (repo_id, worktree_name) → ContainedRoot.
-    contained_roots: DashMap<(String, String), Arc<dyn ContainedRoot>>,
+    /// Cached contained roots for worktrees: (repo_id, worktree_name) → ContainedFs.
+    contained_roots: DashMap<(String, String), Arc<dyn ContainedFs>>,
     /// CRDT editing sessions for collaborative file editing.
     editing_table: Arc<EditingTable>,
 }
@@ -384,6 +384,25 @@ impl RegistryService {
         };
 
         Ok(service)
+    }
+
+    /// Validate that a path is within the base directory (I5/I6 fix).
+    fn validate_path_within_base(&self, path: &Path) -> Result<()> {
+        // If path exists, use canonical check
+        if path.exists() {
+            let canonical_path = path.canonicalize()
+                .map_err(|e| anyhow!("Failed to canonicalize path: {}", e))?;
+            let canonical_base = self.base_dir.canonicalize()
+                .map_err(|e| anyhow!("Failed to canonicalize base dir: {}", e))?;
+            if !canonical_path.starts_with(&canonical_base) {
+                return Err(anyhow!("Path {:?} is outside base directory {:?}", canonical_path, canonical_base));
+            }
+        } else {
+            // Path doesn't exist yet — use contained_join for validation
+            let _ = hyprstream_containedfs::contained_join(&self.base_dir, &path.to_string_lossy())
+                .map_err(|e| anyhow!("Path validation failed: {}", e))?;
+        }
+        Ok(())
     }
 
     /// Background task that reaps idle fids.
@@ -838,6 +857,11 @@ impl RegistryService {
     ) -> Result<PathBuf> {
         let id = Self::parse_repo_id(repo_id)?;
         let path = PathBuf::from(path);
+        // I6: Validate path is within base_dir
+        self.validate_path_within_base(&path)?;
+        // Validate branch name
+        hyprstream_containedfs::validate_ref_name(branch)
+            .map_err(|e| anyhow!("Invalid branch name: {}", e))?;
         let branch = branch.to_owned();
         let registry = self.registry.read().await;
         let handle = registry.repo(&id)?;
@@ -854,6 +878,8 @@ impl RegistryService {
         _tracking_ref: Option<&str>,
     ) -> Result<TrackedRepository> {
         let path = PathBuf::from(path);
+        // I5: Validate path is within base_dir
+        self.validate_path_within_base(&path)?;
         let name = name.map(std::borrow::ToOwned::to_owned);
         // Note: tracking_ref is not yet used by register_repository
 
@@ -1217,12 +1243,12 @@ impl RegistryService {
     // Filesystem Operations
     // ========================================================================
 
-    /// Get or create a ContainedRoot for a (repo_id, worktree) pair.
+    /// Get or create a ContainedFs for a (repo_id, worktree) pair.
     async fn get_contained_root(
         &self,
         repo_id: &str,
         worktree: &str,
-    ) -> Result<Arc<dyn ContainedRoot>, FsServiceError> {
+    ) -> Result<Arc<dyn ContainedFs>, FsError> {
         let key = (repo_id.to_owned(), worktree.to_owned());
         if let Some(root) = self.contained_roots.get(&key) {
             return Ok(Arc::clone(&root));
@@ -1230,13 +1256,13 @@ impl RegistryService {
 
         // Resolve worktree path from repo
         let id = Self::parse_repo_id(repo_id)
-            .map_err(|e| FsServiceError::NotFound(e.to_string()))?;
+            .map_err(|e| FsError::NotFound(e.to_string()))?;
 
         let registry = self.registry.read().await;
         let handle = registry.repo(&id)
-            .map_err(|e| FsServiceError::NotFound(e.to_string()))?;
+            .map_err(|e| FsError::NotFound(e.to_string()))?;
         let worktrees = handle.get_worktrees().await
-            .map_err(|e| FsServiceError::Io(std::io::Error::other(e.to_string())))?;
+            .map_err(|e| FsError::Io(std::io::Error::other(e.to_string())))?;
 
         // Find the worktree matching the requested name
         let mut worktree_path = None;
@@ -1256,20 +1282,19 @@ impl RegistryService {
             p
         } else if worktree == "." || worktree.is_empty() {
             let repo = handle.open_repo()
-                .map_err(|e| FsServiceError::NotFound(e.to_string()))?;
+                .map_err(|e| FsError::NotFound(e.to_string()))?;
             repo.workdir()
                 .map(std::path::Path::to_path_buf)
-                .ok_or_else(|| FsServiceError::NotFound(
+                .ok_or_else(|| FsError::NotFound(
                     format!("worktree '{}' not found for repo '{}'", worktree, repo_id),
                 ))?
         } else {
-            return Err(FsServiceError::NotFound(
+            return Err(FsError::NotFound(
                 format!("worktree '{}' not found for repo '{}'", worktree, repo_id),
             ));
         };
 
-        let root = contained_root::open_contained_root(&worktree_path)?;
-        let root: Arc<dyn ContainedRoot> = Arc::from(root);
+        let root = hyprstream_containedfs::open(&worktree_path)?;
         self.contained_roots.insert(key, Arc::clone(&root));
         Ok(root)
     }
@@ -1705,7 +1730,7 @@ impl RegistryService {
         let rel_path = self.fid_rel_path(fid, client_id)?;
         let root = self.get_contained_root(repo_id, worktree).await
             .map_err(|e| anyhow!("{}", e))?;
-        let file = root.open_file(&rel_path, false, false, false, false, false)
+        let file = root.open(&rel_path, hyprstream_containedfs::OpenMode::OREAD)
             .map_err(|e| anyhow!("{}", e))?;
         let mut content = String::new();
         std::io::BufReader::new(file).read_to_string(&mut content)?;
@@ -1909,7 +1934,7 @@ impl CtlHandler for RegistryService {
         // Write blob content to the worktree file
         let root = self.get_contained_root(repo_id, name).await
             .map_err(|e| anyhow!("{}", e))?;
-        let mut file = root.open_file(&rel_path, true, false, true, false, false)
+        let mut file = root.open(&rel_path, hyprstream_containedfs::OpenMode::OWRITE | hyprstream_containedfs::OpenMode::OTRUNC)
             .map_err(|e| anyhow!("{}", e))?;
         use std::io::Write as _;
         file.write_all(blob.content())?;
@@ -2090,7 +2115,7 @@ impl CtlHandler for RegistryService {
         let root = self.get_contained_root(repo_id, name).await
             .map_err(|e| anyhow!("{}", e))?;
         let current_hash = {
-            let file = root.open_file(&rel_path, false, false, false, false, false)
+            let file = root.open(&rel_path, hyprstream_containedfs::OpenMode::OREAD)
                 .map_err(|e| anyhow!("{}", e))?;
             let mut data = Vec::new();
             std::io::BufReader::new(file).read_to_end(&mut data)?;
@@ -2118,7 +2143,7 @@ impl CtlHandler for RegistryService {
             .unwrap_or_default();
 
         // Write to disk (write=true, truncate=true)
-        let mut file = root.open_file(&rel_path, true, false, true, false, false)
+        let mut file = root.open(&rel_path, hyprstream_containedfs::OpenMode::OWRITE | hyprstream_containedfs::OpenMode::OTRUNC)
             .map_err(|e| anyhow!("{}", e))?;
         use std::io::Write as _;
         file.write_all(content.as_bytes())?;
@@ -2151,7 +2176,7 @@ impl WorktreeHandler for RegistryService {
             data.wnames.join("/")
         };
 
-        let walk_handle = root.resolve_handle(&path)
+        let walk_handle = root.walk(&path)
             .map_err(|e| anyhow!("{}", e))?;
         let meta = walk_handle.metadata()
             .map_err(|e| anyhow!("{}", e))?;
@@ -2286,12 +2311,12 @@ impl WorktreeHandler for RegistryService {
             .map_err(|e| anyhow!("{}", e))?;
 
         if is_dir {
-            // Create child directory via ContainedRoot (kernel-enforced containment)
+            // Create child directory via ContainedFs (kernel-enforced containment)
             root.mkdir(&child_path)
                 .map_err(|e| anyhow!("{}", e))?;
 
             // Resolve a handle to the new child directory
-            let child_handle = root.resolve_handle(&child_path)
+            let child_handle = root.walk(&child_path)
                 .map_err(|e| anyhow!("{}", e))?;
             let meta = child_handle.metadata()
                 .map_err(|e| anyhow!("{}", e))?;
@@ -2309,8 +2334,8 @@ impl WorktreeHandler for RegistryService {
                 iounit: DEFAULT_IOUNIT,
             })
         } else {
-            // Create file via ContainedRoot (kernel-enforced containment)
-            let file = root.open_file(&child_path, /*write*/true, /*create*/true, /*truncate*/true, /*append*/false, /*excl*/false)
+            // Create file via ContainedFs (kernel-enforced containment)
+            let file = root.create(&child_path, hyprstream_containedfs::OpenMode::OWRITE | hyprstream_containedfs::OpenMode::OTRUNC)
                 .map_err(|e| anyhow!("{}", e))?;
 
             let meta = file.metadata()?;

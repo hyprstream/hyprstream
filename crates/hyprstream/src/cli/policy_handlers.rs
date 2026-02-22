@@ -396,37 +396,61 @@ pub async fn handle_token_create(
 
 
 /// Load or generate the signing key from .registry/keys/signing.key
+///
+/// Security: avoids TOCTOU by opening the file directly instead of
+/// checking existence first. New keys are created with mode 0o600 at
+/// open(2) time so the private key is never world-readable on disk.
 pub async fn load_or_generate_signing_key(keys_dir: &Path) -> Result<SigningKey> {
+    use std::io::Read;
+
     let key_path = keys_dir.join("signing.key");
 
-    if key_path.exists() {
-        // Load existing key
-        let key_bytes = tokio::fs::read(&key_path).await?;
-        if key_bytes.len() != 32 {
-            anyhow::bail!("Invalid signing key file: expected 32 bytes, got {}", key_bytes.len());
+    // Try to open existing key first (no TOCTOU — single open call)
+    match std::fs::File::open(&key_path) {
+        Ok(mut file) => {
+            let mut key_bytes = Vec::new();
+            file.read_to_end(&mut key_bytes)?;
+            if key_bytes.len() != 32 {
+                anyhow::bail!("Invalid signing key file: expected 32 bytes, got {}", key_bytes.len());
+            }
+            let mut key_array = [0u8; 32];
+            key_array.copy_from_slice(&key_bytes);
+            let signing_key = SigningKey::from_bytes(&key_array);
+            info!("Loaded signing key from {:?}", key_path);
+            Ok(signing_key)
         }
-        let mut key_array = [0u8; 32];
-        key_array.copy_from_slice(&key_bytes);
-        let signing_key = SigningKey::from_bytes(&key_array);
-        info!("Loaded signing key from {:?}", key_path);
-        Ok(signing_key)
-    } else {
-        // Generate new key
-        tokio::fs::create_dir_all(keys_dir).await?;
-        let signing_key = SigningKey::generate(&mut rand::thread_rng());
-        tokio::fs::write(&key_path, signing_key.to_bytes()).await?;
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Generate new key — create directory with restricted permissions
+            tokio::fs::create_dir_all(keys_dir).await?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                tokio::fs::set_permissions(keys_dir, std::fs::Permissions::from_mode(0o700)).await?;
+            }
 
-        // Set restrictive permissions on Unix
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = tokio::fs::metadata(&key_path).await?.permissions();
-            perms.set_mode(0o600);
-            tokio::fs::set_permissions(&key_path, perms).await?;
+            let signing_key = SigningKey::generate(&mut rand::thread_rng());
+
+            // Write key with mode 0o600 set at open(2) time — never world-readable
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&key_path)?;
+                std::io::Write::write_all(&mut file, &signing_key.to_bytes())?;
+            }
+
+            #[cfg(not(unix))]
+            {
+                tokio::fs::write(&key_path, signing_key.to_bytes()).await?;
+            }
+
+            info!("Generated new signing key at {:?}", key_path);
+            Ok(signing_key)
         }
-
-        info!("Generated new signing key at {:?}", key_path);
-        Ok(signing_key)
+        Err(e) => Err(e.into()),
     }
 }
 
