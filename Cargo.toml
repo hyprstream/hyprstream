@@ -217,6 +217,7 @@ debug = false
 [profile.release]
 lto = "thin"
 strip = true
+codegen-units=4
 
 [workspace.lints.rust]
 # unsafe_code = "warn"  # Informational only, many FFI calls are necessary
