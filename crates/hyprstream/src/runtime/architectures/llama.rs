@@ -2130,22 +2130,24 @@ impl ModelOperations for LlamaModel {
 
     fn lm_head(&self, hidden_states: &Tensor) -> Result<Tensor> {
         if let Some(lm_head) = &self.lm_head {
-            // Cast hidden_states to match lm_head dtype (e.g. BFloat16) in case
-            // training path produced Float32 from delta gradient computation
-            let hidden_states = hidden_states.to_kind(lm_head.kind());
-            Ok(hidden_states.f_matmul(lm_head)
+            // Cast weight UP to match hidden_states dtype instead of casting hidden_states DOWN.
+            // During training, hidden_states may be f32 for gradient precision — casting it
+            // down to bf16 destroys gradients. Casting the (frozen) weight up is a no-op
+            // during inference where both are already bf16.
+            let lm_head = lm_head.to_kind(hidden_states.kind());
+            Ok(hidden_states.f_matmul(&lm_head)
                 .map_err(|e| anyhow!("lm_head matmul failed: {}", e))?)
         } else if let Some(output_proj) = &self.lm_head_transposed {
-            let hidden_states = hidden_states.to_kind(output_proj.kind());
+            let output_proj = output_proj.to_kind(hidden_states.kind());
             let hs_shape = hidden_states.size();
             if hs_shape.len() == 3 {
                 let (batch_size, seq_len, hidden_size) = (hs_shape[0], hs_shape[1], hs_shape[2]);
                 let hidden_2d = hidden_states.reshape([batch_size * seq_len, hidden_size]);
-                let logits_2d = hidden_2d.f_matmul(output_proj)
+                let logits_2d = hidden_2d.f_matmul(&output_proj)
                     .map_err(|e| anyhow!("lm_head transposed matmul failed: {}", e))?;
                 Ok(logits_2d.reshape([batch_size, seq_len, -1]))
             } else {
-                Ok(hidden_states.f_matmul(output_proj)
+                Ok(hidden_states.f_matmul(&output_proj)
                     .map_err(|e| anyhow!("lm_head transposed matmul failed: {}", e))?)
             }
         } else {

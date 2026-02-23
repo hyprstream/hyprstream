@@ -604,6 +604,7 @@ use crate::services::generated::model_client::{
     GetDeltaStatusResponse, ModuleNormRatio,
     SaveAdaptationRequest, SaveAdaptationResponse,
     SnapshotDeltaResponse, TttExportRequest, TttExportResponse,
+    WriteTttConfigRequest,
     // Adapter types
     AdapterInfo, AdapterMergeRequest,
     // Infer types
@@ -742,6 +743,80 @@ impl TttHandler for ModelService {
             adapter_path: r.adapter_path,
             content_hash: r.content_hash,
         })
+    }
+
+    async fn handle_write_ttt_config(
+        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        model_ref: &str, data: &WriteTttConfigRequest,
+    ) -> Result<()> {
+        // 1. Parse model ref and resolve worktree path
+        let parsed = ModelRef::parse(model_ref)?;
+        let tracked = self.registry.get_by_name(&parsed.model).await
+            .map_err(|e| anyhow!("Model '{}' not found in registry: {}", parsed.model, e))?;
+        let repo_client = self.registry.repo(&tracked.id);
+
+        let branch_name = match &parsed.git_ref {
+            crate::storage::GitRef::Branch(name) => name.clone(),
+            _ => repo_client.get_head().await.unwrap_or_else(|_| "main".to_owned()),
+        };
+
+        let storage_paths = crate::storage::StoragePaths::new()?;
+        let model_path = storage_paths.worktree_path(&parsed.model, &branch_name)?;
+
+        if !model_path.exists() {
+            return Err(anyhow!("Model worktree not found for {}", model_ref));
+        }
+
+        // 2. Build HyprstreamTrainingConfig from request
+        let ttt_config = crate::config::TTTTrainingConfig {
+            learning_rate: if data.learning_rate > 0.0 { data.learning_rate } else { 3e-4 },
+            gradient_steps: if data.gradient_steps > 0 { data.gradient_steps as usize } else { 3 },
+            max_grad_norm: if data.max_grad_norm > 0.0 { data.max_grad_norm } else { 1.0 },
+            min_input_length: if data.min_input_length > 0 { data.min_input_length as usize } else { 32 },
+            max_ttt_context: if data.max_ttt_context > 0 { data.max_ttt_context as usize } else { 512 },
+        };
+
+        let training_config = crate::config::HyprstreamTrainingConfig {
+            mode: crate::config::TrainingMode::TestTimeTraining,
+            ttt: ttt_config,
+            lora_rank: if data.lora_rank > 0 { data.lora_rank as usize } else { crate::config::default_lora_rank() },
+            lora_alpha: if data.lora_alpha > 0.0 { Some(data.lora_alpha) } else { None },
+            target_modules: if data.target_modules.is_empty() {
+                crate::config::default_target_modules()
+            } else {
+                data.target_modules.clone()
+            },
+            ..Default::default()
+        };
+
+        // 3. Write config.json
+        crate::runtime::model_config::ModelConfig::save_training_config(&model_path, &training_config)?;
+
+        // 4. Stage and commit via worktree-scoped API
+        let wt = repo_client.worktree(&branch_name);
+        wt.stage_files(&["config.json".to_owned()]).await?;
+        wt.commit_with_author(
+            "Update hyprstream_training config via RPC",
+            "hyprstream",
+            "noreply@hyprstream.dev",
+        ).await?;
+
+        info!("TTT config written for {}", model_ref);
+
+        // 5. Auto-reload if requested and model is loaded
+        if data.auto_reload {
+            let is_loaded = {
+                let cache = self.loaded_models.read().await;
+                cache.contains(model_ref)
+            };
+            if is_loaded {
+                info!("Auto-reloading {} after TTT config change", model_ref);
+                self.unload_model(model_ref).await?;
+                self.load_model(model_ref, None).await?;
+            }
+        }
+
+        Ok(())
     }
 }
 

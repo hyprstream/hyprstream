@@ -60,8 +60,6 @@ use tokio::runtime::Handle;
 use tokenizers::Tokenizer;
 use tracing::{debug, error, info, trace, warn};
 
-/// Auto-rollback timeout for pending TTT adaptations (milliseconds).
-const PENDING_ROLLBACK_MS: u64 = 30_000;
 
 /// Pending work to be executed after REP response is sent.
 ///
@@ -744,7 +742,7 @@ impl InferenceService {
                         pre_adaptation_state: pre_snapshot,
                         ttt_result: result.clone(),
                         created_at: Instant::now(),
-                        timeout_ms: PENDING_ROLLBACK_MS,
+                        timeout_ms: ttt_trainer.config().pending_rollback_ms,
                     };
                     self.pending_adaptations.lock().insert(subject.clone(), pending);
                 }
@@ -1429,7 +1427,7 @@ impl InferenceService {
                     pre_adaptation_state: pre_snapshot,
                     ttt_result: result.clone(),
                     created_at: std::time::Instant::now(),
-                    timeout_ms: PENDING_ROLLBACK_MS,
+                    timeout_ms: ttt_trainer.config().pending_rollback_ms,
                 };
                 self.pending_adaptations.lock().insert(subject.clone(), pending);
             }
@@ -1745,19 +1743,20 @@ impl InferenceService {
             .release_session(&CacheOwner::Session(session_id.to_owned()))
     }
 
-    /// Load a LoRA adapter from a safetensors file as the base delta.
+    /// Load a PEFT adapter directory as the base delta.
     ///
-    /// The loaded adapter is stored as `base_delta` and applied to all inference
-    /// requests. If a per-tenant TTT delta also exists, the two are composed
-    /// (corrections summed) during inference via `resolve_delta()`.
+    /// `path` is a PEFT adapter directory (e.g. `adapters/my-adapter`) containing
+    /// `adapter_model.safetensors`. The loaded adapter is stored as `base_delta`
+    /// and applied to all inference requests. If a per-tenant TTT delta also exists,
+    /// the two are composed (corrections summed) during inference via `resolve_delta()`.
     pub async fn load_lora(&self, path: &Path) -> Result<()> {
         let device = self.engine.read().device();
         // Read via FsOps (path-contained)
         let fs = self.fs.as_ref()
             .ok_or_else(|| anyhow!("FsOps not available — cannot read without path containment"))?;
-        let rel_path = path.to_string_lossy();
-        let bytes = fs.read_file_chunked(&rel_path).await
-            .map_err(|e| anyhow!("Failed to read LoRA adapter via FsOps: {}", e))?;
+        let safetensors_path = format!("{}/adapter_model.safetensors", path.to_string_lossy());
+        let bytes = fs.read_file_chunked(&safetensors_path).await
+            .map_err(|e| anyhow!("Failed to read LoRA adapter from {}: {}", safetensors_path, e))?;
         let delta = crate::training::TenantDelta::load_from_safetensors_bytes(&bytes, device)?;
 
         // Warn if the adapter rank differs from the delta pool rank —

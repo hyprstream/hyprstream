@@ -114,8 +114,13 @@ pub async fn handle_checkout(
         }
     }
 
-    // Checkout via service layer
-    repo_client.checkout(&ref_spec, false).await
+    // Checkout via worktree-scoped service layer
+    // Determine which worktree to operate on
+    let worktree_name = match &model_ref.git_ref {
+        crate::storage::GitRef::Branch(name) => name.clone(),
+        _ => tracked.tracking_ref.clone(),
+    };
+    repo_client.worktree(&worktree_name).checkout(&ref_spec, false).await
         .map_err(|e| anyhow::anyhow!("Failed to checkout '{}': {}", ref_spec, e))?;
 
     // Get new HEAD
@@ -300,21 +305,24 @@ pub async fn handle_commit(
         return Ok(());
     }
 
+    // Use worktree-scoped client for all staging/commit operations
+    let wt = repo_client.worktree(&branch_name);
+
     // Stage files based on mode
     if all_untracked {
         // Stage all files including untracked (git add -A)
         info!("Staging all files including untracked");
-        repo_client.stage_all_including_untracked().await?;
+        wt.stage_all_including_untracked().await?;
     } else if all {
         // Stage all tracked files only (git add -u)
         info!("Staging all tracked files");
-        repo_client.stage_all().await?;
+        wt.stage_all().await?;
     }
 
     // Perform commit operation
     let commit_oid = if amend {
         info!("Amending previous commit");
-        repo_client.amend_commit(message).await?
+        wt.amend_commit(message).await?
     } else if author.is_some() || author_name.is_some() || author_email.is_some() {
         // Parse author information
         let (name, email) = if let Some(author_str) = author {
@@ -341,11 +349,11 @@ pub async fn handle_commit(
             (name, email)
         };
 
-        repo_client.commit_with_author(message, &name, &email).await?
+        wt.commit_with_author(message, &name, &email).await?
     } else {
         // Simple commit
-        repo_client.stage_all().await?;
-        repo_client.commit(message).await?
+        wt.stage_all().await?;
+        wt.commit(message).await?
     };
 
     // Success output
@@ -1526,8 +1534,16 @@ pub async fn handle_merge(
         None
     };
 
-    // Perform merge via service layer
-    let merge_result = repo_client.merge(source, message).await;
+    // Determine target branch for worktree-scoped merge
+    let target_branch = match &target_ref.git_ref {
+        crate::storage::GitRef::Branch(b) => b.clone(),
+        crate::storage::GitRef::DefaultBranch => repo_client.get_head().await
+            .unwrap_or_else(|_| "main".to_owned()),
+        _ => anyhow::bail!("Merge target must be a branch reference"),
+    };
+
+    // Perform merge via worktree-scoped service layer
+    let merge_result = repo_client.worktree(&target_branch).merge(source, message).await;
 
     match merge_result {
         Ok(merge_oid) => {
@@ -1600,13 +1616,16 @@ async fn handle_merge_conflict_resolution(
         bail!("Worktree not found for branch {}", target_branch);
     }
 
+    // Use worktree-scoped client for merge operations
+    let wt = repo_client.worktree(&target_branch);
+
     if options.abort {
         // Abort merge: restore pre-merge state
         if !options.quiet {
             println!("→ Aborting merge...");
         }
 
-        repo_client.abort_merge().await?;
+        wt.abort_merge().await?;
 
         if !options.quiet {
             println!("✓ Merge aborted, restored pre-merge state");
@@ -1617,7 +1636,7 @@ async fn handle_merge_conflict_resolution(
             println!("→ Continuing merge...");
         }
 
-        let merge_oid = repo_client.continue_merge(options.message.as_deref()).await?;
+        let merge_oid = wt.continue_merge(options.message.as_deref()).await?;
 
         if !options.quiet {
             println!("✓ Merge completed successfully");
@@ -1631,7 +1650,7 @@ async fn handle_merge_conflict_resolution(
             println!("→ Quitting merge (keeping changes)...");
         }
 
-        repo_client.quit_merge().await?;
+        wt.quit_merge().await?;
 
         if !options.quiet {
             println!("✓ Merge state removed, changes retained");

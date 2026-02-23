@@ -774,8 +774,11 @@ impl TorchEngine {
 
         // Lock the model and run forward pass (efficient!) with poison recovery
         let model = model_arc.lock();
-        // Wrap in no_grad to prevent gradient tracking during inference
-        let logits = tch::no_grad(|| model.forward(&input_tensor, None))?;
+        // RAII guard: panic-safe — Drop restores GradMode during unwinding
+        let logits = {
+            let _no_grad = tch::no_grad_guard();
+            model.forward(&input_tensor, None)?
+        };
 
         // Extract logits for the last token
         let logits_shape = logits.size();
@@ -823,9 +826,11 @@ impl TorchEngine {
         // Run forward pass with position info for proper KV cache usage
         let model = model_arc.lock();
 
-        // Use the new forward_with_cache method that properly tracks position
-        // CRITICAL: Wrap in no_grad to prevent gradient tracking during inference
-        let logits = tch::no_grad(|| model.forward_with_cache(&input_tensor, start_pos))?;
+        // RAII guard: panic-safe — Drop restores GradMode during unwinding
+        let logits = {
+            let _no_grad = tch::no_grad_guard();
+            model.forward_with_cache(&input_tensor, start_pos)?
+        };
 
         // Extract logits for the last token
         let logits_shape = logits.size();
@@ -871,9 +876,10 @@ impl TorchEngine {
 
         let model = model_arc.lock();
 
-        let logits = tch::no_grad(|| {
-            model.forward_with_cache_and_delta(&input_tensor, start_pos, delta)
-        })?;
+        let logits = {
+            let _no_grad = tch::no_grad_guard();
+            model.forward_with_cache_and_delta(&input_tensor, start_pos, delta)?
+        };
 
         let logits_shape = logits.size();
         let seq_len = logits_shape[1];
@@ -905,9 +911,10 @@ impl TorchEngine {
 
         let model = model_arc.lock();
 
-        let logits = tch::no_grad(|| {
-            model.forward_with_cache_and_delta(&input_tensor, 0, delta)
-        })?;
+        let logits = {
+            let _no_grad = tch::no_grad_guard();
+            model.forward_with_cache_and_delta(&input_tensor, 0, delta)?
+        };
 
         let logits_shape = logits.size();
         let seq_len = logits_shape[1];
@@ -1194,7 +1201,10 @@ impl TorchEngine {
             // Gradients are tracked by default when tensors have requires_grad
             model_guard.forward(input_ids, None)
         } else {
-            tch::no_grad(|| model_guard.forward(input_ids, None))
+            {
+                let _no_grad = tch::no_grad_guard();
+                model_guard.forward(input_ids, None)
+            }
         }
     }
 
@@ -1386,6 +1396,11 @@ impl TorchEngine {
         let input = input_ids.to(self.device);
         let mut hidden_states = model_guard.embed_tokens(&input)?;
 
+        // NOTE: f32 upcast is NOT done here because model weights are bf16 and
+        // ROCm/HIP matmul requires matching dtypes. Gradient precision is handled
+        // by the delta injection path (LoRA A/B matrices) operating in the model's
+        // native dtype with the with_grad() wrapper ensuring autograd is active.
+
         // Generate position IDs
         let seq_len = hidden_states.size()[1];
         let position_ids =
@@ -1560,7 +1575,9 @@ impl TorchEngine {
             .ok_or_else(|| anyhow!("No model loaded"))?
             .lock();
 
-        tch::no_grad(|| {
+        {
+            let _no_grad = tch::no_grad_guard();
+
             // Get token embeddings
             let embeddings = model_guard.embed_tokens(&input_tensor)?;
 
@@ -1593,7 +1610,7 @@ impl TorchEngine {
             cpu_tensor.copy_data(&mut embedding_vec, numel);
 
             Ok(embedding_vec)
-        })
+        }
     }
 
     /// Process embeddings through all model layers for embedding extraction

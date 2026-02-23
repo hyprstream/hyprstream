@@ -67,6 +67,8 @@ struct TttRequest {
       $mcpDescription("Snapshot the tenant delta accumulator to content-addressed storage without merging into an adapter file.");
     export @10 :TttExportRequest
       $mcpDescription("Export the tenant delta accumulator as a standalone PEFT-compatible adapter directory (adapter_config.json + adapter_model.safetensors). For interop with HuggingFace and external tools. The exported adapter can be reloaded via adapter.load.");
+    writeTttConfig @11 :WriteTttConfigRequest
+      $mcpDescription("Write hyprstream_training configuration to the model worktree's config.json and optionally reload. Required before ttt.train or TTT-enabled inference. Sets training mode to test_time_training and configures LoRA rank/alpha, target modules, and learning rate.");
   }
 }
 
@@ -148,6 +150,7 @@ struct TttResponse {
     save @8 :SaveAdaptationResponse;
     snapshot @9 :SnapshotDeltaResponse;
     export @10 :TttExportResponse;
+    writeTttConfig @11 :Void;
   }
 }
 
@@ -384,6 +387,19 @@ struct TttExportRequest {
 struct TttExportResponse {
   adapterPath @0 :Text;
   contentHash @1 :Text;
+}
+
+# Write TTT configuration to model's config.json
+struct WriteTttConfigRequest {
+  learningRate @0 :Float64;
+  gradientSteps @1 :UInt32;
+  maxGradNorm @2 :Float64;
+  minInputLength @3 :UInt32;
+  maxTttContext @4 :UInt32;
+  loraRank @5 :UInt32;
+  loraAlpha @6 :Float32;
+  targetModules @7 :List(Text);
+  autoReload @8 :Bool;
 }
 
 # =============================================================================

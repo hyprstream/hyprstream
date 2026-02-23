@@ -838,7 +838,9 @@ pub async fn handle_training_checkpoint(
         }
     }
 
-    repo_client.stage_files(&files_to_stage).await
+    // Use worktree-scoped client for staging and commit
+    let wt = repo_client.worktree(&branch_for_fs);
+    wt.stage_files(&files_to_stage).await
         .map_err(|e| anyhow::anyhow!("Failed to stage files: {}", e))?;
 
     // Create commit using service layer
@@ -850,7 +852,7 @@ pub async fn handle_training_checkpoint(
         )
     });
 
-    let commit_id = repo_client.commit(&commit_message, "", "").await
+    let commit_id = wt.commit(&commit_message, "", "").await
         .map_err(|e| anyhow::anyhow!("Failed to create commit: {}", e))?;
 
     println!("\n✓ Created commit: {}", &commit_id[..8.min(commit_id.len())]);

@@ -94,6 +94,13 @@ pub struct TTTConfig {
     /// Prevents unbounded compute from malicious or misconfigured clients.
     #[serde(default = "default_max_gradient_steps")]
     pub max_gradient_steps: usize,
+
+    /// Auto-rollback timeout for pending adaptations (milliseconds).
+    /// After a non-auto-commit training, the server holds the pre-adaptation
+    /// snapshot for this long before auto-rolling back. Increase for interactive
+    /// workflows (MCP, human-in-the-loop); decrease for programmatic API clients.
+    #[serde(default = "default_pending_rollback_ms")]
+    pub pending_rollback_ms: u64,
 }
 
 fn default_learning_rate() -> f64 {
@@ -135,6 +142,9 @@ fn default_max_adaptation_ms() -> u64 {
 fn default_max_gradient_steps() -> usize {
     50
 }
+fn default_pending_rollback_ms() -> u64 {
+    60_000
+}
 
 impl Default for TTTConfig {
     fn default() -> Self {
@@ -152,6 +162,7 @@ impl Default for TTTConfig {
             adaptive_steps: default_adaptive_steps(),
             max_adaptation_ms: default_max_adaptation_ms(),
             max_gradient_steps: default_max_gradient_steps(),
+            pending_rollback_ms: default_pending_rollback_ms(),
         }
     }
 }
@@ -612,6 +623,16 @@ impl TestTimeTrainer {
         let mut grad_norms = Vec::with_capacity(gated_steps);
         let mut any_clipped = false;
 
+        // Diagnostic: log autograd state before first backward pass
+        if delta.accumulated_steps == 0 {
+            let vars = delta.vs.trainable_variables();
+            let any_requires_grad = vars.iter().any(|v| v.requires_grad());
+            tracing::info!(
+                "[TTT] Pre-backward check: loss.requires_grad={}, vars_require_grad={}, num_vars={}",
+                initial_loss_tensor.requires_grad(), any_requires_grad, vars.len()
+            );
+        }
+
         // First step (always runs at least one)
         let (gn, clipped) = self.ttt_step(&initial_loss_tensor, delta, Some(lr))?;
         grad_norms.push(gn as f32);
@@ -619,6 +640,16 @@ impl TestTimeTrainer {
             any_clipped = true;
         }
         let mut actual_steps = 1;
+
+        // Diagnostic: log gradient state after first backward pass
+        if delta.accumulated_steps == 0 {
+            let variables = delta.vs.trainable_variables();
+            let defined_count = variables.iter().filter(|v| v.grad().defined()).count();
+            tracing::info!(
+                "[TTT] Post-backward: {}/{} vars have defined grad, grad_norm={:.6}",
+                defined_count, variables.len(), gn
+            );
+        }
 
         // Remaining steps with time budget check BEFORE each step
         for _ in 1..gated_steps {
@@ -661,34 +692,39 @@ impl TestTimeTrainer {
         delta: &TenantDelta,
         tokens: &[u32],
     ) -> Result<Tensor> {
-        let tokens_i64: Vec<i64> = tokens.iter().map(|&t| t as i64).collect();
+        // Defensive: ensure GradMode is enabled for training regardless of leaked state.
+        // If a previous inference panic inside tch::no_grad leaked disabled GradMode,
+        // this ensures gradients still flow through delta's A/B matrices.
+        tch::with_grad(|| {
+            let tokens_i64: Vec<i64> = tokens.iter().map(|&t| t as i64).collect();
 
-        let input_ids = Tensor::from_slice(&tokens_i64)
-            .to_device(self.device)
-            .unsqueeze(0); // [1, seq_len]
+            let input_ids = Tensor::from_slice(&tokens_i64)
+                .to_device(self.device)
+                .unsqueeze(0); // [1, seq_len]
 
-        // Forward pass with delta injection — gradients flow through delta's A/B matrices
-        let logits = engine.forward_with_delta(&input_ids, delta)?;
+            // Forward pass with delta injection — gradients flow through delta's A/B matrices
+            let logits = engine.forward_with_delta(&input_ids, delta)?;
 
-        let seq_len = tokens.len() as i64;
-        let vocab_size = logits.size()[2];
+            let seq_len = tokens.len() as i64;
+            let vocab_size = logits.size()[2];
 
-        // Shift for next-token prediction
-        let pred_logits = logits
-            .narrow(1, 0, seq_len - 1)
-            .reshape([-1, vocab_size]);
+            // Shift for next-token prediction
+            let pred_logits = logits
+                .narrow(1, 0, seq_len - 1)
+                .reshape([-1, vocab_size]);
 
-        let target_ids = input_ids.narrow(1, 1, seq_len - 1).reshape([-1]);
+            let target_ids = input_ids.narrow(1, 1, seq_len - 1).reshape([-1]);
 
-        let loss = pred_logits.cross_entropy_loss::<Tensor>(
-            &target_ids,
-            None,
-            tch::Reduction::Mean,
-            -100,
-            0.0,
-        );
+            let loss = pred_logits.cross_entropy_loss::<Tensor>(
+                &target_ids,
+                None,
+                tch::Reduction::Mean,
+                -100,
+                0.0,
+            );
 
-        Ok(loss)
+            Ok(loss)
+        })
     }
 
     /// Run pure training steps on a tenant delta without generation

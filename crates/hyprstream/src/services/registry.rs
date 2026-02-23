@@ -125,6 +125,8 @@ enum FidState {
         qid: Qid,
         iounit: u32,
         mode: u8,
+        /// Relative path within the worktree (needed for directory reads).
+        rel_path: String,
     },
 }
 
@@ -636,44 +638,6 @@ impl RegistryService {
         Ok(())
     }
 
-    /// Handle checkout
-    async fn handle_checkout(&self, repo_id: &str, ref_name: &str) -> Result<()> {
-        let id = Self::parse_repo_id(repo_id)?;
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&id)?;
-        handle.branch().checkout(ref_name).await?;
-        Ok(())
-    }
-
-    /// Handle stage all
-    async fn handle_stage_all(&self, repo_id: &str) -> Result<()> {
-        let id = Self::parse_repo_id(repo_id)?;
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&id)?;
-        handle.staging().add_all().await?;
-        Ok(())
-    }
-
-    /// Handle commit
-    async fn handle_commit(&self, repo_id: &str, message: &str) -> Result<String> {
-        let id = Self::parse_repo_id(repo_id)?;
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&id)?;
-        let oid = handle.commit(message).await?;
-        Ok(oid.to_string())
-    }
-
-    /// Handle merge
-    async fn handle_merge(&self, repo_id: &str, source: &str, message: Option<&str>) -> Result<String> {
-        let id = Self::parse_repo_id(repo_id)?;
-        let source = source.to_owned();
-        let message = message.map(std::borrow::ToOwned::to_owned);
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&id)?;
-        let oid = handle.merge(&source, message.as_deref()).await?;
-        Ok(oid.to_string())
-    }
-
     /// Handle status
     async fn handle_status(&self, repo_id: &str) -> Result<git2db::RepositoryStatus> {
         let id = Self::parse_repo_id(repo_id)?;
@@ -954,18 +918,6 @@ impl RegistryService {
         Ok(())
     }
 
-    /// Handle stage files operation
-    async fn handle_stage_files(&self, repo_id: &str, files: Vec<String>) -> Result<()> {
-        let id = Self::parse_repo_id(repo_id)?;
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&id)?;
-
-        for file in files {
-            handle.staging().add(&file).await?;
-        }
-        Ok(())
-    }
-
     /// Handle get HEAD operation
     async fn handle_get_head(&self, repo_id: &str) -> Result<String> {
         let id = Self::parse_repo_id(repo_id)?;
@@ -1044,6 +996,30 @@ impl RegistryService {
         tokio::task::spawn_blocking(move || {
             let repo = git2::Repository::open(&repo_path)
                 .map_err(|e| anyhow!("Failed to open repository: {}", e))?;
+            f(repo)
+        })
+        .await
+        .map_err(|e| anyhow!("Task join error: {}", e))?
+    }
+
+    /// Execute a blocking git2 operation on a specific worktree (by branch name).
+    ///
+    /// Unlike `with_repo_blocking` which guesses the worktree via `resolve_worktree_path`,
+    /// this takes an explicit branch/worktree name.
+    async fn with_worktree_blocking<F, T>(&self, id: &git2db::RepoId, branch: &str, f: F) -> Result<T>
+    where
+        F: FnOnce(git2::Repository) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let registry = self.registry.read().await;
+        let handle = registry.repo(id)?;
+        let wt = handle.get_worktree(branch).await
+            .map_err(|e| anyhow!("Worktree '{}' not found: {}", branch, e))?
+            .ok_or_else(|| anyhow!("Worktree '{}' not found", branch))?;
+        let wt_path = wt.path().to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let repo = git2::Repository::open(&wt_path)
+                .map_err(|e| anyhow!("Failed to open worktree: {}", e))?;
             f(repo)
         })
         .await
@@ -1144,73 +1120,6 @@ impl RegistryService {
         let refspec = refspec.to_owned();
         self.with_repo_blocking(&id, move |repo| {
             crate::git::ops::push(&repo, &remote, &refspec, force)
-        }).await
-    }
-
-    // ========================================================================
-    // Advanced Commit Operations
-    // ========================================================================
-
-    /// Handle amend commit operation
-    async fn handle_amend_commit(&self, repo_id: &str, message: &str) -> Result<String> {
-        let id = Self::parse_repo_id(repo_id)?;
-        let message = message.to_owned();
-        self.with_repo_blocking(&id, move |repo| {
-            Ok(crate::git::ops::amend_head(&repo, &message)?.to_string())
-        }).await
-    }
-
-    /// Handle commit with author operation
-    async fn handle_commit_with_author(
-        &self,
-        repo_id: &str,
-        message: &str,
-        author_name: &str,
-        author_email: &str,
-    ) -> Result<String> {
-        let id = Self::parse_repo_id(repo_id)?;
-        let message = message.to_owned();
-        let author_name = author_name.to_owned();
-        let author_email = author_email.to_owned();
-        self.with_repo_blocking(&id, move |repo| {
-            Ok(crate::git::ops::commit_with_author(&repo, &message, &author_name, &author_email)?.to_string())
-        }).await
-    }
-
-    /// Handle stage all including untracked operation
-    async fn handle_stage_all_including_untracked(&self, repo_id: &str) -> Result<()> {
-        let id = Self::parse_repo_id(repo_id)?;
-        self.with_repo_blocking(&id, |repo| {
-            crate::git::ops::stage_all_with_untracked(&repo)
-        }).await
-    }
-
-    // ========================================================================
-    // Merge Conflict Resolution
-    // ========================================================================
-
-    /// Handle abort merge operation
-    async fn handle_abort_merge(&self, repo_id: &str) -> Result<()> {
-        let id = Self::parse_repo_id(repo_id)?;
-        self.with_repo_blocking(&id, |repo| {
-            crate::git::ops::abort_merge(&repo)
-        }).await
-    }
-
-    /// Handle continue merge operation
-    async fn handle_continue_merge(&self, repo_id: &str, message: Option<&str>) -> Result<String> {
-        let id = Self::parse_repo_id(repo_id)?;
-        let message = message.map(std::borrow::ToOwned::to_owned);
-        self.with_repo_blocking(&id, move |repo| {
-            Ok(crate::git::ops::continue_merge(&repo, message.as_deref())?.to_string())
-        }).await
-    }
-
-    /// Handle quit merge operation
-    async fn handle_quit_merge(&self, repo_id: &str) -> Result<()> {
-        let id = Self::parse_repo_id(repo_id)?;
-        self.with_repo_blocking(&id, |repo| {
-            crate::git::ops::quit_merge(&repo)
         }).await
     }
 
@@ -1528,56 +1437,54 @@ impl RepoHandler for RegistryService {
         self.handle_list_branches(repo_id).await
     }
 
+    // DEPRECATED — these operations moved to WorktreeRequest scope.
+    // Kept for wire compatibility; return errors directing callers to the new API.
     async fn handle_checkout(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, data: &CheckoutRequest,
+        _repo_id: &str, _data: &CheckoutRequest,
     ) -> Result<()> {
-        self.handle_checkout(repo_id, &data.ref_name).await
+        Err(anyhow!("checkout moved to worktree scope — use worktree(branch).checkout()"))
     }
 
     async fn handle_stage_all(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str,
+        _repo_id: &str,
     ) -> Result<()> {
-        self.handle_stage_all(repo_id).await
+        Err(anyhow!("stageAll moved to worktree scope — use worktree(branch).stageAll()"))
     }
 
     async fn handle_stage_files(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, data: &StageFilesRequest,
+        _repo_id: &str, _data: &StageFilesRequest,
     ) -> Result<()> {
-        self.handle_stage_files(repo_id, data.files.clone()).await
+        Err(anyhow!("stageFiles moved to worktree scope — use worktree(branch).stageFiles()"))
     }
 
     async fn handle_commit(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, data: &CommitRequest,
+        _repo_id: &str, _data: &CommitRequest,
     ) -> Result<String> {
-        self.handle_commit(repo_id, &data.message).await
+        Err(anyhow!("commit moved to worktree scope — use worktree(branch).commit()"))
     }
 
     async fn handle_merge(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, data: &MergeRequest,
+        _repo_id: &str, _data: &MergeRequest,
     ) -> Result<()> {
-        let msg = if data.message.is_empty() { None } else { Some(data.message.as_str()) };
-        self.handle_merge(repo_id, &data.source, msg).await?;
-        Ok(())
+        Err(anyhow!("merge moved to worktree scope — use worktree(branch).merge()"))
     }
 
     async fn handle_abort_merge(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str,
+        _repo_id: &str,
     ) -> Result<()> {
-        self.handle_abort_merge(repo_id).await
+        Err(anyhow!("abortMerge moved to worktree scope — use worktree(branch).abortMerge()"))
     }
 
     async fn handle_continue_merge(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, data: &ContinueMergeRequest,
+        _repo_id: &str, _data: &ContinueMergeRequest,
     ) -> Result<()> {
-        let msg = if data.message.is_empty() { None } else { Some(data.message.as_str()) };
-        self.handle_continue_merge(repo_id, msg).await?;
-        Ok(())
+        Err(anyhow!("continueMerge moved to worktree scope — use worktree(branch).continueMerge()"))
     }
 
     async fn handle_quit_merge(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str,
+        _repo_id: &str,
     ) -> Result<()> {
-        self.handle_quit_merge(repo_id).await
+        Err(anyhow!("quitMerge moved to worktree scope — use worktree(branch).quitMerge()"))
     }
 
     async fn handle_get_head(&self, _ctx: &EnvelopeContext, _request_id: u64,
@@ -1650,22 +1557,23 @@ impl RepoHandler for RegistryService {
         self.handle_push(repo_id, &data.remote, &data.refspec, data.force).await
     }
 
+    // DEPRECATED — moved to WorktreeRequest scope.
     async fn handle_amend_commit(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, data: &AmendCommitRequest,
+        _repo_id: &str, _data: &AmendCommitRequest,
     ) -> Result<String> {
-        self.handle_amend_commit(repo_id, &data.message).await
+        Err(anyhow!("amendCommit moved to worktree scope — use worktree(branch).amendCommit()"))
     }
 
     async fn handle_commit_with_author(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, data: &CommitWithAuthorRequest,
+        _repo_id: &str, _data: &CommitWithAuthorRequest,
     ) -> Result<String> {
-        self.handle_commit_with_author(repo_id, &data.message, &data.author_name, &data.author_email).await
+        Err(anyhow!("commitWithAuthor moved to worktree scope — use worktree(branch).commitWithAuthor()"))
     }
 
     async fn handle_stage_all_including_untracked(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str,
+        _repo_id: &str,
     ) -> Result<()> {
-        self.handle_stage_all_including_untracked(repo_id).await
+        Err(anyhow!("stageAllIncludingUntracked moved to worktree scope — use worktree(branch).stageAllIncludingUntracked()"))
     }
 
     async fn handle_list_tags(&self, _ctx: &EnvelopeContext, _request_id: u64,
@@ -1761,9 +1669,13 @@ impl CtlHandler for RegistryService {
         let rel_path = self.fid_rel_path(fid, &subject)?;
 
         let id = Self::parse_repo_id(repo_id)?;
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&id)?;
-        let repo = handle.open_repo()?;
+        // Scope the registry lock so it's dropped before blocking git2 ops
+        let repo_path = {
+            let registry = self.registry.read().await;
+            let handle = registry.repo(&id)?;
+            Self::resolve_worktree_path(&handle).await?
+        };
+        let repo = git2::Repository::open(&repo_path)?;
 
         let status = repo.status_file(std::path::Path::new(&rel_path))?;
         let state = format!("{:?}", status);
@@ -1778,9 +1690,12 @@ impl CtlHandler for RegistryService {
         let rel_path = self.fid_rel_path(fid, &subject)?;
 
         let id = Self::parse_repo_id(repo_id)?;
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&id)?;
-        let repo = handle.open_repo()?;
+        let repo_path = {
+            let registry = self.registry.read().await;
+            let handle = registry.repo(&id)?;
+            Self::resolve_worktree_path(&handle).await?
+        };
+        let repo = git2::Repository::open(&repo_path)?;
 
         let max_count = if data.max_count == 0 { 20 } else { data.max_count as usize };
 
@@ -1840,9 +1755,12 @@ impl CtlHandler for RegistryService {
         let rel_path = self.fid_rel_path(fid, &subject)?;
 
         let id = Self::parse_repo_id(repo_id)?;
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&id)?;
-        let repo = handle.open_repo()?;
+        let repo_path = {
+            let registry = self.registry.read().await;
+            let handle = registry.repo(&id)?;
+            Self::resolve_worktree_path(&handle).await?
+        };
+        let repo = git2::Repository::open(&repo_path)?;
 
         let ref_name = if data.ref_name.is_empty() { "HEAD" } else { &data.ref_name };
         let obj = repo.revparse_single(ref_name)?;
@@ -1880,9 +1798,12 @@ impl CtlHandler for RegistryService {
         let rel_path = self.fid_rel_path(fid, &subject)?;
 
         let id = Self::parse_repo_id(repo_id)?;
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&id)?;
-        let repo = handle.open_repo()?;
+        let repo_path = {
+            let registry = self.registry.read().await;
+            let handle = registry.repo(&id)?;
+            Self::resolve_worktree_path(&handle).await?
+        };
+        let repo = git2::Repository::open(&repo_path)?;
 
         let blame = repo.blame_file(std::path::Path::new(&rel_path), None)?;
 
@@ -2159,6 +2080,23 @@ impl WorktreeHandler for RegistryService {
         let root = self.get_contained_root(repo_id, name).await
             .map_err(|e| anyhow!("{}", e))?;
 
+        // Validate each wname is a single safe path component (defense-in-depth;
+        // pathrs also enforces containment at the kernel level via openat2).
+        for wname in &data.wnames {
+            if wname.is_empty() {
+                anyhow::bail!("wname must not be empty");
+            }
+            if wname == ".." {
+                anyhow::bail!("path traversal via '..' rejected");
+            }
+            if wname.contains('/') {
+                anyhow::bail!("wname {:?} contains slash (must be a single component)", wname);
+            }
+            if wname.as_bytes().contains(&0) {
+                anyhow::bail!("wname contains NUL byte");
+            }
+        }
+
         // Join wnames into a path (empty wnames = root)
         let path = if data.wnames.is_empty() {
             ".".to_owned()
@@ -2175,6 +2113,10 @@ impl WorktreeHandler for RegistryService {
         let subject = ctx.subject().to_string();
         // Use client-specified newfid, or auto-allocate
         let fid = if data.newfid > 0 {
+            // Reject if the fid is already in use (prevents overwriting another client's fid)
+            if self.fid_table.fids.contains_key(&data.newfid) {
+                anyhow::bail!("fid {} is already in use", data.newfid);
+            }
             data.newfid
         } else {
             self.fid_table.alloc_fid(&subject)
@@ -2227,6 +2169,9 @@ impl WorktreeHandler for RegistryService {
             }
         };
 
+        // Extract rel_path before consuming the walk_handle
+        let rel_path = walk_handle.rel_path().to_owned();
+
         let write = (data.mode & OWRITE) != 0 || (data.mode & ORDWR) != 0;
         let file = walk_handle.open_file(write)
             .map_err(|e| anyhow!("{}", e))?;
@@ -2245,6 +2190,7 @@ impl WorktreeHandler for RegistryService {
                 qid: qid.clone(),
                 iounit,
                 mode: data.mode,
+                rel_path,
             },
             owner_identity: subject,
             last_accessed: AtomicU64::new(now_epoch_secs()),
@@ -2261,6 +2207,20 @@ impl WorktreeHandler for RegistryService {
         repo_id: &str, name: &str, data: &NpCreate,
     ) -> Result<ROpen> {
         let subject = ctx.subject().to_string();
+
+        // Validate the name is a single safe path component (defense-in-depth)
+        if data.name.is_empty() {
+            anyhow::bail!("create name must not be empty");
+        }
+        if data.name == "." || data.name == ".." {
+            anyhow::bail!("create name {:?} is not a valid file name", data.name);
+        }
+        if data.name.contains('/') {
+            anyhow::bail!("create name {:?} must be a single component (no slashes)", data.name);
+        }
+        if data.name.as_bytes().contains(&0) {
+            anyhow::bail!("create name contains NUL byte");
+        }
 
         // Take the fid to get ownership of the WalkHandle (directory we're creating in)
         let entry = self.fid_table.take(data.fid)
@@ -2342,6 +2302,7 @@ impl WorktreeHandler for RegistryService {
                     qid: qid.clone(),
                     iounit,
                     mode,
+                    rel_path: child_path,
                 },
                 owner_identity: subject,
                 last_accessed: AtomicU64::new(now_epoch_secs()),
@@ -2356,23 +2317,55 @@ impl WorktreeHandler for RegistryService {
 
     /// Read: offset+count read, bounded by iounit. This is THE fix for the
     /// readFile bug — no unbounded allocation possible.
+    /// For directories, returns entries in wire format: name_len(u32le) + name(utf8) + is_dir(u8) + size(u64le).
     async fn handle_read(&self, ctx: &EnvelopeContext, _request_id: u64,
-        _repo_id: &str, _name: &str, data: &NpRead,
+        repo_id: &str, name: &str, data: &NpRead,
     ) -> Result<RRead> {
         let subject = ctx.subject().to_string();
         let entry = self.fid_table.get_verified(data.fid, &subject)
             .map_err(|e| anyhow!("{}", e))?;
 
         match &entry.state {
-            FidState::Opened { file, iounit, .. } => {
-                // Clamp count to iounit — structurally prevents unbounded reads
-                let count = std::cmp::min(data.count, *iounit) as usize;
-                let mut buf = vec![0u8; count];
-                let mut f = file.lock();
-                f.seek(SeekFrom::Start(data.offset))?;
-                let n = f.read(&mut buf)?;
-                buf.truncate(n);
-                Ok(RRead { data: buf })
+            FidState::Opened { file, qid, iounit, rel_path, .. } => {
+                if qid.qtype & QTDIR != 0 {
+                    // Directory read: encode entries as wire format
+                    let root = self.get_contained_root(repo_id, name).await
+                        .map_err(|e| anyhow!("{}", e))?;
+                    let entries = root.readdir(rel_path)
+                        .map_err(|e| anyhow!("{}", e))?;
+
+                    // Serialize all entries into wire format:
+                    // name_len(u32le) + name(utf8) + is_dir(u8) + size(u64le)
+                    //
+                    // Directory listings are served only at offset=0 to prevent
+                    // mid-record splits. The client reads in a loop and stops
+                    // on empty response, so returning empty for offset>0 signals EOF.
+                    if data.offset != 0 {
+                        return Ok(RRead { data: vec![] });
+                    }
+
+                    let mut wire = Vec::new();
+                    for entry in &entries {
+                        let name_bytes = entry.name.as_bytes();
+                        wire.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+                        wire.extend_from_slice(name_bytes);
+                        wire.push(if entry.is_dir { 1 } else { 0 });
+                        wire.extend_from_slice(&entry.size.to_le_bytes());
+                    }
+
+                    let count = std::cmp::min(data.count, *iounit) as usize;
+                    let end = std::cmp::min(count, wire.len());
+                    Ok(RRead { data: wire[..end].to_vec() })
+                } else {
+                    // Regular file read
+                    let count = std::cmp::min(data.count, *iounit) as usize;
+                    let mut buf = vec![0u8; count];
+                    let mut f = file.lock();
+                    f.seek(SeekFrom::Start(data.offset))?;
+                    let n = f.read(&mut buf)?;
+                    buf.truncate(n);
+                    Ok(RRead { data: buf })
+                }
             }
             _ => anyhow::bail!("fid {} is not opened for I/O", data.fid),
         }
@@ -2500,6 +2493,140 @@ impl WorktreeHandler for RegistryService {
     ) -> Result<()> {
         // No-op for synchronous operations
         Ok(())
+    }
+
+    // ========================================================================
+    // Worktree-scoped git operations (moved from RepositoryRequest)
+    // ========================================================================
+
+    /// Stage all tracked modified files in this worktree (git add -u).
+    async fn handle_stage_all(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str,
+    ) -> Result<()> {
+        let id = Self::parse_repo_id(repo_id)?;
+        self.with_worktree_blocking(&id, name, |repo| {
+            crate::git::ops::stage_all(&repo)
+        }).await
+    }
+
+    /// Stage specific files in this worktree.
+    async fn handle_stage_files(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str, data: &StageFilesRequest,
+    ) -> Result<()> {
+        let id = Self::parse_repo_id(repo_id)?;
+        let files = data.files.clone();
+        self.with_worktree_blocking(&id, name, move |repo| {
+            let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+            crate::git::ops::stage_files(&repo, &file_refs)
+        }).await
+    }
+
+    /// Stage all files including untracked in this worktree (git add -A).
+    async fn handle_stage_all_including_untracked(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str,
+    ) -> Result<()> {
+        let id = Self::parse_repo_id(repo_id)?;
+        self.with_worktree_blocking(&id, name, |repo| {
+            crate::git::ops::stage_all_with_untracked(&repo)
+        }).await
+    }
+
+    /// Commit staged changes in this worktree.
+    async fn handle_commit(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str, data: &CommitRequest,
+    ) -> Result<String> {
+        let id = Self::parse_repo_id(repo_id)?;
+        let message = data.message.clone();
+        let author = data.author.clone();
+        let email = data.email.clone();
+        self.with_worktree_blocking(&id, name, move |repo| {
+            let oid = if !author.is_empty() && !email.is_empty() {
+                crate::git::ops::commit_with_author(&repo, &message, &author, &email)?
+            } else {
+                crate::git::ops::commit_index(&repo, &message)?
+            };
+            Ok(oid.to_string())
+        }).await
+    }
+
+    /// Commit staged changes with specified author.
+    async fn handle_commit_with_author(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str, data: &CommitWithAuthorRequest,
+    ) -> Result<String> {
+        let id = Self::parse_repo_id(repo_id)?;
+        let message = data.message.clone();
+        let author_name = data.author_name.clone();
+        let author_email = data.author_email.clone();
+        self.with_worktree_blocking(&id, name, move |repo| {
+            Ok(crate::git::ops::commit_with_author(&repo, &message, &author_name, &author_email)?.to_string())
+        }).await
+    }
+
+    /// Amend the last commit in this worktree.
+    async fn handle_amend_commit(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str, data: &AmendCommitRequest,
+    ) -> Result<String> {
+        let id = Self::parse_repo_id(repo_id)?;
+        let message = data.message.clone();
+        self.with_worktree_blocking(&id, name, move |repo| {
+            Ok(crate::git::ops::amend_head(&repo, &message)?.to_string())
+        }).await
+    }
+
+    /// Checkout a ref in this worktree.
+    async fn handle_checkout(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str, data: &CheckoutRequest,
+    ) -> Result<()> {
+        let id = Self::parse_repo_id(repo_id)?;
+        let ref_name = data.ref_name.clone();
+        self.with_worktree_blocking(&id, name, move |repo| {
+            crate::git::ops::ensure_branch(&repo, &ref_name)
+        }).await
+    }
+
+    /// Merge a branch into this worktree.
+    async fn handle_merge(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str, data: &MergeRequest,
+    ) -> Result<()> {
+        let id = Self::parse_repo_id(repo_id)?;
+        let source = data.source.clone();
+        let message = if data.message.is_empty() { None } else { Some(data.message.clone()) };
+        self.with_worktree_blocking(&id, name, move |repo| {
+            crate::git::ops::merge(&repo, &source, message.as_deref())?;
+            Ok(())
+        }).await
+    }
+
+    /// Abort an in-progress merge in this worktree.
+    async fn handle_abort_merge(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str,
+    ) -> Result<()> {
+        let id = Self::parse_repo_id(repo_id)?;
+        self.with_worktree_blocking(&id, name, |repo| {
+            crate::git::ops::abort_merge(&repo)
+        }).await
+    }
+
+    /// Continue a merge after resolving conflicts.
+    async fn handle_continue_merge(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str, data: &ContinueMergeRequest,
+    ) -> Result<()> {
+        let id = Self::parse_repo_id(repo_id)?;
+        let message = if data.message.is_empty() { None } else { Some(data.message.clone()) };
+        self.with_worktree_blocking(&id, name, move |repo| {
+            crate::git::ops::continue_merge(&repo, message.as_deref())?;
+            Ok(())
+        }).await
+    }
+
+    /// Exit merge state without committing.
+    async fn handle_quit_merge(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str,
+    ) -> Result<()> {
+        let id = Self::parse_repo_id(repo_id)?;
+        self.with_worktree_blocking(&id, name, |repo| {
+            crate::git::ops::quit_merge(&repo)
+        }).await
     }
 }
 

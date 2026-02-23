@@ -1296,8 +1296,8 @@ pub struct StreamChannel {
     signing_key: SigningKey,
     /// Lazy-initialized async PUSH socket to StreamService (wrapped in Arc for sharing)
     push_socket: OnceCell<Arc<tokio::sync::Mutex<tmq::push::Push>>>,
-    /// Shared SUB socket for control channel messages (one FD for all streams)
-    ctrl_sub: OnceCell<Arc<tokio::sync::Mutex<tmq::subscribe::Subscribe>>>,
+    /// Channel to send subscription requests to the ctrl listener task
+    ctrl_sub_tx: OnceCell<tokio::sync::mpsc::Sender<Vec<u8>>>,
     /// Active cancel tokens keyed by ctrl_topic
     cancel_tokens: Arc<DashMap<String, CancellationToken>>,
 }
@@ -1309,7 +1309,7 @@ impl StreamChannel {
             context,
             signing_key,
             push_socket: OnceCell::new(),
-            ctrl_sub: OnceCell::new(),
+            ctrl_sub_tx: OnceCell::new(),
             cancel_tokens: Arc::new(DashMap::new()),
         }
     }
@@ -1361,12 +1361,9 @@ impl StreamChannel {
         self.register_topic(stream_ctx.ctrl_topic(), exp, claims).await?;
 
         // 3. Subscribe control channel and register cancel token
-        let ctrl_sub = self.get_or_init_ctrl_sub().await?;
-        {
-            let mut sub = ctrl_sub.lock().await;
-            sub.subscribe(stream_ctx.ctrl_topic().as_bytes())
-                .map_err(|e| anyhow::anyhow!("Failed to subscribe ctrl topic: {}", e))?;
-        }
+        let ctrl_tx = self.get_or_init_ctrl_sub().await?;
+        ctrl_tx.send(stream_ctx.ctrl_topic().as_bytes().to_vec()).await
+            .map_err(|_| anyhow::anyhow!("ctrl listener closed"))?;
         self.cancel_tokens.insert(
             stream_ctx.ctrl_topic().to_owned(),
             stream_ctx.cancel_token().clone(),
@@ -1448,9 +1445,13 @@ impl StreamChannel {
         Ok(Arc::clone(socket_arc))
     }
 
-    /// Get or initialize the shared control channel SUB socket.
-    async fn get_or_init_ctrl_sub(&self) -> Result<Arc<tokio::sync::Mutex<tmq::subscribe::Subscribe>>> {
-        let sub_arc = self.ctrl_sub.get_or_try_init(|| async {
+    /// Get or initialize the control channel subscription sender.
+    ///
+    /// The SUB socket is owned exclusively by the ctrl listener task.
+    /// Subscription requests are sent via the returned mpsc channel,
+    /// avoiding the deadlock that occurred when a Mutex was held across `.await`.
+    async fn get_or_init_ctrl_sub(&self) -> Result<tokio::sync::mpsc::Sender<Vec<u8>>> {
+        let tx = self.ctrl_sub_tx.get_or_try_init(|| async {
             let endpoint = endpoint_registry()
                 .endpoint("streams", SocketKind::Sub)
                 .to_zmq_string();
@@ -1463,49 +1464,61 @@ impl StreamChannel {
             let sub = without_topic.subscribe(b"\x00__ctrl_init__")
                 .map_err(|e| anyhow::anyhow!("Failed to init ctrl SUB: {}", e))?;
 
-            let sub = Arc::new(tokio::sync::Mutex::new(sub));
+            // Spawn the control listener task — it owns the socket exclusively
+            let tx = self.spawn_ctrl_listener(sub);
 
-            // Spawn the control listener task
-            self.spawn_ctrl_listener(Arc::clone(&sub));
-
-            Ok::<_, anyhow::Error>(sub)
+            Ok::<_, anyhow::Error>(tx)
         }).await?;
-        Ok(Arc::clone(sub_arc))
+        Ok(tx.clone())
     }
 
-    /// Spawn a background task that listens for control messages and fires cancel tokens.
-    fn spawn_ctrl_listener(&self, sub: Arc<tokio::sync::Mutex<tmq::subscribe::Subscribe>>) {
+    /// Spawn a background task that owns the SUB socket and listens for control messages.
+    ///
+    /// Subscription requests arrive via the returned mpsc channel, so the socket
+    /// is never shared behind a Mutex — eliminating the deadlock that occurred when
+    /// the listener held the lock across `sub.next().await`.
+    fn spawn_ctrl_listener(
+        &self,
+        mut sub: tmq::subscribe::Subscribe,
+    ) -> tokio::sync::mpsc::Sender<Vec<u8>> {
         use futures::StreamExt;
 
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
         let tokens = Arc::clone(&self.cancel_tokens);
         tokio::spawn(async move {
             loop {
-                let msg = {
-                    let mut sub = sub.lock().await;
-                    sub.next().await
-                };
-                let multipart = match msg {
-                    Some(Ok(m)) => m,
-                    Some(Err(e)) => {
-                        tracing::warn!("ctrl SUB error: {}", e);
-                        continue;
+                tokio::select! {
+                    Some(topic_bytes) = rx.recv() => {
+                        if let Err(e) = sub.subscribe(&topic_bytes) {
+                            tracing::warn!("ctrl subscribe failed: {}", e);
+                        }
                     }
-                    None => break, // socket closed
-                };
+                    msg = sub.next() => {
+                        let multipart = match msg {
+                            Some(Ok(m)) => m,
+                            Some(Err(e)) => {
+                                tracing::warn!("ctrl SUB error: {}", e);
+                                continue;
+                            }
+                            None => break, // socket closed
+                        };
 
-                // Wire format: [ctrl_topic, capnp, mac]
-                if multipart.is_empty() {
-                    continue;
-                }
-                let topic = String::from_utf8_lossy(&multipart[0]);
+                        // Wire format: [ctrl_topic, capnp, mac]
+                        if multipart.is_empty() {
+                            continue;
+                        }
+                        let topic = String::from_utf8_lossy(&multipart[0]);
 
-                // Fire the cancel token if we have one for this topic
-                if let Some((_, token)) = tokens.remove(topic.as_ref()) {
-                    tracing::debug!(ctrl_topic = %topic, "control cancel received");
-                    token.cancel();
+                        // Fire the cancel token if we have one for this topic
+                        if let Some((_, token)) = tokens.remove(topic.as_ref()) {
+                            tracing::debug!(ctrl_topic = %topic, "control cancel received");
+                            token.cancel();
+                        }
+                    }
                 }
             }
         });
+        tx
     }
 
     /// Create a publisher for the given stream context.
