@@ -217,6 +217,7 @@ debug = false
 [profile.release]
 lto = "thin"
 strip = true
+code-gen = 4 # More threads needed for smaller RAM targets
 
 [workspace.lints.rust]
 # unsafe_code = "warn"  # Informational only, many FFI calls are necessary
