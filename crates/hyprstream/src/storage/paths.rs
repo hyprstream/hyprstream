@@ -104,6 +104,11 @@ impl StoragePaths {
         Ok(loras)
     }
 
+    /// Resolve worktree host path for a model+branch (CLI-only, not exposed via RPC)
+    pub fn worktree_path(&self, model_name: &str, branch: &str) -> Result<PathBuf> {
+        Ok(self.models_dir()?.join(model_name).join("worktrees").join(branch))
+    }
+
     /// Ensure a directory exists, creating it if necessary
     fn ensure_dir_exists(&self, path: &Path) -> Result<()> {
         if !path.exists() {

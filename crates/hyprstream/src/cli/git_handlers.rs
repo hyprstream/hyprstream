@@ -44,9 +44,9 @@ pub async fn handle_branch(
     }
 
     // Create worktree for the branch via service
-    let worktree_path = repo_client.create_worktree("", branch_name, false).await
+    repo_client.create_worktree(branch_name).await
         .map_err(|e| anyhow::anyhow!("Failed to create worktree: {}", e))?;
-    println!("✓ Created worktree at {}", worktree_path);
+    println!("✓ Created worktree for branch {branch_name}");
 
     // Apply policy template if specified
     if let Some(ref template_name) = policy_template {
@@ -55,7 +55,7 @@ pub async fn handle_branch(
 
     // Show helpful next steps
     println!("\n→ Next steps:");
-    println!("  cd {}", worktree_path);
+    println!("  hyprstream worktree info {model} {branch_name}");
     println!("  hyprstream status {model}:{branch_name}");
     println!("  hyprstream lt {model}:{branch_name} --adapter my-adapter");
 
@@ -244,11 +244,12 @@ pub async fn handle_commit(
 
     // Check if worktree exists
     let wts = repo_client.list_worktrees().await?;
-    let _worktree_path = wts.iter().find(|wt| wt.branch_name == branch_name).map(|wt| wt.path.clone())
-        .ok_or_else(|| anyhow::anyhow!(
+    if !wts.iter().any(|wt| wt.branch_name == branch_name) {
+        anyhow::bail!(
             "Worktree '{}' does not exist for model '{}'.\n\nCreate it first with:\n  hyprstream branch {} {}",
             branch_name, model_ref.model, model_ref.model, branch_name
-        ))?;
+        );
+    }
 
     // Use RepositoryClient.detailed_status() for file-level change information
     let detailed_status = repo_client.detailed_status().await?;
@@ -422,6 +423,9 @@ pub async fn handle_list(
     // Get archetype registry for capability detection
     let archetype_registry = crate::archetypes::global_registry();
 
+    // Resolve worktree paths locally for archetype detection
+    let storage_paths = crate::storage::StoragePaths::new()?;
+
     // Collect models with git info and capabilities
     struct ModelInfo {
         display_name: String,
@@ -459,9 +463,10 @@ pub async fn handle_list(
                 let branch_name = if wt.branch_name.is_empty() { "detached".to_owned() } else { wt.branch_name.clone() };
                 let display_name = format!("{}:{}", name, branch_name);
 
-                // Detect capabilities from worktree path (from service)
-                let wt_path = std::path::Path::new(&wt.path);
-                let detected = archetype_registry.detect(wt_path);
+                // Detect capabilities from worktree path (resolved locally)
+                let wt_path = storage_paths.worktree_path(&name, &wt.branch_name)
+                    .unwrap_or_else(|_| PathBuf::from("."));
+                let detected = archetype_registry.detect(&wt_path);
                 let domains = detected.to_detected_domains();
 
                 // Compute access string based on user permissions
@@ -602,12 +607,12 @@ pub async fn handle_clone(
     if !quiet {
         println!("   Creating worktree for branch: {worktree_branch}");
     }
-    let worktree_path = repo_client.create_worktree("", &worktree_branch, false).await
+    repo_client.create_worktree(&worktree_branch).await
         .map_err(|e| anyhow::anyhow!("Failed to create worktree: {}", e))?;
 
     if !quiet {
         println!("✅ Model '{}' cloned successfully!", model_name);
-        println!("   Location: {}", worktree_path);
+        println!("✓ Worktree: {model_name}:{worktree_branch}");
     }
 
     // Apply policy template if specified
@@ -756,10 +761,6 @@ pub async fn handle_info(
         ))
     };
 
-    // Get model path from worktree info via service
-    let worktrees = repo_client.list_worktrees().await
-        .map_err(|e| anyhow::anyhow!("Failed to list worktrees: {}", e))?;
-
     // Find the worktree matching the requested branch/ref
     let branch_name = match &model_ref.git_ref {
         crate::storage::GitRef::DefaultBranch => {
@@ -769,15 +770,10 @@ pub async fn handle_info(
         _ => "main".to_owned(),
     };
 
-    let model_path = worktrees.iter()
-        .find(|wt| wt.branch_name == branch_name)
-        .map(|wt| PathBuf::from(&wt.path))
-        .unwrap_or_else(|| {
-            // Fallback: use first available worktree
-            worktrees.first()
-                .map(|wt| PathBuf::from(&wt.path))
-                .unwrap_or_else(|| PathBuf::from("."))
-        });
+    // Resolve worktree path locally (not from RPC response)
+    let storage_paths = crate::storage::StoragePaths::new()?;
+    let model_path = storage_paths.worktree_path(&model_ref.model, &branch_name)
+        .unwrap_or_else(|_| PathBuf::from("."));
 
     // If adapters_only is true, skip the general model info
     if !adapters_only {
@@ -849,9 +845,9 @@ pub async fn handle_info(
         }
     }
 
-    // Size calculation - this could be moved to RepositoryClient as get_repo_size()
-    // Get bare repo path from TrackedRepository (already fetched above)
-    let bare_repo_path = Some(PathBuf::from(&tracked_repo.worktree_path));
+    // Size calculation - derive bare repo path locally from models_dir
+    let bare_repo_path = storage_paths.models_dir().ok()
+        .map(|d| d.join(&model_ref.model).join(format!("{}.git", &model_ref.model)));
 
     if let Some(ref bare_repo_path) = bare_repo_path {
         if bare_repo_path.exists() {
@@ -1031,17 +1027,13 @@ pub async fn apply_policy_template_to_model(
             template_name
         ))?;
 
-    // Get the policies directory - derive models_dir from TrackedRepository
-    let tracked = registry.get_by_name(model).await
+    // Validate model exists in registry
+    let _tracked = registry.get_by_name(model).await
         .map_err(|e| anyhow::anyhow!("Failed to get repository: {}", e))?;
 
-    // TrackedRepository.worktree_path is bare repo: models/{name}/{name}.git
-    // Navigate up 2 levels to get models_dir
-    let bare_repo_path = PathBuf::from(&tracked.worktree_path);
-    let models_dir = bare_repo_path
-        .parent()  // models/{name}
-        .and_then(|p| p.parent())  // models/
-        .ok_or_else(|| anyhow::anyhow!("Invalid repository path structure"))?;
+    // Derive models_dir from StoragePaths (not from RPC response)
+    let storage_paths = crate::storage::StoragePaths::new()?;
+    let models_dir = storage_paths.models_dir()?;
 
     let registry_path = models_dir.join(".registry");
     let policies_dir = registry_path.join("policies");
@@ -1603,12 +1595,8 @@ async fn handle_merge_conflict_resolution(
 
     // Verify worktree exists
     let wts = repo_client.list_worktrees().await?;
-    let worktree_path = wts.iter().find(|wt| wt.branch_name == target_branch).map(|wt| wt.path.clone())
-        .ok_or_else(|| anyhow::anyhow!("Worktree not found for branch {}", target_branch))?;
-
-    let worktree_path_buf = PathBuf::from(&worktree_path);
-    if !worktree_path_buf.exists() {
-        bail!("Worktree not found: {}", worktree_path);
+    if !wts.iter().any(|wt| wt.branch_name == target_branch) {
+        bail!("Worktree not found for branch {}", target_branch);
     }
 
     if options.abort {
@@ -1695,7 +1683,7 @@ pub async fn handle_remove(
 
         // Show what will be removed
         println!("Worktree '{}:{}' removal plan:", model_ref.model, branch);
-        println!("  📁 Remove worktree at: {}", wt.path);
+        println!("  Remove worktree for branch: {}", wt.branch_name);
 
         // Confirmation prompt unless forced
         if !force {
@@ -1712,8 +1700,8 @@ pub async fn handle_remove(
             }
         }
 
-        // Remove the worktree via service
-        repo_client.remove_worktree(&wt.path, false).await
+        // Remove the worktree via service (pass branch name, not path)
+        repo_client.remove_worktree(&wt.branch_name, false).await
             .map_err(|e| anyhow::anyhow!("Failed to remove worktree: {}", e))?;
 
         println!("✓ Worktree '{}:{}' removed successfully", model_ref.model, branch);

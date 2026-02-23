@@ -45,7 +45,6 @@ use crate::services::generated::registry_client::{
     NpStatReq, NpWstat, NpFlush,
     RWalk, ROpen, RRead, RWrite, RStat,
     NpStat as NpStatData, Qid as QidData,
-    EnsureWorktreeRequest,
     FileStatus, LogEntry, ValidationResult, FileInfo,
     CtlLogRequest, CtlDiffRequest, CtlCheckoutRequest,
     EditOpenRequest, EditApplyRequest,
@@ -833,7 +832,7 @@ impl RegistryService {
                 .unwrap_or_default();
 
             result.push(crate::services::generated::registry_client::WorktreeInfo {
-                path: wt.path().to_string_lossy().to_string(),
+                path_removed: (), // field removed from schema
                 branch_name,
                 head_oid,
                 is_locked: false,
@@ -843,25 +842,36 @@ impl RegistryService {
         Ok(result)
     }
 
-    /// Handle create worktree
+    /// Handle create worktree (idempotent — no-op if worktree already exists)
     async fn handle_create_worktree(
         &self,
         repo_id: &str,
-        path: &str,
         branch: &str,
-    ) -> Result<PathBuf> {
-        let id = Self::parse_repo_id(repo_id)?;
-        let path = PathBuf::from(path);
-        // I6: Validate path is within base_dir
-        self.validate_path_within_base(&path)?;
-        // Validate branch name
+    ) -> Result<()> {
+        // Validate branch name (rejects .., control chars, path traversal)
         hyprstream_containedfs::validate_ref_name(branch)
             .map_err(|e| anyhow!("Invalid branch name: {}", e))?;
-        let branch = branch.to_owned();
+
+        let id = Self::parse_repo_id(repo_id)?;
         let registry = self.registry.read().await;
         let handle = registry.repo(&id)?;
-        let worktree = handle.create_worktree(&path, &branch).await?;
-        Ok(worktree.path().to_path_buf())
+
+        // Check if worktree already exists (idempotent)
+        // Use status().branch instead of file_name() to handle hierarchical
+        // branch names like "feature/my-branch" correctly.
+        let mut worktrees = handle.get_worktrees().await?;
+        for wt in &mut worktrees {
+            let wt_branch = wt.status().await
+                .ok()
+                .and_then(|s| s.branch);
+            if wt_branch.as_deref() == Some(branch) {
+                return Ok(());
+            }
+        }
+
+        // Create — empty path lets git2db derive safe worktrees/{branch} path
+        handle.create_worktree(Path::new(""), branch).await?;
+        Ok(())
     }
 
     /// Handle register operation
@@ -910,21 +920,34 @@ impl RegistryService {
         Ok(())
     }
 
-    /// Handle remove worktree operation
-    async fn handle_remove_worktree(&self, repo_id: &str, worktree_path: &str) -> Result<()> {
+    /// Handle remove worktree operation (accepts branch name, resolves path internally)
+    async fn handle_remove_worktree(&self, repo_id: &str, branch: &str) -> Result<()> {
+        hyprstream_containedfs::validate_ref_name(branch)
+            .map_err(|e| anyhow!("Invalid branch name: {}", e))?;
         let id = Self::parse_repo_id(repo_id)?;
-        let worktree_path = PathBuf::from(worktree_path);
         let registry = self.registry.read().await;
         let handle = registry.repo(&id)?;
 
-        // Get base repo path
-        let repo_path = handle.worktree()?;
+        // Find worktree by branch name using status().branch
+        let mut worktrees = handle.get_worktrees().await?;
+        let mut found = None;
+        for wt in &mut worktrees {
+            let wt_branch = wt.status().await.ok().and_then(|s| s.branch);
+            if wt_branch.as_deref() == Some(branch) {
+                found = Some(wt.path().to_path_buf());
+                break;
+            }
+        }
+        let matched_wt = found
+            .ok_or_else(|| anyhow!("No worktree for branch '{}'", branch))?;
 
-        // Extract worktree name from path
-        let worktree_name = worktree_path
+        let worktree_name = matched_wt
             .file_name()
             .and_then(|s| s.to_str())
             .ok_or_else(|| anyhow!("Invalid worktree path"))?;
+
+        // Get base repo path
+        let repo_path = handle.worktree()?;
 
         // Use GitManager to remove worktree
         git2db::GitManager::global().remove_worktree(repo_path, worktree_name, None)?;
@@ -1353,7 +1376,7 @@ fn tracked_repo_to_data(repo: &TrackedRepository) -> crate::services::generated:
         id: repo.id.to_string(),
         name: repo.name.clone().unwrap_or_default(),
         url: repo.url.clone(),
-        worktree_path: repo.worktree_path.to_string_lossy().to_string(),
+        worktree_path_removed: (), // field removed from schema
         tracking_ref: match &repo.tracking_ref {
             GitRef::Branch(b) => b.clone(),
             _ => String::new(),
@@ -1476,9 +1499,8 @@ impl RegistryHandler for RegistryService {
 impl RepoHandler for RegistryService {
     async fn handle_create_worktree(&self, _ctx: &EnvelopeContext, _request_id: u64,
         repo_id: &str, data: &CreateWorktreeRequest,
-    ) -> Result<String> {
-        let path_buf = self.handle_create_worktree(repo_id, &data.path, &data.branch_name).await?;
-        Ok(path_buf.to_string_lossy().to_string())
+    ) -> Result<()> {
+        self.handle_create_worktree(repo_id, &data.branch).await
     }
 
     async fn handle_list_worktrees(&self, _ctx: &EnvelopeContext, _request_id: u64,
@@ -1490,7 +1512,7 @@ impl RepoHandler for RegistryService {
     async fn handle_remove_worktree(&self, _ctx: &EnvelopeContext, _request_id: u64,
         repo_id: &str, data: &RemoveWorktreeRequest,
     ) -> Result<()> {
-        self.handle_remove_worktree(repo_id, &data.worktree_path).await
+        self.handle_remove_worktree(repo_id, &data.branch).await
     }
 
     async fn handle_create_branch(&self, _ctx: &EnvelopeContext, _request_id: u64,
@@ -1672,33 +1694,6 @@ impl RepoHandler for RegistryService {
         self.handle_update(repo_id, r).await
     }
 
-    async fn handle_ensure_worktree(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, data: &EnsureWorktreeRequest,
-    ) -> Result<String> {
-        let id = Self::parse_repo_id(repo_id)?;
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&id)?;
-
-        // Check if a worktree for this branch already exists
-        let worktrees = handle.get_worktrees().await?;
-        for wt in &worktrees {
-            let wt_branch = wt
-                .path()
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default();
-            if wt_branch == data.branch {
-                return Ok(wt.path().to_string_lossy().to_string());
-            }
-        }
-
-        // Not found — create it
-        let worktree = handle.create_worktree(
-            &PathBuf::from(&data.branch),
-            &data.branch,
-        ).await?;
-        Ok(worktree.path().to_string_lossy().to_string())
-    }
 }
 
 // ============================================================================
@@ -2558,7 +2553,7 @@ impl MetricsRegistryClient for GenRegistryClient {
             .await
             .map_err(|e| MetricsRegistryError::Operation(e.to_string()))?;
         Ok(Some(variant_to_tracked_repository(
-            &r.id, &r.name, &r.url, &r.worktree_path, &r.tracking_ref, &r.current_oid, r.registered_at,
+            &r.id, &r.name, &r.url, "", &r.tracking_ref, &r.current_oid, r.registered_at,
         ).map_err(|e| MetricsRegistryError::Operation(e.to_string()))?))
     }
 

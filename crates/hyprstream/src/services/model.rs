@@ -235,12 +235,12 @@ impl ModelService {
             _ => repo_client.get_head().await.unwrap_or_else(|_| "main".to_owned()),
         };
         let worktrees = repo_client.list_worktrees().await?;
-        let model_path = std::path::PathBuf::from(
-            &worktrees.iter()
-                .find(|wt| wt.branch_name == branch_name)
-                .ok_or_else(|| anyhow!("worktree for {}:{} not found", model_ref.model, branch_name))?
-                .path,
-        );
+        if !worktrees.iter().any(|wt| wt.branch_name == branch_name) {
+            return Err(anyhow!("worktree for {}:{} not found", model_ref.model, branch_name));
+        }
+        // Derive worktree path locally
+        let storage_paths = crate::storage::StoragePaths::new()?;
+        let model_path = storage_paths.worktree_path(&model_ref.model, &branch_name)?;
 
         if !model_path.exists() {
             return Err(anyhow!(
@@ -527,18 +527,18 @@ impl ModelService {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 use crate::services::generated::model_client::{
-    ModelHandler, TttHandler, PeftHandler, InferHandler,
+    ModelHandler, TttHandler, AdapterHandler, InferHandler,
     dispatch_model, serialize_response, ModelResponseVariant,
     LoadedModelResponse, ErrorInfo, ModelListResponse, ModelHealthStatus,
     // Top-level request types
     LoadModelRequest, UnloadModelRequest, KVQuantTypeEnum,
     // TTT types
-    CreateLoraRequest, TrainStepRequest, TrainStepResponse,
+    InitLoraRequest, TrainStepRequest, TrainStepResponse,
     GetDeltaStatusResponse, ModuleNormRatio,
     SaveAdaptationRequest, SaveAdaptationResponse,
     SnapshotDeltaResponse, TttExportRequest, TttExportResponse,
-    // PEFT types
-    PeftAdapterInfo, PeftMergeRequest,
+    // Adapter types
+    AdapterInfo, AdapterMergeRequest,
     // Infer types
     GenerateRequest, ApplyChatTemplateRequest, ModelStatusResponse, OnlineTrainingConfig,
 };
@@ -548,9 +548,9 @@ use crate::services::generated::model_client::{
 
 #[async_trait::async_trait(?Send)]
 impl TttHandler for ModelService {
-    async fn handle_create(
+    async fn handle_init(
         &self, ctx: &EnvelopeContext, _request_id: u64,
-        model_ref: &str, data: &CreateLoraRequest,
+        model_ref: &str, data: &InitLoraRequest,
     ) -> Result<()> {
         let config = crate::training::TenantDeltaConfig {
             rank: data.rank as usize,
@@ -679,7 +679,7 @@ impl TttHandler for ModelService {
 }
 
 #[async_trait::async_trait(?Send)]
-impl PeftHandler for ModelService {
+impl AdapterHandler for ModelService {
     async fn handle_load(
         &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, value: &str,
@@ -693,24 +693,79 @@ impl PeftHandler for ModelService {
         self.unload_lora(model_ref, ctx).await
     }
 
-    async fn handle_has(
+    async fn handle_status(
         &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
     ) -> Result<bool> {
         self.has_lora(model_ref, ctx).await
     }
 
-    async fn handle_check(
+    async fn handle_inspect(
         &self, _ctx: &EnvelopeContext, _request_id: u64,
-        _model_ref: &str, _value: &str,
-    ) -> Result<PeftAdapterInfo> {
-        anyhow::bail!("peft.check not yet implemented")
+        model_ref: &str, value: &str,
+    ) -> Result<AdapterInfo> {
+        // Resolve model_ref to a worktree client (does NOT require model loaded in memory)
+        let parsed = ModelRef::parse(model_ref)?;
+        let tracked = self.registry.get_by_name(&parsed.model).await
+            .map_err(|e| anyhow!("Model '{}' not found in registry: {}", parsed.model, e))?;
+        let repo_client = self.registry.repo(&tracked.id);
+        let branch_name = match &parsed.git_ref {
+            crate::storage::GitRef::Branch(name) => name.clone(),
+            _ => repo_client.get_head().await.unwrap_or_else(|_| "main".to_owned()),
+        };
+        let fs = repo_client.worktree(&branch_name);
+
+        // Read adapter_config.json from the adapter directory
+        let config_path = format!("{}/adapter_config.json", value);
+        let config_bytes = fs.read_file_chunked(&config_path).await
+            .map_err(|e| anyhow!("Failed to read {}: {}", config_path, e))?;
+        let config_json: serde_json::Value = serde_json::from_slice(&config_bytes)
+            .map_err(|e| anyhow!("Failed to parse adapter_config.json: {}", e))?;
+
+        // Verify adapter_model.safetensors exists
+        let model_path = format!("{}/adapter_model.safetensors", value);
+        let stat = fs.stat_path(&model_path).await
+            .map_err(|e| anyhow!("Failed to stat {}: {}", model_path, e))?;
+        if !stat.exists {
+            anyhow::bail!("adapter_model.safetensors not found in {}", value);
+        }
+
+        // Extract PEFT fields from config
+        let rank = config_json.get("r")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let lora_alpha = config_json.get("lora_alpha")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0) as f32;
+        let target_modules = config_json.get("target_modules")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let base_model = config_json.get("base_model_name_or_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+
+        // Extract directory name from path
+        let name = value.rsplit('/').next().unwrap_or(value).to_owned();
+
+        Ok(AdapterInfo {
+            name,
+            path: value.to_owned(),
+            rank,
+            lora_alpha,
+            target_modules,
+            base_model,
+        })
     }
 
     async fn handle_merge(
-        &self, _ctx: &EnvelopeContext, _request_id: u64,
-        _model_ref: &str, _data: &PeftMergeRequest,
+        &self, ctx: &EnvelopeContext, _request_id: u64,
+        model_ref: &str, data: &AdapterMergeRequest,
     ) -> Result<()> {
-        anyhow::bail!("peft.merge not yet implemented")
+        let client = self.get_inference_client(model_ref, ctx).await?;
+        let weight = if data.weight > 0.0 { data.weight } else { 1.0 };
+        let strategy = if data.strategy.is_empty() { "do_merge" } else { &data.strategy };
+        client.merge_lora(&data.adapter_name, weight, strategy).await
     }
 }
 
@@ -1131,7 +1186,7 @@ impl ModelZmqClient {
         Ok(TemplatedPrompt::new(prompt_str))
     }
 
-    /// Create a new LoRA adapter on a loaded model (ttt-scoped)
+    /// Initialize LoRA training infrastructure on a loaded model (ttt-scoped)
     pub async fn create_lora(
         &self,
         model_ref: &str,
@@ -1141,34 +1196,30 @@ impl ModelZmqClient {
         target_modules: &[String],
         learning_rate: f32,
     ) -> Result<()> {
-        self.gen.ttt(model_ref).create(rank, alpha, dropout, target_modules, learning_rate).await
+        self.gen.ttt(model_ref).init(rank, alpha, dropout, target_modules, learning_rate).await
     }
 
-    /// Load a LoRA adapter from a file (peft-scoped)
+    /// Load a LoRA adapter into the base_delta register (adapter-scoped)
     pub async fn load_lora(&self, model_ref: &str, path: &str) -> Result<()> {
-        self.gen.peft(model_ref).load(path).await
+        self.gen.adapter(model_ref).load(path).await
     }
 
-    /// Save the current LoRA adapter to a file (peft-scoped)
-    /// Note: For backward compat, this delegates to peft.load with save semantics.
-    /// Use ttt.save for TTT delta persistence.
+    /// Save the current LoRA adapter to a file
+    /// Note: Legacy — use ttt.save or ttt.export for delta persistence.
     pub async fn save_lora(&self, model_ref: &str, path: &str) -> Result<()> {
-        // saveLora was removed from the schema — this is kept for CLI backward compat
-        // by forwarding to the inference service's save_lora directly
         let client = self.gen.infer(model_ref);
-        // Use call_method for backward compat until the inference schema is updated
         let _result = client.call_method("save_lora", &serde_json::json!({"value": path})).await;
         Ok(())
     }
 
-    /// Unload the current LoRA adapter (peft-scoped)
+    /// Unload the current LoRA adapter from the base_delta register (adapter-scoped)
     pub async fn unload_lora(&self, model_ref: &str) -> Result<()> {
-        self.gen.peft(model_ref).unload().await
+        self.gen.adapter(model_ref).unload().await
     }
 
-    /// Check if a LoRA adapter is loaded (peft-scoped)
+    /// Check if a LoRA adapter is loaded in the base_delta register (adapter-scoped)
     pub async fn has_lora(&self, model_ref: &str) -> Result<bool> {
-        self.gen.peft(model_ref).has().await
+        self.gen.adapter(model_ref).status().await
     }
 
     /// Start streaming training step with E2E authentication

@@ -56,6 +56,9 @@ struct InferenceRequest {
 
     # Export delta as PEFT adapter directory (identity from auth envelope)
     exportPeftAdapter @23 :ExportPeftRequest;
+
+    # Merge an on-disk adapter into the loaded base_delta
+    mergeLora @24 :MergeLoraRequest;
   }
 }
 
@@ -98,6 +101,9 @@ struct InferenceResponse {
 
     # Export PEFT adapter response
     exportPeftAdapterResult @24 :ExportPeftResult;
+
+    # Merge LoRA response
+    mergeLoraResult @25 :Void;
   }
 }
 
@@ -306,6 +312,14 @@ struct ExportPeftRequest {
 struct ExportPeftResult {
   adapterPath @0 :Text;
   contentHash @1 :Text;
+}
+
+# Merge LoRA Request (adapter.merge → inference internal)
+
+struct MergeLoraRequest {
+  adapterPath @0 :Text;    # relative path to adapter dir (e.g. "adapters/demo-1-rust-ttt")
+  weight @1 :Float32;      # merge weight 0.0-1.0, default 1.0
+  strategy @2 :Text;       # "replace", "additive", or "do_merge" (default: "do_merge")
 }
 
 # Error Information

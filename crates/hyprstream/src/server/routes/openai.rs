@@ -248,11 +248,14 @@ async fn resolve_model_path(
             crate::storage::GitRef::Branch(name) => name.clone(),
             _ => repo.get_head().await?,
         };
+        // Verify worktree exists
         let wts = repo.list_worktrees().await?;
-        wts.iter()
-            .find(|wt| wt.branch_name == branch)
-            .map(|wt| std::path::PathBuf::from(&wt.path))
-            .ok_or_else(|| anyhow::anyhow!("worktree for {}:{} not found", model_ref.model, branch))
+        if !wts.iter().any(|wt| wt.branch_name == branch) {
+            anyhow::bail!("worktree for {}:{} not found", model_ref.model, branch);
+        }
+        // Derive path locally
+        let storage_paths = crate::storage::StoragePaths::new()?;
+        Ok(storage_paths.worktree_path(&model_ref.model, &branch)?)
     }.await;
 
     match path_result {
@@ -588,11 +591,14 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                 crate::storage::GitRef::Branch(name) => name.clone(),
                 _ => repo.get_head().await?,
             };
+            // Verify worktree exists
             let wts = repo.list_worktrees().await?;
-            wts.iter()
-                .find(|wt| wt.branch_name == branch)
-                .map(|wt| std::path::PathBuf::from(&wt.path))
-                .ok_or_else(|| anyhow::anyhow!("worktree not found"))
+            if !wts.iter().any(|wt| wt.branch_name == branch) {
+                anyhow::bail!("worktree not found");
+            }
+            // Derive path locally
+            let storage_paths = crate::storage::StoragePaths::new()?;
+            Ok(storage_paths.worktree_path(&model_ref.model, &branch)?)
         }.await {
             Ok(path) => path,
             Err(e) => {

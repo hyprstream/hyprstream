@@ -49,7 +49,8 @@ struct RepositoryRequest {
   repoId @0 :Text;
   union {
     # Create a new worktree for the repository
-    createWorktree @1 :CreateWorktreeRequest $mcpScope(write);
+    createWorktree @1 :CreateWorktreeRequest $mcpScope(write)
+        $mcpDescription("Ensure a worktree exists for a branch, creating if needed");
     # List all worktrees for the repository
     listWorktrees @2 :Void $mcpScope(query);
     # Remove a worktree from the repository
@@ -110,8 +111,6 @@ struct RepositoryRequest {
     update @30 :UpdateRequest $mcpScope(write);
     # Worktree-scoped filesystem operations
     worktree @31 :WorktreeRequest;
-    # Ensure a worktree exists for a branch (create if needed, return path)
-    ensureWorktree @32 :EnsureWorktreeRequest $mcpScope(write) $mcpDescription("Ensure a worktree exists for a branch, creating if needed");
   }
 }
 
@@ -138,7 +137,7 @@ struct RegistryResponse {
 struct RepositoryResponse {
   union {
     error @0 :ErrorInfo;
-    createWorktree @1 :Text;
+    createWorktree @1 :Void;
     listWorktrees @2 :List(WorktreeInfo);
     removeWorktree @3 :Void;
     createBranch @4 :Void;
@@ -169,7 +168,6 @@ struct RepositoryResponse {
     deleteTag @29 :Void;
     update @30 :Void;
     worktreeResult @31 :WorktreeResponse;
-    ensureWorktree @32 :Text;
   }
 }
 
@@ -266,12 +264,6 @@ struct NpStatReq { fid @0 :UInt32; }
 struct NpWstat   { fid @0 :UInt32; stat @1 :NpStat; }
 struct NpFlush   { oldtag @0 :UInt64; }
 
-# Ensure Worktree Request (repoId removed — curried)
-
-struct EnsureWorktreeRequest {
-  branch @0 :Text;
-}
-
 # --- WorktreeResponse: 9P2000-inspired responses ---
 
 struct WorktreeResponse {
@@ -331,18 +323,16 @@ struct RegisterRequest {
 # Create Worktree Request (repoId removed — curried into RepositoryClient)
 
 struct CreateWorktreeRequest {
-  path @0 :Text;
-  branchName @1 :Text;
-  createBranch @2 :Bool;
+  branch @0 :Text;
 }
 
 struct RemoveWorktreeRequest {
-  worktreePath @0 :Text;
+  branch @0 :Text;
   force @1 :Bool;
 }
 
 struct WorktreeInfo {
-  path @0 :Text;
+  pathRemoved @0 :Void;  # was: path — use branchName with 9P worktree tools
   branchName @1 :Text;
   headOid @2 :Text;
   isLocked @3 :Bool;
@@ -389,7 +379,7 @@ struct TrackedRepository {
   id @0 :Text;
   name @1 :Text;
   url @2 :Text;
-  worktreePath @3 :Text;
+  worktreePathRemoved @3 :Void;  # was: worktreePath — internal implementation detail
   trackingRef @4 :Text;
   currentOid @5 :Text;
   registeredAt @6 :Int64;

@@ -65,15 +65,19 @@ pub async fn handle_training_init(
             model_ref.git_ref.display_name()
         );
 
-        // Create worktree for new branch (server determines path)
-        let worktree_path = repo_client.create_worktree("", &new_branch, false).await
+        // Create worktree for new branch
+        repo_client.create_worktree(&new_branch).await
             .map_err(|e| anyhow::anyhow!("Failed to create worktree: {}", e))?;
-        println!("✓ Created worktree at {}", worktree_path);
+        println!("✓ Created worktree for branch {new_branch}");
+
+        // Derive worktree path locally for adapter initialization
+        let storage_paths = crate::storage::StoragePaths::new()?;
+        let worktree_path = storage_paths.worktree_path(&model_ref.model, &new_branch)?;
 
         // Initialize adapter in worktree (use FsOps from repo_client)
         let fs = repo_client.worktree(&new_branch);
         init_adapter_at_path(
-            std::path::Path::new(&worktree_path),
+            &worktree_path,
             adapter_name.as_deref(),
             index,
             rank,
@@ -114,23 +118,23 @@ pub async fn handle_training_init(
         }
     };
 
+    // Verify worktree exists
     let worktrees = repo_client.list_worktrees().await
         .map_err(|e| anyhow::anyhow!("Failed to list worktrees: {}", e))?;
-    let model_path = std::path::PathBuf::from(
-        &worktrees.iter()
-            .find(|wt| wt.branch_name == branch_name)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Worktree '{}' does not exist for model '{}'. Create with:\n  \
-                     hyprstream training init {} --branch {}",
-                    branch_name,
-                    model_ref.model,
-                    model_ref.model,
-                    branch_name
-                )
-            })?
-            .path,
-    );
+    if !worktrees.iter().any(|wt| wt.branch_name == branch_name) {
+        anyhow::bail!(
+            "Worktree '{}' does not exist for model '{}'. Create with:\n  \
+             hyprstream training init {} --branch {}",
+            branch_name,
+            model_ref.model,
+            model_ref.model,
+            branch_name
+        );
+    }
+
+    // Derive worktree path locally
+    let storage_paths = crate::storage::StoragePaths::new()?;
+    let model_path = storage_paths.worktree_path(&model_ref.model, &branch_name)?;
 
     let fs = repo_client.worktree(&branch_name);
     init_adapter_at_path(
@@ -344,12 +348,13 @@ pub async fn handle_training_infer(
         _ => repo_client.get_head().await.unwrap_or_else(|_| "main".to_owned()),
     };
     let worktrees = repo_client.list_worktrees().await?;
-    let model_path = std::path::PathBuf::from(
-        &worktrees.iter()
-            .find(|wt| wt.branch_name == branch_name)
-            .ok_or_else(|| anyhow::anyhow!("worktree for {}:{} not found", model_ref.model, branch_name))?
-            .path,
-    );
+    if !worktrees.iter().any(|wt| wt.branch_name == branch_name) {
+        bail!("worktree for {}:{} not found", model_ref.model, branch_name);
+    }
+
+    // Derive worktree path locally
+    let storage_paths = crate::storage::StoragePaths::new()?;
+    let model_path = storage_paths.worktree_path(&model_ref.model, &branch_name)?;
 
     if !model_path.exists() {
         bail!("Model '{}' not found. Use 'hyprstream list' to see available models", model_ref.model);
@@ -577,21 +582,20 @@ pub async fn handle_training_batch(
         _ => repo_client.get_head().await.unwrap_or_else(|_| "main".to_owned()),
     };
     let worktrees = repo_client.list_worktrees().await?;
-    let model_path = std::path::PathBuf::from(
-        &worktrees.iter()
-            .find(|wt| wt.branch_name == branch_name_resolved)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Worktree '{}' not found for model {}.\n\
-                     Run: hyprstream training init {} --branch {}",
-                    branch_name_resolved,
-                    model_ref.model,
-                    model_ref.model,
-                    branch_name_resolved,
-                )
-            })?
-            .path,
-    );
+    if !worktrees.iter().any(|wt| wt.branch_name == branch_name_resolved) {
+        bail!(
+            "Worktree '{}' not found for model {}.\n\
+             Run: hyprstream training init {} --branch {}",
+            branch_name_resolved,
+            model_ref.model,
+            model_ref.model,
+            branch_name_resolved,
+        );
+    }
+
+    // Derive worktree path locally
+    let storage_paths = crate::storage::StoragePaths::new()?;
+    let model_path = storage_paths.worktree_path(&model_ref.model, &branch_name_resolved)?;
 
     // Collect input files
     let mut files: Vec<PathBuf> = Vec::new();

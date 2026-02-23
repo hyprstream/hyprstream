@@ -308,12 +308,12 @@ pub async fn handle_write_checkpoint(
         None => repo_client.get_head().await?,
     };
     let worktrees = repo_client.list_worktrees().await?;
-    let model_path = std::path::PathBuf::from(
-        &worktrees.iter()
-            .find(|wt| wt.branch_name == branch_name)
-            .ok_or_else(|| anyhow::anyhow!("worktree for {}:{} not found", model_ref.model, branch_name))?
-            .path,
-    );
+    if !worktrees.iter().any(|wt| wt.branch_name == branch_name) {
+        return Err(format!("worktree for {}:{} not found", model_ref.model, branch_name).into());
+    }
+    // Derive worktree path locally
+    let storage_paths = crate::storage::StoragePaths::new()?;
+    let model_path = storage_paths.worktree_path(&model_ref.model, &branch_name)?;
 
     // Create checkpoint manager
     let checkpoint_mgr = CheckpointManager::new(model_path.clone())?;

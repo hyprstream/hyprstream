@@ -1561,6 +1561,50 @@ impl InferenceService {
     pub async fn has_lora(&self) -> Result<bool> {
         Ok(self.base_delta.lock().is_some())
     }
+
+    /// Merge an on-disk PEFT adapter into the currently loaded base_delta.
+    ///
+    /// Reads the adapter from disk via WorktreeClient, loads it as a TenantDelta,
+    /// then merges its corrections into the existing base_delta using the specified
+    /// merge strategy. Requires a base_delta to already be loaded.
+    pub async fn merge_lora(&self, path: &Path, weight: f32, strategy_name: &str) -> Result<()> {
+        let device = self.engine.read().await.device();
+
+        // Read the adapter from disk via FsOps
+        let fs = self.fs.as_ref()
+            .ok_or_else(|| anyhow!("FsOps not available — cannot read without path containment"))?;
+        let safetensors_path = format!("{}/adapter_model.safetensors", path.to_string_lossy());
+        let bytes = fs.read_file_chunked(&safetensors_path).await
+            .map_err(|e| anyhow!("Failed to read adapter for merge: {}", e))?;
+        let incoming = crate::training::TenantDelta::load_from_safetensors_bytes(&bytes, device)?;
+
+        // Get existing base_delta
+        let base_arc = self.base_delta.lock().clone()
+            .ok_or_else(|| anyhow!("No adapter loaded in base_delta register. Load one first with adapter.load."))?;
+
+        // Parse merge strategy
+        let strategy = crate::training::merge::MergeStrategy::from_name(strategy_name, weight as f64)?;
+
+        // Extract state dicts, merge, and update
+        let merged_state = {
+            let base = base_arc.lock();
+            let existing = base.extract_state_dict();
+            let new = incoming.extract_state_dict();
+            crate::training::merge::merge_state_dicts(&existing, &new, &strategy)?
+        };
+
+        // Load merged weights back into the base_delta
+        {
+            let mut base = base_arc.lock();
+            base.load_state_dict(&merged_state)?;
+        }
+
+        tracing::info!(
+            "Merged adapter from {} into base_delta (strategy={}, weight={})",
+            path.display(), strategy_name, weight
+        );
+        Ok(())
+    }
 }
 
 /// Sanitize an adapter name to prevent path traversal.
@@ -1601,6 +1645,7 @@ use crate::services::generated::inference_client::{
     HealthStatus, TrainStepResult, DeltaStatusResult, ModuleNormRatio,
     SaveAdaptationResult, SnapshotDeltaResult, ExportPeftResult,
     ChatTemplateRequest, LoraConfig, TrainStepRequest, SaveAdaptationRequest, ExportPeftRequest,
+    MergeLoraRequest,
 };
 // Conflicting names — use canonical path at usage sites:
 //   inference_client::GenerationResult, inference_client::ModelInfo, inference_client::StreamInfo
@@ -1953,6 +1998,16 @@ impl InferenceHandler for InferenceService {
             adapter_path: info.adapter_path,
             content_hash: info.content_hash,
         }))
+    }
+
+    async fn handle_merge_lora(
+        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        data: &MergeLoraRequest,
+    ) -> Result<InferenceResponseVariant> {
+        let weight = if data.weight > 0.0 { data.weight } else { 1.0 };
+        let strategy = if data.strategy.is_empty() { "do_merge" } else { &data.strategy };
+        self.merge_lora(Path::new(&data.adapter_path), weight, strategy).await?;
+        Ok(InferenceResponseVariant::MergeLoraResult)
     }
 }
 
@@ -2360,6 +2415,11 @@ impl InferenceZmqClient {
     /// Check if a LoRA adapter is loaded (delegates via RPC).
     pub async fn has_lora(&self) -> Result<bool> {
         self.gen.has_lora().await
+    }
+
+    /// Merge an on-disk adapter into the loaded base_delta (delegates via RPC).
+    pub async fn merge_lora(&self, adapter_path: &str, weight: f32, strategy: &str) -> Result<()> {
+        self.gen.merge_lora(adapter_path, weight, strategy).await
     }
 
     // Training loop control (TTT operations)
