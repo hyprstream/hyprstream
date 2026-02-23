@@ -59,6 +59,17 @@ struct InferenceRequest {
 
     # Merge an on-disk adapter into the loaded base_delta
     mergeLora @24 :MergeLoraRequest;
+
+    # Streaming variants — return StreamInfo immediately, results via PUB/SUB.
+    # Use these instead of the non-streaming versions for operations that may
+    # involve significant compute or I/O (GPU alloc, disk writes, merges).
+    createLoraStream @25 :LoraConfig;
+    loadLoraStream @26 :Text;          # path
+    saveLoraStream @27 :Text;          # path
+    saveAdaptationStream @28 :SaveAdaptationRequest;
+    snapshotDeltaStream @29 :Void;
+    exportPeftAdapterStream @30 :ExportPeftRequest;
+    mergeLoraStream @31 :MergeLoraRequest;
   }
 }
 
@@ -104,6 +115,15 @@ struct InferenceResponse {
 
     # Merge LoRA response
     mergeLoraResult @25 :Void;
+
+    # Streaming variant responses — all return StreamInfo
+    createLoraStreamResult @26 :StreamInfo;
+    loadLoraStreamResult @27 :StreamInfo;
+    saveLoraStreamResult @28 :StreamInfo;
+    saveAdaptationStreamResult @29 :StreamInfo;
+    snapshotDeltaStreamResult @30 :StreamInfo;
+    exportPeftAdapterStreamResult @31 :StreamInfo;
+    mergeLoraStreamResult @32 :StreamInfo;
   }
 }
 
@@ -328,4 +348,11 @@ struct ErrorInfo {
   message @0 :Text;
   code @1 :Text;
   details @2 :Text;
+}
+
+# Structured capacity error for TTT delta limits
+struct CapacityError {
+  currentSteps @0 :UInt32;
+  maxSteps @1 :UInt32;
+  message @2 :Text;
 }

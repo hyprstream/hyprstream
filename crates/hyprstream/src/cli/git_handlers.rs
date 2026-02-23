@@ -1334,6 +1334,7 @@ pub async fn handle_load(
             } else {
                 Some(kv_quant)
             },
+            num_inference_instances: None,
         })
     } else {
         None

@@ -16,6 +16,12 @@ use crate::runtime::kv_cache::KVCacheRegistry;
 use crate::services::WorktreeClient;
 use hyprstream_rpc::Subject;
 
+/// Maximum snapshot size in bytes (512 MB). Deltas exceeding this are not snapshotted on eviction.
+const MAX_SNAPSHOT_BYTES: usize = 512 * 1024 * 1024;
+
+/// Default maximum number of tenants before LRU eviction kicks in.
+const MAX_TENANTS_DEFAULT: usize = 100;
+
 /// Registry managing per-tenant LoRA deltas for isolated TTT adaptation
 ///
 /// Each `Subject` gets its own isolated `TenantDelta` wrapped in `Arc<Mutex<_>>`.
@@ -42,6 +48,8 @@ pub struct DeltaPool {
     fs: Option<WorktreeClient>,
     /// Number of model layers for per-layer delta creation
     num_layers: usize,
+    /// Maximum number of tenants before LRU eviction
+    max_tenants: usize,
 }
 
 impl DeltaPool {
@@ -74,12 +82,19 @@ impl DeltaPool {
             snapshots_dir,
             fs,
             num_layers,
+            max_tenants: MAX_TENANTS_DEFAULT,
         }
     }
 
     /// Set memory budget for the pool
     pub fn with_memory_budget(mut self, budget_bytes: usize) -> Self {
         self.memory_budget_bytes = Some(budget_bytes);
+        self
+    }
+
+    /// Set maximum number of tenants before LRU eviction
+    pub fn with_max_tenants(mut self, max_tenants: usize) -> Self {
+        self.max_tenants = max_tenants;
         self
     }
 
@@ -187,21 +202,50 @@ impl DeltaPool {
         &self.snapshots_dir
     }
 
-    /// Evict the least-recently-used tenant delta
+    /// Check if eviction is needed (tenant count or memory budget exceeded).
     ///
-    /// Before eviction:
-    /// 1. Snapshots the delta to a file (if it has accumulated steps)
-    /// 2. Invalidates dependent KV caches (if kv_registry is set)
-    ///
-    /// Returns the evicted tenant ID, delta, and optional snapshot path.
-    pub fn evict_lru(
-        &self,
-    ) -> Option<(Subject, Arc<Mutex<TenantDelta>>, Option<PathBuf>)> {
-        if self.deltas.is_empty() {
-            return None;
+    /// This is a fast, non-blocking check with no I/O.
+    pub fn needs_eviction(&self) -> bool {
+        if self.deltas.len() >= self.max_tenants {
+            return true;
         }
+        if let Some(budget) = self.memory_budget_bytes {
+            if self.total_memory_usage() > budget {
+                return true;
+            }
+        }
+        false
+    }
 
-        // Find LRU tenant
+    /// Ensure the pool has capacity for at least one more tenant.
+    ///
+    /// Call this from async context **before** `get_or_create()` to avoid
+    /// `Handle::block_on()` panics inside `spawn_local` on `current_thread` runtime.
+    ///
+    /// Evicts LRU tenants (with async snapshot I/O) until capacity is available.
+    pub async fn ensure_capacity(&self) -> Result<()> {
+        while self.needs_eviction() {
+            if self.evict_lru_async().await?.is_none() {
+                break; // Pool is empty, nothing left to evict
+            }
+        }
+        Ok(())
+    }
+
+    /// Sanitize a subject string for use as a filename.
+    fn sanitize_filename(subject: &str) -> String {
+        subject
+            .replace(['/', '\\', '\0'], "_")
+            .replace("..", "_")
+            .chars()
+            .take(200)
+            .collect()
+    }
+
+    /// Find the LRU (least recently used) tenant ID.
+    ///
+    /// Returns `None` if the pool is empty.
+    fn find_lru_tenant(&self) -> Option<Subject> {
         let mut oldest_tenant: Option<Subject> = None;
         let mut oldest_time = std::time::Instant::now();
 
@@ -212,87 +256,219 @@ impl DeltaPool {
                 oldest_tenant = Some(entry.key().clone());
             }
         }
+        oldest_tenant
+    }
 
-        oldest_tenant.and_then(|tid| {
-            self.deltas.remove(&tid).map(|(id, delta)| {
-                let id_filename = id.to_string();
-                // Auto-snapshot to file before eviction
-                let snapshot_path = {
-                    let d = delta.lock();
-                    if d.accumulated_steps > 0 {
-                        let snapshot_file = self.snapshots_dir.join(format!("{}.safetensors", id_filename));
-                        if let Some(ref fs) = self.fs {
-                            // FsOps path: serialize in-memory and write through contained-root
-                            let rel_path = format!("adapters/.snapshots/{}.safetensors", id_filename);
-                            // Extract state dict while holding the lock, then release before async I/O
-                            let state_dict = d.extract_state_dict();
-                            let memory_bytes = d.memory_bytes();
-                            drop(d); // Release lock before async operations
-                            const MAX_SNAPSHOT_BYTES: usize = 512 * 1024 * 1024; // 512 MB
-                            let result = if memory_bytes > MAX_SNAPSHOT_BYTES {
-                                tracing::warn!(
-                                    "Delta '{}' exceeds max snapshot size ({} bytes > {}), skipping snapshot",
-                                    id, memory_bytes, MAX_SNAPSHOT_BYTES
+    /// Async eviction of the least-recently-used tenant delta.
+    ///
+    /// Before eviction:
+    /// 1. Snapshots the delta to a file (if it has accumulated steps) using async I/O
+    /// 2. Invalidates dependent KV caches (if kv_registry is set)
+    ///
+    /// Returns the evicted tenant ID, delta, and optional snapshot path.
+    pub async fn evict_lru_async(
+        &self,
+    ) -> Result<Option<(Subject, Arc<Mutex<TenantDelta>>, Option<PathBuf>)>> {
+        if self.deltas.is_empty() {
+            return Ok(None);
+        }
+
+        let Some(tid) = self.find_lru_tenant() else {
+            return Ok(None);
+        };
+
+        let Some((id, delta)) = self.deltas.remove(&tid) else {
+            return Ok(None);
+        };
+
+        let id_filename = Self::sanitize_filename(&id.to_string());
+
+        // Auto-snapshot to file before eviction
+        let snapshot_path = {
+            let d = delta.lock();
+            if d.accumulated_steps > 0 {
+                let snapshot_file = self
+                    .snapshots_dir
+                    .join(format!("{}.safetensors", id_filename));
+                if let Some(ref fs) = self.fs {
+                    let rel_path =
+                        format!("adapters/.snapshots/{}.safetensors", id_filename);
+                    let state_dict = d.extract_state_dict();
+                    let memory_bytes = d.memory_bytes();
+                    drop(d); // Release lock before async I/O
+
+                    if memory_bytes > MAX_SNAPSHOT_BYTES {
+                        tracing::warn!(
+                            "Delta '{}' exceeds max snapshot size ({} bytes > {}), skipping snapshot",
+                            id, memory_bytes, MAX_SNAPSHOT_BYTES
+                        );
+                        None
+                    } else {
+                        match async {
+                            fs.mkdir_p("adapters/.snapshots").await.map_err(|e| {
+                                anyhow::anyhow!("FsOps mkdir failed: {}", e)
+                            })?;
+                            let bytes = serialize_state_dict_to_bytes(&state_dict)?;
+                            fs.write_file_chunked(&rel_path, &bytes).await.map_err(
+                                |e| anyhow::anyhow!("FsOps write_file failed: {}", e),
+                            )?;
+                            Ok::<(), anyhow::Error>(())
+                        }
+                        .await
+                        {
+                            Ok(()) => {
+                                tracing::info!(
+                                    "Auto-snapshot delta '{}' before eviction via FsOps: {}",
+                                    id, rel_path
                                 );
-                                Err(anyhow::anyhow!("Delta too large for snapshot"))
-                            } else {
-                                futures::executor::block_on(async {
-                                    fs.mkdir_p("adapters/.snapshots").await
-                                        .map_err(|e| anyhow::anyhow!("FsOps mkdir failed: {}", e))?;
-                                    let bytes = serialize_state_dict_to_bytes(&state_dict)?;
-                                    fs.write_file_chunked(&rel_path, &bytes).await
-                                        .map_err(|e| anyhow::anyhow!("FsOps write_file failed: {}", e))?;
-                                    Ok::<(), anyhow::Error>(())
-                                })
-                            };
-                            match result {
-                                Ok(()) => {
-                                    tracing::info!(
-                                        "Auto-snapshot delta '{}' before eviction via FsOps: {}",
-                                        id, rel_path
-                                    );
-                                    Some(snapshot_file)
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "Failed to snapshot delta '{}' via FsOps: {}",
-                                        id, e
-                                    );
-                                    None
-                                }
+                                Some(snapshot_file)
                             }
-                        } else {
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to snapshot delta '{}' via FsOps: {}",
+                                    id, e
+                                );
+                                None
+                            }
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "FsOps not available — skipping snapshot for delta '{}' during eviction",
+                        id
+                    );
+                    None
+                }
+            } else {
+                None // No accumulated steps, skip snapshot
+            }
+        };
+
+        // Invalidate dependent KV caches
+        if let Some(kv_reg) = &self.kv_registry {
+            let invalidated = kv_reg.invalidate_for_tenant(&id.to_string());
+            if invalidated > 0 {
+                tracing::info!(
+                    "Invalidated {} KV caches on eviction of delta '{}'",
+                    invalidated,
+                    id
+                );
+            }
+        }
+
+        Ok(Some((id, delta, snapshot_path)))
+    }
+
+    /// Evict the least-recently-used tenant delta (sync version).
+    ///
+    /// **WARNING**: This uses `futures::executor::block_on()` for snapshot I/O.
+    /// Only safe to call from non-async contexts (tests, standalone threads).
+    /// In async contexts, use `evict_lru_async()` instead.
+    pub fn evict_lru(
+        &self,
+    ) -> Option<(Subject, Arc<Mutex<TenantDelta>>, Option<PathBuf>)> {
+        // For sync callers, we can't do async I/O. Remove without snapshot
+        // if there's no WorktreeClient, or use block_on only in non-async contexts.
+        if self.deltas.is_empty() {
+            return None;
+        }
+
+        let tid = self.find_lru_tenant()?;
+        let (id, delta) = self.deltas.remove(&tid)?;
+
+        let id_filename = Self::sanitize_filename(&id.to_string());
+
+        // Snapshot without async I/O — extract state dict only, skip FsOps writes
+        let snapshot_path = {
+            let d = delta.lock();
+            if d.accumulated_steps > 0 {
+                let snapshot_file = self
+                    .snapshots_dir
+                    .join(format!("{}.safetensors", id_filename));
+                // In sync context, we can only write directly to the snapshots_dir
+                // (not through WorktreeClient which requires async)
+                let state_dict = d.extract_state_dict();
+                let memory_bytes = d.memory_bytes();
+                drop(d);
+
+                if memory_bytes > MAX_SNAPSHOT_BYTES {
+                    tracing::warn!(
+                        "Delta '{}' exceeds max snapshot size ({} bytes > {}), skipping snapshot",
+                        id, memory_bytes, MAX_SNAPSHOT_BYTES
+                    );
+                    None
+                } else {
+                    match serialize_state_dict_to_bytes(&state_dict) {
+                        Ok(bytes) => {
+                            if let Err(e) = std::fs::create_dir_all(&self.snapshots_dir) {
+                                tracing::warn!("Failed to create snapshots dir: {}", e);
+                                None
+                            } else if let Err(e) = std::fs::write(&snapshot_file, &bytes) {
+                                tracing::warn!(
+                                    "Failed to write snapshot for delta '{}': {}",
+                                    id, e
+                                );
+                                None
+                            } else {
+                                tracing::info!(
+                                    "Auto-snapshot delta '{}' before eviction: {}",
+                                    id,
+                                    snapshot_file.display()
+                                );
+                                Some(snapshot_file)
+                            }
+                        }
+                        Err(e) => {
                             tracing::warn!(
-                                "FsOps not available — skipping snapshot for delta '{}' during eviction",
-                                id
+                                "Failed to serialize delta '{}' for snapshot: {}",
+                                id, e
                             );
                             None
                         }
-                    } else {
-                        None // No accumulated steps, skip snapshot
-                    }
-                };
-
-                // Invalidate dependent KV caches
-                if let Some(kv_reg) = &self.kv_registry {
-                    let invalidated = kv_reg.invalidate_for_tenant(&id.to_string());
-                    if invalidated > 0 {
-                        tracing::info!(
-                            "Invalidated {} KV caches on eviction of delta '{}'",
-                            invalidated,
-                            id
-                        );
                     }
                 }
+            } else {
+                None
+            }
+        };
 
-                (id, delta, snapshot_path)
-            })
-        })
+        // Invalidate dependent KV caches
+        if let Some(kv_reg) = &self.kv_registry {
+            let invalidated = kv_reg.invalidate_for_tenant(&id.to_string());
+            if invalidated > 0 {
+                tracing::info!(
+                    "Invalidated {} KV caches on eviction of delta '{}'",
+                    invalidated,
+                    id
+                );
+            }
+        }
+
+        Some((id, delta, snapshot_path))
     }
 
-    /// Evict deltas until total memory is under budget
+    /// Async version: evict deltas until total memory is under budget.
     ///
     /// Returns a list of evicted (tenant_id, snapshot_path) pairs for audit/recovery.
+    pub async fn evict_to_budget_async(&self) -> Result<Vec<(Subject, Option<PathBuf>)>> {
+        let budget = match self.memory_budget_bytes {
+            Some(b) => b,
+            None => return Ok(Vec::new()),
+        };
+
+        let mut evicted = Vec::new();
+        while self.total_memory_usage() > budget {
+            match self.evict_lru_async().await? {
+                Some((tid, _, path)) => evicted.push((tid, path)),
+                None => break,
+            }
+        }
+        Ok(evicted)
+    }
+
+    /// Evict deltas until total memory is under budget (sync version).
+    ///
+    /// **WARNING**: Only safe in non-async contexts. See `evict_lru()` docs.
     pub fn evict_to_budget(&self) -> Vec<(Subject, Option<PathBuf>)> {
         let budget = match self.memory_budget_bytes {
             Some(b) => b,

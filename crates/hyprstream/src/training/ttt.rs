@@ -23,7 +23,8 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::time::Instant;
+use std::panic::AssertUnwindSafe;
+use std::time::{Duration, Instant};
 use tch::{Device, Tensor};
 
 use crate::runtime::TorchEngine;
@@ -82,6 +83,17 @@ pub struct TTTConfig {
     /// Whether to use adaptive step counts based on perplexity
     #[serde(default = "default_adaptive_steps")]
     pub adaptive_steps: bool,
+
+    /// Maximum wall-clock time for a single TTT adaptation pass (milliseconds).
+    /// When using ZMQ RPC (default timeout 30s), the default leaves headroom for
+    /// serialization, network transfer, and response processing.
+    #[serde(default = "default_max_adaptation_ms")]
+    pub max_adaptation_ms: u64,
+
+    /// Hard ceiling on gradient steps per request, regardless of client override.
+    /// Prevents unbounded compute from malicious or misconfigured clients.
+    #[serde(default = "default_max_gradient_steps")]
+    pub max_gradient_steps: usize,
 }
 
 fn default_learning_rate() -> f64 {
@@ -117,6 +129,12 @@ fn default_delta_min() -> f32 {
 fn default_adaptive_steps() -> bool {
     true
 }
+fn default_max_adaptation_ms() -> u64 {
+    20_000
+}
+fn default_max_gradient_steps() -> usize {
+    50
+}
 
 impl Default for TTTConfig {
     fn default() -> Self {
@@ -132,6 +150,8 @@ impl Default for TTTConfig {
             tau_heavy: default_tau_heavy(),
             delta_min: default_delta_min(),
             adaptive_steps: default_adaptive_steps(),
+            max_adaptation_ms: default_max_adaptation_ms(),
+            max_gradient_steps: default_max_gradient_steps(),
         }
     }
 }
@@ -191,6 +211,13 @@ pub struct TTTResult {
 
     /// Whether adaptation is pending client commit/rollback
     pub pending: bool,
+
+    /// Wall-clock time used for adaptation (milliseconds)
+    pub time_used_ms: u64,
+
+    /// Time budget that was enforced (milliseconds).
+    /// Client can derive `timed_out = time_used_ms >= time_budget_ms`.
+    pub time_budget_ms: u64,
 }
 
 impl TTTResult {
@@ -214,6 +241,8 @@ impl TTTResult {
             recommendation: false,
             gated_steps: 0,
             pending: false,
+            time_used_ms: 0,
+            time_budget_ms: 0,
         }
     }
 }
@@ -229,6 +258,8 @@ pub struct TTTOverrides {
     pub learning_rate: Option<f32>,
     /// If true, server auto-commits based on its recommendation
     pub auto_commit: bool,
+    /// Override: maximum wall-clock time for adaptation (milliseconds)
+    pub max_adaptation_ms: Option<u64>,
 }
 
 /// Context for TTT adaptation (for future cross-model verification)
@@ -428,8 +459,12 @@ impl TestTimeTrainer {
         let initial_loss: f32 = initial_loss_tensor.double_value(&[]) as f32;
         let initial_perplexity = initial_loss.exp();
 
-        // Gate step count based on perplexity
-        let gated_steps = self.gate_steps(initial_perplexity, overrides);
+        // Gate step count based on perplexity, then clamp to max
+        let gated_steps = self.gate_steps(initial_perplexity, overrides)
+            .min(self.config.max_gradient_steps);
+
+        let time_budget_ms = overrides.max_adaptation_ms
+            .unwrap_or(self.config.max_adaptation_ms);
 
         if gated_steps == 0 {
             return Ok((
@@ -454,6 +489,8 @@ impl TestTimeTrainer {
                     recommendation: false,
                     gated_steps: 0,
                     pending: false,
+                    time_used_ms: start.elapsed().as_millis() as u64,
+                    time_budget_ms,
                 },
                 pre_snapshot,
             ));
@@ -465,75 +502,152 @@ impl TestTimeTrainer {
             .map(|r| r as f64)
             .unwrap_or(delta.learning_rate);
 
-        // SGD gradient loop
+        let budget = Duration::from_millis(time_budget_ms);
+
+        // Run gradient loop with catch_unwind for panic safety.
+        // On panic, delta is restored from pre_snapshot.
+        let loop_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            self.adapt_tenant_inner(engine, delta, &tokens, gated_steps, lr, &start, budget, initial_loss_tensor)
+        }));
+
+        match loop_result {
+            Ok(Ok(inner)) => {
+                let (actual_steps, losses, grad_norms, any_clipped, final_loss, final_perplexity) = inner;
+
+                let avg_loss = losses.iter().sum::<f32>() / losses.len() as f32;
+                let loss_improvement = initial_loss - final_loss;
+
+                let avg_grad_norm = if !grad_norms.is_empty() {
+                    grad_norms.iter().sum::<f32>() / grad_norms.len() as f32
+                } else {
+                    0.0
+                };
+                let max_grad_norm_val = grad_norms.iter().copied().fold(0.0f32, f32::max);
+
+                let recommendation = self.compute_recommendation(
+                    loss_improvement,
+                    any_clipped,
+                    initial_perplexity,
+                    final_perplexity,
+                );
+
+                // Track accumulated steps (adapt_tenant was missing this)
+                delta.accumulated_steps += actual_steps as u64;
+                delta.request_count += 1;
+                let n = delta.request_count as f64;
+                delta.avg_loss_improvement =
+                    delta.avg_loss_improvement * ((n - 1.0) / n) + loss_improvement as f64 / n;
+
+                let time_used_ms = start.elapsed().as_millis() as u64;
+
+                Ok((
+                    TTTResult {
+                        avg_loss,
+                        loss_improvement,
+                        steps_performed: actual_steps,
+                        adaptation_time_ms: time_used_ms,
+                        skipped: false,
+                        skip_reason: None,
+                        avg_grad_norm,
+                        max_grad_norm: max_grad_norm_val,
+                        gradient_clipped: any_clipped,
+                        tokens_used,
+                        tokens_provided,
+                        was_truncated,
+                        initial_perplexity,
+                        final_perplexity,
+                        recommendation,
+                        gated_steps,
+                        pending: true, // Awaiting client commit/rollback
+                        time_used_ms,
+                        time_budget_ms,
+                    },
+                    pre_snapshot,
+                ))
+            }
+            Ok(Err(e)) => {
+                // Gradient loop returned an error — restore delta from snapshot
+                tracing::warn!("TTT adapt_tenant gradient loop error, restoring delta: {}", e);
+                let _ = delta.load_state_dict(&pre_snapshot);
+                // Flush stale gradients from optimizer (may have accumulated before error)
+                delta.optimizer.zero_grad();
+                Err(e)
+            }
+            Err(panic_info) => {
+                // Panic during gradient loop — restore delta from snapshot.
+                // Also zero gradients: a panic mid-backward/step leaves stale
+                // gradient accumulation and corrupted AdamW moment buffers.
+                tracing::error!("TTT adapt_tenant panicked during gradient loop, restoring delta");
+                let _ = delta.load_state_dict(&pre_snapshot);
+                delta.optimizer.zero_grad();
+                let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
+                    s.clone()
+                } else if let Some(s) = panic_info.downcast_ref::<&str>() {
+                    (*s).to_owned()
+                } else {
+                    "unknown panic".to_owned()
+                };
+                Err(anyhow::anyhow!("TTT adaptation panicked: {}", msg))
+            }
+        }
+    }
+
+    /// Inner gradient loop for adapt_tenant (extracted for catch_unwind).
+    /// Receives the pre-computed `initial_loss_tensor` from the caller to avoid
+    /// a redundant forward pass.
+    #[allow(clippy::type_complexity)]
+    fn adapt_tenant_inner(
+        &self,
+        engine: &TorchEngine,
+        delta: &mut TenantDelta,
+        tokens: &[u32],
+        gated_steps: usize,
+        lr: f64,
+        start: &Instant,
+        budget: Duration,
+        initial_loss_tensor: Tensor,
+    ) -> Result<(usize, Vec<f32>, Vec<f32>, bool, f32, f32)> {
+        let initial_loss = initial_loss_tensor.double_value(&[]) as f32;
         let mut losses = vec![initial_loss];
         let mut grad_norms = Vec::with_capacity(gated_steps);
         let mut any_clipped = false;
 
-        // First step uses the already-computed loss
+        // First step (always runs at least one)
         let (gn, clipped) = self.ttt_step(&initial_loss_tensor, delta, Some(lr))?;
         grad_norms.push(gn as f32);
         if clipped {
             any_clipped = true;
         }
+        let mut actual_steps = 1;
 
-        // Remaining steps
+        // Remaining steps with time budget check BEFORE each step
         for _ in 1..gated_steps {
-            let loss = self.compute_ntp_loss_with_delta(engine, delta, &tokens)?;
-            let loss_value = loss.double_value(&[]) as f32;
-            losses.push(loss_value);
+            if start.elapsed() >= budget {
+                tracing::warn!(
+                    "TTT: time budget exhausted after {}/{} steps ({:.0}ms >= {}ms)",
+                    actual_steps, gated_steps,
+                    start.elapsed().as_millis(), budget.as_millis()
+                );
+                break;
+            }
+
+            let loss = self.compute_ntp_loss_with_delta(engine, delta, tokens)?;
+            losses.push(loss.double_value(&[]) as f32);
 
             let (gn, clipped) = self.ttt_step(&loss, delta, Some(lr))?;
             grad_norms.push(gn as f32);
             if clipped {
                 any_clipped = true;
             }
+            actual_steps += 1;
         }
 
         // Compute final loss for perplexity
-        let final_loss_tensor = self.compute_ntp_loss_with_delta(engine, delta, &tokens)?;
-        let final_loss: f32 = final_loss_tensor.double_value(&[]) as f32;
+        let final_loss_tensor = self.compute_ntp_loss_with_delta(engine, delta, tokens)?;
+        let final_loss = final_loss_tensor.double_value(&[]) as f32;
         let final_perplexity = final_loss.exp();
 
-        let avg_loss = losses.iter().sum::<f32>() / losses.len() as f32;
-        let loss_improvement = initial_loss - final_loss;
-
-        let avg_grad_norm = if !grad_norms.is_empty() {
-            grad_norms.iter().sum::<f32>() / grad_norms.len() as f32
-        } else {
-            0.0
-        };
-        let max_grad_norm_val = grad_norms.iter().copied().fold(0.0f32, f32::max);
-
-        let recommendation = self.compute_recommendation(
-            loss_improvement,
-            any_clipped,
-            initial_perplexity,
-            final_perplexity,
-        );
-
-        Ok((
-            TTTResult {
-                avg_loss,
-                loss_improvement,
-                steps_performed: gated_steps,
-                adaptation_time_ms: start.elapsed().as_millis() as u64,
-                skipped: false,
-                skip_reason: None,
-                avg_grad_norm,
-                max_grad_norm: max_grad_norm_val,
-                gradient_clipped: any_clipped,
-                tokens_used,
-                tokens_provided,
-                was_truncated,
-                initial_perplexity,
-                final_perplexity,
-                recommendation,
-                gated_steps,
-                pending: true, // Awaiting client commit/rollback
-            },
-            pre_snapshot,
-        ))
+        Ok((actual_steps, losses, grad_norms, any_clipped, final_loss, final_perplexity))
     }
 
     /// Compute NTP loss with a tenant delta applied
@@ -580,6 +694,7 @@ impl TestTimeTrainer {
     /// Run pure training steps on a tenant delta without generation
     ///
     /// Used by the `trainStep` API endpoint for explicit training.
+    /// Steps are clamped to `max_gradient_steps` and time-budgeted.
     pub fn train_step(
         &self,
         engine: &TorchEngine,
@@ -587,6 +702,7 @@ impl TestTimeTrainer {
         input_tokens: &[u32],
         gradient_steps: usize,
         learning_rate: Option<f64>,
+        max_adaptation_ms: Option<u64>,
     ) -> Result<TTTResult> {
         let start = Instant::now();
 
@@ -604,83 +720,150 @@ impl TestTimeTrainer {
             return Ok(TTTResult::skipped("Input too short for NTP loss"));
         }
 
+        // Clamp steps to hard ceiling
+        let clamped_steps = gradient_steps.min(self.config.max_gradient_steps);
+        let time_budget_ms = max_adaptation_ms
+            .unwrap_or(self.config.max_adaptation_ms);
+        let budget = Duration::from_millis(time_budget_ms);
+
         let lr = learning_rate.unwrap_or(delta.learning_rate);
 
+        // Snapshot for panic recovery
+        let pre_snapshot = delta.extract_state_dict();
+
+        let loop_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            self.train_step_inner(engine, delta, &tokens, clamped_steps, lr, &start, budget)
+        }));
+
+        match loop_result {
+            Ok(Ok(inner)) => {
+                let (actual_steps, losses, grad_norms, any_clipped, final_loss, final_perplexity, initial_loss, initial_perplexity) = inner;
+
+                let avg_loss = losses.iter().sum::<f32>() / losses.len() as f32;
+                let loss_improvement = initial_loss - final_loss;
+                let avg_grad_norm = if !grad_norms.is_empty() {
+                    grad_norms.iter().sum::<f32>() / grad_norms.len() as f32
+                } else {
+                    0.0
+                };
+                let max_grad_norm_val = grad_norms.iter().copied().fold(0.0f32, f32::max);
+
+                let recommendation = self.compute_recommendation(
+                    loss_improvement,
+                    any_clipped,
+                    initial_perplexity,
+                    final_perplexity,
+                );
+
+                // Update delta accumulation stats
+                delta.accumulated_steps += actual_steps as u64;
+                delta.request_count += 1;
+                let n = delta.request_count as f64;
+                delta.avg_loss_improvement =
+                    delta.avg_loss_improvement * ((n - 1.0) / n) + loss_improvement as f64 / n;
+
+                let time_used_ms = start.elapsed().as_millis() as u64;
+
+                Ok(TTTResult {
+                    avg_loss,
+                    loss_improvement,
+                    steps_performed: actual_steps,
+                    adaptation_time_ms: time_used_ms,
+                    skipped: false,
+                    skip_reason: None,
+                    avg_grad_norm,
+                    max_grad_norm: max_grad_norm_val,
+                    gradient_clipped: any_clipped,
+                    tokens_used,
+                    tokens_provided,
+                    was_truncated,
+                    initial_perplexity,
+                    final_perplexity,
+                    recommendation,
+                    gated_steps: clamped_steps,
+                    pending: false, // trainStep commits immediately based on auto_commit
+                    time_used_ms,
+                    time_budget_ms,
+                })
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("TTT train_step gradient loop error, restoring delta: {}", e);
+                let _ = delta.load_state_dict(&pre_snapshot);
+                delta.optimizer.zero_grad();
+                Err(e)
+            }
+            Err(panic_info) => {
+                tracing::error!("TTT train_step panicked during gradient loop, restoring delta");
+                let _ = delta.load_state_dict(&pre_snapshot);
+                delta.optimizer.zero_grad();
+                let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
+                    s.clone()
+                } else if let Some(s) = panic_info.downcast_ref::<&str>() {
+                    (*s).to_owned()
+                } else {
+                    "unknown panic".to_owned()
+                };
+                Err(anyhow::anyhow!("TTT training panicked: {}", msg))
+            }
+        }
+    }
+
+    /// Inner gradient loop for train_step (extracted for catch_unwind)
+    #[allow(clippy::type_complexity)]
+    fn train_step_inner(
+        &self,
+        engine: &TorchEngine,
+        delta: &mut TenantDelta,
+        tokens: &[u32],
+        clamped_steps: usize,
+        lr: f64,
+        start: &Instant,
+        budget: Duration,
+    ) -> Result<(usize, Vec<f32>, Vec<f32>, bool, f32, f32, f32, f32)> {
         // Compute initial loss
-        let initial_loss_tensor = self.compute_ntp_loss_with_delta(engine, delta, &tokens)?;
+        let initial_loss_tensor = self.compute_ntp_loss_with_delta(engine, delta, tokens)?;
         let initial_loss = initial_loss_tensor.double_value(&[]) as f32;
         let initial_perplexity = initial_loss.exp();
 
         let mut losses = vec![initial_loss];
-        let mut grad_norms = Vec::with_capacity(gradient_steps);
+        let mut grad_norms = Vec::with_capacity(clamped_steps);
         let mut any_clipped = false;
 
-        // First step
+        // First step (always runs)
         let (gn, clipped) = self.ttt_step(&initial_loss_tensor, delta, Some(lr))?;
         grad_norms.push(gn as f32);
         if clipped {
             any_clipped = true;
         }
+        let mut actual_steps = 1;
 
-        // Remaining steps
-        for _ in 1..gradient_steps {
-            let loss = self.compute_ntp_loss_with_delta(engine, delta, &tokens)?;
+        // Remaining steps with time budget check
+        for _ in 1..clamped_steps {
+            if start.elapsed() >= budget {
+                tracing::warn!(
+                    "TTT train_step: time budget exhausted after {}/{} steps ({:.0}ms >= {}ms)",
+                    actual_steps, clamped_steps,
+                    start.elapsed().as_millis(), budget.as_millis()
+                );
+                break;
+            }
+
+            let loss = self.compute_ntp_loss_with_delta(engine, delta, tokens)?;
             losses.push(loss.double_value(&[]) as f32);
             let (gn, clipped) = self.ttt_step(&loss, delta, Some(lr))?;
             grad_norms.push(gn as f32);
             if clipped {
                 any_clipped = true;
             }
+            actual_steps += 1;
         }
 
         // Final loss
-        let final_loss_tensor = self.compute_ntp_loss_with_delta(engine, delta, &tokens)?;
+        let final_loss_tensor = self.compute_ntp_loss_with_delta(engine, delta, tokens)?;
         let final_loss = final_loss_tensor.double_value(&[]) as f32;
         let final_perplexity = final_loss.exp();
 
-        let avg_loss = losses.iter().sum::<f32>() / losses.len() as f32;
-        let loss_improvement = initial_loss - final_loss;
-        let avg_grad_norm = if !grad_norms.is_empty() {
-            grad_norms.iter().sum::<f32>() / grad_norms.len() as f32
-        } else {
-            0.0
-        };
-        let max_grad_norm_val = grad_norms.iter().copied().fold(0.0f32, f32::max);
-
-        let recommendation = self.compute_recommendation(
-            loss_improvement,
-            any_clipped,
-            initial_perplexity,
-            final_perplexity,
-        );
-
-        // Update delta accumulation stats
-        delta.accumulated_steps += gradient_steps as u64;
-        delta.request_count += 1;
-        // Running average of loss improvement
-        let n = delta.request_count as f64;
-        delta.avg_loss_improvement =
-            delta.avg_loss_improvement * ((n - 1.0) / n) + loss_improvement as f64 / n;
-
-        Ok(TTTResult {
-            avg_loss,
-            loss_improvement,
-            steps_performed: gradient_steps,
-            adaptation_time_ms: start.elapsed().as_millis() as u64,
-            skipped: false,
-            skip_reason: None,
-            avg_grad_norm,
-            max_grad_norm: max_grad_norm_val,
-            gradient_clipped: any_clipped,
-            tokens_used,
-            tokens_provided,
-            was_truncated,
-            initial_perplexity,
-            final_perplexity,
-            recommendation,
-            gated_steps: gradient_steps,
-            pending: false, // trainStep commits immediately based on auto_commit
-        })
+        Ok((actual_steps, losses, grad_norms, any_clipped, final_loss, final_perplexity, initial_loss, initial_perplexity))
     }
 }
 
@@ -726,6 +909,8 @@ mod tests {
         assert_eq!(config.min_input_length, 32);
         assert_eq!(config.max_ttt_context, 512);
         assert!(config.enabled);
+        assert_eq!(config.max_adaptation_ms, 20_000);
+        assert_eq!(config.max_gradient_steps, 50);
     }
 
     #[test]

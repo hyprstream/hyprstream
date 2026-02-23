@@ -14,6 +14,19 @@ use std::path::PathBuf;
 
 pub use traits::{AsyncTransport, Transport};
 
+/// Socket bind mode for transport configuration.
+///
+/// Controls whether a socket binds to an endpoint (standalone server)
+/// or connects to it (worker behind a load balancer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BindMode {
+    /// Socket binds to the endpoint (default, standalone mode).
+    #[default]
+    Bind,
+    /// Socket connects to the endpoint (worker behind ROUTER/DEALER LB).
+    Connect,
+}
+
 /// CurveZMQ security configuration.
 ///
 /// CurveZMQ provides transport-layer encryption and authentication using
@@ -88,6 +101,10 @@ pub struct TransportConfig {
 
     /// Optional CurveZMQ encryption configuration
     pub curve: Option<CurveConfig>,
+
+    /// Socket bind mode (Bind or Connect).
+    /// Workers behind a ROUTER/DEALER load balancer use Connect.
+    pub bind_mode: BindMode,
 }
 
 /// Endpoint type (without encryption config)
@@ -124,6 +141,7 @@ impl TransportConfig {
                 endpoint: endpoint.into(),
             },
             curve: None,
+            bind_mode: BindMode::Bind,
         }
     }
 
@@ -134,6 +152,7 @@ impl TransportConfig {
                 path: path.into(),
             },
             curve: None,
+            bind_mode: BindMode::Bind,
         }
     }
 
@@ -150,7 +169,19 @@ impl TransportConfig {
                 client_path: client_path.into(),
             },
             curve: None,
+            bind_mode: BindMode::Bind,
         }
+    }
+
+    /// Set bind mode to Connect (for workers behind a load balancer).
+    pub fn with_connect_mode(mut self) -> Self {
+        self.bind_mode = BindMode::Connect;
+        self
+    }
+
+    /// Get the bind mode.
+    pub fn bind_mode(&self) -> BindMode {
+        self.bind_mode
     }
 
     /// Enable CurveZMQ encryption for this transport.
@@ -202,6 +233,7 @@ impl TransportConfig {
         Self {
             endpoint: endpoint_type,
             curve: None,
+            bind_mode: BindMode::Bind,
         }
     }
 

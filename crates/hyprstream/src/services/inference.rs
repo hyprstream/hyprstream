@@ -53,11 +53,15 @@ use hyprstream_rpc::StreamChannel;
 use capnp::serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use parking_lot::Mutex;
 use tokio::runtime::Handle;
 use tokenizers::Tokenizer;
 use tracing::{debug, error, info, trace, warn};
+
+/// Auto-rollback timeout for pending TTT adaptations (milliseconds).
+const PENDING_ROLLBACK_MS: u64 = 30_000;
 
 /// Pending work to be executed after REP response is sent.
 ///
@@ -127,7 +131,7 @@ pub const INFERENCE_ENDPOINT: &str = "inproc://hyprstream/inference";
 /// in `Arc` and implements `Deref` so all field/method access is transparent.
 /// Streaming continuations clone the `Arc` to own the state across await points.
 pub struct InferenceServiceInner {
-    engine: tokio::sync::RwLock<TorchEngine>,
+    engine: parking_lot::RwLock<TorchEngine>,
     /// Model path for checkpoint management
     #[allow(dead_code)] // Future: checkpoint management
     model_path: PathBuf,
@@ -169,6 +173,9 @@ pub struct InferenceServiceInner {
     /// Transport configuration for the service endpoint
     #[allow(dead_code)] // Standard mode passes transport to InferenceZmqAdapter
     transport: hyprstream_rpc::transport::TransportConfig,
+    /// LoRA generation counter — incremented on create/load/unload.
+    /// Checked before generation to detect LoRA reconfiguration mid-stream.
+    lora_generation: Arc<AtomicU64>,
 }
 
 /// ZMQ-based inference service
@@ -608,7 +615,7 @@ impl InferenceService {
 
         Ok(InferenceService {
             inner: Arc::new(InferenceServiceInner {
-                engine: tokio::sync::RwLock::new(engine),
+                engine: parking_lot::RwLock::new(engine),
                 model_path,
                 session_id: parking_lot::RwLock::new(None),
                 runtime_handle,
@@ -625,6 +632,7 @@ impl InferenceService {
                 fs,
                 zmq_context: global_context(),
                 transport: hyprstream_rpc::transport::TransportConfig::inproc("inference-unset"),
+                lora_generation: Arc::new(AtomicU64::new(0)),
             }),
         })
     }
@@ -687,15 +695,32 @@ impl InferenceService {
             .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
         let input_tokens: Vec<u32> = encoding.get_ids().to_vec();
 
-        let engine = self.engine.read().await;
+        let engine = self.engine.read();
 
-        // Ensure delta exists for this subject
+        // Ensure pool has capacity before creating/accessing delta
+        pool.ensure_capacity().await?;
         let delta_arc = pool.get_or_create(subject)?;
 
         // Lock the delta and run adaptation
         let mut delta = delta_arc.lock();
 
-        match ttt_trainer.adapt_tenant(&engine, &mut delta, &input_tokens, overrides) {
+        // Capacity check INSIDE delta lock to eliminate TOCTOU race
+        if delta.is_at_capacity() {
+            let reason = format!(
+                "Delta at capacity ({}/{} steps). Save, export, or reset to continue.",
+                delta.accumulated_steps, delta.max_accumulated_steps
+            );
+            debug!("TTT: {} for subject {}", reason, subject);
+            return Ok(Some(crate::training::ttt::TTTResult::skipped(&reason)));
+        }
+
+        let adapt_result = ttt_trainer.adapt_tenant(&engine, &mut delta, &input_tokens, overrides);
+
+        // Early drop: release engine read lock before bookkeeping.
+        // Delta has its own mutex; the LoRA generation counter detects reconfiguration.
+        drop(engine);
+
+        match adapt_result {
             Ok((result, pre_snapshot)) => {
                 if !result.skipped {
                     debug!(
@@ -719,7 +744,7 @@ impl InferenceService {
                         pre_adaptation_state: pre_snapshot,
                         ttt_result: result.clone(),
                         created_at: Instant::now(),
-                        timeout_ms: 30_000,
+                        timeout_ms: PENDING_ROLLBACK_MS,
                     };
                     self.pending_adaptations.lock().insert(subject.clone(), pending);
                 }
@@ -815,6 +840,14 @@ impl InferenceService {
     async fn execute_stream(&self, pending: PendingWork) {
         use futures::StreamExt;
 
+        // SAFETY: parking_lot::Mutex is safe here because InferenceService runs on
+        // current_thread runtime — no task migration, no .await while lock held.
+        debug_assert!(
+            tokio::runtime::Handle::current().runtime_flavor()
+                == tokio::runtime::RuntimeFlavor::CurrentThread,
+            "InferenceService must run on current_thread runtime for parking_lot safety"
+        );
+
         let PendingWork::Generation { stream_ctx, request, subject, ttt_overrides } = pending else {
             error!("execute_stream called with non-Generation PendingWork");
             return;
@@ -829,6 +862,9 @@ impl InferenceService {
                 return;
             }
         };
+
+        // Snapshot LoRA generation before TTT — used to detect reconfiguration mid-stream
+        let lora_gen_before = self.lora_generation.load(Ordering::Acquire);
 
         // TTT runs HERE (in continuation, after REP sent — ZMQ loop unblocked).
         // If the user explicitly enabled TTT (ttt_enabled=true), failures are stream errors.
@@ -883,8 +919,25 @@ impl InferenceService {
             "Starting E2E authenticated stream via StreamChannel"
         );
 
+        // Check LoRA generation hasn't changed since we started (detects reconfiguration mid-stream)
+        let lora_gen_now = self.lora_generation.load(Ordering::Acquire);
+        if lora_gen_now != lora_gen_before {
+            warn!(
+                stream_id = %stream_ctx.stream_id(),
+                "LoRA reconfigured during TTT adaptation (gen {} -> {}), aborting stream",
+                lora_gen_before, lora_gen_now
+            );
+            let sc = stream_channel;
+            if let Err(e) = sc.run_stream(stream_ctx, |publisher| async move {
+                (publisher, Err::<(), _>(anyhow::anyhow!("LoRA adapter was reconfigured during adaptation — retry request")))
+            }).await {
+                error!(stream_id = %stream_ctx.stream_id(), error = %e, "Failed to publish LoRA error");
+            }
+            return;
+        }
+
         // Run the stream with StreamChannel's async publisher callback
-        let engine = self.engine.read().await;
+        let engine = self.engine.read();
         let stream_result = engine.generate_with_delta(request, delta);
 
         let result = stream_channel.run_stream(stream_ctx, |mut publisher| async move {
@@ -995,12 +1048,12 @@ impl InferenceService {
 
     /// Handle model info request
     async fn handle_model_info(&self) -> ModelInfo {
-        RuntimeEngine::model_info(&*self.engine.read().await)
+        RuntimeEngine::model_info(&*self.engine.read())
     }
 
     /// Handle is ready request
     async fn handle_is_ready(&self) -> bool {
-        self.engine.read().await.is_loaded()
+        self.engine.read().is_loaded()
     }
 
     /// Handle apply chat template
@@ -1012,7 +1065,6 @@ impl InferenceService {
     ) -> Result<String> {
         self.engine
             .read()
-            .await
             .apply_chat_template(&messages, add_generation_prompt, tools)
     }
 
@@ -1027,7 +1079,213 @@ impl InferenceService {
             );
             pool.update_config(config.clone());
         }
-        self.engine.write().await.create_lora(config)
+        let result = self.engine.write().create_lora(config);
+        if result.is_ok() {
+            self.lora_generation.fetch_add(1, Ordering::Release);
+        }
+        result
+    }
+
+    // =========================================================================
+    // Generic streaming setup (used by streaming handler variants)
+    // =========================================================================
+
+    /// Set up a streaming context for a handler that needs to run work in a continuation.
+    ///
+    /// Returns `(StreamInfo, StreamContext)` — the caller builds the continuation
+    /// and returns `Ok((stream_info, continuation))`.
+    async fn setup_stream(
+        &self,
+        ctx: &EnvelopeContext,
+    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::streaming::StreamContext)> {
+        let client_pub_bytes = ctx.ephemeral_pubkey()
+            .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
+        let stream_channel = self.stream_channel.as_ref()
+            .ok_or_else(|| anyhow!("StreamChannel not initialized"))?;
+
+        let expiry_secs = ctx.claims()
+            .map(|c| c.exp - chrono::Utc::now().timestamp())
+            .unwrap_or(300)
+            .max(60);
+        let claims = ctx.claims().cloned();
+
+        let stream_ctx = stream_channel.prepare_stream_with_claims(client_pub_bytes, expiry_secs, claims).await?;
+
+        let stream_id = stream_ctx.stream_id().to_owned();
+        let server_pubkey = *stream_ctx.server_pubkey();
+        let stream_sub_endpoint = hyprstream_rpc::registry::global()
+            .endpoint("streams", hyprstream_rpc::registry::SocketKind::Sub)
+            .to_zmq_string();
+
+        let stream_info = crate::services::generated::inference_client::StreamInfo {
+            stream_id,
+            endpoint: stream_sub_endpoint,
+            server_pubkey,
+        };
+
+        Ok((stream_info, stream_ctx))
+    }
+
+    // =========================================================================
+    // Streaming execution helpers (called from continuations)
+    // =========================================================================
+
+    async fn execute_create_lora_stream(
+        &self,
+        stream_ctx: hyprstream_rpc::streaming::StreamContext,
+        config: crate::training::TenantDeltaConfig,
+    ) {
+        let sc = match &self.stream_channel {
+            Some(sc) => sc,
+            None => { error!("StreamChannel not initialized"); return; }
+        };
+        let _ = sc.run_stream(&stream_ctx, |mut publisher| async {
+            let result = InferenceService::handle_create_lora(self, config).await;
+            match &result {
+                Ok(()) => { let _ = publisher.complete_ref(b"{}").await; }
+                Err(e) => { let _ = publisher.publish_error(&format!("{:#}", e)).await; }
+            }
+            (publisher, result.map(|_| ()))
+        }).await;
+    }
+
+    async fn execute_load_lora_stream(&self, stream_ctx: hyprstream_rpc::streaming::StreamContext, path: String) {
+        let sc = match &self.stream_channel {
+            Some(sc) => sc,
+            None => { error!("StreamChannel not initialized"); return; }
+        };
+        let _ = sc.run_stream(&stream_ctx, |mut publisher| async {
+            let result = self.load_lora(Path::new(&path)).await;
+            match &result {
+                Ok(()) => { let _ = publisher.complete_ref(b"{}").await; }
+                Err(e) => { let _ = publisher.publish_error(&format!("{:#}", e)).await; }
+            }
+            (publisher, result)
+        }).await;
+    }
+
+    async fn execute_save_lora_stream(&self, stream_ctx: hyprstream_rpc::streaming::StreamContext, name: String) {
+        let sc = match &self.stream_channel {
+            Some(sc) => sc,
+            None => { error!("StreamChannel not initialized"); return; }
+        };
+        let _ = sc.run_stream(&stream_ctx, |mut publisher| async {
+            let result = self.save_lora(&name).await;
+            match &result {
+                Ok(()) => { let _ = publisher.complete_ref(b"{}").await; }
+                Err(e) => { let _ = publisher.publish_error(&format!("{:#}", e)).await; }
+            }
+            (publisher, result)
+        }).await;
+    }
+
+    async fn execute_save_adaptation_stream(
+        &self,
+        stream_ctx: hyprstream_rpc::streaming::StreamContext,
+        subject: Subject,
+        name: String,
+        merge_strategy: String,
+        merge_weight: f32,
+    ) {
+        let sc = match &self.stream_channel {
+            Some(sc) => sc,
+            None => { error!("StreamChannel not initialized"); return; }
+        };
+        let _ = sc.run_stream(&stream_ctx, |mut publisher| async {
+            let result = InferenceService::handle_save_adaptation(
+                self, &subject, &name, &merge_strategy, merge_weight,
+            ).await;
+            match &result {
+                Ok(info) => {
+                    let payload = serde_json::to_vec(&serde_json::json!({
+                        "adapter_name": info.adapter_name,
+                        "adapter_path": info.adapter_path,
+                        "content_hash": info.content_hash,
+                        "merge_strategy": info.merge_strategy,
+                    })).unwrap_or_default();
+                    let _ = publisher.complete_ref(&payload).await;
+                }
+                Err(e) => { let _ = publisher.publish_error(&format!("{:#}", e)).await; }
+            }
+            (publisher, result.map(|_| ()))
+        }).await;
+    }
+
+    async fn execute_snapshot_delta_stream(
+        &self,
+        stream_ctx: hyprstream_rpc::streaming::StreamContext,
+        subject: Subject,
+    ) {
+        let sc = match &self.stream_channel {
+            Some(sc) => sc,
+            None => { error!("StreamChannel not initialized"); return; }
+        };
+        let _ = sc.run_stream(&stream_ctx, |mut publisher| async {
+            let result = InferenceService::handle_snapshot_delta(self, &subject).await;
+            match &result {
+                Ok(info) => {
+                    let payload = serde_json::to_vec(&serde_json::json!({
+                        "content_hash": info.content_hash,
+                        "size_bytes": info.size_bytes,
+                        "accumulated_steps": info.accumulated_steps,
+                        "request_count": info.request_count,
+                    })).unwrap_or_default();
+                    let _ = publisher.complete_ref(&payload).await;
+                }
+                Err(e) => { let _ = publisher.publish_error(&format!("{:#}", e)).await; }
+            }
+            (publisher, result.map(|_| ()))
+        }).await;
+    }
+
+    async fn execute_export_peft_adapter_stream(
+        &self,
+        stream_ctx: hyprstream_rpc::streaming::StreamContext,
+        subject: Subject,
+        name: String,
+        commit_message: String,
+    ) {
+        let sc = match &self.stream_channel {
+            Some(sc) => sc,
+            None => { error!("StreamChannel not initialized"); return; }
+        };
+        let _ = sc.run_stream(&stream_ctx, |mut publisher| async {
+            let result = InferenceService::handle_export_peft_adapter(
+                self, &subject, &name, &commit_message,
+            ).await;
+            match &result {
+                Ok(info) => {
+                    let payload = serde_json::to_vec(&serde_json::json!({
+                        "adapter_path": info.adapter_path,
+                        "content_hash": info.content_hash,
+                    })).unwrap_or_default();
+                    let _ = publisher.complete_ref(&payload).await;
+                }
+                Err(e) => { let _ = publisher.publish_error(&format!("{:#}", e)).await; }
+            }
+            (publisher, result.map(|_| ()))
+        }).await;
+    }
+
+    async fn execute_merge_lora_stream(
+        &self,
+        stream_ctx: hyprstream_rpc::streaming::StreamContext,
+        adapter_path: String,
+        weight: f32,
+        strategy: String,
+    ) {
+        let sc = match &self.stream_channel {
+            Some(sc) => sc,
+            None => { error!("StreamChannel not initialized"); return; }
+        };
+        let _ = sc.run_stream(&stream_ctx, |mut publisher| async {
+            let result = self.merge_lora(Path::new(&adapter_path), weight, &strategy).await;
+            match &result {
+                Ok(()) => { let _ = publisher.complete_ref(b"{}").await; }
+                Err(e) => { let _ = publisher.publish_error(&format!("{:#}", e)).await; }
+            }
+            (publisher, result)
+        }).await;
     }
 
     // =========================================================================
@@ -1123,6 +1381,8 @@ impl InferenceService {
         let pool = self.delta_pool.as_ref()
             .ok_or_else(|| anyhow!("Delta pool not initialized"))?;
 
+        // Ensure pool has capacity before creating/accessing delta
+        pool.ensure_capacity().await?;
         let delta_arc = pool.get_or_create(subject)?;
 
         // Phase 1: Sync work under scoped lock — tokenize and snapshot
@@ -1143,18 +1403,17 @@ impl InferenceService {
         let lr = if learning_rate > 0.0 { Some(learning_rate as f64) } else { None };
 
         // Phase 2: Await engine (no lock held — safe for spawn_local concurrency)
-        let engine = self.engine.read().await;
+        let engine = self.engine.read();
 
         // Phase 3: Reacquire delta lock for train_step
         let mut delta = delta_arc.lock();
-        let mut result = ttt_trainer.train_step(&engine, &mut delta, &input_tokens, steps, lr)?;
+        let mut result = ttt_trainer.train_step(&engine, &mut delta, &input_tokens, steps, lr, None)?;
 
         // If auto_commit and recommendation is positive, commit immediately.
         // If auto_commit and recommendation is negative, rollback.
         // If not auto_commit, store as pending for client to decide.
         if auto_commit && result.recommendation {
-            delta.accumulated_steps += result.steps_performed as u64;
-            delta.request_count += 1;
+            // Steps/request_count already tracked by train_step()
             result.pending = false;
         } else if auto_commit && !result.recommendation {
             // Auto-rollback
@@ -1170,7 +1429,7 @@ impl InferenceService {
                     pre_adaptation_state: pre_snapshot,
                     ttt_result: result.clone(),
                     created_at: std::time::Instant::now(),
-                    timeout_ms: 30_000,
+                    timeout_ms: PENDING_ROLLBACK_MS,
                 };
                 self.pending_adaptations.lock().insert(subject.clone(), pending);
             }
@@ -1470,21 +1729,19 @@ impl InferenceService {
         *self.session_id.write() = Some(session_id.clone());
         self.engine
             .write()
-            .await
             .set_session(CacheOwner::Session(session_id))
     }
 
     /// Handle clear session
     async fn handle_clear_session(&self) {
         *self.session_id.write() = None;
-        self.engine.write().await.clear_kv_cache();
+        self.engine.write().clear_kv_cache();
     }
 
     /// Handle release session
     async fn handle_release_session(&self, session_id: &str) -> Result<()> {
         self.engine
             .write()
-            .await
             .release_session(&CacheOwner::Session(session_id.to_owned()))
     }
 
@@ -1494,7 +1751,7 @@ impl InferenceService {
     /// requests. If a per-tenant TTT delta also exists, the two are composed
     /// (corrections summed) during inference via `resolve_delta()`.
     pub async fn load_lora(&self, path: &Path) -> Result<()> {
-        let device = self.engine.read().await.device();
+        let device = self.engine.read().device();
         // Read via FsOps (path-contained)
         let fs = self.fs.as_ref()
             .ok_or_else(|| anyhow!("FsOps not available — cannot read without path containment"))?;
@@ -1518,6 +1775,7 @@ impl InferenceService {
         }
 
         *self.base_delta.lock() = Some(Arc::new(Mutex::new(delta)));
+        self.lora_generation.fetch_add(1, Ordering::Release);
         tracing::info!("Loaded LoRA adapter as base delta from {}", path.display());
         Ok(())
     }
@@ -1550,6 +1808,7 @@ impl InferenceService {
         let mut base = self.base_delta.lock();
         if base.is_some() {
             *base = None;
+            self.lora_generation.fetch_add(1, Ordering::Release);
             tracing::info!("Unloaded base LoRA delta");
             Ok(())
         } else {
@@ -1568,7 +1827,7 @@ impl InferenceService {
     /// then merges its corrections into the existing base_delta using the specified
     /// merge strategy. Requires a base_delta to already be loaded.
     pub async fn merge_lora(&self, path: &Path, weight: f32, strategy_name: &str) -> Result<()> {
-        let device = self.engine.read().await.device();
+        let device = self.engine.read().device();
 
         // Read the adapter from disk via FsOps
         let fs = self.fs.as_ref()
@@ -1642,7 +1901,7 @@ fn sanitize_adapter_name(name: &str) -> Result<String> {
 use crate::services::generated::inference_client::{
     InferenceHandler, dispatch_inference, serialize_response,
     InferenceResponseVariant, ErrorInfo,
-    HealthStatus, TrainStepResult, DeltaStatusResult, ModuleNormRatio,
+    HealthStatus, DeltaStatusResult, ModuleNormRatio,
     SaveAdaptationResult, SnapshotDeltaResult, ExportPeftResult,
     ChatTemplateRequest, LoraConfig, TrainStepRequest, SaveAdaptationRequest, ExportPeftRequest,
     MergeLoraRequest,
@@ -1695,6 +1954,7 @@ impl InferenceHandler for InferenceService {
             gradient_steps: if data.ttt_gradient_steps > 0 { Some(data.ttt_gradient_steps) } else { None },
             learning_rate: if data.ttt_learning_rate > 0.0 { Some(data.ttt_learning_rate) } else { None },
             auto_commit: data.auto_commit,
+            max_adaptation_ms: None,
         };
 
         // Calculate expiry from claims
@@ -1841,7 +2101,7 @@ impl InferenceHandler for InferenceService {
     }
 
     async fn handle_health_check(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
-        let model_loaded = self.engine.read().await.is_loaded();
+        let model_loaded = self.engine.read().is_loaded();
         Ok(InferenceResponseVariant::HealthCheckResult(HealthStatus {
             status: if model_loaded { "ok".into() } else { "not_loaded".into() },
             model_loaded,
@@ -1870,22 +2130,13 @@ impl InferenceHandler for InferenceService {
     }
 
     async fn handle_train_step(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
-        data: &TrainStepRequest,
+        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        _data: &TrainStepRequest,
     ) -> Result<InferenceResponseVariant> {
-        let subject = ctx.subject();
-        let result = InferenceService::handle_train_step(self, &subject, &data.input, data.gradient_steps, data.learning_rate, data.auto_commit).await?;
-        Ok(InferenceResponseVariant::TrainStepResult(TrainStepResult {
-            avg_loss: result.avg_loss,
-            loss_improvement: result.loss_improvement,
-            steps_performed: result.steps_performed as u32,
-            adaptation_time_ms: result.adaptation_time_ms,
-            initial_perplexity: result.initial_perplexity,
-            final_perplexity: result.final_perplexity,
-            recommendation: result.recommendation,
-            committed: !result.pending,
-            gradient_clipped: result.gradient_clipped,
-        }))
+        // DEPRECATED: trainStep @17 blocks the REQ/REP loop during forward/backward pass.
+        // Use trainStepStream instead, which returns StreamInfo immediately and runs
+        // the training in a continuation after the REP is sent.
+        Err(anyhow!("trainStep is deprecated — use trainStepStream for non-blocking training"))
     }
 
     async fn handle_train_step_stream(
@@ -2008,6 +2259,118 @@ impl InferenceHandler for InferenceService {
         let strategy = if data.strategy.is_empty() { "do_merge" } else { &data.strategy };
         self.merge_lora(Path::new(&data.adapter_path), weight, strategy).await?;
         Ok(InferenceResponseVariant::MergeLoraResult)
+    }
+
+    // =========================================================================
+    // Streaming handler variants
+    //
+    // Each returns (StreamInfo, Continuation) immediately. The continuation
+    // calls an execute_*_stream method on the cloned service, which accesses
+    // self.stream_channel by reference (same pattern as execute_training_stream).
+    // =========================================================================
+
+    async fn handle_create_lora_stream(
+        &self, ctx: &EnvelopeContext, _request_id: u64,
+        data: &LoraConfig,
+    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
+        let (stream_info, stream_ctx) = self.setup_stream(ctx).await?;
+        let service = self.clone();
+        let config = crate::training::TenantDeltaConfig {
+            rank: data.rank as usize,
+            alpha: data.alpha,
+            dropout: data.dropout,
+            target_modules: data.target_modules.clone(),
+            learning_rate: data.learning_rate as f64,
+            ..crate::training::TenantDeltaConfig::default()
+        };
+        let continuation: hyprstream_rpc::service::Continuation = Box::pin(async move {
+            service.execute_create_lora_stream(stream_ctx, config).await;
+        });
+        Ok((stream_info, continuation))
+    }
+
+    async fn handle_load_lora_stream(
+        &self, ctx: &EnvelopeContext, _request_id: u64,
+        value: &str,
+    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
+        let (stream_info, stream_ctx) = self.setup_stream(ctx).await?;
+        let service = self.clone();
+        let path = value.to_owned();
+        let continuation: hyprstream_rpc::service::Continuation = Box::pin(async move {
+            service.execute_load_lora_stream(stream_ctx, path).await;
+        });
+        Ok((stream_info, continuation))
+    }
+
+    async fn handle_save_lora_stream(
+        &self, ctx: &EnvelopeContext, _request_id: u64,
+        value: &str,
+    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
+        let (stream_info, stream_ctx) = self.setup_stream(ctx).await?;
+        let service = self.clone();
+        let name = value.to_owned();
+        let continuation: hyprstream_rpc::service::Continuation = Box::pin(async move {
+            service.execute_save_lora_stream(stream_ctx, name).await;
+        });
+        Ok((stream_info, continuation))
+    }
+
+    async fn handle_save_adaptation_stream(
+        &self, ctx: &EnvelopeContext, _request_id: u64,
+        data: &SaveAdaptationRequest,
+    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
+        let (stream_info, stream_ctx) = self.setup_stream(ctx).await?;
+        let service = self.clone();
+        let subject = ctx.subject();
+        let name = data.name.clone();
+        let merge_strategy = data.merge_strategy.clone();
+        let merge_weight = data.merge_weight;
+        let continuation: hyprstream_rpc::service::Continuation = Box::pin(async move {
+            service.execute_save_adaptation_stream(stream_ctx, subject, name, merge_strategy, merge_weight).await;
+        });
+        Ok((stream_info, continuation))
+    }
+
+    async fn handle_snapshot_delta_stream(
+        &self, ctx: &EnvelopeContext, _request_id: u64,
+    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
+        let (stream_info, stream_ctx) = self.setup_stream(ctx).await?;
+        let service = self.clone();
+        let subject = ctx.subject();
+        let continuation: hyprstream_rpc::service::Continuation = Box::pin(async move {
+            service.execute_snapshot_delta_stream(stream_ctx, subject).await;
+        });
+        Ok((stream_info, continuation))
+    }
+
+    async fn handle_export_peft_adapter_stream(
+        &self, ctx: &EnvelopeContext, _request_id: u64,
+        data: &ExportPeftRequest,
+    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
+        let (stream_info, stream_ctx) = self.setup_stream(ctx).await?;
+        let service = self.clone();
+        let subject = ctx.subject();
+        let name = data.name.clone();
+        let commit_message = data.commit_message.clone();
+        let continuation: hyprstream_rpc::service::Continuation = Box::pin(async move {
+            service.execute_export_peft_adapter_stream(stream_ctx, subject, name, commit_message).await;
+        });
+        Ok((stream_info, continuation))
+    }
+
+    async fn handle_merge_lora_stream(
+        &self, ctx: &EnvelopeContext, _request_id: u64,
+        data: &MergeLoraRequest,
+    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
+        let (stream_info, stream_ctx) = self.setup_stream(ctx).await?;
+        let service = self.clone();
+        let adapter_path = data.adapter_path.clone();
+        let weight = if data.weight > 0.0 { data.weight } else { 1.0 };
+        let strategy = if data.strategy.is_empty() { "do_merge".to_owned() } else { data.strategy.clone() };
+        let continuation: hyprstream_rpc::service::Continuation = Box::pin(async move {
+            service.execute_merge_lora_stream(stream_ctx, adapter_path, weight, strategy).await;
+        });
+        Ok((stream_info, continuation))
     }
 }
 

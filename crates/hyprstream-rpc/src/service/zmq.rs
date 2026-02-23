@@ -387,9 +387,17 @@ impl RequestLoop {
         };
         socket.set_linger(0).ok();
 
-        // Bind using TransportConfig - handles SystemdFd via set_use_fd()
-        if let Err(e) = transport.bind(&mut socket) {
-            let err = anyhow!("failed to bind to {}: {}", endpoint, e);
+        // Bind or connect based on BindMode
+        let bind_result = match transport.bind_mode() {
+            crate::transport::BindMode::Bind => transport.bind(&mut socket),
+            crate::transport::BindMode::Connect => transport.connect(&mut socket),
+        };
+        if let Err(e) = bind_result {
+            let mode_str = match transport.bind_mode() {
+                crate::transport::BindMode::Bind => "bind",
+                crate::transport::BindMode::Connect => "connect",
+            };
+            let err = anyhow!("failed to {} to {}: {}", mode_str, endpoint, e);
             if let Some(tx) = ready_tx {
                 let _ = tx.send(Err(anyhow!("{}", err)));
             }
@@ -408,7 +416,11 @@ impl RequestLoop {
             }
         };
 
-        info!("{} service bound to {}", service.name(), endpoint);
+        let mode_str = match transport.bind_mode() {
+            crate::transport::BindMode::Bind => "bound to",
+            crate::transport::BindMode::Connect => "connected to",
+        };
+        info!("{} service {} {}", service.name(), mode_str, endpoint);
 
         // Signal ready AFTER socket is bound
         if let Some(tx) = ready_tx {
@@ -419,6 +431,11 @@ impl RequestLoop {
                 );
             }
         }
+
+        // Bounded semaphore for in-flight continuations (backpressure).
+        // Prevents unbounded memory growth from queued streaming operations.
+        const MAX_INFLIGHT_CONTINUATIONS: usize = 16;
+        let continuation_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_CONTINUATIONS));
 
         loop {
             // Use select! for clean shutdown without polling timeouts
@@ -436,11 +453,26 @@ impl RequestLoop {
                     let (request_msg, sender) = result
                         .map_err(|e| anyhow!("recv error: {}", e))?;
 
-                    // Extract bytes from multipart message
+                    // Extract bytes from multipart message.
+                    // When behind a ROUTER/DEALER LB, identity frames are stripped by
+                    // zmq::proxy_steerable, so this flat_map is safe. We validate the
+                    // envelope structure below via unwrap_envelope (signature check).
                     let request: Vec<u8> = request_msg
                         .into_iter()
                         .flat_map(|frame| frame.to_vec())
                         .collect();
+
+                    // Minimum envelope size check (prevents panic on truncated/empty messages)
+                    if request.len() < 8 {
+                        warn!("{} received undersized message ({} bytes), dropping", service.name(), request.len());
+                        let error_payload = service.build_error_payload(0, "malformed request: too small");
+                        let msg: Multipart = vec![error_payload].into();
+                        receiver = sender
+                            .send(msg)
+                            .await
+                            .map_err(|e| anyhow!("send error: {}", e))?;
+                        continue;
+                    }
 
                     trace!(
                         "{} received request ({} bytes)",
@@ -535,7 +567,15 @@ impl RequestLoop {
                     // This guarantees the client has the StreamInfo (stream_id)
                     // before any data flows on the PUB/SUB channel.
                     if let Some(future) = continuation {
-                        tokio::task::spawn_local(future);
+                        let sem = continuation_semaphore.clone();
+                        tokio::task::spawn_local(async move {
+                            // Acquire owned permit for backpressure on in-flight continuations.
+                            // OwnedSemaphorePermit lives for the full duration of the future,
+                            // ensuring the bound is on concurrent running continuations.
+                            let _permit = sem.acquire_owned().await.expect("continuation semaphore closed");
+                            future.await;
+                            // _permit dropped here — releases slot for next continuation
+                        });
                     }
                 }
             }

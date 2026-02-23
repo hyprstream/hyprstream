@@ -64,6 +64,20 @@ pub struct ModelLoadConfig {
     pub max_context: Option<usize>,
     /// KV cache quantization type (None = use service default)
     pub kv_quant: Option<KVQuantType>,
+    /// Number of inference service instances (default: 1).
+    /// Number of inference worker instances per model (default: 1).
+    ///
+    /// When > 1, a ROUTER/DEALER load balancer is spawned and N workers
+    /// connect to the DEALER backend for concurrent request handling.
+    /// Each worker loads its own copy of the model.
+    ///
+    /// **WARNING — experimental, stateless inference only:**
+    /// Multi-instance mode breaks session affinity (KV cache is per-worker),
+    /// pending TTT commit/rollback (per-worker state), and LoRA consistency
+    /// (base_delta is per-worker). Use only for throughput scaling on pure
+    /// stateless inference. TTT with shared DeltaPool works (pool is Arc-shared),
+    /// but commit/rollback and sessions require single-instance mode.
+    pub num_inference_instances: Option<usize>,
 }
 
 /// Information about a loaded model
@@ -270,20 +284,73 @@ impl ModelService {
         let fs: Option<crate::services::WorktreeClient> = Some(repo_client.worktree(&branch_name));
 
         // Start InferenceService for this model via standard Spawnable infrastructure
-        let transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(&endpoint);
-        let service_config = crate::services::InferenceServiceConfig::new(
-            &model_path,
-            runtime_config,
-            self.signing_key.verifying_key(),
-            self.signing_key.clone(),
-            self.policy_client.clone(),
-            Arc::clone(hyprstream_rpc::ZmqService::context(self)),
-            transport,
-            fs,
-        );
+        let num_instances = load_config.num_inference_instances.unwrap_or(1).max(1);
+        let zmq_ctx = Arc::clone(hyprstream_rpc::ZmqService::context(self));
         let spawner = hyprstream_rpc::service::spawner::ServiceSpawner::threaded();
-        let service_handle = spawner.spawn(service_config).await
-            .map_err(|e| anyhow!("Failed to spawn inference service: {}", e))?;
+
+        let service_handle = if num_instances > 1 {
+            // Multi-instance: spawn ROUTER/DEALER load balancer + N workers.
+            // WARNING: experimental — breaks session affinity, pending TTT
+            // commit/rollback, and LoRA consistency across workers.
+            warn!(
+                "Spawning {} inference instances for {} behind load balancer \
+                 (experimental: sessions, pending TTT, and LoRA state are per-worker)",
+                num_instances, model_ref_str
+            );
+
+            let frontend_transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(&endpoint);
+            let backend_endpoint = format!("inproc://hyprstream/inference-{safe_name}-backend");
+            let backend_transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(&backend_endpoint);
+
+            // Spawn load balancer (ROUTER frontend, DEALER backend)
+            let lb = hyprstream_rpc::service::spawner::LoadBalancerService::new(
+                &format!("inference-{safe_name}-lb"),
+                Arc::clone(&zmq_ctx),
+                frontend_transport,
+                backend_transport.clone(),
+            );
+            let lb_handle = spawner.spawn(lb).await
+                .map_err(|e| anyhow!("Failed to spawn load balancer: {}", e))?;
+
+            // Spawn N worker instances, each connecting to the DEALER backend
+            let worker_transport = backend_transport.with_connect_mode();
+            let mut worker_handles = Vec::with_capacity(num_instances);
+            for idx in 0..num_instances {
+                let worker_config = crate::services::InferenceServiceConfig::new(
+                    &model_path,
+                    runtime_config.clone(),
+                    self.signing_key.verifying_key(),
+                    self.signing_key.clone(),
+                    self.policy_client.clone(),
+                    Arc::clone(&zmq_ctx),
+                    worker_transport.clone(),
+                    fs.clone(),
+                );
+                let handle = spawner.spawn(worker_config).await
+                    .map_err(|e| anyhow!("Failed to spawn inference worker {}: {}", idx, e))?;
+                worker_handles.push(handle);
+            }
+
+            // Return the LB handle as the primary handle (stopping it stops the frontend)
+            // Workers are tracked but not individually managed
+            // TODO: Track worker handles for graceful shutdown
+            lb_handle
+        } else {
+            // Single instance: direct bind (zero overhead, current behavior)
+            let transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(&endpoint);
+            let service_config = crate::services::InferenceServiceConfig::new(
+                &model_path,
+                runtime_config,
+                self.signing_key.verifying_key(),
+                self.signing_key.clone(),
+                self.policy_client.clone(),
+                zmq_ctx,
+                transport,
+                fs,
+            );
+            spawner.spawn(service_config).await
+                .map_err(|e| anyhow!("Failed to spawn inference service: {}", e))?
+        };
 
         // Create client for this service
         let client = InferenceZmqClient::with_endpoint(
@@ -875,7 +942,7 @@ impl ModelHandler for ModelService {
             KVQuantTypeEnum::None => None,
         };
         let config = if max_ctx.is_some() || kv_q.is_some() {
-            Some(ModelLoadConfig { max_context: max_ctx, kv_quant: kv_q })
+            Some(ModelLoadConfig { max_context: max_ctx, kv_quant: kv_q, num_inference_instances: None })
         } else {
             None
         };
