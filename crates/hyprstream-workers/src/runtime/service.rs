@@ -85,7 +85,7 @@ pub struct WorkerService {
     active_fd_streams: Arc<RwLock<HashMap<String, ActiveFdStream>>>,
 
     /// StreamChannel for authenticated, async FD streaming
-    stream_channel: StreamChannel,
+    stream_channel: Arc<StreamChannel>,
 
     // Infrastructure (for Spawnable)
     context: Arc<zmq::Context>,
@@ -117,7 +117,7 @@ impl WorkerService {
         // Create event publisher for worker lifecycle events
         let event_publisher = EventPublisher::new(&context, "worker")?;
 
-        let stream_channel = StreamChannel::new(Arc::clone(&context), signing_key.clone());
+        let stream_channel = Arc::new(StreamChannel::new(Arc::clone(&context), signing_key.clone()));
 
         Ok(Self {
             sandbox_pool,
@@ -828,12 +828,8 @@ impl WorkerService {
         let stream_id = stream_ctx.stream_id().to_owned();
         let stream_endpoint = self.stream_channel.stream_endpoint();
 
-        // Create async publisher (uses tmq::push::Push, not raw zmq::PUSH)
-        let publisher = self.stream_channel.publisher(&stream_ctx).await
-            .map_err(|e| anyhow::anyhow!("Failed to create publisher: {}", e))?;
-
         // Register active stream before returning
-        let cancel_token = CancellationToken::new();
+        let cancel_token = stream_ctx.cancel_token().child_token();
         self.active_fd_streams.write().await.insert(
             stream_id.clone(),
             ActiveFdStream { container_id: container_id.to_owned(), cancel_token: cancel_token.clone() },
@@ -845,6 +841,7 @@ impl WorkerService {
         let container_id_owned = container_id.to_owned();
         let active_streams = self.active_fd_streams.clone();
         let stream_id_for_cleanup = stream_id.clone();
+        let sc = Arc::clone(&self.stream_channel);
 
         let stream_info = StreamInfo {
             stream_id,
@@ -855,15 +852,19 @@ impl WorkerService {
         // Continuation: spawns FD streaming task AFTER REP is sent to client
         let continuation: hyprstream_rpc::service::Continuation = Box::pin(async move {
             tokio::spawn(async move {
-                let result = run_fd_streaming_task(
-                    publisher, container_id_owned.clone(), cancel_token, sandbox_pool, sandbox_id,
-                ).await;
+                let container_id_for_log = container_id_owned.clone();
+                let result = sc.run_stream(&stream_ctx, |mut publisher| async move {
+                    let result = run_fd_streaming_task(
+                        &mut publisher, container_id_owned, cancel_token, sandbox_pool, sandbox_id,
+                    ).await;
+                    (publisher, result)
+                }).await;
 
                 // Always clean up active_fd_streams entry on task exit
                 active_streams.write().await.remove(&stream_id_for_cleanup);
 
                 if let Err(e) = result {
-                    warn!(container_id = %container_id_owned, error = %e, "FD streaming task failed");
+                    warn!(container_id = %container_id_for_log, error = %e, "FD streaming task failed");
                 }
             });
         });
@@ -915,7 +916,7 @@ struct ActiveFdStream {
 /// 2. Reads from container console (vsock/serial)
 /// 3. Publishes data via StreamPublisher with HMAC authentication
 async fn run_fd_streaming_task(
-    mut publisher: StreamPublisher,
+    publisher: &mut StreamPublisher,
     container_id: String,
     cancel_token: CancellationToken,
     sandbox_pool: Arc<SandboxPool>,
@@ -957,7 +958,10 @@ async fn run_fd_streaming_task(
         tokio::select! {
             _ = cancel_token.cancelled() => {
                 info!(container_id = %container_id, "FD streaming cancelled");
-                break;
+                if !publisher.is_terminated() {
+                    publisher.publish_error("cancelled").await?;
+                }
+                return Ok(());  // framework sees terminated=true, no-ops
             }
             _ = interval.tick() => {
                 // Placeholder — poll vsock/serial and publish_data() here
@@ -965,13 +969,10 @@ async fn run_fd_streaming_task(
         }
     }
 
-    // Send stream completion
-    publisher.complete_ref(b"").await
-        .map_err(|e| anyhow::anyhow!("Failed to send stream completion: {}", e))?;
-
-    info!(container_id = %container_id, "FD streaming task completed");
-
-    Ok(())
+    // Note: unreachable in placeholder, but in production the loop would break
+    // on EOF from vsock/serial and fall through here for normal completion.
+    // The framework's run_stream will send Complete if we return Ok without
+    // having called complete_ref ourselves.
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

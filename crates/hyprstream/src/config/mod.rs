@@ -102,14 +102,14 @@ pub struct TokenConfig {
 impl Default for TokenConfig {
     fn default() -> Self {
         Self {
-            default_ttl_seconds: 300,   // 5 minutes
-            max_ttl_seconds: 3600,      // 1 hour
+            default_ttl_seconds: 172_800, // 48 hours
+            max_ttl_seconds: 172_800,    // 48 hours
         }
     }
 }
 
-fn default_token_ttl() -> u32 { 300 }
-fn default_max_token_ttl() -> u32 { 3600 }
+fn default_token_ttl() -> u32 { 172_800 }    // 48 hours
+fn default_max_token_ttl() -> u32 { 172_800 } // 48 hours
 
 /// OpenAI-compatible HTTP API configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]

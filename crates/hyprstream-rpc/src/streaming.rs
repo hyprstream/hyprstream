@@ -37,13 +37,15 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 
 use anyhow::Result;
 use capnp::message::Builder;
 use capnp::serialize;
 use dashmap::DashMap;
-use futures::SinkExt;
+use futures::{SinkExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
@@ -51,6 +53,8 @@ use tokio_util::sync::CancellationToken;
 use crate::auth::Claims;
 use crate::prelude::SigningKey;
 use crate::registry::{global as endpoint_registry, SocketKind};
+
+use tmq::SocketExt;
 
 use crate::crypto::{derive_stream_keys, keyed_mac_truncated};
 
@@ -216,7 +220,7 @@ impl StreamFrames {
     /// Send frames via raw ZMQ socket (sync).
     ///
     /// Use this for low-level streaming code that manages its own zmq sockets.
-    /// For service-level code, prefer `StreamChannel::with_publisher()`.
+    /// For service-level code, prefer `StreamChannel::run_stream()`.
     pub fn send(&self, socket: &zmq::Socket) -> Result<()> {
         socket.send(&self.topic, zmq::SNDMORE)?;
         socket.send(&self.capnp, zmq::SNDMORE)?;
@@ -596,6 +600,7 @@ pub struct StreamPublisher {
     builder: StreamBuilder,
     socket: Arc<tokio::sync::Mutex<tmq::push::Push>>,
     cancel_token: CancellationToken,
+    terminated: bool,
 }
 
 impl StreamPublisher {
@@ -615,6 +620,7 @@ impl StreamPublisher {
             builder,
             socket,
             cancel_token: ctx.cancel_token.clone(),
+            terminated: false,
         }
     }
 
@@ -632,7 +638,6 @@ impl StreamPublisher {
     /// Lower rates result in smaller batches (lower latency).
     pub async fn publish_data_with_rate(&mut self, data: &[u8], rate: f32) -> Result<()> {
         if self.cancel_token.is_cancelled() {
-            self.publish_error("cancelled").await?;
             anyhow::bail!("stream cancelled");
         }
         if let Some(frames) = self.builder.add_data(data, rate)? {
@@ -653,6 +658,7 @@ impl StreamPublisher {
 
     /// Publish an error and flush immediately.
     pub async fn publish_error(&mut self, message: &str) -> Result<()> {
+        self.terminated = true; // Before await — cancellation-safe
         if let Some(frames) = self.builder.add_error(message)? {
             let mut socket = self.socket.lock().await;
             frames.send_async(&mut socket).await?;
@@ -670,8 +676,9 @@ impl StreamPublisher {
     /// Complete the stream with metadata and flush (by reference).
     ///
     /// Same as `complete()` but doesn't consume self, allowing use in
-    /// callback-based APIs like `StreamChannel::with_publisher()`.
+    /// callback-based APIs like `StreamChannel::run_stream()`.
     pub async fn complete_ref(&mut self, metadata: &[u8]) -> Result<()> {
+        self.terminated = true; // Before await — cancellation-safe
         let mut socket = self.socket.lock().await;
         if let Some(frames) = self.builder.add_complete(metadata)? {
             frames.send_async(&mut socket).await?;
@@ -699,6 +706,68 @@ impl StreamPublisher {
     /// Check if this stream has been cancelled.
     pub fn is_cancelled(&self) -> bool {
         self.cancel_token.is_cancelled()
+    }
+
+    /// Whether a terminal frame (Error or Complete) has been sent.
+    pub fn is_terminated(&self) -> bool {
+        self.terminated
+    }
+}
+
+impl Drop for StreamPublisher {
+    fn drop(&mut self) {
+        if self.terminated || self.cancel_token.is_cancelled() {
+            return;
+        }
+
+        // Take the original builder to preserve HMAC chain state.
+        // The replacement is a dummy that will never be used (we're being dropped).
+        let mut builder = std::mem::replace(
+            &mut self.builder,
+            StreamBuilder::new(BatchingConfig::default(), [0u8; 32], String::new()),
+        );
+
+        let frames = match builder.add_error("publisher dropped without terminal frame") {
+            Ok(Some(f)) => f,
+            _ => return,
+        };
+
+        let socket = Arc::clone(&self.socket);
+
+        // Spawn async send — the spawned task yields to the runtime, so Drop
+        // itself returns immediately. Bounded 200ms wait covers brief lock
+        // contention from concurrent publishers or register_topic() on the
+        // same StreamChannel. If the lock cannot be acquired, log an error
+        // so the failure is observable rather than silent.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(200),
+                        socket.lock(),
+                    )
+                    .await
+                    {
+                        Ok(mut sock) => {
+                            let _ = frames.send_async(&mut sock).await;
+                        }
+                        Err(_) => {
+                            tracing::error!(
+                                "StreamPublisher::drop: could not acquire socket lock \
+                                 within 200ms; terminal error frame not sent — \
+                                 client will hang until JWT expiry"
+                            );
+                        }
+                    }
+                });
+            }
+            Err(_) => {
+                tracing::error!(
+                    "StreamPublisher::drop: no tokio runtime; \
+                     terminal error frame not sent"
+                );
+            }
+        }
     }
 }
 
@@ -953,28 +1022,40 @@ impl StreamVerifier {
 ///     &client_pubkey,
 /// )?;
 ///
-/// while let Some(payload) = handle.recv_next()? {
-///     match payload {
-///         StreamPayload::Data { data, .. } => process(data),
-///         StreamPayload::Complete { .. } => break,
-///         StreamPayload::Error { message, .. } => return Err(message.into()),
+/// use futures::StreamExt;
+/// while let Some(payload) = handle.next().await {
+///     match payload? {
+///         StreamPayload::Data(data) => process(data),
+///         StreamPayload::Complete(_) => break,
+///         StreamPayload::Error(message) => return Err(message.into()),
 ///     }
 /// }
 /// ```
 pub struct StreamHandle {
-    subscriber: zmq::Socket,
+    subscriber: tmq::subscribe::Subscribe,
     stream_id: String,
     topic: String,
     verifier: StreamVerifier,
     pending: VecDeque<StreamPayload>,
     completed: bool,
     /// PUSH socket for sending control messages (lazy, consumer → StreamService)
+    /// Kept as sync zmq::Socket — cancel is best-effort fire-and-forget with DONTWAIT.
     ctrl_push: Option<zmq::Socket>,
     /// Control channel topic (DH-derived)
     ctrl_topic: String,
     /// Control channel MAC key
     ctrl_mac_key: [u8; 32],
+    /// Cancellation token — consumer-side; fired by cancel() to unblock poll_next
+    cancel_token: CancellationToken,
 }
+
+// StreamHandle must be Send for ToolResult::Stream(Box<StreamHandle>)
+const _: () = {
+    fn _assert_send<T: Send>() {}
+    fn _check() {
+        _assert_send::<StreamHandle>();
+    }
+};
 
 impl StreamHandle {
     /// Create with DH key derivation (encapsulated).
@@ -1001,10 +1082,15 @@ impl StreamHandle {
         let server_pub_32 = pubkey_to_32(server_pubkey);
         let keys = derive_stream_keys(&shared_secret, &client_pub_32, &server_pub_32)?;
 
-        // Create subscriber
-        let subscriber = context.socket(zmq::SUB)?;
-        subscriber.connect(endpoint)?;
-        subscriber.set_subscribe(keys.topic.as_bytes())?;
+        // Create async TMQ subscriber
+        let subscriber = tmq::subscribe::subscribe(context)
+            .connect(endpoint)
+            .map_err(|e| anyhow::anyhow!("SUB connect to {}: {}", endpoint, e))?
+            .subscribe(keys.topic.as_bytes())
+            .map_err(|e| anyhow::anyhow!("SUB subscribe to topic: {}", e))?;
+
+        subscriber.set_linger(0)
+            .map_err(|e| anyhow::anyhow!("Failed to set linger on SUB: {}", e))?;
 
         tracing::debug!(
             stream_id = %stream_id,
@@ -1035,78 +1121,16 @@ impl StreamHandle {
             ctrl_push,
             ctrl_topic: keys.ctrl_topic,
             ctrl_mac_key: *keys.ctrl_mac_key,
+            cancel_token: CancellationToken::new(),
         })
     }
 
-    /// Receive next payload (blocking).
+    /// Receive next payload (async).
     ///
-    /// Returns `None` when stream is complete.
-    pub fn recv_next(&mut self) -> Result<Option<StreamPayload>> {
-        // Return buffered payloads first
-        if let Some(payload) = self.pending.pop_front() {
-            return Ok(Some(payload));
-        }
-
-        if self.completed {
-            return Ok(None);
-        }
-
-        // Receive and verify
-        let frames = self.subscriber.recv_multipart(0)?;
-
-        if frames.len() != 3 || frames[2].len() != 16 {
-            anyhow::bail!(
-                "Invalid StreamBlock format: expected 3 frames with 16-byte MAC, got {} frames",
-                frames.len()
-            );
-        }
-
-        let payloads = self.verifier.verify(&frames)?;
-
-        // Buffer payloads
-        for payload in payloads {
-            if matches!(payload, StreamPayload::Complete { .. } | StreamPayload::Error { .. }) {
-                self.completed = true;
-            }
-            self.pending.push_back(payload);
-        }
-
-        // Return first
-        Ok(self.pending.pop_front())
-    }
-
-    /// Try to receive next payload (non-blocking).
-    pub fn try_next(&mut self) -> Result<Option<StreamPayload>> {
-        // Return buffered payloads first
-        if let Some(payload) = self.pending.pop_front() {
-            return Ok(Some(payload));
-        }
-
-        if self.completed {
-            return Ok(None);
-        }
-
-        // Non-blocking receive
-        match self.subscriber.recv_multipart(zmq::DONTWAIT) {
-            Ok(frames) => {
-                if frames.len() != 3 || frames[2].len() != 16 {
-                    anyhow::bail!("Invalid StreamBlock format");
-                }
-
-                let payloads = self.verifier.verify(&frames)?;
-
-                for payload in payloads {
-                    if matches!(payload, StreamPayload::Complete { .. } | StreamPayload::Error { .. }) {
-                        self.completed = true;
-                    }
-                    self.pending.push_back(payload);
-                }
-
-                Ok(self.pending.pop_front())
-            }
-            Err(zmq::Error::EAGAIN) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+    /// Returns `None` when stream is complete or socket closed.
+    /// Prefer using `StreamExt::next()` directly for composability.
+    pub async fn recv_next(&mut self) -> Result<Option<StreamPayload>> {
+        self.next().await.transpose()
     }
 
     /// Get the stream ID.
@@ -1124,11 +1148,19 @@ impl StreamHandle {
         self.completed
     }
 
+    /// Get the cancellation token (clone to trigger from another context).
+    pub fn cancel_token(&self) -> &CancellationToken {
+        &self.cancel_token
+    }
+
     /// Send a cancel control message to the producer via the control channel.
     ///
+    /// Also fires the cancellation token to unblock `poll_next` immediately.
     /// Best-effort: if the PUSH socket is unavailable or send fails, the
     /// JWT expiry timeout will still stop the stream.
     pub fn cancel(&self) {
+        self.cancel_token.cancel();  // Unblock poll_next (waker fires)
+
         let Some(ref sock) = self.ctrl_push else { return };
 
         // Build StreamControl::Cancel capnp message
@@ -1151,6 +1183,78 @@ impl StreamHandle {
         let _ = sock.send(mac.as_slice(), zmq::DONTWAIT);
 
         tracing::debug!(stream_id = %self.stream_id, "sent cancel on control channel");
+    }
+}
+
+impl Stream for StreamHandle {
+    type Item = Result<StreamPayload>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        loop {
+            // Fast path: drain buffered payloads
+            if let Some(payload) = self.pending.pop_front() {
+                return Poll::Ready(Some(Ok(payload)));
+            }
+            if self.completed {
+                return Poll::Ready(None);
+            }
+
+            // Poll cancellation token — registers cx.waker() with the token.
+            // When cancel() fires, the waker is invoked and poll_next re-runs.
+            let is_cancelled = {
+                let cancel_fut = std::pin::pin!(self.cancel_token.cancelled());
+                cancel_fut.poll(cx).is_ready()
+            };
+            if is_cancelled {
+                self.completed = true;
+                return Poll::Ready(None);
+            }
+
+            // Poll TMQ subscriber — registers cx.waker() with epoll.
+            // Now the SAME waker is registered with BOTH token AND epoll.
+            match Pin::new(&mut self.subscriber).poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    self.completed = true;
+                    return Poll::Ready(None);
+                }
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e.into()))),
+                Poll::Ready(Some(Ok(multipart))) => {
+                    let frames: Vec<Vec<u8>> =
+                        multipart.into_iter().map(|m| m.to_vec()).collect();
+
+                    if frames.len() != 3 || frames[2].len() != 16 {
+                        return Poll::Ready(Some(Err(anyhow::anyhow!(
+                            "Invalid StreamBlock format: expected 3 frames with 16-byte MAC, got {} frames",
+                            frames.len()
+                        ))));
+                    }
+
+                    match self.verifier.verify(&frames) {
+                        Err(e) => return Poll::Ready(Some(Err(e))),
+                        Ok(payloads) => {
+                            for p in payloads {
+                                if matches!(
+                                    p,
+                                    StreamPayload::Complete(..) | StreamPayload::Error(..)
+                                ) {
+                                    self.completed = true;
+                                }
+                                self.pending.push_back(p);
+                            }
+                            // Loop back: if payloads is non-empty, pop_front
+                            // returns the first one. If empty (heartbeat-only),
+                            // we re-poll the TMQ subscriber which will return
+                            // Poll::Pending and register the waker via epoll.
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1192,8 +1296,8 @@ pub struct StreamChannel {
     signing_key: SigningKey,
     /// Lazy-initialized async PUSH socket to StreamService (wrapped in Arc for sharing)
     push_socket: OnceCell<Arc<tokio::sync::Mutex<tmq::push::Push>>>,
-    /// Shared SUB socket for control channel messages (one FD for all streams)
-    ctrl_sub: OnceCell<Arc<tokio::sync::Mutex<tmq::subscribe::Subscribe>>>,
+    /// Channel to send subscription requests to the ctrl listener task
+    ctrl_sub_tx: OnceCell<tokio::sync::mpsc::Sender<Vec<u8>>>,
     /// Active cancel tokens keyed by ctrl_topic
     cancel_tokens: Arc<DashMap<String, CancellationToken>>,
 }
@@ -1205,7 +1309,7 @@ impl StreamChannel {
             context,
             signing_key,
             push_socket: OnceCell::new(),
-            ctrl_sub: OnceCell::new(),
+            ctrl_sub_tx: OnceCell::new(),
             cancel_tokens: Arc::new(DashMap::new()),
         }
     }
@@ -1257,12 +1361,9 @@ impl StreamChannel {
         self.register_topic(stream_ctx.ctrl_topic(), exp, claims).await?;
 
         // 3. Subscribe control channel and register cancel token
-        let ctrl_sub = self.get_or_init_ctrl_sub().await?;
-        {
-            let mut sub = ctrl_sub.lock().await;
-            sub.subscribe(stream_ctx.ctrl_topic().as_bytes())
-                .map_err(|e| anyhow::anyhow!("Failed to subscribe ctrl topic: {}", e))?;
-        }
+        let ctrl_tx = self.get_or_init_ctrl_sub().await?;
+        ctrl_tx.send(stream_ctx.ctrl_topic().as_bytes().to_vec()).await
+            .map_err(|_| anyhow::anyhow!("ctrl listener closed"))?;
         self.cancel_tokens.insert(
             stream_ctx.ctrl_topic().to_owned(),
             stream_ctx.cancel_token().clone(),
@@ -1344,9 +1445,13 @@ impl StreamChannel {
         Ok(Arc::clone(socket_arc))
     }
 
-    /// Get or initialize the shared control channel SUB socket.
-    async fn get_or_init_ctrl_sub(&self) -> Result<Arc<tokio::sync::Mutex<tmq::subscribe::Subscribe>>> {
-        let sub_arc = self.ctrl_sub.get_or_try_init(|| async {
+    /// Get or initialize the control channel subscription sender.
+    ///
+    /// The SUB socket is owned exclusively by the ctrl listener task.
+    /// Subscription requests are sent via the returned mpsc channel,
+    /// avoiding the deadlock that occurred when a Mutex was held across `.await`.
+    async fn get_or_init_ctrl_sub(&self) -> Result<tokio::sync::mpsc::Sender<Vec<u8>>> {
+        let tx = self.ctrl_sub_tx.get_or_try_init(|| async {
             let endpoint = endpoint_registry()
                 .endpoint("streams", SocketKind::Sub)
                 .to_zmq_string();
@@ -1359,49 +1464,61 @@ impl StreamChannel {
             let sub = without_topic.subscribe(b"\x00__ctrl_init__")
                 .map_err(|e| anyhow::anyhow!("Failed to init ctrl SUB: {}", e))?;
 
-            let sub = Arc::new(tokio::sync::Mutex::new(sub));
+            // Spawn the control listener task — it owns the socket exclusively
+            let tx = self.spawn_ctrl_listener(sub);
 
-            // Spawn the control listener task
-            self.spawn_ctrl_listener(Arc::clone(&sub));
-
-            Ok::<_, anyhow::Error>(sub)
+            Ok::<_, anyhow::Error>(tx)
         }).await?;
-        Ok(Arc::clone(sub_arc))
+        Ok(tx.clone())
     }
 
-    /// Spawn a background task that listens for control messages and fires cancel tokens.
-    fn spawn_ctrl_listener(&self, sub: Arc<tokio::sync::Mutex<tmq::subscribe::Subscribe>>) {
+    /// Spawn a background task that owns the SUB socket and listens for control messages.
+    ///
+    /// Subscription requests arrive via the returned mpsc channel, so the socket
+    /// is never shared behind a Mutex — eliminating the deadlock that occurred when
+    /// the listener held the lock across `sub.next().await`.
+    fn spawn_ctrl_listener(
+        &self,
+        mut sub: tmq::subscribe::Subscribe,
+    ) -> tokio::sync::mpsc::Sender<Vec<u8>> {
         use futures::StreamExt;
 
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
         let tokens = Arc::clone(&self.cancel_tokens);
         tokio::spawn(async move {
             loop {
-                let msg = {
-                    let mut sub = sub.lock().await;
-                    sub.next().await
-                };
-                let multipart = match msg {
-                    Some(Ok(m)) => m,
-                    Some(Err(e)) => {
-                        tracing::warn!("ctrl SUB error: {}", e);
-                        continue;
+                tokio::select! {
+                    Some(topic_bytes) = rx.recv() => {
+                        if let Err(e) = sub.subscribe(&topic_bytes) {
+                            tracing::warn!("ctrl subscribe failed: {}", e);
+                        }
                     }
-                    None => break, // socket closed
-                };
+                    msg = sub.next() => {
+                        let multipart = match msg {
+                            Some(Ok(m)) => m,
+                            Some(Err(e)) => {
+                                tracing::warn!("ctrl SUB error: {}", e);
+                                continue;
+                            }
+                            None => break, // socket closed
+                        };
 
-                // Wire format: [ctrl_topic, capnp, mac]
-                if multipart.is_empty() {
-                    continue;
-                }
-                let topic = String::from_utf8_lossy(&multipart[0]);
+                        // Wire format: [ctrl_topic, capnp, mac]
+                        if multipart.is_empty() {
+                            continue;
+                        }
+                        let topic = String::from_utf8_lossy(&multipart[0]);
 
-                // Fire the cancel token if we have one for this topic
-                if let Some((_, token)) = tokens.remove(topic.as_ref()) {
-                    tracing::debug!(ctrl_topic = %topic, "control cancel received");
-                    token.cancel();
+                        // Fire the cancel token if we have one for this topic
+                        if let Some((_, token)) = tokens.remove(topic.as_ref()) {
+                            tracing::debug!(ctrl_topic = %topic, "control cancel received");
+                            token.cancel();
+                        }
+                    }
                 }
             }
         });
+        tx
     }
 
     /// Create a publisher for the given stream context.
@@ -1425,32 +1542,42 @@ impl StreamChannel {
         Ok(StreamPublisher::new(socket_arc, ctx))
     }
 
-    /// Execute streaming work with a publisher (convenience wrapper).
+    /// Run a streaming operation with framework-guaranteed terminal frame.
     ///
-    /// This is a convenience method that creates a publisher and passes it to the callback.
-    /// The callback receives the publisher by value, so it can be used in async blocks.
+    /// The closure receives `StreamPublisher` by value and **must return it**
+    /// alongside its result. This preserves the HMAC chain so the framework
+    /// can send a valid terminal frame if the closure didn't.
     ///
-    /// # Arguments
-    /// * `ctx` - Stream context from `prepare_stream()`
-    /// * `f` - Async callback that receives the publisher
+    /// After the closure returns:
+    /// - If `Ok` and not terminated → framework sends `Complete` (empty metadata)
+    /// - If `Err` and not terminated → framework sends `Error` with the error message
+    /// - If already terminated → no-op (closure handled it)
     ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// stream_channel.with_publisher(&stream_ctx, |mut publisher| async move {
-    ///     publisher.publish_progress("cloning", 0, 1).await?;
-    ///     // ... perform operation ...
-    ///     publisher.complete(&result_bytes).await?;
-    ///     Ok(())
-    /// }).await?;
-    /// ```
-    pub async fn with_publisher<F, Fut, R>(&self, ctx: &StreamContext, f: F) -> Result<R>
+    /// Drop remains as a panic-only safety net.
+    pub async fn run_stream<F, Fut, R>(&self, ctx: &StreamContext, f: F) -> Result<R>
     where
         F: FnOnce(StreamPublisher) -> Fut,
-        Fut: Future<Output = Result<R>>,
+        Fut: Future<Output = (StreamPublisher, Result<R>)>,
     {
         let publisher = self.publisher(ctx).await?;
-        f(publisher).await
+        let (mut publisher, result) = f(publisher).await;
+
+        if !publisher.is_terminated() && !publisher.is_cancelled() {
+            match &result {
+                Ok(_) => {
+                    if let Err(e) = publisher.complete_ref(b"").await {
+                        tracing::error!("run_stream: failed to send Complete: {}", e);
+                    }
+                }
+                Err(e) => {
+                    if let Err(send_err) = publisher.publish_error(&e.to_string()).await {
+                        tracing::error!("run_stream: failed to send Error: {}", send_err);
+                    }
+                }
+            }
+        }
+
+        result
     }
 
     /// Get the stream endpoint for clients to subscribe to.
@@ -1515,6 +1642,30 @@ impl<T> ResponseStream<T> {
     /// Get the server's public key for client DH.
     pub fn server_pubkey(&self) -> &[u8; 32] {
         self.stream_ctx.server_pubkey()
+    }
+}
+
+// ============================================================================
+// StreamGuard (Codegen hook for dispatch-level terminal frame enforcement)
+// ============================================================================
+
+/// Codegen hook point for dispatch-level streaming continuation wrapping.
+///
+/// Currently a **no-op pass-through**. The real terminal-frame guarantee
+/// lives in [`StreamChannel::run_stream()`], which service handlers call
+/// directly. This struct exists so generated dispatch code has a single
+/// place to wrap continuations — a future iteration can extend `wrap()`
+/// to inject `run_stream` automatically (removing the need for handlers
+/// to call it themselves).
+pub struct StreamGuard;
+
+impl StreamGuard {
+    /// Wrap a continuation (currently no-op pass-through).
+    ///
+    /// Terminal frame enforcement is provided by `StreamChannel::run_stream()`,
+    /// not by this wrapper. See struct-level docs for roadmap.
+    pub fn wrap(continuation: crate::service::Continuation) -> crate::service::Continuation {
+        continuation
     }
 }
 

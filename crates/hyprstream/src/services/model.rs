@@ -33,7 +33,7 @@ use crate::config::{GenerationRequest, TemplatedPrompt};
 use crate::runtime::kv_quant::KVQuantType;
 use crate::runtime::RuntimeConfig;
 use crate::services::{
-    rpc_types::StreamInfo, EnvelopeContext, InferenceService, InferenceZmqClient,
+    rpc_types::StreamInfo, EnvelopeContext, InferenceZmqClient,
     PolicyClient,
 };
 use crate::services::GenRegistryClient;
@@ -64,6 +64,20 @@ pub struct ModelLoadConfig {
     pub max_context: Option<usize>,
     /// KV cache quantization type (None = use service default)
     pub kv_quant: Option<KVQuantType>,
+    /// Number of inference service instances (default: 1).
+    /// Number of inference worker instances per model (default: 1).
+    ///
+    /// When > 1, a ROUTER/DEALER load balancer is spawned and N workers
+    /// connect to the DEALER backend for concurrent request handling.
+    /// Each worker loads its own copy of the model.
+    ///
+    /// **WARNING — experimental, stateless inference only:**
+    /// Multi-instance mode breaks session affinity (KV cache is per-worker),
+    /// pending TTT commit/rollback (per-worker state), and LoRA consistency
+    /// (base_delta is per-worker). Use only for throughput scaling on pure
+    /// stateless inference. TTT with shared DeltaPool works (pool is Arc-shared),
+    /// but commit/rollback and sessions require single-instance mode.
+    pub num_inference_instances: Option<usize>,
 }
 
 /// Information about a loaded model
@@ -235,12 +249,12 @@ impl ModelService {
             _ => repo_client.get_head().await.unwrap_or_else(|_| "main".to_owned()),
         };
         let worktrees = repo_client.list_worktrees().await?;
-        let model_path = std::path::PathBuf::from(
-            &worktrees.iter()
-                .find(|wt| wt.branch_name == branch_name)
-                .ok_or_else(|| anyhow!("worktree for {}:{} not found", model_ref.model, branch_name))?
-                .path,
-        );
+        if !worktrees.iter().any(|wt| wt.branch_name == branch_name) {
+            return Err(anyhow!("worktree for {}:{} not found", model_ref.model, branch_name));
+        }
+        // Derive worktree path locally
+        let storage_paths = crate::storage::StoragePaths::new()?;
+        let model_path = storage_paths.worktree_path(&model_ref.model, &branch_name)?;
 
         if !model_path.exists() {
             return Err(anyhow!(
@@ -269,17 +283,74 @@ impl ModelService {
         // Obtain FsOps from the registry for path-contained adapter I/O
         let fs: Option<crate::services::WorktreeClient> = Some(repo_client.worktree(&branch_name));
 
-        // Start InferenceService for this model
-        let service_handle = InferenceService::start_at(
-            &model_path,
-            runtime_config,
-            self.signing_key.verifying_key(),
-            self.signing_key.clone(),
-            self.policy_client.clone(),
-            &endpoint,
-            fs,
-        )
-        .await?;
+        // Start InferenceService for this model via standard Spawnable infrastructure
+        let num_instances = load_config.num_inference_instances.unwrap_or(1).max(1);
+        let zmq_ctx = Arc::clone(hyprstream_rpc::ZmqService::context(self));
+        let spawner = hyprstream_rpc::service::spawner::ServiceSpawner::threaded();
+
+        let service_handle = if num_instances > 1 {
+            // Multi-instance: spawn ROUTER/DEALER load balancer + N workers.
+            // WARNING: experimental — breaks session affinity, pending TTT
+            // commit/rollback, and LoRA consistency across workers.
+            warn!(
+                "Spawning {} inference instances for {} behind load balancer \
+                 (experimental: sessions, pending TTT, and LoRA state are per-worker)",
+                num_instances, model_ref_str
+            );
+
+            let frontend_transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(&endpoint);
+            let backend_endpoint = format!("inproc://hyprstream/inference-{safe_name}-backend");
+            let backend_transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(&backend_endpoint);
+
+            // Spawn load balancer (ROUTER frontend, DEALER backend)
+            let lb = hyprstream_rpc::service::spawner::LoadBalancerService::new(
+                format!("inference-{safe_name}-lb"),
+                Arc::clone(&zmq_ctx),
+                frontend_transport,
+                backend_transport.clone(),
+            );
+            let lb_handle = spawner.spawn(lb).await
+                .map_err(|e| anyhow!("Failed to spawn load balancer: {}", e))?;
+
+            // Spawn N worker instances, each connecting to the DEALER backend
+            let worker_transport = backend_transport.with_connect_mode();
+            let mut worker_handles = Vec::with_capacity(num_instances);
+            for idx in 0..num_instances {
+                let worker_config = crate::services::InferenceServiceConfig::new(
+                    &model_path,
+                    runtime_config.clone(),
+                    self.signing_key.verifying_key(),
+                    self.signing_key.clone(),
+                    self.policy_client.clone(),
+                    Arc::clone(&zmq_ctx),
+                    worker_transport.clone(),
+                    fs.clone(),
+                );
+                let handle = spawner.spawn(worker_config).await
+                    .map_err(|e| anyhow!("Failed to spawn inference worker {}: {}", idx, e))?;
+                worker_handles.push(handle);
+            }
+
+            // Return the LB handle as the primary handle (stopping it stops the frontend)
+            // Workers are tracked but not individually managed
+            // TODO: Track worker handles for graceful shutdown
+            lb_handle
+        } else {
+            // Single instance: direct bind (zero overhead, current behavior)
+            let transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(&endpoint);
+            let service_config = crate::services::InferenceServiceConfig::new(
+                &model_path,
+                runtime_config,
+                self.signing_key.verifying_key(),
+                self.signing_key.clone(),
+                self.policy_client.clone(),
+                zmq_ctx,
+                transport,
+                fs,
+            );
+            spawner.spawn(service_config).await
+                .map_err(|e| anyhow!("Failed to spawn inference service: {}", e))?
+        };
 
         // Create client for this service
         let client = InferenceZmqClient::with_endpoint(
@@ -523,18 +594,19 @@ impl ModelService {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 use crate::services::generated::model_client::{
-    ModelHandler, TttHandler, PeftHandler, InferHandler,
+    ModelHandler, TttHandler, AdapterHandler, InferHandler,
     dispatch_model, serialize_response, ModelResponseVariant,
     LoadedModelResponse, ErrorInfo, ModelListResponse, ModelHealthStatus,
     // Top-level request types
     LoadModelRequest, UnloadModelRequest, KVQuantTypeEnum,
     // TTT types
-    CreateLoraRequest, TrainStepRequest, TrainStepResponse,
+    InitLoraRequest, TrainStepRequest, TrainStepResponse,
     GetDeltaStatusResponse, ModuleNormRatio,
     SaveAdaptationRequest, SaveAdaptationResponse,
     SnapshotDeltaResponse, TttExportRequest, TttExportResponse,
-    // PEFT types
-    PeftAdapterInfo, PeftMergeRequest,
+    WriteTttConfigRequest,
+    // Adapter types
+    AdapterInfo, AdapterMergeRequest,
     // Infer types
     GenerateRequest, ApplyChatTemplateRequest, ModelStatusResponse, OnlineTrainingConfig,
 };
@@ -544,9 +616,9 @@ use crate::services::generated::model_client::{
 
 #[async_trait::async_trait(?Send)]
 impl TttHandler for ModelService {
-    async fn handle_create(
+    async fn handle_init(
         &self, ctx: &EnvelopeContext, _request_id: u64,
-        model_ref: &str, data: &CreateLoraRequest,
+        model_ref: &str, data: &InitLoraRequest,
     ) -> Result<()> {
         let config = crate::training::TenantDeltaConfig {
             rank: data.rank as usize,
@@ -672,10 +744,84 @@ impl TttHandler for ModelService {
             content_hash: r.content_hash,
         })
     }
+
+    async fn handle_write_ttt_config(
+        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        model_ref: &str, data: &WriteTttConfigRequest,
+    ) -> Result<()> {
+        // 1. Parse model ref and resolve worktree path
+        let parsed = ModelRef::parse(model_ref)?;
+        let tracked = self.registry.get_by_name(&parsed.model).await
+            .map_err(|e| anyhow!("Model '{}' not found in registry: {}", parsed.model, e))?;
+        let repo_client = self.registry.repo(&tracked.id);
+
+        let branch_name = match &parsed.git_ref {
+            crate::storage::GitRef::Branch(name) => name.clone(),
+            _ => repo_client.get_head().await.unwrap_or_else(|_| "main".to_owned()),
+        };
+
+        let storage_paths = crate::storage::StoragePaths::new()?;
+        let model_path = storage_paths.worktree_path(&parsed.model, &branch_name)?;
+
+        if !model_path.exists() {
+            return Err(anyhow!("Model worktree not found for {}", model_ref));
+        }
+
+        // 2. Build HyprstreamTrainingConfig from request
+        let ttt_config = crate::config::TTTTrainingConfig {
+            learning_rate: if data.learning_rate > 0.0 { data.learning_rate } else { 3e-4 },
+            gradient_steps: if data.gradient_steps > 0 { data.gradient_steps as usize } else { 3 },
+            max_grad_norm: if data.max_grad_norm > 0.0 { data.max_grad_norm } else { 1.0 },
+            min_input_length: if data.min_input_length > 0 { data.min_input_length as usize } else { 32 },
+            max_ttt_context: if data.max_ttt_context > 0 { data.max_ttt_context as usize } else { 512 },
+        };
+
+        let training_config = crate::config::HyprstreamTrainingConfig {
+            mode: crate::config::TrainingMode::TestTimeTraining,
+            ttt: ttt_config,
+            lora_rank: if data.lora_rank > 0 { data.lora_rank as usize } else { crate::config::default_lora_rank() },
+            lora_alpha: if data.lora_alpha > 0.0 { Some(data.lora_alpha) } else { None },
+            target_modules: if data.target_modules.is_empty() {
+                crate::config::default_target_modules()
+            } else {
+                data.target_modules.clone()
+            },
+            ..Default::default()
+        };
+
+        // 3. Write config.json
+        crate::runtime::model_config::ModelConfig::save_training_config(&model_path, &training_config)?;
+
+        // 4. Stage and commit via worktree-scoped API
+        let wt = repo_client.worktree(&branch_name);
+        wt.stage_files(&["config.json".to_owned()]).await?;
+        wt.commit_with_author(
+            "Update hyprstream_training config via RPC",
+            "hyprstream",
+            "noreply@hyprstream.dev",
+        ).await?;
+
+        info!("TTT config written for {}", model_ref);
+
+        // 5. Auto-reload if requested and model is loaded
+        if data.auto_reload {
+            let is_loaded = {
+                let cache = self.loaded_models.read().await;
+                cache.contains(model_ref)
+            };
+            if is_loaded {
+                info!("Auto-reloading {} after TTT config change", model_ref);
+                self.unload_model(model_ref).await?;
+                self.load_model(model_ref, None).await?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait(?Send)]
-impl PeftHandler for ModelService {
+impl AdapterHandler for ModelService {
     async fn handle_load(
         &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, value: &str,
@@ -689,24 +835,79 @@ impl PeftHandler for ModelService {
         self.unload_lora(model_ref, ctx).await
     }
 
-    async fn handle_has(
+    async fn handle_status(
         &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
     ) -> Result<bool> {
         self.has_lora(model_ref, ctx).await
     }
 
-    async fn handle_check(
+    async fn handle_inspect(
         &self, _ctx: &EnvelopeContext, _request_id: u64,
-        _model_ref: &str, _value: &str,
-    ) -> Result<PeftAdapterInfo> {
-        anyhow::bail!("peft.check not yet implemented")
+        model_ref: &str, value: &str,
+    ) -> Result<AdapterInfo> {
+        // Resolve model_ref to a worktree client (does NOT require model loaded in memory)
+        let parsed = ModelRef::parse(model_ref)?;
+        let tracked = self.registry.get_by_name(&parsed.model).await
+            .map_err(|e| anyhow!("Model '{}' not found in registry: {}", parsed.model, e))?;
+        let repo_client = self.registry.repo(&tracked.id);
+        let branch_name = match &parsed.git_ref {
+            crate::storage::GitRef::Branch(name) => name.clone(),
+            _ => repo_client.get_head().await.unwrap_or_else(|_| "main".to_owned()),
+        };
+        let fs = repo_client.worktree(&branch_name);
+
+        // Read adapter_config.json from the adapter directory
+        let config_path = format!("{}/adapter_config.json", value);
+        let config_bytes = fs.read_file_chunked(&config_path).await
+            .map_err(|e| anyhow!("Failed to read {}: {}", config_path, e))?;
+        let config_json: serde_json::Value = serde_json::from_slice(&config_bytes)
+            .map_err(|e| anyhow!("Failed to parse adapter_config.json: {}", e))?;
+
+        // Verify adapter_model.safetensors exists
+        let model_path = format!("{}/adapter_model.safetensors", value);
+        let stat = fs.stat_path(&model_path).await
+            .map_err(|e| anyhow!("Failed to stat {}: {}", model_path, e))?;
+        if !stat.exists {
+            anyhow::bail!("adapter_model.safetensors not found in {}", value);
+        }
+
+        // Extract PEFT fields from config
+        let rank = config_json.get("r")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32;
+        let lora_alpha = config_json.get("lora_alpha")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0) as f32;
+        let target_modules = config_json.get("target_modules")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let base_model = config_json.get("base_model_name_or_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+
+        // Extract directory name from path
+        let name = value.rsplit('/').next().unwrap_or(value).to_owned();
+
+        Ok(AdapterInfo {
+            name,
+            path: value.to_owned(),
+            rank,
+            lora_alpha,
+            target_modules,
+            base_model,
+        })
     }
 
     async fn handle_merge(
-        &self, _ctx: &EnvelopeContext, _request_id: u64,
-        _model_ref: &str, _data: &PeftMergeRequest,
+        &self, ctx: &EnvelopeContext, _request_id: u64,
+        model_ref: &str, data: &AdapterMergeRequest,
     ) -> Result<()> {
-        anyhow::bail!("peft.merge not yet implemented")
+        let client = self.get_inference_client(model_ref, ctx).await?;
+        let weight = if data.weight > 0.0 { data.weight } else { 1.0 };
+        let strategy = if data.strategy.is_empty() { "do_merge" } else { &data.strategy };
+        client.merge_lora(&data.adapter_name, weight, strategy).await
     }
 }
 
@@ -816,7 +1017,7 @@ impl ModelHandler for ModelService {
             KVQuantTypeEnum::None => None,
         };
         let config = if max_ctx.is_some() || kv_q.is_some() {
-            Some(ModelLoadConfig { max_context: max_ctx, kv_quant: kv_q })
+            Some(ModelLoadConfig { max_context: max_ctx, kv_quant: kv_q, num_inference_instances: None })
         } else {
             None
         };
@@ -1127,7 +1328,7 @@ impl ModelZmqClient {
         Ok(TemplatedPrompt::new(prompt_str))
     }
 
-    /// Create a new LoRA adapter on a loaded model (ttt-scoped)
+    /// Initialize LoRA training infrastructure on a loaded model (ttt-scoped)
     pub async fn create_lora(
         &self,
         model_ref: &str,
@@ -1137,34 +1338,30 @@ impl ModelZmqClient {
         target_modules: &[String],
         learning_rate: f32,
     ) -> Result<()> {
-        self.gen.ttt(model_ref).create(rank, alpha, dropout, target_modules, learning_rate).await
+        self.gen.ttt(model_ref).init(rank, alpha, dropout, target_modules, learning_rate).await
     }
 
-    /// Load a LoRA adapter from a file (peft-scoped)
+    /// Load a LoRA adapter into the base_delta register (adapter-scoped)
     pub async fn load_lora(&self, model_ref: &str, path: &str) -> Result<()> {
-        self.gen.peft(model_ref).load(path).await
+        self.gen.adapter(model_ref).load(path).await
     }
 
-    /// Save the current LoRA adapter to a file (peft-scoped)
-    /// Note: For backward compat, this delegates to peft.load with save semantics.
-    /// Use ttt.save for TTT delta persistence.
+    /// Save the current LoRA adapter to a file
+    /// Note: Legacy — use ttt.save or ttt.export for delta persistence.
     pub async fn save_lora(&self, model_ref: &str, path: &str) -> Result<()> {
-        // saveLora was removed from the schema — this is kept for CLI backward compat
-        // by forwarding to the inference service's save_lora directly
         let client = self.gen.infer(model_ref);
-        // Use call_method for backward compat until the inference schema is updated
         let _result = client.call_method("save_lora", &serde_json::json!({"value": path})).await;
         Ok(())
     }
 
-    /// Unload the current LoRA adapter (peft-scoped)
+    /// Unload the current LoRA adapter from the base_delta register (adapter-scoped)
     pub async fn unload_lora(&self, model_ref: &str) -> Result<()> {
-        self.gen.peft(model_ref).unload().await
+        self.gen.adapter(model_ref).unload().await
     }
 
-    /// Check if a LoRA adapter is loaded (peft-scoped)
+    /// Check if a LoRA adapter is loaded in the base_delta register (adapter-scoped)
     pub async fn has_lora(&self, model_ref: &str) -> Result<bool> {
-        self.gen.peft(model_ref).has().await
+        self.gen.adapter(model_ref).status().await
     }
 
     /// Start streaming training step with E2E authentication

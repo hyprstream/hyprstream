@@ -378,15 +378,20 @@ impl CheckpointManager {
             .as_ref()
             .ok_or_else(|| anyhow!("Git is not enabled (no RepositoryClient configured)"))?;
 
-        // Switch branch if specified
-        if let Some(ref branch_name) = branch {
+        // Determine worktree branch name
+        let wt_branch = if let Some(ref branch_name) = branch {
             // create_branch may fail if it already exists — that's fine
             let _ = repo_client.create_branch(branch_name, "").await;
-            repo_client
-                .checkout(branch_name, false)
+            // Checkout within the worktree
+            repo_client.worktree(branch_name).checkout(branch_name, false)
                 .await
                 .map_err(|e| anyhow!("Failed to checkout branch '{}': {}", branch_name, e))?;
-        }
+            branch_name.clone()
+        } else {
+            // Use default branch (HEAD)
+            repo_client.get_head().await.unwrap_or_else(|_| "main".to_owned())
+        };
+        let wt = repo_client.worktree(&wt_branch);
 
         // Stage checkpoint files
         let relative_path = checkpoint_path
@@ -418,8 +423,7 @@ impl CheckpointManager {
         }
 
         let files_owned: Vec<String> = files_to_stage.iter().map(|s| (*s).to_owned()).collect();
-        repo_client
-            .stage_files(&files_owned)
+        wt.stage_files(&files_owned)
             .await
             .map_err(|e| anyhow!("Failed to stage files: {}", e))?;
 
@@ -433,8 +437,7 @@ impl CheckpointManager {
             )
         });
 
-        let oid = repo_client
-            .commit(&commit_message, "", "")
+        let oid = wt.commit(&commit_message, "", "")
             .await
             .map_err(|e| anyhow!("Failed to commit: {}", e))?;
 
@@ -707,19 +710,21 @@ impl CheckpointManager {
         step: usize,
         branch_name: &Option<String>,
     ) -> Result<()> {
-        // Ensure we're on the right branch
-        if let Some(branch) = branch_name {
+        // Determine worktree branch name
+        let wt_branch = if let Some(branch) = branch_name {
             // create_branch may fail if it already exists — that's fine
             let _ = repo_client.create_branch(branch, "").await;
-            repo_client
-                .checkout(branch, false)
+            repo_client.worktree(branch).checkout(branch, false)
                 .await
                 .map_err(|e| anyhow!("Failed to checkout branch '{}': {}", branch, e))?;
-        }
+            branch.clone()
+        } else {
+            repo_client.get_head().await.unwrap_or_else(|_| "main".to_owned())
+        };
+        let wt = repo_client.worktree(&wt_branch);
 
         // Stage checkpoint files
-        repo_client
-            .stage_files(&[
+        wt.stage_files(&[
                 ".checkpoints/checkpoint.safetensors".to_owned(),
                 ".checkpoints/checkpoint.json".to_owned(),
             ])
@@ -733,8 +738,7 @@ impl CheckpointManager {
             format!("Training checkpoint step {step}")
         };
 
-        repo_client
-            .commit(&message, "", "")
+        wt.commit(&message, "", "")
             .await
             .map_err(|e| anyhow!("Failed to commit: {}", e))?;
 

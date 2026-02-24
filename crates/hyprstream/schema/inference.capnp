@@ -56,6 +56,20 @@ struct InferenceRequest {
 
     # Export delta as PEFT adapter directory (identity from auth envelope)
     exportPeftAdapter @23 :ExportPeftRequest;
+
+    # Merge an on-disk adapter into the loaded base_delta
+    mergeLora @24 :MergeLoraRequest;
+
+    # Streaming variants — return StreamInfo immediately, results via PUB/SUB.
+    # Use these instead of the non-streaming versions for operations that may
+    # involve significant compute or I/O (GPU alloc, disk writes, merges).
+    createLoraStream @25 :LoraConfig;
+    loadLoraStream @26 :Text;          # path
+    saveLoraStream @27 :Text;          # path
+    saveAdaptationStream @28 :SaveAdaptationRequest;
+    snapshotDeltaStream @29 :Void;
+    exportPeftAdapterStream @30 :ExportPeftRequest;
+    mergeLoraStream @31 :MergeLoraRequest;
   }
 }
 
@@ -98,6 +112,18 @@ struct InferenceResponse {
 
     # Export PEFT adapter response
     exportPeftAdapterResult @24 :ExportPeftResult;
+
+    # Merge LoRA response
+    mergeLoraResult @25 :Void;
+
+    # Streaming variant responses — all return StreamInfo
+    createLoraStreamResult @26 :StreamInfo;
+    loadLoraStreamResult @27 :StreamInfo;
+    saveLoraStreamResult @28 :StreamInfo;
+    saveAdaptationStreamResult @29 :StreamInfo;
+    snapshotDeltaStreamResult @30 :StreamInfo;
+    exportPeftAdapterStreamResult @31 :StreamInfo;
+    mergeLoraStreamResult @32 :StreamInfo;
   }
 }
 
@@ -113,6 +139,12 @@ struct GenerationRequest {
   seed @8 :UInt32 $optional;
   images @9 :List(Data) $optional;
   timeoutMs @10 :UInt64 $optional;
+
+  # Per-request TTT control (all optional — omit for server defaults)
+  tttEnabled @11 :Bool;
+  tttGradientSteps @12 :UInt32 $optional;
+  tttLearningRate @13 :Float32 $optional;
+  autoCommit @14 :Bool;
 }
 
 # Quality metrics for self-supervised training
@@ -302,10 +334,25 @@ struct ExportPeftResult {
   contentHash @1 :Text;
 }
 
+# Merge LoRA Request (adapter.merge → inference internal)
+
+struct MergeLoraRequest {
+  adapterPath @0 :Text;    # relative path to adapter dir (e.g. "adapters/demo-1-rust-ttt")
+  weight @1 :Float32;      # merge weight 0.0-1.0, default 1.0
+  strategy @2 :Text;       # "replace", "additive", or "do_merge" (default: "do_merge")
+}
+
 # Error Information
 
 struct ErrorInfo {
   message @0 :Text;
   code @1 :Text;
   details @2 :Text;
+}
+
+# Structured capacity error for TTT delta limits
+struct CapacityError {
+  currentSteps @0 :UInt32;
+  maxSteps @1 :UInt32;
+  message @2 :Text;
 }

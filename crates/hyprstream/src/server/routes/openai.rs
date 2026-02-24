@@ -121,37 +121,34 @@ async fn collect_stream_to_result(
         &client_pubkey_bytes,
     )?;
 
+    use futures::StreamExt;
+    use hyprstream_rpc::streaming::StreamPayload;
+
     let mut text = String::new();
     loop {
-        match handle.try_next() {
-            Ok(Some(payload)) => {
-                use hyprstream_rpc::streaming::StreamPayload;
-                match payload {
-                    StreamPayload::Data(data) => {
-                        text.push_str(&String::from_utf8_lossy(&data));
-                    }
-                    StreamPayload::Complete(meta) => {
-                        let stats: crate::services::rpc_types::InferenceComplete =
-                            serde_json::from_slice(&meta)
-                                .unwrap_or_else(|e| {
-                                    tracing::warn!("Failed to parse InferenceComplete: {e}");
-                                    crate::services::rpc_types::InferenceComplete::empty()
-                                });
-                        return Ok(CollectedResult { text, stats });
-                    }
-                    StreamPayload::Error(msg) => {
-                        anyhow::bail!("Generation error: {msg}");
-                    }
+        match handle.next().await {
+            Some(Ok(payload)) => match payload {
+                StreamPayload::Data(data) => {
+                    text.push_str(&String::from_utf8_lossy(&data));
                 }
-            }
-            Ok(None) if handle.is_completed() => {
-                anyhow::bail!("Stream ended without completion");
-            }
-            Ok(None) => {
-                tokio::task::yield_now().await;
-            }
-            Err(e) => {
+                StreamPayload::Complete(meta) => {
+                    let stats: crate::services::rpc_types::InferenceComplete =
+                        serde_json::from_slice(&meta)
+                            .unwrap_or_else(|e| {
+                                tracing::warn!("Failed to parse InferenceComplete: {e}");
+                                crate::services::rpc_types::InferenceComplete::empty()
+                            });
+                    return Ok(CollectedResult { text, stats });
+                }
+                StreamPayload::Error(msg) => {
+                    anyhow::bail!("Generation error: {msg}");
+                }
+            },
+            Some(Err(e)) => {
                 anyhow::bail!("Stream error: {e}");
+            }
+            None => {
+                anyhow::bail!("Stream ended without completion");
             }
         }
     }
@@ -251,11 +248,14 @@ async fn resolve_model_path(
             crate::storage::GitRef::Branch(name) => name.clone(),
             _ => repo.get_head().await?,
         };
+        // Verify worktree exists
         let wts = repo.list_worktrees().await?;
-        wts.iter()
-            .find(|wt| wt.branch_name == branch)
-            .map(|wt| std::path::PathBuf::from(&wt.path))
-            .ok_or_else(|| anyhow::anyhow!("worktree for {}:{} not found", model_ref.model, branch))
+        if !wts.iter().any(|wt| wt.branch_name == branch) {
+            anyhow::bail!("worktree for {}:{} not found", model_ref.model, branch);
+        }
+        // Derive path locally
+        let storage_paths = crate::storage::StoragePaths::new()?;
+        storage_paths.worktree_path(&model_ref.model, &branch)
     }.await;
 
     match path_result {
@@ -591,11 +591,14 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                 crate::storage::GitRef::Branch(name) => name.clone(),
                 _ => repo.get_head().await?,
             };
+            // Verify worktree exists
             let wts = repo.list_worktrees().await?;
-            wts.iter()
-                .find(|wt| wt.branch_name == branch)
-                .map(|wt| std::path::PathBuf::from(&wt.path))
-                .ok_or_else(|| anyhow::anyhow!("worktree not found"))
+            if !wts.iter().any(|wt| wt.branch_name == branch) {
+                anyhow::bail!("worktree not found");
+            }
+            // Derive path locally
+            let storage_paths = crate::storage::StoragePaths::new()?;
+            storage_paths.worktree_path(&model_ref.model, &branch)
         }.await {
             Ok(path) => path,
             Err(e) => {
@@ -713,136 +716,134 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
         // Accumulate full response text for tool call parsing
         let mut accumulated_text = String::new();
 
+        use futures::StreamExt;
+
         'outer: loop {
-            // Check if client disconnected (channel closed)
-            if tx.is_closed() {
-                info!("Client disconnected, stopping stream");
-                stream_handle.cancel();
-                break;
-            }
+            tokio::select! {
+                payload = stream_handle.next() => {
+                    match payload {
+                        Some(Ok(payload)) => {
+                            use crate::services::rpc_types::{InferenceStreamPayload, StreamPayloadExt};
+                            match payload.to_inference() {
+                                Ok(InferenceStreamPayload::Token(text)) => {
+                                    // Accumulate text for tool call parsing
+                                    accumulated_text.push_str(&text);
+                                    let sse_chunk = serde_json::json!({
+                                        "id": sse_stream_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": chrono::Utc::now().timestamp(),
+                                        "model": model_name,
+                                        "choices": [{
+                                            "index": 0,
+                                            "delta": {
+                                                "content": text
+                                            },
+                                            "finish_reason": null
+                                        }]
+                                    });
 
-            // Try non-blocking receive (StreamHandle handles DH verification internally)
-            match stream_handle.try_next() {
-                Ok(Some(payload)) => {
-                    use crate::services::rpc_types::{InferenceStreamPayload, StreamPayloadExt};
-                    match payload.to_inference() {
-                        Ok(InferenceStreamPayload::Token(text)) => {
-                            // Accumulate text for tool call parsing
-                            accumulated_text.push_str(&text);
-                            let sse_chunk = serde_json::json!({
-                                "id": sse_stream_id,
-                                "object": "chat.completion.chunk",
-                                "created": chrono::Utc::now().timestamp(),
-                                "model": model_name,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {
-                                        "content": text
-                                    },
-                                    "finish_reason": null
-                                }]
-                            });
+                                    if tx.send(Ok(sse_chunk)).await.is_err() {
+                                        info!("Client disconnected during streaming");
+                                        break 'outer;
+                                    }
+                                }
+                                Ok(InferenceStreamPayload::Complete(stats)) => {
+                                    info!(
+                                        "Streaming complete: {} tokens in {}ms ({:.2} tok/s)",
+                                        stats.tokens_generated,
+                                        stats.generation_time_ms,
+                                        stats.tokens_per_second
+                                    );
 
-                            if tx.send(Ok(sse_chunk)).await.is_err() {
-                                info!("Client disconnected during streaming");
-                                break 'outer;
+                                    state.metrics.total_tokens.fetch_add(
+                                        stats.tokens_generated as u64,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+
+                                    // Map finish_reason to OpenAI format
+                                    let oai_finish_reason = match stats.finish_reason.as_str() {
+                                        "max_tokens" | "MaxTokens" | "length" => "length",
+                                        _ => "stop",
+                                    };
+
+                                    let usage = Usage {
+                                        prompt_tokens: stats.prefill_tokens,
+                                        completion_tokens: stats.tokens_generated,
+                                        total_tokens: stats.prefill_tokens + stats.tokens_generated,
+                                        online_training_details: stats.ttt_metrics.as_ref()
+                                            .map(OnlineTrainingDetails::from),
+                                    };
+
+                                    // Check if response contains tool calls (format-aware)
+                                    let oai_finish_reason = if tools::has_tool_calls_for_format(tool_call_format, &accumulated_text) {
+                                        info!("Detected tool calls in streaming response (format: {:?})", tool_call_format);
+                                        match tools::parse_tool_calls_for_format(tool_call_format, &accumulated_text) {
+                                            Ok(parsed_tool_calls) if !parsed_tool_calls.is_empty() => {
+                                                info!("Parsed {} tool calls", parsed_tool_calls.len());
+                                                let tool_calls_chunk = serde_json::json!({
+                                                    "id": sse_stream_id,
+                                                    "object": "chat.completion.chunk",
+                                                    "created": chrono::Utc::now().timestamp(),
+                                                    "model": model_name,
+                                                    "choices": [{
+                                                        "index": 0,
+                                                        "delta": {
+                                                            "tool_calls": parsed_tool_calls
+                                                        },
+                                                        "finish_reason": null
+                                                    }]
+                                                });
+                                                let _ = tx.send(Ok(tool_calls_chunk)).await;
+                                                "tool_calls"
+                                            }
+                                            _ => oai_finish_reason,
+                                        }
+                                    } else {
+                                        oai_finish_reason
+                                    };
+
+                                    let completion_msg = serde_json::json!({
+                                        "id": sse_stream_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": chrono::Utc::now().timestamp(),
+                                        "model": model_name,
+                                        "choices": [{
+                                            "index": 0,
+                                            "delta": {},
+                                            "finish_reason": oai_finish_reason
+                                        }],
+                                        "usage": usage
+                                    });
+                                    let _ = tx.send(Ok(completion_msg)).await;
+
+                                    let _ = tx.send(Ok(serde_json::json!({"done": true}))).await;
+                                    break 'outer;
+                                }
+                                Ok(InferenceStreamPayload::Error(message)) => {
+                                    error!("Stream error: {}", message);
+                                    let _ = tx.send(Err(anyhow::anyhow!("Generation error: {}", message))).await;
+                                    break 'outer;
+                                }
+                                Err(e) => {
+                                    error!("Failed to parse stream payload: {}", e);
+                                    continue 'outer;
+                                }
                             }
                         }
-                        Ok(InferenceStreamPayload::Complete(stats)) => {
-                            info!(
-                                "Streaming complete: {} tokens in {}ms ({:.2} tok/s)",
-                                stats.tokens_generated,
-                                stats.generation_time_ms,
-                                stats.tokens_per_second
-                            );
-
-                            state.metrics.total_tokens.fetch_add(
-                                stats.tokens_generated as u64,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-
-                            // Map finish_reason to OpenAI format
-                            let oai_finish_reason = match stats.finish_reason.as_str() {
-                                "max_tokens" | "MaxTokens" | "length" => "length",
-                                _ => "stop",
-                            };
-
-                            let usage = Usage {
-                                prompt_tokens: stats.prefill_tokens,
-                                completion_tokens: stats.tokens_generated,
-                                total_tokens: stats.prefill_tokens + stats.tokens_generated,
-                                online_training_details: stats.ttt_metrics.as_ref()
-                                    .map(OnlineTrainingDetails::from),
-                            };
-
-                            // Check if response contains tool calls (format-aware)
-                            let oai_finish_reason = if tools::has_tool_calls_for_format(tool_call_format, &accumulated_text) {
-                                info!("Detected tool calls in streaming response (format: {:?})", tool_call_format);
-                                match tools::parse_tool_calls_for_format(tool_call_format, &accumulated_text) {
-                                    Ok(parsed_tool_calls) if !parsed_tool_calls.is_empty() => {
-                                        info!("Parsed {} tool calls", parsed_tool_calls.len());
-                                        let tool_calls_chunk = serde_json::json!({
-                                            "id": sse_stream_id,
-                                            "object": "chat.completion.chunk",
-                                            "created": chrono::Utc::now().timestamp(),
-                                            "model": model_name,
-                                            "choices": [{
-                                                "index": 0,
-                                                "delta": {
-                                                    "tool_calls": parsed_tool_calls
-                                                },
-                                                "finish_reason": null
-                                            }]
-                                        });
-                                        let _ = tx.send(Ok(tool_calls_chunk)).await;
-                                        "tool_calls"
-                                    }
-                                    _ => oai_finish_reason,
-                                }
-                            } else {
-                                oai_finish_reason
-                            };
-
-                            let completion_msg = serde_json::json!({
-                                "id": sse_stream_id,
-                                "object": "chat.completion.chunk",
-                                "created": chrono::Utc::now().timestamp(),
-                                "model": model_name,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {},
-                                    "finish_reason": oai_finish_reason
-                                }],
-                                "usage": usage
-                            });
-                            let _ = tx.send(Ok(completion_msg)).await;
-
-                            let _ = tx.send(Ok(serde_json::json!({"done": true}))).await;
+                        Some(Err(e)) => {
+                            error!("Stream receive error: {}", e);
+                            let _ = tx.send(Err(anyhow::anyhow!("Stream receive error: {}", e))).await;
                             break 'outer;
                         }
-                        Ok(InferenceStreamPayload::Error(message)) => {
-                            error!("Stream error: {}", message);
-                            let _ = tx.send(Err(anyhow::anyhow!("Generation error: {}", message))).await;
+                        None => {
                             break 'outer;
-                        }
-                        Err(e) => {
-                            error!("Failed to parse stream payload: {}", e);
-                            continue;
                         }
                     }
                 }
-                Ok(None) => {
-                    if stream_handle.is_completed() {
-                        break 'outer;
-                    }
-                    // No data available - yield and retry
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                Err(e) => {
-                    error!("Stream receive error: {}", e);
-                    let _ = tx.send(Err(anyhow::anyhow!("Stream receive error: {}", e))).await;
-                    break;
+                _ = tx.closed() => {
+                    info!("Client disconnected, stopping stream");
+                    stream_handle.cancel();
+                    break 'outer;
                 }
             }
         }

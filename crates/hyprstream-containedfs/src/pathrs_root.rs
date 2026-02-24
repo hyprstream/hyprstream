@@ -35,7 +35,7 @@ fn pathrs_to_fs_error(e: pathrs::error::Error) -> FsError {
     let msg = e.to_string();
     if msg.contains("SafetyViolation") || msg.contains("safety violation") {
         FsError::PathEscape(msg)
-    } else if msg.contains("ENOENT") || msg.contains("No such file") {
+    } else if msg.contains("ENOENT") || msg.contains("No such file") || msg.contains("subpath failed") {
         FsError::NotFound(msg)
     } else if msg.contains("EACCES") || msg.contains("EPERM") || msg.contains("Permission denied")
     {
@@ -50,7 +50,23 @@ fn pathrs_to_fs_error(e: pathrs::error::Error) -> FsError {
 impl ContainedFs for PathrsRoot {
     fn walk(&self, path: &str) -> Result<FsHandle, FsError> {
         let handle = self.root.resolve(path).map_err(pathrs_to_fs_error)?;
-        Ok(FsHandle::from_pathrs(handle, path.to_owned()))
+        // Derive rel_path from the kernel-resolved fd, not the user-supplied string.
+        // This prevents poisoned rel_path strings (e.g. "a/../../b" resolving to "b"
+        // but storing the traversal path) from leaking to git operations.
+        let rel_path = {
+            let probe: File = handle
+                .reopen(OpenFlags::O_PATH | OpenFlags::O_CLOEXEC)
+                .map_err(pathrs_to_fs_error)?;
+            let real = fs::read_link(format!("/proc/self/fd/{}", probe.as_raw_fd()))
+                .map_err(FsError::Io)?;
+            real.strip_prefix(&self.root_path)
+                .map(|p| {
+                    let s = p.to_string_lossy().to_string();
+                    if s.is_empty() { ".".to_owned() } else { s }
+                })
+                .unwrap_or_else(|_| path.to_owned())
+        };
+        Ok(FsHandle::from_pathrs(handle, rel_path))
     }
 
     fn open(&self, path: &str, mode: OpenMode) -> Result<File, FsError> {

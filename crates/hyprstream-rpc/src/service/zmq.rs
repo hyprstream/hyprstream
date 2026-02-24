@@ -16,6 +16,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::rc::Rc;
 use std::sync::Arc;
 use tmq::{FromZmqSocket, Multipart, RequestReceiver, RequestSender};
 use tokio::sync::Notify;
@@ -171,7 +172,7 @@ impl EnvelopeContext {
 /// manager.spawn(Box::new(my_service)).await?;
 /// ```
 #[async_trait(?Send)]
-pub trait ZmqService: Send + Sync + 'static {
+pub trait ZmqService: 'static {
     /// Process a request and return a response with optional continuation.
     ///
     /// # Arguments
@@ -204,13 +205,30 @@ pub trait ZmqService: Send + Sync + 'static {
         self.signing_key().verifying_key()
     }
 
+    /// Optional pre-handler claims verification.
+    ///
+    /// Called by `RequestLoop` after envelope signature verification, before `handle_request`.
+    /// Return `Err` to reject the request before dispatch.
+    ///
+    /// Use this for E2E JWT verification (e.g., downgrade attack prevention).
+    /// Default: no additional verification.
+    fn verify_claims(&self, ctx: &EnvelopeContext) -> anyhow::Result<()> {
+        let _ = ctx;
+        Ok(())
+    }
+
     /// Build a generic error response payload for unexpected errors.
     ///
     /// Default implementation returns an empty vec (backwards compat).
     /// Generated services should override with schema-correct error payloads
     /// so clients receive proper `Error(ErrorInfo{...})` instead of parse failures.
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
-        let _ = (request_id, error);
+        warn!(
+            service = self.name(),
+            request_id,
+            error,
+            "build_error_payload not overridden — sending empty error response"
+        );
         vec![]
     }
 }
@@ -306,8 +324,8 @@ impl RequestLoop {
         // Create oneshot channel for ready signal
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
 
-        // Wrap service in Arc for sharing with spawn_blocking handlers
-        let service = Arc::new(service);
+        // Wrap service in Rc for sharing within single-threaded local set
+        let service = Rc::new(service);
 
         // Spawn async task (not spawn_blocking - TMQ provides async I/O)
         let handle = tokio::task::spawn_local(async move {
@@ -347,7 +365,7 @@ impl RequestLoop {
     async fn service_loop_async<S: ZmqService>(
         transport: TransportConfig,
         context: Arc<zmq::Context>,
-        service: Arc<S>,
+        service: Rc<S>,
         server_pubkey: VerifyingKey,
         signing_key: SigningKey,
         nonce_cache: Arc<InMemoryNonceCache>,
@@ -369,9 +387,17 @@ impl RequestLoop {
         };
         socket.set_linger(0).ok();
 
-        // Bind using TransportConfig - handles SystemdFd via set_use_fd()
-        if let Err(e) = transport.bind(&mut socket) {
-            let err = anyhow!("failed to bind to {}: {}", endpoint, e);
+        // Bind or connect based on BindMode
+        let bind_result = match transport.bind_mode() {
+            crate::transport::BindMode::Bind => transport.bind(&mut socket),
+            crate::transport::BindMode::Connect => transport.connect(&mut socket),
+        };
+        if let Err(e) = bind_result {
+            let mode_str = match transport.bind_mode() {
+                crate::transport::BindMode::Bind => "bind",
+                crate::transport::BindMode::Connect => "connect",
+            };
+            let err = anyhow!("failed to {} to {}: {}", mode_str, endpoint, e);
             if let Some(tx) = ready_tx {
                 let _ = tx.send(Err(anyhow!("{}", err)));
             }
@@ -390,7 +416,11 @@ impl RequestLoop {
             }
         };
 
-        info!("{} service bound to {}", service.name(), endpoint);
+        let mode_str = match transport.bind_mode() {
+            crate::transport::BindMode::Bind => "bound to",
+            crate::transport::BindMode::Connect => "connected to",
+        };
+        info!("{} service {} {}", service.name(), mode_str, endpoint);
 
         // Signal ready AFTER socket is bound
         if let Some(tx) = ready_tx {
@@ -401,6 +431,11 @@ impl RequestLoop {
                 );
             }
         }
+
+        // Bounded semaphore for in-flight continuations (backpressure).
+        // Prevents unbounded memory growth from queued streaming operations.
+        const MAX_INFLIGHT_CONTINUATIONS: usize = 16;
+        let continuation_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_CONTINUATIONS));
 
         loop {
             // Use select! for clean shutdown without polling timeouts
@@ -418,11 +453,26 @@ impl RequestLoop {
                     let (request_msg, sender) = result
                         .map_err(|e| anyhow!("recv error: {}", e))?;
 
-                    // Extract bytes from multipart message
+                    // Extract bytes from multipart message.
+                    // When behind a ROUTER/DEALER LB, identity frames are stripped by
+                    // zmq::proxy_steerable, so this flat_map is safe. We validate the
+                    // envelope structure below via unwrap_envelope (signature check).
                     let request: Vec<u8> = request_msg
                         .into_iter()
                         .flat_map(|frame| frame.to_vec())
                         .collect();
+
+                    // Minimum envelope size check (prevents panic on truncated/empty messages)
+                    if request.len() < 8 {
+                        warn!("{} received undersized message ({} bytes), dropping", service.name(), request.len());
+                        let error_payload = service.build_error_payload(0, "malformed request: too small");
+                        let msg: Multipart = vec![error_payload].into();
+                        receiver = sender
+                            .send(msg)
+                            .await
+                            .map_err(|e| anyhow!("send error: {}", e))?;
+                        continue;
+                    }
 
                     trace!(
                         "{} received request ({} bytes)",
@@ -457,6 +507,21 @@ impl RequestLoop {
                         ctx.subject(),
                         request_id
                     );
+
+                    // Pre-handler claims verification (E2E JWT, downgrade protection)
+                    if let Err(e) = service.verify_claims(&ctx) {
+                        warn!(
+                            "{} claims verification failed for {} (id={}): {}",
+                            service.name(), ctx.subject(), request_id, e
+                        );
+                        let error_payload = service.build_error_payload(request_id, &e.to_string());
+                        let msg: Multipart = vec![error_payload].into();
+                        receiver = sender
+                            .send(msg)
+                            .await
+                            .map_err(|e| anyhow!("send error: {}", e))?;
+                        continue;
+                    }
 
                     // Process request directly (handlers are now async)
                     let result = service.handle_request(&ctx, &payload).await;
@@ -502,7 +567,18 @@ impl RequestLoop {
                     // This guarantees the client has the StreamInfo (stream_id)
                     // before any data flows on the PUB/SUB channel.
                     if let Some(future) = continuation {
-                        tokio::task::spawn_local(future);
+                        let sem = continuation_semaphore.clone();
+                        tokio::task::spawn_local(async move {
+                            // Acquire owned permit for backpressure on in-flight continuations.
+                            // OwnedSemaphorePermit lives for the full duration of the future,
+                            // ensuring the bound is on concurrent running continuations.
+                            let Ok(_permit) = sem.acquire_owned().await else {
+                                warn!("continuation semaphore closed, dropping continuation");
+                                return;
+                            };
+                            future.await;
+                            // _permit dropped here — releases slot for next continuation
+                        });
                     }
                 }
             }

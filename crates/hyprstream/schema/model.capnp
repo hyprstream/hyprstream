@@ -17,7 +17,7 @@ using import "/streaming.capnp".StreamInfo;
 # Convention: Request variants use camelCase names. Response variants
 # use the same name suffixed with "Result" to avoid Cap'n Proto naming
 # collisions. The code generator strips "Result" to pair them.
-# Scoped ops are nested under ttt/peft/infer with matching Result variants.
+# Scoped ops are nested under ttt/adapter/infer with matching Result variants.
 
 struct ModelRequest {
   # Request ID for tracking
@@ -31,9 +31,9 @@ struct ModelRequest {
     healthCheck @4 :Void $mcpDescription("Check model service health and status");
 
     # Scoped interfaces (require modelRef)
-    ttt @5 :TttRequest;     # Test-time training operations
-    peft @6 :PeftRequest;   # PEFT adapter management
-    infer @7 :InferRequest;  # Inference operations
+    ttt @5 :TttRequest;         # Test-time training operations
+    adapter @6 :AdapterRequest; # Adapter management (load/unload/inspect/merge)
+    infer @7 :InferRequest;     # Inference operations
   }
 }
 
@@ -47,49 +47,54 @@ struct ModelRequest {
 struct TttRequest {
   modelRef @0 :Text;
   union {
-    create @1 :CreateLoraRequest
-      $mcpDescription("Create a new LoRA adapter on a loaded model");
+    init @1 :InitLoraRequest
+      $mcpDescription("Initialize the training infrastructure (LoRA parameters, optimizer, delta pool) on a loaded model. Required before ttt.train or TTT-enabled inference. Configure rank, alpha, target modules, and learning rate.");
     train @2 :TrainStepRequest
-      $mcpDescription("Run TTT gradient steps on input text WITHOUT generating a response. Pure training — use for pre-training on domain text before asking questions. Returns loss metrics and recommendation. If autoCommit is false, call commitAdaptation or rollbackAdaptation.");
+      $mcpDescription("Run TTT gradient steps on input text WITHOUT generating a response. Pure training — use for pre-training on domain text before asking questions. Returns loss metrics and recommendation. If autoCommit is false, call ttt.commit or ttt.rollback.");
     trainStream @3 :TrainStepRequest
-      $mcpDescription("Stream TTT training on input text. Returns progress and results via streaming. Use for long-running training that would timeout via trainStep.");
+      $mcpDescription("Stream TTT training on input text. Returns progress and results via streaming. Use for long-running training that would timeout via ttt.train.");
     commit @4 :Void
-      $mcpDescription("Commit a pending TTT adaptation after reviewing metrics from infer/inferStream. Must be called within 30 seconds of the inference response. The adaptation becomes permanent for this tenant's delta.");
+      $mcpDescription("Commit a pending TTT adaptation to the tenant delta accumulator. Call after reviewing metrics from infer.generateStream. Must be called within 30 seconds of the inference response.");
     rollback @5 :Void
-      $mcpDescription("Rollback a pending TTT adaptation, reverting delta to pre-inference state. Call within 30 seconds if recommendation was false or quality was poor.");
+      $mcpDescription("Rollback a pending TTT adaptation, restoring the tenant delta accumulator to its pre-inference state. Call within 30 seconds if recommendation was false or quality was poor.");
     reset @6 :Void
-      $mcpDescription("Clear a tenant's accumulated delta, resetting to base model weights.");
+      $mcpDescription("Clear the tenant delta accumulator, resetting all accumulated training to zero.");
     status @7 :Void
-      $mcpDescription("Get status of a tenant's accumulated TTT delta: step count, loss improvement, drift metrics. Use to decide if adaptations should be saved permanently via saveAdaptation.");
+      $mcpDescription("Get tenant delta accumulator metrics: step count, loss improvement, drift. Use to decide if adaptations should be persisted via ttt.save or ttt.export.");
     save @8 :SaveAdaptationRequest
-      $mcpDescription("Save accumulated TTT adaptations as a permanent LoRA adapter file using DO-Merge strategy. Call getDeltaStatus first to verify quality. The adapter is committed to the model's git repository.");
+      $mcpDescription("Merge the tenant delta accumulator into an on-disk adapter file using a configurable merge strategy (replace/additive/do_merge). For incremental refinement of existing adapters. Call ttt.status first to verify quality. The result is committed to the model's git repository.");
     snapshot @9 :Void
-      $mcpDescription("Snapshot current delta to content-addressed storage without merging into an adapter.");
+      $mcpDescription("Snapshot the tenant delta accumulator to content-addressed storage without merging into an adapter file.");
     export @10 :TttExportRequest
-      $mcpDescription("Export TTT delta as a PEFT-compatible adapter directory (adapter_config.json + adapter_model.safetensors). The exported adapter can be loaded via peft.load.");
+      $mcpDescription("Export the tenant delta accumulator as a standalone PEFT-compatible adapter directory (adapter_config.json + adapter_model.safetensors). For interop with HuggingFace and external tools. The exported adapter can be reloaded via adapter.load.");
+    writeTttConfig @11 :WriteTttConfigRequest
+      $mcpDescription("Write hyprstream_training configuration to the model worktree's config.json and optionally reload. Required before ttt.train or TTT-enabled inference. Sets training mode to test_time_training and configures LoRA rank/alpha, target modules, and learning rate.");
   }
 }
 
 # =============================================================================
-# PEFT (Parameter-Efficient Fine-Tuning) scoped client
+# Adapter scoped client (base_delta register)
 # =============================================================================
 
-# PEFT-scoped request: adapter management operations on a loaded model.
-# Works with PEFT-compatible adapter directories (adapter_config.json +
-# adapter_model.safetensors).
-struct PeftRequest {
+# Adapter-scoped request: manage the base_delta register (the loaded adapter
+# applied to all inference) and inspect on-disk adapter files.
+#
+# The base_delta is a LoRA weight delta loaded from a PEFT-compatible adapter
+# directory. It is applied to all inference requests. If a per-tenant TTT
+# delta also exists, the two are composed at inference time.
+struct AdapterRequest {
   modelRef @0 :Text;
   union {
     load @1 :Text
-      $mcpDescription("Load a PEFT adapter from a directory (relative path within model worktree, e.g. 'adapters/my-adapter')");
+      $mcpDescription("Load a PEFT adapter from disk into the base_delta register. Applied to all inference until unloaded. Path is relative within the model worktree (e.g. 'adapters/my-adapter').");
     unload @2 :Void
-      $mcpDescription("Unload the current LoRA adapter from memory");
-    has @3 :Void
-      $mcpDescription("Check if a LoRA adapter is currently loaded");
-    check @4 :Text
-      $mcpDescription("Validate a path as a PEFT adapter directory and return adapter info (rank, alpha, target modules, base model)");
-    merge @5 :PeftMergeRequest
-      $mcpDescription("Merge a PEFT adapter into the base model weights (experimental)");
+      $mcpDescription("Clear the base_delta register, removing the loaded adapter from GPU/CPU memory.");
+    status @3 :Void
+      $mcpDescription("Check if a LoRA adapter is currently loaded in the base_delta register.");
+    inspect @4 :Text
+      $mcpDescription("Validate an on-disk PEFT adapter directory and return its metadata (rank, alpha, target modules, base model). Does not load anything into memory.");
+    merge @5 :AdapterMergeRequest
+      $mcpDescription("Read a PEFT adapter from disk and merge it into the currently loaded base_delta register using a configurable merge strategy (replace/additive/do_merge). Requires an adapter already loaded via adapter.load.");
   }
 }
 
@@ -102,7 +107,7 @@ struct InferRequest {
   modelRef @0 :Text;
   union {
     generateStream @1 :GenerateRequest
-      $mcpDescription("Run inference with automatic domain adaptation. When TTT is enabled, the model adapts to your prompt before responding. If autoCommit is false (default), the adaptation is PENDING — check onlineTrainingMetrics.recommendation in the response, then call commitAdaptation (if true) or rollbackAdaptation (if false). Pending adaptations auto-rollback after 30 seconds.");
+      $mcpDescription("Run inference with automatic domain adaptation. When TTT is enabled, the model adapts to your prompt before responding. If autoCommit is false (default), the adaptation is PENDING — check onlineTrainingMetrics.recommendation in the response, then call ttt.commit (if true) or ttt.rollback (if false). Pending adaptations auto-rollback after 30 seconds.");
     applyChatTemplate @2 :ApplyChatTemplateRequest
       $mcpDescription("Apply chat template to messages for a loaded model");
     status @3 :Void
@@ -126,7 +131,7 @@ struct ModelResponse {
     listResult @4 :ModelListResponse;
     healthCheckResult @5 :ModelHealthStatus;
     tttResult @6 :TttResponse;
-    peftResult @7 :PeftResponse;
+    adapterResult @7 :AdapterResponse;
     inferResult @8 :InferResponse;
   }
 }
@@ -135,7 +140,7 @@ struct ModelResponse {
 struct TttResponse {
   union {
     error @0 :ErrorInfo;
-    create @1 :Void;
+    init @1 :Void;
     train @2 :TrainStepResponse;
     trainStream @3 :StreamInfo;
     commit @4 :Void;
@@ -145,17 +150,18 @@ struct TttResponse {
     save @8 :SaveAdaptationResponse;
     snapshot @9 :SnapshotDeltaResponse;
     export @10 :TttExportResponse;
+    writeTttConfig @11 :Void;
   }
 }
 
-# PEFT scoped response
-struct PeftResponse {
+# Adapter scoped response
+struct AdapterResponse {
   union {
     error @0 :ErrorInfo;
     load @1 :Void;
     unload @2 :Void;
-    has @3 :Bool;
-    check @4 :PeftAdapterInfo;
+    status @3 :Bool;
+    inspect @4 :AdapterInfo;
     merge @5 :Void;
   }
 }
@@ -295,8 +301,8 @@ struct ApplyChatTemplateRequest {
   toolsJson @2 :Text $optional;  # JSON-serialized tools array (empty string = no tools)
 }
 
-# LoRA adapter configuration for creation
-struct CreateLoraRequest {
+# LoRA training initialization configuration
+struct InitLoraRequest {
   rank @0 :UInt32 $paramDescription("LoRA rank (e.g., 8, 16, 32)");
   alpha @1 :Float32 $optional $paramDescription("LoRA alpha scaling factor");
   dropout @2 :Float32 $optional $paramDescription("Dropout rate during training");
@@ -383,11 +389,24 @@ struct TttExportResponse {
   contentHash @1 :Text;
 }
 
+# Write TTT configuration to model's config.json
+struct WriteTttConfigRequest {
+  learningRate @0 :Float64;
+  gradientSteps @1 :UInt32;
+  maxGradNorm @2 :Float64;
+  minInputLength @3 :UInt32;
+  maxTttContext @4 :UInt32;
+  loraRank @5 :UInt32;
+  loraAlpha @6 :Float32;
+  targetModules @7 :List(Text);
+  autoReload @8 :Bool;
+}
+
 # =============================================================================
-# PEFT Adapter Info / Merge
+# Adapter Info / Merge
 # =============================================================================
 
-struct PeftAdapterInfo {
+struct AdapterInfo {
   name @0 :Text;              # Directory name
   path @1 :Text;              # Relative path within worktree
   rank @2 :UInt32;
@@ -396,9 +415,10 @@ struct PeftAdapterInfo {
   baseModel @5 :Text;         # base_model_name_or_path from config
 }
 
-struct PeftMergeRequest {
+struct AdapterMergeRequest {
   adapterName @0 :Text $paramDescription("Adapter directory name to merge");
   weight @1 :Float32 $optional $paramDescription("Merge weight 0.0-1.0 (default: 1.0 = full merge)");
+  strategy @2 :Text $optional $paramDescription("Merge strategy: 'replace', 'additive', or 'do_merge' (default: 'do_merge')");
 }
 
 # =============================================================================

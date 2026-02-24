@@ -115,7 +115,7 @@ pub use types::{
     FsDirEntryInfo,
 };
 
-pub use inference::{InferenceService, InferenceZmqClient, INFERENCE_ENDPOINT};
+pub use inference::{InferenceService, InferenceServiceConfig, InferenceZmqClient, INFERENCE_ENDPOINT};
 pub use registry::RegistryService;
 pub use policy::PolicyService;
 pub use generated::policy_client::PolicyClient;

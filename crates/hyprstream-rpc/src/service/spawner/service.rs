@@ -59,11 +59,14 @@ pub trait Spawnable: Send + 'static {
 // Blanket Spawnable impl for ZmqService
 // ============================================================================
 
-/// Every `ZmqService` is automatically `Spawnable`.
+/// Every `ZmqService + Send + Sync` is automatically `Spawnable`.
 ///
 /// This blanket implementation eliminates the need for wrapper types.
 /// Services that implement `ZmqService` include their infrastructure
 /// (context, transport, verifying_key) and can be spawned directly.
+///
+/// Services not satisfying `Send + Sync` (e.g., those using `Rc` or `!Send` fields)
+/// must implement `Spawnable` directly (as `InferenceServiceConfig` does).
 ///
 /// # Example
 ///
@@ -81,7 +84,7 @@ pub trait Spawnable: Send + 'static {
 /// // Spawn directly - no wrapping needed!
 /// manager.spawn(Box::new(service)).await?;
 /// ```
-impl<S: ZmqService> Spawnable for S {
+impl<S: ZmqService + Send + Sync> Spawnable for S {
     fn name(&self) -> &str {
         ZmqService::name(self)
     }
@@ -276,6 +279,161 @@ impl Spawnable for ProxyService {
     }
 }
 
+// ============================================================================
+// LoadBalancerService - ROUTER/DEALER Load Balancer
+// ============================================================================
+
+/// ROUTER/DEALER load balancer for distributing REQ/REP traffic across N workers.
+///
+/// Architecture:
+/// ```text
+///   Client (REQ) ──connect──► ROUTER (bind) ═══proxy═══ DEALER (bind) ◄──connect── Worker (REP)
+/// ```
+///
+/// - Clients connect to the ROUTER endpoint (auto-discovered via registry as `SocketKind::Rep`)
+/// - Workers connect their REP sockets to the DEALER backend endpoint
+/// - `zmq::proxy_steerable()` handles fair-queuing distribution (LRU among ready workers)
+/// - Wire-compatible: no changes needed to generated clients or handlers
+///
+/// Uses the same `zmq::proxy_steerable()` + PAIR shutdown pattern as `ProxyService`.
+pub struct LoadBalancerService {
+    /// Service name (for logging and registry)
+    name: String,
+    /// ZMQ context
+    context: Arc<zmq::Context>,
+    /// Frontend: ROUTER socket, clients connect here with REQ
+    frontend_transport: TransportConfig,
+    /// Backend: DEALER socket, workers connect here with REP
+    backend_transport: TransportConfig,
+}
+
+impl LoadBalancerService {
+    /// Create a new load balancer service.
+    ///
+    /// # Arguments
+    /// * `name` - Service name for logging and registry
+    /// * `context` - ZMQ context (shared for inproc connectivity)
+    /// * `frontend` - Transport for ROUTER socket (clients connect here)
+    /// * `backend` - Transport for DEALER socket (workers connect here)
+    pub fn new(
+        name: impl Into<String>,
+        context: Arc<zmq::Context>,
+        frontend: TransportConfig,
+        backend: TransportConfig,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            context,
+            frontend_transport: frontend,
+            backend_transport: backend,
+        }
+    }
+
+    /// Get the backend transport that workers should connect to.
+    pub fn backend_transport(&self) -> &TransportConfig {
+        &self.backend_transport
+    }
+}
+
+impl Spawnable for LoadBalancerService {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn context(&self) -> &Arc<zmq::Context> {
+        &self.context
+    }
+
+    fn registrations(&self) -> Vec<(SocketKind, TransportConfig)> {
+        vec![
+            // Register ROUTER as Rep — clients discover via SocketKind::Rep
+            // and connect with REQ (wire-compatible with ROUTER)
+            (SocketKind::Rep, self.frontend_transport.clone()),
+            // Register backend for internal worker discovery
+            (SocketKind::Dealer, self.backend_transport.clone()),
+        ]
+    }
+
+    fn run(
+        self: Box<Self>,
+        shutdown: Arc<Notify>,
+        on_ready: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<()> {
+        // ROUTER frontend: clients connect with REQ
+        let mut router = self.context.socket(zmq::ROUTER)
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("ROUTER socket: {e}")))?;
+
+        // DEALER backend: workers connect with REP
+        let mut dealer = self.context.socket(zmq::DEALER)
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("DEALER socket: {e}")))?;
+
+        // PAIR control socket for graceful shutdown
+        let mut ctrl = self.context.socket(zmq::PAIR)
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("CTRL socket: {e}")))?;
+        let ctrl_endpoint = format!("inproc://lb-ctrl-{}", self.name);
+        ctrl.bind(&ctrl_endpoint)
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("CTRL bind: {e}")))?;
+
+        // Bind ROUTER frontend
+        self.frontend_transport.bind(&mut router)
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("ROUTER bind: {e}")))?;
+        let frontend_ep = self.frontend_transport.zmq_endpoint();
+
+        // Bind DEALER backend
+        self.backend_transport.bind(&mut dealer)
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("DEALER bind: {e}")))?;
+        let backend_ep = self.backend_transport.zmq_endpoint();
+
+        tracing::info!(
+            "LoadBalancer {} started: ROUTER={}, DEALER={}",
+            self.name,
+            frontend_ep,
+            backend_ep,
+        );
+
+        // Signal ready after sockets are bound
+        if let Some(tx) = on_ready {
+            let _ = tx.send(());
+        }
+
+        // Notify systemd
+        let _ = crate::notify::ready();
+
+        // Spawn shutdown listener (same pattern as ProxyService)
+        let ctrl_sender = self.context.socket(zmq::PAIR)
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("CTRL sender: {e}")))?;
+        ctrl_sender.connect(&ctrl_endpoint)
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("CTRL connect: {e}")))?;
+
+        let name_clone = self.name.clone();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!("Failed to create LB shutdown listener runtime: {e}");
+                    return;
+                }
+            };
+            rt.block_on(shutdown.notified());
+            tracing::debug!("Sending TERMINATE to LoadBalancer {}", name_clone);
+            let _ = ctrl_sender.send("TERMINATE", 0);
+        });
+
+        // zmq::proxy_steerable does fair-queuing distribution.
+        // ROUTER preserves client identity for reply routing.
+        // DEALER routes to next available (LRU) worker.
+        tracing::debug!("LoadBalancer {} calling proxy_steerable", self.name);
+        zmq::proxy_steerable(&mut router, &mut dealer, &mut ctrl)
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("proxy: {e}")))?;
+
+        tracing::info!("LoadBalancer {} stopped", self.name);
+        Ok(())
+    }
+}
+
 /// Mode for spawning services.
 #[derive(Debug, Clone)]
 pub enum ServiceMode {
@@ -412,15 +570,32 @@ impl ServiceSpawner {
     ) -> Result<SpawnedService> {
         let name = service.name().to_owned();
         let name_for_spawn = name.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
         let shutdown = Arc::new(Notify::new());
         let shutdown_clone = shutdown.clone();
 
-        // Spawn task that runs the service
-        let join_handle = tokio::spawn(async move {
-            if let Err(e) = Box::new(service).run(shutdown_clone, None) {
+        // Spawn on the blocking thread pool.
+        // Spawnable::run() creates a new_current_thread runtime and calls block_on(),
+        // which would block a worker thread (or panic) if called directly in tokio::spawn.
+        let blocking_handle = tokio::task::spawn_blocking(move || {
+            if let Err(e) = Box::new(service).run(shutdown_clone, Some(ready_tx)) {
                 tracing::error!("Service {} failed: {}", name_for_spawn, e);
             }
         });
+
+        // Wrap in tokio::spawn so ServiceHandle gets a JoinHandle<()> (not JoinHandle<Result<(), JoinError>>)
+        let join_handle = tokio::spawn(async move {
+            if let Err(e) = blocking_handle.await {
+                tracing::error!("Service blocking task panicked: {}", e);
+            }
+        });
+
+        // Wait for socket to bind before returning
+        if ready_rx.await.is_err() {
+            return Err(crate::error::RpcError::SpawnFailed(
+                "service task exited before ready".to_owned(),
+            ));
+        }
 
         // Create a handle wrapper
         let handle = crate::service::ServiceHandle::from_task(join_handle, shutdown);

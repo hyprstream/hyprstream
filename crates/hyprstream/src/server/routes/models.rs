@@ -11,7 +11,7 @@ use axum::{
 use chrono;
 use serde::{Deserialize, Serialize};
 
-/// Resolve a ModelRef to its worktree path via registry.
+/// Resolve a ModelRef to its worktree path (locally derived, not from RPC).
 async fn resolve_model_path(
     registry: &crate::services::GenRegistryClient,
     model_ref: &crate::storage::ModelRef,
@@ -22,11 +22,15 @@ async fn resolve_model_path(
         crate::storage::GitRef::Branch(name) => name.clone(),
         _ => repo.get_head().await?,
     };
+    // Verify worktree exists
     let wts = repo.list_worktrees().await?;
-    wts.iter()
-        .find(|wt| wt.branch_name == branch)
-        .map(|wt| wt.path.clone())
-        .ok_or_else(|| anyhow::anyhow!("worktree for {}:{} not found", model_ref.model, branch))
+    if !wts.iter().any(|wt| wt.branch_name == branch) {
+        anyhow::bail!("worktree for {}:{} not found", model_ref.model, branch);
+    }
+    // Derive path locally
+    let storage_paths = StoragePaths::new()?;
+    Ok(storage_paths.worktree_path(&model_ref.model, &branch)?
+        .to_string_lossy().to_string())
 }
 
 /// Create model management router
@@ -103,7 +107,7 @@ async fn list_models(
                             architecture: "language_model".to_owned(),
                             size_bytes: 0,
                             is_cached: true,
-                            local_path: Some(wt.path.clone()),
+                            local_path: None, // path no longer exposed via RPC
                         });
                     }
                 }
@@ -148,17 +152,7 @@ async fn get_model_info(
     use crate::storage::model_ref::ModelRef;
     if let Ok(model_ref) = ModelRef::parse(&id) {
         let path_result: Result<String, anyhow::Error> = async {
-            let tracked = state.registry.get_by_name(&model_ref.model).await?;
-            let repo = state.registry.repo(&tracked.id);
-            let branch = match &model_ref.git_ref {
-                crate::storage::GitRef::Branch(name) => name.clone(),
-                _ => repo.get_head().await?,
-            };
-            let wts = repo.list_worktrees().await?;
-            wts.iter()
-                .find(|wt| wt.branch_name == branch)
-                .map(|wt| wt.path.clone())
-                .ok_or_else(|| anyhow::anyhow!("worktree not found"))
+            resolve_model_path(&state.registry, &model_ref).await
         }.await;
         if let Ok(_path) = path_result {
             // Create metadata for the found model
