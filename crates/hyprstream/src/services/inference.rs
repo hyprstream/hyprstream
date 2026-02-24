@@ -663,6 +663,7 @@ impl InferenceService {
     /// - Ok(Some(result)) if TTT was configured and ran (or was skipped)
     /// - Ok(None) if TTT is not configured
     /// - Err(e) if TTT failed unexpectedly
+    ///
     /// Apply TTT adaptation with per-request overrides.
     ///
     /// Uses subject-specific delta pool for isolated per-session adaptation.
@@ -693,10 +694,11 @@ impl InferenceService {
             .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
         let input_tokens: Vec<u32> = encoding.get_ids().to_vec();
 
-        let engine = self.engine.read();
-
         // Ensure pool has capacity before creating/accessing delta
+        // (must happen before acquiring engine read lock to avoid holding lock across await)
         pool.ensure_capacity().await?;
+
+        let engine = self.engine.read();
         let delta_arc = pool.get_or_create(subject)?;
 
         // Lock the delta and run adaptation
@@ -835,6 +837,7 @@ impl InferenceService {
     /// tokio::sync::RwLock allows concurrent readers, but write-lock requests (createLora) will
     /// block until all active streams complete. GPU-intensive TTT is deferred to this continuation
     /// to avoid blocking the ZMQ REQ/REP handler.
+    #[allow(clippy::await_holding_lock)]  // engine read-lock must be held while stream borrows it
     async fn execute_stream(&self, pending: PendingWork) {
         use futures::StreamExt;
 
@@ -934,7 +937,8 @@ impl InferenceService {
             return;
         }
 
-        // Run the stream with StreamChannel's async publisher callback
+        // Run the stream with StreamChannel's async publisher callback.
+        // Engine read-lock held across await: generate_with_delta returns a stream borrowing engine.
         let engine = self.engine.read();
         let stream_result = engine.generate_with_delta(request, delta);
 
@@ -1028,7 +1032,7 @@ impl InferenceService {
                     // Serialize training result as JSON for the completion payload
                     let payload = serde_json::to_vec(&result)
                         .unwrap_or_else(|e| format!("{{\"error\":\"serialize failed: {e}\"}}").into_bytes());
-                    publisher.complete_ref(&payload).await.map(|()| ())
+                    publisher.complete_ref(&payload).await
                 }
                 Err(e) => Err(e),  // framework sends Error frame automatically
             };

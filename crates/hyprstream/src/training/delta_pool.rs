@@ -284,54 +284,14 @@ impl DeltaPool {
         let id_filename = Self::sanitize_filename(&id.to_string());
 
         // Auto-snapshot to file before eviction
-        let snapshot_path = {
+        // Extract data under lock, then release before any async I/O
+        let snapshot_data = {
             let d = delta.lock();
             if d.accumulated_steps > 0 {
-                let snapshot_file = self
-                    .snapshots_dir
-                    .join(format!("{}.safetensors", id_filename));
-                if let Some(ref fs) = self.fs {
-                    let rel_path =
-                        format!("adapters/.snapshots/{}.safetensors", id_filename);
+                if self.fs.is_some() {
                     let state_dict = d.extract_state_dict();
                     let memory_bytes = d.memory_bytes();
-                    drop(d); // Release lock before async I/O
-
-                    if memory_bytes > MAX_SNAPSHOT_BYTES {
-                        tracing::warn!(
-                            "Delta '{}' exceeds max snapshot size ({} bytes > {}), skipping snapshot",
-                            id, memory_bytes, MAX_SNAPSHOT_BYTES
-                        );
-                        None
-                    } else {
-                        match async {
-                            fs.mkdir_p("adapters/.snapshots").await.map_err(|e| {
-                                anyhow::anyhow!("FsOps mkdir failed: {}", e)
-                            })?;
-                            let bytes = serialize_state_dict_to_bytes(&state_dict)?;
-                            fs.write_file_chunked(&rel_path, &bytes).await.map_err(
-                                |e| anyhow::anyhow!("FsOps write_file failed: {}", e),
-                            )?;
-                            Ok::<(), anyhow::Error>(())
-                        }
-                        .await
-                        {
-                            Ok(()) => {
-                                tracing::info!(
-                                    "Auto-snapshot delta '{}' before eviction via FsOps: {}",
-                                    id, rel_path
-                                );
-                                Some(snapshot_file)
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to snapshot delta '{}' via FsOps: {}",
-                                    id, e
-                                );
-                                None
-                            }
-                        }
-                    }
+                    Some((state_dict, memory_bytes))
                 } else {
                     tracing::warn!(
                         "FsOps not available — skipping snapshot for delta '{}' during eviction",
@@ -342,6 +302,53 @@ impl DeltaPool {
             } else {
                 None // No accumulated steps, skip snapshot
             }
+        }; // lock released here
+
+        let snapshot_path = if let Some((state_dict, memory_bytes)) = snapshot_data {
+            let snapshot_file = self
+                .snapshots_dir
+                .join(format!("{}.safetensors", id_filename));
+            // Safety: snapshot_data is Some only when self.fs.is_some() was true above
+            let Some(ref fs) = self.fs else { unreachable!() };
+            let rel_path = format!("adapters/.snapshots/{}.safetensors", id_filename);
+
+            if memory_bytes > MAX_SNAPSHOT_BYTES {
+                tracing::warn!(
+                    "Delta '{}' exceeds max snapshot size ({} bytes > {}), skipping snapshot",
+                    id, memory_bytes, MAX_SNAPSHOT_BYTES
+                );
+                None
+            } else {
+                match async {
+                    fs.mkdir_p("adapters/.snapshots").await.map_err(|e| {
+                        anyhow::anyhow!("FsOps mkdir failed: {}", e)
+                    })?;
+                    let bytes = serialize_state_dict_to_bytes(&state_dict)?;
+                    fs.write_file_chunked(&rel_path, &bytes).await.map_err(
+                        |e| anyhow::anyhow!("FsOps write_file failed: {}", e),
+                    )?;
+                    Ok::<(), anyhow::Error>(())
+                }
+                .await
+                {
+                    Ok(()) => {
+                        tracing::info!(
+                            "Auto-snapshot delta '{}' before eviction via FsOps: {}",
+                            id, rel_path
+                        );
+                        Some(snapshot_file)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to snapshot delta '{}' via FsOps: {}",
+                            id, e
+                        );
+                        None
+                    }
+                }
+            }
+        } else {
+            None
         };
 
         // Invalidate dependent KV caches

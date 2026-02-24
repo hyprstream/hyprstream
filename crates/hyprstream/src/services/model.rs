@@ -304,7 +304,7 @@ impl ModelService {
 
             // Spawn load balancer (ROUTER frontend, DEALER backend)
             let lb = hyprstream_rpc::service::spawner::LoadBalancerService::new(
-                &format!("inference-{safe_name}-lb"),
+                format!("inference-{safe_name}-lb"),
                 Arc::clone(&zmq_ctx),
                 frontend_transport,
                 backend_transport.clone(),
@@ -873,10 +873,10 @@ impl AdapterHandler for ModelService {
 
         // Extract PEFT fields from config
         let rank = config_json.get("r")
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .unwrap_or(0) as u32;
         let lora_alpha = config_json.get("lora_alpha")
-            .and_then(|v| v.as_f64())
+            .and_then(serde_json::Value::as_f64)
             .unwrap_or(0.0) as f32;
         let target_modules = config_json.get("target_modules")
             .and_then(|v| v.as_array())

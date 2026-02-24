@@ -472,7 +472,7 @@ pub async fn handle_list(
                 let display_name = format!("{}:{}", name, branch_name);
 
                 // Detect capabilities from worktree path (resolved locally)
-                let wt_path = storage_paths.worktree_path(&name, &wt.branch_name)
+                let wt_path = storage_paths.worktree_path(name, &wt.branch_name)
                     .unwrap_or_else(|_| PathBuf::from("."));
                 let detected = archetype_registry.detect(&wt_path);
                 let domains = detected.to_detected_domains();

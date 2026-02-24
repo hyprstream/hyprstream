@@ -626,7 +626,7 @@ impl TestTimeTrainer {
         // Diagnostic: log autograd state before first backward pass
         if delta.accumulated_steps == 0 {
             let vars = delta.vs.trainable_variables();
-            let any_requires_grad = vars.iter().any(|v| v.requires_grad());
+            let any_requires_grad = vars.iter().any(tch::Tensor::requires_grad);
             tracing::info!(
                 "[TTT] Pre-backward check: loss.requires_grad={}, vars_require_grad={}, num_vars={}",
                 initial_loss_tensor.requires_grad(), any_requires_grad, vars.len()

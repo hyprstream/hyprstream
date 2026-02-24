@@ -539,10 +539,16 @@ pub async fn handle_worker_terminal(
         // Mini tokio runtime for async TMQ subscriber on this dedicated thread.
         // We use std::thread (not tokio::spawn) because the outer function blocks
         // on stdin which would starve the tokio runtime.
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("stream recv runtime");
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("failed to build stream recv runtime: {e}");
+                return;
+            }
+        };
         rt.block_on(async move {
             use futures::StreamExt;
             while let Some(payload) = stream_handle.next().await {

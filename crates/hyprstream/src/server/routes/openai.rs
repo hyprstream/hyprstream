@@ -255,7 +255,7 @@ async fn resolve_model_path(
         }
         // Derive path locally
         let storage_paths = crate::storage::StoragePaths::new()?;
-        Ok(storage_paths.worktree_path(&model_ref.model, &branch)?)
+        storage_paths.worktree_path(&model_ref.model, &branch)
     }.await;
 
     match path_result {
@@ -598,7 +598,7 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
             }
             // Derive path locally
             let storage_paths = crate::storage::StoragePaths::new()?;
-            Ok(storage_paths.worktree_path(&model_ref.model, &branch)?)
+            storage_paths.worktree_path(&model_ref.model, &branch)
         }.await {
             Ok(path) => path,
             Err(e) => {

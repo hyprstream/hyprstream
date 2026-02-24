@@ -504,7 +504,7 @@ impl RegistryService {
                         "name": repo.name,
                         "url": repo.url,
                     });
-                    publisher.complete_ref(metadata.to_string().as_bytes()).await.map(|()| ())
+                    publisher.complete_ref(metadata.to_string().as_bytes()).await
                 }
                 Ok(Err(e)) => Err(e),  // framework sends Error frame automatically
                 Err(e) => Err(anyhow!("Clone task panicked: {}", e)),  // framework sends Error frame
@@ -2516,7 +2516,7 @@ impl WorktreeHandler for RegistryService {
         let id = Self::parse_repo_id(repo_id)?;
         let files = data.files.clone();
         self.with_worktree_blocking(&id, name, move |repo| {
-            let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+            let file_refs: Vec<&str> = files.iter().map(std::string::String::as_str).collect();
             crate::git::ops::stage_files(&repo, &file_refs)
         }).await
     }
