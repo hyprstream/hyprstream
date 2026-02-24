@@ -572,7 +572,10 @@ impl RequestLoop {
                             // Acquire owned permit for backpressure on in-flight continuations.
                             // OwnedSemaphorePermit lives for the full duration of the future,
                             // ensuring the bound is on concurrent running continuations.
-                            let _permit = sem.acquire_owned().await.expect("continuation semaphore closed");
+                            let Ok(_permit) = sem.acquire_owned().await else {
+                                warn!("continuation semaphore closed, dropping continuation");
+                                return;
+                            };
                             future.await;
                             // _permit dropped here — releases slot for next continuation
                         });
