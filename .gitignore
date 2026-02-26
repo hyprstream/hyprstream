@@ -5,6 +5,7 @@
 .context
 _future
 target
+codegen-out
 models
 libtorch
 .cargo

@@ -53,6 +53,11 @@ pub struct ServiceContext {
 
     /// Models directory path
     models_dir: std::path::PathBuf,
+
+    /// Optional QUIC/WebTransport config for unified request loops.
+    /// When `Some`, factory functions can create `UnifiedRequestLoop`
+    /// instead of standard `RequestLoop`.
+    quic_config: Option<crate::service::QuicLoopConfig>,
 }
 
 impl ServiceContext {
@@ -70,7 +75,27 @@ impl ServiceContext {
             verifying_key,
             ipc,
             models_dir,
+            quic_config: None,
         }
+    }
+
+    /// Set the QUIC/WebTransport configuration.
+    ///
+    /// When set, factory functions can create `UnifiedServiceConfig`
+    /// wrappers that enable QUIC alongside ZMQ.
+    pub fn with_quic(mut self, config: crate::service::QuicLoopConfig) -> Self {
+        self.quic_config = Some(config);
+        self
+    }
+
+    /// Get the QUIC config (if enabled).
+    pub fn quic_config(&self) -> Option<&crate::service::QuicLoopConfig> {
+        self.quic_config.as_ref()
+    }
+
+    /// Check if QUIC/WebTransport is enabled.
+    pub fn has_quic(&self) -> bool {
+        self.quic_config.is_some()
     }
 
     /// Get the shared ZMQ context.

@@ -210,6 +210,25 @@ pub enum ServiceAction {
         /// Callback endpoint for inference service callback mode
         #[arg(long)]
         callback: Option<String>,
+
+        /// Comma-separated list of services to start in multi-service foreground mode
+        ///
+        /// When used with --foreground, starts all listed services in a single process.
+        /// Example: --services registry,policy,model,streams,event
+        #[arg(long, value_delimiter = ',')]
+        services: Option<Vec<String>>,
+
+        /// Bind address for QUIC/WebTransport server (e.g., 127.0.0.1:4433)
+        ///
+        /// Enables WebTransport access to services via HTTP/3. Use port 0 for random port.
+        #[arg(long)]
+        quic_bind: Option<String>,
+
+        /// Print the SHA-256 hash of the QUIC TLS certificate and include it in startup output
+        ///
+        /// The hash is suitable for use in browser's serverCertificateHashes WebTransport option.
+        #[arg(long)]
+        print_cert_hash: bool,
     },
 
     /// Stop services

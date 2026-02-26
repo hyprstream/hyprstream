@@ -78,6 +78,11 @@ fn compile_capnp_schemas() {
                 println!("cargo:warning=Failed to parse schema for {name}: {e}");
                 println!("cargo:warning=Falling back to text parsing (annotations not available)");
             }
+
+            // 3. Copy CGR to stable codegen-out/ for TypeScript codegen
+            let codegen_dir = Path::new(&manifest_dir).join("../../codegen-out");
+            let _ = std::fs::create_dir_all(&codegen_dir);
+            let _ = std::fs::copy(&cgr_path, codegen_dir.join(format!("{name}.cgr")));
         }
     }
 }

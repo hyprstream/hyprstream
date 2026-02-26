@@ -1,8 +1,14 @@
-//! Shared Cap'n Proto build helpers for annotation extraction.
+//! Shared Cap'n Proto build helpers for annotation extraction and TypeScript codegen.
 //!
-//! Extracts schema metadata (structs, enums, annotations) from Cap'n Proto
-//! CodeGeneratorRequest (CGR) files and writes them as JSON for use by
-//! `generate_rpc_service!` proc macro.
+//! This crate provides:
+//! - Schema types (`ParsedSchema`, `StructDef`, `FieldDef`, etc.) shared between
+//!   the proc-macro derive crate and the TypeScript codegen binary
+//! - CGR (CodeGeneratorRequest) parsing with full wire format info
+//! - Metadata JSON extraction for proc-macro annotation merging
+//! - TypeScript codegen from parsed schemas (via the `hyprstream-ts-codegen` binary)
+
+pub mod schema;
+pub mod util;
 
 use std::path::Path;
 

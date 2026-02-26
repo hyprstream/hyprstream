@@ -35,7 +35,7 @@ pub use backend::{derive_key, keyed_mac, keyed_mac_truncated};
 pub use hmac::{ChainedStreamHmac, HmacKey};
 pub use key_exchange::{derive_stream_keys, DefaultKeyExchange, KeyExchange, SharedSecret, StreamKeys};
 pub use signing::{
-    generate_signing_keypair, sign_message, signing_key_from_bytes, verify_message,
+    generate_signing_keypair, signing_key_from_bytes,
     verifying_key_from_bytes, SigningKey, VerifyingKey,
 };
 

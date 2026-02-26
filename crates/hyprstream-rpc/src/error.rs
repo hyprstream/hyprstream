@@ -68,7 +68,8 @@ pub enum RpcError {
     #[error("invalid operation: {0}")]
     InvalidOperation(String),
 
-    /// ZMQ error.
+    /// ZMQ error (native only — zmq crate unavailable on wasm32).
+    #[cfg(not(target_arch = "wasm32"))]
     #[error("zmq error: {0}")]
     Zmq(#[from] zmq::Error),
 

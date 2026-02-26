@@ -4,11 +4,15 @@
 //! - `Transport` / `AsyncTransport` traits for generic transport abstraction
 //! - `TransportConfig` for unified endpoint configuration
 //! - Systemd socket activation support via `SystemdFd` variant
+//! - QUIC transport via `zmtp_quic` module (ZMTP 3.1 over QUIC)
 //! - Raw socket options via `sockopt` submodule
 
 mod traits;
 pub mod sockopt;
+pub mod zmtp_quic;
+pub mod quic_stream_bridge;
 
+use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 
@@ -131,6 +135,20 @@ pub enum EndpointType {
         /// IPC path for client connections
         client_path: PathBuf,
     },
+
+    /// QUIC transport endpoint (ZMTP 3.1 over QUIC).
+    ///
+    /// Provides TLS 1.3 encryption built into the transport layer,
+    /// replacing CurveZMQ. ZMTP handshake uses NULL mechanism since
+    /// QUIC already provides wire confidentiality.
+    ///
+    /// Format: `quic://hostname:port`
+    Quic {
+        /// Socket address to bind (server) or connect (client)
+        addr: SocketAddr,
+        /// Server hostname for TLS certificate validation
+        server_name: String,
+    },
 }
 
 impl TransportConfig {
@@ -169,6 +187,26 @@ impl TransportConfig {
                 client_path: client_path.into(),
             },
             curve: None,
+            bind_mode: BindMode::Bind,
+        }
+    }
+
+    /// Create a QUIC transport endpoint.
+    ///
+    /// QUIC provides TLS 1.3 encryption at the transport layer, so CurveZMQ
+    /// is not needed (NULL mechanism is used in ZMTP handshake).
+    ///
+    /// # Arguments
+    ///
+    /// * `addr` - Socket address to bind (server) or connect (client)
+    /// * `server_name` - Server hostname for TLS certificate validation
+    pub fn quic(addr: SocketAddr, server_name: impl Into<String>) -> Self {
+        Self {
+            endpoint: EndpointType::Quic {
+                addr,
+                server_name: server_name.into(),
+            },
+            curve: None, // QUIC has TLS 1.3 built-in, no CurveZMQ needed
             bind_mode: BindMode::Bind,
         }
     }
@@ -240,12 +278,16 @@ impl TransportConfig {
     /// Get the ZMQ endpoint string for this configuration.
     ///
     /// For `SystemdFd`, returns the client IPC path.
+    /// For `Quic`, returns a descriptive string (not a valid ZMQ endpoint).
     pub fn zmq_endpoint(&self) -> String {
         match &self.endpoint {
             EndpointType::Inproc { endpoint } => format!("inproc://{endpoint}"),
             EndpointType::Ipc { path } => format!("ipc://{}", path.display()),
             EndpointType::SystemdFd { client_path, .. } => {
                 format!("ipc://{}", client_path.display())
+            }
+            EndpointType::Quic { addr, server_name } => {
+                format!("quic://{server_name}:{addr}")
             }
         }
     }
@@ -322,7 +364,8 @@ impl TransportConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error if binding fails or directory creation fails.
+    /// Returns an error if binding fails, directory creation fails,
+    /// or the endpoint type is `Quic` (use `QuicRep::bind` instead).
     pub fn bind(&self, socket: &mut zmq::Socket) -> anyhow::Result<()> {
         // Apply CurveZMQ first (before bind)
         self.apply_curve(socket, true)?;
@@ -345,6 +388,9 @@ impl TransportConfig {
                 socket.bind(&self.zmq_endpoint())?;
                 Ok(())
             }
+            EndpointType::Quic { .. } => {
+                anyhow::bail!("QUIC endpoints require QuicRep::bind(), not ZMQ socket bind")
+            }
         }
     }
 
@@ -352,18 +398,33 @@ impl TransportConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error if connection fails.
+    /// Returns an error if connection fails or the endpoint type is `Quic`
+    /// (use `QuicReq::connect` instead).
     pub fn connect(&self, socket: &mut zmq::Socket) -> anyhow::Result<()> {
         // Apply CurveZMQ first (before connect)
         self.apply_curve(socket, false)?;
 
-        socket.connect(&self.zmq_endpoint())?;
-        Ok(())
+        match &self.endpoint {
+            EndpointType::Inproc { .. }
+            | EndpointType::Ipc { .. }
+            | EndpointType::SystemdFd { .. } => {
+                socket.connect(&self.zmq_endpoint())?;
+                Ok(())
+            }
+            EndpointType::Quic { .. } => {
+                anyhow::bail!("QUIC endpoints require QuicReq::connect(), not ZMQ socket connect")
+            }
+        }
     }
 
     /// Check if this is a systemd-activated endpoint.
     pub fn is_systemd_activated(&self) -> bool {
         matches!(&self.endpoint, EndpointType::SystemdFd { .. })
+    }
+
+    /// Check if this is a QUIC endpoint.
+    pub fn is_quic(&self) -> bool {
+        matches!(&self.endpoint, EndpointType::Quic { .. })
     }
 
 }
@@ -395,5 +456,16 @@ mod tests {
             "ipc:///run/hyprstream/policy.sock"
         );
         assert!(config.is_systemd_activated());
+    }
+
+    #[test]
+    fn test_quic_endpoint() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4433);
+        let config = TransportConfig::quic(addr, "hyprstream.local");
+        assert!(config.zmq_endpoint().starts_with("quic://hyprstream.local:"));
+        assert!(config.is_quic());
+        assert!(!config.is_systemd_activated());
     }
 }

@@ -93,6 +93,8 @@ pub fn parse_capnp_schema(text: &str, service_name: &str) -> Option<ParsedSchema
         structs: referenced,
         scoped_clients,
         enums,
+        request_struct: None,
+        response_struct: None,
     })
 }
 
@@ -207,7 +209,17 @@ pub fn parse_all_structs(text: &str) -> Vec<StructDef> {
                 }
             }
 
-            structs.push(StructDef { name, fields, has_union, domain_type: None, origin_file: None });
+            structs.push(StructDef {
+                name,
+                fields,
+                has_union,
+                domain_type: None,
+                origin_file: None,
+                data_words: 0,
+                pointer_words: 0,
+                discriminant_count: 0,
+                discriminant_offset: 0,
+            });
             i += 1;
         } else if line.starts_with("struct ") && line.ends_with('{') {
             // Multi-line struct
@@ -257,6 +269,10 @@ pub fn parse_all_structs(text: &str) -> Vec<StructDef> {
                 has_union,
                 domain_type: None,
                 origin_file: None,
+                data_words: 0,
+                pointer_words: 0,
+                discriminant_count: 0,
+                discriminant_offset: 0,
             });
         } else {
             i += 1;
@@ -358,7 +374,16 @@ pub fn parse_field_line(line: &str) -> Option<FieldDef> {
     let _ordinal: u32 = ordinal_str.parse().ok()?;
     let type_name = field_part[colon_pos + 1..].trim().to_owned();
 
-    Some(FieldDef { name, type_name, description: comment, fixed_size, optional })
+    Some(FieldDef {
+        name,
+        type_name,
+        description: comment,
+        fixed_size,
+        optional,
+        slot_offset: 0,
+        section: FieldSection::Data,
+        discriminant_value: 0xFFFF,
+    })
 }
 
 pub fn parse_union_variants(text: &str, struct_name: &str) -> Vec<UnionVariant> {

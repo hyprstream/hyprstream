@@ -4,6 +4,8 @@ use proc_macro2::TokenStream;
 use quote::quote;
 
 use crate::schema::types::{EnumDef, StructDef};
+#[cfg(test)]
+use crate::schema::types::{FieldDef, FieldSection};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CapnpType — Centralized type classification
@@ -168,53 +170,10 @@ impl CapnpType {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Name conversion
+// Name conversion — delegated to hyprstream_rpc_build::util for sharing
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Convert snake_case or camelCase to PascalCase.
-pub fn to_pascal_case(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut capitalize_next = true;
-
-    for c in s.chars() {
-        if c == '_' || c == '-' {
-            capitalize_next = true;
-        } else if capitalize_next {
-            result.push(c.to_ascii_uppercase());
-            capitalize_next = false;
-        } else {
-            result.push(c);
-        }
-    }
-
-    result
-}
-
-/// Convert PascalCase or camelCase to snake_case.
-pub fn to_snake_case(s: &str) -> String {
-    let mut result = String::with_capacity(s.len() + 4);
-    let chars: Vec<char> = s.chars().collect();
-
-    for (i, &c) in chars.iter().enumerate() {
-        if c.is_ascii_uppercase() {
-            if i > 0 && !chars[i - 1].is_ascii_uppercase() {
-                result.push('_');
-            }
-            if i > 0
-                && chars[i - 1].is_ascii_uppercase()
-                && i + 1 < chars.len()
-                && chars[i + 1].is_ascii_lowercase()
-            {
-                result.push('_');
-            }
-            result.push(c.to_ascii_lowercase());
-        } else {
-            result.push(c);
-        }
-    }
-
-    result
-}
+pub use hyprstream_rpc_build::util::{to_pascal_case, to_snake_case};
 
 /// Convert PascalCase to snake_case matching Cap'n Proto's Rust codegen naming.
 ///
@@ -242,20 +201,24 @@ pub fn rust_type_tokens(type_str: &str) -> TokenStream {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::schema::types::*;
 
     fn test_structs() -> Vec<StructDef> {
         vec![StructDef {
             name: "ModelInfo".into(),
             fields: vec![
-                FieldDef { name: "name".into(), type_name: "Text".into(), description: String::new(), fixed_size: None, optional: false },
-                FieldDef { name: "size".into(), type_name: "UInt64".into(), description: String::new(), fixed_size: None, optional: false },
+                FieldDef { name: "name".into(), type_name: "Text".into(), description: String::new(), fixed_size: None, optional: false, slot_offset: 0, section: FieldSection::Pointer, discriminant_value: 0xFFFF },
+                FieldDef { name: "size".into(), type_name: "UInt64".into(), description: String::new(), fixed_size: None, optional: false, slot_offset: 0, section: FieldSection::Data, discriminant_value: 0xFFFF },
             ],
             has_union: false,
             domain_type: None,
             origin_file: None,
+            data_words: 0,
+            pointer_words: 0,
+            discriminant_count: 0,
+            discriminant_offset: 0,
         }]
     }
 

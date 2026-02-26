@@ -434,6 +434,83 @@ impl Spawnable for LoadBalancerService {
     }
 }
 
+// ============================================================================
+// QuicServiceLoop — Spawnable wrapper for QUIC-only service loop
+// ============================================================================
+
+/// Spawnable wrapper that runs a ZmqService using `UnifiedRequestLoop`.
+///
+/// This is used when a service factory wants to create a `UnifiedRequestLoop`
+/// (ROUTER + QUIC) instead of the standard `RequestLoop` (REP-only).
+///
+/// Unlike the blanket `impl Spawnable for S: ZmqService` which always creates
+/// a `RequestLoop`, this explicitly creates a `UnifiedRequestLoop` with QUIC.
+pub struct UnifiedServiceConfig<S: ZmqService + Send + 'static> {
+    service: S,
+    quic_config: Option<crate::service::QuicLoopConfig>,
+}
+
+impl<S: ZmqService + Send + 'static> UnifiedServiceConfig<S> {
+    /// Create a unified service config with optional QUIC.
+    pub fn new(service: S, quic_config: Option<crate::service::QuicLoopConfig>) -> Self {
+        Self { service, quic_config }
+    }
+}
+
+impl<S: ZmqService + Send + Sync + 'static> Spawnable for UnifiedServiceConfig<S> {
+    fn name(&self) -> &str {
+        ZmqService::name(&self.service)
+    }
+
+    fn context(&self) -> &Arc<zmq::Context> {
+        ZmqService::context(&self.service)
+    }
+
+    fn registrations(&self) -> Vec<(SocketKind, TransportConfig)> {
+        vec![(SocketKind::Rep, ZmqService::transport(&self.service).clone())]
+    }
+
+    fn run(
+        self: Box<Self>,
+        shutdown: Arc<Notify>,
+        on_ready: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<()> {
+        let UnifiedServiceConfig { service, quic_config } = *self;
+        let transport = ZmqService::transport(&service).clone();
+        let context = Arc::clone(ZmqService::context(&service));
+        let signing_key = ZmqService::signing_key(&service);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| crate::error::RpcError::SpawnFailed(format!("runtime: {e}")))?;
+
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async move {
+            let mut runner = crate::service::UnifiedRequestLoop::new(
+                transport, context, signing_key,
+            );
+
+            if let Some(qc) = quic_config {
+                runner = runner.with_quic(qc);
+            }
+
+            match runner.run(service).await {
+                Ok(mut handle) => {
+                    if let Some(tx) = on_ready {
+                        let _ = tx.send(());
+                    }
+                    let _ = crate::notify::ready();
+                    shutdown.notified().await;
+                    handle.stop().await;
+                    Ok(())
+                }
+                Err(e) => Err(crate::error::RpcError::SpawnFailed(e.to_string())),
+            }
+        })
+    }
+}
+
 /// Mode for spawning services.
 #[derive(Debug, Clone)]
 pub enum ServiceMode {
@@ -958,6 +1035,86 @@ impl ServiceManager for InprocManager {
             shutdown,
             _registration,
         ))
+    }
+}
+
+// ============================================================================
+// DualSpawnable - Run two Spawnables concurrently
+// ============================================================================
+
+/// Wrapper that runs two Spawnables: primary on calling thread, secondary on a sub-thread.
+///
+/// Used when a service needs to listen on two transports simultaneously
+/// (e.g., ZMQ and QUIC). Since `Spawnable::run()` is blocking, we can't run
+/// both on the same thread.
+///
+/// # Example
+///
+/// ```ignore
+/// let zmq_loop = create_zmq_loop(&ctx)?;
+/// let quic_loop = QuicServiceLoop::new(quic_rep, service);
+///
+/// let dual = DualSpawnable::new(zmq_loop, quic_loop);
+/// Ok(Box::new(dual))
+/// ```
+pub struct DualSpawnable {
+    primary: Box<dyn Spawnable>,
+    secondary: Box<dyn Spawnable>,
+}
+
+impl DualSpawnable {
+    /// Create a new DualSpawnable.
+    ///
+    /// The primary spawnable runs on the calling thread.
+    /// The secondary spawnable runs on a dedicated sub-thread.
+    pub fn new(primary: Box<dyn Spawnable>, secondary: Box<dyn Spawnable>) -> Self {
+        Self { primary, secondary }
+    }
+}
+
+impl Spawnable for DualSpawnable {
+    fn name(&self) -> &str {
+        // Use primary's name as the service name
+        self.primary.name()
+    }
+
+    fn context(&self) -> &Arc<zmq::Context> {
+        self.primary.context()
+    }
+
+    fn registrations(&self) -> Vec<(SocketKind, TransportConfig)> {
+        // Merge registrations from both
+        let mut regs = self.primary.registrations();
+        regs.extend(self.secondary.registrations());
+        regs
+    }
+
+    fn run(
+        self: Box<Self>,
+        shutdown: Arc<Notify>,
+        on_ready: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<()> {
+        let shutdown2 = shutdown.clone();
+        let secondary = self.secondary;
+        let secondary_name = secondary.name().to_string();
+
+        // Spawn secondary on a sub-thread
+        let handle = thread::Builder::new()
+            .name(format!("{}-quic", secondary_name))
+            .spawn(move || {
+                if let Err(e) = secondary.run(shutdown2, None) {
+                    tracing::error!("Secondary service {} failed: {}", secondary_name, e);
+                }
+            })
+            .map_err(|e| crate::error::RpcError::Other(format!("thread spawn: {}", e)))?;
+
+        // Run primary on current thread (blocks until shutdown)
+        let result = self.primary.run(shutdown, on_ready);
+
+        // Wait for secondary thread to finish
+        let _ = handle.join();
+
+        result
     }
 }
 

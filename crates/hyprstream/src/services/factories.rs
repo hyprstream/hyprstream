@@ -149,7 +149,14 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
         ))
     })?;
 
-    Ok(Box::new(registry_service))
+    // Wrap in UnifiedServiceConfig if QUIC is enabled
+    if let Some(qc) = ctx.quic_config() {
+        Ok(Box::new(hyprstream_rpc::service::spawner::UnifiedServiceConfig::new(
+            registry_service, Some(qc.clone()),
+        )))
+    } else {
+        Ok(Box::new(registry_service))
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

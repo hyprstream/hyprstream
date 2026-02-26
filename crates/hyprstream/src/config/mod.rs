@@ -87,7 +87,129 @@ pub struct HyprConfig {
     /// StreamService configuration (buffer sizes, TTL, etc.)
     #[serde(default)]
     pub streaming: StreamingConfig,
+
+    /// QUIC/WebTransport configuration (optional)
+    ///
+    /// When enabled, services expose a WebTransport endpoint alongside ZMQ,
+    /// allowing browsers to connect directly via HTTP/3 + QUIC.
+    #[serde(default)]
+    pub quic: Option<QuicConfig>,
 }
+
+/// QUIC/WebTransport transport configuration.
+///
+/// Enables WebTransport alongside ZMQ for browser-direct RPC.
+/// When `cert_path` is empty, a self-signed certificate is generated at startup.
+///
+/// # Example TOML
+///
+/// ```toml
+/// [quic]
+/// enabled = true
+/// bind_addr = "0.0.0.0:4433"
+/// server_name = "localhost"
+/// cert_path = ""
+/// key_path = ""
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuicConfig {
+    /// Whether QUIC/WebTransport is enabled
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Address to bind the WebTransport server
+    #[serde(default = "default_quic_bind_addr")]
+    pub bind_addr: String,
+
+    /// Server name for TLS certificate (used in self-signed cert generation)
+    #[serde(default = "default_quic_server_name")]
+    pub server_name: String,
+
+    /// Path to TLS certificate (PEM). Empty = generate self-signed.
+    #[serde(default)]
+    pub cert_path: String,
+
+    /// Path to TLS private key (PEM). Empty = generate self-signed.
+    #[serde(default)]
+    pub key_path: String,
+}
+
+impl Default for QuicConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_addr: default_quic_bind_addr(),
+            server_name: default_quic_server_name(),
+            cert_path: String::new(),
+            key_path: String::new(),
+        }
+    }
+}
+
+impl QuicConfig {
+    /// Parse bind_addr into a SocketAddr.
+    pub fn socket_addr(&self) -> anyhow::Result<std::net::SocketAddr> {
+        self.bind_addr.parse().map_err(|e| anyhow::anyhow!("invalid quic.bind_addr '{}': {}", self.bind_addr, e))
+    }
+
+    /// Check if self-signed certificate should be generated.
+    pub fn use_self_signed(&self) -> bool {
+        self.cert_path.is_empty() || self.key_path.is_empty()
+    }
+
+    /// Generate or load TLS materials, returning (cert_der, key_der).
+    ///
+    /// For self-signed certs, generates an ECDSA P-256 certificate with ≤14 day validity,
+    /// as required by WebTransport `serverCertificateHashes` (W3C spec).
+    pub fn load_tls_materials(&self) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+        if self.use_self_signed() {
+            // Generate self-signed cert with ≤14 day validity for WebTransport compat
+            let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
+            let mut params = rcgen::CertificateParams::new(vec![self.server_name.clone()])?;
+            params.not_before = time::OffsetDateTime::now_utc();
+            params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(14);
+            let cert = params.self_signed(&key_pair)?;
+            let cert_der = cert.der().to_vec();
+            let key_der = key_pair.serialize_der();
+            Ok((cert_der, key_der))
+        } else {
+            // Load from files
+            let cert_pem = std::fs::read(&self.cert_path)
+                .map_err(|e| anyhow::anyhow!("failed to read cert_path '{}': {}", self.cert_path, e))?;
+            let key_pem = std::fs::read(&self.key_path)
+                .map_err(|e| anyhow::anyhow!("failed to read key_path '{}': {}", self.key_path, e))?;
+
+            // Parse PEM to DER
+            let cert_der = rustls_pemfile::certs(&mut &cert_pem[..])
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("no certificate found in {}", self.cert_path))?
+                .map_err(|e| anyhow::anyhow!("invalid certificate PEM: {}", e))?
+                .to_vec();
+
+            let key_der = rustls_pemfile::private_key(&mut &key_pem[..])
+                .map_err(|e| anyhow::anyhow!("invalid key PEM: {}", e))?
+                .ok_or_else(|| anyhow::anyhow!("no private key found in {}", self.key_path))?
+                .secret_der()
+                .to_vec();
+
+            Ok((cert_der, key_der))
+        }
+    }
+
+    /// Build a `QuicLoopConfig` for use with `UnifiedRequestLoop`.
+    pub fn to_loop_config(&self) -> anyhow::Result<hyprstream_rpc::service::QuicLoopConfig> {
+        let addr = self.socket_addr()?;
+        let (cert_der, key_der) = self.load_tls_materials()?;
+        Ok(hyprstream_rpc::service::QuicLoopConfig {
+            cert_der,
+            key_der,
+            bind_addr: addr,
+        })
+    }
+}
+
+fn default_quic_bind_addr() -> String { "0.0.0.0:4433".to_owned() }
+fn default_quic_server_name() -> String { "localhost".to_owned() }
 
 /// JWT token issuance configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -636,6 +758,7 @@ pub struct HyprConfigBuilder {
     mcp: MCPConfig,
     oauth: OAuthConfig,
     streaming: StreamingConfig,
+    quic: Option<QuicConfig>,
 }
 
 impl HyprConfigBuilder {
@@ -657,6 +780,7 @@ impl HyprConfigBuilder {
             mcp: MCPConfig::default(),
             oauth: OAuthConfig::default(),
             streaming: StreamingConfig::default(),
+            quic: None,
         }
     }
 
@@ -678,6 +802,7 @@ impl HyprConfigBuilder {
             mcp: config.mcp,
             oauth: config.oauth,
             streaming: config.streaming,
+            quic: config.quic,
         }
     }
 
@@ -711,6 +836,7 @@ impl HyprConfigBuilder {
             mcp: self.mcp,
             oauth: self.oauth,
             streaming: self.streaming,
+            quic: self.quic,
         }
     }
 
