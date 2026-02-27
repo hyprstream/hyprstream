@@ -34,5 +34,11 @@ pub mod mcp_client {
     hyprstream_rpc_derive::generate_rpc_service!("mcp");
 }
 
+pub mod discovery_client {
+    #![allow(dead_code, unused_imports, unused_variables)]
+    #![allow(clippy::all)]
+    hyprstream_rpc_derive::generate_rpc_service!("discovery");
+}
+
 // worker_client — use hyprstream_workers::generated::worker_client instead.
 // workflow_client — use hyprstream_workers::generated::workflow_client instead.

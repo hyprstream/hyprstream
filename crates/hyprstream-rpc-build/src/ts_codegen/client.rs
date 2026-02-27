@@ -222,12 +222,13 @@ fn generate_scoped_client(
             None
         };
 
-        // Return type from matching inner response variant
-        let resp_variant_name = format!("{}Result", variant.name);
+        // Return type from matching inner response variant.
+        // Inner response variants use bare names (e.g., "generateStream"),
+        // NOT the "Result" suffix used by top-level response variants.
         let resp_variant = sc
             .inner_response_variants
             .iter()
-            .find(|v| v.name == resp_variant_name);
+            .find(|v| v.name == variant.name);
         let return_type = resp_variant
             .map(|v| capnp_to_ts_type(&v.type_name))
             .unwrap_or_else(|| "unknown".into());

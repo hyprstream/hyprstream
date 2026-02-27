@@ -51,8 +51,9 @@ pub enum JwtError {
 pub fn encode(claims: &Claims, signing_key: &SigningKey) -> String {
     // Encode header and payload
     let header_b64 = URL_SAFE_NO_PAD.encode(JWT_HEADER);
-    let payload_json = serde_json::to_string(claims).unwrap_or_else(|e| {
-        tracing::error!("JWT claims serialization failed: {}", e);
+    let payload_json = serde_json::to_string(claims).unwrap_or_else(|_e| {
+        #[cfg(not(target_arch = "wasm32"))]
+        tracing::error!("JWT claims serialization failed: {}", _e);
         "{}".to_owned()
     });
     let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);

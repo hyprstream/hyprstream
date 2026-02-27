@@ -40,7 +40,6 @@
 //!
 //! The nested structure makes clear exactly what is being signed.
 
-#[cfg(not(target_arch = "wasm32"))]
 use crate::auth::Claims;
 use crate::capnp::{FromCapnp, ToCapnp};
 use crate::common_capnp;
@@ -303,7 +302,6 @@ impl From<&RequestIdentity> for Subject {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl From<&Claims> for Subject {
     fn from(claims: &Claims) -> Self {
         Subject::new(claims.sub.clone())
@@ -426,8 +424,6 @@ pub struct RequestEnvelope {
     pub timestamp: i64,
 
     /// User authorization claims (protected by envelope signature).
-    /// Native only — Claims type requires auth module with inventory crate.
-    #[cfg(not(target_arch = "wasm32"))]
     pub claims: Option<Claims>,
 }
 
@@ -441,7 +437,6 @@ impl RequestEnvelope {
             ephemeral_pubkey: None,
             nonce: generate_nonce(),
             timestamp: current_timestamp(),
-            #[cfg(not(target_arch = "wasm32"))]
             claims: None,
         }
     }
@@ -452,8 +447,7 @@ impl RequestEnvelope {
         self
     }
 
-    /// Set user authorization claims (native only).
-    #[cfg(not(target_arch = "wasm32"))]
+    /// Set user authorization claims.
     pub fn with_claims(mut self, claims: Claims) -> Self {
         self.claims = Some(claims);
         self
@@ -917,7 +911,6 @@ impl ToCapnp for RequestEnvelope {
         }
         builder.set_nonce(&self.nonce);
         builder.set_timestamp(self.timestamp);
-        #[cfg(not(target_arch = "wasm32"))]
         if let Some(ref claims) = self.claims {
             claims.write_to(&mut builder.reborrow().init_claims());
         }
@@ -957,7 +950,6 @@ impl FromCapnp for RequestEnvelope {
             arr
         };
 
-        #[cfg(not(target_arch = "wasm32"))]
         let claims = {
             if reader.has_claims() {
                 Some(Claims::read_from(reader.get_claims()?)?)
@@ -973,7 +965,6 @@ impl FromCapnp for RequestEnvelope {
             ephemeral_pubkey,
             nonce,
             timestamp: reader.get_timestamp(),
-            #[cfg(not(target_arch = "wasm32"))]
             claims,
         })
     }

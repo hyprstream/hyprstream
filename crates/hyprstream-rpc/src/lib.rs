@@ -85,7 +85,6 @@ pub mod zmtp_framing;
 // Native-only modules (not compiled for wasm32)
 // ============================================================================
 
-#[cfg(not(target_arch = "wasm32"))]
 pub mod auth;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod registry;

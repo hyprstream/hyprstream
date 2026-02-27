@@ -532,14 +532,14 @@ pub fn collect_list_struct_types(schema: &ParsedSchema) -> Vec<String> {
         }
     }
     for s in &schema.structs {
-        for f in &s.fields {
+        for f in s.non_union_fields() {
             add_type(&f.type_name);
         }
     }
     for v in &schema.request_variants {
         add_type(&v.type_name);
         if let Some(s) = schema.structs.iter().find(|s| s.name == v.type_name) {
-            for f in &s.fields {
+            for f in s.non_union_fields() {
                 add_type(&f.type_name);
             }
         }
@@ -579,7 +579,7 @@ pub fn collect_list_struct_types(schema: &ParsedSchema) -> Vec<String> {
         for v in &sc.inner_request_variants {
             add_type(&v.type_name);
             if let Some(s) = schema.structs.iter().find(|s| s.name == v.type_name) {
-                for f in &s.fields {
+                for f in s.non_union_fields() {
                     add_type(&f.type_name);
                 }
             }

@@ -303,6 +303,11 @@ impl EndpointRegistry {
         self.services.read().keys().cloned().collect()
     }
 
+    /// Get a clone of a service entry by name.
+    pub fn service_entry(&self, name: &str) -> Option<ServiceEntry> {
+        self.services.read().get(name).cloned()
+    }
+
     /// Get all endpoints for a service.
     pub fn service_endpoints(&self, name: &str) -> Option<HashMap<SocketKind, TransportConfig>> {
         self.services.read().get(name).map(|e| e.endpoints.clone())

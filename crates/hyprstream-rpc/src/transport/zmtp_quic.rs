@@ -522,11 +522,11 @@ impl QuicRep {
 
         let raw_bytes = &request.parts[0];
 
-        // Process through envelope pipeline
-        let (response_bytes, continuation) = process_zmtp_request(
+        // Process through envelope pipeline (FixedSigner: QUIC peers pre-share keys)
+        let (response_bytes, continuation) = process_request(
             raw_bytes,
             &*service,
-            &server_pubkey,
+            EnvelopeVerification::FixedSigner(&server_pubkey),
             &signing_key,
             &nonce_cache,
         ).await?;
@@ -1507,10 +1507,11 @@ impl WebTransportServer {
         let mut request_buf = vec![0u8; len];
         recv.read_exact(&mut request_buf).await?;
 
-        // Process through WebTransport pipeline (accepts any valid signer)
-        let (response_bytes, continuation) = process_webtransport_request(
+        // Process through WebTransport pipeline (AnySigner: TLS 1.3 provides transport auth)
+        let (response_bytes, continuation) = process_request(
             &request_buf,
             &*service,
+            EnvelopeVerification::AnySigner,
             &signing_key,
             &nonce_cache,
         ).await?;
@@ -1602,31 +1603,54 @@ pub fn client_tls_system_roots() -> Result<rustls::ClientConfig> {
 // Request Processing Helper
 // ============================================================================
 
-/// Process a ZMTP request envelope and return the signed response.
+/// Envelope verification mode for `process_request`.
 ///
-/// This helper extracts the envelope processing logic shared between
-/// `RequestLoop` (ZMQ) and `QuicServiceLoop` (QUIC). It:
-/// 1. Deserializes the SignedEnvelope
-/// 2. Verifies signature + nonce + claims
-/// 3. Calls handle_request
-/// 4. Signs and serializes the response
+/// Two modes exist for different transport security models:
+///
+/// - **FixedSigner**: ZMQ (internal service-to-service) — envelope signer must match
+///   known `server_pubkey` for mutual authentication. Peers pre-share keys.
+/// - **AnySigner**: WebTransport (external browser clients) — any valid Ed25519 signer
+///   accepted. TLS 1.3 provides transport-layer authentication.
+///
+/// Both modes share: timestamp window (5 min), nonce replay protection, JWT claims
+/// verification. The only difference is step 1 of 4 in the verification pipeline.
+pub enum EnvelopeVerification<'a> {
+    /// Require the envelope signer to match this specific verifying key.
+    /// Used for ZMQ transport where peers pre-share Ed25519 keys.
+    FixedSigner(&'a ed25519_dalek::VerifyingKey),
+    /// Accept any valid Ed25519 signer.
+    /// Used for WebTransport where TLS 1.3 provides channel authentication.
+    AnySigner,
+}
+
+/// Process a request through the full envelope verification pipeline.
+///
+/// Unified handler for both ZMQ (ROUTER) and WebTransport paths. The only
+/// difference is envelope signer verification, controlled by `verification`.
+///
+/// # Pipeline
+///
+/// 1. Unwrap `SignedEnvelope` and verify Ed25519 signature (mode-dependent)
+/// 2. Verify JWT claims (`sub`, `exp`, `aud`, `scope`, downgrade protection)
+/// 3. Dispatch to `service.handle_request()` with verified `EnvelopeContext`
+/// 4. Sign response with server's `signing_key`
 ///
 /// # Arguments
 ///
-/// * `raw_bytes` - Raw Cap'n Proto serialized SignedEnvelope bytes
-/// * `service` - ZMQ service implementation
-/// * `server_pubkey` - Server's Ed25519 verifying key
-/// * `signing_key` - Server's Ed25519 signing key
+/// * `raw_bytes` - Raw Cap'n Proto bytes containing a `SignedEnvelope`
+/// * `service` - The ZmqService to dispatch to
+/// * `verification` - Envelope signer verification mode
+/// * `signing_key` - Server's signing key for response
 /// * `nonce_cache` - Nonce cache for replay protection
 ///
 /// # Returns
 ///
 /// * `Ok((response_bytes, continuation))` - Signed response and optional continuation
 /// * `Err(e)` - Processing error (already logged)
-pub async fn process_zmtp_request<S>(
+pub async fn process_request<S>(
     raw_bytes: &[u8],
     service: &S,
-    server_pubkey: &ed25519_dalek::VerifyingKey,
+    verification: EnvelopeVerification<'_>,
     signing_key: &ed25519_dalek::SigningKey,
     nonce_cache: &crate::envelope::InMemoryNonceCache,
 ) -> Result<(Vec<u8>, Option<crate::service::Continuation>)>
@@ -1639,8 +1663,13 @@ where
     use capnp::serialize;
     use tracing::warn;
 
-    // 1. Unwrap and verify SignedEnvelope
-    let (ctx, payload) = match crate::envelope::unwrap_envelope(raw_bytes, server_pubkey, nonce_cache) {
+    // 1. Unwrap and verify SignedEnvelope based on verification mode
+    let (ctx, payload) = match match verification {
+        EnvelopeVerification::FixedSigner(pubkey) =>
+            crate::envelope::unwrap_envelope(raw_bytes, pubkey, nonce_cache),
+        EnvelopeVerification::AnySigner =>
+            crate::envelope::unwrap_envelope_any_signer(raw_bytes, nonce_cache),
+    } {
         Ok(result) => result,
         Err(e) => {
             warn!("{} envelope verification failed: {}", service.name(), e);
@@ -1667,92 +1696,6 @@ where
     );
 
     // 2. Verify claims (E2E JWT, downgrade protection)
-    if let Err(e) = service.verify_claims(&ctx) {
-        warn!(
-            "{} claims verification failed for {} (id={}): {}",
-            service.name(), ctx.subject(), request_id, e
-        );
-        let error_payload = service.build_error_payload(request_id, &e.to_string());
-        let signed_response = ResponseEnvelope::new_signed(request_id, error_payload, signing_key);
-
-        let mut message = Builder::new_default();
-        let mut builder = message.init_root::<crate::common_capnp::response_envelope::Builder>();
-        signed_response.write_to(&mut builder);
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-        return Ok((bytes, None));
-    }
-
-    // 3. Handle request
-    let (response_payload, continuation) = match service.handle_request(&ctx, &payload).await {
-        Ok((resp, cont)) => (resp, cont),
-        Err(e) => {
-            error!("{} request handling error: {}", service.name(), e);
-            (service.build_error_payload(request_id, &e.to_string()), None)
-        }
-    };
-
-    // 4. Sign and serialize response
-    let signed_response = ResponseEnvelope::new_signed(request_id, response_payload, signing_key);
-
-    let mut message = Builder::new_default();
-    let mut builder = message.init_root::<crate::common_capnp::response_envelope::Builder>();
-    signed_response.write_to(&mut builder);
-
-    let mut bytes = Vec::new();
-    serialize::write_message(&mut bytes, &message)?;
-
-    Ok((bytes, continuation))
-}
-
-/// Process a WebTransport request from a browser client.
-///
-/// Unlike `process_zmtp_request`, this accepts any valid Ed25519 signer
-/// rather than requiring the signer to match the server's pubkey.
-/// Browser clients sign with their own keypair.
-pub async fn process_webtransport_request<S>(
-    raw_bytes: &[u8],
-    service: &S,
-    signing_key: &ed25519_dalek::SigningKey,
-    nonce_cache: &crate::envelope::InMemoryNonceCache,
-) -> Result<(Vec<u8>, Option<crate::service::Continuation>)>
-where
-    S: crate::service::ZmqService,
-{
-    use crate::ToCapnp;
-    use crate::envelope::ResponseEnvelope;
-    use capnp::message::Builder;
-    use capnp::serialize;
-    use tracing::warn;
-
-    // 1. Unwrap and verify SignedEnvelope (any signer)
-    let (ctx, payload) = match crate::envelope::unwrap_envelope_any_signer(raw_bytes, nonce_cache) {
-        Ok(result) => result,
-        Err(e) => {
-            warn!("{} WebTransport envelope verification failed: {}", service.name(), e);
-            let error_payload = service.build_error_payload(0, &format!("envelope verification failed: {}", e));
-            let signed_response = ResponseEnvelope::new_signed(0, error_payload, signing_key);
-
-            let mut message = Builder::new_default();
-            let mut builder = message.init_root::<crate::common_capnp::response_envelope::Builder>();
-            signed_response.write_to(&mut builder);
-
-            let mut bytes = Vec::new();
-            serialize::write_message(&mut bytes, &message)?;
-            return Ok((bytes, None));
-        }
-    };
-
-    let request_id = ctx.request_id;
-    debug!(
-        "{} verified WebTransport request from {} (id={})",
-        service.name(),
-        ctx.subject(),
-        request_id
-    );
-
-    // 2. Verify claims
     if let Err(e) = service.verify_claims(&ctx) {
         warn!(
             "{} claims verification failed for {} (id={}): {}",

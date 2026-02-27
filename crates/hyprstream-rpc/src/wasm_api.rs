@@ -74,12 +74,124 @@ pub fn build_signed_envelope(
         nonce: crate::envelope::generate_nonce(),
         ephemeral_pubkey: ephemeral,
         payload: payload.to_vec(),
+        claims: None,
     };
 
     // new_signed takes owned envelope, returns SignedEnvelope (not Result)
     let signed = SignedEnvelope::new_signed(envelope, &signing_key);
 
     // Serialize to Cap'n Proto
+    use capnp::message::Builder;
+    use capnp::serialize;
+    use crate::ToCapnp;
+
+    let mut message = Builder::new_default();
+    let mut builder = message.init_root::<crate::common_capnp::signed_envelope::Builder>();
+    signed.write_to(&mut builder);
+
+    let mut bytes = Vec::new();
+    serialize::write_message(&mut bytes, &message)
+        .map_err(|e| JsError::new(&format!("serialization failed: {}", e)))?;
+
+    Ok(bytes)
+}
+
+/// Build a signed envelope with JWT claims from raw payload bytes.
+///
+/// The JWT token is NOT verified here — the server verifies via `claims.verify_token()`.
+/// This function decodes the JWT payload section to extract claims for the envelope,
+/// and attaches the original token for end-to-end verification server-side.
+///
+/// # Arguments
+///
+/// * `payload` - Raw payload bytes (Cap'n Proto serialized request)
+/// * `privkey_seed` - 32-byte Ed25519 seed (from generate_signing_keypair)
+/// * `ephemeral_pubkey` - 32-byte Ristretto255 pubkey (empty slice = no DH; 32 bytes = with DH)
+/// * `request_id` - Request ID for correlation
+/// * `jwt_token` - JWT token string (header.payload.signature)
+///
+/// # Returns
+///
+/// Cap'n Proto serialized SignedEnvelope bytes with claims populated
+#[wasm_bindgen]
+pub fn build_signed_envelope_with_token(
+    payload: &[u8],
+    privkey_seed: &[u8],
+    ephemeral_pubkey: &[u8],
+    request_id: u64,
+    jwt_token: &str,
+) -> Result<Vec<u8>, JsError> {
+    use crate::auth::Claims;
+    use crate::crypto::signing::signing_key_from_bytes;
+    use crate::envelope::{RequestEnvelope, RequestIdentity, SignedEnvelope};
+
+    if privkey_seed.len() != 32 {
+        return Err(JsError::new("privkey_seed must be 32 bytes"));
+    }
+
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(privkey_seed);
+    let signing_key = signing_key_from_bytes(&seed);
+
+    let ephemeral = if ephemeral_pubkey.is_empty() {
+        None
+    } else if ephemeral_pubkey.len() == 32 {
+        let mut buf = [0u8; 32];
+        buf.copy_from_slice(ephemeral_pubkey);
+        Some(buf)
+    } else {
+        return Err(JsError::new("ephemeral_pubkey must be empty or 32 bytes"));
+    };
+
+    // Decode JWT payload to extract claims (no signature verification — server does that)
+    let claims = if !jwt_token.is_empty() {
+        let parts: Vec<&str> = jwt_token.splitn(3, '.').collect();
+        if parts.len() != 3 {
+            return Err(JsError::new("Invalid JWT format: expected header.payload.signature"));
+        }
+
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+        let payload_json = URL_SAFE_NO_PAD.decode(parts[1])
+            .map_err(|e| JsError::new(&format!("JWT payload base64 decode failed: {}", e)))?;
+
+        #[derive(serde::Deserialize)]
+        struct JwtPayload {
+            sub: String,
+            exp: i64,
+            iat: i64,
+            aud: Option<String>,
+        }
+
+        let jwt_payload: JwtPayload = serde_json::from_slice(&payload_json)
+            .map_err(|e| JsError::new(&format!("JWT payload JSON parse failed: {}", e)))?;
+
+        Some(Claims::new(jwt_payload.sub, jwt_payload.iat, jwt_payload.exp)
+            .with_audience(jwt_payload.aud)
+            .with_token(jwt_token.to_string()))
+    } else {
+        None
+    };
+
+    // Extract subject from claims for the identity
+    let identity = match &claims {
+        Some(c) => RequestIdentity::api_token(&c.sub, "jwt"),
+        None => RequestIdentity::Anonymous,
+    };
+
+    let mut envelope = RequestEnvelope {
+        request_id,
+        identity,
+        timestamp: crate::envelope::current_timestamp(),
+        nonce: crate::envelope::generate_nonce(),
+        ephemeral_pubkey: ephemeral,
+        payload: payload.to_vec(),
+        claims: None,
+    };
+    envelope.claims = claims;
+
+    let signed = SignedEnvelope::new_signed(envelope, &signing_key);
+
     use capnp::message::Builder;
     use capnp::serialize;
     use crate::ToCapnp;

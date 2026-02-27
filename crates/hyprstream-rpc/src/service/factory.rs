@@ -55,8 +55,8 @@ pub struct ServiceContext {
     models_dir: std::path::PathBuf,
 
     /// Optional QUIC/WebTransport config for unified request loops.
-    /// When `Some`, factory functions can create `UnifiedRequestLoop`
-    /// instead of standard `RequestLoop`.
+    /// When `Some`, factory functions can create a `RequestLoop` with QUIC
+    /// via `into_spawnable()` or `RequestLoop::with_quic()`.
     quic_config: Option<crate::service::QuicLoopConfig>,
 }
 
@@ -81,8 +81,8 @@ impl ServiceContext {
 
     /// Set the QUIC/WebTransport configuration.
     ///
-    /// When set, factory functions can create `UnifiedServiceConfig`
-    /// wrappers that enable QUIC alongside ZMQ.
+    /// When set, `into_spawnable()` wraps services in `UnifiedServiceConfig`
+    /// to enable QUIC alongside ZMQ.
     pub fn with_quic(mut self, config: crate::service::QuicLoopConfig) -> Self {
         self.quic_config = Some(config);
         self
@@ -172,6 +172,26 @@ impl ServiceContext {
     /// Get schema bytes for a service (if registered with a schema).
     pub fn schema(&self, service: &str) -> Option<&'static [u8]> {
         global_registry().service_schema(service)
+    }
+
+    /// Wrap a ZmqService for spawning, enabling QUIC when configured.
+    ///
+    /// When `quic_config` is set on this context, the service is wrapped in
+    /// `UnifiedServiceConfig` which creates a `RequestLoop` with QUIC enabled.
+    /// Otherwise, the service is boxed directly (using the blanket `Spawnable` impl).
+    ///
+    /// This eliminates per-factory boilerplate for QUIC support.
+    pub fn into_spawnable<S: crate::service::ZmqService + Send + Sync + 'static>(
+        &self,
+        service: S,
+    ) -> Box<dyn Spawnable> {
+        if let Some(qc) = self.quic_config() {
+            Box::new(crate::service::spawner::UnifiedServiceConfig::new(
+                service, Some(qc.clone()),
+            ))
+        } else {
+            Box::new(service)
+        }
     }
 }
 

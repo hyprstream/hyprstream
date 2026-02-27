@@ -73,6 +73,7 @@ mod worktree_helpers;
 pub use worktree_helpers::StatResult;
 // contained_root replaced by hyprstream-containedfs crate
 pub mod callback;
+pub mod discovery;
 pub mod editing;
 pub mod factories;
 pub mod flight;
@@ -129,4 +130,6 @@ pub use oauth::OAuthService;
 pub use oai::OAIService;
 pub use flight::FlightService;
 pub use callback::{CallbackRouter, Instance};
+pub use discovery::DiscoveryService;
+pub use generated::discovery_client::DiscoveryClient;
 pub use mcp_service::{McpConfig, McpService};

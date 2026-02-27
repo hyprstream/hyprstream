@@ -98,8 +98,7 @@ fn generate_method_schema_entry(
         CapnpType::Void => vec![],
         CapnpType::Struct(_) | CapnpType::Unknown(_) => {
             if let Some(sdef) = resolved.find_struct(&v.type_name) {
-                sdef.fields
-                    .iter()
+                sdef.non_union_fields()
                     .map(|f| {
                         let fname = to_snake_case(&f.name);
                         let ftype = &f.type_name;
@@ -323,8 +322,7 @@ fn generate_json_method_dispatch_arm(
         _ => {
             if let Some(sdef) = resolved.find_struct(&v.type_name) {
                 let settable_fields: Vec<&FieldDef> = sdef
-                    .fields
-                    .iter()
+                    .non_union_fields()
                     .filter(|f| !is_union_only_struct(&f.type_name, resolved))
                     .collect();
 
@@ -392,8 +390,7 @@ fn generate_json_streaming_dispatch_arm(
         _ => {
             if let Some(sdef) = resolved.find_struct(&v.type_name) {
                 let settable_fields: Vec<&FieldDef> = sdef
-                    .fields
-                    .iter()
+                    .non_union_fields()
                     .filter(|f| !is_union_only_struct(&f.type_name, resolved))
                     .collect();
 
@@ -813,7 +810,7 @@ fn generate_tree_consts(
 /// Check if a type name refers to a union-only struct (no regular fields).
 fn is_union_only_struct(type_name: &str, resolved: &ResolvedSchema) -> bool {
     if let Some(s) = resolved.find_struct(type_name) {
-        s.has_union && s.fields.is_empty()
+        s.is_pure_union()
     } else {
         false
     }

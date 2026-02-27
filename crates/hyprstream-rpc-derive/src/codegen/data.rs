@@ -89,8 +89,7 @@ fn generate_data_struct(
     let doc = format!("Generated from Cap'n Proto struct {type_name}");
 
     let fields: Vec<TokenStream> = s
-        .fields
-        .iter()
+        .non_union_fields()
         .map(|field| {
             let rust_name = resolved.name(&field.name).snake_ident.clone();
             let rust_type = if field.type_name == "Data" && field.fixed_size.is_some() {
@@ -128,7 +127,7 @@ fn generate_to_capnp_impl(
     let data_name = format_ident!("{}", type_name);
     let capnp_struct = format_ident!("{}", to_capnp_module_name(type_name));
 
-    let field_setters: Vec<TokenStream> = s.fields.iter().map(|field| {
+    let field_setters: Vec<TokenStream> = s.non_union_fields().map(|field| {
         generate_data_field_setter(field, resolved, service_name, types_crate)
     }).collect();
 
@@ -269,7 +268,7 @@ fn generate_from_capnp_impl(
     let data_name = format_ident!("{}", type_name);
     let capnp_struct = format_ident!("{}", to_capnp_module_name(type_name));
 
-    let field_readers: Vec<TokenStream> = s.fields.iter().map(|field| {
+    let field_readers: Vec<TokenStream> = s.non_union_fields().map(|field| {
         generate_data_field_reader(field, resolved, service_name, types_crate)
     }).collect();
 

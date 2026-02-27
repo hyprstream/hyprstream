@@ -88,7 +88,7 @@ pub fn generate_builders(out: &mut String, service_name: &str, schema: &ParsedSc
 
         // Set non-union fields
         for f in &non_union_fields {
-            emit_field_setter(out, "msg", f, &to_camel_case(&f.name), "  ", &schema.enums);
+            emit_field_setter(out, "msg", f, &to_camel_case(&f.name), "  ", &schema.enums, &schema.structs);
         }
 
         // Set discriminant
@@ -102,7 +102,7 @@ pub fn generate_builders(out: &mut String, service_name: &str, schema: &ParsedSc
             // Nothing
         } else if is_prim {
             if let Some(vf) = variant_field {
-                emit_field_setter(out, "msg", vf, "p", "  ", &schema.enums);
+                emit_field_setter(out, "msg", vf, "p", "  ", &schema.enums, &schema.structs);
             }
         } else if let Some(ps) = payload_struct {
             if let Some(vf) = variant_field {
@@ -215,7 +215,7 @@ fn generate_scoped_builders(
 
         // Set root non-union fields
         for f in root_non_union_fields {
-            emit_field_setter(out, "msg", f, &to_camel_case(&f.name), "  ", &schema.enums);
+            emit_field_setter(out, "msg", f, &to_camel_case(&f.name), "  ", &schema.enums, &schema.structs);
         }
 
         // Build the chain: root → ancestors → current → method
@@ -247,7 +247,7 @@ fn generate_scoped_builders(
 
                 // Set scope fields on this level's struct
                 for sf in &level.scope_fields {
-                    emit_field_setter(out, &var_name, sf, &to_camel_case(&sf.name), "  ", &schema.enums);
+                    emit_field_setter(out, &var_name, sf, &to_camel_case(&sf.name), "  ", &schema.enums, &schema.structs);
                 }
 
                 builder_var = var_name;
@@ -277,7 +277,7 @@ fn generate_scoped_builders(
                 if is_void {
                     // Nothing
                 } else if is_prim {
-                    emit_field_setter(out, &builder_var, mf, "p", "  ", &schema.enums);
+                    emit_field_setter(out, &builder_var, mf, "p", "  ", &schema.enums, &schema.structs);
                 } else if let Some(ps) = payload_struct {
                     emit_struct_init(out, mf, ps, &builder_var, "p", "  ", schema);
                 }
@@ -397,6 +397,7 @@ fn emit_field_setter(
     value_expr: &str,
     indent: &str,
     enums: &[EnumDef],
+    structs: &[StructDef],
 ) {
     match field.section {
         FieldSection::Data => {
@@ -416,7 +417,6 @@ fn emit_field_setter(
                 // Enum type — stored as UInt16, needs ordinal conversion
                 let enum_def = enums.iter().find(|e| e.name == field.type_name);
                 if let Some(ed) = enum_def {
-                    // Generate ordinal lookup: ['variant1', 'variant2'].indexOf(value)
                     let variants: Vec<String> = ed
                         .variants
                         .iter()
@@ -427,7 +427,6 @@ fn emit_field_setter(
                         variants.join(", ")
                     ));
                 } else {
-                    // Unknown enum — fall back to numeric cast
                     out.push_str(&format!(
                         "{indent}{builder_var}.setUint16({byte_off}, {value_expr} as unknown as number);\n"
                     ));
@@ -440,8 +439,47 @@ fn emit_field_setter(
                     "{indent}{builder_var}.{method}({}, {value_expr});\n",
                     field.slot_offset
                 ));
+            } else if let Some(inner) = super::extract_list_inner_type(&field.type_name) {
+                // List(Struct) — init struct list and set each element's fields
+                if let Some(sd) = structs.iter().find(|s| s.name == inner) {
+                    let sl = format!("_sl{}", field.slot_offset);
+                    let sv = format!("_sv{}", field.slot_offset);
+                    let si = format!("_si{}", field.slot_offset);
+                    out.push_str(&format!("{indent}{{\n"));
+                    out.push_str(&format!(
+                        "{indent}  const {sl} = {builder_var}.initStructList({}, {value_expr}.length, {}, {});\n",
+                        field.slot_offset, sd.data_words, sd.pointer_words
+                    ));
+                    out.push_str(&format!(
+                        "{indent}  {value_expr}.forEach(({sv}, {si}) => {{\n"
+                    ));
+                    for sf in &sd.fields {
+                        if sf.discriminant_value != 0xFFFF {
+                            continue;
+                        }
+                        let inner_builder = format!("{sl}[{si}]");
+                        let inner_value = format!("{sv}.{}", to_camel_case(&sf.name));
+                        emit_field_setter(
+                            out,
+                            &inner_builder,
+                            sf,
+                            &inner_value,
+                            &format!("{indent}    "),
+                            enums,
+                            structs,
+                        );
+                    }
+                    out.push_str(&format!("{indent}  }});\n"));
+                    out.push_str(&format!("{indent}}}\n"));
+                } else {
+                    out.push_str(&format!(
+                        "{indent}// {}: {} — struct definition not found\n",
+                        to_camel_case(&field.name),
+                        field.type_name
+                    ));
+                }
             } else {
-                // Unsupported pointer type (struct lists, etc.) — skip with comment
+                // Unsupported pointer type — skip with comment
                 out.push_str(&format!(
                     "{indent}// {}: {} — not yet supported by runtime\n",
                     to_camel_case(&field.name),
@@ -497,6 +535,6 @@ fn emit_struct_init(
         } else {
             raw_expr
         };
-        emit_field_setter(out, "_ps", f, &value_expr, indent, &schema.enums);
+        emit_field_setter(out, "_ps", f, &value_expr, indent, &schema.enums, &schema.structs);
     }
 }

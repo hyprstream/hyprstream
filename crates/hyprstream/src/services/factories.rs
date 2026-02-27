@@ -35,7 +35,7 @@ use tracing::info;
 
 use crate::auth::PolicyManager;
 use crate::config::TokenConfig;
-use crate::services::{McpService, McpConfig, PolicyService, PolicyClient, RegistryService, GenRegistryClient};
+use crate::services::{DiscoveryService, McpService, McpConfig, PolicyService, PolicyClient, RegistryService, GenRegistryClient};
 use crate::zmq::global_context;
 
 /// Shared Git2DB registry instance. Lazily initialized by the first factory
@@ -112,7 +112,6 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         });
     });
 
-    // Service includes infrastructure - directly Spawnable via blanket impl
     let policy_service = PolicyService::new(
         policy_manager,
         Arc::new(ctx.signing_key().clone()),
@@ -122,7 +121,7 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         ctx.transport("policy", SocketKind::Rep),
     );
 
-    Ok(Box::new(policy_service))
+    Ok(ctx.into_spawnable(policy_service))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -149,14 +148,7 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
         ))
     })?;
 
-    // Wrap in UnifiedServiceConfig if QUIC is enabled
-    if let Some(qc) = ctx.quic_config() {
-        Ok(Box::new(hyprstream_rpc::service::spawner::UnifiedServiceConfig::new(
-            registry_service, Some(qc.clone()),
-        )))
-    } else {
-        Ok(Box::new(registry_service))
-    }
+    Ok(ctx.into_spawnable(registry_service))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -207,7 +199,6 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
         RequestIdentity::local(),
     );
 
-    // Service includes infrastructure - directly Spawnable via blanket impl
     let model_service = ModelService::new(
         ModelServiceConfig::default(),
         ctx.signing_key().clone(),
@@ -217,7 +208,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
         ctx.transport("model", SocketKind::Rep),
     );
 
-    Ok(Box::new(model_service))
+    Ok(ctx.into_spawnable(model_service))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -285,7 +276,7 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     );
     worker_service.set_authorize_fn(super::worker::build_authorize_fn(policy_client));
 
-    Ok(Box::new(worker_service))
+    Ok(ctx.into_spawnable(worker_service))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -571,5 +562,26 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     });
     info!("McpService created (HTTP/SSE on {}:{})", config.mcp.host, http_port);
 
-    Ok(Box::new(mcp_service))  // Gets auto-Spawnable via ZmqService
+    Ok(ctx.into_spawnable(mcp_service))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Discovery Service Factory
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Factory for DiscoveryService (endpoint registry over ZMQ RPC)
+///
+/// This service exposes the EndpointRegistry so remote clients can discover
+/// registered services, their endpoints, socket kinds, and schemas.
+#[service_factory("discovery", schema = "../../schema/discovery.capnp", metadata = crate::services::generated::discovery_client::schema_metadata)]
+fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+    info!("Creating DiscoveryService");
+
+    let discovery_service = DiscoveryService::new(
+        Arc::new(ctx.signing_key().clone()),
+        global_context(),
+        ctx.transport("discovery", SocketKind::Rep),
+    );
+
+    Ok(ctx.into_spawnable(discovery_service))
 }

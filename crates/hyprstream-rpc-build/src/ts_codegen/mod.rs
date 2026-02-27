@@ -176,12 +176,13 @@ fn getter_method(type_name: &str) -> &str {
         "Text" => "getText",
         "Data" => "getData",
         _ if type_name.starts_with("List(Text") => "getTextList",
+        _ if type_name.starts_with("List(Data") => "getDataList",
         _ => "getText",
     }
 }
 
 /// Check if a capnp type is a simple scalar (data section, not pointer).
-fn is_data_scalar(type_name: &str) -> bool {
+pub(crate) fn is_data_scalar(type_name: &str) -> bool {
     matches!(
         type_name,
         "Bool"
@@ -196,6 +197,15 @@ fn is_data_scalar(type_name: &str) -> bool {
             | "Float32"
             | "Float64"
     )
+}
+
+/// Extract the inner type name from a `List(Foo)` type string. Returns `None` for non-list types.
+fn extract_list_inner_type(type_name: &str) -> Option<&str> {
+    if type_name.starts_with("List(") && type_name.ends_with(')') {
+        Some(&type_name[5..type_name.len() - 1])
+    } else {
+        None
+    }
 }
 
 /// Check if a capnp type name is a primitive (not a struct reference).

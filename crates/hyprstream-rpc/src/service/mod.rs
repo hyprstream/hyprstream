@@ -17,6 +17,7 @@ pub mod factory;
 pub mod metadata;
 
 pub use traits::{RpcHandler, RpcRequest, RpcService};
+#[allow(deprecated)]
 pub use zmq::{AuthorizeFn, CallOptions, Continuation, EnvelopeContext, QuicLoopConfig, ServiceHandle, RequestLoop, UnifiedRequestLoop, ZmqClient, ZmqService};
 pub use streaming::StreamService;
 pub use spawner::{InprocManager, Spawnable, SpawnedService};

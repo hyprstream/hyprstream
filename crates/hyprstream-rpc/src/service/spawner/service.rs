@@ -438,13 +438,13 @@ impl Spawnable for LoadBalancerService {
 // QuicServiceLoop — Spawnable wrapper for QUIC-only service loop
 // ============================================================================
 
-/// Spawnable wrapper that runs a ZmqService using `UnifiedRequestLoop`.
+/// Spawnable wrapper that runs a ZmqService with explicit QUIC configuration.
 ///
-/// This is used when a service factory wants to create a `UnifiedRequestLoop`
-/// (ROUTER + QUIC) instead of the standard `RequestLoop` (REP-only).
+/// This is used when a service factory wants to pass a `QuicLoopConfig` to
+/// `RequestLoop::with_quic()` without relying on the blanket `Spawnable` impl.
 ///
-/// Unlike the blanket `impl Spawnable for S: ZmqService` which always creates
-/// a `RequestLoop`, this explicitly creates a `UnifiedRequestLoop` with QUIC.
+/// The blanket `impl Spawnable for S: ZmqService` creates a plain `RequestLoop`;
+/// this wrapper additionally enables QUIC when `quic_config` is `Some`.
 pub struct UnifiedServiceConfig<S: ZmqService + Send + 'static> {
     service: S,
     quic_config: Option<crate::service::QuicLoopConfig>,
@@ -487,7 +487,7 @@ impl<S: ZmqService + Send + Sync + 'static> Spawnable for UnifiedServiceConfig<S
 
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async move {
-            let mut runner = crate::service::UnifiedRequestLoop::new(
+            let mut runner = crate::service::RequestLoop::new(
                 transport, context, signing_key,
             );
 

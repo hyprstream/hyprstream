@@ -92,6 +92,23 @@ impl Default for FieldSection {
     }
 }
 
+impl StructDef {
+    /// Fields that are NOT union members (discriminant_value == 0xFFFF).
+    ///
+    /// Use this for Rust codegen which should not generate `get_*()` / `set_*()`
+    /// calls for union members (Cap'n Proto Rust uses `which()` for those).
+    /// TypeScript codegen should use `.fields` directly since it needs all fields
+    /// including union members for wire format slot offsets and discriminant values.
+    pub fn non_union_fields(&self) -> impl Iterator<Item = &FieldDef> {
+        self.fields.iter().filter(|f| f.discriminant_value == 0xFFFF)
+    }
+
+    /// True if this struct is a pure union (has_union and no non-union fields).
+    pub fn is_pure_union(&self) -> bool {
+        self.has_union && self.non_union_fields().count() == 0
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EnumDef {
     pub name: String,

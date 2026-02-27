@@ -1,7 +1,7 @@
 //! QuicStreamBridge — Bridges ZMQ SUB → WebTransport for streaming data.
 //!
 //! When a client requests a streaming operation (e.g., model inference) via
-//! `UnifiedRequestLoop`, the service returns a `StreamInfo` response containing
+//! `RequestLoop`, the service returns a `StreamInfo` response containing
 //! the topic and server's DH public key. The client then opens a second
 //! WebTransport stream for subscription.
 //!

@@ -196,7 +196,7 @@ impl QuicConfig {
         }
     }
 
-    /// Build a `QuicLoopConfig` for use with `UnifiedRequestLoop`.
+    /// Build a `QuicLoopConfig` for use with `RequestLoop`.
     pub fn to_loop_config(&self) -> anyhow::Result<hyprstream_rpc::service::QuicLoopConfig> {
         let addr = self.socket_addr()?;
         let (cert_der, key_der) = self.load_tls_materials()?;

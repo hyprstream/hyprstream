@@ -278,6 +278,46 @@ export class CapnpMessageBuilder {
     return new StructBuilder(this, targetOffset, dataWords, ptrWords);
   }
 
+  /**
+   * Initialize a List(Struct) composite list at the given pointer index.
+   * Returns a StructBuilder[] for writing fields into each element.
+   */
+  initStructList(ptrIndex: number, count: number, dataWords: number, ptrWords: number): StructBuilder[] {
+    if (count === 0) return [];
+
+    this.alignAlloc();
+    const tagOffset = this.allocOffset;
+    const elementWords = dataWords + ptrWords;
+    const totalBodyWords = count * elementWords;
+
+    this.ensureCapacity((1 + totalBodyWords) * WORD_SIZE);
+
+    // Write tag word (struct pointer describing element shape)
+    const tagLo = ((count << 2) | 0) >>> 0;
+    const tagHi = ((dataWords & 0xFFFF) | ((ptrWords & 0xFFFF) << 16)) >>> 0;
+    this.buf.setUint32(tagOffset, tagLo, true);
+    this.buf.setUint32(tagOffset + 4, tagHi, true);
+
+    // Reserve space for all elements (pointer targets will be appended after)
+    this.allocOffset = tagOffset + WORD_SIZE + totalBodyWords * WORD_SIZE;
+
+    // Write composite list pointer
+    const ptrOffset = this.rootPtrOffset + ptrIndex * WORD_SIZE;
+    const offsetWords = (tagOffset - ptrOffset - WORD_SIZE) / WORD_SIZE;
+    const lo = ((offsetWords << 2) | 1) >>> 0;
+    const hi = ((totalBodyWords << 3) | 7) >>> 0;
+    this.buf.setUint32(ptrOffset, lo, true);
+    this.buf.setUint32(ptrOffset + 4, hi, true);
+
+    // Create StructBuilder for each element slot
+    const builders: StructBuilder[] = [];
+    for (let i = 0; i < count; i++) {
+      const elemStart = tagOffset + WORD_SIZE + i * elementWords * WORD_SIZE;
+      builders.push(new StructBuilder(this, elemStart, dataWords, ptrWords));
+    }
+    return builders;
+  }
+
   /** Finalize the message and return the wire-format bytes. */
   finish(): Uint8Array {
     // Calculate segment size in words
@@ -479,6 +519,38 @@ export class StructBuilder {
       this.msg._setAllocOffset(textOffset + wordLen * WORD_SIZE);
     }
   }
+
+  initStructList(ptrIndex: number, count: number, dataWords: number, ptrWords: number): StructBuilder[] {
+    if (count === 0) return [];
+
+    this.msg._alignAlloc();
+    const tagOffset = this.msg._getAllocOffset();
+    const elementWords = dataWords + ptrWords;
+    const totalBodyWords = count * elementWords;
+
+    this.msg._ensureCapacity((1 + totalBodyWords) * WORD_SIZE);
+
+    const tagLo = ((count << 2) | 0) >>> 0;
+    const tagHi = ((dataWords & 0xFFFF) | ((ptrWords & 0xFFFF) << 16)) >>> 0;
+    this.msg._getBuf().setUint32(tagOffset, tagLo, true);
+    this.msg._getBuf().setUint32(tagOffset + 4, tagHi, true);
+
+    this.msg._setAllocOffset(tagOffset + WORD_SIZE + totalBodyWords * WORD_SIZE);
+
+    const ptrOffset = this.ptrOffset + ptrIndex * WORD_SIZE;
+    const offsetWords = (tagOffset - ptrOffset - WORD_SIZE) / WORD_SIZE;
+    const lo = ((offsetWords << 2) | 1) >>> 0;
+    const hi = ((totalBodyWords << 3) | 7) >>> 0;
+    this.msg._getBuf().setUint32(ptrOffset, lo, true);
+    this.msg._getBuf().setUint32(ptrOffset + 4, hi, true);
+
+    const builders: StructBuilder[] = [];
+    for (let i = 0; i < count; i++) {
+      const elemStart = tagOffset + WORD_SIZE + i * elementWords * WORD_SIZE;
+      builders.push(new StructBuilder(this.msg, elemStart, dataWords, ptrWords));
+    }
+    return builders;
+  }
 }
 
 /**
@@ -657,6 +729,79 @@ export class CapnpReader {
 
     return results;
   }
+
+  /** Read a List(Data) pointer. */
+  getDataList(ptrIndex: number): Uint8Array[] {
+    const ptrOffset = this.rootPtrOffset + ptrIndex * WORD_SIZE;
+    const lo = this.buf.getUint32(ptrOffset, true);
+    const hi = this.buf.getUint32(ptrOffset + 4, true);
+
+    if (lo === 0 && hi === 0) return [];
+
+    const ptrType = lo & 3;
+    if (ptrType !== 1) return [];
+
+    const offsetWords = (lo >> 2) | 0;
+    const elementSize = hi & 7;
+    const targetOffset = ptrOffset + WORD_SIZE + offsetWords * WORD_SIZE;
+
+    if (elementSize !== 7) return []; // not composite
+
+    const tagLo = this.buf.getUint32(targetOffset, true);
+    const elementCount = (tagLo >> 2) | 0;
+
+    const results: Uint8Array[] = [];
+    for (let i = 0; i < elementCount; i++) {
+      const elemOffset = targetOffset + WORD_SIZE + i * WORD_SIZE;
+      const elemLo = this.buf.getUint32(elemOffset, true);
+      const elemHi = this.buf.getUint32(elemOffset + 4, true);
+
+      if (elemLo === 0 && elemHi === 0) {
+        results.push(new Uint8Array(0));
+        continue;
+      }
+
+      const elemOffsetWords = (elemLo >> 2) | 0;
+      const byteCount = elemHi >>> 3;
+      const dataOffset = elemOffset + WORD_SIZE + elemOffsetWords * WORD_SIZE;
+      results.push(this.raw.slice(dataOffset, dataOffset + byteCount));
+    }
+
+    return results;
+  }
+
+  /** Read a List(Struct) composite list pointer. Returns StructReader[] using wire-format shape from tag word. */
+  getStructList(ptrIndex: number, _dataWords: number, _ptrWords: number): StructReader[] {
+    const ptrOffset = this.rootPtrOffset + ptrIndex * WORD_SIZE;
+    const lo = this.buf.getUint32(ptrOffset, true);
+    const hi = this.buf.getUint32(ptrOffset + 4, true);
+
+    if (lo === 0 && hi === 0) return [];
+
+    const ptrType = lo & 3;
+    if (ptrType !== 1) return [];
+
+    const offsetWords = (lo >> 2) | 0;
+    const elementSize = hi & 7;
+    const targetOffset = ptrOffset + WORD_SIZE + offsetWords * WORD_SIZE;
+
+    if (elementSize !== 7) return []; // not composite
+
+    // Read tag word — struct pointer encoding element shape
+    const tagLo = this.buf.getUint32(targetOffset, true);
+    const tagHi = this.buf.getUint32(targetOffset + 4, true);
+    const elementCount = (tagLo >> 2) | 0;
+    const tagDataWords = tagHi & 0xFFFF;
+    const tagPtrWords = (tagHi >> 16) & 0xFFFF;
+    const elementWords = tagDataWords + tagPtrWords;
+
+    const results: StructReader[] = [];
+    for (let i = 0; i < elementCount; i++) {
+      const elemDataOffset = targetOffset + WORD_SIZE + i * elementWords * WORD_SIZE;
+      results.push(new StructReader(this.raw, this.buf, elemDataOffset, tagDataWords, tagPtrWords));
+    }
+    return results;
+  }
 }
 
 /**
@@ -783,6 +928,66 @@ export class StructReader {
       const textOffset = elemOffset + WORD_SIZE + elemOffsetWords * WORD_SIZE;
       const strLen = byteCount > 0 ? byteCount - 1 : 0;
       results.push(new TextDecoder().decode(this.raw.slice(textOffset, textOffset + strLen)));
+    }
+    return results;
+  }
+
+  getDataList(ptrIndex: number): Uint8Array[] {
+    const ptrOffset = this.dataOffset + this.dataWords * WORD_SIZE + ptrIndex * WORD_SIZE;
+    const lo = this.buf.getUint32(ptrOffset, true);
+    const hi = this.buf.getUint32(ptrOffset + 4, true);
+
+    if (lo === 0 && hi === 0) return [];
+    const ptrType = lo & 3;
+    if (ptrType !== 1) return [];
+
+    const offsetWords = (lo >> 2) | 0;
+    const elementSize = hi & 7;
+    const targetOffset = ptrOffset + WORD_SIZE + offsetWords * WORD_SIZE;
+
+    if (elementSize !== 7) return [];
+    const tagLo = this.buf.getUint32(targetOffset, true);
+    const elementCount = (tagLo >> 2) | 0;
+
+    const results: Uint8Array[] = [];
+    for (let i = 0; i < elementCount; i++) {
+      const elemOffset = targetOffset + WORD_SIZE + i * WORD_SIZE;
+      const elemLo = this.buf.getUint32(elemOffset, true);
+      const elemHi = this.buf.getUint32(elemOffset + 4, true);
+      if (elemLo === 0 && elemHi === 0) { results.push(new Uint8Array(0)); continue; }
+      const elemOffsetWords = (elemLo >> 2) | 0;
+      const byteCount = elemHi >>> 3;
+      const dataOffset = elemOffset + WORD_SIZE + elemOffsetWords * WORD_SIZE;
+      results.push(this.raw.slice(dataOffset, dataOffset + byteCount));
+    }
+    return results;
+  }
+
+  getStructList(ptrIndex: number, _dataWords: number, _ptrWords: number): StructReader[] {
+    const ptrOffset = this.dataOffset + this.dataWords * WORD_SIZE + ptrIndex * WORD_SIZE;
+    const lo = this.buf.getUint32(ptrOffset, true);
+    const hi = this.buf.getUint32(ptrOffset + 4, true);
+
+    if (lo === 0 && hi === 0) return [];
+    const ptrType = lo & 3;
+    if (ptrType !== 1) return [];
+
+    const offsetWords = (lo >> 2) | 0;
+    const elementSize = hi & 7;
+    const targetOffset = ptrOffset + WORD_SIZE + offsetWords * WORD_SIZE;
+
+    if (elementSize !== 7) return [];
+    const tagLo = this.buf.getUint32(targetOffset, true);
+    const tagHi = this.buf.getUint32(targetOffset + 4, true);
+    const elementCount = (tagLo >> 2) | 0;
+    const tagDataWords = tagHi & 0xFFFF;
+    const tagPtrWords = (tagHi >> 16) & 0xFFFF;
+    const elementWords = tagDataWords + tagPtrWords;
+
+    const results: StructReader[] = [];
+    for (let i = 0; i < elementCount; i++) {
+      const elemDataOffset = targetOffset + WORD_SIZE + i * elementWords * WORD_SIZE;
+      results.push(new StructReader(this.raw, this.buf, elemDataOffset, tagDataWords, tagPtrWords));
     }
     return results;
   }

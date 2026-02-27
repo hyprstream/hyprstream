@@ -300,7 +300,7 @@ fn handler_method_params(
             if let Some(sdef) = resolved.find_struct(name) {
                 // Union-only struct (e.g., scope structs like RuntimeRequest):
                 // handler needs raw payload to dispatch the inner union
-                if sdef.has_union && sdef.fields.is_empty() {
+                if sdef.is_pure_union() {
                     return vec![quote! { payload: &[u8] }];
                 }
                 // Option 2: Accept whole struct instead of individual fields
@@ -319,7 +319,7 @@ fn handler_method_params(
 fn is_union_only_struct_variant(v: &UnionVariant, resolved: &ResolvedSchema) -> bool {
     if let CapnpType::Struct(ref name) = resolved.resolve_type(&v.type_name).capnp_type {
         if let Some(sdef) = resolved.find_struct(name) {
-            return sdef.has_union && sdef.fields.is_empty();
+            return sdef.is_pure_union();
         }
     }
     false
@@ -460,7 +460,7 @@ fn generate_dispatch_fn(
                     },
                     CapnpType::Struct(ref name) => {
                         if let Some(sdef) = resolved.find_struct(name) {
-                            if sdef.has_union && sdef.fields.is_empty() {
+                            if sdef.is_pure_union() {
                                 let call = call_handler!(payload);
                                 quote! {
                                     Which::#variant_pascal(_) => {
@@ -583,7 +583,7 @@ fn generate_dispatch_fn(
                 CapnpType::Struct(ref name) => {
                     if let Some(sdef) = resolved.find_struct(name) {
                         // Union-only struct (e.g., scope structs): pass raw payload
-                        if sdef.has_union && sdef.fields.is_empty() {
+                        if sdef.is_pure_union() {
                             let call = if scope_handlers {
                                 quote! { #trait_name::#handler_method(handler, ctx, request_id, payload).await }
                             } else {
@@ -1042,7 +1042,7 @@ fn scope_handler_method_params(
         }
         CapnpType::Struct(ref name) => {
             if let Some(sdef) = resolved.find_struct(name) {
-                if sdef.has_union && sdef.fields.is_empty() {
+                if sdef.is_pure_union() {
                     return vec![quote! { payload: &[u8] }];
                 }
                 // Option 2: Accept whole struct instead of individual fields
@@ -1548,7 +1548,7 @@ fn generate_scope_params_enum(
                 },
                 CapnpType::Struct(ref name) => {
                     if let Some(sdef) = resolved.find_struct(name) {
-                        if sdef.has_union && sdef.fields.is_empty() {
+                        if sdef.is_pure_union() {
                             quote! { #variant_pascal }
                         } else {
                             let struct_ident = format_ident!("{}", name);
@@ -1643,7 +1643,7 @@ fn generate_scope_extraction_phase(
                 },
                 CapnpType::Struct(ref name) => {
                     if let Some(sdef) = resolved.find_struct(name) {
-                        if sdef.has_union && sdef.fields.is_empty() {
+                        if sdef.is_pure_union() {
                             quote! {
                                 Which::#variant_pascal(_) => {
                                     (#tag_enum::#variant_pascal, #params_enum::#variant_pascal)
@@ -2072,7 +2072,7 @@ fn generate_nested_scope_extraction_phase(
                 },
                 CapnpType::Struct(ref name) => {
                     if let Some(sdef) = resolved.find_struct(name) {
-                        if sdef.has_union && sdef.fields.is_empty() {
+                        if sdef.is_pure_union() {
                             quote! {
                                 Which::#variant_pascal(_) => {
                                     (#tag_enum::#variant_pascal, #params_enum::#variant_pascal)

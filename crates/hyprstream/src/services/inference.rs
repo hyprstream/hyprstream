@@ -2570,12 +2570,8 @@ impl hyprstream_rpc::service::spawner::Spawnable for InferenceServiceConfig {
             };
 
             // Use shared nonce cache between service and RequestLoop
-            let runner = RequestLoop::with_nonce_cache(
-                transport,
-                context,
-                signing_key,
-                nonce_cache,
-            );
+            let runner = RequestLoop::new(transport, context, signing_key)
+                .with_nonce_cache(nonce_cache);
             let mut handle = runner.run(adapter).await
                 .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("loop: {e}")))?;
 

@@ -60,7 +60,7 @@ pub fn generate_parsers(out: &mut String, service_name: &str, schema: &ParsedSch
     ));
 
     for f in &non_union_fields {
-        emit_reader_field(out, "reader", f, &to_camel_case(&f.name), "  ");
+        emit_reader_field(out, "reader", f, &to_camel_case(&f.name), "  ", schema);
     }
 
     out.push_str(&format!(
@@ -147,12 +147,29 @@ pub fn generate_parsers(out: &mut String, service_name: &str, schema: &ParsedSch
                     &format!("reader.getTextList({})", vf.slot_offset),
                 );
             }
+        } else if let Some(inner) = super::extract_list_inner_type(&variant.type_name) {
+            // List(Struct) variant
+            if let Some(vf) = variant_field {
+                if let Some(sd) = schema.structs.iter().find(|s| s.name == inner) {
+                    emit_struct_list_read(
+                        out,
+                        "reader",
+                        vf,
+                        sd,
+                        &non_union_fields,
+                        &variant.name,
+                        schema,
+                    );
+                } else {
+                    emit_return(out, &non_union_fields, &variant.name, "[]");
+                }
+            }
         } else {
             // Struct type
             if let Some(vf) = variant_field {
                 let struct_def = schema.structs.iter().find(|s| s.name == variant.type_name);
                 if let Some(sd) = struct_def {
-                    emit_struct_read(out, "reader", vf, sd, &non_union_fields, &variant.name);
+                    emit_struct_read(out, "reader", vf, sd, &non_union_fields, &variant.name, schema);
                 } else {
                     emit_return(out, &non_union_fields, &variant.name, "null");
                 }
@@ -319,45 +336,185 @@ fn emit_inner_variant_read(
         t if t.starts_with("List(Text") => {
             format!("_inner.getTextList({})", f.slot_offset)
         }
+        t if t.starts_with("List(") => {
+            // List(Struct) — read as mapped array
+            let inner = super::extract_list_inner_type(t).unwrap_or("");
+            if let Some(sd) = schema.structs.iter().find(|s| s.name == inner) {
+                emit_struct_list_field_expr("_inner", f.slot_offset, sd, schema)
+            } else {
+                "[]".into()
+            }
+        }
         _ => {
-            // Struct — read its fields as an object
-            let struct_def = schema.structs.iter().find(|s| s.name == type_name);
-            if let Some(sd) = struct_def {
-                let fields: Vec<String> = sd
-                    .fields
-                    .iter()
-                    .filter(|sf| sf.discriminant_value == 0xFFFF)
-                    .map(|sf| {
-                        let camel = to_camel_case(&sf.name);
-                        let read = match sf.section {
-                            FieldSection::Data => {
-                                let byte_off = data_byte_offset(sf);
-                                if sf.type_name == "Bool" {
-                                    let bit = bool_bit_index(sf);
-                                    format!("_is.getBool({byte_off}, {bit})")
-                                } else {
-                                    let method = super::getter_method(&sf.type_name);
-                                    format!("_is.{method}({byte_off})")
-                                }
-                            }
-                            FieldSection::Pointer => {
-                                let method = super::getter_method(&sf.type_name);
-                                format!("_is.{method}({})", sf.slot_offset)
-                            }
-                            FieldSection::Group => "undefined".into(),
-                        };
-                        format!("{camel}: {read}")
-                    })
-                    .collect();
-                format!(
-                    "(() => {{ const _is = _inner.getStruct({}, {}, {}); return _is ? {{ {} }} : null; }})()",
-                    f.slot_offset, sd.data_words, sd.pointer_words, fields.join(", ")
-                )
+            // Struct — read its fields as an object via getStruct
+            if let Some(sd) = schema.structs.iter().find(|s| s.name == type_name) {
+                emit_struct_pointer_expr("_inner", f.slot_offset, sd, schema, 0)
             } else {
                 "null".into()
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// List(Struct) helpers
+// ---------------------------------------------------------------------------
+
+/// Emit an inline IIFE that reads a struct pointer and returns an object literal.
+///
+/// Uses `_p{depth}` variable names to avoid temporal dead zone collisions in nested IIFEs.
+fn emit_struct_pointer_expr(
+    reader_var: &str,
+    slot: u32,
+    sd: &StructDef,
+    schema: &ParsedSchema,
+    depth: usize,
+) -> String {
+    if depth > 4 {
+        return "null".into(); // guard against hypothetical recursive schemas
+    }
+    let var_name = format!("_p{depth}");
+    let fields: Vec<String> = sd
+        .fields
+        .iter()
+        .filter(|sf| sf.discriminant_value == 0xFFFF)
+        .map(|sf| {
+            let camel = to_camel_case(&sf.name);
+            let read = emit_struct_element_field_read_inner(&var_name, sf, schema, depth + 1);
+            format!("{camel}: {read}")
+        })
+        .collect();
+    format!(
+        "(() => {{ const {var_name} = {reader_var}.getStruct({slot}, {}, {}); return {var_name} ? {{ {} }} : null; }})()",
+        sd.data_words, sd.pointer_words, fields.join(", ")
+    )
+}
+
+/// Generate an inline read expression for a single struct field (thin wrapper).
+fn emit_struct_element_field_read(
+    reader_var: &str,
+    field: &FieldDef,
+    schema: &ParsedSchema,
+) -> String {
+    emit_struct_element_field_read_inner(reader_var, field, schema, 0)
+}
+
+/// Emit a read expression for a pointer-section field.
+///
+/// Handles: List(Text), List(Data), List(Struct), Struct, Text, Data.
+fn emit_pointer_read_expr(
+    reader_var: &str,
+    field: &FieldDef,
+    schema: &ParsedSchema,
+    depth: usize,
+) -> String {
+    match super::extract_list_inner_type(&field.type_name) {
+        Some("Text") => {
+            format!("{reader_var}.getTextList({})", field.slot_offset)
+        }
+        Some("Data") => {
+            format!("{reader_var}.getDataList({})", field.slot_offset)
+        }
+        Some(inner) => {
+            // List(Struct) — look up struct def, map elements
+            if let Some(isd) = schema.structs.iter().find(|s| s.name == inner) {
+                emit_struct_list_field_expr(reader_var, field.slot_offset, isd, schema)
+            } else {
+                "[]".into()
+            }
+        }
+        None => {
+            // Non-list pointer: Struct, Text, Data, or unknown
+            if let Some(sd) = schema.structs.iter().find(|s| s.name == field.type_name) {
+                emit_struct_pointer_expr(reader_var, field.slot_offset, sd, schema, depth)
+            } else if field.type_name == "Text" || field.type_name == "Data" {
+                let method = super::getter_method(&field.type_name);
+                format!("{reader_var}.{method}({})", field.slot_offset)
+            } else {
+                // Unknown pointer type (AnyPointer, Interface, etc.)
+                "null".into()
+            }
+        }
+    }
+}
+
+/// Generate an inline read expression for a single struct field.
+/// Handles data scalars, pointers (Text, Data, List(Text), List(Struct), Struct), and groups.
+fn emit_struct_element_field_read_inner(
+    reader_var: &str,
+    field: &FieldDef,
+    schema: &ParsedSchema,
+    depth: usize,
+) -> String {
+    match field.section {
+        FieldSection::Data => {
+            if field.type_name == "Void" {
+                return "undefined".into();
+            }
+            let byte_off = data_byte_offset(field);
+            if field.type_name == "Bool" {
+                let bit = bool_bit_index(field);
+                format!("{reader_var}.getBool({byte_off}, {bit})")
+            } else if !super::is_data_scalar(&field.type_name) {
+                // Enum type — stored as UInt16 in data section
+                if let Some(ed) = schema.enums.iter().find(|e| e.name == field.type_name) {
+                    let array = ed
+                        .variants
+                        .iter()
+                        .map(|(v, _)| format!("'{}'", to_camel_case(v)))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("[{array}][{reader_var}.getUint16({byte_off})] ?? 'unknown'")
+                } else {
+                    format!("{reader_var}.getUint16({byte_off})")
+                }
+            } else {
+                let method = super::getter_method(&field.type_name);
+                format!("{reader_var}.{method}({byte_off})")
+            }
+        }
+        FieldSection::Pointer => emit_pointer_read_expr(reader_var, field, schema, depth),
+        FieldSection::Group => "undefined".into(),
+    }
+}
+
+/// Generate an inline expression that reads a List(Struct) and maps elements to objects.
+fn emit_struct_list_field_expr(
+    reader_var: &str,
+    slot: u32,
+    sd: &StructDef,
+    schema: &ParsedSchema,
+) -> String {
+    let fields: Vec<String> = sd
+        .fields
+        .iter()
+        .filter(|f| f.discriminant_value == 0xFFFF)
+        .map(|f| {
+            let camel = to_camel_case(&f.name);
+            let read = emit_struct_element_field_read_inner("_el", f, schema, 0);
+            format!("{camel}: {read}")
+        })
+        .collect();
+    format!(
+        "{reader_var}.getStructList({}, {}, {}).map(_el => ({{ {} }}))",
+        slot, sd.data_words, sd.pointer_words, fields.join(", ")
+    )
+}
+
+/// Emit a top-level List(Struct) variant read wrapped in a block.
+fn emit_struct_list_read(
+    out: &mut String,
+    reader_var: &str,
+    ptr_field: &FieldDef,
+    struct_def: &StructDef,
+    non_union_fields: &[&FieldDef],
+    variant_name: &str,
+    schema: &ParsedSchema,
+) {
+    let expr = emit_struct_list_field_expr(reader_var, ptr_field.slot_offset, struct_def, schema);
+    out.push_str(&format!("    {{\n      const _items = {expr};\n"));
+    emit_return(out, non_union_fields, variant_name, "_items");
+    out.push_str("    }\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -370,15 +527,39 @@ fn emit_reader_field(
     field: &FieldDef,
     local_name: &str,
     indent: &str,
+    schema: &ParsedSchema,
 ) {
     match field.section {
         FieldSection::Data => {
+            if field.type_name == "Void" {
+                out.push_str(&format!(
+                    "{indent}const {local_name} = undefined;\n"
+                ));
+                return;
+            }
             let byte_off = data_byte_offset(field);
             if field.type_name == "Bool" {
                 let bit = bool_bit_index(field);
                 out.push_str(&format!(
                     "{indent}const {local_name} = {reader_var}.getBool({byte_off}, {bit});\n"
                 ));
+            } else if !super::is_data_scalar(&field.type_name) {
+                // Enum type — stored as UInt16 in data section
+                if let Some(ed) = schema.enums.iter().find(|e| e.name == field.type_name) {
+                    let array = ed
+                        .variants
+                        .iter()
+                        .map(|(v, _)| format!("'{}'", to_camel_case(v)))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    out.push_str(&format!(
+                        "{indent}const {local_name} = [{array}][{reader_var}.getUint16({byte_off})] ?? 'unknown';\n"
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "{indent}const {local_name} = {reader_var}.getUint16({byte_off});\n"
+                    ));
+                }
             } else {
                 let method = super::getter_method(&field.type_name);
                 out.push_str(&format!(
@@ -387,10 +568,9 @@ fn emit_reader_field(
             }
         }
         FieldSection::Pointer => {
-            let method = super::getter_method(&field.type_name);
+            let read_expr = emit_pointer_read_expr(reader_var, field, schema, 0);
             out.push_str(&format!(
-                "{indent}const {local_name} = {reader_var}.{method}({});\n",
-                field.slot_offset
+                "{indent}const {local_name} = {read_expr};\n"
             ));
         }
         FieldSection::Group => {
@@ -425,6 +605,7 @@ fn emit_struct_read(
     struct_def: &StructDef,
     non_union_fields: &[&FieldDef],
     variant_name: &str,
+    schema: &ParsedSchema,
 ) {
     out.push_str(&format!(
         "    {{\n      const _s = {reader_var}.getStruct({}, {}, {});\n",
@@ -440,23 +621,7 @@ fn emit_struct_read(
     out.push_str("      const _data = _s ? {\n");
     for sf in &visible_fields {
         let camel = to_camel_case(&sf.name);
-        let read_expr = match sf.section {
-            FieldSection::Data => {
-                let byte_off = data_byte_offset(sf);
-                if sf.type_name == "Bool" {
-                    let bit = bool_bit_index(sf);
-                    format!("_s.getBool({byte_off}, {bit})")
-                } else {
-                    let method = super::getter_method(&sf.type_name);
-                    format!("_s.{method}({byte_off})")
-                }
-            }
-            FieldSection::Pointer => {
-                let method = super::getter_method(&sf.type_name);
-                format!("_s.{method}({})", sf.slot_offset)
-            }
-            FieldSection::Group => "undefined".into(),
-        };
+        let read_expr = emit_struct_element_field_read("_s", sf, schema);
         out.push_str(&format!("        {camel}: {read_expr},\n"));
     }
     out.push_str("      } : null;\n");
