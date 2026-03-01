@@ -88,12 +88,29 @@ pub struct HyprConfig {
     #[serde(default)]
     pub streaming: StreamingConfig,
 
-    /// QUIC/WebTransport configuration (optional)
+    /// QUIC/WebTransport configuration
     ///
-    /// When enabled, services expose a WebTransport endpoint alongside ZMQ,
+    /// Enabled by default. Services expose a WebTransport endpoint alongside ZMQ,
     /// allowing browsers to connect directly via HTTP/3 + QUIC.
+    /// Set `enabled = false` to disable.
     #[serde(default)]
-    pub quic: Option<QuicConfig>,
+    pub quic: QuicConfig,
+
+    /// Event proxy service configuration
+    #[serde(default)]
+    pub event: EventServiceConfig,
+
+    /// Registry service configuration
+    #[serde(default)]
+    pub registry: RegistryServiceConfig,
+
+    /// Policy service configuration
+    #[serde(default)]
+    pub policy: PolicyServiceConfig,
+
+    /// Discovery service configuration
+    #[serde(default)]
+    pub discovery: DiscoveryServiceConfig,
 }
 
 /// QUIC/WebTransport transport configuration.
@@ -113,8 +130,8 @@ pub struct HyprConfig {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuicConfig {
-    /// Whether QUIC/WebTransport is enabled
-    #[serde(default)]
+    /// Whether QUIC/WebTransport is enabled (defaults to true)
+    #[serde(default = "default_quic_enabled")]
     pub enabled: bool,
 
     /// Address to bind the WebTransport server
@@ -137,7 +154,7 @@ pub struct QuicConfig {
 impl Default for QuicConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             bind_addr: default_quic_bind_addr(),
             server_name: default_quic_server_name(),
             cert_path: String::new(),
@@ -197,17 +214,34 @@ impl QuicConfig {
     }
 
     /// Build a `QuicLoopConfig` for use with `RequestLoop`.
-    pub fn to_loop_config(&self) -> anyhow::Result<hyprstream_rpc::service::QuicLoopConfig> {
+    ///
+    /// Optionally embeds RFC 9728 Protected Resource Metadata so HTTP/3 clients
+    /// can discover the OAuth authorization server for this QUIC endpoint.
+    pub fn to_loop_config(
+        &self,
+        service_name: &str,
+        oauth_issuer_url: Option<&str>,
+    ) -> anyhow::Result<hyprstream_rpc::service::QuicLoopConfig> {
         let addr = self.socket_addr()?;
         let (cert_der, key_der) = self.load_tls_materials()?;
+        let meta_json = oauth_issuer_url.map(|issuer| {
+            let meta = crate::services::oauth::protected_resource_metadata(
+                &format!("https://{}/{}", self.server_name, service_name),
+                issuer,
+            );
+            serde_json::to_vec(&meta).unwrap_or_default()
+        });
         Ok(hyprstream_rpc::service::QuicLoopConfig {
             cert_der,
             key_der,
             bind_addr: addr,
+            server_name: self.server_name.clone(),
+            protected_resource_json: meta_json,
         })
     }
 }
 
+fn default_quic_enabled() -> bool { true }
 fn default_quic_bind_addr() -> String { "0.0.0.0:4433".to_owned() }
 fn default_quic_server_name() -> String { "localhost".to_owned() }
 
@@ -264,6 +298,10 @@ pub struct OAIConfig {
     /// CORS configuration
     #[serde(default)]
     pub cors: server::CorsConfig,
+
+    /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
 }
 
 impl Default for OAIConfig {
@@ -276,6 +314,7 @@ impl Default for OAIConfig {
             tls_key: None,
             request_timeout_secs: default_oai_timeout(),
             cors: server::CorsConfig::default(),
+            quic_port: None,
         }
     }
 }
@@ -318,6 +357,10 @@ pub struct FlightConfig {
     /// TLS private key path (optional)
     #[serde(default)]
     pub tls_key: Option<PathBuf>,
+
+    /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
 }
 
 impl Default for FlightConfig {
@@ -328,6 +371,7 @@ impl Default for FlightConfig {
             default_dataset: None,
             tls_cert: None,
             tls_key: None,
+            quic_port: None,
         }
     }
 }
@@ -353,6 +397,14 @@ pub struct MCPConfig {
     /// Auto-derived from host:http_port if not set.
     #[serde(default)]
     pub external_url: Option<String>,
+
+    /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
+
+    /// CORS configuration for the MCP HTTP/SSE server
+    #[serde(default)]
+    pub cors: server::CorsConfig,
 }
 
 impl Default for MCPConfig {
@@ -361,6 +413,8 @@ impl Default for MCPConfig {
             host: default_mcp_host(),
             http_port: default_mcp_port(),
             external_url: None,
+            quic_port: None,
+            cors: server::CorsConfig::default(),
         }
     }
 }
@@ -411,6 +465,18 @@ pub struct OAuthConfig {
     /// Refresh token TTL in seconds (default: 72 hours)
     #[serde(default = "default_refresh_token_ttl")]
     pub refresh_token_ttl_seconds: u32,
+
+    /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
+
+    /// CORS configuration for the OAuth HTTP server
+    #[serde(default = "default_oauth_cors")]
+    pub cors: server::CorsConfig,
+}
+
+fn default_oauth_cors() -> server::CorsConfig {
+    server::CorsConfig::public()
 }
 
 impl Default for OAuthConfig {
@@ -422,6 +488,8 @@ impl Default for OAuthConfig {
             default_scopes: default_oauth_scopes(),
             token_ttl_seconds: default_oauth_token_ttl(),
             refresh_token_ttl_seconds: default_refresh_token_ttl(),
+            quic_port: None,
+            cors: default_oauth_cors(),
         }
     }
 }
@@ -478,6 +546,10 @@ pub struct StreamingConfig {
     /// Lower rates → smaller batches (reduced latency).
     #[serde(flatten, default)]
     pub batching: hyprstream_rpc::streaming::BatchingConfig,
+
+    /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
 }
 
 impl Default for StreamingConfig {
@@ -487,6 +559,7 @@ impl Default for StreamingConfig {
             message_ttl_secs: default_message_ttl_secs(),
             compact_interval_secs: default_compact_interval_secs(),
             batching: hyprstream_rpc::streaming::BatchingConfig::default(),
+            quic_port: None,
         }
     }
 }
@@ -538,6 +611,38 @@ impl Default for StorageConfig {
     }
 }
 
+/// Event proxy service configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EventServiceConfig {
+    /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
+}
+
+/// Registry service configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RegistryServiceConfig {
+    /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
+}
+
+/// Policy service configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PolicyServiceConfig {
+    /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
+}
+
+/// Discovery service configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DiscoveryServiceConfig {
+    /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
+}
+
 /// Service management configuration
 ///
 /// Controls which services are started at startup in ipc-systemd mode.
@@ -570,6 +675,7 @@ fn default_startup_services() -> Vec<String> {
         "oauth".to_owned(),     // OAuth 2.1 authorization server
         "oai".to_owned(),       // OpenAI-compatible HTTP API
         "flight".to_owned(),    // Arrow Flight SQL server
+        "discovery".to_owned(), // Endpoint discovery (RFC 9728 metadata)
         "mcp".to_owned(),       // Model Context Protocol service
     ]
 }
@@ -585,6 +691,9 @@ pub struct ModelConfig {
     pub architecture: String,
     /// Expected parameter count
     pub parameters: Option<u64>,
+    /// QUIC/WebTransport port for model service. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
 }
 
 impl Default for ModelConfig {
@@ -594,6 +703,7 @@ impl Default for ModelConfig {
             name: String::new(),
             architecture: String::new(),
             parameters: None,
+            quic_port: None,
         }
     }
 }
@@ -758,7 +868,11 @@ pub struct HyprConfigBuilder {
     mcp: MCPConfig,
     oauth: OAuthConfig,
     streaming: StreamingConfig,
-    quic: Option<QuicConfig>,
+    quic: QuicConfig,
+    event: EventServiceConfig,
+    registry: RegistryServiceConfig,
+    policy: PolicyServiceConfig,
+    discovery: DiscoveryServiceConfig,
 }
 
 impl HyprConfigBuilder {
@@ -780,7 +894,11 @@ impl HyprConfigBuilder {
             mcp: MCPConfig::default(),
             oauth: OAuthConfig::default(),
             streaming: StreamingConfig::default(),
-            quic: None,
+            quic: QuicConfig::default(),
+            event: EventServiceConfig::default(),
+            registry: RegistryServiceConfig::default(),
+            policy: PolicyServiceConfig::default(),
+            discovery: DiscoveryServiceConfig::default(),
         }
     }
 
@@ -803,6 +921,10 @@ impl HyprConfigBuilder {
             oauth: config.oauth,
             streaming: config.streaming,
             quic: config.quic,
+            event: config.event,
+            registry: config.registry,
+            policy: config.policy,
+            discovery: config.discovery,
         }
     }
 
@@ -837,6 +959,10 @@ impl HyprConfigBuilder {
             oauth: self.oauth,
             streaming: self.streaming,
             quic: self.quic,
+            event: self.event,
+            registry: self.registry,
+            policy: self.policy,
+            discovery: self.discovery,
         }
     }
 

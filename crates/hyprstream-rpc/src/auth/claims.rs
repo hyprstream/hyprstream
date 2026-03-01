@@ -123,19 +123,20 @@ impl Claims {
     pub fn verify_token(
         &self,
         verifying_key: &ed25519_dalek::VerifyingKey,
+        expected_aud: Option<&str>,
     ) -> std::result::Result<Option<Claims>, super::jwt::JwtError> {
         match &self.token {
             Some(token) => {
-                let verified = super::jwt::decode(token, verifying_key)?;
+                let verified = super::jwt::decode(token, verifying_key, expected_aud)?;
                 Ok(Some(verified))
             }
             None => Ok(None),
         }
     }
 
-    /// Check if token is expired.
+    /// Check if token is expired (with 5-second leeway for clock skew).
     pub fn is_expired(&self) -> bool {
-        chrono::Utc::now().timestamp() > self.exp
+        chrono::Utc::now().timestamp() > self.exp + 5
     }
 }
 

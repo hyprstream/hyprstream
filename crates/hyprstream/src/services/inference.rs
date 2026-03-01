@@ -2381,40 +2381,8 @@ impl InferenceHandler for InferenceService {
 // ZmqService adapter and Spawnable implementation
 // ═══════════════════════════════════════════════════════════════════════════════
 
-impl InferenceService {
-    /// E2E JWT verification with downgrade attack protection.
-    ///
-    /// This is the shared implementation used by `InferenceZmqAdapter::verify_claims()`.
-    /// Moved from the custom REP loop to the standard `ZmqService` hook.
-    fn verify_claims_impl(&self, ctx: &EnvelopeContext) -> anyhow::Result<()> {
-        if let Some(claims) = ctx.claims() {
-            match claims.verify_token(&self.server_pubkey) {
-                Ok(Some(verified)) => {
-                    if verified.sub != claims.sub {
-                        warn!("Claims sub mismatch: envelope={} jwt={}", claims.sub, verified.sub);
-                        anyhow::bail!("Claims subject mismatch");
-                    }
-                }
-                Ok(None) => {
-                    // SECURITY: Non-local requests MUST have JWT token
-                    // to prevent subject impersonation via fabricated claims
-                    if !ctx.identity.is_local() {
-                        warn!(
-                            "Non-local request with claims but no JWT token: sub={}, identity={:?}",
-                            claims.sub, ctx.identity
-                        );
-                        anyhow::bail!("JWT token required for non-local requests");
-                    }
-                }
-                Err(e) => {
-                    warn!("E2E JWT verification failed: {}", e);
-                    anyhow::bail!("JWT verification failed");
-                }
-            }
-        }
-        Ok(())
-    }
-}
+// verify_claims is now handled by the default ZmqService::verify_claims() implementation
+// in hyprstream-rpc (E2E JWT verification for all non-local identities).
 
 /// ZmqService adapter for InferenceService.
 ///
@@ -2426,6 +2394,7 @@ struct InferenceZmqAdapter {
     zmq_context: Arc<zmq::Context>,
     transport: hyprstream_rpc::transport::TransportConfig,
     signing_key: SigningKey,
+    expected_audience: Option<String>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -2437,10 +2406,6 @@ impl hyprstream_rpc::service::ZmqService for InferenceZmqAdapter {
     ) -> anyhow::Result<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
         self.service.cleanup_expired_adaptations();
         dispatch_inference(&self.service, ctx, payload).await
-    }
-
-    fn verify_claims(&self, ctx: &EnvelopeContext) -> anyhow::Result<()> {
-        self.service.verify_claims_impl(ctx)
     }
 
     fn name(&self) -> &str {
@@ -2457,6 +2422,10 @@ impl hyprstream_rpc::service::ZmqService for InferenceZmqAdapter {
 
     fn signing_key(&self) -> SigningKey {
         self.signing_key.clone()
+    }
+
+    fn expected_audience(&self) -> Option<&str> {
+        self.expected_audience.as_deref()
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
@@ -2486,6 +2455,8 @@ pub struct InferenceServiceConfig {
     zmq_context: Arc<zmq::Context>,
     transport: hyprstream_rpc::transport::TransportConfig,
     fs: Option<WorktreeClient>,
+    /// Expected audience for JWT validation (resource URL)
+    expected_audience: Option<String>,
 }
 
 impl InferenceServiceConfig {
@@ -2512,7 +2483,14 @@ impl InferenceServiceConfig {
             zmq_context,
             transport,
             fs,
+            expected_audience: None,
         }
+    }
+
+    /// Set the expected audience for JWT validation.
+    pub fn with_expected_audience(mut self, audience: String) -> Self {
+        self.expected_audience = Some(audience);
+        self
     }
 }
 
@@ -2567,6 +2545,7 @@ impl hyprstream_rpc::service::spawner::Spawnable for InferenceServiceConfig {
                 zmq_context: context.clone(),
                 transport: transport.clone(),
                 signing_key: signing_key.clone(),
+                expected_audience: self.expected_audience,
             };
 
             // Use shared nonce cache between service and RequestLoop

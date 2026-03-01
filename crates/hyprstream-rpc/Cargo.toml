@@ -55,11 +55,14 @@ tmq = { workspace = true }
 zmq = { workspace = true }
 zmq-sys = { workspace = true }  # Raw FFI for ZMQ_USE_FD socket option
 
-# QUIC transport (ZMTP over QUIC)
+# QUIC transport (HTTP/3 + WebTransport + ZMTP over QUIC)
 quinn = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true, features = ["ring"] }
-web-transport-quinn = { workspace = true }
+h3 = { workspace = true }
+h3-quinn = { workspace = true }
+h3-webtransport = { workspace = true }
+http = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true, features = ["io-util", "net"] }

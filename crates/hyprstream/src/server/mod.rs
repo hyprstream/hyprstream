@@ -87,10 +87,13 @@ async fn oauth_protected_resource_metadata() -> impl IntoResponse {
     let oai_url = config.oai.resource_url();
     let oauth_issuer = config.oauth.issuer_url();
 
-    Json(crate::services::oauth::protected_resource_metadata(
+    let mut meta = crate::services::oauth::protected_resource_metadata(
         &oai_url,
         &oauth_issuer,
-    ))
+    );
+    meta.resource_name = Some("HyprStream OpenAI-Compatible API".to_string());
+    meta.scopes_supported = Some(vec!["infer:model:*".into(), "read:model:*".into()]);
+    Json(meta)
 }
 
 /// Start the HTTP server

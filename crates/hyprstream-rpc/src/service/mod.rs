@@ -21,7 +21,7 @@ pub use traits::{RpcHandler, RpcRequest, RpcService};
 pub use zmq::{AuthorizeFn, CallOptions, Continuation, EnvelopeContext, QuicLoopConfig, ServiceHandle, RequestLoop, UnifiedRequestLoop, ZmqClient, ZmqService};
 pub use streaming::StreamService;
 pub use spawner::{InprocManager, Spawnable, SpawnedService};
-pub use factory::{get_factory, list_factories, ServiceClient, ServiceContext, ServiceFactory};
+pub use factory::{get_factory, list_factories, QuicSharedConfig, ServiceClient, ServiceContext, ServiceFactory};
 
 // Re-export service manager types
 pub use manager::{detect as detect_service_manager, ServiceManager, StandaloneManager};

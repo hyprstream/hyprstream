@@ -34,6 +34,47 @@ use crate::service::spawner::Spawnable;
 use crate::service::ZmqClient;
 use crate::transport::TransportConfig;
 
+/// Shared QUIC/WebTransport configuration for all services.
+///
+/// Contains TLS materials and base settings shared across services.
+/// Each service gets its own port via `for_service()`.
+#[derive(Clone)]
+pub struct QuicSharedConfig {
+    /// DER-encoded TLS certificate
+    pub cert_der: Vec<u8>,
+    /// DER-encoded TLS private key
+    pub key_der: Vec<u8>,
+    /// Base IP address for binding (e.g., 0.0.0.0)
+    pub base_ip: std::net::IpAddr,
+    /// TLS server name (for certificate validation and discovery)
+    pub server_name: String,
+    /// OAuth issuer URL for RFC 9728 protected resource metadata
+    pub oauth_issuer_url: Option<String>,
+}
+
+impl QuicSharedConfig {
+    /// Build a per-service `QuicLoopConfig` with the given port.
+    ///
+    /// Port 0 = ephemeral (OS-assigned).
+    pub fn for_service(&self, service_name: &str, port: u16) -> crate::service::QuicLoopConfig {
+        let bind_addr = std::net::SocketAddr::new(self.base_ip, port);
+        let metadata = self.oauth_issuer_url.as_ref().map(|issuer| {
+            serde_json::json!({
+                "resource": format!("https://{}/{}", self.server_name, service_name),
+                "authorization_servers": [issuer],
+                "bearer_methods_supported": ["header"],
+            }).to_string().into_bytes()
+        });
+        crate::service::QuicLoopConfig {
+            cert_der: self.cert_der.clone(),
+            key_der: self.key_der.clone(),
+            bind_addr,
+            server_name: self.server_name.clone(),
+            protected_resource_json: metadata,
+        }
+    }
+}
+
 /// Context for service creation.
 ///
 /// Contains all shared resources needed by services during initialization.
@@ -54,10 +95,13 @@ pub struct ServiceContext {
     /// Models directory path
     models_dir: std::path::PathBuf,
 
-    /// Optional QUIC/WebTransport config for unified request loops.
-    /// When `Some`, factory functions can create a `RequestLoop` with QUIC
-    /// via `into_spawnable()` or `RequestLoop::with_quic()`.
-    quic_config: Option<crate::service::QuicLoopConfig>,
+    /// Shared QUIC/WebTransport config (TLS materials + base settings).
+    /// Per-service ports are resolved via `into_spawnable_quic()`.
+    quic_shared: Option<QuicSharedConfig>,
+
+    /// OAuth issuer URL for protected resource metadata (RFC 9728).
+    /// When set, QUIC services serve `.well-known/oauth-protected-resource`.
+    oauth_issuer_url: Option<String>,
 }
 
 impl ServiceContext {
@@ -75,27 +119,38 @@ impl ServiceContext {
             verifying_key,
             ipc,
             models_dir,
-            quic_config: None,
+            quic_shared: None,
+            oauth_issuer_url: None,
         }
     }
 
-    /// Set the QUIC/WebTransport configuration.
+    /// Set the shared QUIC/WebTransport configuration.
     ///
-    /// When set, `into_spawnable()` wraps services in `UnifiedServiceConfig`
-    /// to enable QUIC alongside ZMQ.
-    pub fn with_quic(mut self, config: crate::service::QuicLoopConfig) -> Self {
-        self.quic_config = Some(config);
+    /// Per-service ports are resolved via `into_spawnable_quic()`.
+    pub fn with_quic(mut self, config: QuicSharedConfig) -> Self {
+        self.quic_shared = Some(config);
         self
     }
 
-    /// Get the QUIC config (if enabled).
-    pub fn quic_config(&self) -> Option<&crate::service::QuicLoopConfig> {
-        self.quic_config.as_ref()
+    /// Get the shared QUIC config (if enabled).
+    pub fn quic_shared(&self) -> Option<&QuicSharedConfig> {
+        self.quic_shared.as_ref()
     }
 
     /// Check if QUIC/WebTransport is enabled.
     pub fn has_quic(&self) -> bool {
-        self.quic_config.is_some()
+        self.quic_shared.is_some()
+    }
+
+    /// Set the OAuth issuer URL for RFC 9728 metadata.
+    pub fn with_oauth_issuer(mut self, url: String) -> Self {
+        self.oauth_issuer_url = Some(url);
+        self
+    }
+
+    /// Get the OAuth issuer URL (if configured).
+    pub fn oauth_issuer_url(&self) -> Option<&str> {
+        self.oauth_issuer_url.as_deref()
     }
 
     /// Get the shared ZMQ context.
@@ -174,24 +229,45 @@ impl ServiceContext {
         global_registry().service_schema(service)
     }
 
-    /// Wrap a ZmqService for spawning, enabling QUIC when configured.
+    /// Wrap a ZmqService for spawning with a per-service QUIC port.
     ///
-    /// When `quic_config` is set on this context, the service is wrapped in
-    /// `UnifiedServiceConfig` which creates a `RequestLoop` with QUIC enabled.
-    /// Otherwise, the service is boxed directly (using the blanket `Spawnable` impl).
+    /// - `quic_port: None` → use ephemeral port (0) when QUIC is globally enabled
+    /// - `quic_port: Some(0)` → ephemeral (OS-assigned) port
+    /// - `quic_port: Some(N)` → explicit port N
     ///
-    /// This eliminates per-factory boilerplate for QUIC support.
-    pub fn into_spawnable<S: crate::service::ZmqService + Send + Sync + 'static>(
+    /// When `[quic] enabled = true` in config, all services get QUIC on
+    /// auto-assigned ephemeral ports by default. Set an explicit port to
+    /// control which port a service uses.
+    pub fn into_spawnable_quic<S: crate::service::ZmqService + Send + Sync + 'static>(
         &self,
         service: S,
+        quic_port: Option<u16>,
     ) -> Box<dyn Spawnable> {
-        if let Some(qc) = self.quic_config() {
+        let quic = match &self.quic_shared {
+            Some(shared) => {
+                // Default to ephemeral (0) when no explicit port is configured
+                let port = quic_port.unwrap_or(0);
+                Some(shared.for_service(service.name(), port))
+            }
+            None => None,
+        };
+        if quic.is_some() {
             Box::new(crate::service::spawner::UnifiedServiceConfig::new(
-                service, Some(qc.clone()),
+                service, quic,
             ))
         } else {
             Box::new(service)
         }
+    }
+
+    /// Wrap a ZmqService for spawning, enabling QUIC when globally configured.
+    ///
+    /// Uses ephemeral port (0) for QUIC when `[quic] enabled = true`.
+    pub fn into_spawnable<S: crate::service::ZmqService + Send + Sync + 'static>(
+        &self,
+        service: S,
+    ) -> Box<dyn Spawnable> {
+        self.into_spawnable_quic(service, None)
     }
 }
 

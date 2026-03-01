@@ -10,6 +10,9 @@
 # - Tool discovery and introspection
 # - Internal tool invocation for other hyprstream services
 
+using import "/annotations.capnp".mcpScope;
+using import "/annotations.capnp".mcpDescription;
+
 # Unified MCP request with union discriminator
 struct McpRequest {
   # Request ID for tracking
@@ -18,16 +21,16 @@ struct McpRequest {
   # Request payload (union of request types)
   union {
     # Get service status
-    getStatus @1 :Void;
+    getStatus @1 :Void $mcpScope(query) $mcpDescription("Get MCP service status");
 
     # List available tools
-    listTools @2 :Void;
+    listTools @2 :Void $mcpScope(query) $mcpDescription("List available MCP tools");
 
     # Get service metrics
-    getMetrics @3 :Void;
+    getMetrics @3 :Void $mcpScope(query) $mcpDescription("Get MCP service metrics");
 
     # Call an MCP tool internally
-    callTool @4 :CallTool;
+    callTool @4 :CallTool $mcpScope(write) $mcpDescription("Call an MCP tool internally");
   }
 }
 

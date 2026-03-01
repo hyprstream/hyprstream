@@ -51,11 +51,19 @@ use state::OAuthState;
 pub const SERVICE_NAME: &str = "oauth";
 
 /// Create the OAuth Axum router.
-pub fn create_app(state: Arc<OAuthState>) -> Router {
-    Router::new()
+///
+/// CORS is outermost (applied last) so OPTIONS preflights are handled before
+/// any inner middleware (like logging) runs. This fixes the previous ordering
+/// where logging was outermost and CORS was inner.
+pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfig) -> Router {
+    let mut router = Router::new()
         .route(
             "/.well-known/oauth-authorization-server",
             get(metadata::authorization_server_metadata),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(oauth_self_protected_resource_metadata),
         )
         .route("/oauth/register", post(registration::register_client))
         .route(
@@ -73,8 +81,29 @@ pub fn create_app(state: Arc<OAuthState>) -> Router {
             let uri = req.uri().clone();
             tracing::info!(%method, %uri, "OAuth request");
             next.run(req).await
-        }))
-        .with_state(state)
+        }));
+
+    // CORS outermost (added last = runs first on request)
+    if cors_config.enabled {
+        router = router.layer(crate::server::middleware::cors_layer(cors_config));
+    }
+
+    router.with_state(state)
+}
+
+/// RFC 9728 Protected Resource Metadata for the OAuth server itself.
+async fn oauth_self_protected_resource_metadata() -> axum::Json<ProtectedResourceMetadata> {
+    let config = crate::config::HyprConfig::load().unwrap_or_default();
+    let issuer_url = config.oauth.issuer_url();
+    let mut meta = protected_resource_metadata(&issuer_url, &issuer_url);
+    meta.resource_name = Some("HyprStream OAuth 2.1 Authorization Server".to_string());
+    meta.scopes_supported = Some(vec![
+        "openid".into(),
+        "read:*:*".into(),
+        "write:*:*".into(),
+        "infer:model:*".into(),
+    ]);
+    axum::Json(meta)
 }
 
 /// OAuth 2.1 Authorization Server service.
@@ -156,8 +185,8 @@ impl Spawnable for OAuthService {
             let state = Arc::new(OAuthState::new(&self.config, policy_client));
             state.spawn_code_sweeper();
 
-            // Create router
-            let app = create_app(state);
+            // Create router with configurable CORS
+            let app = create_app(state, &self.config.cors);
 
             // Bind
             let listener = TcpListener::bind(addr).await.map_err(|e| {
@@ -194,14 +223,36 @@ impl Spawnable for OAuthService {
     }
 }
 
-/// Create a Protected Resource Metadata JSON response (RFC 9728).
+/// RFC 9728 Protected Resource Metadata.
+///
+/// Typed representation of the JSON served at `/.well-known/oauth-protected-resource`.
+/// Used by MCP, OAI, Flight, and QUIC services to advertise their OAuth authorization server.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProtectedResourceMetadata {
+    pub resource: String,
+    pub authorization_servers: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bearer_methods_supported: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes_supported: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_documentation: Option<String>,
+}
+
+/// Create a Protected Resource Metadata response (RFC 9728).
 ///
 /// Used by MCP and OAI servers to advertise their OAuth authorization server.
-pub fn protected_resource_metadata(resource_url: &str, oauth_issuer_url: &str) -> serde_json::Value {
-    serde_json::json!({
-        "resource": resource_url,
-        "authorization_servers": [oauth_issuer_url],
-    })
+pub fn protected_resource_metadata(resource_url: &str, oauth_issuer_url: &str) -> ProtectedResourceMetadata {
+    ProtectedResourceMetadata {
+        resource: resource_url.to_string(),
+        authorization_servers: vec![oauth_issuer_url.to_string()],
+        bearer_methods_supported: Some(vec!["header".to_string()]),
+        scopes_supported: None,
+        resource_name: None,
+        resource_documentation: None,
+    }
 }
 
 #[cfg(test)]
@@ -215,8 +266,9 @@ mod tests {
             "http://localhost:6790",
             "http://localhost:6791",
         );
-        assert_eq!(meta["resource"], "http://localhost:6790");
-        assert_eq!(meta["authorization_servers"][0], "http://localhost:6791");
+        assert_eq!(meta.resource, "http://localhost:6790");
+        assert_eq!(meta.authorization_servers[0], "http://localhost:6791");
+        assert_eq!(meta.bearer_methods_supported.as_deref(), Some(&["header".to_string()][..]));
     }
 
     #[test]

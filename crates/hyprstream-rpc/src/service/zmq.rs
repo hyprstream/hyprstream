@@ -205,15 +205,47 @@ pub trait ZmqService: 'static {
         self.signing_key().verifying_key()
     }
 
-    /// Optional pre-handler claims verification.
+    /// Expected audience (resource URL) for JWT validation.
+    ///
+    /// When `Some`, `verify_claims()` rejects tokens whose `aud` claim doesn't match.
+    /// Override this on services that should bind tokens to a specific resource.
+    fn expected_audience(&self) -> Option<&str> {
+        None
+    }
+
+    /// E2E JWT verification with downgrade attack protection.
     ///
     /// Called by `RequestLoop` after envelope signature verification, before `handle_request`.
     /// Return `Err` to reject the request before dispatch.
     ///
-    /// Use this for E2E JWT verification (e.g., downgrade attack prevention).
-    /// Default: no additional verification.
+    /// Default: Require valid JWT for all non-local identities to prevent
+    /// subject impersonation via fabricated envelope claims.
     fn verify_claims(&self, ctx: &EnvelopeContext) -> anyhow::Result<()> {
-        let _ = ctx;
+        if let Some(claims) = ctx.claims() {
+            match claims.verify_token(&self.verifying_key(), self.expected_audience()) {
+                Ok(Some(verified)) => {
+                    if verified.sub != claims.sub {
+                        tracing::warn!("Claims sub mismatch: envelope={} jwt={}", claims.sub, verified.sub);
+                        anyhow::bail!("Claims subject mismatch");
+                    }
+                }
+                Ok(None) => {
+                    // SECURITY: Non-local requests MUST have JWT token
+                    // to prevent subject impersonation via fabricated claims
+                    if !ctx.identity.is_local() {
+                        tracing::warn!(
+                            "Non-local request with claims but no JWT token: sub={}, identity={:?}",
+                            claims.sub, ctx.identity
+                        );
+                        anyhow::bail!("JWT token required for non-local requests");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("E2E JWT verification failed: {}", e);
+                    anyhow::bail!("JWT verification failed");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -300,6 +332,10 @@ pub struct QuicLoopConfig {
     pub key_der: Vec<u8>,
     /// Address to bind the WebTransport server
     pub bind_addr: std::net::SocketAddr,
+    /// TLS server name (for endpoint discovery registration)
+    pub server_name: String,
+    /// Pre-serialized RFC 9728 JSON for HTTP/3 `.well-known/oauth-protected-resource`
+    pub protected_resource_json: Option<Vec<u8>>,
 }
 
 impl RequestLoop {
@@ -438,14 +474,27 @@ impl RequestLoop {
                 qc.cert_der.clone(),
                 qc.key_der.clone(),
             ) {
-                Ok(wts) => {
+                Ok(mut wts) => {
+                    if let Some(ref meta) = qc.protected_resource_json {
+                        wts = wts.with_protected_resource_metadata(meta.clone());
+                    }
+                    let actual_addr = wts.local_addr().unwrap_or(qc.bind_addr);
                     let cert_hash = crate::transport::zmtp_quic::cert_hash(&qc.cert_der);
                     info!(
                         "{} QUIC/WebTransport bound to {} (cert hash: {})",
                         service.name(),
-                        qc.bind_addr,
+                        actual_addr,
                         cert_hash,
                     );
+                    // Register QUIC endpoint in the global registry for discovery
+                    if let Some(reg) = crate::registry::try_global() {
+                        reg.register(
+                            service.name(),
+                            crate::registry::SocketKind::Quic,
+                            crate::transport::TransportConfig::quic(actual_addr, &qc.server_name),
+                            None,
+                        );
+                    }
                     Some(wts)
                 }
                 Err(e) => {
@@ -594,6 +643,13 @@ impl RequestLoop {
                         });
                     }
                 }
+            }
+        }
+
+        // Unregister QUIC endpoint on shutdown
+        if quic_config.is_some() {
+            if let Some(reg) = crate::registry::try_global() {
+                reg.unregister(service.name(), crate::registry::SocketKind::Quic);
             }
         }
 

@@ -48,7 +48,7 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -607,9 +607,10 @@ pub struct McpService {
     signing_key: SigningKey,
     /// ServiceContext for typed_client() / client() access
     service_ctx: Option<Arc<ServiceContext>>,
-    /// Expected audience for tokens (resource URL, for future defense-in-depth)
-    #[allow(dead_code)]
+    /// Expected audience for tokens (resource URL, for defense-in-depth)
     expected_audience: Option<String>,
+    /// Policy client for authorization checks (shared, avoids per-call socket creation)
+    policy_client: PolicyClient,
 }
 
 impl McpService {
@@ -625,6 +626,8 @@ impl McpService {
             tool_reg.by_uuid.len(),
         );
 
+        let policy_client = PolicyClient::new(config.signing_key.clone(), RequestIdentity::local());
+
         Ok(Self {
             registry: Arc::new(tool_reg),
             stdio_token,
@@ -634,6 +637,7 @@ impl McpService {
             signing_key: config.signing_key,
             service_ctx: config.ctx,
             expected_audience: config.expected_audience,
+            policy_client,
         })
     }
 
@@ -663,61 +667,44 @@ impl McpService {
         }).collect()
     }
 
-    /// Extract identity from HTTP Bearer token or fall back to env/local.
+    /// Extract identity from validated middleware state or fall back to env/local.
     ///
     /// This is pure authentication (identity extraction). No audience checks,
     /// no scope filtering — ZMQ backends handle authorization via Casbin.
     ///
     /// Priority:
-    /// 1. HTTP transport: extract from `Authorization: Bearer <token>` header
-    ///    - Valid token → `RequestIdentity::api_token(sub, "mcp")`
-    ///    - Invalid/expired token → `RequestIdentity::anonymous()` (let ZMQ reject)
-    ///    - No token → `RequestIdentity::anonymous()` (NOT local!)
+    /// 1. HTTP transport: use `AuthenticatedUser` from middleware (already validated)
+    ///    - Present → `RequestIdentity::api_token(user, "mcp")`
+    ///    - Absent with Authorization header → log warning, return anonymous
+    ///    - Absent without header → `RequestIdentity::anonymous()`
     /// 2. Stdio/ZMQ transport (no HTTP Parts): use env var claims or `local()`
     fn extract_identity(&self, context: &RequestContext<RoleServer>) -> RequestIdentity {
         // Check for HTTP transport by looking for http::request::Parts in extensions
         if let Some(parts) = context.extensions.get::<http::request::Parts>() {
-            // HTTP transport — extract Bearer token from Authorization header
-            trace!(
-                "MCP HTTP auth: has Authorization header: {}, all headers: {:?}",
-                parts.headers.contains_key(AUTHORIZATION),
-                parts.headers.keys().collect::<Vec<_>>()
-            );
-            let token = parts
-                .headers
-                .get(AUTHORIZATION)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|h| h.strip_prefix("Bearer ").map(str::trim));
-
-            match token {
-                Some(token) => {
-                    trace!("MCP HTTP auth: Bearer token present, len={}", token.len());
-                    match jwt::decode(token, &self.verifying_key) {
-                        Ok(claims) => {
-                            trace!("MCP HTTP auth: token validated for {}", claims.sub);
-                            RequestIdentity::api_token(&claims.sub, "mcp")
-                        }
-                        Err(e) => {
-                            trace!("MCP HTTP auth: token validation failed: {}", e);
-                            RequestIdentity::anonymous()
-                        }
-                    }
-                }
-                None => {
-                    trace!("MCP HTTP auth: no Bearer token found in Authorization header");
-                    RequestIdentity::anonymous()
-                }
+            // HTTP transport — use AuthenticatedUser from middleware (already JWT-validated)
+            if let Some(auth_user) = parts.extensions.get::<crate::server::middleware::AuthenticatedUser>() {
+                trace!("MCP HTTP auth: using validated identity for {}", auth_user.user);
+                return RequestIdentity::api_token(&auth_user.user, "mcp");
             }
+
+            // No AuthenticatedUser — check if there was an Authorization header
+            // (if present, middleware already rejected invalid tokens, so this shouldn't happen)
+            if parts.headers.contains_key(AUTHORIZATION) {
+                warn!("MCP HTTP auth: Authorization header present but no AuthenticatedUser — middleware should have rejected");
+            } else {
+                trace!("MCP HTTP auth: no Authorization header, anonymous access");
+            }
+            RequestIdentity::anonymous()
         } else {
             trace!("MCP HTTP auth: no http::request::Parts in extensions (stdio/zmq transport)");
             // Stdio/ZMQ transport — decode env token per-request
             match &self.stdio_token {
                 Some(token) => {
-                    match jwt::decode(token, &self.verifying_key) {
+                    match jwt::decode(token, &self.verifying_key, self.expected_audience.as_deref()) {
                         Ok(claims) => RequestIdentity::api_token(&claims.sub, "mcp"),
                         Err(e) => {
-                            debug!("MCP stdio auth: token invalid ({}), using local identity", e);
-                            RequestIdentity::local()
+                            warn!("MCP stdio auth: token decode failed ({}), downgrading to anonymous", e);
+                            RequestIdentity::anonymous()
                         }
                     }
                 }
@@ -841,6 +828,26 @@ impl ServerHandler for McpService {
 
 #[async_trait::async_trait(?Send)]
 impl McpHandler for McpService {
+    async fn authorize(&self, ctx: &crate::services::EnvelopeContext, resource: &str, operation: &str) -> anyhow::Result<()> {
+        // Local callers are always authorized
+        if ctx.identity.is_local() {
+            return Ok(());
+        }
+        // Delegate to policy service
+        let subject = ctx.subject().to_string();
+        let allowed = self.policy_client.check(&subject, "*", resource, operation)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("MCP policy check failed for {}: {}", subject, e);
+                false
+            });
+        if allowed {
+            Ok(())
+        } else {
+            anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource)
+        }
+    }
+
     async fn handle_get_status(
         &self,
         _ctx: &crate::services::EnvelopeContext,
@@ -859,7 +866,7 @@ impl McpHandler for McpService {
             loaded_model_count,
             is_authenticated: self.stdio_token.is_some(),
             authenticated_user: self.stdio_token.as_ref()
-                .and_then(|t| jwt::decode(t, &self.verifying_key).ok())
+                .and_then(|t| jwt::decode(t, &self.verifying_key, self.expected_audience.as_deref()).ok())
                 .map(|c| c.sub)
                 .unwrap_or_default(),
             scopes: vec![],  // Scopes no longer in JWT; authorization via Casbin
@@ -973,6 +980,10 @@ impl ZmqService for McpService {
 
     fn signing_key(&self) -> SigningKey {
         self.signing_key.clone()
+    }
+
+    fn expected_audience(&self) -> Option<&str> {
+        self.expected_audience.as_deref()
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {

@@ -27,8 +27,8 @@ struct ModelRequest {
   union {
     load @1 :LoadModelRequest $mcpDescription("Load a model into memory for inference") $mcpScope(write);
     unload @2 :UnloadModelRequest $mcpDescription("Unload a model from memory to free resources") $mcpScope(write);
-    list @3 :Void $mcpDescription("List all models currently loaded in memory");
-    healthCheck @4 :Void $mcpDescription("Check model service health and status");
+    list @3 :Void $mcpDescription("List all models currently loaded in memory") $mcpScope(query);
+    healthCheck @4 :Void $mcpDescription("Check model service health and status") $mcpScope(query);
 
     # Scoped interfaces (require modelRef)
     ttt @5 :TttRequest;         # Test-time training operations

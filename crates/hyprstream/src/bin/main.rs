@@ -1287,7 +1287,7 @@ fn main() -> Result<()> {
                     verifying_key,
                     false,
                     models_dir.clone(),
-                );
+                ).with_oauth_issuer(config.oauth.issuer_url());
 
                 let manager = InprocManager::new();
                 let mut handles = Vec::new();
@@ -1544,24 +1544,37 @@ fn main() -> Result<()> {
                                     verifying_key,
                                     ipc,
                                     models_dir.clone(),
-                                );
+                                ).with_oauth_issuer(config.oauth.issuer_url());
 
-                                // Wire QUIC config if --quic-bind is specified
-                                if let Some(ref bind_addr) = quic_bind {
-                                    let mut quic_cfg = hyprstream_core::config::QuicConfig::default();
-                                    quic_cfg.enabled = true;
-                                    quic_cfg.bind_addr = bind_addr.clone();
-                                    let loop_config = quic_cfg.to_loop_config()
-                                        .context("Failed to configure QUIC")?;
+                                // Wire QUIC shared config from --quic-bind or [quic] config
+                                let quic_cfg = if let Some(ref bind_addr) = quic_bind {
+                                    let mut qc = hyprstream_core::config::QuicConfig::default();
+                                    qc.enabled = true;
+                                    qc.bind_addr = bind_addr.clone();
+                                    qc
+                                } else {
+                                    config.quic.clone()
+                                };
+
+                                if quic_cfg.enabled {
+                                    let qc = quic_cfg;
+                                    let (cert_der, key_der) = qc.load_tls_materials()
+                                        .context("Failed to load QUIC TLS materials")?;
 
                                     // Print cert hash if requested
                                     if print_cert_hash {
-                                        let hash = hyprstream_rpc::transport::zmtp_quic::cert_hash(&loop_config.cert_der);
-                                        let bound_addr = loop_config.bind_addr;
-                                        println!("QUIC/WebTransport bound to {} (cert hash: {})", bound_addr, hash);
+                                        let hash = hyprstream_rpc::transport::zmtp_quic::cert_hash(&cert_der);
+                                        println!("QUIC/WebTransport cert hash: {}", hash);
                                     }
 
-                                    ctx = ctx.with_quic(loop_config);
+                                    let shared = hyprstream_rpc::service::QuicSharedConfig {
+                                        cert_der,
+                                        key_der,
+                                        base_ip: qc.socket_addr()?.ip(),
+                                        server_name: qc.server_name.clone(),
+                                        oauth_issuer_url: Some(config.oauth.issuer_url()),
+                                    };
+                                    ctx = ctx.with_quic(shared);
                                 }
 
                                 // Determine which services to start

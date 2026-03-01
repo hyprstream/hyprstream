@@ -25,6 +25,10 @@ pub struct WorkerConfig {
 
     /// Event bus configuration
     pub events: EventConfig,
+
+    /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
 }
 
 

@@ -4,11 +4,11 @@
 //! socket kinds, and schemas via the standard ZMQ REQ/REP transport.
 
 use async_trait::async_trait;
-use crate::services::{EnvelopeContext, ZmqService};
+use crate::services::{EnvelopeContext, PolicyClient, ZmqService};
 use crate::services::generated::discovery_client::{
     DiscoveryClient, DiscoveryHandler, DiscoveryResponseVariant,
     ErrorInfo, ServiceList, ServiceSummary, ServiceEndpoints, EndpointInfo,
-    PingInfo, dispatch_discovery, serialize_response,
+    PingInfo, AuthMetadata, AuthMetadataList, dispatch_discovery, serialize_response,
 };
 use anyhow::Result;
 use hyprstream_rpc::prelude::*;
@@ -31,6 +31,12 @@ pub struct DiscoveryService {
     started_at: Instant,
     /// Ed25519 signing key for envelope signing
     signing_key: Arc<SigningKey>,
+    /// OAuth issuer URL for RFC 9728 metadata (None = not configured)
+    oauth_issuer_url: Option<String>,
+    /// Expected audience for JWT validation (resource URL)
+    expected_audience: Option<String>,
+    /// Policy client for authorization checks (None = no authorization)
+    policy_client: Option<PolicyClient>,
     // Infrastructure (for Spawnable)
     context: Arc<zmq::Context>,
     transport: TransportConfig,
@@ -46,9 +52,30 @@ impl DiscoveryService {
         Self {
             started_at: Instant::now(),
             signing_key,
+            oauth_issuer_url: None,
+            expected_audience: None,
+            policy_client: None,
             context,
             transport,
         }
+    }
+
+    /// Set the OAuth issuer URL for RFC 9728 auth metadata responses.
+    pub fn with_oauth_issuer(mut self, url: String) -> Self {
+        self.oauth_issuer_url = Some(url);
+        self
+    }
+
+    /// Set the expected audience for JWT validation.
+    pub fn with_expected_audience(mut self, audience: String) -> Self {
+        self.expected_audience = Some(audience);
+        self
+    }
+
+    /// Set the policy client for authorization checks.
+    pub fn with_policy_client(mut self, client: PolicyClient) -> Self {
+        self.policy_client = Some(client);
+        self
     }
 }
 
@@ -67,6 +94,7 @@ fn socket_kind_to_string(kind: SocketKind) -> &'static str {
         SocketKind::Pull => "pull",
         SocketKind::Pair => "pair",
         SocketKind::Stream => "stream",
+        SocketKind::Quic => "quic",
     }
 }
 
@@ -76,6 +104,31 @@ fn socket_kind_to_string(kind: SocketKind) -> &'static str {
 
 #[async_trait::async_trait(?Send)]
 impl DiscoveryHandler for DiscoveryService {
+    async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
+        // Local callers are always authorized
+        if ctx.identity.is_local() {
+            return Ok(());
+        }
+        // Delegate to policy service if available
+        if let Some(ref policy_client) = self.policy_client {
+            let subject = ctx.subject().to_string();
+            let allowed = policy_client.check(&subject, "*", resource, operation)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Discovery policy check failed for {}: {}", subject, e);
+                    false
+                });
+            if allowed {
+                Ok(())
+            } else {
+                anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource)
+            }
+        } else {
+            // No policy client — allow (backward compat for local-only deployments)
+            Ok(())
+        }
+    }
+
     async fn handle_list_services(
         &self,
         _ctx: &EnvelopeContext,
@@ -187,6 +240,52 @@ impl DiscoveryHandler for DiscoveryService {
             uptime,
         }))
     }
+
+    async fn handle_get_auth_metadata(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &str,
+    ) -> Result<DiscoveryResponseVariant> {
+        let filter = data;
+        trace!("Discovery: get auth metadata (filter='{}')", filter);
+
+        let issuer = match &self.oauth_issuer_url {
+            Some(url) => url.clone(),
+            None => {
+                return Ok(DiscoveryResponseVariant::Error(ErrorInfo {
+                    message: "OAuth issuer URL not configured".to_owned(),
+                    code: "NOT_CONFIGURED".to_owned(),
+                    details: String::new(),
+                }));
+            }
+        };
+
+        let reg = registry();
+        let service_names = reg.list_services();
+
+        let services: Vec<AuthMetadata> = service_names
+            .iter()
+            .filter(|name| filter.is_empty() || *name == filter)
+            .filter_map(|name| {
+                // Look up QUIC endpoint to derive the resource URL
+                let quic_transport = reg.endpoint(name, SocketKind::Quic);
+                let resource = quic_transport.quic_resource_url(name)?;
+                Some(AuthMetadata {
+                    service_name: name.clone(),
+                    resource,
+                    authorization_servers: vec![issuer.clone()],
+                    scopes_supported: Vec::new(),
+                    resource_name: format!("HyprStream {} Service", name),
+                })
+            })
+            .collect();
+        drop(reg);
+
+        Ok(DiscoveryResponseVariant::GetAuthMetadataResult(
+            AuthMetadataList { services },
+        ))
+    }
 }
 
 // ============================================================================
@@ -222,6 +321,10 @@ impl ZmqService for DiscoveryService {
 
     fn signing_key(&self) -> SigningKey {
         (*self.signing_key).clone()
+    }
+
+    fn expected_audience(&self) -> Option<&str> {
+        self.expected_audience.as_deref()
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {

@@ -43,6 +43,9 @@ pub enum JwtError {
 
     #[error("Missing required claim: {0}")]
     MissingClaim(String),
+
+    #[error("Invalid audience")]
+    InvalidAudience,
 }
 
 /// Encode and sign a JWT token
@@ -72,7 +75,8 @@ pub fn encode(claims: &Claims, signing_key: &SigningKey) -> String {
 /// Decode and verify a JWT token
 ///
 /// Accepts a raw RFC 7519 JWT. Returns the claims if valid and not expired.
-pub fn decode(token: &str, verifying_key: &VerifyingKey) -> Result<Claims, JwtError> {
+/// If `expected_aud` is Some, validates the audience claim matches.
+pub fn decode(token: &str, verifying_key: &VerifyingKey, expected_aud: Option<&str>) -> Result<Claims, JwtError> {
     // Split into parts
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
@@ -118,6 +122,14 @@ pub fn decode(token: &str, verifying_key: &VerifyingKey) -> Result<Claims, JwtEr
     let now = Utc::now().timestamp();
     if claims.iat > now + 60 {
         return Err(JwtError::NotYetValid);
+    }
+
+    // Validate audience if expected
+    if let Some(expected) = expected_aud {
+        match &claims.aud {
+            Some(aud) if aud == expected => {}
+            _ => return Err(JwtError::InvalidAudience),
+        }
     }
 
     Ok(claims)

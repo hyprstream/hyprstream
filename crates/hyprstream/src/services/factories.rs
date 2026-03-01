@@ -34,9 +34,14 @@ use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::auth::PolicyManager;
-use crate::config::TokenConfig;
+use crate::config::{HyprConfig, TokenConfig};
 use crate::services::{DiscoveryService, McpService, McpConfig, PolicyService, PolicyClient, RegistryService, GenRegistryClient};
 use crate::zmq::global_context;
+
+/// Load HyprConfig, falling back to default on error.
+fn load_config() -> HyprConfig {
+    HyprConfig::load().unwrap_or_default()
+}
 
 /// Shared Git2DB registry instance. Lazily initialized by the first factory
 /// that needs it. Both PolicyService and RegistryService share this instance.
@@ -112,7 +117,8 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         });
     });
 
-    let policy_service = PolicyService::new(
+    let config = load_config();
+    let mut policy_service = PolicyService::new(
         policy_manager,
         Arc::new(ctx.signing_key().clone()),
         TokenConfig::default(),
@@ -120,8 +126,11 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         global_context(),
         ctx.transport("policy", SocketKind::Rep),
     );
+    if let Some(issuer) = ctx.oauth_issuer_url() {
+        policy_service = policy_service.with_default_audience(issuer.to_owned());
+    }
 
-    Ok(ctx.into_spawnable(policy_service))
+    Ok(ctx.into_spawnable_quic(policy_service, config.policy.quic_port))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -133,11 +142,13 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating RegistryService");
 
+    let config = load_config();
+
     // Create policy client for authorization checks
     let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::local());
 
     // Create registry service with infrastructure (blocking since we're in sync context)
-    let registry_service = tokio::task::block_in_place(|| {
+    let mut registry_service = tokio::task::block_in_place(|| {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(RegistryService::new(
             ctx.models_dir(),
@@ -147,8 +158,11 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
             ctx.signing_key().clone(),
         ))
     })?;
+    if let Some(issuer) = ctx.oauth_issuer_url() {
+        registry_service = registry_service.with_expected_audience(issuer.to_owned());
+    }
 
-    Ok(ctx.into_spawnable(registry_service))
+    Ok(ctx.into_spawnable_quic(registry_service, config.registry.quic_port))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -189,6 +203,8 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
 
     use crate::services::{ModelService, ModelServiceConfig};
 
+    let config = load_config();
+
     // Create policy client for authorization checks
     let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::local());
 
@@ -199,7 +215,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
         RequestIdentity::local(),
     );
 
-    let model_service = ModelService::new(
+    let mut model_service = ModelService::new(
         ModelServiceConfig::default(),
         ctx.signing_key().clone(),
         policy_client,
@@ -207,8 +223,11 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
         global_context(),
         ctx.transport("model", SocketKind::Rep),
     );
+    if let Some(issuer) = ctx.oauth_issuer_url() {
+        model_service = model_service.with_expected_audience(issuer.to_owned());
+    }
 
-    Ok(ctx.into_spawnable(model_service))
+    Ok(ctx.into_spawnable_quic(model_service, config.model.quic_port))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -226,6 +245,9 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     use hyprstream_workers::config::{ImageConfig, PoolConfig};
     use hyprstream_workers::image::RafsStore;
     use hyprstream_workers::WorkerService;
+
+    let config = load_config();
+    let worker_quic_port = config.worker.as_ref().and_then(|w| w.quic_port);
 
     // Use default paths based on XDG directories
     let data_dir = dirs::data_local_dir()
@@ -275,8 +297,11 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         hyprstream_rpc::RequestIdentity::local(),
     );
     worker_service.set_authorize_fn(super::worker::build_authorize_fn(policy_client));
+    if let Some(issuer) = ctx.oauth_issuer_url() {
+        worker_service.set_expected_audience(issuer.to_owned());
+    }
 
-    Ok(ctx.into_spawnable(worker_service))
+    Ok(ctx.into_spawnable_quic(worker_service, worker_quic_port))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -291,12 +316,11 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating OAIService");
 
-    use crate::config::HyprConfig;
     use crate::server::state::ServerState;
     use crate::services::{ModelZmqClient, OAIService};
 
     // Load full config for OAI settings
-    let config = HyprConfig::load().unwrap_or_default();
+    let config = load_config();
 
     // Create ZMQ clients for Model and Policy services
     let model_client = ModelZmqClient::new(ctx.signing_key().clone(), RequestIdentity::local());
@@ -347,11 +371,10 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating FlightService");
 
-    use crate::config::HyprConfig;
     use crate::services::FlightService;
 
     // Load full config for Flight settings
-    let config = HyprConfig::load().unwrap_or_default();
+    let config = load_config();
 
     // Create registry client for dataset lookup (if default_dataset is configured)
     // GenRegistryClient already implements hyprstream_metrics::RegistryClient
@@ -390,10 +413,9 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating OAuthService");
 
-    use crate::config::HyprConfig;
     use crate::services::OAuthService;
 
-    let config = HyprConfig::load().unwrap_or_default();
+    let config = load_config();
 
     // Pass signing key instead of a pre-created PolicyClient.
     // OAuthService runs in its own tokio runtime (separate thread), so the
@@ -425,10 +447,8 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
 fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating McpService");
 
-    use crate::config::HyprConfig;
-
     // Load full config for MCP settings
-    let config = HyprConfig::load().unwrap_or_default();
+    let config = load_config();
 
     // Create McpConfig for the service
     let mcp_config = McpConfig {
@@ -449,6 +469,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     // Spawn rmcp HTTP/SSE server as background task
     let mcp_host = config.mcp.host.clone();
     let http_port = config.mcp.http_port;
+    let mcp_cors_config = config.mcp.cors.clone();
     tokio::task::block_in_place(|| {
         let rt = tokio::runtime::Handle::current();
         rt.spawn(async move {
@@ -483,68 +504,87 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                         let mcp_resource_url = mcp_resource_url.clone();
                         let mcp_oauth_issuer = mcp_oauth_issuer.clone();
                         move || async move {
-                            axum::Json(crate::services::oauth::protected_resource_metadata(
+                            let mut meta = crate::services::oauth::protected_resource_metadata(
                                 &mcp_resource_url,
                                 &mcp_oauth_issuer,
-                            ))
+                            );
+                            meta.resource_name = Some("HyprStream MCP Server".to_string());
+                            meta.scopes_supported = Some(vec![
+                                "read:model:*".into(),
+                                "infer:model:*".into(),
+                                "write:model:*".into(),
+                            ]);
+                            axum::Json(meta)
                         }
                     }),
                 )
                 .nest_service("/mcp", service)
-                .layer(axum::middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
-                    let www_authenticate = www_authenticate.clone();
-                    async move {
-                        use axum::http::{header, StatusCode};
-                        use axum::response::IntoResponse;
-                        let method = req.method().clone();
-                        let uri = req.uri().clone();
-                        // Allow OAuth discovery endpoint without auth
-                        if req.uri().path().starts_with("/.well-known/") {
-                            tracing::debug!(%method, %uri, "MCP discovery request (no auth required)");
-                            return next.run(req).await;
-                        }
-                        let has_auth_header = req.headers().contains_key(header::AUTHORIZATION);
-                        let auth_value = req.headers()
-                            .get(header::AUTHORIZATION)
-                            .and_then(|v| v.to_str().ok())
-                            .map(str::to_owned);
-                        // RFC 6750: Bearer scheme is case-insensitive
-                        let token = auth_value.as_deref()
-                            .and_then(|h| {
-                                if h.len() > 7 && h[..7].eq_ignore_ascii_case("bearer ") {
-                                    Some(h[7..].trim())
-                                } else {
-                                    None
-                                }
-                            });
-                        match token {
-                            Some(t) => {
-                                match crate::auth::jwt::decode(t, &verifying_key) {
-                                    Ok(claims) => {
-                                        tracing::debug!(%method, %uri, sub = %claims.sub, "MCP auth OK");
-                                        next.run(req).await
+                .layer(axum::middleware::from_fn({
+                    let mcp_resource_url = mcp_resource_url.clone();
+                    move |req: axum::extract::Request, next: axum::middleware::Next| {
+                        let www_authenticate = www_authenticate.clone();
+                        let mcp_resource_url = mcp_resource_url.clone();
+                        async move {
+                            use axum::http::{header, StatusCode};
+                            use axum::response::IntoResponse;
+                            let method = req.method().clone();
+                            let uri = req.uri().clone();
+                            // Allow OAuth discovery endpoint without auth
+                            if req.uri().path().starts_with("/.well-known/") {
+                                tracing::debug!(%method, %uri, "MCP discovery request (no auth required)");
+                                return next.run(req).await;
+                            }
+                            let has_auth_header = req.headers().contains_key(header::AUTHORIZATION);
+                            let auth_value = req.headers()
+                                .get(header::AUTHORIZATION)
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_owned);
+                            // RFC 6750: Bearer scheme is case-insensitive
+                            let token = auth_value.as_deref()
+                                .and_then(|h| {
+                                    if h.len() > 7 && h[..7].eq_ignore_ascii_case("bearer ") {
+                                        Some(h[7..].trim())
+                                    } else {
+                                        None
                                     }
-                                    Err(e) => {
-                                        tracing::warn!(%method, %uri, error = %e, "MCP auth REJECTED");
-                                        let mut res = (StatusCode::UNAUTHORIZED, "Invalid or expired token").into_response();
-                                        if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
-                                            res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
+                                });
+                            match token {
+                                Some(t) => {
+                                    match crate::auth::jwt::decode(t, &verifying_key, Some(mcp_resource_url.as_str())) {
+                                        Ok(claims) => {
+                                            tracing::debug!(%method, %uri, sub = %claims.sub, "MCP auth OK");
+                                            next.run(req).await
                                         }
-                                        res
+                                        Err(e) => {
+                                            tracing::warn!(%method, %uri, error = %e, "MCP auth REJECTED");
+                                            let mut res = (StatusCode::UNAUTHORIZED, "Invalid or expired token").into_response();
+                                            if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
+                                                res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
+                                            }
+                                            res
+                                        }
                                     }
+                                },
+                                None => {
+                                    tracing::info!(%method, %uri, has_auth_header, "MCP auth MISSING token");
+                                    let mut res = (StatusCode::UNAUTHORIZED, "Authentication required").into_response();
+                                    if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
+                                        res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
+                                    }
+                                    res
                                 }
-                            },
-                            None => {
-                                tracing::info!(%method, %uri, has_auth_header, "MCP auth MISSING token");
-                                let mut res = (StatusCode::UNAUTHORIZED, "Authentication required").into_response();
-                                if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
-                                    res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
-                                }
-                                res
                             }
                         }
                     }
                 }));
+
+            // CORS must be outermost layer (added last) so OPTIONS preflights
+            // are handled before auth middleware rejects them.
+            let router = if mcp_cors_config.enabled {
+                router.layer(crate::server::middleware::cors_layer(&mcp_cors_config))
+            } else {
+                router
+            };
 
             let addr = format!("{}:{}", mcp_host, http_port);
             let listener = match tokio::net::TcpListener::bind(&addr).await {
@@ -562,7 +602,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     });
     info!("McpService created (HTTP/SSE on {}:{})", config.mcp.host, http_port);
 
-    Ok(ctx.into_spawnable(mcp_service))
+    Ok(ctx.into_spawnable_quic(mcp_service, config.mcp.quic_port))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -577,11 +617,21 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating DiscoveryService");
 
-    let discovery_service = DiscoveryService::new(
+    let config = load_config();
+
+    // Create policy client for authorization checks
+    let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::local());
+
+    let mut discovery_service = DiscoveryService::new(
         Arc::new(ctx.signing_key().clone()),
         global_context(),
         ctx.transport("discovery", SocketKind::Rep),
-    );
+    ).with_policy_client(policy_client);
+    if let Some(issuer) = ctx.oauth_issuer_url() {
+        discovery_service = discovery_service.with_oauth_issuer(issuer.to_owned());
+        // Use the issuer URL as the audience for discovery tokens
+        discovery_service = discovery_service.with_expected_audience(issuer.to_owned());
+    }
 
-    Ok(ctx.into_spawnable(discovery_service))
+    Ok(ctx.into_spawnable_quic(discovery_service, config.discovery.quic_port))
 }

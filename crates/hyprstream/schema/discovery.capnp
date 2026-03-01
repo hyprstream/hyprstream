@@ -28,6 +28,10 @@ struct DiscoveryRequest {
 
     # Health check
     ping @4 :Void $mcpScope(query) $mcpDescription("Health check");
+
+    # Get OAuth protected resource metadata (RFC 9728) for services
+    # Text parameter filters by service name (empty = all services)
+    getAuthMetadata @5 :Text $mcpScope(query) $mcpDescription("Get OAuth protected resource metadata for services");
   }
 }
 
@@ -53,6 +57,9 @@ struct DiscoveryResponse {
 
     # Ping result (for ping)
     pingResult @5 :PingInfo;
+
+    # Auth metadata result (for getAuthMetadata)
+    getAuthMetadataResult @6 :AuthMetadataList;
   }
 }
 
@@ -101,4 +108,23 @@ struct PingInfo {
   serviceCount @1 :UInt32;
   # Uptime in seconds
   uptime @2 :UInt64;
+}
+
+# OAuth protected resource metadata for a service (RFC 9728)
+struct AuthMetadata {
+  # Service name (e.g. "registry", "model", "oai")
+  serviceName @0 :Text;
+  # Resource URL (e.g. "https://localhost:4433/registry")
+  resource @1 :Text;
+  # Authorization server URLs
+  authorizationServers @2 :List(Text);
+  # Supported OAuth scopes
+  scopesSupported @3 :List(Text);
+  # Human-readable resource name
+  resourceName @4 :Text;
+}
+
+# List of auth metadata entries
+struct AuthMetadataList {
+  services @0 :List(AuthMetadata);
 }

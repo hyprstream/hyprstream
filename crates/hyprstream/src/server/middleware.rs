@@ -44,17 +44,23 @@ pub async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
-    // Get JWT token from Authorization header
+    // Get JWT token from Authorization header (RFC 6750: Bearer scheme is case-insensitive)
     let token = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .map(str::trim);
+        .and_then(|h| {
+            if h.len() > 7 && h[..7].eq_ignore_ascii_case("bearer ") {
+                Some(h[7..].trim())
+            } else {
+                None
+            }
+        });
 
-    // If no token provided, allow anonymous access
+    // SECURITY: No anonymous access — require Bearer token
     let Some(token) = token else {
-        return next.run(request).await;
+        let www_authenticate = build_www_authenticate(&state);
+        return unauthorized_response("Authentication required", &www_authenticate);
     };
 
     // Build WWW-Authenticate header for 401 responses (RFC 9728)
@@ -62,7 +68,7 @@ pub async fn auth_middleware(
 
     // Try JWT validation (stateless)
     if token.contains('.') {
-        match jwt::decode(token, &state.verifying_key) {
+        match jwt::decode(token, &state.verifying_key, Some(&state.resource_url)) {
             Ok(claims) => {
                 debug!("JWT validated for user: {}", claims.sub);
                 let user = AuthenticatedUser {
@@ -73,23 +79,17 @@ pub async fn auth_middleware(
                 request.extensions_mut().insert(user);
                 return next.run(request).await;
             }
-            Err(jwt::JwtError::Expired) => {
-                debug!("JWT expired");
-                return unauthorized_response("Token expired", &www_authenticate);
-            }
-            Err(jwt::JwtError::InvalidSignature) => {
-                debug!("JWT signature invalid");
-                return unauthorized_response("Invalid token signature", &www_authenticate);
-            }
             Err(e) => {
+                // SECURITY: Generic error message — don't reveal token state to attackers.
+                // Log specific error server-side for debugging.
                 debug!("JWT validation failed: {}", e);
-                return unauthorized_response("Invalid token", &www_authenticate);
+                return unauthorized_response("Authentication failed", &www_authenticate);
             }
         }
     }
 
-    warn!("Invalid token format");
-    unauthorized_response("Invalid token format", &www_authenticate)
+    debug!("Invalid token format");
+    unauthorized_response("Authentication failed", &www_authenticate)
 }
 
 /// Request logging middleware

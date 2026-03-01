@@ -1340,46 +1340,64 @@ where
 /// // });
 /// ```
 pub struct WebTransportServer {
-    server: web_transport_quinn::Server,
-    addr: SocketAddr,
+    endpoint: quinn::Endpoint,
+    /// Serialized RFC 9728 metadata JSON for GET /.well-known/oauth-protected-resource
+    protected_resource_json: Option<Vec<u8>>,
 }
 
+/// Concrete h3-quinn stream types used throughout WebTransportServer.
+type H3QuinnBidiStream = h3_quinn::BidiStream<bytes::Bytes>;
+type H3QuinnRequestStream = h3::server::RequestStream<H3QuinnBidiStream, bytes::Bytes>;
+type H3QuinnConnection = h3::server::Connection<h3_quinn::Connection, bytes::Bytes>;
+type WtSession = h3_webtransport::server::WebTransportSession<h3_quinn::Connection, bytes::Bytes>;
+type WtBidiStream = h3_webtransport::stream::BidiStream<H3QuinnBidiStream, bytes::Bytes>;
+
 impl WebTransportServer {
-    /// Bind a WebTransport server to the given address with a certificate.
+    /// Bind an HTTP/3 + WebTransport server to the given address with a certificate.
+    ///
+    /// Uses h3 + h3-quinn + h3-webtransport to serve both regular HTTP/3 GET requests
+    /// (e.g. `.well-known/oauth-protected-resource`) and WebTransport CONNECT sessions
+    /// (for ZMTP-framed Cap'n Proto RPC) on the same QUIC port.
     ///
     /// # Arguments
     ///
     /// * `addr` - Socket address to bind to
-    /// * `cert_der` - DER-encoded certificate chain
+    /// * `cert_der` - DER-encoded certificate
     /// * `key_der` - DER-encoded private key
     pub fn bind(
         addr: SocketAddr,
         cert_der: Vec<u8>,
         key_der: Vec<u8>,
     ) -> Result<Self> {
-        let server = web_transport_quinn::ServerBuilder::new()
-            .with_addr(addr)
-            .with_certificate(
-                vec![rustls::pki_types::CertificateDer::from(cert_der)],
-                rustls::pki_types::PrivateKeyDer::from(
-                    rustls::pki_types::PrivatePkcs8KeyDer::from(key_der)
-                ),
-            )
-            .map_err(|e| anyhow!("WebTransport server build failed: {}", e))?;
+        let tls = webtransport_tls_config(cert_der, key_der)?;
+        let quic_cfg = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(tls)
+                .map_err(|e| anyhow!("QUIC server config failed: {}", e))?
+        ));
+        let endpoint = quinn::Endpoint::server(quic_cfg, addr)?;
 
-        Ok(Self { server, addr })
+        Ok(Self { endpoint, protected_resource_json: None })
     }
 
-    /// Get the bound address.
-    pub fn local_addr(&self) -> SocketAddr {
-        self.addr
+    /// Set RFC 9728 Protected Resource Metadata served at /.well-known/oauth-protected-resource.
+    pub fn with_protected_resource_metadata(mut self, json_bytes: Vec<u8>) -> Self {
+        self.protected_resource_json = Some(json_bytes);
+        self
     }
 
-    /// Accept WebTransport sessions and dispatch to ZmqService.
+    /// Get the actual bound address from the QUIC endpoint.
+    ///
+    /// This returns the real OS-assigned address, which matters when
+    /// binding to port 0 (ephemeral port assignment).
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        self.endpoint.local_addr().map_err(Into::into)
+    }
+
+    /// Accept connections and dispatch HTTP/3 + WebTransport.
     ///
     /// Uses `spawn_local` because `ZmqService` is `?Send`.
     pub async fn accept_loop_service<S>(
-        mut self,
+        self,
         service: Rc<S>,
         server_pubkey: ed25519_dalek::VerifyingKey,
         signing_key: ed25519_dalek::SigningKey,
@@ -1389,40 +1407,25 @@ impl WebTransportServer {
     where
         S: crate::service::ZmqService + 'static,
     {
+        let metadata_json = self.protected_resource_json.map(Arc::new);
+
         loop {
             tokio::select! {
-                request = self.server.accept() => {
-                    match request {
-                        Some(wt_request) => {
-                            let service = Rc::clone(&service);
-                            let nonce_cache = Arc::clone(&nonce_cache);
-                            let signing_key = signing_key.clone();
+                incoming = self.endpoint.accept() => {
+                    let Some(incoming) = incoming else { break; };
+                    let service = Rc::clone(&service);
+                    let nonce_cache = Arc::clone(&nonce_cache);
+                    let signing_key = signing_key.clone();
+                    let metadata = metadata_json.clone();
 
-                            tokio::task::spawn_local(async move {
-                                // Accept the WebTransport session
-                                match wt_request.ok().await {
-                                    Ok(session) => {
-                                        if let Err(e) = Self::handle_session(
-                                            session,
-                                            service,
-                                            server_pubkey,
-                                            signing_key,
-                                            nonce_cache,
-                                        ).await {
-                                            debug!("WebTransport session error: {}", e);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        debug!("WebTransport session rejected: {}", e);
-                                    }
-                                }
-                            });
+                    tokio::task::spawn_local(async move {
+                        if let Err(e) = Self::handle_connection(
+                            incoming, service, server_pubkey, signing_key,
+                            nonce_cache, metadata,
+                        ).await {
+                            debug!("H3 connection error: {}", e);
                         }
-                        None => {
-                            debug!("WebTransport server closed");
-                            break;
-                        }
-                    }
+                    });
                 }
                 _ = shutdown.notified() => {
                     debug!("WebTransport accept loop shutting down");
@@ -1430,56 +1433,154 @@ impl WebTransportServer {
                 }
             }
         }
-
         Ok(())
     }
 
-    async fn handle_session<S>(
-        session: web_transport_quinn::Session,
+    /// Handle an individual QUIC connection via h3.
+    ///
+    /// Routes incoming requests: WebTransport CONNECT upgrades go to
+    /// `handle_webtransport_session`, regular HTTP/3 GETs go to `handle_http_request`.
+    async fn handle_connection<S>(
+        incoming: quinn::Incoming,
         service: Rc<S>,
         server_pubkey: ed25519_dalek::VerifyingKey,
         signing_key: ed25519_dalek::SigningKey,
         nonce_cache: Arc<crate::envelope::InMemoryNonceCache>,
+        metadata_json: Option<Arc<Vec<u8>>>,
+    ) -> Result<()>
+    where
+        S: crate::service::ZmqService + 'static,
+    {
+        let quinn_conn = incoming.await?;
+        let h3_conn = h3_quinn::Connection::new(quinn_conn);
+        let mut h3_server: H3QuinnConnection = h3::server::builder()
+            .enable_webtransport(true)
+            .enable_datagram(true)
+            .enable_extended_connect(true)
+            .build(h3_conn)
+            .await
+            .map_err(|e| anyhow!("h3 server build failed: {}", e))?;
+
+        // Accept requests — route HTTP/3 GETs vs WebTransport CONNECT
+        loop {
+            match h3_server.accept().await {
+                Ok(Some(resolver)) => {
+                    let (req, stream) = resolver.resolve_request().await
+                        .map_err(|e| anyhow!("h3 resolve request failed: {}", e))?;
+
+                    // Check for WebTransport CONNECT upgrade
+                    let is_webtransport = req.method() == http::Method::CONNECT
+                        && req.extensions().get::<h3::ext::Protocol>()
+                            == Some(&h3::ext::Protocol::WEB_TRANSPORT);
+
+                    if is_webtransport {
+                        // Upgrade to WebTransport session (consumes h3 connection)
+                        let session: WtSession = h3_webtransport::server::WebTransportSession::accept(
+                            req, stream, h3_server,
+                        ).await
+                        .map_err(|e| anyhow!("WebTransport session accept failed: {}", e))?;
+
+                        Self::handle_webtransport_session(
+                            session, service, server_pubkey, signing_key,
+                            nonce_cache, metadata_json,
+                        ).await?;
+                        break; // session consumed the connection
+                    } else {
+                        // Regular HTTP/3 request
+                        Self::handle_http_request(req, stream, metadata_json.as_ref()).await?;
+                        // Continue accepting more requests on this connection
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    debug!("H3 accept error: {}", e);
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Serve HTTP/3 requests: `.well-known/oauth-protected-resource` and `/health`.
+    async fn handle_http_request(
+        req: http::Request<()>,
+        mut stream: H3QuinnRequestStream,
+        metadata_json: Option<&Arc<Vec<u8>>>,
+    ) -> Result<()> {
+        let (status, content_type, body) = match req.uri().path() {
+            "/.well-known/oauth-protected-resource" => {
+                if let Some(json) = metadata_json {
+                    (http::StatusCode::OK, "application/json", json.as_ref().clone())
+                } else {
+                    (http::StatusCode::NOT_FOUND, "text/plain", b"Not configured".to_vec())
+                }
+            }
+            "/health" => (http::StatusCode::OK, "text/plain", b"ok".to_vec()),
+            _ => (http::StatusCode::NOT_FOUND, "text/plain", b"Not found".to_vec()),
+        };
+
+        let response = http::Response::builder()
+            .status(status)
+            .header("content-type", content_type)
+            .body(())
+            .map_err(|e| anyhow!("failed to build HTTP response: {}", e))?;
+
+        stream.send_response(response).await
+            .map_err(|e| anyhow!("failed to send HTTP response: {}", e))?;
+        stream.send_data(bytes::Bytes::from(body)).await
+            .map_err(|e| anyhow!("failed to send HTTP body: {}", e))?;
+        stream.finish().await
+            .map_err(|e| anyhow!("failed to finish HTTP stream: {}", e))?;
+        Ok(())
+    }
+
+    /// Handle a WebTransport session: accept bidi streams for ZMTP-framed RPC,
+    /// and also handle any in-session HTTP/3 requests (via `AcceptedBi::Request`).
+    async fn handle_webtransport_session<S>(
+        session: WtSession,
+        service: Rc<S>,
+        server_pubkey: ed25519_dalek::VerifyingKey,
+        signing_key: ed25519_dalek::SigningKey,
+        nonce_cache: Arc<crate::envelope::InMemoryNonceCache>,
+        metadata_json: Option<Arc<Vec<u8>>>,
     ) -> Result<()>
     where
         S: crate::service::ZmqService + 'static,
     {
         debug!("WebTransport session established");
-
         loop {
-            // Accept bidi streams from browser (one per request)
             match session.accept_bi().await {
-                Ok((send, recv)) => {
+                Ok(Some(h3_webtransport::server::AcceptedBi::BidiStream(_session_id, stream))) => {
                     let service = Rc::clone(&service);
                     let nonce_cache = Arc::clone(&nonce_cache);
                     let signing_key = signing_key.clone();
-
                     tokio::task::spawn_local(async move {
-                        if let Err(e) = Self::handle_stream(
-                            send,
-                            recv,
-                            service,
-                            server_pubkey,
-                            signing_key,
-                            nonce_cache,
+                        if let Err(e) = Self::handle_wt_stream(
+                            stream, service, server_pubkey, signing_key, nonce_cache,
                         ).await {
                             debug!("WebTransport stream error: {}", e);
                         }
                     });
                 }
+                Ok(Some(h3_webtransport::server::AcceptedBi::Request(req, stream))) => {
+                    // HTTP/3 request within WebTransport session
+                    if let Err(e) = Self::handle_http_request(req, stream, metadata_json.as_ref()).await {
+                        debug!("WebTransport in-session HTTP request error: {}", e);
+                    }
+                }
+                Ok(None) => break,
                 Err(e) => {
                     debug!("WebTransport session closed: {}", e);
                     break;
                 }
             }
         }
-
         Ok(())
     }
 
-    async fn handle_stream<S>(
-        send: web_transport_quinn::SendStream,
-        mut recv: web_transport_quinn::RecvStream,
+    /// Handle a single WebTransport bidi stream: length-prefixed Cap'n Proto RPC.
+    async fn handle_wt_stream<S>(
+        stream: WtBidiStream,
         service: Rc<S>,
         _server_pubkey: ed25519_dalek::VerifyingKey,
         signing_key: ed25519_dalek::SigningKey,
@@ -1488,13 +1589,15 @@ impl WebTransportServer {
     where
         S: crate::service::ZmqService + 'static,
     {
-        // WebTransport streams don't need ZMTP handshake - we send raw Cap'n Proto
-        // This is a simplification since both ends are controlled code (not libzmq peers)
+        use h3::quic::BidiStream as H3BidiStream;
+        let (mut send, mut recv) = H3BidiStream::split(stream);
+
+        // WebTransport streams don't need ZMTP handshake - we send raw Cap'n Proto.
+        // This is a simplification since both ends are controlled code (not libzmq peers).
 
         // Read request bytes (length-prefixed)
         const MAX_WEBTRANSPORT_REQUEST_SIZE: usize = 16 * 1024 * 1024;
         let mut len_buf = [0u8; 4];
-        use tokio::io::AsyncReadExt;
         recv.read_exact(&mut len_buf).await?;
         let len = u32::from_be_bytes(len_buf) as usize;
         ensure!(
@@ -1517,15 +1620,9 @@ impl WebTransportServer {
         ).await?;
 
         // Write response length + bytes
-        use tokio::io::AsyncWriteExt;
-        let mut send = send;
         send.write_all(&(response_bytes.len() as u32).to_be_bytes()).await?;
         send.write_all(&response_bytes).await?;
-        send.finish()?;
-
-        // Wait for the peer to acknowledge the stream is done.
-        // Without this, dropping the stream may cancel unacknowledged data.
-        let _ = send.stopped().await;
+        send.shutdown().await?;
 
         // Handle continuation if present (for streaming)
         if let Some(cont) = continuation {
@@ -1548,10 +1645,35 @@ pub fn cert_hash(cert_der: &[u8]) -> String {
 // TLS Helpers
 // ============================================================================
 
+/// Install the ring crypto provider for rustls (required for QUIC/TLS).
+///
+/// Must be called before creating any rustls `ServerConfig` or quinn endpoint.
+/// No-op if already installed (safe to call multiple times).
+pub fn ensure_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+/// Build TLS config for HTTP/3 + WebTransport (ALPN: h3).
+fn webtransport_tls_config(
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+) -> Result<rustls::ServerConfig> {
+    ensure_crypto_provider();
+    let key = rustls::pki_types::PrivateKeyDer::from(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(key_der)
+    );
+    let mut cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der.into()], key)?;
+    cfg.alpn_protocols = vec![b"h3".to_vec()];
+    Ok(cfg)
+}
+
 /// Generate a self-signed TLS certificate for development/testing.
 ///
 /// Returns (ServerConfig, cert_der_bytes).
 pub fn server_tls_self_signed(name: &str) -> Result<(rustls::ServerConfig, Vec<u8>)> {
+    ensure_crypto_provider();
     let cert_key = rcgen::generate_simple_self_signed(vec![name.to_string()])?;
 
     let cert_der = cert_key.cert.der().to_vec();
@@ -1745,9 +1867,9 @@ mod tests {
     use crate::zmtp_framing::{build_greeting, validate_greeting, build_ready_metadata};
 
     /// Install the ring crypto provider for rustls (required for TLS tests).
-    /// This is a no-op if already installed.
+    /// Delegates to the public module-level function.
     fn ensure_crypto_provider() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        super::ensure_crypto_provider();
     }
 
     #[test]

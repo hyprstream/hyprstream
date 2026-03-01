@@ -427,6 +427,24 @@ impl TransportConfig {
         matches!(&self.endpoint, EndpointType::Quic { .. })
     }
 
+    /// Build an RFC 9728 resource URL from a QUIC endpoint.
+    ///
+    /// Returns `https://{server_name}/{path}`, matching the format used
+    /// by `QuicSharedConfig::for_service()`. The port is omitted because
+    /// resource URLs are identity tokens (used as JWT audience), not
+    /// connection endpoints — clients discover actual ports via the
+    /// endpoint registry.
+    ///
+    /// Returns `None` if this is not a QUIC endpoint.
+    pub fn quic_resource_url(&self, path: &str) -> Option<String> {
+        match &self.endpoint {
+            EndpointType::Quic { server_name, .. } => {
+                Some(format!("https://{}/{}", server_name, path))
+            }
+            _ => None,
+        }
+    }
+
 }
 
 #[cfg(test)]
