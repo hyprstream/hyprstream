@@ -52,11 +52,6 @@ impl StoragePaths {
         Ok(config_dir)
     }
 
-    /// Get the path for HuggingFace authentication token
-    pub fn hf_token_path(&self) -> Result<PathBuf> {
-        Ok(self.config_dir()?.join("hf_token"))
-    }
-
     /// Get the temporary download directory
     pub fn temp_download_dir(&self) -> Result<PathBuf> {
         let temp_dir = self.cache_dir()?.join("downloads");
