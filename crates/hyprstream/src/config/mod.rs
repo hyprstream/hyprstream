@@ -88,6 +88,13 @@ pub struct HyprConfig {
     #[serde(default)]
     pub streaming: StreamingConfig,
 
+    /// TLS configuration for HTTP services (OAI, OAuth, MCP)
+    ///
+    /// Enabled by default. Auto-generates self-signed cert when paths are unset.
+    /// Per-service `tls_cert`/`tls_key` overrides take precedence.
+    #[serde(default)]
+    pub tls: TlsConfig,
+
     /// QUIC/WebTransport configuration
     ///
     /// Enabled by default. Services expose a WebTransport endpoint alongside ZMQ,
@@ -112,6 +119,80 @@ pub struct HyprConfig {
     #[serde(default)]
     pub discovery: DiscoveryServiceConfig,
 }
+
+/// TLS configuration for HTTP services (OAI, OAuth, MCP).
+///
+/// When `cert_path`/`key_path` are unset, a self-signed ECDSA P-256 certificate
+/// is auto-generated at startup with 365-day validity. Per-service overrides
+/// (`tls_cert`/`tls_key` on OAI/OAuth/MCP configs) take precedence.
+///
+/// # Example TOML
+///
+/// ```toml
+/// [tls]
+/// enabled = true
+/// server_name = "localhost"
+/// # Leave cert_path/key_path unset for auto-generated self-signed cert
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsConfig {
+    /// Whether TLS is enabled for HTTP services (defaults to true)
+    #[serde(default = "default_tls_enabled")]
+    pub enabled: bool,
+
+    /// Path to TLS certificate (PEM). None = generate self-signed.
+    #[serde(default)]
+    pub cert_path: Option<PathBuf>,
+
+    /// Path to TLS private key (PEM). None = generate self-signed.
+    #[serde(default)]
+    pub key_path: Option<PathBuf>,
+
+    /// Server name for TLS certificate (used in self-signed cert generation)
+    #[serde(default = "default_tls_server_name")]
+    pub server_name: String,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cert_path: None,
+            key_path: None,
+            server_name: default_tls_server_name(),
+        }
+    }
+}
+
+impl TlsConfig {
+    /// Check if self-signed certificate should be generated.
+    ///
+    /// Returns `true` when both cert_path and key_path are None.
+    /// Warns if only one is set (likely misconfiguration).
+    pub fn use_self_signed(&self) -> bool {
+        match (&self.cert_path, &self.key_path) {
+            (None, None) => true,
+            (Some(_), Some(_)) => false,
+            (Some(cert), None) => {
+                tracing::warn!(
+                    "tls.cert_path is set ({}) but tls.key_path is missing — generating self-signed cert instead",
+                    cert.display()
+                );
+                true
+            }
+            (None, Some(key)) => {
+                tracing::warn!(
+                    "tls.key_path is set ({}) but tls.cert_path is missing — generating self-signed cert instead",
+                    key.display()
+                );
+                true
+            }
+        }
+    }
+}
+
+fn default_tls_enabled() -> bool { true }
+fn default_tls_server_name() -> String { "localhost".to_owned() }
 
 /// QUIC/WebTransport transport configuration.
 ///
@@ -321,12 +402,18 @@ impl Default for OAIConfig {
 
 impl OAIConfig {
     /// Get the resource URL, using external_url if set, otherwise deriving from host:port.
+    /// Auto-derives `https://` when global TLS is enabled.
     pub fn resource_url(&self) -> String {
         if let Some(ref url) = self.external_url {
             url.clone()
         } else {
+            let scheme = if HyprConfig::load().map(|c| c.tls.enabled).unwrap_or(false) {
+                "https"
+            } else {
+                "http"
+            };
             let host = if self.host == "0.0.0.0" { "localhost" } else { &self.host };
-            format!("http://{}:{}", host, self.port)
+            format!("{scheme}://{host}:{}", self.port)
         }
     }
 }
@@ -398,6 +485,14 @@ pub struct MCPConfig {
     #[serde(default)]
     pub external_url: Option<String>,
 
+    /// TLS certificate path (optional, overrides global [tls])
+    #[serde(default)]
+    pub tls_cert: Option<PathBuf>,
+
+    /// TLS private key path (optional, overrides global [tls])
+    #[serde(default)]
+    pub tls_key: Option<PathBuf>,
+
     /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
     #[serde(default)]
     pub quic_port: Option<u16>,
@@ -413,6 +508,8 @@ impl Default for MCPConfig {
             host: default_mcp_host(),
             http_port: default_mcp_port(),
             external_url: None,
+            tls_cert: None,
+            tls_key: None,
             quic_port: None,
             cors: server::CorsConfig::default(),
         }
@@ -421,12 +518,18 @@ impl Default for MCPConfig {
 
 impl MCPConfig {
     /// Get the resource URL, using external_url if set, otherwise deriving from host:http_port.
+    /// Auto-derives `https://` when global TLS is enabled.
     pub fn resource_url(&self) -> String {
         if let Some(ref url) = self.external_url {
             url.clone()
         } else {
+            let scheme = if HyprConfig::load().map(|c| c.tls.enabled).unwrap_or(false) {
+                "https"
+            } else {
+                "http"
+            };
             let host = if self.host == "0.0.0.0" { "localhost" } else { &self.host };
-            format!("http://{}:{}", host, self.http_port)
+            format!("{scheme}://{host}:{}", self.http_port)
         }
     }
 }
@@ -466,6 +569,14 @@ pub struct OAuthConfig {
     #[serde(default = "default_refresh_token_ttl")]
     pub refresh_token_ttl_seconds: u32,
 
+    /// TLS certificate path (optional, overrides global [tls])
+    #[serde(default)]
+    pub tls_cert: Option<PathBuf>,
+
+    /// TLS private key path (optional, overrides global [tls])
+    #[serde(default)]
+    pub tls_key: Option<PathBuf>,
+
     /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
     #[serde(default)]
     pub quic_port: Option<u16>,
@@ -488,6 +599,8 @@ impl Default for OAuthConfig {
             default_scopes: default_oauth_scopes(),
             token_ttl_seconds: default_oauth_token_ttl(),
             refresh_token_ttl_seconds: default_refresh_token_ttl(),
+            tls_cert: None,
+            tls_key: None,
             quic_port: None,
             cors: default_oauth_cors(),
         }
@@ -496,12 +609,18 @@ impl Default for OAuthConfig {
 
 impl OAuthConfig {
     /// Get the issuer URL, using external_url if set, otherwise deriving from host:port.
+    /// Auto-derives `https://` when global TLS is enabled.
     pub fn issuer_url(&self) -> String {
         if let Some(ref url) = self.external_url {
             url.clone()
         } else {
+            let scheme = if HyprConfig::load().map(|c| c.tls.enabled).unwrap_or(false) {
+                "https"
+            } else {
+                "http"
+            };
             let host = if self.host == "0.0.0.0" { "localhost" } else { &self.host };
-            format!("http://{}:{}", host, self.port)
+            format!("{scheme}://{host}:{}", self.port)
         }
     }
 }
@@ -868,6 +987,7 @@ pub struct HyprConfigBuilder {
     mcp: MCPConfig,
     oauth: OAuthConfig,
     streaming: StreamingConfig,
+    tls: TlsConfig,
     quic: QuicConfig,
     event: EventServiceConfig,
     registry: RegistryServiceConfig,
@@ -894,6 +1014,7 @@ impl HyprConfigBuilder {
             mcp: MCPConfig::default(),
             oauth: OAuthConfig::default(),
             streaming: StreamingConfig::default(),
+            tls: TlsConfig::default(),
             quic: QuicConfig::default(),
             event: EventServiceConfig::default(),
             registry: RegistryServiceConfig::default(),
@@ -920,6 +1041,7 @@ impl HyprConfigBuilder {
             mcp: config.mcp,
             oauth: config.oauth,
             streaming: config.streaming,
+            tls: config.tls,
             quic: config.quic,
             event: config.event,
             registry: config.registry,
@@ -958,6 +1080,7 @@ impl HyprConfigBuilder {
             mcp: self.mcp,
             oauth: self.oauth,
             streaming: self.streaming,
+            tls: self.tls,
             quic: self.quic,
             event: self.event,
             registry: self.registry,

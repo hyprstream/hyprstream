@@ -350,6 +350,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 
     let oai_service = OAIService::new(
         config.oai.clone(),
+        config.tls.clone(),
         server_state,
         global_context(),
         ctx.transport("oai", SocketKind::Rep),
@@ -422,6 +423,7 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     // PolicyClient must be created inside that runtime for ZMQ async I/O to work.
     let oauth_service = OAuthService::new(
         config.oauth.clone(),
+        config.tls.clone(),
         ctx.signing_key().clone(),
         global_context(),
         ctx.transport("oauth", SocketKind::Rep),
@@ -470,6 +472,9 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let mcp_host = config.mcp.host.clone();
     let http_port = config.mcp.http_port;
     let mcp_cors_config = config.mcp.cors.clone();
+    let mcp_tls_config = config.tls.clone();
+    let mcp_tls_cert = config.mcp.tls_cert.clone();
+    let mcp_tls_key = config.mcp.tls_key.clone();
     tokio::task::block_in_place(|| {
         let rt = tokio::runtime::Handle::current();
         rt.spawn(async move {
@@ -586,17 +591,61 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                 router
             };
 
-            let addr = format!("{}:{}", mcp_host, http_port);
-            let listener = match tokio::net::TcpListener::bind(&addr).await {
-                Ok(l) => l,
+            let addr: std::net::SocketAddr = format!("{}:{}", mcp_host, http_port)
+                .parse()
+                .unwrap_or_else(|_| ([0, 0, 0, 0], http_port).into());
+
+            // Resolve TLS configuration for MCP HTTP server.
+            // If the user explicitly configured cert/key paths and TLS fails,
+            // refuse to start (don't silently degrade to HTTP).
+            let has_explicit_tls = mcp_tls_cert.is_some() || mcp_tls_key.is_some()
+                || mcp_tls_config.cert_path.is_some() || mcp_tls_config.key_path.is_some();
+
+            let rustls_config = match crate::server::tls::resolve_rustls_config(
+                &mcp_tls_config,
+                mcp_tls_cert.as_ref(),
+                mcp_tls_key.as_ref(),
+            ).await {
+                Ok(cfg) => cfg,
                 Err(e) => {
-                    tracing::error!("Failed to bind MCP HTTP/SSE on {}: {}", addr, e);
-                    return;
+                    if has_explicit_tls {
+                        tracing::error!(
+                            "MCP TLS config error with explicit cert/key paths: {} — refusing to start without TLS", e
+                        );
+                        return;
+                    }
+                    tracing::warn!("MCP TLS config error (self-signed): {} — falling back to HTTP", e);
+                    None
                 }
             };
-            tracing::info!("MCP HTTP/SSE server listening on {}", addr);
-            if let Err(e) = axum::serve(listener, router).await {
-                tracing::error!("MCP HTTP/SSE server error: {}", e);
+
+            let scheme = if rustls_config.is_some() { "https" } else { "http" };
+            tracing::info!("MCP HTTP/SSE server listening on {scheme}://{addr}");
+
+            match rustls_config {
+                Some(tls) => {
+                    // MCP HTTP is fire-and-forget (no Arc<Notify> shutdown signal),
+                    // so no Handle is wired for graceful shutdown. The process exit
+                    // will terminate this task. OAI/OAuth use serve_app() instead.
+                    if let Err(e) = axum_server::bind_rustls(addr, tls)
+                        .serve(router.into_make_service())
+                        .await
+                    {
+                        tracing::error!("MCP HTTPS server error: {}", e);
+                    }
+                }
+                None => {
+                    let listener = match tokio::net::TcpListener::bind(addr).await {
+                        Ok(l) => l,
+                        Err(e) => {
+                            tracing::error!("Failed to bind MCP HTTP/SSE on {}: {}", addr, e);
+                            return;
+                        }
+                    };
+                    if let Err(e) = axum::serve(listener, router).await {
+                        tracing::error!("MCP HTTP/SSE server error: {}", e);
+                    }
+                }
             }
         });
     });

@@ -29,8 +29,9 @@
 //! port = 8080
 //! ```
 
-use crate::config::OAIConfig;
+use crate::config::{OAIConfig, TlsConfig};
 use crate::server::{create_app, state::ServerState};
+use crate::server::tls::{resolve_rustls_config, serve_app};
 use anyhow::Result;
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::SocketKind;
@@ -38,9 +39,8 @@ use hyprstream_rpc::service::spawner::Spawnable;
 use hyprstream_rpc::transport::TransportConfig;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::TcpListener;
 use tokio::sync::Notify;
-use tracing::{error, info};
+use tracing::info;
 
 /// Service name for registry and logging
 pub const SERVICE_NAME: &str = "oai";
@@ -56,6 +56,9 @@ pub const SERVICE_NAME: &str = "oai";
 pub struct OAIService {
     /// OAI-specific configuration (host, port, TLS)
     config: OAIConfig,
+
+    /// Global TLS configuration (passed from factory, avoids re-loading config)
+    tls_config: TlsConfig,
 
     /// Shared server state containing clients and metrics
     server_state: ServerState,
@@ -77,12 +80,14 @@ impl OAIService {
     /// # Arguments
     ///
     /// * `config` - OAI configuration (host, port, TLS settings)
+    /// * `tls_config` - Global TLS configuration
     /// * `server_state` - Shared state with ZMQ clients and metrics
     /// * `context` - ZMQ context for control socket
     /// * `control_transport` - Transport for ZMQ control channel
     /// * `verifying_key` - Key for verifying signed envelopes
     pub fn new(
         config: OAIConfig,
+        tls_config: TlsConfig,
         server_state: ServerState,
         context: Arc<zmq::Context>,
         control_transport: TransportConfig,
@@ -90,6 +95,7 @@ impl OAIService {
     ) -> Self {
         Self {
             config,
+            tls_config,
             server_state,
             context,
             control_transport,
@@ -135,24 +141,23 @@ impl Spawnable for OAIService {
                 hyprstream_rpc::error::RpcError::SpawnFailed(format!("Invalid HTTP address: {e}"))
             })?;
 
+            // Resolve TLS configuration (tls_config passed from factory, not re-loaded)
+            let rustls_config = resolve_rustls_config(
+                &self.tls_config,
+                self.config.tls_cert.as_ref(),
+                self.config.tls_key.as_ref(),
+            )
+            .await
+            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("TLS config: {e}")))?;
+
+            let scheme = if rustls_config.is_some() { "https" } else { "http" };
+
             // Create HTTP server
             let app = create_app(self.server_state.clone());
 
-            // Bind HTTP listener
-            let listener = TcpListener::bind(addr).await.map_err(|e| {
-                hyprstream_rpc::error::RpcError::SpawnFailed(format!("HTTP bind failed: {e}"))
-            })?;
+            info!("OpenAI-compatible API available at {scheme}://{addr}/oai/v1");
 
-            info!(
-                "OAIService HTTP server listening on http://{}",
-                addr
-            );
-            info!(
-                "OpenAI-compatible API available at http://{}/oai/v1",
-                addr
-            );
-
-            // Signal ready after HTTP socket is bound
+            // Signal ready
             if let Some(tx) = on_ready {
                 let _ = tx.send(());
             }
@@ -160,23 +165,8 @@ impl Spawnable for OAIService {
             // Notify systemd that service is ready
             let _ = hyprstream_rpc::notify::ready();
 
-            // Create shutdown signal for axum
-            let shutdown_clone = shutdown.clone();
-
-            // Run HTTP server with graceful shutdown
-            let server_result = axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    shutdown_clone.notified().await;
-                    info!("OAIService received shutdown signal");
-                })
-                .await;
-
-            if let Err(e) = server_result {
-                error!("OAIService HTTP server error: {}", e);
-            }
-
-            info!("OAIService stopped");
-            Ok(())
+            // Run HTTP(S) server with graceful shutdown
+            serve_app(addr, app, rustls_config, shutdown, "OAIService").await
         })
     }
 }

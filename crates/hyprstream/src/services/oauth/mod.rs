@@ -39,9 +39,8 @@ use axum::{routing::{get, post}, Router};
 use hyprstream_rpc::registry::SocketKind;
 use hyprstream_rpc::service::spawner::Spawnable;
 use hyprstream_rpc::transport::TransportConfig;
-use tokio::net::TcpListener;
 use tokio::sync::Notify;
-use tracing::{error, info};
+use tracing::info;
 
 use crate::config::OAuthConfig;
 use crate::services::PolicyClient;
@@ -118,6 +117,8 @@ async fn oauth_self_protected_resource_metadata() -> axum::Json<ProtectedResourc
 /// would hang when polled from the OAuth runtime.
 pub struct OAuthService {
     config: OAuthConfig,
+    /// Global TLS configuration (passed from factory, avoids re-loading config)
+    tls_config: crate::config::TlsConfig,
     /// Signing key for creating the PolicyClient inside `run()`.
     signing_key: hyprstream_rpc::prelude::SigningKey,
     context: Arc<zmq::Context>,
@@ -129,6 +130,7 @@ pub struct OAuthService {
 impl OAuthService {
     pub fn new(
         config: OAuthConfig,
+        tls_config: crate::config::TlsConfig,
         signing_key: hyprstream_rpc::prelude::SigningKey,
         context: Arc<zmq::Context>,
         control_transport: TransportConfig,
@@ -136,6 +138,7 @@ impl OAuthService {
     ) -> Self {
         Self {
             config,
+            tls_config,
             signing_key,
             context,
             control_transport,
@@ -173,6 +176,17 @@ impl Spawnable for OAuthService {
                 hyprstream_rpc::error::RpcError::SpawnFailed(format!("Invalid address: {e}"))
             })?;
 
+            // Resolve TLS configuration (tls_config passed from factory, not re-loaded)
+            let rustls_config = crate::server::tls::resolve_rustls_config(
+                &self.tls_config,
+                self.config.tls_cert.as_ref(),
+                self.config.tls_key.as_ref(),
+            )
+            .await
+            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("TLS config: {e}")))?;
+
+            let scheme = if rustls_config.is_some() { "https" } else { "http" };
+
             // Create PolicyClient HERE, inside the OAuth runtime, so that ZMQ
             // async I/O (TMQ) registers socket FDs with THIS runtime's epoll.
             // Creating it in the factory (main runtime) would cause hangs.
@@ -188,15 +202,8 @@ impl Spawnable for OAuthService {
             // Create router with configurable CORS
             let app = create_app(state, &self.config.cors);
 
-            // Bind
-            let listener = TcpListener::bind(addr).await.map_err(|e| {
-                hyprstream_rpc::error::RpcError::SpawnFailed(format!("HTTP bind failed: {e}"))
-            })?;
-
-            info!("OAuth 2.1 server listening on http://{}", addr);
             info!(
-                "Authorization server metadata at http://{}/.well-known/oauth-authorization-server",
-                addr
+                "Authorization server metadata at {scheme}://{addr}/.well-known/oauth-authorization-server",
             );
 
             if let Some(tx) = on_ready {
@@ -205,20 +212,8 @@ impl Spawnable for OAuthService {
 
             let _ = hyprstream_rpc::notify::ready();
 
-            let shutdown_clone = shutdown.clone();
-            let server_result = axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    shutdown_clone.notified().await;
-                    info!("OAuthService received shutdown signal");
-                })
-                .await;
-
-            if let Err(e) = server_result {
-                error!("OAuthService HTTP server error: {}", e);
-            }
-
-            info!("OAuthService stopped");
-            Ok(())
+            // Run HTTP(S) server with graceful shutdown
+            crate::server::tls::serve_app(addr, app, rustls_config, shutdown, "OAuthService").await
         })
     }
 }

@@ -7,8 +7,10 @@
 use anyhow::Result;
 use axum::{middleware as axum_middleware, response::IntoResponse, routing::get, Json, Router};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 use axum::http::StatusCode;
 use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 use tracing::info;
@@ -16,6 +18,7 @@ use tracing::info;
 pub mod middleware;
 pub mod routes;
 pub mod state;
+pub mod tls;
 
 pub use middleware::AuthenticatedUser;
 use state::ServerState;
@@ -96,7 +99,7 @@ async fn oauth_protected_resource_metadata() -> impl IntoResponse {
     Json(meta)
 }
 
-/// Start the HTTP server
+/// Start the HTTP server (plain, no TLS).
 pub async fn start_server(addr: SocketAddr, state: ServerState) -> Result<()> {
     let app = create_app(state);
 
@@ -109,13 +112,28 @@ pub async fn start_server(addr: SocketAddr, state: ServerState) -> Result<()> {
     Ok(())
 }
 
-/// Start the HTTPS server with TLS
+/// Start the HTTPS server with TLS.
+///
+/// Resolves TLS configuration from the global `[tls]` section, with optional
+/// per-service cert/key overrides. Uses `serve_app()` for HTTPS or falls back to HTTP.
 pub async fn start_server_tls(
     addr: SocketAddr,
     state: ServerState,
-    _cert_path: &str,
-    _key_path: &str,
+    shutdown: Arc<Notify>,
 ) -> Result<()> {
-    info!("TLS server support not yet implemented");
-    start_server(addr, state).await
+    let hypr_config = crate::config::HyprConfig::load().unwrap_or_default();
+    let rustls_config = tls::resolve_rustls_config(
+        &hypr_config.tls,
+        hypr_config.oai.tls_cert.as_ref(),
+        hypr_config.oai.tls_key.as_ref(),
+    )
+    .await?;
+
+    let scheme = if rustls_config.is_some() { "https" } else { "http" };
+    info!("OpenAI-compatible API available at {scheme}://{addr}/oai/v1");
+
+    let app = create_app(state);
+    tls::serve_app(addr, app, rustls_config, shutdown, "Hyprstream")
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))
 }

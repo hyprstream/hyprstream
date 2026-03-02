@@ -82,7 +82,9 @@ hmac.workspace = true  # HMAC for authenticated stream chunks
 daemonize.workspace = true
 prost.workspace = true
 rcgen.workspace = true  # Self-signed TLS cert generation for QUIC
+rustls.workspace = true  # TLS runtime (ring crypto provider for axum-server)
 rustls-pemfile.workspace = true  # PEM file parsing for TLS certs
+zeroize.workspace = true  # Zeroing private key material on drop
 time = "0.3"  # Datetime types for certificate validity
 
 # HTTP socket activation (systemd)
@@ -147,6 +149,7 @@ subtle.workspace = true                  # Constant-time operations
 
 # HTTP API dependencies
 axum.workspace = true
+axum-server.workspace = true
 tower-http.workspace = true
 url.workspace = true
 urlencoding.workspace = true

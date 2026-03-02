@@ -106,6 +106,7 @@ tonic = { version = "0.12.3", features = ["transport", "codegen", "prost", "tls"
 rustls = { version = "0.23.1", features = ["ring"] }
 rustls-pemfile = "2.1.0"
 axum = { version = "0.7", features = ["macros", "tokio"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower-http = { version = "0.6", features = ["trace", "cors", "timeout"] }
 reqwest = { version = "0.11", features = ["json", "stream"] }
 url = "2.5"
