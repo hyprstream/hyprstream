@@ -416,8 +416,9 @@ pub fn generate_request_method(
         }
         struct_name => {
             if let Some(s) = resolved.find_struct(struct_name) {
-                let is_void_wrapper = s.fields.is_empty()
-                    || (s.fields.len() == 1 && s.fields[0].type_name == "Void");
+                let nuf: Vec<_> = s.non_union_fields().collect();
+                let is_void_wrapper = nuf.is_empty()
+                    || (nuf.len() == 1 && nuf[0].type_name == "Void");
 
                 if is_void_wrapper {
                     let init_method = format_ident!("init_{}", to_snake_case(&variant.name));
@@ -437,10 +438,11 @@ pub fn generate_request_method(
                         }
                     }
                 } else {
-                    let params = generate_method_params(&s.fields, resolved);
+                    let nuf: Vec<_> = s.non_union_fields().cloned().collect();
+                    let params = generate_method_params(&nuf, resolved);
                     let init_method = format_ident!("init_{}", to_snake_case(&variant.name));
                     let builder_var = format_ident!("req");
-                    let setters = generate_struct_setters(&s.fields, resolved, capnp_mod, &builder_var);
+                    let setters = generate_struct_setters(&nuf, resolved, capnp_mod, &builder_var);
 
                     let inner_init = quote! { let mut req = req.#init_method(); };
 
@@ -658,7 +660,7 @@ fn generate_method_params(
         .filter(|field| {
             if let CapnpType::Struct(ref name) = resolved.resolve_type(&field.type_name).capnp_type {
                 if let Some(s) = resolved.find_struct(name) {
-                    if s.has_union && s.fields.is_empty() {
+                    if s.is_pure_union() {
                         return false;
                     }
                 }
@@ -732,7 +734,7 @@ fn generate_field_setter(
                 let field_snake = to_snake_case(
                     setter_name.to_string().strip_prefix("set_").unwrap_or(&setter_name.to_string())
                 );
-                if s.has_union && s.fields.is_empty() {
+                if s.is_pure_union() {
                     let init_name = format_ident!("init_{}", &field_snake);
                     quote! { #builder_var.reborrow().#init_name(); }
                 } else {

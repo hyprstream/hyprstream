@@ -268,7 +268,7 @@ fn classify_with_indexes(
                 "Data" => CapnpType::ListData,
                 _ => {
                     let inner_type = classify_with_indexes(inner, struct_index, enum_index);
-                    if inner_type.is_numeric() {
+                    if inner_type.is_numeric() || inner_type.is_list() {
                         CapnpType::ListPrimitive(Box::new(inner_type))
                     } else {
                         CapnpType::ListStruct(inner.to_owned())

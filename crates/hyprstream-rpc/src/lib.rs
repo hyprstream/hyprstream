@@ -37,9 +37,11 @@
 //! }
 //! ```
 
+// ============================================================================
+// Modules available on ALL targets (including wasm32)
+// ============================================================================
+
 // Cap'n Proto generated modules
-// Note: Generated code uses unwrap/expect internally - this is standard capnp-rust behavior
-// These modules are excluded from clippy checks via cargo configuration
 pub mod common_capnp {
     #![allow(dead_code, unused_imports)]
     #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
@@ -72,21 +74,101 @@ pub mod annotations_capnp {
     include!(concat!(env!("OUT_DIR"), "/annotations_capnp.rs"));
 }
 
-pub mod auth;
 pub mod capnp;
 pub mod crypto;
 pub mod envelope;
 pub mod error;
-pub mod registry;
-pub mod service;
-pub mod streaming;
-pub mod transport;
+pub mod platform;
+pub mod zmtp_framing;
 
-/// Prelude for convenient imports.
-///
-/// Re-exports the most commonly used types for `use hyprstream_rpc::prelude::*;`
+// ============================================================================
+// Native-only modules (not compiled for wasm32)
+// ============================================================================
+
+pub mod auth;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod registry;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod service;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod streaming;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod transport;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod notify;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod paths;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod socket;
+
+// ============================================================================
+// WASM-bindgen API (wasm32 target only)
+// ============================================================================
+
+#[cfg(target_arch = "wasm32")]
+pub mod wasm_api;
+
+// ============================================================================
+// Re-exports available on ALL targets
+// ============================================================================
+
+pub use capnp::{serialize_message, FromCapnp, ToCapnp};
+pub use crypto::{
+    generate_signing_keypair, signing_key_from_bytes, verifying_key_from_bytes, ChainedStreamHmac,
+    DefaultKeyExchange, HmacKey, KeyExchange, SharedSecret, SigningKey, VerifyingKey,
+};
+
+#[cfg(not(feature = "fips"))]
+pub use crypto::{generate_ephemeral_keypair, ristretto_dh, RistrettoPublic, RistrettoSecret};
+
+pub use envelope::{
+    unwrap_and_verify, InMemoryNonceCache, NonceCache, RequestEnvelope, RequestIdentity,
+    ResponseEnvelope, SignedEnvelope, Subject, MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use envelope::unwrap_envelope;
+pub use error::{EnvelopeError, EnvelopeResult, Result, RpcError};
+
+// ============================================================================
+// Native-only re-exports
+// ============================================================================
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use hyprstream_rpc_derive::{authorize, service_factory, FromCapnp, ToCapnp};
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use service::{Continuation, EnvelopeContext, RequestLoop, ServiceClient, ServiceHandle, ZmqClient, ZmqService};
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use streaming::{
+    ChannelProgressReporter, forward_progress_to_stream, progress_channel,
+    ProgressUpdate, ResponseStream, StreamChannel, StreamContext, StreamHandle,
+    StreamPayload, StreamPublisher, StreamVerifier,
+};
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use service::spawner::{
+    ProcessBackend, ProcessConfig, ProcessKind, ProcessSpawner,
+    ProxyService, ServiceKind, ServiceMode, ServiceSpawner,
+    Spawnable, SpawnedProcess, SpawnedService, SpawnerBackend, StandaloneBackend,
+    SystemdBackend,
+};
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use service::{detect_service_manager, ServiceManager, StandaloneManager};
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use service::metadata::{MethodMeta, ParamMeta};
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "systemd"))]
+pub use service::SystemdManager;
+
+// ============================================================================
+// Prelude (native only — too many native-only types)
+// ============================================================================
+
+#[cfg(not(target_arch = "wasm32"))]
 pub mod prelude {
-    // Re-export from crate root (DRY - single source of truth)
     pub use crate::{
         // Serialization
         serialize_message, FromCapnp, ToCapnp,
@@ -95,8 +177,9 @@ pub mod prelude {
         ChainedStreamHmac, DefaultKeyExchange, HmacKey, KeyExchange, SharedSecret,
         SigningKey, VerifyingKey,
         // Envelope
-        unwrap_envelope, InMemoryNonceCache, NonceCache, RequestEnvelope, RequestIdentity,
-        ResponseEnvelope, SignedEnvelope, Subject, MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
+        unwrap_envelope, unwrap_and_verify, InMemoryNonceCache, NonceCache, RequestEnvelope,
+        RequestIdentity, ResponseEnvelope, SignedEnvelope, Subject,
+        MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
         // Error
         EnvelopeError, EnvelopeResult, Result, RpcError,
         // Service
@@ -128,52 +211,16 @@ pub mod prelude {
     pub use crate::transport::{AsyncTransport, Transport, TransportConfig};
 }
 
-// Utility modules (merged from hyprstream-utils)
-pub mod notify;
-pub mod paths;
-pub mod socket;
+// ============================================================================
+// Systemd helpers (native only)
+// ============================================================================
 
-// Re-export key types at crate root
-pub use capnp::{serialize_message, FromCapnp, ToCapnp};
-pub use crypto::{
-    generate_signing_keypair, signing_key_from_bytes, verifying_key_from_bytes, ChainedStreamHmac,
-    DefaultKeyExchange, HmacKey, KeyExchange, SharedSecret, SigningKey, VerifyingKey,
-};
-
-#[cfg(not(feature = "fips"))]
-pub use crypto::{generate_ephemeral_keypair, ristretto_dh, RistrettoPublic, RistrettoSecret};
-pub use envelope::{
-    unwrap_envelope, InMemoryNonceCache, NonceCache, RequestEnvelope, RequestIdentity,
-    ResponseEnvelope, SignedEnvelope, Subject, MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
-};
-pub use error::{EnvelopeError, EnvelopeResult, Result, RpcError};
-pub use hyprstream_rpc_derive::{authorize, service_factory, FromCapnp, ToCapnp};
-pub use service::{Continuation, EnvelopeContext, RequestLoop, ServiceClient, ServiceHandle, ZmqClient, ZmqService};
-pub use streaming::{
-    ChannelProgressReporter, forward_progress_to_stream, progress_channel,
-    ProgressUpdate, ResponseStream, StreamChannel, StreamContext, StreamHandle,
-    StreamPayload, StreamPublisher, StreamVerifier,
-};
-pub use service::spawner::{
-    ProcessBackend, ProcessConfig, ProcessKind, ProcessSpawner,
-    ProxyService, ServiceKind, ServiceMode, ServiceSpawner,
-    Spawnable, SpawnedProcess, SpawnedService, SpawnerBackend, StandaloneBackend,
-    SystemdBackend,
-};
-
-// Service manager re-exports
-pub use service::{detect_service_manager, ServiceManager, StandaloneManager};
-pub use service::metadata::{MethodMeta, ParamMeta};
-#[cfg(feature = "systemd")]
-pub use service::SystemdManager;
-
-/// Check if system booted with systemd
-#[cfg(feature = "systemd")]
+#[cfg(all(not(target_arch = "wasm32"), feature = "systemd"))]
 pub fn has_systemd() -> bool {
     systemd::daemon::booted().unwrap_or(false)
 }
 
-#[cfg(not(feature = "systemd"))]
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "systemd")))]
 pub fn has_systemd() -> bool {
     false
 }

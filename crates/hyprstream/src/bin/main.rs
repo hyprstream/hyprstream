@@ -1287,7 +1287,7 @@ fn main() -> Result<()> {
                     verifying_key,
                     false,
                     models_dir.clone(),
-                );
+                ).with_oauth_issuer(config.oauth.issuer_url());
 
                 let manager = InprocManager::new();
                 let mut handles = Vec::new();
@@ -1434,11 +1434,19 @@ fn main() -> Result<()> {
                     daemon,
                     ipc,
                     callback,
+                    services: multi_services,
+                    quic_bind,
+                    print_cert_hash,
                 } => {
                     if foreground {
-                        let name = name.ok_or_else(|| {
-                            anyhow::anyhow!("--foreground requires a service name")
-                        })?;
+                        // --foreground requires either a service name or --services list
+                        let name = match (name, &multi_services) {
+                            (Some(n), _) => n,
+                            (None, Some(_)) => String::from("multi"), // placeholder for multi-service mode
+                            (None, None) => return Err(anyhow::anyhow!(
+                                "--foreground requires a service name or --services list"
+                            )),
+                        };
 
                         // Check if this is inference callback mode
                         if let Some(callback_endpoint) = callback {
@@ -1530,77 +1538,130 @@ fn main() -> Result<()> {
                                     load_or_generate_signing_key(&keys_dir).await?;
                                 let verifying_key = signing_key.verifying_key();
 
-                                let ctx = ServiceContext::new(
+                                let mut ctx = ServiceContext::new(
                                     global_context(),
                                     signing_key.clone(),
                                     verifying_key,
                                     ipc,
                                     models_dir.clone(),
-                                );
+                                ).with_oauth_issuer(config.oauth.issuer_url());
 
-                                let factory = get_factory(&name).ok_or_else(|| {
-                                    let available: Vec<_> =
-                                        hyprstream_rpc::service::list_factories()
-                                            .map(|f| f.name)
-                                            .collect();
-                                    anyhow::anyhow!(
-                                        "Unknown service: '{}'. Available services: {}",
-                                        name,
-                                        available.join(", ")
-                                    )
-                                })?;
+                                // Wire QUIC shared config from --quic-bind or [quic] config
+                                let quic_cfg = if let Some(ref bind_addr) = quic_bind {
+                                    let mut qc = hyprstream_core::config::QuicConfig::default();
+                                    qc.enabled = true;
+                                    qc.bind_addr = bind_addr.clone();
+                                    qc
+                                } else {
+                                    config.quic.clone()
+                                };
 
-                                info!(
-                                    "Starting {} service in standalone mode (IPC: {})",
-                                    name, ipc
-                                );
+                                if quic_cfg.enabled {
+                                    let qc = quic_cfg;
+                                    let (cert_der, key_der) = qc.load_tls_materials()
+                                        .context("Failed to load QUIC TLS materials")?;
 
-                                let spawnable = (factory.factory)(&ctx).context(format!(
-                                    "Failed to create {} service",
-                                    name
-                                ))?;
-                                let manager = InprocManager::new();
-                                let mut handle = manager.spawn(spawnable).await.context(
-                                    format!("Failed to start {} service", name),
-                                )?;
+                                    // Print cert hash if requested
+                                    if print_cert_hash {
+                                        let hash = hyprstream_rpc::transport::zmtp_quic::cert_hash(&cert_der);
+                                        println!("QUIC/WebTransport cert hash: {}", hash);
+                                    }
 
-                                if let Ok(mut publisher) =
-                                    hyprstream_workers::EventPublisher::new(
-                                        &global_context(),
-                                        "system",
-                                    )
-                                {
-                                    let _ = publisher
-                                        .publish_raw(
-                                            &format!("system.{}.ready", name),
-                                            b"",
-                                        )
-                                        .await;
+                                    let shared = hyprstream_rpc::service::QuicSharedConfig {
+                                        cert_der,
+                                        key_der,
+                                        base_ip: qc.socket_addr()?.ip(),
+                                        server_name: qc.server_name.clone(),
+                                        oauth_issuer_url: Some(config.oauth.issuer_url()),
+                                    };
+                                    ctx = ctx.with_quic(shared);
                                 }
 
+                                // Determine which services to start
+                                let service_names: Vec<String> = if let Some(ref svc_list) = multi_services {
+                                    svc_list.clone()
+                                } else {
+                                    vec![name.clone()]
+                                };
+
+                                let manager = InprocManager::new();
+                                let mut handles = Vec::new();
+
+                                for svc_name in &service_names {
+                                    let factory = get_factory(svc_name).ok_or_else(|| {
+                                        let available: Vec<_> =
+                                            hyprstream_rpc::service::list_factories()
+                                                .map(|f| f.name)
+                                                .collect();
+                                        anyhow::anyhow!(
+                                            "Unknown service: '{}'. Available services: {}",
+                                            svc_name,
+                                            available.join(", ")
+                                        )
+                                    })?;
+
+                                    info!(
+                                        "Starting {} service in standalone mode (IPC: {})",
+                                        svc_name, ipc
+                                    );
+
+                                    let spawnable = (factory.factory)(&ctx).context(format!(
+                                        "Failed to create {} service",
+                                        svc_name
+                                    ))?;
+                                    let handle = manager.spawn(spawnable).await.context(
+                                        format!("Failed to start {} service", svc_name),
+                                    )?;
+                                    handles.push((svc_name.clone(), handle));
+                                }
+
+                                if handles.is_empty() {
+                                    return Err(anyhow::anyhow!("No services to start"));
+                                }
+
+                                // Publish ready events for all services
+                                for (svc_name, _) in &handles {
+                                    if let Ok(mut publisher) =
+                                        hyprstream_workers::EventPublisher::new(
+                                            &global_context(),
+                                            "system",
+                                        )
+                                    {
+                                        let _ = publisher
+                                            .publish_raw(
+                                                &format!("system.{}.ready", svc_name),
+                                                b"",
+                                            )
+                                            .await;
+                                    }
+                                }
+
+                                let svc_names: Vec<_> = handles.iter().map(|(n, _)| n.as_str()).collect();
                                 info!(
-                                    "{} service ready, waiting for shutdown signal",
-                                    name
+                                    "Services ready: [{}], waiting for shutdown signal",
+                                    svc_names.join(", ")
                                 );
 
                                 let _ = shutdown_rx.await;
 
-                                if let Ok(mut publisher) =
-                                    hyprstream_workers::EventPublisher::new(
-                                        &global_context(),
-                                        "system",
-                                    )
-                                {
-                                    let _ = publisher
-                                        .publish_raw(
-                                            &format!("system.{}.stopping", name),
-                                            b"",
+                                // Stop all services
+                                for (svc_name, mut handle) in handles {
+                                    if let Ok(mut publisher) =
+                                        hyprstream_workers::EventPublisher::new(
+                                            &global_context(),
+                                            "system",
                                         )
-                                        .await;
+                                    {
+                                        let _ = publisher
+                                            .publish_raw(
+                                                &format!("system.{}.stopping", svc_name),
+                                                b"",
+                                            )
+                                            .await;
+                                    }
+                                    let _ = handle.stop().await;
+                                    info!("{} service stopped", svc_name);
                                 }
-
-                                let _ = handle.stop().await;
-                                info!("{} service stopped", name);
 
                                 Ok(())
                             },

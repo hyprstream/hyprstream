@@ -63,6 +63,8 @@ pub enum SocketKind {
     Pair,
     /// STREAM socket (raw TCP)
     Stream,
+    /// QUIC/WebTransport (not a ZMQ socket type)
+    Quic,
 }
 
 impl SocketKind {
@@ -81,6 +83,7 @@ impl SocketKind {
             SocketKind::Pull => "-pull",
             SocketKind::Pair => "-pair",
             SocketKind::Stream => "-stream",
+            SocketKind::Quic => "-quic",
         }
     }
 }
@@ -100,6 +103,7 @@ impl From<SocketKind> for zmq::SocketType {
             SocketKind::Pull => zmq::SocketType::PULL,
             SocketKind::Pair => zmq::SocketType::PAIR,
             SocketKind::Stream => zmq::SocketType::STREAM,
+            SocketKind::Quic => panic!("SocketKind::Quic has no ZMQ equivalent"),
         }
     }
 }
@@ -245,6 +249,13 @@ impl EndpointRegistry {
 
     /// Generate a default endpoint for a service and socket type.
     fn default_endpoint(&self, name: &str, socket_kind: SocketKind) -> TransportConfig {
+        // QUIC endpoints are always TCP-based, independent of ZMQ endpoint mode
+        if socket_kind == SocketKind::Quic {
+            return TransportConfig::quic(
+                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
+                "localhost",
+            );
+        }
         let suffix = socket_kind.suffix();
         match self.mode {
             EndpointMode::Inproc => {
@@ -301,6 +312,11 @@ impl EndpointRegistry {
     /// List all registered services.
     pub fn list_services(&self) -> Vec<String> {
         self.services.read().keys().cloned().collect()
+    }
+
+    /// Get a clone of a service entry by name.
+    pub fn service_entry(&self, name: &str) -> Option<ServiceEntry> {
+        self.services.read().get(name).cloned()
     }
 
     /// Get all endpoints for a service.

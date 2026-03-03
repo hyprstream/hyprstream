@@ -103,13 +103,22 @@ futures = { version = "0.3.31", features = ["alloc"] }
 futures-util = "0.3.31"
 pin-project-lite = "0.2"
 tonic = { version = "0.12.3", features = ["transport", "codegen", "prost", "tls"] }
-rustls = "0.23.1"
+rustls = { version = "0.23.1", features = ["ring"] }
 rustls-pemfile = "2.1.0"
 axum = { version = "0.7", features = ["macros", "tokio"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower-http = { version = "0.6", features = ["trace", "cors", "timeout"] }
 reqwest = { version = "0.11", features = ["json", "stream"] }
 url = "2.5"
 urlencoding = "2.1"
+
+# QUIC transport (HTTP/3 + WebTransport + ZMTP over QUIC)
+quinn = { version = "0.11", features = ["rustls-ring", "futures-io"] }
+rcgen = "0.13"
+h3 = { version = "0.0.8", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
+h3-quinn = { version = "0.0.10", features = ["datagram"] }
+h3-webtransport = "0.1.2"
+http = "1"
 
 # Data processing
 polars = "0.45.1"

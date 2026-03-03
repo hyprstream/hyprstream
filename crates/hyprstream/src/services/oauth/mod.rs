@@ -39,9 +39,8 @@ use axum::{routing::{get, post}, Router};
 use hyprstream_rpc::registry::SocketKind;
 use hyprstream_rpc::service::spawner::Spawnable;
 use hyprstream_rpc::transport::TransportConfig;
-use tokio::net::TcpListener;
 use tokio::sync::Notify;
-use tracing::{error, info};
+use tracing::info;
 
 use crate::config::OAuthConfig;
 use crate::services::PolicyClient;
@@ -51,11 +50,19 @@ use state::OAuthState;
 pub const SERVICE_NAME: &str = "oauth";
 
 /// Create the OAuth Axum router.
-pub fn create_app(state: Arc<OAuthState>) -> Router {
-    Router::new()
+///
+/// CORS is outermost (applied last) so OPTIONS preflights are handled before
+/// any inner middleware (like logging) runs. This fixes the previous ordering
+/// where logging was outermost and CORS was inner.
+pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfig) -> Router {
+    let mut router = Router::new()
         .route(
             "/.well-known/oauth-authorization-server",
             get(metadata::authorization_server_metadata),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(oauth_self_protected_resource_metadata),
         )
         .route("/oauth/register", post(registration::register_client))
         .route(
@@ -73,8 +80,29 @@ pub fn create_app(state: Arc<OAuthState>) -> Router {
             let uri = req.uri().clone();
             tracing::info!(%method, %uri, "OAuth request");
             next.run(req).await
-        }))
-        .with_state(state)
+        }));
+
+    // CORS outermost (added last = runs first on request)
+    if cors_config.enabled {
+        router = router.layer(crate::server::middleware::cors_layer(cors_config));
+    }
+
+    router.with_state(state)
+}
+
+/// RFC 9728 Protected Resource Metadata for the OAuth server itself.
+async fn oauth_self_protected_resource_metadata() -> axum::Json<ProtectedResourceMetadata> {
+    let config = crate::config::HyprConfig::load().unwrap_or_default();
+    let issuer_url = config.oauth.issuer_url();
+    let mut meta = protected_resource_metadata(&issuer_url, &issuer_url);
+    meta.resource_name = Some("HyprStream OAuth 2.1 Authorization Server".to_owned());
+    meta.scopes_supported = Some(vec![
+        "openid".into(),
+        "read:*:*".into(),
+        "write:*:*".into(),
+        "infer:model:*".into(),
+    ]);
+    axum::Json(meta)
 }
 
 /// OAuth 2.1 Authorization Server service.
@@ -89,6 +117,8 @@ pub fn create_app(state: Arc<OAuthState>) -> Router {
 /// would hang when polled from the OAuth runtime.
 pub struct OAuthService {
     config: OAuthConfig,
+    /// Global TLS configuration (passed from factory, avoids re-loading config)
+    tls_config: crate::config::TlsConfig,
     /// Signing key for creating the PolicyClient inside `run()`.
     signing_key: hyprstream_rpc::prelude::SigningKey,
     context: Arc<zmq::Context>,
@@ -100,6 +130,7 @@ pub struct OAuthService {
 impl OAuthService {
     pub fn new(
         config: OAuthConfig,
+        tls_config: crate::config::TlsConfig,
         signing_key: hyprstream_rpc::prelude::SigningKey,
         context: Arc<zmq::Context>,
         control_transport: TransportConfig,
@@ -107,6 +138,7 @@ impl OAuthService {
     ) -> Self {
         Self {
             config,
+            tls_config,
             signing_key,
             context,
             control_transport,
@@ -144,6 +176,17 @@ impl Spawnable for OAuthService {
                 hyprstream_rpc::error::RpcError::SpawnFailed(format!("Invalid address: {e}"))
             })?;
 
+            // Resolve TLS configuration (tls_config passed from factory, not re-loaded)
+            let rustls_config = crate::server::tls::resolve_rustls_config(
+                &self.tls_config,
+                self.config.tls_cert.as_ref(),
+                self.config.tls_key.as_ref(),
+            )
+            .await
+            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("TLS config: {e}")))?;
+
+            let scheme = if rustls_config.is_some() { "https" } else { "http" };
+
             // Create PolicyClient HERE, inside the OAuth runtime, so that ZMQ
             // async I/O (TMQ) registers socket FDs with THIS runtime's epoll.
             // Creating it in the factory (main runtime) would cause hangs.
@@ -156,18 +199,11 @@ impl Spawnable for OAuthService {
             let state = Arc::new(OAuthState::new(&self.config, policy_client));
             state.spawn_code_sweeper();
 
-            // Create router
-            let app = create_app(state);
+            // Create router with configurable CORS
+            let app = create_app(state, &self.config.cors);
 
-            // Bind
-            let listener = TcpListener::bind(addr).await.map_err(|e| {
-                hyprstream_rpc::error::RpcError::SpawnFailed(format!("HTTP bind failed: {e}"))
-            })?;
-
-            info!("OAuth 2.1 server listening on http://{}", addr);
             info!(
-                "Authorization server metadata at http://{}/.well-known/oauth-authorization-server",
-                addr
+                "Authorization server metadata at {scheme}://{addr}/.well-known/oauth-authorization-server",
             );
 
             if let Some(tx) = on_ready {
@@ -176,32 +212,42 @@ impl Spawnable for OAuthService {
 
             let _ = hyprstream_rpc::notify::ready();
 
-            let shutdown_clone = shutdown.clone();
-            let server_result = axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    shutdown_clone.notified().await;
-                    info!("OAuthService received shutdown signal");
-                })
-                .await;
-
-            if let Err(e) = server_result {
-                error!("OAuthService HTTP server error: {}", e);
-            }
-
-            info!("OAuthService stopped");
-            Ok(())
+            // Run HTTP(S) server with graceful shutdown
+            crate::server::tls::serve_app(addr, app, rustls_config, shutdown, "OAuthService").await
         })
     }
 }
 
-/// Create a Protected Resource Metadata JSON response (RFC 9728).
+/// RFC 9728 Protected Resource Metadata.
+///
+/// Typed representation of the JSON served at `/.well-known/oauth-protected-resource`.
+/// Used by MCP, OAI, Flight, and QUIC services to advertise their OAuth authorization server.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProtectedResourceMetadata {
+    pub resource: String,
+    pub authorization_servers: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bearer_methods_supported: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes_supported: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_documentation: Option<String>,
+}
+
+/// Create a Protected Resource Metadata response (RFC 9728).
 ///
 /// Used by MCP and OAI servers to advertise their OAuth authorization server.
-pub fn protected_resource_metadata(resource_url: &str, oauth_issuer_url: &str) -> serde_json::Value {
-    serde_json::json!({
-        "resource": resource_url,
-        "authorization_servers": [oauth_issuer_url],
-    })
+pub fn protected_resource_metadata(resource_url: &str, oauth_issuer_url: &str) -> ProtectedResourceMetadata {
+    ProtectedResourceMetadata {
+        resource: resource_url.to_owned(),
+        authorization_servers: vec![oauth_issuer_url.to_owned()],
+        bearer_methods_supported: Some(vec!["header".to_owned()]),
+        scopes_supported: None,
+        resource_name: None,
+        resource_documentation: None,
+    }
 }
 
 #[cfg(test)]
@@ -215,8 +261,9 @@ mod tests {
             "http://localhost:6790",
             "http://localhost:6791",
         );
-        assert_eq!(meta["resource"], "http://localhost:6790");
-        assert_eq!(meta["authorization_servers"][0], "http://localhost:6791");
+        assert_eq!(meta.resource, "http://localhost:6790");
+        assert_eq!(meta.authorization_servers[0], "http://localhost:6791");
+        assert_eq!(meta.bearer_methods_supported.as_deref(), Some(&["header".to_owned()][..]));
     }
 
     #[test]

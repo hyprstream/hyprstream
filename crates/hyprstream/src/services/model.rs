@@ -163,6 +163,8 @@ pub struct ModelService {
     // Infrastructure (for Spawnable)
     context: Arc<zmq::Context>,
     transport: TransportConfig,
+    /// Expected JWT audience for token validation (RFC 8707).
+    expected_audience: Option<String>,
 }
 
 impl ModelService {
@@ -192,7 +194,14 @@ impl ModelService {
             spawned_instances: RwLock::new(HashMap::new()),
             context,
             transport,
+            expected_audience: None,
         }
+    }
+
+    /// Set the expected JWT audience for token validation.
+    pub fn with_expected_audience(mut self, audience: String) -> Self {
+        self.expected_audience = Some(audience);
+        self
     }
 
     /// Create a model service with callback router for spawned mode
@@ -221,6 +230,7 @@ impl ModelService {
             spawned_instances: RwLock::new(HashMap::new()),
             context,
             transport,
+            expected_audience: None,
         }
     }
 
@@ -316,7 +326,7 @@ impl ModelService {
             let worker_transport = backend_transport.with_connect_mode();
             let mut worker_handles = Vec::with_capacity(num_instances);
             for idx in 0..num_instances {
-                let worker_config = crate::services::InferenceServiceConfig::new(
+                let mut worker_config = crate::services::InferenceServiceConfig::new(
                     &model_path,
                     runtime_config.clone(),
                     self.signing_key.verifying_key(),
@@ -326,6 +336,9 @@ impl ModelService {
                     worker_transport.clone(),
                     fs.clone(),
                 );
+                if let Some(ref aud) = self.expected_audience {
+                    worker_config = worker_config.with_expected_audience(aud.clone());
+                }
                 let handle = spawner.spawn(worker_config).await
                     .map_err(|e| anyhow!("Failed to spawn inference worker {}: {}", idx, e))?;
                 worker_handles.push(handle);
@@ -338,7 +351,7 @@ impl ModelService {
         } else {
             // Single instance: direct bind (zero overhead, current behavior)
             let transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(&endpoint);
-            let service_config = crate::services::InferenceServiceConfig::new(
+            let mut service_config = crate::services::InferenceServiceConfig::new(
                 &model_path,
                 runtime_config,
                 self.signing_key.verifying_key(),
@@ -348,6 +361,9 @@ impl ModelService {
                 transport,
                 fs,
             );
+            if let Some(ref aud) = self.expected_audience {
+                service_config = service_config.with_expected_audience(aud.clone());
+            }
             spawner.spawn(service_config).await
                 .map_err(|e| anyhow!("Failed to spawn inference service: {}", e))?
         };
@@ -609,6 +625,7 @@ use crate::services::generated::model_client::{
     AdapterInfo, AdapterMergeRequest,
     // Infer types
     GenerateRequest, ApplyChatTemplateRequest, ModelStatusResponse, OnlineTrainingConfig,
+    EmbedRequest, EmbedResponse,
 };
 // Conflicting names — use canonical path at usage sites:
 //   model_client::LoadedModelInfo, model_client::StreamInfo,
@@ -965,6 +982,19 @@ impl InferHandler for ModelService {
         Ok(templated.as_str().to_owned())
     }
 
+    async fn handle_embed(
+        &self, ctx: &EnvelopeContext, _request_id: u64,
+        model_ref: &str, data: &EmbedRequest,
+    ) -> Result<EmbedResponse> {
+        let client = self.get_inference_client(model_ref, ctx).await?;
+        let embeddings = client.embed(&data.images).await?;
+        let dimensions = embeddings.first().map(|v| v.len() as u32).unwrap_or(0);
+        Ok(EmbedResponse {
+            embeddings,
+            dimensions,
+        })
+    }
+
     async fn handle_status(
         &self, _ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
     ) -> Result<ModelStatusResponse> {
@@ -1111,6 +1141,10 @@ impl crate::services::ZmqService for ModelService {
 
     fn signing_key(&self) -> SigningKey {
         self.signing_key.clone()
+    }
+
+    fn expected_audience(&self) -> Option<&str> {
+        self.expected_audience.as_deref()
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {

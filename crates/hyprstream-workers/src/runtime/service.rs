@@ -94,6 +94,8 @@ pub struct WorkerService {
 
     /// Optional authorization callback (injected by parent crate)
     authorize_fn: Option<AuthorizeFn>,
+    /// Expected JWT audience for token validation (RFC 8707).
+    expected_audience: Option<String>,
 }
 
 impl WorkerService {
@@ -131,12 +133,18 @@ impl WorkerService {
             transport,
             signing_key,
             authorize_fn: None,
+            expected_audience: None,
         })
     }
 
     /// Set the authorization callback for policy checks.
     pub fn set_authorize_fn(&mut self, authorize_fn: AuthorizeFn) {
         self.authorize_fn = Some(authorize_fn);
+    }
+
+    /// Set the expected JWT audience for token validation.
+    pub fn set_expected_audience(&mut self, audience: String) {
+        self.expected_audience = Some(audience);
     }
 
     /// Initialize the service (start warm pool)
@@ -1359,6 +1367,10 @@ impl ZmqService for WorkerService {
 
     fn signing_key(&self) -> SigningKey {
         self.signing_key.clone()
+    }
+
+    fn expected_audience(&self) -> Option<&str> {
+        self.expected_audience.as_deref()
     }
 }
 

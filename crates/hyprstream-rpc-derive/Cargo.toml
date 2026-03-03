@@ -16,6 +16,7 @@ syn = { version = "2.0", features = ["full", "parsing", "extra-traits"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 capnp = { workspace = true }
+hyprstream-rpc-build = { path = "../hyprstream-rpc-build" }
 
 [lints]
 workspace = true

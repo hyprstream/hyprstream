@@ -87,7 +87,244 @@ pub struct HyprConfig {
     /// StreamService configuration (buffer sizes, TTL, etc.)
     #[serde(default)]
     pub streaming: StreamingConfig,
+
+    /// TLS configuration for HTTP services (OAI, OAuth, MCP)
+    ///
+    /// Enabled by default. Auto-generates self-signed cert when paths are unset.
+    /// Per-service `tls_cert`/`tls_key` overrides take precedence.
+    #[serde(default)]
+    pub tls: TlsConfig,
+
+    /// QUIC/WebTransport configuration
+    ///
+    /// Enabled by default. Services expose a WebTransport endpoint alongside ZMQ,
+    /// allowing browsers to connect directly via HTTP/3 + QUIC.
+    /// Set `enabled = false` to disable.
+    #[serde(default)]
+    pub quic: QuicConfig,
+
+    /// Event proxy service configuration
+    #[serde(default)]
+    pub event: EventServiceConfig,
+
+    /// Registry service configuration
+    #[serde(default)]
+    pub registry: RegistryServiceConfig,
+
+    /// Policy service configuration
+    #[serde(default)]
+    pub policy: PolicyServiceConfig,
+
+    /// Discovery service configuration
+    #[serde(default)]
+    pub discovery: DiscoveryServiceConfig,
 }
+
+/// TLS configuration for HTTP services (OAI, OAuth, MCP).
+///
+/// When `cert_path`/`key_path` are unset, a self-signed ECDSA P-256 certificate
+/// is auto-generated at startup with 365-day validity. Per-service overrides
+/// (`tls_cert`/`tls_key` on OAI/OAuth/MCP configs) take precedence.
+///
+/// # Example TOML
+///
+/// ```toml
+/// [tls]
+/// enabled = true
+/// server_name = "localhost"
+/// # Leave cert_path/key_path unset for auto-generated self-signed cert
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsConfig {
+    /// Whether TLS is enabled for HTTP services (defaults to true)
+    #[serde(default = "default_tls_enabled")]
+    pub enabled: bool,
+
+    /// Path to TLS certificate (PEM). None = generate self-signed.
+    #[serde(default)]
+    pub cert_path: Option<PathBuf>,
+
+    /// Path to TLS private key (PEM). None = generate self-signed.
+    #[serde(default)]
+    pub key_path: Option<PathBuf>,
+
+    /// Server name for TLS certificate (used in self-signed cert generation)
+    #[serde(default = "default_tls_server_name")]
+    pub server_name: String,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cert_path: None,
+            key_path: None,
+            server_name: default_tls_server_name(),
+        }
+    }
+}
+
+impl TlsConfig {
+    /// Check if self-signed certificate should be generated.
+    ///
+    /// Returns `true` when both cert_path and key_path are None.
+    /// Warns if only one is set (likely misconfiguration).
+    pub fn use_self_signed(&self) -> bool {
+        match (&self.cert_path, &self.key_path) {
+            (None, None) => true,
+            (Some(_), Some(_)) => false,
+            (Some(cert), None) => {
+                tracing::warn!(
+                    "tls.cert_path is set ({}) but tls.key_path is missing — generating self-signed cert instead",
+                    cert.display()
+                );
+                true
+            }
+            (None, Some(key)) => {
+                tracing::warn!(
+                    "tls.key_path is set ({}) but tls.cert_path is missing — generating self-signed cert instead",
+                    key.display()
+                );
+                true
+            }
+        }
+    }
+}
+
+fn default_tls_enabled() -> bool { true }
+fn default_tls_server_name() -> String { "localhost".to_owned() }
+
+/// QUIC/WebTransport transport configuration.
+///
+/// Enables WebTransport alongside ZMQ for browser-direct RPC.
+/// When `cert_path` is empty, a self-signed certificate is generated at startup.
+///
+/// # Example TOML
+///
+/// ```toml
+/// [quic]
+/// enabled = true
+/// bind_addr = "0.0.0.0:4433"
+/// server_name = "localhost"
+/// cert_path = ""
+/// key_path = ""
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuicConfig {
+    /// Whether QUIC/WebTransport is enabled (defaults to true)
+    #[serde(default = "default_quic_enabled")]
+    pub enabled: bool,
+
+    /// Address to bind the WebTransport server
+    #[serde(default = "default_quic_bind_addr")]
+    pub bind_addr: String,
+
+    /// Server name for TLS certificate (used in self-signed cert generation)
+    #[serde(default = "default_quic_server_name")]
+    pub server_name: String,
+
+    /// Path to TLS certificate (PEM). Empty = generate self-signed.
+    #[serde(default)]
+    pub cert_path: String,
+
+    /// Path to TLS private key (PEM). Empty = generate self-signed.
+    #[serde(default)]
+    pub key_path: String,
+}
+
+impl Default for QuicConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bind_addr: default_quic_bind_addr(),
+            server_name: default_quic_server_name(),
+            cert_path: String::new(),
+            key_path: String::new(),
+        }
+    }
+}
+
+impl QuicConfig {
+    /// Parse bind_addr into a SocketAddr.
+    pub fn socket_addr(&self) -> anyhow::Result<std::net::SocketAddr> {
+        self.bind_addr.parse().map_err(|e| anyhow::anyhow!("invalid quic.bind_addr '{}': {}", self.bind_addr, e))
+    }
+
+    /// Check if self-signed certificate should be generated.
+    pub fn use_self_signed(&self) -> bool {
+        self.cert_path.is_empty() || self.key_path.is_empty()
+    }
+
+    /// Generate or load TLS materials, returning (cert_der, key_der).
+    ///
+    /// For self-signed certs, generates an ECDSA P-256 certificate with ≤14 day validity,
+    /// as required by WebTransport `serverCertificateHashes` (W3C spec).
+    pub fn load_tls_materials(&self) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+        if self.use_self_signed() {
+            // Generate self-signed cert with ≤14 day validity for WebTransport compat
+            let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
+            let mut params = rcgen::CertificateParams::new(vec![self.server_name.clone()])?;
+            params.not_before = time::OffsetDateTime::now_utc();
+            params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(14);
+            let cert = params.self_signed(&key_pair)?;
+            let cert_der = cert.der().to_vec();
+            let key_der = key_pair.serialize_der();
+            Ok((cert_der, key_der))
+        } else {
+            // Load from files
+            let cert_pem = std::fs::read(&self.cert_path)
+                .map_err(|e| anyhow::anyhow!("failed to read cert_path '{}': {}", self.cert_path, e))?;
+            let key_pem = std::fs::read(&self.key_path)
+                .map_err(|e| anyhow::anyhow!("failed to read key_path '{}': {}", self.key_path, e))?;
+
+            // Parse PEM to DER
+            let cert_der = rustls_pemfile::certs(&mut &cert_pem[..])
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("no certificate found in {}", self.cert_path))?
+                .map_err(|e| anyhow::anyhow!("invalid certificate PEM: {}", e))?
+                .to_vec();
+
+            let key_der = rustls_pemfile::private_key(&mut &key_pem[..])
+                .map_err(|e| anyhow::anyhow!("invalid key PEM: {}", e))?
+                .ok_or_else(|| anyhow::anyhow!("no private key found in {}", self.key_path))?
+                .secret_der()
+                .to_vec();
+
+            Ok((cert_der, key_der))
+        }
+    }
+
+    /// Build a `QuicLoopConfig` for use with `RequestLoop`.
+    ///
+    /// Optionally embeds RFC 9728 Protected Resource Metadata so HTTP/3 clients
+    /// can discover the OAuth authorization server for this QUIC endpoint.
+    pub fn to_loop_config(
+        &self,
+        service_name: &str,
+        oauth_issuer_url: Option<&str>,
+    ) -> anyhow::Result<hyprstream_rpc::service::QuicLoopConfig> {
+        let addr = self.socket_addr()?;
+        let (cert_der, key_der) = self.load_tls_materials()?;
+        let meta_json = oauth_issuer_url.map(|issuer| {
+            let meta = crate::services::oauth::protected_resource_metadata(
+                &format!("https://{}/{}", self.server_name, service_name),
+                issuer,
+            );
+            serde_json::to_vec(&meta).unwrap_or_default()
+        });
+        Ok(hyprstream_rpc::service::QuicLoopConfig {
+            cert_der,
+            key_der,
+            bind_addr: addr,
+            server_name: self.server_name.clone(),
+            protected_resource_json: meta_json,
+        })
+    }
+}
+
+fn default_quic_enabled() -> bool { true }
+fn default_quic_bind_addr() -> String { "0.0.0.0:4433".to_owned() }
+fn default_quic_server_name() -> String { "localhost".to_owned() }
 
 /// JWT token issuance configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,6 +379,10 @@ pub struct OAIConfig {
     /// CORS configuration
     #[serde(default)]
     pub cors: server::CorsConfig,
+
+    /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
 }
 
 impl Default for OAIConfig {
@@ -154,18 +395,25 @@ impl Default for OAIConfig {
             tls_key: None,
             request_timeout_secs: default_oai_timeout(),
             cors: server::CorsConfig::default(),
+            quic_port: None,
         }
     }
 }
 
 impl OAIConfig {
     /// Get the resource URL, using external_url if set, otherwise deriving from host:port.
+    /// Auto-derives `https://` when global TLS is enabled.
     pub fn resource_url(&self) -> String {
         if let Some(ref url) = self.external_url {
             url.clone()
         } else {
+            let scheme = if HyprConfig::load().map(|c| c.tls.enabled).unwrap_or(false) {
+                "https"
+            } else {
+                "http"
+            };
             let host = if self.host == "0.0.0.0" { "localhost" } else { &self.host };
-            format!("http://{}:{}", host, self.port)
+            format!("{scheme}://{host}:{}", self.port)
         }
     }
 }
@@ -196,6 +444,10 @@ pub struct FlightConfig {
     /// TLS private key path (optional)
     #[serde(default)]
     pub tls_key: Option<PathBuf>,
+
+    /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
 }
 
 impl Default for FlightConfig {
@@ -206,6 +458,7 @@ impl Default for FlightConfig {
             default_dataset: None,
             tls_cert: None,
             tls_key: None,
+            quic_port: None,
         }
     }
 }
@@ -231,6 +484,22 @@ pub struct MCPConfig {
     /// Auto-derived from host:http_port if not set.
     #[serde(default)]
     pub external_url: Option<String>,
+
+    /// TLS certificate path (optional, overrides global [tls])
+    #[serde(default)]
+    pub tls_cert: Option<PathBuf>,
+
+    /// TLS private key path (optional, overrides global [tls])
+    #[serde(default)]
+    pub tls_key: Option<PathBuf>,
+
+    /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
+
+    /// CORS configuration for the MCP HTTP/SSE server
+    #[serde(default)]
+    pub cors: server::CorsConfig,
 }
 
 impl Default for MCPConfig {
@@ -239,18 +508,28 @@ impl Default for MCPConfig {
             host: default_mcp_host(),
             http_port: default_mcp_port(),
             external_url: None,
+            tls_cert: None,
+            tls_key: None,
+            quic_port: None,
+            cors: server::CorsConfig::default(),
         }
     }
 }
 
 impl MCPConfig {
     /// Get the resource URL, using external_url if set, otherwise deriving from host:http_port.
+    /// Auto-derives `https://` when global TLS is enabled.
     pub fn resource_url(&self) -> String {
         if let Some(ref url) = self.external_url {
             url.clone()
         } else {
+            let scheme = if HyprConfig::load().map(|c| c.tls.enabled).unwrap_or(false) {
+                "https"
+            } else {
+                "http"
+            };
             let host = if self.host == "0.0.0.0" { "localhost" } else { &self.host };
-            format!("http://{}:{}", host, self.http_port)
+            format!("{scheme}://{host}:{}", self.http_port)
         }
     }
 }
@@ -289,6 +568,26 @@ pub struct OAuthConfig {
     /// Refresh token TTL in seconds (default: 72 hours)
     #[serde(default = "default_refresh_token_ttl")]
     pub refresh_token_ttl_seconds: u32,
+
+    /// TLS certificate path (optional, overrides global [tls])
+    #[serde(default)]
+    pub tls_cert: Option<PathBuf>,
+
+    /// TLS private key path (optional, overrides global [tls])
+    #[serde(default)]
+    pub tls_key: Option<PathBuf>,
+
+    /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
+
+    /// CORS configuration for the OAuth HTTP server
+    #[serde(default = "default_oauth_cors")]
+    pub cors: server::CorsConfig,
+}
+
+fn default_oauth_cors() -> server::CorsConfig {
+    server::CorsConfig::public()
 }
 
 impl Default for OAuthConfig {
@@ -300,18 +599,28 @@ impl Default for OAuthConfig {
             default_scopes: default_oauth_scopes(),
             token_ttl_seconds: default_oauth_token_ttl(),
             refresh_token_ttl_seconds: default_refresh_token_ttl(),
+            tls_cert: None,
+            tls_key: None,
+            quic_port: None,
+            cors: default_oauth_cors(),
         }
     }
 }
 
 impl OAuthConfig {
     /// Get the issuer URL, using external_url if set, otherwise deriving from host:port.
+    /// Auto-derives `https://` when global TLS is enabled.
     pub fn issuer_url(&self) -> String {
         if let Some(ref url) = self.external_url {
             url.clone()
         } else {
+            let scheme = if HyprConfig::load().map(|c| c.tls.enabled).unwrap_or(false) {
+                "https"
+            } else {
+                "http"
+            };
             let host = if self.host == "0.0.0.0" { "localhost" } else { &self.host };
-            format!("http://{}:{}", host, self.port)
+            format!("{scheme}://{host}:{}", self.port)
         }
     }
 }
@@ -356,6 +665,10 @@ pub struct StreamingConfig {
     /// Lower rates → smaller batches (reduced latency).
     #[serde(flatten, default)]
     pub batching: hyprstream_rpc::streaming::BatchingConfig,
+
+    /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
 }
 
 impl Default for StreamingConfig {
@@ -365,6 +678,7 @@ impl Default for StreamingConfig {
             message_ttl_secs: default_message_ttl_secs(),
             compact_interval_secs: default_compact_interval_secs(),
             batching: hyprstream_rpc::streaming::BatchingConfig::default(),
+            quic_port: None,
         }
     }
 }
@@ -416,6 +730,38 @@ impl Default for StorageConfig {
     }
 }
 
+/// Event proxy service configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EventServiceConfig {
+    /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
+}
+
+/// Registry service configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RegistryServiceConfig {
+    /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
+}
+
+/// Policy service configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PolicyServiceConfig {
+    /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
+}
+
+/// Discovery service configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DiscoveryServiceConfig {
+    /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
+}
+
 /// Service management configuration
 ///
 /// Controls which services are started at startup in ipc-systemd mode.
@@ -448,6 +794,7 @@ fn default_startup_services() -> Vec<String> {
         "oauth".to_owned(),     // OAuth 2.1 authorization server
         "oai".to_owned(),       // OpenAI-compatible HTTP API
         "flight".to_owned(),    // Arrow Flight SQL server
+        "discovery".to_owned(), // Endpoint discovery (RFC 9728 metadata)
         "mcp".to_owned(),       // Model Context Protocol service
     ]
 }
@@ -463,6 +810,9 @@ pub struct ModelConfig {
     pub architecture: String,
     /// Expected parameter count
     pub parameters: Option<u64>,
+    /// QUIC/WebTransport port for model service. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
 }
 
 impl Default for ModelConfig {
@@ -472,6 +822,7 @@ impl Default for ModelConfig {
             name: String::new(),
             architecture: String::new(),
             parameters: None,
+            quic_port: None,
         }
     }
 }
@@ -636,6 +987,12 @@ pub struct HyprConfigBuilder {
     mcp: MCPConfig,
     oauth: OAuthConfig,
     streaming: StreamingConfig,
+    tls: TlsConfig,
+    quic: QuicConfig,
+    event: EventServiceConfig,
+    registry: RegistryServiceConfig,
+    policy: PolicyServiceConfig,
+    discovery: DiscoveryServiceConfig,
 }
 
 impl HyprConfigBuilder {
@@ -657,6 +1014,12 @@ impl HyprConfigBuilder {
             mcp: MCPConfig::default(),
             oauth: OAuthConfig::default(),
             streaming: StreamingConfig::default(),
+            tls: TlsConfig::default(),
+            quic: QuicConfig::default(),
+            event: EventServiceConfig::default(),
+            registry: RegistryServiceConfig::default(),
+            policy: PolicyServiceConfig::default(),
+            discovery: DiscoveryServiceConfig::default(),
         }
     }
 
@@ -678,6 +1041,12 @@ impl HyprConfigBuilder {
             mcp: config.mcp,
             oauth: config.oauth,
             streaming: config.streaming,
+            tls: config.tls,
+            quic: config.quic,
+            event: config.event,
+            registry: config.registry,
+            policy: config.policy,
+            discovery: config.discovery,
         }
     }
 
@@ -711,6 +1080,12 @@ impl HyprConfigBuilder {
             mcp: self.mcp,
             oauth: self.oauth,
             streaming: self.streaming,
+            tls: self.tls,
+            quic: self.quic,
+            event: self.event,
+            registry: self.registry,
+            policy: self.policy,
+            discovery: self.discovery,
         }
     }
 

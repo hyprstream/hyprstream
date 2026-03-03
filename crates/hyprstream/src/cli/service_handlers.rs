@@ -782,6 +782,20 @@ fn remove_if_exists(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Handle `--print-cert-hash` — output the SHA-256 hash of the QUIC certificate.
+///
+/// Loads or generates the TLS certificate from QuicConfig and prints
+/// the base64-encoded SHA-256 hash, suitable for use in the browser's
+/// `serverCertificateHashes` WebTransport option.
+pub fn handle_print_cert_hash(quic_config: &crate::config::QuicConfig) -> Result<()> {
+    let (cert_der, _key_der) = quic_config.load_tls_materials()
+        .context("Failed to load/generate QUIC TLS certificate")?;
+
+    let hash = hyprstream_rpc::transport::zmtp_quic::cert_hash(&cert_der);
+    println!("{}", hash);
+    Ok(())
+}
+
 /// Update shell profiles to include bin_dir in PATH
 fn update_shell_profiles(home: &Path, bin_dir: &Path) -> Result<Vec<String>> {
     let path_line = format!(r#"export PATH="{}:$PATH""#, bin_dir.display());

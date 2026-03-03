@@ -46,11 +46,21 @@ use crate::common_capnp;
 use crate::crypto::{SigningKey, VerifyingKey};
 use crate::error::{EnvelopeError, EnvelopeResult};
 use anyhow::{anyhow, Result};
-use ed25519_dalek::{Signature, Signer, Verifier};
+use ed25519_dalek::{Signature, Signer};
+use subtle::ConstantTimeEq;
 use std::fmt;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Cap'n Proto reader options with bounded traversal limits to prevent DoS.
+fn envelope_reader_options() -> capnp::message::ReaderOptions {
+    let mut opts = capnp::message::ReaderOptions::new();
+    opts.traversal_limit_in_words(Some(131_072)); // 1 MiB
+    opts.nesting_limit(64);
+    opts
+}
 
 /// Global request ID counter for unique IDs
 static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -58,6 +68,34 @@ static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// Generate a unique request ID
 pub fn next_request_id() -> u64 {
     REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Get current Unix timestamp in milliseconds.
+/// Used for envelope timestamp validation.
+pub fn current_timestamp() -> i64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        // In WASM, SystemTime::now() is not available.
+        // Use js_sys::Date::now() which returns milliseconds as f64.
+        js_sys::Date::now() as i64
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // SAFETY: Only fails if system time is before Unix epoch (1970)
+        // Cap at i64::MAX (won't overflow for ~292 million years)
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or(0)
+    }
+}
+
+/// Generate a random 16-byte nonce for replay protection.
+pub fn generate_nonce() -> [u8; 16] {
+    use rand::RngCore;
+    let mut nonce = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    nonce
 }
 
 /// Identity of a request sender.
@@ -87,7 +125,8 @@ pub enum RequestIdentity {
 }
 
 impl RequestIdentity {
-    /// Create a local identity using the current OS username.
+    /// Create a local identity using the current OS username (native only).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn local() -> Self {
         Self::Local {
             user: whoami::username(),
@@ -139,6 +178,7 @@ impl RequestIdentity {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Default for RequestIdentity {
     fn default() -> Self {
         Self::local()
@@ -383,32 +423,20 @@ pub struct RequestEnvelope {
     /// Unix timestamp in milliseconds for expiration check
     pub timestamp: i64,
 
-    /// User authorization claims (protected by envelope signature)
-    /// Contains the user's identity, scopes, and expiration.
-    /// No separate JWT signature needed - the envelope signature covers this.
+    /// User authorization claims (protected by envelope signature).
     pub claims: Option<Claims>,
 }
 
 impl RequestEnvelope {
     /// Create a new request envelope with fresh request ID, nonce, and timestamp.
     pub fn new(identity: RequestIdentity, payload: Vec<u8>) -> Self {
-        let mut nonce = [0u8; 16];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
-
-        // SAFETY: Only fails if system time is before Unix epoch (1970)
-        // Cap at i64::MAX (won't overflow for ~292 million years)
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-            .unwrap_or(0);
-
         Self {
             request_id: next_request_id(),
             identity,
             payload,
             ephemeral_pubkey: None,
-            nonce,
-            timestamp,
+            nonce: generate_nonce(),
+            timestamp: current_timestamp(),
             claims: None,
         }
     }
@@ -426,6 +454,7 @@ impl RequestEnvelope {
     }
 
     /// Create an envelope for a local request.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn local(payload: Vec<u8>) -> Self {
         Self::new(RequestIdentity::local(), payload)
     }
@@ -485,19 +514,21 @@ impl RequestEnvelope {
 
         // Step 2: Serialize to bytes first (to create a reader)
         let mut temp_bytes = Vec::new();
-        if let Err(e) = serialize::write_message(&mut temp_bytes, &message) {
-            tracing::error!("RequestEnvelope temporary serialization failed: {}", e);
+        if let Err(_e) = serialize::write_message(&mut temp_bytes, &message) {
+            #[cfg(not(target_arch = "wasm32"))]
+            tracing::error!("RequestEnvelope temporary serialization failed: {}", _e);
             return Vec::new();
         }
 
         // Step 3: Read back to get a Reader
         let reader = match serialize::read_message(
             &mut std::io::Cursor::new(&temp_bytes),
-            capnp::message::ReaderOptions::default(),
+            envelope_reader_options(),
         ) {
             Ok(r) => r,
-            Err(e) => {
-                tracing::error!("RequestEnvelope reader creation failed: {}", e);
+            Err(_e) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                tracing::error!("RequestEnvelope reader creation failed: {}", _e);
                 return Vec::new();
             }
         };
@@ -508,8 +539,9 @@ impl RequestEnvelope {
         // breaking signature verification across platforms/versions.
         let canonical_words = match reader.canonicalize() {
             Ok(words) => words,
-            Err(e) => {
-                tracing::error!("Envelope canonicalization failed: {}", e);
+            Err(_e) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                tracing::error!("Envelope canonicalization failed: {}", _e);
                 // Fall back to temp_bytes if canonicalization fails
                 return temp_bytes;
             }
@@ -585,7 +617,10 @@ pub trait NonceCache: Send + Sync {
 /// when the limit is reached.
 pub struct InMemoryNonceCache {
     /// Map of nonce -> timestamp when it was first seen
+    #[cfg(not(target_arch = "wasm32"))]
     seen: parking_lot::RwLock<std::collections::HashMap<[u8; 16], i64>>,
+    #[cfg(target_arch = "wasm32")]
+    seen: std::sync::RwLock<std::collections::HashMap<[u8; 16], i64>>,
     /// Maximum age for entries (in milliseconds)
     max_age_ms: i64,
     /// Maximum number of entries before cleanup
@@ -606,7 +641,7 @@ impl InMemoryNonceCache {
     /// - Max entries: 100,000
     pub fn new() -> Self {
         Self {
-            seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            seen: Default::default(),
             max_age_ms: MAX_TIMESTAMP_AGE_MS,
             max_entries: 100_000,
         }
@@ -615,15 +650,35 @@ impl InMemoryNonceCache {
     /// Create a new cache with custom settings.
     pub fn with_config(max_age_ms: i64, max_entries: usize) -> Self {
         Self {
-            seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            seen: Default::default(),
             max_age_ms,
             max_entries,
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_lock(&self) -> parking_lot::RwLockReadGuard<'_, std::collections::HashMap<[u8; 16], i64>> {
+        self.seen.read()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn read_lock(&self) -> std::sync::RwLockReadGuard<'_, std::collections::HashMap<[u8; 16], i64>> {
+        self.seen.read().expect("nonce cache lock poisoned")
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn write_lock(&self) -> parking_lot::RwLockWriteGuard<'_, std::collections::HashMap<[u8; 16], i64>> {
+        self.seen.write()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn write_lock(&self) -> std::sync::RwLockWriteGuard<'_, std::collections::HashMap<[u8; 16], i64>> {
+        self.seen.write().expect("nonce cache lock poisoned")
+    }
+
     /// Remove expired entries.
     fn cleanup(&self, now: i64) {
-        let mut seen = self.seen.write();
+        let mut seen = self.write_lock();
 
         // Remove entries older than max_age
         seen.retain(|_, timestamp| now - *timestamp <= self.max_age_ms);
@@ -644,23 +699,18 @@ impl InMemoryNonceCache {
 
 impl NonceCache for InMemoryNonceCache {
     fn check_and_insert(&self, nonce: &[u8; 16]) -> bool {
-        // SAFETY: Only fails if system time is before Unix epoch (1970)
-        // Cap at i64::MAX (won't overflow for ~292 million years)
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-            .unwrap_or(0);
+        let now = current_timestamp();
 
         // Fast path: check if already seen (read lock)
         {
-            let seen = self.seen.read();
+            let seen = self.read_lock();
             if seen.contains_key(nonce) {
                 return false;
             }
         }
 
         // Slow path: insert (write lock)
-        let mut seen = self.seen.write();
+        let mut seen = self.write_lock();
 
         // Double-check after acquiring write lock
         if seen.contains_key(nonce) {
@@ -723,8 +773,8 @@ impl SignedEnvelope {
         expected_pubkey: &VerifyingKey,
         nonce_cache: &dyn NonceCache,
     ) -> EnvelopeResult<()> {
-        // 1. Verify signer matches expected
-        if self.signer_pubkey != expected_pubkey.to_bytes() {
+        // 1. Verify signer matches expected (constant-time comparison)
+        if !bool::from(self.signer_pubkey.ct_eq(&expected_pubkey.to_bytes())) {
             return Err(EnvelopeError::SignerMismatch {
                 expected: hex::encode(expected_pubkey.to_bytes()),
                 actual: hex::encode(self.signer_pubkey),
@@ -732,12 +782,7 @@ impl SignedEnvelope {
         }
 
         // 2. Check timestamp window
-        // SAFETY: Only fails if system time is before Unix epoch (1970)
-        // Cap at i64::MAX (won't overflow for ~292 million years)
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-            .unwrap_or(0);
+        let now = current_timestamp();
 
         let age = now - self.envelope.timestamp;
         if age > MAX_TIMESTAMP_AGE_MS {
@@ -759,10 +804,10 @@ impl SignedEnvelope {
             ));
         }
 
-        // 4. Verify signature
+        // 4. Verify signature (strict: rejects small-order public keys)
         let envelope_bytes = self.envelope.to_bytes();
         let signature = Signature::from_bytes(&self.signature);
-        expected_pubkey.verify(&envelope_bytes, &signature)?;
+        expected_pubkey.verify_strict(&envelope_bytes, &signature)?;
 
         Ok(())
     }
@@ -771,7 +816,7 @@ impl SignedEnvelope {
     ///
     /// Use this for testing or when replay protection is handled elsewhere.
     pub fn verify_signature_only(&self, expected_pubkey: &VerifyingKey) -> EnvelopeResult<()> {
-        if self.signer_pubkey != expected_pubkey.to_bytes() {
+        if !bool::from(self.signer_pubkey.ct_eq(&expected_pubkey.to_bytes())) {
             return Err(EnvelopeError::SignerMismatch {
                 expected: hex::encode(expected_pubkey.to_bytes()),
                 actual: hex::encode(self.signer_pubkey),
@@ -780,7 +825,49 @@ impl SignedEnvelope {
 
         let envelope_bytes = self.envelope.to_bytes();
         let signature = Signature::from_bytes(&self.signature);
-        expected_pubkey.verify(&envelope_bytes, &signature)?;
+        expected_pubkey.verify_strict(&envelope_bytes, &signature)?;
+
+        Ok(())
+    }
+
+    /// Verify against the envelope's own embedded signer pubkey.
+    ///
+    /// For WebTransport clients that sign with their own keypair rather than
+    /// a shared server key. Still checks timestamp and nonce for replay protection.
+    pub fn verify_any_signer(
+        &self,
+        nonce_cache: &dyn NonceCache,
+    ) -> EnvelopeResult<()> {
+        // 1. Reconstruct the verifying key from the embedded pubkey
+        let verifying_key = VerifyingKey::from_bytes(&self.signer_pubkey)
+            .map_err(|_| EnvelopeError::InvalidPublicKey { expected: 32, actual: 0 })?;
+
+        // 2. Check timestamp window
+        let now = current_timestamp();
+        let age = now - self.envelope.timestamp;
+        if age > MAX_TIMESTAMP_AGE_MS {
+            return Err(EnvelopeError::ReplayAttack(format!(
+                "timestamp too old: {age}ms > {MAX_TIMESTAMP_AGE_MS}ms"
+            )));
+        }
+        if age < -MAX_CLOCK_SKEW_MS {
+            return Err(EnvelopeError::ReplayAttack(format!(
+                "timestamp in future: {}ms beyond clock skew tolerance",
+                -age - MAX_CLOCK_SKEW_MS
+            )));
+        }
+
+        // 3. Check nonce not seen before
+        if !nonce_cache.check_and_insert(&self.envelope.nonce) {
+            return Err(EnvelopeError::ReplayAttack(
+                "nonce already seen".to_owned(),
+            ));
+        }
+
+        // 4. Verify signature against the embedded public key
+        let envelope_bytes = self.envelope.to_bytes();
+        let signature = Signature::from_bytes(&self.signature);
+        verifying_key.verify_strict(&envelope_bytes, &signature)?;
 
         Ok(())
     }
@@ -995,7 +1082,7 @@ impl ResponseEnvelope {
             .map_err(|_| anyhow::anyhow!("Invalid signer public key"))?;
 
         if let Some(expected) = expected_pubkey {
-            if verifying_key.to_bytes() != expected.to_bytes() {
+            if !bool::from(verifying_key.to_bytes().ct_eq(&expected.to_bytes())) {
                 anyhow::bail!("Response signed by unexpected key");
             }
         }
@@ -1057,51 +1144,79 @@ impl FromCapnp for ResponseEnvelope {
     }
 }
 
-/// Unwrap and verify a SignedEnvelope from wire bytes.
+/// Unwrap and verify a SignedEnvelope from wire bytes (core logic, all targets).
 ///
 /// Deserializes, verifies signature and replay protection, then extracts
-/// the context and payload.
+/// the verified envelope and payload.
+pub fn unwrap_and_verify(
+    request: &[u8],
+    server_pubkey: &VerifyingKey,
+    nonce_cache: &dyn NonceCache,
+) -> Result<(SignedEnvelope, Vec<u8>)> {
+    use capnp::serialize;
+
+    let reader = serialize::read_message(
+        &mut std::io::Cursor::new(request),
+        envelope_reader_options(),
+    )?;
+    let signed_reader = reader.get_root::<crate::common_capnp::signed_envelope::Reader>()?;
+    let signed = SignedEnvelope::read_from(signed_reader)?;
+
+    signed.verify(server_pubkey, nonce_cache)?;
+
+    let payload = signed.payload().to_vec();
+    Ok((signed, payload))
+}
+
+/// Unwrap and verify a SignedEnvelope, returning `EnvelopeContext` + payload.
 ///
-/// # Arguments
-///
-/// * `request` - Raw bytes containing a serialized SignedEnvelope
-/// * `server_pubkey` - Expected Ed25519 public key of the signer
-/// * `nonce_cache` - Cache for replay protection
-///
-/// # Returns
-///
-/// On success, returns `(EnvelopeContext, payload)` where:
-/// - `EnvelopeContext` contains verified request metadata
-/// - `payload` is the inner request bytes
-///
-/// # Errors
-///
-/// Returns error if:
-/// - Deserialization fails
-/// - Signature verification fails
-/// - Replay attack detected (nonce reused or timestamp expired)
+/// Native only — `EnvelopeContext` requires the `service` module.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn unwrap_envelope(
     request: &[u8],
     server_pubkey: &VerifyingKey,
     nonce_cache: &dyn NonceCache,
 ) -> Result<(crate::service::EnvelopeContext, Vec<u8>)> {
+    let (signed, payload) = unwrap_and_verify(request, server_pubkey, nonce_cache)?;
+    let ctx = crate::service::EnvelopeContext::from_verified(&signed);
+    Ok((ctx, payload))
+}
+
+/// Unwrap and verify a SignedEnvelope from any signer (WebTransport clients).
+///
+/// Unlike `unwrap_and_verify`, this does NOT require the signer to match a
+/// specific server pubkey. Instead, it verifies the signature against the
+/// envelope's own embedded public key. Used for browser clients that sign
+/// with their own keypair.
+pub fn unwrap_and_verify_any_signer(
+    request: &[u8],
+    nonce_cache: &dyn NonceCache,
+) -> Result<(SignedEnvelope, Vec<u8>)> {
     use capnp::serialize;
 
-    // Deserialize SignedEnvelope from Cap'n Proto
     let reader = serialize::read_message(
         &mut std::io::Cursor::new(request),
-        capnp::message::ReaderOptions::default(),
+        envelope_reader_options(),
     )?;
     let signed_reader = reader.get_root::<crate::common_capnp::signed_envelope::Reader>()?;
     let signed = SignedEnvelope::read_from(signed_reader)?;
 
-    // Verify signature and replay protection
-    signed.verify(server_pubkey, nonce_cache)?;
+    signed.verify_any_signer(nonce_cache)?;
 
-    // Extract context and payload
-    let ctx = crate::service::EnvelopeContext::from_verified(&signed);
     let payload = signed.payload().to_vec();
+    Ok((signed, payload))
+}
 
+/// Unwrap and verify a SignedEnvelope from any signer, returning `EnvelopeContext` + payload.
+///
+/// WebTransport variant of `unwrap_envelope` — accepts any valid Ed25519 signer.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn unwrap_envelope_any_signer(
+    request: &[u8],
+    nonce_cache: &dyn NonceCache,
+) -> Result<(crate::service::EnvelopeContext, Vec<u8>)> {
+    let (signed, payload) = unwrap_and_verify_any_signer(request, nonce_cache)?;
+    let ctx = crate::service::EnvelopeContext::from_verified(&signed);
     Ok((ctx, payload))
 }
 
@@ -1135,7 +1250,7 @@ pub fn unwrap_response(
     // Deserialize ResponseEnvelope from Cap'n Proto
     let reader = serialize::read_message(
         &mut std::io::Cursor::new(response),
-        capnp::message::ReaderOptions::default(),
+        envelope_reader_options(),
     )?;
     let response_reader = reader.get_root::<crate::common_capnp::response_envelope::Reader>()?;
     let envelope = ResponseEnvelope::read_from(response_reader)?;

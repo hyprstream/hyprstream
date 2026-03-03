@@ -1613,6 +1613,59 @@ impl TorchEngine {
         }
     }
 
+    /// Compute vision embeddings for one or more images.
+    ///
+    /// Preprocesses raw image bytes and runs them through the model's vision
+    /// encoder (e.g. SigLIP). Returns one embedding vector per image.
+    ///
+    /// # Arguments
+    /// * `images` - Raw image bytes (PNG/JPEG/RGB) per image
+    ///
+    /// # Returns
+    /// * Vec<Vec<f32>> - Embedding vectors, one per input image
+    pub fn embed_images(&self, images: &[Vec<u8>]) -> Result<Vec<Vec<f32>>> {
+        use crate::runtime::image_utils::{load_image_from_bytes, ImagePreprocessConfig};
+
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let model_guard = self
+            .persistent_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("No model loaded"))?
+            .lock();
+
+        // Preprocess images to tensors
+        let config = ImagePreprocessConfig::siglip();
+        let mut image_tensors = Vec::with_capacity(images.len());
+        for img_bytes in images {
+            let tensor = load_image_from_bytes(img_bytes, &config, self.device)?;
+            image_tensors.push(tensor);
+        }
+        let batch = Tensor::cat(&image_tensors, 0); // [B, 3, H, W]
+
+        let _no_grad = tch::no_grad_guard();
+
+        // Run through vision encoder
+        let embeddings_tensor = model_guard.encode_vision(&batch)?;
+        // embeddings_tensor shape: [B, hidden_size]
+
+        let batch_size = embeddings_tensor.size()[0] as usize;
+        let dim = embeddings_tensor.size()[1] as usize;
+        let cpu_tensor = embeddings_tensor.to_device(tch::Device::Cpu).to_kind(tch::Kind::Float);
+
+        let mut results = Vec::with_capacity(batch_size);
+        for i in 0..batch_size {
+            let mut vec = vec![0.0f32; dim];
+            let row = cpu_tensor.get(i as i64);
+            row.copy_data(&mut vec, dim);
+            results.push(vec);
+        }
+
+        Ok(results)
+    }
+
     /// Process embeddings through all model layers for embedding extraction
     fn process_through_layers_for_embedding(
         &self,

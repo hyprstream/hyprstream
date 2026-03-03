@@ -18,7 +18,7 @@ use chrono::Utc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::rc::Rc;
 use std::sync::Arc;
-use tmq::{FromZmqSocket, Multipart, RequestReceiver, RequestSender};
+use tmq::{FromZmqSocket, Multipart, RequestSender};
 use tokio::sync::Notify;
 use tracing::{debug, error, info, trace, warn};
 
@@ -205,15 +205,47 @@ pub trait ZmqService: 'static {
         self.signing_key().verifying_key()
     }
 
-    /// Optional pre-handler claims verification.
+    /// Expected audience (resource URL) for JWT validation.
+    ///
+    /// When `Some`, `verify_claims()` rejects tokens whose `aud` claim doesn't match.
+    /// Override this on services that should bind tokens to a specific resource.
+    fn expected_audience(&self) -> Option<&str> {
+        None
+    }
+
+    /// E2E JWT verification with downgrade attack protection.
     ///
     /// Called by `RequestLoop` after envelope signature verification, before `handle_request`.
     /// Return `Err` to reject the request before dispatch.
     ///
-    /// Use this for E2E JWT verification (e.g., downgrade attack prevention).
-    /// Default: no additional verification.
+    /// Default: Require valid JWT for all non-local identities to prevent
+    /// subject impersonation via fabricated envelope claims.
     fn verify_claims(&self, ctx: &EnvelopeContext) -> anyhow::Result<()> {
-        let _ = ctx;
+        if let Some(claims) = ctx.claims() {
+            match claims.verify_token(&self.verifying_key(), self.expected_audience()) {
+                Ok(Some(verified)) => {
+                    if verified.sub != claims.sub {
+                        tracing::warn!("Claims sub mismatch: envelope={} jwt={}", claims.sub, verified.sub);
+                        anyhow::bail!("Claims subject mismatch");
+                    }
+                }
+                Ok(None) => {
+                    // SECURITY: Non-local requests MUST have JWT token
+                    // to prevent subject impersonation via fabricated claims
+                    if !ctx.identity.is_local() {
+                        tracing::warn!(
+                            "Non-local request with claims but no JWT token: sub={}, identity={:?}",
+                            claims.sub, ctx.identity
+                        );
+                        anyhow::bail!("JWT token required for non-local requests");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("E2E JWT verification failed: {}", e);
+                    anyhow::bail!("JWT verification failed");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -252,27 +284,62 @@ pub trait ZmqService: 'static {
 ///
 /// Typically used internally by the blanket `Spawnable` impl for `ZmqService`.
 /// Direct usage is for advanced cases only.
+/// REQ/REP message loop with ZMQ ROUTER + optional QUIC accept.
+///
+/// Runs a single service instance handling both ZMQ (via ROUTER socket) and
+/// QUIC (via `WebTransportServer`) transports in a single `tokio::select!` loop.
+///
+/// # Motivation
+///
+/// Unlike `DualSpawnable` which runs transports on separate threads (requiring
+/// `Send + Sync`), `RequestLoop` runs everything on a single `LocalSet`.
+/// This allows `!Send` services like `ModelService` (with GPU tensors) to serve
+/// both ZMQ and QUIC clients from one thread.
+///
+/// # ROUTER vs REP
+///
+/// Uses ROUTER socket instead of REP for ZMQ path:
+/// - ROUTER is wire-compatible with existing REQ clients (REQ prepends identity + empty delimiter)
+/// - ROUTER doesn't enforce strict send/recv alternation, enabling `select!` with QUIC
+/// - Identity frames are stripped before processing and prepended before sending
+///
+/// # QUIC Path
+///
+/// Uses `WebTransportServer` for browser clients. WebTransport sessions carry
+/// length-prefixed Cap'n Proto payloads (no ZMTP framing needed — both endpoints
+/// are controlled code, not libzmq peers).
 pub struct RequestLoop {
-    /// Transport configuration (supports SystemdFd for socket activation)
+    /// ZMQ transport configuration
     transport: TransportConfig,
-    /// ZMQ context for socket creation (required for inproc:// connectivity)
+    /// ZMQ context for socket creation
     context: Arc<zmq::Context>,
-    /// Server's Ed25519 verifying key for signature verification
+    /// Server's Ed25519 verifying key
     server_pubkey: VerifyingKey,
-    /// Server's Ed25519 signing key for signing responses
+    /// Server's Ed25519 signing key
     signing_key: SigningKey,
     /// Nonce cache for replay protection
     nonce_cache: Arc<InMemoryNonceCache>,
+    /// Optional QUIC configuration (cert DER + key DER + bind addr)
+    quic_config: Option<QuicLoopConfig>,
+}
+
+/// QUIC server configuration for `RequestLoop`.
+#[derive(Clone)]
+pub struct QuicLoopConfig {
+    /// DER-encoded certificate
+    pub cert_der: Vec<u8>,
+    /// DER-encoded private key
+    pub key_der: Vec<u8>,
+    /// Address to bind the WebTransport server
+    pub bind_addr: std::net::SocketAddr,
+    /// TLS server name (for endpoint discovery registration)
+    pub server_name: String,
+    /// Pre-serialized RFC 9728 JSON for HTTP/3 `.well-known/oauth-protected-resource`
+    pub protected_resource_json: Option<Vec<u8>>,
 }
 
 impl RequestLoop {
-    /// Create a new request loop bound to the given transport.
-    ///
-    /// # Arguments
-    ///
-    /// * `transport` - Transport configuration (supports SystemdFd for socket activation)
-    /// * `context` - ZMQ context (must be shared for inproc:// to work)
-    /// * `signing_key` - Server's Ed25519 signing key for signing responses
+    /// Create a new unified request loop with ZMQ transport only.
     pub fn new(transport: TransportConfig, context: Arc<zmq::Context>, signing_key: SigningKey) -> Self {
         Self {
             transport,
@@ -280,75 +347,60 @@ impl RequestLoop {
             server_pubkey: signing_key.verifying_key(),
             signing_key,
             nonce_cache: Arc::new(InMemoryNonceCache::new()),
+            quic_config: None,
         }
     }
 
-    /// Create a service runner with a shared nonce cache.
-    ///
-    /// Use this when multiple services should share replay protection state.
-    pub fn with_nonce_cache(
-        transport: TransportConfig,
-        context: Arc<zmq::Context>,
-        signing_key: SigningKey,
-        nonce_cache: Arc<InMemoryNonceCache>,
-    ) -> Self {
-        Self {
-            transport,
-            context,
-            server_pubkey: signing_key.verifying_key(),
-            signing_key,
-            nonce_cache,
-        }
+    /// Enable QUIC (WebTransport) alongside ZMQ.
+    pub fn with_quic(mut self, config: QuicLoopConfig) -> Self {
+        self.quic_config = Some(config);
+        self
     }
 
-    /// Run the service as an async task
+    /// Create with a shared nonce cache.
+    pub fn with_nonce_cache(mut self, nonce_cache: Arc<InMemoryNonceCache>) -> Self {
+        self.nonce_cache = nonce_cache;
+        self
+    }
+
+    /// Run the unified service loop as an async task.
     ///
-    /// This spawns an async task that:
-    /// 1. Creates a REP socket and binds using TransportConfig (supports SystemdFd)
-    /// 2. Converts to TMQ for async I/O via epoll
-    /// 3. Loops receiving and verifying `SignedEnvelope` requests
-    /// 4. Dispatches to handler with verified `EnvelopeContext`
-    ///
-    /// Handler execution runs in spawn_blocking to avoid blocking the runtime.
-    /// Waits for socket binding to complete before returning.
-    /// Returns a handle that can be used to stop the service.
+    /// Spawns on `LocalSet` via `spawn_local` — supports `!Send` services.
     pub async fn run<S: ZmqService>(self, service: S) -> Result<ServiceHandle> {
         let transport = self.transport.clone();
         let context = Arc::clone(&self.context);
         let server_pubkey = self.server_pubkey;
         let signing_key = self.signing_key.clone();
         let nonce_cache = Arc::clone(&self.nonce_cache);
+        let quic_config = self.quic_config;
         let shutdown = Arc::new(Notify::new());
         let shutdown_clone = Arc::clone(&shutdown);
 
-        // Create oneshot channel for ready signal
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
 
-        // Wrap service in Rc for sharing within single-threaded local set
         let service = Rc::new(service);
 
-        // Spawn async task (not spawn_blocking - TMQ provides async I/O)
         let handle = tokio::task::spawn_local(async move {
-            if let Err(e) = Self::service_loop_async(
+            if let Err(e) = Self::unified_loop(
                 transport,
                 context,
                 service,
                 server_pubkey,
                 signing_key,
                 nonce_cache,
+                quic_config,
                 shutdown_clone,
                 Some(ready_tx),
             )
             .await
             {
-                error!("Service loop error: {}", e);
+                error!("Unified service loop error: {}", e);
             }
         });
 
-        // Wait for the socket to bind (or get bind error)
         ready_rx
             .await
-            .map_err(|_| anyhow!("Service task exited before signaling ready"))??;
+            .map_err(|_| anyhow!("Unified service task exited before signaling ready"))??;
 
         Ok(ServiceHandle {
             task: Some(handle),
@@ -356,29 +408,29 @@ impl RequestLoop {
         })
     }
 
-    /// Async service loop using TMQ
+    /// Main unified select! loop.
     ///
-    /// The `ready_tx` channel signals when the socket is bound and ready.
-    /// Uses raw ZMQ socket creation + TransportConfig::bind() for SystemdFd support,
-    /// then converts to TMQ via from_zmq_socket for async I/O.
+    /// Accepts requests from both ZMQ ROUTER and WebTransport server,
+    /// dispatching both through `process_request`.
     #[allow(clippy::too_many_arguments)]
-    async fn service_loop_async<S: ZmqService>(
+    async fn unified_loop<S: ZmqService>(
         transport: TransportConfig,
         context: Arc<zmq::Context>,
         service: Rc<S>,
         server_pubkey: VerifyingKey,
         signing_key: SigningKey,
         nonce_cache: Arc<InMemoryNonceCache>,
+        quic_config: Option<QuicLoopConfig>,
         shutdown: Arc<Notify>,
         ready_tx: Option<tokio::sync::oneshot::Sender<Result<()>>>,
     ) -> Result<()> {
         let endpoint = transport.zmq_endpoint();
 
-        // Create raw ZMQ REP socket
-        let mut socket = match context.socket(zmq::REP) {
+        // Create raw ZMQ ROUTER socket
+        let mut socket = match context.socket(zmq::ROUTER) {
             Ok(s) => s,
             Err(e) => {
-                let err = anyhow!("failed to create REP socket: {}", e);
+                let err = anyhow!("failed to create ROUTER socket: {}", e);
                 if let Some(tx) = ready_tx {
                     let _ = tx.send(Err(anyhow!("{}", err)));
                 }
@@ -386,29 +438,28 @@ impl RequestLoop {
             }
         };
         socket.set_linger(0).ok();
+        // ROUTER_MANDATORY: return errors instead of silently dropping messages
+        // when routing identity is unknown
+        socket.set_router_mandatory(true).ok();
 
-        // Bind or connect based on BindMode
+        // Bind or connect
         let bind_result = match transport.bind_mode() {
             crate::transport::BindMode::Bind => transport.bind(&mut socket),
             crate::transport::BindMode::Connect => transport.connect(&mut socket),
         };
         if let Err(e) = bind_result {
-            let mode_str = match transport.bind_mode() {
-                crate::transport::BindMode::Bind => "bind",
-                crate::transport::BindMode::Connect => "connect",
-            };
-            let err = anyhow!("failed to {} to {}: {}", mode_str, endpoint, e);
+            let err = anyhow!("failed to bind ROUTER to {}: {}", endpoint, e);
             if let Some(tx) = ready_tx {
                 let _ = tx.send(Err(anyhow!("{}", err)));
             }
             return Err(err);
         }
 
-        // Convert to TMQ for async I/O (from_zmq_socket makes no assumptions about state)
-        let mut receiver: RequestReceiver = match RequestReceiver::from_zmq_socket(socket) {
+        // Convert to TMQ Router for async I/O
+        let router = match tmq::Router::from_zmq_socket(socket) {
             Ok(r) => r,
             Err(e) => {
-                let err = anyhow!("failed to wrap socket in TMQ: {}", e);
+                let err = anyhow!("failed to wrap ROUTER socket in TMQ: {}", e);
                 if let Some(tx) = ready_tx {
                     let _ = tx.send(Err(anyhow!("{}", err)));
                 }
@@ -416,178 +467,224 @@ impl RequestLoop {
             }
         };
 
+        // Optionally create WebTransport server
+        let wt_server = if let Some(ref qc) = quic_config {
+            match crate::transport::zmtp_quic::WebTransportServer::bind(
+                qc.bind_addr,
+                qc.cert_der.clone(),
+                qc.key_der.clone(),
+            ) {
+                Ok(mut wts) => {
+                    if let Some(ref meta) = qc.protected_resource_json {
+                        wts = wts.with_protected_resource_metadata(meta.clone());
+                    }
+                    let actual_addr = wts.local_addr().unwrap_or(qc.bind_addr);
+                    let cert_hash = crate::transport::zmtp_quic::cert_hash(&qc.cert_der);
+                    info!(
+                        "{} QUIC/WebTransport bound to {} (cert hash: {})",
+                        service.name(),
+                        actual_addr,
+                        cert_hash,
+                    );
+                    // Register QUIC endpoint in the global registry for discovery
+                    if let Some(reg) = crate::registry::try_global() {
+                        reg.register(
+                            service.name(),
+                            crate::registry::SocketKind::Quic,
+                            crate::transport::TransportConfig::quic(actual_addr, &qc.server_name),
+                            None,
+                        );
+                    }
+                    Some(wts)
+                }
+                Err(e) => {
+                    warn!("{} failed to bind WebTransport: {}", service.name(), e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let mode_str = match transport.bind_mode() {
             crate::transport::BindMode::Bind => "bound to",
             crate::transport::BindMode::Connect => "connected to",
         };
-        info!("{} service {} {}", service.name(), mode_str, endpoint);
+        info!(
+            "{} unified service {} {} (ROUTER{})",
+            service.name(),
+            mode_str,
+            endpoint,
+            if wt_server.is_some() { " + WebTransport" } else { "" },
+        );
 
-        // Signal ready AFTER socket is bound
+        // Signal ready
         if let Some(tx) = ready_tx {
             if tx.send(Ok(())).is_err() {
-                warn!(
-                    "{} service ready signal dropped - receiver gone",
-                    service.name()
-                );
+                warn!("{} unified service ready signal dropped", service.name());
             }
         }
 
-        // Bounded semaphore for in-flight continuations (backpressure).
-        // Prevents unbounded memory growth from queued streaming operations.
+        // If WebTransport is available, spawn its accept loop as a separate local task
+        // sharing the same service Rc
+        if let Some(wts) = wt_server {
+            let svc = Rc::clone(&service);
+            let sk = signing_key.clone();
+            let nc = Arc::clone(&nonce_cache);
+            let sd = Arc::clone(&shutdown);
+            tokio::task::spawn_local(async move {
+                if let Err(e) = wts
+                    .accept_loop_service(svc, server_pubkey, sk, nc, sd)
+                    .await
+                {
+                    error!("WebTransport accept loop error: {}", e);
+                }
+            });
+        }
+
+        // Bounded semaphore for continuations
         const MAX_INFLIGHT_CONTINUATIONS: usize = 16;
         let continuation_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_CONTINUATIONS));
 
+        // Use futures traits for Router async I/O
+        use futures::{SinkExt, StreamExt};
+        let mut router_stream = router;
+
         loop {
-            // Use select! for clean shutdown without polling timeouts
             tokio::select! {
                 biased;
 
-                // Check for shutdown signal
+                // Shutdown
                 _ = shutdown.notified() => {
-                    debug!("{} service received shutdown signal", service.name());
+                    debug!("{} unified service received shutdown signal", service.name());
                     break;
                 }
 
-                // Receive request via TMQ async I/O
-                result = receiver.recv() => {
-                    let (request_msg, sender) = result
-                        .map_err(|e| anyhow!("recv error: {}", e))?;
-
-                    // Extract bytes from multipart message.
-                    // When behind a ROUTER/DEALER LB, identity frames are stripped by
-                    // zmq::proxy_steerable, so this flat_map is safe. We validate the
-                    // envelope structure below via unwrap_envelope (signature check).
-                    let request: Vec<u8> = request_msg
-                        .into_iter()
-                        .flat_map(|frame| frame.to_vec())
-                        .collect();
-
-                    // Minimum envelope size check (prevents panic on truncated/empty messages)
-                    if request.len() < 8 {
-                        warn!("{} received undersized message ({} bytes), dropping", service.name(), request.len());
-                        let error_payload = service.build_error_payload(0, "malformed request: too small");
-                        let msg: Multipart = vec![error_payload].into();
-                        receiver = sender
-                            .send(msg)
-                            .await
-                            .map_err(|e| anyhow!("send error: {}", e))?;
-                        continue;
-                    }
-
-                    trace!(
-                        "{} received request ({} bytes)",
-                        service.name(),
-                        request.len()
-                    );
-
-                    // Unwrap and verify SignedEnvelope
-                    let (ctx, payload) = match crate::envelope::unwrap_envelope(&request, &server_pubkey, &*nonce_cache) {
-                        Ok((ctx, payload)) => (ctx, payload),
+                // ZMQ ROUTER path
+                Some(result) = router_stream.next() => {
+                    let msg = match result {
+                        Ok(msg) => msg,
                         Err(e) => {
-                            warn!(
-                                "{} envelope verification failed: {}",
-                                service.name(),
-                                e
-                            );
-                            // Send error response (request_id=0 since envelope is invalid)
-                            let error_payload = service.build_error_payload(0, &format!("envelope verification failed: {}", e));
-                            let msg: Multipart = vec![error_payload].into();
-                            receiver = sender
-                                .send(msg)
-                                .await
-                                .map_err(|e| anyhow!("send error: {}", e))?;
+                            error!("{} ROUTER recv error: {}", service.name(), e);
                             continue;
                         }
                     };
 
-                    let request_id = ctx.request_id;
-                    debug!(
-                        "{} verified request from {} (id={})",
-                        service.name(),
-                        ctx.subject(),
-                        request_id
-                    );
+                    // Split identity envelope from payload.
+                    // ROUTER multipart: [identity, empty_delimiter, ...payload_frames...]
+                    // REQ clients automatically prepend identity + empty frame.
+                    let frames: Vec<Vec<u8>> = msg.into_iter().map(|f| f.to_vec()).collect();
 
-                    // Pre-handler claims verification (E2E JWT, downgrade protection)
-                    if let Err(e) = service.verify_claims(&ctx) {
-                        warn!(
-                            "{} claims verification failed for {} (id={}): {}",
-                            service.name(), ctx.subject(), request_id, e
-                        );
-                        let error_payload = service.build_error_payload(request_id, &e.to_string());
-                        let msg: Multipart = vec![error_payload].into();
-                        receiver = sender
-                            .send(msg)
-                            .await
-                            .map_err(|e| anyhow!("send error: {}", e))?;
-                        continue;
-                    }
-
-                    // Process request directly (handlers are now async)
-                    let result = service.handle_request(&ctx, &payload).await;
-
-                    let (response_payload, continuation) = match result {
-                        Ok((resp, cont)) => (resp, cont),
-                        Err(e) => {
-                            error!("{} request handling error: {}", service.name(), e);
-                            (service.build_error_payload(request_id, &e.to_string()), None)
+                    // Find the empty delimiter frame
+                    let delimiter_pos = frames.iter().position(Vec::is_empty);
+                    let (identity_frames, payload_frames) = match delimiter_pos {
+                        Some(pos) => (&frames[..=pos], &frames[pos + 1..]),
+                        None => {
+                            warn!("{} ROUTER message missing empty delimiter, dropping", service.name());
+                            continue;
                         }
                     };
 
-                    // Wrap response in signed envelope and serialize (scoped for Send)
-                    let response_bytes = {
-                        use crate::envelope::ResponseEnvelope;
-                        use capnp::message::Builder;
-                        use capnp::serialize;
+                    // Concatenate payload frames
+                    let request: Vec<u8> = payload_frames.iter().flat_map(|f| f.iter().copied()).collect();
 
-                        let signed_response = ResponseEnvelope::new_signed(
-                            request_id,
-                            response_payload,
-                            &signing_key,
-                        );
+                    if request.len() < 8 {
+                        warn!("{} received undersized ROUTER message ({} bytes), dropping", service.name(), request.len());
+                        // Send error response with identity envelope
+                        let error_payload = service.build_error_payload(0, "malformed request: too small");
+                        let response_bytes = Self::wrap_response(0, error_payload, &signing_key)?;
+                        let mut response_msg = Multipart::default();
+                        for frame in identity_frames {
+                            response_msg.push_back(frame.as_slice().into());
+                        }
+                        response_msg.push_back(response_bytes.into());
+                        if let Err(e) = router_stream.send(response_msg).await {
+                            error!("{} ROUTER send error: {}", service.name(), e);
+                        }
+                        continue;
+                    }
 
-                        let mut message = Builder::new_default();
-                        let mut builder = message.init_root::<crate::common_capnp::response_envelope::Builder>();
-                        signed_response.write_to(&mut builder);
-
-                        let mut bytes = Vec::new();
-                        serialize::write_message(&mut bytes, &message)
-                            .map_err(|e| anyhow!("Failed to serialize signed response: {}", e))?;
-                        bytes
+                    // Process through shared envelope pipeline (FixedSigner: ZMQ peers pre-share keys)
+                    let (response_bytes, continuation) = match crate::transport::zmtp_quic::process_request(
+                        &request,
+                        &*service,
+                        crate::transport::zmtp_quic::EnvelopeVerification::FixedSigner(&server_pubkey),
+                        &signing_key,
+                        &nonce_cache,
+                    ).await {
+                        Ok(result) => result,
+                        Err(e) => {
+                            error!("{} request processing error: {}", service.name(), e);
+                            let error_payload = service.build_error_payload(0, &e.to_string());
+                            (Self::wrap_response(0, error_payload, &signing_key)?, None)
+                        }
                     };
 
-                    // Send signed response via TMQ async I/O
-                    let msg: Multipart = vec![response_bytes].into();
-                    receiver = sender
-                        .send(msg)
-                        .await
-                        .map_err(|e| anyhow!("send error: {}", e))?;
+                    // Prepend identity frames and send response
+                    let mut response_msg = Multipart::default();
+                    for frame in identity_frames {
+                        response_msg.push_back(frame.as_slice().into());
+                    }
+                    response_msg.push_back(response_bytes.into());
 
-                    // Spawn continuation AFTER REP is sent.
-                    // This guarantees the client has the StreamInfo (stream_id)
-                    // before any data flows on the PUB/SUB channel.
+                    if let Err(e) = router_stream.send(response_msg).await {
+                        error!("{} ROUTER send error: {}", service.name(), e);
+                    }
+
+                    // Spawn continuation after response is sent
                     if let Some(future) = continuation {
                         let sem = continuation_semaphore.clone();
                         tokio::task::spawn_local(async move {
-                            // Acquire owned permit for backpressure on in-flight continuations.
-                            // OwnedSemaphorePermit lives for the full duration of the future,
-                            // ensuring the bound is on concurrent running continuations.
                             let Ok(_permit) = sem.acquire_owned().await else {
-                                warn!("continuation semaphore closed, dropping continuation");
+                                warn!("continuation semaphore closed");
                                 return;
                             };
                             future.await;
-                            // _permit dropped here — releases slot for next continuation
                         });
                     }
                 }
             }
         }
 
-        info!("{} service stopped", service.name());
+        // Unregister QUIC endpoint on shutdown
+        if quic_config.is_some() {
+            if let Some(reg) = crate::registry::try_global() {
+                reg.unregister(service.name(), crate::registry::SocketKind::Quic);
+            }
+        }
+
+        info!("{} unified service stopped", service.name());
         Ok(())
     }
+
+    /// Wrap a response payload in a signed ResponseEnvelope.
+    fn wrap_response(
+        request_id: u64,
+        payload: Vec<u8>,
+        signing_key: &SigningKey,
+    ) -> Result<Vec<u8>> {
+        use crate::envelope::ResponseEnvelope;
+        use capnp::message::Builder;
+        use capnp::serialize;
+
+        let signed = ResponseEnvelope::new_signed(request_id, payload, signing_key);
+        let mut message = Builder::new_default();
+        let mut builder = message.init_root::<crate::common_capnp::response_envelope::Builder>();
+        signed.write_to(&mut builder);
+
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
 }
+
+/// Deprecated alias for `RequestLoop`.
+///
+/// The old `UnifiedRequestLoop` has been merged into `RequestLoop` which now
+/// always uses ROUTER sockets (wire-compatible with REQ clients) and supports
+/// optional QUIC via `.with_quic()`.
+#[deprecated(note = "Use RequestLoop instead")]
+pub type UnifiedRequestLoop = RequestLoop;
 
 /// Handle for a running service
 pub struct ServiceHandle {

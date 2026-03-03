@@ -9,6 +9,7 @@
 pub mod claims;
 pub mod jwt;
 pub mod scope;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod scope_registry;
 
 pub use claims::Claims;
@@ -16,4 +17,5 @@ pub use jwt::{decode, encode, JwtError};
 #[cfg(test)]
 pub use jwt::decode_unverified;
 pub use scope::Scope;
+#[cfg(not(target_arch = "wasm32"))]
 pub use scope_registry::ScopeDefinition;

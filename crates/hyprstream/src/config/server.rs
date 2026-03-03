@@ -66,6 +66,18 @@ impl Default for CorsConfig {
 }
 
 impl CorsConfig {
+    /// CORS config for public endpoints (OAuth metadata, token, registration).
+    /// Allows any origin but disables credentials (per CORS spec, wildcard + credentials is invalid).
+    pub fn public() -> Self {
+        Self {
+            enabled: true,
+            allowed_origins: vec!["*".to_owned()],
+            allow_credentials: false,
+            max_age: 3600,
+            permissive_headers: false,
+        }
+    }
+
     /// Create CORS config with dynamic port-based origins
     pub fn with_port(port: u16) -> Self {
         let mut config = Self::default();

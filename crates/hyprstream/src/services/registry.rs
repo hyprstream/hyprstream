@@ -315,6 +315,8 @@ pub struct RegistryService {
     contained_roots: DashMap<(String, String), Arc<dyn ContainedFs>>,
     /// CRDT editing sessions for collaborative file editing.
     editing_table: Arc<EditingTable>,
+    /// Expected JWT audience for token validation (RFC 8707).
+    expected_audience: Option<String>,
 }
 
 /// Progress reporter that sends updates via a tokio mpsc channel.
@@ -382,9 +384,16 @@ impl RegistryService {
             fid_table,
             contained_roots: DashMap::new(),
             editing_table,
+            expected_audience: None,
         };
 
         Ok(service)
+    }
+
+    /// Set the expected JWT audience for token validation.
+    pub fn with_expected_audience(mut self, audience: String) -> Self {
+        self.expected_audience = Some(audience);
+        self
     }
 
     /// Validate that a path is within the base directory (I5/I6 fix).
@@ -2650,6 +2659,10 @@ impl ZmqService for RegistryService {
 
     fn signing_key(&self) -> SigningKey {
         self.signing_key.clone()
+    }
+
+    fn expected_audience(&self) -> Option<&str> {
+        self.expected_audience.as_deref()
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {

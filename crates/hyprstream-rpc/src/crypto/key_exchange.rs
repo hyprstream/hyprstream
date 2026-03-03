@@ -271,6 +271,16 @@ mod ristretto_impl {
     pub struct RistrettoSecret(Scalar);
 
     impl RistrettoSecret {
+        /// Reconstruct a secret key from a scalar.
+        ///
+        /// Returns `None` if the scalar is zero (identity element, unsafe for DH).
+        pub fn from_scalar(scalar: Scalar) -> Option<Self> {
+            if bool::from(scalar.ct_eq(&Scalar::ZERO)) {
+                return None;
+            }
+            Some(Self(scalar))
+        }
+
         /// Get the underlying scalar for DH computation.
         pub fn scalar(&self) -> &Scalar {
             &self.0

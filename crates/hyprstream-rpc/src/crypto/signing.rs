@@ -12,29 +12,25 @@
 //! 3. Signs `(request_id || identity || payload)` with server's Ed25519 key
 //! 4. ZMQ service verifies signature before processing
 
-use ed25519_dalek::{Signature, Signer, Verifier};
-use sha2::{Digest, Sha512};
 use zeroize::Zeroizing;
 
 use crate::error::{EnvelopeError, EnvelopeResult};
 
+#[cfg(test)]
+use ed25519_dalek::{Signature, Signer, Verifier};
+#[cfg(test)]
+use sha2::{Digest, Sha512};
+
 // Re-export key types
 pub use ed25519_dalek::{SigningKey, VerifyingKey};
 
-/// Sign a message using Ed25519.
+/// Sign a message using Ed25519 with pre-hashing (Ed25519ph).
 ///
 /// Uses streaming hash to avoid allocating the full message.
 ///
-/// # Arguments
-///
-/// * `signing_key` - The Ed25519 signing key
-/// * `request_id` - Unique request ID (included in signed data)
-/// * `identity_bytes` - Canonical serialization of RequestIdentity
-/// * `payload` - The request payload
-///
-/// # Returns
-///
-/// 64-byte Ed25519 signature
+/// Note: Only used in tests. The production signing path uses
+/// `SignedEnvelope::new_signed` which signs canonicalized envelope bytes directly.
+#[cfg(test)]
 pub fn sign_message(
     signing_key: &SigningKey,
     request_id: u64,
@@ -55,19 +51,10 @@ pub fn sign_message(
     signature.to_bytes()
 }
 
-/// Verify an Ed25519 signature.
+/// Verify an Ed25519 pre-hashed signature.
 ///
-/// # Arguments
-///
-/// * `verifying_key` - The Ed25519 public key
-/// * `signature` - The 64-byte signature to verify
-/// * `request_id` - Request ID that was signed
-/// * `identity_bytes` - Canonical serialization of RequestIdentity
-/// * `payload` - The request payload
-///
-/// # Errors
-///
-/// Returns `EnvelopeError::InvalidSignature` if verification fails.
+/// Note: Only used in tests alongside `sign_message`.
+#[cfg(test)]
 pub fn verify_message(
     verifying_key: &VerifyingKey,
     signature: &[u8; 64],

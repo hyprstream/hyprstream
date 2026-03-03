@@ -17,6 +17,7 @@ struct PolicyRequest {
   # Request payload (union of request types)
   union {
     # Authorization check
+    # Intentionally unscoped — authorization check cannot require authorization (circular dependency)
     check @1 :PolicyCheck;
 
     # JWT token issuance

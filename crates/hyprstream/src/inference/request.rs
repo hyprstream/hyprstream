@@ -107,6 +107,14 @@ pub enum InferenceRequest {
         reply: oneshot::Sender<Result<(), InferenceError>>,
     },
 
+    // === Embeddings ===
+
+    /// Compute embeddings for images.
+    Embed {
+        images: Vec<Vec<u8>>,
+        reply: oneshot::Sender<Result<Vec<Vec<f32>>, InferenceError>>,
+    },
+
     // === Health ===
 
     /// Health check request.
@@ -153,6 +161,9 @@ impl std::fmt::Debug for InferenceRequest {
             Self::ClearSession { .. } => write!(f, "InferenceRequest::ClearSession"),
             Self::ReleaseSession { session_id, .. } => {
                 write!(f, "InferenceRequest::ReleaseSession {{ session_id: {session_id:?} }}")
+            }
+            Self::Embed { images, .. } => {
+                write!(f, "InferenceRequest::Embed {{ images: {} }}", images.len())
             }
             Self::HealthCheck { .. } => write!(f, "InferenceRequest::HealthCheck"),
             Self::Shutdown { .. } => write!(f, "InferenceRequest::Shutdown"),

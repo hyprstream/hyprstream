@@ -44,6 +44,9 @@ pub struct PolicyService {
     git2db: Arc<RwLock<Git2DB>>,
     /// RepoId of the .registry self-tracked entry
     registry_repo_id: RepoId,
+    /// Default audience for issued tokens (OAuth issuer URL, shared instance identifier).
+    /// Used when IssueToken.audience is empty, ensuring all tokens get an `aud` claim.
+    default_audience: Option<String>,
     // Infrastructure (for Spawnable)
     context: Arc<zmq::Context>,
     transport: TransportConfig,
@@ -67,9 +70,16 @@ impl PolicyService {
             supported_scopes: compute_supported_scopes(),
             git2db,
             registry_repo_id,
+            default_audience: None,
             context,
             transport,
         }
+    }
+
+    /// Set the default audience for issued tokens (typically the OAuth issuer URL).
+    pub fn with_default_audience(mut self, audience: String) -> Self {
+        self.default_audience = Some(audience);
+        self
     }
 
     /// Parse operation from string
@@ -135,6 +145,21 @@ fn compute_supported_scopes() -> Vec<String> {
 
 #[async_trait::async_trait(?Send)]
 impl PolicyHandler for PolicyService {
+    async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
+        let subject = ctx.subject();
+        let allowed = self.policy_manager.check_with_domain(
+            &subject.to_string(),
+            "*",
+            resource,
+            Self::parse_operation(operation).unwrap_or(Operation::Query),
+        ).await;
+        if allowed {
+            Ok(())
+        } else {
+            anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource)
+        }
+    }
+
     async fn handle_check(
         &self,
         _ctx: &EnvelopeContext,
@@ -230,13 +255,14 @@ impl PolicyHandler for PolicyService {
             }));
         }
 
-        // Create and sign JWT with optional audience binding (RFC 8707)
+        // Create and sign JWT with audience binding (RFC 8707)
         // Scopes are not embedded in JWT - Casbin enforces authorization server-side
         let now = chrono::Utc::now().timestamp();
-        let audience = if data.audience.is_empty() {
-            None
-        } else {
+        let audience = if !data.audience.is_empty() {
             Some(data.audience.clone())
+        } else {
+            // Default to instance-wide audience (OAuth issuer URL) so all tokens get an `aud` claim
+            self.default_audience.clone()
         };
 
         let claims = hyprstream_rpc::auth::Claims::new(
@@ -660,6 +686,10 @@ impl ZmqService for PolicyService {
 
     fn signing_key(&self) -> SigningKey {
         (*self.signing_key).clone()
+    }
+
+    fn expected_audience(&self) -> Option<&str> {
+        self.default_audience.as_deref()
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {

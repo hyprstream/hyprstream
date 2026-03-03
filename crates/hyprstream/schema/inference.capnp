@@ -2,6 +2,7 @@
 
 using import "/streaming.capnp".StreamInfo;
 using import "/annotations.capnp".optional;
+using import "/annotations.capnp".mcpScope;
 
 # Cap'n Proto schema for inference service
 #
@@ -19,57 +20,60 @@ struct InferenceRequest {
 
   # Request payload (union of request types)
   union {
-    generateStream @1 :GenerationRequest;
-    modelInfo @2 :Void;
-    isReady @3 :Void;
-    applyChatTemplate @4 :ChatTemplateRequest;
+    generateStream @1 :GenerationRequest $mcpScope(infer);
+    modelInfo @2 :Void $mcpScope(query);
+    isReady @3 :Void $mcpScope(query);
+    applyChatTemplate @4 :ChatTemplateRequest $mcpScope(query);
 
     # LoRA operations
-    createLora @5 :LoraConfig;
-    loadLora @6 :Text;       # path
-    saveLora @7 :Text;       # path
-    unloadLora @8 :Void;
-    hasLora @9 :Void;
+    createLora @5 :LoraConfig $mcpScope(write);
+    loadLora @6 :Text $mcpScope(write);       # path
+    saveLora @7 :Text $mcpScope(write);       # path
+    unloadLora @8 :Void $mcpScope(write);
+    hasLora @9 :Void $mcpScope(query);
 
     # Session operations
-    setSession @10 :Text;    # session_id
-    clearSession @11 :Void;
-    releaseSession @12 :Text;
+    setSession @10 :Text $mcpScope(write);    # session_id
+    clearSession @11 :Void $mcpScope(write);
+    releaseSession @12 :Text $mcpScope(write);
 
     # Health/Lifecycle
-    healthCheck @13 :Void;
-    shutdown @14 :Void;
+    healthCheck @13 :Void $mcpScope(query);
+    shutdown @14 :Void $mcpScope(manage);
 
     # Training loop control — tenant-aware TTT (identity from auth envelope)
-    commitAdaptation @15 :Void;
-    rollbackAdaptation @16 :Void;
-    trainStep @17 :TrainStepRequest;
-    resetDelta @18 :Void;
+    commitAdaptation @15 :Void $mcpScope(write);
+    rollbackAdaptation @16 :Void $mcpScope(write);
+    trainStep @17 :TrainStepRequest $mcpScope(train);
+    resetDelta @18 :Void $mcpScope(manage);
 
     # Persistence operations (identity from auth envelope)
-    getDeltaStatus @19 :Void;
-    saveAdaptation @20 :SaveAdaptationRequest;
-    snapshotDelta @21 :Void;
+    getDeltaStatus @19 :Void $mcpScope(query);
+    saveAdaptation @20 :SaveAdaptationRequest $mcpScope(write);
+    snapshotDelta @21 :Void $mcpScope(write);
 
     # Streaming training (returns immediately, results via PUB/SUB)
-    trainStepStream @22 :TrainStepRequest;
+    trainStepStream @22 :TrainStepRequest $mcpScope(train);
 
     # Export delta as PEFT adapter directory (identity from auth envelope)
-    exportPeftAdapter @23 :ExportPeftRequest;
+    exportPeftAdapter @23 :ExportPeftRequest $mcpScope(write);
 
     # Merge an on-disk adapter into the loaded base_delta
-    mergeLora @24 :MergeLoraRequest;
+    mergeLora @24 :MergeLoraRequest $mcpScope(write);
 
     # Streaming variants — return StreamInfo immediately, results via PUB/SUB.
     # Use these instead of the non-streaming versions for operations that may
     # involve significant compute or I/O (GPU alloc, disk writes, merges).
-    createLoraStream @25 :LoraConfig;
-    loadLoraStream @26 :Text;          # path
-    saveLoraStream @27 :Text;          # path
-    saveAdaptationStream @28 :SaveAdaptationRequest;
-    snapshotDeltaStream @29 :Void;
-    exportPeftAdapterStream @30 :ExportPeftRequest;
-    mergeLoraStream @31 :MergeLoraRequest;
+    createLoraStream @25 :LoraConfig $mcpScope(write);
+    loadLoraStream @26 :Text $mcpScope(write);          # path
+    saveLoraStream @27 :Text $mcpScope(write);          # path
+    saveAdaptationStream @28 :SaveAdaptationRequest $mcpScope(write);
+    snapshotDeltaStream @29 :Void $mcpScope(write);
+    exportPeftAdapterStream @30 :ExportPeftRequest $mcpScope(write);
+    mergeLoraStream @31 :MergeLoraRequest $mcpScope(write);
+
+    # Vision embeddings (synchronous — returns all embeddings in one response)
+    embed @32 :EmbedImagesRequest $mcpScope(infer);
   }
 }
 
@@ -124,6 +128,9 @@ struct InferenceResponse {
     snapshotDeltaStreamResult @30 :StreamInfo;
     exportPeftAdapterStreamResult @31 :StreamInfo;
     mergeLoraStreamResult @32 :StreamInfo;
+
+    # Embed result
+    embedResult @33 :EmbedImagesResponse;
   }
 }
 
@@ -340,6 +347,17 @@ struct MergeLoraRequest {
   adapterPath @0 :Text;    # relative path to adapter dir (e.g. "adapters/demo-1-rust-ttt")
   weight @1 :Float32;      # merge weight 0.0-1.0, default 1.0
   strategy @2 :Text;       # "replace", "additive", or "do_merge" (default: "do_merge")
+}
+
+# Vision embedding request (raw image bytes)
+struct EmbedImagesRequest {
+  images @0 :List(Data);   # raw image bytes (PNG/JPEG/RGB)
+}
+
+# Vision embedding response
+struct EmbedImagesResponse {
+  embeddings @0 :List(List(Float32));  # one vector per image
+  dimensions @1 :UInt32;               # embedding dimensionality
 }
 
 # Error Information

@@ -1,8 +1,14 @@
-//! Shared Cap'n Proto build helpers for annotation extraction.
+//! Shared Cap'n Proto build helpers for annotation extraction and TypeScript codegen.
 //!
-//! Extracts schema metadata (structs, enums, annotations) from Cap'n Proto
-//! CodeGeneratorRequest (CGR) files and writes them as JSON for use by
-//! `generate_rpc_service!` proc macro.
+//! This crate provides:
+//! - Schema types (`ParsedSchema`, `StructDef`, `FieldDef`, etc.) shared between
+//!   the proc-macro derive crate and the TypeScript codegen binary
+//! - CGR (CodeGeneratorRequest) parsing with full wire format info
+//! - Metadata JSON extraction for proc-macro annotation merging
+//! - TypeScript codegen from parsed schemas (via the `hyprstream-ts-codegen` binary)
+
+pub mod schema;
+pub mod util;
 
 use std::path::Path;
 
@@ -35,8 +41,8 @@ pub fn parse_schema_and_extract_annotations(
     for i in 0..nodes.len() {
         let node = nodes.get(i);
         if let Ok(capnp::schema_capnp::node::Annotation(_)) = node.which() {
-            let dn = node.get_display_name()?.to_str()?.to_string();
-            let short = dn.rsplit(':').next().unwrap_or(&dn).to_string();
+            let dn = node.get_display_name()?.to_str()?.to_owned();
+            let short = dn.rsplit(':').next().unwrap_or(&dn).to_owned();
             annotation_names.insert(node.get_id(), short);
         }
     }
@@ -49,7 +55,7 @@ pub fn parse_schema_and_extract_annotations(
     for i in 0..nodes.len() {
         let node = nodes.get(i);
         let node_id = node.get_id();
-        let display_name = node.get_display_name()?.to_str()?.to_string();
+        let display_name = node.get_display_name()?.to_str()?.to_owned();
 
         // Extract node-level annotations
         let node_annotations = extract_annotations(node.get_annotations()?, &annotation_names)?;
@@ -65,7 +71,7 @@ pub fn parse_schema_and_extract_annotations(
 
                 for j in 0..struct_fields.len() {
                     let field = struct_fields.get(j);
-                    let field_name = field.get_name()?.to_str()?.to_string();
+                    let field_name = field.get_name()?.to_str()?.to_owned();
                     let discriminant = field.get_discriminant_value();
 
                     // Extract field-level annotations
@@ -75,7 +81,7 @@ pub fn parse_schema_and_extract_annotations(
                     // Get field type name
                     let type_name = match field.which()? {
                         field::Slot(slot) => extract_type_name(slot.get_type()?),
-                        field::Group(_) => "Group".to_string(),
+                        field::Group(_) => "Group".to_owned(),
                     };
 
                     fields.push(serde_json::json!({
@@ -98,7 +104,7 @@ pub fn parse_schema_and_extract_annotations(
 
                 for j in 0..enumerants.len() {
                     let enumerant = enumerants.get(j);
-                    let variant_name = enumerant.get_name()?.to_str()?.to_string();
+                    let variant_name = enumerant.get_name()?.to_str()?.to_owned();
                     let code_order = enumerant.get_code_order();
 
                     variants.push(serde_json::json!({
@@ -179,12 +185,11 @@ fn extract_value_json(value: capnp::schema_capnp::value::Reader) -> Option<serde
 
     match value.which().ok()? {
         value::Text(text_reader) => Some(serde_json::Value::String(
-            text_reader.ok()?.to_str().ok()?.to_string(),
+            text_reader.ok()?.to_str().ok()?.to_owned(),
         )),
         value::Bool(b) => Some(serde_json::Value::Bool(b)),
         value::Uint32(n) => Some(serde_json::Value::Number(n.into())),
         value::Enum(ordinal) => Some(serde_json::json!({"enum_ordinal": ordinal})),
-        value::Void(()) => None,
         _ => None,
     }
 }
@@ -194,31 +199,31 @@ fn extract_type_name(type_reader: capnp::schema_capnp::type_::Reader) -> String 
     use capnp::schema_capnp::type_;
 
     match type_reader.which() {
-        Ok(type_::Void(())) => "Void".to_string(),
-        Ok(type_::Bool(())) => "Bool".to_string(),
-        Ok(type_::Int8(())) => "Int8".to_string(),
-        Ok(type_::Int16(())) => "Int16".to_string(),
-        Ok(type_::Int32(())) => "Int32".to_string(),
-        Ok(type_::Int64(())) => "Int64".to_string(),
-        Ok(type_::Uint8(())) => "UInt8".to_string(),
-        Ok(type_::Uint16(())) => "UInt16".to_string(),
-        Ok(type_::Uint32(())) => "UInt32".to_string(),
-        Ok(type_::Uint64(())) => "UInt64".to_string(),
-        Ok(type_::Float32(())) => "Float32".to_string(),
-        Ok(type_::Float64(())) => "Float64".to_string(),
-        Ok(type_::Text(())) => "Text".to_string(),
-        Ok(type_::Data(())) => "Data".to_string(),
+        Ok(type_::Void(())) => "Void".to_owned(),
+        Ok(type_::Bool(())) => "Bool".to_owned(),
+        Ok(type_::Int8(())) => "Int8".to_owned(),
+        Ok(type_::Int16(())) => "Int16".to_owned(),
+        Ok(type_::Int32(())) => "Int32".to_owned(),
+        Ok(type_::Int64(())) => "Int64".to_owned(),
+        Ok(type_::Uint8(())) => "UInt8".to_owned(),
+        Ok(type_::Uint16(())) => "UInt16".to_owned(),
+        Ok(type_::Uint32(())) => "UInt32".to_owned(),
+        Ok(type_::Uint64(())) => "UInt64".to_owned(),
+        Ok(type_::Float32(())) => "Float32".to_owned(),
+        Ok(type_::Float64(())) => "Float64".to_owned(),
+        Ok(type_::Text(())) => "Text".to_owned(),
+        Ok(type_::Data(())) => "Data".to_owned(),
         Ok(type_::List(list_type)) => {
             if let Ok(element_type) = list_type.get_element_type() {
                 format!("List({})", extract_type_name(element_type))
             } else {
-                "List".to_string()
+                "List".to_owned()
             }
         }
-        Ok(type_::Enum(_)) => "Enum".to_string(),
-        Ok(type_::Struct(_)) => "Struct".to_string(),
-        Ok(type_::Interface(_)) => "Interface".to_string(),
-        Ok(type_::AnyPointer(_)) => "AnyPointer".to_string(),
-        Err(_) => "Unknown".to_string(),
+        Ok(type_::Enum(_)) => "Enum".to_owned(),
+        Ok(type_::Struct(_)) => "Struct".to_owned(),
+        Ok(type_::Interface(_)) => "Interface".to_owned(),
+        Ok(type_::AnyPointer(_)) => "AnyPointer".to_owned(),
+        Err(_) => "Unknown".to_owned(),
     }
 }

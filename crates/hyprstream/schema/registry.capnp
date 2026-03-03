@@ -33,7 +33,7 @@ struct RegistryRequest {
     # Remove a repository from the registry
     remove @6 :Text $mcpScope(manage);
     # Check registry service health
-    healthCheck @7 :Void;
+    healthCheck @7 :Void $mcpScope(query);
     # Clone a model repository from a URL (streaming progress)
     cloneStream @8 :CloneRequest $mcpScope(write) $mcpDescription("Clone a model repository from a URL (streaming progress)");
 
