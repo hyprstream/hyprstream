@@ -1440,8 +1440,8 @@ fn main() -> Result<()> {
                 } => {
                     if foreground {
                         // --foreground requires either a service name or --services list
-                        let name = match (&name, &multi_services) {
-                            (Some(_), _) => name.unwrap(),
+                        let name = match (name, &multi_services) {
+                            (Some(n), _) => n,
                             (None, Some(_)) => String::from("multi"), // placeholder for multi-service mode
                             (None, None) => return Err(anyhow::anyhow!(
                                 "--foreground requires a service name or --services list"
