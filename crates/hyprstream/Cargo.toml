@@ -53,6 +53,7 @@ hyprstream-workers = { path = "../hyprstream-workers" }  # Worker runtime (Kata 
 inventory.workspace = true  # Service factory registration
 gittorrent = { workspace = true, optional = true }  # P2P transport
 clap.workspace = true
+inquire = "0.7"
 tracing.workspace = true
 tracing-opentelemetry = { workspace = true, optional = true }
 opentelemetry = { workspace = true, optional = true }

@@ -132,6 +132,25 @@ fn build_cli() -> ClapCommand {
         ),
     );
 
+    // Interactive setup wizard
+    app = app.subcommand(
+        ClapCommand::new("wizard")
+            .about("Interactive setup wizard — configure policies, users, and API tokens")
+            .arg(
+                Arg::new("non_interactive")
+                    .long("non-interactive")
+                    .short('y')
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Accept defaults without prompting"),
+            )
+            .arg(
+                Arg::new("start")
+                    .long("start")
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Start services after setup"),
+            ),
+    );
+
     app
 }
 
@@ -1848,6 +1867,29 @@ fn main() -> Result<()> {
                         );
                     }
                     Ok(())
+                },
+            )?;
+        }
+
+        // ── Interactive setup wizard ─────────────────────────────────────
+        Some(("wizard", sub_m)) => {
+            let non_interactive = sub_m.get_flag("non_interactive");
+            let start_services = sub_m.get_flag("start");
+            let models_dir = config_for_service.models_dir().clone();
+            let services = config_for_service.services.startup.clone();
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: true,
+                },
+                || async move {
+                    hyprstream_core::cli::handle_wizard(
+                        &models_dir,
+                        &services,
+                        non_interactive,
+                        start_services,
+                    )
+                    .await
                 },
             )?;
         }
