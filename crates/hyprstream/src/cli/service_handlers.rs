@@ -386,7 +386,7 @@ pub async fn handle_service_status(
 ///
 /// Extracted from the old `handle_service_repair` so it can be called as part
 /// of `handle_service_install` without the surrounding summary chrome.
-async fn run_repair_checks(
+pub(crate) async fn run_repair_checks(
     models_dir: &Path,
     verbose: bool,
 ) -> Result<()> {
@@ -617,14 +617,14 @@ async fn run_repair_checks(
     Ok(())
 }
 
-enum CheckStatus {
+pub(crate) enum CheckStatus {
     Ok,
     Fixed,
     Warn,
     Fail,
 }
 
-fn print_check(label: &str, status: CheckStatus, detail: &str) {
+pub(crate) fn print_check(label: &str, status: CheckStatus, detail: &str) {
     let (icon, color) = match status {
         CheckStatus::Ok => ("\u{2713}", "\x1b[32m"),    // green checkmark
         CheckStatus::Fixed => ("\u{2713}", "\x1b[33m"),  // yellow checkmark (fixed)

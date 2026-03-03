@@ -1,0 +1,22 @@
+[package]
+name = "hyprstream-tui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Terminal UI for hyprstream — wizard, dashboards, status"
+
+[lib]
+name = "hyprstream_tui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hyprstream-tui"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = { version = "0.30", default-features = false, features = ["layout-cache"] }
+waxterm = { path = "../waxterm" }
+
+[profile.release]
+opt-level = "s"
+lto = true

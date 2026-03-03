@@ -19,6 +19,7 @@ pub mod service_handlers;
 pub mod systemd_setup;
 pub mod training_handlers;
 pub mod worker_handlers;
+pub mod wizard_handlers;
 pub mod worktree_handlers;
 
 pub use context::AppContext;
@@ -58,6 +59,7 @@ pub use service_handlers::{
     handle_service_install,
     handle_service_uninstall, handle_service_start, handle_service_stop, handle_service_status,
 };
+pub use wizard_handlers::handle_wizard;
 
 /// Device preference strategy
 #[derive(Debug, Clone, Copy)]
