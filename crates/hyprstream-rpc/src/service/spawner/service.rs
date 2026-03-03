@@ -1096,7 +1096,7 @@ impl Spawnable for DualSpawnable {
     ) -> Result<()> {
         let shutdown2 = shutdown.clone();
         let secondary = self.secondary;
-        let secondary_name = secondary.name().to_string();
+        let secondary_name = secondary.name().to_owned();
 
         // Spawn secondary on a sub-thread
         let handle = thread::Builder::new()

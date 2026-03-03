@@ -291,26 +291,14 @@ fn resolve_type_name(
 fn field_section_from_type(type_reader: capnp::schema_capnp::type_::Reader) -> FieldSection {
     use capnp::schema_capnp::type_;
     match type_reader.which() {
-        Ok(type_::Void(())) => FieldSection::Data,
-        Ok(type_::Bool(())) => FieldSection::Data,
-        Ok(type_::Int8(())) => FieldSection::Data,
-        Ok(type_::Int16(())) => FieldSection::Data,
-        Ok(type_::Int32(())) => FieldSection::Data,
-        Ok(type_::Int64(())) => FieldSection::Data,
-        Ok(type_::Uint8(())) => FieldSection::Data,
-        Ok(type_::Uint16(())) => FieldSection::Data,
-        Ok(type_::Uint32(())) => FieldSection::Data,
-        Ok(type_::Uint64(())) => FieldSection::Data,
-        Ok(type_::Float32(())) => FieldSection::Data,
-        Ok(type_::Float64(())) => FieldSection::Data,
-        Ok(type_::Enum(_)) => FieldSection::Data,
-        Ok(type_::Text(())) => FieldSection::Pointer,
-        Ok(type_::Data(())) => FieldSection::Pointer,
-        Ok(type_::List(_)) => FieldSection::Pointer,
-        Ok(type_::Struct(_)) => FieldSection::Pointer,
-        Ok(type_::Interface(_)) => FieldSection::Pointer,
-        Ok(type_::AnyPointer(_)) => FieldSection::Pointer,
-        Err(_) => FieldSection::Data,
+        Ok(type_::Text(())) | Ok(type_::Data(())) | Ok(type_::List(_)) | Ok(type_::Struct(_))
+        | Ok(type_::Interface(_)) | Ok(type_::AnyPointer(_)) => FieldSection::Pointer,
+        Ok(type_::Void(())) | Ok(type_::Bool(())) | Ok(type_::Int8(())) | Ok(type_::Int16(()))
+        | Ok(type_::Int32(())) | Ok(type_::Int64(())) | Ok(type_::Uint8(()))
+        | Ok(type_::Uint16(())) | Ok(type_::Uint32(())) | Ok(type_::Uint64(()))
+        | Ok(type_::Float32(())) | Ok(type_::Float64(())) | Ok(type_::Enum(_)) | Err(_) => {
+            FieldSection::Data
+        }
     }
 }
 
@@ -577,7 +565,7 @@ fn extract_struct_from_node(
                 let tn = resolve_type_name(type_reader, node_map);
                 let offset = slot.get_offset();
                 let sec = field_section_from_type(type_reader);
-                (tn, offset as u32, sec)
+                (tn, offset, sec)
             }
             Ok(capnp::schema_capnp::field::Group(_)) => {
                 ("Group".into(), 0, FieldSection::Group)

@@ -72,13 +72,13 @@ impl QuicStreamBridge {
     pub fn subscribe(&mut self, topic: &str) -> mpsc::UnboundedReceiver<Vec<u8>> {
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let senders = self.subscriptions.entry(topic.to_string()).or_default();
+        let senders = self.subscriptions.entry(topic.to_owned()).or_default();
 
         // If this is the first subscriber for this topic, start the ZMQ SUB task
         if senders.is_empty() {
             let zmq_context = Arc::clone(&self.zmq_context);
             let sub_transport = self.sub_transport.clone();
-            let topic_owned = topic.to_string();
+            let topic_owned = topic.to_owned();
             let shutdown = Arc::clone(&self.shutdown);
             let tx_clone = tx.clone();
 

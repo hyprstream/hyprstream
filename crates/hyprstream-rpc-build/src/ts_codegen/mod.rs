@@ -88,7 +88,7 @@ fn capnp_to_ts_type(type_name: &str) -> String {
             let inner = &type_name[5..type_name.len() - 1];
             format!("{}[]", capnp_to_ts_type(inner))
         }
-        _ => type_name.to_string(),
+        _ => type_name.to_owned(),
     }
 }
 

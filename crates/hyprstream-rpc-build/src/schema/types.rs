@@ -76,20 +76,15 @@ pub struct FieldDef {
 }
 
 /// Which section of a Cap'n Proto struct a field resides in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FieldSection {
     /// Data section (fixed-size scalars: bool, ints, floats, enum ordinals)
+    #[default]
     Data,
     /// Pointer section (variable-length: Text, Data, List, Struct)
     Pointer,
     /// Group (inlined, no slot)
     Group,
-}
-
-impl Default for FieldSection {
-    fn default() -> Self {
-        Self::Data
-    }
 }
 
 impl StructDef {

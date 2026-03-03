@@ -992,5 +992,5 @@ export class StructReader {
     return results;
   }
 }
-"##.to_string()
+"##.to_owned()
 }

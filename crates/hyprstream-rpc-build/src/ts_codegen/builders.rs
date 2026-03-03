@@ -222,7 +222,7 @@ fn generate_scoped_builders(
         // Level 0: root → first scope (sc or first ancestor)
         let chain: Vec<&ScopedClient> = ancestors.iter().copied().chain(std::iter::once(sc)).collect();
 
-        let mut builder_var = "msg".to_string();
+        let mut builder_var = "msg".to_owned();
         for (i, level) in chain.iter().enumerate() {
             // Find the variant field in the parent struct for this level
             let (parent_disc_byte_off, variant_disc_value, variant_slot_offset) =
@@ -255,7 +255,7 @@ fn generate_scoped_builders(
         }
 
         // Now set the method discriminant on the innermost struct
-        let _innermost_sc = chain.last().unwrap();
+        let _innermost_sc = chain.last().expect("chain must be non-empty");
         let inner_struct_name =
             find_inner_struct_name(chain.len() - 1, &chain, root_struct, schema);
         let inner_struct = schema.structs.iter().find(|s| s.name == inner_struct_name);
@@ -529,7 +529,7 @@ fn emit_struct_init(
                     .map(|(name, _)| format!("'{}'", to_camel_case(name)))
                     .unwrap_or_else(|| "0".into())
             } else {
-                super::default_value_expr(&f.type_name).to_string()
+                super::default_value_expr(&f.type_name).to_owned()
             };
             format!("{raw_expr} ?? {default}")
         } else {

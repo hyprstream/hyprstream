@@ -54,6 +54,7 @@ pub struct ZmtpFrame {
     pub data: Bytes,
 }
 
+#[cfg(test)]
 impl ZmtpFrame {
     /// Convert from the owned framing type.
     fn from_owned(f: zmtp_framing::ZmtpFrame) -> Self {
@@ -596,31 +597,25 @@ impl QuicRep {
         // Perform ZMTP handshake as server
         stream.handshake(ZmqSocketType::Rep, true).await?;
 
-        // REP state machine: receive request, send reply, repeat
-        loop {
-            // Receive request
-            let request = match stream.recv_multipart().await {
-                Ok(msg) => msg,
-                Err(e) => {
-                    // Stream closed is normal at end of request
-                    if e.downcast_ref::<std::io::Error>()
-                        .map_or(false, |io_err| io_err.kind() == std::io::ErrorKind::UnexpectedEof)
-                    {
-                        break;
-                    }
-                    return Err(e);
+        // REP: receive request, send reply (each request gets its own stream)
+        let request = match stream.recv_multipart().await {
+            Ok(msg) => msg,
+            Err(e) => {
+                // Stream closed is normal at end of request
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::UnexpectedEof)
+                {
+                    return Ok(());
                 }
-            };
+                return Err(e);
+            }
+        };
 
-            // Process request
-            let response = handler(request).await?;
+        // Process request
+        let response = handler(request).await?;
 
-            // Send reply
-            stream.send_multipart(&response.parts).await?;
-
-            // In REQ/REP, each request gets its own stream, so we're done
-            break;
-        }
+        // Send reply
+        stream.send_multipart(&response.parts).await?;
 
         Ok(())
     }
@@ -930,16 +925,11 @@ impl QuicSub {
 
         // Spawn a task to receive messages and forward them
         tokio::spawn(async move {
-            loop {
-                match stream.recv_multipart().await {
-                    Ok(msg) => {
-                        // parts[0] = topic prefix, parts[1] = data payload
-                        let data = msg.parts.get(1).or_else(|| msg.parts.first());
-                        if let Some(data) = data {
-                            let _ = tx.send(data.clone());
-                        }
-                    }
-                    Err(_) => break,
+            while let Ok(msg) = stream.recv_multipart().await {
+                // parts[0] = topic prefix, parts[1] = data payload
+                let data = msg.parts.get(1).or_else(|| msg.parts.first());
+                if let Some(data) = data {
+                    let _ = tx.send(data.clone());
                 }
             }
         });
@@ -1161,7 +1151,7 @@ impl AsyncWrite for QuicStream {
     ) -> std::task::Poll<std::io::Result<usize>> {
         std::pin::Pin::new(&mut self.send)
             .poll_write(cx, buf)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            .map_err(std::io::Error::other)
     }
 
     fn poll_flush(
@@ -1170,7 +1160,7 @@ impl AsyncWrite for QuicStream {
     ) -> std::task::Poll<std::io::Result<()>> {
         std::pin::Pin::new(&mut self.send)
             .poll_flush(cx)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            .map_err(std::io::Error::other)
     }
 
     fn poll_shutdown(
@@ -1179,7 +1169,7 @@ impl AsyncWrite for QuicStream {
     ) -> std::task::Poll<std::io::Result<()>> {
         std::pin::Pin::new(&mut self.send)
             .poll_shutdown(cx)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            .map_err(std::io::Error::other)
     }
 }
 
@@ -1223,7 +1213,7 @@ where
     rep: QuicRep,
     service: S,
     /// Server certificate DER bytes (for registration)
-    cert_der: Vec<u8>,
+    _cert_der: Vec<u8>,
     /// ZMQ context (for Spawnable trait)
     context: Arc<zmq::Context>,
     /// Service name
@@ -1239,11 +1229,11 @@ where
     /// Create a new QUIC service loop.
     pub fn new(rep: QuicRep, service: S, cert_der: Vec<u8>) -> Result<Self> {
         let addr = rep.local_addr()?;
-        let name = service.name().to_string();
+        let name = service.name().to_owned();
         Ok(Self {
             rep,
             service,
-            cert_der,
+            _cert_der: cert_der,
             context: Arc::new(zmq::Context::new()),
             name,
             addr,
@@ -1674,7 +1664,7 @@ fn webtransport_tls_config(
 /// Returns (ServerConfig, cert_der_bytes).
 pub fn server_tls_self_signed(name: &str) -> Result<(rustls::ServerConfig, Vec<u8>)> {
     ensure_crypto_provider();
-    let cert_key = rcgen::generate_simple_self_signed(vec![name.to_string()])?;
+    let cert_key = rcgen::generate_simple_self_signed(vec![name.to_owned()])?;
 
     let cert_der = cert_key.cert.der().to_vec();
     let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(cert_key.key_pair.serialize_der());

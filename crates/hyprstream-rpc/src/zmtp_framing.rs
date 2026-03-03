@@ -57,9 +57,12 @@ impl ZmqSocketType {
             Self::Pull => "PULL",
         }
     }
+}
 
-    /// Parse from string.
-    pub fn from_str(s: &str) -> Result<Self> {
+impl std::str::FromStr for ZmqSocketType {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
         match s {
             "REQ" => Ok(Self::Req),
             "REP" => Ok(Self::Rep),
@@ -103,7 +106,7 @@ impl ZmtpCommand {
 
         let name_len = data[0] as usize;
         ensure!(
-            1 + name_len <= data.len(),
+            name_len < data.len(),
             "Command name truncated: need {} bytes, have {}",
             1 + name_len,
             data.len()
@@ -389,7 +392,7 @@ pub fn decode_multipart(buf: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
 /// Output: ZMTP-framed bytes.
 pub fn encode_multipart_flat(flat: &[u8]) -> Result<Vec<u8>> {
     let parts = decode_flat_parts(flat)?;
-    let refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
+    let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
     Ok(encode_multipart(&refs))
 }
 
@@ -633,7 +636,7 @@ mod tests {
             ZmqSocketType::Pull,
         ] {
             let s = st.as_str();
-            let parsed = ZmqSocketType::from_str(s).unwrap();
+            let parsed: ZmqSocketType = s.parse().unwrap();
             assert_eq!(parsed, st);
         }
     }

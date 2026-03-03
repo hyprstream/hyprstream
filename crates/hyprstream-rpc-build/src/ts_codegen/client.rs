@@ -252,12 +252,12 @@ fn generate_scoped_client(
         let builder_name = format!("build{pascal}Request{name_chain}_{}", variant.name);
 
         // Builder args: transport.nextId() + all scope fields + optional payload
-        let mut builder_args = vec!["this.transport.nextId()".to_string()];
+        let mut builder_args = vec!["this.transport.nextId()".to_owned()];
         for f in &all_scope_fields {
             builder_args.push(format!("this.{}", to_camel_case(&f.name)));
         }
         if !is_void {
-            builder_args.push("p".to_string());
+            builder_args.push("p".to_owned());
         }
 
         out.push_str(&format!(
@@ -281,7 +281,7 @@ fn generate_scoped_client(
         // Unwrap through the scoped response chain.
         // The parser returns nested { variant, data: { variant, data: ... } } for scoped responses.
         // Each chain level adds one layer of wrapping.
-        let mut current_var = "parsed.data".to_string();
+        let mut current_var = "parsed.data".to_owned();
         for depth in 0..chain_depth {
             let inner_var = format!("_r{depth}");
             out.push_str(&format!(

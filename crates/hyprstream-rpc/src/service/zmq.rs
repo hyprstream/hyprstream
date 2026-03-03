@@ -576,7 +576,7 @@ impl RequestLoop {
                     let frames: Vec<Vec<u8>> = msg.into_iter().map(|f| f.to_vec()).collect();
 
                     // Find the empty delimiter frame
-                    let delimiter_pos = frames.iter().position(|f| f.is_empty());
+                    let delimiter_pos = frames.iter().position(Vec::is_empty);
                     let (identity_frames, payload_frames) = match delimiter_pos {
                         Some(pos) => (&frames[..=pos], &frames[pos + 1..]),
                         None => {
@@ -610,7 +610,7 @@ impl RequestLoop {
                         &*service,
                         crate::transport::zmtp_quic::EnvelopeVerification::FixedSigner(&server_pubkey),
                         &signing_key,
-                        &*nonce_cache,
+                        &nonce_cache,
                     ).await {
                         Ok(result) => result,
                         Err(e) => {
