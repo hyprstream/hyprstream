@@ -111,6 +111,11 @@ impl Driver for Overlay2Driver {
         self.create_git_worktree(&opts.base_repo, &opts.worktree_path, &opts.ref_spec, opts.progress.clone())
             .await?;
 
+        // Apply pathspec filter if requested
+        if let Some(ref paths) = opts.checkout_paths {
+            super::vfs::apply_pathspec_filter(&opts.worktree_path, paths)?;
+        }
+
         // Create handle with cleanup
         let mount_point = mount_dir.clone();
         let upper = upper_dir.clone();

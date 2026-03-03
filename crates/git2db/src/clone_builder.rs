@@ -502,6 +502,7 @@ async fn create_worktree(
         worktree_path: worktree_path.to_path_buf(),
         ref_spec: branch.to_owned(),
         progress: progress.clone(),
+        checkout_paths: None,
     };
 
     match driver.create_worktree(&opts).await {

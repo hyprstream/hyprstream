@@ -148,6 +148,24 @@ fn build_cli() -> ClapCommand {
                     .long("start")
                     .action(clap::ArgAction::SetTrue)
                     .help("Start services after setup"),
+            )
+            .arg(
+                Arg::new("tui")
+                    .long("tui")
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Use TUI wizard with GPU detection and install phase"),
+            ),
+    );
+
+    // Self-update
+    app = app.subcommand(
+        ClapCommand::new("update")
+            .about("Check for and install updates")
+            .arg(
+                Arg::new("cleanup")
+                    .long("cleanup")
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Remove old version worktrees"),
             ),
     );
 
@@ -1201,6 +1219,25 @@ fn main() -> Result<()> {
         eprintln!("Please check for unsafe RefCell usage or race conditions.");
     }));
 
+    // Check if we should re-exec into an installed GPU variant.
+    // Uses Unix execve() to replace this process with the GPU-optimized binary.
+    // The binary path comes from our own data directory (not user input).
+    {
+        let data_dir = dirs::data_local_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("hyprstream");
+        if let Some((variant_id, version)) =
+            hyprstream_core::cli::update_handlers::check_should_reexec(&data_dir)
+        {
+            hyprstream_core::cli::update_handlers::re_exec_variant(
+                &data_dir,
+                &variant_id,
+                &version,
+            );
+            // re_exec_variant never returns
+        }
+    }
+
     // Parse CLI arguments using builder API
     let matches = build_cli().get_matches();
 
@@ -1873,6 +1910,7 @@ fn main() -> Result<()> {
 
         // ── Interactive setup wizard ─────────────────────────────────────
         Some(("wizard", sub_m)) => {
+            let tui_mode = sub_m.get_flag("tui");
             let non_interactive = sub_m.get_flag("non_interactive");
             let start_services = sub_m.get_flag("start");
             let models_dir = config_for_service.models_dir().clone();
@@ -1883,13 +1921,32 @@ fn main() -> Result<()> {
                     multi_threaded: true,
                 },
                 || async move {
-                    hyprstream_core::cli::handle_wizard(
-                        &models_dir,
-                        &services,
-                        non_interactive,
-                        start_services,
-                    )
-                    .await
+                    if tui_mode {
+                        hyprstream_core::cli::handle_wizard_tui(&models_dir).await
+                    } else {
+                        hyprstream_core::cli::handle_wizard(
+                            &models_dir,
+                            &services,
+                            non_interactive,
+                            start_services,
+                        )
+                        .await
+                    }
+                },
+            )?;
+        }
+
+        // ── Self-update ──────────────────────────────────────────────────
+        Some(("update", sub_m)) => {
+            let cleanup = sub_m.get_flag("cleanup");
+            let models_dir = config_for_service.models_dir().clone();
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: true,
+                },
+                || async move {
+                    hyprstream_core::cli::update_handlers::handle_update(&models_dir, cleanup).await
                 },
             )?;
         }

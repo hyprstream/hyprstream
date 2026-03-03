@@ -1064,6 +1064,93 @@ impl<'a> RepositoryHandle<'a> {
         Ok(())
     }
 
+    /// Create a worktree with pathspec-filtered checkout.
+    ///
+    /// Only files matching `checkout_paths` prefixes are materialized.
+    /// Excluded entries get skip-worktree index bits to prevent re-materialization.
+    ///
+    /// # Arguments
+    /// * `worktree_path` - Where to create the worktree (empty = auto-derive)
+    /// * `branch` - Git ref to checkout
+    /// * `checkout_paths` - Path prefixes to materialize (e.g., `["backends/cuda130/", "manifest.toml"]`)
+    pub async fn create_filtered_worktree(
+        &self,
+        worktree_path: &Path,
+        branch: &str,
+        checkout_paths: Vec<String>,
+    ) -> Git2DBResult<WorktreeHandle> {
+        if checkout_paths.is_empty() {
+            return Err(Git2DBError::configuration(
+                "checkout_paths must not be empty; use create_worktree() for a full checkout",
+            ));
+        }
+
+        let tracked_repo = self.metadata()?;
+
+        let worktree_path = if worktree_path.as_os_str().is_empty() {
+            let worktrees_dir = tracked_repo
+                .worktree_path
+                .parent()
+                .ok_or_else(|| Git2DBError::internal("Invalid base repository path"))?
+                .join("worktrees");
+            worktrees_dir.join(branch)
+        } else {
+            worktree_path.to_path_buf()
+        };
+
+        let driver = self.registry.storage_driver().clone();
+
+        info!(
+            "Creating filtered worktree with {} driver: base={}, path={}, ref={}, paths={:?}",
+            driver.name(),
+            tracked_repo.worktree_path.display(),
+            worktree_path.display(),
+            branch,
+            checkout_paths
+        );
+
+        let opts = DriverOpts {
+            base_repo: tracked_repo.worktree_path.clone(),
+            worktree_path: worktree_path.clone(),
+            ref_spec: branch.to_owned(),
+            checkout_paths: Some(checkout_paths),
+        };
+
+        let result = driver.create_worktree(&opts).await;
+
+        match result {
+            Ok(mut handle) => {
+                if let Err(e) = Self::fetch_lfs_files(&worktree_path).await {
+                    tracing::error!(
+                        "Failed to fetch LFS files for filtered worktree at {}: {}",
+                        worktree_path.display(),
+                        e
+                    );
+                    tracing::info!("Rolling back worktree creation due to LFS fetch failure");
+                    if let Err(cleanup_err) = handle.cleanup().await {
+                        tracing::error!("Failed to cleanup worktree during rollback: {}", cleanup_err);
+                    }
+                    return Err(Git2DBError::internal(format!(
+                        "Worktree creation failed: LFS fetch error: {e}. Worktree has been rolled back."
+                    )));
+                }
+                Ok(handle)
+            }
+            Err(e) => {
+                tracing::error!("Failed to create filtered worktree at {}: {}", worktree_path.display(), e);
+                if worktree_path.exists() {
+                    tracing::info!("Cleaning up partial worktree at {}", worktree_path.display());
+                    tokio::fs::remove_dir_all(worktree_path)
+                        .await
+                        .unwrap_or_else(|cleanup_err| {
+                            tracing::warn!("Failed to cleanup partial worktree: {}", cleanup_err);
+                        });
+                }
+                Err(e)
+            }
+        }
+    }
+
     pub async fn create_worktree(&self, worktree_path: &Path, branch: &str) -> Git2DBResult<WorktreeHandle> {
         let tracked_repo = self.metadata()?;
 
@@ -1096,6 +1183,7 @@ impl<'a> RepositoryHandle<'a> {
             worktree_path: worktree_path.clone(),
             ref_spec: branch.to_owned(),
             progress: None,
+            checkout_paths: None,
         };
 
         // Create worktree using driver

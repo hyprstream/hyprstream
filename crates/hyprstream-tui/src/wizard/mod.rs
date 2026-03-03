@@ -1,7 +1,7 @@
 //! Setup wizard TUI application.
 //!
-//! Implements `waxterm::TerminalApp` to drive the wizard through 5 phases:
-//! Bootstrap, Policy Templates, Users & Roles, API Tokens, Services.
+//! Implements `waxterm::TerminalApp` to drive the wizard through 6 phases:
+//! Install, Bootstrap, Policy Templates, Users & Roles, API Tokens, Services.
 
 pub mod backend;
 pub mod phases;
@@ -15,7 +15,9 @@ use ratatui::Frame;
 use waxterm::input::KeyPress;
 use waxterm::widgets::{ConfirmDialog, MultiSelectList, SelectList, TextInput, WidgetResult};
 
-use backend::{BootstrapPoll, OpStatus, WizardBackend};
+use backend::{
+    BootstrapPoll, InstallAction, InstallPoll, LibtorchVariant, OpStatus, RunMode, WizardBackend,
+};
 use phases::*;
 
 /// Wizard command type — just wraps KeyPress.
@@ -55,6 +57,7 @@ pub struct WizardApp<B: WizardBackend> {
     phase: WizardPhase,
     quit: bool,
     // Accumulated state across phases
+    install_summary: Option<String>,
     templates_applied: Vec<String>,
     users_created: Vec<UserRecord>,
     tokens_generated: Vec<TokenRecord>,
@@ -66,14 +69,17 @@ pub struct WizardApp<B: WizardBackend> {
     // Token generation queue
     token_queue: Vec<String>,
     token_queue_idx: usize,
+    // Install phase transient state
+    install_variant: Option<LibtorchVariant>,
 }
 
 impl<B: WizardBackend> WizardApp<B> {
     pub fn new(backend: B) -> Self {
         Self {
             backend,
-            phase: WizardPhase::Bootstrap(BootstrapScreen::new()),
+            phase: WizardPhase::Install(InstallScreen::Detecting),
             quit: false,
+            install_summary: None,
             templates_applied: Vec::new(),
             users_created: Vec::new(),
             tokens_generated: Vec::new(),
@@ -83,22 +89,25 @@ impl<B: WizardBackend> WizardApp<B> {
             pending_resource: String::new(),
             token_queue: Vec::new(),
             token_queue_idx: 0,
+            install_variant: None,
         }
     }
 
     fn phase_number(&self) -> u8 {
         match &self.phase {
-            WizardPhase::Bootstrap(_) => 1,
-            WizardPhase::PolicyTemplate(_) => 2,
-            WizardPhase::Users(_) => 3,
-            WizardPhase::Tokens(_) => 4,
-            WizardPhase::Services(_) => 5,
-            WizardPhase::Summary(_) => 5,
+            WizardPhase::Install(_) => 1,
+            WizardPhase::Bootstrap(_) => 2,
+            WizardPhase::PolicyTemplate(_) => 3,
+            WizardPhase::Users(_) => 4,
+            WizardPhase::Tokens(_) => 5,
+            WizardPhase::Services(_) => 6,
+            WizardPhase::Summary(_) => 6,
         }
     }
 
     fn phase_name(&self) -> &str {
         match &self.phase {
+            WizardPhase::Install(_) => "Install / Update",
             WizardPhase::Bootstrap(_) => "Environment Bootstrap",
             WizardPhase::PolicyTemplate(_) => "Policy Template",
             WizardPhase::Users(_) => "Users & Roles",
@@ -106,6 +115,10 @@ impl<B: WizardBackend> WizardApp<B> {
             WizardPhase::Services(_) => "Services",
             WizardPhase::Summary(_) => "Setup Complete",
         }
+    }
+
+    fn advance_to_bootstrap(&mut self) {
+        self.phase = WizardPhase::Bootstrap(BootstrapScreen::new());
     }
 
     fn advance_to_policy(&mut self) {
@@ -163,11 +176,32 @@ impl<B: WizardBackend> WizardApp<B> {
 
     fn advance_to_summary(&mut self) {
         self.phase = WizardPhase::Summary(SummaryScreen {
+            install_result: self.install_summary.clone(),
             templates_applied: self.templates_applied.clone(),
             users_created: self.users_created.clone(),
             tokens_generated: self.tokens_generated.clone(),
             services_started: self.services_started,
         });
+    }
+
+    fn make_variant_select() -> SelectList<String> {
+        let options: Vec<String> = LibtorchVariant::all()
+            .iter()
+            .map(|v| format!("{} ({})", v.label(), v.id()))
+            .collect();
+        SelectList::new("Select variant:", options)
+    }
+
+    fn variant_from_selection(selection: &str) -> LibtorchVariant {
+        if selection.contains("cuda128") {
+            LibtorchVariant::Cuda128
+        } else if selection.contains("cuda130") {
+            LibtorchVariant::Cuda130
+        } else if selection.contains("rocm71") {
+            LibtorchVariant::Rocm71
+        } else {
+            LibtorchVariant::Cpu
+        }
     }
 
     fn make_role_select() -> SelectList<String> {
@@ -241,14 +275,15 @@ impl<B: WizardBackend> waxterm::TerminalApp for WizardApp<B> {
         // to avoid double-mutable-borrow in the handler methods (which use mem::replace).
         let phase_num = self.phase_number();
         match phase_num {
-            1 => {
+            1 => self.handle_install_input(&key),
+            2 => {
                 // Bootstrap is tick-driven, no input needed
                 false
             }
-            2 => self.handle_policy_input(&key),
-            3 => self.handle_users_input(&key),
-            4 => self.handle_tokens_input(&key),
-            5 => {
+            3 => self.handle_policy_input(&key),
+            4 => self.handle_users_input(&key),
+            5 => self.handle_tokens_input(&key),
+            6 => {
                 if matches!(&self.phase, WizardPhase::Summary(_)) {
                     if key == KeyPress::Enter {
                         self.quit = true;
@@ -264,6 +299,72 @@ impl<B: WizardBackend> waxterm::TerminalApp for WizardApp<B> {
 
     fn tick(&mut self, _delta_ms: u64) -> bool {
         match &mut self.phase {
+            WizardPhase::Install(screen) => match screen {
+                InstallScreen::Detecting => {
+                    let env = self.backend.detect_environment();
+                    let action = self.backend.recommend_action(&env);
+                    // Auto-skip for AppImage and Development modes
+                    match &action {
+                        InstallAction::Skip { .. } => {
+                            self.phase = WizardPhase::Install(InstallScreen::Skipped);
+                            self.advance_to_bootstrap();
+                            return true;
+                        }
+                        InstallAction::AlreadyCurrent => {
+                            self.install_summary =
+                                Some(format!("Already running optimal variant ({})", env.current_variant));
+                            self.phase = WizardPhase::Install(InstallScreen::Done(
+                                format!("Already running {} — no changes needed", env.current_variant),
+                            ));
+                            // Don't auto-advance; let user press Enter
+                        }
+                        InstallAction::UpgradeVariant(_) => {}
+                    }
+                    if !matches!(self.phase, WizardPhase::Install(InstallScreen::Done(_))) {
+                        self.phase = WizardPhase::Install(InstallScreen::ShowFindings {
+                            env,
+                            action,
+                        });
+                    }
+                    true
+                }
+                InstallScreen::Installing {
+                    variant,
+                    progress_pct,
+                    status_msg,
+                } => {
+                    match self.backend.poll_install() {
+                        InstallPoll::Downloading { item, pct } => {
+                            *progress_pct = pct;
+                            *status_msg = format!("Downloading {item}...");
+                            true
+                        }
+                        InstallPoll::Extracting { item } => {
+                            *status_msg = format!("Extracting {item}...");
+                            true
+                        }
+                        InstallPoll::Configuring { step } => {
+                            *status_msg = step;
+                            *progress_pct = 100;
+                            true
+                        }
+                        InstallPoll::Done { summary } => {
+                            self.install_summary = Some(summary.clone());
+                            let v = variant.clone();
+                            self.phase = WizardPhase::Install(InstallScreen::Done(
+                                format!("{} variant installed — {summary}", v.label()),
+                            ));
+                            true
+                        }
+                        InstallPoll::Failed(msg) => {
+                            self.phase = WizardPhase::Install(InstallScreen::Failed(msg));
+                            true
+                        }
+                        InstallPoll::Detecting => true,
+                    }
+                }
+                _ => false,
+            },
             WizardPhase::Bootstrap(screen) => {
                 if !screen.started {
                     screen.started = true;
@@ -326,6 +427,144 @@ impl<B: WizardBackend> waxterm::TerminalApp for WizardApp<B> {
 // We use a pattern of taking the phase enum, matching, then reassigning.
 
 impl<B: WizardBackend> WizardApp<B> {
+    fn handle_install_input(&mut self, key: &KeyPress) -> bool {
+        let phase = std::mem::replace(
+            &mut self.phase,
+            WizardPhase::Install(InstallScreen::Skipped),
+        );
+
+        let WizardPhase::Install(screen) = phase else {
+            return false;
+        };
+
+        match screen {
+            InstallScreen::Detecting => {
+                // Tick-driven, no input needed
+                self.phase = WizardPhase::Install(InstallScreen::Detecting);
+                false
+            }
+            InstallScreen::ShowFindings { env, action } => {
+                match key {
+                    KeyPress::Enter => {
+                        // Accept recommendation
+                        if let InstallAction::UpgradeVariant(ref variant) = action {
+                            let v = variant.clone();
+                            self.install_variant = Some(v.clone());
+                            self.backend.start_install(&v);
+                            self.phase = WizardPhase::Install(InstallScreen::Installing {
+                                variant: v,
+                                progress_pct: 0,
+                                status_msg: "Starting download...".to_string(),
+                            });
+                        } else {
+                            // Skip/AlreadyCurrent — advance
+                            self.advance_to_bootstrap();
+                        }
+                    }
+                    KeyPress::Char(b's') => {
+                        // Skip
+                        self.phase = WizardPhase::Install(InstallScreen::Skipped);
+                        self.advance_to_bootstrap();
+                    }
+                    KeyPress::Char(b'v') => {
+                        // Choose variant manually
+                        self.phase = WizardPhase::Install(InstallScreen::SelectVariant(
+                            Self::make_variant_select(),
+                        ));
+                    }
+                    _ => {
+                        // Put it back
+                        self.phase = WizardPhase::Install(InstallScreen::ShowFindings {
+                            env,
+                            action,
+                        });
+                        return false;
+                    }
+                }
+                true
+            }
+            InstallScreen::SelectVariant(mut list) => {
+                match list.handle_key(key) {
+                    WidgetResult::Confirmed(selection) => {
+                        let variant = Self::variant_from_selection(&selection);
+                        self.install_variant = Some(variant.clone());
+                        self.backend.start_install(&variant);
+                        self.phase = WizardPhase::Install(InstallScreen::Installing {
+                            variant,
+                            progress_pct: 0,
+                            status_msg: "Starting download...".to_string(),
+                        });
+                    }
+                    WidgetResult::Cancelled => {
+                        self.phase = WizardPhase::Install(InstallScreen::Skipped);
+                        self.advance_to_bootstrap();
+                    }
+                    WidgetResult::Pending => {
+                        self.phase =
+                            WizardPhase::Install(InstallScreen::SelectVariant(list));
+                    }
+                }
+                true
+            }
+            InstallScreen::Installing {
+                variant,
+                progress_pct,
+                status_msg,
+            } => {
+                // Tick-driven, no user input
+                self.phase = WizardPhase::Install(InstallScreen::Installing {
+                    variant,
+                    progress_pct,
+                    status_msg,
+                });
+                false
+            }
+            InstallScreen::Done(_msg) => {
+                if *key == KeyPress::Enter {
+                    self.advance_to_bootstrap();
+                    true
+                } else {
+                    self.phase = WizardPhase::Install(InstallScreen::Done(_msg));
+                    false
+                }
+            }
+            InstallScreen::Skipped => {
+                self.advance_to_bootstrap();
+                true
+            }
+            InstallScreen::Failed(msg) => {
+                match key {
+                    KeyPress::Char(b'r') => {
+                        // Retry
+                        if let Some(ref variant) = self.install_variant {
+                            let v = variant.clone();
+                            self.backend.start_install(&v);
+                            self.phase = WizardPhase::Install(InstallScreen::Installing {
+                                variant: v,
+                                progress_pct: 0,
+                                status_msg: "Retrying download...".to_string(),
+                            });
+                        } else {
+                            self.phase = WizardPhase::Install(InstallScreen::Detecting);
+                        }
+                    }
+                    KeyPress::Char(b's') => {
+                        self.phase = WizardPhase::Install(InstallScreen::Skipped);
+                        self.advance_to_bootstrap();
+                    }
+                    KeyPress::Char(b'q') => {
+                        self.quit = true;
+                    }
+                    _ => {
+                        self.phase = WizardPhase::Install(InstallScreen::Failed(msg));
+                        return false;
+                    }
+                }
+                true
+            }
+        }
+    }
+
     fn handle_policy_input(&mut self, key: &KeyPress) -> bool {
         // Take the phase to work around the borrow
         let phase = std::mem::replace(
@@ -679,7 +918,7 @@ fn render_header(frame: &mut Frame, area: Rect) {
 }
 
 fn render_phase_indicator(frame: &mut Frame, area: Rect, current: u8, name: &str) {
-    let phases = ["Bootstrap", "Policy", "Users", "Tokens", "Services"];
+    let phases = ["Install", "Bootstrap", "Policy", "Users", "Tokens", "Services"];
     let mut spans = vec![Span::raw("  ")];
     for (i, label) in phases.iter().enumerate() {
         let num = (i + 1) as u8;
@@ -714,6 +953,22 @@ fn render_separator(frame: &mut Frame, area: Rect) {
 
 fn render_footer(frame: &mut Frame, area: Rect, phase: &WizardPhase) {
     let hint = match phase {
+        WizardPhase::Install(screen) => match screen {
+            InstallScreen::Detecting => "  Detecting environment...",
+            InstallScreen::ShowFindings { action, .. } => match action {
+                InstallAction::UpgradeVariant(_) => {
+                    "  [Enter] Install  [s] Skip  [v] Choose variant"
+                }
+                _ => "  [Enter] Continue",
+            },
+            InstallScreen::SelectVariant(_) => {
+                "  Arrow keys to navigate, Enter to select, Esc to skip"
+            }
+            InstallScreen::Installing { .. } => "  Downloading and installing...",
+            InstallScreen::Done(_) => "  [Enter] Continue",
+            InstallScreen::Skipped => "  Skipping...",
+            InstallScreen::Failed(_) => "  [r] Retry  [s] Skip  [q] Quit",
+        },
         WizardPhase::Bootstrap(_) => "  Bootstrapping environment...",
         WizardPhase::PolicyTemplate(_) => "  Arrow keys to navigate, Enter to select, Esc to skip",
         WizardPhase::Users(_) => "  Arrow keys to navigate, Enter to confirm, Esc to skip",
@@ -738,6 +993,9 @@ impl<B: WizardBackend> WizardApp<B> {
         };
 
         match &self.phase {
+            WizardPhase::Install(screen) => {
+                render_install(frame, content_area, screen);
+            }
             WizardPhase::Bootstrap(screen) => {
                 render_bootstrap(frame, content_area, screen);
             }
@@ -756,6 +1014,163 @@ impl<B: WizardBackend> WizardApp<B> {
             WizardPhase::Summary(screen) => {
                 render_summary(frame, content_area, screen);
             }
+        }
+    }
+}
+
+fn render_install(frame: &mut Frame, area: Rect, screen: &InstallScreen) {
+    use backend::{GpuKind, LIBTORCH_VERSION};
+
+    match screen {
+        InstallScreen::Detecting => {
+            let lines = vec![
+                Line::from(vec![
+                    Span::styled("  > ", Style::default().fg(Color::Yellow)),
+                    Span::styled("Detecting environment...", Style::default().fg(Color::Yellow)),
+                ]),
+            ];
+            frame.render_widget(Paragraph::new(lines), area);
+        }
+        InstallScreen::ShowFindings { env, action } => {
+            let mut lines = vec![
+                Line::from(Span::styled(
+                    "Environment Detection",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    "-".repeat(30),
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ];
+
+            let run_mode_str = match &env.run_mode {
+                RunMode::AppImage => "AppImage",
+                RunMode::BareBinary => "cargo install (bare binary)",
+                RunMode::Development => "development (cargo)",
+            };
+            lines.push(Line::from(format!("Run mode:    {run_mode_str}")));
+
+            let gpu_str = match &env.gpu {
+                GpuKind::Nvidia {
+                    driver_version,
+                    cuda_compat,
+                } => format!("NVIDIA (driver {driver_version}) -> {cuda_compat}"),
+                GpuKind::Amd { rocm_version } => {
+                    if let Some(ver) = rocm_version {
+                        format!("AMD (ROCm {ver})")
+                    } else {
+                        "AMD (no ROCm)".to_string()
+                    }
+                }
+                GpuKind::None => "None".to_string(),
+            };
+            lines.push(Line::from(format!("GPU:         {gpu_str}")));
+            lines.push(Line::from(format!(
+                "libtorch:    {LIBTORCH_VERSION}+{} (compiled)",
+                env.current_variant.id()
+            )));
+
+            if let Some(ref installed) = env.installed_variant {
+                lines.push(Line::from(format!("Installed:   {}", installed.label())));
+            } else {
+                lines.push(Line::from("Installed:   (none)"));
+            }
+
+            lines.push(Line::from(""));
+
+            match action {
+                InstallAction::UpgradeVariant(variant) => {
+                    lines.push(Line::from(Span::styled(
+                        "Recommendation",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )));
+                    lines.push(Line::from(Span::styled(
+                        "-".repeat(30),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                    lines.push(Line::from(format!(
+                        "Download GPU binary + libtorch ({}) (~2.5 GB)",
+                        variant.label()
+                    )));
+                    lines.push(Line::from("Enables GPU-accelerated inference."));
+                }
+                InstallAction::AlreadyCurrent => {
+                    lines.push(Line::from(Span::styled(
+                        "Already running the optimal variant.",
+                        Style::default().fg(Color::Green),
+                    )));
+                }
+                InstallAction::Skip { reason } => {
+                    lines.push(Line::from(Span::styled(
+                        format!("Skipping: {reason}"),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            }
+
+            frame.render_widget(Paragraph::new(lines), area);
+        }
+        InstallScreen::SelectVariant(list) => {
+            list.render(frame, area);
+        }
+        InstallScreen::Installing {
+            progress_pct,
+            status_msg,
+            ..
+        } => {
+            let bar_width = 40usize;
+            let filled = ((*progress_pct as usize) * bar_width) / 100;
+            let empty = bar_width - filled;
+            let bar = format!(
+                "[{}{}] {:>3}%",
+                "#".repeat(filled),
+                " ".repeat(empty),
+                progress_pct,
+            );
+
+            let lines = vec![
+                Line::from(Span::raw(format!("  {status_msg}"))),
+                Line::from(Span::styled(
+                    format!("  {bar}"),
+                    Style::default().fg(Color::Cyan),
+                )),
+            ];
+            frame.render_widget(Paragraph::new(lines), area);
+        }
+        InstallScreen::Done(msg) => {
+            let lines = vec![
+                Line::from(vec![
+                    Span::styled("  v ", Style::default().fg(Color::Green)),
+                    Span::raw(msg.as_str()),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Press Enter to continue...",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ];
+            frame.render_widget(Paragraph::new(lines), area);
+        }
+        InstallScreen::Skipped => {
+            let line = Line::from(Span::styled(
+                "  Skipped",
+                Style::default().fg(Color::DarkGray),
+            ));
+            frame.render_widget(Paragraph::new(line), area);
+        }
+        InstallScreen::Failed(msg) => {
+            let lines = vec![
+                Line::from(vec![
+                    Span::styled("  x ", Style::default().fg(Color::Red)),
+                    Span::styled(msg.as_str(), Style::default().fg(Color::Red)),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  [r] Retry  [s] Skip  [q] Quit",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ];
+            frame.render_widget(Paragraph::new(lines), area);
         }
     }
 }
@@ -933,6 +1348,10 @@ fn render_summary(frame: &mut Frame, area: Rect, screen: &SummaryScreen) {
         Line::from(""),
     ];
 
+    if let Some(ref install) = screen.install_result {
+        lines.push(Line::from(format!("Install: {install}")));
+    }
+
     if !screen.templates_applied.is_empty() {
         lines.push(Line::from(format!(
             "Templates: {}",
@@ -985,61 +1404,190 @@ fn render_summary(frame: &mut Frame, area: Rect, screen: &SummaryScreen) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use backend::MockWizardBackend;
+    use backend::{GpuKind, MockWizardBackend, RunMode};
     use waxterm::TerminalApp;
 
     fn make_app() -> WizardApp<MockWizardBackend> {
         WizardApp::new(MockWizardBackend::new())
     }
 
+    /// Advance past install phase (tick once to detect, then skip).
+    fn skip_install(app: &mut WizardApp<MockWizardBackend>) {
+        // First tick triggers detection → ShowFindings
+        app.tick(33);
+        assert_eq!(app.phase_number(), 1, "Should still be at Install after detection");
+        // Press 's' to skip
+        app.handle_input(WizardCommand::Key(KeyPress::Char(b's')));
+        assert_eq!(app.phase_number(), 2, "Should be at Bootstrap after skip");
+    }
+
+    /// Advance past bootstrap phase (tick until done).
+    fn complete_bootstrap(app: &mut WizardApp<MockWizardBackend>) {
+        for _ in 0..100 {
+            app.tick(33);
+            if app.phase_number() > 2 {
+                break;
+            }
+        }
+        assert!(app.phase_number() >= 3, "Should have advanced past bootstrap");
+    }
+
+    // ─── Install phase tests ─────────────────────────────────────────────
+
     #[test]
-    fn test_initial_phase_is_bootstrap() {
+    fn test_initial_phase_is_install() {
         let app = make_app();
         assert_eq!(app.phase_number(), 1);
+        assert!(matches!(app.phase, WizardPhase::Install(InstallScreen::Detecting)));
         assert!(!app.should_quit());
     }
 
     #[test]
-    fn test_bootstrap_auto_advances() {
+    fn test_install_detect_advances() {
         let mut app = make_app();
-        // Tick enough times for bootstrap to complete
-        for _ in 0..100 {
+        // Tick triggers detection
+        app.tick(33);
+        assert!(matches!(
+            app.phase,
+            WizardPhase::Install(InstallScreen::ShowFindings { .. })
+        ));
+    }
+
+    #[test]
+    fn test_install_skip() {
+        let mut app = make_app();
+        app.tick(33); // detect
+        // Press 's' to skip
+        app.handle_input(WizardCommand::Key(KeyPress::Char(b's')));
+        assert_eq!(app.phase_number(), 2, "Should advance to Bootstrap");
+    }
+
+    #[test]
+    fn test_install_confirm() {
+        let mut app = make_app();
+        app.tick(33); // detect → ShowFindings with UpgradeVariant(Cuda130)
+
+        // Press Enter to install
+        app.handle_input(WizardCommand::Key(KeyPress::Enter));
+        assert!(
+            matches!(app.phase, WizardPhase::Install(InstallScreen::Installing { .. })),
+            "Should be installing"
+        );
+
+        // Tick until done
+        for _ in 0..50 {
             app.tick(33);
-            if app.phase_number() > 1 {
+            if matches!(app.phase, WizardPhase::Install(InstallScreen::Done(_))) {
                 break;
             }
         }
-        assert!(app.phase_number() >= 2, "Should have advanced past bootstrap");
+        assert!(matches!(app.phase, WizardPhase::Install(InstallScreen::Done(_))));
+
+        // Press Enter to advance
+        app.handle_input(WizardCommand::Key(KeyPress::Enter));
+        assert_eq!(app.phase_number(), 2, "Should advance to Bootstrap");
+        assert!(app.install_summary.is_some());
+    }
+
+    #[test]
+    fn test_install_select_variant() {
+        let mut app = make_app();
+        app.tick(33); // detect
+
+        // Press 'v' to pick variant
+        app.handle_input(WizardCommand::Key(KeyPress::Char(b'v')));
+        assert!(matches!(
+            app.phase,
+            WizardPhase::Install(InstallScreen::SelectVariant(_))
+        ));
+
+        // Select first option (CPU)
+        app.handle_input(WizardCommand::Key(KeyPress::Enter));
+        assert!(matches!(
+            app.phase,
+            WizardPhase::Install(InstallScreen::Installing { .. })
+        ));
+    }
+
+    #[test]
+    fn test_install_appimage_auto_skip() {
+        let backend = MockWizardBackend::new().with_run_mode(RunMode::AppImage);
+        let mut app = WizardApp::new(backend);
+
+        // Tick triggers detection → auto-skip for AppImage
+        app.tick(33);
+        assert_eq!(
+            app.phase_number(),
+            2,
+            "AppImage should auto-skip to Bootstrap"
+        );
+    }
+
+    #[test]
+    fn test_install_already_current() {
+        // No GPU → recommends CPU, compiled variant is CPU → AlreadyCurrent
+        let backend = MockWizardBackend::new().with_gpu(GpuKind::None);
+        let mut app = WizardApp::new(backend);
+
+        app.tick(33); // detect → AlreadyCurrent → Done
+        assert!(
+            matches!(app.phase, WizardPhase::Install(InstallScreen::Done(_))),
+            "Should show Done for already-current"
+        );
+
+        // Enter to continue
+        app.handle_input(WizardCommand::Key(KeyPress::Enter));
+        assert_eq!(app.phase_number(), 2);
+    }
+
+    #[test]
+    fn test_install_development_auto_skip() {
+        let backend = MockWizardBackend::new().with_run_mode(RunMode::Development);
+        let mut app = WizardApp::new(backend);
+
+        app.tick(33);
+        assert_eq!(
+            app.phase_number(),
+            2,
+            "Development mode should auto-skip to Bootstrap"
+        );
+    }
+
+    // ─── Existing tests updated for new phase numbering ──────────────────
+
+    #[test]
+    fn test_bootstrap_auto_advances() {
+        let mut app = make_app();
+        skip_install(&mut app);
+        complete_bootstrap(&mut app);
+        assert!(app.phase_number() >= 3, "Should have advanced past bootstrap");
     }
 
     #[test]
     fn test_full_flow_skip_everything() {
         let mut app = make_app();
 
+        // Install: skip
+        skip_install(&mut app);
+
         // Bootstrap
-        for _ in 0..100 {
-            app.tick(33);
-            if app.phase_number() > 1 {
-                break;
-            }
-        }
-        assert_eq!(app.phase_number(), 2);
+        complete_bootstrap(&mut app);
+        assert_eq!(app.phase_number(), 3);
 
         // Policy: select "None — skip template" (last option)
-        // Navigate down to last option
         for _ in 0..5 {
             app.handle_input(WizardCommand::Key(KeyPress::ArrowDown));
         }
         app.handle_input(WizardCommand::Key(KeyPress::Enter));
-        assert_eq!(app.phase_number(), 3, "Should be at Users phase");
+        assert_eq!(app.phase_number(), 4, "Should be at Users phase");
 
         // Users: decline to add user (press 'n')
         app.handle_input(WizardCommand::Key(KeyPress::Char(b'n')));
-        assert_eq!(app.phase_number(), 4, "Should be at Tokens phase");
+        assert_eq!(app.phase_number(), 5, "Should be at Tokens phase");
 
         // Tokens: decline to generate (press 'n')
         app.handle_input(WizardCommand::Key(KeyPress::Char(b'n')));
-        assert_eq!(app.phase_number(), 5, "Should be at Services phase");
+        assert_eq!(app.phase_number(), 6, "Should be at Services phase");
 
         // Services: decline to start (press 'n')
         app.handle_input(WizardCommand::Key(KeyPress::Char(b'n')));
@@ -1053,16 +1601,41 @@ mod tests {
     }
 
     #[test]
-    fn test_select_template() {
+    fn test_full_flow_with_install() {
         let mut app = make_app();
 
-        // Bootstrap
-        for _ in 0..100 {
+        // Install: detect → confirm → tick through → done → advance
+        app.tick(33);
+        app.handle_input(WizardCommand::Key(KeyPress::Enter)); // install
+        for _ in 0..50 {
             app.tick(33);
-            if app.phase_number() > 1 {
+            if matches!(app.phase, WizardPhase::Install(InstallScreen::Done(_))) {
                 break;
             }
         }
+        app.handle_input(WizardCommand::Key(KeyPress::Enter)); // continue
+        assert_eq!(app.phase_number(), 2);
+
+        // Bootstrap
+        complete_bootstrap(&mut app);
+
+        // Skip remaining phases
+        app.handle_input(WizardCommand::Key(KeyPress::Escape)); // policy
+        app.handle_input(WizardCommand::Key(KeyPress::Char(b'n'))); // users
+        app.handle_input(WizardCommand::Key(KeyPress::Char(b'n'))); // tokens
+        app.handle_input(WizardCommand::Key(KeyPress::Char(b'n'))); // services
+
+        assert!(matches!(app.phase, WizardPhase::Summary(_)));
+        if let WizardPhase::Summary(ref s) = app.phase {
+            assert!(s.install_result.is_some());
+        }
+    }
+
+    #[test]
+    fn test_select_template() {
+        let mut app = make_app();
+        skip_install(&mut app);
+        complete_bootstrap(&mut app);
 
         // Select first template (local)
         app.handle_input(WizardCommand::Key(KeyPress::Enter));
@@ -1075,14 +1648,9 @@ mod tests {
     #[test]
     fn test_quit_at_summary() {
         let mut app = make_app();
+        skip_install(&mut app);
+        complete_bootstrap(&mut app);
 
-        // Fast-forward to summary
-        for _ in 0..100 {
-            app.tick(33);
-            if app.phase_number() > 1 {
-                break;
-            }
-        }
         // Skip all phases
         app.handle_input(WizardCommand::Key(KeyPress::Escape)); // policy
         app.handle_input(WizardCommand::Key(KeyPress::Char(b'n'))); // users

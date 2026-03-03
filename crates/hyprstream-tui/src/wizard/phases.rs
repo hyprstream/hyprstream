@@ -2,10 +2,11 @@
 
 use waxterm::widgets::{ConfirmDialog, MultiSelectList, SelectList, TextInput};
 
-use super::backend::TemplateInfo;
+use super::backend::{EnvironmentInfo, InstallAction, LibtorchVariant, TemplateInfo};
 
 /// Top-level wizard phase.
 pub enum WizardPhase {
+    Install(InstallScreen),
     Bootstrap(BootstrapScreen),
     PolicyTemplate(PolicyScreen),
     Users(UserScreen),
@@ -15,7 +16,35 @@ pub enum WizardPhase {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Phase 1: Bootstrap
+// Phase 1: Install / Update
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub enum InstallScreen {
+    /// Auto-detecting environment.
+    Detecting,
+    /// Show findings and recommendation.
+    ShowFindings {
+        env: EnvironmentInfo,
+        action: InstallAction,
+    },
+    /// User chose to pick variant manually.
+    SelectVariant(SelectList<String>),
+    /// Download + install in progress.
+    Installing {
+        variant: LibtorchVariant,
+        progress_pct: u8,
+        status_msg: String,
+    },
+    /// Completed.
+    Done(String),
+    /// User skipped.
+    Skipped,
+    /// Failed with option to retry.
+    Failed(String),
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 2: Bootstrap
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub struct BootstrapScreen {
@@ -45,7 +74,7 @@ impl BootstrapScreen {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Phase 2: Policy Template
+// Phase 3: Policy Template
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub enum PolicyScreen {
@@ -72,7 +101,7 @@ impl PolicyScreen {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Phase 3: Users & Roles
+// Phase 4: Users & Roles
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub enum UserScreen {
@@ -108,7 +137,7 @@ pub struct TokenRecord {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Phase 4: Tokens
+// Phase 5: Tokens
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub enum TokenScreen {
@@ -125,7 +154,7 @@ pub enum TokenScreen {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Phase 5: Services
+// Phase 6: Services
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub enum ServiceScreen {
@@ -142,6 +171,7 @@ pub enum ServiceScreen {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub struct SummaryScreen {
+    pub install_result: Option<String>,
     pub templates_applied: Vec<String>,
     pub users_created: Vec<UserRecord>,
     pub tokens_generated: Vec<TokenRecord>,

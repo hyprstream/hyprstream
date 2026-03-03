@@ -107,6 +107,23 @@ const PREDEFINED_ROLES: &[RoleDef] = &[
 // Entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Handle `hyprstream wizard --tui` — TUI setup wizard with bootstrap manager.
+///
+/// Runs the TUI on a blocking thread so that `BootstrapManager`'s synchronous
+/// trait methods can safely call `block_on` without panicking inside Tokio.
+pub async fn handle_wizard_tui(models_dir: &Path) -> Result<()> {
+    let rt = tokio::runtime::Handle::current();
+    let models_dir = models_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let backend =
+            crate::cli::bootstrap_manager::BootstrapManager::new(rt, models_dir);
+        let app = hyprstream_tui::wizard::WizardApp::new(backend);
+        waxterm::run_sync(app, waxterm::TerminalConfig::new())
+    })
+    .await??;
+    Ok(())
+}
+
 /// Handle `hyprstream wizard` — interactive setup wizard
 pub async fn handle_wizard(
     models_dir: &Path,
@@ -342,7 +359,7 @@ async fn phase_users(state: &mut WizardState, non_interactive: bool) -> Result<(
                 .context("Resource input cancelled")?;
 
             let actions = &["infer", "train", "query", "write", "serve", "manage"];
-            let action_options: Vec<String> = actions.iter().map(|a| (*a).to_string()).collect();
+            let action_options: Vec<String> = actions.iter().map(|a| (*a).to_owned()).collect();
 
             let selected_actions = inquire::MultiSelect::new(
                 "  Actions to allow:",
