@@ -142,6 +142,7 @@ pub struct InferenceServiceInner {
     /// Handles DH key exchange, pre-authorization, and publishing.
     stream_channel: Option<StreamChannel>,
     /// Server's Ed25519 verifying key for signature verification
+    #[allow(dead_code)] // Reserved for callback-mode signature verification
     server_pubkey: VerifyingKey,
     /// Service signing key for stream registration (generated at init)
     #[allow(dead_code)] // Used by callback mode; standard mode passes key to InferenceZmqAdapter

@@ -48,7 +48,7 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, trace, warn};
+use tracing::{trace, warn};
 use uuid::Uuid;
 
 // ═══════════════════════════════════════════════════════════════════════════════

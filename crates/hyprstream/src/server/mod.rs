@@ -94,7 +94,7 @@ async fn oauth_protected_resource_metadata() -> impl IntoResponse {
         &oai_url,
         &oauth_issuer,
     );
-    meta.resource_name = Some("HyprStream OpenAI-Compatible API".to_string());
+    meta.resource_name = Some("HyprStream OpenAI-Compatible API".to_owned());
     meta.scopes_supported = Some(vec!["infer:model:*".into(), "read:model:*".into()]);
     Json(meta)
 }

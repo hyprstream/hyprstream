@@ -513,7 +513,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                                 &mcp_resource_url,
                                 &mcp_oauth_issuer,
                             );
-                            meta.resource_name = Some("HyprStream MCP Server".to_string());
+                            meta.resource_name = Some("HyprStream MCP Server".to_owned());
                             meta.scopes_supported = Some(vec![
                                 "read:model:*".into(),
                                 "infer:model:*".into(),

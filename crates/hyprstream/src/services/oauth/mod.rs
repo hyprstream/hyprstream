@@ -95,7 +95,7 @@ async fn oauth_self_protected_resource_metadata() -> axum::Json<ProtectedResourc
     let config = crate::config::HyprConfig::load().unwrap_or_default();
     let issuer_url = config.oauth.issuer_url();
     let mut meta = protected_resource_metadata(&issuer_url, &issuer_url);
-    meta.resource_name = Some("HyprStream OAuth 2.1 Authorization Server".to_string());
+    meta.resource_name = Some("HyprStream OAuth 2.1 Authorization Server".to_owned());
     meta.scopes_supported = Some(vec![
         "openid".into(),
         "read:*:*".into(),
@@ -241,9 +241,9 @@ pub struct ProtectedResourceMetadata {
 /// Used by MCP and OAI servers to advertise their OAuth authorization server.
 pub fn protected_resource_metadata(resource_url: &str, oauth_issuer_url: &str) -> ProtectedResourceMetadata {
     ProtectedResourceMetadata {
-        resource: resource_url.to_string(),
-        authorization_servers: vec![oauth_issuer_url.to_string()],
-        bearer_methods_supported: Some(vec!["header".to_string()]),
+        resource: resource_url.to_owned(),
+        authorization_servers: vec![oauth_issuer_url.to_owned()],
+        bearer_methods_supported: Some(vec!["header".to_owned()]),
         scopes_supported: None,
         resource_name: None,
         resource_documentation: None,
@@ -263,7 +263,7 @@ mod tests {
         );
         assert_eq!(meta.resource, "http://localhost:6790");
         assert_eq!(meta.authorization_servers[0], "http://localhost:6791");
-        assert_eq!(meta.bearer_methods_supported.as_deref(), Some(&["header".to_string()][..]));
+        assert_eq!(meta.bearer_methods_supported.as_deref(), Some(&["header".to_owned()][..]));
     }
 
     #[test]
