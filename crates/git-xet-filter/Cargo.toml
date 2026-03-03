@@ -47,6 +47,9 @@ cas-serve = { path = "../cas-serve", optional = true }
 base64 = { version = "0.22", optional = true }
 dirs = { version = "5.0", optional = true }
 
+# Gittorrent P2P transport (optional)
+gittorrent = { path = "../gittorrent", optional = true }
+
 [dev-dependencies]
 tokio-test.workspace = true
 tracing-subscriber.workspace = true
@@ -59,6 +62,8 @@ default = ["xet-storage"]
 xet-storage = ["data", "cas_client", "cas_object", "merklehash", "async-trait"]
 # Enable SSH transport for self-hosted CAS servers
 ssh-transport = ["xet-storage", "russh", "russh-keys", "cas-serve", "base64", "dirs"]
+# Enable gittorrent P2P transport
+gittorrent-transport = ["xet-storage", "gittorrent"]
 
 [lints]
 workspace = true

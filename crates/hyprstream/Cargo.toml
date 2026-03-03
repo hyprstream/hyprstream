@@ -130,6 +130,8 @@ notify = { version = "7", default-features = false, features = ["macos_kqueue"] 
 libc = "0.2"  # For system calls in overlay2 driver
 reflink-copy = "0.1"  # COW file copying (reflink when available)
 hyprstream-containedfs.workspace = true  # Path-contained filesystem operations
+hyprstream-tui = { path = "../hyprstream-tui" }  # Setup wizard TUI (WizardBackend trait + WizardApp)
+waxterm = { path = "../waxterm" }  # Terminal abstraction for TUI rendering
 
 [target.'cfg(target_os = "linux")'.dependencies]
 lru.workspace = true  # LRU cache for model caching and Git repository handles

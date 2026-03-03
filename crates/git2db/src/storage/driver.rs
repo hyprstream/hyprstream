@@ -61,6 +61,15 @@ pub struct DriverOpts {
 
     /// Optional progress reporter for smudge/checkout progress
     pub progress: Option<Arc<dyn crate::callback_config::ProgressReporter>>,
+
+    /// Optional pathspec filter for selective checkout.
+    ///
+    /// When set, only files matching these path prefixes are materialized in the
+    /// worktree. Excluded entries get the `SKIP_WORKTREE` index bit so they won't
+    /// be re-materialized by subsequent `checkout_head()` calls.
+    ///
+    /// Example: `vec!["backends/cuda130/".into(), "manifest.toml".into()]`
+    pub checkout_paths: Option<Vec<String>>,
 }
 
 impl Clone for DriverOpts {
@@ -70,6 +79,7 @@ impl Clone for DriverOpts {
             worktree_path: self.worktree_path.clone(),
             ref_spec: self.ref_spec.clone(),
             progress: self.progress.clone(),
+            checkout_paths: self.checkout_paths.clone(),
         }
     }
 }
@@ -81,6 +91,7 @@ impl fmt::Debug for DriverOpts {
             .field("worktree_path", &self.worktree_path)
             .field("ref_spec", &self.ref_spec)
             .field("progress", &self.progress.as_ref().map(|_| "<reporter>"))
+            .field("checkout_paths", &self.checkout_paths)
             .finish()
     }
 }

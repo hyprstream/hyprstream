@@ -39,6 +39,9 @@ pub mod callbacks;
 #[cfg(feature = "ssh-transport")]
 pub mod ssh_client;
 
+#[cfg(feature = "gittorrent-transport")]
+pub mod gittorrent_storage;
+
 #[cfg(feature = "xet-storage")]
 use tokio::sync::OnceCell;
 

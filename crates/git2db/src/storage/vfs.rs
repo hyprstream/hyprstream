@@ -10,7 +10,7 @@ use super::driver::{Driver, DriverOpts, WorktreeHandle, DriverFactory};
 use crate::errors::{Git2DBError, Git2DBResult};
 use async_trait::async_trait;
 use std::path::Path;
-use tracing::info;
+use tracing::{info, warn};
 
 inventory::submit!(DriverFactory::new(
     "vfs",
@@ -119,10 +119,170 @@ impl Driver for VfsDriver {
     }
 }
 
+/// Skip-worktree flag in git index extended flags.
+///
+/// When set on an index entry, `checkout_head()` will not overwrite the
+/// (absent) working-tree file, preventing re-materialization of filtered-out
+/// paths on subsequent checkouts.
+pub(crate) const GIT_INDEX_ENTRY_SKIP_WORKTREE: u16 = 0x4000;
+
+/// Check whether `path` matches any of the `keep_paths` with proper path-boundary semantics.
+///
+/// A keep_path ending with `/` is a directory prefix: `backends/cuda130/` matches
+/// `backends/cuda130/lib.so` but NOT `backends/cuda130_old/lib.so`.
+/// A keep_path without `/` suffix requires exact match or a `/`-separated prefix:
+/// `manifest.toml` matches `manifest.toml` but NOT `manifest.toml.bak`.
+fn path_matches_keep(path: &str, keep: &str) -> bool {
+    if keep.ends_with('/') {
+        path.starts_with(keep)
+    } else {
+        path == keep || path.starts_with(&format!("{keep}/"))
+    }
+}
+
+/// Apply pathspec filtering to a worktree after creation.
+///
+/// 1. Re-checkout with only the matching paths materialized
+/// 2. Remove working-tree files that don't match
+/// 3. Set skip-worktree bits on excluded index entries
+///
+/// Shared by VFS and overlay2 drivers.
+pub(crate) fn apply_pathspec_filter(
+    worktree_path: &std::path::Path,
+    keep_paths: &[String],
+) -> Git2DBResult<()> {
+    let wt_repo = git2::Repository::open(worktree_path)
+        .map_err(|e| Git2DBError::internal(format!("Failed to open worktree: {e}")))?;
+
+    info!(
+        "Applying pathspec filter to worktree at {}: {:?}",
+        worktree_path.display(),
+        keep_paths
+    );
+
+    // Step 1: Remove working-tree files that don't match keep_paths
+    {
+        let index = wt_repo.index().map_err(|e| {
+            Git2DBError::internal(format!("Failed to open index: {e}"))
+        })?;
+        for i in 0..index.len() {
+            let entry = match index.get(i) {
+                Some(e) => e,
+                None => continue,
+            };
+            let path = String::from_utf8_lossy(&entry.path).to_string();
+            let keep = keep_paths.iter().any(|p| path_matches_keep(&path, p));
+            if !keep {
+                let full_path = worktree_path.join(&path);
+                if full_path.exists() {
+                    if let Err(e) = std::fs::remove_file(&full_path) {
+                        warn!("Could not remove filtered path {}: {e}", full_path.display());
+                    }
+                }
+            }
+        }
+        // Clean up empty directories left behind
+        remove_empty_dirs(worktree_path);
+    }
+
+    // Step 2: Set skip-worktree bits on excluded index entries
+    mark_skip_worktree(&wt_repo, keep_paths)?;
+
+    let index = wt_repo.index().map_err(|e| {
+        Git2DBError::internal(format!("Failed to open index: {e}"))
+    })?;
+    let total = index.len();
+    let skipped = (0..total)
+        .filter(|i| {
+            index
+                .get(*i)
+                .map(|e| e.flags_extended & GIT_INDEX_ENTRY_SKIP_WORKTREE != 0)
+                .unwrap_or(false)
+        })
+        .count();
+
+    info!(
+        "Pathspec filter applied: {}/{} entries materialized, {} skipped",
+        total - skipped,
+        total,
+        skipped
+    );
+
+    Ok(())
+}
+
+/// Set `GIT_INDEX_ENTRY_SKIP_WORKTREE` on index entries that don't match
+/// the keep_paths prefixes. This prevents `checkout_head()` from
+/// re-materializing them on subsequent operations.
+pub(crate) fn mark_skip_worktree(
+    repo: &git2::Repository,
+    keep_paths: &[String],
+) -> Git2DBResult<()> {
+    let mut index = repo.index().map_err(|e| {
+        Git2DBError::internal(format!("Failed to open index: {e}"))
+    })?;
+
+    for i in 0..index.len() {
+        let entry = match index.get(i) {
+            Some(e) => e,
+            None => continue,
+        };
+        let path = String::from_utf8_lossy(&entry.path).to_string();
+        let dominated = keep_paths.iter().any(|p| path_matches_keep(&path, p));
+        if !dominated {
+            let mut modified = entry;
+            modified.flags_extended |= GIT_INDEX_ENTRY_SKIP_WORKTREE;
+            index.add(&modified).map_err(|e| {
+                Git2DBError::internal(format!(
+                    "Failed to set skip-worktree on '{}': {e}",
+                    path
+                ))
+            })?;
+        }
+    }
+
+    index.write().map_err(|e| {
+        Git2DBError::internal(format!("Failed to write index: {e}"))
+    })?;
+
+    Ok(())
+}
+
+/// Recursively remove empty directories under `root`, ignoring `.git`.
+fn remove_empty_dirs(root: &std::path::Path) {
+    fn walk(dir: &std::path::Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        let mut has_files = false;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            if name == ".git" {
+                has_files = true;
+                continue;
+            }
+            if path.is_dir() {
+                if walk(&path) {
+                    has_files = true;
+                } else {
+                    let _ = std::fs::remove_dir(&path);
+                }
+            } else {
+                has_files = true;
+            }
+        }
+        has_files
+    }
+    walk(root);
+}
+
 impl VfsDriver {
     /// Create git worktree using libgit2 with unified ref support
     ///
     /// Supports any git ref: branches, commits, tags, symbolic refs (HEAD~3), etc.
+    /// When `opts.checkout_paths` is set, only matching files are materialized
+    /// and excluded entries get skip-worktree bits.
     async fn create_git_worktree(&self, opts: &DriverOpts) -> Git2DBResult<()> {
         let base_repo = opts.base_repo.clone();
         let worktree_path = opts.worktree_path.clone();
@@ -208,7 +368,14 @@ impl VfsDriver {
             result
         })
         .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?;
+
+        // Apply pathspec filter if requested
+        if let Some(ref paths) = opts.checkout_paths {
+            apply_pathspec_filter(&opts.worktree_path, paths)?;
+        }
+
+        Ok(())
     }
 }
 
