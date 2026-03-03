@@ -227,6 +227,21 @@ fn generate_data_field_setter(
                 }
             }
         }
+        CapnpType::ListPrimitive(ref inner) if inner.is_list() => {
+            // Nested list: List(List(Float32)) → Vec<Vec<f32>>
+            let init_name = format_ident!("init_{}", field_snake);
+            quote! {
+                {
+                    let mut outer = builder.reborrow().#init_name(self.#rust_name.len() as u32);
+                    for (i, inner_vec) in self.#rust_name.iter().enumerate() {
+                        let mut inner_list = outer.reborrow().init(i as u32, inner_vec.len() as u32);
+                        for (j, val) in inner_vec.iter().enumerate() {
+                            inner_list.set(j as u32, *val);
+                        }
+                    }
+                }
+            }
+        }
         CapnpType::ListPrimitive(_) => {
             let init_name = format_ident!("init_{}", field_snake);
             quote! {
@@ -371,6 +386,20 @@ fn generate_data_field_reader(
                     let mut result = Vec::with_capacity(list.len() as usize);
                     for i in 0..list.len() {
                         result.push(list.get(i)?.to_vec());
+                    }
+                    result
+                },
+            }
+        }
+        CapnpType::ListPrimitive(ref inner) if inner.is_list() => {
+            // Nested list: List(List(Float32)) → Vec<Vec<f32>>
+            quote! {
+                #rust_name: {
+                    let outer_list = reader.#getter_name()?;
+                    let mut result = Vec::with_capacity(outer_list.len() as usize);
+                    for i in 0..outer_list.len() {
+                        let inner_list = outer_list.get(i)?;
+                        result.push(inner_list.iter().collect());
                     }
                     result
                 },

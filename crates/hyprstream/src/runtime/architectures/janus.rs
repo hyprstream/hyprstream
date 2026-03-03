@@ -1071,6 +1071,14 @@ impl ModelOperations for JanusModel {
         self.language_model.get_attention_mask(seq_len, past_kv_len)
     }
 
+    fn encode_vision(&self, pixel_values: &Tensor) -> Result<Tensor> {
+        let features = self.vision_encoder.forward(pixel_values)?;
+        // features shape depends on model: [B, num_patches, hidden_size]
+        // Mean pool over patches to get [B, hidden_size]
+        let pooled = features.mean_dim(1, false, tch::Kind::Float);
+        Ok(pooled)
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

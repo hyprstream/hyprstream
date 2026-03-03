@@ -71,7 +71,7 @@ impl CapnpType {
                     "Data" => Self::ListData,
                     _ => {
                         let inner_type = Self::classify(inner, structs, enums);
-                        if inner_type.is_numeric() {
+                        if inner_type.is_numeric() || inner_type.is_list() {
                             Self::ListPrimitive(Box::new(inner_type))
                         } else {
                             Self::ListStruct(inner.to_owned())
@@ -146,6 +146,17 @@ impl CapnpType {
                 | Self::ListPrimitive(_)
                 | Self::ListStruct(_)
                 | Self::Enum(_)
+        )
+    }
+
+    /// Whether this is a list type (for nested List(List(...)) support).
+    pub fn is_list(&self) -> bool {
+        matches!(
+            self,
+            Self::ListText
+                | Self::ListData
+                | Self::ListPrimitive(_)
+                | Self::ListStruct(_)
         )
     }
 

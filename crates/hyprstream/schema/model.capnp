@@ -112,6 +112,8 @@ struct InferRequest {
       $mcpDescription("Apply chat template to messages for a loaded model");
     status @3 :Void
       $mcpDescription("Get detailed status information about a model including online training configuration");
+    embed @4 :EmbedRequest
+      $mcpDescription("Compute embeddings for one or more images. Returns embedding vectors from the model's vision encoder (e.g. SigLIP). Synchronous — returns all embeddings in a single response.");
   }
 }
 
@@ -173,6 +175,7 @@ struct InferResponse {
     generateStream @1 :StreamInfo;
     applyChatTemplate @2 :Text;
     status @3 :ModelStatusResponse;
+    embed @4 :EmbedResponse;
   }
 }
 
@@ -223,6 +226,20 @@ struct GenerateRequest {
   tttGradientSteps @12 :UInt32 $optional $paramDescription("Override: number of gradient steps (0 = skip)");
   tttLearningRate @13 :Float32 $optional $paramDescription("Override: learning rate");
   autoCommit @14 :Bool $paramDescription("If true, server auto-commits based on its recommendation. If false (default), adaptation is pending until client commits.");
+}
+
+# Embedding request for vision models (e.g. SigLIP)
+struct EmbedRequest {
+  # Raw image bytes (PNG/JPEG/RGB) — one entry per image
+  images @0 :List(Data);
+}
+
+# Embedding response
+struct EmbedResponse {
+  # One embedding vector per input image
+  embeddings @0 :List(List(Float32));
+  # Embedding dimensionality (e.g. 384, 768)
+  dimensions @1 :UInt32;
 }
 
 # Response when model is loaded

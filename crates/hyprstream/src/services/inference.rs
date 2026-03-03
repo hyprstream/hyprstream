@@ -1907,7 +1907,7 @@ use crate::services::generated::inference_client::{
     HealthStatus, DeltaStatusResult, ModuleNormRatio,
     SaveAdaptationResult, SnapshotDeltaResult, ExportPeftResult,
     ChatTemplateRequest, LoraConfig, TrainStepRequest, SaveAdaptationRequest, ExportPeftRequest,
-    MergeLoraRequest,
+    MergeLoraRequest, EmbedImagesRequest, EmbedImagesResponse,
 };
 // Conflicting names — use canonical path at usage sites:
 //   inference_client::GenerationResult, inference_client::ModelInfo, inference_client::StreamInfo
@@ -2375,6 +2375,19 @@ impl InferenceHandler for InferenceService {
         });
         Ok((stream_info, continuation))
     }
+
+    async fn handle_embed(
+        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        data: &EmbedImagesRequest,
+    ) -> Result<InferenceResponseVariant> {
+        let engine = self.engine.read();
+        let embeddings = engine.embed_images(&data.images)?;
+        let dimensions = embeddings.first().map(|v| v.len() as u32).unwrap_or(0);
+        Ok(InferenceResponseVariant::EmbedResult(EmbedImagesResponse {
+            embeddings,
+            dimensions,
+        }))
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2811,6 +2824,12 @@ impl InferenceZmqClient {
     /// Release a session's KV cache
     pub async fn release_session(&self, session_id: &str) -> Result<()> {
         self.gen.release_session(session_id).await
+    }
+
+    /// Compute vision embeddings for images — delegates to generated client
+    pub async fn embed(&self, images: &[Vec<u8>]) -> Result<Vec<Vec<f32>>> {
+        let response = self.gen.embed(images).await?;
+        Ok(response.embeddings)
     }
 
     /// Request service shutdown

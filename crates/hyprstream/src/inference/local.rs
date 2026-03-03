@@ -250,6 +250,11 @@ impl LocalInferenceService {
                 let _ = reply.send(result);
             }
 
+            InferenceRequest::Embed { images, reply } => {
+                let result = self.handle_embed(images).await;
+                let _ = reply.send(result);
+            }
+
             InferenceRequest::HealthCheck { reply } => {
                 // Service is healthy if we can respond
                 let _ = reply.send(Ok(()));
@@ -313,6 +318,16 @@ impl LocalInferenceService {
                 let _ = stats_sender.send(StreamStats::default());
             }
         }
+    }
+
+    /// Handle embedding request.
+    async fn handle_embed(
+        &self,
+        images: Vec<Vec<u8>>,
+    ) -> Result<Vec<Vec<f32>>, InferenceError> {
+        self.engine
+            .embed_images(&images)
+            .map_err(|e| InferenceError::Generation(e.to_string()))
     }
 }
 
@@ -467,6 +482,17 @@ impl InferenceClient for LocalInferenceClient {
         self.sender
             .send(InferenceRequest::ReleaseSession {
                 session_id: session_id.to_owned(),
+                reply: tx,
+            })
+            .map_err(|_| InferenceError::Unavailable)?;
+        rx.await.map_err(|_| InferenceError::channel("No response"))?
+    }
+
+    async fn embed(&self, images: &[Vec<u8>]) -> Result<Vec<Vec<f32>>, InferenceError> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(InferenceRequest::Embed {
+                images: images.to_vec(),
                 reply: tx,
             })
             .map_err(|_| InferenceError::Unavailable)?;

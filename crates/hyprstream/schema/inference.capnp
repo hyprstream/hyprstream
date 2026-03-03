@@ -71,6 +71,9 @@ struct InferenceRequest {
     snapshotDeltaStream @29 :Void $mcpScope(write);
     exportPeftAdapterStream @30 :ExportPeftRequest $mcpScope(write);
     mergeLoraStream @31 :MergeLoraRequest $mcpScope(write);
+
+    # Vision embeddings (synchronous — returns all embeddings in one response)
+    embed @32 :EmbedImagesRequest $mcpScope(infer);
   }
 }
 
@@ -125,6 +128,9 @@ struct InferenceResponse {
     snapshotDeltaStreamResult @30 :StreamInfo;
     exportPeftAdapterStreamResult @31 :StreamInfo;
     mergeLoraStreamResult @32 :StreamInfo;
+
+    # Embed result
+    embedResult @33 :EmbedImagesResponse;
   }
 }
 
@@ -341,6 +347,17 @@ struct MergeLoraRequest {
   adapterPath @0 :Text;    # relative path to adapter dir (e.g. "adapters/demo-1-rust-ttt")
   weight @1 :Float32;      # merge weight 0.0-1.0, default 1.0
   strategy @2 :Text;       # "replace", "additive", or "do_merge" (default: "do_merge")
+}
+
+# Vision embedding request (raw image bytes)
+struct EmbedImagesRequest {
+  images @0 :List(Data);   # raw image bytes (PNG/JPEG/RGB)
+}
+
+# Vision embedding response
+struct EmbedImagesResponse {
+  embeddings @0 :List(List(Float32));  # one vector per image
+  dimensions @1 :UInt32;               # embedding dimensionality
 }
 
 # Error Information

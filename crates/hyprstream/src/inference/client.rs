@@ -72,6 +72,15 @@ pub trait InferenceClient: Send + Sync {
     /// Release a session's KV cache.
     async fn release_session(&self, session_id: &str) -> Result<(), InferenceError>;
 
+    // === Embeddings ===
+
+    /// Compute embeddings for one or more images.
+    ///
+    /// Returns one embedding vector per input image. The image bytes can be
+    /// raw RGB pixels, PNG, or JPEG encoded data — the model's preprocessor
+    /// handles decoding.
+    async fn embed(&self, images: &[Vec<u8>]) -> Result<Vec<Vec<f32>>, InferenceError>;
+
     // === Health ===
 
     /// Check service health.

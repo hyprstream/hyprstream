@@ -283,6 +283,20 @@ pub trait ModelOperations: Send {
         Err(anyhow!("prepare_multimodal_inputs not implemented - model is not multimodal"))
     }
 
+    /// Encode images through the vision encoder and return embeddings.
+    ///
+    /// For multimodal models with a vision encoder (e.g. Janus with SigLIP),
+    /// this runs the vision encoder forward pass and returns pooled embeddings.
+    ///
+    /// # Arguments
+    /// * `pixel_values` - Preprocessed images [batch_size, channels, height, width]
+    ///
+    /// # Returns
+    /// Embedding tensor [batch_size, embedding_dim]
+    fn encode_vision(&self, _pixel_values: &Tensor) -> Result<Tensor> {
+        Err(anyhow!("encode_vision not implemented - model has no vision encoder"))
+    }
+
     /// Decode a single layer (for layer-wise processing)
     fn decode_layer(
         &self,

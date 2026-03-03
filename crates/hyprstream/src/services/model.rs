@@ -625,6 +625,7 @@ use crate::services::generated::model_client::{
     AdapterInfo, AdapterMergeRequest,
     // Infer types
     GenerateRequest, ApplyChatTemplateRequest, ModelStatusResponse, OnlineTrainingConfig,
+    EmbedRequest, EmbedResponse,
 };
 // Conflicting names — use canonical path at usage sites:
 //   model_client::LoadedModelInfo, model_client::StreamInfo,
@@ -979,6 +980,19 @@ impl InferHandler for ModelService {
             model_ref, ctx, chat_messages, data.add_generation_prompt, tools.as_ref(),
         ).await?;
         Ok(templated.as_str().to_owned())
+    }
+
+    async fn handle_embed(
+        &self, ctx: &EnvelopeContext, _request_id: u64,
+        model_ref: &str, data: &EmbedRequest,
+    ) -> Result<EmbedResponse> {
+        let client = self.get_inference_client(model_ref, ctx).await?;
+        let embeddings = client.embed(&data.images).await?;
+        let dimensions = embeddings.first().map(|v| v.len() as u32).unwrap_or(0);
+        Ok(EmbedResponse {
+            embeddings,
+            dimensions,
+        })
     }
 
     async fn handle_status(

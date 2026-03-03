@@ -8,15 +8,19 @@ use crate::services::{EnvelopeContext, PolicyClient, ZmqService};
 use crate::services::generated::discovery_client::{
     DiscoveryClient, DiscoveryHandler, DiscoveryResponseVariant,
     ErrorInfo, ServiceList, ServiceSummary, ServiceEndpoints, EndpointInfo,
-    PingInfo, AuthMetadata, AuthMetadataList, dispatch_discovery, serialize_response,
+    PingInfo, AuthMetadata, AuthMetadataList,
+    StreamPrepareRequest, StreamEndpoints, StreamEndpointsList,
+    dispatch_discovery, serialize_response,
 };
 use anyhow::Result;
+use dashmap::DashMap;
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::{global as registry, SocketKind};
 use hyprstream_rpc::transport::TransportConfig;
+use rand::Rng;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::trace;
+use tracing::{info, trace};
 
 /// Service name for endpoint registry
 const SERVICE_NAME: &str = "discovery";
@@ -37,6 +41,8 @@ pub struct DiscoveryService {
     expected_audience: Option<String>,
     /// Policy client for authorization checks (None = no authorization)
     policy_client: Option<PolicyClient>,
+    /// Named stream registry (name -> StreamEndpoints)
+    stream_registry: Arc<DashMap<String, StreamEndpoints>>,
     // Infrastructure (for Spawnable)
     context: Arc<zmq::Context>,
     transport: TransportConfig,
@@ -55,6 +61,7 @@ impl DiscoveryService {
             oauth_issuer_url: None,
             expected_audience: None,
             policy_client: None,
+            stream_registry: Arc::new(DashMap::new()),
             context,
             transport,
         }
@@ -284,6 +291,90 @@ impl DiscoveryHandler for DiscoveryService {
 
         Ok(DiscoveryResponseVariant::GetAuthMetadataResult(
             AuthMetadataList { services },
+        ))
+    }
+
+    async fn handle_prepare_stream(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &StreamPrepareRequest,
+    ) -> Result<DiscoveryResponseVariant> {
+        let name = &data.name;
+        info!("Discovery: prepare_stream('{}')", name);
+
+        // Idempotent: return existing stream if already registered
+        if let Some(existing) = self.stream_registry.get(name) {
+            return Ok(DiscoveryResponseVariant::PrepareStreamResult(
+                existing.value().clone(),
+            ));
+        }
+
+        // Generate random topic (64 hex chars) + mac_key (32 bytes)
+        let mut rng = rand::thread_rng();
+        let mut topic_bytes = [0u8; 32];
+        let mut mac_key = [0u8; 32];
+        rng.fill(&mut topic_bytes);
+        rng.fill(&mut mac_key);
+        let topic = hex::encode(topic_bytes);
+
+        // Look up StreamService endpoints from registry
+        let reg = registry();
+        let push_ep = reg.endpoint("streams", SocketKind::Push).to_zmq_string();
+        let sub_ep = reg.endpoint("streams", SocketKind::Sub).to_zmq_string();
+        drop(reg);
+
+        let endpoints = StreamEndpoints {
+            name: name.clone(),
+            stream_id: format!("stream-{}", uuid::Uuid::new_v4()),
+            topic,
+            push_endpoint: push_ep,
+            sub_endpoint: sub_ep,
+            mac_key: mac_key.to_vec(),
+        };
+
+        self.stream_registry
+            .insert(name.clone(), endpoints.clone());
+
+        Ok(DiscoveryResponseVariant::PrepareStreamResult(endpoints))
+    }
+
+    async fn handle_get_stream(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &str,
+    ) -> Result<DiscoveryResponseVariant> {
+        let name = data;
+        trace!("Discovery: get_stream('{}')", name);
+
+        match self.stream_registry.get(name) {
+            Some(entry) => Ok(DiscoveryResponseVariant::GetStreamResult(
+                entry.value().clone(),
+            )),
+            None => Ok(DiscoveryResponseVariant::Error(ErrorInfo {
+                message: format!("Stream '{}' not found", name),
+                code: "NOT_FOUND".to_owned(),
+                details: String::new(),
+            })),
+        }
+    }
+
+    async fn handle_list_streams(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+    ) -> Result<DiscoveryResponseVariant> {
+        trace!("Discovery: list_streams");
+
+        let streams: Vec<StreamEndpoints> = self
+            .stream_registry
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+
+        Ok(DiscoveryResponseVariant::ListStreamsResult(
+            StreamEndpointsList { streams },
         ))
     }
 }
