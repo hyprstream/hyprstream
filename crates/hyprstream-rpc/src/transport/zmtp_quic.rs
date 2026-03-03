@@ -1852,6 +1852,7 @@ where
 // ============================================================================
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::zmtp_framing::{build_greeting, validate_greeting, build_ready_metadata};
@@ -2114,7 +2115,7 @@ mod tests {
         // SUBSCRIBE command: body is topic prefix
         let topic = b"my.topic";
         let cmd = ZmtpCommand {
-            name: "SUBSCRIBE".to_string(),
+            name: "SUBSCRIBE".to_owned(),
             body: Bytes::copy_from_slice(topic),
         };
 
@@ -2127,7 +2128,7 @@ mod tests {
         // CANCEL command: body is topic prefix
         let topic = b"my.topic";
         let cmd = ZmtpCommand {
-            name: "CANCEL".to_string(),
+            name: "CANCEL".to_owned(),
             body: Bytes::copy_from_slice(topic),
         };
 

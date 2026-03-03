@@ -456,6 +456,7 @@ pub fn decode_flat_parts(flat: &[u8]) -> Result<Vec<Vec<u8>>> {
 // ============================================================================
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
