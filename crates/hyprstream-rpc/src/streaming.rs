@@ -70,6 +70,40 @@ use crate::streaming_capnp;
 // Configuration
 // ============================================================================
 
+/// Configuration for a StreamPublisher socket.
+///
+/// Controls high-water mark and whether the publisher gets a dedicated socket
+/// (bypasses the shared StreamChannel socket for high-frequency publishers like TUI frames).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamPublisherConfig {
+    /// ZMQ send high-water mark. 0 = unlimited. Default: 1000.
+    #[serde(default = "default_sndhwm")]
+    pub sndhwm: i32,
+    /// If true, the publisher creates its own PUSH socket instead of sharing.
+    #[serde(default)]
+    pub dedicated: bool,
+}
+
+fn default_sndhwm() -> i32 { 1000 }
+
+impl Default for StreamPublisherConfig {
+    fn default() -> Self {
+        Self { sndhwm: default_sndhwm(), dedicated: false }
+    }
+}
+
+/// Socket variant for StreamPublisher — shared (default) or dedicated.
+///
+/// `Shared` reuses the StreamChannel's single PUSH socket (suitable for most streams).
+/// `Dedicated` owns its own PUSH socket (for high-frequency publishers like TUI frame loops
+/// where HWM saturation on the shared socket would block other streams).
+pub enum PublisherSocket {
+    /// Shared socket from StreamChannel (existing behavior).
+    Shared(Arc<tokio::sync::Mutex<tmq::push::Push>>),
+    /// Dedicated socket owned by this publisher. Wrapped in `Option` for `Drop` take.
+    Dedicated(Option<tmq::push::Push>),
+}
+
 /// Configuration for adaptive batching (rate control).
 ///
 /// Controls how payloads are batched based on throughput rate.
@@ -237,6 +271,24 @@ impl StreamFrames {
         ]);
         socket.send(multipart).await
             .map_err(|e| anyhow::anyhow!("Failed to send stream frames: {}", e))?;
+        Ok(())
+    }
+
+    /// Try to send frames via async tmq Push socket with zero timeout.
+    ///
+    /// Returns `Ok(())` if sent, `Err` if the send would block (HWM full).
+    /// Used by `try_publish_data()` for non-blocking frame delivery.
+    pub async fn try_send_async(&self, socket: &mut tmq::push::Push) -> Result<()> {
+        let multipart = tmq::Multipart::from(vec![
+            self.topic.clone(),
+            self.capnp.clone(),
+            self.mac.to_vec(),
+        ]);
+        // tmq::push::Push wraps ZMQ PUSH — if HWM is hit and SNDTIMEO is 0,
+        // send returns EAGAIN. We rely on the socket having SNDTIMEO=0 for
+        // dedicated sockets used in frame loops.
+        socket.send(multipart).await
+            .map_err(|e| anyhow::anyhow!("try_send failed (HWM full?): {}", e))?;
         Ok(())
     }
 
@@ -598,18 +650,18 @@ impl StreamContext {
 /// ```
 pub struct StreamPublisher {
     builder: StreamBuilder,
-    socket: Arc<tokio::sync::Mutex<tmq::push::Push>>,
+    socket: PublisherSocket,
     cancel_token: CancellationToken,
     terminated: bool,
 }
 
 impl StreamPublisher {
-    /// Create a new publisher from a stream context.
+    /// Create a new publisher from a stream context (shared socket).
     pub fn new(socket: Arc<tokio::sync::Mutex<tmq::push::Push>>, ctx: &StreamContext) -> Self {
         Self::with_config(socket, ctx, BatchingConfig::default())
     }
 
-    /// Create a new publisher with custom batching config.
+    /// Create a new publisher with custom batching config (shared socket).
     pub fn with_config(
         socket: Arc<tokio::sync::Mutex<tmq::push::Push>>,
         ctx: &StreamContext,
@@ -618,7 +670,26 @@ impl StreamPublisher {
         let builder = StreamBuilder::new(config, ctx.mac_key, ctx.topic.clone());
         Self {
             builder,
-            socket,
+            socket: PublisherSocket::Shared(socket),
+            cancel_token: ctx.cancel_token.clone(),
+            terminated: false,
+        }
+    }
+
+    /// Create a publisher with a dedicated PUSH socket.
+    ///
+    /// The dedicated socket is owned exclusively by this publisher, avoiding
+    /// contention with other streams on the shared StreamChannel socket.
+    /// Used for high-frequency publishers (e.g., TUI frame loops at 30fps).
+    pub fn with_dedicated_socket(
+        socket: tmq::push::Push,
+        ctx: &StreamContext,
+        config: BatchingConfig,
+    ) -> Self {
+        let builder = StreamBuilder::new(config, ctx.mac_key, ctx.topic.clone());
+        Self {
+            builder,
+            socket: PublisherSocket::Dedicated(Some(socket)),
             cancel_token: ctx.cancel_token.clone(),
             terminated: false,
         }
@@ -641,8 +712,51 @@ impl StreamPublisher {
             anyhow::bail!("stream cancelled");
         }
         if let Some(frames) = self.builder.add_data(data, rate)? {
-            let mut socket = self.socket.lock().await;
-            frames.send_async(&mut socket).await?;
+            self.send_frames(frames).await?;
+        }
+        Ok(())
+    }
+
+    /// Try to publish data without blocking on a full HWM.
+    ///
+    /// Returns `Ok(true)` if the data was sent, `Ok(false)` if the socket's
+    /// high-water mark is full (zero-timeout send). Useful for frame loops
+    /// where a slow viewer should be skipped rather than blocking the loop.
+    ///
+    /// Only meaningful with `Dedicated` sockets; `Shared` sockets always await.
+    pub async fn try_publish_data(&mut self, data: &[u8], rate: f32) -> Result<bool> {
+        if self.cancel_token.is_cancelled() {
+            anyhow::bail!("stream cancelled");
+        }
+        if let Some(frames) = self.builder.add_data(data, rate)? {
+            match &mut self.socket {
+                PublisherSocket::Dedicated(Some(sock)) => {
+                    match frames.try_send_async(sock).await {
+                        Ok(()) => return Ok(true),
+                        Err(_) => return Ok(false),
+                    }
+                }
+                _ => {
+                    self.send_frames(frames).await?;
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Send frames via the appropriate socket variant.
+    async fn send_frames(&mut self, frames: StreamFrames) -> Result<()> {
+        match &mut self.socket {
+            PublisherSocket::Shared(arc) => {
+                let mut socket = arc.lock().await;
+                frames.send_async(&mut socket).await?;
+            }
+            PublisherSocket::Dedicated(Some(sock)) => {
+                frames.send_async(sock).await?;
+            }
+            PublisherSocket::Dedicated(None) => {
+                anyhow::bail!("dedicated socket already taken (publisher dropped?)");
+            }
         }
         Ok(())
     }
@@ -660,8 +774,7 @@ impl StreamPublisher {
     pub async fn publish_error(&mut self, message: &str) -> Result<()> {
         self.terminated = true; // Before await — cancellation-safe
         if let Some(frames) = self.builder.add_error(message)? {
-            let mut socket = self.socket.lock().await;
-            frames.send_async(&mut socket).await?;
+            self.send_frames(frames).await?;
         }
         Ok(())
     }
@@ -679,12 +792,11 @@ impl StreamPublisher {
     /// callback-based APIs like `StreamChannel::run_stream()`.
     pub async fn complete_ref(&mut self, metadata: &[u8]) -> Result<()> {
         self.terminated = true; // Before await — cancellation-safe
-        let mut socket = self.socket.lock().await;
         if let Some(frames) = self.builder.add_complete(metadata)? {
-            frames.send_async(&mut socket).await?;
+            self.send_frames(frames).await?;
         }
         if let Some(frames) = self.builder.flush()? {
-            frames.send_async(&mut socket).await?;
+            self.send_frames(frames).await?;
         }
         Ok(())
     }
@@ -692,8 +804,7 @@ impl StreamPublisher {
     /// Flush any pending batched data immediately.
     pub async fn flush(&mut self) -> Result<()> {
         if let Some(frames) = self.builder.flush()? {
-            let mut socket = self.socket.lock().await;
-            frames.send_async(&mut socket).await?;
+            self.send_frames(frames).await?;
         }
         Ok(())
     }
@@ -732,7 +843,11 @@ impl Drop for StreamPublisher {
             _ => return,
         };
 
-        let socket = Arc::clone(&self.socket);
+        // Take the socket out of self for the spawned flush task.
+        let socket = std::mem::replace(
+            &mut self.socket,
+            PublisherSocket::Dedicated(None),
+        );
 
         // Spawn async send — the spawned task yields to the runtime, so Drop
         // itself returns immediately. Bounded 200ms wait covers brief lock
@@ -742,20 +857,32 @@ impl Drop for StreamPublisher {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    match tokio::time::timeout(
-                        std::time::Duration::from_millis(200),
-                        socket.lock(),
-                    )
-                    .await
-                    {
-                        Ok(mut sock) => {
+                    match socket {
+                        PublisherSocket::Shared(arc) => {
+                            match tokio::time::timeout(
+                                std::time::Duration::from_millis(200),
+                                arc.lock(),
+                            )
+                            .await
+                            {
+                                Ok(mut sock) => {
+                                    let _ = frames.send_async(&mut sock).await;
+                                }
+                                Err(_) => {
+                                    tracing::error!(
+                                        "StreamPublisher::drop: could not acquire socket lock \
+                                         within 200ms; terminal error frame not sent — \
+                                         client will hang until JWT expiry"
+                                    );
+                                }
+                            }
+                        }
+                        PublisherSocket::Dedicated(Some(mut sock)) => {
                             let _ = frames.send_async(&mut sock).await;
                         }
-                        Err(_) => {
+                        PublisherSocket::Dedicated(None) => {
                             tracing::error!(
-                                "StreamPublisher::drop: could not acquire socket lock \
-                                 within 200ms; terminal error frame not sent — \
-                                 client will hang until JWT expiry"
+                                "StreamPublisher::drop: dedicated socket already taken"
                             );
                         }
                     }
@@ -1598,6 +1725,30 @@ impl StreamChannel {
             [0u8; 32], // No server pubkey needed for notification delivery
         );
         self.publisher(&ctx).await
+    }
+
+    /// Create a dedicated PUSH socket for a high-frequency publisher.
+    ///
+    /// The returned socket has `SNDTIMEO=0` (non-blocking) and the specified HWM.
+    /// Used for TUI frame loops and other publishers that need `try_publish_data()`.
+    pub fn create_publisher_socket(&self, config: &StreamPublisherConfig) -> Result<tmq::push::Push> {
+        let endpoint = endpoint_registry()
+            .endpoint("streams", SocketKind::Push)
+            .to_zmq_string();
+
+        let socket = tmq::push::push(&self.context)
+            .set_sndhwm(config.sndhwm)
+            .set_sndtimeo(0)  // Non-blocking for try_publish_data
+            .connect(&endpoint)
+            .map_err(|e| anyhow::anyhow!("Failed to create dedicated PUSH socket: {}", e))?;
+
+        tracing::debug!(
+            endpoint = %endpoint,
+            sndhwm = config.sndhwm,
+            "Created dedicated publisher socket"
+        );
+
+        Ok(socket)
     }
 
     /// Get the stream endpoint for clients to subscribe to.

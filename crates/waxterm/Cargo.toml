@@ -14,6 +14,11 @@ libc = "0.2"
 [features]
 default = []
 tokio = ["dep:tokio"]
+avt = ["dep:avt"]
+
+[dependencies.avt]
+version = "0.17"
+optional = true
 
 [dependencies.tokio]
 version = "1"

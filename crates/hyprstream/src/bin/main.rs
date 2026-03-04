@@ -11,7 +11,7 @@ use tracing::info;
 
 // Core application imports
 use hyprstream_core::cli::commands::{
-    ExecutionMode, FlightArgs, ImageCommand, ServiceAction, TrainingAction, WorkerAction,
+    ExecutionMode, FlightArgs, ImageCommand, ServiceAction, TrainingAction, TuiAction, WorkerAction,
 };
 use hyprstream_core::cli::quick::{QuickCommand, RemoteQuickCommand, WorktreeQuickCommand};
 use hyprstream_core::cli::schema_cli;
@@ -115,6 +115,13 @@ fn build_cli() -> ClapCommand {
     app = app.subcommand(
         <ServiceAction as ClapSubcommand>::augment_subcommands(
             ClapCommand::new("service").about("Service management and lifecycle commands"),
+        ),
+    );
+
+    // TUI display server (derive-based subcommands)
+    app = app.subcommand(
+        <TuiAction as ClapSubcommand>::augment_subcommands(
+            ClapCommand::new("tui").about("TUI display server \u{2014} terminal multiplexer with session persistence"),
         ),
     );
 
@@ -1859,6 +1866,42 @@ fn main() -> Result<()> {
                     handle_user_show(&credentials_dir, &username)?;
                 }
             }
+        }
+
+        // ── TUI display server ──────────────────────────────────────────
+        Some(("tui", sub_m)) => {
+            let action = TuiAction::from_arg_matches(sub_m)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: true,
+                },
+                || async move {
+                    use hyprstream_core::cli::tui_handlers;
+
+                    // Load signing key for RPC authentication
+                    let data_dir = dirs::data_local_dir()
+                        .unwrap_or_else(|| std::path::PathBuf::from("."))
+                        .join("hyprstream");
+                    let keys_dir = data_dir.join("keys");
+                    let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+
+                    match action {
+                        TuiAction::Attach { session } => {
+                            let sid = if session == 0 { None } else { Some(session) };
+                            tui_handlers::handle_tui_attach(&signing_key, sid).await
+                        }
+                        TuiAction::New => tui_handlers::handle_tui_new(&signing_key).await,
+                        TuiAction::List => tui_handlers::handle_tui_list(&signing_key).await,
+                        TuiAction::Detach => tui_handlers::handle_tui_detach().await,
+                        TuiAction::Play { cast_file, session, loop_playback } => {
+                            tui_handlers::handle_tui_play(&signing_key, &cast_file, session, loop_playback).await
+                        }
+                    }
+                },
+            )?;
         }
 
         // ── Flight SQL client ───────────────────────────────────────────

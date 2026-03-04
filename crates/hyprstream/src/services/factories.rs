@@ -708,6 +708,39 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// TUI Service Factory
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Factory for TuiService (terminal multiplexer display server)
+///
+/// This service provides a terminal multiplexer with session persistence,
+/// multi-pane layouts, and remote access via ZMQ RPC and WebTransport.
+#[service_factory("tui", schema = "../../schema/tui.capnp")]
+fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+    info!("Creating TuiService");
+
+    use crate::tui::{TuiState, service::TuiService};
+
+    let config = load_config();
+    let tui_config = &config.tui;
+
+    let state = Arc::new(RwLock::new(TuiState::new(
+        80,
+        24,
+        tui_config.scrollback_lines,
+    )));
+
+    let tui_service = TuiService::new(
+        state,
+        global_context(),
+        ctx.transport("tui", SocketKind::Rep),
+        ctx.signing_key().clone(),
+    );
+
+    Ok(ctx.into_spawnable_quic(tui_service, tui_config.quic_port))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Discovery Service Factory
 // ═══════════════════════════════════════════════════════════════════════════════
 

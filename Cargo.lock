@@ -918,6 +918,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "avt"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa0f99f7bcce0e99d842c94947f8d0ab5f6f3abc08424e1a4b58a8a7ae30f7c7"
+dependencies = [
+ "rgb",
+ "unicode-width 0.1.14",
+]
+
+[[package]]
 name = "aws-lc-rs"
 version = "1.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5598,6 +5608,7 @@ dependencies = [
  "parking_lot 0.12.4",
  "prost 0.13.5",
  "rand 0.8.5",
+ "ratatui",
  "rayon",
  "rcgen",
  "reflink-copy",
@@ -5605,6 +5616,7 @@ dependencies = [
  "reqwest 0.11.27",
  "rlimit 0.10.2",
  "rmcp",
+ "rtrb",
  "rustls 0.23.31",
  "rustls-pemfile 2.2.0",
  "safetensors 0.4.5",
@@ -5636,6 +5648,7 @@ dependencies = [
  "urlencoding",
  "users",
  "uuid 1.18.1",
+ "vte",
  "walkdir",
  "waxterm",
  "xdg",
@@ -5820,7 +5833,10 @@ dependencies = [
 name = "hyprstream-tui"
 version = "0.1.0"
 dependencies = [
+ "avt",
  "ratatui",
+ "serde",
+ "serde_json",
  "waxterm",
 ]
 
@@ -10789,6 +10805,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rgb"
+version = "0.8.53"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
 name = "rhai"
 version = "1.23.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10985,6 +11010,12 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
 ]
+
+[[package]]
+name = "rtrb"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7204ed6420f698836b76d4d5c2ec5dec7585fd5c3a788fd1cde855d1de598239"
 
 [[package]]
 name = "runtime-spec"
@@ -13873,6 +13904,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "vte"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a0b683b20ef64071ff03745b14391751f6beab06a54347885459b77a3f2caa5"
+dependencies = [
+ "arrayvec",
+ "utf8parse",
+ "vte_generate_state_changes",
+]
+
+[[package]]
+name = "vte_generate_state_changes"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e369bee1b05d510a7b4ed645f5faa90619e05437111783ea5848f28d97d3c2e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+]
+
+[[package]]
 name = "wait-timeout"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14064,6 +14116,7 @@ dependencies = [
 name = "waxterm"
 version = "0.1.0"
 dependencies = [
+ "avt",
  "libc",
  "ratatui",
  "tokio",

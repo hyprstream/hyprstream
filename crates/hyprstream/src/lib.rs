@@ -85,6 +85,14 @@ pub mod notification_capnp {
     include!(concat!(env!("OUT_DIR"), "/notification_capnp.rs"));
 }
 
+pub mod tui_capnp {
+    #![allow(dead_code, unused_imports)]
+    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
+    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    include!(concat!(env!("OUT_DIR"), "/tui_capnp.rs"));
+}
+
 pub mod api;
 pub mod archetypes;
 pub mod auth;
@@ -103,6 +111,7 @@ pub mod storage;
 #[cfg(unix)]
 pub mod systemd;
 pub mod training;
+pub mod tui;
 pub mod zmq;
 
 // Storage exports removed

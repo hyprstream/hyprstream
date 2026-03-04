@@ -159,6 +159,46 @@ pub enum Commands {
     // load signing key from keyring, compute challenge = "{username}:{user_code}:{nonce}",
     // sign with ed25519_dalek, and print base64 signature.
     // The nonce endpoint is already implemented at GET /oauth/device/nonce.
+
+    /// TUI display server — terminal multiplexer with session persistence
+    Tui {
+        #[command(subcommand)]
+        action: TuiAction,
+    },
+}
+
+/// TUI display server actions
+#[derive(Subcommand)]
+pub enum TuiAction {
+    /// Attach to an existing session (or create new if none exist)
+    Attach {
+        /// Session ID to attach to (0 = most recent)
+        #[arg(default_value = "0")]
+        session: u32,
+    },
+
+    /// Create a new session
+    New,
+
+    /// List active sessions
+    List,
+
+    /// Detach from current session
+    Detach,
+
+    /// Play an asciicast v2 recording in a TUI pane
+    Play {
+        /// Path to the .cast file
+        cast_file: std::path::PathBuf,
+
+        /// Session ID to play in (0 = most recent)
+        #[arg(long, default_value = "0")]
+        session: u32,
+
+        /// Loop playback continuously instead of exiting when finished
+        #[arg(long, short = 'l')]
+        loop_playback: bool,
+    },
 }
 
 /// Service management actions

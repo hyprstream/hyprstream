@@ -118,6 +118,10 @@ pub struct HyprConfig {
     /// Discovery service configuration
     #[serde(default)]
     pub discovery: DiscoveryServiceConfig,
+
+    /// TUI display server configuration
+    #[serde(default)]
+    pub tui: TuiServiceConfig,
 }
 
 /// TLS configuration for HTTP services (OAI, OAuth, MCP).
@@ -789,6 +793,38 @@ pub struct DiscoveryServiceConfig {
     pub quic_port: Option<u16>,
 }
 
+/// TUI display server configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuiServiceConfig {
+    /// QUIC/WebTransport port for TUI viewers. None = no QUIC.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
+    /// Maximum concurrent sessions.
+    #[serde(default = "default_tui_max_sessions")]
+    pub max_sessions: u32,
+    /// Scrollback lines per pane.
+    #[serde(default = "default_tui_scrollback")]
+    pub scrollback_lines: usize,
+    /// WebTransport certificate validity in days (max 14).
+    #[serde(default = "default_tui_wt_cert_days")]
+    pub wt_cert_validity_days: u32,
+}
+
+fn default_tui_max_sessions() -> u32 { 16 }
+fn default_tui_scrollback() -> usize { 2000 }
+fn default_tui_wt_cert_days() -> u32 { 14 }
+
+impl Default for TuiServiceConfig {
+    fn default() -> Self {
+        Self {
+            quic_port: None,
+            max_sessions: default_tui_max_sessions(),
+            scrollback_lines: default_tui_scrollback(),
+            wt_cert_validity_days: default_tui_wt_cert_days(),
+        }
+    }
+}
+
 /// Service management configuration
 ///
 /// Controls which services are started at startup in ipc-systemd mode.
@@ -1021,6 +1057,7 @@ pub struct HyprConfigBuilder {
     registry: RegistryServiceConfig,
     policy: PolicyServiceConfig,
     discovery: DiscoveryServiceConfig,
+    tui: TuiServiceConfig,
 }
 
 impl HyprConfigBuilder {
@@ -1048,6 +1085,7 @@ impl HyprConfigBuilder {
             registry: RegistryServiceConfig::default(),
             policy: PolicyServiceConfig::default(),
             discovery: DiscoveryServiceConfig::default(),
+            tui: TuiServiceConfig::default(),
         }
     }
 
@@ -1075,6 +1113,7 @@ impl HyprConfigBuilder {
             registry: config.registry,
             policy: config.policy,
             discovery: config.discovery,
+            tui: config.tui,
         }
     }
 
@@ -1114,6 +1153,7 @@ impl HyprConfigBuilder {
             registry: self.registry,
             policy: self.policy,
             discovery: self.discovery,
+            tui: self.tui,
         }
     }
 
