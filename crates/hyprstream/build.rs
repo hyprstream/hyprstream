@@ -58,7 +58,7 @@ fn compile_capnp_schemas() {
     }
 
     // Note: common.capnp (identity, envelope) is in hyprstream-rpc crate
-    for name in ["events", "inference", "registry", "policy", "model", "mcp", "worker", "discovery", "notification"] {
+    for name in ["events", "inference", "registry", "policy", "model", "mcp", "worker", "discovery", "notification", "tui"] {
         let path = schema_dir.join(format!("{name}.capnp"));
         if path.exists() {
             let cgr_path = Path::new(&out_dir).join(format!("{name}.cgr"));

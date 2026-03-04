@@ -150,6 +150,46 @@ pub enum Commands {
         #[command(subcommand)]
         action: ServiceAction,
     },
+
+    /// TUI display server — terminal multiplexer with session persistence
+    Tui {
+        #[command(subcommand)]
+        action: TuiAction,
+    },
+}
+
+/// TUI display server actions
+#[derive(Subcommand)]
+pub enum TuiAction {
+    /// Attach to an existing session (or create new if none exist)
+    Attach {
+        /// Session ID to attach to (0 = most recent)
+        #[arg(default_value = "0")]
+        session: u32,
+    },
+
+    /// Create a new session
+    New,
+
+    /// List active sessions
+    List,
+
+    /// Detach from current session
+    Detach,
+
+    /// Play an asciicast v2 recording in a TUI pane
+    Play {
+        /// Path to the .cast file
+        cast_file: std::path::PathBuf,
+
+        /// Session ID to play in (0 = most recent)
+        #[arg(long, default_value = "0")]
+        session: u32,
+
+        /// Loop playback continuously instead of exiting when finished
+        #[arg(long, short = 'l')]
+        loop_playback: bool,
+    },
 }
 
 /// Service management actions

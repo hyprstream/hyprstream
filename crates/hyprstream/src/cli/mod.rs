@@ -20,6 +20,7 @@ pub mod schema_cli;
 pub mod service_handlers;
 pub mod systemd_setup;
 pub mod training_handlers;
+pub mod tui_handlers;
 pub mod update_handlers;
 pub mod worker_handlers;
 pub mod wizard_handlers;
