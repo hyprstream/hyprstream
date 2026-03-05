@@ -607,9 +607,10 @@ pub async fn handle_clone(
     // Use requested branch or fall back to default branch (usually "main")
     let worktree_branch = if let Some(ref b) = branch {
         b.clone()
+    } else if !tracked.tracking_ref.is_empty() {
+        tracked.tracking_ref.clone()
     } else {
-        repo_client.get_head().await
-            .unwrap_or_else(|_| "main".to_owned())
+        "main".to_owned()
     };
 
     if !quiet {

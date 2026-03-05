@@ -11,6 +11,7 @@ use crate::storage::{DriverOpts, WorktreeHandle};
 use crate::stage::StageManager;
 use git2::{Oid, Repository, Signature};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tracing::info;
 
 /// Handle to a tracked repository
@@ -912,6 +913,80 @@ impl<'a> RepositoryHandle<'a> {
 
         // Fallback to git lfs pull
         Self::run_git_lfs_pull(repo_path).await
+    }
+
+    /// Fetch LFS files for a worktree with progress reporting
+    pub async fn fetch_lfs_files_with_progress(
+        repo_path: &Path,
+        progress: Option<Arc<dyn crate::callback_config::ProgressReporter>>,
+    ) -> Git2DBResult<()> {
+        if !repo_path.exists() {
+            return Err(Git2DBError::internal(format!(
+                "Worktree path does not exist: {}",
+                repo_path.display()
+            )));
+        }
+
+        let gitattributes_path = repo_path.join(".gitattributes");
+
+        let uses_lfs = if gitattributes_path.exists() {
+            tokio::fs::read_to_string(&gitattributes_path)
+                .await
+                .map(|content| content.contains("filter=lfs"))
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        if !uses_lfs {
+            tracing::debug!("Repository does not use Git LFS, skipping LFS fetch");
+            return Ok(());
+        }
+
+        // Try XET first if initialized (faster for XET-enabled repos)
+        #[cfg(feature = "xet-storage")]
+        if crate::xet_filter::is_initialized() {
+            tracing::info!("XET initialized, attempting XET fetch for LFS files...");
+            match Self::try_xet_lfs_fetch_with_progress(repo_path, progress.as_ref()).await {
+                Ok(stats) => {
+                    if stats.processed > 0 || stats.skipped > 0 {
+                        tracing::info!(
+                            "XET fetch complete: {} processed, {} skipped, {} failed",
+                            stats.processed, stats.skipped, stats.failed
+                        );
+                        if stats.failed == 0 {
+                            return Ok(());
+                        }
+                        tracing::warn!("Some files failed via XET, falling back to git-lfs for remaining files");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("XET fetch failed: {}. Falling back to git-lfs...", e);
+                }
+            }
+        }
+
+        // Fallback to git lfs pull
+        Self::run_git_lfs_pull(repo_path).await
+    }
+
+    /// Try to fetch LFS files via XET with progress reporting
+    #[cfg(feature = "xet-storage")]
+    async fn try_xet_lfs_fetch_with_progress(
+        repo_path: &Path,
+        progress: Option<&Arc<dyn crate::callback_config::ProgressReporter>>,
+    ) -> Git2DBResult<crate::lfs::ProcessingStats> {
+        use crate::lfs::LfsStorage;
+
+        let config = crate::xet_filter::get_config().ok_or_else(|| {
+            Git2DBError::internal("BUG: XET filter initialized but FILTER_CONFIG was not set")
+        })?;
+
+        let storage = LfsStorage::new(&config).await.map_err(|e| {
+            Git2DBError::internal(format!("Failed to create LFS storage: {e}"))
+        })?;
+
+        storage.process_worktree_with_progress(repo_path, progress).await
     }
 
     /// Try to fetch LFS files via XET

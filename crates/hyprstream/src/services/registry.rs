@@ -337,14 +337,20 @@ impl CloneProgressReporter {
 
 impl git2db::callback_config::ProgressReporter for CloneProgressReporter {
     fn report(&self, stage: &str, current: usize, total: usize) {
-        // Use blocking_send since we're in a sync context (spawn_blocking)
-        // Log if channel is full instead of silently dropping
-        if let Err(e) = self.sender.blocking_send(hyprstream_rpc::streaming::ProgressUpdate::Progress {
+        // Use try_send to avoid deadlocking the single-threaded runtime
+        // when called from async context (e.g., LFS progress). Progress is best-effort.
+        match self.sender.try_send(hyprstream_rpc::streaming::ProgressUpdate::Progress {
             stage: stage.to_owned(),
             current,
             total,
         }) {
-            tracing::trace!("Progress channel full, dropping update: {}", e);
+            Ok(()) => {},
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                tracing::trace!("Progress channel full, dropping update");
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                tracing::trace!("Progress channel closed");
+            }
         }
     }
 }

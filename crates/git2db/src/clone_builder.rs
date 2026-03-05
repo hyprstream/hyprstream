@@ -285,6 +285,10 @@ impl CloneBuilder {
         }
 
         // ===== Phase 2: No lock - perform network clone =====
+        // Extract progress reporter before callback_config is consumed by clone options
+        let progress_reporter = self.callback_config.as_ref()
+            .and_then(crate::callback_config::CallbackConfig::progress_reporter);
+
         let bare_repo = if let Some(repo) = existing_bare_repo {
             repo
         } else {
@@ -343,7 +347,7 @@ impl CloneBuilder {
         }
 
         tracing::info!("Creating default worktree '{}' at {:?}", default_branch, initial_worktree);
-        create_worktree(&driver, &bare_repo_path, &initial_worktree, &default_branch).await?;
+        create_worktree(&driver, &bare_repo_path, &initial_worktree, &default_branch, progress_reporter.clone()).await?;
 
         // Create additional worktree if requested ref differs from default
         let checkout_ref = match &self.reference {
@@ -366,7 +370,7 @@ impl CloneBuilder {
                 })?;
             }
             tracing::info!("Creating worktree for ref '{}'", checkout_ref);
-            create_worktree(&driver, &bare_repo_path, &ref_worktree_path, &checkout_ref).await?;
+            create_worktree(&driver, &bare_repo_path, &ref_worktree_path, &checkout_ref, progress_reporter.clone()).await?;
         }
 
         // Build remote configs
@@ -455,6 +459,7 @@ async fn create_worktree(
     bare_repo_path: &std::path::Path,
     worktree_path: &std::path::Path,
     branch: &str,
+    progress: Option<std::sync::Arc<dyn crate::callback_config::ProgressReporter>>,
 ) -> Git2DBResult<()> {
     // Ensure parent exists
     if let Some(parent) = worktree_path.parent() {
@@ -472,15 +477,15 @@ async fn create_worktree(
 
     match driver.create_worktree(&opts).await {
         Ok(_) => {
-            // LFS fetch (idempotent)
-            crate::repository_handle::RepositoryHandle::fetch_lfs_files(worktree_path).await?;
+            // LFS fetch (idempotent) with progress reporting
+            crate::repository_handle::RepositoryHandle::fetch_lfs_files_with_progress(worktree_path, progress).await?;
             tracing::info!("Created worktree at {:?} for branch '{}'", worktree_path, branch);
             Ok(())
         }
         Err(e) if e.is_worktree_exists() => {
             // Clone resume: worktree already exists, just fetch LFS
             tracing::info!("Worktree already exists at {:?}, fetching LFS files", worktree_path);
-            crate::repository_handle::RepositoryHandle::fetch_lfs_files(worktree_path).await?;
+            crate::repository_handle::RepositoryHandle::fetch_lfs_files_with_progress(worktree_path, progress).await?;
             Ok(())
         }
         Err(e) => Err(Git2DBError::repository(
