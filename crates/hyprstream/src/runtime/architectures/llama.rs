@@ -50,9 +50,9 @@ impl LinearProjection {
     /// Weight shape: [in_features, out_features]  (pre-transposed at load time)
     /// Output shape: [*, out_features]
     ///
-    /// FP8 weights (if any slipped through without a scale) are cast to BF16 on GPU.
-    /// In normal operation, FP8 weights are dequantized to BF16 with block scales
-    /// applied by `ModelFactory::apply_fp8_scales` before architectures see them.
+    /// FP8 weights are dequantized lazily: `LinearProjection::take` captures the
+    /// companion `_scale_inv` tensor, and `apply()` expands the block scale and
+    /// multiplies on each forward pass (keeping VRAM at FP8 size).
     #[inline]
     pub(crate) fn apply(&self, input: &Tensor) -> Tensor {
         let w = match self.weight.kind() {
@@ -117,7 +117,7 @@ impl LinearProjection {
         bias_key: &str,
     ) -> Result<Self> {
         let mut proj = Self::take(weights, weight_key)?;
-        if let Some(bias) = weights.get(bias_key).map(|b| b.shallow_clone()) {
+        if let Some(bias) = weights.get(bias_key).map(tch::Tensor::shallow_clone) {
             proj.bias = Some(bias);
         }
         Ok(proj)
