@@ -169,7 +169,8 @@ fn run_app_loop<A>(
             }
         }
 
-        if app.tick(delta_ms) {
+        let tick_changed = app.tick(delta_ms);
+        if tick_changed {
             needs_redraw = true;
         }
 

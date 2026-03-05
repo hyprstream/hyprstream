@@ -272,8 +272,10 @@ struct ConnectResult {
   # Session this viewer is connected to
   sessionId @1 :UInt32;
 
-  # Stream info for receiving frames
-  streamInfo @2 :StreamInfo;
+  # FD-indexed streams: [0]=stdin (viewer input relay), [1]=stdout (frame output)
+  # Modeled after Unix file descriptors — each stream is a StreamInfo
+  # with its own DH-derived topic and MAC key.
+  streams @2 :List(StreamInfo);
 
   # Current window list
   windows @3 :List(WindowInfo);

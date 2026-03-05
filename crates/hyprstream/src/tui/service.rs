@@ -51,8 +51,11 @@ pub enum DisplayMode {
 struct ViewerHandle {
     /// Viewer ID.
     id: u32,
-    /// Dedicated publisher for this viewer's stream.
+    /// FD 1 (stdout): dedicated publisher for this viewer's frame stream.
     publisher: StreamPublisher,
+    /// FD 0 (stdin): publisher for relaying viewer input back to the CLI process.
+    /// Only populated when a session has a remote process that needs input relay.
+    stdin_publisher: Option<StreamPublisher>,
     /// How this viewer wants frames encoded.
     display_mode: DisplayMode,
     /// Consecutive frames that failed to send (HWM full).
@@ -71,8 +74,8 @@ pub(crate) struct PendingViewer {
     session_id: u32,
     display_mode: DisplayMode,
     cancel: CancellationToken,
-    /// StreamContext fields needed to create the publisher on the local task.
-    stream_ctx: StreamContext,
+    /// FD-indexed stream contexts: [0]=stdin (input relay), [1]=stdout (frames).
+    stream_ctxs: Vec<StreamContext>,
 }
 
 // We need PendingViewer to be Send so it can cross from the RPC thread
@@ -201,37 +204,43 @@ impl TuiService {
 
         drop(state);
 
-        // DH key exchange: derive stream context from client's ephemeral pubkey.
-        // If no pubkey (local/test connections), generate a random standalone context.
-        let stream_ctx = match ctx.ephemeral_pubkey() {
-            Some(pubkey) => StreamContext::from_dh(pubkey)?,
-            None => {
-                // Generate random topic + mac_key for non-DH connections
-                use rand::RngCore;
-                let mut rng = rand::thread_rng();
-                let mut topic_bytes = [0u8; 32];
-                let mut mac_key = [0u8; 32];
-                rng.fill_bytes(&mut topic_bytes);
-                rng.fill_bytes(&mut mac_key);
-                StreamContext::new(
-                    format!("tui-viewer-{}", viewer_id),
-                    hex::encode(topic_bytes),
-                    mac_key,
-                    [0u8; 32], // no server pubkey needed for local
-                )
+        // Create FD-indexed stream contexts: [0]=stdin (input relay), [1]=stdout (frames).
+        // DH key exchange derives context from client's ephemeral pubkey.
+        // If no pubkey (local/test connections), generate random standalone contexts.
+        let make_stream_ctx = |label: &str| -> Result<StreamContext> {
+            match ctx.ephemeral_pubkey() {
+                Some(pubkey) => StreamContext::from_dh(pubkey),
+                None => {
+                    use rand::RngCore;
+                    let mut rng = rand::thread_rng();
+                    let mut topic_bytes = [0u8; 32];
+                    let mut mac_key = [0u8; 32];
+                    rng.fill_bytes(&mut topic_bytes);
+                    rng.fill_bytes(&mut mac_key);
+                    Ok(StreamContext::new(
+                        format!("tui-{}-{}", label, viewer_id),
+                        hex::encode(topic_bytes),
+                        mac_key,
+                        [0u8; 32],
+                    ))
+                }
             }
         };
 
-        let topic = stream_ctx.topic().to_owned();
-        let mac_key = *stream_ctx.mac_key();
-        // Get sub endpoint from registry
+        let stdin_ctx = make_stream_ctx("stdin")?;
+        let stdout_ctx = make_stream_ctx("stdout")?;
+
         let sub_endpoint = hyprstream_rpc::registry::global()
             .endpoint("streams", hyprstream_rpc::registry::SocketKind::Sub)
             .to_zmq_string();
 
+        let streams: [(&str, &str, &[u8; 32]); 2] = [
+            (stdin_ctx.topic(), &sub_endpoint, stdin_ctx.mac_key()),
+            (stdout_ctx.topic(), &sub_endpoint, stdout_ctx.mac_key()),
+        ];
+
         let response = self.build_connect_response(
-            request_id, viewer_id, sid, &windows,
-            &topic, &sub_endpoint, &mac_key,
+            request_id, viewer_id, sid, &windows, &streams,
         )?;
 
         let viewer_cancel = CancellationToken::new();
@@ -240,7 +249,7 @@ impl TuiService {
             session_id: sid,
             display_mode,
             cancel: viewer_cancel,
-            stream_ctx,
+            stream_ctxs: vec![stdin_ctx, stdout_ctx],
         };
 
         // Build continuation: send viewer registration to frame loop
@@ -545,9 +554,7 @@ impl TuiService {
         viewer_id: u32,
         session_id: u32,
         windows: &[(u32, String, Vec<(u32, (u16, u16))>, u32)],
-        topic: &str,
-        sub_endpoint: &str,
-        mac_key: &[u8; 32],
+        streams: &[(&str, &str, &[u8; 32])], // (topic, sub_endpoint, mac_key)
     ) -> Result<Vec<u8>> {
         let mut msg = Builder::new_default();
         {
@@ -557,10 +564,14 @@ impl TuiService {
             connect.set_viewer_id(viewer_id);
             connect.set_session_id(session_id);
 
-            let mut si = connect.reborrow().init_stream_info();
-            si.set_topic(topic);
-            si.set_sub_endpoint(sub_endpoint);
-            si.set_mac_key(mac_key);
+            // FD-indexed streams: [0]=stdin (input relay), [1]=stdout (frames)
+            let mut stream_list = connect.reborrow().init_streams(streams.len() as u32);
+            for (i, (topic, sub_endpoint, mac_key)) in streams.iter().enumerate() {
+                let mut si = stream_list.reborrow().get(i as u32);
+                si.set_topic(topic);
+                si.set_sub_endpoint(sub_endpoint);
+                si.set_mac_key(*mac_key);
+            }
 
             let mut win_list = connect.init_windows(windows.len() as u32);
             for (i, (wid, name, panes, active_pane)) in windows.iter().enumerate() {
@@ -831,33 +842,67 @@ pub(crate) async fn run_frame_loop(
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
                     FrameLoopCommand::RegisterViewer(pending) => {
-                        // Pre-authorize the stream topic with the StreamService proxy.
-                        // Without this, the proxy rejects subscriptions for this topic.
-                        let topic = pending.stream_ctx.topic().to_owned();
+                        // Pre-authorize stream topics with the StreamService proxy.
+                        // Without this, the proxy rejects subscriptions.
+                        let publisher_config = StreamPublisherConfig { sndhwm: 100, dedicated: true };
+                        let batching = BatchingConfig {
+                            min_batch_size: 1,
+                            max_batch_size: 1,
+                            max_block_bytes: 256 * 1024,
+                            min_rate: 1.0,
+                            max_rate: 30.0,
+                        };
                         let exp = chrono::Utc::now().timestamp() + 86400; // 24h expiry
-                        if let Err(e) = stream_channel.register_topic(&topic, exp, None).await {
-                            warn!(viewer_id = pending.id, error = %e, "Failed to register stream topic");
+
+                        // FD 0 (stdin): input relay publisher — only for Capnp-mode viewers
+                        // (i.e. the CLI cast player). Ansi-mode viewers don't need it;
+                        // their keyboard input falls through to VTE when no producer exists.
+                        let stdin_publisher = if pending.display_mode == DisplayMode::Capnp {
+                            if let Some(stdin_ctx) = pending.stream_ctxs.get(0) {
+                                let topic = stdin_ctx.topic().to_owned();
+                                if let Err(e) = stream_channel.register_topic(&topic, exp, None).await {
+                                    warn!(viewer_id = pending.id, error = %e, "Failed to register stdin topic");
+                                }
+                                match stream_channel.create_publisher_socket(&publisher_config) {
+                                    Ok(socket) => Some(StreamPublisher::with_dedicated_socket(
+                                        socket, stdin_ctx, batching.clone(),
+                                    )),
+                                    Err(e) => {
+                                        warn!(viewer_id = pending.id, error = %e, "Failed to create stdin publisher");
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            }
                         } else {
-                            debug!(viewer_id = pending.id, topic = %topic, "Stream topic registered with proxy");
+                            None
+                        };
+
+                        // FD 1 (stdout): frame output publisher
+                        let stdout_ctx = match pending.stream_ctxs.get(1) {
+                            Some(ctx) => ctx,
+                            None => {
+                                warn!(viewer_id = pending.id, "Missing stdout stream context");
+                                continue;
+                            }
+                        };
+                        let stdout_topic = stdout_ctx.topic().to_owned();
+                        if let Err(e) = stream_channel.register_topic(&stdout_topic, exp, None).await {
+                            warn!(viewer_id = pending.id, error = %e, "Failed to register stdout topic");
+                        } else {
+                            debug!(viewer_id = pending.id, topic = %stdout_topic, "Stream topic registered with proxy");
                         }
 
-                        // Create dedicated publisher socket on this local task
-                        let publisher_config = StreamPublisherConfig { sndhwm: 100, dedicated: true };
                         match stream_channel.create_publisher_socket(&publisher_config) {
                             Ok(socket) => {
-                                let batching = BatchingConfig {
-                                    min_batch_size: 1,
-                                    max_batch_size: 1,
-                                    max_block_bytes: 256 * 1024,
-                                    min_rate: 1.0,
-                                    max_rate: 30.0,
-                                };
                                 let publisher = StreamPublisher::with_dedicated_socket(
-                                    socket, &pending.stream_ctx, batching,
+                                    socket, stdout_ctx, batching,
                                 );
                                 viewers.push(ViewerHandle {
                                     id: pending.id,
                                     publisher,
+                                    stdin_publisher,
                                     display_mode: pending.display_mode,
                                     consecutive_skips: 0,
                                     cancel: pending.cancel,
@@ -869,11 +914,11 @@ pub(crate) async fn run_frame_loop(
                                 debug!(viewer_id = pending.id, session_id, "Viewer registered in frame loop");
                             }
                             Err(e) => {
-                                warn!(viewer_id = pending.id, error = %e, "Failed to create publisher socket");
+                                warn!(viewer_id = pending.id, error = %e, "Failed to create stdout publisher");
                             }
                         }
                     }
-                    FrameLoopCommand::SendInput { viewer_id: _, data } => {
+                    FrameLoopCommand::SendInput { viewer_id, data } => {
                         // Find the active pane ID to check for an attached process
                         let active_pane_id = {
                             let s = state.read().await;
@@ -885,7 +930,7 @@ pub(crate) async fn run_frame_loop(
 
                         if let Some(pane_id) = active_pane_id {
                             if let Some(proc) = processes.get(&pane_id) {
-                                // Route input to the attached process
+                                // Route input to the local attached process
                                 let _ = proc.input_tx.try_send(
                                     super::process::ProcessInput::Stdin(data),
                                 );
@@ -893,24 +938,69 @@ pub(crate) async fn run_frame_loop(
                             }
                         }
 
-                        // No process attached — feed directly via VTE parser
-                        let mut tui_state = state.write().await;
-                        let damage_info = if let Some(session) = tui_state.session_mut(session_id) {
-                            if let Some(window) = session.active_window_mut() {
-                                let window_id = window.id;
-                                if let Some(pane) = window.active_pane_mut() {
-                                    let pane_id = pane.id;
-                                    let mut performer = vte_parser::PanePerformer::new(pane);
-                                    performer.feed(&data);
-                                    Some((window_id, pane_id))
-                                } else { None }
-                            } else { None }
-                        } else { None };
-                        drop(tui_state);
+                        // Determine if the sender is a producer (Capnp-mode viewer
+                        // sending ANSI output, e.g. cast player) or a consumer
+                        // (Ansi-mode viewer sending keyboard input, e.g. tui attach).
+                        let sender_is_producer = viewers.iter()
+                            .any(|v| v.id == viewer_id && v.display_mode == DisplayMode::Capnp);
 
-                        if let Some((window_id, pane_id)) = damage_info {
-                            let s = state.read().await;
-                            s.notify_damage(session_id, window_id, pane_id);
+                        if sender_is_producer {
+                            // Producer output → VTE render into pane
+                            let mut tui_state = state.write().await;
+                            let damage_info = if let Some(session) = tui_state.session_mut(session_id) {
+                                if let Some(window) = session.active_window_mut() {
+                                    let window_id = window.id;
+                                    if let Some(pane) = window.active_pane_mut() {
+                                        let pane_id = pane.id;
+                                        let mut performer = vte_parser::PanePerformer::new(pane);
+                                        performer.feed(&data);
+                                        Some((window_id, pane_id))
+                                    } else { None }
+                                } else { None }
+                            } else { None };
+                            drop(tui_state);
+
+                            if let Some((window_id, pane_id)) = damage_info {
+                                has_damage = true;
+                                let s = state.read().await;
+                                s.notify_damage(session_id, window_id, pane_id);
+                            }
+                        } else {
+                            // Consumer input → relay via stdin stream (FD 0)
+                            // to any remote process listening (e.g. CLI cast player).
+                            let mut relayed = false;
+                            for viewer in &mut viewers {
+                                if let Some(ref mut stdin_pub) = viewer.stdin_publisher {
+                                    if stdin_pub.publish_data(&data).await.is_ok() {
+                                        relayed = true;
+                                    }
+                                }
+                            }
+
+                            if !relayed {
+                                // No stdin subscribers — VTE fallback (direct write to pane)
+                                let mut tui_state = state.write().await;
+                                let damage_info = if let Some(session) = tui_state.session_mut(session_id) {
+                                    if let Some(window) = session.active_window_mut() {
+                                        let window_id = window.id;
+                                        if let Some(pane) = window.active_pane_mut() {
+                                            let pane_id = pane.id;
+                                            let mut performer = vte_parser::PanePerformer::new(pane);
+                                            performer.feed(&data);
+                                            Some((window_id, pane_id))
+                                        } else { None }
+                                    } else { None }
+                                } else { None };
+                                drop(tui_state);
+
+                                if let Some((window_id, pane_id)) = damage_info {
+                                    // Set has_damage directly so the next interval tick
+                                    // publishes the frame even if event_rx races ahead.
+                                    has_damage = true;
+                                    let s = state.read().await;
+                                    s.notify_damage(session_id, window_id, pane_id);
+                                }
+                            }
                         }
                     }
                     FrameLoopCommand::EvictViewer { viewer_id } => {
