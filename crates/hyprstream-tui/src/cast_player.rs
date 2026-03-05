@@ -195,6 +195,11 @@ impl CastPlayer {
         self.event_index >= self.cast.events.len() && self.elapsed_ms >= self.cast.duration_ms
     }
 
+    pub fn elapsed_ms(&self) -> u64 { self.elapsed_ms }
+    pub fn duration_ms(&self) -> u64 { self.cast.duration_ms }
+    pub fn event_index(&self) -> usize { self.event_index }
+    pub fn event_count(&self) -> usize { self.cast.events.len() }
+
     pub fn toggle_pause(&mut self) {
         self.paused = !self.paused;
     }

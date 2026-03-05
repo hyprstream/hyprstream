@@ -49,13 +49,16 @@ pub async fn handle_tui_attach(signing_key: &SigningKey, session_id: Option<u32>
 
     println!("Connected to session {} (viewer {})", result.session_id, result.viewer_id);
 
-    let stream_info = &result.stream_info;
-    if !stream_info.topic.is_empty() {
-        info!(
-            topic = %stream_info.topic,
-            endpoint = %stream_info.sub_endpoint,
-            "Stream info received"
-        );
+    // FD-indexed streams: [0]=stdin (input relay), [1]=stdout (frames)
+    let stdout_stream = result.streams.get(1);
+    if let Some(si) = stdout_stream {
+        if !si.topic.is_empty() {
+            info!(
+                topic = %si.topic,
+                endpoint = %si.sub_endpoint,
+                "Stream info received"
+            );
+        }
     }
 
     // Print window list
@@ -64,8 +67,12 @@ pub async fn handle_tui_attach(signing_key: &SigningKey, session_id: Option<u32>
     }
 
     // Subscribe to frame stream and enter raw mode
-    if !stream_info.topic.is_empty() {
-        run_attach_loop(stream_info, &client, result.viewer_id).await?;
+    if let Some(stream_info) = stdout_stream {
+        if !stream_info.topic.is_empty() {
+            run_attach_loop(stream_info, &client, result.viewer_id).await?;
+        } else {
+            println!("No stream info — session may be inactive.");
+        }
     } else {
         println!("No stream info — session may be inactive.");
     }
@@ -445,13 +452,13 @@ pub async fn handle_tui_play(
     })?;
     let _ = client.call(payload).await;
 
-    // In the current architecture, the process lives in this CLI process.
-    // The app thread produces ANSI output that we could forward via sendInput.
-    // For a proper integration, the SpawnProcess command would be sent to
-    // the frame loop. For now, forward process output via RPC sendInput.
+    // The process lives in this CLI process. Forward its output to the TUI
+    // service via sendInput RPC, and subscribe to streams[0] (stdin) for
+    // relayed viewer input (keypresses from browser/tui-attach viewers).
+    let stdin_stream = result.streams.first();
     forward_process_output(
         process, &client, signing_key, result.viewer_id, active_pane_id,
-        pane_cols, pane_rows,
+        pane_cols, pane_rows, stdin_stream,
     ).await?;
 
     println!("Playback complete.");
@@ -464,6 +471,10 @@ pub async fn handle_tui_play(
 /// via `list_windows` RPC. If the size changed (e.g. a browser viewer connected),
 /// sends `ProcessInput::Resize` to the local PaneProcess so the AnsiBackend
 /// matches the new pane dimensions.
+///
+/// If `stdin_stream` is provided (FD 0 from ConnectResult), subscribes to
+/// the PUB/SUB stream for relayed viewer input (keypresses from browser or
+/// tui-attach viewers) and forwards them to the local PaneProcess.
 async fn forward_process_output(
     mut process: crate::tui::process::PaneProcess,
     client: &TuiClient,
@@ -472,6 +483,7 @@ async fn forward_process_output(
     _pane_id: u32,
     initial_cols: u16,
     initial_rows: u16,
+    stdin_stream: Option<&crate::services::generated::tui_client::StreamInfo>,
 ) -> Result<()> {
     use crate::tui::process::ProcessInput;
 
@@ -553,6 +565,76 @@ async fn forward_process_output(
         }
     });
 
+    // Subscribe to stdin stream (FD 0) for relayed viewer input
+    let stdin_input_tx = process.input_tx.clone();
+    let stdin_handle = if let Some(si) = stdin_stream {
+        if !si.topic.is_empty() {
+            let zmq_ctx = zmq::Context::new();
+            let sub_endpoint = hyprstream_rpc::registry::global()
+                .endpoint("streams", hyprstream_rpc::registry::SocketKind::Sub)
+                .to_zmq_string();
+            let sub_socket = zmq_ctx.socket(zmq::SUB)?;
+            sub_socket.connect(&sub_endpoint)?;
+            sub_socket.set_subscribe(si.topic.as_bytes())?;
+            sub_socket.set_linger(0)?;
+
+            let mac_key: [u8; 32] = si.mac_key.as_slice()
+                .try_into()
+                .context("stdin mac_key must be 32 bytes")?;
+            let topic = si.topic.clone();
+
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+
+            // ZMQ recv in blocking thread — verifies HMAC chain and extracts data
+            let recv_handle = tokio::task::spawn_blocking(move || {
+                use hyprstream_rpc::streaming::{StreamPayload, StreamVerifier};
+                let mut verifier = StreamVerifier::new(mac_key, topic);
+                loop {
+                    let mut frames: Vec<Vec<u8>> = Vec::with_capacity(3);
+                    match sub_socket.recv_bytes(0) {
+                        Ok(frame) => frames.push(frame),
+                        Err(_) => break,
+                    }
+                    while sub_socket.get_rcvmore().unwrap_or(false) {
+                        match sub_socket.recv_bytes(0) {
+                            Ok(frame) => frames.push(frame),
+                            Err(_) => break,
+                        }
+                    }
+                    match verifier.verify(&frames) {
+                        Ok(payloads) => {
+                            for payload in payloads {
+                                if let StreamPayload::Data(data) = payload {
+                                    if tx.blocking_send(data).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Stdin stream verification failed: {}", e);
+                        }
+                    }
+                }
+            });
+
+            // Forward received input to local PaneProcess
+            let forward_handle = tokio::spawn(async move {
+                while let Some(data) = rx.recv().await {
+                    if stdin_input_tx.send(ProcessInput::Stdin(data)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            Some((recv_handle, forward_handle))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Forward output loop (existing sendInput RPC)
     loop {
         match process.stdout_rx.recv().await {
@@ -579,6 +661,11 @@ async fn forward_process_output(
 
     resize_handle.abort();
     if let Some(h) = stdin_forward { h.abort(); }
+    // Abort stdin stream subscriber
+    if let Some((recv_h, fwd_h)) = stdin_handle {
+        recv_h.abort();
+        fwd_h.abort();
+    }
     // Signal stdin reader thread to exit via cancel pipe
     if let Some(fd) = cancel_fd {
         unsafe { libc::write(fd, b"x".as_ptr().cast(), 1); }

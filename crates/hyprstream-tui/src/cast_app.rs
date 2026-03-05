@@ -5,8 +5,9 @@ use waxterm::TerminalApp;
 
 use crate::cast_player::{CastFile, CastPlayer};
 
-/// Idle time limit: cap gaps between events to 100ms for smoother playback.
-const IDLE_TIME_LIMIT_MS: u64 = 100;
+/// Default idle time limit: cap gaps between events (ms).
+/// Set to None for real-time playback, or Some(ms) to compress long pauses.
+const DEFAULT_IDLE_LIMIT_MS: Option<u64> = None;
 
 /// A log entry with a name and its cast file content.
 pub struct LogEntry {
@@ -35,7 +36,7 @@ impl From<KeyPress> for CastCommand {
 }
 
 fn parse_cast(content: &str) -> CastFile {
-    CastFile::parse_with_idle_limit(content, Some(IDLE_TIME_LIMIT_MS)).unwrap_or_else(|e| {
+    CastFile::parse_with_idle_limit(content, DEFAULT_IDLE_LIMIT_MS).unwrap_or_else(|e| {
         eprintln!("Failed to parse cast: {}", e);
         CastFile {
             header: crate::cast_player::CastHeader {

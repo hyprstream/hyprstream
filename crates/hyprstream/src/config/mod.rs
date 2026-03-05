@@ -860,6 +860,7 @@ fn default_startup_services() -> Vec<String> {
         "flight".to_owned(),    // Arrow Flight SQL server
         "discovery".to_owned(), // Endpoint discovery (RFC 9728 metadata)
         "mcp".to_owned(),       // Model Context Protocol service
+        "tui".to_owned(),       // Terminal multiplexer display server
     ]
 }
 
