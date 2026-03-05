@@ -136,24 +136,59 @@ impl Qwen3_5TextConfig {
 }
 
 // ============================================================================
+// FP8 dequantization helper
+// ============================================================================
+
+/// Dequantize an FP8 `LinearProjection` weight to BF16, applying block-wise scales.
+/// Non-FP8 weights are returned as-is. Consumes the projection, returns the raw weight tensor.
+fn dequant_proj(proj: LinearProjection) -> Tensor {
+    match proj.weight.kind() {
+        tch::Kind::Float8e4m3fn | tch::Kind::Float8e5m2 => {
+            let w_bf = proj.weight.to_kind(tch::Kind::BFloat16);
+            if let Some(scale) = proj.scale {
+                let ws = w_bf.size();
+                let ss = scale.size();
+                let br = ws[0] / ss[0];
+                let bc = ws[1] / ss[1];
+                let s_exp = scale
+                    .to_kind(tch::Kind::BFloat16)
+                    .view([ss[0], 1, ss[1], 1])
+                    .expand([ss[0], br, ss[1], bc], false)
+                    .reshape([ws[0], ws[1]]);
+                w_bf / s_exp
+            } else {
+                w_bf
+            }
+        }
+        _ => proj.weight,
+    }
+}
+
+// ============================================================================
 // Normalization helpers
 // ============================================================================
 
 /// Qwen3.5 RMSNorm: weight initialized to 0, formula norm(x_f32) * (1 + weight)
 struct Qwen3_5RMSNorm {
     weight: Tensor,
+    /// Precomputed `(1.0 + weight).to_kind(Float)` — avoids 2 kernels (cast + add) per forward call.
+    weight_plus_one_f32: Tensor,
     eps: f32,
 }
 
 impl Qwen3_5RMSNorm {
+    fn new(weight: Tensor, eps: f32) -> Self {
+        let weight_plus_one_f32 = (1.0f64 + &weight).to_kind(Kind::Float);
+        Self { weight, weight_plus_one_f32, eps }
+    }
+
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let orig = x.kind();
         let x_f = x.to_kind(Kind::Float);
         let mean_sq = (&x_f * &x_f).mean_dim(&[-1i64][..], true, Kind::Float);
-        let rrms = (mean_sq + self.eps as f64).reciprocal().sqrt();
+        let rrms = (mean_sq + self.eps as f64).rsqrt();
         let normed = &x_f * rrms;
-        let w = self.weight.to_kind(Kind::Float);
-        Ok((normed * (1.0f64 + w)).to_kind(orig))
+        Ok((normed * &self.weight_plus_one_f32).to_kind(orig))
     }
 }
 
@@ -163,19 +198,25 @@ unsafe impl Sync for Qwen3_5RMSNorm {}
 /// Gated RMSNorm used for GatedDeltaNet output: norm(x) * weight * silu(gate)
 struct RMSNormGated {
     weight: Tensor,
+    /// Precomputed `weight.to_kind(Float)` — avoids 1 cast kernel per forward call.
+    weight_f32: Tensor,
     eps: f32,
 }
 
 impl RMSNormGated {
+    fn new(weight: Tensor, eps: f32) -> Self {
+        let weight_f32 = weight.to_kind(Kind::Float);
+        Self { weight, weight_f32, eps }
+    }
+
     fn forward(&self, x: &Tensor, gate: &Tensor) -> Result<Tensor> {
         let orig = x.kind();
-        let x_f = x.to_kind(Kind::Float);
+        let x_f = if x.kind() == Kind::Float { x.shallow_clone() } else { x.to_kind(Kind::Float) };
         let mean_sq = (&x_f * &x_f).mean_dim(&[-1i64][..], true, Kind::Float);
-        let rrms = (mean_sq + self.eps as f64).reciprocal().sqrt();
+        let rrms = (mean_sq + self.eps as f64).rsqrt();
         let normed = &x_f * rrms;
-        let w = self.weight.to_kind(Kind::Float);
         let g = gate.to_kind(Kind::Float).silu();
-        Ok((normed * w * g).to_kind(orig))
+        Ok((normed * &self.weight_f32 * g).to_kind(orig))
     }
 }
 
@@ -185,8 +226,9 @@ unsafe impl Sync for RMSNormGated {}
 /// L2 normalization along last dim (used on Q and K before delta rule)
 #[inline]
 fn l2_normalize(x: &Tensor) -> Tensor {
-    let norm_sq = (x * x).sum_dim_intlist(&[-1i64][..], true, None);
-    x / (norm_sq + 1e-6f64).sqrt()
+    // norm_scalaropt_dim = 2 GPU ops (vs 5 with manual x*x+sum+sqrt+div)
+    let norm = x.norm_scalaropt_dim(2.0, &[-1i64][..], true);
+    x / norm.clamp_min(1e-6)
 }
 
 /// Chunked GatedDeltaNet prefill (translation of `torch_chunk_gated_delta_rule`).
@@ -334,16 +376,18 @@ fn chunked_delta_rule(
 // ============================================================================
 
 struct GatedDeltaNetLayer {
-    // Input projections
-    in_proj_qkv: LinearProjection, // hidden → conv_dim (key_dim*2 + value_dim)
-    in_proj_z: LinearProjection,   // hidden → value_dim (gate)
-    in_proj_b: LinearProjection,   // hidden → num_v_heads (beta)
-    in_proj_a: LinearProjection,   // hidden → num_v_heads (decay input)
+    // Fused input projection: hidden → (conv_dim + value_dim + 2*num_v_heads)
+    // Single matmul instead of 4 — reduces kernel launches by 75% for this step.
+    in_proj_all: LinearProjection,
+    // Split offsets (conv_dim, value_dim, num_v_heads, num_v_heads)
+    proj_split: [i64; 4],
     // Depthwise conv1d on mixed QKV
     conv1d_weight: Tensor,         // [conv_dim, 1, kernel_size]
-    // Decay and dt bias
-    a_log: Tensor,                 // [num_v_heads]
-    dt_bias: Tensor,               // [num_v_heads]
+    // Decay and dt bias (stored in Float to avoid per-step casting)
+    a_log: Tensor,                 // [num_v_heads] original dtype
+    dt_bias: Tensor,               // [num_v_heads] original dtype
+    neg_a_exp_f32: Tensor,          // [1, 1, num_v_heads] precomputed -exp(a_log) in Float
+    dt_bias_f32: Tensor,           // [1, 1, num_v_heads] precomputed in Float
     // Output norm and projection
     norm: RMSNormGated,
     out_proj: LinearProjection,    // value_dim → hidden
@@ -383,29 +427,46 @@ impl GatedDeltaNetLayer {
             weights.remove(&full).ok_or_else(|| anyhow!("Missing weight: {}", full))
         };
 
-        let in_proj_qkv_w = get("in_proj_qkv.weight")?;
-        let in_proj_z_w = get("in_proj_z.weight")?;
-        let in_proj_b_w = get("in_proj_b.weight")?;
-        let in_proj_a_w = get("in_proj_a.weight")?;
         let conv1d_weight = get("conv1d.weight")?;
         let a_log = get("A_log")?;
         let dt_bias = get("dt_bias")?;
         let norm_weight = get("norm.weight")?;
-        let out_proj_w = get("out_proj.weight")?;
 
-        // Weights stored as [out, in] for matmul, LinearProjection expects [in, out]
-        let t = |w: Tensor| w.tr().contiguous();
+        let a_log_sq = a_log.squeeze();
+        let dt_bias_sq = dt_bias.squeeze();
+        // Precompute float versions with broadcast shape [1, 1, nv] for decode path
+        let neg_a_exp_f32 = -(a_log_sq.to_kind(Kind::Float).exp()
+            .unsqueeze(0).unsqueeze(0));   // [1, 1, nv] already negated
+        let dt_bias_f32 = dt_bias_sq.to_kind(Kind::Float)
+            .unsqueeze(0).unsqueeze(0);   // [1, 1, nv]
+
+        // Fuse 4 input projections into 1 matmul.
+        // Dequantize each projection to BF16 at load time (once), then cat along output dim.
+        // This trades ~1.3 GB extra VRAM for 3 fewer kernel launches per layer per decode step.
+        let w_qkv = LinearProjection::take(weights, &format!("{prefix}.in_proj_qkv.weight"))?;
+        let w_z   = LinearProjection::take(weights, &format!("{prefix}.in_proj_z.weight"))?;
+        let w_b   = LinearProjection::take(weights, &format!("{prefix}.in_proj_b.weight"))?;
+        let w_a   = LinearProjection::take(weights, &format!("{prefix}.in_proj_a.weight"))?;
+        let fused_weight = Tensor::cat(&[
+            &dequant_proj(w_qkv), &dequant_proj(w_z), &dequant_proj(w_b), &dequant_proj(w_a)
+        ], 1); // cat along output dim (index 1 since weight is [in, out] after take())
+        let proj_split = [
+            conv_dim as i64,
+            value_dim as i64,
+            num_v_heads as i64,
+            num_v_heads as i64,
+        ];
 
         Ok(Self {
-            in_proj_qkv: LinearProjection::new(t(in_proj_qkv_w)),
-            in_proj_z: LinearProjection::new(t(in_proj_z_w)),
-            in_proj_b: LinearProjection::new(t(in_proj_b_w)),
-            in_proj_a: LinearProjection::new(t(in_proj_a_w)),
+            in_proj_all: LinearProjection { weight: fused_weight, bias: None, scale: None },
+            proj_split,
             conv1d_weight,
-            a_log: a_log.squeeze(),
-            dt_bias: dt_bias.squeeze(),
-            norm: RMSNormGated { weight: norm_weight, eps: 1e-6 },
-            out_proj: LinearProjection::new(t(out_proj_w)),
+            a_log: a_log_sq,
+            dt_bias: dt_bias_sq,
+            neg_a_exp_f32,
+            dt_bias_f32,
+            norm: RMSNormGated::new(norm_weight, 1e-6),
+            out_proj: LinearProjection::take(weights, &format!("{prefix}.out_proj.weight"))?,
             num_k_heads,
             num_v_heads,
             head_k_dim,
@@ -428,16 +489,15 @@ impl GatedDeltaNetLayer {
         let device = hidden.device();
         let dtype = hidden.kind();
 
-        // Input projections
+        // Fused input projection: 1 matmul for all 4 projections.
         let h2 = hidden.reshape([batch * seq, hidden.size()[2]]);
-        let mixed_qkv = self.in_proj_qkv.apply(&h2)
-            .reshape([batch, seq, self.conv_dim as i64]);
-        let z = self.in_proj_z.apply(&h2)
-            .reshape([batch, seq, self.value_dim as i64]);
-        let b = self.in_proj_b.apply(&h2)
-            .reshape([batch, seq, self.num_v_heads as i64]);
-        let a_in = self.in_proj_a.apply(&h2)
-            .reshape([batch, seq, self.num_v_heads as i64]);
+        let all_proj = self.in_proj_all.apply(&h2); // [batch*seq, conv_dim+val_dim+2*nv]
+        let [cd, vd, nv_d, _] = self.proj_split;
+        let mut off = 0i64;
+        let mixed_qkv = all_proj.narrow(1, off, cd).reshape([batch, seq, cd]); off += cd;
+        let z         = all_proj.narrow(1, off, vd).reshape([batch, seq, vd]); off += vd;
+        let b         = all_proj.narrow(1, off, nv_d).reshape([batch, seq, nv_d]); off += nv_d;
+        let a_in      = all_proj.narrow(1, off, nv_d).reshape([batch, seq, nv_d]);
 
         // Depthwise causal conv1d on mixed_qkv
         // mixed_qkv: [batch, seq, conv_dim] → need [batch, conv_dim, seq] for conv1d
@@ -498,12 +558,10 @@ impl GatedDeltaNetLayer {
 
         // Compute decay g = A * dt where A = -exp(A_log), dt = softplus(a_in + dt_bias)
         // A_log stores log(-A) so A = -exp(A_log) is negative; g = A * dt is negative log-decay
-        let a_log_f = self.a_log.to_kind(Kind::Float); // [num_v_heads]
-        let dt_bias_f = self.dt_bias.to_kind(Kind::Float); // [num_v_heads]
+        // Use precomputed float tensors — avoids to_kind + exp + unsqueeze per step
         let a_in_f = a_in.to_kind(Kind::Float); // [batch, seq, num_v_heads]
-        let a_exp = a_log_f.exp(); // exp(A_log) = -A (positive)
-        let softplus_input = a_in_f + &dt_bias_f.unsqueeze(0).unsqueeze(0);
-        let g = -(a_exp.unsqueeze(0).unsqueeze(0) * softplus_input.softplus()); // = A * dt (negative)
+        let softplus_input = a_in_f + &self.dt_bias_f32; // [1,1,nv] broadcasts
+        let g = &self.neg_a_exp_f32 * softplus_input.softplus(); // [batch, seq, nv]
 
         // Recurrent delta rule
         // state shape: [batch, num_v_heads, head_k_dim, head_v_dim]
@@ -548,15 +606,20 @@ impl GatedDeltaNetLayer {
             let q_t = q_for_state.narrow(1, 0, 1).squeeze_dim(1);
 
             // state: [B, nv, hk, hv]; k_t, q_t: [B, nv, hk]; v_t, b_t: [B, nv, hv]
+            // In-place state decay (Step 9)
             let decay = g_t.exp().reshape([batch, nv, 1, 1]);
-            let state = &state_init * decay;
-            // kv_mem[h,v] = sum_k(state[h,k,v] * k[h,k]) = (state * k_t.unsqueeze(-1)).sum(-2)
-            let kv_mem = (&state * k_t.unsqueeze(-1)).sum_dim_intlist(&[-2i64][..], false, None);
+            let state = &state_init * &decay;
+            // BMM-based readout: state[B*nv, hk, hv] × k_t[B*nv, 1, hk]^T → [B*nv, 1, hv]
+            let state_3d = state.reshape([batch * nv, hk, hv]);
+            let k_col = k_t.reshape([batch * nv, 1, hk]);
+            let kv_mem = k_col.bmm(&state_3d).reshape([batch, nv, hv]);
             let delta = (v_t - kv_mem) * b_t.unsqueeze(-1);
             // outer product update: state[h,k,v] += k[h,k] * delta[h,v]
-            let state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2);
-            // out_t[h,v] = sum_k(state[h,k,v] * q[h,k])
-            let out_t = (&state * q_t.unsqueeze(-1)).sum_dim_intlist(&[-2i64][..], false, None);
+            let state = state.reshape([batch, nv, hk, hv]) + k_t.unsqueeze(-1) * delta.unsqueeze(-2);
+            // BMM-based output readout
+            let state_3d = state.reshape([batch * nv, hk, hv]);
+            let q_col = q_t.reshape([batch * nv, 1, hk]);
+            let out_t = q_col.bmm(&state_3d).reshape([batch, nv, hv]);
 
             *rec_state = Some(state);
             // out_t: [batch, nv, hv] → [batch, 1, nv, hv] → [batch, 1, val_dim]
@@ -584,7 +647,9 @@ impl GatedDeltaNetLayer {
         let z_f = z; // [batch, seq, value_dim]
         let out_4d = out.reshape([batch, seq, nv, hv]);
         let z_4d = z_f.reshape([batch, seq, nv, hv]);
-        let normed = self.norm.forward(&out_4d.to_kind(dtype), &z_4d)?;
+        let normed = self.norm.forward(&out_4d, &z_4d)?;  // out_4d may be F32 from recurrent step; RMSNormGated handles both
+        // Ensure output matches model dtype for out_proj matmul (weight is BF16)
+        let normed = if normed.kind() != dtype { normed.to_kind(dtype) } else { normed };
         let flat = normed.reshape([batch * seq, val_dim]);
         let projected = self.out_proj.apply(&flat);
         Ok(projected.reshape([batch, seq, self.hidden_size_from_out_proj()]))
@@ -600,11 +665,10 @@ impl GatedDeltaNetLayer {
 // ============================================================================
 
 struct Qwen3_5FullAttention {
-    q_proj: LinearProjection, // out: num_heads * head_dim * 2 (query + gate)
-    k_proj: LinearProjection, // out: num_kv_heads * head_dim
-    v_proj: LinearProjection, // out: num_kv_heads * head_dim
-    o_proj: LinearProjection, // in: num_heads * head_dim
-    q_norm: Qwen3_5RMSNorm,  // per-head, weight dim = head_dim
+    qkv_proj: LinearProjection, // fused: hidden → (q_out + k_out + v_out)
+    qkv_split: [i64; 3],       // [q_dim, k_dim, v_dim] for narrow splits
+    o_proj: LinearProjection,   // in: num_heads * head_dim
+    q_norm: Qwen3_5RMSNorm,    // per-head, weight dim = head_dim
     k_norm: Qwen3_5RMSNorm,
     num_heads: usize,
     num_kv_heads: usize,
@@ -625,23 +689,31 @@ impl Qwen3_5FullAttention {
         cfg: &Qwen3_5TextConfig,
         layer_idx: usize,
     ) -> Result<Self> {
-        let mut get = |name: &str| -> Result<Tensor> {
-            let full = format!("{prefix}.{name}");
-            weights.remove(&full).ok_or_else(|| anyhow!("Missing weight: {}", full))
-        };
+        let q_norm_weight = weights
+            .remove(&format!("{prefix}.q_norm.weight"))
+            .ok_or_else(|| anyhow!("Missing {prefix}.q_norm.weight"))?;
+        let k_norm_weight = weights
+            .remove(&format!("{prefix}.k_norm.weight"))
+            .ok_or_else(|| anyhow!("Missing {prefix}.k_norm.weight"))?;
 
-        let t = |w: Tensor| w.tr().contiguous();
-
-        let q_norm_weight = get("q_norm.weight")?;
-        let k_norm_weight = get("k_norm.weight")?;
+        // Fuse Q/K/V projections into single matmul (dequantize FP8 at load time)
+        let q_proj = LinearProjection::take(weights, &format!("{prefix}.q_proj.weight"))?;
+        let k_proj = LinearProjection::take(weights, &format!("{prefix}.k_proj.weight"))?;
+        let v_proj = LinearProjection::take(weights, &format!("{prefix}.v_proj.weight"))?;
+        let q_w = dequant_proj(q_proj);
+        let k_w = dequant_proj(k_proj);
+        let v_w = dequant_proj(v_proj);
+        let q_dim = q_w.size()[1];
+        let k_dim = k_w.size()[1];
+        let v_dim = v_w.size()[1];
+        let fused = Tensor::cat(&[&q_w, &k_w, &v_w], 1);
 
         Ok(Self {
-            q_proj: LinearProjection::new(t(get("q_proj.weight")?)),
-            k_proj: LinearProjection::new(t(get("k_proj.weight")?)),
-            v_proj: LinearProjection::new(t(get("v_proj.weight")?)),
-            o_proj: LinearProjection::new(t(get("o_proj.weight")?)),
-            q_norm: Qwen3_5RMSNorm { weight: q_norm_weight, eps: cfg.rms_norm_eps },
-            k_norm: Qwen3_5RMSNorm { weight: k_norm_weight, eps: cfg.rms_norm_eps },
+            qkv_proj: LinearProjection { weight: fused, bias: None, scale: None },
+            qkv_split: [q_dim, k_dim, v_dim],
+            o_proj: LinearProjection::take(weights, &format!("{prefix}.o_proj.weight"))?,
+            q_norm: Qwen3_5RMSNorm::new(q_norm_weight, cfg.rms_norm_eps),
+            k_norm: Qwen3_5RMSNorm::new(k_norm_weight, cfg.rms_norm_eps),
             num_heads: cfg.num_attention_heads,
             num_kv_heads: cfg.num_key_value_heads,
             head_dim: cfg.head_dim,
@@ -664,10 +736,12 @@ impl Qwen3_5FullAttention {
         let dtype = hidden.kind();
         let h2 = hidden.reshape([batch * seq, hidden.size()[2]]);
 
-        // Q projection outputs query + gate interleaved
-        let q_out = self.q_proj.apply(&h2); // [batch*seq, heads * head_dim * 2]
-        let k_out = self.k_proj.apply(&h2); // [batch*seq, kv_heads * head_dim]
-        let v_out = self.v_proj.apply(&h2); // [batch*seq, kv_heads * head_dim]
+        // Fused QKV projection: single matmul, then split
+        let qkv = self.qkv_proj.apply(&h2);
+        let [q_dim, k_dim, v_dim] = self.qkv_split;
+        let q_out = qkv.narrow(1, 0, q_dim);
+        let k_out = qkv.narrow(1, q_dim, k_dim);
+        let v_out = qkv.narrow(1, q_dim + k_dim, v_dim);
 
         let nh = self.num_heads as i64;
         let nkv = self.num_kv_heads as i64;
@@ -735,7 +809,7 @@ impl Qwen3_5FullAttention {
 
         // Apply output gate: gate_flat[batch*seq, nh*hd] * sigmoid(gate) BEFORE o_proj
         let ctx_flat = ctx.reshape([batch * seq, nh * hd]);
-        let gate_flat = gate.reshape([batch * seq, nh * hd]).to_kind(Kind::Float).sigmoid().to_kind(dtype);
+        let gate_flat = gate.reshape([batch * seq, nh * hd]).sigmoid();
         let ctx_gated = ctx_flat * gate_flat;
         let out = self.o_proj.apply(&ctx_gated);
         Ok(out.reshape([batch, seq, -1]))
@@ -743,19 +817,15 @@ impl Qwen3_5FullAttention {
 
     fn apply_qknorm(&self, x: &Tensor, norm: &Qwen3_5RMSNorm, _nheads: usize) -> Result<Tensor> {
         // x: [batch, seq, heads, head_dim]
-        // Apply norm per-head (last dim)
         let orig_shape = x.size();
         let (batch, seq, heads, hd) = dims4(x)?;
-        // Reshape to [batch*seq*heads, head_dim] for norm, then restore
         let flat = x.reshape([batch * seq * heads, hd]);
-        // Broadcast weight [head_dim] over batch*seq*heads
         let orig = flat.kind();
         let flat_f = flat.to_kind(Kind::Float);
         let mean_sq = (&flat_f * &flat_f).mean_dim(&[-1i64][..], true, Kind::Float);
-        let rrms = (mean_sq + norm.eps as f64).reciprocal().sqrt();
+        let rrms = (mean_sq + norm.eps as f64).rsqrt();
         let normed = &flat_f * rrms;
-        let w = norm.weight.to_kind(Kind::Float).reshape([1, hd]);
-        let normed_scaled = normed * (1.0f64 + w);
+        let normed_scaled = normed * norm.weight_plus_one_f32.reshape([1, hd]);
         Ok(normed_scaled.to_kind(orig).reshape(orig_shape))
     }
 
@@ -767,14 +837,32 @@ impl Qwen3_5FullAttention {
         device: Device,
         dtype: Kind,
     ) -> Result<Tensor> {
-        // x: [batch, seq, heads, rotary_dim]
+        // Thread-local RoPE cache: reuses sin/cos tables across decode steps.
+        // Saves ~9 GPU kernels per call (generate_embeddings) after the first token.
+        // Same pattern as LlamaModel::apply_rope.
+        use std::cell::RefCell;
+        thread_local! {
+            static ROPE_CACHE: RefCell<HashMap<(usize, u32), RoPE>> =
+                RefCell::new(HashMap::new());
+        }
+
         let rd = self.rotary_dim as i64;
         let seq = x.size()[1];
-        let mut rope = RoPE::new_with_dtype(rd, self.rope_theta as f64, self.max_pos as i64, device, dtype)?;
         let pos_ids = position_ids.map(|p| p.shallow_clone()).unwrap_or_else(|| {
             Tensor::arange_start(start_pos as i64, start_pos as i64 + seq, (Kind::Int64, device))
         });
-        rope.forward(x, Some(&pos_ids))
+
+        ROPE_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let key = (self.layer_idx, (self.rope_theta * 1000.0) as u32);
+            let rope = match cache.entry(key) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(RoPE::new_with_dtype(rd, self.rope_theta as f64, self.max_pos as i64, device, dtype)?)
+                }
+            };
+            rope.forward(x, Some(&pos_ids))
+        })
     }
 }
 
@@ -800,49 +888,63 @@ unsafe impl Send for Qwen3_5Expert {}
 unsafe impl Sync for Qwen3_5Expert {}
 
 struct Qwen3_5SparseMoE {
-    gate: LinearProjection,     // [hidden, num_experts] router
-    experts: Vec<Qwen3_5Expert>,
+    gate: LinearProjection,     // router: [hidden, num_experts]
+    // Stacked expert weights — [num_experts, in_dim, out_dim].
+    // GPU-native BMM dispatch: no CPU routing sync, 3 kernels instead of 8×3=24.
+    expert_gate_w: Tensor,      // [num_experts, hidden, moe_int]
+    expert_up_w: Tensor,        // [num_experts, hidden, moe_int]
+    expert_down_w: Tensor,      // [num_experts, moe_int, hidden]
     shared_expert: Qwen3_5Expert,
     num_experts_per_tok: usize,
 }
 
 impl Qwen3_5SparseMoE {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // x: [batch*seq, hidden]
-        let router_logits = self.gate.apply(x); // [B, num_experts]
-        let router_probs = router_logits.softmax(-1, x.kind());
-        let k = self.num_experts_per_tok as i64;
-        let (top_weights, top_ids) = router_probs.topk(k, -1, true, true);
-
-        // Normalize selected weights
-        let top_weights_sum = top_weights.sum_dim_intlist(&[-1i64][..], true, None);
-        let top_weights = top_weights / top_weights_sum;
-
+        // x: [batch, hidden]
         let batch = x.size()[0];
         let hidden = x.size()[1];
-        let mut output = Tensor::zeros([batch, hidden], (x.kind(), x.device()));
+        let k = self.num_experts_per_tok as i64;
+        let dtype = x.kind();
 
-        // Dispatch to each of the top-k expert slots
-        for slot in 0..k {
-            let expert_ids = top_ids.select(1, slot); // [batch]
-            let weights = top_weights.select(1, slot).unsqueeze(-1); // [batch, 1]
+        // Router — topK on raw logits, then softmax over selected experts only.
+        // Avoids softmax over all 256 experts + renormalize div+sum.
+        let logits = self.gate.apply(x);  // [batch, num_experts]
+        let (top_logits, top_ids) = logits.topk(k, -1, true, true);
+        let top_weights = top_logits.softmax(-1, dtype);  // softmax over k=8 only
 
-            // Group tokens by expert and process
-            for expert_idx in 0..self.experts.len() {
-                let mask = expert_ids.eq(expert_idx as i64); // [batch] bool
-                if mask.any().int64_value(&[]) == 0 {
-                    continue;
-                }
-                let indices = mask.nonzero().squeeze_dim(1); // token indices
-                let expert_input = x.index_select(0, &indices);
-                let expert_out = self.experts[expert_idx].forward(&expert_input)?;
-                let w = weights.index_select(0, &indices);
-                let weighted = expert_out * w;
-                output = output.index_add(0, &indices, &weighted);
-            }
-        }
+        // Gather expert weights on GPU — no CPU sync.
+        // top_ids: [batch, k] → [batch*k]
+        let top_ids_flat = top_ids.reshape([-1]);
 
-        // Always-active shared expert
+        // Expert weights are already BF16 (dequantized at load time).
+        let gate_sel = self.expert_gate_w.index_select(0, &top_ids_flat);  // [batch*k, hidden, moe_int]
+        let up_sel = self.expert_up_w.index_select(0, &top_ids_flat);
+
+        // Repeat input k times: [batch*k, hidden]
+        let x_rep = if x.kind() != tch::Kind::BFloat16 {
+            x.repeat_interleave_self_int(k, 0, None).to_kind(tch::Kind::BFloat16)
+        } else {
+            x.repeat_interleave_self_int(k, 0, None)
+        };
+
+        // Fused gate+up BMM: cat weights along output dim, single BMM, then split
+        let moe_int = gate_sel.size()[2];
+        let gate_up_sel = Tensor::cat(&[&gate_sel, &up_sel], 2); // [batch*k, hidden, 2*moe_int]
+        let x_3d = x_rep.unsqueeze(1); // [batch*k, 1, hidden]
+        let gate_up = x_3d.bmm(&gate_up_sel).squeeze_dim(1); // [batch*k, 2*moe_int]
+        let gate_out = gate_up.narrow(1, 0, moe_int).silu();
+        let up_out = gate_up.narrow(1, moe_int, moe_int);
+
+        // [batch*k, 1, moe_int] × [batch*k, moe_int, hidden] → [batch*k, hidden]
+        let down_sel = self.expert_down_w.index_select(0, &top_ids_flat);  // [batch*k, moe_int, hidden]
+        let expert_out = (gate_out * up_out).unsqueeze(1).bmm(&down_sel).squeeze_dim(1);
+
+        // Weighted sum: [batch, k, hidden], then reduce over k.
+        let expert_out = expert_out.reshape([batch, k, hidden]);
+        let output = (expert_out * top_weights.unsqueeze(-1).to_kind(tch::Kind::BFloat16))
+            .sum_dim_intlist(&[1i64][..], false, None);
+        let output = if dtype != tch::Kind::BFloat16 { output.to_kind(dtype) } else { output };
+
         let shared_out = self.shared_expert.forward(x)?;
         Ok(output + shared_out)
     }
@@ -971,10 +1073,15 @@ impl Qwen3_5Model {
                 // Best-effort: vision key naming varies across model sizes; skip on error
                 match Qwen3_5VisionEncoder::from_weights(weights, vcfg) {
                     Ok(enc) => {
-                        let proj_w = weights.remove("visual_projector.weight")
-                            .or_else(|| weights.remove("vision_projector.weight"));
-                        let projector = if let Some(w) = proj_w {
-                            Some(LinearProjection::new(w.tr().contiguous()))
+                        let proj_key = if weights.contains_key("visual_projector.weight") {
+                            Some("visual_projector.weight")
+                        } else if weights.contains_key("vision_projector.weight") {
+                            Some("vision_projector.weight")
+                        } else {
+                            None
+                        };
+                        let projector = if let Some(key) = proj_key {
+                            Some(LinearProjection::take(weights, key)?)
                         } else {
                             info!("No vision_projector weights found; vision output will be zeros");
                             let w = Tensor::zeros([out_hidden as i64, text_hidden as i64], (dtype, *device));
@@ -1004,7 +1111,13 @@ impl Qwen3_5Model {
             .ok_or_else(|| anyhow!("Missing model.embed_tokens.weight"))?;
         let norm_w = weights.remove("model.norm.weight")
             .ok_or_else(|| anyhow!("Missing model.norm.weight"))?;
-        let lm_head_w = weights.remove("lm_head.weight");
+        let lm_head_w = weights.remove("lm_head.weight").map(|w| {
+            // Cast FP8 lm_head to BF16 at load time — matmul requires matching dtype.
+            match w.kind() {
+                tch::Kind::Float8e4m3fn | tch::Kind::Float8e5m2 => w.to_kind(tch::Kind::BFloat16),
+                _ => w,
+            }
+        });
 
         let num_layers = cfg.num_hidden_layers;
         let mut layers = Vec::with_capacity(num_layers);
@@ -1034,13 +1147,18 @@ impl Qwen3_5Model {
             layers.push(Qwen3_5Layer {
                 mixer,
                 mlp,
-                input_layernorm: Qwen3_5RMSNorm { weight: input_norm_w, eps: cfg.rms_norm_eps },
-                post_attention_layernorm: Qwen3_5RMSNorm { weight: post_norm_w, eps: cfg.rms_norm_eps },
+                input_layernorm: Qwen3_5RMSNorm::new(input_norm_w, cfg.rms_norm_eps),
+                post_attention_layernorm: Qwen3_5RMSNorm::new(post_norm_w, cfg.rms_norm_eps),
             });
         }
 
         let lm_head_transposed = if lm_head_w.is_none() {
-            Some(embed.tr().contiguous())
+            // embed may be FP8; cast to BF16 for matmul
+            let embed_bf16 = match embed.kind() {
+                tch::Kind::Float8e4m3fn | tch::Kind::Float8e5m2 => embed.to_kind(tch::Kind::BFloat16),
+                _ => embed.shallow_clone(),
+            };
+            Some(embed_bf16.tr().contiguous())
         } else {
             None
         };
@@ -1052,18 +1170,27 @@ impl Qwen3_5Model {
             (0..num_layers).map(|_| None::<Tensor>).collect::<Vec<_>>(),
         ));
 
+        // Create KV cache for full-attention layers (same pattern as LlamaModel)
+        let kv_cache = Some(Arc::new(parking_lot::Mutex::new(
+            crate::runtime::kv_cache::KVCacheManager::new(
+                num_layers,
+                cfg.max_position_embeddings,
+                _kv_quant_type,
+            ),
+        )));
+
         Ok(Self {
             config: cfg,
             device: *device,
             dtype,
             embed_tokens: embed,
             layers,
-            norm: Qwen3_5RMSNorm { weight: norm_w, eps: 1e-6 },
+            norm: Qwen3_5RMSNorm::new(norm_w, 1e-6),
             lm_head: lm_head_w,
             lm_head_transposed,
             conv_states,
             rec_states,
-            kv_cache: None,
+            kv_cache,
             vision_encoder,
             vision_projector,
         })
@@ -1075,66 +1202,52 @@ impl Qwen3_5Model {
         cfg: &Qwen3_5TextConfig,
         layer_idx: usize,
     ) -> Result<Qwen3_5Mlp> {
-        let t = |w: Tensor| w.tr().contiguous();
-
         if cfg.is_moe {
-            let mut get = |name: &str| -> Result<Tensor> {
-                let full = format!("{prefix}.{name}");
-                weights.remove(&full).ok_or_else(|| anyhow!("Missing weight: {}", full))
-            };
+            // gate: [num_experts, hidden] → [hidden, num_experts]
+            let gate_proj = LinearProjection::take(weights, &format!("{prefix}.gate.weight"))?;
 
-            let gate_w = get("gate.weight")?;
-            // gate stored as [num_experts, hidden] — need [hidden, num_experts] for our LinearProjection
-            let gate_proj = LinearProjection::new(gate_w.tr().contiguous());
-
-            let mut experts = Vec::with_capacity(cfg.num_experts);
-            for e in 0..cfg.num_experts {
-                let ep = format!("experts.{e}");
-                let gp = weights.remove(&format!("{prefix}.{ep}.gate_proj.weight"))
-                    .ok_or_else(|| anyhow!("Missing {prefix}.{ep}.gate_proj.weight"))?;
-                let up = weights.remove(&format!("{prefix}.{ep}.up_proj.weight"))
-                    .ok_or_else(|| anyhow!("Missing {prefix}.{ep}.up_proj.weight"))?;
-                let dn = weights.remove(&format!("{prefix}.{ep}.down_proj.weight"))
-                    .ok_or_else(|| anyhow!("Missing {prefix}.{ep}.down_proj.weight"))?;
-                experts.push(Qwen3_5Expert {
-                    gate_proj: LinearProjection::new(t(gp)),
-                    up_proj: LinearProjection::new(t(up)),
-                    down_proj: LinearProjection::new(t(dn)),
-                });
+            // Stack expert weights as [num_experts, in_dim, out_dim] for GPU-native BMM dispatch.
+            // weights["expert.N.gate_proj.weight"] stored as [in, out] after LinearProjection::take.
+            // We collect them and stack: [num_experts, in, out].
+            let n = cfg.num_experts;
+            let mut gate_vecs: Vec<Tensor> = Vec::with_capacity(n);
+            let mut up_vecs: Vec<Tensor> = Vec::with_capacity(n);
+            let mut down_vecs: Vec<Tensor> = Vec::with_capacity(n);
+            for e in 0..n {
+                let ep = format!("{prefix}.experts.{e}");
+                // take() transposes [out, in] → [in, out]; dequant_proj handles FP8 → BF16 with scales
+                let g = LinearProjection::take(weights, &format!("{ep}.gate_proj.weight"))?;
+                let u = LinearProjection::take(weights, &format!("{ep}.up_proj.weight"))?;
+                let d = LinearProjection::take(weights, &format!("{ep}.down_proj.weight"))?;
+                gate_vecs.push(dequant_proj(g).unsqueeze(0));
+                up_vecs.push(dequant_proj(u).unsqueeze(0));
+                down_vecs.push(dequant_proj(d).unsqueeze(0));
             }
+            // Stack: [num_experts, in, out]
+            let expert_gate_w = Tensor::cat(&gate_vecs, 0);
+            let expert_up_w   = Tensor::cat(&up_vecs, 0);
+            let expert_down_w = Tensor::cat(&down_vecs, 0);
 
-            let shared = {
-                let gp = weights.remove(&format!("{prefix}.shared_expert.gate_proj.weight"))
-                    .ok_or_else(|| anyhow!("Missing {prefix}.shared_expert.gate_proj.weight"))?;
-                let up = weights.remove(&format!("{prefix}.shared_expert.up_proj.weight"))
-                    .ok_or_else(|| anyhow!("Missing {prefix}.shared_expert.up_proj.weight"))?;
-                let dn = weights.remove(&format!("{prefix}.shared_expert.down_proj.weight"))
-                    .ok_or_else(|| anyhow!("Missing {prefix}.shared_expert.down_proj.weight"))?;
-                Qwen3_5Expert {
-                    gate_proj: LinearProjection::new(t(gp)),
-                    up_proj: LinearProjection::new(t(up)),
-                    down_proj: LinearProjection::new(t(dn)),
-                }
+            let sp = format!("{prefix}.shared_expert");
+            let shared = Qwen3_5Expert {
+                gate_proj: LinearProjection::take(weights, &format!("{sp}.gate_proj.weight"))?,
+                up_proj: LinearProjection::take(weights, &format!("{sp}.up_proj.weight"))?,
+                down_proj: LinearProjection::take(weights, &format!("{sp}.down_proj.weight"))?,
             };
 
             Ok(Qwen3_5Mlp::Sparse(Qwen3_5SparseMoE {
                 gate: gate_proj,
-                experts,
+                expert_gate_w,
+                expert_up_w,
+                expert_down_w,
                 shared_expert: shared,
                 num_experts_per_tok: cfg.num_experts_per_tok,
             }))
         } else {
-            let gp = weights.remove(&format!("{prefix}.gate_proj.weight"))
-                .ok_or_else(|| anyhow!("Missing {prefix}.gate_proj.weight"))?;
-            let up = weights.remove(&format!("{prefix}.up_proj.weight"))
-                .ok_or_else(|| anyhow!("Missing {prefix}.up_proj.weight"))?;
-            let dn = weights.remove(&format!("{prefix}.down_proj.weight"))
-                .ok_or_else(|| anyhow!("Missing {prefix}.down_proj.weight"))?;
-
             Ok(Qwen3_5Mlp::Dense(LlamaMLP {
-                gate_proj: LinearProjection::new(t(gp)),
-                up_proj: LinearProjection::new(t(up)),
-                down_proj: LinearProjection::new(t(dn)),
+                gate_proj: LinearProjection::take(weights, &format!("{prefix}.gate_proj.weight"))?,
+                up_proj: LinearProjection::take(weights, &format!("{prefix}.up_proj.weight"))?,
+                down_proj: LinearProjection::take(weights, &format!("{prefix}.down_proj.weight"))?,
                 activation: "silu".to_owned(),
                 layer_idx,
             }))

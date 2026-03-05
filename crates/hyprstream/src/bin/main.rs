@@ -1109,6 +1109,27 @@ fn handle_quick_command(
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
+    // ROCm allocator and BLAS optimizations — must be set before any tch/libtorch init.
+    // Expandable segments eliminates ~1,900 hipMalloc/hipFree calls per decode step.
+    // hipBLASLt split-K improves M=1 GEMM (single-token decode) throughput.
+    if std::env::var("HIP_VISIBLE_DEVICES").is_ok() {
+        if std::env::var("PYTORCH_HIP_ALLOC_CONF").is_err() {
+            // SAFETY: single-threaded at this point (before any thread spawning)
+            unsafe {
+                std::env::set_var(
+                    "PYTORCH_HIP_ALLOC_CONF",
+                    "expandable_segments:True,garbage_collection_threshold:0.8",
+                );
+            }
+        }
+        if std::env::var("TORCH_BLAS_PREFER_HIPBLASLT").is_err() {
+            unsafe { std::env::set_var("TORCH_BLAS_PREFER_HIPBLASLT", "1"); }
+        }
+        if std::env::var("HIPBLASLT_FORCE_SPLIT_K").is_err() {
+            unsafe { std::env::set_var("HIPBLASLT_FORCE_SPLIT_K", "1"); }
+        }
+    }
+
     // Set up panic handler to get better debugging information
     std::panic::set_hook(Box::new(|info| {
         eprintln!("\u{1f6a8} PANIC occurred:");

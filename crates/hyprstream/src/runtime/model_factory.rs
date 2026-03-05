@@ -48,7 +48,9 @@ impl ModelFactory {
                 safetensors::Dtype::F16 => f16_count += 1,
                 safetensors::Dtype::BF16 => bf16_count += 1,
                 safetensors::Dtype::F32 => f32_count += 1,
-                _ => {}, // Other dtypes are ignored
+                // FP8 models use BF16 for activations/norms; target dtype = BF16
+                safetensors::Dtype::F8_E4M3 | safetensors::Dtype::F8_E5M2 => bf16_count += 1,
+                _ => {},
             }
         }
 
@@ -522,9 +524,46 @@ impl ModelFactory {
                         cpu_tensor
                     }
                 }
+                // FP8 formats: keep as FP8 in VRAM. ROCm 7.1+ dispatches FP8→BF16 on-GPU.
+                // Block-wise scale tensors (weight_scale_inv) are loaded alongside and stored
+                // in LinearProjection.scale for correct dequantization at matmul time.
+                safetensors::Dtype::F8_E4M3 => {
+                    let borrowed_tensor = unsafe {
+                        Tensor::from_blob(
+                            data.as_ptr(),
+                            &shape,
+                            &[],
+                            tch::Kind::Float8e4m3fn,
+                            Device::Cpu,
+                        )
+                    };
+                    let cpu_tensor = borrowed_tensor.copy();
+                    if *device != Device::Cpu {
+                        cpu_tensor.to_device(*device)
+                    } else {
+                        cpu_tensor
+                    }
+                }
+                safetensors::Dtype::F8_E5M2 => {
+                    let borrowed_tensor = unsafe {
+                        Tensor::from_blob(
+                            data.as_ptr(),
+                            &shape,
+                            &[],
+                            tch::Kind::Float8e5m2,
+                            Device::Cpu,
+                        )
+                    };
+                    let cpu_tensor = borrowed_tensor.copy();
+                    if *device != Device::Cpu {
+                        cpu_tensor.to_device(*device)
+                    } else {
+                        cpu_tensor
+                    }
+                }
                 dtype => {
                     return Err(anyhow!(
-                        "Tensor '{}' has unsupported dtype {:?}. Supported: F16, BF16, F32",
+                        "Tensor '{}' has unsupported dtype {:?}. Supported: F16, BF16, F32, F8_E4M3, F8_E5M2",
                         name, dtype
                     ));
                 }
@@ -539,6 +578,59 @@ impl ModelFactory {
         );
 
         Ok(())
+    }
+
+    /// For every FP8 weight tensor that has a companion `<key>_scale_inv` block-scale
+    /// tensor, apply the scale and convert the weight to BF16 in-place.
+    ///
+    /// Scale shape is `[out/128, in/128]` (block size 128). Each scale element
+    /// covers a 128×128 block of the weight matrix.
+    fn apply_fp8_scales(weights: &mut HashMap<String, Tensor>) {
+        let scale_keys: Vec<String> = weights
+            .keys()
+            .filter(|k| k.ends_with("_scale_inv"))
+            .cloned()
+            .collect();
+
+        for scale_key in scale_keys {
+            // scale_key: "model.layers.0.self_attn.q_proj.weight_scale_inv"
+            // weight_key: "model.layers.0.self_attn.q_proj.weight"
+            let weight_key = scale_key.strip_suffix("_scale_inv").unwrap().to_owned();
+
+            let scale = match weights.remove(&scale_key) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let weight = match weights.get(&weight_key) {
+                Some(w) => w,
+                None => continue,
+            };
+
+            if !matches!(weight.kind(), tch::Kind::Float8e4m3fn | tch::Kind::Float8e5m2) {
+                continue;
+            }
+
+            let ws = weight.size();
+            let ss = scale.size();
+            if ws.len() != 2 || ss.len() != 2 || ss[0] == 0 || ss[1] == 0 {
+                tracing::warn!("Unexpected scale shape {:?} for weight {:?}, skipping", ss, ws);
+                continue;
+            }
+
+            let block_r = ws[0] / ss[0];
+            let block_c = ws[1] / ss[1];
+
+            // Expand scale from [out/128, in/128] → [out, in]
+            let scale_exp = scale
+                .to_kind(tch::Kind::BFloat16)
+                .repeat_interleave_self_int(block_r, 0, None)
+                .repeat_interleave_self_int(block_c, 1, None);
+
+            // FP8 → BF16 on GPU, then multiply by expanded scale
+            let dequant = weight.to_kind(tch::Kind::BFloat16) * scale_exp;
+            weights.insert(weight_key, dequant);
+        }
     }
 
     /// Create model instance from configuration
@@ -849,6 +941,7 @@ impl ModelFactory {
                 safetensors::Dtype::F16 => f16_count += 1,
                 safetensors::Dtype::BF16 => bf16_count += 1,
                 safetensors::Dtype::F32 => f32_count += 1,
+                safetensors::Dtype::F8_E4M3 | safetensors::Dtype::F8_E5M2 => bf16_count += 1,
                 _ => {},
             }
         }

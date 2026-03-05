@@ -928,13 +928,13 @@ impl TorchEngine {
     pub fn clear_kv_cache(&self) {
         if let Some(model_arc) = &self.persistent_model {
             let model = model_arc.lock();
-
-            // Use downcasting to call clear_kv_cache on LlamaModel
-            // This is safe because we know the model type at runtime
             let model_any = model.as_any();
             if let Some(llama_model) = model_any.downcast_ref::<crate::runtime::architectures::llama::LlamaModel>() {
                 llama_model.clear_kv_cache();
                 tracing::debug!("Cleared KV cache before generation");
+            } else if let Some(q35_model) = model_any.downcast_ref::<crate::runtime::architectures::qwen3_5::Qwen3_5Model>() {
+                q35_model.clear_kv_cache();
+                tracing::debug!("Cleared Qwen3.5 KV cache + SSM states before generation");
             }
         }
     }

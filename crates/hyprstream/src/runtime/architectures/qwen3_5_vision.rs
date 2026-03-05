@@ -237,33 +237,24 @@ impl VisionBlock {
         cfg: &Qwen3_5VisionConfig,
         block_idx: usize,
     ) -> Result<Self> {
-        let mut get = |name: &str| -> Result<Tensor> {
-            let full = format!("{prefix}.{name}");
-            weights.remove(&full).ok_or_else(|| anyhow!("Missing weight: {}", full))
-        };
-        let t = |w: Tensor| w.tr().contiguous();
-
-        let norm1_w = get("norm1.weight")?;
-        let norm2_w = get("norm2.weight")?;
-        let qkv_w = get("attn.qkv.weight")?;
-        let proj_w = get("attn.proj.weight")?;
-        let gate_w = get("mlp.gate_proj.weight")?;
-        let up_w = get("mlp.up_proj.weight")?;
-        let down_w = get("mlp.down_proj.weight")?;
+        let norm1_w = weights.remove(&format!("{prefix}.norm1.weight"))
+            .ok_or_else(|| anyhow!("Missing {prefix}.norm1.weight"))?;
+        let norm2_w = weights.remove(&format!("{prefix}.norm2.weight"))
+            .ok_or_else(|| anyhow!("Missing {prefix}.norm2.weight"))?;
 
         Ok(Self {
             norm1: RMSNorm { weight: norm1_w, eps: cfg.rms_norm_eps },
             attn: VisionAttention {
-                qkv: LinearProjection::new(t(qkv_w)),
-                proj: LinearProjection::new(t(proj_w)),
+                qkv: LinearProjection::take(weights, &format!("{prefix}.attn.qkv.weight"))?,
+                proj: LinearProjection::take(weights, &format!("{prefix}.attn.proj.weight"))?,
                 num_heads: cfg.num_heads,
                 head_dim: cfg.head_dim,
             },
             norm2: RMSNorm { weight: norm2_w, eps: cfg.rms_norm_eps },
             mlp: LlamaMLP {
-                gate_proj: LinearProjection::new(t(gate_w)),
-                up_proj: LinearProjection::new(t(up_w)),
-                down_proj: LinearProjection::new(t(down_w)),
+                gate_proj: LinearProjection::take(weights, &format!("{prefix}.mlp.gate_proj.weight"))?,
+                up_proj: LinearProjection::take(weights, &format!("{prefix}.mlp.up_proj.weight"))?,
+                down_proj: LinearProjection::take(weights, &format!("{prefix}.mlp.down_proj.weight"))?,
                 activation: "gelu_pytorch_tanh".to_owned(),
                 layer_idx: block_idx,
             },
@@ -300,16 +291,13 @@ impl VisionPatchMerger {
         prefix: &str,
         cfg: &Qwen3_5VisionConfig,
     ) -> Result<Self> {
-        let mut get = |name: &str| -> Result<Tensor> {
-            let full = format!("{prefix}.{name}");
-            weights.remove(&full).ok_or_else(|| anyhow!("Missing weight: {}", full))
-        };
-        let t = |w: Tensor| w.tr().contiguous();
+        let ln_q_w = weights.remove(&format!("{prefix}.ln_q.weight"))
+            .ok_or_else(|| anyhow!("Missing {prefix}.ln_q.weight"))?;
 
         Ok(Self {
-            ln_q: RMSNorm { weight: get("ln_q.weight")?, eps: cfg.rms_norm_eps },
-            mlp0: LinearProjection::new(t(get("mlp.0.weight")?)),
-            mlp2: LinearProjection::new(t(get("mlp.2.weight")?)),
+            ln_q: RMSNorm { weight: ln_q_w, eps: cfg.rms_norm_eps },
+            mlp0: LinearProjection::take(weights, &format!("{prefix}.mlp.0.weight"))?,
+            mlp2: LinearProjection::take(weights, &format!("{prefix}.mlp.2.weight"))?,
             spatial_merge_size: cfg.spatial_merge_size,
             hidden_size: cfg.hidden_size,
             out_hidden_size: cfg.out_hidden_size,
