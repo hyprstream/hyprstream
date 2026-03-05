@@ -15,21 +15,21 @@ use tch::{nn, Device, Kind as DType, Tensor};
 ///
 /// This is a zero-cost abstraction that encapsulates weight matrices
 /// and optional bias vectors for linear transformations.
-struct LinearProjection {
-    weight: Tensor,
-    bias: Option<Tensor>,
+pub(crate) struct LinearProjection {
+    pub(crate) weight: Tensor,
+    pub(crate) bias: Option<Tensor>,
 }
 
 impl LinearProjection {
     /// Create projection from weight only (no bias)
     #[inline]
-    fn new(weight: Tensor) -> Self {
+    pub(crate) fn new(weight: Tensor) -> Self {
         Self { weight, bias: None }
     }
 
     /// Create projection with weight and bias
     #[inline]
-    fn with_bias(weight: Tensor, bias: Tensor) -> Self {
+    pub(crate) fn with_bias(weight: Tensor, bias: Tensor) -> Self {
         Self {
             weight,
             bias: Some(bias),
@@ -43,7 +43,7 @@ impl LinearProjection {
     /// Bias shape: [out_features] (broadcasted)
     /// Output shape: [*, out_features]
     #[inline]
-    fn apply(&self, input: &Tensor) -> Tensor {
+    pub(crate) fn apply(&self, input: &Tensor) -> Tensor {
         let output = input.matmul(&self.weight);
 
         match &self.bias {
@@ -758,19 +758,19 @@ impl LlamaAttention {
 }
 
 /// Llama MLP/FFN layer
-struct LlamaMLP {
-    gate_proj: LinearProjection,
-    up_proj: LinearProjection,
-    down_proj: LinearProjection,
-    activation: String, // Activation function name
-    layer_idx: usize,   // Layer index for per-layer delta lookup
+pub(crate) struct LlamaMLP {
+    pub(crate) gate_proj: LinearProjection,
+    pub(crate) up_proj: LinearProjection,
+    pub(crate) down_proj: LinearProjection,
+    pub(crate) activation: String, // Activation function name
+    pub(crate) layer_idx: usize,   // Layer index for per-layer delta lookup
 }
 
 unsafe impl Send for LlamaMLP {}
 unsafe impl Sync for LlamaMLP {}
 
 impl LlamaMLP {
-    fn forward(
+    pub(crate) fn forward(
         &self,
         hidden_states: &Tensor,
         delta: Option<&crate::training::TenantDelta>,
@@ -913,16 +913,16 @@ impl LlamaMLP {
 }
 
 /// RMSNorm implementation for Llama
-struct RMSNorm {
-    weight: Tensor,
-    eps: f32,
+pub(crate) struct RMSNorm {
+    pub(crate) weight: Tensor,
+    pub(crate) eps: f32,
 }
 
 unsafe impl Send for RMSNorm {}
 unsafe impl Sync for RMSNorm {}
 
 impl RMSNorm {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // Compute RMS, preserving the original dtype
         let original_dtype = x.kind();
         let x2 = square_tensor(x)?;

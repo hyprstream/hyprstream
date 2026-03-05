@@ -1,0 +1,1401 @@
+//! Qwen3.5 hybrid SSM/full-attention model implementation
+#![allow(dead_code, unused_variables, clippy::redundant_closure, clippy::assign_op_pattern, clippy::needless_borrows_for_generic_args, clippy::redundant_closure_for_method_calls)]
+//!
+//! Qwen3.5 interleaves Gated DeltaNet (linear SSM attention) and standard GQA layers.
+//! Every 4th layer (by default) is full attention; the rest are GatedDeltaNet.
+//! Supports both dense (qwen3_5_text) and MoE (qwen3_5_moe) variants.
+
+use super::config::ArchitectureConfig;
+use super::llama::{LlamaMLP, LinearProjection};
+use super::qwen3_5_vision::{Qwen3_5VisionConfig, Qwen3_5VisionEncoder};
+use super::{ModelArchitecture, ModelOperations};
+use crate::runtime::kv_cache::KVCacheManager;
+use crate::runtime::kv_quant::KVQuantType;
+use crate::runtime::model_config::ModelConfig;
+use crate::runtime::rope::RoPE;
+use crate::runtime::tensor_helpers::{dims3, dims4};
+use anyhow::{anyhow, Result};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tch::{Device, Kind, Tensor};
+use tracing::info;
+
+// ============================================================================
+// Config
+// ============================================================================
+
+/// Qwen3.5 text backbone configuration
+pub struct Qwen3_5TextConfig {
+    pub hidden_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    pub head_dim: usize,
+    pub intermediate_size: usize,
+    pub vocab_size: usize,
+    pub max_position_embeddings: usize,
+    pub rms_norm_eps: f32,
+    pub rope_theta: f32,
+    /// Fraction of head_dim to rotate (0.25 → rotary_dim = head_dim/4)
+    pub partial_rotary_factor: f32,
+    /// Derived: head_dim * partial_rotary_factor
+    pub rotary_dim: usize,
+    /// Per-layer type: "linear_attention" or "full_attention"
+    pub layer_types: Vec<String>,
+    // Linear attention (GatedDeltaNet) dimensions
+    pub linear_conv_kernel_dim: usize,
+    pub linear_key_head_dim: usize,
+    pub linear_value_head_dim: usize,
+    pub linear_num_key_heads: usize,
+    pub linear_num_value_heads: usize,
+    // MoE
+    pub is_moe: bool,
+    pub num_experts: usize,
+    pub num_experts_per_tok: usize,
+    pub moe_intermediate_size: usize,
+    pub shared_expert_intermediate_size: usize,
+    // Vision
+    pub has_vision: bool,
+    pub vision_out_hidden_size: usize,
+}
+
+impl ArchitectureConfig for Qwen3_5TextConfig {
+    fn num_attention_heads(&self) -> usize { self.num_attention_heads }
+    fn num_key_value_heads(&self) -> usize { self.num_key_value_heads }
+    fn hidden_size(&self) -> usize { self.hidden_size }
+    fn intermediate_size(&self) -> usize { self.intermediate_size }
+    fn head_dim(&self) -> usize { self.head_dim }
+    fn vocab_size(&self) -> usize { self.vocab_size }
+    fn max_position_embeddings(&self) -> usize { self.max_position_embeddings }
+    fn rope_theta(&self) -> Option<f32> { Some(self.rope_theta) }
+    fn rope_dim(&self) -> Option<usize> { Some(self.rotary_dim) }
+    fn layer_norm_eps(&self) -> f32 { self.rms_norm_eps }
+    fn use_rms_norm(&self) -> bool { true }
+}
+
+impl Qwen3_5TextConfig {
+    pub fn from_model_config(cfg: &ModelConfig, max_pos: usize) -> Self {
+        let partial_rotary_factor = cfg.partial_rotary_factor.unwrap_or(0.25);
+        let rotary_dim = ((cfg.head_dim as f32) * partial_rotary_factor) as usize;
+
+        // Derive layer_types if not present (text-only checkpoint may lack them)
+        let layer_types = if cfg.layer_types.is_empty() {
+            (0..cfg.num_hidden_layers)
+                .map(|i| {
+                    if (i + 1) % 4 == 0 {
+                        "full_attention".to_owned()
+                    } else {
+                        "linear_attention".to_owned()
+                    }
+                })
+                .collect()
+        } else {
+            cfg.layer_types.clone()
+        };
+
+        // MoE: use config.moe_intermediate_size if set, else fall back to intermediate_size
+        let moe_int_size = if cfg.moe_intermediate_size > 0 {
+            cfg.moe_intermediate_size
+        } else {
+            cfg.intermediate_size
+        };
+        let shared_int_size = if cfg.shared_expert_intermediate_size > 0 {
+            cfg.shared_expert_intermediate_size
+        } else {
+            cfg.intermediate_size
+        };
+
+        Self {
+            hidden_size: cfg.hidden_size,
+            num_hidden_layers: cfg.num_hidden_layers,
+            num_attention_heads: cfg.num_attention_heads,
+            num_key_value_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            intermediate_size: cfg.intermediate_size,
+            vocab_size: cfg.vocab_size,
+            max_position_embeddings: max_pos,
+            rms_norm_eps: cfg.rms_norm_eps,
+            rope_theta: cfg.rope_theta,
+            partial_rotary_factor,
+            rotary_dim,
+            layer_types,
+            linear_conv_kernel_dim: if cfg.linear_conv_kernel_dim > 0 { cfg.linear_conv_kernel_dim } else { 4 },
+            linear_key_head_dim: if cfg.linear_key_head_dim > 0 { cfg.linear_key_head_dim } else { 128 },
+            linear_value_head_dim: if cfg.linear_value_head_dim > 0 { cfg.linear_value_head_dim } else { 128 },
+            linear_num_key_heads: if cfg.linear_num_key_heads > 0 { cfg.linear_num_key_heads } else { 16 },
+            linear_num_value_heads: if cfg.linear_num_value_heads > 0 { cfg.linear_num_value_heads } else { 32 },
+            is_moe: cfg.is_moe,
+            num_experts: cfg.num_experts,
+            num_experts_per_tok: cfg.num_experts_per_tok,
+            moe_intermediate_size: moe_int_size,
+            shared_expert_intermediate_size: shared_int_size,
+            has_vision: cfg.has_vision,
+            vision_out_hidden_size: cfg.vision_out_hidden_size,
+        }
+    }
+}
+
+// ============================================================================
+// Normalization helpers
+// ============================================================================
+
+/// Qwen3.5 RMSNorm: weight initialized to 0, formula norm(x_f32) * (1 + weight)
+struct Qwen3_5RMSNorm {
+    weight: Tensor,
+    eps: f32,
+}
+
+impl Qwen3_5RMSNorm {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let orig = x.kind();
+        let x_f = x.to_kind(Kind::Float);
+        let mean_sq = (&x_f * &x_f).mean_dim(&[-1i64][..], true, Kind::Float);
+        let rrms = (mean_sq + self.eps as f64).reciprocal().sqrt();
+        let normed = &x_f * rrms;
+        let w = self.weight.to_kind(Kind::Float);
+        Ok((normed * (1.0f64 + w)).to_kind(orig))
+    }
+}
+
+unsafe impl Send for Qwen3_5RMSNorm {}
+unsafe impl Sync for Qwen3_5RMSNorm {}
+
+/// Gated RMSNorm used for GatedDeltaNet output: norm(x) * weight * silu(gate)
+struct RMSNormGated {
+    weight: Tensor,
+    eps: f32,
+}
+
+impl RMSNormGated {
+    fn forward(&self, x: &Tensor, gate: &Tensor) -> Result<Tensor> {
+        let orig = x.kind();
+        let x_f = x.to_kind(Kind::Float);
+        let mean_sq = (&x_f * &x_f).mean_dim(&[-1i64][..], true, Kind::Float);
+        let rrms = (mean_sq + self.eps as f64).reciprocal().sqrt();
+        let normed = &x_f * rrms;
+        let w = self.weight.to_kind(Kind::Float);
+        let g = gate.to_kind(Kind::Float).silu();
+        Ok((normed * w * g).to_kind(orig))
+    }
+}
+
+unsafe impl Send for RMSNormGated {}
+unsafe impl Sync for RMSNormGated {}
+
+/// L2 normalization along last dim (used on Q and K before delta rule)
+#[inline]
+fn l2_normalize(x: &Tensor) -> Tensor {
+    let norm_sq = (x * x).sum_dim_intlist(&[-1i64][..], true, None);
+    x / (norm_sq + 1e-6f64).sqrt()
+}
+
+/// Chunked GatedDeltaNet prefill (translation of `torch_chunk_gated_delta_rule`).
+///
+/// All inputs in [batch, num_v_heads, seq, head_dim] layout (heads second, already in f32).
+/// `q` is already L2-normalized and scaled by 1/sqrt(head_k_dim).
+/// Returns (output [batch, num_v_heads, seq, head_v_dim], final state [batch, nv, hk, hv]).
+fn chunked_delta_rule(
+    q: &Tensor,       // [B, nv, T, hk]  L2-normed, scaled
+    k: &Tensor,       // [B, nv, T, hk]  L2-normed
+    v: &Tensor,       // [B, nv, T, hv]
+    g: &Tensor,       // [B, nv, T]      log-decay (negative)
+    beta: &Tensor,    // [B, nv, T]      in (0,1)
+    initial_state: Option<&Tensor>,
+    device: tch::Device,
+) -> Result<(Tensor, Tensor)> {
+    const CHUNK_SIZE: i64 = 64;
+
+    let batch = q.size()[0];
+    let nv    = q.size()[1];
+    let seq   = q.size()[2];
+    let hk    = q.size()[3];
+    let hv    = v.size()[3];
+
+    // Pad sequence length to multiple of CHUNK_SIZE
+    let pad = (CHUNK_SIZE - seq % CHUNK_SIZE) % CHUNK_SIZE;
+    let seq_p = seq + pad;
+
+    let pad_tensor = |t: &Tensor, extra_dims: i64| -> Tensor {
+        if pad == 0 { return t.shallow_clone(); }
+        let z = match extra_dims {
+            0 => Tensor::zeros([batch, nv, pad], (Kind::Float, device)),
+            _ => Tensor::zeros([batch, nv, pad, extra_dims], (Kind::Float, device)),
+        };
+        Tensor::cat(&[t, &z], 2)
+    };
+
+    let q  = pad_tensor(q, hk);
+    let k  = pad_tensor(k, hk);
+    let v  = pad_tensor(v, hv);
+    let g  = pad_tensor(g, 0);
+    let beta = pad_tensor(beta, 0);
+
+    let v_beta = &v * beta.unsqueeze(-1);
+    let k_beta = &k * beta.unsqueeze(-1);
+
+    let nc = seq_p / CHUNK_SIZE;
+
+    // Reshape to [B, nv, num_chunks, chunk_size, D]
+    let reshape5 = |t: &Tensor, d: i64| t.reshape([batch, nv, nc, CHUNK_SIZE, d]);
+    let q      = reshape5(&q,      hk);
+    let k      = reshape5(&k,      hk);
+    let v      = reshape5(&v,      hv);
+    let k_beta = reshape5(&k_beta, hk);
+    let v_beta = reshape5(&v_beta, hv);
+    // g: [B, nv, num_chunks, chunk_size]
+    let g = g.reshape([batch, nv, nc, CHUNK_SIZE]);
+
+    // Cumulative decay within each chunk
+    let g = g.cumsum(-1, Kind::Float);
+
+    // decay_mask[t, s] = exp(g[t] - g[s]) for t >= s, 0 for t < s
+    // Must exp first, then tril — otherwise upper tri becomes exp(0)=1 instead of 0
+    let g_t = g.unsqueeze(-1);  // [..., C, 1]
+    let g_s = g.unsqueeze(-2);  // [..., 1, C]
+    let decay_mask = (g_t - g_s).exp().tril(0); // [B, nv, nc, C, C]
+
+    // Upper triangular mask (diagonal=0 inclusive) for masking future positions
+    let mask0 = Tensor::ones([CHUNK_SIZE, CHUNK_SIZE], (Kind::Bool, device)).triu(0);
+    // Upper triangular excluding diagonal (diagonal=1) for within-chunk attn
+    let mask1 = Tensor::ones([CHUNK_SIZE, CHUNK_SIZE], (Kind::Bool, device)).triu(1);
+
+    // attn = -(k_beta @ k^T * decay_mask).masked_fill(mask0, 0)
+    // [B, nv, nc, C, C]
+    let attn = -(k_beta.matmul(&k.transpose(-1, -2)) * &decay_mask)
+        .masked_fill(&mask0, 0.0f64);
+
+    // Recursive delta-rule correction (loop over chunk_size positions)
+    for i in 1..CHUNK_SIZE as usize {
+        let i = i as i64;
+        // row = attn[..., i, :i]
+        let row = attn.narrow(-2, i, 1).narrow(-1, 0, i).squeeze_dim(-2); // [B, nv, nc, i]
+        // sub = attn[..., :i, :i]
+        let sub = attn.narrow(-2, 0, i).narrow(-1, 0, i); // [B, nv, nc, i, i]
+        // correction = (row @ sub)  [B, nv, nc, i]
+        let correction = row.unsqueeze(-2).matmul(&sub).squeeze_dim(-2);
+        let new_row = (&row + &correction).unsqueeze(-2); // [B, nv, nc, 1, i]
+        attn.narrow(-2, i, 1).narrow(-1, 0, i).copy_(&new_row);
+    }
+
+    // Add identity
+    let eye = Tensor::eye(CHUNK_SIZE, (Kind::Float, device))
+        .unsqueeze(0).unsqueeze(0).unsqueeze(0); // [1, 1, 1, C, C]
+    let attn = attn + eye;
+
+    // value_transformed = attn @ v_beta  [B, nv, nc, C, hv]
+    let value_t = attn.matmul(&v_beta);
+    // k_cumdecay = attn @ (k_beta * g.exp()) [B, nv, nc, C, hk]
+    let k_cumdecay = attn.matmul(&(k_beta * g.exp().unsqueeze(-1)));
+
+    let mut state = initial_state.map(|s| s.to_kind(Kind::Float)).unwrap_or_else(|| {
+        Tensor::zeros([batch, nv, hk, hv], (Kind::Float, device))
+    });
+    let mut chunks_out = Vec::with_capacity(nc as usize);
+
+    for i in 0..nc {
+        let q_i  = q.select(2, i);           // [B, nv, C, hk]
+        let k_i  = k.select(2, i);           // [B, nv, C, hk]
+        let v_i  = value_t.select(2, i);     // [B, nv, C, hv]
+        let g_i  = g.select(2, i);           // [B, nv, C]
+        let dm_i = decay_mask.select(2, i);  // [B, nv, C, C]
+        let kcd_i = k_cumdecay.select(2, i); // [B, nv, C, hk]
+
+        // Within-chunk attention (causal, exclude future)
+        let attn_inner = (q_i.matmul(&k_i.transpose(-1, -2)) * &dm_i).masked_fill(&mask1, 0.0f64);
+
+        // Cross-chunk contribution from previous state
+        let v_prime = kcd_i.matmul(&state);           // [B, nv, C, hv]
+        let v_new   = v_i - v_prime;
+
+        // Inter-chunk: q scaled by cumulative g × state
+        let attn_inter = (q_i * g_i.exp().unsqueeze(-1)).matmul(&state); // [B, nv, C, hv]
+
+        let chunk_out = attn_inter + attn_inner.matmul(&v_new);
+        chunks_out.push(chunk_out);
+
+        // Update state for next chunk
+        let g_last = g_i.narrow(-1, CHUNK_SIZE - 1, 1); // [B, nv, 1]
+        let decay = g_last.exp().unsqueeze(-1);          // [B, nv, 1, 1]
+        let g_diff = (g_last - &g_i).exp().unsqueeze(-1); // [B, nv, C, 1]
+        let update = (k_i * g_diff).transpose(-1, -2).matmul(&v_new); // [B, nv, hk, hv]
+        state = &state * decay + update;
+    }
+
+    // Stack chunks: [B, nv, nc, C, hv] → flatten → trim padding
+    let out = Tensor::stack(&chunks_out, 2) // [B, nv, nc, C, hv]
+        .reshape([batch, nv, seq_p, hv])
+        .narrow(2, 0, seq);
+
+    Ok((out, state))
+}
+
+// ============================================================================
+// GatedDeltaNet (linear attention / SSM layer)
+// ============================================================================
+
+struct GatedDeltaNetLayer {
+    // Input projections
+    in_proj_qkv: LinearProjection, // hidden → conv_dim (key_dim*2 + value_dim)
+    in_proj_z: LinearProjection,   // hidden → value_dim (gate)
+    in_proj_b: LinearProjection,   // hidden → num_v_heads (beta)
+    in_proj_a: LinearProjection,   // hidden → num_v_heads (decay input)
+    // Depthwise conv1d on mixed QKV
+    conv1d_weight: Tensor,         // [conv_dim, 1, kernel_size]
+    // Decay and dt bias
+    a_log: Tensor,                 // [num_v_heads]
+    dt_bias: Tensor,               // [num_v_heads]
+    // Output norm and projection
+    norm: RMSNormGated,
+    out_proj: LinearProjection,    // value_dim → hidden
+    // Dimensions
+    num_k_heads: usize,
+    num_v_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    key_dim: usize,   // num_k_heads * head_k_dim
+    value_dim: usize, // num_v_heads * head_v_dim
+    conv_dim: usize,  // key_dim*2 + value_dim
+    kernel_size: usize,
+    layer_idx: usize,
+}
+
+unsafe impl Send for GatedDeltaNetLayer {}
+unsafe impl Sync for GatedDeltaNetLayer {}
+
+impl GatedDeltaNetLayer {
+    fn load(
+        weights: &mut HashMap<String, Tensor>,
+        prefix: &str,
+        cfg: &Qwen3_5TextConfig,
+        layer_idx: usize,
+    ) -> Result<Self> {
+        let num_k_heads = cfg.linear_num_key_heads;
+        let num_v_heads = cfg.linear_num_value_heads;
+        let head_k_dim = cfg.linear_key_head_dim;
+        let head_v_dim = cfg.linear_value_head_dim;
+        let key_dim = num_k_heads * head_k_dim;
+        let value_dim = num_v_heads * head_v_dim;
+        let conv_dim = key_dim * 2 + value_dim;
+        let kernel_size = cfg.linear_conv_kernel_dim;
+
+        let mut get = |name: &str| -> Result<Tensor> {
+            let full = format!("{prefix}.{name}");
+            weights.remove(&full).ok_or_else(|| anyhow!("Missing weight: {}", full))
+        };
+
+        let in_proj_qkv_w = get("in_proj_qkv.weight")?;
+        let in_proj_z_w = get("in_proj_z.weight")?;
+        let in_proj_b_w = get("in_proj_b.weight")?;
+        let in_proj_a_w = get("in_proj_a.weight")?;
+        let conv1d_weight = get("conv1d.weight")?;
+        let a_log = get("A_log")?;
+        let dt_bias = get("dt_bias")?;
+        let norm_weight = get("norm.weight")?;
+        let out_proj_w = get("out_proj.weight")?;
+
+        // Weights stored as [out, in] for matmul, LinearProjection expects [in, out]
+        let t = |w: Tensor| w.tr().contiguous();
+
+        Ok(Self {
+            in_proj_qkv: LinearProjection::new(t(in_proj_qkv_w)),
+            in_proj_z: LinearProjection::new(t(in_proj_z_w)),
+            in_proj_b: LinearProjection::new(t(in_proj_b_w)),
+            in_proj_a: LinearProjection::new(t(in_proj_a_w)),
+            conv1d_weight,
+            a_log: a_log.squeeze(),
+            dt_bias: dt_bias.squeeze(),
+            norm: RMSNormGated { weight: norm_weight, eps: 1e-6 },
+            out_proj: LinearProjection::new(t(out_proj_w)),
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            key_dim,
+            value_dim,
+            conv_dim,
+            kernel_size,
+            layer_idx,
+        })
+    }
+
+    fn forward(
+        &self,
+        hidden: &Tensor,
+        conv_state: &mut Option<Tensor>,
+        rec_state: &mut Option<Tensor>,
+    ) -> Result<Tensor> {
+        let (batch, seq, _) = dims3(hidden)?;
+        let device = hidden.device();
+        let dtype = hidden.kind();
+
+        // Input projections
+        let h2 = hidden.reshape([batch * seq, hidden.size()[2]]);
+        let mixed_qkv = self.in_proj_qkv.apply(&h2)
+            .reshape([batch, seq, self.conv_dim as i64]);
+        let z = self.in_proj_z.apply(&h2)
+            .reshape([batch, seq, self.value_dim as i64]);
+        let b = self.in_proj_b.apply(&h2)
+            .reshape([batch, seq, self.num_v_heads as i64]);
+        let a_in = self.in_proj_a.apply(&h2)
+            .reshape([batch, seq, self.num_v_heads as i64]);
+
+        // Depthwise causal conv1d on mixed_qkv
+        // mixed_qkv: [batch, seq, conv_dim] → need [batch, conv_dim, seq] for conv1d
+        let conv_dim = self.conv_dim as i64;
+        let ks = self.kernel_size as i64;
+
+        // Maintain conv state: [batch, conv_dim, kernel_size-1]
+        let x_t = mixed_qkv.permute([0, 2, 1]); // [batch, conv_dim, seq]
+
+        let (x_for_conv, new_conv_state) = match conv_state {
+            Some(ref cs) => {
+                // Prepend previous state for causal context
+                let padded = Tensor::cat(&[cs, &x_t], 2); // [batch, conv_dim, prev+seq]
+                // Keep last kernel_size-1 frames as new state
+                let total = padded.size()[2];
+                let new_state = padded.narrow(2, total - (ks - 1), ks - 1).contiguous();
+                (padded, new_state)
+            }
+            None => {
+                // First call: zero-pad left by kernel_size-1
+                let pad = Tensor::zeros([batch, conv_dim, ks - 1], (dtype, device));
+                let padded = Tensor::cat(&[&pad, &x_t], 2);
+                let new_state = x_t.narrow(2, (seq - (ks - 1)).max(0), (ks - 1).min(seq))
+                    .contiguous();
+                (padded, new_state)
+            }
+        };
+        *conv_state = Some(new_conv_state);
+
+        // conv1d with groups=conv_dim (depthwise), no padding (already padded manually)
+        let conv_out = x_for_conv.conv1d(
+            &self.conv1d_weight,
+            None::<&Tensor>,
+            &[1i64],      // stride=1
+            &[0i64],      // padding=0 (handled manually)
+            &[1i64],      // dilation=1
+            conv_dim,     // groups
+        ); // [batch, conv_dim, seq]
+        let conv_out = conv_out.silu().permute([0, 2, 1]); // [batch, seq, conv_dim]
+
+        // Split conv_out into q, k, v
+        let key_dim = self.key_dim as i64;
+        let val_dim = self.value_dim as i64;
+        let q_raw = conv_out.narrow(2, 0, key_dim);
+        let k_raw = conv_out.narrow(2, key_dim, key_dim);
+        let v_raw = conv_out.narrow(2, key_dim * 2, val_dim);
+
+        // Reshape to [batch, seq, num_heads, head_dim]
+        let q = q_raw.reshape([batch, seq, self.num_k_heads as i64, self.head_k_dim as i64]);
+        let k = k_raw.reshape([batch, seq, self.num_k_heads as i64, self.head_k_dim as i64]);
+        let v = v_raw.reshape([batch, seq, self.num_v_heads as i64, self.head_v_dim as i64]);
+
+        // L2 normalize Q and K before delta rule
+        let q = l2_normalize(&q.to_kind(Kind::Float));
+        let k = l2_normalize(&k.to_kind(Kind::Float));
+        let scale = 1.0 / (self.head_k_dim as f64).sqrt();
+        let q = q * scale;
+
+        // Compute decay g = A * dt where A = -exp(A_log), dt = softplus(a_in + dt_bias)
+        // A_log stores log(-A) so A = -exp(A_log) is negative; g = A * dt is negative log-decay
+        let a_log_f = self.a_log.to_kind(Kind::Float); // [num_v_heads]
+        let dt_bias_f = self.dt_bias.to_kind(Kind::Float); // [num_v_heads]
+        let a_in_f = a_in.to_kind(Kind::Float); // [batch, seq, num_v_heads]
+        let a_exp = a_log_f.exp(); // exp(A_log) = -A (positive)
+        let softplus_input = a_in_f + &dt_bias_f.unsqueeze(0).unsqueeze(0);
+        let g = -(a_exp.unsqueeze(0).unsqueeze(0) * softplus_input.softplus()); // = A * dt (negative)
+
+        // Recurrent delta rule
+        // state shape: [batch, num_v_heads, head_k_dim, head_v_dim]
+        let nv = self.num_v_heads as i64;
+        let hk = self.head_k_dim as i64;
+        let hv = self.head_v_dim as i64;
+
+        let state_init = rec_state.take().unwrap_or_else(|| {
+            Tensor::zeros([batch, nv, hk, hv], (Kind::Float, device))
+        });
+
+        let b_f = b.to_kind(Kind::Float).sigmoid(); // [batch, seq, num_v_heads]
+        let v_f = v.to_kind(Kind::Float); // [batch, seq, num_v_heads, head_v_dim]
+
+        // For num_k_heads != num_v_heads, we use k heads 0..num_k_heads-1
+        // and map each v head to a k head (assuming num_k_heads <= num_v_heads, evenly divisible)
+        // Simple 1:1 mapping if equal; otherwise tile k to match v heads
+        let k_for_state = if self.num_k_heads == self.num_v_heads {
+            k.to_kind(Kind::Float)
+        } else {
+            // Repeat k along head dim to match num_v_heads
+            let repeats = self.num_v_heads / self.num_k_heads;
+            k.repeat([1, 1, repeats as i64, 1]).to_kind(Kind::Float)
+        };
+        // q similarly expanded
+        let q_for_state = if self.num_k_heads == self.num_v_heads {
+            q.shallow_clone()
+        } else {
+            let repeats = self.num_v_heads / self.num_k_heads;
+            q.repeat([1, 1, repeats as i64, 1])
+        };
+
+        // Choose recurrent path based on sequence length:
+        // - seq == 1  (decode): token-by-token recurrent loop
+        // - seq > 1   (prefill): chunked algorithm for O(seq · chunk) vs O(seq²)
+        let out = if seq == 1 {
+            // --- Decode path: single-token recurrent step ---
+            let g_t = g.narrow(1, 0, 1).squeeze_dim(1);
+            let b_t = b_f.narrow(1, 0, 1).squeeze_dim(1);
+            let k_t = k_for_state.narrow(1, 0, 1).squeeze_dim(1);
+            let v_t = v_f.narrow(1, 0, 1).squeeze_dim(1);
+            let q_t = q_for_state.narrow(1, 0, 1).squeeze_dim(1);
+
+            // state: [B, nv, hk, hv]; k_t, q_t: [B, nv, hk]; v_t, b_t: [B, nv, hv]
+            let decay = g_t.exp().reshape([batch, nv, 1, 1]);
+            let state = &state_init * decay;
+            // kv_mem[h,v] = sum_k(state[h,k,v] * k[h,k]) = (state * k_t.unsqueeze(-1)).sum(-2)
+            let kv_mem = (&state * k_t.unsqueeze(-1)).sum_dim_intlist(&[-2i64][..], false, None);
+            let delta = (v_t - kv_mem) * b_t.unsqueeze(-1);
+            // outer product update: state[h,k,v] += k[h,k] * delta[h,v]
+            let state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2);
+            // out_t[h,v] = sum_k(state[h,k,v] * q[h,k])
+            let out_t = (&state * q_t.unsqueeze(-1)).sum_dim_intlist(&[-2i64][..], false, None);
+
+            *rec_state = Some(state);
+            // out_t: [batch, nv, hv] → [batch, 1, nv, hv] → [batch, 1, val_dim]
+            out_t.unsqueeze(1).reshape([batch, 1, val_dim])
+        } else {
+            // --- Prefill path: chunked GatedDeltaNet ---
+            // Reorder to [batch, nv, seq, dim] for chunked_delta_rule
+            let q_h = q_for_state.permute([0, 2, 1, 3]);  // [B, nv, T, hk]
+            let k_h = k_for_state.permute([0, 2, 1, 3]);
+            let v_h = v_f.permute([0, 2, 1, 3]);           // [B, nv, T, hv]
+            let g_h = g.permute([0, 2, 1]);                 // [B, nv, T]
+            let b_h = b_f.permute([0, 2, 1]);               // [B, nv, T]
+
+            let init = if rec_state.is_some() { rec_state.as_ref() } else { None };
+            let (out_h, new_state) = chunked_delta_rule(&q_h, &k_h, &v_h, &g_h, &b_h, init, device)?;
+            // out_h: [B, nv, T, hv]
+            *rec_state = Some(new_state);
+
+            // Transpose back to [B, T, nv, hv] and flatten
+            out_h.permute([0, 2, 1, 3]).reshape([batch, seq, val_dim])
+        };
+
+        // Gated norm and output projection
+        // RMSNormGated weight is [head_v_dim]; reshape to per-head before norm
+        let z_f = z; // [batch, seq, value_dim]
+        let out_4d = out.reshape([batch, seq, nv, hv]);
+        let z_4d = z_f.reshape([batch, seq, nv, hv]);
+        let normed = self.norm.forward(&out_4d.to_kind(dtype), &z_4d)?;
+        let flat = normed.reshape([batch * seq, val_dim]);
+        let projected = self.out_proj.apply(&flat);
+        Ok(projected.reshape([batch, seq, self.hidden_size_from_out_proj()]))
+    }
+
+    fn hidden_size_from_out_proj(&self) -> i64 {
+        self.out_proj.weight.size()[1]
+    }
+}
+
+// ============================================================================
+// Full attention layer (GQA + output gate + partial RoPE)
+// ============================================================================
+
+struct Qwen3_5FullAttention {
+    q_proj: LinearProjection, // out: num_heads * head_dim * 2 (query + gate)
+    k_proj: LinearProjection, // out: num_kv_heads * head_dim
+    v_proj: LinearProjection, // out: num_kv_heads * head_dim
+    o_proj: LinearProjection, // in: num_heads * head_dim
+    q_norm: Qwen3_5RMSNorm,  // per-head, weight dim = head_dim
+    k_norm: Qwen3_5RMSNorm,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    rope_theta: f32,
+    max_pos: usize,
+    layer_idx: usize,
+}
+
+unsafe impl Send for Qwen3_5FullAttention {}
+unsafe impl Sync for Qwen3_5FullAttention {}
+
+impl Qwen3_5FullAttention {
+    fn load(
+        weights: &mut HashMap<String, Tensor>,
+        prefix: &str,
+        cfg: &Qwen3_5TextConfig,
+        layer_idx: usize,
+    ) -> Result<Self> {
+        let mut get = |name: &str| -> Result<Tensor> {
+            let full = format!("{prefix}.{name}");
+            weights.remove(&full).ok_or_else(|| anyhow!("Missing weight: {}", full))
+        };
+
+        let t = |w: Tensor| w.tr().contiguous();
+
+        let q_norm_weight = get("q_norm.weight")?;
+        let k_norm_weight = get("k_norm.weight")?;
+
+        Ok(Self {
+            q_proj: LinearProjection::new(t(get("q_proj.weight")?)),
+            k_proj: LinearProjection::new(t(get("k_proj.weight")?)),
+            v_proj: LinearProjection::new(t(get("v_proj.weight")?)),
+            o_proj: LinearProjection::new(t(get("o_proj.weight")?)),
+            q_norm: Qwen3_5RMSNorm { weight: q_norm_weight, eps: cfg.rms_norm_eps },
+            k_norm: Qwen3_5RMSNorm { weight: k_norm_weight, eps: cfg.rms_norm_eps },
+            num_heads: cfg.num_attention_heads,
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            rotary_dim: cfg.rotary_dim,
+            rope_theta: cfg.rope_theta,
+            max_pos: cfg.max_position_embeddings,
+            layer_idx,
+        })
+    }
+
+    fn forward(
+        &self,
+        hidden: &Tensor,
+        position_ids: Option<&Tensor>,
+        kv_cache: Option<&mut crate::runtime::kv_cache::LayerKVCache>,
+        start_pos: usize,
+    ) -> Result<Tensor> {
+        let (batch, seq, _) = dims3(hidden)?;
+        let device = hidden.device();
+        let dtype = hidden.kind();
+        let h2 = hidden.reshape([batch * seq, hidden.size()[2]]);
+
+        // Q projection outputs query + gate interleaved
+        let q_out = self.q_proj.apply(&h2); // [batch*seq, heads * head_dim * 2]
+        let k_out = self.k_proj.apply(&h2); // [batch*seq, kv_heads * head_dim]
+        let v_out = self.v_proj.apply(&h2); // [batch*seq, kv_heads * head_dim]
+
+        let nh = self.num_heads as i64;
+        let nkv = self.num_kv_heads as i64;
+        let hd = self.head_dim as i64;
+
+        // Split query and gate (from doubled q_proj output)
+        // Reference: gate.reshape(batch, seq, num_heads * head_dim), then * sigmoid(gate) before o_proj
+        let q_full = q_out.reshape([batch, seq, nh, hd * 2]);
+        let query = q_full.narrow(3, 0, hd);  // [batch, seq, nh, head_dim]
+        let gate = q_full.narrow(3, hd, hd);  // [batch, seq, nh, head_dim]
+        // gate will be applied as sigmoid(gate.reshape(batch, seq, nh*hd)) * attn_output BEFORE o_proj
+
+        let mut k = k_out.reshape([batch, seq, nkv, hd]);
+        let v = v_out.reshape([batch, seq, nkv, hd]);
+
+        // Per-head QK norm
+        let query = self.apply_qknorm(&query, &self.q_norm, self.num_heads)?;
+        k = self.apply_qknorm(&k, &self.k_norm, self.num_kv_heads)?;
+
+        // Partial RoPE: rotate first rotary_dim dims, pass through rest
+        let rd = self.rotary_dim as i64;
+        let (query, k) = if rd > 0 {
+            let query_rot = self.apply_rope(&query.narrow(3, 0, rd), position_ids, start_pos, device, dtype)?;
+            let query_pass = query.narrow(3, rd, hd - rd);
+            let query = Tensor::cat(&[query_rot, query_pass], 3);
+
+            let k_rot = self.apply_rope(&k.narrow(3, 0, rd), position_ids, start_pos, device, dtype)?;
+            let k_pass = k.narrow(3, rd, hd - rd);
+            let k = Tensor::cat(&[k_rot, k_pass], 3);
+            (query, k)
+        } else {
+            (query, k)
+        };
+
+        // KV cache
+        let (k_full, v_full) = if let Some(cache) = kv_cache {
+            cache.update(&k, &v, start_pos)?;
+            cache.get()?
+        } else {
+            (k.shallow_clone(), v.shallow_clone())
+        };
+
+        // Expand KV for GQA
+        let groups = self.num_heads / self.num_kv_heads;
+        let k_exp = k_full.repeat_interleave_self_int(groups as i64, 2, None);
+        let v_exp = v_full.repeat_interleave_self_int(groups as i64, 2, None);
+
+        // Manual attention in f32 for numerical stability
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        let q_p = query.permute([0, 2, 1, 3]).to_kind(Kind::Float).contiguous();
+        let k_p = k_exp.permute([0, 2, 3, 1]).to_kind(Kind::Float).contiguous();
+        let v_p = v_exp.permute([0, 2, 1, 3]).to_kind(Kind::Float).contiguous();
+
+        let mut scores = q_p.matmul(&k_p) * scale; // [batch, heads, q_seq, kv_seq]
+        let q_len = scores.size()[2];
+        let kv_len = scores.size()[3];
+        if q_len > 1 {
+            let mask = Tensor::ones([q_len, kv_len], (Kind::Float, device)).tril(0);
+            let mask = mask.unsqueeze(0).unsqueeze(0).expand_as(&scores);
+            scores = scores.masked_fill(&mask.eq(0.0), -10000.0f64);
+        }
+        let attn = scores.softmax(-1, Kind::Float).to_kind(dtype);
+        let ctx = attn.matmul(&v_p.to_kind(dtype)); // [batch, heads, seq, head_dim]
+        let ctx = ctx.permute([0, 2, 1, 3]).contiguous(); // [batch, seq, heads, head_dim]
+
+        // Apply output gate: gate_flat[batch*seq, nh*hd] * sigmoid(gate) BEFORE o_proj
+        let ctx_flat = ctx.reshape([batch * seq, nh * hd]);
+        let gate_flat = gate.reshape([batch * seq, nh * hd]).to_kind(Kind::Float).sigmoid().to_kind(dtype);
+        let ctx_gated = ctx_flat * gate_flat;
+        let out = self.o_proj.apply(&ctx_gated);
+        Ok(out.reshape([batch, seq, -1]))
+    }
+
+    fn apply_qknorm(&self, x: &Tensor, norm: &Qwen3_5RMSNorm, _nheads: usize) -> Result<Tensor> {
+        // x: [batch, seq, heads, head_dim]
+        // Apply norm per-head (last dim)
+        let orig_shape = x.size();
+        let (batch, seq, heads, hd) = dims4(x)?;
+        // Reshape to [batch*seq*heads, head_dim] for norm, then restore
+        let flat = x.reshape([batch * seq * heads, hd]);
+        // Broadcast weight [head_dim] over batch*seq*heads
+        let orig = flat.kind();
+        let flat_f = flat.to_kind(Kind::Float);
+        let mean_sq = (&flat_f * &flat_f).mean_dim(&[-1i64][..], true, Kind::Float);
+        let rrms = (mean_sq + norm.eps as f64).reciprocal().sqrt();
+        let normed = &flat_f * rrms;
+        let w = norm.weight.to_kind(Kind::Float).reshape([1, hd]);
+        let normed_scaled = normed * (1.0f64 + w);
+        Ok(normed_scaled.to_kind(orig).reshape(orig_shape))
+    }
+
+    fn apply_rope(
+        &self,
+        x: &Tensor,
+        position_ids: Option<&Tensor>,
+        start_pos: usize,
+        device: Device,
+        dtype: Kind,
+    ) -> Result<Tensor> {
+        // x: [batch, seq, heads, rotary_dim]
+        let rd = self.rotary_dim as i64;
+        let seq = x.size()[1];
+        let mut rope = RoPE::new_with_dtype(rd, self.rope_theta as f64, self.max_pos as i64, device, dtype)?;
+        let pos_ids = position_ids.map(|p| p.shallow_clone()).unwrap_or_else(|| {
+            Tensor::arange_start(start_pos as i64, start_pos as i64 + seq, (Kind::Int64, device))
+        });
+        rope.forward(x, Some(&pos_ids))
+    }
+}
+
+// ============================================================================
+// MoE (Sparse MLP)
+// ============================================================================
+
+struct Qwen3_5Expert {
+    gate_proj: LinearProjection,
+    up_proj: LinearProjection,
+    down_proj: LinearProjection,
+}
+
+impl Qwen3_5Expert {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let gate = self.gate_proj.apply(x).silu();
+        let up = self.up_proj.apply(x);
+        Ok(self.down_proj.apply(&(gate * up)))
+    }
+}
+
+unsafe impl Send for Qwen3_5Expert {}
+unsafe impl Sync for Qwen3_5Expert {}
+
+struct Qwen3_5SparseMoE {
+    gate: LinearProjection,     // [hidden, num_experts] router
+    experts: Vec<Qwen3_5Expert>,
+    shared_expert: Qwen3_5Expert,
+    num_experts_per_tok: usize,
+}
+
+impl Qwen3_5SparseMoE {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // x: [batch*seq, hidden]
+        let router_logits = self.gate.apply(x); // [B, num_experts]
+        let router_probs = router_logits.softmax(-1, x.kind());
+        let k = self.num_experts_per_tok as i64;
+        let (top_weights, top_ids) = router_probs.topk(k, -1, true, true);
+
+        // Normalize selected weights
+        let top_weights_sum = top_weights.sum_dim_intlist(&[-1i64][..], true, None);
+        let top_weights = top_weights / top_weights_sum;
+
+        let batch = x.size()[0];
+        let hidden = x.size()[1];
+        let mut output = Tensor::zeros([batch, hidden], (x.kind(), x.device()));
+
+        // Dispatch to each of the top-k expert slots
+        for slot in 0..k {
+            let expert_ids = top_ids.select(1, slot); // [batch]
+            let weights = top_weights.select(1, slot).unsqueeze(-1); // [batch, 1]
+
+            // Group tokens by expert and process
+            for expert_idx in 0..self.experts.len() {
+                let mask = expert_ids.eq(expert_idx as i64); // [batch] bool
+                if mask.any().int64_value(&[]) == 0 {
+                    continue;
+                }
+                let indices = mask.nonzero().squeeze_dim(1); // token indices
+                let expert_input = x.index_select(0, &indices);
+                let expert_out = self.experts[expert_idx].forward(&expert_input)?;
+                let w = weights.index_select(0, &indices);
+                let weighted = expert_out * w;
+                output = output.index_add(0, &indices, &weighted);
+            }
+        }
+
+        // Always-active shared expert
+        let shared_out = self.shared_expert.forward(x)?;
+        Ok(output + shared_out)
+    }
+}
+
+unsafe impl Send for Qwen3_5SparseMoE {}
+unsafe impl Sync for Qwen3_5SparseMoE {}
+
+// ============================================================================
+// MLP enum (Dense or Sparse)
+// ============================================================================
+
+enum Qwen3_5Mlp {
+    Dense(LlamaMLP),
+    Sparse(Qwen3_5SparseMoE),
+}
+
+impl Qwen3_5Mlp {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Qwen3_5Mlp::Dense(mlp) => mlp.forward(x, None),
+            Qwen3_5Mlp::Sparse(moe) => {
+                let orig = x.size();
+                let batch = orig[0];
+                let seq = orig[1];
+                let h = orig[2];
+                let flat = x.reshape([batch * seq, h]);
+                let out = moe.forward(&flat)?;
+                Ok(out.reshape(orig))
+            }
+        }
+    }
+}
+
+unsafe impl Send for Qwen3_5Mlp {}
+unsafe impl Sync for Qwen3_5Mlp {}
+
+// ============================================================================
+// Transformer layer
+// ============================================================================
+
+enum LayerMixer {
+    LinearAttn(GatedDeltaNetLayer),
+    FullAttn(Qwen3_5FullAttention),
+}
+
+unsafe impl Send for LayerMixer {}
+unsafe impl Sync for LayerMixer {}
+
+struct Qwen3_5Layer {
+    mixer: LayerMixer,
+    mlp: Qwen3_5Mlp,
+    input_layernorm: Qwen3_5RMSNorm,
+    post_attention_layernorm: Qwen3_5RMSNorm,
+}
+
+unsafe impl Send for Qwen3_5Layer {}
+unsafe impl Sync for Qwen3_5Layer {}
+
+// ============================================================================
+// Top-level model
+// ============================================================================
+
+pub struct Qwen3_5Model {
+    config: Qwen3_5TextConfig,
+    device: Device,
+    dtype: Kind,
+    embed_tokens: Tensor,
+    layers: Vec<Qwen3_5Layer>,
+    norm: Qwen3_5RMSNorm,
+    lm_head: Option<Tensor>,             // None = tied to embed_tokens
+    lm_head_transposed: Option<Tensor>,  // pre-transposed tied weights
+    // Interior-mutable SSM state (required because forward_with_cache takes &self)
+    conv_states: Arc<parking_lot::Mutex<Vec<Option<Tensor>>>>,
+    rec_states: Arc<parking_lot::Mutex<Vec<Option<Tensor>>>>,
+    kv_cache: Option<Arc<parking_lot::Mutex<KVCacheManager>>>,
+    // Vision encoder (optional — None for text-only weights)
+    vision_encoder: Option<Qwen3_5VisionEncoder>,
+    // Linear projection: vision out_hidden_size → text hidden_size
+    vision_projector: Option<LinearProjection>,
+}
+
+unsafe impl Send for Qwen3_5Model {}
+unsafe impl Sync for Qwen3_5Model {}
+
+impl Qwen3_5Model {
+    pub fn from_weights(
+        weights: &mut HashMap<String, Tensor>,
+        cfg: Qwen3_5TextConfig,
+        vision_cfg: Option<Qwen3_5VisionConfig>,
+        device: &Device,
+        dtype: Kind,
+        _kv_quant_type: KVQuantType,
+    ) -> Result<Self> {
+        // Normalize weight key prefixes:
+        // Qwen3.5 Instruct weights use "model.language_model." and "model.visual." prefixes
+        // Strip these so the rest of the loader sees the expected flat names
+        let needs_remap = weights.keys().any(|k| k.starts_with("model.language_model."));
+        if needs_remap {
+            info!("Remapping Qwen3.5 weight prefixes (model.language_model.* → *, model.visual.* → visual.*)");
+            let remapped: HashMap<String, Tensor> = weights
+                .drain()
+                .map(|(k, v)| {
+                    // model.language_model.X → model.X  (restores expected prefix)
+                    // model.visual.X        → visual.X  (handled by vision loader)
+                    let new_key = if let Some(rest) = k.strip_prefix("model.language_model.") {
+                        format!("model.{rest}")
+                    } else if let Some(rest) = k.strip_prefix("model.visual.") {
+                        format!("visual.{rest}")
+                    } else {
+                        k
+                    };
+                    (new_key, v)
+                })
+                .collect();
+            *weights = remapped;
+        }
+
+        // Load vision encoder if visual weights are present
+        let has_vision = weights.keys().any(|k| k.starts_with("visual."));
+        let (vision_encoder, vision_projector) = if has_vision {
+            if let Some(vcfg) = vision_cfg {
+                info!("Loading Qwen3.5 vision encoder (out_hidden_size={})", vcfg.out_hidden_size);
+                let out_hidden = vcfg.out_hidden_size;
+                let text_hidden = cfg.hidden_size;
+                // Best-effort: vision key naming varies across model sizes; skip on error
+                match Qwen3_5VisionEncoder::from_weights(weights, vcfg) {
+                    Ok(enc) => {
+                        let proj_w = weights.remove("visual_projector.weight")
+                            .or_else(|| weights.remove("vision_projector.weight"));
+                        let projector = if let Some(w) = proj_w {
+                            Some(LinearProjection::new(w.tr().contiguous()))
+                        } else {
+                            info!("No vision_projector weights found; vision output will be zeros");
+                            let w = Tensor::zeros([out_hidden as i64, text_hidden as i64], (dtype, *device));
+                            Some(LinearProjection::new(w))
+                        };
+                        (Some(enc), projector)
+                    }
+                    Err(e) => {
+                        info!("Vision encoder load skipped (key naming mismatch, text-only mode): {e}");
+                        weights.retain(|k, _| !k.starts_with("visual."));
+                        (None, None)
+                    }
+                }
+            } else {
+                // No vision config provided — discard visual weights
+                weights.retain(|k, _| !k.starts_with("visual."));
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
+        // Remove MTP (multi-token prediction) weights silently
+        weights.retain(|k, _| !k.starts_with("mtp."));
+
+        let embed = weights.remove("model.embed_tokens.weight")
+            .ok_or_else(|| anyhow!("Missing model.embed_tokens.weight"))?;
+        let norm_w = weights.remove("model.norm.weight")
+            .ok_or_else(|| anyhow!("Missing model.norm.weight"))?;
+        let lm_head_w = weights.remove("lm_head.weight");
+
+        let num_layers = cfg.num_hidden_layers;
+        let mut layers = Vec::with_capacity(num_layers);
+
+        for idx in 0..num_layers {
+            let layer_prefix = format!("model.layers.{idx}");
+            let ln_prefix = &layer_prefix;
+
+            let input_norm_w = weights.remove(&format!("{ln_prefix}.input_layernorm.weight"))
+                .ok_or_else(|| anyhow!("Missing {ln_prefix}.input_layernorm.weight"))?;
+            let post_norm_w = weights.remove(&format!("{ln_prefix}.post_attention_layernorm.weight"))
+                .ok_or_else(|| anyhow!("Missing {ln_prefix}.post_attention_layernorm.weight"))?;
+
+            let layer_type = cfg.layer_types.get(idx).map(|s| s.as_str()).unwrap_or("linear_attention");
+            info!("Loading layer {idx}: {layer_type}");
+
+            let mixer = if layer_type == "full_attention" {
+                let attn_prefix = format!("{layer_prefix}.self_attn");
+                LayerMixer::FullAttn(Qwen3_5FullAttention::load(weights, &attn_prefix, &cfg, idx)?)
+            } else {
+                let lin_prefix = format!("{layer_prefix}.linear_attn");
+                LayerMixer::LinearAttn(GatedDeltaNetLayer::load(weights, &lin_prefix, &cfg, idx)?)
+            };
+
+            let mlp = Self::load_mlp(weights, &format!("{layer_prefix}.mlp"), &cfg, idx)?;
+
+            layers.push(Qwen3_5Layer {
+                mixer,
+                mlp,
+                input_layernorm: Qwen3_5RMSNorm { weight: input_norm_w, eps: cfg.rms_norm_eps },
+                post_attention_layernorm: Qwen3_5RMSNorm { weight: post_norm_w, eps: cfg.rms_norm_eps },
+            });
+        }
+
+        let lm_head_transposed = if lm_head_w.is_none() {
+            Some(embed.tr().contiguous())
+        } else {
+            None
+        };
+
+        let conv_states = Arc::new(parking_lot::Mutex::new(
+            (0..num_layers).map(|_| None::<Tensor>).collect::<Vec<_>>(),
+        ));
+        let rec_states = Arc::new(parking_lot::Mutex::new(
+            (0..num_layers).map(|_| None::<Tensor>).collect::<Vec<_>>(),
+        ));
+
+        Ok(Self {
+            config: cfg,
+            device: *device,
+            dtype,
+            embed_tokens: embed,
+            layers,
+            norm: Qwen3_5RMSNorm { weight: norm_w, eps: 1e-6 },
+            lm_head: lm_head_w,
+            lm_head_transposed,
+            conv_states,
+            rec_states,
+            kv_cache: None,
+            vision_encoder,
+            vision_projector,
+        })
+    }
+
+    fn load_mlp(
+        weights: &mut HashMap<String, Tensor>,
+        prefix: &str,
+        cfg: &Qwen3_5TextConfig,
+        layer_idx: usize,
+    ) -> Result<Qwen3_5Mlp> {
+        let t = |w: Tensor| w.tr().contiguous();
+
+        if cfg.is_moe {
+            let mut get = |name: &str| -> Result<Tensor> {
+                let full = format!("{prefix}.{name}");
+                weights.remove(&full).ok_or_else(|| anyhow!("Missing weight: {}", full))
+            };
+
+            let gate_w = get("gate.weight")?;
+            // gate stored as [num_experts, hidden] — need [hidden, num_experts] for our LinearProjection
+            let gate_proj = LinearProjection::new(gate_w.tr().contiguous());
+
+            let mut experts = Vec::with_capacity(cfg.num_experts);
+            for e in 0..cfg.num_experts {
+                let ep = format!("experts.{e}");
+                let gp = weights.remove(&format!("{prefix}.{ep}.gate_proj.weight"))
+                    .ok_or_else(|| anyhow!("Missing {prefix}.{ep}.gate_proj.weight"))?;
+                let up = weights.remove(&format!("{prefix}.{ep}.up_proj.weight"))
+                    .ok_or_else(|| anyhow!("Missing {prefix}.{ep}.up_proj.weight"))?;
+                let dn = weights.remove(&format!("{prefix}.{ep}.down_proj.weight"))
+                    .ok_or_else(|| anyhow!("Missing {prefix}.{ep}.down_proj.weight"))?;
+                experts.push(Qwen3_5Expert {
+                    gate_proj: LinearProjection::new(t(gp)),
+                    up_proj: LinearProjection::new(t(up)),
+                    down_proj: LinearProjection::new(t(dn)),
+                });
+            }
+
+            let shared = {
+                let gp = weights.remove(&format!("{prefix}.shared_expert.gate_proj.weight"))
+                    .ok_or_else(|| anyhow!("Missing {prefix}.shared_expert.gate_proj.weight"))?;
+                let up = weights.remove(&format!("{prefix}.shared_expert.up_proj.weight"))
+                    .ok_or_else(|| anyhow!("Missing {prefix}.shared_expert.up_proj.weight"))?;
+                let dn = weights.remove(&format!("{prefix}.shared_expert.down_proj.weight"))
+                    .ok_or_else(|| anyhow!("Missing {prefix}.shared_expert.down_proj.weight"))?;
+                Qwen3_5Expert {
+                    gate_proj: LinearProjection::new(t(gp)),
+                    up_proj: LinearProjection::new(t(up)),
+                    down_proj: LinearProjection::new(t(dn)),
+                }
+            };
+
+            Ok(Qwen3_5Mlp::Sparse(Qwen3_5SparseMoE {
+                gate: gate_proj,
+                experts,
+                shared_expert: shared,
+                num_experts_per_tok: cfg.num_experts_per_tok,
+            }))
+        } else {
+            let gp = weights.remove(&format!("{prefix}.gate_proj.weight"))
+                .ok_or_else(|| anyhow!("Missing {prefix}.gate_proj.weight"))?;
+            let up = weights.remove(&format!("{prefix}.up_proj.weight"))
+                .ok_or_else(|| anyhow!("Missing {prefix}.up_proj.weight"))?;
+            let dn = weights.remove(&format!("{prefix}.down_proj.weight"))
+                .ok_or_else(|| anyhow!("Missing {prefix}.down_proj.weight"))?;
+
+            Ok(Qwen3_5Mlp::Dense(LlamaMLP {
+                gate_proj: LinearProjection::new(t(gp)),
+                up_proj: LinearProjection::new(t(up)),
+                down_proj: LinearProjection::new(t(dn)),
+                activation: "silu".to_owned(),
+                layer_idx,
+            }))
+        }
+    }
+
+    fn forward_inner(
+        &self,
+        input_ids: Option<&Tensor>,
+        embeddings: Option<&Tensor>,
+        start_pos: usize,
+    ) -> Result<Tensor> {
+        let mut hidden = if let Some(embeds) = embeddings {
+            embeds.shallow_clone()
+        } else {
+            let ids = input_ids.ok_or_else(|| anyhow!("No input"))?;
+            let flat = ids.flatten(0, -1);
+            let emb = self.embed_tokens.index_select(0, &flat);
+            let emb_shape = emb.size();
+            let hidden_sz = emb_shape[emb_shape.len() - 1];
+            let id_shape = ids.size();
+            let batch = id_shape[0];
+            let seq = id_shape[1];
+            emb.reshape([batch, seq, hidden_sz])
+        };
+
+        let (batch, seq) = (hidden.size()[0], hidden.size()[1]);
+        let device = self.device;
+
+        // Position IDs for full-attention RoPE
+        let position_ids = Tensor::arange_start(
+            start_pos as i64,
+            start_pos as i64 + seq,
+            (Kind::Int64, device),
+        );
+
+        let mut conv_guard = self.conv_states.lock();
+        let mut rec_guard = self.rec_states.lock();
+        // kv_arc dropped per-layer to avoid holding lock across SSM layers
+
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let residual = hidden.shallow_clone();
+            hidden = layer.input_layernorm.forward(&hidden)?;
+
+            hidden = match &layer.mixer {
+                LayerMixer::LinearAttn(gdn) => {
+                    gdn.forward(&hidden, &mut conv_guard[idx], &mut rec_guard[idx])?
+                }
+                LayerMixer::FullAttn(attn) => {
+                    if let Some(ref cache_arc) = self.kv_cache {
+                        let kv = cache_arc.lock();
+                        kv.with_layer_cache(idx, |lc| {
+                            attn.forward(&hidden, Some(&position_ids), Some(lc), start_pos)
+                        })
+                        .ok_or_else(|| anyhow!("No KV cache for layer {idx}"))??
+                    } else {
+                        attn.forward(&hidden, Some(&position_ids), None, start_pos)?
+                    }
+                }
+            };
+
+            hidden = residual + &hidden;
+
+            let residual2 = hidden.shallow_clone();
+            hidden = layer.post_attention_layernorm.forward(&hidden)?;
+            hidden = layer.mlp.forward(&hidden)?;
+            hidden = residual2 + &hidden;
+        }
+        Ok(hidden)
+    }
+
+    /// Encode images through the vision encoder and project to text hidden space.
+    ///
+    /// pixel_values: [B, C, H, W]
+    /// Returns: [total_image_patches, hidden_size]
+    fn encode_vision_features(&self, pixel_values: &Tensor) -> Result<Tensor> {
+        let enc = self.vision_encoder.as_ref()
+            .ok_or_else(|| anyhow!("No vision encoder loaded"))?;
+        let proj = self.vision_projector.as_ref()
+            .ok_or_else(|| anyhow!("No vision projector loaded"))?;
+
+        // [B * out_patches, out_hidden_size]
+        let features = enc.forward(pixel_values)?;
+        // Project to text hidden size: [B * out_patches, hidden_size]
+        Ok(proj.apply(&features))
+    }
+
+    /// Build combined embeddings by replacing image placeholder tokens with vision features.
+    ///
+    /// image_token_id identifies placeholder positions in input_ids.
+    /// pixel_values provides image patches for each placeholder sequence.
+    fn prepare_inputs_embeds(
+        &self,
+        input_ids: &Tensor,
+        pixel_values: Option<&Tensor>,
+        images_seq_mask: Option<&Tensor>,
+        _images_emb_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        // Get text embeddings for all tokens
+        let flat = input_ids.flatten(0, -1);
+        let text_emb = self.embed_tokens.index_select(0, &flat);
+        let ids_shape = input_ids.size();
+        let hidden_sz = text_emb.size().last().copied().unwrap_or(self.config.hidden_size as i64);
+        let combined = text_emb.reshape([ids_shape[0], ids_shape[1], hidden_sz]);
+
+        // If we have pixel_values and a sequence mask, inject vision embeddings
+        if let (Some(pv), Some(mask)) = (pixel_values, images_seq_mask) {
+            let vision_feats = self.encode_vision_features(pv)?; // [N_img, hidden]
+            // mask: [batch, seq] bool tensor marking where to inject
+            // Flatten and scatter vision features into combined at masked positions
+            let (batch, seq, hs) = dims3(&combined)?;
+            for b in 0..batch {
+                let mask_b = mask.select(0, b).to_kind(Kind::Bool); // [seq]
+                let positions: Vec<i64> = (0..seq)
+                    .filter(|&t| mask_b.double_value(&[t]) != 0.0)
+                    .collect();
+                if positions.is_empty() { continue; }
+                // Slice vision_feats to match the number of masked positions
+                let n_img = positions.len() as i64;
+                let vf_slice = vision_feats.narrow(0, 0, n_img.min(vision_feats.size()[0]));
+                for (img_idx, &pos) in positions.iter().enumerate() {
+                    if (img_idx as i64) < vf_slice.size()[0] {
+                        let vf = vf_slice.select(0, img_idx as i64); // [hidden]
+                        combined.select(0, b).select(0, pos).copy_(&vf.to_kind(self.dtype));
+                    }
+                }
+            }
+        }
+
+        Ok(combined)
+    }
+
+    fn lm_head_apply(&self, hidden: &Tensor) -> Result<Tensor> {
+        let (batch, seq, hs) = dims3(hidden)?;
+        let flat = hidden.reshape([batch * seq, hs]);
+        let logits = if let Some(ref lm_head) = self.lm_head {
+            // lm_head stored as [vocab, hidden], need to transpose for matmul
+            flat.matmul(&lm_head.tr())
+        } else if let Some(ref lm_t) = self.lm_head_transposed {
+            flat.matmul(lm_t)
+        } else {
+            return Err(anyhow!("No lm_head weight"));
+        };
+        Ok(logits.reshape([batch, seq, -1]))
+    }
+}
+
+// ============================================================================
+// ModelOperations impl
+// ============================================================================
+
+impl ModelOperations for Qwen3_5Model {
+    fn architecture(&self) -> ModelArchitecture {
+        ModelArchitecture::Qwen3_5
+    }
+
+    fn config(&self) -> &dyn ArchitectureConfig {
+        &self.config
+    }
+
+    fn forward(&self, input: &Tensor, _past_kv: Option<&Tensor>) -> Result<Tensor> {
+        let hidden = self.forward_inner(Some(input), None, 0)?;
+        let normed = self.norm.forward(&hidden)?;
+        self.lm_head_apply(&normed)
+    }
+
+    fn forward_with_cache(&self, input: &Tensor, start_pos: usize) -> Result<Tensor> {
+        let hidden = self.forward_inner(Some(input), None, start_pos)?;
+        let normed = self.norm.forward(&hidden)?;
+        self.lm_head_apply(&normed)
+    }
+
+    fn forward_from_embeddings(&self, embeddings: &Tensor, start_pos: usize) -> Result<Tensor> {
+        let hidden = self.forward_inner(None, Some(embeddings), start_pos)?;
+        let normed = self.norm.forward(&hidden)?;
+        self.lm_head_apply(&normed)
+    }
+
+    fn embed_tokens(&self, input_ids: &Tensor) -> Result<Tensor> {
+        let flat = input_ids.flatten(0, -1);
+        let emb = self.embed_tokens.index_select(0, &flat);
+        let emb_shape = emb.size();
+        let hidden_sz = emb_shape[emb_shape.len() - 1];
+        let ids_shape = input_ids.size();
+        Ok(emb.reshape([ids_shape[0], ids_shape[1], hidden_sz]))
+    }
+
+    fn apply_final_norm(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        self.norm.forward(hidden_states)
+    }
+
+    fn lm_head(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        self.lm_head_apply(hidden_states)
+    }
+
+    fn num_layers(&self) -> usize {
+        self.config.num_hidden_layers
+    }
+
+    fn clear_kv_cache(&self) {
+        let mut conv = self.conv_states.lock();
+        let mut rec = self.rec_states.lock();
+        for s in conv.iter_mut() { *s = None; }
+        for s in rec.iter_mut() { *s = None; }
+        if let Some(ref cache) = self.kv_cache {
+            cache.lock().clear_all();
+        }
+    }
+
+    fn set_kv_cache(&mut self, cache: Arc<parking_lot::Mutex<KVCacheManager>>) {
+        self.kv_cache = Some(cache);
+    }
+
+    fn get_kv_cache(&self) -> Option<Arc<parking_lot::Mutex<KVCacheManager>>> {
+        self.kv_cache.clone()
+    }
+
+    fn take_kv_cache(&mut self) -> Option<Arc<parking_lot::Mutex<KVCacheManager>>> {
+        self.kv_cache.take()
+    }
+
+    fn reshape_for_attention(&self, tensor: &Tensor, _is_key_value: bool) -> Result<Tensor> {
+        Ok(tensor.shallow_clone())
+    }
+
+    fn apply_rope(&self, tensor: &Tensor, position_ids: &Tensor) -> Result<Tensor> {
+        let rd = self.config.rotary_dim as i64;
+        let device = tensor.device();
+        let dtype = tensor.kind();
+        let mut rope = RoPE::new_with_dtype(rd, self.config.rope_theta as f64, self.config.max_position_embeddings as i64, device, dtype)?;
+        rope.forward(tensor, Some(position_ids))
+    }
+
+    fn normalize(&self, tensor: &Tensor) -> Result<Tensor> {
+        self.norm.forward(tensor)
+    }
+
+    fn get_attention_mask(&self, seq_len: usize, _past_kv_len: usize) -> Result<Tensor> {
+        let sq = seq_len as i64;
+        Ok(Tensor::ones([sq, sq], (Kind::Float, self.device)).tril(0))
+    }
+
+    fn is_multimodal(&self) -> bool {
+        self.vision_encoder.is_some()
+    }
+
+    fn prepare_multimodal_inputs(
+        &self,
+        input_ids: &Tensor,
+        pixel_values: Option<&Tensor>,
+        images_seq_mask: Option<&Tensor>,
+        images_emb_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        self.prepare_inputs_embeds(input_ids, pixel_values, images_seq_mask, images_emb_mask)
+    }
+
+    fn encode_vision(&self, pixel_values: &Tensor) -> Result<Tensor> {
+        self.encode_vision_features(pixel_values)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}

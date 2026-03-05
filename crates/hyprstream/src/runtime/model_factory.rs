@@ -106,29 +106,70 @@ impl ModelFactory {
         }
     }
 
-    /// Find all shard files in a model directory
+    /// Find all shard files in a model directory.
+    ///
+    /// Prefers `model.safetensors.index.json` (authoritative HuggingFace shard manifest)
+    /// over filename glob patterns, which are fragile across model families.
     fn find_shard_files(model_path: &Path) -> Result<Vec<std::path::PathBuf>> {
-        let mut shard_files = Vec::new();
+        // 1. Use index file if present (most reliable)
+        let index_path = model_path.join("model.safetensors.index.json");
+        if index_path.exists() {
+            return Self::shard_files_from_index(model_path, &index_path);
+        }
 
-        // Check for single file first
+        // 2. Single unsharded file
         let single_file = model_path.join("model.safetensors");
         if single_file.exists() {
             return Ok(vec![single_file]);
         }
 
-        // Look for sharded files
+        // 3. Fallback: glob for known shard naming patterns
+        let mut shard_files = Vec::new();
         for entry in std::fs::read_dir(model_path)? {
             let entry = entry?;
-            let filename = entry.file_name();
-            if let Some(name) = filename.to_str() {
-                if name.starts_with("model-") && name.ends_with(".safetensors") {
+            if let Some(name) = entry.file_name().to_str() {
+                if (name.starts_with("model-") || name.starts_with("model.safetensors-"))
+                    && name.ends_with(".safetensors")
+                {
                     shard_files.push(entry.path());
                 }
             }
         }
-
         shard_files.sort();
         Ok(shard_files)
+    }
+
+    /// Parse shard filenames from `model.safetensors.index.json`.
+    /// Returns unique shard paths in sorted order (guaranteed by the index).
+    fn shard_files_from_index(
+        model_path: &Path,
+        index_path: &Path,
+    ) -> Result<Vec<std::path::PathBuf>> {
+        let content = std::fs::read_to_string(index_path)?;
+        let index: serde_json::Value = serde_json::from_str(&content)?;
+        let weight_map = index["weight_map"]
+            .as_object()
+            .ok_or_else(|| anyhow!("model.safetensors.index.json missing weight_map"))?;
+
+        let mut seen = std::collections::BTreeSet::new();
+        for filename in weight_map.values() {
+            if let Some(s) = filename.as_str() {
+                seen.insert(s.to_owned());
+            }
+        }
+
+        let mut paths: Vec<_> = seen
+            .into_iter()
+            .map(|name| model_path.join(&name))
+            .collect();
+        paths.sort();
+
+        info!(
+            "📋 Index file lists {} shard(s): {:?}",
+            paths.len(),
+            paths.iter().map(|p| p.file_name().unwrap_or_default()).collect::<Vec<_>>()
+        );
+        Ok(paths)
     }
 
     /// Create model using incremental loading for large sharded models
@@ -183,20 +224,28 @@ impl ModelFactory {
             return Ok(all_weights);
         }
 
-        // Look for sharded safetensors files (model-00001-of-00002.safetensors pattern)
+        // Look for sharded safetensors files — prefer index file, then glob patterns
         let model_path_buf = model_path.to_path_buf();
         let mut shard_files =
             tokio::task::spawn_blocking(move || -> Result<Vec<std::path::PathBuf>> {
+                // Use index if present
+                let index_path = model_path_buf.join("model.safetensors.index.json");
+                if index_path.exists() {
+                    return Self::shard_files_from_index(&model_path_buf, &index_path);
+                }
+                // Fallback glob
                 let mut files = Vec::new();
                 for entry in std::fs::read_dir(&model_path_buf)? {
                     let entry = entry?;
-                    let filename = entry.file_name();
-                    if let Some(name) = filename.to_str() {
-                        if name.starts_with("model-") && name.ends_with(".safetensors") {
+                    if let Some(name) = entry.file_name().to_str() {
+                        if (name.starts_with("model-") || name.starts_with("model.safetensors-"))
+                            && name.ends_with(".safetensors")
+                        {
                             files.push(entry.path());
                         }
                     }
                 }
+                files.sort();
                 Ok(files)
             })
             .await??;
@@ -523,6 +572,10 @@ impl ModelFactory {
                 info!("Creating Janus multimodal model");
                 Self::create_janus_model(config, weights, device, dtype, max_context, kv_quant_type)
             }
+            ModelArchitecture::Qwen3_5 => {
+                info!("Creating Qwen3.5 hybrid SSM/attention model");
+                Self::create_qwen3_5_model(config, weights, device, dtype, max_context, kv_quant_type)
+            }
             ModelArchitecture::Unknown(arch) => Err(anyhow!("Unknown architecture: {}", arch)),
         }
     }
@@ -682,6 +735,65 @@ impl ModelFactory {
             janus_config,
             *device,
             dtype,
+        )?))
+    }
+
+    fn create_qwen3_5_model(
+        config: ModelConfig,
+        mut weights: HashMap<String, Tensor>,
+        device: &Device,
+        dtype: DType,
+        max_context: Option<usize>,
+        kv_quant_type: KVQuantType,
+    ) -> Result<Box<dyn ModelOperations>> {
+        use super::architectures::qwen3_5::{Qwen3_5Model, Qwen3_5TextConfig};
+        use super::architectures::qwen3_5_vision::Qwen3_5VisionConfig;
+
+        let effective_max_pos = max_context.unwrap_or(config.max_position_embeddings);
+
+        let text_cfg = Qwen3_5TextConfig::from_model_config(&config, effective_max_pos);
+
+        // Build vision config if the checkpoint has vision weights
+        let vision_cfg = if config.has_vision {
+            // vision_config is stored in the ModelConfig's raw JSON during loading
+            // Use the fields already parsed into ModelConfig
+            Some(Qwen3_5VisionConfig {
+                depth: 27,
+                hidden_size: 1152,
+                intermediate_size: 4304,
+                num_heads: 16,
+                head_dim: 72,
+                patch_size: 16,
+                temporal_patch_size: 2,
+                spatial_merge_size: 2,
+                out_hidden_size: config.vision_out_hidden_size,
+                rms_norm_eps: 1e-6,
+            })
+        } else if weights.keys().any(|k| k.starts_with("visual.")) {
+            // Fallback: detect from weights even if config didn't set has_vision
+            Some(Qwen3_5VisionConfig {
+                depth: 27,
+                hidden_size: 1152,
+                intermediate_size: 4304,
+                num_heads: 16,
+                head_dim: 72,
+                patch_size: 16,
+                temporal_patch_size: 2,
+                spatial_merge_size: 2,
+                out_hidden_size: if config.vision_out_hidden_size > 0 { config.vision_out_hidden_size } else { 3584 },
+                rms_norm_eps: 1e-6,
+            })
+        } else {
+            None
+        };
+
+        Ok(Box::new(Qwen3_5Model::from_weights(
+            &mut weights,
+            text_cfg,
+            vision_cfg,
+            device,
+            dtype,
+            kv_quant_type,
         )?))
     }
 

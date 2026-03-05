@@ -35,7 +35,7 @@ impl ToolCallFormat {
     /// Select the tool-call format from the model architecture.
     pub fn from_architecture(arch: &ModelArchitecture) -> Self {
         match arch {
-            ModelArchitecture::Qwen => Self::Qwen3Xml,
+            ModelArchitecture::Qwen | ModelArchitecture::Qwen3_5 => Self::Qwen3Xml,
             ModelArchitecture::Llama => Self::LlamaJson,
             ModelArchitecture::Mistral => Self::MistralJson,
             ModelArchitecture::Gemma | ModelArchitecture::Janus | ModelArchitecture::Unknown(_) => Self::None,

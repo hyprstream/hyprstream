@@ -988,13 +988,16 @@ impl RuntimeEngine for TorchEngine {
 
             // If no single file found, check for sharded SafeTensors
             if found_file.is_none() {
-                let _shard_pattern = path.join("model-00001-of-*.safetensors");
                 if let Ok(entries) = std::fs::read_dir(path) {
                     for entry in entries.flatten() {
                         let filename = entry.file_name();
                         if let Some(name) = filename.to_str() {
-                            if name.starts_with("model-00001-of-") && name.ends_with(".safetensors")
-                            {
+                            // Match standard shard pattern: model-00001-of-NNNNN.safetensors
+                            // Also match Qwen3.5 pattern: model.safetensors-00001-of-NNNNN.safetensors
+                            let is_first_shard = (name.starts_with("model-00001-of-")
+                                || name.starts_with("model.safetensors-00001-of-"))
+                                && name.ends_with(".safetensors");
+                            if is_first_shard {
                                 info!(
                                     "🔍 Detected sharded SafeTensors model starting with: {}",
                                     name

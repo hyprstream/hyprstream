@@ -61,6 +61,26 @@ pub struct ModelConfig {
     pub dtype: String,
     pub use_flash_attention: bool,
     pub use_kv_cache: bool,
+
+    // Qwen3.5 hybrid SSM/attention fields
+    pub partial_rotary_factor: Option<f32>,
+    pub layer_types: Vec<String>,
+    pub linear_conv_kernel_dim: usize,
+    pub linear_key_head_dim: usize,
+    pub linear_value_head_dim: usize,
+    pub linear_num_key_heads: usize,
+    pub linear_num_value_heads: usize,
+
+    // Qwen3.5 MoE fields
+    pub is_moe: bool,
+    pub num_experts: usize,
+    pub num_experts_per_tok: usize,
+    pub moe_intermediate_size: usize,
+    pub shared_expert_intermediate_size: usize,
+
+    // Vision fields (Qwen3.5 multimodal)
+    pub has_vision: bool,
+    pub vision_out_hidden_size: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +96,8 @@ pub enum ModelArchitecture {
     Gemma,
     Mistral,
     Janus,
+    /// Qwen3.5 hybrid GatedDeltaNet/full-attention model (dense and MoE variants)
+    Qwen3_5,
     Unknown(String),
 }
 
@@ -156,25 +178,32 @@ impl ModelConfig {
         // Detect architecture from model_type or architectures field
         let architecture = Self::detect_architecture_from_json(&json);
 
-        // For Janus models, extract language_config and use that as the source
-        let lang_json_opt = if architecture == ModelArchitecture::Janus {
+        // For Janus models, extract language_config and use that as the source.
+        // For Qwen3.5 models, extract text_config.
+        let nested_json_opt = if architecture == ModelArchitecture::Janus {
             info!("Detected Janus multimodal model - loading from language_config");
 
             let lang_config = json["language_config"].as_object()
                 .ok_or_else(|| anyhow::anyhow!("Janus config missing required 'language_config'"))?;
 
-            // Convert to serde_json::Value for uniform access
             let lang_json = serde_json::Value::Object(lang_config.clone());
-
             info!("Language config hidden_size: {}", lang_json["hidden_size"].as_u64().unwrap_or(0));
-
             Some(lang_json)
+        } else if architecture == ModelArchitecture::Qwen3_5 {
+            info!("Detected Qwen3.5 model - loading from text_config");
+            if let Some(text_cfg) = json["text_config"].as_object() {
+                let text_json = serde_json::Value::Object(text_cfg.clone());
+                info!("text_config hidden_size: {}", text_json["hidden_size"].as_u64().unwrap_or(0));
+                Some(text_json)
+            } else {
+                None // flat config (text-only checkpoint)
+            }
         } else {
             None
         };
 
         // Choose config source based on architecture
-        let config_source = lang_json_opt.as_ref().unwrap_or(&json);
+        let config_source = nested_json_opt.as_ref().unwrap_or(&json);
 
         // Extract all configuration values from the appropriate source
         let config = Self {
@@ -204,7 +233,9 @@ impl ModelConfig {
             vocab_size: config_source["vocab_size"].as_u64().unwrap_or(32000) as usize,
             max_position_embeddings: config_source["max_position_embeddings"].as_u64().unwrap_or(4096)
                 as usize,
-            rope_theta: config_source["rope_theta"].as_f64().unwrap_or(10_000.0) as f32,
+            rope_theta: config_source["rope_parameters"]["rope_theta"].as_f64()
+                .or_else(|| config_source["rope_theta"].as_f64())
+                .unwrap_or(10_000.0) as f32,
             rope_scaling: Self::parse_rope_scaling(config_source),
 
             rms_norm_eps: config_source["rms_norm_eps"].as_f64().unwrap_or(1e-5) as f32,
@@ -221,6 +252,58 @@ impl ModelConfig {
             dtype: "bfloat16".to_owned(),
             use_flash_attention: true,
             use_kv_cache: true,
+
+            // Qwen3.5 hybrid SSM/attention fields
+            partial_rotary_factor: if architecture == ModelArchitecture::Qwen3_5 {
+                Some(
+                    config_source["rope_parameters"]["partial_rotary_factor"].as_f64()
+                        .or_else(|| config_source["partial_rotary_factor"].as_f64())
+                        .unwrap_or(0.25) as f32,
+                )
+            } else {
+                None
+            },
+            layer_types: if architecture == ModelArchitecture::Qwen3_5 {
+                let num_layers = config_source["num_hidden_layers"].as_u64()
+                    .or_else(|| json["num_hidden_layers"].as_u64())
+                    .unwrap_or(32) as usize;
+                config_source["layer_types"].as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_else(|| {
+                        let interval = config_source["full_attention_interval"]
+                            .as_u64().unwrap_or(4) as usize;
+                        (0..num_layers)
+                            .map(|i| {
+                                if (i + 1) % interval == 0 { "full_attention".to_owned() }
+                                else { "linear_attention".to_owned() }
+                            })
+                            .collect()
+                    })
+            } else {
+                vec![]
+            },
+            linear_conv_kernel_dim: config_source["linear_conv_kernel_dim"].as_u64().unwrap_or(0) as usize,
+            linear_key_head_dim: config_source["linear_key_head_dim"].as_u64().unwrap_or(0) as usize,
+            linear_value_head_dim: config_source["linear_value_head_dim"].as_u64().unwrap_or(0) as usize,
+            linear_num_key_heads: config_source["linear_num_key_heads"].as_u64().unwrap_or(0) as usize,
+            linear_num_value_heads: config_source["linear_num_value_heads"].as_u64().unwrap_or(0) as usize,
+
+            // Qwen3.5 MoE fields
+            is_moe: json["model_type"].as_str().map(|s| s.contains("moe")).unwrap_or(false),
+            num_experts: config_source["num_experts"].as_u64().unwrap_or(0) as usize,
+            num_experts_per_tok: config_source["num_experts_per_tok"].as_u64().unwrap_or(0) as usize,
+            moe_intermediate_size: config_source["moe_intermediate_size"].as_u64().unwrap_or(0) as usize,
+            shared_expert_intermediate_size: config_source["shared_expert_intermediate_size"]
+                .as_u64().unwrap_or(0) as usize,
+
+            // Vision fields
+            has_vision: json["vision_config"].is_object(),
+            vision_out_hidden_size: json["vision_config"]["out_hidden_size"]
+                .as_u64().unwrap_or(3584) as usize,
         };
 
         Ok(config)
@@ -278,8 +361,9 @@ impl ModelConfig {
         // Check model_type field
         if let Some(model_type) = json["model_type"].as_str() {
             return match model_type.to_lowercase().as_str() {
-                "janus" => ModelArchitecture::Janus,  // Explicit Janus type
+                "janus" => ModelArchitecture::Janus,
                 "llama" => ModelArchitecture::Llama,
+                "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" => ModelArchitecture::Qwen3_5,
                 "qwen" | "qwen2" | "qwen3" => ModelArchitecture::Qwen,
                 "gemma" => ModelArchitecture::Gemma,
                 "mistral" => ModelArchitecture::Mistral,
@@ -292,8 +376,9 @@ impl ModelConfig {
             if let Some(first) = architectures.first() {
                 if let Some(arch_str) = first.as_str() {
                     return match arch_str.to_lowercase().as_str() {
-                        s if s.contains("janus") => ModelArchitecture::Janus,  // Janus in architecture name
+                        s if s.contains("janus") => ModelArchitecture::Janus,
                         s if s.contains("llama") => ModelArchitecture::Llama,
+                        s if s.contains("qwen3_5") || s.contains("Qwen3_5") => ModelArchitecture::Qwen3_5,
                         s if s.contains("qwen") => ModelArchitecture::Qwen,
                         s if s.contains("gemma") => ModelArchitecture::Gemma,
                         s if s.contains("mistral") => ModelArchitecture::Mistral,
@@ -320,6 +405,11 @@ impl ModelConfig {
             info!("  has_aligner: {}", has_aligner);
             info!("  has_language_model: {}", has_language_model);
             return ModelArchitecture::Janus;
+        }
+
+        // Qwen3.5 has linear_attn layers (GatedDeltaNet)
+        if weights.keys().any(|k| k.contains("linear_attn.")) {
+            return ModelArchitecture::Qwen3_5;
         }
 
         for key in weights.keys() {
@@ -447,6 +537,12 @@ impl ModelConfig {
                     self.version = 3;
                 }
             }
+            ModelArchitecture::Qwen3_5 => {
+                // Qwen3.5 defaults — nested config parsing handles most fields
+                if self.rope_theta == 10_000.0 {
+                    self.rope_theta = 10_000_000.0; // Qwen3.5 uses 10M
+                }
+            }
             ModelArchitecture::Gemma => {
                 if self.vocab_size == 262144 {
                     self.rope_theta = 1_000_000.0;
@@ -512,6 +608,23 @@ impl Default for ModelConfig {
             dtype: "bfloat16".to_owned(),
             use_flash_attention: true,
             use_kv_cache: true,
+
+            partial_rotary_factor: None,
+            layer_types: vec![],
+            linear_conv_kernel_dim: 0,
+            linear_key_head_dim: 0,
+            linear_value_head_dim: 0,
+            linear_num_key_heads: 0,
+            linear_num_value_heads: 0,
+
+            is_moe: false,
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            moe_intermediate_size: 0,
+            shared_expert_intermediate_size: 0,
+
+            has_vision: false,
+            vision_out_hidden_size: 0,
         }
     }
 }
