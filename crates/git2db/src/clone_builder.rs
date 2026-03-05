@@ -256,26 +256,27 @@ impl CloneBuilder {
         let worktrees_dir = repo_dir.join("worktrees");
 
         // Check for existing bare repo (resume case)
-        let existing_bare_repo = if repo_dir.exists() {
-            match git2::Repository::open_bare(&bare_repo_path) {
-                Ok(repo) => {
-                    tracing::info!("Resuming clone: valid bare repo found at {:?}", bare_repo_path);
-                    Some(repo)
-                }
-                Err(_) => {
-                    tracing::warn!("Removing incomplete/corrupted clone at {:?}", repo_dir);
-                    std::fs::remove_dir_all(&repo_dir).map_err(|e| {
-                        Git2DBError::repository(&repo_dir, format!("Failed to cleanup incomplete clone: {e}"))
+        let existing_valid = if repo_dir.exists() {
+            let bp = bare_repo_path.clone();
+            let rd = repo_dir.clone();
+            tokio::task::spawn_blocking(move || -> Git2DBResult<bool> {
+                if git2::Repository::open_bare(&bp).is_ok() {
+                    tracing::info!("Resuming clone: valid bare repo found at {:?}", bp);
+                    Ok(true)
+                } else {
+                    tracing::warn!("Removing incomplete/corrupted clone at {:?}", rd);
+                    std::fs::remove_dir_all(&rd).map_err(|e| {
+                        Git2DBError::repository(&rd, format!("Failed to cleanup incomplete clone: {e}"))
                     })?;
-                    None
+                    Ok(false)
                 }
-            }
+            }).await.map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))??
         } else {
-            None
+            false
         };
 
         // Create directory structure if fresh clone
-        if existing_bare_repo.is_none() {
+        if !existing_valid {
             std::fs::create_dir_all(&repo_dir).map_err(|e| {
                 Git2DBError::repository(&repo_dir, format!("Failed to create repo directory: {e}"))
             })?;
@@ -289,9 +290,7 @@ impl CloneBuilder {
         let progress_reporter = self.callback_config.as_ref()
             .and_then(crate::callback_config::CallbackConfig::progress_reporter);
 
-        let bare_repo = if let Some(repo) = existing_bare_repo {
-            repo
-        } else {
+        if !existing_valid {
             tracing::info!("Cloning repository '{}' as bare to {:?}", repo_name, bare_repo_path);
 
             let clone_options = if let Some(config) = self.callback_config.take() {
@@ -304,7 +303,8 @@ impl CloneBuilder {
             let bare_path_clone = bare_repo_path.clone();
 
             // This is the slow network operation - no lock held!
-            tokio::task::spawn_blocking(move || -> Git2DBResult<git2::Repository> {
+            // We discard the returned Repository (it's !Send) and re-open below.
+            tokio::task::spawn_blocking(move || -> Git2DBResult<()> {
                 let mut git2_options = clone_options.to_git2_options();
                 let mut builder = git2::build::RepoBuilder::new();
                 builder.bare(true);
@@ -315,21 +315,31 @@ impl CloneBuilder {
                     .map_err(|e| Git2DBError::repository(
                         &bare_path_clone,
                         format!("Failed to clone bare repository: {e}")
-                    ))
+                    ))?;
+                Ok(())
             })
             .await
-            .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))??
-        };
-
-        // Add additional remotes
-        for (remote_name, remote_url) in &self.remotes {
-            bare_repo.remote(remote_name, remote_url).map_err(|e| {
-                Git2DBError::configuration(format!("Failed to add remote '{remote_name}': {e}"))
-            })?;
+            .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))??;
         }
 
-        // Get default branch and create worktrees
-        let default_branch = get_default_branch(&bare_repo)?;
+        // Post-clone git2 operations: add remotes + detect default branch.
+        // Re-open the bare repo inside spawn_blocking (git2::Repository is !Send).
+        let remotes_clone = self.remotes.clone();
+        let bp = bare_repo_path.clone();
+        let default_branch = tokio::task::spawn_blocking(move || -> Git2DBResult<String> {
+            let repo = git2::Repository::open_bare(&bp)
+                .map_err(|e| Git2DBError::repository(&bp, format!("Failed to open bare repo: {e}")))?;
+            for (remote_name, remote_url) in &remotes_clone {
+                // Use remote_set_url: creates the remote if missing, updates if it exists.
+                // This is idempotent for the resume path where remotes may already exist.
+                repo.remote_set_url(remote_name, remote_url).map_err(|e| {
+                    Git2DBError::configuration(format!("Failed to set remote '{remote_name}': {e}"))
+                })?;
+            }
+            get_default_branch(&repo)
+        })
+        .await
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))??;
         tracing::debug!("Default branch detected: {}", default_branch);
 
         // Validate branch name for path safety (C2 fix)

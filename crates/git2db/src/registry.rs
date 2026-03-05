@@ -171,18 +171,27 @@ impl Git2DB {
 
         // Check if directory exists AND is a git repository
         // (directory might exist but not be initialized, e.g., from Docker volume mount)
+        let rp = registry_path.clone();
+        let is_valid_repo = tokio::task::spawn_blocking(move || {
+            Repository::open(&rp).is_ok()
+        }).await.unwrap_or(false);
         let is_git_repo = registry_path.join(".git").exists()
-            || (registry_path.exists() && Repository::open(&registry_path).is_ok());
+            || (registry_path.exists() && is_valid_repo);
 
         // Create or open registry repo
         if is_git_repo {
-            // Verify we can open it
-            let _repo = git_manager.get_repository(&registry_path).map_err(|e| {
-                Git2DBError::repository(
-                    &registry_path,
-                    format!("Failed to open registry repository: {e}"),
-                )
-            })?;
+            // Verify we can open it (git2 is blocking)
+            let rp = registry_path.clone();
+            tokio::task::spawn_blocking(move || {
+                GitManager::global().get_repository(&rp).map_err(|e| {
+                    Git2DBError::repository(
+                        &rp,
+                        format!("Failed to open registry repository: {e}"),
+                    )
+                })
+            })
+            .await
+            .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))??;
         } else {
             // Initialize new registry
             info!("Initializing new model registry at {:?}", registry_path);
@@ -207,10 +216,6 @@ impl Git2DB {
                         )
                     })?;
             }
-
-            let repo = Repository::init(&registry_path).map_err(|e| {
-                Git2DBError::repository(&registry_path, format!("Failed to init repository: {e}"))
-            })?;
 
             // Create directory structure for v2
             fs::create_dir_all(registry_path.join("repos"))
@@ -261,49 +266,60 @@ impl Git2DB {
                 })?;
             }
 
-            // Initial commit using standardized signature
-            let sig = git_manager
-                .create_signature(None, None)
-                .map_err(|e| Git2DBError::internal(format!("Failed to create signature: {e}")))?;
-
-            let tree_id = {
-                let mut index = repo.index().map_err(|e| {
-                    Git2DBError::repository(&registry_path, format!("Failed to get index: {e}"))
+            // Init repo + initial commit in spawn_blocking (git2::Repository is !Send)
+            let rp = registry_path.clone();
+            tokio::task::spawn_blocking(move || -> Git2DBResult<()> {
+                let repo = Repository::init(&rp).map_err(|e| {
+                    Git2DBError::repository(&rp, format!("Failed to init repository: {e}"))
                 })?;
-                index
-                    .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
-                    .map_err(|e| {
-                        Git2DBError::repository(
-                            &registry_path,
-                            format!("Failed to stage files: {e}"),
-                        )
+
+                let sig = GitManager::global()
+                    .create_signature(None, None)
+                    .map_err(|e| Git2DBError::internal(format!("Failed to create signature: {e}")))?;
+
+                let tree_id = {
+                    let mut index = repo.index().map_err(|e| {
+                        Git2DBError::repository(&rp, format!("Failed to get index: {e}"))
                     })?;
-                index.write().map_err(|e| {
-                    Git2DBError::repository(&registry_path, format!("Failed to write index: {e}"))
+                    index
+                        .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
+                        .map_err(|e| {
+                            Git2DBError::repository(
+                                &rp,
+                                format!("Failed to stage files: {e}"),
+                            )
+                        })?;
+                    index.write().map_err(|e| {
+                        Git2DBError::repository(&rp, format!("Failed to write index: {e}"))
+                    })?;
+                    index.write_tree().map_err(|e| {
+                        Git2DBError::repository(&rp, format!("Failed to write tree: {e}"))
+                    })?
+                };
+
+                let tree = repo.find_tree(tree_id).map_err(|e| {
+                    Git2DBError::repository(&rp, format!("Failed to find tree: {e}"))
                 })?;
-                index.write_tree().map_err(|e| {
-                    Git2DBError::repository(&registry_path, format!("Failed to write tree: {e}"))
-                })?
-            };
 
-            let tree = repo.find_tree(tree_id).map_err(|e| {
-                Git2DBError::repository(&registry_path, format!("Failed to find tree: {e}"))
-            })?;
-
-            repo.commit(
-                Some("HEAD"),
-                &sig,
-                &sig,
-                "Initialize model registry",
-                &tree,
-                &[],
-            )
-            .map_err(|e| {
-                Git2DBError::repository(
-                    &registry_path,
-                    format!("Failed to create initial commit: {e}"),
+                repo.commit(
+                    Some("HEAD"),
+                    &sig,
+                    &sig,
+                    "Initialize model registry",
+                    &tree,
+                    &[],
                 )
-            })?;
+                .map_err(|e| {
+                    Git2DBError::repository(
+                        &rp,
+                        format!("Failed to create initial commit: {e}"),
+                    )
+                })?;
+
+                Ok(())
+            })
+            .await
+            .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))??;
         }
 
         // Load metadata
