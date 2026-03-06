@@ -483,6 +483,7 @@ async fn create_worktree(
         base_repo: bare_repo_path.to_path_buf(),
         worktree_path: worktree_path.to_path_buf(),
         ref_spec: branch.to_owned(),
+        progress: progress.clone(),
     };
 
     match driver.create_worktree(&opts).await {

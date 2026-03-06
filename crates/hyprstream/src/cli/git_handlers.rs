@@ -681,6 +681,7 @@ async fn clone_with_streaming(
     }
 
     // Receive and display progress
+    let mut current_stage = String::new();
     loop {
         match stream_handle.recv_next().await? {
             Some(StreamPayload::Data(data)) => {
@@ -691,9 +692,39 @@ async fn clone_with_streaming(
                         let parts: Vec<&str> = text.split(':').collect();
                         if parts.len() >= 3 {
                             let stage = parts[0];
-                            if verbose {
-                                println!("\r   {}: {}/{}", stage, parts[1], parts[2]);
-                            } else {
+                            let current = parts[1];
+                            let total = parts[2];
+
+                            // Detect stage transitions and print stage names
+                            let is_transition = stage != current_stage;
+                            if is_transition {
+                                if !current_stage.is_empty() && !verbose {
+                                    println!();
+                                }
+                                let stage_label = match stage {
+                                    "fetch" => "Fetching objects",
+                                    "indexing" => "Indexing",
+                                    "smudge" => "Downloading model files",
+                                    "lfs" => "Downloading LFS files",
+                                    other => other,
+                                };
+                                current_stage = stage.to_owned();
+                                if verbose {
+                                    println!("   {stage_label}...");
+                                } else {
+                                    print!("   {stage_label}...");
+                                    io::stdout().flush()?;
+                                }
+                            }
+
+                            if verbose && !is_transition {
+                                if total == "0" {
+                                    // Indeterminate total (e.g. smudge)
+                                    println!("   {}: {} files", stage, current);
+                                } else {
+                                    println!("   {}: {}/{}", stage, current, total);
+                                }
+                            } else if !verbose {
                                 print!(".");
                                 io::stdout().flush()?;
                             }

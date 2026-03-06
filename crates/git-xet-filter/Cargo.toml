@@ -21,6 +21,7 @@ thiserror.workspace = true
 # Data structures and concurrency
 dashmap.workspace = true
 once_cell.workspace = true
+parking_lot.workspace = true
 
 # Serialization
 serde.workspace = true

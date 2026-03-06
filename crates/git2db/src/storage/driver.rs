@@ -48,7 +48,6 @@ impl std::str::FromStr for StorageDriver {
 }
 
 /// Options for creating a worktree with a driver
-#[derive(Debug, Clone)]
 pub struct DriverOpts {
     /// Base repository path (lower layer for CoW drivers)
     pub base_repo: PathBuf,
@@ -59,6 +58,31 @@ pub struct DriverOpts {
     /// Git ref specification (branch, commit SHA, tag, HEAD~3, etc.)
     /// Examples: "main", "a1b2c3d4", "v1.0.0", "HEAD~3", "origin/main"
     pub ref_spec: String,
+
+    /// Optional progress reporter for smudge/checkout progress
+    pub progress: Option<Arc<dyn crate::callback_config::ProgressReporter>>,
+}
+
+impl Clone for DriverOpts {
+    fn clone(&self) -> Self {
+        Self {
+            base_repo: self.base_repo.clone(),
+            worktree_path: self.worktree_path.clone(),
+            ref_spec: self.ref_spec.clone(),
+            progress: self.progress.clone(),
+        }
+    }
+}
+
+impl fmt::Debug for DriverOpts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DriverOpts")
+            .field("base_repo", &self.base_repo)
+            .field("worktree_path", &self.worktree_path)
+            .field("ref_spec", &self.ref_spec)
+            .field("progress", &self.progress.as_ref().map(|_| "<reporter>"))
+            .finish()
+    }
 }
 
 

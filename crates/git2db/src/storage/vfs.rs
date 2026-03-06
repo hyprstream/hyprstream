@@ -127,69 +127,85 @@ impl VfsDriver {
         let base_repo = opts.base_repo.clone();
         let worktree_path = opts.worktree_path.clone();
         let ref_spec = opts.ref_spec.clone();
+        let progress = opts.progress.clone();
 
         tokio::task::spawn_blocking(move || {
-            let repo = git2::Repository::open(&base_repo)
-                .map_err(|e| Git2DBError::internal(format!("Failed to open repository: {e}")))?;
-
-            let object = repo.revparse_single(&ref_spec).map_err(|e| {
-                Git2DBError::internal(format!("Failed to resolve ref '{}': {}", ref_spec, e))
-            })?;
-
-            let commit = object.peel_to_commit().map_err(|e| {
-                Git2DBError::internal(format!(
-                    "Ref '{}' does not point to a commit: {}",
-                    ref_spec, e
-                ))
-            })?;
-
-            let branch_ref_name = format!("refs/heads/{}", ref_spec);
-            let is_branch = repo.find_reference(&branch_ref_name).is_ok();
-
-            let worktree_name = worktree_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| {
-                    Git2DBError::invalid_path(worktree_path.clone(), "Invalid worktree path")
-                })?;
-
-            if is_branch {
-                let reference = repo.find_reference(&branch_ref_name)?;
-                repo.worktree(
-                    worktree_name,
-                    &worktree_path,
-                    Some(git2::WorktreeAddOptions::new().reference(Some(&reference))),
-                )
-                .map_err(|e| Git2DBError::internal(format!("Failed to create worktree: {e}")))?;
-
-                info!(
-                    "Created git worktree at {} for branch '{}' (commit: {})",
-                    worktree_path.display(),
-                    ref_spec,
-                    commit.id()
-                );
-            } else {
-                repo.worktree(worktree_name, &worktree_path, None)
-                    .map_err(|e| Git2DBError::internal(format!("Failed to create worktree: {e}")))?;
-
-                let wt_repo = git2::Repository::open(&worktree_path)?;
-                wt_repo.set_head_detached(commit.id()).map_err(|e| {
-                    Git2DBError::internal(format!("Failed to set detached HEAD: {e}"))
-                })?;
-
-                wt_repo
-                    .checkout_head(Some(git2::build::CheckoutBuilder::default().force()))
-                    .map_err(|e| Git2DBError::internal(format!("Failed to checkout HEAD: {e}")))?;
-
-                info!(
-                    "Created git worktree at {} for ref '{}' (detached HEAD at {})",
-                    worktree_path.display(),
-                    ref_spec,
-                    commit.id()
-                );
+            // Set up smudge progress hook if progress reporter is available
+            if let Some(ref reporter) = progress {
+                let r = std::sync::Arc::clone(reporter);
+                git_xet_filter::set_smudge_progress(std::sync::Arc::new(move |count, _path| {
+                    r.report("smudge", count, 0);
+                }));
             }
 
-            Ok(())
+            let result = (|| -> Git2DBResult<()> {
+                let repo = git2::Repository::open(&base_repo)
+                    .map_err(|e| Git2DBError::internal(format!("Failed to open repository: {e}")))?;
+
+                let object = repo.revparse_single(&ref_spec).map_err(|e| {
+                    Git2DBError::internal(format!("Failed to resolve ref '{}': {}", ref_spec, e))
+                })?;
+
+                let commit = object.peel_to_commit().map_err(|e| {
+                    Git2DBError::internal(format!(
+                        "Ref '{}' does not point to a commit: {}",
+                        ref_spec, e
+                    ))
+                })?;
+
+                let branch_ref_name = format!("refs/heads/{}", ref_spec);
+                let is_branch = repo.find_reference(&branch_ref_name).is_ok();
+
+                let worktree_name = worktree_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| {
+                        Git2DBError::invalid_path(worktree_path.clone(), "Invalid worktree path")
+                    })?;
+
+                if is_branch {
+                    let reference = repo.find_reference(&branch_ref_name)?;
+                    repo.worktree(
+                        worktree_name,
+                        &worktree_path,
+                        Some(git2::WorktreeAddOptions::new().reference(Some(&reference))),
+                    )
+                    .map_err(|e| Git2DBError::internal(format!("Failed to create worktree: {e}")))?;
+
+                    info!(
+                        "Created git worktree at {} for branch '{}' (commit: {})",
+                        worktree_path.display(),
+                        ref_spec,
+                        commit.id()
+                    );
+                } else {
+                    repo.worktree(worktree_name, &worktree_path, None)
+                        .map_err(|e| Git2DBError::internal(format!("Failed to create worktree: {e}")))?;
+
+                    let wt_repo = git2::Repository::open(&worktree_path)?;
+                    wt_repo.set_head_detached(commit.id()).map_err(|e| {
+                        Git2DBError::internal(format!("Failed to set detached HEAD: {e}"))
+                    })?;
+
+                    wt_repo
+                        .checkout_head(Some(git2::build::CheckoutBuilder::default().force()))
+                        .map_err(|e| Git2DBError::internal(format!("Failed to checkout HEAD: {e}")))?;
+
+                    info!(
+                        "Created git worktree at {} for ref '{}' (detached HEAD at {})",
+                        worktree_path.display(),
+                        ref_spec,
+                        commit.id()
+                    );
+                }
+
+                Ok(())
+            })();
+
+            // Always clear smudge progress hook
+            git_xet_filter::clear_smudge_progress();
+
+            result
         })
         .await
         .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?
@@ -211,5 +227,4 @@ mod tests {
         let driver = VfsDriver;
         assert!(driver.is_available());
     }
-
-  }
+}
