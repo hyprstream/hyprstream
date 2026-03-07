@@ -114,6 +114,8 @@ struct InferRequest {
       $mcpDescription("Get detailed status information about a model including online training configuration");
     embed @4 :EmbedRequest
       $mcpDescription("Compute embeddings for one or more images. Returns embedding vectors from the model's vision encoder (e.g. SigLIP). Synchronous — returns all embeddings in a single response.");
+    embedRaw @5 :EmbedRawRequest
+      $mcpDescription("Compute embeddings from raw pixel data. Accepts RGB/BGR uint8 or pre-normalized float32 CHW tensors. Supports server-side SigLIP preprocessing.");
   }
 }
 
@@ -176,6 +178,7 @@ struct InferResponse {
     applyChatTemplate @2 :Text;
     status @3 :ModelStatusResponse;
     embed @4 :EmbedResponse;
+    embedRaw @5 :EmbedResponse;
   }
 }
 
@@ -240,6 +243,30 @@ struct EmbedResponse {
   embeddings @0 :List(List(Float32));
   # Embedding dimensionality (e.g. 384, 768)
   dimensions @1 :UInt32;
+}
+
+# Raw tensor embedding request — accepts raw pixel bytes.
+# See inference.capnp for full documentation.
+struct EmbedRawRequest {
+  pixels          @0 :Data;
+  width           @1 :UInt32;
+  height          @2 :UInt32;
+  channels        @3 :UInt32;
+  pixelFormat     @4 :PixelFormat;
+  preprocessMode  @5 :PreprocessMode;
+  batchCount      @6 :UInt32;
+  rowStride       @7 :UInt32;
+}
+
+enum PixelFormat {
+  rgb8 @0;
+  bgr8 @1;
+  float32Chw @2;
+}
+
+enum PreprocessMode {
+  siglip @0;
+  none @1;
 }
 
 # Response when model is loaded

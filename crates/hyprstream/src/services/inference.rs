@@ -1909,6 +1909,7 @@ use crate::services::generated::inference_client::{
     SaveAdaptationResult, SnapshotDeltaResult, ExportPeftResult,
     ChatTemplateRequest, LoraConfig, TrainStepRequest, SaveAdaptationRequest, ExportPeftRequest,
     MergeLoraRequest, EmbedImagesRequest, EmbedImagesResponse,
+    EmbedRawRequest, PixelFormatEnum, PreprocessModeEnum,
 };
 // Conflicting names — use canonical path at usage sites:
 //   inference_client::GenerationResult, inference_client::ModelInfo, inference_client::StreamInfo
@@ -2389,6 +2390,38 @@ impl InferenceHandler for InferenceService {
             dimensions,
         }))
     }
+
+    async fn handle_embed_raw(
+        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        data: &EmbedRawRequest,
+    ) -> Result<InferenceResponseVariant> {
+        let pixel_format = match data.pixel_format {
+            PixelFormatEnum::Rgb8 => "rgb8",
+            PixelFormatEnum::Bgr8 => "bgr8",
+            PixelFormatEnum::Float32Chw => "float32Chw",
+        };
+        let preprocess_mode = match data.preprocess_mode {
+            PreprocessModeEnum::Siglip => "siglip",
+            PreprocessModeEnum::None => "none",
+        };
+
+        let engine = self.engine.read();
+        let embeddings = engine.embed_raw(
+            &data.pixels,
+            data.width,
+            data.height,
+            data.channels,
+            pixel_format,
+            preprocess_mode,
+            data.batch_count,
+            data.row_stride,
+        )?;
+        let dimensions = embeddings.first().map(|v| v.len() as u32).unwrap_or(0);
+        Ok(InferenceResponseVariant::EmbedRawResult(EmbedImagesResponse {
+            embeddings,
+            dimensions,
+        }))
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2830,6 +2863,26 @@ impl InferenceZmqClient {
     /// Compute vision embeddings for images — delegates to generated client
     pub async fn embed(&self, images: &[Vec<u8>]) -> Result<Vec<Vec<f32>>> {
         let response = self.gen.embed(images).await?;
+        Ok(response.embeddings)
+    }
+
+    /// Compute vision embeddings from raw pixel data — delegates to generated client
+    pub async fn embed_raw(
+        &self,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        channels: u32,
+        pixel_format: &str,
+        preprocess_mode: &str,
+        batch_count: u32,
+        row_stride: u32,
+    ) -> Result<Vec<Vec<f32>>> {
+        let response = self.gen.embed_raw(
+            pixels, width, height, channels,
+            pixel_format, preprocess_mode,
+            batch_count, row_stride,
+        ).await?;
         Ok(response.embeddings)
     }
 
