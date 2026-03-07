@@ -53,6 +53,7 @@ hyprstream-workers = { path = "../hyprstream-workers" }  # Worker runtime (Kata 
 inventory.workspace = true  # Service factory registration
 gittorrent = { workspace = true, optional = true }  # P2P transport
 clap.workspace = true
+inquire = "0.7"
 tracing.workspace = true
 tracing-opentelemetry = { workspace = true, optional = true }
 opentelemetry = { workspace = true, optional = true }
@@ -129,6 +130,11 @@ notify = { version = "7", default-features = false, features = ["macos_kqueue"] 
 libc = "0.2"  # For system calls in overlay2 driver
 reflink-copy = "0.1"  # COW file copying (reflink when available)
 hyprstream-containedfs.workspace = true  # Path-contained filesystem operations
+hyprstream-tui = { path = "../hyprstream-tui" }  # Setup wizard TUI (WizardBackend trait + WizardApp)
+waxterm = { path = "../waxterm" }  # Terminal abstraction for TUI rendering
+ratatui = { version = "0.30", default-features = false }  # TUI framework for pane buffers
+vte = "0.13"  # VT100/ANSI escape sequence parser for TUI pane ingestion
+rtrb = "0.3"  # SPSC ring buffer for VTE parser thread
 
 [target.'cfg(target_os = "linux")'.dependencies]
 lru.workspace = true  # LRU cache for model caching and Git repository handles

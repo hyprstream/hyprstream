@@ -11,7 +11,7 @@ use tracing::info;
 
 // Core application imports
 use hyprstream_core::cli::commands::{
-    ExecutionMode, FlightArgs, ImageCommand, ServiceAction, TrainingAction, WorkerAction,
+    ExecutionMode, FlightArgs, ImageCommand, ServiceAction, TrainingAction, TuiAction, WorkerAction,
 };
 use hyprstream_core::cli::quick::{QuickCommand, RemoteQuickCommand, WorktreeQuickCommand};
 use hyprstream_core::cli::schema_cli;
@@ -116,11 +116,55 @@ fn build_cli() -> ClapCommand {
         ),
     );
 
+    // TUI display server (derive-based subcommands)
+    app = app.subcommand(
+        <TuiAction as ClapSubcommand>::augment_subcommands(
+            ClapCommand::new("tui").about("TUI display server \u{2014} terminal multiplexer with session persistence"),
+        ),
+    );
+
     // Flight SQL client (derive-based args)
     app = app.subcommand(
         <FlightArgs as ClapArgs>::augment_args(
             ClapCommand::new("flight").about("Flight SQL client to query datasets"),
         ),
+    );
+
+    // Interactive setup wizard
+    app = app.subcommand(
+        ClapCommand::new("wizard")
+            .about("Interactive setup wizard — configure policies, users, and API tokens")
+            .arg(
+                Arg::new("non_interactive")
+                    .long("non-interactive")
+                    .short('y')
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Accept defaults without prompting"),
+            )
+            .arg(
+                Arg::new("start")
+                    .long("start")
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Start services after setup"),
+            )
+            .arg(
+                Arg::new("tui")
+                    .long("tui")
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Use TUI wizard with GPU detection and install phase"),
+            ),
+    );
+
+    // Self-update
+    app = app.subcommand(
+        ClapCommand::new("update")
+            .about("Check for and install updates")
+            .arg(
+                Arg::new("cleanup")
+                    .long("cleanup")
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Remove old version worktrees"),
+            ),
     );
 
     app
@@ -1162,6 +1206,25 @@ fn main() -> Result<()> {
         eprintln!("Please check for unsafe RefCell usage or race conditions.");
     }));
 
+    // Check if we should re-exec into an installed GPU variant.
+    // Uses Unix execve() to replace this process with the GPU-optimized binary.
+    // The binary path comes from our own data directory (not user input).
+    {
+        let data_dir = dirs::data_local_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("hyprstream");
+        if let Some((variant_id, version)) =
+            hyprstream_core::cli::update_handlers::check_should_reexec(&data_dir)
+        {
+            hyprstream_core::cli::update_handlers::re_exec_variant(
+                &data_dir,
+                &variant_id,
+                &version,
+            );
+            // re_exec_variant never returns
+        }
+    }
+
     // Parse CLI arguments using builder API
     let matches = build_cli().get_matches();
 
@@ -1752,6 +1815,42 @@ fn main() -> Result<()> {
             }
         }
 
+        // ── TUI display server ──────────────────────────────────────────
+        Some(("tui", sub_m)) => {
+            let action = TuiAction::from_arg_matches(sub_m)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: true,
+                },
+                || async move {
+                    use hyprstream_core::cli::tui_handlers;
+
+                    // Load signing key for RPC authentication
+                    let data_dir = dirs::data_local_dir()
+                        .unwrap_or_else(|| std::path::PathBuf::from("."))
+                        .join("hyprstream");
+                    let keys_dir = data_dir.join("keys");
+                    let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+
+                    match action {
+                        TuiAction::Attach { session } => {
+                            let sid = if session == 0 { None } else { Some(session) };
+                            tui_handlers::handle_tui_attach(&signing_key, sid).await
+                        }
+                        TuiAction::New => tui_handlers::handle_tui_new(&signing_key).await,
+                        TuiAction::List => tui_handlers::handle_tui_list(&signing_key).await,
+                        TuiAction::Detach => tui_handlers::handle_tui_detach().await,
+                        TuiAction::Play { cast_file, session, loop_playback } => {
+                            tui_handlers::handle_tui_play(&signing_key, &cast_file, session, loop_playback).await
+                        }
+                    }
+                },
+            )?;
+        }
+
         // ── Flight SQL client ───────────────────────────────────────────
         Some(("flight", sub_m)) => {
             let args = FlightArgs::from_arg_matches(sub_m)
@@ -1795,6 +1894,49 @@ fn main() -> Result<()> {
                         );
                     }
                     Ok(())
+                },
+            )?;
+        }
+
+        // ── Interactive setup wizard ─────────────────────────────────────
+        Some(("wizard", sub_m)) => {
+            let tui_mode = sub_m.get_flag("tui");
+            let non_interactive = sub_m.get_flag("non_interactive");
+            let start_services = sub_m.get_flag("start");
+            let models_dir = config_for_service.models_dir().clone();
+            let services = config_for_service.services.startup.clone();
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: true,
+                },
+                || async move {
+                    if tui_mode {
+                        hyprstream_core::cli::handle_wizard_tui(&models_dir).await
+                    } else {
+                        hyprstream_core::cli::handle_wizard(
+                            &models_dir,
+                            &services,
+                            non_interactive,
+                            start_services,
+                        )
+                        .await
+                    }
+                },
+            )?;
+        }
+
+        // ── Self-update ──────────────────────────────────────────────────
+        Some(("update", sub_m)) => {
+            let cleanup = sub_m.get_flag("cleanup");
+            let models_dir = config_for_service.models_dir().clone();
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: true,
+                },
+                || async move {
+                    hyprstream_core::cli::update_handlers::handle_update(&models_dir, cleanup).await
                 },
             )?;
         }

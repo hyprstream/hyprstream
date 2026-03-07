@@ -204,6 +204,51 @@ impl XetConfig {
     /// ```
     #[cfg(feature = "xet-storage")]
     pub async fn create_storage(&self) -> crate::error::Result<Box<dyn crate::storage::StorageBackend>> {
+        #[cfg(feature = "gittorrent-transport")]
+        if self.endpoint.starts_with("gittorrent://") {
+            // Initialize gittorrent service and create storage with HTTPS fallback
+            let gt_config = gittorrent::service::GitTorrentConfig::load()
+                .map_err(|e| crate::error::XetError::new(
+                    crate::error::XetErrorKind::RuntimeError,
+                    format!("Failed to load gittorrent config: {e}"),
+                ))?;
+            let gt_service = std::sync::Arc::new(
+                gittorrent::service::GitTorrentService::new(gt_config)
+                    .await
+                    .map_err(|e| crate::error::XetError::new(
+                        crate::error::XetErrorKind::RuntimeError,
+                        format!("Failed to start gittorrent: {e}"),
+                    ))?
+            );
+            // Try to create HTTPS fallback storage
+            let https_endpoint = format!(
+                "https://{}",
+                self.endpoint.strip_prefix("gittorrent://").unwrap_or(&self.endpoint)
+            );
+            let fallback_config = Self {
+                endpoint: https_endpoint,
+                ..self.clone()
+            };
+            let fallback = match crate::storage::XetStorage::new(&fallback_config).await {
+                Ok(s) => Some(Box::new(s) as Box<dyn crate::storage::StorageBackend>),
+                Err(e) => {
+                    tracing::warn!("Failed to initialize HTTPS fallback for gittorrent: {e}");
+                    None
+                }
+            };
+            return Ok(Box::new(
+                crate::gittorrent_storage::GittorrentStorage::new(gt_service, fallback),
+            ));
+        }
+
+        #[cfg(not(feature = "gittorrent-transport"))]
+        if self.endpoint.starts_with("gittorrent://") {
+            return Err(crate::error::XetError::new(
+                crate::error::XetErrorKind::InvalidConfig,
+                "Gittorrent transport requires the 'gittorrent-transport' feature",
+            ));
+        }
+
         #[cfg(feature = "ssh-transport")]
         if self.is_ssh_transport() {
             let storage = crate::ssh_client::SshStorage::connect(&self.endpoint).await?;

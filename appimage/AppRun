@@ -36,13 +36,16 @@ detect_backend() {
                 # NVIDIA driver version to CUDA version mapping:
                 # - Driver 555+ supports CUDA 13.0
                 # - Driver 535+ supports CUDA 12.8
-                # - Driver 525+ supports CUDA 12.x
+                # - Driver <535: CPU fallback (no supported CUDA)
                 if (( major_version >= 555 )); then
                     log_debug "Selecting CUDA 13.0 backend"
                     echo "cuda130"
-                else
+                elif (( major_version >= 535 )); then
                     log_debug "Selecting CUDA 12.8 backend"
                     echo "cuda128"
+                else
+                    log_debug "NVIDIA driver $driver_version too old for CUDA, falling back to CPU"
+                    echo "cpu"
                 fi
                 return
             fi
@@ -123,7 +126,25 @@ case "${1:-}" in
         ;;
 esac
 
-# Main execution
+# Check for wizard-installed GPU backend (installed via `hyprstream wizard --tui`)
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/hyprstream"
+ACTIVE_BACKEND=$(cat "$DATA_DIR/active-backend" 2>/dev/null || true)
+ACTIVE_VERSION=$(cat "$DATA_DIR/active-version" 2>/dev/null || true)
+
+if [[ -n "$ACTIVE_BACKEND" && -n "$ACTIVE_VERSION" ]]; then
+    GPU_BINARY="$DATA_DIR/versions/$ACTIVE_VERSION-$ACTIVE_BACKEND/backends/$ACTIVE_BACKEND/hyprstream"
+    if [[ -x "$GPU_BINARY" ]]; then
+        LIBTORCH_LIB="$(dirname "$GPU_BINARY")/libtorch/lib"
+        export LD_LIBRARY_PATH="$LIBTORCH_LIB:${LD_LIBRARY_PATH:-}"
+        export LIBTORCH="$(dirname "$GPU_BINARY")/libtorch"
+        export LIBTORCH_BYPASS_VERSION_CHECK=1
+        export HYPRSTREAM_LIBTORCH_CONFIGURED=1
+        log_debug "Using wizard-installed backend: $ACTIVE_BACKEND ($GPU_BINARY)"
+        exec "$GPU_BINARY" "$@"
+    fi
+fi
+
+# Main execution (bundled backends)
 BACKEND=$(detect_backend)
 
 # Validate the selected backend
