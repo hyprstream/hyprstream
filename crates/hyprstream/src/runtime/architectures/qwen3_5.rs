@@ -293,7 +293,7 @@ unsafe impl Sync for RMSNormGated {}
 fn l2_normalize(x: &Tensor) -> Tensor {
     // norm_scalaropt_dim = 2 GPU ops (vs 5 with manual x*x+sum+sqrt+div)
     let norm = x.norm_scalaropt_dim(2.0, &[-1i64][..], true);
-    x / norm.clamp_min(1e-6)
+    x / norm.clamp_min(1e-3)
 }
 
 /// Chunked GatedDeltaNet prefill (translation of `torch_chunk_gated_delta_rule`).
@@ -918,7 +918,7 @@ impl Qwen3_5FullAttention {
 
         ROPE_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
-            let key = (self.layer_idx, (self.rope_theta * 1000.0) as u32);
+            let key = (self.layer_idx, self.rope_theta.to_bits());
             let rope = match cache.entry(key) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                 std::collections::hash_map::Entry::Vacant(e) => {
