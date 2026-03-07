@@ -165,13 +165,12 @@ async fn run_attach_loop(
         let stdin = std::io::stdin();
         loop {
             match stdin.lock().read(&mut buf) {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(n) => {
                     if stdin_tx.blocking_send(buf[..n].to_vec()).is_err() {
                         break;
                     }
                 }
-                Err(_) => break,
             }
         }
     });
@@ -395,7 +394,7 @@ pub async fn handle_tui_play(
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("cast")
-        .to_string();
+        .to_owned();
 
     let mut app = CastPlayerApp::new(vec![LogEntry {
         name,
@@ -636,26 +635,21 @@ async fn forward_process_output(
     };
 
     // Forward output loop (existing sendInput RPC)
-    loop {
-        match process.stdout_rx.recv().await {
-            Some(data) => {
-                let request_id = client.next_id();
-                let payload = hyprstream_rpc::serialize_message(|msg| {
-                    let mut req =
-                        msg.init_root::<crate::tui_capnp::tui_request::Builder<'_>>();
-                    req.set_id(request_id);
-                    let mut send_input = req.init_send_input();
-                    send_input.set_viewer_id(viewer_id);
-                    send_input.set_data(&data);
-                });
-                if let Ok(payload) = payload {
-                    if let Err(e) = client.call(payload).await {
-                        tracing::debug!("sendInput failed: {}", e);
-                        break;
-                    }
-                }
+    while let Some(data) = process.stdout_rx.recv().await {
+        let request_id = client.next_id();
+        let payload = hyprstream_rpc::serialize_message(|msg| {
+            let mut req =
+                msg.init_root::<crate::tui_capnp::tui_request::Builder<'_>>();
+            req.set_id(request_id);
+            let mut send_input = req.init_send_input();
+            send_input.set_viewer_id(viewer_id);
+            send_input.set_data(&data);
+        });
+        if let Ok(payload) = payload {
+            if let Err(e) = client.call(payload).await {
+                tracing::debug!("sendInput failed: {}", e);
+                break;
             }
-            None => break, // Process ended
         }
     }
 
@@ -704,7 +698,7 @@ async fn query_pane_size(client: &TuiClient) -> Result<(u16, u16)> {
 /// Truncate a string with ellipsis if too long.
 fn truncate_str(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
-        s.to_string()
+        s.to_owned()
     } else {
         format!("{}…", &s[..max_len - 1])
     }

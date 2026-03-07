@@ -286,12 +286,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_walk_paths() {
+    fn test_walk_paths() -> Result<(), Box<dyn std::error::Error>> {
         let mut state = TuiState::default();
         let sid = state.create_session();
 
         // The first session gets window_id=1, pane_id=1
-        let session = state.session(sid).unwrap();
+        let session = state.session(sid).ok_or("session missing")?;
         let window = &session.windows[0];
         let wid = window.id;
         let pid = window.panes[0].id;
@@ -315,6 +315,7 @@ mod tests {
             walk_path(&state, TuiNodeId::PanesDir(wid), &pid.to_string()),
             Some(TuiNodeId::PaneDir(wid, pid))
         );
+        Ok(())
     }
 
     #[test]
@@ -363,7 +364,7 @@ mod tests {
             TuiNodeId::PaneCons(0, 0),
             TuiNodeId::PaneScreen(0, 0),
         ];
-        let paths: HashSet<u64> = nodes.iter().map(|n| n.qid_path()).collect();
+        let paths: HashSet<u64> = nodes.iter().map(super::TuiNodeId::qid_path).collect();
         assert_eq!(paths.len(), nodes.len(), "qid_path collision detected");
     }
 

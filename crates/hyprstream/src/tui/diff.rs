@@ -173,7 +173,7 @@ pub fn encode_ansi(diff: &FrameDiff) -> Vec<u8> {
     for delta in &diff.deltas {
         // Cursor positioning
         let need_move = match (last_x, last_y) {
-            (Some(lx), Some(ly)) => !(ly == delta.y && lx + 1 == delta.x),
+            (Some(lx), Some(ly)) => !(ly == delta.y && lx == delta.x),
             _ => true,
         };
         if need_move {
@@ -428,7 +428,7 @@ mod tests {
         let diff = compute_diff(&buf, Some(&prev), 2, CursorState::default());
 
         assert!(!diff.is_full);
-        assert!(diff.deltas.len() >= 1);
+        assert!(!diff.deltas.is_empty());
     }
 
     #[test]
@@ -445,5 +445,33 @@ mod tests {
         let diff = compute_diff(&buf, Some(&prev), 3, CursorState::default());
 
         assert!(diff.is_full);
+    }
+
+    #[test]
+    fn test_encode_ansi_gap_cursor_position() {
+        // Regression: encode_ansi had lx+1==delta.x condition which caused cells
+        // with exactly one unchanged cell between them to be written at the wrong
+        // position (off-by-one ghost bug).
+        //
+        // Pattern: changed at x=0, unchanged at x=1, changed at x=2.
+        // The encoded ANSI must position the cursor at x=2 before writing it,
+        // not assume the cursor is already there after x=0's write.
+        let deltas = vec![
+            CellDelta { x: 0, y: 0, symbol: "A".to_owned(), fg: Color::Reset, bg: Color::Reset, modifiers: Modifier::empty() },
+            CellDelta { x: 2, y: 0, symbol: "B".to_owned(), fg: Color::Reset, bg: Color::Reset, modifiers: Modifier::empty() },
+        ];
+        let diff = FrameDiff {
+            is_full: false,
+            cols: 10,
+            rows: 1,
+            scrolls: vec![],
+            deltas,
+            cursor: CursorState::default(),
+            generation: 1,
+        };
+        let ansi = encode_ansi(&diff);
+        let s = String::from_utf8_lossy(&ansi);
+        // Must contain a cursor position for x=2 (column 3 in 1-indexed)
+        assert!(s.contains("\x1b[1;3H"), "Missing CUP for x=2: {:?}", s);
     }
 }

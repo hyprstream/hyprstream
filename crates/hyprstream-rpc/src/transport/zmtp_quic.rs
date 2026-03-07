@@ -1681,7 +1681,7 @@ impl WebTransportServer {
         // Quinn/H3 event loop (which runs on the same local set).
         // Messages are forwarded via an async channel.
         let (block_tx, mut block_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-        let topic_owned = topic.to_string();
+        let topic_owned = topic.to_owned();
         let sub_endpoint_owned = sub_endpoint.clone();
 
         std::thread::spawn(move || {

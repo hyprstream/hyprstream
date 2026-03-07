@@ -858,7 +858,7 @@ pub(crate) async fn run_frame_loop(
                         // (i.e. the CLI cast player). Ansi-mode viewers don't need it;
                         // their keyboard input falls through to VTE when no producer exists.
                         let stdin_publisher = if pending.display_mode == DisplayMode::Capnp {
-                            if let Some(stdin_ctx) = pending.stream_ctxs.get(0) {
+                            if let Some(stdin_ctx) = pending.stream_ctxs.first() {
                                 let topic = stdin_ctx.topic().to_owned();
                                 if let Err(e) = stream_channel.register_topic(&topic, exp, None).await {
                                     warn!(viewer_id = pending.id, error = %e, "Failed to register stdin topic");
@@ -1087,7 +1087,7 @@ pub(crate) async fn run_frame_loop(
                     };
                     let pane_id = pane.id;
                     let buf = pane.active_buffer();
-                    let prev = prev_cells.get(&pane_id).map(|v| v.as_slice());
+                    let prev = prev_cells.get(&pane_id).map(Vec::as_slice);
                     let frame_diff = diff::compute_diff(buf, prev, generation, pane.cursor);
 
                     // Encode for each display mode in use
@@ -1124,8 +1124,7 @@ pub(crate) async fn run_frame_loop(
                 for viewer in viewers.iter_mut() {
                     let data = match viewer.display_mode {
                         DisplayMode::Ansi => ansi_bytes.as_deref(),
-                        DisplayMode::Capnp => capnp_bytes.as_deref(),
-                        DisplayMode::Structured => capnp_bytes.as_deref(), // fallback to capnp encoding
+                        DisplayMode::Capnp | DisplayMode::Structured => capnp_bytes.as_deref(), // Structured falls back to capnp encoding
                     };
                     let data = match data {
                         Some(d) if !d.is_empty() => d,

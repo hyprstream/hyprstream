@@ -189,11 +189,11 @@ mod tests {
     fn test_parse_rocm_version() {
         assert_eq!(
             parse_rocm_version("ROCm Runtime Version: 7.1.0"),
-            Some("7.1.0".to_string())
+            Some("7.1.0".to_owned())
         );
         assert_eq!(
             parse_rocm_version("some junk\nROCm Runtime Version: 6.2.0\nmore"),
-            Some("6.2.0".to_string())
+            Some("6.2.0".to_owned())
         );
         assert_eq!(parse_rocm_version("no version here"), None);
     }
@@ -208,13 +208,13 @@ mod tests {
     #[test]
     fn test_recommend_variant() {
         let nvidia = GpuKind::Nvidia {
-            driver_version: "555.0".to_string(),
-            cuda_compat: "cuda130".to_string(),
+            driver_version: "555.0".to_owned(),
+            cuda_compat: "cuda130".to_owned(),
         };
         assert_eq!(recommend_variant(&nvidia), LibtorchVariant::Cuda130);
 
         let amd = GpuKind::Amd {
-            rocm_version: Some("7.1.0".to_string()),
+            rocm_version: Some("7.1.0".to_owned()),
         };
         assert_eq!(recommend_variant(&amd), LibtorchVariant::Rocm71);
 
