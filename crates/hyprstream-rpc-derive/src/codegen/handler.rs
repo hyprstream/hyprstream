@@ -1859,19 +1859,7 @@ fn generate_scope_dispatch_phase(
                             }
                         }
                     },
-                    CapnpType::Text => {
-                        quote! {
-                            #tag_enum::#variant_pascal => {
-                                let #params_enum::#variant_pascal(v) = params else { unreachable!() };
-                                #auth_stmt
-                                match #scope_trait::#handler_method(handler, ctx, request_id, #(#scope_field_args,)* &v).await {
-                                    #ok_wrap,
-                                    #err_wrap,
-                                }
-                            }
-                        }
-                    },
-                    CapnpType::Data => {
+                    CapnpType::Text | CapnpType::Data => {
                         quote! {
                             #tag_enum::#variant_pascal => {
                                 let #params_enum::#variant_pascal(v) = params else { unreachable!() };
@@ -2280,21 +2268,7 @@ fn generate_nested_scope_dispatch_phase(
                             }
                         }
                     },
-                    CapnpType::Text => {
-                        quote! {
-                            #tag_enum::#variant_pascal => {
-                                let #params_enum::#variant_pascal(v) = params else { unreachable!() };
-                                #auth_stmt
-                                match #nested_trait::#handler_method(
-                                    handler, ctx, request_id, #(#parent_scope_args,)* #(#nested_scope_args,)* &v
-                                ).await {
-                                    #ok_wrap,
-                                    #err_wrap,
-                                }
-                            }
-                        }
-                    },
-                    CapnpType::Data => {
+                    CapnpType::Text | CapnpType::Data => {
                         quote! {
                             #tag_enum::#variant_pascal => {
                                 let #params_enum::#variant_pascal(v) = params else { unreachable!() };

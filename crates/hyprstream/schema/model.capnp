@@ -27,7 +27,7 @@ struct ModelRequest {
   union {
     load @1 :LoadModelRequest $mcpDescription("Load a model into memory for inference") $mcpScope(write);
     unload @2 :UnloadModelRequest $mcpDescription("Unload a model from memory to free resources") $mcpScope(write);
-    list @3 :Void $mcpDescription("List all models currently loaded in memory") $mcpScope(query);
+    status @3 :StatusRequest $mcpDescription("Get status of all loaded/loading models (empty modelRef) or a specific model") $mcpScope(query);
     healthCheck @4 :Void $mcpDescription("Check model service health and status") $mcpScope(query);
 
     # Scoped interfaces (require modelRef)
@@ -130,7 +130,7 @@ struct ModelResponse {
     error @1 :ErrorInfo;
     loadResult @2 :LoadedModelResponse;
     unloadResult @3 :Void;
-    listResult @4 :ModelListResponse;
+    statusResult @4 :List(ModelStatusEntry);
     healthCheckResult @5 :ModelHealthStatus;
     tttResult @6 :TttResponse;
     adapterResult @7 :AdapterResponse;
@@ -248,19 +248,20 @@ struct LoadedModelResponse {
   endpoint @1 :Text;  # inproc://hyprstream/inference/{model_ref}
 }
 
-# List of loaded models
-struct ModelListResponse {
-  models @0 :List(LoadedModelInfo);
+# Status request: empty modelRef = all known models; non-empty = specific model (0 or 1 result)
+struct StatusRequest {
+  modelRef @0 :Text;
 }
 
-# Information about a loaded model
-struct LoadedModelInfo {
-  modelRef @0 :Text;
-  endpoint @1 :Text;
-  loadedAt @2 :Int64;      # Unix timestamp (millis)
-  lastUsed @3 :Int64;      # Unix timestamp (millis)
-  memoryBytes @4 :UInt64;  # GPU/CPU memory usage
-  sessionCount @5 :UInt32; # Active session count
+# Status entry for a single model (loaded or loading)
+# Absence from the list means unloaded.
+struct ModelStatusEntry {
+  modelRef   @0 :Text;
+  status     @1 :Text;    # "loaded" | "loading"
+  endpoint   @2 :Text;    # empty if loading
+  loadedAt   @3 :Int64;   # ms elapsed since load (0 if loading)
+  lastUsed   @4 :Int64;   # ms elapsed since last use (0 if loading)
+  onlineTrainingConfig @5 :OnlineTrainingConfig;
 }
 
 # Online Training (Test-Time Training) configuration

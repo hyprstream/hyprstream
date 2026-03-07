@@ -11,45 +11,117 @@ use std::collections::HashMap;
 use std::path::Path;
 use tch::{nn, Device, Kind as DType, Tensor};
 
-/// Linear projection layer with optional bias
+/// Linear projection layer with optional bias and optional FP8 block scale.
 ///
-/// This is a zero-cost abstraction that encapsulates weight matrices
-/// and optional bias vectors for linear transformations.
-struct LinearProjection {
-    weight: Tensor,
-    bias: Option<Tensor>,
+/// Weights may be stored as FP8 (E4M3 or E5M2) to save VRAM. When a `scale`
+/// tensor is present (shape `[out/128, in/128]`), `apply()` performs block-wise
+/// dequantization: cast FP8 → BF16 on GPU, expand scale to weight shape, multiply.
+/// ROCm 7.1+ dispatches the FP8 cast on-GPU without CPU fallback.
+pub(crate) struct LinearProjection {
+    pub(crate) weight: Tensor,
+    pub(crate) bias: Option<Tensor>,
+    /// Block-wise scale for FP8 weights: shape [out/block, in/block], BF16.
+    /// None for non-FP8 weights.
+    pub(crate) scale: Option<Tensor>,
 }
 
 impl LinearProjection {
-    /// Create projection from weight only (no bias)
+    /// Create projection from weight only (no bias, no scale).
     #[inline]
-    fn new(weight: Tensor) -> Self {
-        Self { weight, bias: None }
+    pub(crate) fn new(weight: Tensor) -> Self {
+        Self { weight, bias: None, scale: None }
     }
 
-    /// Create projection with weight and bias
+    /// Create projection with weight and bias (no scale).
     #[inline]
-    fn with_bias(weight: Tensor, bias: Tensor) -> Self {
-        Self {
-            weight,
-            bias: Some(bias),
-        }
+    pub(crate) fn with_bias(weight: Tensor, bias: Tensor) -> Self {
+        Self { weight, bias: Some(bias), scale: None }
+    }
+
+    /// Create FP8 projection with block-wise scale.
+    #[inline]
+    pub(crate) fn with_scale(weight: Tensor, scale: Tensor) -> Self {
+        Self { weight, bias: None, scale: Some(scale) }
     }
 
     /// Apply projection to input: output = input @ weight + bias
     ///
-    /// Input shape: [*, in_features]
-    /// Weight shape: [in_features, out_features] (already transposed)
-    /// Bias shape: [out_features] (broadcasted)
+    /// Input shape:  [*, in_features]
+    /// Weight shape: [in_features, out_features]  (pre-transposed at load time)
     /// Output shape: [*, out_features]
+    ///
+    /// FP8 weights are dequantized lazily: `LinearProjection::take` captures the
+    /// companion `_scale_inv` tensor, and `apply()` expands the block scale and
+    /// multiplies on each forward pass (keeping VRAM at FP8 size).
     #[inline]
-    fn apply(&self, input: &Tensor) -> Tensor {
-        let output = input.matmul(&self.weight);
-
+    pub(crate) fn apply(&self, input: &Tensor) -> Tensor {
+        let w = match self.weight.kind() {
+            tch::Kind::Float8e4m3fn | tch::Kind::Float8e5m2 => {
+                // Cast FP8 → BF16 on GPU (ROCm 7.1+ dispatches on-device, no CPU fallback).
+                let w_bf16 = self.weight.to_kind(tch::Kind::BFloat16);
+                if let Some(scale) = &self.scale {
+                    // scale: [in/128, out/128] — apply block-wise via reshape+expand+reshape.
+                    // This avoids repeat_interleave (which fully materializes a copy) by using
+                    // a lazy expand view over the 128-element block strides.
+                    let ws = w_bf16.size();  // [in, out]
+                    let ss = scale.size();   // [in/128, out/128]
+                    let block_r = ws[0] / ss[0];
+                    let block_c = ws[1] / ss[1];
+                    // weight_scale_inv stores the per-block multiplier: dequant = fp8 * scale
+                    // (values ~0.0002 mean max_abs ≈ 448 * 0.0002 ≈ 0.09, typical for NN weights)
+                    let s_exp = scale
+                        .to_kind(tch::Kind::BFloat16)
+                        .view([ss[0], 1, ss[1], 1])
+                        .expand([ss[0], block_r, ss[1], block_c], false)
+                        .reshape([ws[0], ws[1]]);
+                    w_bf16 * s_exp
+                } else {
+                    w_bf16
+                }
+            }
+            _ => self.weight.shallow_clone(),
+        };
+        let output = input.matmul(&w);
         match &self.bias {
             Some(bias) => output + bias,
             None => output,
         }
+    }
+
+    /// Remove weight (and its companion `_scale_inv` if present) from `weights`,
+    /// transpose from `[out, in]` → `[in, out]`, and build a `LinearProjection`.
+    ///
+    /// FP8 weights are kept as FP8 in VRAM. The scale (if present) is stored for
+    /// use during `apply()`. This keeps memory at FP8 size (e.g. 7.4 GB for 35B),
+    /// which is necessary when the BF16 equivalent would exceed VRAM (e.g. 70 GB > 64 GB).
+    pub(crate) fn take(weights: &mut HashMap<String, Tensor>, key: &str) -> Result<Self> {
+        let weight = weights
+            .remove(key)
+            .ok_or_else(|| anyhow!("Missing weight tensor: {}", key))?
+            .transpose(0, 1)
+            .contiguous();
+        // Scale stored as [out/128, in/128]; transpose to match [in, out] weight orientation.
+        let scale = weights
+            .remove(&format!("{key}_scale_inv"))
+            .map(|s| s.transpose(0, 1).contiguous());
+        Ok(match scale {
+            Some(s) => Self::with_scale(weight, s),
+            None => Self::new(weight),
+        })
+    }
+
+    /// Like `take`, but also attaches an optional bias tensor (not transposed).
+    /// Tries `bias_key` in `weights`; skips silently if absent.
+    pub(crate) fn take_with_optional_bias(
+        weights: &mut HashMap<String, Tensor>,
+        weight_key: &str,
+        bias_key: &str,
+    ) -> Result<Self> {
+        let mut proj = Self::take(weights, weight_key)?;
+        if let Some(bias) = weights.get(bias_key).map(tch::Tensor::shallow_clone) {
+            proj.bias = Some(bias);
+        }
+        Ok(proj)
     }
 
     /// Get output dimension
@@ -758,19 +830,19 @@ impl LlamaAttention {
 }
 
 /// Llama MLP/FFN layer
-struct LlamaMLP {
-    gate_proj: LinearProjection,
-    up_proj: LinearProjection,
-    down_proj: LinearProjection,
-    activation: String, // Activation function name
-    layer_idx: usize,   // Layer index for per-layer delta lookup
+pub(crate) struct LlamaMLP {
+    pub(crate) gate_proj: LinearProjection,
+    pub(crate) up_proj: LinearProjection,
+    pub(crate) down_proj: LinearProjection,
+    pub(crate) activation: String, // Activation function name
+    pub(crate) layer_idx: usize,   // Layer index for per-layer delta lookup
 }
 
 unsafe impl Send for LlamaMLP {}
 unsafe impl Sync for LlamaMLP {}
 
 impl LlamaMLP {
-    fn forward(
+    pub(crate) fn forward(
         &self,
         hidden_states: &Tensor,
         delta: Option<&crate::training::TenantDelta>,
@@ -913,16 +985,16 @@ impl LlamaMLP {
 }
 
 /// RMSNorm implementation for Llama
-struct RMSNorm {
-    weight: Tensor,
-    eps: f32,
+pub(crate) struct RMSNorm {
+    pub(crate) weight: Tensor,
+    pub(crate) eps: f32,
 }
 
 unsafe impl Send for RMSNorm {}
 unsafe impl Sync for RMSNorm {}
 
 impl RMSNorm {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // Compute RMS, preserving the original dtype
         let original_dtype = x.kind();
         let x2 = square_tensor(x)?;
@@ -1289,79 +1361,44 @@ impl LlamaModel {
         let (q_proj, k_proj, v_proj) = if has_separate_qkv {
             // Standard separate Q, K, V projections (Llama/Qwen style)
 
-            // Load Q projection - remove from HashMap to free original tensor after transpose
-            let q_weight = weights
-                .remove(&format!("{prefix}.self_attn.q_proj.weight"))
-                .ok_or_else(|| anyhow!("Missing q_proj weight"))?
-                .transpose(0, 1)
-                .contiguous();
-
-            let q_proj = if let Some(q_bias) = weights.get(&format!("{prefix}.self_attn.q_proj.bias")) {
-                tracing::debug!("Layer {}: Loading Q bias (Qwen-style)", layer_idx);
-                LinearProjection::with_bias(q_weight, q_bias.shallow_clone())
-            } else {
-                LinearProjection::new(q_weight)
-            };
-
-            // Load K projection - remove from HashMap to free original tensor after transpose
-            let k_weight = weights
-                .remove(&format!("{prefix}.self_attn.k_proj.weight"))
-                .ok_or_else(|| anyhow!("Missing k_proj weight"))?
-                .transpose(0, 1)
-                .contiguous();
-
-            let k_proj = if let Some(k_bias) = weights.get(&format!("{prefix}.self_attn.k_proj.bias")) {
-                tracing::debug!("Layer {}: Loading K bias (Qwen-style)", layer_idx);
-                LinearProjection::with_bias(k_weight, k_bias.shallow_clone())
-            } else {
-                LinearProjection::new(k_weight)
-            };
-
-            // Load V projection - remove from HashMap to free original tensor after transpose
-            let v_weight = weights
-                .remove(&format!("{prefix}.self_attn.v_proj.weight"))
-                .ok_or_else(|| anyhow!("Missing v_proj weight"))?
-                .transpose(0, 1)
-                .contiguous();
-
-            let v_proj = if let Some(v_bias) = weights.get(&format!("{prefix}.self_attn.v_proj.bias")) {
-                tracing::debug!("Layer {}: Loading V bias (Qwen-style)", layer_idx);
-                LinearProjection::with_bias(v_weight, v_bias.shallow_clone())
-            } else {
-                LinearProjection::new(v_weight)
-            };
+            let q_proj = LinearProjection::take_with_optional_bias(
+                weights,
+                &format!("{prefix}.self_attn.q_proj.weight"),
+                &format!("{prefix}.self_attn.q_proj.bias"),
+            )?;
+            let k_proj = LinearProjection::take_with_optional_bias(
+                weights,
+                &format!("{prefix}.self_attn.k_proj.weight"),
+                &format!("{prefix}.self_attn.k_proj.bias"),
+            )?;
+            let v_proj = LinearProjection::take_with_optional_bias(
+                weights,
+                &format!("{prefix}.self_attn.v_proj.weight"),
+                &format!("{prefix}.self_attn.v_proj.bias"),
+            )?;
 
             (q_proj, k_proj, v_proj)
         } else {
             // Combined QKV projection (some Qwen models use c_attn)
-            // Remove from HashMap to free original tensor after transpose
             let c_attn_weight = weights
                 .remove(&format!("{prefix}.self_attn.c_attn.weight"))
                 .ok_or_else(|| anyhow!("Missing c_attn weight"))?
-                .transpose(0, 1) // Transpose from [out, in] to [in, out]
+                .transpose(0, 1)
                 .contiguous();
 
-            // Check for combined bias
-            let c_attn_bias = weights.get(&format!("{prefix}.self_attn.c_attn.bias"));
-
-            // Split c_attn into Q, K, V
             // c_attn has shape [hidden_size, 3 * projection_size]
-            let dims = c_attn_weight.size();
-            let _hidden_size = dims[0];
-            let total_proj_size = dims[1];
+            let total_proj_size = c_attn_weight.size()[1];
             let proj_size = total_proj_size / 3;
 
             let q_weight = c_attn_weight.narrow(1, 0, proj_size);
             let k_weight = c_attn_weight.narrow(1, proj_size, proj_size);
             let v_weight = c_attn_weight.narrow(1, proj_size * 2, proj_size);
 
-            // Split bias if present
-            let (q_proj, k_proj, v_proj) = if let Some(bias) = c_attn_bias {
+            let (q_proj, k_proj, v_proj) = if let Some(bias) = weights.get(&format!("{prefix}.self_attn.c_attn.bias")) {
                 tracing::debug!("Layer {}: Loading combined QKV bias (Qwen-style)", layer_idx);
                 let q_bias = bias.narrow(0, 0, proj_size);
                 let k_bias = bias.narrow(0, proj_size, proj_size);
                 let v_bias = bias.narrow(0, proj_size * 2, proj_size);
-
                 (
                     LinearProjection::with_bias(q_weight, q_bias),
                     LinearProjection::with_bias(k_weight, k_bias),
@@ -1419,21 +1456,19 @@ impl LlamaModel {
         };
 
         // Load output projection (typically no bias, but check anyway)
-        // Remove from HashMap to free original tensor after transpose
-        let o_weight = weights
-            .remove(&format!("{prefix}.self_attn.o_proj.weight"))
-            .or_else(|| weights.remove(&format!("{prefix}.self_attn.c_proj.weight"))) // Some models use c_proj for output
-            .ok_or_else(|| anyhow!("Missing o_proj/c_proj weight"))?
-            .transpose(0, 1) // Transpose from [out, in] to [in, out]
-            .contiguous();
-
-        let o_proj = if let Some(o_bias) = weights.get(&format!("{prefix}.self_attn.o_proj.bias"))
-            .or_else(|| weights.get(&format!("{prefix}.self_attn.c_proj.bias")))
-        {
-            tracing::debug!("Layer {}: Loading O bias", layer_idx);
-            LinearProjection::with_bias(o_weight, o_bias.shallow_clone())
+        // Try o_proj first, then c_proj (some Qwen models use c_proj for output)
+        let o_proj = if weights.contains_key(&format!("{prefix}.self_attn.o_proj.weight")) {
+            LinearProjection::take_with_optional_bias(
+                weights,
+                &format!("{prefix}.self_attn.o_proj.weight"),
+                &format!("{prefix}.self_attn.o_proj.bias"),
+            )?
         } else {
-            LinearProjection::new(o_weight)
+            LinearProjection::take_with_optional_bias(
+                weights,
+                &format!("{prefix}.self_attn.c_proj.weight"),
+                &format!("{prefix}.self_attn.c_proj.bias"),
+            )?
         };
 
         let self_attn = LlamaAttention {
@@ -1455,45 +1490,21 @@ impl LlamaModel {
         };
 
         // Build MLP with optional biases
-        // Remove from HashMap to free original tensors after transpose
-        let gate_weight = weights
-            .remove(&format!("{prefix}.mlp.gate_proj.weight"))
-            .ok_or_else(|| anyhow!("Missing gate_proj weight"))?
-            .transpose(0, 1) // Transpose from [out, in] to [in, out]
-            .contiguous();
-
-        let gate_proj = if let Some(gate_bias) = weights.get(&format!("{prefix}.mlp.gate_proj.bias")) {
-            tracing::debug!("Layer {}: Loading gate_proj bias", layer_idx);
-            LinearProjection::with_bias(gate_weight, gate_bias.shallow_clone())
-        } else {
-            LinearProjection::new(gate_weight)
-        };
-
-        let up_weight = weights
-            .remove(&format!("{prefix}.mlp.up_proj.weight"))
-            .ok_or_else(|| anyhow!("Missing up_proj weight"))?
-            .transpose(0, 1) // Transpose from [out, in] to [in, out]
-            .contiguous();
-
-        let up_proj = if let Some(up_bias) = weights.get(&format!("{prefix}.mlp.up_proj.bias")) {
-            tracing::debug!("Layer {}: Loading up_proj bias", layer_idx);
-            LinearProjection::with_bias(up_weight, up_bias.shallow_clone())
-        } else {
-            LinearProjection::new(up_weight)
-        };
-
-        let down_weight = weights
-            .remove(&format!("{prefix}.mlp.down_proj.weight"))
-            .ok_or_else(|| anyhow!("Missing down_proj weight"))?
-            .transpose(0, 1) // Transpose from [out, in] to [in, out]
-            .contiguous();
-
-        let down_proj = if let Some(down_bias) = weights.get(&format!("{prefix}.mlp.down_proj.bias")) {
-            tracing::debug!("Layer {}: Loading down_proj bias", layer_idx);
-            LinearProjection::with_bias(down_weight, down_bias.shallow_clone())
-        } else {
-            LinearProjection::new(down_weight)
-        };
+        let gate_proj = LinearProjection::take_with_optional_bias(
+            weights,
+            &format!("{prefix}.mlp.gate_proj.weight"),
+            &format!("{prefix}.mlp.gate_proj.bias"),
+        )?;
+        let up_proj = LinearProjection::take_with_optional_bias(
+            weights,
+            &format!("{prefix}.mlp.up_proj.weight"),
+            &format!("{prefix}.mlp.up_proj.bias"),
+        )?;
+        let down_proj = LinearProjection::take_with_optional_bias(
+            weights,
+            &format!("{prefix}.mlp.down_proj.weight"),
+            &format!("{prefix}.mlp.down_proj.bias"),
+        )?;
 
         let mlp = LlamaMLP {
             gate_proj,

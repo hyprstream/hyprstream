@@ -928,13 +928,13 @@ impl TorchEngine {
     pub fn clear_kv_cache(&self) {
         if let Some(model_arc) = &self.persistent_model {
             let model = model_arc.lock();
-
-            // Use downcasting to call clear_kv_cache on LlamaModel
-            // This is safe because we know the model type at runtime
             let model_any = model.as_any();
             if let Some(llama_model) = model_any.downcast_ref::<crate::runtime::architectures::llama::LlamaModel>() {
                 llama_model.clear_kv_cache();
                 tracing::debug!("Cleared KV cache before generation");
+            } else if let Some(q35_model) = model_any.downcast_ref::<crate::runtime::architectures::qwen3_5::Qwen3_5Model>() {
+                q35_model.clear_kv_cache();
+                tracing::debug!("Cleared Qwen3.5 KV cache + SSM states before generation");
             }
         }
     }
@@ -988,13 +988,16 @@ impl RuntimeEngine for TorchEngine {
 
             // If no single file found, check for sharded SafeTensors
             if found_file.is_none() {
-                let _shard_pattern = path.join("model-00001-of-*.safetensors");
                 if let Ok(entries) = std::fs::read_dir(path) {
                     for entry in entries.flatten() {
                         let filename = entry.file_name();
                         if let Some(name) = filename.to_str() {
-                            if name.starts_with("model-00001-of-") && name.ends_with(".safetensors")
-                            {
+                            // Match standard shard pattern: model-00001-of-NNNNN.safetensors
+                            // Also match Qwen3.5 pattern: model.safetensors-00001-of-NNNNN.safetensors
+                            let is_first_shard = (name.starts_with("model-00001-of-")
+                                || name.starts_with("model.safetensors-00001-of-"))
+                                && name.ends_with(".safetensors");
+                            if is_first_shard {
                                 info!(
                                     "🔍 Detected sharded SafeTensors model starting with: {}",
                                     name

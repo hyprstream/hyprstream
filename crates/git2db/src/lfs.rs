@@ -666,6 +666,57 @@ impl LfsStorage {
         Ok(stats)
     }
 
+    /// Process all LFS files in a worktree with optional progress reporting
+    pub async fn process_worktree_with_progress(
+        &self,
+        worktree_path: &Path,
+        progress: Option<&Arc<dyn crate::callback_config::ProgressReporter>>,
+    ) -> Git2DBResult<ProcessingStats> {
+        if !worktree_path.is_dir() {
+            return Err(Git2DBError::lfs(
+                LfsErrorKind::IoError,
+                format!("Path is not a directory: {}", worktree_path.display()),
+            ));
+        }
+
+        info!("Scanning worktree for LFS files: {}", worktree_path.display());
+        let lfs_files = self.scan_lfs_files(worktree_path).await?;
+
+        if lfs_files.is_empty() {
+            debug!("No LFS files found in worktree");
+            return Ok(ProcessingStats::default());
+        }
+
+        info!("Found {} LFS files to process", lfs_files.len());
+        let mut stats = ProcessingStats {
+            total_files: lfs_files.len(),
+            ..Default::default()
+        };
+
+        for (idx, lfs_file) in lfs_files.iter().enumerate() {
+            if let Some(reporter) = &progress {
+                reporter.report("lfs", idx + 1, lfs_files.len());
+            }
+            match self.smudge_file_in_place(lfs_file).await {
+                Ok(bytes) => {
+                    stats.processed += 1;
+                    stats.bytes_processed += bytes;
+                    debug!("Processed: {}", lfs_file.display());
+                }
+                Err(e) => {
+                    stats.failed += 1;
+                    warn!("Failed to process {}: {}", lfs_file.display(), e);
+                }
+            }
+        }
+
+        info!(
+            "Processed {}/{} LFS files ({} bytes)",
+            stats.processed, stats.total_files, stats.bytes_processed
+        );
+        Ok(stats)
+    }
+
     /// Batch process LFS files with concurrency control
     pub async fn batch_process(
         &self,

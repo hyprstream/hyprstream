@@ -29,11 +29,15 @@
 pub mod backend;
 pub mod hmac;
 pub mod key_exchange;
+pub mod notification;
 pub mod signing;
 
 pub use backend::{derive_key, keyed_mac, keyed_mac_truncated};
 pub use hmac::{ChainedStreamHmac, HmacKey};
-pub use key_exchange::{derive_stream_keys, DefaultKeyExchange, KeyExchange, SharedSecret, StreamKeys};
+pub use key_exchange::{
+    derive_notification_keys, derive_stream_keys, DefaultKeyExchange, KeyExchange,
+    NotificationKeys, SharedSecret, StreamKeys,
+};
 pub use signing::{
     generate_signing_keypair, signing_key_from_bytes,
     verifying_key_from_bytes, SigningKey, VerifyingKey,
@@ -41,8 +45,9 @@ pub use signing::{
 
 #[cfg(not(feature = "fips"))]
 pub use key_exchange::{
-    generate_ephemeral_keypair, ristretto_dh, RistrettoKeyExchange, RistrettoPublic,
-    RistrettoSecret,
+    blinded_dh, blinded_dh_raw, generate_ephemeral_keypair,
+    reconstruct_blinded_pub_raw, rerandomize_pubkey, ristretto_dh, ristretto_dh_raw,
+    RistrettoKeyExchange, RistrettoPublic, RistrettoSecret,
 };
 
 #[cfg(feature = "fips")]

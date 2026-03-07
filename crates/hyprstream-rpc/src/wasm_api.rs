@@ -10,6 +10,7 @@
 //! - ECDH key exchange (Ristretto255)
 //! - Verifying incoming envelopes (for browser-side services)
 //! - ZMTP 3.1 framing (encode/decode frames, greeting, handshake commands)
+//! - Notification broadcast encryption (blinded DH, AES-GCM, one-shot MAC)
 //!
 //! All crypto is compiled from Rust - no TypeScript reimplementation.
 
@@ -570,5 +571,404 @@ pub fn zmtp_decode_command(buf: &[u8]) -> Result<Vec<u8>, JsError> {
     result.extend_from_slice(&cmd.body);
 
     Ok(result)
+}
+
+// ============================================================================
+// Notification broadcast encryption
+// ============================================================================
+
+/// Derive notification encryption keys from a DH shared secret.
+///
+/// # Arguments
+///
+/// * `shared_secret` - 32 bytes from blinded_dh or ecdh_ristretto
+/// * `publisher_pub` - 32 bytes publisher's Ristretto255 pubkey
+/// * `subscriber_pub` - 32 bytes subscriber's (blinded) Ristretto255 pubkey
+///
+/// # Returns
+///
+/// 64 bytes: [enc_key(32) || mac_key(32)]
+#[wasm_bindgen]
+pub fn derive_notification_keys(
+    shared_secret: &[u8],
+    publisher_pub: &[u8],
+    subscriber_pub: &[u8],
+) -> Result<Vec<u8>, JsError> {
+    if shared_secret.len() != 32 {
+        return Err(JsError::new("shared_secret must be 32 bytes"));
+    }
+    if publisher_pub.len() != 32 {
+        return Err(JsError::new("publisher_pub must be 32 bytes"));
+    }
+    if subscriber_pub.len() != 32 {
+        return Err(JsError::new("subscriber_pub must be 32 bytes"));
+    }
+
+    let mut ss = [0u8; 32];
+    ss.copy_from_slice(shared_secret);
+    let mut pp = [0u8; 32];
+    pp.copy_from_slice(publisher_pub);
+    let mut sp = [0u8; 32];
+    sp.copy_from_slice(subscriber_pub);
+
+    let keys = crate::crypto::key_exchange::derive_notification_keys(&ss, &pp, &sp)
+        .map_err(|e| JsError::new(&format!("notification key derivation failed: {}", e)))?;
+
+    let mut result = Vec::with_capacity(64);
+    result.extend_from_slice(&*keys.enc_key);
+    result.extend_from_slice(&*keys.mac_key);
+    Ok(result)
+}
+
+/// Encrypt with AES-256-GCM.
+///
+/// # Arguments
+///
+/// * `key` - 32-byte AES-256 key
+/// * `nonce` - 12-byte random nonce (must be from OsRng, never reused)
+/// * `plaintext` - Data to encrypt
+/// * `aad` - Associated authenticated data (from notification_build_payload_aad)
+///
+/// # Returns
+///
+/// Ciphertext bytes (plaintext.len() + 16 bytes GCM tag)
+#[wasm_bindgen]
+pub fn aes_gcm_encrypt(
+    key: &[u8],
+    nonce: &[u8],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, JsError> {
+    use aes_gcm::{aead::{Aead, KeyInit, Payload}, Aes256Gcm, Nonce};
+
+    if key.len() != 32 {
+        return Err(JsError::new("key must be 32 bytes"));
+    }
+    if nonce.len() != 12 {
+        return Err(JsError::new("nonce must be 12 bytes"));
+    }
+
+    let cipher = Aes256Gcm::new(key.into());
+    let payload = Payload { msg: plaintext, aad };
+    cipher
+        .encrypt(Nonce::from_slice(nonce), payload)
+        .map_err(|_| JsError::new("AES-GCM encrypt failed"))
+}
+
+/// Decrypt with AES-256-GCM.
+///
+/// # Arguments
+///
+/// * `key` - 32-byte AES-256 key
+/// * `nonce` - 12-byte nonce used during encryption
+/// * `ciphertext` - Data to decrypt (includes GCM tag)
+/// * `aad` - Associated authenticated data (must match encryption AAD)
+///
+/// # Returns
+///
+/// Plaintext bytes
+#[wasm_bindgen]
+pub fn aes_gcm_decrypt(
+    key: &[u8],
+    nonce: &[u8],
+    ciphertext: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, JsError> {
+    use aes_gcm::{aead::{Aead, KeyInit, Payload}, Aes256Gcm, Nonce};
+
+    if key.len() != 32 {
+        return Err(JsError::new("key must be 32 bytes"));
+    }
+    if nonce.len() != 12 {
+        return Err(JsError::new("nonce must be 12 bytes"));
+    }
+
+    let cipher = Aes256Gcm::new(key.into());
+    let payload = Payload { msg: ciphertext, aad };
+    cipher
+        .decrypt(Nonce::from_slice(nonce), payload)
+        .map_err(|_| JsError::new("AES-GCM decrypt failed (wrong key, nonce, or AAD)"))
+}
+
+/// Blinding-aware ECDH: `(subscriber_secret + blinding_scalar) * publisher_pubkey`.
+///
+/// Used by notification subscribers to derive the same shared secret as the publisher
+/// who encrypted against a blinded pubkey.
+///
+/// # Arguments
+///
+/// * `subscriber_secret` - 32-byte Ristretto255 scalar
+/// * `blinding_scalar` - 32-byte blinding scalar `r` from NotificationBlock
+/// * `publisher_pubkey` - 32-byte publisher's Ristretto255 pubkey
+///
+/// # Returns
+///
+/// 32-byte shared secret
+#[wasm_bindgen]
+pub fn notification_blinded_dh(
+    subscriber_secret: &[u8],
+    blinding_scalar: &[u8],
+    publisher_pubkey: &[u8],
+) -> Result<Vec<u8>, JsError> {
+    if subscriber_secret.len() != 32 {
+        return Err(JsError::new("subscriber_secret must be 32 bytes"));
+    }
+    if blinding_scalar.len() != 32 {
+        return Err(JsError::new("blinding_scalar must be 32 bytes"));
+    }
+    if publisher_pubkey.len() != 32 {
+        return Err(JsError::new("publisher_pubkey must be 32 bytes"));
+    }
+
+    let mut ss = [0u8; 32];
+    ss.copy_from_slice(subscriber_secret);
+    let mut bs = [0u8; 32];
+    bs.copy_from_slice(blinding_scalar);
+    let mut pp = [0u8; 32];
+    pp.copy_from_slice(publisher_pubkey);
+
+    let shared = crate::crypto::blinded_dh_raw(&ss, &bs, &pp)
+        .map_err(|e| JsError::new(&format!("blinded DH failed: {}", e)))?;
+
+    Ok(shared.to_vec())
+}
+
+/// Reconstruct a blinded pubkey: `subscriber_pubkey + blinding_scalar * G`.
+///
+/// Used by subscribers to reconstruct the blinded pubkey for fingerprint
+/// computation and key derivation.
+///
+/// # Arguments
+///
+/// * `subscriber_pubkey` - 32-byte subscriber's Ristretto255 pubkey
+/// * `blinding_scalar` - 32-byte blinding scalar `r` from NotificationBlock
+///
+/// # Returns
+///
+/// 32-byte blinded pubkey (compressed Ristretto point)
+#[wasm_bindgen]
+pub fn notification_reconstruct_blinded_pub(
+    subscriber_pubkey: &[u8],
+    blinding_scalar: &[u8],
+) -> Result<Vec<u8>, JsError> {
+    if subscriber_pubkey.len() != 32 {
+        return Err(JsError::new("subscriber_pubkey must be 32 bytes"));
+    }
+    if blinding_scalar.len() != 32 {
+        return Err(JsError::new("blinding_scalar must be 32 bytes"));
+    }
+
+    let mut sp = [0u8; 32];
+    sp.copy_from_slice(subscriber_pubkey);
+    let mut bs = [0u8; 32];
+    bs.copy_from_slice(blinding_scalar);
+
+    let blinded = crate::crypto::reconstruct_blinded_pub_raw(&sp, &bs)
+        .map_err(|e| JsError::new(&format!("reconstruct blinded pub failed: {}", e)))?;
+
+    Ok(blinded.to_vec())
+}
+
+/// Compute a one-shot MAC: `keyed_mac(mac_key, data)`.
+///
+/// Uses Blake3 keyed hash (or HMAC-SHA256 in FIPS mode).
+///
+/// # Arguments
+///
+/// * `mac_key` - 32-byte MAC key (from derive_notification_keys)
+/// * `data` - Data to authenticate (typically the encrypted payload)
+///
+/// # Returns
+///
+/// 32-byte MAC
+#[wasm_bindgen]
+pub fn notification_mac(mac_key: &[u8], data: &[u8]) -> Result<Vec<u8>, JsError> {
+    if mac_key.len() != 32 {
+        return Err(JsError::new("mac_key must be 32 bytes"));
+    }
+
+    let mut key = [0u8; 32];
+    key.copy_from_slice(mac_key);
+    let mac = crate::crypto::notification::notification_mac(&key, data);
+    Ok(mac.to_vec())
+}
+
+/// Verify a one-shot MAC in constant time.
+///
+/// # Arguments
+///
+/// * `mac_key` - 32-byte MAC key
+/// * `data` - Authenticated data
+/// * `expected_mac` - 32-byte expected MAC value
+///
+/// # Returns
+///
+/// `true` if MAC is valid, `false` otherwise. Never errors on mismatch.
+#[wasm_bindgen]
+pub fn notification_mac_verify(
+    mac_key: &[u8],
+    data: &[u8],
+    expected_mac: &[u8],
+) -> Result<bool, JsError> {
+    if mac_key.len() != 32 {
+        return Err(JsError::new("mac_key must be 32 bytes"));
+    }
+    if expected_mac.len() != 32 {
+        return Err(JsError::new("expected_mac must be 32 bytes"));
+    }
+
+    let mut key = [0u8; 32];
+    key.copy_from_slice(mac_key);
+    let mut mac = [0u8; 32];
+    mac.copy_from_slice(expected_mac);
+
+    Ok(crate::crypto::notification::notification_mac_verify(&key, data, &mac).is_ok())
+}
+
+/// Build length-prefixed AAD for notification payload encryption/decryption.
+///
+/// Format: `u32_le(len(intent_id)) || intent_id || u32_le(len(scope)) || scope`
+///
+/// Must be called with matching `intent_id` and `scope` on both encrypt and decrypt sides.
+///
+/// # Arguments
+///
+/// * `intent_id` - Intent ID string from publishIntent response
+/// * `scope` - Scope string (e.g., "serve:model:qwen3")
+///
+/// # Returns
+///
+/// AAD bytes for use with aes_gcm_encrypt/decrypt
+#[wasm_bindgen]
+pub fn notification_build_payload_aad(intent_id: &str, scope: &str) -> Vec<u8> {
+    crate::crypto::notification::build_payload_aad(intent_id, scope)
+}
+
+/// Compute a 128-bit pubkey fingerprint: `Blake3(pubkey)[..16]`.
+///
+/// Used for capsule routing — matches the fingerprint format used by NotificationService.
+///
+/// # Arguments
+///
+/// * `pubkey` - 32-byte Ristretto255 pubkey (typically the blinded pubkey)
+///
+/// # Returns
+///
+/// 16-byte fingerprint
+#[wasm_bindgen]
+pub fn notification_pubkey_fingerprint(pubkey: &[u8]) -> Result<Vec<u8>, JsError> {
+    if pubkey.len() != 32 {
+        return Err(JsError::new("pubkey must be 32 bytes"));
+    }
+    let mut pk = [0u8; 32];
+    pk.copy_from_slice(pubkey);
+    Ok(crate::crypto::notification::pubkey_fingerprint(&pk).to_vec())
+}
+
+/// Build the Ed25519 attestation message for publisher identity verification.
+///
+/// Message format: `ephemeral_pubkey(32) || blinded_sub_pubkey(32) || u32_le(scope_len) || scope || u32_le(intent_len) || intent_id`
+///
+/// # Arguments
+///
+/// * `ephemeral_pubkey` - Publisher's 32-byte ephemeral Ristretto pubkey
+/// * `blinded_sub_pubkey` - 32-byte blinded subscriber pubkey
+/// * `scope` - Claim scope string
+/// * `intent_id` - Intent ID string
+///
+/// # Returns
+///
+/// Message bytes suitable for Ed25519 sign/verify
+#[wasm_bindgen]
+pub fn notification_build_attestation_message(
+    ephemeral_pubkey: &[u8],
+    blinded_sub_pubkey: &[u8],
+    scope: &str,
+    intent_id: &str,
+) -> Result<Vec<u8>, JsError> {
+    if ephemeral_pubkey.len() != 32 {
+        return Err(JsError::new("ephemeral_pubkey must be 32 bytes"));
+    }
+    if blinded_sub_pubkey.len() != 32 {
+        return Err(JsError::new("blinded_sub_pubkey must be 32 bytes"));
+    }
+
+    let mut ep = [0u8; 32];
+    ep.copy_from_slice(ephemeral_pubkey);
+    let mut bp = [0u8; 32];
+    bp.copy_from_slice(blinded_sub_pubkey);
+
+    Ok(crate::crypto::notification::build_attestation_message(&ep, &bp, scope, intent_id))
+}
+
+/// Sign an Ed25519 attestation for publisher identity binding.
+///
+/// Signs the attestation message (from notification_build_attestation_message)
+/// with the publisher's Ed25519 signing key.
+///
+/// # Arguments
+///
+/// * `privkey_seed` - 32-byte Ed25519 seed (from generate_signing_keypair)
+/// * `message` - Attestation message bytes (from notification_build_attestation_message)
+///
+/// # Returns
+///
+/// 64-byte Ed25519 signature
+#[wasm_bindgen]
+pub fn ed25519_sign(privkey_seed: &[u8], message: &[u8]) -> Result<Vec<u8>, JsError> {
+    use ed25519_dalek::{Signer, SigningKey};
+
+    if privkey_seed.len() != 32 {
+        return Err(JsError::new("privkey_seed must be 32 bytes"));
+    }
+
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(privkey_seed);
+    let signing_key = SigningKey::from_bytes(&seed);
+    let sig = signing_key.sign(message);
+    Ok(sig.to_bytes().to_vec())
+}
+
+/// Verify an Ed25519 signature.
+///
+/// # Arguments
+///
+/// * `pubkey` - 32-byte Ed25519 verifying key
+/// * `message` - Message bytes that were signed
+/// * `signature` - 64-byte Ed25519 signature
+///
+/// # Returns
+///
+/// `true` if signature is valid
+#[wasm_bindgen]
+pub fn ed25519_verify(
+    pubkey: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> Result<bool, JsError> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    if pubkey.len() != 32 {
+        return Err(JsError::new("pubkey must be 32 bytes"));
+    }
+    if signature.len() != 64 {
+        return Err(JsError::new("signature must be 64 bytes"));
+    }
+
+    let vk = VerifyingKey::from_bytes(pubkey.try_into().unwrap())
+        .map_err(|e| JsError::new(&format!("invalid verifying key: {}", e)))?;
+    let sig = Signature::from_bytes(signature.try_into().unwrap());
+
+    Ok(vk.verify(message, &sig).is_ok())
+}
+
+/// Generate a random 12-byte AES-GCM nonce from OsRng.
+///
+/// Every AES-GCM encryption MUST use a fresh random nonce. Never reuse nonces.
+#[wasm_bindgen]
+pub fn generate_aes_nonce() -> Vec<u8> {
+    let mut nonce = [0u8; 12];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+    nonce.to_vec()
 }
 

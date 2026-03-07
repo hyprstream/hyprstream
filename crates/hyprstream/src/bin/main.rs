@@ -10,7 +10,6 @@ use clap::{Arg, Args as ClapArgs, Command as ClapCommand, FromArgMatches, Subcom
 use tracing::info;
 
 // Core application imports
-use hyprstream_core::auth::PolicyManager;
 use hyprstream_core::cli::commands::{
     ExecutionMode, FlightArgs, ImageCommand, ServiceAction, TrainingAction, WorkerAction,
 };
@@ -18,7 +17,7 @@ use hyprstream_core::cli::quick::{QuickCommand, RemoteQuickCommand, WorktreeQuic
 use hyprstream_core::cli::schema_cli;
 use hyprstream_core::cli::{
     handle_branch, handle_checkout, handle_clone, handle_infer, handle_info, handle_list,
-    handle_load, handle_policy_apply, handle_policy_apply_template, handle_policy_check,
+    handle_load, handle_notify_command, parse_filters, parse_status_filter, handle_policy_apply, handle_policy_apply_template, handle_policy_check,
     handle_policy_diff, handle_policy_edit, handle_policy_history, handle_policy_list_templates,
     handle_policy_rollback, handle_policy_show, handle_pull, handle_remote_add, handle_remote_list,
     handle_remote_remove, handle_remote_rename, handle_remote_set_url, handle_remove,
@@ -360,16 +359,21 @@ fn handle_quick_command(
             },
         ),
 
-        QuickCommand::List => with_runtime(
+        QuickCommand::List { filter, status } => with_runtime(
             RuntimeConfig {
                 device: DeviceConfig::request_cpu(),
                 multi_threaded: true,
             },
             || async move {
-                let registry_path = ctx.models_dir().join(".registry");
-                let policies_dir = registry_path.join("policies");
-                let policy_manager = PolicyManager::new(&policies_dir).await.ok();
-                handle_list(ctx.registry(), policy_manager.as_ref()).await
+                let keys_dir = ctx.models_dir().join(".registry").join("keys");
+                let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+                let model_client = hyprstream_core::services::ModelZmqClient::new(
+                    signing_key,
+                    RequestIdentity::local(),
+                );
+                let filters = parse_filters(&filter)?;
+                let status_filter = parse_status_filter(&status)?;
+                handle_list(ctx.registry(), model_client, &filters, &status_filter).await
             },
         ),
 
@@ -483,12 +487,15 @@ fn handle_quick_command(
             model,
             max_context,
             kv_quant,
+            wait,
         } => with_runtime(
             RuntimeConfig {
                 device: DeviceConfig::request_gpu(),
                 multi_threaded: true,
             },
-            || async move { handle_load(&model, max_context, kv_quant.into(), signing_key).await },
+            || async move {
+                handle_load(&model, max_context, kv_quant.into(), wait, signing_key).await
+            },
         ),
 
         QuickCommand::Unload { model } => with_runtime(
@@ -497,6 +504,16 @@ fn handle_quick_command(
                 multi_threaded: true,
             },
             || async move { handle_unload(&model, signing_key).await },
+        ),
+
+        QuickCommand::Notify { command } => with_runtime(
+            RuntimeConfig {
+                device: DeviceConfig::request_cpu(),
+                multi_threaded: true,
+            },
+            || async move {
+                handle_notify_command(command, signing_key).await
+            },
         ),
 
         QuickCommand::Worktree { command } => with_runtime(
@@ -1109,6 +1126,27 @@ fn handle_quick_command(
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
+    // ROCm allocator and BLAS optimizations — must be set before any tch/libtorch init.
+    // Expandable segments eliminates ~1,900 hipMalloc/hipFree calls per decode step.
+    // hipBLASLt split-K improves M=1 GEMM (single-token decode) throughput.
+    if std::env::var("HIP_VISIBLE_DEVICES").is_ok() {
+        if std::env::var("PYTORCH_HIP_ALLOC_CONF").is_err() {
+            // SAFETY: single-threaded at this point (before any thread spawning)
+            unsafe {
+                std::env::set_var(
+                    "PYTORCH_HIP_ALLOC_CONF",
+                    "expandable_segments:True,garbage_collection_threshold:0.8",
+                );
+            }
+        }
+        if std::env::var("TORCH_BLAS_PREFER_HIPBLASLT").is_err() {
+            unsafe { std::env::set_var("TORCH_BLAS_PREFER_HIPBLASLT", "1"); }
+        }
+        if std::env::var("HIPBLASLT_FORCE_SPLIT_K").is_err() {
+            unsafe { std::env::set_var("HIPBLASLT_FORCE_SPLIT_K", "1"); }
+        }
+    }
+
     // Set up panic handler to get better debugging information
     std::panic::set_hook(Box::new(|info| {
         eprintln!("\u{1f6a8} PANIC occurred:");

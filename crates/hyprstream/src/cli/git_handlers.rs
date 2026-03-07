@@ -17,6 +17,7 @@ use hyprstream_rpc::streaming::{StreamHandle, StreamPayload};
 use hyprstream_rpc::crypto::generate_ephemeral_keypair;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use tmq::SocketExt;
 use tracing::{debug, info, warn};
 
 /// Handle branch command
@@ -408,15 +409,81 @@ fn print_model_status(model_name: &str, status: &crate::services::GenRepositoryS
     }
 }
 
-/// Handle list command
+/// Parse `--filter key=regex` strings into compiled `(key, Regex)` pairs.
+///
+/// Patterns are unanchored by default. Use `^`/`$` to anchor, `(?i)` for
+/// case-insensitive, `|` for alternation. `status` is not a valid filter key —
+/// use `--status`/`-s` instead.
+///
+/// Returns an error for unknown keys or invalid regex patterns.
+pub fn parse_filters(raw: &[String]) -> Result<Vec<(String, regex::Regex)>> {
+    const VALID_KEYS: &[&str] = &["name", "domains", "access", "ref", "commit", "size"];
+    let mut out = Vec::with_capacity(raw.len());
+    for s in raw {
+        let (k, v) = s.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("--filter '{}': expected KEY=REGEX format", s)
+        })?;
+        let key = k.to_lowercase();
+        if key == "status" {
+            anyhow::bail!(
+                "--filter '{}': 'status' cannot be used with --filter. Use --status/-s instead (e.g. -s loaded,loading)",
+                s
+            );
+        }
+        if !VALID_KEYS.contains(&key.as_str()) {
+            anyhow::bail!(
+                "--filter '{}': unknown column '{}'. Valid columns: {}",
+                s, key, VALID_KEYS.join(", ")
+            );
+        }
+        let re = regex::Regex::new(v).map_err(|e| {
+            anyhow::anyhow!("--filter '{}': invalid regex pattern '{}': {}", s, v, e)
+        })?;
+        out.push((key, re));
+    }
+    Ok(out)
+}
+
+/// Parse `--status`/`-s` values into a `HashSet` of accepted status strings.
+///
+/// Each argument may be a single value or comma-separated list. Multiple `-s`
+/// flags are OR'd together. Empty result means no status filter (all statuses shown).
+///
+/// Valid values: `loaded`, `loading`, `unloaded`.
+pub fn parse_status_filter(raw: &[String]) -> Result<std::collections::HashSet<String>> {
+    const VALID: &[&str] = &["loaded", "loading", "unloaded"];
+    let mut out = std::collections::HashSet::new();
+    for s in raw {
+        for part in s.split(',') {
+            let val = part.trim().to_lowercase();
+            if val.is_empty() { continue; }
+            if !VALID.contains(&val.as_str()) {
+                anyhow::bail!(
+                    "--status '{}': unknown status '{}'. Valid values: {}",
+                    s, val, VALID.join(", ")
+                );
+            }
+            out.insert(val);
+        }
+    }
+    Ok(out)
+}
+
 pub async fn handle_list(
     registry: &GenRegistryClient,
-    policy_manager: Option<&crate::auth::PolicyManager>,
+    model_client: ModelZmqClient,
+    filters: &[(String, regex::Regex)],
+    status_filter: &std::collections::HashSet<String>,
 ) -> Result<()> {
     info!("Listing models");
 
-    // Get list of tracked repositories from service
-    let repos = registry.list().await
+    // Fetch registry list and model service status in parallel
+    let (repos_result, status_result) = tokio::join!(
+        registry.list(),
+        model_client.status(""),
+    );
+
+    let repos = repos_result
         .map_err(|e| anyhow::anyhow!("Failed to list repositories: {}", e))?;
 
     if repos.is_empty() {
@@ -425,106 +492,106 @@ pub async fn handle_list(
         return Ok(());
     }
 
-    // Get current user for permission checks (OS user for CLI)
-    let current_user = hyprstream_rpc::envelope::RequestIdentity::local().user().to_owned();
+    // Build status lookup: model_ref -> status string
+    let status_map: std::collections::HashMap<String, String> = match status_result {
+        Ok(entries) => entries.into_iter().map(|e| (e.model_ref, e.status)).collect(),
+        Err(e) => {
+            warn!("Model service unavailable for status: {}", e);
+            std::collections::HashMap::new()
+        }
+    };
 
-    // Get archetype registry for capability detection
-    let archetype_registry = crate::archetypes::global_registry();
-
-    // Resolve worktree paths locally for archetype detection
-    let storage_paths = crate::storage::StoragePaths::new()?;
-
-    // Collect models with git info and capabilities
-    struct ModelInfo {
+    struct RowInfo {
         display_name: String,
+        domains_str: String,
+        access_str: String,
         git_ref: String,
         commit: String,
-        is_dirty: bool,
-        size_bytes: Option<u64>,
-        domains: crate::archetypes::DetectedDomains,
-        access_str: String,
+        load_status: String,
+        size_str: String,
     }
 
-    let mut models_with_info = Vec::new();
+    let mut rows = Vec::new();
 
     for tracked in repos {
-        if !tracked.name.is_empty() {
-            let name = &tracked.name;
-            let repo_client = registry.repo(&tracked.id);
+        if tracked.name.is_empty() { continue; }
+        let name = &tracked.name;
 
-            // Get worktrees for this model
-            let worktrees = match repo_client.list_worktrees().await {
-                Ok(wts) => wts,
-                Err(e) => {
-                    warn!("Failed to list worktrees for '{}': {}", name, e);
-                    continue;
-                }
+        for wt in &tracked.worktrees {
+            let branch_name = if wt.branch_name.is_empty() { "detached".to_owned() } else { wt.branch_name.clone() };
+            let display_name = format!("{}:{}", name, branch_name);
+            let commit = wt.head_oid.chars().take(7).collect::<String>();
+
+            // Capabilities come from the server — no local filesystem access needed
+            let domains_str = if wt.capabilities.is_empty() {
+                "n/a".to_owned()
+            } else {
+                wt.capabilities.join(",")
             };
+            // All capabilities returned are already policy-filtered by the server
+            let access_str = domains_str.clone();
 
-            // Get commit hash via service layer
-            let commit = match repo_client.get_head().await {
-                Ok(head_oid) => head_oid.chars().take(7).collect::<String>(),
-                Err(_) => "unknown".to_owned(),
-            };
+            // Load status: join with model service response
+            let model_ref = format!("{}:{}", name, branch_name);
+            let load_status = status_map
+                .get(&model_ref)
+                .cloned()
+                .unwrap_or_else(|| "unloaded".to_owned());
 
-            for wt in worktrees {
-                let branch_name = if wt.branch_name.is_empty() { "detached".to_owned() } else { wt.branch_name.clone() };
-                let display_name = format!("{}:{}", name, branch_name);
+            let size_str = "n/a".to_owned();
 
-                // Detect capabilities from worktree path (resolved locally)
-                let wt_path = storage_paths.worktree_path(name, &wt.branch_name)
-                    .unwrap_or_else(|_| PathBuf::from("."));
-                let detected = archetype_registry.detect(&wt_path);
-                let domains = detected.to_detected_domains();
-
-                // Compute access string based on user permissions
-                let resource = format!("model:{}", name);
-                let access_str = if let Some(pm) = policy_manager {
-                    crate::auth::capabilities_to_access_string(pm, &current_user, &resource, &domains.capabilities)
-                } else {
-                    // No policy manager = full access (show all capabilities)
-                    domains.capabilities.to_ids().join(",")
-                };
-
-                models_with_info.push(ModelInfo {
-                    display_name,
-                    git_ref: branch_name,
-                    commit: commit.clone(),
-                    is_dirty: wt.is_dirty,
-                    size_bytes: None, // Could be computed if needed
-                    domains,
-                    access_str,
-                });
-            }
+            rows.push(RowInfo {
+                display_name,
+                domains_str,
+                access_str,
+                git_ref: branch_name,
+                commit,
+                load_status,
+                size_str,
+            });
         }
     }
 
-    if models_with_info.is_empty() {
-        println!("No models found.");
-        println!("Try: hyprstream clone https://huggingface.co/Qwen/Qwen2-1.5B-Instruct");
+    // Apply --status filter (OR semantics: row must match one of the specified statuses)
+    let rows: Vec<_> = if status_filter.is_empty() {
+        rows
+    } else {
+        rows.into_iter()
+            .filter(|r| status_filter.contains(r.load_status.as_str()))
+            .collect()
+    };
+
+    // Apply --filter predicates (AND semantics, unanchored regex match)
+    let rows: Vec<_> = rows.into_iter().filter(|r| {
+        filters.iter().all(|(key, re)| {
+            let haystack = match key.as_str() {
+                "name"    => &r.display_name,
+                "domains" => &r.domains_str,
+                "access"  => &r.access_str,
+                "ref"     => &r.git_ref,
+                "commit"  => &r.commit,
+                "size"    => &r.size_str,
+                _         => return true,
+            };
+            re.is_match(haystack)
+        })
+    }).collect();
+
+    if rows.is_empty() {
+        println!("No models match the given filters.");
         return Ok(());
     }
 
-    // Table format with DOMAINS and ACCESS columns
     println!(
-        "{:<30} {:<16} {:<16} {:<15} {:<8} {:<6} {:<10}",
-        "MODEL NAME", "DOMAINS", "ACCESS", "REF", "COMMIT", "STATUS", "SIZE"
+        "{:<35} {:<16} {:<15} {:<8} {:<10}",
+        "MODEL NAME", "DOMAINS", "REF", "COMMIT", "STATUS"
     );
-    println!("{}", "-".repeat(111));
+    println!("{}", "-".repeat(90));
 
-    for info in &models_with_info {
-        let size_str = if let Some(size) = info.size_bytes {
-            format!("{:.1}GB", size as f64 / (1024.0 * 1024.0 * 1024.0))
-        } else {
-            "n/a".to_owned()
-        };
-
-        let domains_str = info.domains.domains_display();
-        let status = if info.is_dirty { "dirty" } else { "clean" };
-
+    for r in &rows {
         println!(
-            "{:<30} {:<16} {:<16} {:<15} {:<8} {:<6} {:<10}",
-            info.display_name, domains_str, info.access_str, info.git_ref, info.commit, status, size_str
+            "{:<35} {:<16} {:<15} {:<8} {:<10}",
+            r.display_name, r.domains_str, r.git_ref, r.commit, r.load_status
         );
     }
 
@@ -607,9 +674,10 @@ pub async fn handle_clone(
     // Use requested branch or fall back to default branch (usually "main")
     let worktree_branch = if let Some(ref b) = branch {
         b.clone()
+    } else if !tracked.tracking_ref.is_empty() {
+        tracked.tracking_ref.clone()
     } else {
-        repo_client.get_head().await
-            .unwrap_or_else(|_| "main".to_owned())
+        "main".to_owned()
     };
 
     if !quiet {
@@ -680,6 +748,7 @@ async fn clone_with_streaming(
     }
 
     // Receive and display progress
+    let mut current_stage = String::new();
     loop {
         match stream_handle.recv_next().await? {
             Some(StreamPayload::Data(data)) => {
@@ -690,9 +759,39 @@ async fn clone_with_streaming(
                         let parts: Vec<&str> = text.split(':').collect();
                         if parts.len() >= 3 {
                             let stage = parts[0];
-                            if verbose {
-                                println!("\r   {}: {}/{}", stage, parts[1], parts[2]);
-                            } else {
+                            let current = parts[1];
+                            let total = parts[2];
+
+                            // Detect stage transitions and print stage names
+                            let is_transition = stage != current_stage;
+                            if is_transition {
+                                if !current_stage.is_empty() && !verbose {
+                                    println!();
+                                }
+                                let stage_label = match stage {
+                                    "fetch" => "Fetching objects",
+                                    "indexing" => "Indexing",
+                                    "smudge" => "Downloading model files",
+                                    "lfs" => "Downloading LFS files",
+                                    other => other,
+                                };
+                                current_stage = stage.to_owned();
+                                if verbose {
+                                    println!("   {stage_label}...");
+                                } else {
+                                    print!("   {stage_label}...");
+                                    io::stdout().flush()?;
+                                }
+                            }
+
+                            if verbose && !is_transition {
+                                if total == "0" {
+                                    // Indeterminate total (e.g. smudge)
+                                    println!("   {}: {} files", stage, current);
+                                } else {
+                                    println!("   {}: {}/{}", stage, current, total);
+                                }
+                            } else if !verbose {
                                 print!(".");
                                 io::stdout().flush()?;
                             }
@@ -1318,10 +1417,14 @@ pub async fn handle_infer(
 }
 
 /// Handle load command - pre-load a model with optional runtime config
+///
+/// `wait` is `None` for fire-and-forget, or `Some(timeout_secs)` to subscribe
+/// to notification events and wait for model.loaded/model.failed.
 pub async fn handle_load(
     model_ref_str: &str,
     max_context: Option<usize>,
     kv_quant: crate::runtime::kv_quant::KVQuantType,
+    wait: Option<u64>,
     signing_key: SigningKey,
 ) -> Result<()> {
     use crate::services::model::ModelLoadConfig;
@@ -1329,9 +1432,7 @@ pub async fn handle_load(
     info!("Loading model: {}", model_ref_str);
 
     // Validate model reference format
-    let _ = ModelRef::parse(model_ref_str)?;
-
-    let model_client = ModelZmqClient::new(signing_key, RequestIdentity::local());
+    let model_ref = ModelRef::parse(model_ref_str)?;
 
     // Build config if any options specified
     let config = if max_context.is_some() || kv_quant != crate::runtime::kv_quant::KVQuantType::None {
@@ -1348,10 +1449,62 @@ pub async fn handle_load(
         None
     };
 
-    let endpoint = model_client.load(model_ref_str, config.as_ref()).await?;
+    // If --wait, subscribe to notifications BEFORE issuing load request
+    // (ensures no events are missed between load and subscribe)
+    let notification_state = if let Some(timeout_secs) = wait {
+        let scope_pattern = format!("serve:model:{}", model_ref.model);
+        println!("Subscribing to model events: {}", scope_pattern);
 
-    println!("✓ Model {} loaded", model_ref_str);
-    println!("  Endpoint: {}", endpoint);
+        let (sub_secret, sub_pubkey) = generate_ephemeral_keypair();
+        let sub_pub_bytes = sub_pubkey.to_bytes();
+
+        let notif_client = crate::services::NotificationClient::new(
+            signing_key.clone(),
+            RequestIdentity::local(),
+        );
+
+        let sub_resp = notif_client.subscribe(
+            &scope_pattern,
+            &sub_pub_bytes,
+            timeout_secs.min(3600) as u32,
+        ).await?;
+
+        debug!(
+            subscription_id = %sub_resp.subscription_id,
+            topic = %sub_resp.assigned_topic,
+            endpoint = %sub_resp.stream_endpoint,
+            "Subscribed to notification stream"
+        );
+
+        // Connect SUB socket to StreamService XPUB
+        let ctx = global_context();
+        let subscriber = tmq::subscribe::subscribe(&ctx)
+            .connect(&sub_resp.stream_endpoint)
+            .map_err(|e| anyhow::anyhow!("SUB connect to {}: {}", sub_resp.stream_endpoint, e))?
+            .subscribe(sub_resp.assigned_topic.as_bytes())
+            .map_err(|e| anyhow::anyhow!("SUB subscribe to topic: {}", e))?;
+
+        subscriber.set_linger(0)
+            .map_err(|e| anyhow::anyhow!("Failed to set linger on SUB: {}", e))?;
+
+        Some((subscriber, sub_secret, sub_pub_bytes, notif_client, sub_resp, timeout_secs))
+    } else {
+        None
+    };
+
+    // Await the load RPC directly — the model service returns "accepted" immediately
+    // (Continuation pattern), so this completes in milliseconds.
+    // fire-and-forget via tokio::spawn caused the task to never run: the CLI runtime
+    // drops before the spawned task executes.
+    let model_client = ModelZmqClient::new(signing_key.clone(), RequestIdentity::local());
+    let model_ref_owned = model_ref_str.to_owned();
+    let config_clone = config.clone();
+    match model_client.load(&model_ref_owned, config_clone.as_ref()).await {
+        Ok(_endpoint) => debug!("Load RPC accepted for {}", model_ref_owned),
+        Err(e) => warn!("Load RPC failed for {}: {}", model_ref_owned, e),
+    }
+
+    println!("Load initiated for model: {}", model_ref_str);
     if let Some(max_ctx) = max_context {
         println!("  Max context: {}", max_ctx);
     }
@@ -1359,8 +1512,362 @@ pub async fn handle_load(
         println!("  KV quantization: {:?}", kv_quant);
     }
 
+    // If --wait, block on notification events until model.loaded or model.failed
+    if let Some((subscriber, sub_secret, sub_pub_bytes, notif_client, sub_resp, timeout_secs)) = notification_state {
+        println!("Waiting for model to load (timeout: {}s)...", timeout_secs);
+
+        let wait_start = tokio::time::Instant::now();
+        let deadline = wait_start + std::time::Duration::from_secs(timeout_secs);
+        let decryptor = hyprstream_rpc::crypto::notification::BroadcastDecryptor::new(
+            &sub_secret.scalar().to_bytes(),
+            &sub_pub_bytes,
+        );
+
+        let result = wait_for_model_notification(
+            subscriber,
+            &decryptor,
+            model_ref_str,
+            deadline,
+        ).await;
+
+        // Clean up subscription
+        let _ = notif_client.unsubscribe(&sub_resp.subscription_id).await;
+
+        match result {
+            Ok(NotificationOutcome::Loaded { endpoint }) => {
+                println!("✓ Model {} loaded", model_ref_str);
+                println!("  Endpoint: {}", endpoint);
+            }
+            Ok(NotificationOutcome::Failed { error }) => {
+                bail!("Model {} failed to load: {}", model_ref_str, error);
+            }
+            Err(_) => {
+                bail!("Timeout waiting for model load notification ({}s elapsed)",
+                    wait_start.elapsed().as_secs());
+            }
+        }
+    }
+
     Ok(())
 }
+
+/// Outcome from waiting on a model notification.
+enum NotificationOutcome {
+    Loaded { endpoint: String },
+    Failed { error: String },
+}
+
+/// Wait for a model.loaded or model.failed notification on the SUB socket.
+async fn wait_for_model_notification(
+    mut subscriber: tmq::subscribe::Subscribe,
+    decryptor: &hyprstream_rpc::crypto::notification::BroadcastDecryptor,
+    model_ref: &str,
+    deadline: tokio::time::Instant,
+) -> Result<NotificationOutcome> {
+    use futures::StreamExt;
+    use crate::events::{EventEnvelope, EventPayload};
+
+    loop {
+        let recv = tokio::time::timeout_at(deadline, subscriber.next()).await;
+
+        let multipart = match recv {
+            Ok(Some(Ok(msg))) => msg,
+            Ok(Some(Err(e))) => {
+                warn!("SUB receive error: {}", e);
+                continue;
+            }
+            Ok(None) => bail!("Notification stream closed"),
+            Err(_) => bail!("Timeout"),
+        };
+
+        // StreamService 3-frame: [topic, capnp_data, hmac]
+        let frames: Vec<_> = multipart.iter().collect();
+        if frames.len() < 2 {
+            continue;
+        }
+
+        // Parse StreamBlock to extract the notification data
+        let capnp_data = &frames[1];
+        let payload_data = match parse_stream_block_data(capnp_data) {
+            Ok(data) => data,
+            Err(e) => {
+                debug!("Failed to parse StreamBlock: {}", e);
+                continue;
+            }
+        };
+
+        // Parse NotificationBlock from the StreamPayload data
+        let block = match parse_notification_block(&payload_data) {
+            Ok(b) => b,
+            Err(e) => {
+                debug!("Failed to parse NotificationBlock: {}", e);
+                continue;
+            }
+        };
+
+        // Decrypt the notification payload
+        let plaintext = match decryptor.decrypt(
+            &block.publisher_pubkey,
+            &block.blinding_scalar,
+            &block.wrapped_key,
+            &block.key_nonce,
+            &block.encrypted_payload,
+            &block.nonce,
+            &block.publisher_mac,
+            &block.intent_id,
+            &block.scope,
+        ) {
+            Ok(pt) => pt,
+            Err(e) => {
+                debug!("Failed to decrypt notification: {}", e);
+                continue;
+            }
+        };
+
+        // Parse EventEnvelope from decrypted payload
+        let event: EventEnvelope = match serde_json::from_slice(&plaintext) {
+            Ok(e) => e,
+            Err(e) => {
+                debug!("Failed to parse event: {}", e);
+                continue;
+            }
+        };
+
+        // Check if this is our model
+        match &event.payload {
+            EventPayload::ModelLoaded { model_ref: ref mr, endpoint } if mr.contains(model_ref) || model_ref.contains(mr.as_str()) => {
+                return Ok(NotificationOutcome::Loaded { endpoint: endpoint.clone() });
+            }
+            EventPayload::ModelFailed { model_ref: ref mr, error } if mr.contains(model_ref) || model_ref.contains(mr.as_str()) => {
+                return Ok(NotificationOutcome::Failed { error: error.clone() });
+            }
+            _ => {
+                debug!("Ignoring unrelated event: {:?}", event.topic);
+                continue;
+            }
+        }
+    }
+}
+
+/// Parsed notification block fields.
+struct NotificationBlockFields {
+    publisher_pubkey: [u8; 32],
+    blinding_scalar: [u8; 32],
+    wrapped_key: Vec<u8>,
+    key_nonce: [u8; 12],
+    encrypted_payload: Vec<u8>,
+    nonce: [u8; 12],
+    intent_id: String,
+    scope: String,
+    publisher_mac: [u8; 32],
+}
+
+/// Parse a StreamBlock's first data payload from Cap'n Proto bytes.
+fn parse_stream_block_data(capnp_data: &[u8]) -> Result<Vec<u8>> {
+    let reader = capnp::serialize::read_message(
+        &mut std::io::Cursor::new(capnp_data),
+        capnp::message::ReaderOptions::default(),
+    )?;
+    let block = reader.get_root::<crate::streaming_capnp::stream_block::Reader>()?;
+
+    // StreamBlock has payloads: List(StreamPayload) — extract first Data variant
+    let payloads = block.get_payloads()?;
+    for i in 0..payloads.len() {
+        let payload = payloads.get(i);
+        if let crate::streaming_capnp::stream_payload::Which::Data(data) = payload.which()? {
+            return Ok(data?.to_vec());
+        }
+    }
+
+    bail!("StreamBlock contains no Data payload")
+}
+
+/// Parse a NotificationBlock from Cap'n Proto bytes.
+fn parse_notification_block(data: &[u8]) -> Result<NotificationBlockFields> {
+    let reader = capnp::serialize::read_message(
+        &mut std::io::Cursor::new(data),
+        capnp::message::ReaderOptions::default(),
+    )?;
+    let block = reader.get_root::<crate::notification_capnp::notification_block::Reader>()?;
+
+    let publisher_pubkey: [u8; 32] = block.get_publisher_pubkey()?
+        .try_into().map_err(|_| anyhow::anyhow!("publisher_pubkey not 32 bytes"))?;
+    let blinding_scalar: [u8; 32] = block.get_blinding_scalar()?
+        .try_into().map_err(|_| anyhow::anyhow!("blinding_scalar not 32 bytes"))?;
+    let wrapped_key = block.get_wrapped_key()?.to_vec();
+    let key_nonce: [u8; 12] = block.get_key_nonce()?
+        .try_into().map_err(|_| anyhow::anyhow!("key_nonce not 12 bytes"))?;
+    let encrypted_payload = block.get_encrypted_payload()?.to_vec();
+    let nonce: [u8; 12] = block.get_nonce()?
+        .try_into().map_err(|_| anyhow::anyhow!("nonce not 12 bytes"))?;
+    let intent_id = block.get_intent_id()?.to_string()?;
+    let scope = block.get_scope()?.to_string()?;
+    let publisher_mac: [u8; 32] = block.get_publisher_mac()?
+        .try_into().map_err(|_| anyhow::anyhow!("publisher_mac not 32 bytes"))?;
+
+    Ok(NotificationBlockFields {
+        publisher_pubkey,
+        blinding_scalar,
+        wrapped_key,
+        key_nonce,
+        encrypted_payload,
+        nonce,
+        intent_id,
+        scope,
+        publisher_mac,
+    })
+}
+
+/// Handle the `notify` subcommands.
+pub async fn handle_notify_command(
+    command: crate::cli::quick::NotifyCommand,
+    signing_key: SigningKey,
+) -> Result<()> {
+    use crate::cli::quick::NotifyCommand;
+
+    match command {
+        NotifyCommand::Subscribe { pattern, json, timeout, count } => {
+            handle_notify_subscribe(&pattern, json, timeout, count, signing_key).await
+        }
+    }
+}
+
+/// Handle `notify subscribe` — listen for and print decrypted notification events.
+async fn handle_notify_subscribe(
+    pattern: &str,
+    json_output: bool,
+    timeout_secs: u64,
+    max_count: u64,
+    signing_key: SigningKey,
+) -> Result<()> {
+    use futures::StreamExt;
+    use crate::events::EventEnvelope;
+
+    let (sub_secret, sub_pubkey) = generate_ephemeral_keypair();
+    let sub_pub_bytes = sub_pubkey.to_bytes();
+
+    let notif_client = crate::services::NotificationClient::new(
+        signing_key,
+        RequestIdentity::local(),
+    );
+
+    // Subscribe with maximum TTL for long-running listeners
+    let ttl = if timeout_secs == 0 { 3600u32 } else { (timeout_secs as u32).min(3600) };
+    let sub_resp = notif_client.subscribe(pattern, &sub_pub_bytes, ttl).await?;
+
+    eprintln!("Subscribed to: {}", pattern);
+    eprintln!("  Subscription ID: {}", sub_resp.subscription_id);
+    eprintln!("  Topic: {}", sub_resp.assigned_topic);
+
+    // Connect SUB socket
+    let ctx = global_context();
+    let mut subscriber = tmq::subscribe::subscribe(&ctx)
+        .connect(&sub_resp.stream_endpoint)
+        .map_err(|e| anyhow::anyhow!("SUB connect: {}", e))?
+        .subscribe(sub_resp.assigned_topic.as_bytes())
+        .map_err(|e| anyhow::anyhow!("SUB subscribe: {}", e))?;
+
+    subscriber.set_linger(0)?;
+
+    let decryptor = hyprstream_rpc::crypto::notification::BroadcastDecryptor::new(
+        &sub_secret.scalar().to_bytes(),
+        &sub_pub_bytes,
+    );
+
+    let deadline = if timeout_secs > 0 {
+        Some(tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs))
+    } else {
+        None
+    };
+
+    let mut received = 0u64;
+
+    loop {
+        // Check count limit
+        if max_count > 0 && received >= max_count {
+            break;
+        }
+
+        // Receive with optional timeout
+        let multipart = if let Some(dl) = deadline {
+            match tokio::time::timeout_at(dl, subscriber.next()).await {
+                Ok(Some(Ok(msg))) => msg,
+                Ok(Some(Err(e))) => { warn!("SUB error: {}", e); continue; }
+                Ok(None) => break,
+                Err(_) => { eprintln!("Timeout reached"); break; }
+            }
+        } else {
+            match subscriber.next().await {
+                Some(Ok(msg)) => msg,
+                Some(Err(e)) => { warn!("SUB error: {}", e); continue; }
+                None => break,
+            }
+        };
+
+        let frames: Vec<_> = multipart.iter().collect();
+        if frames.len() < 2 { continue; }
+
+        let capnp_data = &frames[1];
+        let payload_data = match parse_stream_block_data(capnp_data) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        let block = match parse_notification_block(&payload_data) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+
+        let plaintext = match decryptor.decrypt(
+            &block.publisher_pubkey,
+            &block.blinding_scalar,
+            &block.wrapped_key,
+            &block.key_nonce,
+            &block.encrypted_payload,
+            &block.nonce,
+            &block.publisher_mac,
+            &block.intent_id,
+            &block.scope,
+        ) {
+            Ok(pt) => pt,
+            Err(e) => { debug!("Decrypt failed: {}", e); continue; }
+        };
+
+        if json_output {
+            // Print raw JSON
+            if let Ok(s) = String::from_utf8(plaintext.clone()) {
+                println!("{}", s);
+            }
+        } else {
+            // Human-readable output
+            match serde_json::from_slice::<EventEnvelope>(&plaintext) {
+                Ok(event) => {
+                    println!("[{}] {} (source: {})",
+                        event.timestamp.format("%H:%M:%S"),
+                        event.topic,
+                        event.source,
+                    );
+                    println!("  {:?}", event.payload);
+                }
+                Err(_) => {
+                    // Not an EventEnvelope, print raw
+                    if let Ok(s) = String::from_utf8(plaintext) {
+                        println!("{}", s);
+                    }
+                }
+            }
+        }
+
+        received += 1;
+    }
+
+    // Clean up
+    let _ = notif_client.unsubscribe(&sub_resp.subscription_id).await;
+    eprintln!("Received {} events", received);
+
+    Ok(())
+}
+
 
 /// Handle unload command - unload a model from memory
 pub async fn handle_unload(

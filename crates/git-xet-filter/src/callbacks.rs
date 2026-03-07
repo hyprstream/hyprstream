@@ -238,6 +238,7 @@ fn smudge_data(payload: &XetFilterPayload, input: &[u8], path: &str) -> Result<V
         .map_err(|e| XetError::new(XetErrorKind::DownloadFailed, format!("Download failed: {e}")))?;
 
     tracing::debug!("XET smudge {}: pointer -> {} bytes", path, content.len());
+    crate::notify_smudge_progress(path);
     Ok(content)
 }
 

@@ -337,14 +337,20 @@ impl CloneProgressReporter {
 
 impl git2db::callback_config::ProgressReporter for CloneProgressReporter {
     fn report(&self, stage: &str, current: usize, total: usize) {
-        // Use blocking_send since we're in a sync context (spawn_blocking)
-        // Log if channel is full instead of silently dropping
-        if let Err(e) = self.sender.blocking_send(hyprstream_rpc::streaming::ProgressUpdate::Progress {
+        // Use try_send to avoid deadlocking the single-threaded runtime
+        // when called from async context (e.g., LFS progress). Progress is best-effort.
+        match self.sender.try_send(hyprstream_rpc::streaming::ProgressUpdate::Progress {
             stage: stage.to_owned(),
             current,
             total,
         }) {
-            tracing::trace!("Progress channel full, dropping update: {}", e);
+            Ok(()) => {},
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                tracing::trace!("Progress channel full, dropping update");
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                tracing::trace!("Progress channel closed");
+            }
         }
     }
 }
@@ -787,6 +793,7 @@ impl RegistryService {
         let handle = registry.repo(&id)?;
         let mut worktrees = handle.get_worktrees().await?;
 
+        let archetype_registry = crate::archetypes::global_registry();
         let mut result = Vec::with_capacity(worktrees.len());
         for wt in &mut worktrees {
             // Extract branch name from worktree path (last component)
@@ -804,12 +811,23 @@ impl RegistryService {
                 .and_then(|s| s.head.map(|h| h.to_string()))
                 .unwrap_or_default();
 
+            // Detect capabilities from worktree path (server-side, same machine as files)
+            let capabilities: Vec<String> = archetype_registry
+                .detect(wt.path())
+                .to_detected_domains()
+                .capabilities
+                .to_ids()
+                .into_iter()
+                .map(std::borrow::ToOwned::to_owned)
+                .collect();
+
             result.push(crate::services::generated::registry_client::WorktreeInfo {
                 path_removed: (), // field removed from schema
                 branch_name,
                 head_oid,
                 is_locked: false,
                 is_dirty,
+                capabilities,
             });
         }
         Ok(result)
@@ -1217,13 +1235,8 @@ impl RegistryService {
         let worktree_path = if let Some(p) = worktree_path {
             p
         } else if worktree == "." || worktree.is_empty() {
-            let repo = handle.open_repo()
-                .map_err(|e| FsError::NotFound(e.to_string()))?;
-            repo.workdir()
-                .map(std::path::Path::to_path_buf)
-                .ok_or_else(|| FsError::NotFound(
-                    format!("worktree '{}' not found for repo '{}'", worktree, repo_id),
-                ))?
+            handle.resolve_worktree_path().await
+                .map_err(|e| FsError::NotFound(e.to_string()))?
         } else {
             return Err(FsError::NotFound(
                 format!("worktree '{}' not found for repo '{}'", worktree, repo_id),
@@ -1290,6 +1303,13 @@ impl RegistryService {
 // ============================================================================
 
 fn tracked_repo_to_data(repo: &TrackedRepository) -> crate::services::generated::registry_client::TrackedRepository {
+    tracked_repo_to_data_with_worktrees(repo, vec![])
+}
+
+fn tracked_repo_to_data_with_worktrees(
+    repo: &TrackedRepository,
+    worktrees: Vec<crate::services::generated::registry_client::WorktreeInfo>,
+) -> crate::services::generated::registry_client::TrackedRepository {
     crate::services::generated::registry_client::TrackedRepository {
         id: repo.id.to_string(),
         name: repo.name.clone().unwrap_or_default(),
@@ -1301,6 +1321,7 @@ fn tracked_repo_to_data(repo: &TrackedRepository) -> crate::services::generated:
         },
         current_oid: repo.current_oid.clone().unwrap_or_default(),
         registered_at: repo.registered_at,
+        worktrees,
     }
 }
 
@@ -1334,13 +1355,40 @@ impl RegistryHandler for RegistryService {
         }
     }
 
-    async fn handle_list(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<RegistryResponseVariant> {
-        match self.handle_list().await {
-            Ok(repos) => Ok(RegistryResponseVariant::ListResult(
-                repos.iter().map(tracked_repo_to_data).collect()
-            )),
-            Err(e) => Ok(reg_error(&e.to_string())),
+    async fn handle_list(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<RegistryResponseVariant> {
+        let repos = match self.handle_list().await {
+            Ok(r) => r,
+            Err(e) => return Ok(reg_error(&e.to_string())),
+        };
+
+        let subject = ctx.subject().to_string();
+        let mut result = Vec::with_capacity(repos.len());
+
+        for repo in &repos {
+            let name = repo.name.clone().unwrap_or_default();
+            if name.is_empty() { continue; }
+
+            // Policy gate: only include repos the caller has at least query access to
+            let resource = format!("model:{}", name);
+            let permitted = self.policy_client
+                .check(&subject, "*", &resource, "query")
+                .await
+                .unwrap_or(true); // default allow if policy service unavailable
+            if !permitted { continue; }
+
+            // Collect worktrees with capabilities (holds registry read lock internally)
+            let worktrees = match self.handle_list_worktrees(&repo.id.to_string()).await {
+                Ok(wts) => wts,
+                Err(e) => {
+                    warn!("Failed to list worktrees for '{}': {}", name, e);
+                    vec![]
+                }
+            };
+
+            result.push(tracked_repo_to_data_with_worktrees(repo, worktrees));
         }
+
+        Ok(RegistryResponseVariant::ListResult(result))
     }
 
     async fn handle_get(&self, _ctx: &EnvelopeContext, _request_id: u64, value: &str) -> Result<RegistryResponseVariant> {
@@ -1678,16 +1726,10 @@ impl CtlHandler for RegistryService {
         let rel_path = self.fid_rel_path(fid, &subject)?;
 
         let id = Self::parse_repo_id(repo_id)?;
-        // Scope the registry lock so it's dropped before blocking git2 ops
-        let repo_path = {
-            let registry = self.registry.read().await;
-            let handle = registry.repo(&id)?;
-            Self::resolve_worktree_path(&handle).await?
-        };
-        let repo = git2::Repository::open(&repo_path)?;
-
-        let status = repo.status_file(std::path::Path::new(&rel_path))?;
-        let state = format!("{:?}", status);
+        let state = self.with_repo_blocking(&id, move |repo| {
+            let status = repo.status_file(std::path::Path::new(&rel_path))?;
+            Ok(format!("{:?}", status))
+        }).await?;
         Ok(FileStatus { state })
     }
 
@@ -1699,61 +1741,54 @@ impl CtlHandler for RegistryService {
         let rel_path = self.fid_rel_path(fid, &subject)?;
 
         let id = Self::parse_repo_id(repo_id)?;
-        let repo_path = {
-            let registry = self.registry.read().await;
-            let handle = registry.repo(&id)?;
-            Self::resolve_worktree_path(&handle).await?
-        };
-        let repo = git2::Repository::open(&repo_path)?;
-
+        let ref_name = data.ref_name.clone();
         let max_count = if data.max_count == 0 { 20 } else { data.max_count as usize };
 
-        // Set up revwalk
-        let mut revwalk = repo.revwalk()?;
-        if data.ref_name.is_empty() {
-            revwalk.push_head()?;
-        } else {
-            let obj = repo.revparse_single(&data.ref_name)?;
-            revwalk.push(obj.id())?;
-        }
-        revwalk.set_sorting(git2::Sort::TIME)?;
-
-        let mut entries = Vec::new();
-        for oid_result in revwalk {
-            if entries.len() >= max_count {
-                break;
-            }
-            let oid = oid_result?;
-            let commit = repo.find_commit(oid)?;
-
-            // Check if this commit touches our file
-            let dominated = if commit.parent_count() == 0 {
-                // Initial commit — check if tree contains the file
-                commit.tree()?.get_path(std::path::Path::new(&rel_path)).is_ok()
+        self.with_repo_blocking(&id, move |repo| {
+            let mut revwalk = repo.revwalk()?;
+            if ref_name.is_empty() {
+                revwalk.push_head()?;
             } else {
-                let parent = commit.parent(0)?;
-                let diff = repo.diff_tree_to_tree(
-                    Some(&parent.tree()?),
-                    Some(&commit.tree()?),
-                    None,
-                )?;
-                diff.deltas().any(|d| {
-                    d.new_file().path().is_some_and(|p| p == std::path::Path::new(&rel_path))
-                    || d.old_file().path().is_some_and(|p| p == std::path::Path::new(&rel_path))
-                })
-            };
-
-            if dominated {
-                let author = commit.author();
-                entries.push(LogEntry {
-                    oid: oid.to_string(),
-                    message: commit.message().unwrap_or("").to_owned(),
-                    author: author.name().unwrap_or("").to_owned(),
-                    timestamp: commit.time().seconds() as u64,
-                });
+                let obj = repo.revparse_single(&ref_name)?;
+                revwalk.push(obj.id())?;
             }
-        }
-        Ok(entries)
+            revwalk.set_sorting(git2::Sort::TIME)?;
+
+            let mut entries = Vec::new();
+            for oid_result in revwalk {
+                if entries.len() >= max_count {
+                    break;
+                }
+                let oid = oid_result?;
+                let commit = repo.find_commit(oid)?;
+
+                let dominated = if commit.parent_count() == 0 {
+                    commit.tree()?.get_path(std::path::Path::new(&rel_path)).is_ok()
+                } else {
+                    let parent = commit.parent(0)?;
+                    let diff = repo.diff_tree_to_tree(
+                        Some(&parent.tree()?),
+                        Some(&commit.tree()?),
+                        None,
+                    )?;
+                    diff.deltas().any(|d| {
+                        d.new_file().path().is_some_and(|p| p == std::path::Path::new(&rel_path))
+                        || d.old_file().path().is_some_and(|p| p == std::path::Path::new(&rel_path))
+                    })
+                };
+
+                if dominated {
+                    let author = commit.author();
+                    entries.push(LogEntry {
+                        oid: oid.to_string(),
+                        message: commit.message().unwrap_or("").to_owned(),
+                        author: author.name().unwrap_or("").to_owned(),
+                        timestamp: commit.time().seconds() as u64,
+                    });
+                }
+            }
+            Ok(entries)
+        }).await
     }
 
     /// Diff this file against a ref.
@@ -1764,39 +1799,35 @@ impl CtlHandler for RegistryService {
         let rel_path = self.fid_rel_path(fid, &subject)?;
 
         let id = Self::parse_repo_id(repo_id)?;
-        let repo_path = {
-            let registry = self.registry.read().await;
-            let handle = registry.repo(&id)?;
-            Self::resolve_worktree_path(&handle).await?
-        };
-        let repo = git2::Repository::open(&repo_path)?;
+        let ref_name = if data.ref_name.is_empty() { "HEAD".to_owned() } else { data.ref_name.clone() };
 
-        let ref_name = if data.ref_name.is_empty() { "HEAD" } else { &data.ref_name };
-        let obj = repo.revparse_single(ref_name)?;
-        let commit = obj.peel_to_commit()?;
-        let tree = commit.tree()?;
+        self.with_repo_blocking(&id, move |repo| {
+            let obj = repo.revparse_single(&ref_name)?;
+            let commit = obj.peel_to_commit()?;
+            let tree = commit.tree()?;
 
-        let mut diff_opts = git2::DiffOptions::new();
-        diff_opts.pathspec(&rel_path);
+            let mut diff_opts = git2::DiffOptions::new();
+            diff_opts.pathspec(&rel_path);
 
-        let diff = repo.diff_tree_to_workdir_with_index(
-            Some(&tree),
-            Some(&mut diff_opts),
-        )?;
+            let diff = repo.diff_tree_to_workdir_with_index(
+                Some(&tree),
+                Some(&mut diff_opts),
+            )?;
 
-        let mut output = String::new();
-        diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
-            let origin = line.origin();
-            if origin == '+' || origin == '-' || origin == ' ' {
-                output.push(origin);
-            }
-            if let Ok(s) = std::str::from_utf8(line.content()) {
-                output.push_str(s);
-            }
-            true
-        })?;
+            let mut output = String::new();
+            diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
+                let origin = line.origin();
+                if origin == '+' || origin == '-' || origin == ' ' {
+                    output.push(origin);
+                }
+                if let Ok(s) = std::str::from_utf8(line.content()) {
+                    output.push_str(s);
+                }
+                true
+            })?;
 
-        Ok(output)
+            Ok(output)
+        }).await
     }
 
     /// Git blame for this file.
@@ -1807,29 +1838,25 @@ impl CtlHandler for RegistryService {
         let rel_path = self.fid_rel_path(fid, &subject)?;
 
         let id = Self::parse_repo_id(repo_id)?;
-        let repo_path = {
-            let registry = self.registry.read().await;
-            let handle = registry.repo(&id)?;
-            Self::resolve_worktree_path(&handle).await?
-        };
-        let repo = git2::Repository::open(&repo_path)?;
 
-        let blame = repo.blame_file(std::path::Path::new(&rel_path), None)?;
+        self.with_repo_blocking(&id, move |repo| {
+            let blame = repo.blame_file(std::path::Path::new(&rel_path), None)?;
 
-        let mut output = String::new();
-        for i in 0..blame.len() {
-            if let Some(hunk) = blame.get_index(i) {
-                let sig = hunk.final_signature();
-                let name = sig.name().unwrap_or("?");
-                let oid = hunk.final_commit_id();
-                let line_start = hunk.final_start_line();
-                let line_count = hunk.lines_in_hunk();
-                use std::fmt::Write;
-                writeln!(output, "{:.8} ({} L{}-{}) ",
-                    oid, name, line_start, line_start + line_count - 1)?;
+            let mut output = String::new();
+            for i in 0..blame.len() {
+                if let Some(hunk) = blame.get_index(i) {
+                    let sig = hunk.final_signature();
+                    let name = sig.name().unwrap_or("?");
+                    let oid = hunk.final_commit_id();
+                    let line_start = hunk.final_start_line();
+                    let line_count = hunk.lines_in_hunk();
+                    use std::fmt::Write;
+                    writeln!(output, "{:.8} ({} L{}-{}) ",
+                        oid, name, line_start, line_start + line_count - 1)?;
+                }
             }
-        }
-        Ok(output)
+            Ok(output)
+        }).await
     }
 
     /// Restore file content from a ref.
@@ -1840,24 +1867,25 @@ impl CtlHandler for RegistryService {
         let rel_path = self.fid_rel_path(fid, &subject)?;
 
         let id = Self::parse_repo_id(repo_id)?;
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&id)?;
-        let repo = handle.open_repo()?;
+        let ref_name = if data.ref_name.is_empty() { "HEAD".to_owned() } else { data.ref_name.clone() };
+        let rel_path_clone = rel_path.clone();
 
-        let ref_name = if data.ref_name.is_empty() { "HEAD" } else { &data.ref_name };
-        let obj = repo.revparse_single(ref_name)?;
-        let commit = obj.peel_to_commit()?;
-        let tree = commit.tree()?;
-        let entry = tree.get_path(std::path::Path::new(&rel_path))?;
-        let blob = repo.find_blob(entry.id())?;
+        let blob_content = self.with_repo_blocking(&id, move |repo| {
+            let obj = repo.revparse_single(&ref_name)?;
+            let commit = obj.peel_to_commit()?;
+            let tree = commit.tree()?;
+            let entry = tree.get_path(std::path::Path::new(&rel_path_clone))?;
+            let blob = repo.find_blob(entry.id())?;
+            Ok(blob.content().to_vec())
+        }).await?;
 
-        // Write blob content to the worktree file
+        // Write blob content to the worktree file (no registry lock held)
         let root = self.get_contained_root(repo_id, name).await
             .map_err(|e| anyhow!("{}", e))?;
         let mut file = root.open(&rel_path, hyprstream_containedfs::OpenMode::OWRITE | hyprstream_containedfs::OpenMode::OTRUNC)
             .map_err(|e| anyhow!("{}", e))?;
         use std::io::Write as _;
-        file.write_all(blob.content())?;
+        file.write_all(&blob_content)?;
         file.flush()?;
 
         Ok(())

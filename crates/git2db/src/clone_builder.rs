@@ -14,6 +14,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// Fast-path flag: set after a successful XET initialization so concurrent
+/// callers skip redundant work without entering `initialize()`.
+///
+/// `xet_filter::initialize()` is internally idempotent (uses
+/// `tokio::sync::OnceCell::get_or_try_init`), so concurrent callers that race
+/// past the fast path won't crash, but they will do redundant work. This OnceLock
+/// avoids the extra overhead.
+#[cfg(feature = "xet-storage")]
+static XET_INITIALIZED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
 /// Automatically initialize XET for URLs that have XET support
 ///
 /// XET endpoint resolution:
@@ -22,9 +32,15 @@ use tokio::sync::RwLock;
 /// 3. None - XET disabled, will use git-lfs
 #[cfg(feature = "xet-storage")]
 async fn maybe_init_xet_for_url(url: &str) -> Git2DBResult<()> {
-    // Check if XET is already initialized
+    // Fast path: a previous call already succeeded.
+    if XET_INITIALIZED.get().is_some() {
+        return Ok(());
+    }
+
+    // Check if XET is already initialized (e.g. initialized by caller before clone).
     if crate::xet_filter::is_initialized() {
         tracing::debug!(url = %url, "XET filter already initialized");
+        let _ = XET_INITIALIZED.set(());
         return Ok(());
     }
 
@@ -43,11 +59,13 @@ async fn maybe_init_xet_for_url(url: &str) -> Git2DBResult<()> {
         );
     }
 
-    // Initialize XET - failures are non-fatal (fallback to Git LFS)
+    // Initialize XET - failures are non-fatal (fallback to Git LFS).
+    // Concurrent callers may all reach here; initialize() is non-fatal on re-entry.
     tracing::info!(url = %url, "Auto-initializing XET filter");
 
     match crate::xet_filter::initialize(config).await {
         Ok(()) => {
+            let _ = XET_INITIALIZED.set(());
             tracing::info!(url = %url, "XET filter initialized successfully");
             Ok(())
         }
@@ -256,26 +274,27 @@ impl CloneBuilder {
         let worktrees_dir = repo_dir.join("worktrees");
 
         // Check for existing bare repo (resume case)
-        let existing_bare_repo = if repo_dir.exists() {
-            match git2::Repository::open_bare(&bare_repo_path) {
-                Ok(repo) => {
-                    tracing::info!("Resuming clone: valid bare repo found at {:?}", bare_repo_path);
-                    Some(repo)
-                }
-                Err(_) => {
-                    tracing::warn!("Removing incomplete/corrupted clone at {:?}", repo_dir);
-                    std::fs::remove_dir_all(&repo_dir).map_err(|e| {
-                        Git2DBError::repository(&repo_dir, format!("Failed to cleanup incomplete clone: {e}"))
+        let existing_valid = if repo_dir.exists() {
+            let bp = bare_repo_path.clone();
+            let rd = repo_dir.clone();
+            tokio::task::spawn_blocking(move || -> Git2DBResult<bool> {
+                if git2::Repository::open_bare(&bp).is_ok() {
+                    tracing::info!("Resuming clone: valid bare repo found at {:?}", bp);
+                    Ok(true)
+                } else {
+                    tracing::warn!("Removing incomplete/corrupted clone at {:?}", rd);
+                    std::fs::remove_dir_all(&rd).map_err(|e| {
+                        Git2DBError::repository(&rd, format!("Failed to cleanup incomplete clone: {e}"))
                     })?;
-                    None
+                    Ok(false)
                 }
-            }
+            }).await.map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))??
         } else {
-            None
+            false
         };
 
         // Create directory structure if fresh clone
-        if existing_bare_repo.is_none() {
+        if !existing_valid {
             std::fs::create_dir_all(&repo_dir).map_err(|e| {
                 Git2DBError::repository(&repo_dir, format!("Failed to create repo directory: {e}"))
             })?;
@@ -285,9 +304,11 @@ impl CloneBuilder {
         }
 
         // ===== Phase 2: No lock - perform network clone =====
-        let bare_repo = if let Some(repo) = existing_bare_repo {
-            repo
-        } else {
+        // Extract progress reporter before callback_config is consumed by clone options
+        let progress_reporter = self.callback_config.as_ref()
+            .and_then(crate::callback_config::CallbackConfig::progress_reporter);
+
+        if !existing_valid {
             tracing::info!("Cloning repository '{}' as bare to {:?}", repo_name, bare_repo_path);
 
             let clone_options = if let Some(config) = self.callback_config.take() {
@@ -300,7 +321,8 @@ impl CloneBuilder {
             let bare_path_clone = bare_repo_path.clone();
 
             // This is the slow network operation - no lock held!
-            tokio::task::spawn_blocking(move || -> Git2DBResult<git2::Repository> {
+            // We discard the returned Repository (it's !Send) and re-open below.
+            tokio::task::spawn_blocking(move || -> Git2DBResult<()> {
                 let mut git2_options = clone_options.to_git2_options();
                 let mut builder = git2::build::RepoBuilder::new();
                 builder.bare(true);
@@ -311,21 +333,31 @@ impl CloneBuilder {
                     .map_err(|e| Git2DBError::repository(
                         &bare_path_clone,
                         format!("Failed to clone bare repository: {e}")
-                    ))
+                    ))?;
+                Ok(())
             })
             .await
-            .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))??
-        };
-
-        // Add additional remotes
-        for (remote_name, remote_url) in &self.remotes {
-            bare_repo.remote(remote_name, remote_url).map_err(|e| {
-                Git2DBError::configuration(format!("Failed to add remote '{remote_name}': {e}"))
-            })?;
+            .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))??;
         }
 
-        // Get default branch and create worktrees
-        let default_branch = get_default_branch(&bare_repo)?;
+        // Post-clone git2 operations: add remotes + detect default branch.
+        // Re-open the bare repo inside spawn_blocking (git2::Repository is !Send).
+        let remotes_clone = self.remotes.clone();
+        let bp = bare_repo_path.clone();
+        let default_branch = tokio::task::spawn_blocking(move || -> Git2DBResult<String> {
+            let repo = git2::Repository::open_bare(&bp)
+                .map_err(|e| Git2DBError::repository(&bp, format!("Failed to open bare repo: {e}")))?;
+            for (remote_name, remote_url) in &remotes_clone {
+                // Use remote_set_url: creates the remote if missing, updates if it exists.
+                // This is idempotent for the resume path where remotes may already exist.
+                repo.remote_set_url(remote_name, remote_url).map_err(|e| {
+                    Git2DBError::configuration(format!("Failed to set remote '{remote_name}': {e}"))
+                })?;
+            }
+            get_default_branch(&repo)
+        })
+        .await
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))??;
         tracing::debug!("Default branch detected: {}", default_branch);
 
         // Validate branch name for path safety (C2 fix)
@@ -343,7 +375,7 @@ impl CloneBuilder {
         }
 
         tracing::info!("Creating default worktree '{}' at {:?}", default_branch, initial_worktree);
-        create_worktree(&driver, &bare_repo_path, &initial_worktree, &default_branch).await?;
+        create_worktree(&driver, &bare_repo_path, &initial_worktree, &default_branch, progress_reporter.clone()).await?;
 
         // Create additional worktree if requested ref differs from default
         let checkout_ref = match &self.reference {
@@ -366,7 +398,7 @@ impl CloneBuilder {
                 })?;
             }
             tracing::info!("Creating worktree for ref '{}'", checkout_ref);
-            create_worktree(&driver, &bare_repo_path, &ref_worktree_path, &checkout_ref).await?;
+            create_worktree(&driver, &bare_repo_path, &ref_worktree_path, &checkout_ref, progress_reporter.clone()).await?;
         }
 
         // Build remote configs
@@ -455,6 +487,7 @@ async fn create_worktree(
     bare_repo_path: &std::path::Path,
     worktree_path: &std::path::Path,
     branch: &str,
+    progress: Option<std::sync::Arc<dyn crate::callback_config::ProgressReporter>>,
 ) -> Git2DBResult<()> {
     // Ensure parent exists
     if let Some(parent) = worktree_path.parent() {
@@ -468,19 +501,20 @@ async fn create_worktree(
         base_repo: bare_repo_path.to_path_buf(),
         worktree_path: worktree_path.to_path_buf(),
         ref_spec: branch.to_owned(),
+        progress: progress.clone(),
     };
 
     match driver.create_worktree(&opts).await {
         Ok(_) => {
-            // LFS fetch (idempotent)
-            crate::repository_handle::RepositoryHandle::fetch_lfs_files(worktree_path).await?;
+            // LFS fetch (idempotent) with progress reporting
+            crate::repository_handle::RepositoryHandle::fetch_lfs_files_with_progress(worktree_path, progress).await?;
             tracing::info!("Created worktree at {:?} for branch '{}'", worktree_path, branch);
             Ok(())
         }
         Err(e) if e.is_worktree_exists() => {
             // Clone resume: worktree already exists, just fetch LFS
             tracing::info!("Worktree already exists at {:?}, fetching LFS files", worktree_path);
-            crate::repository_handle::RepositoryHandle::fetch_lfs_files(worktree_path).await?;
+            crate::repository_handle::RepositoryHandle::fetch_lfs_files_with_progress(worktree_path, progress).await?;
             Ok(())
         }
         Err(e) => Err(Git2DBError::repository(

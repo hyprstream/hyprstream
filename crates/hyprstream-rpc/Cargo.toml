@@ -21,6 +21,7 @@ ed25519-dalek = { workspace = true }
 curve25519-dalek = { workspace = true }  # Ristretto255 DH for stream authentication
 sha2 = { workspace = true }              # Always needed for Ed25519 (Sha512)
 blake3 = { workspace = true }            # Default: fast KDF and MAC
+aes-gcm = { workspace = true }          # AES-256-GCM for notification broadcast encryption
 hkdf = { workspace = true, optional = true }   # FIPS mode only
 hmac = { workspace = true, optional = true }   # FIPS mode only
 zeroize = { workspace = true }

@@ -12,6 +12,8 @@ pub mod gemma;
 pub mod janus;
 pub mod llama;
 pub mod qwen;
+pub mod qwen3_5;
+pub mod qwen3_5_vision;
 pub mod siglip;
 // LoRA adapter moved to lora module
 
@@ -65,6 +67,8 @@ pub enum ModelArchitecture {
         /// Whether model supports image generation (VQ-VAE)
         has_generation: bool,
     },
+    /// Alibaba Qwen3.5 hybrid GatedDeltaNet/full-attention (dense and MoE variants)
+    Qwen3_5,
     /// Custom/unknown architecture
     Custom(String),
 }
@@ -119,6 +123,7 @@ impl ModelArchitecture {
             Self::GPTNeoX => "GPT-NeoX".to_owned(),
             Self::GPTOSS { total_params_b, .. } => format!("GPT-OSS-{total_params_b}B"),
             Self::GPTJ => "GPT-J".to_owned(),
+            Self::Qwen3_5 => "Qwen3_5".to_owned(),
             Self::Janus { vision_encoder, has_generation, .. } => {
                 let encoder_type = match vision_encoder {
                     VisionEncoderType::SigLIP { .. } => "SigLIP",
@@ -183,7 +188,7 @@ pub trait ModelOperations: Send {
 
         // Return appropriate config based on architecture
         match self.architecture() {
-            ModelArchitecture::Qwen { .. } => Box::new(QwenTokenizerConfig),
+            ModelArchitecture::Qwen { .. } | ModelArchitecture::Qwen3_5 => Box::new(QwenTokenizerConfig),
             ModelArchitecture::Llama { .. } => Box::new(LlamaTokenizerConfig),
             ModelArchitecture::Gemma => Box::new(GemmaTokenizerConfig),
             ModelArchitecture::Janus { base_architecture, .. } => {

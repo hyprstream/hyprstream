@@ -14,6 +14,8 @@ enum ScopeAction {
   train @4;
   serve @5;
   context @6;
+  subscribe @7;
+  publish @8;
 }
 
 # MCP tool description - used for method-level documentation

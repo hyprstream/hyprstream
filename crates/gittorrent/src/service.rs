@@ -593,33 +593,33 @@ impl GitTorrentService {
     async fn scan_repository(&self, repo_path: &Path) -> Result<RepositoryMetadata> {
         use crate::git::objects::{extract_objects, GitObjectType};
 
-        // Open repository with git2
-        let repo = git2::Repository::open(repo_path)?;
+        // Open repository in spawn_blocking (git2::Repository is !Send)
+        let path = repo_path.to_path_buf();
+        let (branches, root_commits) = crate::git::with_repo_blocking(path, |repo| {
+            let mut branches = HashMap::new();
+            let mut root_commits = HashMap::new();
 
-        let mut branches = HashMap::new();
-        let mut root_commits = HashMap::new();
+            let refs = repo.references()?;
+            for reference in refs {
+                let reference = reference?;
+                if let Some(name) = reference.shorthand() {
+                    if let Some(target) = reference.target() {
+                        let hash_str = format!("{:0>64}", target.to_string());
+                        if let Ok(sha256) = Sha256Hash::new(hash_str) {
+                            branches.insert(name.to_owned(), sha256.clone());
 
-        // Get all references
-        let refs = repo.references()?;
-        for reference in refs {
-            let reference = reference?;
-            if let Some(name) = reference.shorthand() {
-                if let Some(target) = reference.target() {
-                    // Convert git2::Oid to SHA256 (this would need actual SHA256 support in git2)
-                    let hash_str = format!("{:0>64}", target.to_string());
-                    if let Ok(sha256) = Sha256Hash::new(hash_str) {
-                        branches.insert(name.to_owned(), sha256.clone());
-
-                        // If this is a branch (not a tag), add to root commits
-                        if reference.is_branch() {
-                            root_commits.insert(name.to_owned(), sha256);
+                            if reference.is_branch() {
+                                root_commits.insert(name.to_owned(), sha256);
+                            }
                         }
                     }
                 }
             }
-        }
 
-        // Extract all objects to get complete metadata
+            Ok((branches, root_commits))
+        }).await?;
+
+        // Extract all objects to get complete metadata (async)
         let objects = extract_objects(repo_path).await?;
         let mut object_hashes = Vec::new();
         let mut object_stats = ObjectStats::default();
@@ -671,33 +671,33 @@ impl GitTorrentService {
         // Reconstruct repository from individual objects
         self.reconstruct_repository(&metadata.object_hashes, local_path).await?;
 
-        // Open the reconstructed repository to set up refs
-        let repo = git2::Repository::open(local_path)?;
-
-        // Create refs for branches
-        for (branch_name, commit_hash) in &metadata.branches {
-            // Convert hash back to git2::Oid
-            if let Ok(oid) = git2::Oid::from_str(commit_hash.as_str()) {
-                let ref_name = format!("refs/heads/{branch_name}");
-
-                // Create the reference
-                if let Err(e) = repo.reference(&ref_name, oid, false, "Initial clone") {
-                    tracing::warn!("Failed to create ref {}: {}", ref_name, e);
+        // Set up refs in spawn_blocking (git2::Repository is !Send)
+        let path = local_path.to_path_buf();
+        let branches = metadata.branches.clone();
+        let object_count = metadata.object_hashes.len();
+        crate::git::with_repo_blocking(path, move |repo| {
+            for (branch_name, commit_hash) in &branches {
+                if let Ok(oid) = git2::Oid::from_str(commit_hash.as_str()) {
+                    let ref_name = format!("refs/heads/{branch_name}");
+                    if let Err(e) = repo.reference(&ref_name, oid, false, "Initial clone") {
+                        tracing::warn!("Failed to create ref {}: {}", ref_name, e);
+                    }
                 }
             }
-        }
 
-        // Set HEAD to the default branch
-        if let Some(main_commit) = metadata.branches.get("main").or_else(|| metadata.branches.get("master")) {
-            if let Ok(oid) = git2::Oid::from_str(main_commit.as_str()) {
-                if let Err(e) = repo.set_head_detached(oid) {
-                    tracing::warn!("Failed to set HEAD: {}", e);
+            if let Some(main_commit) = branches.get("main").or_else(|| branches.get("master")) {
+                if let Ok(oid) = git2::Oid::from_str(main_commit.as_str()) {
+                    if let Err(e) = repo.set_head_detached(oid) {
+                        tracing::warn!("Failed to set HEAD: {}", e);
+                    }
                 }
             }
-        }
+
+            Ok(())
+        }).await?;
 
         tracing::info!("Created local repository at {:?} with {} objects",
-                      local_path, metadata.object_hashes.len());
+                      local_path, object_count);
         Ok(())
     }
 }

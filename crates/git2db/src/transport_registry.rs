@@ -28,10 +28,20 @@
 use crate::errors::Git2DBError;
 use crate::transport::{BoxedSubtransport, TransportFactory};
 use git2::transport::Transport;
+use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
+
+/// Process-wide mutex serializing all calls to `git2::transport::register`.
+///
+/// libgit2's transport list is a global linked list with no internal lock —
+/// concurrent registration from different schemes (each holding only their
+/// own per-scheme lock) causes heap corruption. This mutex ensures only one
+/// thread calls `git2::transport::register` at a time.
+static GIT2_TRANSPORT_REGISTER_LOCK: Lazy<Mutex<()>> =
+    Lazy::new(|| Mutex::new(()));
 
 /// Thread-safe transport registry with proper lifecycle management
 pub struct TransportRegistry {
@@ -252,9 +262,11 @@ impl TransportRegistry {
 
         // SAFETY:
         // - factory is Arc<dyn TransportFactory> which is Send + Sync + 'static
-        // - We hold a registration lock preventing concurrent calls for this scheme
+        // - GIT2_TRANSPORT_REGISTER_LOCK serializes all calls globally (per-scheme lock
+        //   alone is insufficient because two different schemes hold different locks)
         // - The closure captures factory in an Arc, ensuring proper lifetime
         // - git2::transport::register is unsafe due to global state, but we synchronize access
+        let _global_guard = GIT2_TRANSPORT_REGISTER_LOCK.lock();
         unsafe {
             git2::transport::register(scheme, move |remote| {
                 let url = remote.url().unwrap_or("");

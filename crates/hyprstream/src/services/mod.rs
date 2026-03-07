@@ -81,6 +81,7 @@ pub mod generated;
 pub mod inference;
 pub mod mcp_service;
 pub mod model;
+pub mod notification;
 pub mod oauth;
 pub mod oai;
 pub mod policy;
@@ -121,7 +122,7 @@ pub use registry::RegistryService;
 pub use policy::PolicyService;
 pub use generated::policy_client::PolicyClient;
 pub use model::{
-    LoadedModelInfo, ModelHealthInfo, ModelService, ModelServiceConfig, ModelStatusInfo,
+    ModelHealthInfo, ModelService, ModelServiceConfig, ModelStatusEntry, ModelStatusInfo,
     ModelZmqClient, MODEL_ENDPOINT,
 };
 pub use stream::StreamService;
@@ -132,4 +133,6 @@ pub use flight::FlightService;
 pub use callback::{CallbackRouter, Instance};
 pub use discovery::DiscoveryService;
 pub use generated::discovery_client::DiscoveryClient;
+pub use notification::{NotificationPublisher, NotificationService};
+pub use generated::notification_client::NotificationClient;
 pub use mcp_service::{McpConfig, McpService};

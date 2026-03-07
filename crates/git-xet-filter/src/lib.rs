@@ -42,8 +42,52 @@ pub mod ssh_client;
 #[cfg(feature = "xet-storage")]
 use tokio::sync::OnceCell;
 
-#[cfg(feature = "xet-storage")]
 use std::sync::Arc;
+use std::cell::{Cell, RefCell};
+
+/// Callback invoked on each smudge (download) operation during checkout.
+///
+/// Arguments: `(files_completed, file_path)`
+/// Called from libgit2 filter callbacks (sync context, inside `spawn_blocking`).
+pub type SmudgeProgressCallback = dyn Fn(usize, &str) + Send + Sync;
+
+thread_local! {
+    /// Per-thread smudge progress hook — set before worktree checkout, cleared after.
+    /// Thread-local ensures concurrent checkouts on different `spawn_blocking` threads
+    /// don't interfere with each other.
+    static SMUDGE_HOOK: RefCell<Option<Arc<SmudgeProgressCallback>>> = const { RefCell::new(None) };
+
+    /// Per-thread counter of smudge operations completed (reset on set_smudge_progress).
+    static SMUDGE_COUNT: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Set a callback to receive per-file smudge progress during checkout.
+/// Resets the internal counter to 0.
+///
+/// Uses thread-local storage, so each `spawn_blocking` thread gets its own
+/// independent hook. Safe for concurrent checkouts.
+pub fn set_smudge_progress(callback: Arc<SmudgeProgressCallback>) {
+    SMUDGE_COUNT.with(|c| c.set(0));
+    SMUDGE_HOOK.with(|h| *h.borrow_mut() = Some(callback));
+}
+
+/// Clear the smudge progress callback for the current thread.
+pub fn clear_smudge_progress() {
+    SMUDGE_HOOK.with(|h| *h.borrow_mut() = None);
+}
+
+/// Called internally after each successful smudge operation.
+pub(crate) fn notify_smudge_progress(path: &str) {
+    SMUDGE_COUNT.with(|c| {
+        let count = c.get() + 1;
+        c.set(count);
+        SMUDGE_HOOK.with(|h| {
+            if let Some(ref cb) = *h.borrow() {
+                cb(count, path);
+            }
+        });
+    });
+}
 
 pub use config::{XetConfig, HUGGINGFACE_XET_ENDPOINT};
 pub use error::{Result, XetError, XetErrorKind};

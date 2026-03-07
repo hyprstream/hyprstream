@@ -33,15 +33,15 @@ struct DiscoveryRequest {
     # Text parameter filters by service name (empty = all services)
     getAuthMetadata @5 :Text $mcpScope(query) $mcpDescription("Get OAuth protected resource metadata for services");
 
-    # Register or retrieve a named stream (idempotent).
-    # Returns stream endpoints, topic, and MAC key for pub/sub.
-    prepareStream @6 :StreamPrepareRequest $mcpScope(write) $mcpDescription("Register or retrieve a named stream with topic and MAC key");
+    # Removed: prepareStream (was insecure — bypassed DH key exchange).
+    # Use StreamChannel::prepare_stream for authenticated streaming.
+    prepareStream @6 :Void;
 
-    # Get an existing named stream by name
-    getStream @7 :Text $mcpScope(query) $mcpDescription("Get stream endpoints by name");
+    # Removed: getStream
+    getStream @7 :Void;
 
-    # List all registered streams
-    listStreams @8 :Void $mcpScope(query) $mcpDescription("List all registered named streams");
+    # Removed: listStreams
+    listStreams @8 :Void;
   }
 }
 
@@ -71,14 +71,14 @@ struct DiscoveryResponse {
     # Auth metadata result (for getAuthMetadata)
     getAuthMetadataResult @6 :AuthMetadataList;
 
-    # Stream registration result (for prepareStream)
-    prepareStreamResult @7 :StreamEndpoints;
+    # Removed: prepareStreamResult
+    prepareStreamResult @7 :Void;
 
-    # Get stream result (for getStream)
-    getStreamResult @8 :StreamEndpoints;
+    # Removed: getStreamResult
+    getStreamResult @8 :Void;
 
-    # List streams result (for listStreams)
-    listStreamsResult @9 :StreamEndpointsList;
+    # Removed: listStreamsResult
+    listStreamsResult @9 :Void;
   }
 }
 
@@ -148,35 +148,3 @@ struct AuthMetadataList {
   services @0 :List(AuthMetadata);
 }
 
-# =============================================================================
-# Stream Registration (named streams for pub/sub coordination)
-# =============================================================================
-
-# Request to register or retrieve a named stream
-struct StreamPrepareRequest {
-  # Logical stream name (e.g. "telemetry", "vision", "commands")
-  name @0 :Text;
-  # TTL for topic registration in seconds
-  expirationSecs @1 :Int64;
-}
-
-# Stream endpoints and credentials for pub/sub access
-struct StreamEndpoints {
-  # Logical stream name
-  name @0 :Text;
-  # Unique stream identifier
-  streamId @1 :Text;
-  # Topic string (64-char hex, registered with StreamService)
-  topic @2 :Text;
-  # PUSH socket address for publishers
-  pushEndpoint @3 :Text;
-  # SUB socket address for subscribers
-  subEndpoint @4 :Text;
-  # HMAC key for chain integrity (32 bytes)
-  macKey @5 :Data;
-}
-
-# List of stream endpoints
-struct StreamEndpointsList {
-  streams @0 :List(StreamEndpoints);
-}

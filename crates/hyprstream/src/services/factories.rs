@@ -684,3 +684,23 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
 
     Ok(ctx.into_spawnable_quic(discovery_service, config.discovery.quic_port))
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Notification Service Factory
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Factory for NotificationService (blind relay with broadcast encryption)
+#[service_factory("notification", schema = "../../schema/notification.capnp", metadata = crate::services::generated::notification_client::schema_metadata)]
+fn create_notification_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+    info!("Creating NotificationService");
+
+    let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::local());
+
+    let notification_service = crate::services::NotificationService::new(
+        Arc::new(ctx.signing_key().clone()),
+        global_context(),
+        ctx.transport("notification", SocketKind::Rep),
+    ).with_policy_client(policy_client);
+
+    Ok(ctx.into_spawnable(notification_service))
+}

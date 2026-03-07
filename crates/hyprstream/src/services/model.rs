@@ -34,20 +34,21 @@ use crate::runtime::kv_quant::KVQuantType;
 use crate::runtime::RuntimeConfig;
 use crate::services::{
     rpc_types::StreamInfo, EnvelopeContext, InferenceZmqClient,
-    PolicyClient,
+    NotificationClient, NotificationPublisher, PolicyClient,
 };
 use crate::services::GenRegistryClient;
+use hyprstream_rpc::envelope::RequestIdentity;
 use crate::storage::ModelRef;
 use anyhow::{anyhow, Result};
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::{global as registry, SocketKind};
 use hyprstream_rpc::transport::TransportConfig;
 use lru::LruCache;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 /// Default endpoint for the model service
@@ -134,24 +135,21 @@ impl Default for ModelServiceConfig {
     }
 }
 
-/// Model service that manages InferenceService lifecycle
-///
-/// Runs on multi-threaded runtime. Manages an LRU cache of loaded models,
-/// spawning and stopping InferenceService instances as needed.
-///
-/// Supports two modes:
-/// - InProcess: Runs InferenceService in the same process (default)
-/// - Spawned: Spawns InferenceService as separate process via callback pattern
-pub struct ModelService {
+/// Inner state for ModelService, behind Arc for continuation capture.
+pub struct ModelServiceInner {
     // Business logic
     /// LRU cache of loaded models
     loaded_models: RwLock<LruCache<String, LoadedModel>>,
+    /// Models currently being loaded (accepted but not yet in LRU cache)
+    pending_loads: Mutex<HashSet<String>>,
     /// Service configuration
     config: ModelServiceConfig,
     /// Ed25519 signing key for creating InferenceZmqClients
     signing_key: SigningKey,
     /// Policy client for authorization checks in InferenceService
     policy_client: PolicyClient,
+    /// Notification publisher for model lifecycle events
+    notification_publisher: NotificationPublisher,
     /// Registry client for resolving model paths
     registry: GenRegistryClient,
     /// Callback router for spawned mode (None for in-process)
@@ -165,6 +163,30 @@ pub struct ModelService {
     transport: TransportConfig,
     /// Expected JWT audience for token validation (RFC 8707).
     expected_audience: Option<String>,
+}
+
+/// Model service that manages InferenceService lifecycle.
+///
+/// Wraps `ModelServiceInner` in `Arc` so continuations can capture a cheap
+/// clone. All field access is transparent via `Deref`.
+///
+/// Load requests are handled asynchronously: the request loop returns an
+/// immediate "accepted" response and spawns the actual model loading as a
+/// `Continuation` (via `spawn_local`), keeping the service responsive for
+/// list, health, info, and other requests during long GPU weight transfers.
+pub struct ModelService {
+    inner: Arc<ModelServiceInner>,
+}
+
+impl Clone for ModelService {
+    fn clone(&self) -> Self {
+        Self { inner: Arc::clone(&self.inner) }
+    }
+}
+
+impl std::ops::Deref for ModelService {
+    type Target = ModelServiceInner;
+    fn deref(&self) -> &Self::Target { &self.inner }
 }
 
 impl ModelService {
@@ -184,23 +206,35 @@ impl ModelService {
         };
         let cache_size = NonZeroUsize::new(config.max_models).unwrap_or(DEFAULT_CACHE_SIZE);
 
-        Self {
+        let notif_client = NotificationClient::new(signing_key.clone(), RequestIdentity::local());
+        let notification_publisher = NotificationPublisher::new(notif_client, signing_key.clone());
+
+        Self { inner: Arc::new(ModelServiceInner {
             loaded_models: RwLock::new(LruCache::new(cache_size)),
+            pending_loads: Mutex::new(HashSet::new()),
             config,
             signing_key,
             policy_client,
+            notification_publisher,
             registry,
             callback_router: None,
             spawned_instances: RwLock::new(HashMap::new()),
             context,
             transport,
             expected_audience: None,
-        }
+        })}
     }
 
     /// Set the expected JWT audience for token validation.
+    ///
+    /// # Panics
+    /// Panics if called after the service has been cloned (Arc refcount > 1).
+    /// Must be called during construction, before the service is shared.
+    #[allow(clippy::expect_used)]
     pub fn with_expected_audience(mut self, audience: String) -> Self {
-        self.expected_audience = Some(audience);
+        Arc::get_mut(&mut self.inner)
+            .expect("with_expected_audience must be called before service is shared")
+            .expected_audience = Some(audience);
         self
     }
 
@@ -220,18 +254,23 @@ impl ModelService {
         };
         let cache_size = NonZeroUsize::new(config.max_models).unwrap_or(DEFAULT_CACHE_SIZE);
 
-        Self {
+        let notif_client = NotificationClient::new(signing_key.clone(), RequestIdentity::local());
+        let notification_publisher = NotificationPublisher::new(notif_client, signing_key.clone());
+
+        Self { inner: Arc::new(ModelServiceInner {
             loaded_models: RwLock::new(LruCache::new(cache_size)),
+            pending_loads: Mutex::new(HashSet::new()),
             config,
             signing_key,
             policy_client,
+            notification_publisher,
             registry,
             callback_router: Some(callback_router),
             spawned_instances: RwLock::new(HashMap::new()),
             context,
             transport,
             expected_audience: None,
-        }
+        })}
     }
 
     /// Load a model by reference with optional per-model config, returns the inference endpoint
@@ -331,7 +370,6 @@ impl ModelService {
                     runtime_config.clone(),
                     self.signing_key.verifying_key(),
                     self.signing_key.clone(),
-                    self.policy_client.clone(),
                     Arc::clone(&zmq_ctx),
                     worker_transport.clone(),
                     fs.clone(),
@@ -356,7 +394,6 @@ impl ModelService {
                 runtime_config,
                 self.signing_key.verifying_key(),
                 self.signing_key.clone(),
-                self.policy_client.clone(),
                 zmq_ctx,
                 transport,
                 fs,
@@ -432,24 +469,81 @@ impl ModelService {
         if let Some((_, mut model)) = cache.pop_entry(model_ref_str) {
             info!("Unloading model {}", model_ref_str);
             let _ = model.service_handle.stop().await;
+            let model_name = model_ref_str.split(':').next().unwrap_or(model_ref_str);
+            let scope = format!("serve:model:{}", model_name);
+            let event = crate::events::EventEnvelope::new(
+                crate::events::EventSource::Model,
+                scope.clone(),
+                crate::events::EventPayload::ModelUnloaded {
+                    model_ref: model_ref_str.to_owned(),
+                },
+            );
+            if let Ok(payload) = serde_json::to_vec(&event) {
+                let _ = self.notification_publisher.publish(&scope, &payload).await;
+            }
             Ok(())
         } else {
             Err(anyhow!("Model {} is not loaded", model_ref_str))
         }
     }
 
-    /// List loaded models
-    async fn list_models(&self) -> Vec<LoadedModelInfo> {
+    /// Return status entries for all known models (loaded + loading).
+    /// Absence from this list means unloaded.
+    async fn model_status_all(&self) -> Vec<ModelStatusEntry> {
         let cache = self.loaded_models.read().await;
-        cache
+        let pending = self.pending_loads.lock().await;
+        let mut entries: Vec<ModelStatusEntry> = cache
             .iter()
-            .map(|(_, model)| LoadedModelInfo {
+            .map(|(_, model)| ModelStatusEntry {
                 model_ref: model.model_ref.clone(),
+                status: "loaded".to_owned(),
                 endpoint: model.endpoint.clone(),
                 loaded_at: model.loaded_at.elapsed().as_millis() as i64,
                 last_used: model.last_used.elapsed().as_millis() as i64,
+                online_training_config: model.ttt_config.as_ref().map(OnlineTrainingConfigInfo::from),
             })
-            .collect()
+            .collect();
+        for model_ref in pending.iter() {
+            if !cache.contains(model_ref) {
+                entries.push(ModelStatusEntry {
+                    model_ref: model_ref.clone(),
+                    status: "loading".to_owned(),
+                    endpoint: String::new(),
+                    loaded_at: 0,
+                    last_used: 0,
+                    online_training_config: None,
+                });
+            }
+        }
+        entries
+    }
+
+    /// Return status entry for a specific model ref (0 or 1 element).
+    async fn model_status_single(&self, model_ref_str: &str) -> Vec<ModelStatusEntry> {
+        let cache = self.loaded_models.read().await;
+        if let Some(model) = cache.peek(model_ref_str) {
+            return vec![ModelStatusEntry {
+                model_ref: model_ref_str.to_owned(),
+                status: "loaded".to_owned(),
+                endpoint: model.endpoint.clone(),
+                loaded_at: model.loaded_at.elapsed().as_millis() as i64,
+                last_used: model.last_used.elapsed().as_millis() as i64,
+                online_training_config: model.ttt_config.as_ref().map(OnlineTrainingConfigInfo::from),
+            }];
+        }
+        let pending = self.pending_loads.lock().await;
+        if pending.contains(model_ref_str) {
+            vec![ModelStatusEntry {
+                model_ref: model_ref_str.to_owned(),
+                status: "loading".to_owned(),
+                endpoint: String::new(),
+                loaded_at: 0,
+                last_used: 0,
+                online_training_config: None,
+            }]
+        } else {
+            vec![]
+        }
     }
 
     /// Get model status
@@ -612,7 +706,9 @@ impl ModelService {
 use crate::services::generated::model_client::{
     ModelHandler, TttHandler, AdapterHandler, InferHandler,
     dispatch_model, serialize_response, ModelResponseVariant,
-    LoadedModelResponse, ErrorInfo, ModelListResponse, ModelHealthStatus,
+    LoadedModelResponse, ErrorInfo, ModelHealthStatus,
+    StatusRequest,
+    ModelStatusEntry as GenModelStatusEntry, OnlineTrainingConfig as GenOnlineTrainingConfig,
     // Top-level request types
     LoadModelRequest, UnloadModelRequest, KVQuantTypeEnum,
     // TTT types
@@ -1080,20 +1176,33 @@ impl ModelHandler for ModelService {
         }
     }
 
-    async fn handle_list(
+    async fn handle_status(
         &self, _ctx: &EnvelopeContext, _request_id: u64,
+        data: &StatusRequest,
     ) -> Result<ModelResponseVariant> {
-        let models = self.list_models().await;
-        Ok(ModelResponseVariant::ListResult(ModelListResponse {
-            models: models.into_iter().map(|m| crate::services::generated::model_client::LoadedModelInfo {
+        let entries = if data.model_ref.is_empty() {
+            self.model_status_all().await
+        } else {
+            self.model_status_single(&data.model_ref).await
+        };
+        Ok(ModelResponseVariant::StatusResult(entries.into_iter().map(|m| {
+            let ttt = m.online_training_config.map(|c| GenOnlineTrainingConfig {
+                enabled: c.enabled,
+                learning_rate: c.learning_rate,
+                gradient_steps: c.gradient_steps as u32,
+                max_grad_norm: c.max_grad_norm,
+                min_input_length: c.min_input_length as u32,
+                max_ttt_context: c.max_ttt_context as u32,
+            }).unwrap_or_default();
+            GenModelStatusEntry {
                 model_ref: m.model_ref,
+                status: m.status,
                 endpoint: m.endpoint,
                 loaded_at: m.loaded_at,
                 last_used: m.last_used,
-                memory_bytes: 0,
-                session_count: 0,
-            }).collect(),
-        }))
+                online_training_config: ttt,
+            }
+        }).collect()))
     }
 
     async fn handle_health_check(
@@ -1113,6 +1222,63 @@ impl ModelHandler for ModelService {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Load request interception — parse capnp to detect load before dispatch
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Parsed load request data extracted from Cap'n Proto payload.
+struct ParsedLoadRequest {
+    model_ref: String,
+    max_context: u32,
+    kv_quant: crate::model_capnp::KVQuantType,
+}
+
+impl ParsedLoadRequest {
+    fn to_config(&self) -> Option<ModelLoadConfig> {
+        use crate::model_capnp::KVQuantType as CKV;
+        let max_ctx = match self.max_context {
+            0 => None,
+            n => Some(n as usize),
+        };
+        let kv_q = match self.kv_quant {
+            CKV::Int8 => Some(KVQuantType::Int8),
+            CKV::Nf4 => Some(KVQuantType::Nf4),
+            CKV::Fp4 => Some(KVQuantType::Fp4),
+            CKV::None => None,
+        };
+        if max_ctx.is_some() || kv_q.is_some() {
+            Some(ModelLoadConfig { max_context: max_ctx, kv_quant: kv_q, num_inference_instances: None })
+        } else {
+            None
+        }
+    }
+}
+
+impl ModelService {
+    /// Try to parse a load request from the raw Cap'n Proto payload.
+    /// Returns `None` for all other request variants (list, unload, health, scoped, etc.).
+    fn try_parse_load_request(payload: &[u8]) -> Option<(u64, ParsedLoadRequest)> {
+        use crate::model_capnp::model_request;
+        use crate::model_capnp::KVQuantType as CKV;
+        let reader = capnp::serialize::read_message(
+            &mut std::io::Cursor::new(payload),
+            capnp::message::ReaderOptions::new(),
+        ).ok()?;
+        let req = reader.get_root::<model_request::Reader>().ok()?;
+        let request_id = req.get_id();
+        match req.which().ok()? {
+            model_request::Which::Load(data) => {
+                let data = data.ok()?;
+                let model_ref = data.get_model_ref().ok()?.to_str().ok()?.to_owned();
+                let max_context = data.get_max_context();
+                let kv_quant = data.get_kv_quant().unwrap_or(CKV::None);
+                Some((request_id, ParsedLoadRequest { model_ref, max_context, kv_quant }))
+            }
+            _ => None,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // ZmqService Implementation — delegates to generated dispatch_model
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1124,6 +1290,93 @@ impl crate::services::ZmqService for ModelService {
             ctx.subject(),
             ctx.request_id
         );
+
+        // Intercept load requests to avoid blocking the request loop.
+        // Model loading can take 60s+ (weight transfer to GPU), which would
+        // block all other model service requests (list, health, info, etc.).
+        // Instead, return an immediate "accepted" response and do the actual
+        // load in a Continuation (spawned via spawn_local after the REP is sent).
+        if let Some((request_id, load_data)) = Self::try_parse_load_request(payload) {
+            // Fast path: if already loaded, return immediately
+            {
+                let mut cache = self.loaded_models.write().await;
+                if let Some(model) = cache.get_mut(&load_data.model_ref) {
+                    model.last_used = Instant::now();
+                    let response = serialize_response(request_id, &ModelResponseVariant::LoadResult(
+                        LoadedModelResponse {
+                            model_ref: load_data.model_ref.clone(),
+                            endpoint: model.endpoint.clone(),
+                        },
+                    ))?;
+                    return Ok((response, None));
+                }
+            }
+
+            // Slow path: return "accepted" immediately, load in continuation
+            let model_ref = load_data.model_ref.clone();
+            info!("Load request accepted for {} (async)", model_ref);
+
+            // Predict the endpoint so we can return it in the response
+            let safe_name = model_ref.replace([':', '/', '\\'], "-");
+            let service_name = format!("inference-{safe_name}");
+            let predicted_endpoint = hyprstream_rpc::registry::global()
+                .endpoint(&service_name, SocketKind::Rep)
+                .to_zmq_string();
+
+            let response = serialize_response(request_id, &ModelResponseVariant::LoadResult(
+                LoadedModelResponse {
+                    model_ref: model_ref.clone(),
+                    endpoint: predicted_endpoint,
+                },
+            ))?;
+
+            // Mark as loading before spawning continuation
+            self.pending_loads.lock().await.insert(model_ref.clone());
+
+            let service = self.clone(); // Arc clone — cheap, 'static
+            let config = load_data.to_config();
+            let continuation: crate::services::Continuation = Box::pin(async move {
+                let model_name = model_ref.split(':').next().unwrap_or(&model_ref);
+                let scope = format!("serve:model:{}", model_name);
+                match service.load_model(&model_ref, config).await {
+                    Ok(endpoint) => {
+                        service.pending_loads.lock().await.remove(&model_ref);
+                        info!("Model {} loaded successfully at {}", model_ref, endpoint);
+                        let event = crate::events::EventEnvelope::new(
+                            crate::events::EventSource::Model,
+                            scope.clone(),
+                            crate::events::EventPayload::ModelLoaded {
+                                model_ref: model_ref.clone(),
+                                endpoint,
+                            },
+                        );
+                        if let Ok(payload) = serde_json::to_vec(&event) {
+                            let n = service.notification_publisher.publish(&scope, &payload).await
+                                .unwrap_or(0);
+                            debug!("Published model.loaded to {} subscriber(s)", n);
+                        }
+                    }
+                    Err(e) => {
+                        service.pending_loads.lock().await.remove(&model_ref);
+                        warn!("Model {} failed to load: {}", model_ref, e);
+                        let event = crate::events::EventEnvelope::new(
+                            crate::events::EventSource::Model,
+                            scope.clone(),
+                            crate::events::EventPayload::ModelFailed {
+                                model_ref: model_ref.clone(),
+                                error: e.to_string(),
+                            },
+                        );
+                        if let Ok(payload) = serde_json::to_vec(&event) {
+                            let _ = service.notification_publisher.publish(&scope, &payload).await;
+                        }
+                    }
+                }
+            });
+
+            return Ok((response, Some(continuation)));
+        }
+
         dispatch_model(self, ctx, payload).await
     }
 
@@ -1161,13 +1414,16 @@ impl crate::services::ZmqService for ModelService {
 // Helper types
 // ============================================================================
 
-/// Information about a loaded model (for list response)
+/// Status entry for a single model (loaded or loading).
+/// Absence from a status-all response means unloaded.
 #[derive(Clone)]
-pub struct LoadedModelInfo {
+pub struct ModelStatusEntry {
     pub model_ref: String,
+    pub status: String,  // "loaded" | "loading"
     pub endpoint: String,
     pub loaded_at: i64,
     pub last_used: i64,
+    pub online_training_config: Option<OnlineTrainingConfigInfo>,
 }
 
 /// Online training (TTT) configuration information
@@ -1258,19 +1514,36 @@ impl ModelZmqClient {
         self.gen.unload(model_ref).await
     }
 
-    /// List loaded models — delegates to generated client
-    pub async fn list(&self) -> Result<Vec<LoadedModelInfo>> {
-        let data = self.gen.list().await?;
-        Ok(data.models.into_iter().map(|m| LoadedModelInfo {
-            model_ref: m.model_ref,
-            endpoint: m.endpoint,
-            loaded_at: m.loaded_at,
-            last_used: m.last_used,
+    /// Get status of all known models (model_ref = "") or a specific model.
+    /// Absence from the result means the model is unloaded.
+    pub async fn status(&self, model_ref: &str) -> Result<Vec<ModelStatusEntry>> {
+        let data = self.gen.status(model_ref).await?;
+        Ok(data.into_iter().map(|m| {
+            let ttt = if m.online_training_config.enabled {
+                Some(OnlineTrainingConfigInfo {
+                    enabled: m.online_training_config.enabled,
+                    learning_rate: m.online_training_config.learning_rate,
+                    gradient_steps: m.online_training_config.gradient_steps as usize,
+                    max_grad_norm: m.online_training_config.max_grad_norm,
+                    min_input_length: m.online_training_config.min_input_length as usize,
+                    max_ttt_context: m.online_training_config.max_ttt_context as usize,
+                })
+            } else {
+                None
+            };
+            ModelStatusEntry {
+                model_ref: m.model_ref,
+                status: m.status,
+                endpoint: m.endpoint,
+                loaded_at: m.loaded_at,
+                last_used: m.last_used,
+                online_training_config: ttt,
+            }
         }).collect())
     }
 
-    /// Get model status (infer-scoped)
-    pub async fn status(&self, model_ref: &str) -> Result<ModelStatusInfo> {
+    /// Get model status (infer-scoped, for per-model detailed status)
+    pub async fn infer_status(&self, model_ref: &str) -> Result<ModelStatusInfo> {
         let data = self.gen.infer(model_ref).status().await?;
         Ok(ModelStatusInfo {
             loaded: data.loaded,

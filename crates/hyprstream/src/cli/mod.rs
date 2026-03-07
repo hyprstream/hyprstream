@@ -24,8 +24,8 @@ pub mod worktree_handlers;
 pub use context::AppContext;
 pub use git_handlers::{
     apply_policy_template_to_model, handle_branch, handle_checkout, handle_clone,
-    handle_infer, handle_info, handle_list, handle_load, handle_pull, handle_remove,
-    handle_status, handle_unload,
+    handle_infer, handle_info, handle_list, handle_load, handle_notify_command,
+    parse_filters, parse_status_filter, handle_pull, handle_remove, handle_status, handle_unload,
 };
 
 #[cfg(feature = "experimental")]

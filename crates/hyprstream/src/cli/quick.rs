@@ -91,8 +91,21 @@ pub enum QuickCommand {
         policy: Option<String>,
     },
 
-    /// List available models with capability detection
-    List,
+    /// List available models with status and capability detection
+    List {
+        /// Filter by load status (comma-separated, OR semantics, repeatable).
+        /// Valid values: loaded, loading, unloaded
+        /// e.g. -s loaded  or  -s loaded,loading
+        #[arg(short = 's', long = "status", value_name = "STATUS[,STATUS]...")]
+        status: Vec<String>,
+
+        /// Filter output by column regex (repeatable, AND semantics).
+        /// Patterns are unanchored by default; use ^ and $ to anchor.
+        /// e.g. --filter name=qwen --filter 'domains=llm|vision'
+        /// Valid keys: name, domains, access, ref, commit, size
+        #[arg(long = "filter", value_name = "KEY=REGEX")]
+        filter: Vec<String>,
+    },
 
     /// Get detailed information about a model
     Info {
@@ -181,12 +194,37 @@ pub enum QuickCommand {
         /// KV cache quantization type
         #[arg(long, value_enum, default_value = "none", env = "HYPRSTREAM_KV_QUANT")]
         kv_quant: KVQuantArg,
+        /// Wait for model to finish loading, with optional timeout in seconds
+        ///
+        /// Model loading can take 60s+ for large models, exceeding the default
+        /// 30s RPC timeout. With -w/--wait, the CLI subscribes to encrypted
+        /// notification events from the model service and waits asynchronously
+        /// for a model.loaded or model.failed event.
+        ///
+        /// The timeout value is optional (default: 120s). Examples:
+        ///   -w        Wait up to 120s (default)
+        ///   -w 300    Wait up to 300s
+        ///   --wait    Wait up to 120s
+        ///   --wait 60 Wait up to 60s
+        #[arg(short = 'w', long, default_missing_value = "120", num_args = 0..=1)]
+        wait: Option<u64>,
     },
 
     /// Unload a model from memory
     Unload {
         /// Model reference
         model: String,
+    },
+
+    /// Listen for real-time events from hyprstream services
+    ///
+    /// The notification system uses end-to-end encrypted broadcast delivery.
+    /// Each subscriber gets a unique Ristretto255 keypair, and the notification
+    /// service acts as a blind relay — it routes encrypted messages without
+    /// being able to read their contents.
+    Notify {
+        #[command(subcommand)]
+        command: NotifyCommand,
     },
 
     /// Worktree management
@@ -356,6 +394,51 @@ pub enum WorktreeQuickCommand {
         /// Force removal without confirmation
         #[arg(short, long)]
         force: bool,
+    },
+}
+
+/// Notification subcommands
+#[derive(Subcommand)]
+pub enum NotifyCommand {
+    /// Subscribe to real-time events matching a scope pattern
+    ///
+    /// Opens an encrypted notification channel and prints events as they arrive.
+    /// The scope pattern uses dot-notation with wildcards:
+    ///
+    ///   serve:model:*      — All model lifecycle events (load, unload, fail)
+    ///   serve:model:qwen3  — Events for a specific model
+    ///   infer:model:*      — Inference completion/failure events
+    ///   train:model:*      — Training job events
+    ///
+    /// How it works:
+    ///
+    /// 1. Generates an ephemeral Ristretto255 keypair for this session
+    /// 2. Registers the public key with NotificationService (via RPC)
+    /// 3. Connects a ZMQ SUB socket to the assigned StreamService topic
+    /// 4. For each received message:
+    ///    a. Parses the StreamBlock envelope (HMAC-verified transport)
+    ///    b. Extracts the NotificationBlock (Cap'n Proto)
+    ///    c. Performs blinding-aware DH: shared = (secret + r) × publisher_pub
+    ///    d. Derives enc_key + mac_key from the shared secret
+    ///    e. Verifies the publisher's one-shot MAC
+    ///    f. Unwraps the per-subscriber AES-256-GCM key capsule
+    ///    g. Decrypts the payload with AAD binding to intent + scope
+    /// 5. Prints the decrypted EventEnvelope
+    ///
+    /// The NotificationService never sees plaintext — it only routes encrypted
+    /// capsules to pre-registered subscriber topics.
+    Subscribe {
+        /// Scope pattern to match (e.g., "serve:model:*", "train:model:*")
+        pattern: String,
+        /// Output events as JSON (one per line, suitable for piping)
+        #[arg(long)]
+        json: bool,
+        /// Stop after N seconds (0 = run until interrupted)
+        #[arg(long, default_value = "0")]
+        timeout: u64,
+        /// Stop after receiving N events (0 = unlimited)
+        #[arg(long, short = 'n', default_value = "0")]
+        count: u64,
     },
 }
 
