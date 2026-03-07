@@ -376,6 +376,7 @@ struct WorktreeInfo {
   headOid @2 :Text;
   isLocked @3 :Bool;
   isDirty @4 :Bool;
+  capabilities @5 :List(Text);  # archetype-detected capabilities (e.g. "infer", "train")
 }
 
 # Branch Request (repoId removed — curried)
@@ -422,6 +423,7 @@ struct TrackedRepository {
   trackingRef @4 :Text;
   currentOid @5 :Text;
   registeredAt @6 :Int64;
+  worktrees @7 :List(WorktreeInfo);  # full worktree list with capabilities (populated by list())
 }
 
 # Health Status

@@ -122,7 +122,7 @@ pub use registry::RegistryService;
 pub use policy::PolicyService;
 pub use generated::policy_client::PolicyClient;
 pub use model::{
-    LoadedModelInfo, ModelHealthInfo, ModelService, ModelServiceConfig, ModelStatusInfo,
+    ModelHealthInfo, ModelService, ModelServiceConfig, ModelStatusEntry, ModelStatusInfo,
     ModelZmqClient, MODEL_ENDPOINT,
 };
 pub use stream::StreamService;

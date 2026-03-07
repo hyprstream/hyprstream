@@ -793,6 +793,7 @@ impl RegistryService {
         let handle = registry.repo(&id)?;
         let mut worktrees = handle.get_worktrees().await?;
 
+        let archetype_registry = crate::archetypes::global_registry();
         let mut result = Vec::with_capacity(worktrees.len());
         for wt in &mut worktrees {
             // Extract branch name from worktree path (last component)
@@ -810,12 +811,23 @@ impl RegistryService {
                 .and_then(|s| s.head.map(|h| h.to_string()))
                 .unwrap_or_default();
 
+            // Detect capabilities from worktree path (server-side, same machine as files)
+            let capabilities: Vec<String> = archetype_registry
+                .detect(wt.path())
+                .to_detected_domains()
+                .capabilities
+                .to_ids()
+                .into_iter()
+                .map(|s| s.to_owned())
+                .collect();
+
             result.push(crate::services::generated::registry_client::WorktreeInfo {
                 path_removed: (), // field removed from schema
                 branch_name,
                 head_oid,
                 is_locked: false,
                 is_dirty,
+                capabilities,
             });
         }
         Ok(result)
@@ -1291,6 +1303,13 @@ impl RegistryService {
 // ============================================================================
 
 fn tracked_repo_to_data(repo: &TrackedRepository) -> crate::services::generated::registry_client::TrackedRepository {
+    tracked_repo_to_data_with_worktrees(repo, vec![])
+}
+
+fn tracked_repo_to_data_with_worktrees(
+    repo: &TrackedRepository,
+    worktrees: Vec<crate::services::generated::registry_client::WorktreeInfo>,
+) -> crate::services::generated::registry_client::TrackedRepository {
     crate::services::generated::registry_client::TrackedRepository {
         id: repo.id.to_string(),
         name: repo.name.clone().unwrap_or_default(),
@@ -1302,6 +1321,7 @@ fn tracked_repo_to_data(repo: &TrackedRepository) -> crate::services::generated:
         },
         current_oid: repo.current_oid.clone().unwrap_or_default(),
         registered_at: repo.registered_at,
+        worktrees,
     }
 }
 
@@ -1335,13 +1355,40 @@ impl RegistryHandler for RegistryService {
         }
     }
 
-    async fn handle_list(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<RegistryResponseVariant> {
-        match self.handle_list().await {
-            Ok(repos) => Ok(RegistryResponseVariant::ListResult(
-                repos.iter().map(tracked_repo_to_data).collect()
-            )),
-            Err(e) => Ok(reg_error(&e.to_string())),
+    async fn handle_list(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<RegistryResponseVariant> {
+        let repos = match self.handle_list().await {
+            Ok(r) => r,
+            Err(e) => return Ok(reg_error(&e.to_string())),
+        };
+
+        let subject = ctx.subject().to_string();
+        let mut result = Vec::with_capacity(repos.len());
+
+        for repo in &repos {
+            let name = repo.name.clone().unwrap_or_default();
+            if name.is_empty() { continue; }
+
+            // Policy gate: only include repos the caller has at least query access to
+            let resource = format!("model:{}", name);
+            let permitted = self.policy_client
+                .check(&subject, "*", &resource, "query")
+                .await
+                .unwrap_or(true); // default allow if policy service unavailable
+            if !permitted { continue; }
+
+            // Collect worktrees with capabilities (holds registry read lock internally)
+            let worktrees = match self.handle_list_worktrees(&repo.id.to_string()).await {
+                Ok(wts) => wts,
+                Err(e) => {
+                    warn!("Failed to list worktrees for '{}': {}", name, e);
+                    vec![]
+                }
+            };
+
+            result.push(tracked_repo_to_data_with_worktrees(repo, worktrees));
         }
+
+        Ok(RegistryResponseVariant::ListResult(result))
     }
 
     async fn handle_get(&self, _ctx: &EnvelopeContext, _request_id: u64, value: &str) -> Result<RegistryResponseVariant> {

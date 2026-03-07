@@ -91,11 +91,20 @@ pub enum QuickCommand {
         policy: Option<String>,
     },
 
-    /// List available models with capability detection
+    /// List available models with status and capability detection
     List {
-        /// Show models currently loaded in the model service
-        #[arg(long)]
-        loaded: bool,
+        /// Filter by load status (comma-separated, OR semantics, repeatable).
+        /// Valid values: loaded, loading, unloaded
+        /// e.g. -s loaded  or  -s loaded,loading
+        #[arg(short = 's', long = "status", value_name = "STATUS[,STATUS]...")]
+        status: Vec<String>,
+
+        /// Filter output by column regex (repeatable, AND semantics).
+        /// Patterns are unanchored by default; use ^ and $ to anchor.
+        /// e.g. --filter name=qwen --filter 'domains=llm|vision'
+        /// Valid keys: name, domains, access, ref, commit, size
+        #[arg(long = "filter", value_name = "KEY=REGEX")]
+        filter: Vec<String>,
     },
 
     /// Get detailed information about a model

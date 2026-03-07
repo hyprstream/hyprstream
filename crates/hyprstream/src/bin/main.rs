@@ -17,7 +17,7 @@ use hyprstream_core::cli::quick::{QuickCommand, RemoteQuickCommand, WorktreeQuic
 use hyprstream_core::cli::schema_cli;
 use hyprstream_core::cli::{
     handle_branch, handle_checkout, handle_clone, handle_infer, handle_info, handle_list,
-    handle_list_loaded, handle_load, handle_notify_command, handle_policy_apply, handle_policy_apply_template, handle_policy_check,
+    handle_load, handle_notify_command, parse_filters, parse_status_filter, handle_policy_apply, handle_policy_apply_template, handle_policy_check,
     handle_policy_diff, handle_policy_edit, handle_policy_history, handle_policy_list_templates,
     handle_policy_rollback, handle_policy_show, handle_pull, handle_remote_add, handle_remote_list,
     handle_remote_remove, handle_remote_rename, handle_remote_set_url, handle_remove,
@@ -359,21 +359,21 @@ fn handle_quick_command(
             },
         ),
 
-        QuickCommand::List { loaded } => with_runtime(
+        QuickCommand::List { filter, status } => with_runtime(
             RuntimeConfig {
                 device: DeviceConfig::request_cpu(),
                 multi_threaded: true,
             },
             || async move {
                 let keys_dir = ctx.models_dir().join(".registry").join("keys");
-                if loaded {
-                    let signing_key = load_or_generate_signing_key(&keys_dir).await?;
-                    handle_list_loaded(signing_key).await
-                } else {
-                    let signing_key = load_or_generate_signing_key(&keys_dir).await?;
-                    let policy_client = PolicyClient::new(signing_key, RequestIdentity::local());
-                    handle_list(ctx.registry(), Some(policy_client)).await
-                }
+                let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+                let model_client = hyprstream_core::services::ModelZmqClient::new(
+                    signing_key,
+                    RequestIdentity::local(),
+                );
+                let filters = parse_filters(&filter)?;
+                let status_filter = parse_status_filter(&status)?;
+                handle_list(ctx.registry(), model_client, &filters, &status_filter).await
             },
         ),
 

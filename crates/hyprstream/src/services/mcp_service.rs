@@ -856,7 +856,7 @@ impl McpHandler for McpService {
         let loaded_model_count = {
             // Status check uses local identity (internal health check, no user context)
             let client = ModelZmqClient::new(self.signing_key.clone(), RequestIdentity::local());
-            client.list().await
+            client.status("").await
                 .map(|models| models.len() as u32)
                 .unwrap_or(0)
         };

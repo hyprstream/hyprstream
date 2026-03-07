@@ -4,7 +4,7 @@
 
 use crate::config::GenerationRequest;
 use crate::api::openai_compat::ChatMessage;
-use crate::services::{ModelZmqClient, GenRegistryClient, PolicyClient};
+use crate::services::{ModelZmqClient, GenRegistryClient};
 #[cfg(feature = "experimental")]
 use crate::services::generated::registry_client::FileChangeTypeEnum;
 use crate::zmq::global_context;
@@ -409,15 +409,81 @@ fn print_model_status(model_name: &str, status: &crate::services::GenRepositoryS
     }
 }
 
-/// Handle list command
+/// Parse `--filter key=regex` strings into compiled `(key, Regex)` pairs.
+///
+/// Patterns are unanchored by default. Use `^`/`$` to anchor, `(?i)` for
+/// case-insensitive, `|` for alternation. `status` is not a valid filter key —
+/// use `--status`/`-s` instead.
+///
+/// Returns an error for unknown keys or invalid regex patterns.
+pub fn parse_filters(raw: &[String]) -> Result<Vec<(String, regex::Regex)>> {
+    const VALID_KEYS: &[&str] = &["name", "domains", "access", "ref", "commit", "size"];
+    let mut out = Vec::with_capacity(raw.len());
+    for s in raw {
+        let (k, v) = s.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("--filter '{}': expected KEY=REGEX format", s)
+        })?;
+        let key = k.to_lowercase();
+        if key == "status" {
+            anyhow::bail!(
+                "--filter '{}': 'status' cannot be used with --filter. Use --status/-s instead (e.g. -s loaded,loading)",
+                s
+            );
+        }
+        if !VALID_KEYS.contains(&key.as_str()) {
+            anyhow::bail!(
+                "--filter '{}': unknown column '{}'. Valid columns: {}",
+                s, key, VALID_KEYS.join(", ")
+            );
+        }
+        let re = regex::Regex::new(v).map_err(|e| {
+            anyhow::anyhow!("--filter '{}': invalid regex pattern '{}': {}", s, v, e)
+        })?;
+        out.push((key, re));
+    }
+    Ok(out)
+}
+
+/// Parse `--status`/`-s` values into a `HashSet` of accepted status strings.
+///
+/// Each argument may be a single value or comma-separated list. Multiple `-s`
+/// flags are OR'd together. Empty result means no status filter (all statuses shown).
+///
+/// Valid values: `loaded`, `loading`, `unloaded`.
+pub fn parse_status_filter(raw: &[String]) -> Result<std::collections::HashSet<String>> {
+    const VALID: &[&str] = &["loaded", "loading", "unloaded"];
+    let mut out = std::collections::HashSet::new();
+    for s in raw {
+        for part in s.split(',') {
+            let val = part.trim().to_lowercase();
+            if val.is_empty() { continue; }
+            if !VALID.contains(&val.as_str()) {
+                anyhow::bail!(
+                    "--status '{}': unknown status '{}'. Valid values: {}",
+                    s, val, VALID.join(", ")
+                );
+            }
+            out.insert(val);
+        }
+    }
+    Ok(out)
+}
+
 pub async fn handle_list(
     registry: &GenRegistryClient,
-    policy_client: Option<PolicyClient>,
+    model_client: ModelZmqClient,
+    filters: &[(String, regex::Regex)],
+    status_filter: &std::collections::HashSet<String>,
 ) -> Result<()> {
     info!("Listing models");
 
-    // Get list of tracked repositories from service
-    let repos = registry.list().await
+    // Fetch registry list and model service status in parallel
+    let (repos_result, status_result) = tokio::join!(
+        registry.list(),
+        model_client.status(""),
+    );
+
+    let repos = repos_result
         .map_err(|e| anyhow::anyhow!("Failed to list repositories: {}", e))?;
 
     if repos.is_empty() {
@@ -426,123 +492,106 @@ pub async fn handle_list(
         return Ok(());
     }
 
-    // Get current user for permission checks (OS user for CLI)
-    let current_user = hyprstream_rpc::envelope::RequestIdentity::local().user().to_owned();
+    // Build status lookup: model_ref -> status string
+    let status_map: std::collections::HashMap<String, String> = match status_result {
+        Ok(entries) => entries.into_iter().map(|e| (e.model_ref, e.status)).collect(),
+        Err(e) => {
+            warn!("Model service unavailable for status: {}", e);
+            std::collections::HashMap::new()
+        }
+    };
 
-    // Get archetype registry for capability detection
-    let archetype_registry = crate::archetypes::global_registry();
-
-    // Resolve worktree paths locally for archetype detection
-    let storage_paths = crate::storage::StoragePaths::new()?;
-
-    // Collect models with git info and capabilities
-    struct ModelInfo {
+    struct RowInfo {
         display_name: String,
+        domains_str: String,
+        access_str: String,
         git_ref: String,
         commit: String,
-        is_dirty: bool,
-        size_bytes: Option<u64>,
-        domains: crate::archetypes::DetectedDomains,
-        access_str: String,
+        load_status: String,
+        size_str: String,
     }
 
-    let mut models_with_info = Vec::new();
+    let mut rows = Vec::new();
 
     for tracked in repos {
-        if !tracked.name.is_empty() {
-            let name = &tracked.name;
-            let repo_client = registry.repo(&tracked.id);
+        if tracked.name.is_empty() { continue; }
+        let name = &tracked.name;
 
-            // Get worktrees for this model
-            let worktrees = match repo_client.list_worktrees().await {
-                Ok(wts) => wts,
-                Err(e) => {
-                    warn!("Failed to list worktrees for '{}': {}", name, e);
-                    continue;
-                }
+        for wt in &tracked.worktrees {
+            let branch_name = if wt.branch_name.is_empty() { "detached".to_owned() } else { wt.branch_name.clone() };
+            let display_name = format!("{}:{}", name, branch_name);
+            let commit = wt.head_oid.chars().take(7).collect::<String>();
+
+            // Capabilities come from the server — no local filesystem access needed
+            let domains_str = if wt.capabilities.is_empty() {
+                "n/a".to_owned()
+            } else {
+                wt.capabilities.join(",")
             };
+            // All capabilities returned are already policy-filtered by the server
+            let access_str = domains_str.clone();
 
-            // Get commit hash via service layer
-            let commit = match repo_client.get_head().await {
-                Ok(head_oid) => head_oid.chars().take(7).collect::<String>(),
-                Err(_) => "unknown".to_owned(),
-            };
+            // Load status: join with model service response
+            let model_ref = format!("{}:{}", name, branch_name);
+            let load_status = status_map
+                .get(&model_ref)
+                .cloned()
+                .unwrap_or_else(|| "unloaded".to_owned());
 
-            for wt in worktrees {
-                let branch_name = if wt.branch_name.is_empty() { "detached".to_owned() } else { wt.branch_name.clone() };
-                let display_name = format!("{}:{}", name, branch_name);
+            let size_str = "n/a".to_owned();
 
-                // Detect capabilities from worktree path (resolved locally)
-                let wt_path = storage_paths.worktree_path(name, &wt.branch_name)
-                    .unwrap_or_else(|_| PathBuf::from("."));
-                let detected = archetype_registry.detect(&wt_path);
-                let domains = detected.to_detected_domains();
-
-                // Compute access string based on user permissions via PolicyService
-                let resource = format!("model:{}", name);
-                let access_str = if let Some(ref pc) = policy_client {
-                    use crate::archetypes::capabilities::{Context, Infer, Manage, Query, Serve, Train, Write};
-                    let caps = &domains.capabilities;
-                    let checks: &[(&str, bool)] = &[
-                        ("infer",   caps.has::<Infer>()),
-                        ("train",   caps.has::<Train>()),
-                        ("query",   caps.has::<Query>()),
-                        ("write",   caps.has::<Write>()),
-                        ("serve",   caps.has::<Serve>()),
-                        ("manage",  caps.has::<Manage>()),
-                        ("context", caps.has::<Context>()),
-                    ];
-                    let mut permitted = Vec::new();
-                    for (op, has_cap) in checks {
-                        if *has_cap && pc.check(&current_user, "*", &resource, op).await.unwrap_or(true) {
-                            permitted.push(*op);
-                        }
-                    }
-                    permitted.join(",")
-                } else {
-                    // No policy client = show all capabilities
-                    domains.capabilities.to_ids().join(",")
-                };
-
-                models_with_info.push(ModelInfo {
-                    display_name,
-                    git_ref: branch_name,
-                    commit: commit.clone(),
-                    is_dirty: wt.is_dirty,
-                    size_bytes: None, // Could be computed if needed
-                    domains,
-                    access_str,
-                });
-            }
+            rows.push(RowInfo {
+                display_name,
+                domains_str,
+                access_str,
+                git_ref: branch_name,
+                commit,
+                load_status,
+                size_str,
+            });
         }
     }
 
-    if models_with_info.is_empty() {
-        println!("No models found.");
-        println!("Try: hyprstream clone https://huggingface.co/Qwen/Qwen2-1.5B-Instruct");
+    // Apply --status filter (OR semantics: row must match one of the specified statuses)
+    let rows: Vec<_> = if status_filter.is_empty() {
+        rows
+    } else {
+        rows.into_iter()
+            .filter(|r| status_filter.contains(r.load_status.as_str()))
+            .collect()
+    };
+
+    // Apply --filter predicates (AND semantics, unanchored regex match)
+    let rows: Vec<_> = rows.into_iter().filter(|r| {
+        filters.iter().all(|(key, re)| {
+            let haystack = match key.as_str() {
+                "name"    => &r.display_name,
+                "domains" => &r.domains_str,
+                "access"  => &r.access_str,
+                "ref"     => &r.git_ref,
+                "commit"  => &r.commit,
+                "size"    => &r.size_str,
+                _         => return true,
+            };
+            re.is_match(haystack)
+        })
+    }).collect();
+
+    if rows.is_empty() {
+        println!("No models match the given filters.");
         return Ok(());
     }
 
-    // Table format with DOMAINS and ACCESS columns
     println!(
-        "{:<30} {:<16} {:<16} {:<15} {:<8} {:<6} {:<10}",
-        "MODEL NAME", "DOMAINS", "ACCESS", "REF", "COMMIT", "STATUS", "SIZE"
+        "{:<35} {:<16} {:<15} {:<8} {:<10}",
+        "MODEL NAME", "DOMAINS", "REF", "COMMIT", "STATUS"
     );
-    println!("{}", "-".repeat(111));
+    println!("{}", "-".repeat(90));
 
-    for info in &models_with_info {
-        let size_str = if let Some(size) = info.size_bytes {
-            format!("{:.1}GB", size as f64 / (1024.0 * 1024.0 * 1024.0))
-        } else {
-            "n/a".to_owned()
-        };
-
-        let domains_str = info.domains.domains_display();
-        let status = if info.is_dirty { "dirty" } else { "clean" };
-
+    for r in &rows {
         println!(
-            "{:<30} {:<16} {:<16} {:<15} {:<8} {:<6} {:<10}",
-            info.display_name, domains_str, info.access_str, info.git_ref, info.commit, status, size_str
+            "{:<35} {:<16} {:<15} {:<8} {:<10}",
+            r.display_name, r.domains_str, r.git_ref, r.commit, r.load_status
         );
     }
 
@@ -1819,30 +1868,6 @@ async fn handle_notify_subscribe(
     Ok(())
 }
 
-/// Handle list-loaded command - show models currently loaded in the model service
-pub async fn handle_list_loaded(signing_key: SigningKey) -> Result<()> {
-    let model_client = ModelZmqClient::new(signing_key, RequestIdentity::local());
-    let models = model_client.list().await?;
-    if models.is_empty() {
-        println!("No models currently loaded.");
-        return Ok(());
-    }
-    println!("{:<35} {:<10} {:<10} {}",
-        "MODEL REF", "LOADED", "LAST USED", "ENDPOINT");
-    println!("{}", "-".repeat(90));
-    for m in &models {
-        let loaded_ago = format_duration_ms(m.loaded_at);
-        let used_ago = format_duration_ms(m.last_used);
-        println!("{:<35} {:<10} {:<10} {}", m.model_ref, loaded_ago, used_ago, m.endpoint);
-    }
-    Ok(())
-}
-
-fn format_duration_ms(ms: i64) -> String {
-    if ms < 60_000 { format!("{}s", ms / 1000) }
-    else if ms < 3_600_000 { format!("{}m", ms / 60_000) }
-    else { format!("{}h", ms / 3_600_000) }
-}
 
 /// Handle unload command - unload a model from memory
 pub async fn handle_unload(

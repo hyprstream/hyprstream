@@ -44,11 +44,11 @@ use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::{global as registry, SocketKind};
 use hyprstream_rpc::transport::TransportConfig;
 use lru::LruCache;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 /// Default endpoint for the model service
@@ -140,6 +140,8 @@ pub struct ModelServiceInner {
     // Business logic
     /// LRU cache of loaded models
     loaded_models: RwLock<LruCache<String, LoadedModel>>,
+    /// Models currently being loaded (accepted but not yet in LRU cache)
+    pending_loads: Mutex<HashSet<String>>,
     /// Service configuration
     config: ModelServiceConfig,
     /// Ed25519 signing key for creating InferenceZmqClients
@@ -209,6 +211,7 @@ impl ModelService {
 
         Self { inner: Arc::new(ModelServiceInner {
             loaded_models: RwLock::new(LruCache::new(cache_size)),
+            pending_loads: Mutex::new(HashSet::new()),
             config,
             signing_key,
             policy_client,
@@ -256,6 +259,7 @@ impl ModelService {
 
         Self { inner: Arc::new(ModelServiceInner {
             loaded_models: RwLock::new(LruCache::new(cache_size)),
+            pending_loads: Mutex::new(HashSet::new()),
             config,
             signing_key,
             policy_client,
@@ -483,18 +487,63 @@ impl ModelService {
         }
     }
 
-    /// List loaded models
-    async fn list_models(&self) -> Vec<LoadedModelInfo> {
+    /// Return status entries for all known models (loaded + loading).
+    /// Absence from this list means unloaded.
+    async fn model_status_all(&self) -> Vec<ModelStatusEntry> {
         let cache = self.loaded_models.read().await;
-        cache
+        let pending = self.pending_loads.lock().await;
+        let mut entries: Vec<ModelStatusEntry> = cache
             .iter()
-            .map(|(_, model)| LoadedModelInfo {
+            .map(|(_, model)| ModelStatusEntry {
                 model_ref: model.model_ref.clone(),
+                status: "loaded".to_owned(),
                 endpoint: model.endpoint.clone(),
                 loaded_at: model.loaded_at.elapsed().as_millis() as i64,
                 last_used: model.last_used.elapsed().as_millis() as i64,
+                online_training_config: model.ttt_config.as_ref().map(OnlineTrainingConfigInfo::from),
             })
-            .collect()
+            .collect();
+        for model_ref in pending.iter() {
+            if !cache.contains(model_ref) {
+                entries.push(ModelStatusEntry {
+                    model_ref: model_ref.clone(),
+                    status: "loading".to_owned(),
+                    endpoint: String::new(),
+                    loaded_at: 0,
+                    last_used: 0,
+                    online_training_config: None,
+                });
+            }
+        }
+        entries
+    }
+
+    /// Return status entry for a specific model ref (0 or 1 element).
+    async fn model_status_single(&self, model_ref_str: &str) -> Vec<ModelStatusEntry> {
+        let cache = self.loaded_models.read().await;
+        if let Some(model) = cache.peek(model_ref_str) {
+            return vec![ModelStatusEntry {
+                model_ref: model_ref_str.to_owned(),
+                status: "loaded".to_owned(),
+                endpoint: model.endpoint.clone(),
+                loaded_at: model.loaded_at.elapsed().as_millis() as i64,
+                last_used: model.last_used.elapsed().as_millis() as i64,
+                online_training_config: model.ttt_config.as_ref().map(OnlineTrainingConfigInfo::from),
+            }];
+        }
+        let pending = self.pending_loads.lock().await;
+        if pending.contains(model_ref_str) {
+            vec![ModelStatusEntry {
+                model_ref: model_ref_str.to_owned(),
+                status: "loading".to_owned(),
+                endpoint: String::new(),
+                loaded_at: 0,
+                last_used: 0,
+                online_training_config: None,
+            }]
+        } else {
+            vec![]
+        }
     }
 
     /// Get model status
@@ -657,7 +706,9 @@ impl ModelService {
 use crate::services::generated::model_client::{
     ModelHandler, TttHandler, AdapterHandler, InferHandler,
     dispatch_model, serialize_response, ModelResponseVariant,
-    LoadedModelResponse, ErrorInfo, ModelListResponse, ModelHealthStatus,
+    LoadedModelResponse, ErrorInfo, ModelHealthStatus,
+    StatusRequest,
+    ModelStatusEntry as GenModelStatusEntry, OnlineTrainingConfig as GenOnlineTrainingConfig,
     // Top-level request types
     LoadModelRequest, UnloadModelRequest, KVQuantTypeEnum,
     // TTT types
@@ -1125,20 +1176,33 @@ impl ModelHandler for ModelService {
         }
     }
 
-    async fn handle_list(
+    async fn handle_status(
         &self, _ctx: &EnvelopeContext, _request_id: u64,
+        data: &StatusRequest,
     ) -> Result<ModelResponseVariant> {
-        let models = self.list_models().await;
-        Ok(ModelResponseVariant::ListResult(ModelListResponse {
-            models: models.into_iter().map(|m| crate::services::generated::model_client::LoadedModelInfo {
+        let entries = if data.model_ref.is_empty() {
+            self.model_status_all().await
+        } else {
+            self.model_status_single(&data.model_ref).await
+        };
+        Ok(ModelResponseVariant::StatusResult(entries.into_iter().map(|m| {
+            let ttt = m.online_training_config.map(|c| GenOnlineTrainingConfig {
+                enabled: c.enabled,
+                learning_rate: c.learning_rate,
+                gradient_steps: c.gradient_steps as u32,
+                max_grad_norm: c.max_grad_norm,
+                min_input_length: c.min_input_length as u32,
+                max_ttt_context: c.max_ttt_context as u32,
+            }).unwrap_or_default();
+            GenModelStatusEntry {
                 model_ref: m.model_ref,
+                status: m.status,
                 endpoint: m.endpoint,
                 loaded_at: m.loaded_at,
                 last_used: m.last_used,
-                memory_bytes: 0,
-                session_count: 0,
-            }).collect(),
-        }))
+                online_training_config: ttt,
+            }
+        }).collect()))
     }
 
     async fn handle_health_check(
@@ -1266,6 +1330,9 @@ impl crate::services::ZmqService for ModelService {
                 },
             ))?;
 
+            // Mark as loading before spawning continuation
+            self.pending_loads.lock().await.insert(model_ref.clone());
+
             let service = self.clone(); // Arc clone — cheap, 'static
             let config = load_data.to_config();
             let continuation: crate::services::Continuation = Box::pin(async move {
@@ -1273,6 +1340,7 @@ impl crate::services::ZmqService for ModelService {
                 let scope = format!("serve:model:{}", model_name);
                 match service.load_model(&model_ref, config).await {
                     Ok(endpoint) => {
+                        service.pending_loads.lock().await.remove(&model_ref);
                         info!("Model {} loaded successfully at {}", model_ref, endpoint);
                         let event = crate::events::EventEnvelope::new(
                             crate::events::EventSource::Model,
@@ -1289,6 +1357,7 @@ impl crate::services::ZmqService for ModelService {
                         }
                     }
                     Err(e) => {
+                        service.pending_loads.lock().await.remove(&model_ref);
                         warn!("Model {} failed to load: {}", model_ref, e);
                         let event = crate::events::EventEnvelope::new(
                             crate::events::EventSource::Model,
@@ -1345,13 +1414,16 @@ impl crate::services::ZmqService for ModelService {
 // Helper types
 // ============================================================================
 
-/// Information about a loaded model (for list response)
+/// Status entry for a single model (loaded or loading).
+/// Absence from a status-all response means unloaded.
 #[derive(Clone)]
-pub struct LoadedModelInfo {
+pub struct ModelStatusEntry {
     pub model_ref: String,
+    pub status: String,  // "loaded" | "loading"
     pub endpoint: String,
     pub loaded_at: i64,
     pub last_used: i64,
+    pub online_training_config: Option<OnlineTrainingConfigInfo>,
 }
 
 /// Online training (TTT) configuration information
@@ -1442,19 +1514,36 @@ impl ModelZmqClient {
         self.gen.unload(model_ref).await
     }
 
-    /// List loaded models — delegates to generated client
-    pub async fn list(&self) -> Result<Vec<LoadedModelInfo>> {
-        let data = self.gen.list().await?;
-        Ok(data.models.into_iter().map(|m| LoadedModelInfo {
-            model_ref: m.model_ref,
-            endpoint: m.endpoint,
-            loaded_at: m.loaded_at,
-            last_used: m.last_used,
+    /// Get status of all known models (model_ref = "") or a specific model.
+    /// Absence from the result means the model is unloaded.
+    pub async fn status(&self, model_ref: &str) -> Result<Vec<ModelStatusEntry>> {
+        let data = self.gen.status(model_ref).await?;
+        Ok(data.into_iter().map(|m| {
+            let ttt = if m.online_training_config.enabled {
+                Some(OnlineTrainingConfigInfo {
+                    enabled: m.online_training_config.enabled,
+                    learning_rate: m.online_training_config.learning_rate,
+                    gradient_steps: m.online_training_config.gradient_steps as usize,
+                    max_grad_norm: m.online_training_config.max_grad_norm,
+                    min_input_length: m.online_training_config.min_input_length as usize,
+                    max_ttt_context: m.online_training_config.max_ttt_context as usize,
+                })
+            } else {
+                None
+            };
+            ModelStatusEntry {
+                model_ref: m.model_ref,
+                status: m.status,
+                endpoint: m.endpoint,
+                loaded_at: m.loaded_at,
+                last_used: m.last_used,
+                online_training_config: ttt,
+            }
         }).collect())
     }
 
-    /// Get model status (infer-scoped)
-    pub async fn status(&self, model_ref: &str) -> Result<ModelStatusInfo> {
+    /// Get model status (infer-scoped, for per-model detailed status)
+    pub async fn infer_status(&self, model_ref: &str) -> Result<ModelStatusInfo> {
         let data = self.gen.infer(model_ref).status().await?;
         Ok(ModelStatusInfo {
             loaded: data.loaded,
