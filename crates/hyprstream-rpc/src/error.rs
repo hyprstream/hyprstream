@@ -44,6 +44,18 @@ pub enum EnvelopeError {
     /// Invalid topic format (not valid hex).
     #[error("invalid topic format: expected valid hex string")]
     InvalidTopicFormat,
+
+    /// AES-GCM encryption failed.
+    #[error("encryption failed: {0}")]
+    Encryption(String),
+
+    /// AES-GCM decryption failed (wrong key, tampered ciphertext, or AAD mismatch).
+    #[error("decryption failed: {0}")]
+    Decryption(String),
+
+    /// MAC verification failed.
+    #[error("MAC verification failed")]
+    MacVerification,
 }
 
 /// Result type alias for envelope operations.

@@ -10,7 +10,6 @@ use clap::{Arg, Args as ClapArgs, Command as ClapCommand, FromArgMatches, Subcom
 use tracing::info;
 
 // Core application imports
-use hyprstream_core::auth::PolicyManager;
 use hyprstream_core::cli::commands::{
     ExecutionMode, FlightArgs, ImageCommand, ServiceAction, TrainingAction, WorkerAction,
 };
@@ -18,7 +17,7 @@ use hyprstream_core::cli::quick::{QuickCommand, RemoteQuickCommand, WorktreeQuic
 use hyprstream_core::cli::schema_cli;
 use hyprstream_core::cli::{
     handle_branch, handle_checkout, handle_clone, handle_infer, handle_info, handle_list,
-    handle_load, handle_policy_apply, handle_policy_apply_template, handle_policy_check,
+    handle_list_loaded, handle_load, handle_notify_command, handle_policy_apply, handle_policy_apply_template, handle_policy_check,
     handle_policy_diff, handle_policy_edit, handle_policy_history, handle_policy_list_templates,
     handle_policy_rollback, handle_policy_show, handle_pull, handle_remote_add, handle_remote_list,
     handle_remote_remove, handle_remote_rename, handle_remote_set_url, handle_remove,
@@ -360,16 +359,21 @@ fn handle_quick_command(
             },
         ),
 
-        QuickCommand::List => with_runtime(
+        QuickCommand::List { loaded } => with_runtime(
             RuntimeConfig {
                 device: DeviceConfig::request_cpu(),
                 multi_threaded: true,
             },
             || async move {
-                let registry_path = ctx.models_dir().join(".registry");
-                let policies_dir = registry_path.join("policies");
-                let policy_manager = PolicyManager::new(&policies_dir).await.ok();
-                handle_list(ctx.registry(), policy_manager.as_ref()).await
+                let keys_dir = ctx.models_dir().join(".registry").join("keys");
+                if loaded {
+                    let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+                    handle_list_loaded(signing_key).await
+                } else {
+                    let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+                    let policy_client = PolicyClient::new(signing_key, RequestIdentity::local());
+                    handle_list(ctx.registry(), Some(policy_client)).await
+                }
             },
         ),
 
@@ -483,12 +487,15 @@ fn handle_quick_command(
             model,
             max_context,
             kv_quant,
+            wait,
         } => with_runtime(
             RuntimeConfig {
                 device: DeviceConfig::request_gpu(),
                 multi_threaded: true,
             },
-            || async move { handle_load(&model, max_context, kv_quant.into(), signing_key).await },
+            || async move {
+                handle_load(&model, max_context, kv_quant.into(), wait, signing_key).await
+            },
         ),
 
         QuickCommand::Unload { model } => with_runtime(
@@ -497,6 +504,16 @@ fn handle_quick_command(
                 multi_threaded: true,
             },
             || async move { handle_unload(&model, signing_key).await },
+        ),
+
+        QuickCommand::Notify { command } => with_runtime(
+            RuntimeConfig {
+                device: DeviceConfig::request_cpu(),
+                multi_threaded: true,
+            },
+            || async move {
+                handle_notify_command(command, signing_key).await
+            },
         ),
 
         QuickCommand::Worktree { command } => with_runtime(

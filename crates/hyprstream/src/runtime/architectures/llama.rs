@@ -67,13 +67,14 @@ impl LinearProjection {
                     let ss = scale.size();   // [in/128, out/128]
                     let block_r = ws[0] / ss[0];
                     let block_c = ws[1] / ss[1];
-                    // scale_inv = 1/scale, so dequant = w_fp8 / scale_inv = w_fp8 * (1/scale_inv)
+                    // weight_scale_inv stores the per-block multiplier: dequant = fp8 * scale
+                    // (values ~0.0002 mean max_abs ≈ 448 * 0.0002 ≈ 0.09, typical for NN weights)
                     let s_exp = scale
                         .to_kind(tch::Kind::BFloat16)
                         .view([ss[0], 1, ss[1], 1])
                         .expand([ss[0], block_r, ss[1], block_c], false)
                         .reshape([ws[0], ws[1]]);
-                    w_bf16 / s_exp
+                    w_bf16 * s_exp
                 } else {
                     w_bf16
                 }

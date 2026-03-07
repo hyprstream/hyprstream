@@ -34,9 +34,10 @@ use crate::runtime::kv_quant::KVQuantType;
 use crate::runtime::RuntimeConfig;
 use crate::services::{
     rpc_types::StreamInfo, EnvelopeContext, InferenceZmqClient,
-    PolicyClient,
+    NotificationClient, NotificationPublisher, PolicyClient,
 };
 use crate::services::GenRegistryClient;
+use hyprstream_rpc::envelope::RequestIdentity;
 use crate::storage::ModelRef;
 use anyhow::{anyhow, Result};
 use hyprstream_rpc::prelude::*;
@@ -134,15 +135,8 @@ impl Default for ModelServiceConfig {
     }
 }
 
-/// Model service that manages InferenceService lifecycle
-///
-/// Runs on multi-threaded runtime. Manages an LRU cache of loaded models,
-/// spawning and stopping InferenceService instances as needed.
-///
-/// Supports two modes:
-/// - InProcess: Runs InferenceService in the same process (default)
-/// - Spawned: Spawns InferenceService as separate process via callback pattern
-pub struct ModelService {
+/// Inner state for ModelService, behind Arc for continuation capture.
+pub struct ModelServiceInner {
     // Business logic
     /// LRU cache of loaded models
     loaded_models: RwLock<LruCache<String, LoadedModel>>,
@@ -152,6 +146,8 @@ pub struct ModelService {
     signing_key: SigningKey,
     /// Policy client for authorization checks in InferenceService
     policy_client: PolicyClient,
+    /// Notification publisher for model lifecycle events
+    notification_publisher: NotificationPublisher,
     /// Registry client for resolving model paths
     registry: GenRegistryClient,
     /// Callback router for spawned mode (None for in-process)
@@ -165,6 +161,30 @@ pub struct ModelService {
     transport: TransportConfig,
     /// Expected JWT audience for token validation (RFC 8707).
     expected_audience: Option<String>,
+}
+
+/// Model service that manages InferenceService lifecycle.
+///
+/// Wraps `ModelServiceInner` in `Arc` so continuations can capture a cheap
+/// clone. All field access is transparent via `Deref`.
+///
+/// Load requests are handled asynchronously: the request loop returns an
+/// immediate "accepted" response and spawns the actual model loading as a
+/// `Continuation` (via `spawn_local`), keeping the service responsive for
+/// list, health, info, and other requests during long GPU weight transfers.
+pub struct ModelService {
+    inner: Arc<ModelServiceInner>,
+}
+
+impl Clone for ModelService {
+    fn clone(&self) -> Self {
+        Self { inner: Arc::clone(&self.inner) }
+    }
+}
+
+impl std::ops::Deref for ModelService {
+    type Target = ModelServiceInner;
+    fn deref(&self) -> &Self::Target { &self.inner }
 }
 
 impl ModelService {
@@ -184,23 +204,34 @@ impl ModelService {
         };
         let cache_size = NonZeroUsize::new(config.max_models).unwrap_or(DEFAULT_CACHE_SIZE);
 
-        Self {
+        let notif_client = NotificationClient::new(signing_key.clone(), RequestIdentity::local());
+        let notification_publisher = NotificationPublisher::new(notif_client, signing_key.clone());
+
+        Self { inner: Arc::new(ModelServiceInner {
             loaded_models: RwLock::new(LruCache::new(cache_size)),
             config,
             signing_key,
             policy_client,
+            notification_publisher,
             registry,
             callback_router: None,
             spawned_instances: RwLock::new(HashMap::new()),
             context,
             transport,
             expected_audience: None,
-        }
+        })}
     }
 
     /// Set the expected JWT audience for token validation.
+    ///
+    /// # Panics
+    /// Panics if called after the service has been cloned (Arc refcount > 1).
+    /// Must be called during construction, before the service is shared.
+    #[allow(clippy::expect_used)]
     pub fn with_expected_audience(mut self, audience: String) -> Self {
-        self.expected_audience = Some(audience);
+        Arc::get_mut(&mut self.inner)
+            .expect("with_expected_audience must be called before service is shared")
+            .expected_audience = Some(audience);
         self
     }
 
@@ -220,18 +251,22 @@ impl ModelService {
         };
         let cache_size = NonZeroUsize::new(config.max_models).unwrap_or(DEFAULT_CACHE_SIZE);
 
-        Self {
+        let notif_client = NotificationClient::new(signing_key.clone(), RequestIdentity::local());
+        let notification_publisher = NotificationPublisher::new(notif_client, signing_key.clone());
+
+        Self { inner: Arc::new(ModelServiceInner {
             loaded_models: RwLock::new(LruCache::new(cache_size)),
             config,
             signing_key,
             policy_client,
+            notification_publisher,
             registry,
             callback_router: Some(callback_router),
             spawned_instances: RwLock::new(HashMap::new()),
             context,
             transport,
             expected_audience: None,
-        }
+        })}
     }
 
     /// Load a model by reference with optional per-model config, returns the inference endpoint
@@ -331,7 +366,6 @@ impl ModelService {
                     runtime_config.clone(),
                     self.signing_key.verifying_key(),
                     self.signing_key.clone(),
-                    self.policy_client.clone(),
                     Arc::clone(&zmq_ctx),
                     worker_transport.clone(),
                     fs.clone(),
@@ -356,7 +390,6 @@ impl ModelService {
                 runtime_config,
                 self.signing_key.verifying_key(),
                 self.signing_key.clone(),
-                self.policy_client.clone(),
                 zmq_ctx,
                 transport,
                 fs,
@@ -432,6 +465,18 @@ impl ModelService {
         if let Some((_, mut model)) = cache.pop_entry(model_ref_str) {
             info!("Unloading model {}", model_ref_str);
             let _ = model.service_handle.stop().await;
+            let model_name = model_ref_str.split(':').next().unwrap_or(model_ref_str);
+            let scope = format!("serve:model:{}", model_name);
+            let event = crate::events::EventEnvelope::new(
+                crate::events::EventSource::Model,
+                scope.clone(),
+                crate::events::EventPayload::ModelUnloaded {
+                    model_ref: model_ref_str.to_string(),
+                },
+            );
+            if let Ok(payload) = serde_json::to_vec(&event) {
+                let _ = self.notification_publisher.publish(&scope, &payload).await;
+            }
             Ok(())
         } else {
             Err(anyhow!("Model {} is not loaded", model_ref_str))
@@ -1113,6 +1158,63 @@ impl ModelHandler for ModelService {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Load request interception — parse capnp to detect load before dispatch
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Parsed load request data extracted from Cap'n Proto payload.
+struct ParsedLoadRequest {
+    model_ref: String,
+    max_context: u32,
+    kv_quant: crate::model_capnp::KVQuantType,
+}
+
+impl ParsedLoadRequest {
+    fn to_config(&self) -> Option<ModelLoadConfig> {
+        use crate::model_capnp::KVQuantType as CKV;
+        let max_ctx = match self.max_context {
+            0 => None,
+            n => Some(n as usize),
+        };
+        let kv_q = match self.kv_quant {
+            CKV::Int8 => Some(KVQuantType::Int8),
+            CKV::Nf4 => Some(KVQuantType::Nf4),
+            CKV::Fp4 => Some(KVQuantType::Fp4),
+            CKV::None => None,
+        };
+        if max_ctx.is_some() || kv_q.is_some() {
+            Some(ModelLoadConfig { max_context: max_ctx, kv_quant: kv_q, num_inference_instances: None })
+        } else {
+            None
+        }
+    }
+}
+
+impl ModelService {
+    /// Try to parse a load request from the raw Cap'n Proto payload.
+    /// Returns `None` for all other request variants (list, unload, health, scoped, etc.).
+    fn try_parse_load_request(payload: &[u8]) -> Option<(u64, ParsedLoadRequest)> {
+        use crate::model_capnp::model_request;
+        use crate::model_capnp::KVQuantType as CKV;
+        let reader = capnp::serialize::read_message(
+            &mut std::io::Cursor::new(payload),
+            capnp::message::ReaderOptions::new(),
+        ).ok()?;
+        let req = reader.get_root::<model_request::Reader>().ok()?;
+        let request_id = req.get_id();
+        match req.which().ok()? {
+            model_request::Which::Load(data) => {
+                let data = data.ok()?;
+                let model_ref = data.get_model_ref().ok()?.to_str().ok()?.to_owned();
+                let max_context = data.get_max_context();
+                let kv_quant = data.get_kv_quant().unwrap_or(CKV::None);
+                Some((request_id, ParsedLoadRequest { model_ref, max_context, kv_quant }))
+            }
+            _ => None,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // ZmqService Implementation — delegates to generated dispatch_model
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1124,6 +1226,88 @@ impl crate::services::ZmqService for ModelService {
             ctx.subject(),
             ctx.request_id
         );
+
+        // Intercept load requests to avoid blocking the request loop.
+        // Model loading can take 60s+ (weight transfer to GPU), which would
+        // block all other model service requests (list, health, info, etc.).
+        // Instead, return an immediate "accepted" response and do the actual
+        // load in a Continuation (spawned via spawn_local after the REP is sent).
+        if let Some((request_id, load_data)) = Self::try_parse_load_request(payload) {
+            // Fast path: if already loaded, return immediately
+            {
+                let mut cache = self.loaded_models.write().await;
+                if let Some(model) = cache.get_mut(&load_data.model_ref) {
+                    model.last_used = Instant::now();
+                    let response = serialize_response(request_id, &ModelResponseVariant::LoadResult(
+                        LoadedModelResponse {
+                            model_ref: load_data.model_ref.clone(),
+                            endpoint: model.endpoint.clone(),
+                        },
+                    ))?;
+                    return Ok((response, None));
+                }
+            }
+
+            // Slow path: return "accepted" immediately, load in continuation
+            let model_ref = load_data.model_ref.clone();
+            info!("Load request accepted for {} (async)", model_ref);
+
+            // Predict the endpoint so we can return it in the response
+            let safe_name = model_ref.replace([':', '/', '\\'], "-");
+            let service_name = format!("inference-{safe_name}");
+            let predicted_endpoint = hyprstream_rpc::registry::global()
+                .endpoint(&service_name, SocketKind::Rep)
+                .to_zmq_string();
+
+            let response = serialize_response(request_id, &ModelResponseVariant::LoadResult(
+                LoadedModelResponse {
+                    model_ref: model_ref.clone(),
+                    endpoint: predicted_endpoint,
+                },
+            ))?;
+
+            let service = self.clone(); // Arc clone — cheap, 'static
+            let config = load_data.to_config();
+            let continuation: crate::services::Continuation = Box::pin(async move {
+                let model_name = model_ref.split(':').next().unwrap_or(&model_ref);
+                let scope = format!("serve:model:{}", model_name);
+                match service.load_model(&model_ref, config).await {
+                    Ok(endpoint) => {
+                        info!("Model {} loaded successfully at {}", model_ref, endpoint);
+                        let event = crate::events::EventEnvelope::new(
+                            crate::events::EventSource::Model,
+                            scope.clone(),
+                            crate::events::EventPayload::ModelLoaded {
+                                model_ref: model_ref.clone(),
+                                endpoint,
+                            },
+                        );
+                        if let Ok(payload) = serde_json::to_vec(&event) {
+                            let n = service.notification_publisher.publish(&scope, &payload).await
+                                .unwrap_or(0);
+                            debug!("Published model.loaded to {} subscriber(s)", n);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Model {} failed to load: {}", model_ref, e);
+                        let event = crate::events::EventEnvelope::new(
+                            crate::events::EventSource::Model,
+                            scope.clone(),
+                            crate::events::EventPayload::ModelFailed {
+                                model_ref: model_ref.clone(),
+                                error: e.to_string(),
+                            },
+                        );
+                        if let Ok(payload) = serde_json::to_vec(&event) {
+                            let _ = service.notification_publisher.publish(&scope, &payload).await;
+                        }
+                    }
+                }
+            });
+
+            return Ok((response, Some(continuation)));
+        }
+
         dispatch_model(self, ctx, payload).await
     }
 

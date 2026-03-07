@@ -177,6 +177,73 @@ pub fn derive_stream_keys(
     Ok(StreamKeys::with_ctrl(topic, mac_key, ctrl_topic, ctrl_mac_key))
 }
 
+// ============================================================================
+// Notification Key Derivation (Broadcast Encryption)
+// ============================================================================
+
+/// Derived keys for notification broadcast encryption.
+///
+/// Contains:
+/// - `enc_key`: AES-256-GCM key for wrapping per-subscriber data keys
+/// - `mac_key`: One-shot MAC key for ciphertext authentication
+///
+/// Both publisher and subscriber derive identical keys from their DH shared secret.
+pub struct NotificationKeys {
+    /// AES-256-GCM key for data_key wrapping (zeroized on drop).
+    pub enc_key: Zeroizing<[u8; 32]>,
+    /// One-shot MAC key (zeroized on drop).
+    pub mac_key: Zeroizing<[u8; 32]>,
+}
+
+/// Derive notification keys (enc_key and mac_key) from DH shared secret.
+///
+/// Uses the crypto backend (Blake3 or HKDF-SHA256) with:
+/// - IKM: shared_secret || salt (where salt = XOR of publisher_pub and subscriber_pub)
+/// - Context: notification-specific domain separation strings
+///
+/// # Arguments
+///
+/// * `shared_secret` - 32-byte DH shared secret
+/// * `publisher_pub` - Publisher's ephemeral Ristretto public key (32 bytes)
+/// * `subscriber_pub` - Subscriber's (possibly blinded) Ristretto public key (32 bytes)
+///
+/// # Errors
+///
+/// Returns `EnvelopeError::KeyExchange` if publisher and subscriber keys are identical.
+pub fn derive_notification_keys(
+    shared_secret: &[u8; 32],
+    publisher_pub: &[u8; 32],
+    subscriber_pub: &[u8; 32],
+) -> EnvelopeResult<NotificationKeys> {
+    if is_self_connection(publisher_pub, subscriber_pub) {
+        return Err(EnvelopeError::KeyExchange(
+            "publisher and subscriber keys are identical".into(),
+        ));
+    }
+
+    // XOR public keys for salt
+    let mut salt = [0u8; 32];
+    for i in 0..32 {
+        salt[i] = publisher_pub[i] ^ subscriber_pub[i];
+    }
+
+    // Build IKM: shared_secret || salt
+    let mut ikm = [0u8; 64];
+    ikm[..32].copy_from_slice(shared_secret);
+    ikm[32..64].copy_from_slice(&salt);
+
+    let enc_key = derive_key("hyprstream notification-keys v1 enc", &ikm);
+    let mac_key = derive_key("hyprstream notification-keys v1 mac", &ikm);
+
+    // Zeroize IKM containing shared secret
+    ikm.zeroize();
+
+    Ok(NotificationKeys {
+        enc_key: Zeroizing::new(enc_key),
+        mac_key: Zeroizing::new(mac_key),
+    })
+}
+
 /// Shared secret from DH key exchange.
 ///
 /// Wrapped in `Zeroizing` to ensure secure erasure when dropped.
@@ -415,12 +482,117 @@ mod ristretto_impl {
         let shared_point = their_public.point() * secret.scalar();
         shared_point.compress().to_bytes()
     }
+
+    /// Rerandomize a Ristretto255 public key: `blinded = pubkey + r * G`.
+    ///
+    /// Used by NotificationService to make subscriber pubkeys unlinkable across
+    /// different publish intents. Each intent uses a fresh random blinding scalar.
+    ///
+    /// Returns `(blinded_pubkey, blinding_scalar_bytes)`.
+    pub fn rerandomize_pubkey(pubkey: &RistrettoPublic) -> (RistrettoPublic, [u8; 32]) {
+        let r = Scalar::random(&mut rand::thread_rng());
+        let blinded_point = pubkey.point() + r * RISTRETTO_BASEPOINT_POINT;
+        let blinded = RistrettoPublic::from_point(blinded_point);
+        (blinded, r.to_bytes())
+    }
+
+    /// Perform blinding-aware DH: `shared = (secret + blinding_scalar) * their_pubkey`.
+    ///
+    /// Used by subscribers who received a blinding scalar `r_i` from the
+    /// NotificationService. The subscriber computes `(s_sub + r_i) * P_pub`,
+    /// which equals the publisher's `s_pub * (P_sub + r_i * G)` by DH commutativity.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - The blinding scalar bytes are not a valid Ristretto scalar
+    /// - The resulting combined scalar is zero
+    pub fn blinded_dh(
+        secret: &RistrettoSecret,
+        blinding_scalar_bytes: &[u8; 32],
+        their_pubkey: &RistrettoPublic,
+    ) -> EnvelopeResult<[u8; 32]> {
+        let r = Scalar::from_canonical_bytes(*blinding_scalar_bytes)
+            .into_option()
+            .ok_or_else(|| EnvelopeError::KeyExchange("invalid blinding scalar".into()))?;
+        let combined = secret.scalar() + r;
+        if bool::from(combined.ct_eq(&Scalar::ZERO)) {
+            return Err(EnvelopeError::KeyExchange(
+                "combined scalar is zero".into(),
+            ));
+        }
+        let shared_point = their_pubkey.point() * combined;
+        Ok(shared_point.compress().to_bytes())
+    }
+
+    // =========================================================================
+    // Raw-bytes DH wrappers (for notification broadcast encryption)
+    // =========================================================================
+
+    /// Ristretto255 DH from raw scalar and pubkey bytes.
+    ///
+    /// Used by `BroadcastEncryptor` where typed key objects aren't available.
+    pub fn ristretto_dh_raw(secret_bytes: &[u8; 32], their_pub_bytes: &[u8; 32]) -> EnvelopeResult<[u8; 32]> {
+        let scalar = Scalar::from_canonical_bytes(*secret_bytes)
+            .into_option()
+            .ok_or_else(|| EnvelopeError::KeyExchange("invalid secret scalar".into()))?;
+        let compressed = CompressedRistretto::from_slice(their_pub_bytes)
+            .map_err(|_| EnvelopeError::KeyExchange("invalid public key length".into()))?;
+        let point = compressed
+            .decompress()
+            .ok_or_else(|| EnvelopeError::KeyExchange("invalid ristretto255 point".into()))?;
+        Ok((point * scalar).compress().to_bytes())
+    }
+
+    /// Blinding-aware DH from raw bytes: `(secret + blinding_scalar) * their_pubkey`.
+    ///
+    /// Used by `BroadcastDecryptor` where typed key objects aren't available.
+    pub fn blinded_dh_raw(
+        secret_bytes: &[u8; 32],
+        blinding_scalar_bytes: &[u8; 32],
+        their_pub_bytes: &[u8; 32],
+    ) -> EnvelopeResult<[u8; 32]> {
+        let s = Scalar::from_canonical_bytes(*secret_bytes)
+            .into_option()
+            .ok_or_else(|| EnvelopeError::KeyExchange("invalid subscriber secret".into()))?;
+        let r = Scalar::from_canonical_bytes(*blinding_scalar_bytes)
+            .into_option()
+            .ok_or_else(|| EnvelopeError::KeyExchange("invalid blinding scalar".into()))?;
+        let combined = s + r;
+        if bool::from(combined.ct_eq(&Scalar::ZERO)) {
+            return Err(EnvelopeError::KeyExchange("combined scalar is zero".into()));
+        }
+        let compressed = CompressedRistretto::from_slice(their_pub_bytes)
+            .map_err(|_| EnvelopeError::KeyExchange("invalid public key length".into()))?;
+        let point = compressed
+            .decompress()
+            .ok_or_else(|| EnvelopeError::KeyExchange("invalid ristretto255 point".into()))?;
+        Ok((point * combined).compress().to_bytes())
+    }
+
+    /// Reconstruct a blinded pubkey from raw bytes: `P_sub + r * G`.
+    pub fn reconstruct_blinded_pub_raw(
+        subscriber_pub_bytes: &[u8; 32],
+        blinding_scalar_bytes: &[u8; 32],
+    ) -> EnvelopeResult<[u8; 32]> {
+        let r = Scalar::from_canonical_bytes(*blinding_scalar_bytes)
+            .into_option()
+            .ok_or_else(|| EnvelopeError::KeyExchange("invalid blinding scalar".into()))?;
+        let compressed = CompressedRistretto::from_slice(subscriber_pub_bytes)
+            .map_err(|_| EnvelopeError::KeyExchange("invalid subscriber pubkey length".into()))?;
+        let sub_point = compressed
+            .decompress()
+            .ok_or_else(|| EnvelopeError::KeyExchange("invalid subscriber ristretto point".into()))?;
+        let blinded = sub_point + r * RISTRETTO_BASEPOINT_POINT;
+        Ok(blinded.compress().to_bytes())
+    }
 }
 
 #[cfg(not(feature = "fips"))]
 pub use ristretto_impl::{
-    generate_ephemeral_keypair, ristretto_dh, RistrettoKeyExchange, RistrettoPublic,
-    RistrettoSecret,
+    blinded_dh, blinded_dh_raw, generate_ephemeral_keypair,
+    reconstruct_blinded_pub_raw, rerandomize_pubkey, ristretto_dh, ristretto_dh_raw,
+    RistrettoKeyExchange, RistrettoPublic, RistrettoSecret,
 };
 
 // ============================================================================

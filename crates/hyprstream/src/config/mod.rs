@@ -788,9 +788,10 @@ fn default_startup_services() -> Vec<String> {
         "event".to_owned(),     // Must start first (message bus)
         "registry".to_owned(),  // Model registry
         "policy".to_owned(),    // Authorization
-        "streams".to_owned(),   // Streaming proxy with JWT validation
-        "worker".to_owned(),    // Container workloads
-        "model".to_owned(),     // Model management
+        "streams".to_owned(),       // Streaming proxy with JWT validation
+        "notification".to_owned(),  // Encrypted notification relay (uses streams)
+        "worker".to_owned(),        // Container workloads
+        "model".to_owned(),         // Model management (publishes to notification)
         "oauth".to_owned(),     // OAuth 2.1 authorization server
         "oai".to_owned(),       // OpenAI-compatible HTTP API
         "flight".to_owned(),    // Arrow Flight SQL server

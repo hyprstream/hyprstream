@@ -1580,6 +1580,26 @@ impl StreamChannel {
         result
     }
 
+    /// Create a publisher for a pre-registered topic (no DH).
+    ///
+    /// Used by NotificationService where topics are registered via `register_topic()`
+    /// and don't use DH-based key exchange. The transport MAC key is randomly generated
+    /// (separate from notification E2E MAC which is embedded in the payload).
+    pub async fn publisher_for_topic(&self, topic: &str) -> Result<StreamPublisher> {
+        // Generate a random transport-level MAC key for StreamService wire format.
+        // This is NOT the notification's E2E MAC — it's for StreamService HMAC chain.
+        let mut mac_key = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut mac_key);
+
+        let ctx = StreamContext::new(
+            format!("notify-{}", uuid::Uuid::new_v4()),
+            topic.to_owned(),
+            mac_key,
+            [0u8; 32], // No server pubkey needed for notification delivery
+        );
+        self.publisher(&ctx).await
+    }
+
     /// Get the stream endpoint for clients to subscribe to.
     ///
     /// Returns the SUB endpoint URL from the registry.

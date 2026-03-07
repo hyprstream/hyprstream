@@ -2465,7 +2465,11 @@ pub struct InferenceServiceConfig {
     config: RuntimeConfig,
     server_pubkey: VerifyingKey,
     signing_key: SigningKey,
-    policy_client: PolicyClient,
+    /// PolicyClient is created lazily inside `run()` on the service thread's runtime.
+    /// ZMQ sockets must be registered with the correct runtime's reactor — a PolicyClient
+    /// created in the caller's runtime will fail with "Tokio context being shutdown" when
+    /// used on a different thread's runtime.
+    policy_signing_key: SigningKey,
     zmq_context: Arc<zmq::Context>,
     transport: hyprstream_rpc::transport::TransportConfig,
     fs: Option<WorktreeClient>,
@@ -2478,22 +2482,26 @@ impl InferenceServiceConfig {
     ///
     /// No GPU work is done here — all heavy initialization is deferred
     /// to the service thread via `Spawnable::run()`.
+    ///
+    /// **Important**: Does NOT take a `PolicyClient`. The policy client is created
+    /// lazily inside `run()` on the service thread's own Tokio runtime, because
+    /// ZMQ sockets must be registered with the correct runtime's reactor.
     pub fn new(
         model_path: impl AsRef<Path>,
         config: RuntimeConfig,
         server_pubkey: VerifyingKey,
         signing_key: SigningKey,
-        policy_client: PolicyClient,
         zmq_context: Arc<zmq::Context>,
         transport: hyprstream_rpc::transport::TransportConfig,
         fs: Option<WorktreeClient>,
     ) -> Self {
+        let policy_signing_key = signing_key.clone();
         Self {
             model_path: model_path.as_ref().to_path_buf(),
             config,
             server_pubkey,
             signing_key,
-            policy_client,
+            policy_signing_key,
             zmq_context,
             transport,
             fs,
@@ -2540,6 +2548,13 @@ impl hyprstream_rpc::service::spawner::Spawnable for InferenceServiceConfig {
             // Create nonce cache (shared between service and RequestLoop)
             let nonce_cache = Arc::new(InMemoryNonceCache::new());
 
+            // Create PolicyClient HERE, inside the service thread's runtime,
+            // so ZMQ sockets are registered with the correct reactor.
+            let policy_client = PolicyClient::new(
+                self.policy_signing_key,
+                hyprstream_rpc::envelope::RequestIdentity::local(),
+            );
+
             // GPU initialization happens HERE, on the service thread
             let service = InferenceService::initialize(
                 self.model_path,
@@ -2547,7 +2562,7 @@ impl hyprstream_rpc::service::spawner::Spawnable for InferenceServiceConfig {
                 self.server_pubkey,
                 self.signing_key.clone(),
                 Arc::clone(&nonce_cache),
-                self.policy_client,
+                policy_client,
                 self.fs,
             )
             .await

@@ -18,7 +18,7 @@ use crate::config::{
 };
 use crate::runtime::model_config::ModelConfig;
 use crate::runtime::template_engine::ChatMessage;
-use crate::services::{InferenceServiceConfig, InferenceZmqClient, PolicyClient, GenRegistryClient, WorktreeClient, INFERENCE_ENDPOINT};
+use crate::services::{InferenceServiceConfig, InferenceZmqClient, GenRegistryClient, WorktreeClient, INFERENCE_ENDPOINT};
 use crate::storage::ModelRef;
 use crate::zmq::global_context;
 use hyprstream_rpc::prelude::*;
@@ -365,9 +365,6 @@ pub async fn handle_training_infer(
 
     info!("Using model at: {} (TTT enabled)", model_path.display());
 
-    // Create policy client
-    let policy_client = PolicyClient::new(signing_key.clone(), RequestIdentity::local());
-
     // Configure runtime
     let runtime_config = RuntimeConfig {
         max_context,
@@ -382,7 +379,6 @@ pub async fn handle_training_infer(
         runtime_config,
         verifying_key,
         signing_key.clone(),
-        policy_client,
         global_context(),
         transport,
         None, // CLI: no FsOps
@@ -659,7 +655,6 @@ pub async fn handle_training_batch(
         ..Default::default()
     };
 
-    let policy_client = PolicyClient::new(signing_key.clone(), RequestIdentity::local());
     // Start InferenceService with TTT enabled
     let transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(INFERENCE_ENDPOINT);
     let service_config = InferenceServiceConfig::new(
@@ -667,7 +662,6 @@ pub async fn handle_training_batch(
         runtime_config,
         verifying_key,
         signing_key.clone(),
-        policy_client,
         global_context(),
         transport,
         None, // CLI: no FsOps
