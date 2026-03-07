@@ -180,9 +180,10 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_backend_size() {
+    async fn test_backend_size() -> Result<(), Box<dyn std::error::Error>> {
         let state = Arc::new(RwLock::new(TuiState::default()));
         let backend = TuiPaneBackend::new(state, 1, 1, 1, 80, 24);
-        assert_eq!(backend.size().unwrap(), Size::new(80, 24));
+        assert_eq!(backend.size()?, Size::new(80, 24));
+        Ok(())
     }
 }

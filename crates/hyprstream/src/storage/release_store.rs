@@ -142,7 +142,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_release_manifest() {
+    fn test_parse_release_manifest() -> Result<(), Box<dyn std::error::Error>> {
         let toml = r#"
 [release]
 version = "0.1.0"
@@ -154,14 +154,15 @@ cpu = { host_requires = "glibc" }
 cuda130 = { host_requires = "nvidia-driver" }
 rocm71 = { host_requires = "rocm" }
 "#;
-        let manifest = ReleaseManifest::from_toml(toml).unwrap();
+        let manifest = ReleaseManifest::from_toml(toml)?;
         assert_eq!(manifest.release.version, "0.1.0");
         assert_eq!(manifest.variants.len(), 3);
         assert!(manifest.variants.contains_key("cuda130"));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_variant_manifest() {
+    fn test_parse_variant_manifest() -> Result<(), Box<dyn std::error::Error>> {
         let toml = r#"
 [variant]
 id = "cuda130"
@@ -183,25 +184,25 @@ runtime = [
 dev = ["libtorch/include/**"]
 test = ["libtorch/lib/*_test*"]
 "#;
-        let manifest = VariantManifest::from_toml(toml).unwrap();
+        let manifest = VariantManifest::from_toml(toml)?;
         assert_eq!(manifest.variant.id, "cuda130");
-        assert_eq!(
-            manifest.host.as_ref().unwrap().min_driver_version,
-            Some("535.0".to_string())
-        );
+        let host = manifest.host.as_ref().ok_or("host missing")?;
+        assert_eq!(host.min_driver_version, Some("535.0".to_owned()));
         let paths = manifest.runtime_pathspecs();
-        assert!(paths.contains(&"manifest.toml".to_string()));
+        assert!(paths.contains(&"manifest.toml".to_owned()));
         assert!(paths.iter().any(|p| p.contains("libtorch")));
+        Ok(())
     }
 
     #[test]
-    fn test_runtime_pathspecs_default() {
+    fn test_runtime_pathspecs_default() -> Result<(), Box<dyn std::error::Error>> {
         let toml = r#"
 [variant]
 id = "cpu"
 "#;
-        let manifest = VariantManifest::from_toml(toml).unwrap();
+        let manifest = VariantManifest::from_toml(toml)?;
         let paths = manifest.runtime_pathspecs();
         assert_eq!(paths, vec!["backends/cpu/", "manifest.toml"]);
+        Ok(())
     }
 }

@@ -145,14 +145,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_sha256_from_pointer() {
+    fn test_parse_sha256_from_pointer() -> Result<()> {
         let pointer =
             r#"{"xet":"gittorrent","sha256":"a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2","size":1024}"#;
-        let hash = parse_sha256_from_pointer(pointer).unwrap();
+        let hash = parse_sha256_from_pointer(pointer)?;
         assert_eq!(
             hash,
             "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
         );
+        Ok(())
     }
 
     #[test]

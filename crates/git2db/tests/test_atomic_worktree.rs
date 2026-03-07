@@ -193,7 +193,7 @@ async fn test_filtered_worktree_only_materializes_paths() -> Result<(), Box<dyn 
         .create_filtered_worktree(
             &worktree_path,
             "release",
-            vec!["backends/cuda130/".to_string(), "manifest.toml".to_string()],
+            vec!["backends/cuda130/".to_owned(), "manifest.toml".to_owned()],
         )
         .await;
 
@@ -265,7 +265,7 @@ async fn test_skip_worktree_survives_subsequent_checkout() -> Result<(), Box<dyn
         .create_filtered_worktree(
             &worktree_path,
             "test-branch",
-            vec!["keep/".to_string()],
+            vec!["keep/".to_owned()],
         )
         .await?;
 
@@ -280,14 +280,14 @@ async fn test_skip_worktree_survives_subsequent_checkout() -> Result<(), Box<dyn
     let skip_entry = (0..wt_index.len())
         .find_map(|i| {
             let e = wt_index.get(i)?;
-            let path = String::from_utf8_lossy(&e.path).to_string();
+            let path = String::from_utf8_lossy(&e.path).into_owned();
             if path == "skip/b.txt" {
                 Some(e)
             } else {
                 None
             }
         })
-        .expect("skip/b.txt should be in the index");
+        .ok_or("skip/b.txt should be in the index")?;
 
     assert_ne!(
         skip_entry.flags_extended & 0x4000,
@@ -309,7 +309,10 @@ async fn test_skip_worktree_survives_subsequent_checkout() -> Result<(), Box<dyn
     if reappeared {
         // libgit2 may not fully honor skip-worktree — this is acceptable
         // as long as the bit is correctly set in the index
-        eprintln!("Note: libgit2 re-materialized skip-worktree file (known limitation)");
+        {
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr(), "Note: libgit2 re-materialized skip-worktree file (known limitation)");
+        }
     }
 
     Ok(())

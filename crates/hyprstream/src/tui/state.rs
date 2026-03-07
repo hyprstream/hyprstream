@@ -805,25 +805,27 @@ mod tests {
     }
 
     #[test]
-    fn test_session_creation() {
+    fn test_session_creation() -> Result<(), Box<dyn std::error::Error>> {
         let mut state = TuiState::default();
         let sid = state.create_session();
         assert_eq!(sid, 1);
 
-        let session = state.session(sid).unwrap();
+        let session = state.session(sid).ok_or("session missing")?;
         assert_eq!(session.windows.len(), 1);
         assert_eq!(session.windows[0].panes.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_window_creation() {
+    fn test_window_creation() -> Result<(), Box<dyn std::error::Error>> {
         let mut state = TuiState::default();
         let sid = state.create_session();
-        let wid = state.create_window(sid).unwrap();
+        let wid = state.create_window(sid).ok_or("create_window failed")?;
 
-        let session = state.session(sid).unwrap();
+        let session = state.session(sid).ok_or("session missing")?;
         assert_eq!(session.windows.len(), 2);
         assert!(session.window(wid).is_some());
+        Ok(())
     }
 
     #[test]
@@ -835,7 +837,9 @@ mod tests {
         pane.enter_alternate_screen();
         assert!(pane.using_alternate);
         assert!(pane.alternate.is_some());
-        assert!(pane.alternate.as_ref().unwrap().force_full_frame);
+        if let Some(alt) = pane.alternate.as_ref() {
+            assert!(alt.force_full_frame);
+        }
 
         pane.leave_alternate_screen();
         assert!(!pane.using_alternate);
