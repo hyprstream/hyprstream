@@ -1666,6 +1666,58 @@ impl TorchEngine {
         Ok(results)
     }
 
+    /// Compute embeddings from raw pixel bytes.
+    pub fn embed_raw(
+        &self,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        channels: u32,
+        pixel_format: &str,
+        preprocess_mode: &str,
+        batch_count: u32,
+        row_stride: u32,
+    ) -> Result<Vec<Vec<f32>>> {
+        use crate::runtime::image_utils::{preprocess_raw_pixels, ImagePreprocessConfig};
+
+        if pixels.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let model_guard = self
+            .persistent_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("No model loaded"))?
+            .lock();
+
+        let config = ImagePreprocessConfig::siglip();
+        let batch = preprocess_raw_pixels(
+            pixels, width, height, channels,
+            pixel_format, preprocess_mode,
+            batch_count, row_stride,
+            &config, self.device,
+        )?;
+
+        let _no_grad = tch::no_grad_guard();
+        let embeddings_tensor = model_guard.encode_vision(&batch)?;
+
+        let batch_size = embeddings_tensor.size()[0] as usize;
+        let dim = embeddings_tensor.size()[1] as usize;
+        let cpu_tensor = embeddings_tensor
+            .to_device(tch::Device::Cpu)
+            .to_kind(tch::Kind::Float);
+
+        let mut results = Vec::with_capacity(batch_size);
+        for i in 0..batch_size {
+            let mut vec = vec![0.0f32; dim];
+            let row = cpu_tensor.get(i as i64);
+            row.copy_data(&mut vec, dim);
+            results.push(vec);
+        }
+
+        Ok(results)
+    }
+
     /// Process embeddings through all model layers for embedding extraction
     fn process_through_layers_for_embedding(
         &self,

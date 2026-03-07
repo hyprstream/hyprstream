@@ -217,6 +217,108 @@ pub fn create_fallback_image(
     Ok(tensor.unsqueeze(0))
 }
 
+/// Preprocess raw pixel bytes into a tensor ready for vision inference.
+///
+/// Handles pixel format conversion (RGB/BGR u8 or pre-normalized f32 CHW)
+/// and optional SigLIP normalization (resize to 384x384, (x-0.5)/0.5).
+pub fn preprocess_raw_pixels(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    channels: u32,
+    pixel_format: &str,
+    preprocess_mode: &str,
+    batch_count: u32,
+    row_stride: u32,
+    config: &ImagePreprocessConfig,
+    device: Device,
+) -> Result<Tensor> {
+    let batch = std::cmp::max(batch_count, 1) as i64;
+    let h = height as i64;
+    let w = width as i64;
+    let c = channels as i64;
+
+    let tensor = match pixel_format {
+        "float32Chw" => {
+            let expected = (batch * c * h * w * 4) as usize;
+            anyhow::ensure!(
+                pixels.len() >= expected,
+                "float32Chw: expected {} bytes, got {}",
+                expected, pixels.len()
+            );
+            let float_data: &[f32] = bytemuck::cast_slice(&pixels[..expected]);
+            Tensor::from_slice(float_data)
+                .reshape([batch, c, h, w])
+                .to_device(device)
+        }
+        fmt @ ("rgb8" | "bgr8") => {
+            let stride = if row_stride > 0 {
+                row_stride as usize
+            } else {
+                (w as usize) * (c as usize)
+            };
+            let expected = (batch as usize) * (h as usize) * stride;
+            anyhow::ensure!(
+                pixels.len() >= expected,
+                "{}: expected {} bytes (stride={}), got {}",
+                fmt, expected, stride, pixels.len()
+            );
+
+            let tight_stride = (w as usize) * (c as usize);
+            let pixel_data = if stride == tight_stride {
+                pixels[..expected].to_vec()
+            } else {
+                let mut tight = Vec::with_capacity((batch as usize) * (h as usize) * tight_stride);
+                for row in 0..((batch as usize) * (h as usize)) {
+                    let start = row * stride;
+                    tight.extend_from_slice(&pixels[start..start + tight_stride]);
+                }
+                tight
+            };
+
+            let t = Tensor::from_slice(&pixel_data)
+                .to_kind(tch::Kind::Uint8)
+                .reshape([batch, h, w, c]);
+
+            let t = t.to_kind(tch::Kind::Float) / 255.0;
+
+            let t = if fmt == "bgr8" {
+                t.index_select(3, &Tensor::from_slice(&[2i64, 1, 0]).to_device(t.device()))
+            } else {
+                t
+            };
+
+            t.permute([0, 3, 1, 2]).to_device(device)
+        }
+        other => anyhow::bail!("unsupported pixel format: {}", other),
+    };
+
+    match preprocess_mode {
+        "siglip" => {
+            let target = config.image_size as i64;
+            let tensor = if h != target || w != target {
+                tensor.upsample_bilinear2d([target, target], false, None, None)
+            } else {
+                tensor
+            };
+            normalize_tensor_batched(&tensor, &config.mean, &config.std)
+        }
+        "none" => Ok(tensor),
+        other => anyhow::bail!("unsupported preprocess mode: {}", other),
+    }
+}
+
+/// Normalize a batched tensor [B, C, H, W] using per-channel mean and std.
+fn normalize_tensor_batched(tensor: &Tensor, mean: &[f32; 3], std: &[f32; 3]) -> Result<Tensor> {
+    let mean_tensor = Tensor::from_slice(mean)
+        .to_device(tensor.device())
+        .reshape([1, 3, 1, 1]);
+    let std_tensor = Tensor::from_slice(std)
+        .to_device(tensor.device())
+        .reshape([1, 3, 1, 1]);
+    Ok((tensor - mean_tensor) / std_tensor)
+}
+
 /// Normalize a tensor using mean and std
 ///
 /// Formula: (x - mean) / std
@@ -351,5 +453,213 @@ mod tests {
         assert!(image.is_fallback());
         assert!(image.path.is_none());
         assert_eq!(image.tensor().size(), &[1, 3, 384, 384]);
+    }
+
+    // ── preprocess_raw_pixels tests ──────────────────────────────────
+
+    #[test]
+    fn preprocess_rgb8_shape() {
+        let config = ImagePreprocessConfig::siglip();
+        let w: u32 = 384;
+        let h: u32 = 384;
+        let pixels = vec![128u8; (w * h * 3) as usize];
+
+        let t = preprocess_raw_pixels(
+            &pixels, w, h, 3, "rgb8", "none", 1, 0, &config, Device::Cpu,
+        )
+        .expect("rgb8 preprocess");
+
+        assert_eq!(t.size(), &[1, 3, 384, 384]);
+        assert_eq!(t.kind(), Kind::Float);
+    }
+
+    #[test]
+    fn preprocess_rgb8_values() {
+        // Single pixel: R=255, G=0, B=128
+        let config = ImagePreprocessConfig::siglip();
+        let pixels: Vec<u8> = vec![255, 0, 128];
+
+        let t = preprocess_raw_pixels(
+            &pixels, 1, 1, 3, "rgb8", "none", 1, 0, &config, Device::Cpu,
+        )
+        .expect("rgb8 values");
+
+        // [1, 3, 1, 1] — channel values should be /255.0
+        assert_eq!(t.size(), &[1, 3, 1, 1]);
+        let r = t.double_value(&[0, 0, 0, 0]);
+        let g = t.double_value(&[0, 1, 0, 0]);
+        let b = t.double_value(&[0, 2, 0, 0]);
+        assert!((r - 1.0).abs() < 1e-5, "R should be 1.0, got {r}");
+        assert!(g.abs() < 1e-5, "G should be 0.0, got {g}");
+        assert!((b - 128.0 / 255.0).abs() < 1e-4, "B should be ~0.502, got {b}");
+    }
+
+    #[test]
+    fn preprocess_bgr8_channel_swap() {
+        // BGR pixel: B=10, G=20, R=30 → should become RGB: R=30, G=20, B=10
+        let config = ImagePreprocessConfig::siglip();
+        let pixels: Vec<u8> = vec![10, 20, 30];
+
+        let t = preprocess_raw_pixels(
+            &pixels, 1, 1, 3, "bgr8", "none", 1, 0, &config, Device::Cpu,
+        )
+        .expect("bgr8 swap");
+
+        let r = t.double_value(&[0, 0, 0, 0]);
+        let g = t.double_value(&[0, 1, 0, 0]);
+        let b = t.double_value(&[0, 2, 0, 0]);
+        assert!(
+            (r - 30.0 / 255.0).abs() < 1e-4,
+            "R channel should be 30/255, got {r}"
+        );
+        assert!(
+            (g - 20.0 / 255.0).abs() < 1e-4,
+            "G channel should be 20/255, got {g}"
+        );
+        assert!(
+            (b - 10.0 / 255.0).abs() < 1e-4,
+            "B channel should be 10/255, got {b}"
+        );
+    }
+
+    #[test]
+    fn preprocess_float32chw_passthrough() {
+        let config = ImagePreprocessConfig::siglip();
+        // 1x3x2x2 = 12 floats = 48 bytes
+        let data: Vec<f32> = (0..12).map(|i| i as f32 * 0.1).collect();
+        let pixels: Vec<u8> = bytemuck::cast_slice(&data).to_vec();
+
+        let t = preprocess_raw_pixels(
+            &pixels, 2, 2, 3, "float32Chw", "none", 1, 0, &config, Device::Cpu,
+        )
+        .expect("float32Chw passthrough");
+
+        assert_eq!(t.size(), &[1, 3, 2, 2]);
+        // First element should be 0.0
+        assert!(t.double_value(&[0, 0, 0, 0]).abs() < 1e-5);
+        // Second element (0,0,0,1) should be 0.1
+        assert!((t.double_value(&[0, 0, 0, 1]) - 0.1).abs() < 1e-5);
+    }
+
+    #[test]
+    fn preprocess_stride_padding_removal() {
+        // 2x2 RGB with stride=8 (6 tight bytes + 2 padding per row)
+        let config = ImagePreprocessConfig::siglip();
+        let mut pixels = Vec::new();
+        // Row 0: [R,G,B, R,G,B, pad, pad]
+        pixels.extend_from_slice(&[10, 20, 30, 40, 50, 60, 0, 0]);
+        // Row 1: [R,G,B, R,G,B, pad, pad]
+        pixels.extend_from_slice(&[70, 80, 90, 100, 110, 120, 0, 0]);
+
+        let t = preprocess_raw_pixels(
+            &pixels, 2, 2, 3, "rgb8", "none", 1, 8, &config, Device::Cpu,
+        )
+        .expect("stride padding removal");
+
+        assert_eq!(t.size(), &[1, 3, 2, 2]);
+        // Top-left R channel should be 10/255
+        let r00 = t.double_value(&[0, 0, 0, 0]);
+        assert!(
+            (r00 - 10.0 / 255.0).abs() < 1e-4,
+            "top-left R should be 10/255, got {r00}"
+        );
+        // Bottom-right B channel should be 120/255
+        let b11 = t.double_value(&[0, 2, 1, 1]);
+        assert!(
+            (b11 - 120.0 / 255.0).abs() < 1e-4,
+            "bottom-right B should be 120/255, got {b11}"
+        );
+    }
+
+    #[test]
+    fn preprocess_siglip_normalization() {
+        // With SigLIP: mean=[0.5,0.5,0.5], std=[0.5,0.5,0.5]
+        // pixel 128 → 128/255 ≈ 0.502 → (0.502 - 0.5) / 0.5 ≈ 0.004
+        let config = ImagePreprocessConfig::siglip();
+        let pixels = vec![128u8; 3]; // 1x1 pixel
+
+        let t = preprocess_raw_pixels(
+            &pixels, 1, 1, 3, "rgb8", "siglip", 1, 0, &config, Device::Cpu,
+        )
+        .expect("siglip normalization");
+
+        // SigLIP resizes to 384x384 then normalizes
+        assert_eq!(t.size(), &[1, 3, 384, 384]);
+
+        let val = t.double_value(&[0, 0, 0, 0]);
+        let expected = (128.0 / 255.0 - 0.5) / 0.5;
+        assert!(
+            (val - expected).abs() < 1e-4,
+            "SigLIP normalized value should be ~{expected:.4}, got {val:.4}"
+        );
+    }
+
+    #[test]
+    fn preprocess_rgb8_too_small() {
+        let config = ImagePreprocessConfig::siglip();
+        // 2x2 needs 12 bytes, provide only 6
+        let pixels = vec![0u8; 6];
+
+        let result = preprocess_raw_pixels(
+            &pixels, 2, 2, 3, "rgb8", "none", 1, 0, &config, Device::Cpu,
+        );
+        assert!(result.is_err(), "should fail on undersized buffer");
+    }
+
+    #[test]
+    fn preprocess_float32chw_too_small() {
+        let config = ImagePreprocessConfig::siglip();
+        // 1x3x2x2 needs 48 bytes, provide only 16
+        let pixels = vec![0u8; 16];
+
+        let result = preprocess_raw_pixels(
+            &pixels, 2, 2, 3, "float32Chw", "none", 1, 0, &config, Device::Cpu,
+        );
+        assert!(result.is_err(), "should fail on undersized float32 buffer");
+    }
+
+    #[test]
+    fn preprocess_unsupported_pixel_format() {
+        let config = ImagePreprocessConfig::siglip();
+        let pixels = vec![0u8; 12];
+
+        let result = preprocess_raw_pixels(
+            &pixels, 2, 2, 3, "yuv420", "none", 1, 0, &config, Device::Cpu,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unsupported pixel format"),
+            "error should mention unsupported format: {err}"
+        );
+    }
+
+    #[test]
+    fn preprocess_unsupported_preprocess_mode() {
+        let config = ImagePreprocessConfig::siglip();
+        let pixels = vec![128u8; 3];
+
+        let result = preprocess_raw_pixels(
+            &pixels, 1, 1, 3, "rgb8", "clip", 1, 0, &config, Device::Cpu,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unsupported preprocess mode"),
+            "error should mention unsupported mode: {err}"
+        );
+    }
+
+    #[test]
+    fn preprocess_batch_count_zero_treated_as_one() {
+        let config = ImagePreprocessConfig::siglip();
+        let pixels = vec![128u8; 3];
+
+        let t = preprocess_raw_pixels(
+            &pixels, 1, 1, 3, "rgb8", "none", 0, 0, &config, Device::Cpu,
+        )
+        .expect("batch_count=0 should be treated as 1");
+
+        assert_eq!(t.size()[0], 1, "batch dim should be 1");
     }
 }

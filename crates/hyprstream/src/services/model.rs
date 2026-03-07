@@ -626,6 +626,7 @@ use crate::services::generated::model_client::{
     // Infer types
     GenerateRequest, ApplyChatTemplateRequest, ModelStatusResponse, OnlineTrainingConfig,
     EmbedRequest, EmbedResponse,
+    EmbedRawRequest, PixelFormatEnum, PreprocessModeEnum,
 };
 // Conflicting names — use canonical path at usage sites:
 //   model_client::LoadedModelInfo, model_client::StreamInfo,
@@ -988,6 +989,37 @@ impl InferHandler for ModelService {
     ) -> Result<EmbedResponse> {
         let client = self.get_inference_client(model_ref, ctx).await?;
         let embeddings = client.embed(&data.images).await?;
+        let dimensions = embeddings.first().map(|v| v.len() as u32).unwrap_or(0);
+        Ok(EmbedResponse {
+            embeddings,
+            dimensions,
+        })
+    }
+
+    async fn handle_embed_raw(
+        &self, ctx: &EnvelopeContext, _request_id: u64,
+        model_ref: &str, data: &EmbedRawRequest,
+    ) -> Result<EmbedResponse> {
+        let pixel_format = match data.pixel_format {
+            PixelFormatEnum::Rgb8 => "rgb8",
+            PixelFormatEnum::Bgr8 => "bgr8",
+            PixelFormatEnum::Float32Chw => "float32Chw",
+        };
+        let preprocess_mode = match data.preprocess_mode {
+            PreprocessModeEnum::Siglip => "siglip",
+            PreprocessModeEnum::None => "none",
+        };
+        let client = self.get_inference_client(model_ref, ctx).await?;
+        let embeddings = client.embed_raw(
+            &data.pixels,
+            data.width,
+            data.height,
+            data.channels,
+            pixel_format,
+            preprocess_mode,
+            data.batch_count,
+            data.row_stride,
+        ).await?;
         let dimensions = embeddings.first().map(|v| v.len() as u32).unwrap_or(0);
         Ok(EmbedResponse {
             embeddings,

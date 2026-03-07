@@ -74,6 +74,9 @@ struct InferenceRequest {
 
     # Vision embeddings (synchronous — returns all embeddings in one response)
     embed @32 :EmbedImagesRequest $mcpScope(infer);
+
+    # Raw tensor embedding (synchronous — accepts raw pixel bytes)
+    embedRaw @33 :EmbedRawRequest $mcpScope(infer);
   }
 }
 
@@ -131,6 +134,9 @@ struct InferenceResponse {
 
     # Embed result
     embedResult @33 :EmbedImagesResponse;
+
+    # Raw tensor embed result (reuses response type — output is identical)
+    embedRawResult @34 :EmbedImagesResponse;
   }
 }
 
@@ -358,6 +364,33 @@ struct EmbedImagesRequest {
 struct EmbedImagesResponse {
   embeddings @0 :List(List(Float32));  # one vector per image
   dimensions @1 :UInt32;               # embedding dimensionality
+}
+
+# Pixel format for raw tensor embedding
+enum PixelFormat {
+  rgb8 @0;        # uint8 HWC — GStreamer/image crate default
+  bgr8 @1;        # uint8 HWC — OpenCV default
+  float32Chw @2;  # pre-normalized CHW f32
+}
+
+# Preprocessing mode for raw tensor embedding
+enum PreprocessMode {
+  siglip @0;  # server applies SigLIP normalization (resize, /255, (x-0.5)/0.5, HWC->CHW)
+  none @1;    # client sends ready-to-infer tensor (must be float32Chw)
+}
+
+# Raw tensor embedding request — accepts raw pixel bytes instead of encoded images.
+# Server validates: pixels.len() == max(batchCount,1) * height * (rowStride or width*channels*sizeof(dtype)).
+# Server returns ErrorInfo on size mismatch or invalid preprocessMode+pixelFormat combination.
+struct EmbedRawRequest {
+  pixels          @0 :Data;            # flat pixel bytes, all images concatenated
+  width           @1 :UInt32;          # pixel width per image
+  height          @2 :UInt32;          # pixel height per image
+  channels        @3 :UInt32;          # channels per pixel (3 for RGB/BGR)
+  pixelFormat     @4 :PixelFormat;
+  preprocessMode  @5 :PreprocessMode;
+  batchCount      @6 :UInt32;          # number of images (0 = 1)
+  rowStride       @7 :UInt32;          # bytes per row; 0 = tightly packed
 }
 
 # Error Information
