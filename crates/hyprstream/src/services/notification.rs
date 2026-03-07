@@ -213,8 +213,8 @@ fn scope_matches(pattern: &str, scope: &str) -> bool {
     }
     if let Some(prefix) = pattern.strip_suffix(":*") {
         scope.starts_with(prefix) && scope[prefix.len()..].starts_with(':')
-    } else if pattern.ends_with('*') {
-        scope.starts_with(&pattern[..pattern.len() - 1])
+    } else if let Some(prefix) = pattern.strip_suffix('*') {
+        scope.starts_with(prefix)
     } else {
         pattern == scope
     }
@@ -281,7 +281,8 @@ fn serialize_notification_block(
         block.set_publisher_mac(publisher_mac);
     }
     let mut output = Vec::new();
-    capnp_serialize::write_message(&mut output, &builder).expect("capnp serialization");
+    #[allow(clippy::expect_used)] // writing to Vec<u8> is infallible
+    capnp_serialize::write_message(&mut output, &builder).expect("capnp serialization to Vec is infallible");
     output
 }
 
@@ -600,7 +601,11 @@ impl NotificationHandler for NotificationService {
             }
         }
 
-        // Now safe to remove — caller is verified and intent is not expired
+        // Now safe to remove — caller is verified and intent is not expired.
+        // The prior lookup confirmed it exists; `remove` returns None only if a
+        // concurrent caller already consumed it (which this service's single-task
+        // dispatch prevents).
+        #[allow(clippy::expect_used)]
         let intent = self.pending_intents.write().remove(&intent_id)
             .expect("intent verified above and only removed here");
 

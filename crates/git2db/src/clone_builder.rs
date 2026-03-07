@@ -14,6 +14,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// Fast-path flag: set after a successful XET initialization so concurrent
+/// callers skip redundant work without entering `initialize()`.
+///
+/// `xet_filter::initialize()` is internally idempotent (uses
+/// `tokio::sync::OnceCell::get_or_try_init`), so concurrent callers that race
+/// past the fast path won't crash, but they will do redundant work. This OnceLock
+/// avoids the extra overhead.
+#[cfg(feature = "xet-storage")]
+static XET_INITIALIZED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
 /// Automatically initialize XET for URLs that have XET support
 ///
 /// XET endpoint resolution:
@@ -22,9 +32,15 @@ use tokio::sync::RwLock;
 /// 3. None - XET disabled, will use git-lfs
 #[cfg(feature = "xet-storage")]
 async fn maybe_init_xet_for_url(url: &str) -> Git2DBResult<()> {
-    // Check if XET is already initialized
+    // Fast path: a previous call already succeeded.
+    if XET_INITIALIZED.get().is_some() {
+        return Ok(());
+    }
+
+    // Check if XET is already initialized (e.g. initialized by caller before clone).
     if crate::xet_filter::is_initialized() {
         tracing::debug!(url = %url, "XET filter already initialized");
+        let _ = XET_INITIALIZED.set(());
         return Ok(());
     }
 
@@ -43,11 +59,13 @@ async fn maybe_init_xet_for_url(url: &str) -> Git2DBResult<()> {
         );
     }
 
-    // Initialize XET - failures are non-fatal (fallback to Git LFS)
+    // Initialize XET - failures are non-fatal (fallback to Git LFS).
+    // Concurrent callers may all reach here; initialize() is non-fatal on re-entry.
     tracing::info!(url = %url, "Auto-initializing XET filter");
 
     match crate::xet_filter::initialize(config).await {
         Ok(()) => {
+            let _ = XET_INITIALIZED.set(());
             tracing::info!(url = %url, "XET filter initialized successfully");
             Ok(())
         }

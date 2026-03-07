@@ -395,13 +395,12 @@ pub fn build_attestation_message(
 // ============================================================================
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
     #[cfg(not(feature = "fips"))]
-    use crate::crypto::key_exchange::{
-        generate_ephemeral_keypair, rerandomize_pubkey, ristretto_dh,
-    };
+    use crate::crypto::key_exchange::{generate_ephemeral_keypair, rerandomize_pubkey};
 
     #[cfg(not(feature = "fips"))]
     #[test]

@@ -818,7 +818,7 @@ impl RegistryService {
                 .capabilities
                 .to_ids()
                 .into_iter()
-                .map(|s| s.to_owned())
+                .map(std::borrow::ToOwned::to_owned)
                 .collect();
 
             result.push(crate::services::generated::registry_client::WorktreeInfo {

@@ -475,7 +475,7 @@ impl ModelService {
                 crate::events::EventSource::Model,
                 scope.clone(),
                 crate::events::EventPayload::ModelUnloaded {
-                    model_ref: model_ref_str.to_string(),
+                    model_ref: model_ref_str.to_owned(),
                 },
             );
             if let Ok(payload) = serde_json::to_vec(&event) {

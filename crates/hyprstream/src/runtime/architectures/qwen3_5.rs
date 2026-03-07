@@ -161,6 +161,7 @@ fn cat_projs(projs: Vec<LinearProjection>) -> LinearProjection {
         let fused_weight = Tensor::cat(&weight_refs, 1);
         let has_scale = projs.iter().any(|p| p.scale.is_some());
         let scale = if has_scale {
+            #[allow(clippy::expect_used)] // all_fp8 invariant: every proj has a scale
             let scale_refs: Vec<&Tensor> = projs.iter()
                 .map(|p| p.scale.as_ref().expect("FP8 projection missing scale"))
                 .collect();
