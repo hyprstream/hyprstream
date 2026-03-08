@@ -24,7 +24,7 @@ use crate::services::generated::tui_client::{TuiClient, TuiResponseVariant};
 ///
 /// Resolves the TUI service endpoint from the registry and creates a client
 /// with the given signing key and local identity.
-fn create_tui_client(signing_key: &SigningKey) -> TuiClient {
+pub fn create_tui_client(signing_key: &SigningKey) -> TuiClient {
     use hyprstream_rpc::registry::{global as registry, SocketKind};
 
     let endpoint = registry().endpoint("tui", SocketKind::Rep).to_zmq_string();
@@ -307,7 +307,7 @@ pub async fn handle_tui_detach() -> Result<()> {
 }
 
 /// Get the terminal size, defaulting to 80x24.
-fn terminal_size() -> (u16, u16) {
+pub fn terminal_size() -> (u16, u16) {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
@@ -330,7 +330,7 @@ fn terminal_size() -> (u16, u16) {
 
 /// Enter raw terminal mode. Returns the original termios for restoration.
 #[cfg(unix)]
-fn enter_raw_mode() -> Result<libc::termios> {
+pub fn enter_raw_mode() -> Result<libc::termios> {
     use std::os::unix::io::AsRawFd;
 
     let fd = std::io::stdin().as_raw_fd();
@@ -356,20 +356,20 @@ fn enter_raw_mode() -> Result<libc::termios> {
 }
 
 #[cfg(not(unix))]
-fn enter_raw_mode() -> Result<()> {
+pub fn enter_raw_mode() -> Result<()> {
     Ok(())
 }
 
 /// Restore terminal to original mode.
 #[cfg(unix)]
-fn restore_terminal(orig: &libc::termios) {
+pub fn restore_terminal(orig: &libc::termios) {
     use std::os::unix::io::AsRawFd;
     let fd = std::io::stdin().as_raw_fd();
     unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, orig) };
 }
 
 #[cfg(not(unix))]
-fn restore_terminal(_orig: &()) {}
+pub fn restore_terminal(_orig: &()) {}
 
 /// Play an asciicast v2 recording in a TUI pane.
 ///
@@ -474,7 +474,7 @@ pub async fn handle_tui_play(
 /// If `stdin_stream` is provided (FD 0 from ConnectResult), subscribes to
 /// the PUB/SUB stream for relayed viewer input (keypresses from browser or
 /// tui-attach viewers) and forwards them to the local PaneProcess.
-async fn forward_process_output(
+pub async fn forward_process_output(
     mut process: crate::tui::process::PaneProcess,
     client: &TuiClient,
     signing_key: &SigningKey,
@@ -564,69 +564,30 @@ async fn forward_process_output(
         }
     });
 
-    // Subscribe to stdin stream (FD 0) for relayed viewer input
+    // Poll stdin via pollStdin RPC instead of subscribing to the ZMQ PUB stream.
+    // This avoids creating a second ZMQ context in this process, which triggers a
+    // libzmq signaler assertion (dummy == 0) when fork() is involved.
     let stdin_input_tx = process.input_tx.clone();
     let stdin_handle = if let Some(si) = stdin_stream {
         if !si.topic.is_empty() {
-            let zmq_ctx = zmq::Context::new();
-            let sub_endpoint = hyprstream_rpc::registry::global()
-                .endpoint("streams", hyprstream_rpc::registry::SocketKind::Sub)
-                .to_zmq_string();
-            let sub_socket = zmq_ctx.socket(zmq::SUB)?;
-            sub_socket.connect(&sub_endpoint)?;
-            sub_socket.set_subscribe(si.topic.as_bytes())?;
-            sub_socket.set_linger(0)?;
-
-            let mac_key: [u8; 32] = si.mac_key.as_slice()
-                .try_into()
-                .context("stdin mac_key must be 32 bytes")?;
-            let topic = si.topic.clone();
-
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-
-            // ZMQ recv in blocking thread — verifies HMAC chain and extracts data
-            let recv_handle = tokio::task::spawn_blocking(move || {
-                use hyprstream_rpc::streaming::{StreamPayload, StreamVerifier};
-                let mut verifier = StreamVerifier::new(mac_key, topic);
+            let poll_client = create_tui_client(signing_key);
+            let poll_viewer_id = viewer_id;
+            let handle = tokio::spawn(async move {
+                use crate::tui::shell_client::poll_stdin_rpc;
                 loop {
-                    let mut frames: Vec<Vec<u8>> = Vec::with_capacity(3);
-                    match sub_socket.recv_bytes(0) {
-                        Ok(frame) => frames.push(frame),
-                        Err(_) => break,
-                    }
-                    while sub_socket.get_rcvmore().unwrap_or(false) {
-                        match sub_socket.recv_bytes(0) {
-                            Ok(frame) => frames.push(frame),
-                            Err(_) => break,
-                        }
-                    }
-                    match verifier.verify(&frames) {
-                        Ok(payloads) => {
-                            for payload in payloads {
-                                if let StreamPayload::Data(data) = payload {
-                                    if tx.blocking_send(data).is_err() {
-                                        return;
-                                    }
-                                }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    match poll_stdin_rpc(&poll_client, poll_viewer_id).await {
+                        Ok(data) if !data.is_empty() => {
+                            if stdin_input_tx.send(ProcessInput::Stdin(data)).await.is_err() {
+                                break;
                             }
                         }
-                        Err(e) => {
-                            tracing::warn!("Stdin stream verification failed: {}", e);
-                        }
+                        Err(_) => break,
+                        _ => {}
                     }
                 }
             });
-
-            // Forward received input to local PaneProcess
-            let forward_handle = tokio::spawn(async move {
-                while let Some(data) = rx.recv().await {
-                    if stdin_input_tx.send(ProcessInput::Stdin(data)).await.is_err() {
-                        break;
-                    }
-                }
-            });
-
-            Some((recv_handle, forward_handle))
+            Some(handle)
         } else {
             None
         }
@@ -634,8 +595,28 @@ async fn forward_process_output(
         None
     };
 
+    // SIGTERM handler — allows disconnect RPC to fire before the process dies.
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::terminate(),
+    )?;
+
     // Forward output loop (existing sendInput RPC)
-    while let Some(data) = process.stdout_rx.recv().await {
+    loop {
+        #[cfg(unix)]
+        let recv = tokio::select! {
+            biased;
+            _ = sigterm.recv() => None,
+            maybe = process.stdout_rx.recv() => maybe,
+        };
+        #[cfg(not(unix))]
+        let recv = process.stdout_rx.recv().await;
+
+        let data = match recv {
+            Some(d) => d,
+            None => break,
+        };
+
         let request_id = client.next_id();
         let payload = hyprstream_rpc::serialize_message(|msg| {
             let mut req =
@@ -653,13 +634,24 @@ async fn forward_process_output(
         }
     }
 
+    // Send disconnect RPC so TuiService evicts this viewer immediately.
+    // This prevents stale viewer entries that would intercept stdin relay
+    // for subsequent sessions after this process exits.
+    let request_id = client.next_id();
+    if let Ok(payload) = hyprstream_rpc::serialize_message(|msg| {
+        let mut req = msg.init_root::<crate::tui_capnp::tui_request::Builder<'_>>();
+        req.set_id(request_id);
+        req.set_disconnect(viewer_id);
+    }) {
+            let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            client.call(payload),
+        ).await;
+    }
+
     resize_handle.abort();
     if let Some(h) = stdin_forward { h.abort(); }
-    // Abort stdin stream subscriber
-    if let Some((recv_h, fwd_h)) = stdin_handle {
-        recv_h.abort();
-        fwd_h.abort();
-    }
+    if let Some(h) = stdin_handle { h.abort(); }
     // Signal stdin reader thread to exit via cancel pipe
     if let Some(fd) = cancel_fd {
         unsafe { libc::write(fd, b"x".as_ptr().cast(), 1); }

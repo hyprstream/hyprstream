@@ -18,6 +18,7 @@ pub mod bootstrap_manager;
 pub mod remote_handlers;
 pub mod schema_cli;
 pub mod service_handlers;
+pub mod shell_handlers;
 pub mod systemd_setup;
 pub mod training_handlers;
 pub mod tui_handlers;

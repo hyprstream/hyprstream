@@ -132,7 +132,8 @@ reflink-copy = "0.1"  # COW file copying (reflink when available)
 hyprstream-containedfs.workspace = true  # Path-contained filesystem operations
 age = { version = "0.11.2", features = ["armor"] }
 hyprstream-tui = { path = "../hyprstream-tui" }  # Setup wizard TUI (WizardBackend trait + WizardApp)
-waxterm = { path = "../waxterm" }  # Terminal abstraction for TUI rendering
+waxterm = { path = "../waxterm", features = ["avt"] }  # Terminal abstraction for TUI rendering
+avt = "0.17"  # VTE for ShellClient pane rendering
 ratatui = { version = "0.30", default-features = false }  # TUI framework for pane buffers
 vte = "0.13"  # VT100/ANSI escape sequence parser for TUI pane ingestion
 rtrb = "0.3"  # SPSC ring buffer for VTE parser thread

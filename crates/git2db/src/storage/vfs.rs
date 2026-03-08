@@ -289,7 +289,7 @@ impl VfsDriver {
         let ref_spec = opts.ref_spec.clone();
         let progress = opts.progress.clone();
 
-        tokio::task::spawn_blocking(move || {
+        let _ = tokio::task::spawn_blocking(move || {
             // Set up smudge progress hook if progress reporter is available
             if let Some(ref reporter) = progress {
                 let r = std::sync::Arc::clone(reporter);

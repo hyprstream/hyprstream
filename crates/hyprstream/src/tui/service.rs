@@ -15,7 +15,7 @@ use capnp::serialize;
 use ratatui::buffer::Cell;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, debug, warn};
+use tracing::{debug, info, warn};
 
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::streaming::{
@@ -93,6 +93,10 @@ pub(crate) enum FrameLoopCommand {
     EvictViewer { viewer_id: u32 },
     /// Attach a process to a pane.
     SpawnProcess { pane_id: u32, process: super::process::PaneProcess },
+    /// Notify the frame loop that a pane was resized.
+    Resize { pane_id: u32, cols: u16, rows: u16 },
+    /// Kill the process attached to a pane (called when window/pane is closed).
+    KillProcess { pane_id: u32 },
 }
 
 /// Channel for sending commands to the frame loop.
@@ -102,6 +106,15 @@ pub(crate) type CommandReceiver = tokio::sync::mpsc::UnboundedReceiver<FrameLoop
 /// Registry of active sessions → their command channels + cancel tokens.
 /// This is Send+Sync because it only contains channel senders, not !Send sockets.
 type SessionRegistry = Arc<RwLock<HashMap<u32, (CommandSender, CancellationToken)>>>;
+
+/// Per-viewer stdin queues for the `pollStdin` RPC.
+///
+/// When a consumer viewer sends input (keyboard) and there is no local process
+/// attached, TuiService relays it to Capnp-mode producers via a ZMQ PUB stream.
+/// Simultaneously it enqueues the same data here so producers can poll via RPC
+/// instead of subscribing to the ZMQ stream — avoiding a second ZMQ context and
+/// the associated signaler assertion bugs.
+type StdinQueues = Arc<std::sync::Mutex<HashMap<u32, std::collections::VecDeque<Vec<u8>>>>>;
 
 // ============================================================================
 // TuiService
@@ -126,6 +139,8 @@ pub struct TuiService {
     signing_key: SigningKey,
     /// Per-session viewer registration channels + frame loop tokens.
     sessions: SessionRegistry,
+    /// Per-viewer stdin queues (for pollStdin RPC).
+    stdin_queues: StdinQueues,
 }
 
 impl TuiService {
@@ -143,6 +158,7 @@ impl TuiService {
             transport,
             signing_key,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            stdin_queues: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -257,6 +273,7 @@ impl TuiService {
         let tui_state = Arc::clone(&self.state);
         let zmq_context = Arc::clone(&self.context);
         let sk = self.signing_key.clone();
+        let stdin_queues = Arc::clone(&self.stdin_queues);
         let continuation: Continuation = Box::pin(async move {
             let mut reg = sessions_reg.write().await;
             let (sender, _cancel) = reg.entry(sid).or_insert_with(|| {
@@ -266,7 +283,8 @@ impl TuiService {
                 let s = Arc::clone(&tui_state);
                 let c = cancel.clone();
                 let ctx = Arc::clone(&zmq_context);
-                tokio::task::spawn_local(run_frame_loop(s, sid, rx, ctx, sk, c));
+                let sq = Arc::clone(&stdin_queues);
+                tokio::task::spawn_local(run_frame_loop(s, sid, rx, ctx, sk, c, sq));
                 info!(session_id = sid, "Frame loop spawned");
                 (tx, cancel)
             });
@@ -414,9 +432,25 @@ impl TuiService {
     }
 
     async fn handle_close_window(&self, request_id: u64, window_id: u32) -> Result<Vec<u8>> {
-        let mut state = self.state.write().await;
-        let sid = state.sessions.last().map(|s| s.id).unwrap_or(0);
-        if state.close_window(sid, window_id) {
+        let (sid, pane_ids, ok) = {
+            let mut state = self.state.write().await;
+            let sid = state.sessions.last().map(|s| s.id).unwrap_or(0);
+            // Collect pane IDs before removing the window from state.
+            let pane_ids: Vec<u32> = state.session(sid)
+                .and_then(|sess| sess.window(window_id))
+                .map(|w| w.panes.iter().map(|p| p.id).collect())
+                .unwrap_or_default();
+            let ok = state.close_window(sid, window_id);
+            (sid, pane_ids, ok)
+        };
+
+        if ok {
+            let reg = self.sessions.read().await;
+            if let Some((sender, _)) = reg.get(&sid) {
+                for pane_id in pane_ids {
+                    let _ = sender.send(FrameLoopCommand::KillProcess { pane_id });
+                }
+            }
             let mut msg = Builder::new_default();
             {
                 let mut resp = msg.init_root::<tui_capnp::tui_response::Builder<'_>>();
@@ -509,16 +543,259 @@ impl TuiService {
         }
     }
 
+    async fn handle_spawn_shell(
+        &self,
+        request_id: u64,
+        session_id: u32,
+        pane_id: u32,
+        cwd: &str,
+    ) -> Result<(Vec<u8>, Option<Continuation>)> {
+        // Resolve session ID and get pane dimensions
+        let (sid, cols, rows) = {
+            let state = self.state.read().await;
+            let sid = if session_id == 0 {
+                state.sessions.last().map(|s| s.id).unwrap_or(1)
+            } else {
+                session_id
+            };
+            let (cols, rows) = state
+                .session(sid)
+                .and_then(|s| {
+                    s.windows
+                        .iter()
+                        .flat_map(|w| w.panes.iter())
+                        .find(|p| p.id == pane_id)
+                })
+                .map(|p| p.size())
+                .unwrap_or((80, 24));
+            (sid, cols, rows)
+        };
+
+        let cwd_path = if cwd.is_empty() { None } else { Some(std::path::PathBuf::from(cwd)) };
+
+        let process = match super::process::spawn_pty_process(cwd_path, cols, rows) {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok((
+                    self.build_error_response(
+                        request_id,
+                        &format!("Failed to spawn shell: {e}"),
+                        "SPAWN_FAILED",
+                    )?,
+                    None,
+                ));
+            }
+        };
+
+        // Send SpawnProcess command to the session's frame loop
+        let sessions_reg = Arc::clone(&self.sessions);
+        let continuation: Continuation = Box::pin(async move {
+            let reg = sessions_reg.read().await;
+            if let Some((sender, _)) = reg.get(&sid) {
+                let _ = sender.send(FrameLoopCommand::SpawnProcess { pane_id, process });
+            }
+        });
+
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut resp = msg.init_root::<tui_capnp::tui_response::Builder<'_>>();
+            resp.set_request_id(request_id);
+            let mut result = resp.init_spawn_shell_result();
+            result.set_success(true);
+            result.set_pid(0);
+        }
+        let mut buf = Vec::new();
+        serialize::write_message(&mut buf, &msg)?;
+        Ok((buf, Some(continuation)))
+    }
+
+    /// Drain all stdin bytes queued for `viewer_id` and return them concatenated.
+    ///
+    /// Called by Capnp-mode producers (`hyprstream tui shell`) instead of
+    /// subscribing to the ZMQ PUB stdin relay stream.  Avoids the second ZMQ
+    /// context and the libzmq signaler assertion that fires on some builds.
+    async fn handle_poll_stdin(&self, request_id: u64, viewer_id: u32) -> Result<Vec<u8>> {
+        let all_data: Vec<u8> = {
+            let mut queues = self.stdin_queues.lock().unwrap();
+            if let Some(queue) = queues.get_mut(&viewer_id) {
+                let mut buf = Vec::new();
+                while let Some(chunk) = queue.pop_front() {
+                    buf.extend_from_slice(&chunk);
+                }
+                buf
+            } else {
+                Vec::new()
+            }
+        };
+
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut resp = msg.init_root::<tui_capnp::tui_response::Builder<'_>>();
+            resp.set_request_id(request_id);
+            resp.set_poll_stdin_result(&all_data);
+        }
+        let mut buf = Vec::new();
+        serialize::write_message(&mut buf, &msg)?;
+        Ok(buf)
+    }
+
+    /// Spawn `ShellApp` as a `PaneProcess` inside TuiService.
+    ///
+    /// This is the server-side counterpart to `hyprstream tui shell`.  The
+    /// client calls this RPC and then simply waits for SIGTERM — no
+    /// fork-after-ZMQ ever occurs in the client process.
+    async fn handle_spawn_chrome_shell(
+        &self,
+        request_id: u64,
+        session_id: u32,
+        registry_dir: &str,
+        cols: u16,
+        rows: u16,
+        pane_id: u32,
+    ) -> Result<(Vec<u8>, Option<Continuation>)> {
+        let (sid, active_pane_id) = {
+            let state = self.state.read().await;
+            let sid = if session_id == 0 {
+                state.sessions.last().map(|s| s.id).unwrap_or(1)
+            } else {
+                session_id
+            };
+            let active_pane_id = if pane_id != 0 {
+                pane_id
+            } else {
+                state.session(sid)
+                    .and_then(|s| s.active_window())
+                    .and_then(|w| w.active_pane())
+                    .map(|p| p.id)
+                    .unwrap_or(1)
+            };
+            (sid, active_pane_id)
+        };
+
+        let registry_models_dir = std::path::PathBuf::from(registry_dir)
+            .join(".registry")
+            .join("models");
+        let models = {
+            use hyprstream_rpc::envelope::RequestIdentity;
+            let registry_endpoint = hyprstream_rpc::registry::global()
+                .endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep)
+                .to_zmq_string();
+            let registry_client: crate::services::GenRegistryClient =
+                crate::services::create_service_client(
+                    &registry_endpoint,
+                    self.signing_key.clone(),
+                    RequestIdentity::local(),
+                );
+            let model_client_for_status = crate::services::ModelZmqClient::new(
+                self.signing_key.clone(),
+                RequestIdentity::local(),
+            );
+            let status_timeout = std::time::Duration::from_millis(500);
+            let (repos_result, status_result) = tokio::join!(
+                registry_client.list(),
+                tokio::time::timeout(status_timeout, model_client_for_status.status("")),
+            );
+            let status_map: std::collections::HashMap<String, bool> = match status_result {
+                Ok(Ok(entries)) => entries.into_iter()
+                    .map(|e| (e.model_ref, e.status == "loaded" || e.status == "loading"))
+                    .collect(),
+                _ => std::collections::HashMap::new(),
+            };
+            match repos_result {
+                Ok(repos) => repos
+                    .into_iter()
+                    .filter(|r| !r.name.is_empty())
+                    .flat_map(|r| {
+                        let name = r.name.clone();
+                        let rmd = registry_models_dir.clone();
+                        r.worktrees.into_iter().map(|wt| {
+                            let branch = if wt.branch_name.is_empty() { "main".to_owned() } else { wt.branch_name };
+                            let model_ref = format!("{}:{}", name, branch);
+                            let loaded = *status_map.get(&model_ref).unwrap_or(&false);
+                            let path = rmd.join(&name).join("worktrees").join(&branch);
+                            hyprstream_tui::shell_app::ModelEntry { model_ref, path, loaded }
+                        }).collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>(),
+                Err(_) => vec![],
+            }
+        };
+
+        let handle = tokio::runtime::Handle::current();
+        let sk_load = self.signing_key.clone();
+        let handle_load = handle.clone();
+        let load_fn: Box<dyn Fn(&str) -> bool + Send> = Box::new(move |model_ref: &str| {
+            use hyprstream_rpc::envelope::RequestIdentity;
+            let sk = sk_load.clone();
+            let mr = model_ref.to_owned();
+            handle_load.block_on(async move {
+                let client = crate::services::ModelZmqClient::new(sk, RequestIdentity::local());
+                client.load(&mr, None).await.is_ok()
+            })
+        });
+        let sk_unload = self.signing_key.clone();
+        let handle_unload = handle.clone();
+        let unload_fn: Box<dyn Fn(&str) -> bool + Send> = Box::new(move |model_ref: &str| {
+            use hyprstream_rpc::envelope::RequestIdentity;
+            let sk = sk_unload.clone();
+            let mr = model_ref.to_owned();
+            handle_unload.block_on(async move {
+                let client = crate::services::ModelZmqClient::new(sk, RequestIdentity::local());
+                client.unload(&mr).await.is_ok()
+            })
+        });
+
+        let app = hyprstream_tui::shell_app::ShellApp::new(models, cols, rows, load_fn, unload_fn);
+        let config = waxterm::app::TerminalConfig::new().cols(cols).rows(rows);
+        let process = super::process::spawn_app_process(app, config);
+
+        let sessions_reg = Arc::clone(&self.sessions);
+        let continuation: Continuation = Box::pin(async move {
+            let reg = sessions_reg.read().await;
+            if let Some((sender, _)) = reg.get(&sid) {
+                let _ = sender.send(FrameLoopCommand::SpawnProcess { pane_id: active_pane_id, process });
+            }
+        });
+
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut resp = msg.init_root::<tui_capnp::tui_response::Builder<'_>>();
+            resp.set_request_id(request_id);
+            let mut result = resp.init_spawn_chrome_shell_result();
+            result.set_success(true);
+            result.set_pid(0);
+        }
+        let mut buf = Vec::new();
+        serialize::write_message(&mut buf, &msg)?;
+        Ok((buf, Some(continuation)))
+    }
+
     async fn handle_resize(&self, request_id: u64, cols: u16, rows: u16) -> Result<Vec<u8>> {
-        // Resize the active pane in the most recent session
-        let mut state = self.state.write().await;
-        if let Some(session) = state.sessions.last_mut() {
-            if let Some(window) = session.active_window_mut() {
-                if let Some(pane) = window.active_pane_mut() {
-                    pane.resize(cols, rows);
+        // Resize the active pane in the most recent session; capture pane_id + session_id.
+        let (pane_id, session_id) = {
+            let mut state = self.state.write().await;
+            let mut found_pane_id = 0u32;
+            let mut found_session_id = 0u32;
+            if let Some(session) = state.sessions.last_mut() {
+                found_session_id = session.id;
+                if let Some(window) = session.active_window_mut() {
+                    if let Some(pane) = window.active_pane_mut() {
+                        pane.resize(cols, rows);
+                        found_pane_id = pane.id;
+                    }
                 }
             }
+            (found_pane_id, found_session_id)
+        };
+
+        // Notify the frame loop so it forwards Resize to the attached process.
+        if pane_id != 0 {
+            let reg = self.sessions.read().await;
+            if let Some((sender, _)) = reg.get(&session_id) {
+                let _ = sender.send(FrameLoopCommand::Resize { pane_id, cols, rows });
+            }
         }
+
         let mut msg = Builder::new_default();
         {
             let mut resp = msg.init_root::<tui_capnp::tui_response::Builder<'_>>();
@@ -751,6 +1028,25 @@ impl ZmqService for TuiService {
                 let data = input.get_data()?;
                 Ok((self.handle_send_input(request_id, viewer_id, data).await?, None))
             }
+            tui_capnp::tui_request::Which::SpawnShell(spawn_reader) => {
+                let spawn = spawn_reader?;
+                let sid = spawn.get_session_id();
+                let pane_id = spawn.get_pane_id();
+                let cwd = spawn.get_cwd()?.to_str().unwrap_or("");
+                self.handle_spawn_shell(request_id, sid, pane_id, cwd).await
+            }
+            tui_capnp::tui_request::Which::PollStdin(viewer_id) => {
+                Ok((self.handle_poll_stdin(request_id, viewer_id).await?, None))
+            }
+            tui_capnp::tui_request::Which::SpawnChromeShell(req_reader) => {
+                let req = req_reader?;
+                let sid = req.get_session_id();
+                let registry_dir = req.get_registry_dir()?.to_str().unwrap_or("").to_owned();
+                let cols = req.get_cols();
+                let rows = req.get_rows();
+                let pane_id = req.get_pane_id();
+                self.handle_spawn_chrome_shell(request_id, sid, &registry_dir, cols, rows, pane_id).await
+            }
         }
     }
 
@@ -806,6 +1102,7 @@ pub(crate) async fn run_frame_loop(
     zmq_context: Arc<zmq::Context>,
     signing_key: SigningKey,
     cancel: CancellationToken,
+    stdin_queues: StdinQueues,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(33));
     let mut event_rx = {
@@ -823,6 +1120,10 @@ pub(crate) async fn run_frame_loop(
     // Delayed initial frame: after a viewer registers, wait for the ZMQ SUB to connect
     // before publishing the first frame (avoids "slow joiner" race condition).
     let mut initial_frame_at: Option<tokio::time::Instant> = None;
+    // Periodic heartbeat: re-publish a full frame every 2s when viewers are present.
+    // This guarantees late-joining viewers (whose SUB socket connected after the
+    // initial_frame_at fired) receive current state without waiting for new damage.
+    let mut heartbeat_at = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
 
     // StreamChannel for creating dedicated publisher sockets
     let stream_channel = StreamChannel::new(zmq_context, signing_key);
@@ -894,6 +1195,13 @@ pub(crate) async fn run_frame_loop(
                             debug!(viewer_id = pending.id, topic = %stdout_topic, "Stream topic registered with proxy");
                         }
 
+                        // Register a stdin queue for Capnp-mode viewers so they can
+                        // use pollStdin RPC instead of subscribing to the ZMQ stream.
+                        if pending.display_mode == DisplayMode::Capnp {
+                            let mut queues = stdin_queues.lock().unwrap();
+                            queues.entry(pending.id).or_insert_with(std::collections::VecDeque::new);
+                        }
+
                         match stream_channel.create_publisher_socket(&publisher_config) {
                             Ok(socket) => {
                                 let publisher = StreamPublisher::with_dedicated_socket(
@@ -919,6 +1227,21 @@ pub(crate) async fn run_frame_loop(
                         }
                     }
                     FrameLoopCommand::SendInput { viewer_id, data } => {
+                        // Only process input from viewers that belong to this session.
+                        // handle_send_input broadcasts to all session frame loops, so we
+                        // must reject input from viewers registered in other sessions.
+                        let viewer_known = viewers.iter().any(|v| v.id == viewer_id);
+                        debug!(
+                            session_id, viewer_id,
+                            data_len = data.len(),
+                            viewer_known,
+                            processes_count = processes.len(),
+                            "SendInput received"
+                        );
+                        if !viewer_known {
+                            continue;
+                        }
+
                         // Find the active pane ID to check for an attached process
                         let active_pane_id = {
                             let s = state.read().await;
@@ -931,11 +1254,16 @@ pub(crate) async fn run_frame_loop(
                         if let Some(pane_id) = active_pane_id {
                             if let Some(proc) = processes.get(&pane_id) {
                                 // Route input to the local attached process
-                                let _ = proc.input_tx.try_send(
+                                let send_result = proc.input_tx.try_send(
                                     super::process::ProcessInput::Stdin(data),
                                 );
+                                debug!(session_id, viewer_id, pane_id, send_ok = send_result.is_ok(), "Input routed to process");
                                 continue;
+                            } else {
+                                debug!(session_id, viewer_id, pane_id, "No process for pane, falling through to consumer/producer path");
                             }
+                        } else {
+                            debug!(session_id, viewer_id, "No active pane found for session");
                         }
 
                         // Determine if the sender is a producer (Capnp-mode viewer
@@ -946,6 +1274,13 @@ pub(crate) async fn run_frame_loop(
 
                         if sender_is_producer {
                             // Producer output → VTE render into pane
+                            debug!(
+                                session_id,
+                                viewer_id,
+                                data_len = data.len(),
+                                data_prefix = %String::from_utf8_lossy(&data[..data.len().min(60)]).escape_default(),
+                                "Producer sendInput → VTE feed"
+                            );
                             let mut tui_state = state.write().await;
                             let damage_info = if let Some(session) = tui_state.session_mut(session_id) {
                                 if let Some(window) = session.active_window_mut() {
@@ -973,6 +1308,11 @@ pub(crate) async fn run_frame_loop(
                                 if let Some(ref mut stdin_pub) = viewer.stdin_publisher {
                                     if stdin_pub.publish_data(&data).await.is_ok() {
                                         relayed = true;
+                                    }
+                                    // Also enqueue for pollStdin RPC — avoids ZMQ SUB in client.
+                                    let mut queues = stdin_queues.lock().unwrap();
+                                    if let Some(queue) = queues.get_mut(&viewer.id) {
+                                        queue.push_back(data.clone());
                                     }
                                 }
                             }
@@ -1007,21 +1347,47 @@ pub(crate) async fn run_frame_loop(
                         if let Some(pos) = viewers.iter().position(|v| v.id == viewer_id) {
                             let v = viewers.remove(pos);
                             v.cancel.cancel();
+                            stdin_queues.lock().unwrap().remove(&viewer_id);
                             debug!(viewer_id, session_id, "Viewer evicted by command");
                         }
                     }
                     FrameLoopCommand::SpawnProcess { pane_id, process } => {
-                        debug!(pane_id, session_id, "Process attached to pane");
                         processes.insert(pane_id, process);
+                    }
+                    FrameLoopCommand::Resize { pane_id, cols, rows } => {
+                        if let Some(proc) = processes.get(&pane_id) {
+                            let _ = proc.input_tx.try_send(
+                                super::process::ProcessInput::Resize { cols, rows },
+                            );
+                        }
+                    }
+                    FrameLoopCommand::KillProcess { pane_id } => {
+                        if let Some(proc) = processes.remove(&pane_id) {
+                            let _ = proc.input_tx.try_send(
+                                super::process::ProcessInput::Kill,
+                            );
+                        }
                     }
                 }
             }
 
             Ok(event) = event_rx.recv() => {
-                if let TuiEvent::Damage { session_id: sid, .. } = event {
-                    if sid == session_id {
+                match event {
+                    TuiEvent::Damage { session_id: sid, .. } if sid == session_id => {
                         has_damage = true;
                     }
+                    TuiEvent::WindowClosed { session_id: sid, .. } if sid == session_id => {
+                        has_damage = true;
+                        prev_cells.clear(); // full frame after window change
+                    }
+                    TuiEvent::WindowFocused { session_id: sid, .. } if sid == session_id => {
+                        has_damage = true;
+                        prev_cells.clear(); // full frame so client repaints new window content
+                    }
+                    TuiEvent::PaneClosed { session_id: sid, .. } if sid == session_id => {
+                        has_damage = true;
+                    }
+                    _ => {}
                 }
             }
 
@@ -1029,29 +1395,60 @@ pub(crate) async fn run_frame_loop(
                 // Poll attached processes for output and feed through VTE parser
                 {
                     let process_pane_ids: Vec<u32> = processes.keys().copied().collect();
+                    let mut dead_pane_ids: Vec<u32> = Vec::new();
                     for pane_id in process_pane_ids {
                         let proc = match processes.get_mut(&pane_id) {
                             Some(p) => p,
                             None => continue,
                         };
                         let mut got_output = false;
-                        while let Ok(data) = proc.stdout_rx.try_recv() {
-                            let mut tui_state = state.write().await;
-                            if let Some(session) = tui_state.session_mut(session_id) {
-                                // Search all windows for the pane
-                                for window in &mut session.windows {
-                                    if let Some(pane) = window.pane_mut(pane_id) {
-                                        let mut performer = vte_parser::PanePerformer::new(pane);
-                                        performer.feed(&data);
-                                        got_output = true;
-                                        break;
+                        loop {
+                            match proc.stdout_rx.try_recv() {
+                                Ok(data) => {
+                                    let mut tui_state = state.write().await;
+                                    if let Some(session) = tui_state.session_mut(session_id) {
+                                        // Search all windows for the pane
+                                        for window in &mut session.windows {
+                                            if let Some(pane) = window.pane_mut(pane_id) {
+                                                let mut performer = vte_parser::PanePerformer::new(pane);
+                                                performer.feed(&data);
+                                                got_output = true;
+                                                break;
+                                            }
+                                        }
                                     }
+                                }
+                                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                    // Process has exited — schedule cleanup
+                                    dead_pane_ids.push(pane_id);
+                                    break;
                                 }
                             }
                         }
                         if got_output {
                             has_damage = true;
                         }
+                    }
+                    for pane_id in dead_pane_ids {
+                        debug!(pane_id, session_id, "Process exited, removing from frame loop");
+                        processes.remove(&pane_id);
+                        // Auto-close the pane in TuiState.
+                        // If it's the last pane, close its window instead.
+                        let mut tui_state = state.write().await;
+                        let sid = tui_state.sessions.last().map(|s| s.id).unwrap_or(0);
+                        if !tui_state.close_pane(sid, pane_id) {
+                            // Last pane — find and close the containing window.
+                            let win_id = tui_state.session(sid)
+                                .and_then(|sess| sess.windows.iter()
+                                    .find(|w| w.panes.iter().any(|p| p.id == pane_id))
+                                    .map(|w| w.id))
+                                .unwrap_or(0);
+                            if win_id != 0 {
+                                tui_state.close_window(sid, win_id);
+                            }
+                        }
+                        has_damage = true;
                     }
                 }
 
@@ -1060,9 +1457,39 @@ pub(crate) async fn run_frame_loop(
                     if tokio::time::Instant::now() >= t {
                         has_damage = true;
                         initial_frame_at = None;
+                        // Clear prev_cells so the diff is computed from scratch (full frame).
+                        // This ensures newly-joined viewers (e.g. ANSI-mode Playwright viewer
+                        // joining after a Capnp-mode producer has already been running) receive
+                        // a complete frame rather than an empty incremental diff.
+                        prev_cells.clear();
                         debug!(session_id, "Initial frame timer fired, sending first frame");
+                        // DEBUG: dump row 0 symbols from pane buffer
+                        {
+                            let s = state.read().await;
+                            if let Some(sess) = s.session(session_id) {
+                                if let Some(win) = sess.active_window() {
+                                    if let Some(pane) = win.active_pane() {
+                                        let buf = pane.active_buffer();
+                                        let row0: String = (0..buf.buffer.area().width.min(40))
+                                            .map(|x| buf.buffer[(x, 0)].symbol().chars().next().unwrap_or('?'))
+                                            .collect();
+                                        debug!(session_id, row0 = %row0, "Pane buffer row0 at initial frame fire");
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
+                // Periodic heartbeat: re-publish full frame so late-joining viewers
+                // always receive current state within 2 seconds of subscribing.
+                let now = tokio::time::Instant::now();
+                if !viewers.is_empty() && now >= heartbeat_at {
+                    has_damage = true;
+                    prev_cells.clear(); // full frame for any newly-joined viewer
+                    heartbeat_at = now + std::time::Duration::from_secs(2);
+                    debug!(session_id, "Heartbeat: publishing full frame");
+                }
+
                 if !has_damage || viewers.is_empty() {
                     continue;
                 }

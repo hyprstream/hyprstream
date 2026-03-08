@@ -1113,6 +1113,7 @@ impl<'a> RepositoryHandle<'a> {
             base_repo: tracked_repo.worktree_path.clone(),
             worktree_path: worktree_path.clone(),
             ref_spec: branch.to_owned(),
+            progress: None,
             checkout_paths: Some(checkout_paths),
         };
 

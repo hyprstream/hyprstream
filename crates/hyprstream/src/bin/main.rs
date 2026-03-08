@@ -1899,6 +1899,12 @@ fn main() -> Result<()> {
                         TuiAction::Play { cast_file, session, loop_playback } => {
                             tui_handlers::handle_tui_play(&signing_key, &cast_file, session, loop_playback).await
                         }
+                        TuiAction::Shell { session } => {
+                            let models_dir = config_for_service.models_dir().clone();
+                            hyprstream_core::cli::shell_handlers::handle_tui_shell(
+                                &signing_key, &models_dir, session,
+                            ).await
+                        }
                     }
                 },
             )?;
@@ -1994,9 +2000,29 @@ fn main() -> Result<()> {
             )?;
         }
 
-        // ── No subcommand / help ────────────────────────────────────────
+        // ── No subcommand → wizard (first run) or ShellClient ──────────
         _ => {
-            build_cli().print_help()?;
+            let models_dir = config_for_service.models_dir().clone();
+            if hyprstream_core::cli::bootstrap_manager::is_first_run(&models_dir) {
+                with_runtime(
+                    RuntimeConfig { device: DeviceConfig::request_cpu(), multi_threaded: true },
+                    || async move {
+                        hyprstream_core::cli::handle_wizard_tui(&models_dir).await
+                    },
+                )?;
+            } else {
+                with_runtime(
+                    RuntimeConfig { device: DeviceConfig::request_cpu(), multi_threaded: true },
+                    || {
+                        let md = models_dir.clone();
+                        async move {
+                            let keys_dir = md.join(".registry").join("keys");
+                            let sk = load_or_generate_signing_key(&keys_dir).await?;
+                            hyprstream_core::cli::shell_handlers::handle_shell_tui(&sk, &md).await
+                        }
+                    },
+                )?;
+            }
         }
     };
 

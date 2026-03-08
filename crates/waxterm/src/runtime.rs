@@ -126,6 +126,7 @@ fn enable_raw_mode() -> io::Result<libc::termios> {
         }
         let mut raw = original;
         raw.c_lflag &= !(libc::ECHO | libc::ICANON);
+        raw.c_iflag &= !libc::ICRNL; // CR → NL translation off; Enter delivers 0x0D
         raw.c_cc[libc::VMIN] = 0;
         raw.c_cc[libc::VTIME] = 0;
         if libc::tcsetattr(0, libc::TCSANOW, &raw) != 0 {

@@ -466,6 +466,8 @@ pub enum TuiEvent {
     WindowCreated { session_id: u32, window_id: u32 },
     /// A window was closed.
     WindowClosed { session_id: u32, window_id: u32 },
+    /// The active window changed (focus switched).
+    WindowFocused { session_id: u32, window_id: u32 },
     /// A pane was created.
     PaneCreated { session_id: u32, window_id: u32, pane_id: u32 },
     /// A pane was closed.
@@ -621,6 +623,7 @@ impl TuiState {
             return false;
         }
         session.active_window_id = window_id;
+        let _ = self.event_tx.send(TuiEvent::WindowFocused { session_id, window_id });
         true
     }
 

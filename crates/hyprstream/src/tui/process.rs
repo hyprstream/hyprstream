@@ -70,6 +70,58 @@ impl Drop for ChannelWriter {
     }
 }
 
+/// Spawn a PTY shell as a `PaneProcess`.
+///
+/// The shell's raw output bytes flow directly through `PaneProcess.stdout_rx`
+/// to the frame loop, which feeds them via `PanePerformer` (VTE parser) into
+/// the pane cell buffer. Input is routed from the frame loop to the PTY stdin.
+///
+/// This avoids double VTE parsing: only `PanePerformer` parses the PTY output.
+#[cfg(not(target_os = "wasi"))]
+pub fn spawn_pty_process(
+    cwd: Option<std::path::PathBuf>,
+    cols: u16,
+    rows: u16,
+) -> std::io::Result<PaneProcess> {
+    use hyprstream_tui::shell::{ShellInput, spawn_shell};
+
+    let shell = spawn_shell(cwd, cols, rows)?;
+
+    let (stdout_async_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (input_tx, mut input_rx) = mpsc::channel::<ProcessInput>(64);
+
+    // Bridge sync PTY stdout → async tokio channel
+    let pty_stdout = shell.stdout_rx;
+    std::thread::spawn(move || {
+        while let Ok(data) = pty_stdout.recv() {
+            if stdout_async_tx.blocking_send(data).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Route async ProcessInput → sync PTY stdin
+    let pty_input = shell.input_tx;
+    tokio::spawn(async move {
+        while let Some(input) = input_rx.recv().await {
+            match input {
+                ProcessInput::Stdin(data) => {
+                    let _ = pty_input.send(ShellInput::Bytes(data));
+                }
+                ProcessInput::Resize { cols, rows } => {
+                    let _ = pty_input.send(ShellInput::Resize { cols, rows });
+                }
+                ProcessInput::Kill => {
+                    let _ = pty_input.send(ShellInput::Kill);
+                    break;
+                }
+            }
+        }
+    });
+
+    Ok(PaneProcess { stdout_rx, input_tx })
+}
+
 /// Spawn a `TerminalApp` in a background thread, returning a `PaneProcess`
 /// handle that the frame loop can use to exchange bytes with the app.
 ///

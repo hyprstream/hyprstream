@@ -19,7 +19,7 @@ use crate::auth::policy_templates::{get_template, get_templates};
 use crate::auth::{Claims, PolicyManager, write_policy_file};
 use crate::cli::gpu_detect;
 use crate::cli::policy_handlers::load_or_generate_signing_key;
-use crate::cli::service_handlers::run_repair_checks;
+
 
 /// Pre-service bootstrap manager for the wizard TUI.
 ///
@@ -70,6 +70,17 @@ impl Drop for BootstrapManager {
             handle.abort();
         }
     }
+}
+
+/// Returns true if this is the first run (no signing key exists yet).
+///
+/// Used by the no-args entry point to decide between wizard and ShellClient.
+pub fn is_first_run(models_dir: &std::path::Path) -> bool {
+    !models_dir
+        .join(".registry")
+        .join("keys")
+        .join("signing.key")
+        .exists()
 }
 
 impl BootstrapManager {
@@ -509,7 +520,7 @@ async fn do_install(
     Ok(())
 }
 
-/// Async bootstrap flow.
+/// Async bootstrap flow — silent (no stdout writes; TUI holds the stdout lock).
 async fn do_bootstrap(
     tx: &mpsc::SyncSender<BootstrapPoll>,
     models_dir: &std::path::Path,
@@ -517,28 +528,49 @@ async fn do_bootstrap(
 ) -> anyhow::Result<()> {
     let mut steps = Vec::new();
 
-    let _ = tx.send(BootstrapPoll::InProgress(
-        "Checking directories...".to_owned(),
-    ));
-    // Run repair checks (creates dirs, registry, etc.)
-    run_repair_checks(models_dir, false).await?;
+    // ── 1. Directories ──────────────────────────────────────────────────────
+    let _ = tx.send(BootstrapPoll::InProgress("Checking directories...".to_owned()));
+    let registry_path = models_dir.join(".registry");
+    for dir in &[
+        models_dir,
+        registry_path.as_path(),
+        registry_path.join("policies").as_path(),
+        registry_path.join("keys").as_path(),
+    ] {
+        if !dir.exists() {
+            tokio::fs::create_dir_all(dir)
+                .await
+                .with_context(|| format!("Failed to create {}", dir.display()))?;
+        }
+    }
     steps.push("Directories OK".to_owned());
 
-    let _ = tx.send(BootstrapPoll::InProgress(
-        "Verifying registry...".to_owned(),
-    ));
-    // Registry is created by repair checks
+    // ── 2. Registry git repo ────────────────────────────────────────────────
+    let _ = tx.send(BootstrapPoll::InProgress("Verifying registry...".to_owned()));
+    let git_dir = registry_path.join(".git");
+    if !git_dir.exists() {
+        if git2db::Git2DB::open(models_dir).await.is_err() {
+            git2::Repository::init(&registry_path)
+                .context("Failed to initialize .registry git repo")?;
+        }
+    }
     steps.push("Registry OK".to_owned());
 
-    let _ = tx.send(BootstrapPoll::InProgress(
-        "Loading signing key...".to_owned(),
-    ));
+    // ── 3. Default policy files ─────────────────────────────────────────────
+    let policies_dir = registry_path.join("policies");
+    if !policies_dir.join("model.conf").exists() || !policies_dir.join("policy.csv").exists() {
+        PolicyManager::new(&policies_dir)
+            .await
+            .context("Failed to create default policy files")?;
+    }
+
+    // ── 4. Signing key ──────────────────────────────────────────────────────
+    let _ = tx.send(BootstrapPoll::InProgress("Loading signing key...".to_owned()));
     load_or_generate_signing_key(keys_dir).await?;
     steps.push("Signing key OK".to_owned());
 
-    let _ = tx.send(BootstrapPoll::InProgress(
-        "Validating environment...".to_owned(),
-    ));
+    // ── 5. Done ─────────────────────────────────────────────────────────────
+    let _ = tx.send(BootstrapPoll::InProgress("Validating environment...".to_owned()));
     steps.push("Environment OK".to_owned());
 
     let _ = tx.send(BootstrapPoll::Done(steps));

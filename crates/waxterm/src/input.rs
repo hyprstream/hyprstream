@@ -1,5 +1,5 @@
 /// Standard key events (always parsed by the framework).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum KeyPress {
     Char(u8),
     ArrowUp,
@@ -10,6 +10,8 @@ pub enum KeyPress {
     Enter,
     Escape,
     Backspace,
+    /// Function keys F1–F12.
+    F(u8),
 }
 
 /// Custom OSC handler: receives bytes after `ESC ]`, returns `(command, bytes_consumed)`.
@@ -52,17 +54,73 @@ impl<C: From<KeyPress>> InputParser<C> {
                 // Need at least 1 more byte to determine escape type
                 if i + 1 < data.len() {
                     match data[i + 1] {
-                        // ESC [ → CSI keyboard sequences (3 bytes total)
+                        // ESC O → SS3 sequences: F1–F4
+                        0x4F => {
+                            if i + 2 < data.len() {
+                                let fkey = match data[i + 2] {
+                                    b'P' => Some(KeyPress::F(1)),
+                                    b'Q' => Some(KeyPress::F(2)),
+                                    b'R' => Some(KeyPress::F(3)),
+                                    b'S' => Some(KeyPress::F(4)),
+                                    _ => None,
+                                };
+                                if let Some(k) = fkey {
+                                    cmds.push(C::from(k));
+                                }
+                                i += 3;
+                            } else {
+                                i += 1;
+                            }
+                        }
+                        // ESC [ → CSI sequences: arrows + tilde-terminated F-keys
                         0x5B => {
                             if i + 2 < data.len() {
                                 match data[i + 2] {
-                                    b'A' => cmds.push(C::from(KeyPress::ArrowUp)),
-                                    b'B' => cmds.push(C::from(KeyPress::ArrowDown)),
-                                    b'C' => cmds.push(C::from(KeyPress::ArrowRight)),
-                                    b'D' => cmds.push(C::from(KeyPress::ArrowLeft)),
-                                    _ => {} // ignore unknown CSI sequences
+                                    // Single-byte: arrow keys
+                                    b'A' => { cmds.push(C::from(KeyPress::ArrowUp)); i += 3; }
+                                    b'B' => { cmds.push(C::from(KeyPress::ArrowDown)); i += 3; }
+                                    b'C' => { cmds.push(C::from(KeyPress::ArrowRight)); i += 3; }
+                                    b'D' => { cmds.push(C::from(KeyPress::ArrowLeft)); i += 3; }
+                                    // Digit → tilde-terminated: ESC [ <num> ~
+                                    b'0'..=b'9' => {
+                                        // Scan for '~' terminator (max 4 bytes of digits)
+                                        let start = i + 2;
+                                        let end = data[start..]
+                                            .iter()
+                                            .position(|&b| b == b'~')
+                                            .map(|p| start + p);
+                                        if let Some(tilde_pos) = end {
+                                            let num_bytes = &data[start..tilde_pos];
+                                            let num: u32 = num_bytes.iter().fold(0u32, |acc, &b| {
+                                                acc * 10 + u32::from(b - b'0')
+                                            });
+                                            // VT sequence number → F-key mapping
+                                            let fkey = match num {
+                                                11 => Some(KeyPress::F(1)),
+                                                12 => Some(KeyPress::F(2)),
+                                                13 => Some(KeyPress::F(3)),
+                                                14 => Some(KeyPress::F(4)),
+                                                15 => Some(KeyPress::F(5)),
+                                                17 => Some(KeyPress::F(6)),
+                                                18 => Some(KeyPress::F(7)),
+                                                19 => Some(KeyPress::F(8)),
+                                                20 => Some(KeyPress::F(9)),
+                                                21 => Some(KeyPress::F(10)),
+                                                23 => Some(KeyPress::F(11)),
+                                                24 => Some(KeyPress::F(12)),
+                                                _ => None,
+                                            };
+                                            if let Some(k) = fkey {
+                                                cmds.push(C::from(k));
+                                            }
+                                            i = tilde_pos + 1;
+                                        } else {
+                                            // No tilde found — incomplete, skip ESC
+                                            i += 1;
+                                        }
+                                    }
+                                    _ => { i += 3; } // ignore unknown CSI sequences
                                 }
-                                i += 3;
                             } else {
                                 // Incomplete CSI, skip ESC
                                 i += 1;

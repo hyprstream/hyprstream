@@ -24,6 +24,8 @@ pub mod service;
 pub mod wt_viewer;
 pub mod backend;
 pub mod vte_parser;
+pub mod shell_client;
+pub mod shell_ui;
 
 pub use state::{
     CursorShape, CursorState, IngestionMode, LayoutNode, PaneBuffer, ScrollOp, TuiEvent,

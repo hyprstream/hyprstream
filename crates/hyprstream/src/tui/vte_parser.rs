@@ -49,6 +49,11 @@ pub struct PanePerformer<'a> {
     scroll_top: u16,
     /// Scroll region bottom (0-indexed, inclusive).
     scroll_bottom: u16,
+    /// DEC auto-wrap pending: set when a character is written at the last column.
+    /// The actual wrap (and potential scroll) fires on the next printed character,
+    /// not immediately — this prevents spurious scrolls when a ratatui draw
+    /// writes the very last cell of the screen.
+    pending_wrap: bool,
 }
 
 impl<'a> PanePerformer<'a> {
@@ -61,6 +66,7 @@ impl<'a> PanePerformer<'a> {
             saved_cursor: CursorState::default(),
             scroll_top: 0,
             scroll_bottom: rows.saturating_sub(1),
+            pending_wrap: false,
         }
     }
 
@@ -84,9 +90,8 @@ impl<'a> PanePerformer<'a> {
         let buf = self.pane.active_buffer_mut();
         let area = buf.buffer.area();
         if x < area.width && y < area.height {
-            let cell = &mut buf.buffer[(x, y)];
-            cell.set_symbol(symbol);
-            cell.set_style(Style::default()
+            buf.buffer[(x, y)].set_symbol(symbol);
+            buf.buffer[(x, y)].set_style(Style::default()
                 .fg(self.sgr.fg)
                 .bg(self.sgr.bg)
                 .add_modifier(self.sgr.modifiers));
@@ -292,18 +297,27 @@ impl<'a> PanePerformer<'a> {
 
 impl<'a> vte::Perform for PanePerformer<'a> {
     fn print(&mut self, c: char) {
+        // If a wrap was pending from the previous character at EOL, do it now.
+        if self.pending_wrap {
+            self.pending_wrap = false;
+            self.pane.cursor.x = 0;
+            self.pane.cursor.y += 1;
+            if self.pane.cursor.y > self.scroll_bottom {
+                self.pane.cursor.y = self.scroll_bottom;
+                self.scroll_up(1);
+            }
+        }
+
         let x = self.pane.cursor.x;
         let y = self.pane.cursor.y;
         let cols = self.cols();
 
-        // Write the character
         let mut buf = [0u8; 4];
         let s = c.encode_utf8(&mut buf);
         self.set_cell(x, y, s);
 
-        // Advance cursor
+        // Advance cursor (wide char detection).
         let width = if c.is_ascii() { 1 } else {
-            // Simplified wide char detection
             let cp = c as u32;
             if (0x1100..=0x115F).contains(&cp)
                 || (0x2E80..=0x303E).contains(&cp)
@@ -318,16 +332,15 @@ impl<'a> vte::Perform for PanePerformer<'a> {
             }
         };
 
-        self.pane.cursor.x = x + width;
-
-        // Auto-wrap at end of line
-        if self.pane.cursor.x >= cols {
-            self.pane.cursor.x = 0;
-            self.pane.cursor.y += 1;
-            if self.pane.cursor.y > self.scroll_bottom {
-                self.pane.cursor.y = self.scroll_bottom;
-                self.scroll_up(1);
-            }
+        let new_x = x + width;
+        if new_x >= cols {
+            // Defer the wrap: real wrap fires on the NEXT printed character.
+            // This prevents a spurious scroll when the last cell of the screen
+            // is written (e.g. by a ratatui full-redraw).
+            self.pending_wrap = true;
+            self.pane.cursor.x = cols - 1;
+        } else {
+            self.pane.cursor.x = new_x;
         }
     }
 
@@ -335,15 +348,18 @@ impl<'a> vte::Perform for PanePerformer<'a> {
         match byte {
             // BS (backspace)
             0x08 => {
+                self.pending_wrap = false;
                 self.pane.cursor.x = self.pane.cursor.x.saturating_sub(1);
             }
             // HT (horizontal tab)
             0x09 => {
+                self.pending_wrap = false;
                 let next_tab = ((self.pane.cursor.x / 8) + 1) * 8;
                 self.pane.cursor.x = next_tab.min(self.cols().saturating_sub(1));
             }
             // LF (line feed) / VT / FF
             0x0A..=0x0C => {
+                self.pending_wrap = false;
                 self.pane.cursor.y += 1;
                 if self.pane.cursor.y > self.scroll_bottom {
                     self.pane.cursor.y = self.scroll_bottom;
@@ -352,6 +368,7 @@ impl<'a> vte::Perform for PanePerformer<'a> {
             }
             // CR (carriage return)
             0x0D => {
+                self.pending_wrap = false;
                 self.pane.cursor.x = 0;
             }
             _ => {}
@@ -365,6 +382,9 @@ impl<'a> vte::Perform for PanePerformer<'a> {
         _ignore: bool,
         action: char,
     ) {
+        // Any cursor-movement or screen-operation sequence cancels a pending wrap.
+        self.pending_wrap = false;
+
         let p: Vec<u16> = params.iter().map(|s| s[0]).collect();
         let p0 = p.first().copied().unwrap_or(0);
         let p1 = p.get(1).copied().unwrap_or(0);
@@ -834,6 +854,46 @@ mod tests {
             perf.feed(b"\r\nDDDDD");
         }
         // After scroll: row 0=B, row 1=C, row 2=D
+        assert_eq!(pane.primary.buffer[(0, 0)].symbol(), "B");
+        assert_eq!(pane.primary.buffer[(0, 1)].symbol(), "C");
+        assert_eq!(pane.primary.buffer[(0, 2)].symbol(), "D");
+    }
+
+    /// Verifies that writing to the last column of the last row does NOT
+    /// immediately scroll (pending_wrap deferred until next printed char).
+    /// This prevents spurious scrolling when a ratatui full-redraw writes
+    /// cell (cols-1, rows-1) as its final update.
+    #[test]
+    fn test_no_spurious_scroll_on_last_cell() {
+        let mut pane = TuiPane::new(1, 5, 3, 100); // 5 cols, 3 rows
+        {
+            let mut perf = PanePerformer::new(&mut pane);
+            // Fill all three rows (each CUP cancels pending_wrap).
+            perf.feed(b"\x1b[1;1HAAAAA"); // Row 0: 5 chars → pending_wrap=true
+            perf.feed(b"\x1b[2;1HBBBBB"); // Row 1: CUP cancels pending_wrap
+            perf.feed(b"\x1b[3;1HCCCCC"); // Row 2: 5 chars → pending_wrap=true
+            // No further input: wrap never fires, NO scroll happens.
+        }
+        // All three rows must retain their content.
+        assert_eq!(pane.primary.buffer[(0, 0)].symbol(), "A");
+        assert_eq!(pane.primary.buffer[(0, 1)].symbol(), "B");
+        assert_eq!(pane.primary.buffer[(0, 2)].symbol(), "C");
+    }
+
+    /// Verifies that pending_wrap DOES fire when the next char arrives without
+    /// a cursor-movement command in between.
+    #[test]
+    fn test_pending_wrap_fires_on_next_char() {
+        let mut pane = TuiPane::new(1, 5, 3, 100); // 5 cols, 3 rows
+        {
+            let mut perf = PanePerformer::new(&mut pane);
+            perf.feed(b"\x1b[1;1HAAAAA"); // Row 0
+            perf.feed(b"\x1b[2;1HBBBBB"); // Row 1
+            perf.feed(b"\x1b[3;1HCCCCC"); // Row 2: pending_wrap=true
+            // Next char fires pending_wrap → wrap → scroll.
+            perf.feed(b"D");
+        }
+        // After scroll: row0=B, row1=C, row2 starts with D.
         assert_eq!(pane.primary.buffer[(0, 0)].symbol(), "B");
         assert_eq!(pane.primary.buffer[(0, 1)].symbol(), "C");
         assert_eq!(pane.primary.buffer[(0, 2)].symbol(), "D");

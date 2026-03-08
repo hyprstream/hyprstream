@@ -199,6 +199,16 @@ pub enum TuiAction {
         #[arg(long, short = 'l')]
         loop_playback: bool,
     },
+
+    /// Run hyprstream as an interactive shell client embedded in a TUI pane
+    ///
+    /// Renders the full ShellClient chrome (status bar, window tabs, F-key legend)
+    /// into a TuiService pane. Useful for Playwright/WebTransport testing.
+    Shell {
+        /// Session ID (0 = most recent)
+        #[arg(long, default_value = "0")]
+        session: u32,
+    },
 }
 
 /// Service management actions

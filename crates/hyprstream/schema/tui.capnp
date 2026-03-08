@@ -157,7 +157,50 @@ struct TuiRequest {
     # Send input to the active pane
     sendInput @12 :SendInputRequest
       $mcpScope(write) $mcpDescription("Send input to active pane");
+
+    # Spawn a shell process in a pane
+    spawnShell @13 :SpawnShellRequest
+      $mcpScope(write) $mcpDescription("Spawn a shell in a pane");
+
+    # Poll for stdin bytes queued for this viewer (alternative to ZMQ SUB relay).
+    # Returns all bytes received since the last poll, concatenated.
+    pollStdin @14 :UInt32  # viewer_id
+      $mcpScope(query) $mcpDescription("Poll for stdin bytes queued for this viewer");
+
+    # Spawn the ShellApp chrome process inside TuiService so no fork occurs
+    # in the client process (avoids ZMQ signaler assertion after fork).
+    spawnChromeShell @15 :SpawnChromeShellRequest
+      $mcpScope(write) $mcpDescription("Spawn ShellApp chrome renderer in a TuiService pane");
   }
+}
+
+# Spawn shell request
+struct SpawnShellRequest {
+  # Session containing the pane (0 = most recent)
+  sessionId @0 :UInt32;
+  # Pane to attach the shell to
+  paneId    @1 :UInt32;
+  # Working directory (empty = home dir)
+  cwd       @2 :Text;
+}
+
+# Spawn shell result
+struct SpawnShellResult {
+  success @0 :Bool;
+  pid     @1 :UInt32;
+}
+
+# Spawn ShellApp chrome shell request
+struct SpawnChromeShellRequest {
+  # Session to attach the chrome shell to (0 = most recent)
+  sessionId   @0 :UInt32;
+  # Path to the model registry directory for the model list
+  registryDir @1 :Text;
+  # Terminal dimensions (total, including chrome rows)
+  cols        @2 :UInt16;
+  rows        @3 :UInt16;
+  # Pane to render into (0 = active pane in session's active window)
+  paneId      @4 :UInt32;
 }
 
 # Send input request
@@ -254,6 +297,15 @@ struct TuiResponse {
 
     # Input sent (for sendInput)
     sendInputResult @13 :Void;
+
+    # Shell spawned (for spawnShell)
+    spawnShellResult @14 :SpawnShellResult;
+
+    # Stdin poll result: raw bytes (may be empty if nothing queued)
+    pollStdinResult @15 :Data;
+
+    # SpawnChromeShell result
+    spawnChromeShellResult @16 :SpawnShellResult;
   }
 }
 

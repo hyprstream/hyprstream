@@ -31,6 +31,16 @@ impl<T: Display + Clone> SelectList<T> {
         self.selected
     }
 
+    /// Reference to the currently highlighted item, if any.
+    pub fn selected_item(&self) -> Option<&T> {
+        self.items.get(self.selected)
+    }
+
+    /// Mutable reference to items, for updating status in place.
+    pub fn items_mut(&mut self) -> &mut Vec<T> {
+        &mut self.items
+    }
+
     pub fn handle_key(&mut self, key: &KeyPress) -> WidgetResult<T> {
         match key {
             KeyPress::ArrowUp => {
