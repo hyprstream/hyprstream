@@ -548,11 +548,9 @@ async fn do_bootstrap(
     // ── 2. Registry git repo ────────────────────────────────────────────────
     let _ = tx.send(BootstrapPoll::InProgress("Verifying registry...".to_owned()));
     let git_dir = registry_path.join(".git");
-    if !git_dir.exists() {
-        if git2db::Git2DB::open(models_dir).await.is_err() {
-            git2::Repository::init(&registry_path)
-                .context("Failed to initialize .registry git repo")?;
-        }
+    if !git_dir.exists() && git2db::Git2DB::open(models_dir).await.is_err() {
+        git2::Repository::init(&registry_path)
+            .context("Failed to initialize .registry git repo")?;
     }
     steps.push("Registry OK".to_owned());
 

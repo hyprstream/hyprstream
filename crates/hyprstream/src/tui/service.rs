@@ -114,7 +114,7 @@ type SessionRegistry = Arc<RwLock<HashMap<u32, (CommandSender, CancellationToken
 /// Simultaneously it enqueues the same data here so producers can poll via RPC
 /// instead of subscribing to the ZMQ stream — avoiding a second ZMQ context and
 /// the associated signaler assertion bugs.
-type StdinQueues = Arc<std::sync::Mutex<HashMap<u32, std::collections::VecDeque<Vec<u8>>>>>;
+type StdinQueues = Arc<parking_lot::Mutex<HashMap<u32, std::collections::VecDeque<Vec<u8>>>>>;
 
 // ============================================================================
 // TuiService
@@ -158,7 +158,7 @@ impl TuiService {
             transport,
             signing_key,
             sessions: Arc::new(RwLock::new(HashMap::new())),
-            stdin_queues: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            stdin_queues: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
 
@@ -566,7 +566,7 @@ impl TuiService {
                         .flat_map(|w| w.panes.iter())
                         .find(|p| p.id == pane_id)
                 })
-                .map(|p| p.size())
+                .map(super::state::TuiPane::size)
                 .unwrap_or((80, 24));
             (sid, cols, rows)
         };
@@ -616,7 +616,7 @@ impl TuiService {
     /// context and the libzmq signaler assertion that fires on some builds.
     async fn handle_poll_stdin(&self, request_id: u64, viewer_id: u32) -> Result<Vec<u8>> {
         let all_data: Vec<u8> = {
-            let mut queues = self.stdin_queues.lock().unwrap();
+            let mut queues = self.stdin_queues.lock();
             if let Some(queue) = queues.get_mut(&viewer_id) {
                 let mut buf = Vec::new();
                 while let Some(chunk) = queue.pop_front() {
@@ -1198,8 +1198,8 @@ pub(crate) async fn run_frame_loop(
                         // Register a stdin queue for Capnp-mode viewers so they can
                         // use pollStdin RPC instead of subscribing to the ZMQ stream.
                         if pending.display_mode == DisplayMode::Capnp {
-                            let mut queues = stdin_queues.lock().unwrap();
-                            queues.entry(pending.id).or_insert_with(std::collections::VecDeque::new);
+                            let mut queues = stdin_queues.lock();
+                            queues.entry(pending.id).or_default();
                         }
 
                         match stream_channel.create_publisher_socket(&publisher_config) {
@@ -1310,7 +1310,7 @@ pub(crate) async fn run_frame_loop(
                                         relayed = true;
                                     }
                                     // Also enqueue for pollStdin RPC — avoids ZMQ SUB in client.
-                                    let mut queues = stdin_queues.lock().unwrap();
+                                    let mut queues = stdin_queues.lock();
                                     if let Some(queue) = queues.get_mut(&viewer.id) {
                                         queue.push_back(data.clone());
                                     }
@@ -1347,7 +1347,7 @@ pub(crate) async fn run_frame_loop(
                         if let Some(pos) = viewers.iter().position(|v| v.id == viewer_id) {
                             let v = viewers.remove(pos);
                             v.cancel.cancel();
-                            stdin_queues.lock().unwrap().remove(&viewer_id);
+                            stdin_queues.lock().remove(&viewer_id);
                             debug!(viewer_id, session_id, "Viewer evicted by command");
                         }
                     }
