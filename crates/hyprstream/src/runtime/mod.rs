@@ -16,6 +16,7 @@ pub use crate::config::{
 };
 
 pub mod architectures; // Architecture-specific model implementations (includes Janus placeholder utils)
+pub mod ttn_profile;  // TTN analysis pipeline: adaptive layer profiling + embedded profiles
 pub mod batched_lora; // Batched multi-tenant LoRA forward pass
 // REMOVED: pub mod conversation_router; // Dead code - VDB TemporalStreamingLayer removed
 pub mod generation_metrics; // Quality metrics for self-supervised training

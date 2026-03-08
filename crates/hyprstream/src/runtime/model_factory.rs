@@ -102,7 +102,7 @@ impl ModelFactory {
             // Standard loading for single files or small models
             let weights = Self::load_weights(model_path, device, dtype).await?;
             let config = ModelConfig::load(model_path, &weights)?;
-            let model = Self::create_model_from_config(config, weights, device, dtype, max_context, kv_quant_type)?;
+            let model = Self::create_model_from_config(config, weights, device, dtype, max_context, kv_quant_type, model_path)?;
             info!("✅ ModelFactory: Model created successfully");
             Ok(model)
         }
@@ -205,7 +205,7 @@ impl ModelFactory {
 
         // Load config and create model
         let config = ModelConfig::load(model_path, &all_weights)?;
-        let model = Self::create_model_from_config(config, all_weights, device, dtype, max_context, kv_quant_type)?;
+        let model = Self::create_model_from_config(config, all_weights, device, dtype, max_context, kv_quant_type, model_path)?;
 
         info!("Model loaded");
         Ok(model)
@@ -588,7 +588,16 @@ impl ModelFactory {
         dtype: DType,
         max_context: Option<usize>,
         kv_quant_type: KVQuantType,
+        model_path: &Path,
     ) -> Result<Box<dyn ModelOperations>> {
+        // Run TTN analysis: Tier 1 (embedded) → Tier 2 (cached) → Tier 3 (weight entropy SVD).
+        // Weights are available here, enabling Tier 3 for unknown models.
+        // Result cached to .analysis/layer_profile.json; non-fatal if it fails.
+        // Runs in sync/blocking context (called from spawn_blocking), safe for SVD.
+        if let Err(e) = crate::runtime::ttn_profile::get_layer_profile(model_path, &config, Some(&weights)) {
+            tracing::warn!("TTN profile analysis failed (non-fatal): {e}");
+        }
+
         match config.architecture {
             ModelArchitecture::Llama => {
                 info!("Creating Llama model");
@@ -864,7 +873,7 @@ impl ModelFactory {
 
         let weights = Self::load_weights_fs(fs, &shard_names, device, dtype).await?;
         let config = ModelConfig::load(model_path, &weights)?;
-        let model = Self::create_model_from_config(config, weights, device, dtype, max_context, kv_quant_type)?;
+        let model = Self::create_model_from_config(config, weights, device, dtype, max_context, kv_quant_type, model_path)?;
         info!("Model created successfully via FsOps");
         Ok(model)
     }

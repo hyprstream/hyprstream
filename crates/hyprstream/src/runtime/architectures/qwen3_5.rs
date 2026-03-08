@@ -548,6 +548,7 @@ impl GatedDeltaNetLayer {
         hidden: &Tensor,
         conv_state: &mut Option<Tensor>,
         rec_state: &mut Option<Tensor>,
+        delta: Option<(&crate::training::TenantDelta, usize)>,
     ) -> Result<Tensor> {
         let (batch, seq, _) = dims3(hidden)?;
         let device = hidden.device();
@@ -716,12 +717,27 @@ impl GatedDeltaNetLayer {
         // Ensure output matches model dtype for out_proj matmul (weight is BF16)
         let normed = if normed.kind() != dtype { normed.to_kind(dtype) } else { normed };
         let flat = normed.reshape([batch * seq, val_dim]);
+
         let projected = self.out_proj.apply(&flat);
+        // Standard LoRA: add correction in the OUTPUT space of out_proj (y = Wx + BAx).
+        // Inject after out_proj so correction shape [B*seq, hidden_size] matches projected,
+        // regardless of whether val_dim == hidden_size. (Issue 6 + standard LoRA semantics)
+        let projected = if let Some((delta, layer_idx)) = delta {
+            if delta.has_module("o_proj", layer_idx) {
+                // forward_2d(flat): [B*seq, val_dim] → [B*seq, hidden_size]
+                &projected + delta.forward_2d(&flat, "o_proj", layer_idx)?
+            } else {
+                projected
+            }
+        } else {
+            projected
+        };
         Ok(projected.reshape([batch, seq, self.hidden_size_from_out_proj()]))
     }
 
     fn hidden_size_from_out_proj(&self) -> i64 {
-        self.out_proj.weight.size()[1]
+        // weight is stored [out_features, in_features]; size()[0] = out_features = hidden_size
+        self.out_proj.weight.size()[0]
     }
 }
 
@@ -793,6 +809,7 @@ impl Qwen3_5FullAttention {
         position_ids: Option<&Tensor>,
         kv_cache: Option<&mut crate::runtime::kv_cache::LayerKVCache>,
         start_pos: usize,
+        delta: Option<(&crate::training::TenantDelta, usize)>,
     ) -> Result<Tensor> {
         let (batch, seq, _) = dims3(hidden)?;
         let device = hidden.device();
@@ -802,9 +819,44 @@ impl Qwen3_5FullAttention {
         // Fused QKV projection: single matmul, then split
         let qkv = self.qkv_proj.apply(&h2);
         let [q_dim, k_dim, v_dim] = self.qkv_split;
-        let q_out = qkv.narrow(1, 0, q_dim);
+
+        // Delta injection on q_proj and v_proj (out-of-place to avoid aliasing, C2 fix)
+        // q_out layout: [B*seq, q_dim] where q_dim = num_heads * head_dim * 2
+        //   first half = Q, second half = gate
+        // Must apply correction to Q-half only, then reassemble with gate half
+        let (q_out, v_out) = if let Some((d, layer_idx)) = delta {
+            let q_raw = qkv.narrow(1, 0, q_dim);
+            let v_raw = qkv.narrow(1, q_dim + k_dim, v_dim);
+
+            let q_out = if d.has_module("q_proj", layer_idx) {
+                // q_dim = num_heads * head_dim * 2; split into Q and gate halves
+                let q_half = q_dim / 2;
+                let q_part = q_raw.narrow(1, 0, q_half);
+                let gate_part = q_raw.narrow(1, q_half, q_dim - q_half);
+                let q_correction = d.forward_2d(&h2, "q_proj", layer_idx)?;
+                // q_correction shape: [B*seq, q_half] (delta target is the pre-gate Q only)
+                // If correction has full q_dim, only apply to q-half
+                let q_correction = if q_correction.size()[1] == q_half {
+                    q_correction
+                } else {
+                    q_correction.narrow(1, 0, q_half)
+                };
+                let corrected_q = &q_part + &q_correction;
+                Tensor::cat(&[corrected_q, gate_part], 1)
+            } else {
+                q_raw
+            };
+
+            let v_out = if d.has_module("v_proj", layer_idx) {
+                &v_raw + d.forward_2d(&h2, "v_proj", layer_idx)?
+            } else {
+                v_raw
+            };
+            (q_out, v_out)
+        } else {
+            (qkv.narrow(1, 0, q_dim), qkv.narrow(1, q_dim + k_dim, v_dim))
+        };
         let k_out = qkv.narrow(1, q_dim, k_dim);
-        let v_out = qkv.narrow(1, q_dim + k_dim, v_dim);
 
         let nh = self.num_heads as i64;
         let nkv = self.num_kv_heads as i64;
@@ -874,6 +926,18 @@ impl Qwen3_5FullAttention {
         let ctx_flat = ctx.reshape([batch * seq, nh * hd]);
         let gate_flat = gate.reshape([batch * seq, nh * hd]).sigmoid();
         let ctx_gated = ctx_flat * gate_flat;
+
+        // Delta injection on o_proj (after gate, before linear projection)
+        let ctx_gated = if let Some((d, layer_idx)) = delta {
+            if d.has_module("o_proj", layer_idx) {
+                &ctx_gated + d.forward_2d(&ctx_gated, "o_proj", layer_idx)?
+            } else {
+                ctx_gated
+            }
+        } else {
+            ctx_gated
+        };
+
         let out = self.o_proj.apply(&ctx_gated);
         Ok(out.reshape([batch, seq, -1]))
     }
@@ -1380,11 +1444,16 @@ impl Qwen3_5Model {
         }
     }
 
+    /// Unified forward inner: replaces the old `forward_inner` to avoid
+    /// a deadlock that would occur if a no-delta wrapper acquired conv/rec
+    /// locks and then delegated to a delta version that also tried to acquire them.
+    /// (C5 deadlock fix: single implementation, delta=None for inference path)
     fn forward_inner(
         &self,
         input_ids: Option<&Tensor>,
         embeddings: Option<&Tensor>,
         start_pos: usize,
+        delta: Option<&crate::training::TenantDelta>,
     ) -> Result<Tensor> {
         let mut hidden = if let Some(embeds) = embeddings {
             embeds.shallow_clone()
@@ -1400,7 +1469,7 @@ impl Qwen3_5Model {
             emb.reshape([batch, seq, hidden_sz])
         };
 
-        let (batch, seq) = (hidden.size()[0], hidden.size()[1]);
+        let (_, seq) = (hidden.size()[0], hidden.size()[1]);
         let device = self.device;
 
         // Position IDs for full-attention RoPE
@@ -1412,26 +1481,27 @@ impl Qwen3_5Model {
 
         let mut conv_guard = self.conv_states.lock();
         let mut rec_guard = self.rec_states.lock();
-        // kv_arc dropped per-layer to avoid holding lock across SSM layers
 
         for (idx, layer) in self.layers.iter().enumerate() {
             let residual = hidden.shallow_clone();
 
             hidden = layer.input_layernorm.forward(&hidden)?;
 
+            let delta_arg = delta.map(|d| (d, idx));
+
             let mixer_out = match &layer.mixer {
                 LayerMixer::LinearAttn(gdn) => {
-                    gdn.forward(&hidden, &mut conv_guard[idx], &mut rec_guard[idx])?
+                    gdn.forward(&hidden, &mut conv_guard[idx], &mut rec_guard[idx], delta_arg)?
                 }
                 LayerMixer::FullAttn(attn) => {
                     if let Some(ref cache_arc) = self.kv_cache {
                         let kv = cache_arc.lock();
                         kv.with_layer_cache(idx, |lc| {
-                            attn.forward(&hidden, Some(&position_ids), Some(lc), start_pos)
+                            attn.forward(&hidden, Some(&position_ids), Some(lc), start_pos, delta_arg)
                         })
                         .ok_or_else(|| anyhow!("No KV cache for layer {idx}"))??
                     } else {
-                        attn.forward(&hidden, Some(&position_ids), None, start_pos)?
+                        attn.forward(&hidden, Some(&position_ids), None, start_pos, delta_arg)?
                     }
                 }
             };
@@ -1507,6 +1577,79 @@ impl Qwen3_5Model {
         Ok(combined)
     }
 
+    /// Expose the Qwen3.5 text config for external callers (e.g., get_per_layer_lora_dims).
+    pub fn text_config(&self) -> &Qwen3_5TextConfig {
+        &self.config
+    }
+
+    /// Deep-copy current SSM states for TTT snapshot/restore (C4 fix: must use .copy(), not .shallow_clone()).
+    ///
+    /// Returns (conv_snapshot, rec_snapshot). Each tensor is deep-copied so that
+    /// subsequent SSM mutations during TTT adaptation do not corrupt the snapshot.
+    pub fn snapshot_ssm_states(&self) -> (Vec<Option<Tensor>>, Vec<Option<Tensor>>) {
+        let conv_snapshot = {
+            let guard = self.conv_states.lock();
+            guard.iter().map(|opt| opt.as_ref().map(|t| t.copy())).collect()
+        };
+        let rec_snapshot = {
+            let guard = self.rec_states.lock();
+            guard.iter().map(|opt| opt.as_ref().map(|t| t.copy())).collect()
+        };
+        (conv_snapshot, rec_snapshot)
+    }
+
+    /// Restore SSM states from a snapshot produced by `snapshot_ssm_states`.
+    pub fn restore_ssm_states(
+        &self,
+        conv_snapshot: Vec<Option<Tensor>>,
+        rec_snapshot: Vec<Option<Tensor>>,
+    ) {
+        *self.conv_states.lock() = conv_snapshot;
+        *self.rec_states.lock() = rec_snapshot;
+    }
+
+    /// Shared implementation for `decode_layer` and `decode_layer_with_delta`.
+    ///
+    /// **Training path only.** Full-attention layers run with `start_pos=0` and no KV
+    /// cache, which is correct for the TTT gradient loop (full causal mask over the entire
+    /// context). Do not use this method for incremental autoregressive inference — use
+    /// `forward_with_cache_and_delta` / `forward_with_cache` instead.
+    ///
+    /// GDN layers acquire `conv_states` / `rec_states` locks per call (not held across
+    /// layers), which is safe because `forward_with_delta` in TorchEngine never holds
+    /// those locks itself.
+    fn decode_layer_impl(
+        &self,
+        layer_idx: usize,
+        hidden_states: &Tensor,
+        position_ids: Option<&Tensor>,
+        delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<(Tensor, Option<(Tensor, Tensor)>)> {
+        let layer = self.layers.get(layer_idx)
+            .ok_or_else(|| anyhow!("Layer {layer_idx} out of range"))?;
+        let residual = hidden_states.shallow_clone();
+        let normed = layer.input_layernorm.forward(hidden_states)?;
+
+        let delta_arg = delta.map(|d| (d, layer_idx));
+
+        let mixer_out = match &layer.mixer {
+            LayerMixer::LinearAttn(gdn) => {
+                let mut conv = self.conv_states.lock();
+                let mut rec = self.rec_states.lock();
+                gdn.forward(&normed, &mut conv[layer_idx], &mut rec[layer_idx], delta_arg)?
+            }
+            LayerMixer::FullAttn(attn) => {
+                attn.forward(&normed, position_ids, None, 0, delta_arg)?
+            }
+        };
+
+        let hidden = &residual + &mixer_out;
+        let residual2 = hidden.shallow_clone();
+        let normed2 = layer.post_attention_layernorm.forward(&hidden)?;
+        let ffn_out = layer.mlp.forward(&normed2)?;
+        Ok((&residual2 + &ffn_out, None))
+    }
+
     fn lm_head_apply(&self, hidden: &Tensor) -> Result<Tensor> {
         let (batch, seq, hs) = dims3(hidden)?;
         let flat = hidden.reshape([batch * seq, hs]);
@@ -1537,19 +1680,30 @@ impl ModelOperations for Qwen3_5Model {
     }
 
     fn forward(&self, input: &Tensor, _past_kv: Option<&Tensor>) -> Result<Tensor> {
-        let hidden = self.forward_inner(Some(input), None, 0)?;
+        let hidden = self.forward_inner(Some(input), None, 0, None)?;
         let normed = self.norm.forward(&hidden)?;
         self.lm_head_apply(&normed)
     }
 
     fn forward_with_cache(&self, input: &Tensor, start_pos: usize) -> Result<Tensor> {
-        let hidden = self.forward_inner(Some(input), None, start_pos)?;
+        let hidden = self.forward_inner(Some(input), None, start_pos, None)?;
         let normed = self.norm.forward(&hidden)?;
         self.lm_head_apply(&normed)
     }
 
     fn forward_from_embeddings(&self, embeddings: &Tensor, start_pos: usize) -> Result<Tensor> {
-        let hidden = self.forward_inner(None, Some(embeddings), start_pos)?;
+        let hidden = self.forward_inner(None, Some(embeddings), start_pos, None)?;
+        let normed = self.norm.forward(&hidden)?;
+        self.lm_head_apply(&normed)
+    }
+
+    fn forward_with_cache_and_delta(
+        &self,
+        input: &Tensor,
+        start_pos: usize,
+        delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        let hidden = self.forward_inner(Some(input), None, start_pos, delta)?;
         let normed = self.norm.forward(&hidden)?;
         self.lm_head_apply(&normed)
     }
@@ -1573,6 +1727,29 @@ impl ModelOperations for Qwen3_5Model {
 
     fn num_layers(&self) -> usize {
         self.config.num_hidden_layers
+    }
+
+    fn decode_layer(
+        &self,
+        layer_idx: usize,
+        hidden_states: &Tensor,
+        _attention_mask: Option<&Tensor>,
+        position_ids: Option<&Tensor>,
+        _past_kv: Option<&crate::runtime::kv_cache::LayerKVCache>,
+    ) -> Result<(Tensor, Option<(Tensor, Tensor)>)> {
+        self.decode_layer_impl(layer_idx, hidden_states, position_ids, None)
+    }
+
+    fn decode_layer_with_delta(
+        &self,
+        layer_idx: usize,
+        hidden_states: &Tensor,
+        _attention_mask: Option<&Tensor>,
+        position_ids: Option<&Tensor>,
+        _past_kv: Option<&crate::runtime::kv_cache::LayerKVCache>,
+        delta: &crate::training::TenantDelta,
+    ) -> Result<(Tensor, Option<(Tensor, Tensor)>)> {
+        self.decode_layer_impl(layer_idx, hidden_states, position_ids, Some(delta))
     }
 
     fn clear_kv_cache(&self) {

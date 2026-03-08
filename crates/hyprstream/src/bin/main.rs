@@ -1253,7 +1253,7 @@ fn main() -> Result<()> {
             tracing_subscriber::fmt()
                 .with_env_filter(EnvFilter::builder().parse_lossy(
                     std::env::var("RUST_LOG")
-                        .unwrap_or_else(|_| default_log_level.to_string()),
+                        .unwrap_or_else(|_| default_log_level.to_owned()),
                 ))
                 .with_target(true)
                 .with_file(true)
@@ -1267,7 +1267,7 @@ fn main() -> Result<()> {
             tracing_subscriber::fmt()
                 .with_env_filter(EnvFilter::builder().parse_lossy(
                     std::env::var("RUST_LOG")
-                        .unwrap_or_else(|_| default_log_level.to_string()),
+                        .unwrap_or_else(|_| default_log_level.to_owned()),
                 ))
                 .with_target(true)
                 .with_file(true)

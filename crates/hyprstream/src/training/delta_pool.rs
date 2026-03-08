@@ -33,6 +33,10 @@ pub struct DeltaPool {
     default_config: Mutex<TenantDeltaConfig>,
     /// Module dimensions from the loaded model: module_name -> (in_features, out_features)
     module_dims: HashMap<String, (usize, usize)>,
+    /// Per-layer dimension overrides: layer_idx -> module_name -> (in, out)
+    /// Used for hybrid architectures (e.g., Qwen3.5) where GDN and full-attn layers
+    /// have different dimensions for the same LoRA module name (e.g., "o_proj").
+    per_layer_dims: Option<HashMap<usize, HashMap<String, (usize, usize)>>>,
     /// Device for tensor allocation
     device: Device,
     /// Memory budget in bytes (None = unlimited)
@@ -75,6 +79,7 @@ impl DeltaPool {
             deltas: DashMap::new(),
             default_config: Mutex::new(config),
             module_dims,
+            per_layer_dims: None,
             device,
             memory_budget_bytes: None,
             base_weight_norms: HashMap::new(),
@@ -84,6 +89,15 @@ impl DeltaPool {
             num_layers,
             max_tenants: MAX_TENANTS_DEFAULT,
         }
+    }
+
+    /// Set per-layer dimension overrides for hybrid architectures (e.g., Qwen3.5).
+    pub fn with_per_layer_dims(
+        mut self,
+        per_layer_dims: HashMap<usize, HashMap<String, (usize, usize)>>,
+    ) -> Self {
+        self.per_layer_dims = Some(per_layer_dims);
+        self
     }
 
     /// Set memory budget for the pool
@@ -129,7 +143,13 @@ impl DeltaPool {
 
         // Slow path: create new delta (lock config briefly to clone it)
         let config = self.default_config.lock().clone();
-        let delta = TenantDelta::new(&config, &self.module_dims, self.device, self.num_layers)?;
+        let delta = TenantDelta::new_with_per_layer_dims(
+            &config,
+            &self.module_dims,
+            self.device,
+            self.num_layers,
+            self.per_layer_dims.as_ref(),
+        )?;
         let delta = Arc::new(Mutex::new(delta));
 
         // Insert (handles race condition)

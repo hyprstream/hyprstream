@@ -577,9 +577,10 @@ impl InferenceService {
         // Initialize delta pool if TTT is enabled
         let delta_pool = if ttt_trainer.is_some() {
             let module_dims = engine.get_lora_module_dims().unwrap_or_default();
+            let per_layer_dims = engine.get_per_layer_lora_dims();
             let device = engine.device();
 
-            let delta_config = if let Some(ref tc) = training_config {
+            let base_delta_config = if let Some(ref tc) = training_config {
                 let alpha = tc.lora_alpha.unwrap_or(tc.lora_rank as f32);
                 TenantDeltaConfig {
                     rank: tc.lora_rank,
@@ -591,6 +592,28 @@ impl InferenceService {
             } else {
                 TenantDeltaConfig::default()
             };
+
+            // Try to load TTN layer profile for non-uniform rank allocation
+            let model_config_result = crate::runtime::model_config::ModelConfig::load(&model_path, &std::collections::HashMap::new());
+            let delta_config = if let Ok(ref mc) = model_config_result {
+                match crate::runtime::ttn_profile::get_layer_profile(&model_path, mc, None) {
+                    Ok(profile) => {
+                        let cfg = TenantDeltaConfig::from_profile(&base_delta_config, &profile);
+                        info!(
+                            "Delta pool: using TTN profile ({} layer overrides)",
+                            cfg.layer_overrides.as_ref().map_or(0, std::collections::HashMap::len)
+                        );
+                        cfg
+                    }
+                    Err(e) => {
+                        info!("TTN profile unavailable ({}), using uniform config", e);
+                        base_delta_config
+                    }
+                }
+            } else {
+                base_delta_config
+            };
+
             let kv_reg = engine.kv_registry();
             let snapshots_dir = model_path.join("adapters").join(".snapshots");
             let num_layers = engine.get_num_layers().unwrap_or(32);
@@ -599,7 +622,10 @@ impl InferenceService {
                 "Delta pool initialized: rank={}, alpha={:.1}, modules={:?}, lr={:.1e}",
                 delta_config.rank, delta_config.alpha, delta_config.target_modules, delta_config.learning_rate
             );
-            let pool = DeltaPool::new(delta_config, module_dims, device, kv_reg, snapshots_dir, fs.clone(), num_layers);
+            let mut pool = DeltaPool::new(delta_config, module_dims, device, kv_reg, snapshots_dir, fs.clone(), num_layers);
+            if let Some(pld) = per_layer_dims {
+                pool = pool.with_per_layer_dims(pld);
+            }
 
             Some(Arc::new(pool))
         } else {
@@ -2012,6 +2038,20 @@ impl InferenceHandler for InferenceService {
     async fn handle_is_ready(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
         let ready = InferenceService::handle_is_ready(self).await;
         Ok(InferenceResponseVariant::IsReadyResult(ready))
+    }
+
+    async fn handle_get_layer_profile(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+        use crate::runtime::ttn_profile;
+        use crate::services::generated::inference_client::LayerProfileResult;
+
+        let model_config = crate::runtime::model_config::ModelConfig::load(
+            &self.model_path,
+            &std::collections::HashMap::new(),
+        )?;
+        let profile = ttn_profile::get_layer_profile(&self.model_path, &model_config, None)?;
+        let json = serde_json::to_string_pretty(&profile)?;
+
+        Ok(InferenceResponseVariant::GetLayerProfileResult(LayerProfileResult { json }))
     }
 
     async fn handle_apply_chat_template(
