@@ -19,6 +19,17 @@ using import "/streaming.capnp".StreamInfo;
 # collisions. The code generator strips "Result" to pair them.
 # Scoped ops are nested under ttt/adapter/infer with matching Result variants.
 
+enum AdaptationStrategy {
+  autoWriteback @0;
+  # Write back to delta if recommendation positive, evict if negative.
+  autoEvict @1;
+  # Always evict after generation — eval/benchmark mode.
+  speculative @2;
+  # Keep pending; client calls ttt.writeback or ttt.evict explicitly.
+  writebackIfAbove @3;
+  # Write back if loss_improvement exceeds writebackThreshold, else evict.
+}
+
 struct ModelRequest {
   # Request ID for tracking
   id @0 :UInt64;
@@ -54,9 +65,9 @@ struct TttRequest {
     trainStream @3 :TrainStepRequest
       $mcpDescription("Stream TTT training on input text. Returns progress and results via streaming. Use for long-running training that would timeout via ttt.train.");
     commit @4 :Void
-      $mcpDescription("Commit a pending TTT adaptation to the tenant delta accumulator. Call after reviewing metrics from infer.generateStream. Must be called within 30 seconds of the inference response.");
+      $mcpDescription("Commit a pending TTT adaptation to the tenant delta accumulator. Call after reviewing onlineTrainingMetrics.recommendation from infer.generateStream. Must be called within the pending rollback window (default 60 seconds, configurable via pending_rollback_ms). If the window expires, the adaptation is auto-rolled back and this call will return an error.");
     rollback @5 :Void
-      $mcpDescription("Rollback a pending TTT adaptation, restoring the tenant delta accumulator to its pre-inference state. Call within 30 seconds if recommendation was false or quality was poor.");
+      $mcpDescription("Rollback a pending TTT adaptation, restoring the tenant delta accumulator to its pre-adaptation state. Call within the pending rollback window (default 60 seconds, configurable via pending_rollback_ms) if recommendation was false or output quality was poor. If multiple adaptations were stacked without resolving the first, rollback restores to the state before the earliest pending adaptation.");
     reset @6 :Void
       $mcpDescription("Clear the tenant delta accumulator, resetting all accumulated training to zero.");
     status @7 :Void
@@ -107,7 +118,7 @@ struct InferRequest {
   modelRef @0 :Text;
   union {
     generateStream @1 :GenerateRequest
-      $mcpDescription("Run inference with automatic domain adaptation. When TTT is enabled, the model adapts to your prompt before responding. If autoCommit is false (default), the adaptation is PENDING — check onlineTrainingMetrics.recommendation in the response, then call ttt.commit (if true) or ttt.rollback (if false). Pending adaptations auto-rollback after 30 seconds.");
+      $mcpDescription("Run inference with automatic domain adaptation. When TTT is enabled, the model adapts to your prompt BEFORE generating — the response is always produced using the adapted weights, even when autoCommit is false. Check onlineTrainingMetrics.recommendation in the response, then call ttt.commit (if true) or ttt.rollback (if false) within the pending rollback window (default 60 seconds). If you call generateStream again before resolving a pending adaptation, the new adaptation stacks on top and rollback will restore to the state before the first pending adaptation. Pending adaptations auto-rollback after the timeout if commit/rollback is not called.");
     applyChatTemplate @2 :ApplyChatTemplateRequest
       $mcpDescription("Apply chat template to messages for a loaded model");
     status @3 :Void
@@ -225,7 +236,10 @@ struct GenerateRequest {
   tttEnabled @11 :Bool $paramDescription("Override: enable/disable TTT for this request");
   tttGradientSteps @12 :UInt32 $optional $paramDescription("Override: number of gradient steps (0 = skip)");
   tttLearningRate @13 :Float32 $optional $paramDescription("Override: learning rate");
-  autoCommit @14 :Bool $paramDescription("If true, server auto-commits based on its recommendation. If false (default), adaptation is pending until client commits.");
+  adaptationStrategy @14 :AdaptationStrategy
+    $paramDescription("How to handle the adaptation result. autoWriteback: accept if recommendation positive, evict if negative. autoEvict: always evict (eval mode). speculative: keep pending, client calls ttt.writeback or ttt.evict. writebackIfAbove: accept if loss_improvement exceeds writebackThreshold.");
+  writebackThreshold @15 :Float32 $optional
+    $paramDescription("Loss improvement threshold for writebackIfAbove strategy. Ignored for other strategies.");
 }
 
 # Embedding request for vision models (e.g. SigLIP)
@@ -336,7 +350,10 @@ struct TrainStepRequest {
   input @0 :Text $paramDescription("Text to train on (NTP loss)");
   gradientSteps @1 :UInt32 $optional $paramDescription("Number of gradient steps (default: 3)");
   learningRate @2 :Float32 $optional $paramDescription("Learning rate override (0 = use default)");
-  autoCommit @3 :Bool $paramDescription("If true, auto-commit if quality gate passes");
+  adaptationStrategy @3 :AdaptationStrategy
+    $paramDescription("How to handle the adaptation result. Same semantics as GenerateRequest.adaptationStrategy.");
+  writebackThreshold @4 :Float32 $optional
+    $paramDescription("Loss improvement threshold for writebackIfAbove strategy.");
 }
 
 struct TrainStepResponse {
@@ -357,14 +374,17 @@ struct TrainStepResponse {
 
 struct GetDeltaStatusResponse {
   exists @0 :Bool;
-  accumulatedSteps @1 :UInt64;
-  maxAccumulatedSteps @2 :UInt64;
+  accumulatedSteps @1 :UInt64
+    $paramDescription("Total gradient steps committed to this delta. Counts toward maxAccumulatedSteps.");
+  maxAccumulatedSteps @2 :UInt64
+    $paramDescription("Hard capacity ceiling. When accumulatedSteps reaches this value, further TTT adaptation via generateStream is silently skipped (generation still proceeds with the existing delta). Call ttt.save/ttt.export then ttt.reset to free capacity.");
   requestCount @3 :UInt64;
   avgLossImprovement @4 :Float32;
   memoryBytes @5 :UInt64;
   lastSnapshotHash @6 :Text;
   deltaNormRatios @7 :List(ModuleNormRatio);
-  hasPending @8 :Bool;    # Whether there's an uncommitted adaptation
+  hasPending @8 :Bool
+    $paramDescription("Whether a pending adaptation awaits commit or rollback. Point-in-time snapshot — may become stale if the timeout expires before you act. Call ttt.commit or ttt.rollback to resolve.");
 }
 
 struct ModuleNormRatio {
@@ -377,6 +397,8 @@ struct SaveAdaptationRequest {
   mergeStrategy @1 :Text $optional $paramDescription("Merge strategy: 'replace', 'additive', 'do_merge' (default)");
   mergeWeight @2 :Float32 $optional $paramDescription("Merge weight 0.0-1.0 (default: 0.3)");
   commitMessage @3 :Text $optional $paramDescription("Non-empty triggers git commit");
+  gitCommit @4 :Bool $optional
+    $paramDescription("If true, stage and commit the written file to the model repository after saving.");
 }
 
 struct SaveAdaptationResponse {

@@ -1977,6 +1977,7 @@ use crate::services::generated::inference_client::{
     SaveAdaptationResult, SnapshotDeltaResult, ExportPeftResult,
     ChatTemplateRequest, LoraConfig, TrainStepRequest, SaveAdaptationRequest, ExportPeftRequest,
     MergeLoraRequest, EmbedImagesRequest, EmbedImagesResponse,
+    AdaptationStrategyEnum,
 };
 // Conflicting names — use canonical path at usage sites:
 //   inference_client::GenerationResult, inference_client::ModelInfo, inference_client::StreamInfo
@@ -2017,7 +2018,7 @@ impl InferenceHandler for InferenceService {
             ttt_enabled: data.ttt_enabled,
             ttt_gradient_steps: data.ttt_gradient_steps,
             ttt_learning_rate: data.ttt_learning_rate,
-            auto_commit: data.auto_commit,
+            auto_commit: matches!(data.adaptation_strategy, AdaptationStrategyEnum::AutoWriteback),
         };
 
         // Build per-request TTT overrides from RPC fields
@@ -2025,7 +2026,7 @@ impl InferenceHandler for InferenceService {
             enabled: if data.ttt_enabled { Some(true) } else { None },
             gradient_steps: if data.ttt_gradient_steps > 0 { Some(data.ttt_gradient_steps) } else { None },
             learning_rate: if data.ttt_learning_rate > 0.0 { Some(data.ttt_learning_rate) } else { None },
-            auto_commit: data.auto_commit,
+            auto_commit: matches!(data.adaptation_strategy, AdaptationStrategyEnum::AutoWriteback),
             max_adaptation_ms: None,
         };
 
@@ -2202,16 +2203,16 @@ impl InferenceHandler for InferenceService {
         Ok(InferenceResponseVariant::Success)
     }
 
-    async fn handle_commit_adaptation(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+    async fn handle_ttt_writeback(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
         let subject = ctx.subject();
         InferenceService::handle_writeback(self, &subject)?;
-        Ok(InferenceResponseVariant::CommitAdaptationResult)
+        Ok(InferenceResponseVariant::TttWritebackResult)
     }
 
-    async fn handle_rollback_adaptation(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+    async fn handle_ttt_evict(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
         let subject = ctx.subject();
         InferenceService::handle_evict(self, &subject)?;
-        Ok(InferenceResponseVariant::RollbackAdaptationResult)
+        Ok(InferenceResponseVariant::TttEvictResult)
     }
 
     async fn handle_train_step(
@@ -2262,7 +2263,7 @@ impl InferenceHandler for InferenceService {
             input: data.input.clone(),
             gradient_steps: data.gradient_steps,
             learning_rate: data.learning_rate,
-            auto_commit: data.auto_commit,
+            auto_commit: matches!(data.adaptation_strategy, AdaptationStrategyEnum::AutoWriteback),
         };
 
         // Build continuation
@@ -2274,10 +2275,10 @@ impl InferenceHandler for InferenceService {
         Ok((stream_info, continuation))
     }
 
-    async fn handle_reset_delta(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+    async fn handle_ttt_zero(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
         let subject = ctx.subject();
         InferenceService::handle_reset_delta(self, &subject)?;
-        Ok(InferenceResponseVariant::ResetDeltaResult)
+        Ok(InferenceResponseVariant::TttZeroResult)
     }
 
     async fn handle_get_delta_status(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
@@ -2748,6 +2749,7 @@ impl InferenceZmqClient {
         request: &GenerationRequest,
         ephemeral_pubkey: Option<[u8; 32]>,
     ) -> Result<StreamInfo> {
+        let adaptation_strategy_str = if request.auto_commit { "auto_writeback" } else { "speculative" };
         self.gen.generate_stream(
             request.prompt.as_str(),
             request.max_tokens as u32,
@@ -2763,7 +2765,8 @@ impl InferenceZmqClient {
             request.ttt_enabled,
             request.ttt_gradient_steps,
             request.ttt_learning_rate,
-            request.auto_commit,
+            adaptation_strategy_str,
+            0.0f32, // writeback_threshold (unused for non-writebackIfAbove strategies)
             ephemeral_pubkey.unwrap_or([0u8; 32]),
         ).await
     }
@@ -2874,19 +2877,19 @@ impl InferenceZmqClient {
 
     // Training loop control (TTT operations)
 
-    /// Commit a pending TTT adaptation
+    /// Commit a pending TTT adaptation (writeback)
     pub async fn commit_adaptation(&self) -> Result<()> {
-        self.gen.commit_adaptation().await
+        self.gen.ttt_writeback().await
     }
 
-    /// Rollback a pending TTT adaptation
+    /// Rollback a pending TTT adaptation (evict)
     pub async fn rollback_adaptation(&self) -> Result<()> {
-        self.gen.rollback_adaptation().await
+        self.gen.ttt_evict().await
     }
 
-    /// Reset a tenant's delta
+    /// Reset a tenant's delta (zero)
     pub async fn reset_delta(&self) -> Result<()> {
-        self.gen.reset_delta().await
+        self.gen.ttt_zero().await
     }
 
     /// Start streaming training step with E2E authentication — delegates to generated client
@@ -2898,11 +2901,13 @@ impl InferenceZmqClient {
         auto_commit: bool,
         ephemeral_pubkey: Option<[u8; 32]>,
     ) -> Result<StreamInfo> {
+        let adaptation_strategy_str = if auto_commit { "auto_writeback" } else { "speculative" };
         self.gen.train_step_stream(
             input,
             gradient_steps,
             learning_rate,
-            auto_commit,
+            adaptation_strategy_str,
+            0.0f32, // writeback_threshold
             ephemeral_pubkey.unwrap_or([0u8; 32]),
         ).await
     }

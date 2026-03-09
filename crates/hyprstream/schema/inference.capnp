@@ -3,6 +3,7 @@
 using import "/streaming.capnp".StreamInfo;
 using import "/annotations.capnp".optional;
 using import "/annotations.capnp".mcpScope;
+using import "/annotations.capnp".paramDescription;
 
 # Cap'n Proto schema for inference service
 #
@@ -13,6 +14,17 @@ using import "/annotations.capnp".mcpScope;
 #   - Wire format types are in hyprstream-rpc/schema/streaming.capnp
 #   - Streaming payloads use generic StreamPayload (data/complete/error/heartbeat)
 #   - Completion metadata serialized as JSON InferenceComplete (see rpc_types.rs)
+
+enum AdaptationStrategy {
+  autoWriteback @0;
+  # Write back to delta if recommendation positive, evict if negative.
+  autoEvict @1;
+  # Always evict after generation — eval/benchmark mode.
+  speculative @2;
+  # Keep pending; client calls ttt.writeback or ttt.evict explicitly.
+  writebackIfAbove @3;
+  # Write back if loss_improvement exceeds writebackThreshold, else evict.
+}
 
 struct InferenceRequest {
   # Request ID for tracking
@@ -42,10 +54,10 @@ struct InferenceRequest {
     shutdown @14 :Void $mcpScope(manage);
 
     # Training loop control — tenant-aware TTT (identity from auth envelope)
-    commitAdaptation @15 :Void $mcpScope(write);
-    rollbackAdaptation @16 :Void $mcpScope(write);
+    tttWriteback @15 :Void $mcpScope(train);
+    tttEvict @16 :Void $mcpScope(train);
     trainStep @17 :TrainStepRequest $mcpScope(train);
-    resetDelta @18 :Void $mcpScope(manage);
+    tttZero @18 :Void $mcpScope(manage);
 
     # Persistence operations (identity from auth envelope)
     getDeltaStatus @19 :Void $mcpScope(query);
@@ -104,10 +116,10 @@ struct InferenceResponse {
     healthCheckResult @15 :HealthStatus;
 
     # Training loop control responses
-    commitAdaptationResult @16 :Void;
-    rollbackAdaptationResult @17 :Void;
+    tttWritebackResult @16 :Void;
+    tttEvictResult @17 :Void;
     trainStepResult @18 :TrainStepResult;
-    resetDeltaResult @19 :Void;
+    tttZeroResult @19 :Void;
 
     # Persistence responses
     getDeltaStatusResult @20 :DeltaStatusResult;
@@ -154,10 +166,16 @@ struct GenerationRequest {
   timeoutMs @10 :UInt64 $optional;
 
   # Per-request TTT control (all optional — omit for server defaults)
-  tttEnabled @11 :Bool;
-  tttGradientSteps @12 :UInt32 $optional;
-  tttLearningRate @13 :Float32 $optional;
-  autoCommit @14 :Bool;
+  tttEnabled @11 :Bool
+    $paramDescription("Override: enable/disable TTT for this request");
+  tttGradientSteps @12 :UInt32 $optional
+    $paramDescription("Override: number of gradient steps (0 = skip)");
+  tttLearningRate @13 :Float32 $optional
+    $paramDescription("Override: learning rate");
+  adaptationStrategy @14 :AdaptationStrategy
+    $paramDescription("How to handle the adaptation result. autoWriteback: accept if recommendation positive, evict if negative. autoEvict: always evict (eval mode). speculative: keep pending, client calls ttt.writeback or ttt.evict. writebackIfAbove: accept if loss_improvement exceeds writebackThreshold.");
+  writebackThreshold @15 :Float32 $optional
+    $paramDescription("Loss improvement threshold for writebackIfAbove strategy. Ignored for other strategies.");
 }
 
 # Quality metrics for self-supervised training
@@ -282,7 +300,10 @@ struct TrainStepRequest {
   input @0 :Text;
   gradientSteps @1 :UInt32 $optional;
   learningRate @2 :Float32 $optional;
-  autoCommit @3 :Bool;
+  adaptationStrategy @3 :AdaptationStrategy
+    $paramDescription("How to handle the adaptation result. Same semantics as GenerationRequest.adaptationStrategy.");
+  writebackThreshold @4 :Float32 $optional
+    $paramDescription("Loss improvement threshold for writebackIfAbove strategy.");
 }
 
 struct TrainStepResult {
@@ -302,6 +323,8 @@ struct SaveAdaptationRequest {
   mergeStrategy @1 :Text $optional;
   mergeWeight @2 :Float32 $optional;
   commitMessage @3 :Text $optional;
+  gitCommit @4 :Bool $optional
+    $paramDescription("If true, stage and commit the written file to the model repository after saving.");
 }
 
 struct SaveAdaptationResult {
@@ -313,14 +336,17 @@ struct SaveAdaptationResult {
 
 struct DeltaStatusResult {
   exists @0 :Bool;
-  accumulatedSteps @1 :UInt64;
-  maxAccumulatedSteps @2 :UInt64;
+  accumulatedSteps @1 :UInt64
+    $paramDescription("Total gradient steps committed to this delta. Counts toward maxAccumulatedSteps.");
+  maxAccumulatedSteps @2 :UInt64
+    $paramDescription("Hard capacity ceiling. When accumulatedSteps reaches this value, further TTT adaptation is silently skipped. Call saveLora/exportPeftAdapter then resetDelta to free capacity.");
   requestCount @3 :UInt64;
   avgLossImprovement @4 :Float32;
   memoryBytes @5 :UInt64;
   lastSnapshotHash @6 :Text;
   deltaNormRatios @7 :List(ModuleNormRatio);
-  hasPending @8 :Bool;
+  hasPending @8 :Bool
+    $paramDescription("Whether a pending adaptation awaits commitAdaptation or rollbackAdaptation. Point-in-time snapshot — may become stale if the timeout expires.");
 }
 
 struct ModuleNormRatio {
@@ -340,6 +366,8 @@ struct SnapshotDeltaResult {
 struct ExportPeftRequest {
   name @0 :Text;
   commitMessage @1 :Text $optional;
+  gitCommit @2 :Bool $optional
+    $paramDescription("If true, stage and commit the exported adapter directory to the model repository.");
 }
 
 struct ExportPeftResult {
