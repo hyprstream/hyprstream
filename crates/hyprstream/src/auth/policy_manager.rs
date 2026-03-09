@@ -121,7 +121,7 @@ e = some(where (p.eft == allow)) && !some(where (p.eft == deny))
 m = (g(r.sub, p.sub) || keyMatch(r.sub, p.sub)) && \
     (p.dom == "*" || r.dom == p.dom) && \
     keyMatch(r.obj, p.obj) && \
-    (p.act == "*" || r.act == p.act)
+    (p.act == "*" || keyMatch(r.act, p.act))
 "#;
 
 /// Default policy rules: deny-by-default (no allow rules)
@@ -312,6 +312,30 @@ impl PolicyManager {
         })
     }
 
+    /// Create a PolicyManager with a clean in-memory adapter and no pre-seeded rules.
+    ///
+    /// Intended for unit tests that need a blank-slate enforcer (deny-by-default)
+    /// without touching the filesystem or inheriting the permissive `*` rule from
+    /// [`permissive()`].
+    ///
+    /// WARNING: Not for production use.
+    #[cfg(test)]
+    pub async fn new_in_memory() -> Result<Self, PolicyError> {
+        let model = DefaultModel::from_str(DEFAULT_MODEL_CONF)
+            .await
+            .map_err(|e| PolicyError::ModelLoadError(e.to_string()))?;
+
+        let adapter = MemoryAdapter::default();
+        let enforcer = Enforcer::new(model, adapter)
+            .await
+            .map_err(|e| PolicyError::PolicyLoadError(e.to_string()))?;
+
+        Ok(Self {
+            enforcer: Arc::new(RwLock::new(enforcer)),
+            policies_dir: PathBuf::new(),
+        })
+    }
+
     /// Check if a user is allowed to perform an operation on a resource
     ///
     /// Uses wildcard "*" for domain. For domain-specific checks, use `check_with_domain()`.
@@ -329,16 +353,19 @@ impl PolicyManager {
         resource: &str,
         operation: Operation,
     ) -> bool {
-        self.check_with_domain(user, "*", resource, operation).await
+        self.check_with_domain(user, "*", resource, operation.as_str()).await
     }
 
     /// Check if a user is allowed to perform an operation on a resource in a specific domain
+    ///
+    /// Accepts any `&str` for `operation`, supporting both classic enum-backed actions
+    /// (e.g., `"infer"`, `"train"`) and dot-namespaced actions (e.g., `"ttt.writeback"`).
     ///
     /// # Arguments
     /// * `user` - The user or role requesting access
     /// * `domain` - The domain (e.g., "HfModel", "HfDataset")
     /// * `resource` - The resource being accessed (e.g., "model:qwen3-small")
-    /// * `operation` - The operation being requested
+    /// * `operation` - The operation string (e.g., "infer", "ttt.writeback", "*")
     ///
     /// # Returns
     /// `true` if access is allowed, `false` otherwise
@@ -347,10 +374,10 @@ impl PolicyManager {
         user: &str,
         domain: &str,
         resource: &str,
-        operation: Operation,
+        operation: &str,
     ) -> bool {
         let enforcer = self.enforcer.read().await;
-        match enforcer.enforce((user, domain, resource, operation.as_str())) {
+        match enforcer.enforce((user, domain, resource, operation)) {
             Ok(allowed) => {
                 debug!(
                     "Policy check: user={}, domain={}, resource={}, op={} -> {}",
@@ -776,5 +803,16 @@ mod tests {
         assert!(pm.add_policy("user-123", "model:qwen3-*", "infer").await.is_ok());
         assert!(pm.add_role_for_user("alice_test", "trainer").await.is_ok());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_act_wildcard_keymatch() {
+        let pm = PolicyManager::new_in_memory().await.unwrap();
+        pm.add_policy_with_domain("alice", "*", "model:qwen3-small:main", "ttt.*", "allow").await.unwrap();
+        // Specific action should match the wildcard
+        assert!(pm.check_with_domain("alice", "*", "model:qwen3-small:main", "ttt.writeback").await);
+        assert!(pm.check_with_domain("alice", "*", "model:qwen3-small:main", "ttt.evict").await);
+        // Different namespace should NOT match
+        assert!(!pm.check_with_domain("alice", "*", "model:qwen3-small:main", "infer.generate").await);
     }
 }

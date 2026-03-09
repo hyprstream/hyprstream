@@ -151,7 +151,7 @@ impl PolicyHandler for PolicyService {
             &subject.to_string(),
             "*",
             resource,
-            Self::parse_operation(operation).unwrap_or(Operation::Query),
+            operation,
         ).await;
         if allowed {
             Ok(())
@@ -171,24 +171,13 @@ impl PolicyHandler for PolicyService {
             data.subject, data.domain, data.resource, data.operation
         );
 
-        // Parse operation
-        let operation = match Self::parse_operation(&data.operation) {
-            Ok(op) => op,
-            Err(_) => {
-                return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                    message: format!("Invalid operation: {}", data.operation),
-                    code: "INVALID_OPERATION".to_owned(),
-                    details: String::new(),
-                }));
-            }
-        };
-
-        // Check authorization
+        // Check authorization — pass the operation string directly so dot-namespaced
+        // actions (e.g. "ttt.writeback") are forwarded verbatim to the Casbin enforcer.
         let allowed = self.policy_manager.check_with_domain(
             &data.subject,
             &data.domain,
             &data.resource,
-            operation,
+            &data.operation,
         ).await;
 
         debug!("Policy check result: allowed={}", allowed);
@@ -213,7 +202,7 @@ impl PolicyHandler for PolicyService {
                 &caller,
                 "*",
                 "policy:issue-token",
-                Operation::Manage,
+                Operation::Manage.as_str(),
             ).await;
             if !allowed {
                 return Ok(PolicyResponseVariant::Error(ErrorInfo {
