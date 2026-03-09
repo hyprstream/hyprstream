@@ -242,6 +242,9 @@ impl Subject {
     ///
     /// This prevents path traversal and other injection attacks when the
     /// subject is used in filesystem paths or policy strings.
+    ///
+    /// Note: federated subjects (containing `://`) intentionally bypass this
+    /// validation — call `validate()` only for local subjects.
     pub fn validate(&self) -> Result<()> {
         let name = match &self.0 {
             Some(n) => n.as_str(),
@@ -262,6 +265,26 @@ impl Subject {
         }
 
         Ok(())
+    }
+
+    /// Create a federated subject for a principal from a foreign issuer.
+    ///
+    /// Format: `"{issuer_url}:{local_sub}"` — for example
+    /// `"https://node-a:alice"`. The `://` in the URL makes federated subjects
+    /// unambiguously distinguishable from local bare usernames.
+    ///
+    /// The resulting subject is used directly as the Casbin subject string so
+    /// federation-aware policies can match on the issuer prefix.
+    pub fn federated(iss: &str, sub: &str) -> Self {
+        Subject(Some(format!("{iss}:{sub}")))
+    }
+
+    /// Returns `true` if this subject originated from a foreign issuer.
+    ///
+    /// Federated subjects contain `"://"` (from the issuer URL); local bare
+    /// usernames never do.
+    pub fn is_federated(&self) -> bool {
+        self.0.as_deref().map(|s| s.contains("://")).unwrap_or(false)
     }
 }
 
@@ -1685,5 +1708,53 @@ mod tests {
             2000,
         );
         assert_eq!(Subject::from(&claims), Subject::new("charlie"));
+    }
+
+    #[test]
+    fn test_subject_federated_format() {
+        let s = Subject::federated("https://node-a", "alice");
+        assert_eq!(s.to_string(), "https://node-a:alice");
+        assert!(s.is_federated());
+        assert!(!s.is_anonymous());
+    }
+
+    #[test]
+    fn test_subject_local_is_not_federated() {
+        let s = Subject::new("alice");
+        assert!(!s.is_federated());
+    }
+
+    #[test]
+    fn test_subject_anonymous_is_not_federated() {
+        let s = Subject::anonymous();
+        assert!(!s.is_federated());
+    }
+
+    #[test]
+    fn test_subject_federated_two_node_scenario() {
+        use crate::auth::{jwt, Claims};
+        use ed25519_dalek::SigningKey;
+
+        // Node A issues a JWT
+        let key_a = SigningKey::from_bytes(&[0xAAu8; 32]);
+        let vk_a = key_a.verifying_key();
+        let claims = Claims::new("alice".to_owned(), 0, 9_999_999_999)
+            .with_issuer("https://node-a".to_owned());
+        let token = jwt::encode(&claims, &key_a);
+
+        // Node B verifies using decode_with_key (key obtained from FederationKeyResolver)
+        let decoded = jwt::decode_with_key(&token, &vk_a, None)
+            .expect("federated token must verify with issuer key");
+        assert_eq!(decoded.iss, "https://node-a");
+        assert_eq!(decoded.sub, "alice");
+
+        // Construct the federated subject
+        let subject = Subject::federated(&decoded.iss, &decoded.sub);
+        assert_eq!(subject.to_string(), "https://node-a:alice");
+        assert!(subject.is_federated());
+
+        // Local tokens produce non-federated subjects
+        let local = Subject::new(&decoded.sub);
+        assert!(!local.is_federated());
     }
 }

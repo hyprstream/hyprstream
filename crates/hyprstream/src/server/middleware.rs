@@ -68,6 +68,13 @@ pub async fn auth_middleware(
 
     // Try JWT validation (stateless)
     if token.contains('.') {
+        // TODO(task-9): Multi-issuer federation — when `claims.iss` is non-empty
+        // and does not match `state.resource_url`, re-verify the token via
+        // `FederationKeyResolver::get_key(&claims.iss)` and set the subject to
+        // `Subject::federated(&claims.iss, &claims.sub)` instead of bare `sub`.
+        // This requires threading `Arc<FederationKeyResolver>` into `ServerState`.
+        // The JWT/Subject primitives (`decode_with_key`, `Subject::federated`,
+        // `Subject::is_federated`) are already implemented in Task 9.
         match jwt::decode(token, &state.verifying_key, Some(&state.resource_url)) {
             Ok(claims) => {
                 debug!("JWT validated for user: {}", claims.sub);
