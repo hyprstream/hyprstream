@@ -232,6 +232,93 @@ fn parse_varstore_key_to_delta_key(name: &str) -> Option<String> {
     None
 }
 
+/// Configuration for runtime rank adaptation oracle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RankOracleConfig {
+    /// How many TTT adaptations between rank evaluations (default: 10)
+    #[serde(default = "default_adaptation_interval")]
+    pub adaptation_interval: usize,
+    /// Whether to auto-adapt effective ranks (default: false — just log recommendations)
+    #[serde(default)]
+    pub auto_adapt: bool,
+    /// Available rank levels for reallocation
+    #[serde(default = "default_rank_levels")]
+    pub rank_levels: Vec<usize>,
+    /// Utilization below this triggers rank decrease (default: 0.25)
+    #[serde(default = "default_low_util")]
+    pub low_utilization_threshold: f64,
+    /// Utilization above this triggers rank increase (default: 0.85)
+    #[serde(default = "default_high_util")]
+    pub high_utilization_threshold: f64,
+}
+
+fn default_adaptation_interval() -> usize {
+    10
+}
+fn default_rank_levels() -> Vec<usize> {
+    vec![1, 2, 4, 8]
+}
+fn default_low_util() -> f64 {
+    0.25
+}
+fn default_high_util() -> f64 {
+    0.85
+}
+
+impl Default for RankOracleConfig {
+    fn default() -> Self {
+        Self {
+            adaptation_interval: default_adaptation_interval(),
+            auto_adapt: false,
+            rank_levels: default_rank_levels(),
+            low_utilization_threshold: default_low_util(),
+            high_utilization_threshold: default_high_util(),
+        }
+    }
+}
+
+/// Per-tenant rank adaptation oracle.
+///
+/// Wraps `RankUtilizationTracker` and produces rank adaptation signals.
+/// Stored per-tenant (inside `TenantDelta`, not in `TestTimeTrainer`)
+/// because utilization history is tenant-specific.
+pub struct RankOracle {
+    pub(crate) config: RankOracleConfig,
+    tracker: crate::runtime::ttn_profile::RankUtilizationTracker,
+    observation_count: usize,
+}
+
+impl RankOracle {
+    pub fn new(config: RankOracleConfig) -> Self {
+        let window = config.adaptation_interval * 2;
+        Self {
+            tracker: crate::runtime::ttn_profile::RankUtilizationTracker::new(window),
+            config,
+            observation_count: 0,
+        }
+    }
+
+    pub fn observe(&mut self, utilizations: &HashMap<String, f64>) {
+        for (key, &val) in utilizations {
+            self.tracker.record(key, val);
+        }
+        self.observation_count += 1;
+    }
+
+    pub fn should_evaluate(&self) -> bool {
+        self.observation_count > 0 && self.observation_count % self.config.adaptation_interval == 0
+    }
+
+    pub fn recommend(
+        &self,
+    ) -> HashMap<String, crate::runtime::ttn_profile::RankSignal> {
+        self.tracker.rank_adaptation_signals(
+            self.config.low_utilization_threshold,
+            self.config.high_utilization_threshold,
+        )
+    }
+}
+
 impl Default for TTTConfig {
     fn default() -> Self {
         Self {
@@ -321,6 +408,9 @@ pub struct TTTResult {
 
     /// Layers gated (gradients frozen) during this adaptation
     pub gated_layers: Vec<String>,
+
+    /// Rank adaptation signals from this evaluation (empty if not evaluated)
+    pub rank_signals: HashMap<String, crate::runtime::ttn_profile::RankSignal>,
 }
 
 impl TTTResult {
@@ -348,6 +438,7 @@ impl TTTResult {
             time_budget_ms: 0,
             rank_utilization: HashMap::new(),
             gated_layers: Vec::new(),
+            rank_signals: HashMap::new(),
         }
     }
 }
@@ -636,6 +727,7 @@ impl TestTimeTrainer {
                     time_budget_ms,
                     rank_utilization: HashMap::new(),
                     gated_layers: Vec::new(),
+                    rank_signals: HashMap::new(),
                 },
                 pre_snapshot,
             ));
@@ -685,6 +777,40 @@ impl TestTimeTrainer {
 
                 let time_used_ms = start.elapsed().as_millis() as u64;
 
+                // Per-tenant rank oracle: observe utilization and optionally adapt
+                let rank_signals = if let Some(ref mut oracle) = delta.rank_oracle {
+                    oracle.observe(&rank_utils);
+                    if oracle.should_evaluate() {
+                        let signals = oracle.recommend();
+                        if oracle.config.auto_adapt {
+                            use crate::runtime::ttn_profile::RankSignal;
+                            for (key, signal) in &signals {
+                                if let Some(current) = delta.effective_rank(key) {
+                                    match signal {
+                                        RankSignal::Decrease => {
+                                            let new_rank = (current / 2).max(1);
+                                            delta.set_effective_rank(key, new_rank);
+                                            tracing::info!(key = %key, from = current, to = new_rank, "Rank oracle: decreased");
+                                        }
+                                        RankSignal::Increase => {
+                                            let new_rank = current * 2;
+                                            delta.set_effective_rank(key, new_rank);
+                                            let actual = delta.effective_rank(key).unwrap_or(new_rank);
+                                            tracing::info!(key = %key, from = current, to = actual, "Rank oracle: increased");
+                                        }
+                                        RankSignal::Hold => {}
+                                    }
+                                }
+                            }
+                        }
+                        signals
+                    } else {
+                        HashMap::new()
+                    }
+                } else {
+                    HashMap::new()
+                };
+
                 // Restore SSM states so TTT training data does not pollute inference recurrent state.
                 engine.restore_ssm_states(ssm_snapshot);
 
@@ -711,6 +837,7 @@ impl TestTimeTrainer {
                         time_budget_ms,
                         rank_utilization: rank_utils,
                         gated_layers: gated_layer_keys,
+                        rank_signals,
                     },
                     pre_snapshot,
                 ))
@@ -1030,6 +1157,7 @@ impl TestTimeTrainer {
                     time_budget_ms,
                     rank_utilization: HashMap::new(),
                     gated_layers: Vec::new(), // train_step doesn't use gradient gating
+                    rank_signals: HashMap::new(),
                 })
             }
             Ok(Err(e)) => {
@@ -1258,5 +1386,44 @@ mod tests {
             Some("23.v_proj".to_owned())
         );
         assert_eq!(parse_varstore_key_to_delta_key("invalid_key"), None);
+    }
+
+    #[test]
+    fn test_rank_oracle_config_defaults() {
+        let config = RankOracleConfig::default();
+        assert!(config.adaptation_interval > 0);
+        assert!(!config.auto_adapt); // conservative default
+        assert!(!config.rank_levels.is_empty());
+    }
+
+    #[test]
+    fn test_rank_oracle_produces_signals() {
+        use crate::runtime::ttn_profile::RankSignal;
+        let mut oracle = RankOracle::new(RankOracleConfig::default());
+        // Simulate: feed low utilization for 10 steps
+        for _ in 0..10 {
+            let mut utils = HashMap::new();
+            utils.insert("0.q_proj".to_owned(), 0.1);
+            utils.insert("0.v_proj".to_owned(), 0.9);
+            oracle.observe(&utils);
+        }
+        let signals = oracle.recommend();
+        assert_eq!(signals.get("0.q_proj"), Some(&RankSignal::Decrease));
+        assert_eq!(signals.get("0.v_proj"), Some(&RankSignal::Increase));
+    }
+
+    #[test]
+    fn test_rank_oracle_should_evaluate() {
+        let mut oracle = RankOracle::new(RankOracleConfig {
+            adaptation_interval: 3,
+            ..Default::default()
+        });
+        let utils: HashMap<String, f64> = HashMap::new();
+        oracle.observe(&utils); // 1
+        assert!(!oracle.should_evaluate());
+        oracle.observe(&utils); // 2
+        assert!(!oracle.should_evaluate());
+        oracle.observe(&utils); // 3
+        assert!(oracle.should_evaluate());
     }
 }

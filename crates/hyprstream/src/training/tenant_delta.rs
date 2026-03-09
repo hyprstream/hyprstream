@@ -223,6 +223,8 @@ pub struct TenantDelta {
     max_ranks: HashMap<String, usize>,
     /// Alpha value (stored for scaling recalculation on rank change)
     alpha: f32,
+    /// Optional per-tenant rank oracle for runtime rank adaptation
+    pub rank_oracle: Option<super::ttt::RankOracle>,
 }
 
 impl TenantDelta {
@@ -370,6 +372,7 @@ impl TenantDelta {
             effective_ranks,
             max_ranks,
             alpha: config.alpha,
+            rank_oracle: None,
         })
     }
 
@@ -730,6 +733,7 @@ impl TenantDelta {
             effective_ranks: HashMap::new(),
             max_ranks: HashMap::new(),
             alpha: 1.0, // Already pre-scaled during composition
+            rank_oracle: None,
         }))
     }
 }
@@ -925,6 +929,7 @@ impl TenantDelta {
             effective_ranks,
             max_ranks,
             alpha,
+            rank_oracle: None,
         })
     }
 }
