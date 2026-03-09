@@ -13,6 +13,7 @@ use crate::services::generated::policy_client::{
     ApplyTemplate, ApplyDraft, RollbackPolicy, GetHistory, GetDiff,
     PolicyInfo, PolicyRule, Grouping,
     PolicyHistory, PolicyHistoryEntry, DraftStatus,
+    AddGrouping, RemoveGrouping,
     dispatch_policy, serialize_response,
 };
 use anyhow::{anyhow, Result};
@@ -633,6 +634,140 @@ impl PolicyHandler for PolicyService {
             has_changes,
             summary,
         }))
+    }
+
+    async fn handle_add_grouping(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &AddGrouping,
+    ) -> Result<PolicyResponseVariant> {
+        let caller = ctx.subject().to_string();
+
+        // Fine-grained permission check: caller must have ttt.writeback on policy:roles
+        let allowed = self.policy_manager.check_with_domain(
+            &caller,
+            "*",
+            "policy:roles",
+            "ttt.writeback",
+        ).await;
+        if !allowed {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!(
+                    "Subject '{}' is not authorized to manage role assignments",
+                    caller
+                ),
+                code: "UNAUTHORIZED".to_owned(),
+                details: "Requires 'ttt.writeback' permission on 'policy:roles'".to_owned(),
+            }));
+        }
+
+        // Validate inputs
+        if data.user.is_empty() || data.role.is_empty() {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "user and role must be non-empty".to_owned(),
+                code: "INVALID_INPUT".to_owned(),
+                details: String::new(),
+            }));
+        }
+
+        // Elevated roles require local identity
+        const ELEVATED_ROLES: &[&str] = &["ttt.privileged", "operator"];
+        if ELEVATED_ROLES.contains(&data.role.as_str()) && !ctx.identity.is_local() {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!(
+                    "Role '{}' is an elevated role and can only be assigned by local callers",
+                    data.role
+                ),
+                code: "UNAUTHORIZED".to_owned(),
+                details: "Elevated roles require local identity".to_owned(),
+            }));
+        }
+
+        // Non-local callers cannot assign roles to themselves
+        if !ctx.identity.is_local() && data.user == caller {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "Cannot assign roles to yourself".to_owned(),
+                code: "SELF_ASSIGNMENT".to_owned(),
+                details: "Non-local callers may not assign roles to themselves".to_owned(),
+            }));
+        }
+
+        // Apply the role assignment
+        self.policy_manager.add_role_for_user(&data.user, &data.role).await
+            .map_err(|e| anyhow!("Failed to add role: {}", e))?;
+
+        // Commit to git
+        let commit_msg = format!(
+            "policy: grant role {} to {} [by {}]",
+            data.role, data.user, caller
+        );
+        let sha = match self.stage_and_commit_policies(&commit_msg).await {
+            Ok(sha) => sha,
+            Err(e) => {
+                warn!("Role granted but commit failed: {}", e);
+                format!("(commit failed: {})", e)
+            }
+        };
+
+        info!("Granted role '{}' to '{}' (caller={})", data.role, data.user, caller);
+        Ok(PolicyResponseVariant::AddGroupingResult(sha))
+    }
+
+    async fn handle_remove_grouping(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &RemoveGrouping,
+    ) -> Result<PolicyResponseVariant> {
+        let caller = ctx.subject().to_string();
+
+        // Fine-grained permission check: caller must have ttt.writeback on policy:roles
+        let allowed = self.policy_manager.check_with_domain(
+            &caller,
+            "*",
+            "policy:roles",
+            "ttt.writeback",
+        ).await;
+        if !allowed {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!(
+                    "Subject '{}' is not authorized to manage role assignments",
+                    caller
+                ),
+                code: "UNAUTHORIZED".to_owned(),
+                details: "Requires 'ttt.writeback' permission on 'policy:roles'".to_owned(),
+            }));
+        }
+
+        // Validate inputs
+        if data.user.is_empty() || data.role.is_empty() {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "user and role must be non-empty".to_owned(),
+                code: "INVALID_INPUT".to_owned(),
+                details: String::new(),
+            }));
+        }
+
+        // Remove the role assignment
+        self.policy_manager.remove_role_for_user(&data.user, &data.role).await
+            .map_err(|e| anyhow!("Failed to remove role: {}", e))?;
+
+        // Commit to git
+        let commit_msg = format!(
+            "policy: revoke role {} from {} [by {}]",
+            data.role, data.user, caller
+        );
+        let sha = match self.stage_and_commit_policies(&commit_msg).await {
+            Ok(sha) => sha,
+            Err(e) => {
+                warn!("Role revoked but commit failed: {}", e);
+                format!("(commit failed: {})", e)
+            }
+        };
+
+        info!("Revoked role '{}' from '{}' (caller={})", data.role, data.user, caller);
+        Ok(PolicyResponseVariant::RemoveGroupingResult(sha))
     }
 }
 
