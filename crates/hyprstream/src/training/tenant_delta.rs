@@ -620,45 +620,53 @@ impl TenantDelta {
             let base_scaling = base_guard.scaling_map.get(key).copied().unwrap_or(base_guard.scaling);
             let tenant_scaling = tenant_guard.scaling_map.get(key).copied().unwrap_or(tenant_guard.scaling);
 
-            // Check if ranks match for this specific key
-            let base_rank = base_a.map(|a| a.size()[0]);
-            let tenant_rank = tenant_a.map(|a| a.size()[0]);
-            let ranks_match = base_rank == tenant_rank;
+            // Narrow to effective_rank before composition — matches forward_2d behavior.
+            // Without this, compose operates on dormant rank dimensions (near-zero values
+            // that waste FLOPs and may introduce noise from untrained parameters).
+            let narrow_a = |a: &Tensor, guard: &TenantDelta| -> Tensor {
+                let eff = guard.effective_ranks.get(key).copied()
+                    .unwrap_or_else(|| a.size()[0] as usize) as i64;
+                a.narrow(0, 0, eff)
+            };
+            let narrow_b = |b: &Tensor, guard: &TenantDelta| -> Tensor {
+                let eff = guard.effective_ranks.get(key).copied()
+                    .unwrap_or_else(|| b.size()[1] as usize) as i64;
+                b.narrow(1, 0, eff)
+            };
+
+            // Check if effective ranks match for this specific key
+            let base_eff_rank = base_a.map(|a| {
+                base_guard.effective_ranks.get(key).copied()
+                    .unwrap_or_else(|| a.size()[0] as usize)
+            });
+            let tenant_eff_rank = tenant_a.map(|a| {
+                tenant_guard.effective_ranks.get(key).copied()
+                    .unwrap_or_else(|| a.size()[0] as usize)
+            });
+            let ranks_match = base_eff_rank == tenant_eff_rank;
 
             match (base_a, tenant_a) {
                 (Some(ba), Some(ta)) if ranks_match => {
-                    // Same rank: add A matrices directly (pre-scaled)
-                    let base_effective_a = ba * base_scaling;
-                    let tenant_effective_a = ta * tenant_scaling;
+                    // Same effective rank: narrow then add A matrices directly (pre-scaled)
+                    let base_effective_a = narrow_a(ba, &base_guard) * base_scaling;
+                    let tenant_effective_a = narrow_a(ta, &tenant_guard) * tenant_scaling;
                     composed_a.insert(key.clone(), base_effective_a + tenant_effective_a);
                 }
                 (Some(ba), Some(ta)) => {
-                    // Different ranks: compute effective weight W_eff = s1*(B1 @ A1) + s2*(B2 @ A2)
-                    // then store as rank=out_dim identity-like decomposition: A=W_eff, B=I
-                    // Instead, we compute the combined effective correction directly.
-                    // We store the summed effective weight as A with B=identity,
-                    // but that changes dimensions. Better approach: compute W_eff and
-                    // store it with a thin SVD-like decomposition at the larger rank.
-                    //
-                    // Simplest correct approach: compute full effective weight per-key
-                    // and store as A=[out_dim, in_dim], B=I[out_dim, out_dim] with scaling=1.
-                    // But that's expensive. Instead, use the effective correction approach:
-                    // store the pre-computed W_eff = s1*(B1@A1) + s2*(B2@A2) in composed_a
-                    // with composed_b = I (identity) and scaling = 1.0.
-                    //
-                    // Actually, the cleanest approach is to just compute at forward time.
-                    // Store separate effective weights: A = W_eff, B = I (identity of out_dim).
+                    // Different effective ranks: narrow each to its effective rank, compute
+                    // W_eff = s1*(B1_eff @ A1_eff) + s2*(B2_eff @ A2_eff), store as A=W_eff, B=I.
                     #[allow(clippy::expect_used)] // invariant: B must exist when A exists
                     let bb = base_b.expect("base B must exist if base A exists");
                     #[allow(clippy::expect_used)]
                     let tb = tenant_b.expect("tenant B must exist if tenant A exists");
-                    // W_eff = s1*(B1^T @ (A1^T))^T + s2*(B2^T @ (A2^T))^T
-                    //       = s1*(B1 @ A1) + s2*(B2 @ A2)
-                    // A is [rank, in_dim], B is [out_dim, rank]
-                    // B @ A = [out_dim, in_dim]
-                    // B @ A = [out_dim, rank] @ [rank, in_dim] = [out_dim, in_dim]
-                    let base_w = bb.matmul(ba) * base_scaling;
-                    let tenant_w = tb.matmul(ta) * tenant_scaling;
+                    // Narrow to effective rank before matmul
+                    let ba_eff = narrow_a(ba, &base_guard);
+                    let bb_eff = narrow_b(bb, &base_guard);
+                    let ta_eff = narrow_a(ta, &tenant_guard);
+                    let tb_eff = narrow_b(tb, &tenant_guard);
+                    // B_eff @ A_eff = [out_dim, eff_rank] @ [eff_rank, in_dim] = [out_dim, in_dim]
+                    let base_w = bb_eff.matmul(&ba_eff) * base_scaling;
+                    let tenant_w = tb_eff.matmul(&ta_eff) * tenant_scaling;
                     let w_eff = base_w + tenant_w;
                     // forward_2d computes: scaling * (x @ A^T) @ B^T
                     // We want: x @ W_eff^T  (result shape [tokens, out_dim])
@@ -671,10 +679,10 @@ impl TenantDelta {
                     continue; // Skip the B match below, we already handled it
                 }
                 (Some(ba), None) => {
-                    composed_a.insert(key.clone(), ba * base_scaling);
+                    composed_a.insert(key.clone(), narrow_a(ba, &base_guard) * base_scaling);
                 }
                 (None, Some(ta)) => {
-                    composed_a.insert(key.clone(), ta * tenant_scaling);
+                    composed_a.insert(key.clone(), narrow_a(ta, &tenant_guard) * tenant_scaling);
                 }
                 (None, None) => {}
             }
@@ -683,13 +691,15 @@ impl TenantDelta {
             // (i.e., ranks matched or only one side had the key)
             match (base_b, tenant_b) {
                 (Some(bb), Some(tb)) => {
-                    composed_b.insert(key.clone(), (bb + tb).shallow_clone());
+                    let bb_eff = narrow_b(bb, &base_guard);
+                    let tb_eff = narrow_b(tb, &tenant_guard);
+                    composed_b.insert(key.clone(), &bb_eff + &tb_eff);
                 }
                 (Some(bb), None) => {
-                    composed_b.insert(key.clone(), bb.shallow_clone());
+                    composed_b.insert(key.clone(), narrow_b(bb, &base_guard));
                 }
                 (None, Some(tb)) => {
-                    composed_b.insert(key.clone(), tb.shallow_clone());
+                    composed_b.insert(key.clone(), narrow_b(tb, &tenant_guard));
                 }
                 (None, None) => {}
             }

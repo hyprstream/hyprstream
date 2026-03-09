@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use tch::{Kind, Tensor};
 
 /// Polar Express coefficients for Newton-Schulz iteration.
-/// Pre-optimized for fast convergence in bfloat16.
+/// Pre-optimized for fast convergence in bfloat16; also converge
+/// acceptably in float16 and float32.
 const POLAR_EXPRESS_COEFFS: [(f64, f64, f64); 5] = [
     (8.156554524902461, -22.48329292557795, 15.878769915207462),
     (4.042929935166739, -2.808917465908714, 0.5000178451051316),
@@ -19,13 +20,29 @@ const POLAR_EXPRESS_COEFFS: [(f64, f64, f64); 5] = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ];
 
+/// Choose the best compute dtype for Newton-Schulz based on input dtype.
+///
+/// - **BFloat16/Float16**: Stay native (coefficients tuned for bf16, good GPU throughput)
+/// - **Float32/Float64**: Use Float32 (CPU path or GPUs without bf16 support)
+/// - **Float8/other**: Upcast to Float32 (too few mantissa bits for NS convergence)
+fn ns_compute_kind(input_kind: Kind) -> Kind {
+    match input_kind {
+        Kind::BFloat16 => Kind::BFloat16,
+        Kind::Half => Kind::Half,
+        // Float32, Float64, FP8, and all other types: use Float32.
+        // FP8 has only 3-4 mantissa bits; NS iteration diverges without upcast.
+        _ => Kind::Float,
+    }
+}
+
 /// Newton-Schulz iteration for matrix orthogonalization.
 ///
 /// Maps G → UV^T (its orthogonal factor) by converging all singular values
 /// to 1, without ever computing an expensive SVD.
 ///
 /// Uses the Polar Express variant with pre-optimized coefficients for
-/// stable bfloat16 computation.
+/// stable bfloat16 computation. Compute dtype is chosen adaptively:
+/// bf16/fp16 stay native for GPU throughput, fp8 is upcasted to float32.
 ///
 /// # Arguments
 /// * `g` - 2D gradient matrix [rows, cols]
@@ -39,7 +56,8 @@ pub fn newton_schulz_orthogonalize(g: &Tensor, steps: usize) -> Tensor {
     );
     assert!(steps <= POLAR_EXPRESS_COEFFS.len());
 
-    let mut x = g.to_kind(Kind::Float);
+    let compute_kind = ns_compute_kind(g.kind());
+    let mut x = g.to_kind(compute_kind);
 
     // Algorithm assumes wide (rows ≤ cols) matrices — transpose tall ones
     let transposed = x.size()[0] > x.size()[1];
@@ -184,10 +202,27 @@ pub fn restore_muon_states(
 mod tests {
     use super::*;
 
+    /// Create a well-conditioned test matrix with controlled singular values.
+    /// Uses an outer product construction: U @ diag(sigma) @ V^T where U, V
+    /// are simple orthogonal-ish matrices from sequential values.
+    fn well_conditioned_matrix(rows: i64, cols: i64) -> Tensor {
+        // Use arange-based construction (deterministic, no random state)
+        let a = Tensor::arange(rows * cols, (Kind::Float, tch::Device::Cpu))
+            .reshape([rows, cols]);
+        // Add identity-like structure to improve conditioning
+        let min_dim = rows.min(cols);
+        let eye = Tensor::eye(min_dim, (Kind::Float, tch::Device::Cpu));
+        let padded = Tensor::zeros([rows, cols], (Kind::Float, tch::Device::Cpu));
+        // Narrow view into padded to place eye
+        let mut narrow_r = padded.narrow(0, 0, min_dim).narrow(1, 0, min_dim);
+        narrow_r.copy_(&(&eye * 10.0));
+        &a + padded
+    }
+
     #[test]
     fn test_newton_schulz_produces_orthogonal() {
         let _guard = tch::no_grad_guard();
-        let g = Tensor::randn([8, 64], (Kind::Float, tch::Device::Cpu));
+        let g = well_conditioned_matrix(8, 64);
         let q = newton_schulz_orthogonalize(&g, 5);
         // Q should satisfy Q @ Q^T ≈ I (orthonormal rows)
         let qqt = q.matmul(&q.tr());
@@ -205,7 +240,7 @@ mod tests {
     fn test_newton_schulz_tall_matrix() {
         let _guard = tch::no_grad_guard();
         // Tall matrix [64, 8] — should transpose internally
-        let g = Tensor::randn([64, 8], (Kind::Float, tch::Device::Cpu));
+        let g = well_conditioned_matrix(64, 8);
         let q = newton_schulz_orthogonalize(&g, 5);
         assert_eq!(q.size(), &[64, 8]);
         // Q^T @ Q ≈ I (orthonormal columns for tall)

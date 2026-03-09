@@ -749,6 +749,9 @@ impl TestTimeTrainer {
 
         let budget = Duration::from_millis(time_budget_ms);
 
+        // Snapshot Muon momentum buffers for rollback (matches weight snapshot above)
+        let muon_snapshot = super::muon::snapshot_muon_states(&delta.muon_states);
+
         // Run gradient loop with catch_unwind for panic safety.
         // On panic, delta is restored from pre_snapshot.
         let loop_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -851,20 +854,21 @@ impl TestTimeTrainer {
                 ))
             }
             Ok(Err(e)) => {
-                // Gradient loop returned an error — restore delta and SSM states from snapshot
+                // Gradient loop returned an error — restore delta, momentum, and SSM states
                 tracing::warn!("TTT adapt_tenant gradient loop error, restoring delta: {}", e);
                 let _ = delta.load_state_dict(&pre_snapshot);
-                // Flush stale gradients from optimizer (may have accumulated before error)
+                super::muon::restore_muon_states(&mut delta.muon_states, &muon_snapshot);
                 delta.zero_grad();
                 engine.restore_ssm_states(ssm_snapshot);
                 Err(e)
             }
             Err(panic_info) => {
-                // Panic during gradient loop — restore delta and SSM states from snapshot.
-                // Also zero gradients: a panic mid-backward/step leaves stale
-                // gradient accumulation and corrupted Muon momentum buffers.
+                // Panic during gradient loop — restore delta, momentum, and SSM states.
+                // A panic mid-backward/step leaves stale gradient accumulation and
+                // corrupted Muon momentum buffers.
                 tracing::error!("TTT adapt_tenant panicked during gradient loop, restoring delta");
                 let _ = delta.load_state_dict(&pre_snapshot);
+                super::muon::restore_muon_states(&mut delta.muon_states, &muon_snapshot);
                 delta.zero_grad();
                 engine.restore_ssm_states(ssm_snapshot);
                 let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
@@ -1111,6 +1115,7 @@ impl TestTimeTrainer {
 
         // Snapshot for panic recovery
         let pre_snapshot = delta.extract_state_dict();
+        let muon_snapshot = super::muon::snapshot_muon_states(&delta.muon_states);
 
         // Snapshot SSM states before training loop (prevents training data from polluting inference state).
         let ssm_snapshot = engine.snapshot_ssm_states();
@@ -1148,6 +1153,58 @@ impl TestTimeTrainer {
 
                 let time_used_ms = start.elapsed().as_millis() as u64;
 
+                // Collect rank utilization (narrowed to effective rank)
+                let rank_utils: HashMap<String, f64> = {
+                    let _guard = tch::no_grad_guard();
+                    delta
+                        .lora_a
+                        .iter()
+                        .filter_map(|(key, a)| {
+                            delta.lora_b.get(key).map(|b| {
+                                let eff_rank = delta.effective_ranks.get(key).copied()
+                                    .unwrap_or_else(|| a.size()[0] as usize) as i64;
+                                let a_eff = a.narrow(0, 0, eff_rank);
+                                let b_eff = b.narrow(1, 0, eff_rank);
+                                (key.clone(), crate::runtime::ttn_profile::delta_rank_utilization(&a_eff, &b_eff))
+                            })
+                        })
+                        .collect()
+                };
+
+                // Feed rank oracle (same logic as adapt_tenant)
+                let rank_signals = if let Some(ref mut oracle) = delta.rank_oracle {
+                    oracle.observe(&rank_utils);
+                    if oracle.should_evaluate() {
+                        let signals = oracle.recommend();
+                        if oracle.config.auto_adapt {
+                            use crate::runtime::ttn_profile::RankSignal;
+                            for (key, signal) in &signals {
+                                if let Some(current) = delta.effective_rank(key) {
+                                    match signal {
+                                        RankSignal::Decrease => {
+                                            let new_rank = (current / 2).max(1);
+                                            delta.set_effective_rank(key, new_rank);
+                                            tracing::info!(key = %key, from = current, to = new_rank, "Rank oracle: decreased");
+                                        }
+                                        RankSignal::Increase => {
+                                            let new_rank = current * 2;
+                                            delta.set_effective_rank(key, new_rank);
+                                            let actual = delta.effective_rank(key).unwrap_or(new_rank);
+                                            tracing::info!(key = %key, from = current, to = actual, "Rank oracle: increased");
+                                        }
+                                        RankSignal::Hold => {}
+                                    }
+                                }
+                            }
+                        }
+                        signals
+                    } else {
+                        HashMap::new()
+                    }
+                } else {
+                    HashMap::new()
+                };
+
                 // Restore SSM states so training data does not pollute inference recurrent state.
                 engine.restore_ssm_states(ssm_snapshot);
 
@@ -1171,14 +1228,15 @@ impl TestTimeTrainer {
                     pending: false, // trainStep commits immediately based on auto_commit
                     time_used_ms,
                     time_budget_ms,
-                    rank_utilization: HashMap::new(),
-                    gated_layers: Vec::new(), // train_step doesn't use gradient gating
-                    rank_signals: HashMap::new(),
+                    rank_utilization: rank_utils,
+                    gated_layers: Vec::new(),
+                    rank_signals,
                 })
             }
             Ok(Err(e)) => {
                 tracing::warn!("TTT train_step gradient loop error, restoring delta: {}", e);
                 let _ = delta.load_state_dict(&pre_snapshot);
+                super::muon::restore_muon_states(&mut delta.muon_states, &muon_snapshot);
                 delta.zero_grad();
                 engine.restore_ssm_states(ssm_snapshot);
                 Err(e)
@@ -1186,6 +1244,7 @@ impl TestTimeTrainer {
             Err(panic_info) => {
                 tracing::error!("TTT train_step panicked during gradient loop, restoring delta");
                 let _ = delta.load_state_dict(&pre_snapshot);
+                super::muon::restore_muon_states(&mut delta.muon_states, &muon_snapshot);
                 delta.zero_grad();
                 engine.restore_ssm_states(ssm_snapshot);
                 let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
