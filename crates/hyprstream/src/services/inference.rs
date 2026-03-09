@@ -207,11 +207,15 @@ unsafe impl Sync for InferenceServiceInner {}
 struct PendingAdaptation {
     /// Delta state before adaptation (for rollback)
     pre_adaptation_state: std::collections::HashMap<String, tch::Tensor>,
+    /// Muon momentum buffers before adaptation (for rollback)
+    pre_muon_states: std::collections::HashMap<String, tch::Tensor>,
+    /// Effective ranks before adaptation (for rollback if oracle auto-adapted)
+    pre_effective_ranks: std::collections::HashMap<String, usize>,
     /// The TTT result from the adaptation
     ttt_result: crate::training::ttt::TTTResult,
     /// When the adaptation was created
     created_at: Instant,
-    /// Auto-rollback after this timeout (default: 30s)
+    /// Auto-rollback after this timeout (default: 60s, configurable via TTTConfig.pending_rollback_ms)
     timeout_ms: u64,
 }
 
@@ -453,6 +457,9 @@ impl InferenceService {
     async fn handle_callback_infer(&mut self, request_data: &[u8])
         -> Result<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)>
     {
+        // FIX-3: sweep expired pending adaptations on the callback path (symmetric with ZMQ path)
+        self.cleanup_expired_adaptations();
+
         // Parse InferenceRequest
         let reader = serialize::read_message(
             &mut std::io::Cursor::new(request_data),
@@ -742,15 +749,14 @@ impl InferenceService {
         // Lock the delta and run adaptation
         let mut delta = delta_arc.lock();
 
-        // Capacity check INSIDE delta lock to eliminate TOCTOU race
-        if delta.is_at_capacity() {
-            let reason = format!(
-                "Delta at capacity ({}/{} steps). Save, export, or reset to continue.",
-                delta.accumulated_steps, delta.max_accumulated_steps
-            );
-            debug!("TTT: {} for subject {}", reason, subject);
-            return Ok(Some(crate::training::ttt::TTTResult::skipped(&reason)));
-        }
+        // Note: capacity check is now handled by guard.at_capacity inside resolve().
+        // The guard returns ResolveOutcome::Skipped if the delta is at capacity.
+
+        // Snapshot Muon momentum and effective_ranks for rollback (before adapt_tenant
+        // mutates them). adapt_tenant already returns the weight pre_snapshot, but Muon
+        // and effective_ranks are mutated in-place during the gradient loop.
+        let pre_muon = crate::training::muon::snapshot_muon_states(&delta.muon_states);
+        let pre_eff_ranks = delta.effective_ranks.clone();
 
         let adapt_result = ttt_trainer.adapt_tenant(&engine, &mut delta, &input_tokens, overrides);
 
@@ -759,7 +765,7 @@ impl InferenceService {
         drop(engine);
 
         match adapt_result {
-            Ok((result, pre_snapshot)) => {
+            Ok((mut result, pre_snapshot)) => {
                 if !result.skipped {
                     debug!(
                         "TTT (subject {}): steps={}, improvement={:.4}, time={}ms, ppl={:.1}->{:.1}, rec={}",
@@ -773,18 +779,59 @@ impl InferenceService {
                     );
                 }
 
-                // Handle auto-commit vs pending
-                if overrides.auto_commit && result.recommendation && !result.skipped {
-                    debug!("TTT: auto-committed adaptation for subject {}", subject);
-                } else if !overrides.auto_commit && !result.skipped && !pre_snapshot.is_empty() {
-                    // Store pending adaptation for later commit/rollback
-                    let pending = PendingAdaptation {
-                        pre_adaptation_state: pre_snapshot,
-                        ttt_result: result.clone(),
-                        created_at: Instant::now(),
-                        timeout_ms: ttt_trainer.config().pending_rollback_ms,
-                    };
-                    self.pending_adaptations.lock().insert(subject.clone(), pending);
+                // Map overrides to AdaptationStrategy and drive the state machine.
+                let strategy = if overrides.auto_commit {
+                    crate::training::AdaptationStrategy::AutoWriteback
+                } else {
+                    crate::training::AdaptationStrategy::Speculative
+                };
+
+                // Build guard status for state machine.
+                let guard = crate::training::GuardStatus {
+                    expired: delta.adaptation_state.is_expired(),
+                    at_capacity: delta.is_at_capacity(),
+                    lora_generation: self.lora_generation.load(std::sync::atomic::Ordering::Acquire),
+                };
+
+                let outcome = delta.adaptation_state.resolve(
+                    strategy,
+                    &guard,
+                    &result,
+                    pre_snapshot,
+                    pre_muon,
+                    pre_eff_ranks,
+                );
+
+                match outcome {
+                    crate::training::ResolveOutcome::WrittenBack => {
+                        delta.accumulated_steps += result.steps_performed as u64;
+                        delta.request_count += 1;
+                        let n = delta.request_count as f64;
+                        delta.avg_loss_improvement = delta.avg_loss_improvement * ((n - 1.0) / n)
+                            + result.loss_improvement as f64 / n;
+                        result.pending = false;
+                        debug!("TTT: auto-committed adaptation for subject {}", subject);
+                    }
+                    crate::training::ResolveOutcome::Evicted { snapshot, muon, eff_ranks } => {
+                        // resolve() transitioned state to Idle and returned the baseline
+                        // snapshot (which may be the promoted old-pending baseline in the
+                        // stacked case, or the new adaptation's pre-state otherwise).
+                        // Restore delta weights, Muon momentum, and effective ranks.
+                        let _ = delta.load_state_dict(&snapshot);
+                        crate::training::muon::restore_muon_states(&mut delta.muon_states, &muon);
+                        delta.effective_ranks = eff_ranks;
+                        result.pending = false;
+                        debug!("TTT: auto-rolled back adaptation for subject {}", subject);
+                    }
+                    crate::training::ResolveOutcome::StoredPending => {
+                        // Pending state is now stored inside delta.adaptation_state.
+                        // No insert into self.pending_adaptations needed.
+                        result.pending = true;
+                        debug!("TTT: stored pending adaptation for subject {}", subject);
+                    }
+                    crate::training::ResolveOutcome::Skipped { reason } => {
+                        debug!("TTT: skipped for subject {}: {}", subject, reason);
+                    }
                 }
 
                 Ok(Some(result))
@@ -1369,13 +1416,15 @@ impl InferenceService {
 
         for subject in expired {
             if let Some(adaptation) = pending.remove(&subject) {
-                // Restore delta to pre-adaptation state
+                // Restore delta to pre-adaptation state (weights, Muon momentum, effective ranks)
                 if let Some(pool) = &self.delta_pool {
                     if let Some(delta_arc) = pool.get(&subject) {
                         let mut delta = delta_arc.lock();
                         if let Err(e) = delta.load_state_dict(&adaptation.pre_adaptation_state) {
                             warn!("Failed to rollback expired adaptation for '{}': {}", subject, e);
                         }
+                        crate::training::muon::restore_muon_states(&mut delta.muon_states, &adaptation.pre_muon_states);
+                        delta.effective_ranks = adaptation.pre_effective_ranks.clone();
                     }
                 }
                 warn!(
@@ -1393,11 +1442,13 @@ impl InferenceService {
         let adaptation = pending.remove(subject)
             .ok_or_else(|| anyhow!("No pending adaptation for subject '{}'", subject))?;
 
-        // Restore delta to pre-adaptation state
+        // Restore delta to pre-adaptation state (weights, Muon momentum, effective ranks)
         if let Some(pool) = &self.delta_pool {
             if let Some(delta_arc) = pool.get(subject) {
                 let mut delta = delta_arc.lock();
                 delta.load_state_dict(&adaptation.pre_adaptation_state)?;
+                crate::training::muon::restore_muon_states(&mut delta.muon_states, &adaptation.pre_muon_states);
+                delta.effective_ranks = adaptation.pre_effective_ranks.clone();
             }
         }
 
@@ -1425,18 +1476,25 @@ impl InferenceService {
         pool.ensure_capacity().await?;
         let delta_arc = pool.get_or_create(subject)?;
 
-        // Phase 1: Sync work under scoped lock — tokenize and snapshot
-        let (input_tokens, pre_snapshot) = {
+        // Phase 1: Sync work under scoped lock — tokenize and snapshot.
+        // Always snapshot (even for auto_commit) so auto-rollback can restore state.
+        let (input_tokens, pre_snapshot, pre_muon, pre_eff_ranks) = {
             let delta = delta_arc.lock();
+            // FIX-2: capacity check mirrors the generateStream path — trainStepStream was
+            // previously unbounded and could accumulate steps past max_accumulated_steps.
+            if delta.is_at_capacity() {
+                return Ok(crate::training::ttt::TTTResult::skipped(&format!(
+                    "Delta at capacity ({}/{} steps). Save, export, or reset to continue.",
+                    delta.accumulated_steps, delta.max_accumulated_steps
+                )));
+            }
             let encoding = tokenizer.encode(input, false)
                 .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
             let input_tokens: Vec<u32> = encoding.get_ids().to_vec();
-            let pre_snapshot = if !auto_commit {
-                delta.extract_state_dict()
-            } else {
-                std::collections::HashMap::new()
-            };
-            (input_tokens, pre_snapshot)
+            let pre_snapshot = delta.extract_state_dict();
+            let pre_muon = crate::training::muon::snapshot_muon_states(&delta.muon_states);
+            let pre_eff_ranks = delta.effective_ranks.clone();
+            (input_tokens, pre_snapshot, pre_muon, pre_eff_ranks)
         }; // guard dropped
 
         let steps = if gradient_steps > 0 { gradient_steps as usize } else { ttt_trainer.config.gradient_steps };
@@ -1453,26 +1511,44 @@ impl InferenceService {
         // If auto_commit and recommendation is negative, rollback.
         // If not auto_commit, store as pending for client to decide.
         if auto_commit && result.recommendation {
-            // Steps/request_count already tracked by train_step()
+            // Auto-commit: update stats (train_step no longer does this eagerly)
+            delta.accumulated_steps += result.steps_performed as u64;
+            delta.request_count += 1;
+            let n = delta.request_count as f64;
+            delta.avg_loss_improvement = delta.avg_loss_improvement * ((n - 1.0) / n)
+                + result.loss_improvement as f64 / n;
             result.pending = false;
         } else if auto_commit && !result.recommendation {
-            // Auto-rollback
-            if !pre_snapshot.is_empty() {
-                let _ = delta.load_state_dict(&pre_snapshot);
-            }
+            // Auto-rollback: restore weights, Muon momentum, and effective ranks
+            let _ = delta.load_state_dict(&pre_snapshot);
+            crate::training::muon::restore_muon_states(&mut delta.muon_states, &pre_muon);
+            delta.effective_ranks = pre_eff_ranks.clone();
             result.pending = false;
         } else if !auto_commit {
             result.pending = true;
-            // Store pending adaptation for later commit/rollback
-            if !pre_snapshot.is_empty() {
-                let pending = PendingAdaptation {
-                    pre_adaptation_state: pre_snapshot,
-                    ttt_result: result.clone(),
-                    created_at: std::time::Instant::now(),
-                    timeout_ms: ttt_trainer.config().pending_rollback_ms,
-                };
-                self.pending_adaptations.lock().insert(subject.clone(), pending);
-            }
+            // FIX-1b: promote old pending's pre-snapshot as the baseline so that
+            // rollback always unwinds to the state before any pending work.
+            let old = self.pending_adaptations.lock().remove(subject);
+            let (base_pre_snapshot, base_pre_muon, base_pre_eff_ranks) = match old {
+                Some(prior) => {
+                    warn!(
+                        "TTT: stacked train_step for '{}' (prior pending not resolved); \
+                         rollback will restore to pre-first-adaptation state",
+                        subject
+                    );
+                    (prior.pre_adaptation_state, prior.pre_muon_states, prior.pre_effective_ranks)
+                }
+                None => (pre_snapshot, pre_muon, pre_eff_ranks),
+            };
+            let pending = PendingAdaptation {
+                pre_adaptation_state: base_pre_snapshot,
+                pre_muon_states: base_pre_muon,
+                pre_effective_ranks: base_pre_eff_ranks,
+                ttt_result: result.clone(),
+                created_at: std::time::Instant::now(),
+                timeout_ms: ttt_trainer.config().pending_rollback_ms,
+            };
+            self.pending_adaptations.lock().insert(subject.clone(), pending);
         }
 
         Ok(result)
@@ -2173,8 +2249,9 @@ impl InferenceHandler for InferenceService {
 
     async fn handle_commit_adaptation(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
         let subject = ctx.subject();
-        self.cleanup_expired_adaptations();
+        // Commit before cleanup: prevents cleanup from expiring the entry we're about to commit
         InferenceService::handle_commit_adaptation(self, &subject)?;
+        self.cleanup_expired_adaptations();
         Ok(InferenceResponseVariant::CommitAdaptationResult)
     }
 

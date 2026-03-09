@@ -4,10 +4,16 @@ use anyhow::{anyhow, Result};
 use tch::Tensor;
 
 /// Outcome of resolving an adaptation through the state machine.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub enum ResolveOutcome {
     WrittenBack,
-    Evicted,
+    /// The adaptation was evicted (rolled back). The baseline snapshot is returned
+    /// so the caller can restore delta weights without retaining ownership beforehand.
+    Evicted {
+        snapshot: HashMap<String, Tensor>,
+        muon: HashMap<String, Tensor>,
+        eff_ranks: HashMap<String, usize>,
+    },
     StoredPending,
     Skipped { reason: String },
 }
@@ -94,6 +100,10 @@ impl DeltaAdaptationState {
     ///
     /// This is the single entry point for all commit/rollback/pending decisions.
     /// Called by both the adapt-then-generate and pure-training paths.
+    ///
+    /// For the `Evicted` outcome, the baseline snapshot (pre-first-adaptation state)
+    /// is returned inside `ResolveOutcome::Evicted` so the caller can restore weights
+    /// without needing to retain ownership of the inputs before this call.
     pub fn resolve(
         &mut self,
         strategy: AdaptationStrategy,
@@ -128,7 +138,10 @@ impl DeltaAdaptationState {
             };
         }
 
-        // 4. Stacked adaptation: promote old baseline
+        // 4. Stacked adaptation: promote old baseline.
+        // If an old Pending exists, extract its stored baseline (pre-first-adaptation
+        // state) so that rollback always unwinds to before any pending work.
+        // Otherwise use the caller's snapshot directly (moved in, no copy needed).
         let (base_snapshot, base_muon, base_eff_ranks) = if let Self::Pending {
             pre_snapshot: old_snap,
             pre_muon: old_muon,
@@ -149,7 +162,11 @@ impl DeltaAdaptationState {
             }
             AdaptationStrategy::AutoWriteback | AdaptationStrategy::AutoEvict => {
                 *self = Self::Idle;
-                ResolveOutcome::Evicted
+                ResolveOutcome::Evicted {
+                    snapshot: base_snapshot,
+                    muon: base_muon,
+                    eff_ranks: base_eff_ranks,
+                }
             }
             AdaptationStrategy::Speculative => {
                 *self = Self::Pending {
@@ -167,7 +184,11 @@ impl DeltaAdaptationState {
                 if result.loss_improvement > threshold {
                     ResolveOutcome::WrittenBack
                 } else {
-                    ResolveOutcome::Evicted
+                    ResolveOutcome::Evicted {
+                        snapshot: base_snapshot,
+                        muon: base_muon,
+                        eff_ranks: base_eff_ranks,
+                    }
                 }
             }
         }
@@ -251,7 +272,7 @@ mod tests {
             &result,
             make_fake_snapshot(), HashMap::new(), HashMap::new(),
         );
-        assert_eq!(outcome, ResolveOutcome::WrittenBack);
+        assert!(matches!(outcome, ResolveOutcome::WrittenBack));
         assert!(!state.is_pending());
     }
 
@@ -266,7 +287,7 @@ mod tests {
             &result,
             make_fake_snapshot(), HashMap::new(), HashMap::new(),
         );
-        assert_eq!(outcome, ResolveOutcome::Evicted);
+        assert!(matches!(outcome, ResolveOutcome::Evicted { .. }));
         assert!(!state.is_pending());
     }
 
@@ -281,7 +302,7 @@ mod tests {
             &result,
             make_fake_snapshot(), HashMap::new(), HashMap::new(),
         );
-        assert_eq!(outcome, ResolveOutcome::StoredPending);
+        assert!(matches!(outcome, ResolveOutcome::StoredPending));
         assert!(state.is_pending());
     }
 
@@ -317,7 +338,7 @@ mod tests {
             AdaptationStrategy::AutoWriteback, &guard_expired, &result2,
             make_fake_snapshot(), HashMap::new(), HashMap::new(),
         );
-        assert_eq!(outcome, ResolveOutcome::WrittenBack);
+        assert!(matches!(outcome, ResolveOutcome::WrittenBack));
     }
 
     #[test]
@@ -402,7 +423,7 @@ mod tests {
             AdaptationStrategy::AutoEvict, &guard, &result,
             make_fake_snapshot(), HashMap::new(), HashMap::new(),
         );
-        assert_eq!(outcome, ResolveOutcome::Evicted);
+        assert!(matches!(outcome, ResolveOutcome::Evicted { .. }));
     }
 
     #[test]
@@ -416,7 +437,7 @@ mod tests {
             &guard, &result,
             make_fake_snapshot(), HashMap::new(), HashMap::new(),
         );
-        assert_eq!(outcome, ResolveOutcome::Evicted);
+        assert!(matches!(outcome, ResolveOutcome::Evicted { .. }));
 
         let result2 = make_fake_result(true, 0.05, 3);
         let outcome2 = state.resolve(
@@ -424,7 +445,7 @@ mod tests {
             &guard, &result2,
             make_fake_snapshot(), HashMap::new(), HashMap::new(),
         );
-        assert_eq!(outcome2, ResolveOutcome::WrittenBack);
+        assert!(matches!(outcome2, ResolveOutcome::WrittenBack));
     }
 
     #[test]
