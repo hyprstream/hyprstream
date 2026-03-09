@@ -166,6 +166,8 @@ fn register_schema_tools(reg: &mut ToolRegistry) {
         ($reg:expr, $schema_fn:expr) => {{
             let (service_name, methods) = $schema_fn;
             for method in methods {
+                // FIX-7: respect $cliHidden — don't expose internal methods as MCP tools
+                if method.hidden { continue; }
                 let tool_name = format!("{service_name}.{}", method.name);
                 let params: Vec<(&str, &str, bool, &str)> = method.params.iter()
                     .map(|p| (p.name, p.type_name, p.required, p.description))
@@ -232,6 +234,8 @@ fn register_scoped_tools_recursive(
         }
 
         for method in methods {
+            // FIX-7: respect $cliHidden — don't expose internal methods as MCP tools
+            if method.hidden { continue; }
             let tool_name = format!("{}.{}", new_prefix, method.name);
 
             // Build JSON schema: method params + all scope fields from ancestors
@@ -659,7 +663,8 @@ impl McpService {
                     read_only_hint: Some(entry.required_scope.starts_with("query:")),
                     destructive_hint: Some(!entry.required_scope.starts_with("query:")),
                     open_world_hint: Some(false),
-                    idempotent_hint: Some(true),
+                    // FIX-8: only query-scoped tools are idempotent; write/train/manage ops are not
+                    idempotent_hint: Some(entry.required_scope.starts_with("query:")),
                 }),
                 icons: None,
                 meta: None,
