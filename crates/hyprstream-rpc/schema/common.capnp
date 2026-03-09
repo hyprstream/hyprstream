@@ -120,6 +120,7 @@ struct Claims {
   admin @4 :Bool;        # Deprecated: always false. Use Casbin policies.
   aud @5 :Text;          # RFC 8707 audience (resource indicator)
   token @6 :Text;        # Original JWT for e2e verification by downstream services
+  iss @7 :Text;          # Issuer URL (RFC 7519); hyprstream node that minted this token
 }
 
 # UTC timestamp with nanosecond precision

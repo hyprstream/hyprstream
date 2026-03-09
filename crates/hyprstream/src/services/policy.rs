@@ -241,11 +241,15 @@ impl PolicyHandler for PolicyService {
             self.default_audience.clone()
         };
 
+        // Populate iss with the OAuth issuer URL so federation peers can fetch JWKS.
+        // default_audience is the OAuth issuer URL (set via with_default_audience).
+        let issuer = self.default_audience.clone().unwrap_or_default();
         let claims = hyprstream_rpc::auth::Claims::new(
             subject,
             now,
             now + requested_ttl as i64,
-        ).with_audience(audience);
+        ).with_issuer(issuer)
+         .with_audience(audience);
 
         let token = crate::auth::jwt::encode(&claims, &self.signing_key);
 
