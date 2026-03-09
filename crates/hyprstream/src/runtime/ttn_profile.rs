@@ -688,12 +688,14 @@ pub fn online_rank_allocator(
                         break;
                     }
                     // Reduce highest-rank layer
+                    // Use first-index tie-breaking to match np.argmax behavior
                     let l_max = allocation[ti]
                         .iter()
                         .enumerate()
-                        .max_by(|a, b| {
-                            a.1.partial_cmp(b.1)
+                        .max_by(|(i_a, a), (i_b, b)| {
+                            a.partial_cmp(b)
                                 .unwrap_or(std::cmp::Ordering::Equal)
+                                .then(i_b.cmp(i_a)) // prefer lower index on tie
                         })
                         .map(|(i, _)| i)
                         .unwrap_or(0);
@@ -745,12 +747,14 @@ pub fn online_rank_allocator(
                 if sum <= budget {
                     break;
                 }
+                // Use first-index tie-breaking to match np.argmax behavior
                 let l_max = base_alloc
                     .iter()
                     .enumerate()
-                    .max_by(|a, b| {
-                        a.1.partial_cmp(b.1)
+                    .max_by(|(i_a, a), (i_b, b)| {
+                        a.partial_cmp(b)
                             .unwrap_or(std::cmp::Ordering::Equal)
+                            .then(i_b.cmp(i_a)) // prefer lower index on tie
                     })
                     .map(|(i, _)| i)
                     .unwrap_or(0);
