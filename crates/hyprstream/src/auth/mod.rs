@@ -5,11 +5,13 @@
 //!
 //! Also provides JWT token authentication with Ed25519 signatures.
 
+pub mod federation;
 pub mod jwt;
 mod policy_manager;
 pub mod policy_migration;
 pub mod policy_templates;
 
+pub use federation::FederationKeyResolver;
 pub use jwt::{Claims, JwtError};
 pub use policy_manager::{PolicyManager, PolicyError, write_policy_file};
 pub use policy_migration::migrate_policy_csv;
