@@ -453,6 +453,11 @@ impl TestTimeTrainer {
         // Snapshot delta state before adaptation (for rollback)
         let pre_snapshot = delta.extract_state_dict();
 
+        // Snapshot SSM states before TTT loop (C4 fix: prevents training data from
+        // accumulating into the inference recurrent state for Qwen3.5 GDN layers).
+        // No-op for non-Qwen3.5 models.
+        let ssm_snapshot = engine.snapshot_ssm_states();
+
         // Track whether input was truncated
         let tokens_provided = input_tokens.len();
         let was_truncated = tokens_provided > self.config.max_ttt_context;
@@ -478,6 +483,8 @@ impl TestTimeTrainer {
             .unwrap_or(self.config.max_adaptation_ms);
 
         if gated_steps == 0 {
+            // Restore SSM states — initial NTP loss forward pass may have mutated them.
+            engine.restore_ssm_states(ssm_snapshot);
             return Ok((
                 TTTResult {
                     avg_loss: initial_loss,
@@ -551,6 +558,9 @@ impl TestTimeTrainer {
 
                 let time_used_ms = start.elapsed().as_millis() as u64;
 
+                // Restore SSM states so TTT training data does not pollute inference recurrent state.
+                engine.restore_ssm_states(ssm_snapshot);
+
                 Ok((
                     TTTResult {
                         avg_loss,
@@ -577,20 +587,22 @@ impl TestTimeTrainer {
                 ))
             }
             Ok(Err(e)) => {
-                // Gradient loop returned an error — restore delta from snapshot
+                // Gradient loop returned an error — restore delta and SSM states from snapshot
                 tracing::warn!("TTT adapt_tenant gradient loop error, restoring delta: {}", e);
                 let _ = delta.load_state_dict(&pre_snapshot);
                 // Flush stale gradients from optimizer (may have accumulated before error)
                 delta.optimizer.zero_grad();
+                engine.restore_ssm_states(ssm_snapshot);
                 Err(e)
             }
             Err(panic_info) => {
-                // Panic during gradient loop — restore delta from snapshot.
+                // Panic during gradient loop — restore delta and SSM states from snapshot.
                 // Also zero gradients: a panic mid-backward/step leaves stale
                 // gradient accumulation and corrupted AdamW moment buffers.
                 tracing::error!("TTT adapt_tenant panicked during gradient loop, restoring delta");
                 let _ = delta.load_state_dict(&pre_snapshot);
                 delta.optimizer.zero_grad();
+                engine.restore_ssm_states(ssm_snapshot);
                 let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
                     s.clone()
                 } else if let Some(s) = panic_info.downcast_ref::<&str>() {
@@ -671,6 +683,18 @@ impl TestTimeTrainer {
                 any_clipped = true;
             }
             actual_steps += 1;
+
+            // Delta rank utilization monitoring every 10 cumulative steps (Phase 3e).
+            // Uses delta.accumulated_steps (cross-call total) so monitoring fires even
+            // for short TTT runs (gated_steps < 10). SVD on [rank×rank] is ~μs.
+            if (delta.accumulated_steps + actual_steps as u64).is_multiple_of(10) {
+                for (key, a) in &delta.lora_a {
+                    if let Some(b) = delta.lora_b.get(key) {
+                        let util = crate::runtime::ttn_profile::delta_rank_utilization(a, b);
+                        tracing::debug!(key = %key, utilization = %util, "Delta rank utilization");
+                    }
+                }
+            }
         }
 
         // Compute final loss for perplexity
@@ -767,6 +791,9 @@ impl TestTimeTrainer {
         // Snapshot for panic recovery
         let pre_snapshot = delta.extract_state_dict();
 
+        // Snapshot SSM states before training loop (prevents training data from polluting inference state).
+        let ssm_snapshot = engine.snapshot_ssm_states();
+
         let loop_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
             self.train_step_inner(engine, delta, &tokens, clamped_steps, lr, &start, budget)
         }));
@@ -800,6 +827,9 @@ impl TestTimeTrainer {
 
                 let time_used_ms = start.elapsed().as_millis() as u64;
 
+                // Restore SSM states so training data does not pollute inference recurrent state.
+                engine.restore_ssm_states(ssm_snapshot);
+
                 Ok(TTTResult {
                     avg_loss,
                     loss_improvement,
@@ -826,12 +856,14 @@ impl TestTimeTrainer {
                 tracing::warn!("TTT train_step gradient loop error, restoring delta: {}", e);
                 let _ = delta.load_state_dict(&pre_snapshot);
                 delta.optimizer.zero_grad();
+                engine.restore_ssm_states(ssm_snapshot);
                 Err(e)
             }
             Err(panic_info) => {
                 tracing::error!("TTT train_step panicked during gradient loop, restoring delta");
                 let _ = delta.load_state_dict(&pre_snapshot);
                 delta.optimizer.zero_grad();
+                engine.restore_ssm_states(ssm_snapshot);
                 let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
                     s.clone()
                 } else if let Some(s) = panic_info.downcast_ref::<&str>() {

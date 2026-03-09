@@ -47,6 +47,16 @@ pub fn extract_lora_components(tensor_name: &str) -> Option<(usize, String, Stri
     None
 }
 
+/// Per-layer LoRA rank and target module override.
+///
+/// When present in `TenantDeltaConfig::layer_overrides`, these values replace
+/// the top-level `rank` and `target_modules` for the specified layer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayerDeltaConfig {
+    pub rank: usize,
+    pub target_modules: Vec<String>,
+}
+
 /// Configuration for creating a new tenant delta (also used by the create_lora MCP tool)
 ///
 /// This is the single LoRA configuration type. TTT and PEFT differ only in lifecycle
@@ -80,6 +90,36 @@ pub struct TenantDeltaConfig {
     /// Weight decay factor for AdamW (default: 0.02)
     #[serde(default = "default_decay_lambda")]
     pub decay_lambda: f64,
+
+    /// Per-layer rank/module override. Key = layer index.
+    /// Layers not in map use the top-level `rank` and `target_modules`.
+    #[serde(default)]
+    pub layer_overrides: Option<HashMap<usize, LayerDeltaConfig>>,
+}
+
+impl TenantDeltaConfig {
+    /// Create config with non-uniform per-layer ranks from a TTN analysis profile.
+    ///
+    /// Works for any model — the profile is produced by `ttn_profile::get_layer_profile()`.
+    pub fn from_profile(
+        base: &TenantDeltaConfig,
+        profile: &crate::runtime::ttn_profile::LayerProfile,
+    ) -> Self {
+        let mut overrides = HashMap::new();
+        for la in &profile.layers {
+            overrides.insert(
+                la.layer_idx,
+                LayerDeltaConfig {
+                    rank: la.recommended_rank,
+                    target_modules: la.target_modules.clone(),
+                },
+            );
+        }
+        Self {
+            layer_overrides: Some(overrides),
+            ..base.clone()
+        }
+    }
 }
 
 fn default_rank() -> usize {
@@ -111,6 +151,7 @@ impl Default for TenantDeltaConfig {
             learning_rate: default_learning_rate(),
             max_accumulated_steps: default_max_accumulated_steps(),
             decay_lambda: default_decay_lambda(),
+            layer_overrides: None,
         }
     }
 }
@@ -130,7 +171,10 @@ pub struct TenantDelta {
     pub vs: VarStore,
     /// AdamW optimizer over all trainable parameters
     pub optimizer: tch::nn::Optimizer,
-    /// Scaling factor: alpha / rank
+    /// Per-key scaling: "layer_idx.module_name" -> alpha / layer_rank
+    /// Replaces the single `scaling` field for non-uniform rank support (C7 fix).
+    pub scaling_map: HashMap<String, f64>,
+    /// Default scaling factor: alpha / rank (for uniform-rank deltas or backward compat)
     pub scaling: f64,
     /// LoRA rank
     pub rank: usize,
@@ -163,32 +207,70 @@ pub struct TenantDelta {
 }
 
 impl TenantDelta {
-    /// Create a new per-layer tenant delta with Kaiming init for A and zeros for B
+    /// Create a new per-layer tenant delta with Kaiming init for A and zeros for B.
     ///
     /// Creates `num_layers × num_modules` A/B pairs keyed as `"layer_idx.module_name"`.
     ///
     /// # Arguments
-    /// * `config` - Delta configuration (rank, alpha, target modules, etc.)
-    /// * `module_dims` - Map of module_name -> (in_features, out_features)
+    /// * `config` - Delta configuration (rank, alpha, target modules, layer_overrides, etc.)
+    /// * `module_dims` - Map of module_name -> (in_features, out_features) (flat, for uniform layers)
     /// * `device` - Device for tensor allocation
     /// * `num_layers` - Number of model layers
+    /// * `per_layer_dims` - Optional per-layer dim overrides: layer_idx -> module_name -> (in, out)
+    ///   Required when different layer types have different `o_proj` dimensions (e.g. Qwen3.5).
     pub fn new(
         config: &TenantDeltaConfig,
         module_dims: &HashMap<String, (usize, usize)>,
         device: Device,
         num_layers: usize,
     ) -> Result<Self> {
+        Self::new_with_per_layer_dims(config, module_dims, device, num_layers, None)
+    }
+
+    /// Create a new per-layer tenant delta with optional per-layer dimension overrides.
+    ///
+    /// Same as `new()` but accepts `per_layer_dims` for architectures where
+    /// `o_proj` (or other modules) have different dimensions across layer types.
+    pub fn new_with_per_layer_dims(
+        config: &TenantDeltaConfig,
+        module_dims: &HashMap<String, (usize, usize)>,
+        device: Device,
+        num_layers: usize,
+        per_layer_dims: Option<&HashMap<usize, HashMap<String, (usize, usize)>>>,
+    ) -> Result<Self> {
         let vs = VarStore::new(device);
         let root = vs.root();
 
         let mut lora_a = HashMap::new();
         let mut lora_b = HashMap::new();
+        let mut scaling_map = HashMap::new();
 
         for layer_idx in 0..num_layers {
-            for module_name in &config.target_modules {
-                let (in_features, out_features) = module_dims
-                    .get(module_name)
-                    .ok_or_else(|| anyhow!("Module '{}' not found in model dimensions", module_name))?;
+            // Determine layer-specific rank and modules
+            let (layer_rank, layer_modules): (usize, &Vec<String>) =
+                if let Some(overrides) = &config.layer_overrides {
+                    if let Some(lc) = overrides.get(&layer_idx) {
+                        (lc.rank, &lc.target_modules)
+                    } else {
+                        (config.rank, &config.target_modules)
+                    }
+                } else {
+                    (config.rank, &config.target_modules)
+                };
+
+            for module_name in layer_modules {
+                // Per-layer dims take priority over flat module_dims (C1 fix)
+                let (in_features, out_features) = per_layer_dims
+                    .and_then(|pld| pld.get(&layer_idx))
+                    .and_then(|m| m.get(module_name.as_str()))
+                    .or_else(|| module_dims.get(module_name.as_str()))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Module '{}' not found in model dimensions (layer {})",
+                            module_name,
+                            layer_idx
+                        )
+                    })?;
 
                 let key = format!("{}.{}", layer_idx, module_name);
 
@@ -198,17 +280,20 @@ impl TenantDelta {
                 // A: Kaiming uniform initialization [rank, in_features]
                 let a = layer_path.kaiming_uniform(
                     "lora_a",
-                    &[config.rank as i64, *in_features as i64],
+                    &[layer_rank as i64, *in_features as i64],
                 );
 
                 // B: Zero initialization [out_features, rank]
                 let b = layer_path.zeros(
                     "lora_b",
-                    &[*out_features as i64, config.rank as i64],
+                    &[*out_features as i64, layer_rank as i64],
                 );
 
                 lora_a.insert(key.clone(), a);
-                lora_b.insert(key, b);
+                lora_b.insert(key.clone(), b);
+
+                // Per-key scaling: alpha / layer_rank (C7 fix)
+                scaling_map.insert(key, config.alpha as f64 / layer_rank as f64);
             }
         }
 
@@ -226,15 +311,28 @@ impl TenantDelta {
         let scaling = config.alpha as f64 / config.rank as f64;
         let now = Instant::now();
 
+        // Collect unique target modules across all layers for iteration metadata
+        let mut all_modules: Vec<String> = config.target_modules.clone();
+        if let Some(overrides) = &config.layer_overrides {
+            for lc in overrides.values() {
+                for m in &lc.target_modules {
+                    if !all_modules.contains(m) {
+                        all_modules.push(m.clone());
+                    }
+                }
+            }
+        }
+
         Ok(Self {
             lora_a,
             lora_b,
             vs,
             optimizer,
+            scaling_map,
             scaling,
             rank: config.rank,
             device,
-            target_modules: config.target_modules.clone(),
+            target_modules: all_modules,
             num_layers,
             learning_rate: config.learning_rate,
             accumulated_steps: 0,
@@ -269,13 +367,16 @@ impl TenantDelta {
         let b = self.lora_b.get(&key)
             .ok_or_else(|| anyhow!("Module '{}' B not found in delta", key))?;
 
+        // Per-key scaling (C7 fix): use per-key alpha/rank, fall back to global scaling
+        let scaling = self.scaling_map.get(&key).copied().unwrap_or(self.scaling);
+
         let x = x.to_kind(a.kind());
         let intermediate = x.f_matmul(&a.tr())
             .map_err(|e| anyhow!("Delta forward matmul A failed for '{}': {}", key, e))?;
         let output = intermediate.f_matmul(&b.tr())
             .map_err(|e| anyhow!("Delta forward matmul B failed for '{}': {}", key, e))?;
 
-        Ok(output * self.scaling)
+        Ok(output * scaling)
     }
 
     /// Compute LoRA correction for 2D tensors at a specific layer: output += scaling * (x @ A^T) @ B^T
@@ -296,13 +397,16 @@ impl TenantDelta {
         let b = self.lora_b.get(&key)
             .ok_or_else(|| anyhow!("Module '{}' B not found in delta", key))?;
 
+        // Per-key scaling (C7 fix): use per-key alpha/rank, fall back to global scaling
+        let scaling = self.scaling_map.get(&key).copied().unwrap_or(self.scaling);
+
         let x = x.to_kind(a.kind());
         let intermediate = x.f_matmul(&a.tr())
             .map_err(|e| anyhow!("Delta forward_2d matmul A failed for '{}': {}", key, e))?;
         let output = intermediate.f_matmul(&b.tr())
             .map_err(|e| anyhow!("Delta forward_2d matmul B failed for '{}': {}", key, e))?;
 
-        Ok(output * self.scaling)
+        Ok(output * scaling)
     }
 
     /// Compute the ratio of delta norm to a reference norm for drift monitoring
@@ -313,15 +417,16 @@ impl TenantDelta {
         let _guard = tch::no_grad_guard();
         let mut ratios = HashMap::new();
 
-        for layer_idx in 0..self.num_layers {
-            for module_name in &self.target_modules {
-                let key = format!("{}.{}", layer_idx, module_name);
-                if let (Some(a), Some(b)) = (self.lora_a.get(&key), self.lora_b.get(&key)) {
-                    let delta = b.matmul(a) * self.scaling;
-                    let delta_norm: f64 = delta.norm().double_value(&[]);
-                    let base_norm = base_norms.get(module_name).copied().unwrap_or(1.0);
-                    ratios.insert(key, delta_norm / base_norm.max(1e-8));
-                }
+        // Iterate lora_a.keys() to handle non-uniform per-layer module sets (I1 fix)
+        for key in self.lora_a.keys() {
+            if let (Some(a), Some(b)) = (self.lora_a.get(key), self.lora_b.get(key)) {
+                let scaling = self.scaling_map.get(key).copied().unwrap_or(self.scaling);
+                let delta = b.matmul(a) * scaling;
+                let delta_norm: f64 = delta.norm().double_value(&[]);
+                // Extract module name from key "layer_idx.module_name"
+                let module_name = key.split_once('.').map_or(key.as_str(), |(_, m)| m);
+                let base_norm = base_norms.get(module_name).copied().unwrap_or(1.0);
+                ratios.insert(key.clone(), delta_norm / base_norm.max(1e-8));
             }
         }
 
@@ -335,15 +440,13 @@ impl TenantDelta {
         let _guard = tch::no_grad_guard();
         let mut state = HashMap::new();
 
-        for layer_idx in 0..self.num_layers {
-            for module_name in &self.target_modules {
-                let key = format!("{}.{}", layer_idx, module_name);
-                if let Some(a) = self.lora_a.get(&key) {
-                    state.insert(format!("{}.lora_a", key), a.copy());
-                }
-                if let Some(b) = self.lora_b.get(&key) {
-                    state.insert(format!("{}.lora_b", key), b.copy());
-                }
+        // Iterate lora_a.keys() to handle non-uniform per-layer module sets (I1 fix)
+        for key in self.lora_a.keys() {
+            if let Some(a) = self.lora_a.get(key) {
+                state.insert(format!("{}.lora_a", key), a.copy());
+            }
+            if let Some(b) = self.lora_b.get(key) {
+                state.insert(format!("{}.lora_b", key), b.copy());
             }
         }
 
@@ -356,22 +459,19 @@ impl TenantDelta {
     pub fn load_state_dict(&mut self, state: &HashMap<String, Tensor>) -> Result<()> {
         let _guard = tch::no_grad_guard();
 
-        for layer_idx in 0..self.num_layers {
-            for module_name in &self.target_modules {
-                let key = format!("{}.{}", layer_idx, module_name);
-                let a_key = format!("{}.lora_a", key);
-                let b_key = format!("{}.lora_b", key);
+        for key in self.lora_a.keys().cloned().collect::<Vec<_>>() {
+            let a_key = format!("{}.lora_a", key);
+            let b_key = format!("{}.lora_b", key);
 
-                if let Some(a_src) = state.get(&a_key) {
-                    if let Some(a_dst) = self.lora_a.get_mut(&key) {
-                        a_dst.copy_(a_src);
-                    }
+            if let Some(a_src) = state.get(&a_key) {
+                if let Some(a_dst) = self.lora_a.get_mut(&key) {
+                    a_dst.copy_(a_src);
                 }
+            }
 
-                if let Some(b_src) = state.get(&b_key) {
-                    if let Some(b_dst) = self.lora_b.get_mut(&key) {
-                        b_dst.copy_(b_src);
-                    }
+            if let Some(b_src) = state.get(&b_key) {
+                if let Some(b_dst) = self.lora_b.get_mut(&key) {
+                    b_dst.copy_(b_src);
                 }
             }
         }
@@ -443,19 +543,26 @@ impl TenantDelta {
         let mut composed_a = HashMap::new();
         let mut composed_b = HashMap::new();
 
-        let ranks_match = base_guard.rank == tenant_guard.rank;
-
         for key in &all_keys {
             let base_a = base_guard.lora_a.get(key);
             let base_b = base_guard.lora_b.get(key);
             let tenant_a = tenant_guard.lora_a.get(key);
             let tenant_b = tenant_guard.lora_b.get(key);
 
+            // Use per-key scaling if available (C7 fix), else fall back to global
+            let base_scaling = base_guard.scaling_map.get(key).copied().unwrap_or(base_guard.scaling);
+            let tenant_scaling = tenant_guard.scaling_map.get(key).copied().unwrap_or(tenant_guard.scaling);
+
+            // Check if ranks match for this specific key
+            let base_rank = base_a.map(|a| a.size()[0]);
+            let tenant_rank = tenant_a.map(|a| a.size()[0]);
+            let ranks_match = base_rank == tenant_rank;
+
             match (base_a, tenant_a) {
                 (Some(ba), Some(ta)) if ranks_match => {
                     // Same rank: add A matrices directly (pre-scaled)
-                    let base_effective_a = ba * base_guard.scaling;
-                    let tenant_effective_a = ta * tenant_guard.scaling;
+                    let base_effective_a = ba * base_scaling;
+                    let tenant_effective_a = ta * tenant_scaling;
                     composed_a.insert(key.clone(), base_effective_a + tenant_effective_a);
                 }
                 (Some(ba), Some(ta)) => {
@@ -483,8 +590,8 @@ impl TenantDelta {
                     // A is [rank, in_dim], B is [out_dim, rank]
                     // B @ A = [out_dim, in_dim]
                     // B @ A = [out_dim, rank] @ [rank, in_dim] = [out_dim, in_dim]
-                    let base_w = bb.matmul(ba) * base_guard.scaling;
-                    let tenant_w = tb.matmul(ta) * tenant_guard.scaling;
+                    let base_w = bb.matmul(ba) * base_scaling;
+                    let tenant_w = tb.matmul(ta) * tenant_scaling;
                     let w_eff = base_w + tenant_w;
                     // forward_2d computes: scaling * (x @ A^T) @ B^T
                     // We want: x @ W_eff^T  (result shape [tokens, out_dim])
@@ -497,10 +604,10 @@ impl TenantDelta {
                     continue; // Skip the B match below, we already handled it
                 }
                 (Some(ba), None) => {
-                    composed_a.insert(key.clone(), ba * base_guard.scaling);
+                    composed_a.insert(key.clone(), ba * base_scaling);
                 }
                 (None, Some(ta)) => {
-                    composed_a.insert(key.clone(), ta * tenant_guard.scaling);
+                    composed_a.insert(key.clone(), ta * tenant_scaling);
                 }
                 (None, None) => {}
             }
@@ -544,6 +651,7 @@ impl TenantDelta {
             lora_b: composed_b,
             vs,
             optimizer,
+            scaling_map: HashMap::new(), // scaling=1.0 already baked in during composition
             scaling: 1.0, // Already pre-scaled during composition
             rank,
             device,
@@ -610,25 +718,29 @@ impl TenantDelta {
     pub fn serialize_to_safetensors_bytes(&self) -> Result<Vec<u8>> {
         let mut pairs: Vec<(String, Tensor)> = Vec::new();
 
-        for layer_idx in 0..self.num_layers {
-            for module in &self.target_modules {
-                let key = format!("{}.{}", layer_idx, module);
-                let subpath = module_to_peft_subpath(module);
+        // Iterate lora_a.keys() to handle non-uniform per-layer module sets (I1 fix)
+        let mut keys: Vec<&String> = self.lora_a.keys().collect();
+        keys.sort(); // deterministic output
+        for key in keys {
+            // key format: "layer_idx.module_name"
+            let mut parts = key.splitn(2, '.');
+            let layer_idx: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let module = parts.next().unwrap_or(key.as_str());
+            let subpath = module_to_peft_subpath(module);
 
-                if let Some(a) = self.lora_a.get(&key) {
-                    let peft_key = format!(
-                        "base_model.model.layers.{}.{}.{}.lora_A.weight",
-                        layer_idx, subpath, module
-                    );
-                    pairs.push((peft_key, a.shallow_clone()));
-                }
-                if let Some(b) = self.lora_b.get(&key) {
-                    let peft_key = format!(
-                        "base_model.model.layers.{}.{}.{}.lora_B.weight",
-                        layer_idx, subpath, module
-                    );
-                    pairs.push((peft_key, b.shallow_clone()));
-                }
+            if let Some(a) = self.lora_a.get(key) {
+                let peft_key = format!(
+                    "base_model.model.layers.{}.{}.{}.lora_A.weight",
+                    layer_idx, subpath, module
+                );
+                pairs.push((peft_key, a.shallow_clone()));
+            }
+            if let Some(b) = self.lora_b.get(key) {
+                let peft_key = format!(
+                    "base_model.model.layers.{}.{}.{}.lora_B.weight",
+                    layer_idx, subpath, module
+                );
+                pairs.push((peft_key, b.shallow_clone()));
             }
         }
 
@@ -712,11 +824,21 @@ impl TenantDelta {
             alpha
         );
 
+        // Build per-key scaling map from loaded A matrix ranks
+        let scaling_map: HashMap<String, f64> = lora_a
+            .iter()
+            .map(|(key, a)| {
+                let layer_rank = a.size()[0] as usize;
+                (key.clone(), alpha as f64 / layer_rank as f64)
+            })
+            .collect();
+
         Ok(Self {
             lora_a,
             lora_b,
             vs,
             optimizer,
+            scaling_map,
             scaling,
             rank,
             device,

@@ -939,6 +939,41 @@ impl TorchEngine {
         }
     }
 
+    /// Snapshot Qwen3.5 SSM (conv/rec) states for TTT adaptation.
+    ///
+    /// Returns `Some((conv, rec))` if the loaded model is Qwen3.5; `None` otherwise.
+    /// Each `Tensor` is deep-copied via `.copy()` (C4 fix) so the snapshot is
+    /// independent of subsequent forward-pass mutations during the TTT loop.
+    pub fn snapshot_ssm_states(
+        &self,
+    ) -> Option<(Vec<Option<Tensor>>, Vec<Option<Tensor>>)> {
+        let model_arc = self.persistent_model.as_ref()?;
+        let model = model_arc.lock();
+        let q35 = model
+            .as_any()
+            .downcast_ref::<crate::runtime::architectures::qwen3_5::Qwen3_5Model>()?;
+        Some(q35.snapshot_ssm_states())
+    }
+
+    /// Restore Qwen3.5 SSM states from a snapshot produced by `snapshot_ssm_states`.
+    ///
+    /// No-op if the loaded model is not Qwen3.5 or snapshot is `None`.
+    pub fn restore_ssm_states(
+        &self,
+        snapshot: Option<(Vec<Option<Tensor>>, Vec<Option<Tensor>>)>,
+    ) {
+        let Some((conv_snap, rec_snap)) = snapshot else { return };
+        let Some(model_arc) = &self.persistent_model else { return };
+        let model = model_arc.lock();
+        if let Some(q35) = model
+            .as_any()
+            .downcast_ref::<crate::runtime::architectures::qwen3_5::Qwen3_5Model>()
+        {
+            q35.restore_ssm_states(conv_snap, rec_snap);
+            tracing::debug!("Restored Qwen3.5 SSM states after TTT adaptation");
+        }
+    }
+
     /// Sample next token using bundled parameters with tiered repeat penalty.
     fn sample_token_with_params(
         &self,
@@ -1488,6 +1523,74 @@ impl TorchEngine {
         dims.insert("down_proj".to_owned(), (intermediate_size, hidden_size));
 
         Ok(dims)
+    }
+
+    /// Get per-layer LoRA module dimensions for hybrid architectures (e.g., Qwen3.5).
+    ///
+    /// Returns `None` for uniform architectures (Llama, Gemma, etc.) where all layers
+    /// have identical module dims. Returns per-layer overrides for Qwen3.5 where GDN
+    /// layers have different `o_proj` input dims than full-attention layers.
+    pub fn get_per_layer_lora_dims(
+        &self,
+    ) -> Option<std::collections::HashMap<usize, std::collections::HashMap<String, (usize, usize)>>> {
+        let model_arc = self.persistent_model.as_ref()?;
+        let model = model_arc.lock();
+        let model_any = model.as_any();
+
+        if let Some(q35) = model_any.downcast_ref::<crate::runtime::architectures::qwen3_5::Qwen3_5Model>() {
+            let qcfg = q35.text_config();
+            let hidden = qcfg.hidden_size;
+            let nh = qcfg.num_attention_heads;
+            let hd = qcfg.head_dim;
+            // q_proj outputs num_heads * head_dim * 2 (first half = Q, second half = gate).
+            // The LoRA delta targets only the Q half, so lora_b out_features = nh*hd (the half-dim).
+            // o_proj in_features is also nh*hd (attention output after gate application).
+            let q_half_dim = nh * hd;
+
+            let gdn_out_proj_in = qcfg.linear_num_value_heads * qcfg.linear_value_head_dim;
+            let num_layers = qcfg.num_hidden_layers;
+
+            let mut per_layer: std::collections::HashMap<usize, std::collections::HashMap<String, (usize, usize)>> =
+                std::collections::HashMap::new();
+
+            let nkv_out = qcfg.num_key_value_heads * hd;
+            for (layer_idx, lt) in qcfg.layer_types.iter().enumerate() {
+                let mut layer_dims: std::collections::HashMap<String, (usize, usize)> =
+                    std::collections::HashMap::new();
+                if lt == "full_attention" {
+                    // Full-attention: q correction targets the Q half (not the doubled projection)
+                    layer_dims.insert("q_proj".to_owned(), (hidden, q_half_dim));
+                    layer_dims.insert("v_proj".to_owned(), (hidden, nkv_out));
+                    layer_dims.insert("o_proj".to_owned(), (q_half_dim, hidden));
+                } else {
+                    // GDN (linear_attention): only o_proj; maps to struct field out_proj.
+                    // in_features = val_dim (input to out_proj), out_features = hidden_size.
+                    layer_dims.insert("o_proj".to_owned(), (gdn_out_proj_in, hidden));
+                }
+                per_layer.insert(layer_idx, layer_dims);
+            }
+
+            // Fill any layers not covered by layer_types (every 4th is full_attn)
+            for layer_idx in 0..num_layers {
+                per_layer.entry(layer_idx).or_insert_with(|| {
+                    let is_full_attn = (layer_idx + 1) % 4 == 0;
+                    let mut layer_dims: std::collections::HashMap<String, (usize, usize)> =
+                        std::collections::HashMap::new();
+                    if is_full_attn {
+                        layer_dims.insert("q_proj".to_owned(), (hidden, q_half_dim));
+                        layer_dims.insert("v_proj".to_owned(), (hidden, nkv_out));
+                        layer_dims.insert("o_proj".to_owned(), (q_half_dim, hidden));
+                    } else {
+                        layer_dims.insert("o_proj".to_owned(), (gdn_out_proj_in, hidden));
+                    }
+                    layer_dims
+                });
+            }
+
+            Some(per_layer)
+        } else {
+            None
+        }
     }
 
     /// Validate LoRA configuration against model dimensions.

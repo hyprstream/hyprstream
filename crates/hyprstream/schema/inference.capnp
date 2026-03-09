@@ -74,6 +74,9 @@ struct InferenceRequest {
 
     # Vision embeddings (synchronous — returns all embeddings in one response)
     embed @32 :EmbedImagesRequest $mcpScope(infer);
+
+    # TTN layer profile (returns JSON-encoded LayerProfile for diagnostics/tooling)
+    getLayerProfile @33 :Void $mcpScope(query);
   }
 }
 
@@ -131,6 +134,9 @@ struct InferenceResponse {
 
     # Embed result
     embedResult @33 :EmbedImagesResponse;
+
+    # TTN layer profile result
+    getLayerProfileResult @34 :LayerProfileResult;
   }
 }
 
@@ -358,6 +364,11 @@ struct EmbedImagesRequest {
 struct EmbedImagesResponse {
   embeddings @0 :List(List(Float32));  # one vector per image
   dimensions @1 :UInt32;               # embedding dimensionality
+}
+
+# TTN layer profile result (JSON-encoded to avoid complex capnp map types)
+struct LayerProfileResult {
+  json @0 :Text;   # JSON-encoded LayerProfile (serde_json::to_string_pretty)
 }
 
 # Error Information
