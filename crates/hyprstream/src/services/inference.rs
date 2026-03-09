@@ -626,6 +626,13 @@ impl InferenceService {
             if let Some(pld) = per_layer_dims {
                 pool = pool.with_per_layer_dims(pld);
             }
+            // Wire rank oracle config if provided in training config
+            if let Some(ref tc) = training_config {
+                if let Some(ref oracle_config) = tc.ttt.rank_oracle {
+                    pool = pool.with_rank_oracle(oracle_config.clone());
+                    info!("Rank oracle enabled: interval={}, auto_adapt={}", oracle_config.adaptation_interval, oracle_config.auto_adapt);
+                }
+            }
 
             Some(Arc::new(pool))
         } else {

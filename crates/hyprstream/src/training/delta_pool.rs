@@ -54,6 +54,8 @@ pub struct DeltaPool {
     num_layers: usize,
     /// Maximum number of tenants before LRU eviction
     max_tenants: usize,
+    /// Optional rank oracle config to attach to new deltas
+    rank_oracle_config: Option<super::ttt::RankOracleConfig>,
 }
 
 impl DeltaPool {
@@ -88,7 +90,14 @@ impl DeltaPool {
             fs,
             num_layers,
             max_tenants: MAX_TENANTS_DEFAULT,
+            rank_oracle_config: None,
         }
+    }
+
+    /// Set rank oracle config for runtime rank adaptation on new deltas.
+    pub fn with_rank_oracle(mut self, config: super::ttt::RankOracleConfig) -> Self {
+        self.rank_oracle_config = Some(config);
+        self
     }
 
     /// Set per-layer dimension overrides for hybrid architectures (e.g., Qwen3.5).
@@ -143,13 +152,17 @@ impl DeltaPool {
 
         // Slow path: create new delta (lock config briefly to clone it)
         let config = self.default_config.lock().clone();
-        let delta = TenantDelta::new_with_per_layer_dims(
+        let mut delta = TenantDelta::new_with_per_layer_dims(
             &config,
             &self.module_dims,
             self.device,
             self.num_layers,
             self.per_layer_dims.as_ref(),
         )?;
+        // Attach rank oracle if configured
+        if let Some(ref oracle_config) = self.rank_oracle_config {
+            delta.rank_oracle = Some(super::ttt::RankOracle::new(oracle_config.clone()));
+        }
         let delta = Arc::new(Mutex::new(delta));
 
         // Insert (handles race condition)

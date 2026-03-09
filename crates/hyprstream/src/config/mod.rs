@@ -1987,6 +1987,14 @@ pub struct TTTTrainingConfig {
     /// Maximum input length to process for TTT
     #[serde(default = "default_ttt_max_context")]
     pub max_ttt_context: usize,
+
+    /// Rank oracle configuration (optional — omit to disable runtime rank adaptation)
+    #[serde(default)]
+    pub rank_oracle: Option<crate::training::RankOracleConfig>,
+
+    /// Per-layer gradient gating (optional — enabled by default)
+    #[serde(default)]
+    pub gradient_gating: Option<crate::training::GradientGatingConfig>,
 }
 
 fn default_ttt_learning_rate() -> f64 {
@@ -2013,6 +2021,8 @@ impl Default for TTTTrainingConfig {
             max_grad_norm: default_ttt_max_grad_norm(),
             min_input_length: default_ttt_min_input_length(),
             max_ttt_context: default_ttt_max_context(),
+            rank_oracle: None,
+            gradient_gating: None,
         }
     }
 }

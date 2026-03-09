@@ -887,6 +887,8 @@ impl TttHandler for ModelService {
             max_grad_norm: if data.max_grad_norm > 0.0 { data.max_grad_norm } else { 1.0 },
             min_input_length: if data.min_input_length > 0 { data.min_input_length as usize } else { 32 },
             max_ttt_context: if data.max_ttt_context > 0 { data.max_ttt_context as usize } else { 512 },
+            rank_oracle: None,
+            gradient_gating: None,
         };
 
         let training_config = crate::config::HyprstreamTrainingConfig {

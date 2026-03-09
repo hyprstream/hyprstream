@@ -33,4 +33,4 @@ pub use tenant_delta::{TenantDelta, TenantDeltaConfig, SharedTenantDelta, serial
 
 pub use merge::{MergeStrategy, merge_state_dicts};
 
-pub use ttt::{TTTConfig, TTTContext, TTTOverrides, TTTResult, TTTVerifier, TestTimeTrainer};
+pub use ttt::{TTTConfig, TTTContext, TTTOverrides, TTTResult, TTTVerifier, TestTimeTrainer, RankOracle, RankOracleConfig, GradientGatingConfig};
