@@ -46,16 +46,47 @@ impl Operation {
         }
     }
 
-    /// Get the operation name for policy matching
+    /// Get the dot-namespaced operation name for policy matching.
+    ///
+    /// Returns the canonical dot-namespaced string for this operation variant.
+    ///
+    /// Forwarded verbatim to the Casbin enforcer, which uses `keyMatch` to accept
+    /// both this format and legacy flat strings stored in policy files.
+    ///
+    /// **Note on `Manage`:** This enum variant is a coarse gate over the `ttt.*`
+    /// namespace. `as_str()` returns `"ttt.writeback"` as a representative string,
+    /// but sub-actions (`ttt.evict`, `ttt.zero`) are all gated by the same `Manage`
+    /// variant. When callers need to enforce at sub-action granularity (e.g. in an
+    /// RPC handler), they should pass the specific dot-namespaced string directly to
+    /// `check_with_domain` rather than going through this method.
     pub fn as_str(&self) -> &'static str {
         match self {
-            Operation::Infer => "infer",
-            Operation::Train => "train",
-            Operation::Query => "query",
-            Operation::Write => "write",
-            Operation::Serve => "serve",
-            Operation::Manage => "manage",
-            Operation::Context => "context",
+            Operation::Infer   => "infer.generate",
+            Operation::Train   => "ttt.train",
+            Operation::Query   => "query.status",
+            Operation::Write   => "persist.save",
+            Operation::Serve   => "serve.api",
+            Operation::Manage  => "ttt.writeback",
+            Operation::Context => "context.augment",
+        }
+    }
+
+    /// Parse an operation from a dot-namespaced or legacy flat string.
+    ///
+    /// Returns `None` for unrecognized strings.  Handles both the new
+    /// dot-namespaced format (`"infer.generate"`) and the old flat format
+    /// (`"infer"`) for migration compatibility.
+    pub fn from_dot_str(s: &str) -> Option<Self> {
+        match s {
+            // New dot-namespaced and legacy flat strings merged per variant
+            "infer.generate" | "infer" => Some(Self::Infer),
+            "ttt.train" | "train" => Some(Self::Train),
+            "ttt.writeback" | "ttt.evict" | "ttt.zero" | "manage" => Some(Self::Manage),
+            "query.status" | "query.delta" | "query" => Some(Self::Query),
+            "persist.save" | "persist.export" | "persist.snapshot" | "write" => Some(Self::Write),
+            "context.augment" | "context" => Some(Self::Context),
+            "serve.api" | "serve" => Some(Self::Serve),
+            _ => None,
         }
     }
 
@@ -71,14 +102,6 @@ impl Operation {
             'c' => Some(Operation::Context),
             _ => None,
         }
-    }
-
-    /// Parse from operation name string (e.g., "write", "query").
-    ///
-    /// Used by generated `authorize()` overrides to convert the string action
-    /// from `$mcpScope` annotations into an `Operation` enum value.
-    pub fn parse_operation(s: &str) -> anyhow::Result<Self> {
-        s.parse().map_err(|e: anyhow::Error| e)
     }
 
     /// All operations
@@ -99,16 +122,8 @@ impl std::str::FromStr for Operation {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "infer" => Ok(Operation::Infer),
-            "train" => Ok(Operation::Train),
-            "query" => Ok(Operation::Query),
-            "write" => Ok(Operation::Write),
-            "serve" => Ok(Operation::Serve),
-            "manage" => Ok(Operation::Manage),
-            "context" => Ok(Operation::Context),
-            other => anyhow::bail!("Unknown operation: {}", other),
-        }
+        Self::from_dot_str(s)
+            .ok_or_else(|| anyhow::anyhow!("Unknown operation: {}", s))
     }
 }
 
@@ -187,15 +202,19 @@ mod tests {
     }
 
     #[test]
-    fn test_operation_as_str() {
-        assert_eq!(Operation::Infer.as_str(), "infer");
-        assert_eq!(Operation::Train.as_str(), "train");
-        assert_eq!(Operation::Manage.as_str(), "manage");
-        assert_eq!(Operation::Context.as_str(), "context");
+    fn test_operation_dot_namespaced_strings() {
+        assert_eq!(Operation::Infer.as_str(), "infer.generate");
+        assert_eq!(Operation::Train.as_str(), "ttt.train");
+        assert_eq!(Operation::Query.as_str(), "query.status");
+        assert_eq!(Operation::Write.as_str(), "persist.save");
+        assert_eq!(Operation::Manage.as_str(), "ttt.writeback");
+        assert_eq!(Operation::Context.as_str(), "context.augment");
+        assert_eq!(Operation::Serve.as_str(), "serve.api");
     }
 
     #[test]
     fn test_operation_from_str() {
+        // Legacy flat strings still parse correctly
         assert!(matches!(Operation::from_str("infer"), Ok(Operation::Infer)));
         assert!(matches!(Operation::from_str("train"), Ok(Operation::Train)));
         assert!(matches!(Operation::from_str("query"), Ok(Operation::Query)));
@@ -203,6 +222,20 @@ mod tests {
         assert!(matches!(Operation::from_str("serve"), Ok(Operation::Serve)));
         assert!(matches!(Operation::from_str("manage"), Ok(Operation::Manage)));
         assert!(matches!(Operation::from_str("context"), Ok(Operation::Context)));
+        // Dot-namespaced strings (emitted by Display) must also round-trip
+        assert!(matches!("infer.generate".parse::<Operation>(), Ok(Operation::Infer)));
+        assert!(matches!("ttt.train".parse::<Operation>(), Ok(Operation::Train)));
+        assert!(matches!("ttt.writeback".parse::<Operation>(), Ok(Operation::Manage)));
+        assert!(matches!("query.status".parse::<Operation>(), Ok(Operation::Query)));
+        assert!(matches!("persist.save".parse::<Operation>(), Ok(Operation::Write)));
+        assert!(matches!("serve.api".parse::<Operation>(), Ok(Operation::Serve)));
+        assert!(matches!("context.augment".parse::<Operation>(), Ok(Operation::Context)));
+        // Verify format!("{}", op).parse() round-trip for every variant
+        for op in Operation::all() {
+            let displayed = format!("{}", op);
+            let parsed: Operation = displayed.parse().expect("round-trip parse failed");
+            assert_eq!(&parsed, op);
+        }
         assert!(Operation::from_str("foo").is_err());
     }
 
@@ -211,5 +244,33 @@ mod tests {
         let all = Operation::all();
         assert_eq!(all.len(), 7);
         assert!(all.contains(&Operation::Context));
+    }
+
+    #[test]
+    fn test_operation_from_dot_str() {
+        // New dot-namespaced strings
+        assert_eq!(Operation::from_dot_str("infer.generate"), Some(Operation::Infer));
+        assert_eq!(Operation::from_dot_str("ttt.train"), Some(Operation::Train));
+        assert_eq!(Operation::from_dot_str("ttt.writeback"), Some(Operation::Manage));
+        assert_eq!(Operation::from_dot_str("ttt.evict"), Some(Operation::Manage));
+        assert_eq!(Operation::from_dot_str("ttt.zero"), Some(Operation::Manage));
+        assert_eq!(Operation::from_dot_str("query.status"), Some(Operation::Query));
+        assert_eq!(Operation::from_dot_str("query.delta"), Some(Operation::Query));
+        assert_eq!(Operation::from_dot_str("persist.save"), Some(Operation::Write));
+        assert_eq!(Operation::from_dot_str("persist.export"), Some(Operation::Write));
+        assert_eq!(Operation::from_dot_str("persist.snapshot"), Some(Operation::Write));
+        assert_eq!(Operation::from_dot_str("context.augment"), Some(Operation::Context));
+        assert_eq!(Operation::from_dot_str("serve.api"), Some(Operation::Serve));
+        // Legacy flat strings
+        assert_eq!(Operation::from_dot_str("infer"), Some(Operation::Infer));
+        assert_eq!(Operation::from_dot_str("train"), Some(Operation::Train));
+        assert_eq!(Operation::from_dot_str("query"), Some(Operation::Query));
+        assert_eq!(Operation::from_dot_str("write"), Some(Operation::Write));
+        assert_eq!(Operation::from_dot_str("serve"), Some(Operation::Serve));
+        assert_eq!(Operation::from_dot_str("manage"), Some(Operation::Manage));
+        assert_eq!(Operation::from_dot_str("context"), Some(Operation::Context));
+        // Unknown
+        assert_eq!(Operation::from_dot_str("unknown"), None);
+        assert_eq!(Operation::from_dot_str(""), None);
     }
 }

@@ -695,7 +695,7 @@ mod tests {
         assert!(policies_dir.join("policy.csv").exists());
 
         // After adding explicit policy, access should work
-        pm.add_policy("user", "model:test", "infer").await?;
+        pm.add_policy("user", "model:test", "infer.generate").await?;
         assert!(pm.check("user", "model:test", Operation::Infer).await);
         Ok(())
     }
@@ -711,7 +711,7 @@ mod tests {
         assert!(!pm.check("user", "model:test", Operation::Infer).await);
 
         // Add specific policy
-        pm.add_policy("user", "model:test", "infer").await?;
+        pm.add_policy("user", "model:test", "infer.generate").await?;
 
         // Now this specific access should work
         assert!(pm.check("user", "model:test", Operation::Infer).await);
@@ -728,8 +728,8 @@ mod tests {
         pm.remove_policy("*", "*", "*").await?;
 
         // Add role-based policies
-        pm.add_policy("trainer", "model:*", "infer").await?;
-        pm.add_policy("trainer", "model:*", "train").await?;
+        pm.add_policy("trainer", "model:*", "infer.generate").await?;
+        pm.add_policy("trainer", "model:*", "ttt.train").await?;
 
         // Assign role to user
         pm.add_role_for_user("alice", "trainer").await?;

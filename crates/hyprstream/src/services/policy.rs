@@ -82,20 +82,6 @@ impl PolicyService {
         self
     }
 
-    /// Parse operation from string
-    fn parse_operation(op_str: &str) -> Result<Operation> {
-        match op_str {
-            "infer" => Ok(Operation::Infer),
-            "train" => Ok(Operation::Train),
-            "query" => Ok(Operation::Query),
-            "write" => Ok(Operation::Write),
-            "serve" => Ok(Operation::Serve),
-            "manage" => Ok(Operation::Manage),
-            "context" => Ok(Operation::Context),
-            _ => Err(anyhow!("Unknown operation: {}", op_str)),
-        }
-    }
-
     /// Stage policies/ and commit with the given message via git2db.
     /// Returns the commit OID as a hex string.
     async fn stage_and_commit_policies(&self, message: &str) -> Result<String> {
@@ -775,19 +761,3 @@ pub(crate) async fn watch_policy_file(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_operation() {
-        assert!(matches!(PolicyService::parse_operation("infer"), Ok(Operation::Infer)));
-        assert!(matches!(PolicyService::parse_operation("train"), Ok(Operation::Train)));
-        assert!(matches!(PolicyService::parse_operation("query"), Ok(Operation::Query)));
-        assert!(matches!(PolicyService::parse_operation("write"), Ok(Operation::Write)));
-        assert!(matches!(PolicyService::parse_operation("serve"), Ok(Operation::Serve)));
-        assert!(matches!(PolicyService::parse_operation("manage"), Ok(Operation::Manage)));
-        assert!(matches!(PolicyService::parse_operation("context"), Ok(Operation::Context)));
-        assert!(PolicyService::parse_operation("unknown").is_err());
-    }
-}
