@@ -225,6 +225,8 @@ pub struct TenantDelta {
     alpha: f32,
     /// Optional per-tenant rank oracle for runtime rank adaptation
     pub rank_oracle: Option<super::ttt::RankOracle>,
+    /// Lifecycle state of any pending adaptation (Idle or Pending with snapshot).
+    pub adaptation_state: crate::training::adaptation_state::DeltaAdaptationState,
 }
 
 impl TenantDelta {
@@ -373,6 +375,7 @@ impl TenantDelta {
             max_ranks,
             alpha: config.alpha,
             rank_oracle: None,
+            adaptation_state: crate::training::adaptation_state::DeltaAdaptationState::Idle,
         })
     }
 
@@ -418,6 +421,11 @@ impl TenantDelta {
     /// Compute LoRA correction for 2D tensors at a specific layer: output += scaling * (x @ A^T) @ B^T
     ///
     /// Handles shape [batch*seq_len, features] used inside attention layers.
+    ///
+    /// **Multi-precision:** Input `x` is cast to `a.kind()` (always Float32) via `x.to_kind()`.
+    /// LoRA A/B are kept in Float32 regardless of the base model's dtype. This ensures
+    /// Newton-Schulz convergence in the Muon optimizer and gradient precision within
+    /// TTT's tight 1-5 step budget. See also `muon::ns_compute_kind()`.
     ///
     /// # Arguments
     /// * `x` - Input tensor [tokens, in_features]
@@ -475,9 +483,11 @@ impl TenantDelta {
         ratios
     }
 
-    /// Extract state dict (A and B tensors) for serialization
+    /// Extract state dict (A and B tensors, effective ranks, Muon momentum) for serialization
     ///
     /// Keys use the format `"layer_idx.module_name.lora_a"` / `"layer_idx.module_name.lora_b"`.
+    /// Effective ranks are stored as `"layer_idx.module_name.__effective_rank"` (scalar i64).
+    /// Muon momentum buffers are stored as `"layer_idx.module_name.__muon_momentum"`.
     pub fn extract_state_dict(&self) -> HashMap<String, Tensor> {
         let _guard = tch::no_grad_guard();
         let mut state = HashMap::new();
@@ -492,12 +502,25 @@ impl TenantDelta {
             }
         }
 
+        // Persist effective ranks as scalar metadata tensors
+        for (key, &rank) in &self.effective_ranks {
+            state.insert(format!("{}.__effective_rank", key), Tensor::from_slice(&[rank as i64]));
+        }
+
+        // Persist Muon momentum buffers
+        for (key, muon_state) in &self.muon_states {
+            if let Some(ref buf) = muon_state.momentum_buffer {
+                state.insert(format!("{}.__muon_momentum", key), buf.copy());
+            }
+        }
+
         state
     }
 
-    /// Load state dict (restore A and B tensors from a snapshot)
+    /// Load state dict (restore A/B tensors, effective ranks, and Muon momentum from a snapshot)
     ///
     /// Expects keys in format `"layer_idx.module_name.lora_a"` / `"layer_idx.module_name.lora_b"`.
+    /// Also restores `__effective_rank` and `__muon_momentum` metadata if present.
     pub fn load_state_dict(&mut self, state: &HashMap<String, Tensor>) -> Result<()> {
         let _guard = tch::no_grad_guard();
 
@@ -514,6 +537,27 @@ impl TenantDelta {
             if let Some(b_src) = state.get(&b_key) {
                 if let Some(b_dst) = self.lora_b.get_mut(&key) {
                     b_dst.copy_(b_src);
+                }
+            }
+        }
+
+        // Restore effective ranks from metadata tensors
+        for key in self.effective_ranks.keys().cloned().collect::<Vec<_>>() {
+            let meta_key = format!("{}.__effective_rank", key);
+            if let Some(t) = state.get(&meta_key) {
+                let rank = t.int64_value(&[]) as usize;
+                self.set_effective_rank(&key, rank);
+            }
+        }
+
+        // Restore Muon momentum buffers from metadata tensors
+        for (key, muon_state) in &mut self.muon_states {
+            let meta_key = format!("{}.__muon_momentum", key);
+            if let Some(t) = state.get(&meta_key) {
+                if let Some(ref mut buf) = muon_state.momentum_buffer {
+                    buf.copy_(t);
+                } else {
+                    muon_state.momentum_buffer = Some(t.copy());
                 }
             }
         }
@@ -555,6 +599,7 @@ impl TenantDelta {
         self.accumulated_steps = 0;
         self.request_count = 0;
         self.avg_loss_improvement = 0.0;
+        self.adaptation_state = crate::training::adaptation_state::DeltaAdaptationState::Idle;
     }
 
     /// Zero all gradients on trainable variables.
@@ -744,6 +789,7 @@ impl TenantDelta {
             max_ranks: HashMap::new(),
             alpha: 1.0, // Already pre-scaled during composition
             rank_oracle: None,
+            adaptation_state: crate::training::adaptation_state::DeltaAdaptationState::Idle,
         }))
     }
 }
@@ -940,6 +986,7 @@ impl TenantDelta {
             max_ranks,
             alpha,
             rank_oracle: None,
+            adaptation_state: crate::training::adaptation_state::DeltaAdaptationState::Idle,
         })
     }
 }
@@ -1289,5 +1336,68 @@ mod tests {
         // Layer 0 allocated at 16, layer 1 at default 8
         assert_eq!(delta.effective_rank("0.q_proj"), Some(16));
         assert_eq!(delta.effective_rank("1.q_proj"), Some(8));
+    }
+
+    #[test]
+    fn test_state_dict_round_trip_preserves_effective_ranks() {
+        let config = TenantDeltaConfig { rank: 8, alpha: 4.0, ..Default::default() };
+        let dims = test_module_dims();
+        let mut delta = TenantDelta::new(&config, &dims, Device::Cpu, TEST_NUM_LAYERS).unwrap();
+
+        // Set non-default effective ranks
+        delta.set_effective_rank("0.q_proj", 4);
+        delta.set_effective_rank("1.v_proj", 2);
+
+        let state = delta.extract_state_dict();
+
+        // Verify metadata keys exist
+        assert!(state.contains_key("0.q_proj.__effective_rank"));
+        assert!(state.contains_key("1.v_proj.__effective_rank"));
+
+        // Load into a fresh delta
+        let mut delta2 = TenantDelta::new(&config, &dims, Device::Cpu, TEST_NUM_LAYERS).unwrap();
+        assert_eq!(delta2.effective_rank("0.q_proj"), Some(8)); // default
+        delta2.load_state_dict(&state).unwrap();
+
+        // Verify effective ranks restored
+        assert_eq!(delta2.effective_rank("0.q_proj"), Some(4));
+        assert_eq!(delta2.effective_rank("1.v_proj"), Some(2));
+        // Unchanged keys should keep default
+        assert_eq!(delta2.effective_rank("0.v_proj"), Some(8));
+    }
+
+    #[test]
+    fn test_state_dict_round_trip_preserves_muon_momentum() {
+        let config = TenantDeltaConfig { rank: 8, alpha: 4.0, ..Default::default() };
+        let dims = test_module_dims();
+        let mut delta = TenantDelta::new(&config, &dims, Device::Cpu, TEST_NUM_LAYERS).unwrap();
+
+        // Simulate a Muon step populating momentum for one key
+        let key = "0.q_proj".to_owned();
+        let fake_momentum = Tensor::randn([8, 512], (Kind::Float, Device::Cpu));
+        delta.muon_states.insert(key.clone(), super::super::muon::MuonState {
+            momentum_buffer: Some(fake_momentum.copy()),
+        });
+
+        let state = delta.extract_state_dict();
+
+        // Verify momentum key exists
+        assert!(state.contains_key("0.q_proj.__muon_momentum"));
+
+        // Load into a fresh delta that has the same Muon state key
+        let mut delta2 = TenantDelta::new(&config, &dims, Device::Cpu, TEST_NUM_LAYERS).unwrap();
+        delta2.muon_states.insert(key.clone(), super::super::muon::MuonState {
+            momentum_buffer: None,
+        });
+        delta2.load_state_dict(&state).unwrap();
+
+        // Verify momentum buffer restored
+        let restored = &delta2.muon_states[&key];
+        assert!(restored.momentum_buffer.is_some());
+        let diff: f64 = (restored.momentum_buffer.as_ref().unwrap() - &fake_momentum)
+            .abs()
+            .sum(Kind::Float)
+            .double_value(&[]);
+        assert!(diff < 1e-6, "Muon momentum should be preserved through state_dict round-trip");
     }
 }
