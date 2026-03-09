@@ -116,10 +116,12 @@ pub struct OAuthState {
     pub refresh_token_ttl: u32,
     /// HTTP client for fetching Client ID Metadata Documents
     pub http_client: reqwest::Client,
+    /// Raw Ed25519 verifying key bytes (32 bytes) for the JWKS endpoint.
+    pub verifying_key_bytes: [u8; 32],
 }
 
 impl OAuthState {
-    pub fn new(config: &OAuthConfig, policy_client: PolicyClient) -> Self {
+    pub fn new(config: &OAuthConfig, policy_client: PolicyClient, verifying_key_bytes: [u8; 32]) -> Self {
         Self {
             clients: RwLock::new(HashMap::new()),
             pending_codes: RwLock::new(HashMap::new()),
@@ -135,6 +137,7 @@ impl OAuthState {
                 .timeout(Duration::from_secs(10))
                 .build()
                 .unwrap_or_default(),
+            verifying_key_bytes,
         }
     }
 

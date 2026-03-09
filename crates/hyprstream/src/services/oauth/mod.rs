@@ -21,12 +21,14 @@
 //!   /oauth/register                          → dynamic registration
 //!   /oauth/authorize                         → consent + auth code
 //!   /oauth/token                             → PKCE + PolicyClient delegation
+//!   /oauth/jwks                              → JSON Web Key Set (RFC 7517)
 //!   /oauth/device                            → device authorization (RFC 8628)
 //!   /oauth/device/verify                     → user verification page
 //! ```
 
 pub mod authorize;
 pub mod device;
+pub mod jwks;
 pub mod metadata;
 pub mod registration;
 pub mod state;
@@ -70,6 +72,7 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             get(authorize::authorize_get).post(authorize::authorize_post),
         )
         .route("/oauth/token", post(token::exchange_token))
+        .route("/oauth/jwks", get(jwks::jwks))
         .route("/oauth/device", post(device::device_authorize))
         .route(
             "/oauth/device/verify",
@@ -196,7 +199,11 @@ impl Spawnable for OAuthService {
             );
 
             // Create shared state
-            let state = Arc::new(OAuthState::new(&self.config, policy_client));
+            let state = Arc::new(OAuthState::new(
+                &self.config,
+                policy_client,
+                self.verifying_key.to_bytes(),
+            ));
             state.spawn_code_sweeper();
 
             // Create router with configurable CORS
