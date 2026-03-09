@@ -1252,12 +1252,12 @@ mod tests {
         let mut delta = TenantDelta::new(&config, &dims, Device::Cpu, TEST_NUM_LAYERS).unwrap();
 
         // Original scaling: alpha / rank = 4.0 / 8 = 0.5
-        let s0 = *delta.scaling_map.get("0.q_proj").unwrap();
+        let s0 = delta.scaling_map["0.q_proj"];
         assert!((s0 - 0.5).abs() < 1e-9);
 
         // Set effective rank to 4 -> scaling should be alpha / eff_rank = 4.0 / 4 = 1.0
         delta.set_effective_rank("0.q_proj", 4);
-        let s1 = *delta.scaling_map.get("0.q_proj").unwrap();
+        let s1 = delta.scaling_map["0.q_proj"];
         assert!((s1 - 1.0).abs() < 1e-9);
     }
 
