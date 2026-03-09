@@ -35,7 +35,7 @@ impl std::fmt::Display for ModelEntry {
 }
 
 /// Lightweight window descriptor from TuiService.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct WindowSummary {
     pub id: u32,
     pub name: String,
@@ -44,7 +44,7 @@ pub struct WindowSummary {
 }
 
 /// Lightweight pane descriptor.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PaneSummary {
     pub id: u32,
     pub cols: u16,
@@ -81,7 +81,8 @@ pub const MENU_ITEMS: &[(&str, &str)] = &[
 // ============================================================================
 
 /// Pure typed enum — no ZMQ types, no capnp types, WASM-safe.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum RpcRequest {
     SendInput   { viewer_id: u32, data: Vec<u8> },
     CreateWindow { session_id: u32 },

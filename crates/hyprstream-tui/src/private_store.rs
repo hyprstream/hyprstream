@@ -16,7 +16,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+#[cfg(not(target_os = "wasi"))]
 use parking_lot::Mutex;
+#[cfg(target_os = "wasi")]
+#[allow(clippy::disallowed_types)]
+use std::sync::Mutex;
 
 use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
@@ -103,13 +107,23 @@ impl MemoryBackend {
 
 impl StorageBackend for MemoryBackend {
     fn write(&self, session_id: &Uuid, data: &[u8]) -> std::io::Result<()> {
-        self.store.lock().insert(*session_id, data.to_vec());
+        store_lock(&self.store).insert(*session_id, data.to_vec());
         Ok(())
     }
 
     fn read(&self, session_id: &Uuid) -> std::io::Result<Option<Vec<u8>>> {
-        Ok(self.store.lock().get(session_id).cloned())
+        Ok(store_lock(&self.store).get(session_id).cloned())
     }
+}
+
+/// Acquire the store lock in a cfg-portable way.
+/// - `parking_lot::Mutex::lock()` returns `MutexGuard<T>` directly.
+/// - `std::sync::Mutex::lock()` returns `Result<MutexGuard<T>, PoisonError>`.
+fn store_lock(m: &Mutex<HashMap<Uuid, Vec<u8>>>) -> impl std::ops::DerefMut<Target = HashMap<Uuid, Vec<u8>>> + '_ {
+    #[cfg(not(target_os = "wasi"))]
+    { m.lock() }
+    #[cfg(target_os = "wasi")]
+    { m.lock().unwrap_or_else(|e| e.into_inner()) }
 }
 
 // ============================================================================
