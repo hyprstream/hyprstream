@@ -13,6 +13,7 @@ pub mod checkpoint;
 pub mod data_loader;
 pub mod delta_pool;
 pub mod merge;
+pub mod muon;
 pub mod quality_filter;
 pub mod tenant_delta;
 pub mod ttt;

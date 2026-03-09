@@ -8,9 +8,10 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
-use tch::nn::{OptimizerConfig, VarStore};
+use tch::nn::VarStore;
 use tch::{Device, Kind, Tensor};
 use safetensors::tensor::{TensorView, SafeTensors};
+use super::muon::{MuonConfig, MuonState};
 
 /// Extract LoRA components from hierarchical tensor names
 /// e.g., "base_model.model.layers.5.self_attn.q_proj.lora_A.weight" -> Some((5, "q_proj", "lora_a"))
@@ -87,9 +88,13 @@ pub struct TenantDeltaConfig {
     #[serde(default = "default_max_accumulated_steps")]
     pub max_accumulated_steps: u64,
 
-    /// Weight decay factor for AdamW (default: 0.02)
+    /// Weight decay factor for optimizer (default: 0.02)
     #[serde(default = "default_decay_lambda")]
     pub decay_lambda: f64,
+
+    /// Muon momentum coefficient (default: 0.95)
+    #[serde(default = "default_muon_momentum_config")]
+    pub muon_momentum: f64,
 
     /// Per-layer rank/module override. Key = layer index.
     /// Layers not in map use the top-level `rank` and `target_modules`.
@@ -140,6 +145,9 @@ fn default_max_accumulated_steps() -> u64 {
 fn default_decay_lambda() -> f64 {
     0.02
 }
+fn default_muon_momentum_config() -> f64 {
+    0.95
+}
 
 impl Default for TenantDeltaConfig {
     fn default() -> Self {
@@ -151,6 +159,7 @@ impl Default for TenantDeltaConfig {
             learning_rate: default_learning_rate(),
             max_accumulated_steps: default_max_accumulated_steps(),
             decay_lambda: default_decay_lambda(),
+            muon_momentum: default_muon_momentum_config(),
             layer_overrides: None,
         }
     }
@@ -169,8 +178,10 @@ pub struct TenantDelta {
     pub lora_b: HashMap<String, Tensor>,
     /// VarStore owning all trainable parameters
     pub vs: VarStore,
-    /// AdamW optimizer over all trainable parameters
-    pub optimizer: tch::nn::Optimizer,
+    /// Per-parameter Muon optimizer state: VarStore path -> MuonState
+    pub muon_states: HashMap<String, MuonState>,
+    /// Muon optimizer configuration
+    pub muon_config: MuonConfig,
     /// Per-key scaling: "layer_idx.module_name" -> alpha / layer_rank
     /// Replaces the single `scaling` field for non-uniform rank support (C7 fix).
     pub scaling_map: HashMap<String, f64>,
@@ -202,7 +213,7 @@ pub struct TenantDelta {
     pub created_at: Instant,
     /// Hash of last CAS snapshot (if any)
     pub last_snapshot_hash: Option<String>,
-    /// Weight decay factor (used by AdamW)
+    /// Weight decay factor (used by Muon's decoupled weight decay)
     pub decay_lambda: f64,
 }
 
@@ -297,16 +308,14 @@ impl TenantDelta {
             }
         }
 
-        // Build AdamW optimizer over all trainable parameters
-        let optimizer = tch::nn::AdamW {
-            beta1: 0.9,
-            beta2: 0.999,
-            wd: config.decay_lambda,
-            eps: 1e-8,
-            amsgrad: false,
-        }
-        .build(&vs, config.learning_rate)
-        .map_err(|e| anyhow!("Failed to create AdamW optimizer: {}", e))?;
+        // Build Muon optimizer state (created lazily on first step)
+        let muon_states = HashMap::new();
+        let muon_config = MuonConfig {
+            lr: config.learning_rate,
+            momentum: config.muon_momentum,
+            weight_decay: config.decay_lambda,
+            ..MuonConfig::default()
+        };
 
         let scaling = config.alpha as f64 / config.rank as f64;
         let now = Instant::now();
@@ -327,7 +336,8 @@ impl TenantDelta {
             lora_a,
             lora_b,
             vs,
-            optimizer,
+            muon_states,
+            muon_config,
             scaling_map,
             scaling,
             rank: config.rank,
@@ -514,6 +524,15 @@ impl TenantDelta {
         self.request_count = 0;
         self.avg_loss_improvement = 0.0;
     }
+
+    /// Zero all gradients on trainable variables.
+    pub fn zero_grad(&self) {
+        for (_, var) in self.vs.variables() {
+            if var.grad().defined() {
+                let _ = var.grad().zero_();
+            }
+        }
+    }
 }
 
 impl TenantDelta {
@@ -640,17 +659,14 @@ impl TenantDelta {
         let rank = base_guard.rank.max(tenant_guard.rank);
         let num_layers = base_guard.num_layers.max(tenant_guard.num_layers);
         let vs = VarStore::new(device);
-        // Composed delta is non-trainable — dummy optimizer
-        let optimizer = tch::nn::AdamW {
-            beta1: 0.9, beta2: 0.999, wd: 0.0, eps: 1e-8, amsgrad: false,
-        }.build(&vs, 0.0).unwrap_or_else(|_| unreachable!("AdamW::build with valid VarStore"));
         let now = Instant::now();
 
         std::sync::Arc::new(parking_lot::Mutex::new(TenantDelta {
             lora_a: composed_a,
             lora_b: composed_b,
             vs,
-            optimizer,
+            muon_states: HashMap::new(),
+            muon_config: MuonConfig::default(),
             scaling_map: HashMap::new(), // scaling=1.0 already baked in during composition
             scaling: 1.0, // Already pre-scaled during composition
             rank,
@@ -811,9 +827,6 @@ impl TenantDelta {
         let target_modules: Vec<String> = module_names.into_iter().collect();
         let scaling = alpha as f64 / rank as f64;
         let vs = VarStore::new(device);
-        let optimizer = tch::nn::AdamW {
-            beta1: 0.9, beta2: 0.999, wd: 0.0, eps: 1e-8, amsgrad: false,
-        }.build(&vs, 0.0).map_err(|e| anyhow!("Failed to create optimizer: {}", e))?;
         let now = Instant::now();
 
         tracing::info!(
@@ -837,7 +850,8 @@ impl TenantDelta {
             lora_a,
             lora_b,
             vs,
-            optimizer,
+            muon_states: HashMap::new(),
+            muon_config: MuonConfig::default(),
             scaling_map,
             scaling,
             rank,

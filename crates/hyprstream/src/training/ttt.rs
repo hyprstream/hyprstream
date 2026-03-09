@@ -328,17 +328,18 @@ impl TestTimeTrainer {
         &self.config
     }
 
-    /// Perform a single gradient step on a tenant delta using AdamW
+    /// Perform a single gradient step on a tenant delta using Muon
     ///
-    /// Steps: backward → compute grad_norm → clip_grad_norm → optimizer.step → zero_grad
+    /// Steps: backward → compute grad_norm → clip → muon_step → zero_grad
     pub fn ttt_step(
         &self,
         loss: &Tensor,
         delta: &mut TenantDelta,
         learning_rate: Option<f64>,
     ) -> Result<(f64, bool)> {
+        // Override learning rate for this step
         if let Some(lr) = learning_rate {
-            delta.optimizer.set_lr(lr);
+            delta.muon_config.lr = lr;
         }
 
         // Backward pass
@@ -361,14 +362,43 @@ impl TestTimeTrainer {
 
         let clipped = grad_norm > self.config.max_grad_norm;
         if clipped {
-            delta.optimizer.clip_grad_norm(self.config.max_grad_norm);
+            // Manual gradient clipping (replaces optimizer.clip_grad_norm)
+            let clip_coef = self.config.max_grad_norm / (grad_norm + 1e-6);
+            let _guard = tch::no_grad_guard();
+            for var in delta.vs.trainable_variables() {
+                if var.grad().defined() {
+                    let _ = var.grad().mul_(clip_coef);
+                }
+            }
         }
 
-        // AdamW step (handles weight decay internally)
-        delta.optimizer.step();
-        delta.optimizer.zero_grad();
+        // Muon step for all trainable parameters + zero gradients
+        self.optimizer_step(delta);
 
         Ok((grad_norm, clipped))
+    }
+
+    /// Perform Muon optimization step on all trainable parameters and zero gradients.
+    fn optimizer_step(&self, delta: &mut TenantDelta) {
+        use super::muon::{muon_step, MuonState};
+        let _guard = tch::no_grad_guard();
+        let variables = delta.vs.variables();
+        let config = delta.muon_config.clone();
+        for (name, var) in &variables {
+            if var.requires_grad() && var.grad().defined() {
+                let state = delta
+                    .muon_states
+                    .entry(name.clone())
+                    .or_insert_with(MuonState::new);
+                muon_step(var, state, &config);
+            }
+        }
+        // Zero gradients
+        for (_, var) in &variables {
+            if var.grad().defined() {
+                let _ = var.grad().zero_();
+            }
+        }
     }
 
     /// Determine number of gradient steps based on perplexity gating
@@ -591,17 +621,17 @@ impl TestTimeTrainer {
                 tracing::warn!("TTT adapt_tenant gradient loop error, restoring delta: {}", e);
                 let _ = delta.load_state_dict(&pre_snapshot);
                 // Flush stale gradients from optimizer (may have accumulated before error)
-                delta.optimizer.zero_grad();
+                delta.zero_grad();
                 engine.restore_ssm_states(ssm_snapshot);
                 Err(e)
             }
             Err(panic_info) => {
                 // Panic during gradient loop — restore delta and SSM states from snapshot.
                 // Also zero gradients: a panic mid-backward/step leaves stale
-                // gradient accumulation and corrupted AdamW moment buffers.
+                // gradient accumulation and corrupted Muon momentum buffers.
                 tracing::error!("TTT adapt_tenant panicked during gradient loop, restoring delta");
                 let _ = delta.load_state_dict(&pre_snapshot);
-                delta.optimizer.zero_grad();
+                delta.zero_grad();
                 engine.restore_ssm_states(ssm_snapshot);
                 let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
                     s.clone()
@@ -855,14 +885,14 @@ impl TestTimeTrainer {
             Ok(Err(e)) => {
                 tracing::warn!("TTT train_step gradient loop error, restoring delta: {}", e);
                 let _ = delta.load_state_dict(&pre_snapshot);
-                delta.optimizer.zero_grad();
+                delta.zero_grad();
                 engine.restore_ssm_states(ssm_snapshot);
                 Err(e)
             }
             Err(panic_info) => {
                 tracing::error!("TTT train_step panicked during gradient loop, restoring delta");
                 let _ = delta.load_state_dict(&pre_snapshot);
-                delta.optimizer.zero_grad();
+                delta.zero_grad();
                 engine.restore_ssm_states(ssm_snapshot);
                 let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
                     s.clone()
