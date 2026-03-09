@@ -305,6 +305,7 @@ impl RankOracle {
         self.observation_count += 1;
     }
 
+    #[allow(clippy::manual_is_multiple_of)]
     pub fn should_evaluate(&self) -> bool {
         self.observation_count > 0 && self.observation_count % self.config.adaptation_interval == 0
     }
@@ -566,7 +567,7 @@ impl TestTimeTrainer {
 
     /// Perform Muon optimization step on all trainable parameters and zero gradients.
     fn optimizer_step(&self, delta: &mut TenantDelta) {
-        use super::muon::{muon_step, MuonState};
+        use super::muon::muon_step;
         let _guard = tch::no_grad_guard();
         let variables = delta.vs.variables();
         let config = delta.muon_config.clone();
@@ -575,12 +576,12 @@ impl TestTimeTrainer {
                 let state = delta
                     .muon_states
                     .entry(name.clone())
-                    .or_insert_with(MuonState::new);
+                    .or_default();
                 muon_step(var, state, &config);
             }
         }
         // Zero gradients
-        for (_, var) in &variables {
+        for var in variables.values() {
             if var.grad().defined() {
                 let _ = var.grad().zero_();
             }

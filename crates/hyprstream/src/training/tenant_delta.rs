@@ -402,7 +402,7 @@ impl TenantDelta {
 
         // Narrow to effective rank (view, no copy)
         let eff_rank = self.effective_ranks.get(&key).copied()
-            .unwrap_or(a.size()[0] as usize) as i64;
+            .unwrap_or_else(|| a.size()[0] as usize) as i64;
         let a_eff = a.narrow(0, 0, eff_rank); // [eff_rank, in_features]
         let b_eff = b.narrow(1, 0, eff_rank); // [out_features, eff_rank]
 
@@ -438,7 +438,7 @@ impl TenantDelta {
 
         // Narrow to effective rank (view, no copy)
         let eff_rank = self.effective_ranks.get(&key).copied()
-            .unwrap_or(a.size()[0] as usize) as i64;
+            .unwrap_or_else(|| a.size()[0] as usize) as i64;
         let a_eff = a.narrow(0, 0, eff_rank); // [eff_rank, in_features]
         let b_eff = b.narrow(1, 0, eff_rank); // [out_features, eff_rank]
 

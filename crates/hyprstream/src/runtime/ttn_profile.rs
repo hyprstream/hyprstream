@@ -559,7 +559,7 @@ impl RankUtilizationTracker {
         let entry = self
             .history
             .entry(key.to_owned())
-            .or_insert_with(std::collections::VecDeque::new);
+            .or_default();
         entry.push_back(utilization);
         while entry.len() > self.window_size {
             entry.pop_front();
@@ -659,7 +659,7 @@ pub fn online_rank_allocator(
     }
 
     let mut ranks: Vec<f64> = rank_levels.iter().map(|&r| r as f64).collect();
-    ranks.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    ranks.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let budget = median_sorted(&ranks) * l as f64;
     let t = entropy_trajectory.len();
     let mut allocation = vec![vec![0.0f64; l]; t];
@@ -691,9 +691,12 @@ pub fn online_rank_allocator(
                     let l_max = allocation[ti]
                         .iter()
                         .enumerate()
-                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                        .max_by(|a, b| {
+                            a.1.partial_cmp(b.1)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
                         .map(|(i, _)| i)
-                        .unwrap();
+                        .unwrap_or(0);
                     let current_idx = ranks
                         .iter()
                         .position(|&r| (r - allocation[ti][l_max]).abs() < 1e-9);
@@ -712,13 +715,13 @@ pub fn online_rank_allocator(
         "balanced" => {
             // Mean entropy across time per layer
             let mut mean_entropy = vec![0.0f64; l];
-            for ti in 0..t {
-                for li in 0..l {
-                    mean_entropy[li] += entropy_trajectory[ti][li];
+            for row in entropy_trajectory {
+                for (li, val) in row.iter().enumerate().take(l) {
+                    mean_entropy[li] += val;
                 }
             }
-            for li in 0..l {
-                mean_entropy[li] /= t as f64;
+            for v in &mut mean_entropy {
+                *v /= t as f64;
             }
 
             // Assign closest rank per layer (uniform across time)
@@ -745,9 +748,12 @@ pub fn online_rank_allocator(
                 let l_max = base_alloc
                     .iter()
                     .enumerate()
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .max_by(|a, b| {
+                        a.1.partial_cmp(b.1)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
                     .map(|(i, _)| i)
-                    .unwrap();
+                    .unwrap_or(0);
                 let current_idx = ranks
                     .iter()
                     .position(|&r| (r - base_alloc[l_max]).abs() < 1e-9);
@@ -761,8 +767,8 @@ pub fn online_rank_allocator(
                     break;
                 }
             }
-            for ti in 0..t {
-                allocation[ti] = base_alloc.clone();
+            for row in &mut allocation {
+                *row = base_alloc.clone();
             }
         }
         "offline_optimal" => {
@@ -818,9 +824,12 @@ pub fn online_rank_allocator(
                 let best_b = dp_cost
                     .iter()
                     .enumerate()
-                    .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .min_by(|a, b| {
+                        a.1.partial_cmp(b.1)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
                     .map(|(i, _)| i)
-                    .unwrap();
+                    .unwrap_or(0);
                 allocation[ti] = dp_alloc[best_b].clone();
             }
         }
