@@ -329,7 +329,7 @@ impl TenantDelta {
         let muon_config = MuonConfig {
             lr: config.learning_rate,
             momentum: config.muon_momentum,
-            weight_decay: config.decay_lambda,
+            weight_decay: 0.0, // Muon orthogonalizes gradients; weight decay rarely needed
             ..MuonConfig::default()
         };
 

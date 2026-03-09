@@ -143,18 +143,13 @@ pub fn muon_step(param: &Tensor, state: &mut MuonState, config: &MuonConfig) {
     let g_orth = newton_schulz_orthogonalize(&g_flat, config.ns_steps);
     let g_orth = g_orth.view_as(&g).to_kind(param.kind());
 
-    // 3. Weight decay (decoupled, AdamW-style)
-    if config.weight_decay > 0.0 {
-        let decayed = &param.data() * (1.0 - config.lr * config.weight_decay);
-        param.data().copy_(&decayed);
-    }
-
-    // 4. Scale for matrix rectangularity
+    // 3. Weight decay (decoupled) + 4. Scale for rectangularity + 5. Update
+    // Combined into a single fused operation to minimize tensor allocations.
     let (rows, cols) = (param.size()[0] as f64, param.size()[1] as f64);
     let scale = (1.0f64.max(rows / cols)).sqrt();
-
-    // 5. Update: p -= lr * scale * g_orth
-    let updated = &param.data() - &g_orth * (config.lr * scale);
+    let decay = 1.0 - config.lr * config.weight_decay; // 1.0 when weight_decay=0
+    // p = p * decay - lr * scale * g_orth
+    let updated = &param.data() * decay - &g_orth * (config.lr * scale);
     param.data().copy_(&updated);
 }
 

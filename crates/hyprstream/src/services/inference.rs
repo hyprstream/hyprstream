@@ -562,7 +562,11 @@ impl InferenceService {
                     };
 
                     let device = engine.device();
-                    let trainer = TestTimeTrainer::new(ttt_config, device);
+                    let mut trainer = TestTimeTrainer::new(ttt_config, device);
+                    // Wire gradient gating config if provided
+                    if let Some(ref gating) = tc.ttt.gradient_gating {
+                        trainer = trainer.with_gradient_gating(gating.clone());
+                    }
 
                     // Get tokenizer for input tokenization
                     let tokenizer = engine.get_tokenizer().ok().map(Arc::new);

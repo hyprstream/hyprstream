@@ -495,13 +495,20 @@ pub struct TTTContext {
 /// ```
 pub struct TestTimeTrainer {
     pub config: TTTConfig,
+    pub gradient_gating: GradientGatingConfig,
     device: Device,
 }
 
 impl TestTimeTrainer {
     /// Create a new TTT trainer with the given configuration
     pub fn new(config: TTTConfig, device: Device) -> Self {
-        Self { config, device }
+        Self { config, gradient_gating: GradientGatingConfig::default(), device }
+    }
+
+    /// Create a new TTT trainer with gradient gating configuration
+    pub fn with_gradient_gating(mut self, gating: GradientGatingConfig) -> Self {
+        self.gradient_gating = gating;
+        self
     }
 
     /// Check if TTT is enabled
@@ -922,9 +929,9 @@ impl TestTimeTrainer {
 
         // Per-layer gradient gating: after warmup, freeze low-signal layers
         // to save backward FLOPs and prevent momentum drift
-        let gated_layer_keys = if gated_steps > 1 {
+        let gated_layer_keys = if self.gradient_gating.enabled && gated_steps > self.gradient_gating.warmup_steps {
             let grad_norms_map = compute_per_layer_grad_norms(&delta.vs);
-            let gated = identify_gated_layers(&grad_norms_map, default_min_grad_norm());
+            let gated = identify_gated_layers(&grad_norms_map, self.gradient_gating.min_grad_norm);
             if !gated.is_empty() {
                 let _guard = tch::no_grad_guard();
                 for (name, var) in delta.vs.variables() {
@@ -971,7 +978,12 @@ impl TestTimeTrainer {
             if (delta.accumulated_steps + actual_steps as u64).is_multiple_of(10) {
                 for (key, a) in &delta.lora_a {
                     if let Some(b) = delta.lora_b.get(key) {
-                        let util = crate::runtime::ttn_profile::delta_rank_utilization(a, b);
+                        // Narrow to effective rank so utilization reflects active subspace only
+                        let eff_rank = delta.effective_ranks.get(key).copied()
+                            .unwrap_or_else(|| a.size()[0] as usize) as i64;
+                        let a_eff = a.narrow(0, 0, eff_rank);
+                        let b_eff = b.narrow(1, 0, eff_rank);
+                        let util = crate::runtime::ttn_profile::delta_rank_utilization(&a_eff, &b_eff);
                         tracing::debug!(key = %key, utilization = %util, "Delta rank utilization");
                     }
                 }
@@ -983,17 +995,20 @@ impl TestTimeTrainer {
         let final_loss = final_loss_tensor.double_value(&[]) as f32;
         let final_perplexity = final_loss.exp();
 
-        // Collect final rank utilization for all keys
+        // Collect final rank utilization for all keys (narrowed to effective rank)
         let rank_utils: HashMap<String, f64> = {
             let _guard = tch::no_grad_guard();
             delta
                 .lora_a
                 .iter()
                 .filter_map(|(key, a)| {
-                    delta
-                        .lora_b
-                        .get(key)
-                        .map(|b| (key.clone(), crate::runtime::ttn_profile::delta_rank_utilization(a, b)))
+                    delta.lora_b.get(key).map(|b| {
+                        let eff_rank = delta.effective_ranks.get(key).copied()
+                            .unwrap_or_else(|| a.size()[0] as usize) as i64;
+                        let a_eff = a.narrow(0, 0, eff_rank);
+                        let b_eff = b.narrow(1, 0, eff_rank);
+                        (key.clone(), crate::runtime::ttn_profile::delta_rank_utilization(&a_eff, &b_eff))
+                    })
                 })
                 .collect()
         };
