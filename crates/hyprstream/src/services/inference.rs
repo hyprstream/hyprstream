@@ -434,6 +434,28 @@ impl InferenceService {
         }
     }
 
+    /// Run invariant checks before any TTT-scoped operation.
+    /// Returns GuardStatus encoding expired, capacity, and generation state.
+    /// The result must be passed to delta.adaptation_state.resolve().
+    #[allow(dead_code)] // Reserved for dispatch-layer callers; inline guards kept where delta lock is held
+    fn ttt_guard(&self, subject: &Subject) -> crate::training::GuardStatus {
+        let (expired, at_capacity) = if let Some(pool) = &self.delta_pool {
+            if let Some(delta_arc) = pool.get(subject) {
+                let delta = delta_arc.lock();
+                (delta.adaptation_state.is_expired(), delta.is_at_capacity())
+            } else {
+                (false, false)
+            }
+        } else {
+            (false, false)
+        };
+        crate::training::GuardStatus {
+            expired,
+            at_capacity,
+            lora_generation: self.lora_generation.load(std::sync::atomic::Ordering::Acquire),
+        }
+    }
+
     /// Handle inference request from callback channel
     async fn handle_callback_infer(&mut self, request_data: &[u8])
         -> Result<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)>
