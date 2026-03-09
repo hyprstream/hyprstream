@@ -656,6 +656,41 @@ pub async fn close_window_rpc(client: &TuiClient, window_id: u32) -> anyhow::Res
     Ok(())
 }
 
+pub async fn create_private_pane_rpc(
+    client: &TuiClient,
+    session_id: u32,
+    window_id: u32,
+    cols: u16,
+    rows: u16,
+    name: &str,
+) -> anyhow::Result<u32> {
+    let request_id = client.next_id();
+    let name = name.to_owned();
+    let payload = hyprstream_rpc::serialize_message(|msg| {
+        let mut req = msg.init_root::<crate::tui_capnp::tui_request::Builder<'_>>();
+        req.set_id(request_id);
+        let mut cpr = req.init_create_private_pane();
+        cpr.set_session_id(session_id);
+        cpr.set_window_id(window_id);
+        cpr.set_cols(cols);
+        cpr.set_rows(rows);
+        cpr.set_name(&name);
+    })?;
+    let resp_bytes = client.call(payload).await?;
+    let reader = capnp::serialize::read_message_from_flat_slice(
+        &mut &resp_bytes[..],
+        capnp::message::ReaderOptions::default(),
+    )?;
+    let resp = reader.get_root::<crate::tui_capnp::tui_response::Reader<'_>>()?;
+    match resp.which()? {
+        crate::tui_capnp::tui_response::Which::CreatePrivatePaneResult(pane_id) => Ok(pane_id),
+        crate::tui_capnp::tui_response::Which::Error(e) => {
+            Err(anyhow::anyhow!("{}", e?.get_message()?.to_str().unwrap_or("RPC error")))
+        }
+        _ => Err(anyhow::anyhow!("unexpected response from createPrivatePane")),
+    }
+}
+
 // ============================================================================
 // KeyPress → raw bytes (for forwarding to PTY via sendInput)
 // ============================================================================

@@ -7,6 +7,8 @@
 //! built in `service.rs`, keeping `hyprstream-tui` free of `hyprstream` types.
 
 use std::sync::mpsc;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 use waxterm::app::TerminalApp;
 use waxterm::input::KeyPress;
 
@@ -23,12 +25,14 @@ pub enum ChatEvent {
 }
 
 /// Role of a chat history entry.
+#[derive(Serialize, Deserialize, Clone)]
 pub enum ChatRole {
     User,
     Assistant,
 }
 
 /// A single message in the conversation history.
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ChatHistoryEntry {
     pub role: ChatRole,
     pub content: String,
@@ -41,6 +45,13 @@ pub struct ChatHistoryEntry {
 /// into the background thread spawned by `spawn_app_process`.
 pub type StreamSpawner =
     Box<dyn Fn(Vec<(String, String)>, mpsc::SyncSender<ChatEvent>) + Send + 'static>;
+
+/// Called after `StreamComplete` to persist the current history.
+pub type SaveHook = Box<dyn Fn(&[ChatHistoryEntry]) + Send + 'static>;
+
+/// Called once at construction to restore prior history (returns `None` if no
+/// history exists yet).
+pub type LoadHook = Box<dyn FnOnce() -> Option<Vec<ChatHistoryEntry>> + Send + 'static>;
 
 // ============================================================================
 // App mode
@@ -69,6 +80,10 @@ pub struct ChatApp {
     pub cols: u16,
     pub rows: u16,
     pub quit: bool,
+    /// UUID for this private session (used as the storage filename key).
+    pub session_id: Option<Uuid>,
+    /// Fired after `StreamComplete` to persist `history`.
+    save_hook: Option<SaveHook>,
 }
 
 impl ChatApp {
@@ -87,6 +102,41 @@ impl ChatApp {
             cols,
             rows,
             quit: false,
+            session_id: None,
+            save_hook: None,
+        }
+    }
+
+    /// Create a private chat app with encrypted history persistence.
+    ///
+    /// `load_hook` is called immediately to restore any prior conversation.
+    /// `save_hook` is called after each `StreamComplete` to persist history.
+    pub fn new_private(
+        model_name: String,
+        cols: u16,
+        rows: u16,
+        spawner: StreamSpawner,
+        session_id: Uuid,
+        load_hook: LoadHook,
+        save_hook: SaveHook,
+    ) -> Self {
+        let (event_tx, event_rx) = mpsc::sync_channel::<ChatEvent>(256);
+        let history = load_hook().unwrap_or_default();
+        Self {
+            model_name,
+            history,
+            input_buf: String::new(),
+            mode: ChatMode::Input,
+            scroll_offset: 0,
+            status: None,
+            event_rx,
+            event_tx,
+            spawner,
+            cols,
+            rows,
+            quit: false,
+            session_id: Some(session_id),
+            save_hook: Some(save_hook),
         }
     }
 }
@@ -187,6 +237,9 @@ impl TerminalApp for ChatApp {
                 Ok(ChatEvent::StreamComplete) => {
                     self.mode = ChatMode::Input;
                     self.status = None;
+                    if let Some(ref hook) = self.save_hook {
+                        hook(&self.history);
+                    }
                     redraw = true;
                 }
                 Ok(ChatEvent::StreamError(s)) => {

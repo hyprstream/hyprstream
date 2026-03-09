@@ -175,7 +175,25 @@ struct TuiRequest {
     # Spawn a ChatApp inference pane connected to a loaded model.
     spawnChatApp @16 :SpawnChatAppRequest
       $mcpScope(write) $mcpDescription("Spawn ChatApp inference pane");
+
+    # Create a private pane whose content is client-owned.
+    # The server publishes a [PRIVATE] placeholder to other viewers.
+    createPrivatePane @17 :CreatePrivatePaneRequest
+      $mcpScope(write) $mcpDescription("Create a private client-owned pane");
   }
+}
+
+# Create private pane request
+struct CreatePrivatePaneRequest {
+  # Session to create the pane in (0 = most recent)
+  sessionId @0 :UInt32;
+  # Window to create the pane in (0 = active window)
+  windowId  @1 :UInt32;
+  # Terminal dimensions
+  cols      @2 :UInt16;
+  rows      @3 :UInt16;
+  # Display name for the pane (shown in tab strip as "🔒 <name>")
+  name      @4 :Text;
 }
 
 # Spawn shell request
@@ -326,6 +344,9 @@ struct TuiResponse {
 
     # SpawnChatApp result
     spawnChatAppResult @17 :SpawnShellResult;
+
+    # CreatePrivatePane result: the assigned pane_id
+    createPrivatePaneResult @18 :UInt32;
   }
 }
 

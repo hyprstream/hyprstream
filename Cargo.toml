@@ -13,6 +13,7 @@ members = [
     "crates/hyprstream-workers",
     "crates/hyprstream-containedfs",
     "crates/waxterm",
+    "crates/hyprstream-compositor",
     "crates/hyprstream-tui",
 ]
 # bitsandbytes-sys is standalone - only built when bnb feature is enabled

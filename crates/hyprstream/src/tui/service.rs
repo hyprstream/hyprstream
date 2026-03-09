@@ -98,6 +98,8 @@ pub(crate) enum FrameLoopCommand {
     Resize { pane_id: u32, cols: u16, rows: u16 },
     /// Kill the process attached to a pane (called when window/pane is closed).
     KillProcess { pane_id: u32 },
+    /// Mark a pane as private — frame loop forces a full redraw with [PRIVATE] placeholder.
+    MarkPanePrivate { pane_id: u32 },
 }
 
 /// Channel for sending commands to the frame loop.
@@ -1062,6 +1064,75 @@ impl TuiService {
         Ok(buf)
     }
 
+    /// Create a private pane — marks it `PaneBackend::Private` in `TuiState`,
+    /// notifies the frame loop, and returns the assigned `pane_id`.
+    async fn handle_create_private_pane(
+        &self,
+        request_id: u64,
+        session_id: u32,
+        window_id: u32,
+        cols: u16,
+        rows: u16,
+        name: &str,
+    ) -> Result<Vec<u8>> {
+        use crate::tui::state::PaneBackend;
+
+        let (sid, pane_id) = {
+            let mut state = self.state.write().await;
+            let sid = if session_id == 0 {
+                state.sessions.last().map(|s| s.id).unwrap_or(1)
+            } else {
+                session_id
+            };
+            // Resolve window_id (0 = active window).
+            let wid = if window_id == 0 {
+                state
+                    .session(sid)
+                    .and_then(|s| s.active_window())
+                    .map(|w| w.id)
+                    .unwrap_or(0)
+            } else {
+                window_id
+            };
+            // Allocate a new pane in the target window.
+            let next_id = state.next_pane_id();
+            let pane_id = if let Some(session) = state.session_mut(sid) {
+                if let Some(window) = session.windows.iter_mut().find(|w| w.id == wid) {
+                    let rows_inner = rows.max(1);
+                    let cols_inner = cols.max(1);
+                    let mut pane = crate::tui::state::TuiPane::new(next_id, cols_inner, rows_inner, 0);
+                    pane.backend = PaneBackend::Private;
+                    pane.title = name.to_owned();
+                    window.panes.push(pane);
+                    next_id
+                } else {
+                    return Err(anyhow::anyhow!("window {} not found in session {}", wid, sid));
+                }
+            } else {
+                return Err(anyhow::anyhow!("session {} not found", sid));
+            };
+            (sid, pane_id)
+        };
+
+        // Notify frame loop: force a full frame so the [PRIVATE] placeholder renders.
+        {
+            let reg = self.sessions.read().await;
+            if let Some((sender, _)) = reg.get(&sid) {
+                let _ = sender.send(FrameLoopCommand::MarkPanePrivate { pane_id });
+            }
+        }
+
+        let mut msg = Builder::new_default();
+        {
+            let mut resp = msg.init_root::<tui_capnp::tui_response::Builder<'_>>();
+            resp.set_request_id(request_id);
+            resp.set_create_private_pane_result(pane_id);
+        }
+        let mut buf = Vec::new();
+        serialize::write_message(&mut buf, &msg)?;
+        Ok(buf)
+    }
+
     // ========================================================================
     // Response builders
     // ========================================================================
@@ -1317,6 +1388,17 @@ impl ZmqService for TuiService {
                 let pane_id = req.get_pane_id();
                 self.handle_spawn_chat_app(request_id, sid, &model_ref, cols, rows, pane_id).await
             }
+            tui_capnp::tui_request::Which::CreatePrivatePane(req_reader) => {
+                self.authorize(_ctx, "tui:private", "create").await
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                let req = req_reader?;
+                let session_id = req.get_session_id();
+                let window_id = req.get_window_id();
+                let cols = req.get_cols();
+                let rows = req.get_rows();
+                let name = req.get_name()?.to_str().unwrap_or("chat").to_owned();
+                Ok((self.handle_create_private_pane(request_id, session_id, window_id, cols, rows, &name).await?, None))
+            }
         }
     }
 
@@ -1356,6 +1438,21 @@ const MAX_CONSECUTIVE_SKIPS: u32 = 30;
 /// Spawn a frame loop for a session.
 ///
 /// The frame loop runs at ~30fps, encodes diffs based on damage notifications,
+/// Build an ANSI frame showing `[PRIVATE]` centred in the pane, for viewers
+/// who should not see client-owned pane content.
+fn private_placeholder_ansi(cols: u16, rows: u16) -> Vec<u8> {
+    let label = "[PRIVATE]";
+    let mut out = Vec::with_capacity(256);
+    // Clear screen + move home
+    out.extend_from_slice(b"\x1b[2J\x1b[H");
+    // Move to centre row
+    let row = (rows / 2).max(1);
+    let col = cols.saturating_sub(label.len() as u16) / 2 + 1;
+    // Dim colour
+    out.extend_from_slice(format!("\x1b[{};{}H\x1b[2;37m{}\x1b[0m", row, col, label).as_bytes());
+    out
+}
+
 /// and publishes to all connected viewers. Slow viewers (>30 consecutive skips)
 /// are evicted.
 ///
@@ -1634,6 +1731,12 @@ pub(crate) async fn run_frame_loop(
                             );
                         }
                     }
+                    FrameLoopCommand::MarkPanePrivate { .. } => {
+                        // Just trigger a full frame redraw; PaneBackend::Private is
+                        // already set on the pane in TuiState by handle_create_private_pane.
+                        has_damage = true;
+                        prev_cells.clear();
+                    }
                 }
             }
 
@@ -1766,6 +1869,8 @@ pub(crate) async fn run_frame_loop(
                 let generation = tui_state.generation();
 
                 let (ansi_bytes, capnp_bytes) = {
+                    use crate::tui::state::PaneBackend;
+
                     let session = match tui_state.session(session_id) {
                         Some(s) => s,
                         None => continue,
@@ -1779,26 +1884,42 @@ pub(crate) async fn run_frame_loop(
                         None => continue,
                     };
                     let pane_id = pane.id;
-                    let buf = pane.active_buffer();
-                    let prev = prev_cells.get(&pane_id).map(Vec::as_slice);
-                    let frame_diff = diff::compute_diff(buf, prev, generation, pane.cursor);
 
-                    // Encode for each display mode in use
-                    let needs_ansi = viewers.iter().any(|v| v.display_mode == DisplayMode::Ansi);
-                    let needs_capnp = viewers.iter().any(|v| v.display_mode == DisplayMode::Capnp);
+                    // Private panes: publish a [PRIVATE] placeholder instead of real cells.
+                    if pane.backend == PaneBackend::Private {
+                        let needs_ansi = viewers.iter().any(|v| v.display_mode == DisplayMode::Ansi);
+                        let ansi = if needs_ansi {
+                            let (cols, rows) = pane.size();
+                            Some(private_placeholder_ansi(cols, rows))
+                        } else {
+                            None
+                        };
+                        // Don't snapshot private pane cells; always send a full frame next time.
+                        prev_cells.remove(&pane_id);
+                        // capnp path not implemented for private panes (browser path uses ANSI)
+                        (ansi, None::<Vec<u8>>)
+                    } else {
+                        let buf = pane.active_buffer();
+                        let prev = prev_cells.get(&pane_id).map(Vec::as_slice);
+                        let frame_diff = diff::compute_diff(buf, prev, generation, pane.cursor);
 
-                    let ansi = if needs_ansi { Some(diff::encode_ansi(&frame_diff)) } else { None };
-                    let capnp = if needs_capnp { Some(diff::encode_capnp(&frame_diff)) } else { None };
+                        // Encode for each display mode in use
+                        let needs_ansi = viewers.iter().any(|v| v.display_mode == DisplayMode::Ansi);
+                        let needs_capnp = viewers.iter().any(|v| v.display_mode == DisplayMode::Capnp);
 
-                    // Snapshot cells for next incremental diff
-                    let area = buf.buffer.area();
-                    let cells: Vec<Cell> = (0..area.height)
-                        .flat_map(|y| (0..area.width).map(move |x| (x, y)))
-                        .map(|(x, y)| buf.buffer[(x, y)].clone())
-                        .collect();
-                    prev_cells.insert(pane_id, cells);
+                        let ansi = if needs_ansi { Some(diff::encode_ansi(&frame_diff)) } else { None };
+                        let capnp = if needs_capnp { Some(diff::encode_capnp(&frame_diff)) } else { None };
 
-                    (ansi, capnp)
+                        // Snapshot cells for next incremental diff
+                        let area = buf.buffer.area();
+                        let cells: Vec<Cell> = (0..area.height)
+                            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+                            .map(|(x, y)| buf.buffer[(x, y)].clone())
+                            .collect();
+                        prev_cells.insert(pane_id, cells);
+
+                        (ansi, capnp)
+                    }
                 };
 
                 // Clear damage on the active pane

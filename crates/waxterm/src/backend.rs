@@ -50,6 +50,11 @@ impl<W: Write> AnsiBackend<W> {
         self.height = height;
     }
 
+    /// Borrow the underlying writer (e.g. `&Vec<u8>` for off-screen rendering).
+    pub fn writer(&self) -> &W {
+        &self.writer
+    }
+
     fn write_csi(&mut self, args: &str) -> io::Result<()> {
         write!(self.writer, "\x1b[{}", args)
     }

@@ -1,0 +1,173 @@
+//! hyprstream-compositor — pure Rust TUI compositor.
+//!
+//! WASM-safe: no I/O, no ZMQ, no tokio, no libc.
+//! Compiles natively and to `wasm32-wasip1`.
+//!
+//! # Usage (native CLI)
+//!
+//! ```rust,ignore
+//! let mut compositor = Compositor::new(cols, rows, session_id, viewer_id, windows, models);
+//!
+//! // In event loop:
+//! let outputs = compositor.handle(CompositorInput::KeyPress(key));
+//! for output in outputs {
+//!     match output {
+//!         CompositorOutput::Redraw => { terminal.draw(|f| compositor.render(f))?; }
+//!         CompositorOutput::Rpc(req) => { rpc_adapter.dispatch(req, ...).await; }
+//!         CompositorOutput::RouteInput { .. } => { /* Phase 4 */ }
+//!         CompositorOutput::Quit => break,
+//!     }
+//! }
+//! ```
+
+pub mod background;
+pub mod chrome;
+pub mod layout;
+pub mod render;
+pub mod theme;
+
+pub use background::{BackgroundState, BackgroundStyle, ALL_STYLES, PREVIEW_H, PREVIEW_W};
+pub use chrome::{
+    ChromeOutput, ModelEntry, PaneSummary, RpcRequest, ShellChrome, ShellMode, WindowSummary,
+    MENU_ITEMS, keypress_to_bytes,
+};
+pub use layout::{LayoutTree, PaneId, PaneSource, PaneState};
+
+// ============================================================================
+// CompositorInput / CompositorOutput
+// ============================================================================
+
+/// Events delivered to the compositor from the event loop.
+pub enum CompositorInput {
+    /// ANSI frame bytes from TuiService for a server-managed pane.
+    ServerFrame { pane_id: u32, ansi: Vec<u8> },
+    /// Rendered ANSI bytes from a client-owned ChatApp (Phase 4).
+    AppFrame { app_id: u32, ansi: Vec<u8> },
+    /// Updated window list from TuiService.
+    WindowList(Vec<WindowSummary>),
+    /// A server-managed pane was closed.
+    PaneClosed { pane_id: u32 },
+    /// Keyboard input from the user.
+    KeyPress(waxterm::input::KeyPress),
+    /// Terminal resize.
+    Resize(u16, u16),
+    /// A client-owned ChatApp exited (Phase 4).
+    AppExited { app_id: u32 },
+}
+
+/// Actions returned by `Compositor::handle`.
+pub enum CompositorOutput {
+    /// The compositor state changed — caller should re-render.
+    Redraw,
+    /// A pure RPC request — dispatch to `ShellRpcAdapter` or encode as OSC IPC.
+    Rpc(RpcRequest),
+    /// Route key bytes to a client-owned ChatApp (Phase 4).
+    RouteInput { app_id: u32, data: Vec<u8> },
+    /// Session should exit.
+    Quit,
+}
+
+// ============================================================================
+// Compositor
+// ============================================================================
+
+/// The central compositor state machine.
+pub struct Compositor {
+    pub chrome: ShellChrome,
+    pub layout: LayoutTree,
+    cols: u16,
+    rows: u16,
+}
+
+impl Compositor {
+    pub fn new(
+        cols: u16,
+        rows: u16,
+        session_id: u32,
+        viewer_id: u32,
+        windows: Vec<WindowSummary>,
+        models: Vec<ModelEntry>,
+    ) -> Self {
+        let pane_rows = rows.saturating_sub(3);
+        Self {
+            chrome: ShellChrome::new(cols, pane_rows, session_id, viewer_id, windows, models),
+            layout: LayoutTree::new(cols, pane_rows),
+            cols,
+            rows,
+        }
+    }
+
+    /// The active pane ID (from the focused window's active pane).
+    pub fn active_pane_id(&self) -> u32 {
+        self.chrome.active_pane_id()
+    }
+
+    /// Render the full chrome + pane content into a ratatui frame.
+    pub fn render(&self, frame: &mut ratatui::Frame) {
+        render::draw(frame, &self.chrome, &self.layout);
+    }
+
+    /// Process a compositor input event, returning a list of actions for the
+    /// event loop to dispatch.
+    pub fn handle(&mut self, input: CompositorInput) -> Vec<CompositorOutput> {
+        match input {
+            CompositorInput::ServerFrame { pane_id, ansi } => {
+                let pane = self.layout.get_or_create_server(pane_id);
+                pane.feed(&ansi);
+                vec![CompositorOutput::Redraw]
+            }
+
+            CompositorInput::AppFrame { app_id, ansi } => {
+                if let Some(pane) = self.layout.get_pane_mut(app_id) {
+                    pane.feed(&ansi);
+                    vec![CompositorOutput::Redraw]
+                } else {
+                    vec![]
+                }
+            }
+
+            CompositorInput::WindowList(wins) => {
+                if self.chrome.update_windows(wins) {
+                    vec![CompositorOutput::Redraw]
+                } else {
+                    vec![]
+                }
+            }
+
+            CompositorInput::PaneClosed { pane_id } => {
+                self.layout.remove_pane(pane_id);
+                vec![CompositorOutput::Redraw]
+            }
+
+            CompositorInput::KeyPress(key) => {
+                let chrome_outputs = self.chrome.handle_key(key);
+                chrome_outputs
+                    .into_iter()
+                    .map(|co| match co {
+                        ChromeOutput::Redraw    => CompositorOutput::Redraw,
+                        ChromeOutput::Rpc(req)  => match req {
+                            RpcRequest::Quit    => CompositorOutput::Quit,
+                            other               => CompositorOutput::Rpc(other),
+                        },
+                    })
+                    .collect()
+            }
+
+            CompositorInput::Resize(cols, rows) => {
+                self.cols = cols;
+                self.rows = rows;
+                let pane_rows = rows.saturating_sub(3);
+                self.chrome.cols      = cols;
+                self.chrome.pane_rows = pane_rows;
+                self.layout.resize(cols, pane_rows);
+                vec![CompositorOutput::Redraw]
+            }
+
+            CompositorInput::AppExited { app_id } => {
+                self.layout.remove_pane(app_id);
+                self.chrome.private_panes.remove(&app_id);
+                vec![CompositorOutput::Redraw]
+            }
+        }
+    }
+}

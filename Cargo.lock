@@ -5600,6 +5600,7 @@ dependencies = [
  "hkdf",
  "hmac 0.12.1",
  "http 1.3.1",
+ "hyprstream-compositor",
  "hyprstream-containedfs",
  "hyprstream-flight",
  "hyprstream-metrics",
@@ -5676,6 +5677,17 @@ dependencies = [
  "xdg",
  "zeroize",
  "zmq",
+]
+
+[[package]]
+name = "hyprstream-compositor"
+version = "0.1.0"
+dependencies = [
+ "avt",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "waxterm",
 ]
 
 [[package]]
@@ -5855,13 +5867,20 @@ dependencies = [
 name = "hyprstream-tui"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
+ "anyhow",
  "avt",
  "dirs-next",
+ "hyprstream-compositor",
  "libc",
+ "parking_lot 0.12.4",
+ "rand 0.8.5",
  "ratatui",
  "serde",
  "serde_json",
+ "uuid 1.18.1",
  "waxterm",
+ "zeroize",
 ]
 
 [[package]]

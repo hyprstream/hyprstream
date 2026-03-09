@@ -174,6 +174,25 @@ pub enum IngestionMode {
 }
 
 // ============================================================================
+// Pane Backend
+// ============================================================================
+
+/// How the server manages a pane's content.
+///
+/// Separate from [`PaneSource`](hyprstream_compositor::PaneSource) in the
+/// compositor crate — that type describes the *client-side* source, while this
+/// describes the *server-side* backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaneBackend {
+    /// Server owns the PTY / process (default).
+    #[default]
+    Managed,
+    /// Content is owned by the client; server publishes a `[PRIVATE]`
+    /// placeholder frame to other viewers instead of real cell data.
+    Private,
+}
+
+// ============================================================================
 // TUI Pane
 // ============================================================================
 
@@ -197,6 +216,8 @@ pub struct TuiPane {
     pub ingestion_mode: IngestionMode,
     /// Pane title (set via OSC 0/2).
     pub title: String,
+    /// Server-side backend classification (managed vs. private).
+    pub backend: PaneBackend,
 }
 
 impl TuiPane {
@@ -212,6 +233,7 @@ impl TuiPane {
             cursor: CursorState::default(),
             ingestion_mode: IngestionMode::default(),
             title: String::new(),
+            backend: PaneBackend::default(),
         }
     }
 
