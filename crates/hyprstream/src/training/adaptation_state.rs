@@ -45,6 +45,7 @@ pub struct WritebackInfo {
 }
 
 /// Snapshot returned after eviction (for restoring delta state by the caller).
+#[derive(Debug)]
 pub struct EvictedSnapshot {
     pub pre_snapshot: HashMap<String, Tensor>,
     pub pre_muon: HashMap<String, Tensor>,
@@ -55,6 +56,8 @@ pub struct EvictedSnapshot {
 ///
 /// Stored inside TenantDelta. Replaces the external
 /// `pending_adaptations: Mutex<HashMap<Subject, PendingAdaptation>>`.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum DeltaAdaptationState {
     /// No pending work. Delta holds its last committed state.
     Idle,
@@ -108,6 +111,12 @@ impl DeltaAdaptationState {
         }
 
         // 2. Expired pending: auto-evict silently (guard detected, we clear it)
+        // NOTE: We transition the *state* to Idle but do NOT restore the delta's
+        // LoRA weights here. The expired adaptation's weight changes remain in the
+        // live delta. Weight restoration requires &mut TenantDelta, which will be
+        // threaded through resolve() in the service-layer integration (Task 3/4).
+        // Callers that receive ResolveOutcome::Evicted are responsible for calling
+        // delta.load_state_dict(&snapshot) with whatever snapshot is appropriate.
         if guard.expired && self.is_pending() {
             *self = Self::Idle;
         }
@@ -138,11 +147,7 @@ impl DeltaAdaptationState {
                 *self = Self::Idle;
                 ResolveOutcome::WrittenBack
             }
-            AdaptationStrategy::AutoWriteback => {
-                *self = Self::Idle;
-                ResolveOutcome::Evicted
-            }
-            AdaptationStrategy::AutoEvict => {
+            AdaptationStrategy::AutoWriteback | AdaptationStrategy::AutoEvict => {
                 *self = Self::Idle;
                 ResolveOutcome::Evicted
             }
@@ -157,13 +162,13 @@ impl DeltaAdaptationState {
                 };
                 ResolveOutcome::StoredPending
             }
-            AdaptationStrategy::WritebackIfAbove { threshold } if result.loss_improvement > threshold => {
+            AdaptationStrategy::WritebackIfAbove { threshold } => {
                 *self = Self::Idle;
-                ResolveOutcome::WrittenBack
-            }
-            AdaptationStrategy::WritebackIfAbove { .. } => {
-                *self = Self::Idle;
-                ResolveOutcome::Evicted
+                if result.loss_improvement > threshold {
+                    ResolveOutcome::WrittenBack
+                } else {
+                    ResolveOutcome::Evicted
+                }
             }
         }
     }
@@ -179,7 +184,6 @@ impl DeltaAdaptationState {
                 })
             }
             Self::Idle => {
-                *self = Self::Idle;
                 Err(anyhow!("No pending adaptation to write back"))
             }
         }
@@ -193,7 +197,6 @@ impl DeltaAdaptationState {
                 Ok(EvictedSnapshot { pre_snapshot, pre_muon, pre_eff_ranks })
             }
             Self::Idle => {
-                *self = Self::Idle;
                 Err(anyhow!("No pending adaptation to evict"))
             }
         }
