@@ -215,6 +215,14 @@ pub struct TenantDelta {
     pub last_snapshot_hash: Option<String>,
     /// Weight decay factor (used by Muon's decoupled weight decay)
     pub decay_lambda: f64,
+    /// Per-key effective rank (for narrow-based rank adaptation).
+    /// Key = "layer_idx.module_name", value = active rank (1..=allocated_rank).
+    /// Defaults to the allocated rank for each key.
+    pub effective_ranks: HashMap<String, usize>,
+    /// Per-key maximum (allocated) rank. Set at creation time, never changes.
+    max_ranks: HashMap<String, usize>,
+    /// Alpha value (stored for scaling recalculation on rank change)
+    alpha: f32,
 }
 
 impl TenantDelta {
@@ -255,6 +263,8 @@ impl TenantDelta {
         let mut lora_a = HashMap::new();
         let mut lora_b = HashMap::new();
         let mut scaling_map = HashMap::new();
+        let mut effective_ranks = HashMap::new();
+        let mut max_ranks = HashMap::new();
 
         for layer_idx in 0..num_layers {
             // Determine layer-specific rank and modules
@@ -304,7 +314,11 @@ impl TenantDelta {
                 lora_b.insert(key.clone(), b);
 
                 // Per-key scaling: alpha / layer_rank (C7 fix)
-                scaling_map.insert(key, config.alpha as f64 / layer_rank as f64);
+                scaling_map.insert(key.clone(), config.alpha as f64 / layer_rank as f64);
+
+                // Track effective and max ranks for narrow-based adaptation
+                effective_ranks.insert(key.clone(), layer_rank);
+                max_ranks.insert(key, layer_rank);
             }
         }
 
@@ -353,6 +367,9 @@ impl TenantDelta {
             created_at: now,
             last_snapshot_hash: None,
             decay_lambda: config.decay_lambda,
+            effective_ranks,
+            max_ranks,
+            alpha: config.alpha,
         })
     }
 
@@ -380,10 +397,16 @@ impl TenantDelta {
         // Per-key scaling (C7 fix): use per-key alpha/rank, fall back to global scaling
         let scaling = self.scaling_map.get(&key).copied().unwrap_or(self.scaling);
 
+        // Narrow to effective rank (view, no copy)
+        let eff_rank = self.effective_ranks.get(&key).copied()
+            .unwrap_or(a.size()[0] as usize) as i64;
+        let a_eff = a.narrow(0, 0, eff_rank); // [eff_rank, in_features]
+        let b_eff = b.narrow(1, 0, eff_rank); // [out_features, eff_rank]
+
         let x = x.to_kind(a.kind());
-        let intermediate = x.f_matmul(&a.tr())
+        let intermediate = x.f_matmul(&a_eff.tr())
             .map_err(|e| anyhow!("Delta forward matmul A failed for '{}': {}", key, e))?;
-        let output = intermediate.f_matmul(&b.tr())
+        let output = intermediate.f_matmul(&b_eff.tr())
             .map_err(|e| anyhow!("Delta forward matmul B failed for '{}': {}", key, e))?;
 
         Ok(output * scaling)
@@ -410,10 +433,16 @@ impl TenantDelta {
         // Per-key scaling (C7 fix): use per-key alpha/rank, fall back to global scaling
         let scaling = self.scaling_map.get(&key).copied().unwrap_or(self.scaling);
 
+        // Narrow to effective rank (view, no copy)
+        let eff_rank = self.effective_ranks.get(&key).copied()
+            .unwrap_or(a.size()[0] as usize) as i64;
+        let a_eff = a.narrow(0, 0, eff_rank); // [eff_rank, in_features]
+        let b_eff = b.narrow(1, 0, eff_rank); // [out_features, eff_rank]
+
         let x = x.to_kind(a.kind());
-        let intermediate = x.f_matmul(&a.tr())
+        let intermediate = x.f_matmul(&a_eff.tr())
             .map_err(|e| anyhow!("Delta forward_2d matmul A failed for '{}': {}", key, e))?;
-        let output = intermediate.f_matmul(&b.tr())
+        let output = intermediate.f_matmul(&b_eff.tr())
             .map_err(|e| anyhow!("Delta forward_2d matmul B failed for '{}': {}", key, e))?;
 
         Ok(output * scaling)
@@ -531,6 +560,22 @@ impl TenantDelta {
             if var.grad().defined() {
                 let _ = var.grad().zero_();
             }
+        }
+    }
+
+    /// Get the effective (active) rank for a key. Returns None if key doesn't exist.
+    pub fn effective_rank(&self, key: &str) -> Option<usize> {
+        self.effective_ranks.get(key).copied()
+    }
+
+    /// Set the effective rank for a key. Clamped to [1, max_rank].
+    /// Also updates the scaling factor for this key (alpha / effective_rank).
+    pub fn set_effective_rank(&mut self, key: &str, rank: usize) {
+        if let Some(&max_r) = self.max_ranks.get(key) {
+            let clamped = rank.clamp(1, max_r);
+            self.effective_ranks.insert(key.to_owned(), clamped);
+            // Recalculate scaling: alpha / effective_rank
+            self.scaling_map.insert(key.to_owned(), self.alpha as f64 / clamped as f64);
         }
     }
 }
@@ -682,6 +727,9 @@ impl TenantDelta {
             created_at: now,
             last_snapshot_hash: None,
             decay_lambda: 0.0,
+            effective_ranks: HashMap::new(),
+            max_ranks: HashMap::new(),
+            alpha: 1.0, // Already pre-scaled during composition
         }))
     }
 }
@@ -846,6 +894,13 @@ impl TenantDelta {
             })
             .collect();
 
+        // Build effective_ranks and max_ranks from loaded A matrices
+        let effective_ranks: HashMap<String, usize> = lora_a
+            .iter()
+            .map(|(key, a)| (key.clone(), a.size()[0] as usize))
+            .collect();
+        let max_ranks = effective_ranks.clone();
+
         Ok(Self {
             lora_a,
             lora_b,
@@ -867,6 +922,9 @@ impl TenantDelta {
             created_at: now,
             last_snapshot_hash: None,
             decay_lambda: 0.0,
+            effective_ranks,
+            max_ranks,
+            alpha,
         })
     }
 }
@@ -1135,5 +1193,86 @@ mod tests {
         assert!(delta.has_module("q_proj", 1));
         assert!(delta.has_module("v_proj", 0));
         assert!(!delta.has_module("gate_proj", 0)); // not a target module
+    }
+
+    #[test]
+    fn test_effective_rank_default_is_max() {
+        let config = TenantDeltaConfig { rank: 8, ..Default::default() };
+        let dims = test_module_dims();
+        let delta = TenantDelta::new(&config, &dims, Device::Cpu, TEST_NUM_LAYERS).unwrap();
+
+        // Default effective rank should equal allocated rank
+        assert_eq!(delta.effective_rank("0.q_proj"), Some(8));
+        assert_eq!(delta.effective_rank("0.v_proj"), Some(8));
+        assert_eq!(delta.effective_rank("99.nonexistent"), None);
+    }
+
+    #[test]
+    fn test_effective_rank_forward() {
+        let config = TenantDeltaConfig { rank: 8, ..Default::default() };
+        let dims = test_module_dims();
+        let mut delta = TenantDelta::new(&config, &dims, Device::Cpu, TEST_NUM_LAYERS).unwrap();
+
+        let x = Tensor::randn([2, 512], (Kind::Float, Device::Cpu));
+
+        // Full rank forward
+        let out_full = delta.forward_2d(&x, "q_proj", 0).unwrap();
+        assert_eq!(out_full.size(), &[2, 512]);
+
+        // Set effective rank to 4 (half)
+        delta.set_effective_rank("0.q_proj", 4);
+        let out_narrow = delta.forward_2d(&x, "q_proj", 0).unwrap();
+        assert_eq!(out_narrow.size(), &[2, 512]); // output shape unchanged
+    }
+
+    #[test]
+    fn test_set_effective_rank_clamped() {
+        let config = TenantDeltaConfig { rank: 8, ..Default::default() };
+        let dims = test_module_dims();
+        let mut delta = TenantDelta::new(&config, &dims, Device::Cpu, TEST_NUM_LAYERS).unwrap();
+
+        // Setting eff_rank above max_rank should clamp to max
+        delta.set_effective_rank("0.q_proj", 32);
+        assert_eq!(delta.effective_rank("0.q_proj"), Some(8)); // clamped to allocated
+
+        // Setting eff_rank to 0 should clamp to 1 (minimum)
+        delta.set_effective_rank("0.q_proj", 0);
+        assert_eq!(delta.effective_rank("0.q_proj"), Some(1));
+    }
+
+    #[test]
+    fn test_effective_rank_scaling_adjusts() {
+        let config = TenantDeltaConfig { rank: 8, alpha: 4.0, ..Default::default() };
+        let dims = test_module_dims();
+        let mut delta = TenantDelta::new(&config, &dims, Device::Cpu, TEST_NUM_LAYERS).unwrap();
+
+        // Original scaling: alpha / rank = 4.0 / 8 = 0.5
+        let s0 = *delta.scaling_map.get("0.q_proj").unwrap();
+        assert!((s0 - 0.5).abs() < 1e-9);
+
+        // Set effective rank to 4 -> scaling should be alpha / eff_rank = 4.0 / 4 = 1.0
+        delta.set_effective_rank("0.q_proj", 4);
+        let s1 = *delta.scaling_map.get("0.q_proj").unwrap();
+        assert!((s1 - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_effective_rank_with_layer_overrides() {
+        let mut overrides = HashMap::new();
+        overrides.insert(0, LayerDeltaConfig {
+            rank: 16,
+            target_modules: vec!["q_proj".to_owned(), "v_proj".to_owned()],
+        });
+        let config = TenantDeltaConfig {
+            rank: 8,
+            layer_overrides: Some(overrides),
+            ..Default::default()
+        };
+        let dims = test_module_dims();
+        let delta = TenantDelta::new(&config, &dims, Device::Cpu, TEST_NUM_LAYERS).unwrap();
+
+        // Layer 0 allocated at 16, layer 1 at default 8
+        assert_eq!(delta.effective_rank("0.q_proj"), Some(16));
+        assert_eq!(delta.effective_rank("1.q_proj"), Some(8));
     }
 }
