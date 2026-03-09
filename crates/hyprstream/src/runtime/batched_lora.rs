@@ -213,6 +213,7 @@ mod tests {
             learning_rate: 3e-4,
             max_accumulated_steps: 300,
             decay_lambda: 0.02,
+            muon_momentum: 0.95,
             layer_overrides: None,
         };
 

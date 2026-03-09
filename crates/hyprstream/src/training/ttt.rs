@@ -371,7 +371,8 @@ impl TestTimeTrainer {
             let _guard = tch::no_grad_guard();
             for var in delta.vs.trainable_variables() {
                 if var.grad().defined() {
-                    let _ = var.grad().mul_(clip_coef);
+                    let clipped = &var.grad() * clip_coef;
+                    var.grad().copy_(&clipped);
                 }
             }
         }
