@@ -37,48 +37,50 @@ pub fn get_templates() -> &'static [PolicyTemplate] {
             name: "public-inference",
             description: "Anonymous users can infer and query models",
             rules: Some(r#"# Public inference access
-p, anonymous, *, model:*, infer, allow
-p, anonymous, *, model:*, query, allow
+p, anonymous, *, model:*, infer.generate, allow
+p, anonymous, *, model:*, query.status, allow
 "#),
         },
         PolicyTemplate {
             name: "public-read",
             description: "Anonymous users can query the registry (read-only)",
             rules: Some(r#"# Public read access (registry only)
-p, anonymous, *, registry:*, query, allow
+p, anonymous, *, registry:*, query.status, allow
 "#),
         },
         PolicyTemplate {
             name: "ttt.user",
-            description: "TTT user: infer, query, write, and manage access on all models",
+            description: "TTT user: infer, query, persist on all models",
             rules: Some(
-                r#"# TTT user — infer, query, write, manage on all models
-# NOTE: 'manage' scope covers both ttt.zero (resetDelta) and shutdown.
-# Task 11 will replace this with per-operation policies that gate shutdown
-# separately from delta management operations.
-p, ttt.user, *, model:*, infer, allow
-p, ttt.user, *, model:*, query, allow
-p, ttt.user, *, model:*, write, allow
-p, ttt.user, *, model:*, manage, allow
+                r#"# TTT user — infer, query, persist on all models
+p, ttt.user, *, model:*, infer.generate, allow
+p, ttt.user, *, model:*, query.status, allow
+p, ttt.user, *, model:*, query.delta, allow
+p, ttt.user, *, model:*, persist.save, allow
+p, ttt.user, *, model:*, persist.export, allow
+p, ttt.user, *, model:*, persist.snapshot, allow
 "#,
             ),
         },
         PolicyTemplate {
             name: "ttt.agent",
-            description: "TTT agent: alias for ttt.user (compound ops via generateStream; no direct delta manipulation until Task 11)",
+            description: "TTT agent: alias for ttt.user",
             rules: Some(
-                r#"# ttt.agent is an alias for ttt.user (interim; Task 11 will restrict to compound ops only)
+                r#"# ttt.agent is an alias for ttt.user
 g, ttt.agent, ttt.user
 "#,
             ),
         },
         PolicyTemplate {
             name: "ttt.privileged",
-            description: "TTT privileged: extends ttt.user with train scope for direct delta manipulation",
+            description: "TTT privileged: extends ttt.user with ttt.* operations",
             rules: Some(
-                r#"# ttt.privileged inherits ttt.user and adds train scope
+                r#"# ttt.privileged inherits ttt.user and adds ttt.* operations
 g, ttt.privileged, ttt.user
-p, ttt.privileged, *, model:*, train, allow
+p, ttt.privileged, *, model:*, ttt.train, allow
+p, ttt.privileged, *, model:*, ttt.writeback, allow
+p, ttt.privileged, *, model:*, ttt.evict, allow
+p, ttt.privileged, *, model:*, ttt.zero, allow
 "#,
             ),
         },
