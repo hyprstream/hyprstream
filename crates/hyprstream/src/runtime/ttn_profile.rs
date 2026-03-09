@@ -9,7 +9,7 @@
 //!
 //! Ported from `tnn-transformer-1/src/entropy.py` and `attention_analysis.py`.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -516,6 +516,239 @@ pub fn attention_sparsity(attn_weights: &Tensor, top_k: i64) -> Tensor {
     top_vals.sum_dim_intlist(&[-1i64][..], false, None)
 }
 
+// ============================================================================
+// W-SLC Online Rank Allocator
+// ============================================================================
+
+/// Compute median of a sorted f64 slice.
+///
+/// For even-length arrays, returns average of the two middle values
+/// (matching NumPy's default behavior).
+fn median_sorted(sorted: &[f64]) -> f64 {
+    let n = sorted.len();
+    if n % 2 == 1 {
+        sorted[n / 2]
+    } else {
+        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+    }
+}
+
+/// Simulate online rank allocation for streaming SLC.
+///
+/// All algorithms operate under a per-step budget constraint:
+/// `sum of ranks per step <= median(rank_levels) * L`.
+///
+/// Ported from `qonk/experiments/ttn-transformer/src/wasserstein_slc.py:online_rank_allocator`.
+///
+/// # Arguments
+/// * `entropy_trajectory` - `T` timesteps, each with `L` layer entropies
+/// * `rank_levels` - Available rank levels (e.g., `[1, 2, 4, 8]`)
+/// * `algorithm` - `"greedy"`, `"balanced"`, or `"offline_optimal"`
+///
+/// # Returns
+/// `(allocation, total_cost)` where allocation is T×L assigned ranks
+///
+/// # Errors
+/// - Empty inputs (no timesteps, no layers, no rank levels)
+/// - Unknown algorithm name
+/// - `"offline_optimal"` with non-integer budget
+pub fn online_rank_allocator(
+    entropy_trajectory: &[Vec<f64>],
+    rank_levels: &[usize],
+    algorithm: &str,
+) -> Result<(Vec<Vec<f64>>, f64)> {
+    // Validate inputs
+    if entropy_trajectory.is_empty() {
+        return Err(anyhow!("Empty entropy trajectory"));
+    }
+    if rank_levels.is_empty() {
+        return Err(anyhow!("Empty rank levels"));
+    }
+    let l = entropy_trajectory[0].len();
+    if l == 0 {
+        return Err(anyhow!("Empty layer dimension"));
+    }
+
+    let mut ranks: Vec<f64> = rank_levels.iter().map(|&r| r as f64).collect();
+    ranks.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let budget = median_sorted(&ranks) * l as f64;
+    let t = entropy_trajectory.len();
+    let mut allocation = vec![vec![0.0f64; l]; t];
+
+    match algorithm {
+        "greedy" => {
+            for ti in 0..t {
+                // Assign closest rank per layer
+                for li in 0..l {
+                    let mut best_idx = 0;
+                    let mut best_dist = f64::MAX;
+                    for (ri, &r) in ranks.iter().enumerate() {
+                        let d = (r - entropy_trajectory[ti][li]).abs();
+                        if d < best_dist {
+                            best_dist = d;
+                            best_idx = ri;
+                        }
+                    }
+                    allocation[ti][li] = ranks[best_idx];
+                }
+                // Budget enforcement with iteration guard
+                let max_iters = l * ranks.len();
+                for _ in 0..max_iters {
+                    let sum: f64 = allocation[ti].iter().sum();
+                    if sum <= budget {
+                        break;
+                    }
+                    // Reduce highest-rank layer
+                    let l_max = allocation[ti]
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                        .map(|(i, _)| i)
+                        .unwrap();
+                    let current_idx = ranks
+                        .iter()
+                        .position(|&r| (r - allocation[ti][l_max]).abs() < 1e-9);
+                    if let Some(ci) = current_idx {
+                        if ci > 0 {
+                            allocation[ti][l_max] = ranks[ci - 1];
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        "balanced" => {
+            // Mean entropy across time per layer
+            let mut mean_entropy = vec![0.0f64; l];
+            for ti in 0..t {
+                for li in 0..l {
+                    mean_entropy[li] += entropy_trajectory[ti][li];
+                }
+            }
+            for li in 0..l {
+                mean_entropy[li] /= t as f64;
+            }
+
+            // Assign closest rank per layer (uniform across time)
+            let mut base_alloc = vec![0.0f64; l];
+            for li in 0..l {
+                let mut best_idx = 0;
+                let mut best_dist = f64::MAX;
+                for (ri, &r) in ranks.iter().enumerate() {
+                    let d = (r - mean_entropy[li]).abs();
+                    if d < best_dist {
+                        best_dist = d;
+                        best_idx = ri;
+                    }
+                }
+                base_alloc[li] = ranks[best_idx];
+            }
+            // Budget enforcement
+            let max_iters = l * ranks.len();
+            for _ in 0..max_iters {
+                let sum: f64 = base_alloc.iter().sum();
+                if sum <= budget {
+                    break;
+                }
+                let l_max = base_alloc
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .map(|(i, _)| i)
+                    .unwrap();
+                let current_idx = ranks
+                    .iter()
+                    .position(|&r| (r - base_alloc[l_max]).abs() < 1e-9);
+                if let Some(ci) = current_idx {
+                    if ci > 0 {
+                        base_alloc[l_max] = ranks[ci - 1];
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            for ti in 0..t {
+                allocation[ti] = base_alloc.clone();
+            }
+        }
+        "offline_optimal" => {
+            let budget_int = budget as usize;
+            if (budget_int as f64 - budget).abs() > 1e-9 {
+                return Err(anyhow!(
+                    "offline_optimal requires integer budget, got {budget} \
+                     (from median({ranks:?}) * {l}). Use greedy or balanced instead."
+                ));
+            }
+            for ti in 0..t {
+                let entropies = &entropy_trajectory[ti];
+                let inf = f64::MAX;
+                let mut dp_cost = vec![inf; budget_int + 1];
+                let mut dp_alloc = vec![vec![0.0f64; l]; budget_int + 1];
+                // Initialize: layer 0
+                for &r in &ranks {
+                    let ri = r as usize;
+                    if ri <= budget_int {
+                        let c = (entropies[0] - r).abs();
+                        if c < dp_cost[ri] {
+                            dp_cost[ri] = c;
+                            dp_alloc[ri][0] = r;
+                        }
+                    }
+                }
+                // Extend: layers 1..L-1
+                for li in 1..l {
+                    let mut new_cost = vec![inf; budget_int + 1];
+                    let mut new_alloc = vec![vec![0.0f64; l]; budget_int + 1];
+                    for b in 0..=budget_int {
+                        if dp_cost[b] == inf {
+                            continue;
+                        }
+                        for &r in &ranks {
+                            let ri = r as usize;
+                            let nb = b + ri;
+                            if nb > budget_int {
+                                continue;
+                            }
+                            let c = dp_cost[b] + (entropies[li] - r).abs();
+                            if c < new_cost[nb] {
+                                new_cost[nb] = c;
+                                new_alloc[nb] = dp_alloc[b].clone();
+                                new_alloc[nb][li] = r;
+                            }
+                        }
+                    }
+                    dp_cost = new_cost;
+                    dp_alloc = new_alloc;
+                }
+                // Find best total budget usage
+                let best_b = dp_cost
+                    .iter()
+                    .enumerate()
+                    .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .map(|(i, _)| i)
+                    .unwrap();
+                allocation[ti] = dp_alloc[best_b].clone();
+            }
+        }
+        _ => return Err(anyhow!("Unknown algorithm: {algorithm:?}")),
+    }
+
+    let cost: f64 = (0..t)
+        .map(|ti| {
+            (0..l)
+                .map(|li| (entropy_trajectory[ti][li] - allocation[ti][li]).abs())
+                .sum::<f64>()
+        })
+        .sum();
+
+    Ok((allocation, cost))
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -589,5 +822,101 @@ mod tests {
         // B = 0 → product is 0 → utilization should be 0
         let util = delta_rank_utilization(&a, &b);
         assert_eq!(util, 0.0);
+    }
+
+    // --- W-SLC Online Rank Allocator Tests ---
+
+    #[test]
+    fn test_greedy_allocator_basic() {
+        let entropy = vec![vec![6.0, 2.0, 4.0], vec![3.0, 7.0, 1.0]];
+        let ranks = vec![1, 2, 4, 8];
+        let (alloc, cost) = online_rank_allocator(&entropy, &ranks, "greedy").unwrap();
+        assert_eq!(alloc.len(), 2);
+        assert_eq!(alloc[0].len(), 3);
+        // Each row sum must be <= budget (median(ranks) * L = 3 * 3 = 9)
+        for row in &alloc {
+            let sum: f64 = row.iter().sum();
+            assert!(sum <= 9.0 + 1e-9, "Row sum {sum} exceeds budget 9.0");
+        }
+        assert!(cost >= 0.0);
+    }
+
+    #[test]
+    fn test_balanced_allocator_uniform_across_time() {
+        let entropy = vec![vec![4.0, 4.0], vec![4.0, 4.0]];
+        let ranks = vec![1, 2, 4, 8];
+        let (alloc, _) = online_rank_allocator(&entropy, &ranks, "balanced").unwrap();
+        // Balanced should assign same allocation to both timesteps
+        assert_eq!(alloc[0], alloc[1]);
+    }
+
+    #[test]
+    fn test_dp_optimal_beats_greedy() {
+        let entropy = vec![vec![7.5, 1.5, 1.5]];
+        let ranks = vec![1, 2, 4, 8];
+        let (_, cost_greedy) = online_rank_allocator(&entropy, &ranks, "greedy").unwrap();
+        let (alloc_dp, cost_dp) =
+            online_rank_allocator(&entropy, &ranks, "offline_optimal").unwrap();
+        assert!(
+            cost_dp <= cost_greedy + 1e-9,
+            "DP cost {cost_dp} should be <= greedy cost {cost_greedy}"
+        );
+        for row in &alloc_dp {
+            let sum: f64 = row.iter().sum();
+            assert!(sum <= 9.0 + 1e-9);
+        }
+    }
+
+    #[test]
+    fn test_budget_enforcement() {
+        let entropy = vec![vec![8.0, 8.0, 8.0, 8.0]]; // all want max rank
+        let ranks = vec![1, 2, 4, 8];
+        let budget = 3.0 * 4.0; // median(1,2,4,8)=3 * L=4 = 12
+        for algo in &["greedy", "balanced", "offline_optimal"] {
+            let (alloc, _) = online_rank_allocator(&entropy, &ranks, algo).unwrap();
+            let sum: f64 = alloc[0].iter().sum();
+            assert!(sum <= budget + 1e-9, "{algo}: sum {sum} > budget {budget}");
+        }
+    }
+
+    #[test]
+    fn test_unknown_algorithm_errors() {
+        let entropy = vec![vec![1.0]];
+        let ranks = vec![1, 2, 4];
+        assert!(online_rank_allocator(&entropy, &ranks, "unknown").is_err());
+    }
+
+    #[test]
+    fn test_empty_inputs_error() {
+        // Empty trajectory
+        assert!(online_rank_allocator(&[], &[1, 2, 4], "greedy").is_err());
+        // Empty rank levels
+        assert!(online_rank_allocator(&[vec![1.0]], &[], "greedy").is_err());
+        // Empty layers
+        assert!(online_rank_allocator(&[vec![]], &[1, 2, 4], "greedy").is_err());
+    }
+
+    #[test]
+    fn test_median_even_length() {
+        let entropy = vec![vec![3.0]]; // 1 layer, wants rank 3
+        let ranks = vec![1, 2, 4, 8];
+        let (alloc, _) = online_rank_allocator(&entropy, &ranks, "greedy").unwrap();
+        // budget = median(1,2,4,8) * 1 = 3.0; closest rank to 3.0 is 2 or 4
+        let sum: f64 = alloc[0].iter().sum();
+        assert!(
+            sum <= 3.0 + 1e-9,
+            "Budget should use median=3.0 for even-length ranks"
+        );
+    }
+
+    #[test]
+    fn test_dp_non_integer_budget_errors() {
+        let entropy = vec![vec![1.0]];
+        let ranks = vec![1, 2];
+        // greedy/balanced work fine with fractional budget
+        assert!(online_rank_allocator(&entropy, &ranks, "greedy").is_ok());
+        assert!(online_rank_allocator(&entropy, &ranks, "balanced").is_ok());
+        // DP should return error, not panic
+        assert!(online_rank_allocator(&entropy, &ranks, "offline_optimal").is_err());
     }
 }
