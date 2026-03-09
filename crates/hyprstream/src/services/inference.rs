@@ -54,7 +54,6 @@ use capnp::serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 use parking_lot::Mutex;
 use tokio::runtime::Handle;
 use tokenizers::Tokenizer;
@@ -161,8 +160,6 @@ pub struct InferenceServiceInner {
     /// Base LoRA delta loaded from a .safetensors adapter file.
     /// Applied to all tenants (composed with per-tenant delta if both exist).
     base_delta: Mutex<Option<Arc<Mutex<crate::training::TenantDelta>>>>,
-    /// Pending adaptations awaiting client commit/rollback
-    pending_adaptations: Mutex<std::collections::HashMap<Subject, PendingAdaptation>>,
     /// Optional WorktreeClient for worktree-scoped file operations.
     /// When present, adapter/snapshot writes use contained-root access.
     fs: Option<WorktreeClient>,
@@ -202,22 +199,6 @@ impl std::ops::Deref for InferenceService {
 // TestTimeTrainer, etc.) which all have `unsafe impl Send + Sync`.
 unsafe impl Send for InferenceServiceInner {}
 unsafe impl Sync for InferenceServiceInner {}
-
-/// A pending TTT adaptation awaiting client commit or rollback
-struct PendingAdaptation {
-    /// Delta state before adaptation (for rollback)
-    pre_adaptation_state: std::collections::HashMap<String, tch::Tensor>,
-    /// Muon momentum buffers before adaptation (for rollback)
-    pre_muon_states: std::collections::HashMap<String, tch::Tensor>,
-    /// Effective ranks before adaptation (for rollback if oracle auto-adapted)
-    pre_effective_ranks: std::collections::HashMap<String, usize>,
-    /// The TTT result from the adaptation
-    ttt_result: crate::training::ttt::TTTResult,
-    /// When the adaptation was created
-    created_at: Instant,
-    /// Auto-rollback after this timeout (default: 60s, configurable via TTTConfig.pending_rollback_ms)
-    timeout_ms: u64,
-}
 
 /// Delta status information returned by getDeltaStatus
 pub struct DeltaStatusInfo {
@@ -457,9 +438,6 @@ impl InferenceService {
     async fn handle_callback_infer(&mut self, request_data: &[u8])
         -> Result<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)>
     {
-        // FIX-3: sweep expired pending adaptations on the callback path (symmetric with ZMQ path)
-        self.cleanup_expired_adaptations();
-
         // Parse InferenceRequest
         let reader = serialize::read_message(
             &mut std::io::Cursor::new(request_data),
@@ -671,7 +649,6 @@ impl InferenceService {
                 tokenizer,
                 delta_pool,
                 base_delta: Mutex::new(None),
-                pending_adaptations: Mutex::new(std::collections::HashMap::new()),
                 fs,
                 zmq_context: global_context(),
                 transport: hyprstream_rpc::transport::TransportConfig::inproc("inference-unset"),
@@ -824,8 +801,7 @@ impl InferenceService {
                         debug!("TTT: auto-rolled back adaptation for subject {}", subject);
                     }
                     crate::training::ResolveOutcome::StoredPending => {
-                        // Pending state is now stored inside delta.adaptation_state.
-                        // No insert into self.pending_adaptations needed.
+                        // Pending state is stored inside delta.adaptation_state.
                         result.pending = true;
                         debug!("TTT: stored pending adaptation for subject {}", subject);
                     }
@@ -1379,81 +1355,45 @@ impl InferenceService {
     // Training loop control handlers (tenant-aware TTT)
     // =========================================================================
 
-    /// Commit a pending TTT adaptation
-    fn handle_commit_adaptation(&self, subject: &Subject) -> Result<()> {
-        let mut pending = self.pending_adaptations.lock();
-
-        let adaptation = pending.remove(subject)
-            .ok_or_else(|| anyhow!("No pending adaptation for subject '{}'", subject))?;
-
-        // Get the subject's delta and update accumulation stats
+    /// Write back a pending TTT adaptation (commit path)
+    fn handle_writeback(&self, subject: &Subject) -> Result<()> {
         if let Some(pool) = &self.delta_pool {
             if let Some(delta_arc) = pool.get(subject) {
                 let mut delta = delta_arc.lock();
-                delta.accumulated_steps += adaptation.ttt_result.steps_performed as u64;
+                let info = delta.adaptation_state.writeback_stats()?;
+                delta.accumulated_steps += info.steps_performed as u64;
                 delta.request_count += 1;
                 let n = delta.request_count as f64;
                 delta.avg_loss_improvement = delta.avg_loss_improvement * ((n - 1.0) / n)
-                    + adaptation.ttt_result.loss_improvement as f64 / n;
+                    + info.loss_improvement as f64 / n;
+                debug!("Wrote back adaptation for '{}': steps={}, improvement={:.4}",
+                    subject, info.steps_performed, info.loss_improvement);
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("No delta found for subject '{}'", subject))
             }
-        }
-
-        debug!(
-            "Committed adaptation for subject '{}': steps={}, improvement={:.4}",
-            subject, adaptation.ttt_result.steps_performed, adaptation.ttt_result.loss_improvement
-        );
-
-        Ok(())
-    }
-
-    /// Clean up expired pending adaptations (auto-rollback after timeout)
-    fn cleanup_expired_adaptations(&self) {
-        let mut pending = self.pending_adaptations.lock();
-        let expired: Vec<Subject> = pending.iter()
-            .filter(|(_, a)| a.created_at.elapsed().as_millis() as u64 > a.timeout_ms)
-            .map(|(s, _)| s.clone())
-            .collect();
-
-        for subject in expired {
-            if let Some(adaptation) = pending.remove(&subject) {
-                // Restore delta to pre-adaptation state (weights, Muon momentum, effective ranks)
-                if let Some(pool) = &self.delta_pool {
-                    if let Some(delta_arc) = pool.get(&subject) {
-                        let mut delta = delta_arc.lock();
-                        if let Err(e) = delta.load_state_dict(&adaptation.pre_adaptation_state) {
-                            warn!("Failed to rollback expired adaptation for '{}': {}", subject, e);
-                        }
-                        crate::training::muon::restore_muon_states(&mut delta.muon_states, &adaptation.pre_muon_states);
-                        delta.effective_ranks = adaptation.pre_effective_ranks.clone();
-                    }
-                }
-                warn!(
-                    "Auto-rolled back expired adaptation for '{}' (timeout {}ms)",
-                    subject, adaptation.timeout_ms
-                );
-            }
+        } else {
+            Err(anyhow::anyhow!("No delta pool configured"))
         }
     }
 
-    /// Rollback a pending TTT adaptation
-    fn handle_rollback_adaptation(&self, subject: &Subject) -> Result<()> {
-        let mut pending = self.pending_adaptations.lock();
-
-        let adaptation = pending.remove(subject)
-            .ok_or_else(|| anyhow!("No pending adaptation for subject '{}'", subject))?;
-
-        // Restore delta to pre-adaptation state (weights, Muon momentum, effective ranks)
+    /// Evict a pending TTT adaptation (rollback path)
+    fn handle_evict(&self, subject: &Subject) -> Result<()> {
         if let Some(pool) = &self.delta_pool {
             if let Some(delta_arc) = pool.get(subject) {
                 let mut delta = delta_arc.lock();
-                delta.load_state_dict(&adaptation.pre_adaptation_state)?;
-                crate::training::muon::restore_muon_states(&mut delta.muon_states, &adaptation.pre_muon_states);
-                delta.effective_ranks = adaptation.pre_effective_ranks.clone();
+                let snapshot = delta.adaptation_state.evict()?;
+                let _ = delta.load_state_dict(&snapshot.pre_snapshot);
+                crate::training::muon::restore_muon_states(&mut delta.muon_states, &snapshot.pre_muon);
+                delta.effective_ranks = snapshot.pre_eff_ranks;
+                debug!("Evicted adaptation for subject '{}'", subject);
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("No delta found for subject '{}'", subject))
             }
+        } else {
+            Err(anyhow::anyhow!("No delta pool configured"))
         }
-
-        debug!("Rolled back adaptation for subject '{}'", subject);
-        Ok(())
     }
 
     /// Run pure training steps without generation
@@ -1553,9 +1493,6 @@ impl InferenceService {
 
     /// Reset a tenant's delta to zeros
     fn handle_reset_delta(&self, subject: &Subject) -> Result<()> {
-        // Clear any pending adaptation
-        self.pending_adaptations.lock().remove(subject);
-
         if let Some(pool) = &self.delta_pool {
             if let Some(delta_arc) = pool.get(subject) {
                 let mut delta = delta_arc.lock();
@@ -1571,12 +1508,11 @@ impl InferenceService {
 
     /// Get status of a tenant's delta
     fn handle_get_delta_status(&self, subject: &Subject) -> Result<DeltaStatusInfo> {
-        let has_pending = self.pending_adaptations.lock().contains_key(subject);
-
         if let Some(pool) = &self.delta_pool {
             if let Some(delta_arc) = pool.get(subject) {
                 let delta = delta_arc.lock();
                 let norm_ratios = delta.delta_norm_ratio(pool.base_weight_norms());
+                let has_pending = delta.adaptation_state.is_pending();
                 return Ok(DeltaStatusInfo {
                     exists: true,
                     accumulated_steps: delta.accumulated_steps,
@@ -2246,15 +2182,13 @@ impl InferenceHandler for InferenceService {
 
     async fn handle_commit_adaptation(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
         let subject = ctx.subject();
-        // Commit before cleanup: prevents cleanup from expiring the entry we're about to commit
-        InferenceService::handle_commit_adaptation(self, &subject)?;
-        self.cleanup_expired_adaptations();
+        InferenceService::handle_writeback(self, &subject)?;
         Ok(InferenceResponseVariant::CommitAdaptationResult)
     }
 
     async fn handle_rollback_adaptation(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
         let subject = ctx.subject();
-        InferenceService::handle_rollback_adaptation(self, &subject)?;
+        InferenceService::handle_evict(self, &subject)?;
         Ok(InferenceResponseVariant::RollbackAdaptationResult)
     }
 
@@ -2543,7 +2477,6 @@ impl hyprstream_rpc::service::ZmqService for InferenceZmqAdapter {
         ctx: &EnvelopeContext,
         payload: &[u8],
     ) -> anyhow::Result<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
-        self.service.cleanup_expired_adaptations();
         dispatch_inference(&self.service, ctx, payload).await
     }
 
