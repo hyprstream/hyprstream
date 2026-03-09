@@ -91,8 +91,8 @@ enum PendingWork {
         gradient_steps: u32,
         /// Learning rate override (0 = use default)
         learning_rate: f32,
-        /// Whether to auto-commit if quality gate passes
-        auto_commit: bool,
+        /// How to handle the adaptation result
+        adaptation_strategy: crate::training::adaptation_state::AdaptationStrategy,
     },
 }
 
@@ -779,11 +779,7 @@ impl InferenceService {
                 }
 
                 // Map overrides to AdaptationStrategy and drive the state machine.
-                let strategy = if overrides.auto_commit {
-                    crate::training::AdaptationStrategy::AutoWriteback
-                } else {
-                    crate::training::AdaptationStrategy::Speculative
-                };
+                let strategy = overrides.adaptation_strategy.clone();
 
                 // Build guard status for state machine.
                 let guard = crate::training::GuardStatus {
@@ -1086,7 +1082,7 @@ impl InferenceService {
     /// Runs the training step in the background and publishes results via StreamChannel.
     /// This avoids REQ/REP timeout on long-running training (e.g., backward pass compilation).
     async fn execute_training_stream(&self, pending: PendingWork) {
-        let PendingWork::Training { stream_ctx, subject, input, gradient_steps, learning_rate, auto_commit } = pending else {
+        let PendingWork::Training { stream_ctx, subject, input, gradient_steps, learning_rate, adaptation_strategy } = pending else {
             error!("execute_training_stream called with non-Training PendingWork");
             return;
         };
@@ -1110,7 +1106,7 @@ impl InferenceService {
                 let _ = publisher.publish_error("cancelled").await;
                 return (publisher, Ok(()));
             }
-            let result = match self.handle_train_step(&subject, &input, gradient_steps, learning_rate, auto_commit).await {
+            let result = match self.handle_train_step(&subject, &input, gradient_steps, learning_rate, adaptation_strategy).await {
                 Ok(result) => {
                     // Serialize training result as JSON for the completion payload
                     let payload = serde_json::to_vec(&result)
@@ -1425,7 +1421,7 @@ impl InferenceService {
         input: &str,
         gradient_steps: u32,
         learning_rate: f32,
-        auto_commit: bool,
+        strategy: crate::training::adaptation_state::AdaptationStrategy,
     ) -> Result<crate::training::ttt::TTTResult> {
         let ttt_trainer = self.ttt_trainer.as_ref()
             .ok_or_else(|| anyhow!("TTT not configured"))?;
@@ -1461,12 +1457,7 @@ impl InferenceService {
         let mut delta = delta_arc.lock();
         let mut result = ttt_trainer.train_step(&engine, &mut delta, &input_tokens, steps, lr, None)?;
 
-        // Map auto_commit to strategy
-        let strategy = if auto_commit {
-            crate::training::AdaptationStrategy::AutoWriteback
-        } else {
-            crate::training::AdaptationStrategy::Speculative
-        };
+        // strategy is passed in directly from the caller
 
         // Build guard status
         let guard = crate::training::GuardStatus {
@@ -1982,6 +1973,29 @@ use crate::services::generated::inference_client::{
 // Conflicting names — use canonical path at usage sites:
 //   inference_client::GenerationResult, inference_client::ModelInfo, inference_client::StreamInfo
 
+/// Map a capnp AdaptationStrategyEnum + optional threshold to the internal AdaptationStrategy.
+fn map_adaptation_strategy(
+    capnp_strategy: AdaptationStrategyEnum,
+    writeback_threshold: f32,
+) -> crate::training::adaptation_state::AdaptationStrategy {
+    match capnp_strategy {
+        AdaptationStrategyEnum::AutoWriteback => {
+            crate::training::adaptation_state::AdaptationStrategy::AutoWriteback
+        }
+        AdaptationStrategyEnum::AutoEvict => {
+            crate::training::adaptation_state::AdaptationStrategy::AutoEvict
+        }
+        AdaptationStrategyEnum::Speculative => {
+            crate::training::adaptation_state::AdaptationStrategy::Speculative
+        }
+        AdaptationStrategyEnum::WritebackIfAbove => {
+            crate::training::adaptation_state::AdaptationStrategy::WritebackIfAbove {
+                threshold: writeback_threshold,
+            }
+        }
+    }
+}
+
 #[async_trait::async_trait(?Send)]
 impl InferenceHandler for InferenceService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
@@ -2026,7 +2040,7 @@ impl InferenceHandler for InferenceService {
             enabled: if data.ttt_enabled { Some(true) } else { None },
             gradient_steps: if data.ttt_gradient_steps > 0 { Some(data.ttt_gradient_steps) } else { None },
             learning_rate: if data.ttt_learning_rate > 0.0 { Some(data.ttt_learning_rate) } else { None },
-            auto_commit: matches!(data.adaptation_strategy, AdaptationStrategyEnum::AutoWriteback),
+            adaptation_strategy: map_adaptation_strategy(data.adaptation_strategy, data.writeback_threshold),
             max_adaptation_ms: None,
         };
 
@@ -2257,13 +2271,14 @@ impl InferenceHandler for InferenceService {
             server_pubkey,
         };
 
+        let adaptation_strategy = map_adaptation_strategy(data.adaptation_strategy, data.writeback_threshold);
         let pending = PendingWork::Training {
             stream_ctx,
             subject,
             input: data.input.clone(),
             gradient_steps: data.gradient_steps,
             learning_rate: data.learning_rate,
-            auto_commit: matches!(data.adaptation_strategy, AdaptationStrategyEnum::AutoWriteback),
+            adaptation_strategy,
         };
 
         // Build continuation
@@ -2892,22 +2907,25 @@ impl InferenceZmqClient {
         self.gen.ttt_zero().await
     }
 
-    /// Start streaming training step with E2E authentication — delegates to generated client
+    /// Start streaming training step with E2E authentication — delegates to generated client.
+    ///
+    /// `adaptation_strategy` must be one of: "auto_writeback", "auto_evict",
+    /// "speculative", "writeback_if_above".
     pub async fn train_step_stream(
         &self,
         input: &str,
         gradient_steps: u32,
         learning_rate: f32,
-        auto_commit: bool,
+        adaptation_strategy: &str,
+        writeback_threshold: f32,
         ephemeral_pubkey: Option<[u8; 32]>,
     ) -> Result<StreamInfo> {
-        let adaptation_strategy_str = if auto_commit { "auto_writeback" } else { "speculative" };
         self.gen.train_step_stream(
             input,
             gradient_steps,
             learning_rate,
-            adaptation_strategy_str,
-            0.0f32, // writeback_threshold
+            adaptation_strategy,
+            writeback_threshold,
             ephemeral_pubkey.unwrap_or([0u8; 32]),
         ).await
     }

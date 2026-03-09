@@ -656,11 +656,18 @@ impl ModelService {
         input: &str,
         gradient_steps: u32,
         learning_rate: f32,
-        auto_commit: bool,
+        adaptation_strategy: AdaptationStrategyEnum,
+        writeback_threshold: f32,
         client_ephemeral_pubkey: Option<[u8; 32]>,
     ) -> Result<StreamInfo> {
+        let strategy_str = match adaptation_strategy {
+            AdaptationStrategyEnum::AutoWriteback => "auto_writeback",
+            AdaptationStrategyEnum::AutoEvict => "auto_evict",
+            AdaptationStrategyEnum::Speculative => "speculative",
+            AdaptationStrategyEnum::WritebackIfAbove => "writeback_if_above",
+        };
         let client = self.get_inference_client(model_ref_str, ctx).await?;
-        client.train_step_stream(input, gradient_steps, learning_rate, auto_commit, client_ephemeral_pubkey).await
+        client.train_step_stream(input, gradient_steps, learning_rate, strategy_str, writeback_threshold, client_ephemeral_pubkey).await
     }
 
     async fn reset_delta(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
@@ -776,10 +783,9 @@ impl TttHandler for ModelService {
         &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &TrainStepRequest,
     ) -> Result<(crate::services::generated::model_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
-        let auto_commit = matches!(data.adaptation_strategy, AdaptationStrategyEnum::AutoWriteback);
         let info = self.train_step_stream(
                 model_ref, ctx, &data.input, data.gradient_steps, data.learning_rate,
-                auto_commit, ctx.ephemeral_pubkey,
+                data.adaptation_strategy, data.writeback_threshold, ctx.ephemeral_pubkey,
             ).await?;
         let stream_info = crate::services::generated::model_client::StreamInfo {
             stream_id: info.stream_id,
@@ -1690,16 +1696,22 @@ impl ModelZmqClient {
         input: &str,
         gradient_steps: u32,
         learning_rate: f32,
-        auto_commit: bool,
+        adaptation_strategy: AdaptationStrategyEnum,
+        writeback_threshold: f32,
         client_ephemeral_pubkey: [u8; 32],
     ) -> Result<StreamInfo> {
-        let adaptation_strategy_str = if auto_commit { "auto_writeback" } else { "speculative" };
+        let (strategy_str, threshold) = match adaptation_strategy {
+            AdaptationStrategyEnum::AutoWriteback => ("auto_writeback", writeback_threshold),
+            AdaptationStrategyEnum::AutoEvict => ("auto_evict", writeback_threshold),
+            AdaptationStrategyEnum::Speculative => ("speculative", writeback_threshold),
+            AdaptationStrategyEnum::WritebackIfAbove => ("writeback_if_above", writeback_threshold),
+        };
         let info = self.gen.ttt(model_ref).train_stream(
             input,
             gradient_steps,
             learning_rate,
-            adaptation_strategy_str,
-            0.0f32, // writeback_threshold
+            strategy_str,
+            threshold,
             client_ephemeral_pubkey,
         ).await?;
         Ok(StreamInfo {
