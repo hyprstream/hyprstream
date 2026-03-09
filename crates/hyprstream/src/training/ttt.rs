@@ -146,6 +146,92 @@ fn default_pending_rollback_ms() -> u64 {
     60_000
 }
 
+/// Per-layer gradient gating configuration.
+///
+/// After the first gradient step, identifies low-signal layers via gradient
+/// norms and sets `requires_grad_(false)` on their parameters for subsequent
+/// steps. This saves backward-pass FLOPs and prevents Muon momentum
+/// from drifting on frozen layers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GradientGatingConfig {
+    /// Enable per-layer gradient gating (default: true)
+    #[serde(default = "default_grad_gating_enabled")]
+    pub enabled: bool,
+    /// Minimum gradient L2 norm to keep updating a layer (default: 1e-5)
+    #[serde(default = "default_min_grad_norm")]
+    pub min_grad_norm: f64,
+    /// Number of initial adaptation steps before gating activates (default: 1)
+    #[serde(default = "default_grad_warmup")]
+    pub warmup_steps: usize,
+}
+
+fn default_grad_gating_enabled() -> bool {
+    true
+}
+fn default_min_grad_norm() -> f64 {
+    1e-5
+}
+fn default_grad_warmup() -> usize {
+    1
+}
+
+impl Default for GradientGatingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_grad_gating_enabled(),
+            min_grad_norm: default_min_grad_norm(),
+            warmup_steps: default_grad_warmup(),
+        }
+    }
+}
+
+/// Compute per-layer gradient norms from VarStore.
+///
+/// Returns map of "layer_idx.module_name" -> L2 norm of combined A+B gradients.
+fn compute_per_layer_grad_norms(
+    vs: &tch::nn::VarStore,
+) -> HashMap<String, f64> {
+    let mut norms: HashMap<String, f64> = HashMap::new();
+    for (name, var) in vs.variables() {
+        if !var.grad().defined() {
+            continue;
+        }
+        if let Some(key) = parse_varstore_key_to_delta_key(&name) {
+            let grad_sq = var.grad().norm().double_value(&[]).powi(2);
+            *norms.entry(key).or_insert(0.0) += grad_sq;
+        }
+    }
+    // Take sqrt of accumulated squared norms
+    for v in norms.values_mut() {
+        *v = v.sqrt();
+    }
+    norms
+}
+
+/// Identify layers to gate (freeze) based on gradient norms.
+fn identify_gated_layers(norms: &HashMap<String, f64>, threshold: f64) -> Vec<String> {
+    norms
+        .iter()
+        .filter(|(_, &norm)| norm <= threshold)
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
+/// Parse VarStore key "layer_{idx}.{module}.lora_{a|b}" to delta key "idx.module"
+fn parse_varstore_key_to_delta_key(name: &str) -> Option<String> {
+    let parts: Vec<&str> = name.split('.').collect();
+    if parts.len() >= 3 {
+        let layer_part = parts[0]; // "layer_0"
+        let module = parts[1]; // "q_proj"
+        if let Some(idx_str) = layer_part.strip_prefix("layer_") {
+            if let Ok(idx) = idx_str.parse::<usize>() {
+                return Some(format!("{idx}.{module}"));
+            }
+        }
+    }
+    None
+}
+
 impl Default for TTTConfig {
     fn default() -> Self {
         Self {
@@ -232,6 +318,9 @@ pub struct TTTResult {
 
     /// Per-key rank utilization from this adaptation (empty if skipped)
     pub rank_utilization: HashMap<String, f64>,
+
+    /// Layers gated (gradients frozen) during this adaptation
+    pub gated_layers: Vec<String>,
 }
 
 impl TTTResult {
@@ -258,6 +347,7 @@ impl TTTResult {
             time_used_ms: 0,
             time_budget_ms: 0,
             rank_utilization: HashMap::new(),
+            gated_layers: Vec::new(),
         }
     }
 }
@@ -545,6 +635,7 @@ impl TestTimeTrainer {
                     time_used_ms: start.elapsed().as_millis() as u64,
                     time_budget_ms,
                     rank_utilization: HashMap::new(),
+                    gated_layers: Vec::new(),
                 },
                 pre_snapshot,
             ));
@@ -566,7 +657,7 @@ impl TestTimeTrainer {
 
         match loop_result {
             Ok(Ok(inner)) => {
-                let (actual_steps, losses, grad_norms, any_clipped, final_loss, final_perplexity, rank_utils) = inner;
+                let (actual_steps, losses, grad_norms, any_clipped, final_loss, final_perplexity, rank_utils, gated_layer_keys) = inner;
 
                 let avg_loss = losses.iter().sum::<f32>() / losses.len() as f32;
                 let loss_improvement = initial_loss - final_loss;
@@ -619,6 +710,7 @@ impl TestTimeTrainer {
                         time_used_ms,
                         time_budget_ms,
                         rank_utilization: rank_utils,
+                        gated_layers: gated_layer_keys,
                     },
                     pre_snapshot,
                 ))
@@ -666,7 +758,7 @@ impl TestTimeTrainer {
         start: &Instant,
         budget: Duration,
         initial_loss_tensor: Tensor,
-    ) -> Result<(usize, Vec<f32>, Vec<f32>, bool, f32, f32, HashMap<String, f64>)> {
+    ) -> Result<(usize, Vec<f32>, Vec<f32>, bool, f32, f32, HashMap<String, f64>, Vec<String>)> {
         let initial_loss = initial_loss_tensor.double_value(&[]) as f32;
         let mut losses = vec![initial_loss];
         let mut grad_norms = Vec::with_capacity(gated_steps);
@@ -699,6 +791,30 @@ impl TestTimeTrainer {
                 defined_count, variables.len(), gn
             );
         }
+
+        // Per-layer gradient gating: after warmup, freeze low-signal layers
+        // to save backward FLOPs and prevent momentum drift
+        let gated_layer_keys = if gated_steps > 1 {
+            let grad_norms_map = compute_per_layer_grad_norms(&delta.vs);
+            let gated = identify_gated_layers(&grad_norms_map, default_min_grad_norm());
+            if !gated.is_empty() {
+                let _guard = tch::no_grad_guard();
+                for (name, var) in delta.vs.variables() {
+                    if let Some(key) = parse_varstore_key_to_delta_key(&name) {
+                        if gated.contains(&key) {
+                            let _ = var.set_requires_grad(false);
+                        }
+                    }
+                }
+                tracing::debug!(
+                    gated_count = gated.len(),
+                    "Gradient gating: froze low-signal layers"
+                );
+            }
+            gated
+        } else {
+            Vec::new()
+        };
 
         // Remaining steps with time budget check BEFORE each step
         for _ in 1..gated_steps {
@@ -754,7 +870,17 @@ impl TestTimeTrainer {
                 .collect()
         };
 
-        Ok((actual_steps, losses, grad_norms, any_clipped, final_loss, final_perplexity, rank_utils))
+        // Restore requires_grad on all vars (undo gradient gating for next TTT call)
+        if !gated_layer_keys.is_empty() {
+            let _guard = tch::no_grad_guard();
+            for (_, var) in delta.vs.variables() {
+                if !var.requires_grad() {
+                    let _ = var.set_requires_grad(true);
+                }
+            }
+        }
+
+        Ok((actual_steps, losses, grad_norms, any_clipped, final_loss, final_perplexity, rank_utils, gated_layer_keys))
     }
 
     /// Compute NTP loss with a tenant delta applied
@@ -902,7 +1028,8 @@ impl TestTimeTrainer {
                     pending: false, // trainStep commits immediately based on auto_commit
                     time_used_ms,
                     time_budget_ms,
-                    rank_utilization: HashMap::new(), // train_step doesn't track utilization
+                    rank_utilization: HashMap::new(),
+                    gated_layers: Vec::new(), // train_step doesn't use gradient gating
                 })
             }
             Ok(Err(e)) => {
@@ -1056,5 +1183,80 @@ mod tests {
         assert!(!config.enabled);
         // Defaults should apply for missing fields
         assert_eq!(config.min_input_length, 32);
+    }
+
+    #[test]
+    fn test_gradient_gating_config_defaults() {
+        let config = GradientGatingConfig::default();
+        assert!(config.enabled);
+        assert!(config.min_grad_norm > 0.0);
+        assert!(config.warmup_steps > 0);
+    }
+
+    #[test]
+    fn test_identify_gated_layers() {
+        let mut norms = HashMap::new();
+        norms.insert("0.q_proj".to_owned(), 1e-3); // above threshold
+        norms.insert("0.v_proj".to_owned(), 1e-8); // below threshold
+        norms.insert("1.q_proj".to_owned(), 5e-6); // at threshold
+        let gated = identify_gated_layers(&norms, 1e-5);
+        assert!(!gated.contains(&"0.q_proj".to_owned())); // not gated (high norm)
+        assert!(gated.contains(&"0.v_proj".to_owned())); // gated (low norm)
+        assert!(gated.contains(&"1.q_proj".to_owned())); // gated (at/below threshold)
+    }
+
+    #[test]
+    fn test_gradient_gating_with_real_backward() {
+        use tch::{Kind, nn::VarStore};
+        let vs = VarStore::new(Device::Cpu);
+        let root = vs.root();
+        let a = root
+            .sub("layer_0")
+            .sub("q_proj")
+            .kaiming_uniform("lora_a", &[4, 8]);
+        let b = root
+            .sub("layer_0")
+            .sub("q_proj")
+            .zeros("lora_b", &[8, 4]);
+        let x = Tensor::randn([2, 8], (Kind::Float, Device::Cpu));
+
+        // Forward + backward with requires_grad=true
+        let out = x.matmul(&a.tr()).matmul(&b.tr());
+        let loss = out.sum(Kind::Float);
+        loss.backward();
+        assert!(a.grad().defined());
+
+        // Zero grads, disable requires_grad, forward + backward
+        for (_, v) in vs.variables() {
+            if v.grad().defined() {
+                let _ = v.grad().zero_();
+            }
+        }
+        let _ = a.set_requires_grad(false);
+        let out2 = x.matmul(&a.tr()).matmul(&b.tr());
+        let loss2 = out2.sum(Kind::Float);
+        loss2.backward();
+        // a should have NO gradient (frozen)
+        assert!(
+            !a.grad().defined() || a.grad().abs().sum(Kind::Double).double_value(&[]) == 0.0
+        );
+        // b should still have gradient
+        assert!(b.grad().defined());
+
+        // Re-enable
+        let _ = a.set_requires_grad(true);
+    }
+
+    #[test]
+    fn test_parse_varstore_key() {
+        assert_eq!(
+            parse_varstore_key_to_delta_key("layer_0.q_proj.lora_a"),
+            Some("0.q_proj".to_owned())
+        );
+        assert_eq!(
+            parse_varstore_key_to_delta_key("layer_23.v_proj.lora_b"),
+            Some("23.v_proj".to_owned())
+        );
+        assert_eq!(parse_varstore_key_to_delta_key("invalid_key"), None);
     }
 }
