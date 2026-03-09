@@ -12,6 +12,8 @@ fn main() {
         Some("shell") => run_shell(args),
         Some("wizard") => run_wizard(),
         #[cfg(target_os = "wasi")]
+        Some("chat") => run_chat_wasi(),
+        #[cfg(target_os = "wasi")]
         _ => run_compositor_wasi(),
         #[cfg(not(target_os = "wasi"))]
         _ => run_wizard(),
@@ -229,6 +231,120 @@ fn osc_write_route(app_id: u32, data: &[u8]) {
     let _ = out.write_all(&app_id.to_le_bytes());
     let _ = out.write_all(&len.to_le_bytes());
     let _ = out.write_all(data);
+    let _ = out.write_all(b"\x07");
+    let _ = out.flush();
+}
+
+// ============================================================================
+// WASI chat entry point (Phase W3)
+// ============================================================================
+
+/// Minimal private chat WASI entry point.
+///
+/// Model name is argv[2] (e.g. `#bundle/hyprstream-tui.wasm chat qwen3.5`).
+/// Uses the same 9-byte framed stdin protocol as run_compositor_wasi:
+///   0x01 → keyboard bytes
+///   0x02 → resize
+///   0x03 → inference token UTF-8
+///   0x04 → inference complete
+///   0x05 → inference error UTF-8
+///
+/// Writes OSC 0xFD inference requests to stdout:
+///   ESC ] 0xFD <len:u32 LE> <json> BEL
+#[cfg(target_os = "wasi")]
+fn run_chat_wasi() {
+    use hyprstream_tui::wasm_chat::{WasmChat, draw as chat_draw};
+    use std::io::Write;
+    use waxterm::backend::AnsiBackend;
+    use waxterm::input::{InputParser, KeyPress};
+
+    let model_name = std::env::args().nth(2).unwrap_or_else(|| "unknown".to_owned());
+    let (mut cols, mut rows) = (80u16, 24u16);
+
+    let stdout = std::io::stdout();
+    let backend = AnsiBackend::new(
+        std::io::BufWriter::with_capacity(32 * 1024, stdout),
+        cols, rows,
+        true,
+    );
+    let Ok(mut terminal) = ratatui::Terminal::new(backend) else { return };
+
+    let mut app = WasmChat::new(model_name, cols, rows);
+    terminal.draw(|f| chat_draw(f, &app)).ok();
+
+    let stdin = std::io::stdin();
+    let mut stdin = stdin.lock();
+    let mut header = [0u8; 9];
+
+    loop {
+        if read_exact(&mut stdin, &mut header).is_err() { break }
+
+        let msg_type = header[0];
+        let len = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
+        let mut data = vec![0u8; len];
+        if read_exact(&mut stdin, &mut data).is_err() { break }
+
+        let mut needs_redraw = false;
+
+        match msg_type {
+            0x01 => {
+                // Keyboard bytes from compositor RouteInput
+                let parser: InputParser<KeyPress> = InputParser::new(vec![]);
+                for key in parser.parse(&data) {
+                    if let Some(req_json) = app.handle_key(key) {
+                        osc_write_inference(&req_json);
+                    }
+                    needs_redraw = true;
+                    if app.quit { break }
+                }
+                if app.quit { break }
+            }
+            0x02 if data.len() >= 4 => {
+                cols = u16::from_le_bytes([data[0], data[1]]);
+                rows = u16::from_le_bytes([data[2], data[3]]);
+                app.cols = cols;
+                app.rows = rows;
+                terminal.backend_mut().resize(cols, rows);
+                needs_redraw = true;
+            }
+            0x03 => {
+                // Inference token
+                if let Ok(s) = std::str::from_utf8(&data) {
+                    app.on_token(s);
+                    needs_redraw = true;
+                }
+            }
+            0x04 => {
+                // Inference complete
+                app.on_complete();
+                needs_redraw = true;
+            }
+            0x05 => {
+                // Inference error
+                let msg = std::str::from_utf8(&data).unwrap_or("unknown error");
+                app.on_error(msg);
+                needs_redraw = true;
+            }
+            _ => {}
+        }
+
+        if needs_redraw {
+            terminal.draw(|f| chat_draw(f, &app)).ok();
+        }
+    }
+}
+
+/// Write an inference request as  ESC ] 0xFD <len:u32 LE> <json> BEL  on stdout.
+#[cfg(target_os = "wasi")]
+fn osc_write_inference(json: &str) {
+    use std::io::Write;
+    let bytes = json.as_bytes();
+    let len = bytes.len() as u32;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(b"\x1b]");
+    let _ = out.write_all(&[0xFDu8]);
+    let _ = out.write_all(&len.to_le_bytes());
+    let _ = out.write_all(bytes);
     let _ = out.write_all(b"\x07");
     let _ = out.flush();
 }

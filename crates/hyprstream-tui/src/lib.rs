@@ -5,6 +5,9 @@ pub use hyprstream_compositor::theme;
 
 pub mod private_store;
 
+#[cfg(target_os = "wasi")]
+pub mod wasm_chat;
+
 pub mod cast_app;
 pub mod cast_player;
 pub mod cast_ui;

@@ -149,6 +149,8 @@ impl Compositor {
                             RpcRequest::Quit    => CompositorOutput::Quit,
                             other               => CompositorOutput::Rpc(other),
                         },
+                        ChromeOutput::RouteInput { app_id, data }
+                            => CompositorOutput::RouteInput { app_id, data },
                     })
                     .collect()
             }

@@ -112,6 +112,8 @@ pub enum RpcRequest {
 pub enum ChromeOutput {
     Redraw,
     Rpc(RpcRequest),
+    /// Key bytes that should be routed to a client-owned ChatApp task.
+    RouteInput { app_id: u32, data: Vec<u8> },
 }
 
 // ============================================================================
@@ -277,8 +279,14 @@ impl ShellChrome {
                 if bytes.is_empty() {
                     vec![]
                 } else {
-                    let vid = self.viewer_id;
-                    vec![ChromeOutput::Rpc(RpcRequest::SendInput { viewer_id: vid, data: bytes })]
+                    let active = self.active_pane_id();
+                    if self.private_panes.contains(&active) {
+                        // Route to client-owned ChatApp task instead of server
+                        vec![ChromeOutput::RouteInput { app_id: active, data: bytes }]
+                    } else {
+                        let vid = self.viewer_id;
+                        vec![ChromeOutput::Rpc(RpcRequest::SendInput { viewer_id: vid, data: bytes })]
+                    }
                 }
             }
         }
