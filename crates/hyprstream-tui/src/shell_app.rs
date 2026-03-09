@@ -1,8 +1,10 @@
-//! ShellApp — TUI shell with model list modal and basic pane management.
+//! ShellApp — TUI shell with model list modal, settings, and background.
 //!
 //! Each "window" is a PTY-backed shell process. Output is VTE-parsed by
-//! `avt::Vt`. The model list modal lets users open shells scoped to a
-//! model worktree directory.
+//! `avt::Vt`. The model list modal (F10) lets users open shells scoped to a
+//! model worktree directory. The settings modal (F11) lets users choose a
+//! background style. When no windows are open the animated background fills
+//! the pane area.
 
 #![cfg(not(target_os = "wasi"))]
 
@@ -13,7 +15,10 @@ use waxterm::app::TerminalApp;
 use waxterm::input::KeyPress;
 use waxterm::widgets::{SelectList, WidgetResult};
 
+use crate::background::{BackgroundState, BackgroundStyle, ALL_STYLES, PREVIEW_H, PREVIEW_W};
 use crate::shell::{kill_shell, spawn_shell, ShellInput, ShellWindow};
+
+type LoadFn = Box<dyn Fn(&str, ModelStatusSender) + Send>;
 
 // ============================================================================
 // Model discovery
@@ -126,7 +131,21 @@ pub enum ShellMode {
     Normal,
     /// Model list modal is open.
     ModelList,
+    /// Settings modal is open.
+    Settings,
+    /// Start-menu popup (Ctrl+Space).
+    StartMenu { selected: usize },
 }
+
+/// Menu items: (label, chord hint shown in popup).
+pub const MENU_ITEMS: &[(&str, &str)] = &[
+    ("New",        "N"),
+    ("Close",      "Q"),
+    ("Cycle",      "Tab"),
+    ("Models",     "M"),
+    ("Settings",   "S"),
+    ("Disconnect", "D"),
+];
 
 // ============================================================================
 // Command
@@ -146,17 +165,36 @@ impl From<KeyPress> for ShellCmd {
 // ShellApp
 // ============================================================================
 
+/// Sender half for model status updates from background load-polling threads.
+pub type ModelStatusSender = std::sync::mpsc::Sender<(String, bool)>;
+
 pub struct ShellApp {
     pub mode: ShellMode,
     pub windows: Vec<PaneWindow>,
     pub active: usize,
     pub model_list: SelectList<ModelEntry>,
+    /// Background animation state (full terminal area).
+    pub bg: BackgroundState,
+    /// Background animation state for the settings preview box.
+    pub preview_bg: BackgroundState,
+    /// Settings drop-down (one entry per BackgroundStyle).
+    pub settings_list: SelectList<BackgroundStyle>,
+    /// Background style saved when settings opens — restored on cancel.
+    saved_style: BackgroundStyle,
+    /// Shown in status bar while a model is loading.
+    pub load_status: Option<String>,
+    /// Receives `(model_ref, loaded)` updates from background load-polling threads.
+    status_rx: std::sync::mpsc::Receiver<(String, bool)>,
+    /// Cloned and passed into `load_fn` on each call.
+    status_tx: ModelStatusSender,
     pub cols: u16,
     pub rows: u16,
     quit: bool,
     /// Ctrl-B prefix was pressed; next key selects action.
     ctrl_b_pending: bool,
-    load_fn: Box<dyn Fn(&str) -> bool + Send>,
+    /// Submit a load request.  Receives a `ModelStatusSender` to push the final
+    /// `(model_ref, true/false)` result once the model is actually loaded.
+    load_fn: LoadFn,
     unload_fn: Box<dyn Fn(&str) -> bool + Send>,
 }
 
@@ -165,7 +203,7 @@ impl ShellApp {
         models: Vec<ModelEntry>,
         cols: u16,
         rows: u16,
-        load_fn: Box<dyn Fn(&str) -> bool + Send>,
+        load_fn: LoadFn,
         unload_fn: Box<dyn Fn(&str) -> bool + Send>,
     ) -> Self {
         let pane_rows = rows.saturating_sub(3);
@@ -174,11 +212,26 @@ impl ShellApp {
 
         let model_list = SelectList::new("Models", models);
 
+        let default_style = BackgroundStyle::Stars;
+        let settings_list = SelectList::new(
+            "Background",
+            ALL_STYLES.to_vec(),
+        ).with_selected(1); // Stars is index 1
+
+        let (status_tx, status_rx) = std::sync::mpsc::channel();
+
         Self {
             mode: ShellMode::Normal,
             windows: vec![initial],
             active: 0,
             model_list,
+            bg: BackgroundState::new(default_style),
+            preview_bg: BackgroundState::new(default_style),
+            settings_list,
+            saved_style: default_style,
+            load_status: None,
+            status_rx,
+            status_tx,
             cols,
             rows,
             quit: false,
@@ -222,7 +275,7 @@ impl ShellApp {
     }
 
     fn handle_normal(&mut self, key: KeyPress) -> bool {
-        // Ctrl-B prefix: next key selects multiplexer action.
+        // Ctrl-B prefix: next key selects action.
         if self.ctrl_b_pending {
             self.ctrl_b_pending = false;
             match key {
@@ -252,6 +305,21 @@ impl ShellApp {
                 self.mode = ShellMode::ModelList;
                 true
             }
+            KeyPress::F(11) => {
+                self.saved_style = self.bg.style;
+                // Sync the SelectList cursor to the current style.
+                let idx = ALL_STYLES
+                    .iter()
+                    .position(|s| *s == self.bg.style)
+                    .unwrap_or(0);
+                *self.settings_list.items_mut() = ALL_STYLES.to_vec();
+                // Re-create with current index selected (cheapest approach).
+                self.settings_list = SelectList::new("Background", ALL_STYLES.to_vec())
+                    .with_selected(idx);
+                self.preview_bg.style = self.bg.style;
+                self.mode = ShellMode::Settings;
+                true
+            }
             KeyPress::F(7) => {
                 self.open_terminal(None, "shell".to_owned());
                 true
@@ -260,8 +328,8 @@ impl ShellApp {
                 self.close_active();
                 true
             }
-            KeyPress::Tab => {
-                self.cycle_window();
+            KeyPress::CtrlSpace => {
+                self.mode = ShellMode::StartMenu { selected: 0 };
                 true
             }
             KeyPress::Char(0x02) => {
@@ -284,16 +352,17 @@ impl ShellApp {
     fn handle_model_list(&mut self, key: KeyPress) -> bool {
         if matches!(key, KeyPress::Char(b'l' | b'L')) {
             if let Some(model) = self.model_list.selected_item().cloned() {
-                let loaded = (self.load_fn)(&model.model_ref);
-                let idx = self.model_list.selected_index();
-                if let Some(entry) = self.model_list.items_mut().get_mut(idx) {
-                    entry.loaded = loaded;
-                }
+                // Submit the load request; the closure polls status and sends
+                // (model_ref, true) back via status_tx when actually loaded.
+                (self.load_fn)(&model.model_ref, self.status_tx.clone());
+                self.load_status = Some(format!("Loading {}…", model.model_ref));
+                // Do NOT mark loaded=true here — wait for status_rx confirmation.
                 return true;
             }
         }
         if matches!(key, KeyPress::Char(b'u' | b'U')) {
             if let Some(model) = self.model_list.selected_item().cloned() {
+                // Unload is synchronous — the RPC blocks until unloaded.
                 let ok = (self.unload_fn)(&model.model_ref);
                 if ok {
                     let idx = self.model_list.selected_index();
@@ -336,6 +405,87 @@ impl ShellApp {
             }
         }
     }
+
+    fn handle_start_menu(&mut self, key: KeyPress, selected: usize) -> bool {
+        let n = MENU_ITEMS.len();
+        // Chord shortcuts execute immediately, closing the menu.
+        let chord_action: Option<usize> = match key {
+            KeyPress::Char(b'n' | b'N') => Some(0),
+            KeyPress::Char(b'q' | b'Q') => Some(1),
+            KeyPress::Tab               => Some(2),
+            KeyPress::Char(b'm' | b'M') => Some(3),
+            KeyPress::Char(b's' | b'S') => Some(4),
+            KeyPress::Char(b'd' | b'D') => Some(5),
+            _ => None,
+        };
+        if let Some(idx) = chord_action {
+            self.mode = ShellMode::Normal;
+            return self.execute_menu_action(idx);
+        }
+        match key {
+            KeyPress::Escape | KeyPress::CtrlSpace => { self.mode = ShellMode::Normal; }
+            KeyPress::ArrowUp => {
+                self.mode = ShellMode::StartMenu {
+                    selected: if selected == 0 { n - 1 } else { selected - 1 },
+                };
+            }
+            KeyPress::ArrowDown => {
+                self.mode = ShellMode::StartMenu { selected: (selected + 1) % n };
+            }
+            KeyPress::Enter => {
+                self.mode = ShellMode::Normal;
+                return self.execute_menu_action(selected);
+            }
+            _ => {}
+        }
+        true
+    }
+
+    fn execute_menu_action(&mut self, idx: usize) -> bool {
+        match idx {
+            0 => self.open_terminal(None, "shell".to_owned()),
+            1 => self.close_active(),
+            2 => self.cycle_window(),
+            3 => { self.mode = ShellMode::ModelList; }
+            4 => {
+                self.saved_style = self.bg.style;
+                let i = ALL_STYLES.iter().position(|s| *s == self.bg.style).unwrap_or(0);
+                self.settings_list = SelectList::new("Background", ALL_STYLES.to_vec())
+                    .with_selected(i);
+                self.preview_bg.style = self.bg.style;
+                self.mode = ShellMode::Settings;
+            }
+            5 => { self.quit = true; }
+            _ => {}
+        }
+        true
+    }
+
+    fn handle_settings(&mut self, key: KeyPress) -> bool {
+        match self.settings_list.handle_key(&key) {
+            WidgetResult::Cancelled => {
+                // Restore saved style on Esc.
+                self.bg.style      = self.saved_style;
+                self.preview_bg.style = self.saved_style;
+                self.mode          = ShellMode::Normal;
+                true
+            }
+            WidgetResult::Confirmed(style) => {
+                self.bg.style      = style;
+                self.preview_bg.style = style;
+                self.mode          = ShellMode::Normal;
+                true
+            }
+            WidgetResult::Pending => {
+                // Live-preview: sync bg style to the highlighted list entry.
+                if let Some(&style) = self.settings_list.selected_item() {
+                    self.bg.style      = style;
+                    self.preview_bg.style = style;
+                }
+                true
+            }
+        }
+    }
 }
 
 impl TerminalApp for ShellApp {
@@ -348,8 +498,10 @@ impl TerminalApp for ShellApp {
     fn handle_input(&mut self, cmd: ShellCmd) -> bool {
         let ShellCmd::Key(key) = cmd;
         match self.mode {
-            ShellMode::Normal    => self.handle_normal(key),
-            ShellMode::ModelList => self.handle_model_list(key),
+            ShellMode::Normal                 => self.handle_normal(key),
+            ShellMode::ModelList              => self.handle_model_list(key),
+            ShellMode::Settings               => self.handle_settings(key),
+            ShellMode::StartMenu { selected } => self.handle_start_menu(key, selected),
         }
     }
 
@@ -373,7 +525,36 @@ impl TerminalApp for ShellApp {
             }
             redraw = true;
         }
-        // Shell does not exit when all windows close (feature: pane closes, not shell).
+
+        // Drain model status updates from background load-polling threads.
+        while let Ok((model_ref, loaded)) = self.status_rx.try_recv() {
+            for entry in self.model_list.items_mut() {
+                if entry.model_ref == model_ref {
+                    entry.loaded = loaded;
+                }
+            }
+            // Clear the "Loading…" status once the model responds.
+            if self.load_status.as_ref()
+                .is_some_and(|s| s.contains(&model_ref))
+            {
+                self.load_status = None;
+            }
+            redraw = true;
+        }
+
+        // Tick background animation when it is visible.
+        let show_bg = self.windows.is_empty() || matches!(self.mode, ShellMode::Settings);
+        if show_bg {
+            self.bg.tick(self.cols, self.pane_rows());
+            if self.bg.is_animated() {
+                redraw = true;
+            }
+            // Also tick the settings preview at its fixed small dimensions.
+            if matches!(self.mode, ShellMode::Settings) {
+                self.preview_bg.tick(PREVIEW_W, PREVIEW_H);
+            }
+        }
+
         redraw
     }
 
@@ -393,6 +574,7 @@ pub fn keypress_to_bytes(key: KeyPress) -> Vec<u8> {
         KeyPress::Backspace  => vec![0x7f],
         KeyPress::Tab        => vec![b'\t'],
         KeyPress::Escape     => vec![0x1b],
+        KeyPress::CtrlSpace  => vec![],  // consumed by chrome; never forward to PTY
         KeyPress::ArrowUp    => b"\x1b[A".to_vec(),
         KeyPress::ArrowDown  => b"\x1b[B".to_vec(),
         KeyPress::ArrowRight => b"\x1b[C".to_vec(),

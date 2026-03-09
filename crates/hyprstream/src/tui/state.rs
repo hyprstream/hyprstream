@@ -415,6 +415,9 @@ impl TuiWindow {
 pub struct TuiSession {
     /// Session identifier.
     pub id: u32,
+    /// Subject (user identity) that created this session.
+    /// Empty string for local/anonymous sessions.
+    pub owner: String,
     /// All windows in this session.
     pub windows: Vec<TuiWindow>,
     /// Currently active window ID.
@@ -427,6 +430,7 @@ impl TuiSession {
         let window = TuiWindow::new(window_id, pane_id, cols, rows, max_scrollback);
         Self {
             id,
+            owner: String::new(),
             windows: vec![window],
             active_window_id: window_id,
         }

@@ -24,6 +24,7 @@ use hyprstream_rpc::streaming::{
 use hyprstream_rpc::{EnvelopeContext, ZmqService, Continuation};
 
 use crate::tui_capnp;
+use crate::services::PolicyClient;
 use super::state::{TuiState, TuiEvent};
 use super::diff;
 use super::vte_parser;
@@ -141,6 +142,8 @@ pub struct TuiService {
     sessions: SessionRegistry,
     /// Per-viewer stdin queues (for pollStdin RPC).
     stdin_queues: StdinQueues,
+    /// Optional policy client for authorization checks.
+    policy_client: Option<PolicyClient>,
 }
 
 impl TuiService {
@@ -159,7 +162,39 @@ impl TuiService {
             signing_key,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             stdin_queues: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            policy_client: None,
         }
+    }
+
+    /// Attach a PolicyClient for Casbin authorization.
+    pub fn with_policy_client(mut self, client: PolicyClient) -> Self {
+        self.policy_client = Some(client);
+        self
+    }
+
+    /// Check authorization via PolicyClient.
+    ///
+    /// Local callers are always permitted. Remote callers require a policy
+    /// allowance; if no PolicyClient is configured, remote callers are also
+    /// permitted (backward-compat for local-only deployments).
+    async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
+        if ctx.identity.is_local() {
+            return Ok(());
+        }
+        if let Some(ref policy_client) = self.policy_client {
+            let subject = ctx.subject().to_string();
+            let allowed = policy_client
+                .check(&subject, "*", resource, operation)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!("TUI policy check failed for {}: {}", subject, e);
+                    false
+                });
+            if !allowed {
+                anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource);
+            }
+        }
+        Ok(())
     }
 
     /// Handle a connect request.
@@ -179,9 +214,15 @@ impl TuiService {
         let mut state = self.state.write().await;
 
         // Create or find session
+        let subject = ctx.subject().to_string();
         let sid = if session_id == 0 {
             if state.sessions.is_empty() {
-                state.create_session()
+                let new_sid = state.create_session();
+                // Record the connecting client as session owner
+                if let Some(session) = state.session_mut(new_sid) {
+                    session.owner = subject.clone();
+                }
+                new_sid
             } else {
                 state.sessions.last().map(|s| s.id).unwrap_or(1)
             }
@@ -697,7 +738,9 @@ impl TuiService {
             );
             let status_map: std::collections::HashMap<String, bool> = match status_result {
                 Ok(Ok(entries)) => entries.into_iter()
-                    .map(|e| (e.model_ref, e.status == "loaded" || e.status == "loading"))
+                    // Only mark as loaded when the model is fully ready.
+                    // "loading" means GPU load is still in progress.
+                    .map(|e| (e.model_ref, e.status == "loaded"))
                     .collect(),
                 _ => std::collections::HashMap::new(),
             };
@@ -724,15 +767,42 @@ impl TuiService {
         let handle = tokio::runtime::Handle::current();
         let sk_load = self.signing_key.clone();
         let handle_load = handle.clone();
-        let load_fn: Box<dyn Fn(&str) -> bool + Send> = Box::new(move |model_ref: &str| {
-            use hyprstream_rpc::envelope::RequestIdentity;
-            let sk = sk_load.clone();
-            let mr = model_ref.to_owned();
-            handle_load.block_on(async move {
-                let client = crate::services::ModelZmqClient::new(sk, RequestIdentity::local());
-                client.load(&mr, None).await.is_ok()
-            })
-        });
+        let load_fn: Box<dyn Fn(&str, hyprstream_tui::shell_app::ModelStatusSender) + Send> =
+            Box::new(move |model_ref: &str, tx: hyprstream_tui::shell_app::ModelStatusSender| {
+                use hyprstream_rpc::envelope::RequestIdentity;
+                let sk  = sk_load.clone();
+                let mr  = model_ref.to_owned();
+                let h   = handle_load.clone();
+                // Submit load — returns "accepted" immediately (Continuation pattern).
+                h.block_on(async {
+                    let client = crate::services::ModelZmqClient::new(
+                        sk.clone(), RequestIdentity::local(),
+                    );
+                    let _ = client.load(&mr, None).await;
+                });
+                // Poll status in a background thread so we don't block the ShellApp.
+                let sk_poll = sk.clone();
+                let mr_poll = mr.clone();
+                let h_poll  = h.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..60u32 {   // max ~2 minutes (60 × 2 s)
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                        let loaded = h_poll.block_on(async {
+                            let client = crate::services::ModelZmqClient::new(
+                                sk_poll.clone(), RequestIdentity::local(),
+                            );
+                            client.status(&mr_poll).await
+                                .is_ok_and(|es| es.iter().any(|e| e.status == "loaded"))
+                        });
+                        if loaded {
+                            let _ = tx.send((mr_poll, true));
+                            return;
+                        }
+                    }
+                    // Timed out — clear the "Loading…" indicator.
+                    let _ = tx.send((mr_poll, false));
+                });
+            });
         let sk_unload = self.signing_key.clone();
         let handle_unload = handle.clone();
         let unload_fn: Box<dyn Fn(&str) -> bool + Send> = Box::new(move |model_ref: &str| {
@@ -762,6 +832,191 @@ impl TuiService {
             let mut resp = msg.init_root::<tui_capnp::tui_response::Builder<'_>>();
             resp.set_request_id(request_id);
             let mut result = resp.init_spawn_chrome_shell_result();
+            result.set_success(true);
+            result.set_pid(0);
+        }
+        let mut buf = Vec::new();
+        serialize::write_message(&mut buf, &msg)?;
+        Ok((buf, Some(continuation)))
+    }
+
+    /// Spawn a [`ChatApp`] as a `PaneProcess` inside TuiService.
+    ///
+    /// Mirrors [`handle_spawn_chrome_shell`] — returns an "accepted" response
+    /// immediately, then delivers the process to the frame loop via Continuation.
+    async fn handle_spawn_chat_app(
+        &self,
+        request_id: u64,
+        session_id: u32,
+        model_ref: &str,
+        cols: u16,
+        rows: u16,
+        pane_id: u32,
+    ) -> Result<(Vec<u8>, Option<Continuation>)> {
+        let (sid, active_pane_id) = {
+            let state = self.state.read().await;
+            let sid = if session_id == 0 {
+                state.sessions.last().map(|s| s.id).unwrap_or(1)
+            } else {
+                session_id
+            };
+            let active_pane_id = if pane_id != 0 {
+                pane_id
+            } else {
+                state
+                    .session(sid)
+                    .and_then(|s| s.active_window())
+                    .and_then(|w| w.active_pane())
+                    .map(|p| p.id)
+                    .unwrap_or(1)
+            };
+            (sid, active_pane_id)
+        };
+
+        let model_ref = model_ref.to_owned();
+        let sk = self.signing_key.clone();
+
+        // Build the StreamSpawner closure.  Captures signing_key + model_ref.
+        // Called on every user message submission from inside the app thread.
+        // Routes through ModelService (scoped inference) rather than hitting
+        // InferenceService directly, so the model routing and auth logic applies.
+        let spawner_model_ref = model_ref.clone();
+        let spawner: hyprstream_tui::chat_app::StreamSpawner = Box::new(move |pairs, event_tx| {
+            use hyprstream_rpc::envelope::RequestIdentity;
+            use hyprstream_rpc::streaming::StreamPayload;
+            use hyprstream_rpc::crypto::generate_ephemeral_keypair;
+            use crate::services::model::ModelZmqClient;
+            use crate::services::rpc_types::StreamHandle;
+            use crate::config::GenerationRequest;
+            use crate::api::openai_compat::ChatMessage;
+            use crate::zmq::global_context;
+            use hyprstream_tui::chat_app::ChatEvent;
+
+            let sk_inner   = sk.clone();
+            let mr_inner   = spawner_model_ref.clone();
+            let event_tx   = event_tx.clone();
+
+            std::thread::spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = event_tx.send(ChatEvent::StreamError(e.to_string()));
+                        return;
+                    }
+                };
+
+                rt.block_on(async move {
+                    let model_client = ModelZmqClient::new(sk_inner.clone(), RequestIdentity::local());
+
+                    // Build ChatMessage list from (role, content) pairs.
+                    let messages: Vec<ChatMessage> = pairs
+                        .into_iter()
+                        .map(|(role, content)| ChatMessage {
+                            role,
+                            content: Some(content),
+                            function_call: None,
+                            tool_calls: None,
+                            tool_call_id: None,
+                        })
+                        .collect();
+
+                    // Apply chat template via ModelService (scoped to model_ref).
+                    let prompt = match model_client.apply_chat_template(&mr_inner, &messages, true, None).await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            let _ = event_tx.send(ChatEvent::TemplateError(e.to_string()));
+                            return;
+                        }
+                    };
+
+                    let req = GenerationRequest {
+                        prompt,
+                        max_tokens: 2048,
+                        temperature: 0.7,
+                        ..Default::default()
+                    };
+
+                    // Generate ephemeral keypair for E2E authenticated stream.
+                    let (client_secret, client_pubkey) = generate_ephemeral_keypair();
+                    let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
+
+                    // Start streaming via ModelService (scoped to model_ref).
+                    let stream_info = match model_client.infer_stream(&mr_inner, &req, client_pubkey_bytes).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let _ = event_tx.send(ChatEvent::StreamError(e.to_string()));
+                            return;
+                        }
+                    };
+
+                    // Build authenticated StreamHandle from ModelService-returned StreamInfo.
+                    let mut handle = match StreamHandle::new(
+                        &global_context(),
+                        stream_info.stream_id,
+                        &stream_info.endpoint,
+                        &stream_info.server_pubkey,
+                        &client_secret,
+                        &client_pubkey_bytes,
+                    ) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            let _ = event_tx.send(ChatEvent::StreamError(e.to_string()));
+                            return;
+                        }
+                    };
+
+                    loop {
+                        match handle.recv_next().await {
+                            Ok(Some(StreamPayload::Data(b))) => {
+                                let s = String::from_utf8_lossy(&b).into_owned();
+                                let _ = event_tx.send(ChatEvent::Token(s));
+                            }
+                            Ok(Some(StreamPayload::Complete(_))) | Ok(None) => {
+                                let _ = event_tx.send(ChatEvent::StreamComplete);
+                                break;
+                            }
+                            Ok(Some(StreamPayload::Error(m))) => {
+                                let _ = event_tx.send(ChatEvent::StreamError(m));
+                                break;
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(ChatEvent::StreamError(e.to_string()));
+                                break;
+                            }
+                        }
+                    }
+                });
+            });
+        });
+
+        let app = hyprstream_tui::chat_app::ChatApp::new(
+            model_ref.clone(),
+            cols,
+            rows,
+            spawner,
+        );
+        let config = waxterm::app::TerminalConfig::new().cols(cols).rows(rows);
+        let process = super::process::spawn_app_process(app, config);
+
+        let sessions_reg = Arc::clone(&self.sessions);
+        let continuation: Continuation = Box::pin(async move {
+            let reg = sessions_reg.read().await;
+            if let Some((sender, _)) = reg.get(&sid) {
+                let _ = sender.send(FrameLoopCommand::SpawnProcess {
+                    pane_id: active_pane_id,
+                    process,
+                });
+            }
+        });
+
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut resp = msg.init_root::<tui_capnp::tui_response::Builder<'_>>();
+            resp.set_request_id(request_id);
+            let mut result = resp.init_spawn_chat_app_result();
             result.set_success(true);
             result.set_pid(0);
         }
@@ -1033,12 +1288,16 @@ impl ZmqService for TuiService {
                 let sid = spawn.get_session_id();
                 let pane_id = spawn.get_pane_id();
                 let cwd = spawn.get_cwd()?.to_str().unwrap_or("");
+                self.authorize(_ctx, "tui:shell", "spawn").await
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
                 self.handle_spawn_shell(request_id, sid, pane_id, cwd).await
             }
             tui_capnp::tui_request::Which::PollStdin(viewer_id) => {
                 Ok((self.handle_poll_stdin(request_id, viewer_id).await?, None))
             }
             tui_capnp::tui_request::Which::SpawnChromeShell(req_reader) => {
+                self.authorize(_ctx, "tui:shell", "spawn").await
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
                 let req = req_reader?;
                 let sid = req.get_session_id();
                 let registry_dir = req.get_registry_dir()?.to_str().unwrap_or("").to_owned();
@@ -1046,6 +1305,17 @@ impl ZmqService for TuiService {
                 let rows = req.get_rows();
                 let pane_id = req.get_pane_id();
                 self.handle_spawn_chrome_shell(request_id, sid, &registry_dir, cols, rows, pane_id).await
+            }
+            tui_capnp::tui_request::Which::SpawnChatApp(req_reader) => {
+                self.authorize(_ctx, "tui:chat", "spawn").await
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                let req = req_reader?;
+                let sid = req.get_session_id();
+                let model_ref = req.get_model_ref()?.to_str().unwrap_or("").to_owned();
+                let cols = req.get_cols();
+                let rows = req.get_rows();
+                let pane_id = req.get_pane_id();
+                self.handle_spawn_chat_app(request_id, sid, &model_ref, cols, rows, pane_id).await
             }
         }
     }
@@ -1068,10 +1338,6 @@ impl ZmqService for TuiService {
 
     fn expected_audience(&self) -> Option<&str> {
         None
-    }
-
-    fn verify_claims(&self, _ctx: &EnvelopeContext) -> Result<()> {
-        Ok(())
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {

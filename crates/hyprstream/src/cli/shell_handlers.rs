@@ -101,7 +101,7 @@ pub async fn handle_shell_tui(
         );
         let status_map: std::collections::HashMap<String, bool> = match status_result {
             Ok(Ok(entries)) => entries.into_iter()
-                .map(|e| (e.model_ref, e.status == "loaded" || e.status == "loading"))
+                .map(|e| (e.model_ref, e.status == "loaded"))
                 .collect(),
             _ => std::collections::HashMap::new(),
         };
@@ -131,8 +131,13 @@ pub async fn handle_shell_tui(
         RequestIdentity::local(),
     );
 
+    // Channel for background load-polling tasks to report confirmed status.
+    let (model_status_tx, mut model_status_rx) =
+        tokio::sync::mpsc::channel::<(String, bool)>(32);
+
     let mut state = ShellClientState::new(
         cols, pane_rows, session_id, viewer_id, windows, models, model_client,
+        model_status_tx,
     );
 
     // Subscribe to ANSI frame stream (FD 1 = stdout)
@@ -225,6 +230,10 @@ pub async fn handle_shell_tui(
     let mut saw_ctrl_b = false;
     let mut win_refresh = tokio::time::interval(std::time::Duration::from_secs(2));
     win_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Background animation: ~20fps tick used when no windows are open or
+    // the settings modal is showing.
+    let mut bg_tick = tokio::time::interval(std::time::Duration::from_millis(50));
+    bg_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // SIGWINCH — forward terminal resize to TuiService.
     let sigwinch_key = signing_key.clone();
@@ -313,6 +322,25 @@ pub async fn handle_shell_tui(
                         let _ = terminal.draw(|f| shell_ui::draw(f, &state));
                     }
                 }
+            }
+            _ = bg_tick.tick() => {
+                if state.tick_bg() {
+                    let _ = terminal.draw(|f| shell_ui::draw(f, &state));
+                }
+            }
+            Some((model_ref, loaded)) = model_status_rx.recv() => {
+                // Background poll confirmed model load/timeout — update list entry.
+                for entry in state.model_list.items_mut() {
+                    if entry.model_ref == model_ref {
+                        entry.loaded = loaded;
+                    }
+                }
+                if state.load_status.as_ref()
+                    .is_some_and(|s| s.contains(&model_ref))
+                {
+                    state.load_status = None;
+                }
+                let _ = terminal.draw(|f| shell_ui::draw(f, &state));
             }
             else => break,
         }

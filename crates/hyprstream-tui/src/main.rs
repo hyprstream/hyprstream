@@ -50,7 +50,7 @@ fn run_shell(mut args: impl Iterator<Item = String>) {
         models,
         cols,
         rows,
-        Box::new(|_| false),  // no model service in standalone mode
+        Box::new(|_, _| {}),  // no model service in standalone mode
         Box::new(|_| false),
     );
     let config = waxterm::TerminalConfig::new().cols(cols).rows(rows);

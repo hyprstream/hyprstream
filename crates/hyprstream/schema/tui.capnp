@@ -171,6 +171,10 @@ struct TuiRequest {
     # in the client process (avoids ZMQ signaler assertion after fork).
     spawnChromeShell @15 :SpawnChromeShellRequest
       $mcpScope(write) $mcpDescription("Spawn ShellApp chrome renderer in a TuiService pane");
+
+    # Spawn a ChatApp inference pane connected to a loaded model.
+    spawnChatApp @16 :SpawnChatAppRequest
+      $mcpScope(write) $mcpDescription("Spawn ChatApp inference pane");
   }
 }
 
@@ -188,6 +192,19 @@ struct SpawnShellRequest {
 struct SpawnShellResult {
   success @0 :Bool;
   pid     @1 :UInt32;
+}
+
+# Spawn ChatApp inference pane request
+struct SpawnChatAppRequest {
+  # Session to attach the chat app to (0 = most recent)
+  sessionId @0 :UInt32;
+  # Model reference in "name:branch" format
+  modelRef  @1 :Text;
+  # Terminal dimensions
+  cols      @2 :UInt16;
+  rows      @3 :UInt16;
+  # Pane to render into (0 = active pane in session's active window)
+  paneId    @4 :UInt32;
 }
 
 # Spawn ShellApp chrome shell request
@@ -306,6 +323,9 @@ struct TuiResponse {
 
     # SpawnChromeShell result
     spawnChromeShellResult @16 :SpawnShellResult;
+
+    # SpawnChatApp result
+    spawnChatAppResult @17 :SpawnShellResult;
   }
 }
 

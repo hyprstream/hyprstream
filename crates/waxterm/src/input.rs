@@ -10,6 +10,8 @@ pub enum KeyPress {
     Enter,
     Escape,
     Backspace,
+    /// Ctrl+Space (NUL / 0x00) — start-menu trigger for the TUI shell chrome.
+    CtrlSpace,
     /// Function keys F1–F12.
     F(u8),
 }
@@ -44,8 +46,9 @@ impl<C: From<KeyPress>> InputParser<C> {
         let mut i = 0;
 
         while i < data.len() {
-            // Skip NUL heartbeat bytes (JS sends 0x00 to keep stdin flowing)
+            // NUL (0x00) = Ctrl+Space — used as start-menu trigger.
             if data[i] == 0x00 {
+                cmds.push(C::from(KeyPress::CtrlSpace));
                 i += 1;
                 continue;
             }
@@ -277,12 +280,15 @@ mod tests {
     }
 
     #[test]
-    fn test_nul_bytes_skipped() {
+    fn test_nul_bytes_become_ctrl_space() {
         let data = [0x00, b'a', 0x00, 0x00, b'b'];
         let cmds = parser().parse(&data);
-        assert_eq!(cmds.len(), 2);
-        assert_eq!(cmds[0], KeyPress::Char(b'a'));
-        assert_eq!(cmds[1], KeyPress::Char(b'b'));
+        assert_eq!(cmds.len(), 5);
+        assert_eq!(cmds[0], KeyPress::CtrlSpace);
+        assert_eq!(cmds[1], KeyPress::Char(b'a'));
+        assert_eq!(cmds[2], KeyPress::CtrlSpace);
+        assert_eq!(cmds[3], KeyPress::CtrlSpace);
+        assert_eq!(cmds[4], KeyPress::Char(b'b'));
     }
 
     #[test]

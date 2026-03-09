@@ -36,6 +36,14 @@ impl<T: Display + Clone> SelectList<T> {
         self.items.get(self.selected)
     }
 
+    /// Builder: set the initial selection index.
+    pub fn with_selected(mut self, idx: usize) -> Self {
+        if idx < self.items.len() {
+            self.selected = idx;
+        }
+        self
+    }
+
     /// Mutable reference to items, for updating status in place.
     pub fn items_mut(&mut self) -> &mut Vec<T> {
         &mut self.items

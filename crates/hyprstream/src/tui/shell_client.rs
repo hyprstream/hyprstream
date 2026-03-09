@@ -1,15 +1,19 @@
 //! Client-side state for the ShellClient TUI.
 //!
 //! `ShellClientState` holds the `avt::Vt` that is fed ANSI frames from
-//! TuiService, plus the window list, model list, and keyboard-dispatch logic.
-//! The event loop in `shell_handlers.rs` owns this state and calls
-//! `feed_frame` / `handle_key` on each tick.
+//! TuiService, plus the window list, model list, settings, and keyboard-
+//! dispatch logic.  The event loop in `shell_handlers.rs` owns this state and
+//! calls `feed_frame` / `handle_key` on each tick.
 
 use std::path::PathBuf;
 
 use avt::Vt;
 use waxterm::input::KeyPress;
 use waxterm::widgets::{SelectList, WidgetResult};
+
+use hyprstream_tui::background::{
+    BackgroundState, BackgroundStyle, ALL_STYLES, PREVIEW_H, PREVIEW_W,
+};
 
 use crate::services::generated::tui_client::TuiClient;
 
@@ -35,10 +39,10 @@ pub struct PaneSummary {
 }
 
 // ============================================================================
-// Model entry (re-exported from hyprstream-tui for local use)
+// Model entry
 // ============================================================================
 
-/// A model repo discovered in the registry directory.
+/// A model repo discovered via the registry RPC.
 #[derive(Clone)]
 pub struct ModelEntry {
     pub model_ref: String,  // "name:branch" — used as display label and load key
@@ -56,7 +60,6 @@ impl std::fmt::Display for ModelEntry {
     }
 }
 
-
 // ============================================================================
 // Mode + Action
 // ============================================================================
@@ -66,7 +69,21 @@ pub enum ShellMode {
     Normal,
     /// Model-list modal is open.
     ModelList,
+    /// Settings modal is open.
+    Settings,
+    /// Start-menu popup (Ctrl+Space).
+    StartMenu { selected: usize },
 }
+
+/// Menu items: (label, chord hint shown in popup).
+pub const MENU_ITEMS: &[(&str, &str)] = &[
+    ("New",        "N"),
+    ("Close",      "Q"),
+    ("Cycle",      "Tab"),
+    ("Models",     "M"),
+    ("Settings",   "S"),
+    ("Disconnect", "D"),
+];
 
 /// Result of handling a key in the event loop.
 pub enum ShellAction {
@@ -92,11 +109,22 @@ pub struct ShellClientState {
     pub active_win: usize,
     pub model_list: SelectList<ModelEntry>,
     pub load_status: Option<String>,
+    /// Background animation (full terminal area).
+    pub bg: BackgroundState,
+    /// Background animation for the settings preview box.
+    pub preview_bg: BackgroundState,
+    /// Settings drop-down.
+    pub settings_list: SelectList<BackgroundStyle>,
+    /// Saved background style — restored when settings is cancelled.
+    saved_style: BackgroundStyle,
     pub cols: u16,
     pub pane_rows: u16,
     pub session_id: u32,
     pub viewer_id: u32,
     pub model_client: crate::services::ModelZmqClient,
+    /// Send `(model_ref, loaded)` updates back to the event loop in
+    /// `shell_handlers.rs` once a background polling task confirms load.
+    pub model_status_tx: tokio::sync::mpsc::Sender<(String, bool)>,
 }
 
 impl ShellClientState {
@@ -108,11 +136,21 @@ impl ShellClientState {
         windows: Vec<WindowSummary>,
         models: Vec<ModelEntry>,
         model_client: crate::services::ModelZmqClient,
+        model_status_tx: tokio::sync::mpsc::Sender<(String, bool)>,
     ) -> Self {
         let model_list = SelectList::new("Models", models);
         let vt = Vt::builder()
             .size(cols as usize, pane_rows as usize)
             .build();
+
+        let default_style = BackgroundStyle::Stars;
+        let settings_list = SelectList::new("Background", ALL_STYLES.to_vec())
+            .with_selected(1); // Stars is index 1
+
+        let mut bg = BackgroundState::new(default_style);
+        // Initialise immediately so the first rendered frame isn't blank.
+        bg.tick(cols, pane_rows);
+
         Self {
             mode: ShellMode::Normal,
             vt,
@@ -120,17 +158,34 @@ impl ShellClientState {
             active_win: 0,
             model_list,
             load_status: None,
+            bg,
+            preview_bg: BackgroundState::new(default_style),
+            settings_list,
+            saved_style: default_style,
             cols,
             pane_rows,
             session_id,
             viewer_id,
             model_client,
+            model_status_tx,
         }
     }
 
     /// Feed ANSI bytes from TuiService into the local Vt.
     pub fn feed_frame(&mut self, ansi: &[u8]) {
         self.vt.feed_str(&String::from_utf8_lossy(ansi));
+    }
+
+    /// Tick background animations.  Returns true when a redraw is needed.
+    pub fn tick_bg(&mut self) -> bool {
+        let show_bg = self.windows.is_empty() || matches!(self.mode, ShellMode::Settings);
+        if show_bg {
+            self.bg.tick(self.cols, self.pane_rows);
+        }
+        if matches!(self.mode, ShellMode::Settings) {
+            self.preview_bg.tick(PREVIEW_W, PREVIEW_H);
+        }
+        show_bg && self.bg.is_animated()
     }
 
     /// Dispatch a keypress and return the resulting action.
@@ -140,8 +195,10 @@ impl ShellClientState {
         client: &TuiClient,
     ) -> ShellAction {
         match self.mode {
-            ShellMode::Normal => self.handle_normal(key, client).await,
-            ShellMode::ModelList => self.handle_model_list(key, client).await,
+            ShellMode::Normal                 => self.handle_normal(key, client).await,
+            ShellMode::ModelList              => self.handle_model_list(key, client).await,
+            ShellMode::Settings               => self.handle_settings(key),
+            ShellMode::StartMenu { selected } => self.handle_start_menu(key, selected, client).await,
         }
     }
 
@@ -152,6 +209,18 @@ impl ShellClientState {
             KeyPress::F(12) => ShellAction::Quit,
             KeyPress::F(10) => {
                 self.mode = ShellMode::ModelList;
+                ShellAction::Redraw
+            }
+            KeyPress::F(11) => {
+                self.saved_style = self.bg.style;
+                let idx = ALL_STYLES
+                    .iter()
+                    .position(|s| *s == self.bg.style)
+                    .unwrap_or(0);
+                self.settings_list = SelectList::new("Background", ALL_STYLES.to_vec())
+                    .with_selected(idx);
+                self.preview_bg.style = self.bg.style;
+                self.mode = ShellMode::Settings;
                 ShellAction::Redraw
             }
             KeyPress::F(7) => {
@@ -180,9 +249,13 @@ impl ShellClientState {
                     let win_id = win.id;
                     let _ = close_window_rpc(client, win_id).await;
                     self.windows.remove(self.active_win);
-                    if !self.windows.is_empty() {
+                    if self.windows.is_empty() {
+                        // Clear stale VT content so the background shows through.
+                        self.vt = Vt::builder()
+                            .size(self.cols as usize, self.pane_rows as usize)
+                            .build();
+                    } else {
                         self.active_win = self.active_win.min(self.windows.len() - 1);
-                        // Focus the new active window server-side.
                         if let Some(w) = self.windows.get(self.active_win) {
                             let _ = focus_window_rpc(client, w.id).await;
                         }
@@ -190,14 +263,8 @@ impl ShellClientState {
                 }
                 ShellAction::Redraw
             }
-            KeyPress::Tab => {
-                // Cycle windows and tell the server which is active.
-                if !self.windows.is_empty() {
-                    self.active_win = (self.active_win + 1) % self.windows.len();
-                    if let Some(w) = self.windows.get(self.active_win) {
-                        let _ = focus_window_rpc(client, w.id).await;
-                    }
-                }
+            KeyPress::CtrlSpace => {
+                self.mode = ShellMode::StartMenu { selected: 0 };
                 ShellAction::Redraw
             }
             // Ctrl-B D — detach
@@ -209,15 +276,35 @@ impl ShellClientState {
     // ── ModelList mode ───────────────────────────────────────────────────────
 
     async fn handle_model_list(&mut self, key: KeyPress, client: &TuiClient) -> ShellAction {
-        // l — load selected model
+        // l — submit load request; poll status in background until confirmed
         if matches!(key, KeyPress::Char(b'l' | b'L')) {
             if let Some(model) = self.model_list.selected_item().cloned() {
                 let model_ref = model.model_ref.clone();
-                let loaded = self.model_client.load(&model_ref, None).await.is_ok();
-                let idx = self.model_list.selected_index();
-                if let Some(entry) = self.model_list.items_mut().get_mut(idx) {
-                    entry.loaded = loaded;
-                }
+                // The ModelService returns "accepted" immediately (Continuation
+                // pattern).  is_ok() only confirms the RPC was received, NOT
+                // that the model is loaded.  We spawn a polling task instead.
+                let _ = self.model_client.load(&model_ref, None).await;
+                self.load_status = Some(format!("Loading {}…", model_ref));
+                // Do NOT mark loaded=true yet.
+
+                let poll_client = self.model_client.clone();
+                let poll_mr    = model_ref.clone();
+                let tx         = self.model_status_tx.clone();
+                tokio::spawn(async move {
+                    for _ in 0..60u32 {  // max ~2 minutes
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        match poll_client.status(&poll_mr).await {
+                            Ok(entries) if entries.iter().any(|e| e.status == "loaded") => {
+                                let _ = tx.send((poll_mr, true)).await;
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                    // Timed out — clear "Loading…" without marking loaded.
+                    let _ = tx.send((poll_mr, false)).await;
+                });
+
                 return ShellAction::Redraw;
             }
         }
@@ -236,14 +323,47 @@ impl ShellClientState {
             }
         }
 
-        // T / Enter — open terminal in selected model worktree
-        let is_open = matches!(key, KeyPress::Char(b't' | b'T') | KeyPress::Enter);
-        if is_open {
+        // Enter / C — spawn ChatApp inference pane for selected model (default action)
+        let is_chat = matches!(key, KeyPress::Enter | KeyPress::Char(b'c' | b'C'));
+        if is_chat {
+            if let Some(model) = self.model_list.selected_item().cloned() {
+                if let Ok(win_info) = client.create_window().await {
+                    let pane_id = win_info.active_pane_id;
+                    let _ = focus_window_rpc(client, win_info.id).await;
+                    let _ = spawn_chat_app_rpc(
+                        client,
+                        self.session_id,
+                        &model.model_ref,
+                        self.cols,
+                        self.pane_rows,
+                        pane_id,
+                    )
+                    .await;
+                    self.windows.push(WindowSummary {
+                        id: win_info.id,
+                        name: format!("{} chat", model.model_ref),
+                        active_pane_id: win_info.active_pane_id,
+                        panes: win_info
+                            .panes
+                            .iter()
+                            .map(|p| PaneSummary { id: p.id, cols: p.cols, rows: p.rows })
+                            .collect(),
+                    });
+                    self.active_win = self.windows.len() - 1;
+                }
+                self.mode = ShellMode::Normal;
+                return ShellAction::Redraw;
+            }
+        }
+
+        // T — open terminal scoped to the model's git worktree directory
+        if matches!(key, KeyPress::Char(b't' | b'T')) {
             if let Some(model) = self.model_list.selected_item().cloned() {
                 let cwd = model.path.to_string_lossy().into_owned();
                 let title = format!("{} shell", model.model_ref);
                 if let Ok(win_info) = client.create_window().await {
                     let pane_id = win_info.active_pane_id;
+                    let _ = focus_window_rpc(client, win_info.id).await;
                     let _ = spawn_shell_rpc(client, self.session_id, pane_id, &cwd).await;
                     self.windows.push(WindowSummary {
                         id: win_info.id,
@@ -268,14 +388,24 @@ impl ShellClientState {
                 ShellAction::Redraw
             }
             WidgetResult::Confirmed(model) => {
-                let cwd = model.path.to_string_lossy().into_owned();
-                let title = format!("{} shell", model.model_ref);
+                // Enter on the select list widget → chat (same as is_chat above, but
+                // handle_key consumes Enter before we reach the is_chat arm when focus
+                // is inside the widget, so mirror the action here).
                 if let Ok(win_info) = client.create_window().await {
                     let pane_id = win_info.active_pane_id;
-                    let _ = spawn_shell_rpc(client, self.session_id, pane_id, &cwd).await;
+                    let _ = focus_window_rpc(client, win_info.id).await;
+                    let _ = spawn_chat_app_rpc(
+                        client,
+                        self.session_id,
+                        &model.model_ref,
+                        self.cols,
+                        self.pane_rows,
+                        pane_id,
+                    )
+                    .await;
                     self.windows.push(WindowSummary {
                         id: win_info.id,
-                        name: title,
+                        name: format!("{} chat", model.model_ref),
                         active_pane_id: win_info.active_pane_id,
                         panes: win_info
                             .panes
@@ -296,14 +426,142 @@ impl ShellClientState {
             }
         }
     }
+
+    // ── Start-menu mode ──────────────────────────────────────────────────────
+
+    async fn handle_start_menu(
+        &mut self,
+        key: KeyPress,
+        selected: usize,
+        client: &TuiClient,
+    ) -> ShellAction {
+        let n = MENU_ITEMS.len();
+        // Chord shortcuts execute immediately.
+        let chord: Option<usize> = match key {
+            KeyPress::Char(b'n' | b'N') => Some(0),
+            KeyPress::Char(b'q' | b'Q') => Some(1),
+            KeyPress::Tab               => Some(2),
+            KeyPress::Char(b'm' | b'M') => Some(3),
+            KeyPress::Char(b's' | b'S') => Some(4),
+            KeyPress::Char(b'd' | b'D') => Some(5),
+            _ => None,
+        };
+        if let Some(idx) = chord {
+            self.mode = ShellMode::Normal;
+            return self.execute_menu_action(idx, client).await;
+        }
+        match key {
+            KeyPress::Escape | KeyPress::CtrlSpace => { self.mode = ShellMode::Normal; }
+            KeyPress::ArrowUp => {
+                self.mode = ShellMode::StartMenu {
+                    selected: if selected == 0 { n - 1 } else { selected - 1 },
+                };
+            }
+            KeyPress::ArrowDown => {
+                self.mode = ShellMode::StartMenu { selected: (selected + 1) % n };
+            }
+            KeyPress::Enter => {
+                self.mode = ShellMode::Normal;
+                return self.execute_menu_action(selected, client).await;
+            }
+            _ => {}
+        }
+        ShellAction::Redraw
+    }
+
+    async fn execute_menu_action(&mut self, idx: usize, client: &TuiClient) -> ShellAction {
+        match idx {
+            0 => {
+                // New window
+                if let Ok(win_info) = client.create_window().await {
+                    let pane_id = win_info.active_pane_id;
+                    let _ = spawn_shell_rpc(client, self.session_id, pane_id, "").await;
+                    let _ = focus_window_rpc(client, win_info.id).await;
+                    self.windows.push(WindowSummary {
+                        id: win_info.id, name: win_info.name,
+                        active_pane_id: win_info.active_pane_id,
+                        panes: win_info.panes.iter()
+                            .map(|p| PaneSummary { id: p.id, cols: p.cols, rows: p.rows })
+                            .collect(),
+                    });
+                    self.active_win = self.windows.len() - 1;
+                }
+            }
+            1 => {
+                // Close active window
+                if let Some(win) = self.windows.get(self.active_win) {
+                    let win_id = win.id;
+                    let _ = close_window_rpc(client, win_id).await;
+                    self.windows.remove(self.active_win);
+                    if self.windows.is_empty() {
+                        self.vt = avt::Vt::builder()
+                            .size(self.cols as usize, self.pane_rows as usize)
+                            .build();
+                    } else {
+                        self.active_win = self.active_win.min(self.windows.len() - 1);
+                        if let Some(w) = self.windows.get(self.active_win) {
+                            let _ = focus_window_rpc(client, w.id).await;
+                        }
+                    }
+                }
+            }
+            2 => {
+                // Cycle windows
+                if !self.windows.is_empty() {
+                    self.active_win = (self.active_win + 1) % self.windows.len();
+                    if let Some(w) = self.windows.get(self.active_win) {
+                        let _ = focus_window_rpc(client, w.id).await;
+                    }
+                }
+            }
+            3 => { self.mode = ShellMode::ModelList; }
+            4 => {
+                self.saved_style = self.bg.style;
+                let idx = hyprstream_tui::background::ALL_STYLES
+                    .iter().position(|s| *s == self.bg.style).unwrap_or(0);
+                self.settings_list = waxterm::widgets::SelectList::new(
+                    "Background",
+                    hyprstream_tui::background::ALL_STYLES.to_vec(),
+                ).with_selected(idx);
+                self.preview_bg.style = self.bg.style;
+                self.mode = ShellMode::Settings;
+            }
+            5 => return ShellAction::Quit,
+            _ => {}
+        }
+        ShellAction::Redraw
+    }
+
+    // ── Settings mode ────────────────────────────────────────────────────────
+
+    fn handle_settings(&mut self, key: KeyPress) -> ShellAction {
+        match self.settings_list.handle_key(&key) {
+            WidgetResult::Cancelled => {
+                self.bg.style         = self.saved_style;
+                self.preview_bg.style = self.saved_style;
+                self.mode             = ShellMode::Normal;
+                ShellAction::Redraw
+            }
+            WidgetResult::Confirmed(style) => {
+                self.bg.style         = style;
+                self.preview_bg.style = style;
+                self.mode             = ShellMode::Normal;
+                ShellAction::Redraw
+            }
+            WidgetResult::Pending => {
+                // Live preview: follow the highlighted list entry.
+                if let Some(&style) = self.settings_list.selected_item() {
+                    self.bg.style         = style;
+                    self.preview_bg.style = style;
+                }
+                ShellAction::Redraw
+            }
+        }
+    }
 }
 
 // ============================================================================
 // Manual RPC helpers (spawnShell / closePane)
-//
-// The generated TuiClient won't have typed methods for the new schema variants
-// until after `cargo build` regenerates CGR metadata. We build the Cap'n Proto
-// messages manually here — same pattern as `handle_tui_list` / `sendInput`.
 // ============================================================================
 
 /// Send a spawnShell RPC to TuiService.
@@ -327,10 +585,6 @@ pub async fn spawn_shell_rpc(
 }
 
 /// Poll for stdin bytes queued for this viewer (pollStdin RPC).
-///
-/// Returns all bytes enqueued since the last poll, concatenated.
-/// Empty slice means nothing was queued.  Used instead of ZMQ SUB in embedded
-/// mode to avoid a second ZMQ context and libzmq signaler assertion bugs.
 pub async fn poll_stdin_rpc(client: &TuiClient, viewer_id: u32) -> anyhow::Result<Vec<u8>> {
     let request_id = client.next_id();
     let payload = hyprstream_rpc::serialize_message(|msg| {
@@ -366,6 +620,30 @@ pub async fn focus_window_rpc(client: &TuiClient, window_id: u32) -> anyhow::Res
     Ok(())
 }
 
+/// Send a spawnChatApp RPC to TuiService.
+pub async fn spawn_chat_app_rpc(
+    client: &TuiClient,
+    session_id: u32,
+    model_ref: &str,
+    cols: u16,
+    rows: u16,
+    pane_id: u32,
+) -> anyhow::Result<()> {
+    let request_id = client.next_id();
+    let payload = hyprstream_rpc::serialize_message(|msg| {
+        let mut req = msg.init_root::<crate::tui_capnp::tui_request::Builder<'_>>();
+        req.set_id(request_id);
+        let mut chat = req.init_spawn_chat_app();
+        chat.set_session_id(session_id);
+        chat.set_model_ref(model_ref);
+        chat.set_cols(cols);
+        chat.set_rows(rows);
+        chat.set_pane_id(pane_id);
+    })?;
+    client.call(payload).await?;
+    Ok(())
+}
+
 /// Close a window by ID via RPC.
 pub async fn close_window_rpc(client: &TuiClient, window_id: u32) -> anyhow::Result<()> {
     let request_id = client.next_id();
@@ -377,7 +655,6 @@ pub async fn close_window_rpc(client: &TuiClient, window_id: u32) -> anyhow::Res
     client.call(payload).await?;
     Ok(())
 }
-
 
 // ============================================================================
 // KeyPress → raw bytes (for forwarding to PTY via sendInput)
@@ -406,6 +683,6 @@ pub fn keypress_to_bytes(key: KeyPress) -> Vec<u8> {
         KeyPress::F(10) => b"\x1b[21~".to_vec(),
         KeyPress::F(11) => b"\x1b[23~".to_vec(),
         KeyPress::F(12) => b"\x1b[24~".to_vec(),
-        KeyPress::F(_)  => vec![],
+        KeyPress::F(_) | KeyPress::CtrlSpace  => vec![],  // consumed by chrome or unmapped; never forward to PTY
     }
 }

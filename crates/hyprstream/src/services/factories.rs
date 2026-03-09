@@ -730,12 +730,14 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         tui_config.scrollback_lines,
     )));
 
+    let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::local());
+
     let tui_service = TuiService::new(
         state,
         global_context(),
         ctx.transport("tui", SocketKind::Rep),
         ctx.signing_key().clone(),
-    );
+    ).with_policy_client(policy_client);
 
     Ok(ctx.into_spawnable_quic(tui_service, tui_config.quic_port))
 }
