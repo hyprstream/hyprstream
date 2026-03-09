@@ -229,6 +229,9 @@ pub struct TTTResult {
     /// Time budget that was enforced (milliseconds).
     /// Client can derive `timed_out = time_used_ms >= time_budget_ms`.
     pub time_budget_ms: u64,
+
+    /// Per-key rank utilization from this adaptation (empty if skipped)
+    pub rank_utilization: HashMap<String, f64>,
 }
 
 impl TTTResult {
@@ -254,6 +257,7 @@ impl TTTResult {
             pending: false,
             time_used_ms: 0,
             time_budget_ms: 0,
+            rank_utilization: HashMap::new(),
         }
     }
 }
@@ -539,6 +543,7 @@ impl TestTimeTrainer {
                     pending: false,
                     time_used_ms: start.elapsed().as_millis() as u64,
                     time_budget_ms,
+                    rank_utilization: HashMap::new(),
                 },
                 pre_snapshot,
             ));
@@ -560,7 +565,7 @@ impl TestTimeTrainer {
 
         match loop_result {
             Ok(Ok(inner)) => {
-                let (actual_steps, losses, grad_norms, any_clipped, final_loss, final_perplexity) = inner;
+                let (actual_steps, losses, grad_norms, any_clipped, final_loss, final_perplexity, rank_utils) = inner;
 
                 let avg_loss = losses.iter().sum::<f32>() / losses.len() as f32;
                 let loss_improvement = initial_loss - final_loss;
@@ -612,6 +617,7 @@ impl TestTimeTrainer {
                         pending: true, // Awaiting client commit/rollback
                         time_used_ms,
                         time_budget_ms,
+                        rank_utilization: rank_utils,
                     },
                     pre_snapshot,
                 ))
@@ -659,7 +665,7 @@ impl TestTimeTrainer {
         start: &Instant,
         budget: Duration,
         initial_loss_tensor: Tensor,
-    ) -> Result<(usize, Vec<f32>, Vec<f32>, bool, f32, f32)> {
+    ) -> Result<(usize, Vec<f32>, Vec<f32>, bool, f32, f32, HashMap<String, f64>)> {
         let initial_loss = initial_loss_tensor.double_value(&[]) as f32;
         let mut losses = vec![initial_loss];
         let mut grad_norms = Vec::with_capacity(gated_steps);
@@ -732,7 +738,22 @@ impl TestTimeTrainer {
         let final_loss = final_loss_tensor.double_value(&[]) as f32;
         let final_perplexity = final_loss.exp();
 
-        Ok((actual_steps, losses, grad_norms, any_clipped, final_loss, final_perplexity))
+        // Collect final rank utilization for all keys
+        let rank_utils: HashMap<String, f64> = {
+            let _guard = tch::no_grad_guard();
+            delta
+                .lora_a
+                .iter()
+                .filter_map(|(key, a)| {
+                    delta
+                        .lora_b
+                        .get(key)
+                        .map(|b| (key.clone(), crate::runtime::ttn_profile::delta_rank_utilization(a, b)))
+                })
+                .collect()
+        };
+
+        Ok((actual_steps, losses, grad_norms, any_clipped, final_loss, final_perplexity, rank_utils))
     }
 
     /// Compute NTP loss with a tenant delta applied
@@ -880,6 +901,7 @@ impl TestTimeTrainer {
                     pending: false, // trainStep commits immediately based on auto_commit
                     time_used_ms,
                     time_budget_ms,
+                    rank_utilization: HashMap::new(), // train_step doesn't track utilization
                 })
             }
             Ok(Err(e)) => {

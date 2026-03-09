@@ -517,6 +517,95 @@ pub fn attention_sparsity(attn_weights: &Tensor, top_k: i64) -> Tensor {
 }
 
 // ============================================================================
+// Rank Utilization Tracker
+// ============================================================================
+
+/// Rolling-window rank utilization tracker.
+///
+/// Records per-key utilization values and produces adaptation signals
+/// (increase/decrease/hold) based on configurable thresholds.
+#[derive(Debug, Clone)]
+pub struct RankUtilizationTracker {
+    window_size: usize,
+    history: HashMap<String, std::collections::VecDeque<f64>>,
+}
+
+/// Signal for rank adaptation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RankSignal {
+    Increase,
+    Decrease,
+    Hold,
+}
+
+/// Summary statistics for a key's utilization history.
+#[derive(Debug, Clone)]
+pub struct UtilizationSummary {
+    pub mean: f64,
+    pub min: f64,
+    pub max: f64,
+    pub count: usize,
+}
+
+impl RankUtilizationTracker {
+    pub fn new(window_size: usize) -> Self {
+        Self {
+            window_size,
+            history: HashMap::new(),
+        }
+    }
+
+    pub fn record(&mut self, key: &str, utilization: f64) {
+        let entry = self
+            .history
+            .entry(key.to_owned())
+            .or_insert_with(std::collections::VecDeque::new);
+        entry.push_back(utilization);
+        while entry.len() > self.window_size {
+            entry.pop_front();
+        }
+    }
+
+    pub fn summary(&self, key: &str) -> Option<UtilizationSummary> {
+        let h = self.history.get(key)?;
+        if h.is_empty() {
+            return None;
+        }
+        let count = h.len();
+        let sum: f64 = h.iter().sum();
+        let min = h.iter().copied().fold(f64::MAX, f64::min);
+        let max = h.iter().copied().fold(f64::MIN, f64::max);
+        Some(UtilizationSummary {
+            mean: sum / count as f64,
+            min,
+            max,
+            count,
+        })
+    }
+
+    pub fn rank_adaptation_signals(
+        &self,
+        low_threshold: f64,
+        high_threshold: f64,
+    ) -> HashMap<String, RankSignal> {
+        self.history
+            .keys()
+            .filter_map(|key| {
+                let s = self.summary(key)?;
+                let signal = if s.mean < low_threshold {
+                    RankSignal::Decrease
+                } else if s.mean > high_threshold {
+                    RankSignal::Increase
+                } else {
+                    RankSignal::Hold
+                };
+                Some((key.clone(), signal))
+            })
+            .collect()
+    }
+}
+
+// ============================================================================
 // W-SLC Online Rank Allocator
 // ============================================================================
 
@@ -822,6 +911,58 @@ mod tests {
         // B = 0 → product is 0 → utilization should be 0
         let util = delta_rank_utilization(&a, &b);
         assert_eq!(util, 0.0);
+    }
+
+    // --- Rank Utilization Tracker Tests ---
+
+    #[test]
+    fn test_utilization_tracker_records() {
+        let mut tracker = RankUtilizationTracker::new(5);
+        tracker.record("0.q_proj", 0.3);
+        tracker.record("0.q_proj", 0.5);
+        let summary = tracker.summary("0.q_proj");
+        assert!(summary.is_some());
+        let s = summary.unwrap();
+        assert_eq!(s.count, 2);
+        assert!((s.mean - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_utilization_tracker_window() {
+        let mut tracker = RankUtilizationTracker::new(3);
+        tracker.record("k", 0.1);
+        tracker.record("k", 0.2);
+        tracker.record("k", 0.3);
+        tracker.record("k", 0.9); // pushes out 0.1
+        let s = tracker.summary("k").unwrap();
+        assert_eq!(s.count, 3);
+        // mean of [0.2, 0.3, 0.9] = 0.4667
+        assert!((s.mean - 0.4667).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_utilization_tracker_rank_signals() {
+        let mut tracker = RankUtilizationTracker::new(10);
+        for _ in 0..5 {
+            tracker.record("low", 0.15);
+        }
+        for _ in 0..5 {
+            tracker.record("high", 0.95);
+        }
+        for _ in 0..5 {
+            tracker.record("ok", 0.5);
+        }
+
+        let signals = tracker.rank_adaptation_signals(0.25, 0.85);
+        assert_eq!(signals.get("low"), Some(&RankSignal::Decrease));
+        assert_eq!(signals.get("high"), Some(&RankSignal::Increase));
+        assert_eq!(signals.get("ok"), Some(&RankSignal::Hold));
+    }
+
+    #[test]
+    fn test_utilization_tracker_empty_key() {
+        let tracker = RankUtilizationTracker::new(5);
+        assert!(tracker.summary("nonexistent").is_none());
     }
 
     // --- W-SLC Online Rank Allocator Tests ---
