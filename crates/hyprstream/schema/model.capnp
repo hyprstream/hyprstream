@@ -61,15 +61,15 @@ struct TttRequest {
     init @1 :InitLoraRequest
       $mcpDescription("Initialize the training infrastructure (LoRA parameters, optimizer, delta pool) on a loaded model. Required before ttt.train or TTT-enabled inference. Configure rank, alpha, target modules, and learning rate.");
     train @2 :TrainStepRequest
-      $mcpDescription("Run TTT gradient steps on input text WITHOUT generating a response. Pure training — use for pre-training on domain text before asking questions. Returns loss metrics and recommendation. If autoCommit is false, call ttt.commit or ttt.rollback.");
+      $mcpDescription("Run TTT gradient steps on input text WITHOUT generating a response. Pure training — use for pre-training on domain text before asking questions. Returns loss metrics and recommendation. Use adaptationStrategy=speculative to keep pending, then call ttt.writeback or ttt.evict.");
     trainStream @3 :TrainStepRequest
       $mcpDescription("Stream TTT training on input text. Returns progress and results via streaming. Use for long-running training that would timeout via ttt.train.");
-    commit @4 :Void
-      $mcpDescription("Commit a pending TTT adaptation to the tenant delta accumulator. Call after reviewing onlineTrainingMetrics.recommendation from infer.generateStream. Must be called within the pending rollback window (default 60 seconds, configurable via pending_rollback_ms). If the window expires, the adaptation is auto-rolled back and this call will return an error.");
-    rollback @5 :Void
-      $mcpDescription("Rollback a pending TTT adaptation, restoring the tenant delta accumulator to its pre-adaptation state. Call within the pending rollback window (default 60 seconds, configurable via pending_rollback_ms) if recommendation was false or output quality was poor. If multiple adaptations were stacked without resolving the first, rollback restores to the state before the earliest pending adaptation.");
-    reset @6 :Void
-      $mcpDescription("Clear the tenant delta accumulator, resetting all accumulated training to zero.");
+    writeback @4 :Void
+      $mcpDescription("Write back a pending TTT adaptation to the tenant delta accumulator. Call after reviewing onlineTrainingMetrics.recommendation from infer.generateStream. Must be called within the pending rollback window (default 60 seconds, configurable via pending_rollback_ms). If the window expires, the adaptation is auto-evicted and this call will return an error.");
+    evict @5 :Void
+      $mcpDescription("Evict (discard) a pending TTT adaptation, restoring the tenant delta accumulator to its pre-adaptation state. Call within the pending rollback window (default 60 seconds, configurable via pending_rollback_ms) if recommendation was false or output quality was poor. If multiple adaptations were stacked, evict restores to the state before the earliest pending adaptation.");
+    zero @6 :Void
+      $mcpDescription("Zero the tenant delta accumulator, clearing all accumulated training. Use after ttt.save or ttt.export to free capacity.");
     status @7 :Void
       $mcpDescription("Get tenant delta accumulator metrics: step count, loss improvement, drift. Use to decide if adaptations should be persisted via ttt.save or ttt.export.");
     save @8 :SaveAdaptationRequest
@@ -118,7 +118,7 @@ struct InferRequest {
   modelRef @0 :Text;
   union {
     generateStream @1 :GenerateRequest
-      $mcpDescription("Run inference with automatic domain adaptation. When TTT is enabled, the model adapts to your prompt BEFORE generating — the response is always produced using the adapted weights, even when autoCommit is false. Check onlineTrainingMetrics.recommendation in the response, then call ttt.commit (if true) or ttt.rollback (if false) within the pending rollback window (default 60 seconds). If you call generateStream again before resolving a pending adaptation, the new adaptation stacks on top and rollback will restore to the state before the first pending adaptation. Pending adaptations auto-rollback after the timeout if commit/rollback is not called.");
+      $mcpDescription("Run inference with automatic domain adaptation. When TTT is enabled, the model adapts to your prompt BEFORE generating — the response is always produced using the adapted weights, even when adaptationStrategy=speculative. Check onlineTrainingMetrics.recommendation in the response, then call ttt.writeback (if true) or ttt.evict (if false) within the pending rollback window (default 60 seconds). If you call generateStream again before resolving a pending adaptation, the new adaptation stacks on top and evict will restore to the state before the first pending adaptation. Pending adaptations auto-evict after the timeout if writeback/evict is not called.");
     applyChatTemplate @2 :ApplyChatTemplateRequest
       $mcpDescription("Apply chat template to messages for a loaded model");
     status @3 :Void
@@ -156,9 +156,9 @@ struct TttResponse {
     init @1 :Void;
     train @2 :TrainStepResponse;
     trainStream @3 :StreamInfo;
-    commit @4 :Void;
-    rollback @5 :Void;
-    reset @6 :Void;
+    writeback @4 :Void;
+    evict @5 :Void;
+    zero @6 :Void;
     status @7 :GetDeltaStatusResponse;
     save @8 :SaveAdaptationResponse;
     snapshot @9 :SnapshotDeltaResponse;
@@ -384,7 +384,7 @@ struct GetDeltaStatusResponse {
   lastSnapshotHash @6 :Text;
   deltaNormRatios @7 :List(ModuleNormRatio);
   hasPending @8 :Bool
-    $paramDescription("Whether a pending adaptation awaits commit or rollback. Point-in-time snapshot — may become stale if the timeout expires before you act. Call ttt.commit or ttt.rollback to resolve.");
+    $paramDescription("Whether a pending adaptation awaits writeback or evict. Point-in-time snapshot — may become stale if the timeout expires before you act. Call ttt.writeback or ttt.evict to resolve.");
 }
 
 struct ModuleNormRatio {

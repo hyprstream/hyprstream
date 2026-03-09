@@ -638,14 +638,14 @@ impl ModelService {
     }
 
     // Training loop control - forward to InferenceService via ZMQ
-    async fn commit_adaptation(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
+    async fn writeback_adaptation(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
         let client = self.get_inference_client(model_ref_str, ctx).await?;
-        client.commit_adaptation().await
+        client.writeback_adaptation().await
     }
 
-    async fn rollback_adaptation(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
+    async fn evict_adaptation(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
         let client = self.get_inference_client(model_ref_str, ctx).await?;
-        client.rollback_adaptation().await
+        client.evict_adaptation().await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -670,9 +670,9 @@ impl ModelService {
         client.train_step_stream(input, gradient_steps, learning_rate, strategy_str, writeback_threshold, client_ephemeral_pubkey).await
     }
 
-    async fn reset_delta(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
+    async fn zero_delta(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
         let client = self.get_inference_client(model_ref_str, ctx).await?;
-        client.reset_delta().await
+        client.zero_delta().await
     }
 
     async fn get_delta_status_forward(
@@ -795,22 +795,22 @@ impl TttHandler for ModelService {
         Ok((stream_info, Box::pin(async {})))
     }
 
-    async fn handle_commit(
+    async fn handle_writeback(
         &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
     ) -> Result<()> {
-        self.commit_adaptation(model_ref, ctx).await
+        self.writeback_adaptation(model_ref, ctx).await
     }
 
-    async fn handle_rollback(
+    async fn handle_evict(
         &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
     ) -> Result<()> {
-        self.rollback_adaptation(model_ref, ctx).await
+        self.evict_adaptation(model_ref, ctx).await
     }
 
-    async fn handle_reset(
+    async fn handle_zero(
         &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
     ) -> Result<()> {
-        self.reset_delta(model_ref, ctx).await
+        self.zero_delta(model_ref, ctx).await
     }
 
     async fn handle_status(

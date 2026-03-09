@@ -2892,18 +2892,18 @@ impl InferenceZmqClient {
 
     // Training loop control (TTT operations)
 
-    /// Commit a pending TTT adaptation (writeback)
-    pub async fn commit_adaptation(&self) -> Result<()> {
+    /// Write back a pending TTT adaptation
+    pub async fn writeback_adaptation(&self) -> Result<()> {
         self.gen.ttt_writeback().await
     }
 
-    /// Rollback a pending TTT adaptation (evict)
-    pub async fn rollback_adaptation(&self) -> Result<()> {
+    /// Evict a pending TTT adaptation
+    pub async fn evict_adaptation(&self) -> Result<()> {
         self.gen.ttt_evict().await
     }
 
-    /// Reset a tenant's delta (zero)
-    pub async fn reset_delta(&self) -> Result<()> {
+    /// Zero a tenant's delta accumulator
+    pub async fn zero_delta(&self) -> Result<()> {
         self.gen.ttt_zero().await
     }
 
