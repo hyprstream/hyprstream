@@ -8,7 +8,7 @@ pub mod worker;
 
 pub use flight::FlightArgs;
 pub use git::{GitAction, GitCommand};
-pub use policy::{PolicyCommand, TokenCommand};
+pub use policy::{PolicyCommand, RoleCommand, TokenCommand};
 pub use training::{TrainingAction, TrainingCommand};
 pub use worker::{ImageCommand, WorkerAction};
 

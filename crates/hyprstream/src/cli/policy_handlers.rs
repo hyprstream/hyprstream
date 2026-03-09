@@ -510,6 +510,83 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 // Re-export policy templates from shared location
 pub use crate::auth::policy_templates::{PolicyTemplate, get_template, get_templates};
 
+// === Role handlers ===
+
+/// Handle `policy role add <user> <role>` - Assign a role to a user via RPC
+pub async fn handle_policy_role_add(
+    signing_key: &SigningKey,
+    user: &str,
+    role: &str,
+    dry_run: bool,
+) -> Result<()> {
+    if dry_run {
+        println!("Would add: g, {user}, {role}");
+        return Ok(());
+    }
+
+    let client = create_policy_client(signing_key);
+    let sha = client.add_grouping(user, role).await
+        .context("Failed to add role assignment via PolicyService. Are services running?")?;
+
+    println!("Role assigned. Commit: {}", &sha[..sha.len().min(8)]);
+    Ok(())
+}
+
+/// Handle `policy role remove <user> <role>` - Remove a role from a user via RPC
+pub async fn handle_policy_role_remove(
+    signing_key: &SigningKey,
+    user: &str,
+    role: &str,
+    force: bool,
+) -> Result<()> {
+    if !force {
+        print!("Remove role '{role}' from '{user}'? [y/N] ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let client = create_policy_client(signing_key);
+    let sha = client.remove_grouping(user, role).await
+        .context("Failed to remove role assignment via PolicyService. Are services running?")?;
+
+    println!("Role removed. Commit: {}", &sha[..sha.len().min(8)]);
+    Ok(())
+}
+
+/// Handle `policy role list` - List role assignments (g-lines) via RPC
+pub async fn handle_policy_role_list(
+    signing_key: &SigningKey,
+    user: Option<&str>,
+    role: Option<&str>,
+) -> Result<()> {
+    let client = create_policy_client(signing_key);
+    let policy_info = client.get_policy().await
+        .context("Failed to get policy from PolicyService. Are services running?")?;
+
+    let groupings: Vec<_> = policy_info.groupings.iter()
+        .filter(|g| user.is_none_or(|u| g.user == u))
+        .filter(|g| role.is_none_or(|r| g.role == r))
+        .collect();
+
+    if groupings.is_empty() {
+        println!("No role assignments found.");
+        return Ok(());
+    }
+
+    for g in groupings {
+        println!("g, {}, {}", g.user, g.role);
+    }
+
+    Ok(())
+}
+
 /// Handle `policy list-templates` - List available templates
 pub async fn handle_policy_list_templates() -> Result<()> {
     let templates = get_templates();

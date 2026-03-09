@@ -86,6 +86,46 @@ pub enum PolicyCommand {
 
     /// List available policy templates
     ListTemplates,
+
+    /// Role assignment subcommands
+    Role {
+        #[command(subcommand)]
+        command: RoleCommand,
+    },
+}
+
+/// Role assignment subcommands
+#[derive(Subcommand, Debug)]
+pub enum RoleCommand {
+    /// Assign a role to a user
+    Add {
+        /// User subject (e.g., "alice" or "https://node.example.com:alice")
+        user: String,
+        /// Role to assign (e.g., "ttt.user", "ttt.privileged")
+        role: String,
+        /// Preview without making changes
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove a role from a user
+    Remove {
+        /// User subject
+        user: String,
+        /// Role to remove
+        role: String,
+        /// Skip confirmation prompt
+        #[arg(short = 'f', long)]
+        force: bool,
+    },
+    /// List role assignments (g-lines from policy)
+    List {
+        /// Filter by user
+        #[arg(short = 'u', long)]
+        user: Option<String>,
+        /// Filter by role
+        #[arg(short = 'r', long)]
+        role: Option<String>,
+    },
 }
 
 /// Token management subcommands

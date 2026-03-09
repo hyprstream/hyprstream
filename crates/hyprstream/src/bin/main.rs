@@ -19,7 +19,8 @@ use hyprstream_core::cli::{
     handle_branch, handle_checkout, handle_clone, handle_infer, handle_info, handle_list,
     handle_load, handle_notify_command, parse_filters, parse_status_filter, handle_policy_apply, handle_policy_apply_template, handle_policy_check,
     handle_policy_diff, handle_policy_edit, handle_policy_history, handle_policy_list_templates,
-    handle_policy_rollback, handle_policy_show, handle_pull, handle_remote_add, handle_remote_list,
+    handle_policy_rollback, handle_policy_show, handle_policy_role_add, handle_policy_role_remove,
+    handle_policy_role_list, handle_pull, handle_remote_add, handle_remote_list,
     handle_remote_remove, handle_remote_rename, handle_remote_set_url, handle_remove,
     handle_status, handle_token_create, handle_unload, handle_training_batch,
     handle_training_checkpoint, handle_training_infer, handle_training_init, handle_worktree_add,
@@ -35,7 +36,7 @@ use hyprstream_core::cli::{
     handle_service_start, handle_service_status,
     handle_service_stop, handle_service_uninstall,
 };
-use hyprstream_core::cli::commands::{PolicyCommand, TokenCommand};
+use hyprstream_core::cli::commands::{PolicyCommand, RoleCommand, TokenCommand};
 
 #[cfg(feature = "experimental")]
 use hyprstream_core::cli::{handle_commit, handle_merge, handle_push, MergeOptions};
@@ -881,6 +882,17 @@ fn handle_quick_command(
                         handle_policy_apply_template(&signing_key, &template, dry_run).await
                     }
                     PolicyCommand::ListTemplates => handle_policy_list_templates().await,
+                    PolicyCommand::Role { command } => match command {
+                        RoleCommand::Add { user, role, dry_run } => {
+                            handle_policy_role_add(&signing_key, &user, &role, dry_run).await
+                        }
+                        RoleCommand::Remove { user, role, force } => {
+                            handle_policy_role_remove(&signing_key, &user, &role, force).await
+                        }
+                        RoleCommand::List { user, role } => {
+                            handle_policy_role_list(&signing_key, user.as_deref(), role.as_deref()).await
+                        }
+                    },
                 }
             },
         ),
