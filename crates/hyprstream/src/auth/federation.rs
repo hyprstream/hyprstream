@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::VerifyingKey;
@@ -33,8 +33,13 @@ impl CachedKey {
 /// Set `allow_http: true` in `TrustedIssuerConfig` on a per-issuer basis to
 /// permit plain HTTP (development / internal use only).
 pub struct FederationKeyResolver {
-    /// issuer_url → cached key
-    cache: RwLock<HashMap<String, CachedKey>>,
+    /// issuer_url → cached key.
+    ///
+    /// A single `Mutex` (not `RwLock`) serialises both reads and writes so
+    /// that concurrent cache-miss events for the same issuer do not race:
+    /// the first waiter fetches, writes the result, and the second waiter
+    /// then finds a valid entry on re-check.
+    cache: Mutex<HashMap<String, CachedKey>>,
     /// issuer_url → (optional jwks_uri_override, ttl, allow_http)
     config: HashMap<String, (Option<String>, Duration, bool)>,
     http: reqwest::Client,
@@ -58,7 +63,7 @@ impl FederationKeyResolver {
             })
             .collect();
         Self {
-            cache: RwLock::new(HashMap::new()),
+            cache: Mutex::new(HashMap::new()),
             config,
             // TLS certificate verification is enabled by default (reqwest default).
             http: reqwest::Client::builder()
@@ -74,24 +79,29 @@ impl FederationKeyResolver {
     }
 
     /// Get the verifying key for an issuer, fetching/refreshing JWKS as needed.
+    ///
+    /// Uses a single `Mutex` for both cache reads and writes so that concurrent
+    /// requests for the same issuer serialise: the second waiter re-checks the
+    /// cache after the first finishes, finding a fresh entry rather than issuing
+    /// a redundant JWKS fetch.
     pub async fn get_key(&self, issuer: &str) -> Result<VerifyingKey> {
-        // Check cache first (read lock)
-        {
-            let cache = self.cache.read().await;
-            if let Some(entry) = cache.get(issuer) {
-                if !entry.is_expired() {
-                    return Ok(entry.key);
-                }
-            }
-        }
-
-        // Fetch JWKS (outside read lock)
+        // Look up config before acquiring cache lock (config is immutable after new())
         let (jwks_uri_override, ttl, allow_http) = self
             .config
             .get(issuer)
             .map(|(u, t, h)| (u.clone(), *t, *h))
             .ok_or_else(|| anyhow!("Issuer not in trusted list: {}", issuer))?;
 
+        // Acquire the cache lock once. Check first; only fetch if expired/absent.
+        let mut cache = self.cache.lock().await;
+        if let Some(entry) = cache.get(issuer) {
+            if !entry.is_expired() {
+                return Ok(entry.key);
+            }
+        }
+
+        // Cache miss or expired — fetch while holding the lock so concurrent
+        // callers for the same issuer block here and reuse the result.
         let jwks_uri = if let Some(uri) = jwks_uri_override {
             self.check_scheme(&uri, allow_http)?;
             uri
@@ -101,33 +111,40 @@ impl FederationKeyResolver {
 
         let key = self.fetch_ed25519_key(&jwks_uri).await?;
 
-        // Update cache (write lock)
-        {
-            let mut cache = self.cache.write().await;
-            cache.insert(
-                issuer.to_owned(),
-                CachedKey {
-                    key,
-                    fetched_at: Instant::now(),
-                    ttl,
-                },
-            );
-        }
+        cache.insert(
+            issuer.to_owned(),
+            CachedKey {
+                key,
+                fetched_at: Instant::now(),
+                ttl,
+            },
+        );
 
         Ok(key)
     }
 
-    /// Validate that `url` uses HTTPS unless `allow_http` is explicitly set.
+    /// Validate that `url` uses HTTPS (or HTTP when explicitly permitted).
+    ///
+    /// Rejects all non-HTTP(S) schemes (e.g. `ftp://`, `file://`) regardless
+    /// of the `allow_http` flag.
     fn check_scheme(&self, url: &str, allow_http: bool) -> Result<()> {
-        if !allow_http && !url.starts_with("https://") {
+        if url.starts_with("https://") || (allow_http && url.starts_with("http://")) {
+            Ok(())
+        } else if url.starts_with("http://") {
+            // HTTP but not explicitly allowed
             anyhow::bail!(
                 "JWKS URI must use HTTPS for security (got '{}'). \
                  Set allow_http: true in trusted_issuers config to permit HTTP \
                  (development / internal networks only).",
                 url
-            );
+            )
+        } else {
+            // Non-HTTP(S) scheme (ftp://, file://, javascript:, etc.)
+            anyhow::bail!(
+                "JWKS URI must use HTTPS or HTTP scheme (got '{}').",
+                url
+            )
         }
-        Ok(())
     }
 
     async fn discover_jwks_uri(&self, issuer: &str, allow_http: bool) -> Result<String> {
