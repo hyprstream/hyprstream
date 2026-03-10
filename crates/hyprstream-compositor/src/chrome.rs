@@ -244,7 +244,6 @@ pub struct ShellChrome {
     pub windows: Vec<WindowSummary>,
     pub active_win: usize,
     pub model_list: SelectList<ModelEntry>,
-    pub load_status: Option<String>,
     /// Background animation (full terminal area).
     pub bg: BackgroundState,
     /// Background animation for the settings preview box.
@@ -295,7 +294,6 @@ impl ShellChrome {
             windows,
             active_win: 0,
             model_list,
-            load_status: None,
             bg,
             preview_bg: BackgroundState::new(default_style),
             settings_list,
@@ -316,14 +314,16 @@ impl ShellChrome {
 
     /// Update model loaded status (called from background polling results).
     pub fn update_model_status(&mut self, model_ref: &str, loaded: bool) {
+        let mut was_loading = false;
         for entry in self.model_list.items_mut() {
             if entry.model_ref == model_ref {
+                was_loading = was_loading || entry.loading;
                 entry.loaded = loaded;
                 entry.loading = false;
             }
         }
-        if self.load_status.as_ref().is_some_and(|s| s.contains(model_ref)) {
-            self.load_status = None;
+        if was_loading && loaded {
+            self.push_toast(format!("Loaded {model_ref}"), ToastLevel::Info);
         }
     }
 
@@ -497,6 +497,7 @@ impl ShellChrome {
                 // Ctrl-B — handled at event loop level; chrome does nothing.
                 vec![]
             }
+            #[cfg(feature = "experimental")]
             KeyPress::F(5) => {
                 self.mode = ShellMode::ServiceManager { selected: 0 };
                 vec![ChromeOutput::Redraw]
@@ -532,7 +533,7 @@ impl ShellChrome {
         if matches!(key, KeyPress::Char(b'l' | b'L')) {
             if let Some(model) = self.model_list.selected_item().cloned() {
                 let model_ref = model.model_ref.clone();
-                self.load_status = Some(format!("Loading {model_ref}\u{2026}"));
+                self.push_toast(format!("Loading {model_ref}\u{2026}"), ToastLevel::Info);
                 for entry in self.model_list.items_mut() {
                     if entry.model_ref == model_ref {
                         entry.loading = true;

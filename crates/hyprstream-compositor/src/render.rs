@@ -67,9 +67,15 @@ pub fn draw(frame: &mut Frame, chrome: &ShellChrome, layout: &LayoutTree) {
         ShellMode::Normal | ShellMode::Fullscreen => {}
     }
 
-    // Toasts drawn on top of pane area (not over modals).
+    // Toasts drawn in the upper-right of the full chrome area (below status bar).
     if !chrome.toasts.is_empty() && !matches!(chrome.mode, ShellMode::Console) {
-        draw_toasts(frame, pane_block, chrome);
+        let toast_area = Rect {
+            x: area.x,
+            y: area.y + 1, // below status bar
+            width: area.width,
+            height: area.height.saturating_sub(3), // above strip + fkeys
+        };
+        draw_toasts(frame, toast_area, chrome);
     }
 }
 
@@ -132,12 +138,6 @@ fn pane_title_line(chrome: &ShellChrome) -> Line<'static> {
             spans.push(Span::raw(" "));
         }
         spans.push(Span::styled(w.name.clone(), theme::titlebar_style()));
-        if let Some(status) = &chrome.load_status {
-            spans.push(Span::styled(
-                format!("  {}  ", status),
-                theme::titlebar_dim_style(),
-            ));
-        }
         Line::from(spans)
     } else {
         Line::from(Span::styled(" no windows", theme::titlebar_dim_style()))
@@ -327,16 +327,33 @@ fn draw_fkey_bar(frame: &mut Frame, area: Rect, mode: &ShellMode) {
         ShellMode::Fullscreen => &[
             ("Ctrl-F/Esc", "exit fullscreen"),
         ],
-        ShellMode::Normal => &[
-            ("F5",  "svc"),
-            ("F6",  "wrk"),
-            ("F7",  "new"),
-            ("F8",  "close"),
-            ("F9",  "log"),
-            ("F10", "models"),
-            ("F11", "settings"),
-            ("F12", "quit"),
-        ],
+        ShellMode::Normal => {
+            #[cfg(feature = "experimental")]
+            {
+                &[
+                    ("F5",  "svc"),
+                    ("F6",  "wrk"),
+                    ("F7",  "new"),
+                    ("F8",  "close"),
+                    ("F9",  "log"),
+                    ("F10", "models"),
+                    ("F11", "settings"),
+                    ("F12", "quit"),
+                ]
+            }
+            #[cfg(not(feature = "experimental"))]
+            {
+                &[
+                    ("F6",  "wrk"),
+                    ("F7",  "new"),
+                    ("F8",  "close"),
+                    ("F9",  "log"),
+                    ("F10", "models"),
+                    ("F11", "settings"),
+                    ("F12", "quit"),
+                ]
+            }
+        }
         ShellMode::Console => &[
             ("\u{2191}\u{2193}", "scroll"),
             ("F9/Esc",           "close"),
