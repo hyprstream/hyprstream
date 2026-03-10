@@ -150,6 +150,13 @@ pub enum Commands {
         #[command(subcommand)]
         action: ServiceAction,
     },
+
+    // TODO(task-12): sign-challenge CLI
+    // Add a `SignChallenge { user_code: String }` variant here.
+    // Handler: fetch nonce from GET /oauth/device/nonce?user_code={user_code},
+    // load signing key from keyring, compute challenge = "{username}:{user_code}:{nonce}",
+    // sign with ed25519_dalek, and print base64 signature.
+    // The nonce endpoint is already implemented at GET /oauth/device/nonce.
 }
 
 /// Service management actions

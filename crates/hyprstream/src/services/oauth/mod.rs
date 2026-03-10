@@ -78,6 +78,7 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             "/oauth/device/verify",
             get(device::verify_get).post(device::verify_post),
         )
+        .route("/oauth/device/nonce", get(device::device_nonce))
         .layer(axum::middleware::from_fn(|req: axum::extract::Request, next: axum::middleware::Next| async move {
             let method = req.method().clone();
             let uri = req.uri().clone();
@@ -198,12 +199,42 @@ impl Spawnable for OAuthService {
                 hyprstream_rpc::RequestIdentity::local(),
             );
 
+            // Attempt to load the user credential store for Ed25519 device verification.
+            // Failure is non-fatal; the verify endpoint will report "not configured" instead.
+            let user_store: Option<Arc<dyn crate::auth::user_store::UserStore + Send + Sync>> = {
+                let credentials_dir = crate::config::HyprConfig::load()
+                    .map(|c| c.config_dir().join("credentials"))
+                    .unwrap_or_else(|_| {
+                        dirs::config_dir()
+                            .unwrap_or_else(|| std::path::PathBuf::from("/etc/hyprstream"))
+                            .join("hyprstream")
+                            .join("credentials")
+                    });
+                match crate::auth::user_store::LocalKeyStore::load(&credentials_dir) {
+                    Ok(store) => {
+                        info!("User credential store loaded from {:?}", credentials_dir);
+                        Some(Arc::new(store))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Could not load user credential store (device verify will require manual setup): {}",
+                            e
+                        );
+                        None
+                    }
+                }
+            };
+
             // Create shared state
-            let state = Arc::new(OAuthState::new(
+            let mut oauth_state = OAuthState::new(
                 &self.config,
                 policy_client,
                 self.verifying_key.to_bytes(),
-            ));
+            );
+            if let Some(store) = user_store {
+                oauth_state = oauth_state.with_user_store(store);
+            }
+            let state = Arc::new(oauth_state);
             state.spawn_code_sweeper();
 
             // Create router with configurable CORS
