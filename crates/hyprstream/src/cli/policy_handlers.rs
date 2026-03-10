@@ -395,12 +395,76 @@ pub async fn handle_token_create(
 }
 
 
-/// Load or generate the signing key from .registry/keys/signing.key
+/// Load or generate the signing key, preferring the OS keyring over file storage.
 ///
-/// Security: avoids TOCTOU by opening the file directly instead of
-/// checking existence first. New keys are created with mode 0o600 at
-/// open(2) time so the private key is never world-readable on disk.
+/// Priority order:
+/// 1. OS keyring (Linux keyutils / macOS Keychain / Windows Credential Manager)
+/// 2. File at `keys_dir/signing.key` (fallback when keyring is unavailable)
+///
+/// Security: file-based fallback avoids TOCTOU by opening the file directly
+/// instead of checking existence first. New keys are created with mode 0o600
+/// at open(2) time so the private key is never world-readable on disk.
 pub async fn load_or_generate_signing_key(keys_dir: &Path) -> Result<SigningKey> {
+    #[cfg(target_os = "linux")]
+    {
+        const SERVICE: &str = "hyprstream";
+        const KEY_NAME: &str = "signing-key";
+
+        // Try OS keyring first
+        match keyring::Entry::new(SERVICE, KEY_NAME) {
+            Ok(entry) => match entry.get_secret() {
+                Ok(bytes) if bytes.len() == 32 => {
+                    let arr: [u8; 32] = bytes.try_into().unwrap_or([0u8; 32]);
+                    return Ok(SigningKey::from_bytes(&arr));
+                }
+                Ok(_) => {
+                    tracing::warn!("Keyring entry for signing key has wrong size; regenerating");
+                    // Fall through to generate new key below
+                }
+                Err(keyring::Error::NoEntry) => {
+                    // Fall through to generate new key below
+                }
+                Err(e) => {
+                    tracing::warn!("Keyring unavailable ({}); falling back to file", e);
+                    return load_or_generate_signing_key_file(keys_dir).await;
+                }
+            },
+            Err(_) => {
+                return load_or_generate_signing_key_file(keys_dir).await;
+            }
+        }
+
+        // Generate new key and store in keyring
+        let key = SigningKey::generate(&mut rand::thread_rng());
+        let key_bytes = key.to_bytes();
+        match keyring::Entry::new(SERVICE, KEY_NAME) {
+            Ok(entry) => {
+                if let Err(e) = entry.set_secret(&key_bytes) {
+                    tracing::warn!(
+                        "Failed to store signing key in keyring ({}); falling back to file",
+                        e
+                    );
+                    return load_or_generate_signing_key_file_with_key(keys_dir, key).await;
+                }
+            }
+            Err(_) => {
+                return load_or_generate_signing_key_file_with_key(keys_dir, key).await;
+            }
+        }
+        tracing::info!("Generated new Ed25519 signing key (stored in OS keyring)");
+        Ok(key)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        load_or_generate_signing_key_file(keys_dir).await
+    }
+}
+
+/// Load or generate the signing key from `keys_dir/signing.key`.
+///
+/// Used as fallback when the OS keyring is unavailable.
+async fn load_or_generate_signing_key_file(keys_dir: &Path) -> Result<SigningKey> {
     use std::io::Read;
 
     let key_path = keys_dir.join("signing.key");
@@ -411,7 +475,10 @@ pub async fn load_or_generate_signing_key(keys_dir: &Path) -> Result<SigningKey>
             let mut key_bytes = Vec::new();
             file.read_to_end(&mut key_bytes)?;
             if key_bytes.len() != 32 {
-                anyhow::bail!("Invalid signing key file: expected 32 bytes, got {}", key_bytes.len());
+                anyhow::bail!(
+                    "Invalid signing key file: expected 32 bytes, got {}",
+                    key_bytes.len()
+                );
             }
             let mut key_array = [0u8; 32];
             key_array.copy_from_slice(&key_bytes);
@@ -420,38 +487,50 @@ pub async fn load_or_generate_signing_key(keys_dir: &Path) -> Result<SigningKey>
             Ok(signing_key)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Generate new key — create directory with restricted permissions
-            tokio::fs::create_dir_all(keys_dir).await?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                tokio::fs::set_permissions(keys_dir, std::fs::Permissions::from_mode(0o700)).await?;
-            }
-
             let signing_key = SigningKey::generate(&mut rand::thread_rng());
-
-            // Write key with mode 0o600 set at open(2) time — never world-readable
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(&key_path)?;
-                std::io::Write::write_all(&mut file, &signing_key.to_bytes())?;
-            }
-
-            #[cfg(not(unix))]
-            {
-                tokio::fs::write(&key_path, signing_key.to_bytes()).await?;
-            }
-
-            info!("Generated new signing key at {:?}", key_path);
-            Ok(signing_key)
+            load_or_generate_signing_key_file_with_key(keys_dir, signing_key).await
         }
         Err(e) => Err(e.into()),
     }
+}
+
+/// Write the given signing key to `keys_dir/signing.key` and return it.
+///
+/// Creates the directory with mode 0o700 and the file with mode 0o600 so
+/// the private key is never world-readable on disk.
+async fn load_or_generate_signing_key_file_with_key(
+    keys_dir: &Path,
+    key: SigningKey,
+) -> Result<SigningKey> {
+    let key_path = keys_dir.join("signing.key");
+
+    // Create directory with restricted permissions
+    tokio::fs::create_dir_all(keys_dir).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(keys_dir, std::fs::Permissions::from_mode(0o700)).await?;
+    }
+
+    // Write key with mode 0o600 set at open(2) time — never world-readable
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&key_path)?;
+        std::io::Write::write_all(&mut file, &key.to_bytes())?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::fs::write(&key_path, key.to_bytes()).await?;
+    }
+
+    info!("Generated new signing key at {:?}", key_path);
+    Ok(key)
 }
 
 /// Parse duration string like "30d", "90d", "1y", "never"

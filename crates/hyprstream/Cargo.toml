@@ -143,6 +143,7 @@ blake3.workspace = true                  # Fast cryptographic hashing for checks
 tempfile.workspace = true                # Temporary files for model conversion
 base64.workspace = true                  # JWT token encoding
 ed25519-dalek.workspace = true           # JWT Ed25519 signatures
+keyring = { version = "3", features = ["linux-native"] }  # OS keyring for signing key storage
 curve25519-dalek.workspace = true        # Ristretto255 DH for stream authentication
 hkdf.workspace = true                    # HKDF key derivation
 subtle.workspace = true                  # Constant-time operations
