@@ -13,7 +13,7 @@ pub mod scope;
 pub mod scope_registry;
 
 pub use claims::Claims;
-pub use jwt::{decode, encode, JwtError};
+pub use jwt::{decode, decode_with_key, encode, JwtError};
 #[cfg(test)]
 pub use jwt::decode_unverified;
 pub use scope::Scope;

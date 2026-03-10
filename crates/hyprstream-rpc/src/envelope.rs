@@ -246,6 +246,10 @@ impl Subject {
     /// Note: federated subjects (containing `://`) intentionally bypass this
     /// validation — call `validate()` only for local subjects.
     pub fn validate(&self) -> Result<()> {
+        if self.is_federated() {
+            return Ok(()); // federated subjects are validated at JWT decode time
+        }
+
         let name = match &self.0 {
             Some(n) => n.as_str(),
             None => return Ok(()),

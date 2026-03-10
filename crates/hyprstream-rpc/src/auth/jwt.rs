@@ -72,10 +72,10 @@ pub fn encode(claims: &Claims, signing_key: &SigningKey) -> String {
     format!("{signing_input}.{signature_b64}")
 }
 
-/// Decode and verify a JWT token
+/// Decode and verify a JWT token issued by the **local** node.
 ///
-/// Accepts a raw RFC 7519 JWT. Returns the claims if valid and not expired.
-/// If `expected_aud` is Some, validates the audience claim matches.
+/// For tokens from foreign issuers (federation), use [`decode_with_key`]
+/// with the key obtained from `FederationKeyResolver::get_key`.
 pub fn decode(token: &str, verifying_key: &VerifyingKey, expected_aud: Option<&str>) -> Result<Claims, JwtError> {
     decode_inner(token, verifying_key, expected_aud)
 }
