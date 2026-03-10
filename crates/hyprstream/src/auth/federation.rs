@@ -177,14 +177,17 @@ impl FederationKeyResolver {
     }
 }
 
+// Adapter: delegates to the inherent methods. Using fully-qualified paths
+// prevents latent infinite recursion if the inherent methods are later
+// removed or made private during API cleanup.
 #[async_trait::async_trait]
 impl FederationKeySource for FederationKeyResolver {
     fn is_trusted(&self, issuer: &str) -> bool {
-        self.is_trusted(issuer)
+        FederationKeyResolver::is_trusted(self, issuer)
     }
 
     async fn get_key(&self, issuer: &str) -> anyhow::Result<ed25519_dalek::VerifyingKey> {
-        self.get_key(issuer).await
+        FederationKeyResolver::get_key(self, issuer).await
     }
 }
 
