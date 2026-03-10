@@ -222,6 +222,9 @@ pub trait ZmqService: 'static {
     /// subject impersonation via fabricated envelope claims.
     fn verify_claims(&self, ctx: &EnvelopeContext) -> anyhow::Result<()> {
         if let Some(claims) = ctx.claims() {
+            // TODO(task-9): wire FederationKeyResolver here — if claims.iss is non-empty and
+            // doesn't match the local issuer URL, call federation_resolver.get_key(&claims.iss)
+            // and pass the result to jwt::decode_with_key instead of using self.verifying_key().
             match claims.verify_token(&self.verifying_key(), self.expected_audience()) {
                 Ok(Some(verified)) => {
                     if verified.sub != claims.sub {
