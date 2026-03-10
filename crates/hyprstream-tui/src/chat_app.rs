@@ -186,7 +186,7 @@ impl ChatApp {
         let mut ta = TextArea::default();
         ta.set_block(hyprstream_compositor::theme::input_block());
         ta.set_line_number_style(hyprstream_compositor::theme::gutter_style());
-        ta.set_cursor_line_style(Style::default());
+        ta.set_cursor_line_style(Style::default().bg(hyprstream_compositor::theme::BG).fg(Color::White));
         ta.set_style(Style::default().bg(hyprstream_compositor::theme::BG).fg(Color::White));
         ta.set_placeholder_text("Type a message…");
         ta

@@ -745,9 +745,7 @@ impl TuiService {
             (sid, active_pane_id)
         };
 
-        let registry_models_dir = std::path::PathBuf::from(registry_dir)
-            .join(".registry")
-            .join("models");
+        let registry_models_dir = std::path::PathBuf::from(registry_dir);
         let models = {
             use hyprstream_rpc::envelope::RequestIdentity;
             let registry_endpoint = hyprstream_rpc::registry::global()

@@ -785,7 +785,7 @@ async fn fetch_models(
         signing_key.clone(),
         RequestIdentity::local(),
     );
-    let registry_models_dir = models_dir.join(".registry").join("models");
+    let registry_models_dir = models_dir.to_path_buf();
     let status_timeout = std::time::Duration::from_millis(500);
 
     let (repos_result, status_result) = tokio::join!(
