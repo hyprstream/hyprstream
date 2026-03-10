@@ -19,12 +19,11 @@ use ed25519_dalek::VerifyingKey;
 /// `get_key` uses the default (`Send`) flavour of `#[async_trait]` because
 /// `FederationKeyResolver` performs real async I/O (HTTPS JWKS fetch) whose
 /// future must be `Send`. Call sites inside `#[async_trait(?Send)]` contexts
-/// (e.g. the single-threaded ZMQ reactor in `ZmqService::verify_claims`)
-/// **must not** `.await` this future directly inside the `?Send` async fn.
-/// Instead, either:
-/// - `tokio::task::spawn` the lookup and `.await` the `JoinHandle`, or
-/// - restructure `verify_claims` so the federation lookup happens outside
-///   the `?Send` reactor (recommended approach for Task 3).
+/// (e.g. `ZmqService::verify_claims`) may `.await` this future directly:
+/// it is valid in Rust to await a `Send` future from within a `!Send`
+/// async function — the `?Send` bound constrains the outer function's
+/// future, not the futures it polls. `ZmqService::verify_claims` does
+/// exactly this and compiles correctly.
 #[async_trait::async_trait]
 pub trait FederationKeySource: Send + Sync + 'static {
     /// Return `true` if `issuer` is in the configured trusted-issuer list.

@@ -289,18 +289,20 @@ pub trait ZmqService: 'static {
             } else {
                 // --- Federated token path ---
                 let resolver = self.federation_key_source().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Federated JWT (iss={}) rejected: no FederationKeySource \
-                         configured on this service",
+                    tracing::warn!(
+                        "Federated JWT rejected: no FederationKeySource configured \
+                         (iss={})",
                         claims.iss
-                    )
+                    );
+                    anyhow::anyhow!("Federated JWT rejected: federation not configured")
                 })?;
 
                 if !resolver.is_trusted(&claims.iss) {
-                    anyhow::bail!(
-                        "Federated JWT issuer '{}' is not in the trusted-issuer list",
+                    tracing::warn!(
+                        "Federated JWT from untrusted issuer rejected (iss={})",
                         claims.iss
                     );
+                    anyhow::bail!("Federated JWT issuer not trusted");
                 }
 
                 let fed_key = resolver.get_key(&claims.iss).await.map_err(|e| {
@@ -309,14 +311,15 @@ pub trait ZmqService: 'static {
                         claims.iss,
                         e
                     );
-                    anyhow::anyhow!("Federation key resolution failed: {}", e)
+                    anyhow::anyhow!("Federation key resolution failed")
                 })?;
 
                 let token = claims.token.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Federated JWT (iss={}) present in claims but no raw token embedded",
+                    tracing::warn!(
+                        "Federated JWT (iss={}) missing raw token field",
                         claims.iss
-                    )
+                    );
+                    anyhow::anyhow!("Federated JWT missing token")
                 })?;
 
                 let verified = crate::auth::decode_with_key(token, &fed_key, self.expected_audience())
