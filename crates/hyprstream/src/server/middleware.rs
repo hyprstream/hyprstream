@@ -68,13 +68,34 @@ pub async fn auth_middleware(
 
     // Try JWT validation (stateless)
     if token.contains('.') {
-        // TODO(task-9): Multi-issuer federation — when `claims.iss` is non-empty
-        // and does not match `state.resource_url`, re-verify the token via
-        // `FederationKeyResolver::get_key(&claims.iss)` and set the subject to
-        // `Subject::federated(&claims.iss, &claims.sub)` instead of bare `sub`.
-        // This requires threading `Arc<FederationKeyResolver>` into `ServerState`.
-        // The JWT/Subject primitives (`decode_with_key`, `Subject::federated`,
-        // `Subject::is_federated`) are already implemented in Task 9.
+        // TODO(federation-wiring): Multi-issuer federation — federated JWTs are
+        // silently rejected here because only the local verifying key is used.
+        //
+        // To fix:
+        //   1. Add `federation_resolver: Arc<FederationKeyResolver>` to `ServerState`
+        //      and pass it in from `main.rs` where `ServerState::new` is called.
+        //   2. Add a helper `fn extract_iss_from_token(token: &str) -> String` that
+        //      base64-decodes the payload segment without signature verification and
+        //      returns the `iss` field (empty string on any parse failure).
+        //   3. Replace the single `jwt::decode` call below with:
+        //      ```
+        //      let iss = extract_iss_from_token(token);
+        //      let claims = if iss.is_empty() || iss == state.resource_url {
+        //          jwt::decode(token, &state.verifying_key, Some(&state.resource_url))
+        //              .map_err(|_| AuthError::InvalidToken)?
+        //      } else {
+        //          let key = state.federation_resolver.get_key(&iss).await
+        //              .map_err(|_| AuthError::UntrustedIssuer)?;
+        //          jwt::decode_with_key(token, &key, Some(&state.resource_url))
+        //              .map_err(|_| AuthError::InvalidToken)?
+        //      };
+        //      ```
+        //   4. Use `Subject::federated(&claims.iss, &claims.sub)` instead of bare
+        //      `claims.sub` when `iss` is non-empty and not the local issuer.
+        //
+        // All required JWT/Subject primitives (`decode_with_key`, `Subject::federated`,
+        // `Subject::is_federated`, `FederationKeyResolver::get_key`) are already
+        // implemented; only the ServerState threading and middleware call-site remain.
         match jwt::decode(token, &state.verifying_key, Some(&state.resource_url)) {
             Ok(claims) => {
                 debug!("JWT validated for user: {}", claims.sub);

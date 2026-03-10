@@ -306,10 +306,22 @@ impl PolicyHandler for PolicyService {
 
     async fn handle_apply_template(
         &self,
-        _ctx: &EnvelopeContext,
+        ctx: &EnvelopeContext,
         _request_id: u64,
         data: &ApplyTemplate,
     ) -> Result<PolicyResponseVariant> {
+        let caller = ctx.subject().to_string();
+        let allowed = self.policy_manager.check_with_domain(
+            &caller, "*", "policy:*", "ttt.writeback",
+        ).await;
+        if !allowed {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Unauthorized: {} cannot manage policy", caller),
+                code: "UNAUTHORIZED".into(),
+                details: String::new(),
+            }));
+        }
+
         info!("Applying policy template: {}", data.name);
 
         // Validate template exists
@@ -376,10 +388,22 @@ impl PolicyHandler for PolicyService {
 
     async fn handle_apply_draft(
         &self,
-        _ctx: &EnvelopeContext,
+        ctx: &EnvelopeContext,
         _request_id: u64,
         data: &ApplyDraft,
     ) -> Result<PolicyResponseVariant> {
+        let caller = ctx.subject().to_string();
+        let allowed = self.policy_manager.check_with_domain(
+            &caller, "*", "policy:*", "ttt.writeback",
+        ).await;
+        if !allowed {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Unauthorized: {} cannot manage policy", caller),
+                code: "UNAUTHORIZED".into(),
+                details: String::new(),
+            }));
+        }
+
         info!("Applying draft policy changes");
 
         // Validate current disk state
@@ -417,10 +441,22 @@ impl PolicyHandler for PolicyService {
 
     async fn handle_rollback(
         &self,
-        _ctx: &EnvelopeContext,
+        ctx: &EnvelopeContext,
         _request_id: u64,
         data: &RollbackPolicy,
     ) -> Result<PolicyResponseVariant> {
+        let caller = ctx.subject().to_string();
+        let allowed = self.policy_manager.check_with_domain(
+            &caller, "*", "policy:*", "ttt.writeback",
+        ).await;
+        if !allowed {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Unauthorized: {} cannot manage policy", caller),
+                code: "UNAUTHORIZED".into(),
+                details: String::new(),
+            }));
+        }
+
         info!("Rolling back policy to: {}", data.git_ref);
 
         let git_ref = data.git_ref.clone();
@@ -486,10 +522,22 @@ impl PolicyHandler for PolicyService {
 
     async fn handle_get_history(
         &self,
-        _ctx: &EnvelopeContext,
+        ctx: &EnvelopeContext,
         _request_id: u64,
         data: &GetHistory,
     ) -> Result<PolicyResponseVariant> {
+        let caller = ctx.subject().to_string();
+        let allowed = self.policy_manager.check_with_domain(
+            &caller, "*", "policy:*", "ttt.writeback",
+        ).await;
+        if !allowed {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Unauthorized: {} cannot manage policy", caller),
+                code: "UNAUTHORIZED".into(),
+                details: String::new(),
+            }));
+        }
+
         let count = if data.count == 0 { 10 } else { data.count as usize };
 
         trace!("Getting policy history (count={})", count);
@@ -561,10 +609,22 @@ impl PolicyHandler for PolicyService {
 
     async fn handle_get_diff(
         &self,
-        _ctx: &EnvelopeContext,
+        ctx: &EnvelopeContext,
         _request_id: u64,
         data: &GetDiff,
     ) -> Result<PolicyResponseVariant> {
+        let caller = ctx.subject().to_string();
+        let allowed = self.policy_manager.check_with_domain(
+            &caller, "*", "policy:*", "ttt.writeback",
+        ).await;
+        if !allowed {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Unauthorized: {} cannot manage policy", caller),
+                code: "UNAUTHORIZED".into(),
+                details: String::new(),
+            }));
+        }
+
         let git_ref = if data.git_ref.is_empty() { "HEAD".to_owned() } else { data.git_ref.clone() };
 
         let reg = self.git2db.read().await;
@@ -607,9 +667,21 @@ impl PolicyHandler for PolicyService {
 
     async fn handle_get_draft_status(
         &self,
-        _ctx: &EnvelopeContext,
+        ctx: &EnvelopeContext,
         _request_id: u64,
     ) -> Result<PolicyResponseVariant> {
+        let caller = ctx.subject().to_string();
+        let allowed = self.policy_manager.check_with_domain(
+            &caller, "*", "policy:*", "ttt.writeback",
+        ).await;
+        if !allowed {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Unauthorized: {} cannot manage policy", caller),
+                code: "UNAUTHORIZED".into(),
+                details: String::new(),
+            }));
+        }
+
         let reg = self.git2db.read().await;
         let handle = reg.repo(&self.registry_repo_id)?;
         let repo = handle.open_repo()
@@ -701,6 +773,10 @@ impl PolicyHandler for PolicyService {
         self.policy_manager.add_role_for_user(&data.user, &data.role).await
             .map_err(|e| anyhow!("Failed to add role: {}", e))?;
 
+        // Persist in-memory Casbin state to disk before staging
+        self.policy_manager.save().await
+            .map_err(|e| anyhow!("Failed to save policy after role grant: {}", e))?;
+
         // Commit to git
         let commit_msg = format!(
             "policy: grant role {} to {} [by {}]",
@@ -757,6 +833,10 @@ impl PolicyHandler for PolicyService {
         self.policy_manager.remove_role_for_user(&data.user, &data.role).await
             .map_err(|e| anyhow!("Failed to remove role: {}", e))?;
 
+        // Persist in-memory Casbin state to disk before staging
+        self.policy_manager.save().await
+            .map_err(|e| anyhow!("Failed to save policy after role revoke: {}", e))?;
+
         // Commit to git
         let commit_msg = format!(
             "policy: revoke role {} from {} [by {}]",
@@ -811,6 +891,10 @@ impl PolicyHandler for PolicyService {
             let _ = self.policy_manager.remove_policy_with_domain(
                 "*", "*", &resource, "query.status", "allow").await;
         }
+
+        // Persist in-memory Casbin state to disk before staging
+        self.policy_manager.save().await
+            .map_err(|e| anyhow!("Failed to save policy after visibility change: {}", e))?;
 
         let vis_str = if data.public { "public" } else { "private" };
         let msg = format!(

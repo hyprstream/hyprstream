@@ -250,6 +250,18 @@ pub async fn verify_post(
         }
     };
 
+    // Validate username does not contain ':' — the challenge format is
+    // "{username}:{user_code}:{nonce}" and a colon in the username would
+    // make the challenge string ambiguous.
+    if form.username.contains(':') {
+        let html = render_verify_page(
+            &form.user_code,
+            &nonce,
+            Some("Username must not contain ':'"),
+        );
+        return Html(html).into_response();
+    }
+
     // Reconstruct the challenge string: "{username}:{user_code}:{nonce}"
     // user_code here is the normalized (no-dash) form stored internally
     let challenge = format!("{}:{}:{}", form.username, normalized, nonce);

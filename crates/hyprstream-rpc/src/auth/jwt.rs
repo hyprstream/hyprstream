@@ -123,6 +123,17 @@ fn decode_inner(token: &str, verifying_key: &VerifyingKey, expected_aud: Option<
         .verify(signing_input.as_bytes(), &signature)
         .map_err(|_| JwtError::InvalidSignature)?;
 
+    // Validate the JWT header `alg` field to prevent algorithm-agility attacks.
+    // We only accept EdDSA tokens; any other alg value is rejected.
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(header_b64)
+        .map_err(|_| JwtError::InvalidBase64)?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
+        .map_err(|e| JwtError::InvalidJson(e.to_string()))?;
+    if header.get("alg").and_then(|v| v.as_str()) != Some("EdDSA") {
+        return Err(JwtError::InvalidSignature);
+    }
+
     // Decode payload
     let payload_bytes = URL_SAFE_NO_PAD
         .decode(payload_b64)

@@ -65,6 +65,13 @@ impl Operation {
     /// variant. When callers need to enforce at sub-action granularity (e.g. in an
     /// RPC handler), they should pass the specific dot-namespaced string directly to
     /// `check_with_domain` rather than going through this method.
+    ///
+    /// `Operation::Manage.as_str()` (i.e. `"ttt.writeback"`) is intentionally used
+    /// only for gates that specifically require the *highest* privilege in the `ttt.*`
+    /// namespace, such as issuing tokens on behalf of another subject. Handlers that
+    /// only need any `ttt.*` permission (e.g. `ttt.evict`) must pass the specific
+    /// action string to avoid incorrectly denying callers who hold a lesser `ttt.*`
+    /// permission but not `ttt.writeback`.
     pub fn as_str(&self) -> &'static str {
         match self {
             Operation::Infer   => "infer.generate",
