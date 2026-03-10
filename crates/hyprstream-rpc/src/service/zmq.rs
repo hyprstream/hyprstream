@@ -89,13 +89,14 @@ impl EnvelopeContext {
 
     /// Get the typed authorization subject.
     ///
-    /// Prefers Claims subject (gateway forwarding scenario) over transport identity.
-    /// This is the single source of truth for "who is this request from?" for
-    /// both authorization checks and resource isolation.
+    /// Uses Claims subject only when an embedded JWT token is present (gateway
+    /// forwarding scenario). Without a verified JWT, `claims.sub` is unverified
+    /// user input and MUST NOT be trusted — use the transport identity instead.
     pub fn subject(&self) -> Subject {
-        self.claims.as_ref()
-            .map(Subject::from)
-            .unwrap_or_else(|| Subject::from(&self.identity))
+        match &self.claims {
+            Some(c) if c.token.is_some() => Subject::from(c),
+            _ => Subject::from(&self.identity),
+        }
     }
 
     /// Get the bare username string.
@@ -230,6 +231,10 @@ pub trait ZmqService: 'static {
                     if verified.sub != claims.sub {
                         tracing::warn!("Claims sub mismatch: envelope={} jwt={}", claims.sub, verified.sub);
                         anyhow::bail!("Claims subject mismatch");
+                    }
+                    if verified.iss != claims.iss {
+                        tracing::warn!("Claims iss mismatch: envelope={} jwt={}", claims.iss, verified.iss);
+                        anyhow::bail!("Claims issuer mismatch");
                     }
                 }
                 Ok(None) => {

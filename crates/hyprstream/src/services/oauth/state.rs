@@ -86,6 +86,9 @@ impl PendingDeviceCode {
 #[derive(Debug, Clone)]
 pub struct RefreshTokenEntry {
     pub client_id: String,
+    /// JWT subject (username) of the token owner.
+    /// Used to re-issue the access token on refresh with the correct sub.
+    pub username: String,
     pub scopes: Vec<String>,
     pub resource: Option<String>,
     pub expires_at: Instant,

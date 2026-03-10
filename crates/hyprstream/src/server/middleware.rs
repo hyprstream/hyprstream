@@ -97,6 +97,13 @@ pub async fn auth_middleware(
                     // Federated subject: "{iss}:{sub}" for Casbin policy matching
                     format!("{}:{}", claims.iss, claims.sub)
                 };
+                // Validate local subjects for safe characters. Federated subjects
+                // (containing "://") bypass this check — they are validated at JWT decode time.
+                let subject = hyprstream_rpc::Subject::new(&user_str);
+                if let Err(e) = subject.validate() {
+                    debug!("JWT sub validation failed: {}", e);
+                    return unauthorized_response("Authentication failed", &www_authenticate);
+                }
                 let user = AuthenticatedUser {
                     user: user_str,
                     token: Some(token.to_owned()),
@@ -170,8 +177,9 @@ fn unauthorized_response(message: &str, www_authenticate: &str) -> Response {
 }
 
 /// Extract the `iss` claim from a JWT payload without signature verification.
+/// Exported for use in other middleware-like contexts (e.g. MCP inline auth).
 /// Returns an empty string on any parse failure.
-fn extract_iss_from_token(token: &str) -> String {
+pub fn extract_iss_from_token(token: &str) -> String {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     let parts: Vec<&str> = token.splitn(3, '.').collect();
     if parts.len() < 2 {

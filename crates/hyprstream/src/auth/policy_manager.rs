@@ -92,6 +92,12 @@ fn validate_policy_component(component: &str, name: &str) -> Result<(), PolicyEr
         )));
     }
 
+    if component.contains(',') {
+        return Err(PolicyError::ValidationError(format!(
+            "{name} contains comma (potential CSV injection)"
+        )));
+    }
+
     Ok(())
 }
 

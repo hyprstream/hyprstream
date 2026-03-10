@@ -478,6 +478,9 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let mcp_tls_config = config.tls.clone();
     let mcp_tls_cert = config.mcp.tls_cert.clone();
     let mcp_tls_key = config.mcp.tls_key.clone();
+    let mcp_federation_resolver = std::sync::Arc::new(
+        crate::auth::FederationKeyResolver::new(&config.oauth.trusted_issuers)
+    );
     tokio::task::block_in_place(|| {
         let rt = tokio::runtime::Handle::current();
         rt.spawn(async move {
@@ -529,9 +532,13 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                 .nest_service("/mcp", service)
                 .layer(axum::middleware::from_fn({
                     let mcp_resource_url = mcp_resource_url.clone();
+                    let mcp_oauth_issuer_clone = mcp_oauth_issuer.clone();
+                    let mcp_federation_resolver = mcp_federation_resolver.clone();
                     move |req: axum::extract::Request, next: axum::middleware::Next| {
                         let www_authenticate = www_authenticate.clone();
                         let mcp_resource_url = mcp_resource_url.clone();
+                        let mcp_oauth_issuer = mcp_oauth_issuer_clone.clone();
+                        let federation_resolver = mcp_federation_resolver.clone();
                         async move {
                             use axum::http::{header, StatusCode};
                             use axum::response::IntoResponse;
@@ -558,11 +565,27 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                                 });
                             match token {
                                 Some(t) => {
-                                    // TODO(federation-wiring): MCP inline auth does not perform federation branching.
-                                    // Federated tokens presented to the MCP endpoint will be rejected unconditionally.
-                                    // Apply the same extract_iss_from_token / federation_resolver.get_key pattern
-                                    // used in server/middleware.rs auth_middleware to support federated clients here.
-                                    match crate::auth::jwt::decode(t, &verifying_key, Some(mcp_resource_url.as_str())) {
+                                    // Federation branching: same logic as server/middleware.rs auth_middleware.
+                                    let iss = crate::server::middleware::extract_iss_from_token(t);
+                                    let is_local = iss.is_empty()
+                                        || iss == mcp_oauth_issuer
+                                        || iss == mcp_resource_url;
+                                    let result = if is_local {
+                                        crate::auth::jwt::decode(t, &verifying_key, Some(mcp_resource_url.as_str()))
+                                    } else {
+                                        match federation_resolver.get_key(&iss).await {
+                                            Ok(key) => crate::auth::jwt::decode_with_key(t, &key, None),
+                                            Err(e) => {
+                                                tracing::debug!(%method, %uri, issuer = %iss, error = %e, "MCP federation key resolution failed");
+                                                let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
+                                                if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
+                                                    res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
+                                                }
+                                                return res;
+                                            }
+                                        }
+                                    };
+                                    match result {
                                         Ok(claims) => {
                                             tracing::debug!(%method, %uri, sub = %claims.sub, "MCP auth OK");
                                             next.run(req).await

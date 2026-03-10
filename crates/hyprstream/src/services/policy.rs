@@ -459,7 +459,21 @@ impl PolicyHandler for PolicyService {
 
         info!("Rolling back policy to: {}", data.git_ref);
 
-        let git_ref = data.git_ref.clone();
+        // Validate git_ref to prevent shell injection or path traversal.
+        // Accept: 40-hex SHA, short SHA (7+ hex chars), or simple branch/tag names.
+        let git_ref = data.git_ref.trim().to_owned();
+        {
+            let valid = !git_ref.is_empty()
+                && git_ref.len() <= 256
+                && git_ref.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/' | '.'));
+            if !valid {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: format!("Invalid git ref '{}': only [a-zA-Z0-9._/-] allowed", git_ref),
+                    code: "INVALID_GIT_REF".into(),
+                    details: String::new(),
+                }));
+            }
+        }
 
         // Use git2 escape hatch to checkout policies/ from the target ref
         let reg = self.git2db.read().await;
