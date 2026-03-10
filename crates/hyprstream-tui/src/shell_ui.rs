@@ -207,14 +207,24 @@ fn draw_fkey_bar(frame: &mut Frame, area: Rect, mode: &ShellMode) {
             );
             return;
         }
-        ShellMode::ModelList => &[
-            ("\u{2191}\u{2193}", "Navigate"),
-            ("c",                "Private"),
-            ("C/Enter",          "Server chat"),
-            ("T",                "Terminal"),
-            ("l/u",              "Load/Unload"),
-            ("Esc",              "Close"),
-        ],
+        ShellMode::ModelList => if cfg!(any(target_os = "linux", target_os = "openbsd")) {
+            &[
+                ("\u{2191}\u{2193}", "Navigate"),
+                ("c",                "Private"),
+                ("C/Enter",          "Server chat"),
+                ("T",                "Terminal"),
+                ("l/u",              "Load/Unload"),
+                ("Esc",              "Close"),
+            ] as &[_]
+        } else {
+            &[
+                ("\u{2191}\u{2193}", "Navigate"),
+                ("c",                "Private"),
+                ("C/Enter",          "Server chat"),
+                ("l/u",              "Load/Unload"),
+                ("Esc",              "Close"),
+            ] as &[_]
+        },
         ShellMode::Settings => &[
             ("\u{2191}\u{2193}", "Navigate"),
             ("Enter",            "Select"),
@@ -255,22 +265,28 @@ fn draw_model_modal(frame: &mut Frame, full_area: Rect, app: &ShellApp) {
     let hint_area = Rect { y: inner.y + inner.height.saturating_sub(1), height: 1, ..inner };
     let list_area = Rect { height: inner.height.saturating_sub(2), ..inner };
 
-    let hint = Paragraph::new(Line::from(vec![
+    let mut hint_spans = vec![
         Span::styled("c",     theme::help_key()),
         Span::styled(" private  ",  theme::help_text()),
         Span::styled("C",     theme::help_key()),
         Span::styled("/",     theme::help_text()),
         Span::styled("Enter", theme::help_key()),
         Span::styled(" server  ",   theme::help_text()),
-        Span::styled("T",     theme::help_key()),
-        Span::styled(" terminal  ", theme::help_text()),
+    ];
+    // Scoped terminal is only available on platforms with filesystem sandbox support.
+    if cfg!(any(target_os = "linux", target_os = "openbsd")) {
+        hint_spans.push(Span::styled("T",     theme::help_key()));
+        hint_spans.push(Span::styled(" terminal  ", theme::help_text()));
+    }
+    hint_spans.extend([
         Span::styled("l",     theme::help_key()),
         Span::styled(" load  ",     theme::help_text()),
         Span::styled("u",     theme::help_key()),
         Span::styled(" unload  ",   theme::help_text()),
         Span::styled("Esc",   theme::help_key()),
         Span::styled(" close",      theme::help_text()),
-    ]))
+    ]);
+    let hint = Paragraph::new(Line::from(hint_spans))
     .style(Style::default().bg(theme::BG_PANEL));
     frame.render_widget(hint, hint_area);
 

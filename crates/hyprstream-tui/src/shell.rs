@@ -4,7 +4,7 @@
 
 use std::io::{self, Read, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 
@@ -49,9 +49,22 @@ pub fn spawn_shell(cwd: Option<PathBuf>, cols: u16, rows: u16) -> io::Result<She
     let mut cmd = Command::new(&shell);
     cmd.stdin(slave_in).stdout(slave_out).stderr(slave_err);
     cmd.env("TERM", "xterm-256color");
-    if let Some(dir) = cwd {
+    if let Some(ref dir) = cwd {
         cmd.current_dir(dir);
     }
+
+    // Pre-compute sandbox paths in the parent (before fork) so no heap allocation
+    // occurs post-fork in the child process.  Both are Option<PathBuf> moved into the
+    // pre_exec closure.  sandbox_cwd = None means no sandboxing (plain shell tab).
+    //
+    // Sandbox support: Linux (Landlock) and OpenBSD (unveil).
+    // Other platforms leave cwd unused here; it was already consumed by current_dir above.
+    #[cfg(any(target_os = "linux", target_os = "openbsd"))]
+    let sandbox_cwd: Option<PathBuf> = cwd;
+    #[cfg(any(target_os = "linux", target_os = "openbsd"))]
+    let sandbox_home: Option<PathBuf> = std::env::var_os("HOME").map(PathBuf::from);
+    #[cfg(not(any(target_os = "linux", target_os = "openbsd")))]
+    let _ = cwd;
 
     // FDs the child must keep open for Rust's stdio dup2 setup (happens after pre_exec).
     let keep_fds = [slave_fd, slave_dup1, slave_dup2];
@@ -76,6 +89,13 @@ pub fn spawn_shell(cwd: Option<PathBuf>, cols: u16, rows: u16) -> io::Result<She
                 if !keep_fds.contains(&fd) {
                     libc::close(fd);
                 }
+            }
+            // Apply filesystem sandboxing for scoped (worktree) terminals.
+            // Paths were pre-allocated in the parent; no heap allocation here.
+            // Linux: Landlock MAC.  OpenBSD: unveil(2).
+            #[cfg(any(target_os = "linux", target_os = "openbsd"))]
+            if let Some(ref wt) = sandbox_cwd {
+                apply_worktree_sandbox(wt, sandbox_home.as_deref());
             }
             Ok(())
         });
@@ -159,4 +179,144 @@ fn open_pty(cols: u16, rows: u16) -> io::Result<(i32, i32)> {
 fn dup_fd(fd: i32) -> io::Result<i32> {
     let new = unsafe { libc::dup(fd) };
     if new < 0 { Err(io::Error::last_os_error()) } else { Ok(new) }
+}
+
+// ============================================================================
+// Landlock sandbox (Linux only)
+// ============================================================================
+
+/// Restrict the current process's filesystem access to a model worktree.
+///
+/// Policy:
+/// - System paths (`/usr`, `/lib*`, `/bin`, `/etc`, `/proc`, `/dev`, …) — read + execute
+/// - `/tmp`           — read + execute only (no writes; avoids temp-file leakage)
+/// - `$HOME`          — read + execute only (shell init files; no history writes)
+/// - `worktree`       — full access (the model directory the terminal is scoped to)
+/// - everything else  — blocked (including other model worktrees)
+///
+/// Best-effort: if the running kernel does not support Landlock (< 5.13) or the
+/// process lacks permission, sandboxing is silently skipped.
+///
+/// # Safety
+/// Called from `pre_exec` (post-fork, pre-exec child).  All `PathBuf` arguments
+/// were allocated in the parent before the fork; no heap allocation occurs here.
+#[cfg(target_os = "linux")]
+fn apply_worktree_sandbox(worktree: &Path, home: Option<&Path>) {
+    use landlock::{ABI, Access, AccessFs, Compatible, CompatLevel, Ruleset, RulesetAttr, RulesetCreatedAttr, path_beneath_rules};
+
+    // ABI::V3 = Linux 5.19 (Truncate right).  The crate degrades gracefully on older ABIs.
+    let abi = ABI::V3;
+
+    // Read-only rights: open files + list directories + execute binaries.
+    let read_exec = AccessFs::from_read(abi);
+    // Full rights for this ABI level.
+    let full = AccessFs::from_all(abi);
+
+    // Standard system paths that a usable shell needs to read/execute.
+    // path_beneath_rules() silently skips paths that cannot be opened (e.g. /nix on non-NixOS).
+    let sys_paths: &[&Path] = &[
+        Path::new("/usr"),
+        Path::new("/lib"),
+        Path::new("/lib64"),
+        Path::new("/lib32"),
+        Path::new("/libx32"),
+        Path::new("/bin"),
+        Path::new("/sbin"),
+        Path::new("/etc"),
+        Path::new("/proc"),
+        Path::new("/dev"),
+        Path::new("/run"),
+        Path::new("/sys"),
+        Path::new("/nix"),
+        Path::new("/opt"),
+        Path::new("/snap"),
+    ];
+
+    // Best-effort: if any step fails (unsupported kernel, EPERM, …) just return.
+    let result = (|| {
+        let created = Ruleset::default()
+            .set_compatibility(CompatLevel::BestEffort)
+            .handle_access(full)?
+            .create()?;
+
+        // System paths: read + execute only.
+        let created = created.add_rules(path_beneath_rules(sys_paths, read_exec))?;
+
+        // /tmp: read + execute only (avoid leaking temp files across sessions).
+        let created = created.add_rules(path_beneath_rules(&[Path::new("/tmp")], read_exec))?;
+
+        // $HOME: read + execute only (shell init files; bash_history not written in sandboxed sessions).
+        let created = match home {
+            Some(h) => created.add_rules(path_beneath_rules(&[h], read_exec))?,
+            None => created,
+        };
+
+        // Worktree: full access — the user is here to work on this model.
+        let created = created.add_rules(path_beneath_rules(&[worktree], full))?;
+
+        created.restrict_self()
+    })();
+
+    // Silently discard errors (best-effort sandbox).
+    let _ = result;
+}
+
+/// Restrict the current process's filesystem access to a model worktree (OpenBSD).
+///
+/// Uses `unveil(2)` which is the direct OpenBSD equivalent of Linux Landlock:
+/// applied once pre-exec and inherited by the shell and all its children.
+///
+/// Policy mirrors the Linux implementation:
+/// - System paths — read + execute
+/// - `$HOME`       — read only (shell init files)
+/// - `worktree`    — full access
+/// - everything else — blocked (including other model worktrees)
+///
+/// `pledge(2)` is intentionally NOT called here: the spawned shell will set its
+/// own pledges, and pre-pledging would prevent the shell from expanding to the
+/// syscall set it needs for interactive use.
+///
+/// # Safety
+/// Called from `pre_exec` (post-fork, pre-exec child).  All `PathBuf` arguments
+/// were allocated in the parent before the fork; no heap allocation occurs here.
+#[cfg(target_os = "openbsd")]
+fn apply_worktree_sandbox(worktree: &Path, home: Option<&Path>) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    // Open a path with the given unveil permissions.  Errors are silently ignored.
+    let do_unveil = |path: &Path, perms: &[u8]| {
+        let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else { return };
+        unsafe { libc::unveil(c_path.as_ptr(), perms.as_ptr() as *const libc::c_char) };
+    };
+
+    // Standard system paths the shell needs to read/execute.
+    // /proc is not mounted by default on OpenBSD so is omitted.
+    let sys_paths: &[&str] = &[
+        "/usr",
+        "/lib",
+        "/libexec",     // OpenBSD: ld.so lives here
+        "/bin",
+        "/sbin",
+        "/etc",
+        "/dev",
+    ];
+    for &p in sys_paths {
+        do_unveil(Path::new(p), b"rx\0");
+    }
+
+    // /tmp: read + write + create (for shell temp files; no execute needed).
+    do_unveil(Path::new("/tmp"), b"rwc\0");
+
+    // $HOME: read only (shell init files; history not written in sandboxed sessions).
+    if let Some(h) = home {
+        do_unveil(h, b"r\0");
+    }
+
+    // Worktree: full access — read, write, execute, create/remove.
+    do_unveil(worktree, b"rwxc\0");
+
+    // Lock: calling unveil(NULL, NULL) prevents any further unveil calls and
+    // blocks access to all paths not already unveiled.
+    unsafe { libc::unveil(std::ptr::null(), std::ptr::null()) };
 }

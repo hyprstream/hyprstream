@@ -374,9 +374,11 @@ impl ShellApp {
             }
         }
 
-        // T / Enter both open a terminal in the selected model worktree.
-        let is_open = matches!(key, KeyPress::Char(b't' | b'T') | KeyPress::Enter);
-        if is_open {
+        // T / Enter open a terminal scoped to the model worktree.
+        // Only available on platforms with filesystem sandbox support (Linux, OpenBSD).
+        // On other platforms the key is a no-op; a Worker-based approach will be added later.
+        #[cfg(any(target_os = "linux", target_os = "openbsd"))]
+        if matches!(key, KeyPress::Char(b't' | b'T') | KeyPress::Enter) {
             if let Some(model) = self.model_list.selected_item().cloned() {
                 self.open_terminal(Some(model.path), format!("{} shell", model.model_ref));
                 self.mode = ShellMode::Normal;
@@ -390,10 +392,11 @@ impl ShellApp {
                 true
             }
             WidgetResult::Confirmed(model) => {
-                // Enter also handled above, but handle_key may fire too.
-                let path = model.path.clone();
-                let title = format!("{} shell", model.model_ref);
-                self.open_terminal(Some(path), title);
+                // Scoped terminal: only on platforms with sandbox support.
+                #[cfg(any(target_os = "linux", target_os = "openbsd"))]
+                self.open_terminal(Some(model.path), format!("{} shell", model.model_ref));
+                #[cfg(not(any(target_os = "linux", target_os = "openbsd")))]
+                let _ = model; // worktree terminal not available on this platform
                 self.mode = ShellMode::Normal;
                 true
             }
