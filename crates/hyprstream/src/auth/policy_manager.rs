@@ -806,6 +806,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::unwrap_used)]
     async fn test_act_wildcard_keymatch() {
         let pm = PolicyManager::new_in_memory().await.unwrap();
         pm.add_policy_with_domain("alice", "*", "model:qwen3-small:main", "ttt.*", "allow").await.unwrap();
@@ -817,6 +818,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::unwrap_used)]
     async fn test_set_branch_visibility_adds_removes_rules() {
         let pm = PolicyManager::new_in_memory().await.unwrap();
 

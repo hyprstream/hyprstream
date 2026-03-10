@@ -120,7 +120,7 @@ impl FederationKeyResolver {
             .await?;
         meta["jwks_uri"]
             .as_str()
-            .map(|s| s.to_owned())
+            .map(str::to_owned)
             .ok_or_else(|| anyhow!("No jwks_uri in AS metadata for {}", issuer))
     }
 

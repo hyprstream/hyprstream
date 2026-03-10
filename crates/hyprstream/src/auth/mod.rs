@@ -219,6 +219,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn test_operation_from_str() {
         // Legacy flat strings still parse correctly
         assert!(matches!(Operation::from_str("infer"), Ok(Operation::Infer)));

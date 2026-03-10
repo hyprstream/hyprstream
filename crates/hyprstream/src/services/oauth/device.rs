@@ -674,8 +674,6 @@ mod tests {
 
     #[test]
     fn test_ed25519_signature_verification_roundtrip() {
-        use ed25519_dalek::Verifier;
-
         // Generate a key pair
         let signing_key = SigningKey::generate(&mut rand::thread_rng());
         let verifying_key = signing_key.verifying_key();
