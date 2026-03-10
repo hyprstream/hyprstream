@@ -88,6 +88,8 @@ pub enum ShellMode {
     StartMenu { selected: usize },
     /// Console log overlay (F9).
     Console,
+    /// Fullscreen — all chrome hidden, pane fills terminal.
+    Fullscreen,
 }
 
 /// Menu items: (label, chord hint shown in popup).
@@ -307,6 +309,7 @@ impl ShellChrome {
     pub fn handle_key(&mut self, key: KeyPress) -> Vec<ChromeOutput> {
         match self.mode {
             ShellMode::Normal                 => self.handle_normal(key),
+            ShellMode::Fullscreen             => self.handle_fullscreen(key),
             ShellMode::ModelList              => self.handle_model_list(key),
             ShellMode::Settings               => self.handle_settings(key),
             ShellMode::StartMenu { selected } => self.handle_start_menu(key, selected),
@@ -354,6 +357,11 @@ impl ShellChrome {
             }
             KeyPress::CtrlSpace => {
                 self.mode = ShellMode::StartMenu { selected: 0 };
+                vec![ChromeOutput::Redraw]
+            }
+            KeyPress::Char(0x06) => {
+                // Ctrl-F — toggle fullscreen (hide all chrome).
+                self.mode = ShellMode::Fullscreen;
                 vec![ChromeOutput::Redraw]
             }
             KeyPress::Char(0x02) => {
@@ -582,6 +590,32 @@ impl ShellChrome {
                 vec![ChromeOutput::Redraw]
             }
             _ => vec![],
+        }
+    }
+
+    // ── Fullscreen mode ───────────────────────────────────────────────────────
+
+    fn handle_fullscreen(&mut self, key: KeyPress) -> Vec<ChromeOutput> {
+        match key {
+            KeyPress::Char(0x06) | KeyPress::Escape => {
+                // Ctrl-F or Esc — exit fullscreen.
+                self.mode = ShellMode::Normal;
+                vec![ChromeOutput::Redraw]
+            }
+            key => {
+                let bytes = keypress_to_bytes(key);
+                if bytes.is_empty() {
+                    vec![]
+                } else {
+                    let active = self.active_pane_id();
+                    if self.private_panes.contains(&active) {
+                        vec![ChromeOutput::RouteInput { app_id: active, data: bytes }]
+                    } else {
+                        let vid = self.viewer_id;
+                        vec![ChromeOutput::Rpc(RpcRequest::SendInput { viewer_id: vid, data: bytes })]
+                    }
+                }
+            }
         }
     }
 

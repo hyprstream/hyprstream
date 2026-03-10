@@ -122,6 +122,18 @@ impl<C: From<KeyPress>> InputParser<C> {
                                             i += 1;
                                         }
                                     }
+                                    // SGR mouse: ESC [ < btn;col;row M/m
+                                    b'<' => {
+                                        let start = i + 3;
+                                        let end = data[start..]
+                                            .iter()
+                                            .position(|&b| b == b'M' || b == b'm');
+                                        i = end.map(|p| start + p + 1).unwrap_or(start);
+                                    }
+                                    // X10 mouse: ESC [ M btn cx cy (3 fixed bytes)
+                                    b'M' => {
+                                        i += if i + 5 < data.len() { 6 } else { data.len() };
+                                    }
                                     _ => { i += 3; } // ignore unknown CSI sequences
                                 }
                             } else {

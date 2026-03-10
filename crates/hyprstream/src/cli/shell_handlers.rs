@@ -27,6 +27,7 @@ use hyprstream_compositor::{
 };
 use hyprstream_compositor::layout::{CellUpdate, CursorState, FrameContent, FrameUpdate, ScrollUpdate};
 use hyprstream_tui::chat_app::{ChatApp, LoadHook, SaveHook};
+use hyprstream_tui::console_app::ConsoleApp;
 use hyprstream_tui::private_store::{FsBackend, StorageKey};
 use waxterm::app::TerminalApp;
 
@@ -52,12 +53,13 @@ pub async fn handle_shell_tui(
 
     let client = create_tui_client(signing_key);
     let (cols, rows) = terminal_size();
-    let pane_rows = rows.saturating_sub(4);
+    let pane_rows = rows.saturating_sub(5); // status(1) + top border(1) + bottom border(1) + strip(1) + fkeys(1)
+    let pane_cols = cols.saturating_sub(2); // left + right border
 
     // Connect to session 0 using Capnp display mode so the frame stream
     // carries structured TuiFrame messages with pane_id for correct routing.
     let result = client
-        .connect(0, "capnp", cols, pane_rows)
+        .connect(0, "capnp", pane_cols, pane_rows)
         .await
         .context("Failed to connect to TUI session. Is the TUI service running?")?;
 
@@ -186,6 +188,10 @@ pub async fn handle_shell_tui(
         .with_ansi(false)
         .set_default();
 
+    // Install tui-logger so the Console overlay can display structured logs.
+    let _ = tui_logger::init_logger(log::LevelFilter::Debug);
+    tui_logger::set_default_level(log::LevelFilter::Info);
+
     let orig = enter_raw_mode()?;
 
     // Enable SGR mouse tracking.
@@ -197,6 +203,9 @@ pub async fn handle_shell_tui(
 
     // Derive storage key for private chat sessions.
     let storage_key = derive_storage_key(signing_key);
+
+    // Console overlay for log viewing (F9 / Ctrl-L).
+    let mut console_app = ConsoleApp::new();
 
     // Active client-owned ChatApps keyed by pane_id.
     let mut active_apps: HashMap<u32, ChatApp> = HashMap::new();
@@ -220,16 +229,16 @@ pub async fn handle_shell_tui(
         loop {
             sigwinch.recv().await;
             let (c, r) = terminal_size();
-            // Send pane dimensions to server (full rows minus 4 chrome rows),
-            // matching the initial connect() call which sends pane_rows not rows.
-            let _ = resize_rpc(&resize_client, c, r.saturating_sub(4)).await;
+            // Send pane dimensions to server (full rows minus 5 chrome rows, cols minus 2 borders),
+            // matching the initial connect() call which sends pane dimensions not terminal dimensions.
+            let _ = resize_rpc(&resize_client, c.saturating_sub(2), r.saturating_sub(5)).await;
             // Compositor needs full terminal rows to recalculate layout.
             let _ = resize_tx_sigwinch.try_send((c, r));
         }
     });
 
     // Initial render.
-    let _ = terminal.draw(|f| compositor.render(f));
+    composite_draw(&mut terminal, &compositor, &mut console_app);
 
     let mut should_exit = false;
 
@@ -252,7 +261,7 @@ pub async fn handle_shell_tui(
                 };
                 if dispatch_outputs(
                     &mut compositor, &client, &model_client,
-                    &model_status_tx, &mut terminal,
+                    &model_status_tx, &mut terminal, &mut console_app,
                     &mut active_apps, &storage_key, signing_key, outputs,
                 ).await { break; }
             }
@@ -278,12 +287,16 @@ pub async fn handle_shell_tui(
                                 let wid = w.id;
                                 let _ = focus_window_rpc(&client, wid).await;
                             }
-                            let _ = terminal.draw(|f| compositor.render(f));
+                            composite_draw(&mut terminal, &compositor, &mut console_app);
                         }
                         continue;
                     }
-                    let pane_top = 2u16; // status bar (0) + titlebar (1)
-                    let pane_rows = rows.saturating_sub(4);
+                    let (pane_top, pane_rows) =
+                        if matches!(compositor.chrome.mode, hyprstream_compositor::ShellMode::Fullscreen) {
+                            (0u16, rows)
+                        } else {
+                            (2u16, rows.saturating_sub(5))
+                        };
                     if row < pane_top || row >= pane_top + pane_rows {
                         continue;
                     }
@@ -294,7 +307,7 @@ pub async fn handle_shell_tui(
                     let outputs = compositor.handle(CompositorInput::KeyPress(key));
                     if dispatch_outputs(
                         &mut compositor, &client, &model_client,
-                        &model_status_tx, &mut terminal,
+                        &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &storage_key, signing_key, outputs,
                     ).await {
                         should_exit = true;
@@ -309,7 +322,7 @@ pub async fn handle_shell_tui(
                     let outputs = compositor.handle(CompositorInput::WindowList(wins));
                     if dispatch_outputs(
                         &mut compositor, &client, &model_client,
-                        &model_status_tx, &mut terminal,
+                        &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &storage_key, signing_key, outputs,
                     ).await { break; }
                 }
@@ -319,7 +332,7 @@ pub async fn handle_shell_tui(
                 let bg_dirty = compositor.chrome.tick_bg();
                 let toast_dirty = compositor.chrome.tick_toasts();
                 if bg_dirty || toast_dirty {
-                    let _ = terminal.draw(|f| compositor.render(f));
+                    composite_draw(&mut terminal, &compositor, &mut console_app);
                 }
                 // Tick active ChatApps and collect frames / quit IDs.
                 // Two-pass to avoid holding &mut active_apps while dispatching.
@@ -344,7 +357,7 @@ pub async fn handle_shell_tui(
                     let outputs = compositor.handle(CompositorInput::AppFrame { app_id: pane_id, ansi });
                     if dispatch_outputs(
                         &mut compositor, &client, &model_client,
-                        &model_status_tx, &mut terminal,
+                        &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &storage_key, signing_key, outputs,
                     ).await { should_exit = true; break; }
                 }
@@ -355,7 +368,7 @@ pub async fn handle_shell_tui(
                     let outputs = compositor.handle(CompositorInput::AppExited { app_id: id });
                     dispatch_outputs(
                         &mut compositor, &client, &model_client,
-                        &model_status_tx, &mut terminal,
+                        &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &storage_key, signing_key, outputs,
                     ).await;
                 }
@@ -370,7 +383,7 @@ pub async fn handle_shell_tui(
                         ToastLevel::Error,
                     );
                 }
-                let _ = terminal.draw(|f| compositor.render(f));
+                composite_draw(&mut terminal, &compositor, &mut console_app);
             }
 
             Some((new_cols, new_rows)) = resize_rx.recv() => {
@@ -381,10 +394,10 @@ pub async fn handle_shell_tui(
                 let outputs = compositor.handle(CompositorInput::Resize(new_cols, new_rows));
                 if dispatch_outputs(
                     &mut compositor, &client, &model_client,
-                    &model_status_tx, &mut terminal,
+                    &model_status_tx, &mut terminal, &mut console_app,
                     &mut active_apps, &storage_key, signing_key, outputs,
                 ).await { break; }
-                let _ = terminal.draw(|f| compositor.render(f));
+                composite_draw(&mut terminal, &compositor, &mut console_app);
             }
 
             else => break,
@@ -407,6 +420,33 @@ pub async fn handle_shell_tui(
 // dispatch_outputs — translate CompositorOutput to ZMQ calls
 // ============================================================================
 
+// ============================================================================
+// composite_draw — render compositor + optional Console overlay
+// ============================================================================
+
+fn composite_draw(
+    terminal: &mut ratatui::Terminal<AnsiBackend<AnsiWriter>>,
+    compositor: &hyprstream_compositor::Compositor,
+    console_app: &mut ConsoleApp,
+) {
+    let _ = terminal.draw(|f| {
+        compositor.render(f);
+        if matches!(compositor.chrome.mode, hyprstream_compositor::ShellMode::Console) {
+            use ratatui::layout::{Constraint, Flex, Layout};
+            use ratatui::widgets::Clear;
+            let area = f.area();
+            let pane_area = compositor.pane_block_area(area);
+            let [v] = Layout::vertical([Constraint::Percentage(68)]).flex(Flex::Center).areas(pane_area);
+            let [popup] = Layout::horizontal([Constraint::Percentage(82)]).flex(Flex::Center).areas(v);
+            f.render_widget(Clear, popup);
+            let block = hyprstream_compositor::theme::modal_block(ratatui::text::Line::from(" Console "));
+            let inner = block.inner(popup);
+            f.render_widget(block, popup);
+            console_app.draw(f, inner);
+        }
+    });
+}
+
 /// Dispatch compositor outputs to the appropriate ZMQ RPC calls.
 /// Returns `true` if the session should exit.
 async fn dispatch_outputs(
@@ -415,6 +455,7 @@ async fn dispatch_outputs(
     model_client: &crate::services::ModelZmqClient,
     model_status_tx: &tokio::sync::mpsc::Sender<(String, bool)>,
     terminal: &mut ratatui::Terminal<AnsiBackend<AnsiWriter>>,
+    console_app: &mut ConsoleApp,
     active_apps: &mut HashMap<u32, ChatApp>,
     storage_key: &StorageKey,
     signing_key: &SigningKey,
@@ -423,7 +464,7 @@ async fn dispatch_outputs(
     for output in outputs {
         match output {
             CompositorOutput::Redraw => {
-                let _ = terminal.draw(|f| compositor.render(f));
+                composite_draw(terminal, compositor, console_app);
             }
             CompositorOutput::Quit => return true,
             CompositorOutput::Rpc(req) => {
@@ -435,7 +476,7 @@ async fn dispatch_outputs(
                     let follow = compositor.handle(input);
                     for fo in follow {
                         match fo {
-                            CompositorOutput::Redraw => { let _ = terminal.draw(|f| compositor.render(f)); }
+                            CompositorOutput::Redraw => { composite_draw(terminal, compositor, console_app); }
                             CompositorOutput::Quit => return true,
                             _ => {}
                         }
@@ -451,7 +492,7 @@ async fn dispatch_outputs(
                             let outs = compositor.handle(CompositorInput::AppFrame { app_id, ansi });
                             for o in outs {
                                 if let CompositorOutput::Redraw = o {
-                                    let _ = terminal.draw(|f| compositor.render(f));
+                                    composite_draw(terminal, compositor, console_app);
                                 }
                             }
                         }
@@ -919,9 +960,14 @@ fn make_chat_spawner(
     let mr = model_ref.to_owned();
 
     Box::new(move |pairs, event_tx| {
+        use tokio::sync::oneshot;
+        use hyprstream_tui::chat_app::CancelHandle;
+
         let sk_inner = sk.clone();
         let mr_inner = mr.clone();
         let tx = event_tx.clone();
+
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
 
         std::thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
@@ -996,27 +1042,42 @@ fn make_chat_spawner(
                     }
                 };
 
+                let mut cancel_rx = cancel_rx;
                 loop {
-                    match handle.recv_next().await {
-                        Ok(Some(StreamPayload::Data(b))) => {
-                            let _ = tx.send(ChatEvent::Token(String::from_utf8_lossy(&b).into_owned()));
-                        }
-                        Ok(Some(StreamPayload::Complete(_))) | Ok(None) => {
-                            let _ = tx.send(ChatEvent::StreamComplete);
+                    tokio::select! {
+                        biased;
+                        _ = &mut cancel_rx => {
+                            let _ = tx.send(ChatEvent::StreamCancelled);
                             break;
                         }
-                        Ok(Some(StreamPayload::Error(m))) => {
-                            let _ = tx.send(ChatEvent::StreamError(m));
-                            break;
-                        }
-                        Err(e) => {
-                            let _ = tx.send(ChatEvent::StreamError(e.to_string()));
-                            break;
+                        result = handle.recv_next() => {
+                            match result {
+                                Ok(Some(StreamPayload::Data(b))) => {
+                                    let _ = tx.send(ChatEvent::Token(
+                                        String::from_utf8_lossy(&b).into_owned(),
+                                    ));
+                                }
+                                Ok(Some(StreamPayload::Complete(_))) | Ok(None) => {
+                                    let _ = tx.send(ChatEvent::StreamComplete);
+                                    break;
+                                }
+                                Ok(Some(StreamPayload::Error(m))) => {
+                                    let _ = tx.send(ChatEvent::StreamError(m));
+                                    break;
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(ChatEvent::StreamError(e.to_string()));
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
             });
         });
+
+        let handle: CancelHandle = Box::new(move || { let _ = cancel_tx.send(()); });
+        handle
     })
 }
 

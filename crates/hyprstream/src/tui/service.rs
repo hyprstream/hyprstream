@@ -955,11 +955,14 @@ impl TuiService {
             use crate::config::GenerationRequest;
             use crate::api::openai_compat::ChatMessage;
             use crate::zmq::global_context;
-            use hyprstream_tui::chat_app::ChatEvent;
+            use hyprstream_tui::chat_app::{CancelHandle, ChatEvent};
+            use tokio::sync::oneshot;
 
             let sk_inner   = sk.clone();
             let mr_inner   = spawner_model_ref.clone();
             let event_tx   = event_tx.clone();
+
+            let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
 
             std::thread::spawn(move || {
                 let rt = match tokio::runtime::Builder::new_current_thread()
@@ -1033,28 +1036,41 @@ impl TuiService {
                         }
                     };
 
+                    let mut cancel_rx = cancel_rx;
                     loop {
-                        match handle.recv_next().await {
-                            Ok(Some(StreamPayload::Data(b))) => {
-                                let s = String::from_utf8_lossy(&b).into_owned();
-                                let _ = event_tx.send(ChatEvent::Token(s));
-                            }
-                            Ok(Some(StreamPayload::Complete(_))) | Ok(None) => {
-                                let _ = event_tx.send(ChatEvent::StreamComplete);
+                        tokio::select! {
+                            biased;
+                            _ = &mut cancel_rx => {
+                                let _ = event_tx.send(ChatEvent::StreamCancelled);
                                 break;
                             }
-                            Ok(Some(StreamPayload::Error(m))) => {
-                                let _ = event_tx.send(ChatEvent::StreamError(m));
-                                break;
-                            }
-                            Err(e) => {
-                                let _ = event_tx.send(ChatEvent::StreamError(e.to_string()));
-                                break;
+                            result = handle.recv_next() => {
+                                match result {
+                                    Ok(Some(StreamPayload::Data(b))) => {
+                                        let s = String::from_utf8_lossy(&b).into_owned();
+                                        let _ = event_tx.send(ChatEvent::Token(s));
+                                    }
+                                    Ok(Some(StreamPayload::Complete(_))) | Ok(None) => {
+                                        let _ = event_tx.send(ChatEvent::StreamComplete);
+                                        break;
+                                    }
+                                    Ok(Some(StreamPayload::Error(m))) => {
+                                        let _ = event_tx.send(ChatEvent::StreamError(m));
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        let _ = event_tx.send(ChatEvent::StreamError(e.to_string()));
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
                 });
             });
+
+            let handle: CancelHandle = Box::new(move || { let _ = cancel_tx.send(()); });
+            handle
         });
 
         let app = hyprstream_tui::chat_app::ChatApp::new(

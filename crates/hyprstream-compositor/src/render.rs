@@ -7,13 +7,14 @@
 //! Layout:
 //! ```text
 //! ┌─ status bar (1 row) ─────────────────────────────┐
+//! ╭─ 🔒 Name ──────────────────────────────────────╮  ← pane block top border (title)
 //! │  pane content (Min rows) — VT cells or background │
-//! │  [model/settings modal overlay]                   │
+//! ╰───────────────────────────────────────────────────╯  ← pane block bottom border
 //! ├─ window strip / taskbar (1 row) ─────────────────┤
 //! └─ F-key legend (1 row) ────────────────────────────┘
 //! ```
 
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Tabs};
@@ -31,32 +32,40 @@ use crate::theme;
 
 pub fn draw(frame: &mut Frame, chrome: &ShellChrome, layout: &LayoutTree) {
     let area = frame.area();
-    let chunks = Layout::vertical([
-        Constraint::Length(1), // status bar
-        Constraint::Length(1), // window titlebar
-        Constraint::Min(1),    // pane content / background
+
+    if matches!(chrome.mode, ShellMode::Fullscreen) {
+        // Fullscreen: pane fills entire terminal, no chrome rows.
+        draw_content(frame, area, chrome, layout);
+        if !chrome.toasts.is_empty() {
+            draw_toasts(frame, area, chrome);
+        }
+        return;
+    }
+
+    let [status, pane_block, strip, fkeys] = Layout::vertical([
+        Constraint::Length(1), // global status bar
+        Constraint::Min(1),    // pane block (border + content + bottom border)
         Constraint::Length(1), // window strip
         Constraint::Length(1), // F-key legend
     ])
-    .split(area);
+    .areas(area);
 
-    draw_status_bar(frame, chunks[0], chrome);
-    draw_window_titlebar(frame, chunks[1], chrome);
-    draw_content(frame, chunks[2], chrome, layout);
-    draw_window_strip(frame, chunks[3], chrome);
-    draw_fkey_bar(frame, chunks[4], &chrome.mode);
+    draw_status_bar(frame, status, chrome);
+    draw_pane_block(frame, pane_block, chrome, layout);
+    draw_window_strip(frame, strip, chrome);
+    draw_fkey_bar(frame, fkeys, &chrome.mode);
 
     match chrome.mode {
         ShellMode::ModelList              => draw_model_modal(frame, area, chrome),
         ShellMode::Settings               => draw_settings_modal(frame, area, chrome),
         ShellMode::StartMenu { selected } => draw_start_menu(frame, area, selected),
-        ShellMode::Console                => draw_console_modal(frame, area, chrome),
-        ShellMode::Normal                 => {}
+        ShellMode::Console                => { /* drawn by shell_handlers (native) or wasm path */ }
+        ShellMode::Normal | ShellMode::Fullscreen => {}
     }
 
-    // Toasts are drawn on top of everything (except modals).
+    // Toasts drawn on top of pane area (not over modals).
     if !chrome.toasts.is_empty() && !matches!(chrome.mode, ShellMode::Console) {
-        draw_toasts(frame, chunks[1], chrome);
+        draw_toasts(frame, pane_block, chrome);
     }
 }
 
@@ -105,43 +114,49 @@ fn current_time_str() -> String {
 }
 
 // ============================================================================
-// Window titlebar — one row below status bar, distinct color from status/fkeys
+// Pane block — rounded border whose title row is the window titlebar
 // ============================================================================
 
-fn draw_window_titlebar(frame: &mut Frame, area: Rect, chrome: &ShellChrome) {
+fn pane_title_line(chrome: &ShellChrome) -> Line<'static> {
     let win = chrome.windows.get(chrome.active_win);
-    let title_spans: Vec<Span> = if let Some(w) = win {
+    if let Some(w) = win {
         let is_private = w.panes.iter().any(|p| chrome.private_panes.contains(&p.id));
-        let lock = if is_private { " \u{1f512}" } else { "" };
-        vec![
-            Span::styled("  ", theme::titlebar_dim_style()),
-            Span::styled(format!("{}{lock}", w.name), theme::titlebar_style()),
-        ]
+        let mut spans = vec![];
+        if is_private {
+            spans.push(Span::styled(" \u{1f512} ", Style::default().fg(theme::LOCK_COLOR)));
+        } else {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(w.name.clone(), theme::titlebar_style()));
+        if let Some(status) = &chrome.load_status {
+            spans.push(Span::styled(
+                format!("  {}  ", status),
+                theme::titlebar_dim_style(),
+            ));
+        }
+        Line::from(spans)
     } else {
-        vec![Span::styled("  no windows", theme::titlebar_dim_style())]
-    };
-
-    if let Some(status) = &chrome.load_status {
-        let right_text = format!("  {}  ", status);
-        let right_w = right_text.chars().count() as u16;
-        let left_w = area.width.saturating_sub(right_w);
-        let left_area  = Rect { width: left_w, ..area };
-        let right_area = Rect { x: area.x + left_w, width: right_w, ..area };
-        frame.render_widget(
-            Paragraph::new(Line::from(title_spans)).style(Style::default().bg(theme::BG_TITLEBAR)),
-            left_area,
-        );
-        frame.render_widget(
-            Paragraph::new(Span::styled(right_text, theme::titlebar_dim_style()))
-                .style(Style::default().bg(theme::BG_TITLEBAR)),
-            right_area,
-        );
-    } else {
-        frame.render_widget(
-            Paragraph::new(Line::from(title_spans)).style(Style::default().bg(theme::BG_TITLEBAR)),
-            area,
-        );
+        Line::from(Span::styled(" no windows", theme::titlebar_dim_style()))
     }
+}
+
+fn draw_pane_block(frame: &mut Frame, area: Rect, chrome: &ShellChrome, layout: &LayoutTree) {
+    let title = pane_title_line(chrome);
+    let block = theme::window_block(title, true);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    draw_content(frame, inner, chrome, layout);
+}
+
+/// Clear `area`, render `block` border frame, then call `f` with the inner area.
+fn render_modal<F>(frame: &mut Frame, area: Rect, block: Block<'_>, f: F)
+where
+    F: FnOnce(&mut Frame, Rect),
+{
+    frame.render_widget(Clear, area);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    f(frame, inner);
 }
 
 // ============================================================================
@@ -305,6 +320,9 @@ fn draw_fkey_bar(frame: &mut Frame, area: Rect, mode: &ShellMode) {
             );
             return;
         }
+        ShellMode::Fullscreen => &[
+            ("Ctrl-F/Esc", "exit fullscreen"),
+        ],
         ShellMode::Normal => &[
             ("F7",  "new"),
             ("F8",  "close"),
@@ -351,40 +369,31 @@ fn draw_fkey_bar(frame: &mut Frame, area: Rect, mode: &ShellMode) {
 
 fn draw_model_modal(frame: &mut Frame, full_area: Rect, chrome: &ShellChrome) {
     let modal = centered_rect(60, 70, full_area);
-    frame.render_widget(Clear, modal);
+    render_modal(frame, modal, theme::modal_block(Line::from(" Models ")), |frame, inner| {
+        let hint_area = Rect { y: inner.y + inner.height.saturating_sub(1), height: 1, ..inner };
+        let list_area = Rect { height: inner.height.saturating_sub(2), ..inner };
 
-    let block = Block::default()
-        .title(Span::styled(" Models ", theme::title_style()))
-        .borders(Borders::ALL)
-        .border_style(theme::border_style())
-        .style(Style::default().bg(theme::BG_PANEL));
+        let hint = Paragraph::new(Line::from(vec![
+            Span::styled("c",     theme::help_key()),
+            Span::styled(" private  ",  theme::help_text()),
+            Span::styled("C",     theme::help_key()),
+            Span::styled("/",     theme::help_text()),
+            Span::styled("Enter", theme::help_key()),
+            Span::styled(" server  ",   theme::help_text()),
+            Span::styled("T",     theme::help_key()),
+            Span::styled(" terminal  ", theme::help_text()),
+            Span::styled("l",     theme::help_key()),
+            Span::styled(" load  ",     theme::help_text()),
+            Span::styled("u",     theme::help_key()),
+            Span::styled(" unload  ",   theme::help_text()),
+            Span::styled("Esc",   theme::help_key()),
+            Span::styled(" close",      theme::help_text()),
+        ]))
+        .style(Style::default().bg(theme::BG_MODAL));
+        frame.render_widget(hint, hint_area);
 
-    let inner = block.inner(modal);
-    frame.render_widget(block, modal);
-
-    let hint_area = Rect { y: inner.y + inner.height.saturating_sub(1), height: 1, ..inner };
-    let list_area = Rect { height: inner.height.saturating_sub(2), ..inner };
-
-    let hint = Paragraph::new(Line::from(vec![
-        Span::styled("c",     theme::help_key()),
-        Span::styled(" private  ",  theme::help_text()),
-        Span::styled("C",     theme::help_key()),
-        Span::styled("/",     theme::help_text()),
-        Span::styled("Enter", theme::help_key()),
-        Span::styled(" server  ",   theme::help_text()),
-        Span::styled("T",     theme::help_key()),
-        Span::styled(" terminal  ", theme::help_text()),
-        Span::styled("l",     theme::help_key()),
-        Span::styled(" load  ",     theme::help_text()),
-        Span::styled("u",     theme::help_key()),
-        Span::styled(" unload  ",   theme::help_text()),
-        Span::styled("Esc",   theme::help_key()),
-        Span::styled(" close",      theme::help_text()),
-    ]))
-    .style(Style::default().bg(theme::BG_PANEL));
-    frame.render_widget(hint, hint_area);
-
-    chrome.model_list.render(frame, list_area);
+        chrome.model_list.render(frame, list_area);
+    });
 }
 
 // ============================================================================
@@ -393,39 +402,29 @@ fn draw_model_modal(frame: &mut Frame, full_area: Rect, chrome: &ShellChrome) {
 
 fn draw_settings_modal(frame: &mut Frame, full_area: Rect, chrome: &ShellChrome) {
     let modal = centered_rect(50, 65, full_area);
-    frame.render_widget(Clear, modal);
+    render_modal(frame, modal, theme::modal_block(Line::from(" Settings ")), |frame, inner| {
+        let list_height = 5u16.min(inner.height / 2);
+        let [list_area, preview_outer] = Layout::vertical([
+            Constraint::Length(list_height),
+            Constraint::Min(3),
+        ])
+        .areas(inner);
 
-    let block = Block::default()
-        .title(Span::styled(" Settings ", theme::title_style()))
-        .borders(Borders::ALL)
-        .border_style(theme::border_style())
-        .style(Style::default().bg(theme::BG_PANEL));
+        chrome.settings_list.render(frame, list_area);
 
-    let inner = block.inner(modal);
-    frame.render_widget(block, modal);
+        let preview_block = Block::default()
+            .title(Span::styled(" Preview ", theme::help_text()))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::DIM))
+            .style(Style::default().bg(Color::Black));
 
-    let list_height = 5u16.min(inner.height / 2);
-    let chunks = Layout::vertical([
-        Constraint::Length(list_height),
-        Constraint::Min(3),
-    ])
-    .split(inner);
+        let preview_inner = preview_block.inner(preview_outer);
+        frame.render_widget(preview_block, preview_outer);
 
-    chrome.settings_list.render(frame, chunks[0]);
-
-    let preview_block = Block::default()
-        .title(Span::styled(" Preview ", theme::help_text()))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::DIM))
-        .style(Style::default().bg(Color::Black));
-
-    let preview_outer = chunks[1];
-    let preview_inner = preview_block.inner(preview_outer);
-    frame.render_widget(preview_block, preview_outer);
-
-    let pw = preview_inner.width.min(PREVIEW_W);
-    let preview_render = Rect { width: pw, ..preview_inner };
-    chrome.preview_bg.render(frame, preview_render);
+        let pw = preview_inner.width.min(PREVIEW_W);
+        let preview_render = Rect { width: pw, ..preview_inner };
+        chrome.preview_bg.render(frame, preview_render);
+    });
 }
 
 // ============================================================================
@@ -506,77 +505,60 @@ fn draw_toasts(frame: &mut Frame, area: Rect, chrome: &ShellChrome) {
 // Console log modal
 // ============================================================================
 
-fn draw_console_modal(frame: &mut Frame, full_area: Rect, chrome: &ShellChrome) {
-    let modal = centered_rect(85, 80, full_area);
-    frame.render_widget(Clear, modal);
+#[allow(dead_code)]
+fn draw_console_modal(frame: &mut Frame, content: Rect, chrome: &ShellChrome) {
+    let modal = centered_rect(85, 80, content);
+    render_modal(frame, modal, theme::modal_block(Line::from(" Console Log ")), |frame, inner| {
+        let footer_area = Rect { y: inner.y + inner.height.saturating_sub(1), height: 1, ..inner };
+        let log_area = Rect { height: inner.height.saturating_sub(1), ..inner };
 
-    let block = Block::default()
-        .title(Span::styled(" Console Log ", theme::title_style()))
-        .borders(Borders::ALL)
-        .border_style(theme::border_style())
-        .style(Style::default().bg(theme::BG_PANEL));
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("\u{2191}\u{2193}", theme::help_key()),
+                Span::styled(" scroll  ", theme::help_text()),
+                Span::styled("F9/Esc", theme::help_key()),
+                Span::styled(" close", theme::help_text()),
+            ]))
+            .style(Style::default().bg(theme::BG_MODAL)),
+            footer_area,
+        );
 
-    let inner = block.inner(modal);
-    frame.render_widget(block, modal);
+        let visible = log_area.height as usize;
+        let total = chrome.console_log.len();
+        let start = chrome.console_scroll.min(total.saturating_sub(1));
+        let recent_threshold = total.saturating_sub(10);
 
-    // Footer hint
-    let footer_area = Rect { y: inner.y + inner.height.saturating_sub(1), height: 1, ..inner };
-    let log_area = Rect { height: inner.height.saturating_sub(1), ..inner };
+        let lines: Vec<Line> = chrome.console_log.iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+            .map(|(idx, line)| {
+                let style = if idx >= recent_threshold {
+                    Style::default().fg(Color::White)
+                } else {
+                    Style::default().fg(Color::from((120u8, 120u8, 120u8)))
+                };
+                Line::from(Span::styled(line.clone(), style))
+            })
+            .collect();
 
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("\u{2191}\u{2193}", theme::help_key()),
-            Span::styled(" scroll  ", theme::help_text()),
-            Span::styled("F9/Esc", theme::help_key()),
-            Span::styled(" close", theme::help_text()),
-        ]))
-        .style(Style::default().bg(theme::BG_PANEL)),
-        footer_area,
-    );
-
-    let visible = log_area.height as usize;
-    let total = chrome.console_log.len();
-    // scroll is an index into console_log; show lines starting from scroll.
-    let start = chrome.console_scroll.min(total.saturating_sub(1));
-    let recent_threshold = total.saturating_sub(10);
-
-    let lines: Vec<Line> = chrome.console_log.iter()
-        .enumerate()
-        .skip(start)
-        .take(visible)
-        .map(|(idx, line)| {
-            let style = if idx >= recent_threshold {
-                Style::default().fg(Color::White)
-            } else {
-                Style::default().fg(Color::from((120u8, 120u8, 120u8)))
-            };
-            Line::from(Span::styled(line.clone(), style))
-        })
-        .collect();
-
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(theme::BG_PANEL)),
-        log_area,
-    );
+        frame.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(theme::BG_MODAL)),
+            log_area,
+        );
+    });
 }
 
 // ============================================================================
 // Utility
 // ============================================================================
 
-fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
-    let margin_y = (100 - pct_y) / 2;
-    let margin_x = (100 - pct_x) / 2;
-    let vert = Layout::vertical([
-        Constraint::Percentage(margin_y),
-        Constraint::Percentage(pct_y),
-        Constraint::Percentage(margin_y),
-    ])
-    .split(area);
-    Layout::horizontal([
-        Constraint::Percentage(margin_x),
-        Constraint::Percentage(pct_x),
-        Constraint::Percentage(margin_x),
-    ])
-    .split(vert[1])[1]
+fn centered_rect(pct_w: u16, pct_h: u16, area: Rect) -> Rect {
+    let [v] = Layout::vertical([Constraint::Percentage(pct_h)])
+        .flex(Flex::Center)
+        .areas(area);
+    let [h] = Layout::horizontal([Constraint::Percentage(pct_w)])
+        .flex(Flex::Center)
+        .areas(v);
+    h
 }

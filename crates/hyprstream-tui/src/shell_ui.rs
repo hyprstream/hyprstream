@@ -54,14 +54,46 @@ pub fn draw(frame: &mut Frame, app: &ShellApp) {
 // ============================================================================
 
 fn draw_status_bar(frame: &mut Frame, area: Rect, app: &ShellApp) {
-    let mut spans = vec![Span::raw("  ")];
+    let clock = current_time_str();
+    let clock_width = clock.len() as u16 + 1;
+
+    let mut left_spans = vec![
+        Span::raw(" \u{1f319} "),
+        Span::styled("HYPRSTREAM", theme::title_style()),
+    ];
     if let Some(status) = &app.load_status {
-        spans.push(Span::styled(status.clone(), theme::help_text()));
+        left_spans.push(Span::raw("  "));
+        left_spans.push(Span::styled(status.clone(), theme::help_text()));
     }
+
+    let left_w = area.width.saturating_sub(clock_width);
+    let left_area  = Rect { width: left_w, ..area };
+    let right_area = Rect { x: area.x + left_w, width: clock_width, ..area };
+
     frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::BG_PANEL)),
-        area,
+        Paragraph::new(Line::from(left_spans)).style(Style::default().bg(theme::BG_PANEL)),
+        left_area,
     );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(clock, theme::help_text()),
+            Span::raw(" "),
+        ]))
+        .style(Style::default().bg(theme::BG_PANEL)),
+        right_area,
+    );
+}
+
+fn current_time_str() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let h = (secs / 3600) % 24;
+    let m = (secs / 60) % 60;
+    let s = secs % 60;
+    format!("{h:02}:{m:02}:{s:02}")
 }
 
 // ============================================================================

@@ -30,6 +30,10 @@ zeroize = { version = "1", features = ["derive"] }
 [target.'cfg(not(target_os = "wasi"))'.dependencies]
 libc = "0.2"
 dirs-next = "2"
+tui-logger = { version = "0.18", default-features = false }
+ratatui-textarea = { version = "0.8", default-features = false }
+edtui = { version = "0.11" }
+crossterm = { version = "0.29", default-features = false }
 
 [profile.release]
 opt-level = "s"

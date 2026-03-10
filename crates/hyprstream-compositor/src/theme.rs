@@ -1,6 +1,8 @@
 //! Color constants and reusable styles for hyprstream TUI applications.
 
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Line;
+use ratatui::widgets::{Block, BorderType, Borders};
 
 // ── Palette ──
 pub const AMBER: Color = Color::Rgb(236, 201, 75);
@@ -8,9 +10,53 @@ pub const CYAN: Color = Color::Rgb(0, 232, 252);
 pub const DIM: Color = Color::Rgb(112, 128, 160);
 pub const BG: Color = Color::Rgb(10, 10, 20);
 pub const BG_PANEL: Color = Color::Rgb(20, 20, 40);
-/// Per-window titlebar background — distinct hue from BG_PANEL to visually
-/// separate the window title row from the global status and F-key bars.
-pub const BG_TITLEBAR: Color = Color::Rgb(10, 22, 48);
+/// Floating modal background — slightly lighter than BG for visual separation.
+pub const BG_MODAL: Color = Color::Rgb(16, 16, 34);
+/// Lock icon color in window titlebars.
+pub const LOCK_COLOR: Color = Color::Rgb(136, 170, 255);
+
+// ── Block factories ──
+
+/// Rounded border block for pane windows, with focus-sensitive border color.
+pub fn window_block(title: Line<'_>, focused: bool) -> Block<'_> {
+    Block::new()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(if focused { border_focused_style() } else { border_style() })
+        .title(title)
+        .style(Style::default().bg(BG))
+}
+
+/// Rounded border block for floating modals.
+pub fn modal_block(title: Line<'_>) -> Block<'_> {
+    Block::new()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_focused_style())
+        .title(title)
+        .style(Style::default().bg(BG_MODAL))
+}
+
+/// Rounded border block for the multi-line input box in ChatApp.
+pub fn input_block() -> Block<'static> {
+    Block::new()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(input_border_style())
+        .style(Style::default().bg(BG_PANEL))
+}
+
+pub fn border_focused_style() -> Style {
+    Style::default().fg(CYAN)
+}
+
+pub fn input_border_style() -> Style {
+    Style::default().fg(Color::Rgb(68, 85, 102))
+}
+
+pub fn gutter_style() -> Style {
+    Style::default().fg(DIM)
+}
 
 // ── Reusable styles ──
 
@@ -42,11 +88,11 @@ pub fn border_style() -> Style {
 }
 
 pub fn titlebar_style() -> Style {
-    Style::default().fg(CYAN).bg(BG_TITLEBAR).add_modifier(Modifier::BOLD)
+    Style::default().fg(CYAN).add_modifier(Modifier::BOLD)
 }
 
 pub fn titlebar_dim_style() -> Style {
-    Style::default().fg(DIM).bg(BG_TITLEBAR)
+    Style::default().fg(DIM)
 }
 
 pub fn help_key() -> Style {

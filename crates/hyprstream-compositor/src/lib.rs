@@ -93,13 +93,31 @@ impl Compositor {
         windows: Vec<WindowSummary>,
         models: Vec<ModelEntry>,
     ) -> Self {
-        let pane_rows = rows.saturating_sub(4);
+        let pane_rows = rows.saturating_sub(5);
+        let pane_cols = cols.saturating_sub(2);
         Self {
-            chrome: ShellChrome::new(cols, pane_rows, session_id, viewer_id, windows, models),
-            layout: LayoutTree::new(cols, pane_rows),
+            chrome: ShellChrome::new(pane_cols, pane_rows, session_id, viewer_id, windows, models),
+            layout: LayoutTree::new(pane_cols, pane_rows),
             cols,
             rows,
         }
+    }
+
+    /// Returns the area occupied by the pane block (inside border) for the given frame area.
+    /// Used by shell_handlers to position overlay widgets that aren't WASM-safe.
+    pub fn pane_block_area(&self, frame_area: ratatui::layout::Rect) -> ratatui::layout::Rect {
+        use ratatui::layout::{Constraint, Layout};
+        if matches!(self.chrome.mode, ShellMode::Fullscreen) {
+            return frame_area;
+        }
+        let [_, pane_block, _, _] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .areas(frame_area);
+        pane_block
     }
 
     /// The active pane ID (from the focused window's active pane).
@@ -168,10 +186,11 @@ impl Compositor {
             CompositorInput::Resize(cols, rows) => {
                 self.cols = cols;
                 self.rows = rows;
-                let pane_rows = rows.saturating_sub(4);
-                self.chrome.cols      = cols;
+                let pane_rows = rows.saturating_sub(5);
+                let pane_cols = cols.saturating_sub(2);
+                self.chrome.cols      = pane_cols;
                 self.chrome.pane_rows = pane_rows;
-                self.layout.resize(cols, pane_rows);
+                self.layout.resize(pane_cols, pane_rows);
                 vec![CompositorOutput::Redraw]
             }
 

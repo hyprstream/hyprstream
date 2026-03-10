@@ -16,6 +16,8 @@ pub mod wizard;
 #[cfg(not(target_os = "wasi"))]
 pub mod chat_app;
 #[cfg(not(target_os = "wasi"))]
+pub mod console_app;
+#[cfg(not(target_os = "wasi"))]
 pub mod chat_ui;
 #[cfg(not(target_os = "wasi"))]
 pub mod shell;

@@ -3,7 +3,7 @@
 //! Layout:
 //! ```text
 //! │  history scrollback (word-wrapped messages)       │
-//! ├─ input line (1 row) ──────────────────────────────┤
+//! ├─ textarea (multi-line input with border) ─────────┤
 //! └─ fkey legend / status (1 row) ────────────────────┘
 //! ```
 //!
@@ -11,14 +11,41 @@
 //! top bar is rendered here. If a status message is active (error, generating),
 //! the fkey legend row shows it instead of the key hints.
 
+use std::cell::RefCell;
+
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Widget};
 use ratatui::Frame;
 
 use crate::chat_app::{ChatApp, ChatHistoryEntry, ChatMode, ChatRole};
 use crate::theme;
+
+// ============================================================================
+// Thread-local EditorState for the full-screen editor overlay.
+//
+// edtui::EditorState is !Send (contains Rc), so we store it in a thread_local
+// rather than in ChatApp (which must be Send for spawn_app_process).
+// The editor is only used client-side where single-threaded rendering applies.
+// ============================================================================
+
+thread_local! {
+    pub(crate) static EDITOR_STATE: RefCell<Option<edtui::EditorState>> = const { RefCell::new(None) };
+}
+
+/// Extract the current editor text from the thread_local state and clear it.
+/// Called from ChatApp::handle_input on Ctrl-S to read back edited content.
+pub fn take_editor_text() -> String {
+    EDITOR_STATE.with(|cell| {
+        let state = cell.borrow();
+        if let Some(ref s) = *state {
+            s.lines.to_string()
+        } else {
+            String::new()
+        }
+    })
+}
 
 // ============================================================================
 // Top-level draw
@@ -26,16 +53,29 @@ use crate::theme;
 
 pub fn draw(frame: &mut Frame, app: &ChatApp) {
     let area = frame.area();
-    let chunks = Layout::vertical([
-        Constraint::Min(1),    // history scrollback
-        Constraint::Length(1), // input line
-        Constraint::Length(1), // fkey legend / status
-    ])
-    .split(area);
 
-    draw_history(frame, chunks[0], app);
-    draw_input_line(frame, chunks[1], app);
-    draw_fkey_bar(frame, chunks[2], app);
+    if matches!(app.mode, ChatMode::Editor) {
+        draw_editor_overlay(frame, area, app);
+        return;
+    }
+
+    // Clear the thread_local EditorState when not in editor mode so that
+    // re-opening the editor starts fresh from the current textarea content.
+    EDITOR_STATE.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+
+    let input_height = (app.textarea.lines().len() as u16).max(1) + 2; // +2 for borders
+    let [history, input_area, fkey] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(input_height),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+
+    draw_history(frame, history, app);
+    draw_input_area(frame, input_area, app);
+    draw_fkey_bar(frame, fkey, app);
 }
 
 // ============================================================================
@@ -201,24 +241,19 @@ fn draw_history(frame: &mut Frame, area: Rect, app: &ChatApp) {
 }
 
 // ============================================================================
-// Input line
+// Input area (textarea or streaming indicator)
 // ============================================================================
 
-fn draw_input_line(frame: &mut Frame, area: Rect, app: &ChatApp) {
-    let content = match app.mode {
-        ChatMode::Input => format!("> {}", app.input_buf),
-        ChatMode::Streaming => "\u{2026} (generating)".to_owned(),
-    };
-
-    let para = Paragraph::new(Line::from(content))
-        .style(Style::default().bg(theme::BG_PANEL).fg(Color::White));
-    frame.render_widget(para, area);
-
-    // Show cursor in input mode.
-    if matches!(app.mode, ChatMode::Input) {
-        let cursor_x = area.x + 2 + app.input_buf.len() as u16;
-        let cx = cursor_x.min(area.x + area.width.saturating_sub(1));
-        frame.set_cursor_position((cx, area.y));
+fn draw_input_area(frame: &mut Frame, area: Rect, app: &ChatApp) {
+    match app.mode {
+        // Textarea is rendered in both Input and Streaming so the user can
+        // compose and queue the next prompt while inference is in flight.
+        ChatMode::Input | ChatMode::Streaming => {
+            frame.render_widget(&app.textarea, area);
+        }
+        ChatMode::Editor => {
+            // Editor mode is handled by draw_editor_overlay — should not reach here.
+        }
     }
 }
 
@@ -227,20 +262,47 @@ fn draw_input_line(frame: &mut Frame, area: Rect, app: &ChatApp) {
 // ============================================================================
 
 fn draw_fkey_bar(frame: &mut Frame, area: Rect, app: &ChatApp) {
-    // When a status message is active in input mode, show it here instead of key hints.
-    // "Generating…" is already communicated by the input line, so skip it.
+    // When a non-trivial status is active in Input mode, show it instead of hints.
     let show_status = matches!(app.mode, ChatMode::Input)
-        && app.status.as_deref().map(|s| s != "Generating\u{2026}").unwrap_or(false);
+        && app.status.as_deref()
+            .map(|s| s != "Generating\u{2026}" && s != "Cancelled")
+            .unwrap_or(false);
 
     let line = if show_status {
         let msg = app.status.as_deref().unwrap_or("");
         Line::from(Span::styled(format!("  {msg}"), theme::help_text()))
+    } else if matches!(app.mode, ChatMode::Streaming) {
+        // Streaming mode: show cancel hint + queue depth.
+        let mut spans = vec![
+            Span::raw("  "),
+            Span::styled("Esc", theme::help_key()),
+            Span::raw(" "),
+            Span::styled("Cancel", theme::help_text()),
+            Span::raw("  "),
+            Span::styled("Enter", theme::help_key()),
+            Span::raw(" "),
+            Span::styled("Queue", theme::help_text()),
+            Span::raw("  "),
+            Span::styled("Ctrl-O", theme::help_key()),
+            Span::raw(" "),
+            Span::styled("Thinking", theme::help_text()),
+        ];
+        if !app.pending_prompts.is_empty() {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                format!("\u{23f3} {} queued", app.pending_prompts.len()),
+                theme::help_text(),
+            ));
+        }
+        Line::from(spans)
     } else {
         let keys: &[(&str, &str)] = &[
             ("Enter", "Send"),
+            ("Ctrl-J", "Newline"),
             ("\u{2191}\u{2193}", "Scroll"),
+            ("Ctrl-E", "Editor"),
             ("Ctrl-O", "Thinking"),
-            ("Esc", "Close"),
+            ("Esc\u{00d7}2", "Close"),
         ];
         let mut spans = Vec::new();
         spans.push(Span::raw("  "));
@@ -257,4 +319,33 @@ fn draw_fkey_bar(frame: &mut Frame, area: Rect, app: &ChatApp) {
         Paragraph::new(line).style(Style::default().bg(theme::BG_PANEL)),
         area,
     );
+}
+
+// ============================================================================
+// Editor overlay (edtui full-screen)
+// ============================================================================
+
+fn draw_editor_overlay(frame: &mut Frame, area: Rect, app: &ChatApp) {
+    use ratatui::widgets::Clear;
+    frame.render_widget(Clear, area);
+    let block = hyprstream_compositor::theme::modal_block(
+        Line::from(" Editor  (Ctrl-S save · Esc cancel) "),
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Ensure the thread_local EditorState is initialised with the app's editor_text.
+    EDITOR_STATE.with(|cell| {
+        let mut opt = cell.borrow_mut();
+        if opt.is_none() {
+            *opt = Some(edtui::EditorState::new(
+                edtui::Lines::from(app.editor_text.as_str()),
+            ));
+        }
+        if let Some(ref mut state) = *opt {
+            edtui::EditorView::new(state)
+                .wrap(true)
+                .render(inner, frame.buffer_mut());
+        }
+    });
 }
