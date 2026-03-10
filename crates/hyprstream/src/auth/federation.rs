@@ -9,6 +9,7 @@ use tokio::sync::RwLock;
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::VerifyingKey;
+use hyprstream_rpc::auth::FederationKeySource;
 
 struct CachedKey {
     key: VerifyingKey,
@@ -173,6 +174,17 @@ impl FederationKeyResolver {
             }
         }
         Err(anyhow!("No Ed25519 key found in JWKS at {}", jwks_uri))
+    }
+}
+
+#[async_trait::async_trait]
+impl FederationKeySource for FederationKeyResolver {
+    fn is_trusted(&self, issuer: &str) -> bool {
+        self.is_trusted(issuer)
+    }
+
+    async fn get_key(&self, issuer: &str) -> anyhow::Result<ed25519_dalek::VerifyingKey> {
+        self.get_key(issuer).await
     }
 }
 
