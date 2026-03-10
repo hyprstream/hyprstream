@@ -60,6 +60,7 @@ pub fn draw(frame: &mut Frame, chrome: &ShellChrome, layout: &LayoutTree) {
         ShellMode::Settings               => draw_settings_modal(frame, area, chrome),
         ShellMode::StartMenu { selected } => draw_start_menu(frame, area, selected),
         ShellMode::Console                => { /* drawn by shell_handlers (native) or wasm path */ }
+        ShellMode::ConversationPicker { .. } => draw_conversation_picker(frame, area, chrome),
         ShellMode::Normal | ShellMode::Fullscreen => {}
     }
 
@@ -337,8 +338,8 @@ fn draw_fkey_bar(frame: &mut Frame, area: Rect, mode: &ShellMode) {
         ],
         ShellMode::ModelList => &[
             ("\u{2191}\u{2193}", "Navigate"),
-            ("c",                "Private"),
-            ("C/Enter",          "Server chat"),
+            ("c",                "Chat \u{1f512}"),
+            ("C/Enter",          "Chat"),
             ("T",                "Terminal"),
             ("l/u",              "Load/Unload"),
             ("Esc",              "Close"),
@@ -346,6 +347,12 @@ fn draw_fkey_bar(frame: &mut Frame, area: Rect, mode: &ShellMode) {
         ShellMode::Settings => &[
             ("\u{2191}\u{2193}", "Navigate"),
             ("Enter",            "Select"),
+            ("Esc",              "Cancel"),
+        ],
+        ShellMode::ConversationPicker { .. } => &[
+            ("\u{2191}\u{2193}", "Navigate"),
+            ("Enter",            "Select"),
+            ("d",                "Delete"),
             ("Esc",              "Cancel"),
         ],
     };
@@ -375,11 +382,11 @@ fn draw_model_modal(frame: &mut Frame, full_area: Rect, chrome: &ShellChrome) {
 
         let hint = Paragraph::new(Line::from(vec![
             Span::styled("c",     theme::help_key()),
-            Span::styled(" private  ",  theme::help_text()),
+            Span::styled(" chat \u{1f512}  ",  theme::help_text()),
             Span::styled("C",     theme::help_key()),
             Span::styled("/",     theme::help_text()),
             Span::styled("Enter", theme::help_key()),
-            Span::styled(" server  ",   theme::help_text()),
+            Span::styled(" chat  ",     theme::help_text()),
             Span::styled("T",     theme::help_key()),
             Span::styled(" terminal  ", theme::help_text()),
             Span::styled("l",     theme::help_key()),
@@ -502,50 +509,32 @@ fn draw_toasts(frame: &mut Frame, area: Rect, chrome: &ShellChrome) {
 }
 
 // ============================================================================
-// Console log modal
+// Conversation picker modal
 // ============================================================================
 
-#[allow(dead_code)]
-fn draw_console_modal(frame: &mut Frame, content: Rect, chrome: &ShellChrome) {
-    let modal = centered_rect(85, 80, content);
-    render_modal(frame, modal, theme::modal_block(Line::from(" Console Log ")), |frame, inner| {
-        let footer_area = Rect { y: inner.y + inner.height.saturating_sub(1), height: 1, ..inner };
-        let log_area = Rect { height: inner.height.saturating_sub(1), ..inner };
+fn draw_conversation_picker(frame: &mut Frame, full_area: Rect, chrome: &ShellChrome) {
+    let (model_ref, list) = match &chrome.mode {
+        ShellMode::ConversationPicker { model_ref, list } => (model_ref, list),
+        _ => return,
+    };
+    let modal = centered_rect(55, 60, full_area);
+    let title = format!(" {} — Conversations ", model_ref);
+    render_modal(frame, modal, theme::modal_block(Line::from(title)), |frame, inner| {
+        let hint_area = Rect { y: inner.y + inner.height.saturating_sub(1), height: 1, ..inner };
+        let list_area = Rect { height: inner.height.saturating_sub(2), ..inner };
 
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("\u{2191}\u{2193}", theme::help_key()),
-                Span::styled(" scroll  ", theme::help_text()),
-                Span::styled("F9/Esc", theme::help_key()),
-                Span::styled(" close", theme::help_text()),
-            ]))
-            .style(Style::default().bg(theme::BG_MODAL)),
-            footer_area,
-        );
+        let hint = Paragraph::new(Line::from(vec![
+            Span::styled("Enter", theme::help_key()),
+            Span::styled(" select  ",  theme::help_text()),
+            Span::styled("d",     theme::help_key()),
+            Span::styled(" delete  ",  theme::help_text()),
+            Span::styled("Esc",   theme::help_key()),
+            Span::styled(" cancel",    theme::help_text()),
+        ]))
+        .style(Style::default().bg(theme::BG_MODAL));
+        frame.render_widget(hint, hint_area);
 
-        let visible = log_area.height as usize;
-        let total = chrome.console_log.len();
-        let start = chrome.console_scroll.min(total.saturating_sub(1));
-        let recent_threshold = total.saturating_sub(10);
-
-        let lines: Vec<Line> = chrome.console_log.iter()
-            .enumerate()
-            .skip(start)
-            .take(visible)
-            .map(|(idx, line)| {
-                let style = if idx >= recent_threshold {
-                    Style::default().fg(Color::White)
-                } else {
-                    Style::default().fg(Color::from((120u8, 120u8, 120u8)))
-                };
-                Line::from(Span::styled(line.clone(), style))
-            })
-            .collect();
-
-        frame.render_widget(
-            Paragraph::new(lines).style(Style::default().bg(theme::BG_MODAL)),
-            log_area,
-        );
+        list.render(frame, list_area);
     });
 }
 

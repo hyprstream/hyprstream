@@ -28,6 +28,14 @@ pub struct Toast {
     ttl:         std::time::Duration,
 }
 
+/// Bit-31 marks client-local IDs (windows/panes not on the server).
+pub const LOCAL_ID_BIT: u32 = 0x8000_0000;
+
+/// Returns true if the ID is client-local (bit 31 set).
+pub fn is_local_id(id: u32) -> bool {
+    id & LOCAL_ID_BIT != 0
+}
+
 use crate::background::{BackgroundState, BackgroundStyle, ALL_STYLES, PREVIEW_H, PREVIEW_W};
 
 // ============================================================================
@@ -77,6 +85,21 @@ pub struct PaneSummary {
 // ShellMode
 // ============================================================================
 
+/// Entry in the conversation picker.
+#[derive(Clone, Debug)]
+pub struct ConversationPickerEntry {
+    /// UUID as string (avoids uuid dependency in compositor).
+    pub uuid: String,
+    pub label: String,
+    pub last_active: u64,
+}
+
+impl std::fmt::Display for ConversationPickerEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.label)
+    }
+}
+
 pub enum ShellMode {
     /// Keys forwarded to the active shell via SendInput RPC.
     Normal,
@@ -90,6 +113,11 @@ pub enum ShellMode {
     Console,
     /// Fullscreen — all chrome hidden, pane fills terminal.
     Fullscreen,
+    /// Conversation picker for a specific model.
+    ConversationPicker {
+        model_ref: String,
+        list: waxterm::widgets::SelectList<ConversationPickerEntry>,
+    },
 }
 
 /// Menu items: (label, chord hint shown in popup).
@@ -124,11 +152,22 @@ pub enum RpcRequest {
         rows: u16,
         pane_id: u32,
     },
-    CreatePrivatePane {
-        session_id: u32,
+    /// Client-local private chat — no server round-trip required.
+    /// If `resume_uuid` is Some, resumes an existing conversation.
+    LocalPrivateChat {
+        model_ref: String,
         cols: u16,
         rows: u16,
-        name: String,
+        resume_uuid: Option<String>,
+    },
+    /// Delete a private conversation (UUID as string).
+    DeleteConversation {
+        uuid: String,
+        model_ref: String,
+    },
+    /// Request the conversation list for a model (shell handler populates it).
+    ListConversations {
+        model_ref: String,
     },
     Quit,
 }
@@ -225,25 +264,38 @@ impl ShellChrome {
     }
 
     /// Update window list (called when TuiService reports window changes).
-    pub fn update_windows(&mut self, wins: Vec<WindowSummary>) -> bool {
-        // Sync private_panes from the window list (server is authoritative).
-        let new_private: std::collections::HashSet<u32> = wins.iter()
+    /// Merges server windows with existing client-local windows (bit-31 set).
+    pub fn update_windows(&mut self, server_wins: Vec<WindowSummary>) -> bool {
+        // Preserve client-local windows (bit-31 set).
+        let local_wins: Vec<WindowSummary> = self.windows.drain(..)
+            .filter(|w| is_local_id(w.id))
+            .collect();
+
+        // Sync private_panes: combine server-reported + locally-tracked.
+        let mut new_private: std::collections::HashSet<u32> = server_wins.iter()
             .flat_map(|w| w.panes.iter())
             .filter(|p| p.is_private)
             .map(|p| p.id)
             .collect();
+        for w in &local_wins {
+            for p in &w.panes {
+                if p.is_private { new_private.insert(p.id); }
+            }
+        }
         let private_changed = new_private != self.private_panes;
         self.private_panes = new_private;
 
-        // Also detect pane-list changes within existing windows (e.g. a private pane
-        // added to an existing window without changing the window count/IDs).
-        let changed = wins.len() != self.windows.len()
-            || wins.iter().zip(&self.windows).any(|(a, b)| {
+        // Merge: server windows first, then local windows.
+        let mut merged = server_wins;
+        merged.extend(local_wins);
+
+        let changed = merged.len() != self.windows.len()
+            || merged.iter().zip(&self.windows).any(|(a, b)| {
                 a.id != b.id || a.panes.len() != b.panes.len()
             });
         if changed || private_changed {
-            self.active_win = self.active_win.min(wins.len().saturating_sub(1));
-            self.windows = wins;
+            self.active_win = self.active_win.min(merged.len().saturating_sub(1));
+            self.windows = merged;
         }
         changed || private_changed
     }
@@ -314,6 +366,7 @@ impl ShellChrome {
             ShellMode::Settings               => self.handle_settings(key),
             ShellMode::StartMenu { selected } => self.handle_start_menu(key, selected),
             ShellMode::Console                => self.handle_console(key),
+            ShellMode::ConversationPicker { .. } => self.handle_conversation_picker(key),
         }
     }
 
@@ -412,16 +465,10 @@ impl ShellChrome {
         // c (lowercase) — private chat (client-owned, encrypted history)
         if matches!(key, KeyPress::Char(b'c')) {
             if let Some(model) = self.model_list.selected_item().cloned() {
-                let sid  = self.session_id;
-                let cols = self.cols;
-                let rows = self.pane_rows;
-                let name = model.model_ref.clone();
+                let model_ref = model.model_ref.clone();
                 self.mode = ShellMode::Normal;
-                return vec![ChromeOutput::Rpc(RpcRequest::CreatePrivatePane {
-                    session_id: sid,
-                    cols,
-                    rows,
-                    name,
+                return vec![ChromeOutput::Rpc(RpcRequest::ListConversations {
+                    model_ref,
                 })];
             }
         }
@@ -615,6 +662,75 @@ impl ShellChrome {
                         vec![ChromeOutput::Rpc(RpcRequest::SendInput { viewer_id: vid, data: bytes })]
                     }
                 }
+            }
+        }
+    }
+
+    /// Open the conversation picker with the given entries.
+    /// Called by the shell handler after loading the manifest.
+    pub fn open_conversation_picker(
+        &mut self,
+        model_ref: String,
+        conversations: Vec<ConversationPickerEntry>,
+    ) {
+        let mut items = vec![ConversationPickerEntry {
+            uuid: "new".to_owned(),
+            label: "[New conversation]".to_owned(),
+            last_active: u64::MAX, // sort first
+        }];
+        items.extend(conversations);
+        let list = SelectList::new(format!("{} — Conversations", model_ref), items);
+        self.mode = ShellMode::ConversationPicker { model_ref, list };
+    }
+
+    // ── ConversationPicker mode ────────────────────────────────────────────
+
+    fn handle_conversation_picker(&mut self, key: KeyPress) -> Vec<ChromeOutput> {
+        let (model_ref, list) = match &mut self.mode {
+            ShellMode::ConversationPicker { model_ref, list } => (model_ref.clone(), list),
+            _ => return vec![],
+        };
+
+        // 'd' — delete selected conversation (stays in picker)
+        if matches!(key, KeyPress::Char(b'd' | b'D')) {
+            let idx = list.selected_index();
+            if let Some(entry) = list.selected_item().cloned() {
+                if entry.uuid != "new" {
+                    let uuid = entry.uuid.clone();
+                    let mr = model_ref.clone();
+                    list.items_mut().remove(idx);
+                    list.clamp_selected();
+                    self.push_toast("Deleted conversation", ToastLevel::Info);
+                    return vec![
+                        ChromeOutput::Rpc(RpcRequest::DeleteConversation { uuid, model_ref: mr }),
+                        ChromeOutput::Redraw,
+                    ];
+                }
+            }
+        }
+
+        match list.handle_key(&key) {
+            WidgetResult::Cancelled => {
+                self.mode = ShellMode::Normal;
+                vec![ChromeOutput::Redraw]
+            }
+            WidgetResult::Confirmed(entry) => {
+                let resume = if entry.uuid == "new" { None } else { Some(entry.uuid) };
+                let cols = self.cols;
+                let rows = self.pane_rows;
+                self.mode = ShellMode::Normal;
+                vec![ChromeOutput::Rpc(RpcRequest::LocalPrivateChat {
+                    model_ref,
+                    cols,
+                    rows,
+                    resume_uuid: resume,
+                })]
+            }
+            WidgetResult::Pending => {
+                if matches!(key, KeyPress::Escape) {
+                    self.mode = ShellMode::Normal;
+                }
+                vec![ChromeOutput::Redraw]
             }
         }
     }

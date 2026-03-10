@@ -28,8 +28,9 @@ pub mod theme;
 
 pub use background::{BackgroundState, BackgroundStyle, ALL_STYLES, PREVIEW_H, PREVIEW_W};
 pub use chrome::{
-    ChromeOutput, ModelEntry, PaneSummary, RpcRequest, ShellChrome, ShellMode, Toast, ToastLevel,
-    WindowSummary, MENU_ITEMS, keypress_to_bytes,
+    ChromeOutput, ConversationPickerEntry, ModelEntry, PaneSummary, RpcRequest, ShellChrome,
+    ShellMode, Toast, ToastLevel, WindowSummary, MENU_ITEMS, keypress_to_bytes,
+    LOCAL_ID_BIT, is_local_id,
 };
 pub use layout::{
     CellUpdate, CursorState, FrameContent, FrameUpdate, LayoutTree, PaneId, PaneSource,
@@ -197,7 +198,26 @@ impl Compositor {
             CompositorInput::AppExited { app_id } => {
                 self.layout.remove_pane(app_id);
                 self.chrome.private_panes.remove(&app_id);
-                vec![CompositorOutput::Redraw]
+
+                // Find and close the server-side window that contained this pane.
+                let mut out = vec![CompositorOutput::Redraw];
+                if let Some(win_idx) = self.chrome.windows.iter().position(|w| {
+                    w.panes.iter().any(|p| p.id == app_id)
+                }) {
+                    let window_id = self.chrome.windows[win_idx].id;
+                    self.chrome.windows.remove(win_idx);
+                    if self.chrome.windows.is_empty() {
+                        self.chrome.active_win = 0;
+                    } else {
+                        self.chrome.active_win =
+                            self.chrome.active_win.min(self.chrome.windows.len() - 1);
+                    }
+                    out.push(CompositorOutput::Rpc(RpcRequest::CloseWindow {
+                        session_id: self.chrome.session_id,
+                        window_id,
+                    }));
+                }
+                out
             }
         }
     }

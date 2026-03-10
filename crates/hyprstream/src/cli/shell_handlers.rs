@@ -22,8 +22,8 @@ use waxterm::input::InputParser;
 use zeroize::Zeroizing;
 
 use hyprstream_compositor::{
-    Compositor, CompositorInput, CompositorOutput, ModelEntry, PaneSummary, RpcRequest,
-    ToastLevel, WindowSummary,
+    Compositor, CompositorInput, CompositorOutput, ConversationPickerEntry, ModelEntry,
+    PaneSummary, RpcRequest, ToastLevel, WindowSummary,
 };
 use hyprstream_compositor::layout::{CellUpdate, CursorState, FrameContent, FrameUpdate, ScrollUpdate};
 use hyprstream_tui::chat_app::{ChatApp, LoadHook, SaveHook};
@@ -33,7 +33,7 @@ use waxterm::app::TerminalApp;
 
 use crate::services::generated::tui_client::TuiClient;
 use crate::tui::shell_client::{
-    close_window_rpc, create_private_pane_rpc, focus_window_rpc, spawn_chat_app_rpc,
+    close_window_rpc, focus_window_rpc, spawn_chat_app_rpc,
     spawn_shell_rpc,
 };
 
@@ -209,6 +209,8 @@ pub async fn handle_shell_tui(
 
     // Active client-owned ChatApps keyed by pane_id.
     let mut active_apps: HashMap<u32, ChatApp> = HashMap::new();
+    // Local pane ID counter — high bit set to avoid collision with server IDs.
+    let mut next_local_id: u32 = hyprstream_compositor::LOCAL_ID_BIT;
 
     let mut saw_ctrl_b = false;
     let mut win_refresh = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -262,7 +264,7 @@ pub async fn handle_shell_tui(
                 if dispatch_outputs(
                     &mut compositor, &client, &model_client,
                     &model_status_tx, &mut terminal, &mut console_app,
-                    &mut active_apps, &storage_key, signing_key, outputs,
+                    &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
                 ).await { break; }
             }
 
@@ -308,7 +310,7 @@ pub async fn handle_shell_tui(
                     if dispatch_outputs(
                         &mut compositor, &client, &model_client,
                         &model_status_tx, &mut terminal, &mut console_app,
-                        &mut active_apps, &storage_key, signing_key, outputs,
+                        &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
                     ).await {
                         should_exit = true;
                         break;
@@ -323,7 +325,7 @@ pub async fn handle_shell_tui(
                     if dispatch_outputs(
                         &mut compositor, &client, &model_client,
                         &model_status_tx, &mut terminal, &mut console_app,
-                        &mut active_apps, &storage_key, signing_key, outputs,
+                        &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
                     ).await { break; }
                 }
             }
@@ -358,7 +360,7 @@ pub async fn handle_shell_tui(
                     if dispatch_outputs(
                         &mut compositor, &client, &model_client,
                         &model_status_tx, &mut terminal, &mut console_app,
-                        &mut active_apps, &storage_key, signing_key, outputs,
+                        &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
                     ).await { should_exit = true; break; }
                 }
                 // Remove quitting apps.
@@ -369,7 +371,7 @@ pub async fn handle_shell_tui(
                     dispatch_outputs(
                         &mut compositor, &client, &model_client,
                         &model_status_tx, &mut terminal, &mut console_app,
-                        &mut active_apps, &storage_key, signing_key, outputs,
+                        &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
                     ).await;
                 }
                 if should_exit { break; }
@@ -395,7 +397,7 @@ pub async fn handle_shell_tui(
                 if dispatch_outputs(
                     &mut compositor, &client, &model_client,
                     &model_status_tx, &mut terminal, &mut console_app,
-                    &mut active_apps, &storage_key, signing_key, outputs,
+                    &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
                 ).await { break; }
                 composite_draw(&mut terminal, &compositor, &mut console_app);
             }
@@ -457,6 +459,7 @@ async fn dispatch_outputs(
     terminal: &mut ratatui::Terminal<AnsiBackend<AnsiWriter>>,
     console_app: &mut ConsoleApp,
     active_apps: &mut HashMap<u32, ChatApp>,
+    next_local_id: &mut u32,
     storage_key: &StorageKey,
     signing_key: &SigningKey,
     outputs: Vec<CompositorOutput>,
@@ -470,7 +473,7 @@ async fn dispatch_outputs(
             CompositorOutput::Rpc(req) => {
                 let feed_back = handle_rpc(
                     compositor, client, model_client, model_status_tx,
-                    active_apps, storage_key, signing_key, req,
+                    active_apps, next_local_id, storage_key, signing_key, req,
                 ).await;
                 for input in feed_back {
                     let follow = compositor.handle(input);
@@ -512,6 +515,7 @@ async fn handle_rpc(
     model_client: &crate::services::ModelZmqClient,
     model_status_tx: &tokio::sync::mpsc::Sender<(String, bool)>,
     active_apps: &mut HashMap<u32, ChatApp>,
+    next_local_id: &mut u32,
     storage_key: &StorageKey,
     signing_key: &SigningKey,
     req: RpcRequest,
@@ -634,80 +638,145 @@ async fn handle_rpc(
             vec![]
         }
 
-        RpcRequest::CreatePrivatePane { cols, rows, name, .. } => {
-            let window_id = compositor.chrome.windows
-                .get(compositor.chrome.active_win)
-                .map(|w| w.id)
-                .unwrap_or(0);
-            match create_private_pane_rpc(
-                client,
-                compositor.chrome.session_id,
-                window_id,
-                cols,
-                rows,
-                &name,
-            ).await {
-                Ok(pane_id) => {
-                    let session_uuid = uuid::Uuid::new_v4();
-                    let storage_dir = private_store_dir();
-                    let app = match FsBackend::new(storage_dir) {
-                        Ok(fs) => {
-                            // Derive a fresh copy of the storage key for this store instance.
-                            let key_bytes: [u8; 32] = **storage_key;
-                            let fs_store = std::sync::Arc::new(
-                                hyprstream_tui::private_store::PrivateStore::new(
-                                    fs,
-                                    Zeroizing::new(key_bytes),
-                                )
-                            );
-                            let load_store = fs_store.clone();
-                            let save_store = fs_store;
-                            let uuid_for_load = session_uuid;
-                            let uuid_for_save = session_uuid;
-                            let load_hook: LoadHook = Box::new(move || {
-                                load_store.load::<hyprstream_tui::chat_app::ChatHistoryEntry>(&uuid_for_load)
-                                    .ok()
-                                    .flatten()
-                            });
-                            let save_hook: SaveHook = Box::new(move |entries| {
-                                let _ = save_store.save(&uuid_for_save, entries);
-                            });
-                            let spawner = make_chat_spawner(signing_key, &name);
-                            ChatApp::new_private(
-                                name.clone(), cols, rows, spawner,
-                                session_uuid, load_hook, save_hook,
-                            )
-                        }
-                        Err(e) => {
-                            compositor.chrome.push_toast(
-                                format!("Private store dir unavailable: {e}"),
-                                ToastLevel::Warn,
-                            );
-                            ChatApp::new(name.clone(), cols, rows, make_chat_spawner(signing_key, &name))
-                        }
-                    };
-                    active_apps.insert(pane_id, app);
-                    compositor.chrome.private_panes.insert(pane_id);
-                    // Register in layout so AppFrame / draw_content can reach it.
-                    compositor.layout.get_or_create_private(pane_id);
-                    // Refresh windows FIRST so chrome.windows includes the new private pane
-                    // before the first render — lock indicator is correct from frame 1.
-                    if let Ok(wins) = list_windows_rpc(client).await {
-                        compositor.handle(CompositorInput::WindowList(wins));
+        RpcRequest::LocalPrivateChat { model_ref, cols, rows, resume_uuid } => {
+            // Allocate a local pane ID in the high-bit range to avoid
+            // collision with server-allocated IDs (which start at 1).
+            let pane_id = *next_local_id;
+            *next_local_id = next_local_id.saturating_add(1);
+
+            let session_uuid = match &resume_uuid {
+                Some(s) => uuid::Uuid::parse_str(s).unwrap_or_else(|_| uuid::Uuid::new_v4()),
+                None => uuid::Uuid::new_v4(),
+            };
+            let storage_dir = private_store_dir();
+            let app = match FsBackend::new(storage_dir) {
+                Ok(fs) => {
+                    let key_bytes: [u8; 32] = **storage_key;
+                    let fs_store = std::sync::Arc::new(
+                        hyprstream_tui::private_store::PrivateStore::new(
+                            fs,
+                            Zeroizing::new(key_bytes),
+                        )
+                    );
+                    // Register conversation in manifest (skip if resuming).
+                    if resume_uuid.is_none() {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let _ = fs_store.register_conversation(
+                            hyprstream_tui::private_store::ConversationMeta {
+                                uuid: session_uuid,
+                                model_ref: model_ref.clone(),
+                                created_at: now,
+                                last_active: now,
+                                label: Some(format!("Chat: {}", model_ref)),
+                            },
+                        );
                     }
-                    // Now render first frame — chrome.windows is up to date.
-                    if let Some(a) = active_apps.get(&pane_id) {
-                        let ansi = render_chat_app_to_ansi(a);
-                        compositor.handle(CompositorInput::AppFrame { app_id: pane_id, ansi });
-                    }
-                    // Return empty — dispatch_outputs picks up Redraw from AppFrame output.
-                    vec![]
+                    let load_store = fs_store.clone();
+                    let save_store = fs_store;
+                    let uuid_for_load = session_uuid;
+                    let uuid_for_save = session_uuid;
+                    let load_hook: LoadHook = Box::new(move || {
+                        load_store.load::<hyprstream_tui::chat_app::ChatHistoryEntry>(&uuid_for_load)
+                            .ok()
+                            .flatten()
+                    });
+                    let save_hook: SaveHook = Box::new(move |entries| {
+                        let _ = save_store.save(&uuid_for_save, entries);
+                    });
+                    let spawner = make_chat_spawner(signing_key, &model_ref);
+                    ChatApp::new_private(
+                        model_ref.clone(), cols, rows, spawner,
+                        session_uuid, load_hook, save_hook,
+                    )
                 }
                 Err(e) => {
-                    compositor.chrome.push_toast(format!("Private chat: {e}"), ToastLevel::Error);
-                    vec![]
+                    compositor.chrome.push_toast(
+                        format!("Private store dir unavailable: {e}"),
+                        ToastLevel::Warn,
+                    );
+                    ChatApp::new(model_ref.clone(), cols, rows, make_chat_spawner(signing_key, &model_ref))
+                }
+            };
+            active_apps.insert(pane_id, app);
+            compositor.chrome.private_panes.insert(pane_id);
+            compositor.layout.get_or_create_private(pane_id);
+
+            // Auto-number window names for duplicate models.
+            let chat_prefix = format!("Chat: {}", model_ref);
+            let existing_count = compositor.chrome.windows.iter()
+                .filter(|w| w.name == chat_prefix || w.name.starts_with(&format!("{} (", chat_prefix)))
+                .count();
+            let win_name = if existing_count > 0 {
+                format!("{} ({})", chat_prefix, existing_count + 1)
+            } else {
+                chat_prefix
+            };
+
+            // Insert a phantom local window into chrome (no server round-trip).
+            let win_summary = WindowSummary {
+                id: pane_id, // use pane_id as window_id for local windows
+                name: win_name,
+                active_pane_id: pane_id,
+                panes: vec![PaneSummary {
+                    id: pane_id,
+                    cols,
+                    rows,
+                    is_private: true,
+                }],
+            };
+            compositor.chrome.windows.push(win_summary);
+            compositor.chrome.active_win = compositor.chrome.windows.len() - 1;
+
+            // Render first frame.
+            if let Some(a) = active_apps.get(&pane_id) {
+                let ansi = render_chat_app_to_ansi(a);
+                compositor.handle(CompositorInput::AppFrame { app_id: pane_id, ansi });
+            }
+            vec![]
+        }
+
+        RpcRequest::ListConversations { model_ref } => {
+            let storage_dir = private_store_dir();
+            let conversations = match FsBackend::new(storage_dir) {
+                Ok(fs) => {
+                    let key_bytes: [u8; 32] = **storage_key;
+                    let store = hyprstream_tui::private_store::PrivateStore::new(
+                        fs, Zeroizing::new(key_bytes),
+                    );
+                    store.list_conversations(&model_ref)
+                        .into_iter()
+                        .map(|meta| ConversationPickerEntry {
+                            uuid: meta.uuid.to_string(),
+                            label: meta.label.unwrap_or_else(|| format!("Chat: {}", meta.model_ref)),
+                            last_active: meta.last_active,
+                        })
+                        .collect()
+                }
+                Err(_) => vec![],
+            };
+            compositor.chrome.open_conversation_picker(model_ref, conversations);
+            vec![]
+        }
+
+        RpcRequest::DeleteConversation { uuid, model_ref } => {
+            let storage_dir = private_store_dir();
+            if let Ok(fs) = FsBackend::new(storage_dir) {
+                let key_bytes: [u8; 32] = **storage_key;
+                let store = hyprstream_tui::private_store::PrivateStore::new(
+                    fs, Zeroizing::new(key_bytes),
+                );
+                if let Ok(uid) = uuid::Uuid::parse_str(&uuid) {
+                    let _ = store.delete_conversation(&uid);
                 }
             }
+            compositor.chrome.push_toast(
+                format!("Deleted conversation from {}", model_ref),
+                ToastLevel::Info,
+            );
+            vec![]
         }
 
         RpcRequest::Quit => vec![],
@@ -936,149 +1005,12 @@ fn tab_index_at_col(windows: &[WindowSummary], col: u16) -> Option<usize> {
 // Private chat helpers
 // ============================================================================
 
-/// Build a `StreamSpawner` that drives inference via `ModelZmqClient`.
-///
-/// Matches the pattern in `service.rs::handle_spawn_chat_app`:
-/// - Spawns a dedicated OS thread with a single-threaded Tokio runtime.
-/// - Applies the chat template, starts an authenticated inference stream.
-/// - Sends `ChatEvent::Token` / `StreamComplete` / `StreamError` to the app.
+/// Build a `StreamSpawner` — delegates to `tui::zmq_transport`.
 fn make_chat_spawner(
     signing_key: &SigningKey,
     model_ref: &str,
 ) -> hyprstream_tui::chat_app::StreamSpawner {
-    use hyprstream_rpc::envelope::RequestIdentity;
-    use hyprstream_rpc::streaming::StreamPayload;
-    use hyprstream_rpc::crypto::generate_ephemeral_keypair;
-    use crate::services::model::ModelZmqClient;
-    use crate::services::rpc_types::StreamHandle;
-    use crate::config::GenerationRequest;
-    use crate::api::openai_compat::ChatMessage;
-    use crate::zmq::global_context;
-    use hyprstream_tui::chat_app::ChatEvent;
-
-    let sk = signing_key.clone();
-    let mr = model_ref.to_owned();
-
-    Box::new(move |pairs, event_tx| {
-        use tokio::sync::oneshot;
-        use hyprstream_tui::chat_app::CancelHandle;
-
-        let sk_inner = sk.clone();
-        let mr_inner = mr.clone();
-        let tx = event_tx.clone();
-
-        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-
-        std::thread::spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = tx.send(ChatEvent::StreamError(e.to_string()));
-                    return;
-                }
-            };
-
-            rt.block_on(async move {
-                let model_client = ModelZmqClient::new(sk_inner.clone(), RequestIdentity::local());
-
-                let messages: Vec<ChatMessage> = pairs
-                    .into_iter()
-                    .map(|(role, content)| ChatMessage {
-                        role,
-                        content: Some(content),
-                        function_call: None,
-                        tool_calls: None,
-                        tool_call_id: None,
-                    })
-                    .collect();
-
-                let prompt = match model_client
-                    .apply_chat_template(&mr_inner, &messages, true, None)
-                    .await
-                {
-                    Ok(p) => p,
-                    Err(e) => {
-                        let _ = tx.send(ChatEvent::TemplateError(e.to_string()));
-                        return;
-                    }
-                };
-
-                let req = GenerationRequest {
-                    prompt,
-                    max_tokens: 2048,
-                    temperature: 0.7,
-                    ..Default::default()
-                };
-
-                let (client_secret, client_pubkey) = generate_ephemeral_keypair();
-                let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
-
-                let stream_info = match model_client
-                    .infer_stream(&mr_inner, &req, client_pubkey_bytes)
-                    .await
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let _ = tx.send(ChatEvent::StreamError(e.to_string()));
-                        return;
-                    }
-                };
-
-                let mut handle = match StreamHandle::new(
-                    &global_context(),
-                    stream_info.stream_id,
-                    &stream_info.endpoint,
-                    &stream_info.server_pubkey,
-                    &client_secret,
-                    &client_pubkey_bytes,
-                ) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        let _ = tx.send(ChatEvent::StreamError(e.to_string()));
-                        return;
-                    }
-                };
-
-                let mut cancel_rx = cancel_rx;
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = &mut cancel_rx => {
-                            let _ = tx.send(ChatEvent::StreamCancelled);
-                            break;
-                        }
-                        result = handle.recv_next() => {
-                            match result {
-                                Ok(Some(StreamPayload::Data(b))) => {
-                                    let _ = tx.send(ChatEvent::Token(
-                                        String::from_utf8_lossy(&b).into_owned(),
-                                    ));
-                                }
-                                Ok(Some(StreamPayload::Complete(_))) | Ok(None) => {
-                                    let _ = tx.send(ChatEvent::StreamComplete);
-                                    break;
-                                }
-                                Ok(Some(StreamPayload::Error(m))) => {
-                                    let _ = tx.send(ChatEvent::StreamError(m));
-                                    break;
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(ChatEvent::StreamError(e.to_string()));
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-        });
-
-        let handle: CancelHandle = Box::new(move || { let _ = cancel_tx.send(()); });
-        handle
-    })
+    crate::tui::zmq_transport::make_chat_spawner(signing_key, model_ref)
 }
 
 /// Derive a 32-byte AES-256 storage key from the Ed25519 signing key seed.

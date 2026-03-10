@@ -49,6 +49,13 @@ impl<T: Display + Clone> SelectList<T> {
         &mut self.items
     }
 
+    /// Clamp the selected index to be within bounds after items are removed.
+    pub fn clamp_selected(&mut self) {
+        if !self.items.is_empty() {
+            self.selected = self.selected.min(self.items.len() - 1);
+        }
+    }
+
     pub fn handle_key(&mut self, key: &KeyPress) -> WidgetResult<T> {
         match key {
             KeyPress::ArrowUp => {

@@ -563,11 +563,11 @@ impl TuiState {
     /// Create a new session.
     pub fn create_session(&mut self) -> u32 {
         let session_id = self.next_session_id;
-        self.next_session_id += 1;
+        self.next_session_id = self.next_session_id.saturating_add(1);
         let window_id = self.next_window_id;
-        self.next_window_id += 1;
+        self.next_window_id = self.next_window_id.saturating_add(1);
         let pane_id = self.next_pane_id;
-        self.next_pane_id += 1;
+        self.next_pane_id = self.next_pane_id.saturating_add(1);
 
         let session = TuiSession::new(
             session_id,
@@ -596,9 +596,9 @@ impl TuiState {
     /// Create a new window in a session.
     pub fn create_window(&mut self, session_id: u32) -> Option<u32> {
         let window_id = self.next_window_id;
-        self.next_window_id += 1;
+        self.next_window_id = self.next_window_id.saturating_add(1);
         let pane_id = self.next_pane_id;
-        self.next_pane_id += 1;
+        self.next_pane_id = self.next_pane_id.saturating_add(1);
 
         let session = self.sessions.iter_mut().find(|s| s.id == session_id)?;
         let window = TuiWindow::new(
@@ -617,7 +617,7 @@ impl TuiState {
     /// Allocate a new pane ID.
     pub fn next_pane_id(&mut self) -> u32 {
         let id = self.next_pane_id;
-        self.next_pane_id += 1;
+        self.next_pane_id = self.next_pane_id.saturating_add(1);
         id
     }
 
