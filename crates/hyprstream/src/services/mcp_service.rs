@@ -83,6 +83,10 @@ pub struct McpConfig {
     pub ctx: Option<Arc<ServiceContext>>,
     /// Expected audience (resource URL) for future defense-in-depth
     pub expected_audience: Option<String>,
+    /// Local OAuth issuer URL for distinguishing local vs. federated JWTs on ZMQ path.
+    pub local_issuer_url: Option<String>,
+    /// Federation key source for verifying externally-issued JWTs on ZMQ path.
+    pub federation_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -613,6 +617,10 @@ pub struct McpService {
     service_ctx: Option<Arc<ServiceContext>>,
     /// Expected audience for tokens (resource URL, for defense-in-depth)
     expected_audience: Option<String>,
+    /// Local OAuth issuer URL for distinguishing local vs. federated JWTs on ZMQ path.
+    local_issuer_url: Option<String>,
+    /// Federation key source for verifying externally-issued JWTs on ZMQ path.
+    federation_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>>,
     /// Policy client for authorization checks (shared, avoids per-call socket creation)
     policy_client: PolicyClient,
 }
@@ -641,6 +649,8 @@ impl McpService {
             signing_key: config.signing_key,
             service_ctx: config.ctx,
             expected_audience: config.expected_audience,
+            local_issuer_url: config.local_issuer_url,
+            federation_key_source: config.federation_key_source,
             policy_client,
         })
     }
@@ -989,6 +999,16 @@ impl ZmqService for McpService {
 
     fn expected_audience(&self) -> Option<&str> {
         self.expected_audience.as_deref()
+    }
+
+    fn local_issuer_url(&self) -> Option<&str> {
+        self.local_issuer_url.as_deref()
+    }
+
+    fn federation_key_source(
+        &self,
+    ) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>> {
+        self.federation_key_source.clone()
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {

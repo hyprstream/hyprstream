@@ -2506,6 +2506,8 @@ struct InferenceZmqAdapter {
     transport: hyprstream_rpc::transport::TransportConfig,
     signing_key: SigningKey,
     expected_audience: Option<String>,
+    local_issuer_url: Option<String>,
+    federation_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -2536,6 +2538,16 @@ impl hyprstream_rpc::service::ZmqService for InferenceZmqAdapter {
 
     fn expected_audience(&self) -> Option<&str> {
         self.expected_audience.as_deref()
+    }
+
+    fn local_issuer_url(&self) -> Option<&str> {
+        self.local_issuer_url.as_deref()
+    }
+
+    fn federation_key_source(
+        &self,
+    ) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>> {
+        self.federation_key_source.clone()
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
@@ -2571,6 +2583,10 @@ pub struct InferenceServiceConfig {
     fs: Option<WorktreeClient>,
     /// Expected audience for JWT validation (resource URL)
     expected_audience: Option<String>,
+    /// Local OAuth issuer URL for distinguishing local vs. federated JWTs.
+    local_issuer_url: Option<String>,
+    /// Federation key source for verifying externally-issued JWTs.
+    federation_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>>,
 }
 
 impl InferenceServiceConfig {
@@ -2602,12 +2618,29 @@ impl InferenceServiceConfig {
             transport,
             fs,
             expected_audience: None,
+            local_issuer_url: None,
+            federation_key_source: None,
         }
     }
 
     /// Set the expected audience for JWT validation.
     pub fn with_expected_audience(mut self, audience: String) -> Self {
         self.expected_audience = Some(audience);
+        self
+    }
+
+    /// Set the local OAuth issuer URL for distinguishing local vs. federated JWTs.
+    pub fn with_local_issuer_url(mut self, url: String) -> Self {
+        self.local_issuer_url = Some(url);
+        self
+    }
+
+    /// Set the federation key source for verifying externally-issued JWTs.
+    pub fn with_federation_key_source(
+        mut self,
+        src: std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>,
+    ) -> Self {
+        self.federation_key_source = Some(src);
         self
     }
 }
@@ -2671,6 +2704,8 @@ impl hyprstream_rpc::service::spawner::Spawnable for InferenceServiceConfig {
                 transport: transport.clone(),
                 signing_key: signing_key.clone(),
                 expected_audience: self.expected_audience,
+                local_issuer_url: self.local_issuer_url,
+                federation_key_source: self.federation_key_source,
             };
 
             // Use shared nonce cache between service and RequestLoop

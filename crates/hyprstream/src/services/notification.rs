@@ -301,6 +301,10 @@ pub struct NotificationService {
     signing_key: Arc<SigningKey>,
     policy_client: Option<PolicyClient>,
     expected_audience: Option<String>,
+    /// Local OAuth issuer URL for distinguishing local vs. federated JWTs.
+    local_issuer_url: Option<String>,
+    /// Federation key source for verifying externally-issued JWTs.
+    federation_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>>,
     // Infrastructure
     context: Arc<zmq::Context>,
     transport: TransportConfig,
@@ -340,6 +344,8 @@ impl NotificationService {
             signing_key,
             policy_client: None,
             expected_audience: None,
+            local_issuer_url: None,
+            federation_key_source: None,
             context,
             transport,
         }
@@ -354,6 +360,21 @@ impl NotificationService {
     /// Set expected audience for JWT validation.
     pub fn with_expected_audience(mut self, audience: String) -> Self {
         self.expected_audience = Some(audience);
+        self
+    }
+
+    /// Set the local OAuth issuer URL for distinguishing local vs. federated JWTs.
+    pub fn with_local_issuer_url(mut self, url: String) -> Self {
+        self.local_issuer_url = Some(url);
+        self
+    }
+
+    /// Set the federation key source for verifying externally-issued JWTs.
+    pub fn with_federation_key_source(
+        mut self,
+        src: std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>,
+    ) -> Self {
+        self.federation_key_source = Some(src);
         self
     }
 
@@ -798,6 +819,16 @@ impl ZmqService for NotificationService {
 
     fn expected_audience(&self) -> Option<&str> {
         self.expected_audience.as_deref()
+    }
+
+    fn local_issuer_url(&self) -> Option<&str> {
+        self.local_issuer_url.as_deref()
+    }
+
+    fn federation_key_source(
+        &self,
+    ) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>> {
+        self.federation_key_source.clone()
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {

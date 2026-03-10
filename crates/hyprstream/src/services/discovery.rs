@@ -38,6 +38,8 @@ pub struct DiscoveryService {
     expected_audience: Option<String>,
     /// Policy client for authorization checks (None = no authorization)
     policy_client: Option<PolicyClient>,
+    /// Federation key source for verifying externally-issued JWTs.
+    federation_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>>,
     // Infrastructure (for Spawnable)
     context: Arc<zmq::Context>,
     transport: TransportConfig,
@@ -56,6 +58,7 @@ impl DiscoveryService {
             oauth_issuer_url: None,
             expected_audience: None,
             policy_client: None,
+            federation_key_source: None,
             context,
             transport,
         }
@@ -76,6 +79,15 @@ impl DiscoveryService {
     /// Set the policy client for authorization checks.
     pub fn with_policy_client(mut self, client: PolicyClient) -> Self {
         self.policy_client = Some(client);
+        self
+    }
+
+    /// Set the federation key source for verifying externally-issued JWTs.
+    pub fn with_federation_key_source(
+        mut self,
+        src: std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>,
+    ) -> Self {
+        self.federation_key_source = Some(src);
         self
     }
 }
@@ -362,6 +374,16 @@ impl ZmqService for DiscoveryService {
 
     fn expected_audience(&self) -> Option<&str> {
         self.expected_audience.as_deref()
+    }
+
+    fn local_issuer_url(&self) -> Option<&str> {
+        self.oauth_issuer_url.as_deref()
+    }
+
+    fn federation_key_source(
+        &self,
+    ) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>> {
+        self.federation_key_source.clone()
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {

@@ -128,6 +128,10 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     );
     if let Some(issuer) = ctx.oauth_issuer_url() {
         policy_service = policy_service.with_default_audience(issuer.to_owned());
+        policy_service = policy_service.with_local_issuer_url(issuer.to_owned());
+    }
+    if let Some(fed) = ctx.federation_key_source() {
+        policy_service = policy_service.with_federation_key_source(fed);
     }
 
     Ok(ctx.into_spawnable_quic(policy_service, config.policy.quic_port))
@@ -160,6 +164,10 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     })?;
     if let Some(issuer) = ctx.oauth_issuer_url() {
         registry_service = registry_service.with_expected_audience(issuer.to_owned());
+        registry_service = registry_service.with_local_issuer_url(issuer.to_owned());
+    }
+    if let Some(fed) = ctx.federation_key_source() {
+        registry_service = registry_service.with_federation_key_source(fed);
     }
 
     Ok(ctx.into_spawnable_quic(registry_service, config.registry.quic_port))
@@ -225,6 +233,10 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     );
     if let Some(issuer) = ctx.oauth_issuer_url() {
         model_service = model_service.with_expected_audience(issuer.to_owned());
+        model_service = model_service.with_local_issuer_url(issuer.to_owned());
+    }
+    if let Some(fed) = ctx.federation_key_source() {
+        model_service = model_service.with_federation_key_source(fed);
     }
 
     Ok(ctx.into_spawnable_quic(model_service, config.model.quic_port))
@@ -456,6 +468,8 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let config = load_config();
 
     // Create McpConfig for the service
+    let oauth_issuer = ctx.oauth_issuer_url().map(str::to_owned);
+    let federation_key_source = ctx.federation_key_source();
     let mcp_config = McpConfig {
         verifying_key: ctx.verifying_key(),
         zmq_context: global_context(),
@@ -463,6 +477,8 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         transport: ctx.transport("mcp", SocketKind::Rep),
         ctx: None, // ServiceContext not yet available as Arc — handlers use signing_key directly
         expected_audience: Some(config.mcp.resource_url()),
+        local_issuer_url: oauth_issuer.clone(),
+        federation_key_source: federation_key_source.clone(),
     };
 
     // Clone config for HTTP/SSE server before consuming it for ZMQ service
@@ -478,9 +494,16 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let mcp_tls_config = config.tls.clone();
     let mcp_tls_cert = config.mcp.tls_cert.clone();
     let mcp_tls_key = config.mcp.tls_key.clone();
-    let mcp_federation_resolver = std::sync::Arc::new(
-        crate::auth::FederationKeyResolver::new(&config.oauth.trusted_issuers)
-    );
+    // Use the shared FederationKeySource from ServiceContext if available,
+    // otherwise fall back to a locally-constructed resolver from config.
+    let mcp_federation_resolver: std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource> =
+        if let Some(fed) = federation_key_source {
+            fed
+        } else {
+            std::sync::Arc::new(
+                crate::auth::FederationKeyResolver::new(&config.oauth.trusted_issuers)
+            )
+        };
     tokio::task::block_in_place(|| {
         let rt = tokio::runtime::Handle::current();
         rt.spawn(async move {
@@ -711,6 +734,9 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
         // Use the issuer URL as the audience for discovery tokens
         discovery_service = discovery_service.with_expected_audience(issuer.to_owned());
     }
+    if let Some(fed) = ctx.federation_key_source() {
+        discovery_service = discovery_service.with_federation_key_source(fed);
+    }
 
     Ok(ctx.into_spawnable_quic(discovery_service, config.discovery.quic_port))
 }
@@ -726,11 +752,18 @@ fn create_notification_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn S
 
     let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::local());
 
-    let notification_service = crate::services::NotificationService::new(
+    let mut notification_service = crate::services::NotificationService::new(
         Arc::new(ctx.signing_key().clone()),
         global_context(),
         ctx.transport("notification", SocketKind::Rep),
     ).with_policy_client(policy_client);
+    if let Some(issuer) = ctx.oauth_issuer_url() {
+        notification_service = notification_service.with_local_issuer_url(issuer.to_owned());
+        notification_service = notification_service.with_expected_audience(issuer.to_owned());
+    }
+    if let Some(fed) = ctx.federation_key_source() {
+        notification_service = notification_service.with_federation_key_source(fed);
+    }
 
     Ok(ctx.into_spawnable(notification_service))
 }
