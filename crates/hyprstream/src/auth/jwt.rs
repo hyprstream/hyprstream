@@ -5,7 +5,7 @@
 
 // Re-export everything from hyprstream-rpc
 pub use hyprstream_rpc::auth::{
-    decode, encode, Claims, JwtError,
+    decode, decode_with_key, encode, Claims, JwtError,
 };
 // Note: decode_unverified is available directly in hyprstream_rpc::auth for tests
 // within that crate. Cross-crate cfg(test) re-export doesn't work.

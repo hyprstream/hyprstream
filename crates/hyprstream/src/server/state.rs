@@ -40,6 +40,10 @@ pub struct ServerState {
 
     /// Cached resource URL for WWW-Authenticate headers (avoids per-request config reload)
     pub resource_url: String,
+
+    /// Federation key resolver for multi-issuer JWT verification.
+    /// Contains trusted issuers (empty if none configured).
+    pub federation_resolver: Arc<crate::auth::FederationKeyResolver>,
 }
 
 /// Metrics collector
@@ -81,6 +85,7 @@ impl ServerState {
         registry: GenRegistryClient,
         signing_key: SigningKey,
         resource_url: String,
+        trusted_issuers: &std::collections::HashMap<String, crate::config::TrustedIssuerConfig>,
     ) -> Result<Self, anyhow::Error> {
         let verifying_key = signing_key.verifying_key();
         let signing_key = Arc::new(signing_key);
@@ -101,6 +106,8 @@ impl ServerState {
         // Initialize metrics
         let metrics = Arc::new(Metrics::default());
 
+        let federation_resolver = Arc::new(crate::auth::FederationKeyResolver::new(trusted_issuers));
+
         Ok(Self {
             model_client,
             policy_client,
@@ -111,6 +118,7 @@ impl ServerState {
             verifying_key,
             context_store: None, // Initialize via enable_context_store() if needed
             resource_url,
+            federation_resolver,
         })
     }
 

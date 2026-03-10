@@ -344,6 +344,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
             registry_client,
             ctx.signing_key().clone(),
             resource_url,
+            &config.oauth.trusted_issuers,
         ))
     })
     .context("Failed to create server state")?;
