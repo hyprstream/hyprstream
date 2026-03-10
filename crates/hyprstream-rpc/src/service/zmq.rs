@@ -223,9 +223,22 @@ pub trait ZmqService: 'static {
     /// subject impersonation via fabricated envelope claims.
     fn verify_claims(&self, ctx: &EnvelopeContext) -> anyhow::Result<()> {
         if let Some(claims) = ctx.claims() {
-            // TODO(task-9): wire FederationKeyResolver here — if claims.iss is non-empty and
-            // doesn't match the local issuer URL, call federation_resolver.get_key(&claims.iss)
-            // and pass the result to jwt::decode_with_key instead of using self.verifying_key().
+            // SECURITY: Reject federated JWTs (non-empty iss) until FederationKeyResolver is
+            // wired into the ZMQ path (TODO task-9 / Option B).  Without the resolver, any JWT
+            // signed by the local key but carrying a foreign iss would pass signature
+            // verification — creating a full identity-impersonation vector.  Explicit rejection
+            // is safe: federated clients use the HTTP/OAuth endpoint.
+            if !claims.iss.is_empty() {
+                anyhow::bail!(
+                    "Federated JWT (iss={}) is not accepted on the ZMQ transport; \
+                     use the HTTP/OAuth endpoint for cross-node authentication",
+                    claims.iss
+                );
+            }
+            // TODO(task-9 / Option B): replace the guard above with federation key lookup:
+            // wire FederationKeyResolver here — if claims.iss is non-empty and doesn't match
+            // the local issuer URL, call federation_resolver.get_key(&claims.iss) and pass the
+            // result to jwt::decode_with_key instead of using self.verifying_key().
             match claims.verify_token(&self.verifying_key(), self.expected_audience()) {
                 Ok(Some(verified)) => {
                     if verified.sub != claims.sub {
