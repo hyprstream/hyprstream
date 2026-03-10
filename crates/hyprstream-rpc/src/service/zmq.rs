@@ -214,56 +214,131 @@ pub trait ZmqService: 'static {
         None
     }
 
-    /// E2E JWT verification with downgrade attack protection.
+    /// Local OAuth issuer URL used to distinguish locally-issued JWTs from
+    /// federated ones. Return `None` to treat all tokens as local.
     ///
-    /// Called by `RequestLoop` after envelope signature verification, before `handle_request`.
-    /// Return `Err` to reject the request before dispatch.
+    /// When `Some(url)`, a JWT whose `iss` matches `url` (or is empty) is
+    /// verified with `self.verifying_key()`. Any other non-empty `iss` falls
+    /// through to `federation_key_source()`.
+    fn local_issuer_url(&self) -> Option<&str> {
+        None
+    }
+
+    /// Federation key resolver for multi-issuer JWT verification on the ZMQ path.
     ///
-    /// Default: Require valid JWT for all non-local identities to prevent
-    /// subject impersonation via fabricated envelope claims.
-    fn verify_claims(&self, ctx: &EnvelopeContext) -> anyhow::Result<()> {
+    /// Return `None` (default) to disable federated JWT acceptance. Services that
+    /// accept external / network traffic should return `Some(Arc<dyn FederationKeySource>)`.
+    /// Internal-only services (workers, workflows) keep the default.
+    fn federation_key_source(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::auth::FederationKeySource>> {
+        None
+    }
+
+    /// E2E JWT verification with federation and downgrade attack protection.
+    ///
+    /// Called by `process_request` after envelope signature verification.
+    /// Async because federated key resolution may require an HTTP JWKS fetch.
+    async fn verify_claims(&self, ctx: &EnvelopeContext) -> anyhow::Result<()> {
         if let Some(claims) = ctx.claims() {
-            // SECURITY: Reject federated JWTs (non-empty iss) until FederationKeyResolver is
-            // wired into the ZMQ path (TODO task-9 / Option B).  Without the resolver, any JWT
-            // signed by the local key but carrying a foreign iss would pass signature
-            // verification — creating a full identity-impersonation vector.  Explicit rejection
-            // is safe: federated clients use the HTTP/OAuth endpoint.
-            if !claims.iss.is_empty() {
-                anyhow::bail!(
-                    "Federated JWT (iss={}) is not accepted on the ZMQ transport; \
-                     use the HTTP/OAuth endpoint for cross-node authentication",
-                    claims.iss
-                );
-            }
-            // TODO(task-9 / Option B): replace the guard above with federation key lookup:
-            // wire FederationKeyResolver here — if claims.iss is non-empty and doesn't match
-            // the local issuer URL, call federation_resolver.get_key(&claims.iss) and pass the
-            // result to jwt::decode_with_key instead of using self.verifying_key().
-            match claims.verify_token(&self.verifying_key(), self.expected_audience()) {
-                Ok(Some(verified)) => {
-                    if verified.sub != claims.sub {
-                        tracing::warn!("Claims sub mismatch: envelope={} jwt={}", claims.sub, verified.sub);
-                        anyhow::bail!("Claims subject mismatch");
+            // A token is local when iss is empty (legacy / intra-cluster) OR
+            // matches the configured local OAuth issuer URL.
+            let is_local = claims.iss.is_empty()
+                || self
+                    .local_issuer_url()
+                    .map_or(false, |local| local == claims.iss);
+
+            if is_local {
+                // --- Local token path ---
+                match claims.verify_token(&self.verifying_key(), self.expected_audience()) {
+                    Ok(Some(verified)) => {
+                        if verified.sub != claims.sub {
+                            tracing::warn!(
+                                "Claims sub mismatch: envelope={} jwt={}",
+                                claims.sub,
+                                verified.sub
+                            );
+                            anyhow::bail!("Claims subject mismatch");
+                        }
+                        if verified.iss != claims.iss {
+                            tracing::warn!(
+                                "Claims iss mismatch: envelope={} jwt={}",
+                                claims.iss,
+                                verified.iss
+                            );
+                            anyhow::bail!("Claims issuer mismatch");
+                        }
                     }
-                    if verified.iss != claims.iss {
-                        tracing::warn!("Claims iss mismatch: envelope={} jwt={}", claims.iss, verified.iss);
-                        anyhow::bail!("Claims issuer mismatch");
+                    Ok(None) => {
+                        // SECURITY: Non-local requests MUST carry a JWT.
+                        if !ctx.identity.is_local() {
+                            tracing::warn!(
+                                "Non-local request with claims but no JWT token: \
+                                 sub={}, identity={:?}",
+                                claims.sub,
+                                ctx.identity
+                            );
+                            anyhow::bail!("JWT token required for non-local requests");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("E2E JWT verification failed: {}", e);
+                        anyhow::bail!("JWT verification failed");
                     }
                 }
-                Ok(None) => {
-                    // SECURITY: Non-local requests MUST have JWT token
-                    // to prevent subject impersonation via fabricated claims
-                    if !ctx.identity.is_local() {
-                        tracing::warn!(
-                            "Non-local request with claims but no JWT token: sub={}, identity={:?}",
-                            claims.sub, ctx.identity
-                        );
-                        anyhow::bail!("JWT token required for non-local requests");
-                    }
+            } else {
+                // --- Federated token path ---
+                let resolver = self.federation_key_source().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Federated JWT (iss={}) rejected: no FederationKeySource \
+                         configured on this service",
+                        claims.iss
+                    )
+                })?;
+
+                if !resolver.is_trusted(&claims.iss) {
+                    anyhow::bail!(
+                        "Federated JWT issuer '{}' is not in the trusted-issuer list",
+                        claims.iss
+                    );
                 }
-                Err(e) => {
-                    tracing::warn!("E2E JWT verification failed: {}", e);
-                    anyhow::bail!("JWT verification failed");
+
+                let fed_key = resolver.get_key(&claims.iss).await.map_err(|e| {
+                    tracing::warn!(
+                        "Federation key resolution failed for iss={}: {}",
+                        claims.iss,
+                        e
+                    );
+                    anyhow::anyhow!("Federation key resolution failed: {}", e)
+                })?;
+
+                let token = claims.token.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Federated JWT (iss={}) present in claims but no raw token embedded",
+                        claims.iss
+                    )
+                })?;
+
+                let verified = crate::auth::decode_with_key(token, &fed_key, self.expected_audience())
+                    .map_err(|e| {
+                        anyhow::anyhow!("Federated JWT signature invalid: {}", e)
+                    })?;
+
+                if verified.sub != claims.sub {
+                    tracing::warn!(
+                        "Federated claims sub mismatch: envelope={} jwt={}",
+                        claims.sub,
+                        verified.sub
+                    );
+                    anyhow::bail!("Federated claims subject mismatch");
+                }
+                if verified.iss != claims.iss {
+                    tracing::warn!(
+                        "Federated claims iss mismatch: envelope={} jwt={}",
+                        claims.iss,
+                        verified.iss
+                    );
+                    anyhow::bail!("Federated claims issuer mismatch");
                 }
             }
         }
