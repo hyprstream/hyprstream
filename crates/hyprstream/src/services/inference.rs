@@ -54,7 +54,6 @@ use capnp::serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 use parking_lot::Mutex;
 use tokio::runtime::Handle;
 use tokenizers::Tokenizer;
@@ -92,8 +91,8 @@ enum PendingWork {
         gradient_steps: u32,
         /// Learning rate override (0 = use default)
         learning_rate: f32,
-        /// Whether to auto-commit if quality gate passes
-        auto_commit: bool,
+        /// How to handle the adaptation result
+        adaptation_strategy: crate::training::adaptation_state::AdaptationStrategy,
     },
 }
 
@@ -161,8 +160,6 @@ pub struct InferenceServiceInner {
     /// Base LoRA delta loaded from a .safetensors adapter file.
     /// Applied to all tenants (composed with per-tenant delta if both exist).
     base_delta: Mutex<Option<Arc<Mutex<crate::training::TenantDelta>>>>,
-    /// Pending adaptations awaiting client commit/rollback
-    pending_adaptations: Mutex<std::collections::HashMap<Subject, PendingAdaptation>>,
     /// Optional WorktreeClient for worktree-scoped file operations.
     /// When present, adapter/snapshot writes use contained-root access.
     fs: Option<WorktreeClient>,
@@ -202,18 +199,6 @@ impl std::ops::Deref for InferenceService {
 // TestTimeTrainer, etc.) which all have `unsafe impl Send + Sync`.
 unsafe impl Send for InferenceServiceInner {}
 unsafe impl Sync for InferenceServiceInner {}
-
-/// A pending TTT adaptation awaiting client commit or rollback
-struct PendingAdaptation {
-    /// Delta state before adaptation (for rollback)
-    pre_adaptation_state: std::collections::HashMap<String, tch::Tensor>,
-    /// The TTT result from the adaptation
-    ttt_result: crate::training::ttt::TTTResult,
-    /// When the adaptation was created
-    created_at: Instant,
-    /// Auto-rollback after this timeout (default: 30s)
-    timeout_ms: u64,
-}
 
 /// Delta status information returned by getDeltaStatus
 pub struct DeltaStatusInfo {
@@ -449,6 +434,28 @@ impl InferenceService {
         }
     }
 
+    /// Run invariant checks before any TTT-scoped operation.
+    /// Returns GuardStatus encoding expired, capacity, and generation state.
+    /// The result must be passed to delta.adaptation_state.resolve().
+    #[allow(dead_code)] // Reserved for dispatch-layer callers; inline guards kept where delta lock is held
+    fn ttt_guard(&self, subject: &Subject) -> crate::training::GuardStatus {
+        let (expired, at_capacity) = if let Some(pool) = &self.delta_pool {
+            if let Some(delta_arc) = pool.get(subject) {
+                let delta = delta_arc.lock();
+                (delta.adaptation_state.is_expired(), delta.is_at_capacity())
+            } else {
+                (false, false)
+            }
+        } else {
+            (false, false)
+        };
+        crate::training::GuardStatus {
+            expired,
+            at_capacity,
+            lora_generation: self.lora_generation.load(std::sync::atomic::Ordering::Acquire),
+        }
+    }
+
     /// Handle inference request from callback channel
     async fn handle_callback_infer(&mut self, request_data: &[u8])
         -> Result<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)>
@@ -562,7 +569,11 @@ impl InferenceService {
                     };
 
                     let device = engine.device();
-                    let trainer = TestTimeTrainer::new(ttt_config, device);
+                    let mut trainer = TestTimeTrainer::new(ttt_config, device);
+                    // Wire gradient gating config if provided
+                    if let Some(ref gating) = tc.ttt.gradient_gating {
+                        trainer = trainer.with_gradient_gating(gating.clone());
+                    }
 
                     // Get tokenizer for input tokenization
                     let tokenizer = engine.get_tokenizer().ok().map(Arc::new);
@@ -626,6 +637,13 @@ impl InferenceService {
             if let Some(pld) = per_layer_dims {
                 pool = pool.with_per_layer_dims(pld);
             }
+            // Wire rank oracle config if provided in training config
+            if let Some(ref tc) = training_config {
+                if let Some(ref oracle_config) = tc.ttt.rank_oracle {
+                    pool = pool.with_rank_oracle(oracle_config.clone());
+                    info!("Rank oracle enabled: interval={}, auto_adapt={}", oracle_config.adaptation_interval, oracle_config.auto_adapt);
+                }
+            }
 
             Some(Arc::new(pool))
         } else {
@@ -653,7 +671,6 @@ impl InferenceService {
                 tokenizer,
                 delta_pool,
                 base_delta: Mutex::new(None),
-                pending_adaptations: Mutex::new(std::collections::HashMap::new()),
                 fs,
                 zmq_context: global_context(),
                 transport: hyprstream_rpc::transport::TransportConfig::inproc("inference-unset"),
@@ -731,15 +748,14 @@ impl InferenceService {
         // Lock the delta and run adaptation
         let mut delta = delta_arc.lock();
 
-        // Capacity check INSIDE delta lock to eliminate TOCTOU race
-        if delta.is_at_capacity() {
-            let reason = format!(
-                "Delta at capacity ({}/{} steps). Save, export, or reset to continue.",
-                delta.accumulated_steps, delta.max_accumulated_steps
-            );
-            debug!("TTT: {} for subject {}", reason, subject);
-            return Ok(Some(crate::training::ttt::TTTResult::skipped(&reason)));
-        }
+        // Note: capacity check is now handled by guard.at_capacity inside resolve().
+        // The guard returns ResolveOutcome::Skipped if the delta is at capacity.
+
+        // Snapshot Muon momentum and effective_ranks for rollback (before adapt_tenant
+        // mutates them). adapt_tenant already returns the weight pre_snapshot, but Muon
+        // and effective_ranks are mutated in-place during the gradient loop.
+        let pre_muon = crate::training::muon::snapshot_muon_states(&delta.muon_states);
+        let pre_eff_ranks = delta.effective_ranks.clone();
 
         let adapt_result = ttt_trainer.adapt_tenant(&engine, &mut delta, &input_tokens, overrides);
 
@@ -748,7 +764,7 @@ impl InferenceService {
         drop(engine);
 
         match adapt_result {
-            Ok((result, pre_snapshot)) => {
+            Ok((mut result, pre_snapshot)) => {
                 if !result.skipped {
                     debug!(
                         "TTT (subject {}): steps={}, improvement={:.4}, time={}ms, ppl={:.1}->{:.1}, rec={}",
@@ -762,18 +778,54 @@ impl InferenceService {
                     );
                 }
 
-                // Handle auto-commit vs pending
-                if overrides.auto_commit && result.recommendation && !result.skipped {
-                    debug!("TTT: auto-committed adaptation for subject {}", subject);
-                } else if !overrides.auto_commit && !result.skipped && !pre_snapshot.is_empty() {
-                    // Store pending adaptation for later commit/rollback
-                    let pending = PendingAdaptation {
-                        pre_adaptation_state: pre_snapshot,
-                        ttt_result: result.clone(),
-                        created_at: Instant::now(),
-                        timeout_ms: ttt_trainer.config().pending_rollback_ms,
-                    };
-                    self.pending_adaptations.lock().insert(subject.clone(), pending);
+                // Map overrides to AdaptationStrategy and drive the state machine.
+                let strategy = overrides.adaptation_strategy.clone();
+
+                // Build guard status for state machine.
+                let guard = crate::training::GuardStatus {
+                    expired: delta.adaptation_state.is_expired(),
+                    at_capacity: delta.is_at_capacity(),
+                    lora_generation: self.lora_generation.load(std::sync::atomic::Ordering::Acquire),
+                };
+
+                let outcome = delta.adaptation_state.resolve(
+                    strategy,
+                    &guard,
+                    &result,
+                    pre_snapshot,
+                    pre_muon,
+                    pre_eff_ranks,
+                );
+
+                match outcome {
+                    crate::training::ResolveOutcome::WrittenBack => {
+                        delta.accumulated_steps += result.steps_performed as u64;
+                        delta.request_count += 1;
+                        let n = delta.request_count as f64;
+                        delta.avg_loss_improvement = delta.avg_loss_improvement * ((n - 1.0) / n)
+                            + result.loss_improvement as f64 / n;
+                        result.pending = false;
+                        debug!("TTT: auto-committed adaptation for subject {}", subject);
+                    }
+                    crate::training::ResolveOutcome::Evicted { snapshot, muon, eff_ranks } => {
+                        // resolve() transitioned state to Idle and returned the baseline
+                        // snapshot (which may be the promoted old-pending baseline in the
+                        // stacked case, or the new adaptation's pre-state otherwise).
+                        // Restore delta weights, Muon momentum, and effective ranks.
+                        let _ = delta.load_state_dict(&snapshot);
+                        crate::training::muon::restore_muon_states(&mut delta.muon_states, &muon);
+                        delta.effective_ranks = eff_ranks;
+                        result.pending = false;
+                        debug!("TTT: auto-rolled back adaptation for subject {}", subject);
+                    }
+                    crate::training::ResolveOutcome::StoredPending => {
+                        // Pending state is stored inside delta.adaptation_state.
+                        result.pending = true;
+                        debug!("TTT: stored pending adaptation for subject {}", subject);
+                    }
+                    crate::training::ResolveOutcome::Skipped { reason } => {
+                        debug!("TTT: skipped for subject {}: {}", subject, reason);
+                    }
                 }
 
                 Ok(Some(result))
@@ -1030,7 +1082,7 @@ impl InferenceService {
     /// Runs the training step in the background and publishes results via StreamChannel.
     /// This avoids REQ/REP timeout on long-running training (e.g., backward pass compilation).
     async fn execute_training_stream(&self, pending: PendingWork) {
-        let PendingWork::Training { stream_ctx, subject, input, gradient_steps, learning_rate, auto_commit } = pending else {
+        let PendingWork::Training { stream_ctx, subject, input, gradient_steps, learning_rate, adaptation_strategy } = pending else {
             error!("execute_training_stream called with non-Training PendingWork");
             return;
         };
@@ -1054,7 +1106,7 @@ impl InferenceService {
                 let _ = publisher.publish_error("cancelled").await;
                 return (publisher, Ok(()));
             }
-            let result = match self.handle_train_step(&subject, &input, gradient_steps, learning_rate, auto_commit).await {
+            let result = match self.handle_train_step(&subject, &input, gradient_steps, learning_rate, adaptation_strategy).await {
                 Ok(result) => {
                     // Serialize training result as JSON for the completion payload
                     let payload = serde_json::to_vec(&result)
@@ -1321,77 +1373,45 @@ impl InferenceService {
     // Training loop control handlers (tenant-aware TTT)
     // =========================================================================
 
-    /// Commit a pending TTT adaptation
-    fn handle_commit_adaptation(&self, subject: &Subject) -> Result<()> {
-        let mut pending = self.pending_adaptations.lock();
-
-        let adaptation = pending.remove(subject)
-            .ok_or_else(|| anyhow!("No pending adaptation for subject '{}'", subject))?;
-
-        // Get the subject's delta and update accumulation stats
+    /// Write back a pending TTT adaptation (commit path)
+    fn handle_writeback(&self, subject: &Subject) -> Result<()> {
         if let Some(pool) = &self.delta_pool {
             if let Some(delta_arc) = pool.get(subject) {
                 let mut delta = delta_arc.lock();
-                delta.accumulated_steps += adaptation.ttt_result.steps_performed as u64;
+                let info = delta.adaptation_state.writeback_stats()?;
+                delta.accumulated_steps += info.steps_performed as u64;
                 delta.request_count += 1;
                 let n = delta.request_count as f64;
                 delta.avg_loss_improvement = delta.avg_loss_improvement * ((n - 1.0) / n)
-                    + adaptation.ttt_result.loss_improvement as f64 / n;
+                    + info.loss_improvement as f64 / n;
+                debug!("Wrote back adaptation for '{}': steps={}, improvement={:.4}",
+                    subject, info.steps_performed, info.loss_improvement);
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("No delta found for subject '{}'", subject))
             }
-        }
-
-        debug!(
-            "Committed adaptation for subject '{}': steps={}, improvement={:.4}",
-            subject, adaptation.ttt_result.steps_performed, adaptation.ttt_result.loss_improvement
-        );
-
-        Ok(())
-    }
-
-    /// Clean up expired pending adaptations (auto-rollback after timeout)
-    fn cleanup_expired_adaptations(&self) {
-        let mut pending = self.pending_adaptations.lock();
-        let expired: Vec<Subject> = pending.iter()
-            .filter(|(_, a)| a.created_at.elapsed().as_millis() as u64 > a.timeout_ms)
-            .map(|(s, _)| s.clone())
-            .collect();
-
-        for subject in expired {
-            if let Some(adaptation) = pending.remove(&subject) {
-                // Restore delta to pre-adaptation state
-                if let Some(pool) = &self.delta_pool {
-                    if let Some(delta_arc) = pool.get(&subject) {
-                        let mut delta = delta_arc.lock();
-                        if let Err(e) = delta.load_state_dict(&adaptation.pre_adaptation_state) {
-                            warn!("Failed to rollback expired adaptation for '{}': {}", subject, e);
-                        }
-                    }
-                }
-                warn!(
-                    "Auto-rolled back expired adaptation for '{}' (timeout {}ms)",
-                    subject, adaptation.timeout_ms
-                );
-            }
+        } else {
+            Err(anyhow::anyhow!("No delta pool configured"))
         }
     }
 
-    /// Rollback a pending TTT adaptation
-    fn handle_rollback_adaptation(&self, subject: &Subject) -> Result<()> {
-        let mut pending = self.pending_adaptations.lock();
-
-        let adaptation = pending.remove(subject)
-            .ok_or_else(|| anyhow!("No pending adaptation for subject '{}'", subject))?;
-
-        // Restore delta to pre-adaptation state
+    /// Evict a pending TTT adaptation (rollback path)
+    fn handle_evict(&self, subject: &Subject) -> Result<()> {
         if let Some(pool) = &self.delta_pool {
             if let Some(delta_arc) = pool.get(subject) {
                 let mut delta = delta_arc.lock();
-                delta.load_state_dict(&adaptation.pre_adaptation_state)?;
+                let snapshot = delta.adaptation_state.evict()?;
+                let _ = delta.load_state_dict(&snapshot.pre_snapshot);
+                crate::training::muon::restore_muon_states(&mut delta.muon_states, &snapshot.pre_muon);
+                delta.effective_ranks = snapshot.pre_eff_ranks;
+                debug!("Evicted adaptation for subject '{}'", subject);
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("No delta found for subject '{}'", subject))
             }
+        } else {
+            Err(anyhow::anyhow!("No delta pool configured"))
         }
-
-        debug!("Rolled back adaptation for subject '{}'", subject);
-        Ok(())
     }
 
     /// Run pure training steps without generation
@@ -1401,7 +1421,7 @@ impl InferenceService {
         input: &str,
         gradient_steps: u32,
         learning_rate: f32,
-        auto_commit: bool,
+        strategy: crate::training::adaptation_state::AdaptationStrategy,
     ) -> Result<crate::training::ttt::TTTResult> {
         let ttt_trainer = self.ttt_trainer.as_ref()
             .ok_or_else(|| anyhow!("TTT not configured"))?;
@@ -1414,18 +1434,17 @@ impl InferenceService {
         pool.ensure_capacity().await?;
         let delta_arc = pool.get_or_create(subject)?;
 
-        // Phase 1: Sync work under scoped lock — tokenize and snapshot
-        let (input_tokens, pre_snapshot) = {
+        // Phase 1: Sync work under scoped lock — tokenize and snapshot.
+        // Always snapshot (even for auto_commit) so auto-rollback can restore state.
+        let (input_tokens, pre_snapshot, pre_muon, pre_eff_ranks) = {
             let delta = delta_arc.lock();
             let encoding = tokenizer.encode(input, false)
                 .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
             let input_tokens: Vec<u32> = encoding.get_ids().to_vec();
-            let pre_snapshot = if !auto_commit {
-                delta.extract_state_dict()
-            } else {
-                std::collections::HashMap::new()
-            };
-            (input_tokens, pre_snapshot)
+            let pre_snapshot = delta.extract_state_dict();
+            let pre_muon = crate::training::muon::snapshot_muon_states(&delta.muon_states);
+            let pre_eff_ranks = delta.effective_ranks.clone();
+            (input_tokens, pre_snapshot, pre_muon, pre_eff_ranks)
         }; // guard dropped
 
         let steps = if gradient_steps > 0 { gradient_steps as usize } else { ttt_trainer.config.gradient_steps };
@@ -1438,29 +1457,47 @@ impl InferenceService {
         let mut delta = delta_arc.lock();
         let mut result = ttt_trainer.train_step(&engine, &mut delta, &input_tokens, steps, lr, None)?;
 
-        // If auto_commit and recommendation is positive, commit immediately.
-        // If auto_commit and recommendation is negative, rollback.
-        // If not auto_commit, store as pending for client to decide.
-        if auto_commit && result.recommendation {
-            // Steps/request_count already tracked by train_step()
-            result.pending = false;
-        } else if auto_commit && !result.recommendation {
-            // Auto-rollback
-            if !pre_snapshot.is_empty() {
-                let _ = delta.load_state_dict(&pre_snapshot);
+        // strategy is passed in directly from the caller
+
+        // Build guard status
+        let guard = crate::training::GuardStatus {
+            expired: delta.adaptation_state.is_expired(),
+            at_capacity: delta.is_at_capacity(),
+            lora_generation: self.lora_generation.load(std::sync::atomic::Ordering::Acquire),
+        };
+
+        let outcome = delta.adaptation_state.resolve(
+            strategy,
+            &guard,
+            &result,
+            pre_snapshot,
+            pre_muon,
+            pre_eff_ranks,
+        );
+
+        match outcome {
+            crate::training::ResolveOutcome::WrittenBack => {
+                delta.accumulated_steps += result.steps_performed as u64;
+                delta.request_count += 1;
+                let n = delta.request_count as f64;
+                delta.avg_loss_improvement = delta.avg_loss_improvement * ((n - 1.0) / n)
+                    + result.loss_improvement as f64 / n;
+                result.pending = false;
+                debug!("TTT: auto-committed train_step adaptation for subject {}", subject);
             }
-            result.pending = false;
-        } else if !auto_commit {
-            result.pending = true;
-            // Store pending adaptation for later commit/rollback
-            if !pre_snapshot.is_empty() {
-                let pending = PendingAdaptation {
-                    pre_adaptation_state: pre_snapshot,
-                    ttt_result: result.clone(),
-                    created_at: std::time::Instant::now(),
-                    timeout_ms: ttt_trainer.config().pending_rollback_ms,
-                };
-                self.pending_adaptations.lock().insert(subject.clone(), pending);
+            crate::training::ResolveOutcome::Evicted { snapshot, muon, eff_ranks } => {
+                let _ = delta.load_state_dict(&snapshot);
+                crate::training::muon::restore_muon_states(&mut delta.muon_states, &muon);
+                delta.effective_ranks = eff_ranks;
+                result.pending = false;
+                debug!("TTT: auto-rolled back train_step adaptation for subject {} (negative recommendation)", subject);
+            }
+            crate::training::ResolveOutcome::StoredPending => {
+                result.pending = true;
+                debug!("TTT: stored pending train_step adaptation for subject {}", subject);
+            }
+            crate::training::ResolveOutcome::Skipped { reason } => {
+                debug!("TTT: train_step skipped for subject {}: {}", subject, reason);
             }
         }
 
@@ -1469,9 +1506,6 @@ impl InferenceService {
 
     /// Reset a tenant's delta to zeros
     fn handle_reset_delta(&self, subject: &Subject) -> Result<()> {
-        // Clear any pending adaptation
-        self.pending_adaptations.lock().remove(subject);
-
         if let Some(pool) = &self.delta_pool {
             if let Some(delta_arc) = pool.get(subject) {
                 let mut delta = delta_arc.lock();
@@ -1487,12 +1521,11 @@ impl InferenceService {
 
     /// Get status of a tenant's delta
     fn handle_get_delta_status(&self, subject: &Subject) -> Result<DeltaStatusInfo> {
-        let has_pending = self.pending_adaptations.lock().contains_key(subject);
-
         if let Some(pool) = &self.delta_pool {
             if let Some(delta_arc) = pool.get(subject) {
                 let delta = delta_arc.lock();
                 let norm_ratios = delta.delta_norm_ratio(pool.base_weight_norms());
+                let has_pending = delta.adaptation_state.is_pending();
                 return Ok(DeltaStatusInfo {
                     exists: true,
                     accumulated_steps: delta.accumulated_steps,
@@ -1935,9 +1968,33 @@ use crate::services::generated::inference_client::{
     SaveAdaptationResult, SnapshotDeltaResult, ExportPeftResult,
     ChatTemplateRequest, LoraConfig, TrainStepRequest, SaveAdaptationRequest, ExportPeftRequest,
     MergeLoraRequest, EmbedImagesRequest, EmbedImagesResponse,
+    AdaptationStrategyEnum,
 };
 // Conflicting names — use canonical path at usage sites:
 //   inference_client::GenerationResult, inference_client::ModelInfo, inference_client::StreamInfo
+
+/// Map a capnp AdaptationStrategyEnum + optional threshold to the internal AdaptationStrategy.
+fn map_adaptation_strategy(
+    capnp_strategy: AdaptationStrategyEnum,
+    writeback_threshold: f32,
+) -> crate::training::adaptation_state::AdaptationStrategy {
+    match capnp_strategy {
+        AdaptationStrategyEnum::AutoWriteback => {
+            crate::training::adaptation_state::AdaptationStrategy::AutoWriteback
+        }
+        AdaptationStrategyEnum::AutoEvict => {
+            crate::training::adaptation_state::AdaptationStrategy::AutoEvict
+        }
+        AdaptationStrategyEnum::Speculative => {
+            crate::training::adaptation_state::AdaptationStrategy::Speculative
+        }
+        AdaptationStrategyEnum::WritebackIfAbove => {
+            crate::training::adaptation_state::AdaptationStrategy::WritebackIfAbove {
+                threshold: writeback_threshold,
+            }
+        }
+    }
+}
 
 #[async_trait::async_trait(?Send)]
 impl InferenceHandler for InferenceService {
@@ -1975,7 +2032,7 @@ impl InferenceHandler for InferenceService {
             ttt_enabled: data.ttt_enabled,
             ttt_gradient_steps: data.ttt_gradient_steps,
             ttt_learning_rate: data.ttt_learning_rate,
-            auto_commit: data.auto_commit,
+            auto_commit: matches!(data.adaptation_strategy, AdaptationStrategyEnum::AutoWriteback),
         };
 
         // Build per-request TTT overrides from RPC fields
@@ -1983,7 +2040,7 @@ impl InferenceHandler for InferenceService {
             enabled: if data.ttt_enabled { Some(true) } else { None },
             gradient_steps: if data.ttt_gradient_steps > 0 { Some(data.ttt_gradient_steps) } else { None },
             learning_rate: if data.ttt_learning_rate > 0.0 { Some(data.ttt_learning_rate) } else { None },
-            auto_commit: data.auto_commit,
+            adaptation_strategy: map_adaptation_strategy(data.adaptation_strategy, data.writeback_threshold),
             max_adaptation_ms: None,
         };
 
@@ -2160,17 +2217,16 @@ impl InferenceHandler for InferenceService {
         Ok(InferenceResponseVariant::Success)
     }
 
-    async fn handle_commit_adaptation(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+    async fn handle_ttt_writeback(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
         let subject = ctx.subject();
-        self.cleanup_expired_adaptations();
-        InferenceService::handle_commit_adaptation(self, &subject)?;
-        Ok(InferenceResponseVariant::CommitAdaptationResult)
+        InferenceService::handle_writeback(self, &subject)?;
+        Ok(InferenceResponseVariant::TttWritebackResult)
     }
 
-    async fn handle_rollback_adaptation(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+    async fn handle_ttt_evict(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
         let subject = ctx.subject();
-        InferenceService::handle_rollback_adaptation(self, &subject)?;
-        Ok(InferenceResponseVariant::RollbackAdaptationResult)
+        InferenceService::handle_evict(self, &subject)?;
+        Ok(InferenceResponseVariant::TttEvictResult)
     }
 
     async fn handle_train_step(
@@ -2215,13 +2271,14 @@ impl InferenceHandler for InferenceService {
             server_pubkey,
         };
 
+        let adaptation_strategy = map_adaptation_strategy(data.adaptation_strategy, data.writeback_threshold);
         let pending = PendingWork::Training {
             stream_ctx,
             subject,
             input: data.input.clone(),
             gradient_steps: data.gradient_steps,
             learning_rate: data.learning_rate,
-            auto_commit: data.auto_commit,
+            adaptation_strategy,
         };
 
         // Build continuation
@@ -2233,10 +2290,10 @@ impl InferenceHandler for InferenceService {
         Ok((stream_info, continuation))
     }
 
-    async fn handle_reset_delta(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+    async fn handle_ttt_zero(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
         let subject = ctx.subject();
         InferenceService::handle_reset_delta(self, &subject)?;
-        Ok(InferenceResponseVariant::ResetDeltaResult)
+        Ok(InferenceResponseVariant::TttZeroResult)
     }
 
     async fn handle_get_delta_status(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
@@ -2458,7 +2515,6 @@ impl hyprstream_rpc::service::ZmqService for InferenceZmqAdapter {
         ctx: &EnvelopeContext,
         payload: &[u8],
     ) -> anyhow::Result<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
-        self.service.cleanup_expired_adaptations();
         dispatch_inference(&self.service, ctx, payload).await
     }
 
@@ -2708,6 +2764,7 @@ impl InferenceZmqClient {
         request: &GenerationRequest,
         ephemeral_pubkey: Option<[u8; 32]>,
     ) -> Result<StreamInfo> {
+        let adaptation_strategy_str = if request.auto_commit { "auto_writeback" } else { "speculative" };
         self.gen.generate_stream(
             request.prompt.as_str(),
             request.max_tokens as u32,
@@ -2723,7 +2780,8 @@ impl InferenceZmqClient {
             request.ttt_enabled,
             request.ttt_gradient_steps,
             request.ttt_learning_rate,
-            request.auto_commit,
+            adaptation_strategy_str,
+            0.0f32, // writeback_threshold (unused for non-writebackIfAbove strategies)
             ephemeral_pubkey.unwrap_or([0u8; 32]),
         ).await
     }
@@ -2834,35 +2892,40 @@ impl InferenceZmqClient {
 
     // Training loop control (TTT operations)
 
-    /// Commit a pending TTT adaptation
-    pub async fn commit_adaptation(&self) -> Result<()> {
-        self.gen.commit_adaptation().await
+    /// Write back a pending TTT adaptation
+    pub async fn writeback_adaptation(&self) -> Result<()> {
+        self.gen.ttt_writeback().await
     }
 
-    /// Rollback a pending TTT adaptation
-    pub async fn rollback_adaptation(&self) -> Result<()> {
-        self.gen.rollback_adaptation().await
+    /// Evict a pending TTT adaptation
+    pub async fn evict_adaptation(&self) -> Result<()> {
+        self.gen.ttt_evict().await
     }
 
-    /// Reset a tenant's delta
-    pub async fn reset_delta(&self) -> Result<()> {
-        self.gen.reset_delta().await
+    /// Zero a tenant's delta accumulator
+    pub async fn zero_delta(&self) -> Result<()> {
+        self.gen.ttt_zero().await
     }
 
-    /// Start streaming training step with E2E authentication — delegates to generated client
+    /// Start streaming training step with E2E authentication — delegates to generated client.
+    ///
+    /// `adaptation_strategy` must be one of: "auto_writeback", "auto_evict",
+    /// "speculative", "writeback_if_above".
     pub async fn train_step_stream(
         &self,
         input: &str,
         gradient_steps: u32,
         learning_rate: f32,
-        auto_commit: bool,
+        adaptation_strategy: &str,
+        writeback_threshold: f32,
         ephemeral_pubkey: Option<[u8; 32]>,
     ) -> Result<StreamInfo> {
         self.gen.train_step_stream(
             input,
             gradient_steps,
             learning_rate,
-            auto_commit,
+            adaptation_strategy,
+            writeback_threshold,
             ephemeral_pubkey.unwrap_or([0u8; 32]),
         ).await
     }

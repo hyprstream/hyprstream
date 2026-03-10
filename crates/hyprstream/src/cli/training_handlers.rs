@@ -290,6 +290,8 @@ fn save_training_config(
             max_grad_norm: 1.0,
             min_input_length: 32,
             max_ttt_context: 512,
+            rank_oracle: None,
+            gradient_gating: None,
         },
     };
 

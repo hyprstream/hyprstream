@@ -146,6 +146,204 @@ fn default_pending_rollback_ms() -> u64 {
     60_000
 }
 
+/// Per-layer gradient gating configuration.
+///
+/// After the first gradient step, identifies low-signal layers via gradient
+/// norms and sets `requires_grad_(false)` on their parameters for subsequent
+/// steps. This saves backward-pass FLOPs and prevents Muon momentum
+/// from drifting on frozen layers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GradientGatingConfig {
+    /// Enable per-layer gradient gating (default: true)
+    #[serde(default = "default_grad_gating_enabled")]
+    pub enabled: bool,
+    /// Minimum gradient L2 norm to keep updating a layer (default: 1e-5)
+    #[serde(default = "default_min_grad_norm")]
+    pub min_grad_norm: f64,
+    /// Number of initial adaptation steps before gating activates (default: 1)
+    #[serde(default = "default_grad_warmup")]
+    pub warmup_steps: usize,
+}
+
+fn default_grad_gating_enabled() -> bool {
+    true
+}
+fn default_min_grad_norm() -> f64 {
+    1e-5
+}
+fn default_grad_warmup() -> usize {
+    1
+}
+
+impl Default for GradientGatingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_grad_gating_enabled(),
+            min_grad_norm: default_min_grad_norm(),
+            warmup_steps: default_grad_warmup(),
+        }
+    }
+}
+
+/// Compute per-layer gradient norms from VarStore.
+///
+/// Returns map of "layer_idx.module_name" -> L2 norm of combined A+B gradients.
+fn compute_per_layer_grad_norms(
+    vs: &tch::nn::VarStore,
+) -> HashMap<String, f64> {
+    let mut norms: HashMap<String, f64> = HashMap::new();
+    for (name, var) in vs.variables() {
+        if !var.grad().defined() {
+            continue;
+        }
+        if let Some(key) = parse_varstore_key_to_delta_key(&name) {
+            let grad_sq = var.grad().norm().double_value(&[]).powi(2);
+            *norms.entry(key).or_insert(0.0) += grad_sq;
+        }
+    }
+    // Take sqrt of accumulated squared norms
+    for v in norms.values_mut() {
+        *v = v.sqrt();
+    }
+    norms
+}
+
+/// Identify layers to gate (freeze) based on gradient norms.
+fn identify_gated_layers(norms: &HashMap<String, f64>, threshold: f64) -> Vec<String> {
+    norms
+        .iter()
+        .filter(|(_, &norm)| norm <= threshold)
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
+/// Parse VarStore key "layer_{idx}.{module}.lora_{a|b}" to delta key "idx.module"
+fn parse_varstore_key_to_delta_key(name: &str) -> Option<String> {
+    let parts: Vec<&str> = name.split('.').collect();
+    if parts.len() >= 3 {
+        let layer_part = parts[0]; // "layer_0"
+        let module = parts[1]; // "q_proj"
+        if let Some(idx_str) = layer_part.strip_prefix("layer_") {
+            if let Ok(idx) = idx_str.parse::<usize>() {
+                return Some(format!("{idx}.{module}"));
+            }
+        }
+    }
+    None
+}
+
+/// Collect per-key rank utilization, narrowed to effective ranks.
+fn collect_rank_utilization(delta: &TenantDelta) -> HashMap<String, f64> {
+    let _guard = tch::no_grad_guard();
+    delta
+        .lora_a
+        .iter()
+        .filter_map(|(key, a)| {
+            delta.lora_b.get(key).map(|b| {
+                let eff_rank = delta
+                    .effective_ranks
+                    .get(key)
+                    .copied()
+                    .unwrap_or_else(|| a.size()[0] as usize) as i64;
+                let a_eff = a.narrow(0, 0, eff_rank);
+                let b_eff = b.narrow(1, 0, eff_rank);
+                (
+                    key.clone(),
+                    crate::runtime::ttn_profile::delta_rank_utilization(&a_eff, &b_eff),
+                )
+            })
+        })
+        .collect()
+}
+
+/// Configuration for runtime rank adaptation oracle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RankOracleConfig {
+    /// How many TTT adaptations between rank evaluations (default: 10)
+    #[serde(default = "default_adaptation_interval")]
+    pub adaptation_interval: usize,
+    /// Whether to auto-adapt effective ranks (default: false — just log recommendations)
+    #[serde(default)]
+    pub auto_adapt: bool,
+    /// Available rank levels for reallocation
+    #[serde(default = "default_rank_levels")]
+    pub rank_levels: Vec<usize>,
+    /// Utilization below this triggers rank decrease (default: 0.25)
+    #[serde(default = "default_low_util")]
+    pub low_utilization_threshold: f64,
+    /// Utilization above this triggers rank increase (default: 0.85)
+    #[serde(default = "default_high_util")]
+    pub high_utilization_threshold: f64,
+}
+
+fn default_adaptation_interval() -> usize {
+    10
+}
+fn default_rank_levels() -> Vec<usize> {
+    vec![1, 2, 4, 8]
+}
+fn default_low_util() -> f64 {
+    0.25
+}
+fn default_high_util() -> f64 {
+    0.85
+}
+
+impl Default for RankOracleConfig {
+    fn default() -> Self {
+        Self {
+            adaptation_interval: default_adaptation_interval(),
+            auto_adapt: false,
+            rank_levels: default_rank_levels(),
+            low_utilization_threshold: default_low_util(),
+            high_utilization_threshold: default_high_util(),
+        }
+    }
+}
+
+/// Per-tenant rank adaptation oracle.
+///
+/// Wraps `RankUtilizationTracker` and produces rank adaptation signals.
+/// Stored per-tenant (inside `TenantDelta`, not in `TestTimeTrainer`)
+/// because utilization history is tenant-specific.
+pub struct RankOracle {
+    pub(crate) config: RankOracleConfig,
+    tracker: crate::runtime::ttn_profile::RankUtilizationTracker,
+    observation_count: usize,
+}
+
+impl RankOracle {
+    pub fn new(config: RankOracleConfig) -> Self {
+        let window = config.adaptation_interval * 2;
+        Self {
+            tracker: crate::runtime::ttn_profile::RankUtilizationTracker::new(window),
+            config,
+            observation_count: 0,
+        }
+    }
+
+    pub fn observe(&mut self, utilizations: &HashMap<String, f64>) {
+        for (key, &val) in utilizations {
+            self.tracker.record(key, val);
+        }
+        self.observation_count += 1;
+    }
+
+    #[allow(clippy::manual_is_multiple_of)]
+    pub fn should_evaluate(&self) -> bool {
+        self.observation_count > 0 && self.observation_count % self.config.adaptation_interval == 0
+    }
+
+    pub fn recommend(
+        &self,
+    ) -> HashMap<String, crate::runtime::ttn_profile::RankSignal> {
+        self.tracker.rank_adaptation_signals(
+            self.config.low_utilization_threshold,
+            self.config.high_utilization_threshold,
+        )
+    }
+}
+
 impl Default for TTTConfig {
     fn default() -> Self {
         Self {
@@ -229,6 +427,15 @@ pub struct TTTResult {
     /// Time budget that was enforced (milliseconds).
     /// Client can derive `timed_out = time_used_ms >= time_budget_ms`.
     pub time_budget_ms: u64,
+
+    /// Per-key rank utilization from this adaptation (empty if skipped)
+    pub rank_utilization: HashMap<String, f64>,
+
+    /// Layers gated (gradients frozen) during this adaptation
+    pub gated_layers: Vec<String>,
+
+    /// Rank adaptation signals from this evaluation (empty if not evaluated)
+    pub rank_signals: HashMap<String, crate::runtime::ttn_profile::RankSignal>,
 }
 
 impl TTTResult {
@@ -254,12 +461,15 @@ impl TTTResult {
             pending: false,
             time_used_ms: 0,
             time_budget_ms: 0,
+            rank_utilization: HashMap::new(),
+            gated_layers: Vec::new(),
+            rank_signals: HashMap::new(),
         }
     }
 }
 
 /// Per-request TTT overrides from the client
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct TTTOverrides {
     /// Override: enable/disable TTT for this request
     pub enabled: Option<bool>,
@@ -267,10 +477,22 @@ pub struct TTTOverrides {
     pub gradient_steps: Option<u32>,
     /// Override: learning rate
     pub learning_rate: Option<f32>,
-    /// If true, server auto-commits based on its recommendation
-    pub auto_commit: bool,
+    /// How to handle the adaptation result after training
+    pub adaptation_strategy: crate::training::adaptation_state::AdaptationStrategy,
     /// Override: maximum wall-clock time for adaptation (milliseconds)
     pub max_adaptation_ms: Option<u64>,
+}
+
+impl Default for TTTOverrides {
+    fn default() -> Self {
+        Self {
+            enabled: None,
+            gradient_steps: None,
+            learning_rate: None,
+            adaptation_strategy: crate::training::adaptation_state::AdaptationStrategy::Speculative,
+            max_adaptation_ms: None,
+        }
+    }
 }
 
 /// Context for TTT adaptation (for future cross-model verification)
@@ -309,13 +531,20 @@ pub struct TTTContext {
 /// ```
 pub struct TestTimeTrainer {
     pub config: TTTConfig,
+    pub gradient_gating: GradientGatingConfig,
     device: Device,
 }
 
 impl TestTimeTrainer {
     /// Create a new TTT trainer with the given configuration
     pub fn new(config: TTTConfig, device: Device) -> Self {
-        Self { config, device }
+        Self { config, gradient_gating: GradientGatingConfig::default(), device }
+    }
+
+    /// Create a new TTT trainer with gradient gating configuration
+    pub fn with_gradient_gating(mut self, gating: GradientGatingConfig) -> Self {
+        self.gradient_gating = gating;
+        self
     }
 
     /// Check if TTT is enabled
@@ -328,17 +557,18 @@ impl TestTimeTrainer {
         &self.config
     }
 
-    /// Perform a single gradient step on a tenant delta using AdamW
+    /// Perform a single gradient step on a tenant delta using Muon
     ///
-    /// Steps: backward → compute grad_norm → clip_grad_norm → optimizer.step → zero_grad
+    /// Steps: backward → compute grad_norm → clip → muon_step → zero_grad
     pub fn ttt_step(
         &self,
         loss: &Tensor,
         delta: &mut TenantDelta,
         learning_rate: Option<f64>,
     ) -> Result<(f64, bool)> {
+        // Override learning rate for this step
         if let Some(lr) = learning_rate {
-            delta.optimizer.set_lr(lr);
+            delta.muon_config.lr = lr;
         }
 
         // Backward pass
@@ -361,14 +591,44 @@ impl TestTimeTrainer {
 
         let clipped = grad_norm > self.config.max_grad_norm;
         if clipped {
-            delta.optimizer.clip_grad_norm(self.config.max_grad_norm);
+            // Manual gradient clipping (replaces optimizer.clip_grad_norm)
+            let clip_coef = self.config.max_grad_norm / (grad_norm + 1e-6);
+            let _guard = tch::no_grad_guard();
+            for var in delta.vs.trainable_variables() {
+                if var.grad().defined() {
+                    let clipped = &var.grad() * clip_coef;
+                    var.grad().copy_(&clipped);
+                }
+            }
         }
 
-        // AdamW step (handles weight decay internally)
-        delta.optimizer.step();
-        delta.optimizer.zero_grad();
+        // Muon step for all trainable parameters + zero gradients
+        self.optimizer_step(delta);
 
         Ok((grad_norm, clipped))
+    }
+
+    /// Perform Muon optimization step on all trainable parameters and zero gradients.
+    fn optimizer_step(&self, delta: &mut TenantDelta) {
+        use super::muon::muon_step;
+        let _guard = tch::no_grad_guard();
+        let variables = delta.vs.variables();
+        let config = delta.muon_config.clone();
+        for (name, var) in &variables {
+            if var.requires_grad() && var.grad().defined() {
+                let state = delta
+                    .muon_states
+                    .entry(name.clone())
+                    .or_default();
+                muon_step(var, state, &config);
+            }
+        }
+        // Zero gradients
+        for var in variables.values() {
+            if var.grad().defined() {
+                let _ = var.grad().zero_();
+            }
+        }
     }
 
     /// Determine number of gradient steps based on perplexity gating
@@ -509,6 +769,9 @@ impl TestTimeTrainer {
                     pending: false,
                     time_used_ms: start.elapsed().as_millis() as u64,
                     time_budget_ms,
+                    rank_utilization: HashMap::new(),
+                    gated_layers: Vec::new(),
+                    rank_signals: HashMap::new(),
                 },
                 pre_snapshot,
             ));
@@ -522,6 +785,9 @@ impl TestTimeTrainer {
 
         let budget = Duration::from_millis(time_budget_ms);
 
+        // Snapshot Muon momentum buffers for rollback (matches weight snapshot above)
+        let muon_snapshot = super::muon::snapshot_muon_states(&delta.muon_states);
+
         // Run gradient loop with catch_unwind for panic safety.
         // On panic, delta is restored from pre_snapshot.
         let loop_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -530,7 +796,7 @@ impl TestTimeTrainer {
 
         match loop_result {
             Ok(Ok(inner)) => {
-                let (actual_steps, losses, grad_norms, any_clipped, final_loss, final_perplexity) = inner;
+                let (actual_steps, losses, grad_norms, any_clipped, final_loss, final_perplexity, rank_utils, gated_layer_keys) = inner;
 
                 let avg_loss = losses.iter().sum::<f32>() / losses.len() as f32;
                 let loss_improvement = initial_loss - final_loss;
@@ -549,14 +815,46 @@ impl TestTimeTrainer {
                     final_perplexity,
                 );
 
-                // Track accumulated steps (adapt_tenant was missing this)
-                delta.accumulated_steps += actual_steps as u64;
-                delta.request_count += 1;
-                let n = delta.request_count as f64;
-                delta.avg_loss_improvement =
-                    delta.avg_loss_improvement * ((n - 1.0) / n) + loss_improvement as f64 / n;
+                // Stats are NOT updated here — they are updated at commit time
+                // by handle_commit_adaptation (pending path) or by train_step
+                // (auto-commit path). Updating here would double-count because
+                // handle_commit_adaptation also increments on commit.
 
                 let time_used_ms = start.elapsed().as_millis() as u64;
+
+                // Per-tenant rank oracle: observe utilization and optionally adapt
+                let rank_signals = if let Some(ref mut oracle) = delta.rank_oracle {
+                    oracle.observe(&rank_utils);
+                    if oracle.should_evaluate() {
+                        let signals = oracle.recommend();
+                        if oracle.config.auto_adapt {
+                            use crate::runtime::ttn_profile::RankSignal;
+                            for (key, signal) in &signals {
+                                if let Some(current) = delta.effective_rank(key) {
+                                    match signal {
+                                        RankSignal::Decrease => {
+                                            let new_rank = (current / 2).max(1);
+                                            delta.set_effective_rank(key, new_rank);
+                                            tracing::info!(key = %key, from = current, to = new_rank, "Rank oracle: decreased");
+                                        }
+                                        RankSignal::Increase => {
+                                            let new_rank = current * 2;
+                                            delta.set_effective_rank(key, new_rank);
+                                            let actual = delta.effective_rank(key).unwrap_or(new_rank);
+                                            tracing::info!(key = %key, from = current, to = actual, "Rank oracle: increased");
+                                        }
+                                        RankSignal::Hold => {}
+                                    }
+                                }
+                            }
+                        }
+                        signals
+                    } else {
+                        HashMap::new()
+                    }
+                } else {
+                    HashMap::new()
+                };
 
                 // Restore SSM states so TTT training data does not pollute inference recurrent state.
                 engine.restore_ssm_states(ssm_snapshot);
@@ -582,26 +880,33 @@ impl TestTimeTrainer {
                         pending: true, // Awaiting client commit/rollback
                         time_used_ms,
                         time_budget_ms,
+                        rank_utilization: rank_utils,
+                        gated_layers: gated_layer_keys,
+                        rank_signals,
                     },
                     pre_snapshot,
                 ))
             }
             Ok(Err(e)) => {
-                // Gradient loop returned an error — restore delta and SSM states from snapshot
+                // Gradient loop returned an error — restore delta, momentum, SSM states,
+                // and requires_grad (gradient gating may have frozen some variables).
                 tracing::warn!("TTT adapt_tenant gradient loop error, restoring delta: {}", e);
                 let _ = delta.load_state_dict(&pre_snapshot);
-                // Flush stale gradients from optimizer (may have accumulated before error)
-                delta.optimizer.zero_grad();
+                super::muon::restore_muon_states(&mut delta.muon_states, &muon_snapshot);
+                Self::restore_requires_grad(delta);
+                delta.zero_grad();
                 engine.restore_ssm_states(ssm_snapshot);
                 Err(e)
             }
             Err(panic_info) => {
-                // Panic during gradient loop — restore delta and SSM states from snapshot.
-                // Also zero gradients: a panic mid-backward/step leaves stale
-                // gradient accumulation and corrupted AdamW moment buffers.
+                // Panic during gradient loop — restore delta, momentum, SSM states,
+                // and requires_grad. A panic mid-backward/step leaves stale gradient
+                // accumulation and corrupted Muon momentum buffers.
                 tracing::error!("TTT adapt_tenant panicked during gradient loop, restoring delta");
                 let _ = delta.load_state_dict(&pre_snapshot);
-                delta.optimizer.zero_grad();
+                super::muon::restore_muon_states(&mut delta.muon_states, &muon_snapshot);
+                Self::restore_requires_grad(delta);
+                delta.zero_grad();
                 engine.restore_ssm_states(ssm_snapshot);
                 let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
                     s.clone()
@@ -611,6 +916,44 @@ impl TestTimeTrainer {
                     "unknown panic".to_owned()
                 };
                 Err(anyhow::anyhow!("TTT adaptation panicked: {}", msg))
+            }
+        }
+    }
+
+    /// Apply gradient gating: freeze low-signal layers after warmup.
+    /// Returns list of gated layer keys (for restoration later).
+    fn apply_gradient_gating(&self, delta: &TenantDelta, step: usize, total_steps: usize) -> Vec<String> {
+        if !self.gradient_gating.enabled || total_steps <= self.gradient_gating.warmup_steps {
+            return Vec::new();
+        }
+        if step < self.gradient_gating.warmup_steps {
+            return Vec::new();
+        }
+        let grad_norms_map = compute_per_layer_grad_norms(&delta.vs);
+        let gated = identify_gated_layers(&grad_norms_map, self.gradient_gating.min_grad_norm);
+        if !gated.is_empty() {
+            let _guard = tch::no_grad_guard();
+            for (name, var) in delta.vs.variables() {
+                if let Some(key) = parse_varstore_key_to_delta_key(&name) {
+                    if gated.contains(&key) {
+                        let _ = var.set_requires_grad(false);
+                    }
+                }
+            }
+            tracing::debug!(
+                gated_count = gated.len(),
+                "Gradient gating: froze low-signal layers"
+            );
+        }
+        gated
+    }
+
+    /// Restore requires_grad on all variables (undo gradient gating).
+    fn restore_requires_grad(delta: &TenantDelta) {
+        let _guard = tch::no_grad_guard();
+        for (_, var) in delta.vs.variables() {
+            if !var.requires_grad() {
+                let _ = var.set_requires_grad(true);
             }
         }
     }
@@ -629,7 +972,7 @@ impl TestTimeTrainer {
         start: &Instant,
         budget: Duration,
         initial_loss_tensor: Tensor,
-    ) -> Result<(usize, Vec<f32>, Vec<f32>, bool, f32, f32)> {
+    ) -> Result<(usize, Vec<f32>, Vec<f32>, bool, f32, f32, HashMap<String, f64>, Vec<String>)> {
         let initial_loss = initial_loss_tensor.double_value(&[]) as f32;
         let mut losses = vec![initial_loss];
         let mut grad_norms = Vec::with_capacity(gated_steps);
@@ -663,6 +1006,10 @@ impl TestTimeTrainer {
             );
         }
 
+        // Per-layer gradient gating: after warmup, freeze low-signal layers
+        // to save backward FLOPs and prevent momentum drift
+        let gated_layer_keys = self.apply_gradient_gating(delta, 1, gated_steps);
+
         // Remaining steps with time budget check BEFORE each step
         for _ in 1..gated_steps {
             if start.elapsed() >= budget {
@@ -684,15 +1031,13 @@ impl TestTimeTrainer {
             }
             actual_steps += 1;
 
-            // Delta rank utilization monitoring every 10 cumulative steps (Phase 3e).
-            // Uses delta.accumulated_steps (cross-call total) so monitoring fires even
-            // for short TTT runs (gated_steps < 10). SVD on [rank×rank] is ~μs.
-            if (delta.accumulated_steps + actual_steps as u64).is_multiple_of(10) {
-                for (key, a) in &delta.lora_a {
-                    if let Some(b) = delta.lora_b.get(key) {
-                        let util = crate::runtime::ttn_profile::delta_rank_utilization(a, b);
-                        tracing::debug!(key = %key, utilization = %util, "Delta rank utilization");
-                    }
+            // Delta rank utilization monitoring on last step + every 10 cumulative steps.
+            // Last-step monitoring ensures short TTT runs (1-5 steps) always get at least
+            // one observation. SVD on [rank×rank] is ~μs.
+            let is_last_step = actual_steps == gated_steps;
+            if is_last_step || (delta.accumulated_steps + actual_steps as u64).is_multiple_of(10) {
+                for (key, util) in &collect_rank_utilization(delta) {
+                    tracing::debug!(key = %key, utilization = %util, "Delta rank utilization");
                 }
             }
         }
@@ -702,7 +1047,14 @@ impl TestTimeTrainer {
         let final_loss = final_loss_tensor.double_value(&[]) as f32;
         let final_perplexity = final_loss.exp();
 
-        Ok((actual_steps, losses, grad_norms, any_clipped, final_loss, final_perplexity))
+        let rank_utils = collect_rank_utilization(delta);
+
+        // Restore requires_grad on all vars (undo gradient gating for next TTT call)
+        if !gated_layer_keys.is_empty() {
+            Self::restore_requires_grad(delta);
+        }
+
+        Ok((actual_steps, losses, grad_norms, any_clipped, final_loss, final_perplexity, rank_utils, gated_layer_keys))
     }
 
     /// Compute NTP loss with a tenant delta applied
@@ -790,6 +1142,7 @@ impl TestTimeTrainer {
 
         // Snapshot for panic recovery
         let pre_snapshot = delta.extract_state_dict();
+        let muon_snapshot = super::muon::snapshot_muon_states(&delta.muon_states);
 
         // Snapshot SSM states before training loop (prevents training data from polluting inference state).
         let ssm_snapshot = engine.snapshot_ssm_states();
@@ -800,7 +1153,7 @@ impl TestTimeTrainer {
 
         match loop_result {
             Ok(Ok(inner)) => {
-                let (actual_steps, losses, grad_norms, any_clipped, final_loss, final_perplexity, initial_loss, initial_perplexity) = inner;
+                let (actual_steps, losses, grad_norms, any_clipped, final_loss, final_perplexity, initial_loss, initial_perplexity, gated_layer_keys) = inner;
 
                 let avg_loss = losses.iter().sum::<f32>() / losses.len() as f32;
                 let loss_improvement = initial_loss - final_loss;
@@ -818,14 +1171,43 @@ impl TestTimeTrainer {
                     final_perplexity,
                 );
 
-                // Update delta accumulation stats
-                delta.accumulated_steps += actual_steps as u64;
-                delta.request_count += 1;
-                let n = delta.request_count as f64;
-                delta.avg_loss_improvement =
-                    delta.avg_loss_improvement * ((n - 1.0) / n) + loss_improvement as f64 / n;
-
                 let time_used_ms = start.elapsed().as_millis() as u64;
+
+                let rank_utils = collect_rank_utilization(delta);
+
+                // Feed rank oracle (same logic as adapt_tenant)
+                let rank_signals = if let Some(ref mut oracle) = delta.rank_oracle {
+                    oracle.observe(&rank_utils);
+                    if oracle.should_evaluate() {
+                        let signals = oracle.recommend();
+                        if oracle.config.auto_adapt {
+                            use crate::runtime::ttn_profile::RankSignal;
+                            for (key, signal) in &signals {
+                                if let Some(current) = delta.effective_rank(key) {
+                                    match signal {
+                                        RankSignal::Decrease => {
+                                            let new_rank = (current / 2).max(1);
+                                            delta.set_effective_rank(key, new_rank);
+                                            tracing::info!(key = %key, from = current, to = new_rank, "Rank oracle: decreased");
+                                        }
+                                        RankSignal::Increase => {
+                                            let new_rank = current * 2;
+                                            delta.set_effective_rank(key, new_rank);
+                                            let actual = delta.effective_rank(key).unwrap_or(new_rank);
+                                            tracing::info!(key = %key, from = current, to = actual, "Rank oracle: increased");
+                                        }
+                                        RankSignal::Hold => {}
+                                    }
+                                }
+                            }
+                        }
+                        signals
+                    } else {
+                        HashMap::new()
+                    }
+                } else {
+                    HashMap::new()
+                };
 
                 // Restore SSM states so training data does not pollute inference recurrent state.
                 engine.restore_ssm_states(ssm_snapshot);
@@ -850,19 +1232,26 @@ impl TestTimeTrainer {
                     pending: false, // trainStep commits immediately based on auto_commit
                     time_used_ms,
                     time_budget_ms,
+                    rank_utilization: rank_utils,
+                    gated_layers: gated_layer_keys,
+                    rank_signals,
                 })
             }
             Ok(Err(e)) => {
                 tracing::warn!("TTT train_step gradient loop error, restoring delta: {}", e);
                 let _ = delta.load_state_dict(&pre_snapshot);
-                delta.optimizer.zero_grad();
+                super::muon::restore_muon_states(&mut delta.muon_states, &muon_snapshot);
+                Self::restore_requires_grad(delta);
+                delta.zero_grad();
                 engine.restore_ssm_states(ssm_snapshot);
                 Err(e)
             }
             Err(panic_info) => {
                 tracing::error!("TTT train_step panicked during gradient loop, restoring delta");
                 let _ = delta.load_state_dict(&pre_snapshot);
-                delta.optimizer.zero_grad();
+                super::muon::restore_muon_states(&mut delta.muon_states, &muon_snapshot);
+                Self::restore_requires_grad(delta);
+                delta.zero_grad();
                 engine.restore_ssm_states(ssm_snapshot);
                 let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
                     s.clone()
@@ -887,7 +1276,7 @@ impl TestTimeTrainer {
         lr: f64,
         start: &Instant,
         budget: Duration,
-    ) -> Result<(usize, Vec<f32>, Vec<f32>, bool, f32, f32, f32, f32)> {
+    ) -> Result<(usize, Vec<f32>, Vec<f32>, bool, f32, f32, f32, f32, Vec<String>)> {
         // Compute initial loss
         let initial_loss_tensor = self.compute_ntp_loss_with_delta(engine, delta, tokens)?;
         let initial_loss = initial_loss_tensor.double_value(&[]) as f32;
@@ -904,6 +1293,9 @@ impl TestTimeTrainer {
             any_clipped = true;
         }
         let mut actual_steps = 1;
+
+        // Per-layer gradient gating: after warmup, freeze low-signal layers
+        let gated_layer_keys = self.apply_gradient_gating(delta, 1, clamped_steps);
 
         // Remaining steps with time budget check
         for _ in 1..clamped_steps {
@@ -931,7 +1323,12 @@ impl TestTimeTrainer {
         let final_loss = final_loss_tensor.double_value(&[]) as f32;
         let final_perplexity = final_loss.exp();
 
-        Ok((actual_steps, losses, grad_norms, any_clipped, final_loss, final_perplexity, initial_loss, initial_perplexity))
+        // Restore requires_grad (undo gradient gating)
+        if !gated_layer_keys.is_empty() {
+            Self::restore_requires_grad(delta);
+        }
+
+        Ok((actual_steps, losses, grad_norms, any_clipped, final_loss, final_perplexity, initial_loss, initial_perplexity, gated_layer_keys))
     }
 }
 
@@ -1003,5 +1400,119 @@ mod tests {
         assert!(!config.enabled);
         // Defaults should apply for missing fields
         assert_eq!(config.min_input_length, 32);
+    }
+
+    #[test]
+    fn test_gradient_gating_config_defaults() {
+        let config = GradientGatingConfig::default();
+        assert!(config.enabled);
+        assert!(config.min_grad_norm > 0.0);
+        assert!(config.warmup_steps > 0);
+    }
+
+    #[test]
+    fn test_identify_gated_layers() {
+        let mut norms = HashMap::new();
+        norms.insert("0.q_proj".to_owned(), 1e-3); // above threshold
+        norms.insert("0.v_proj".to_owned(), 1e-8); // below threshold
+        norms.insert("1.q_proj".to_owned(), 5e-6); // at threshold
+        let gated = identify_gated_layers(&norms, 1e-5);
+        assert!(!gated.contains(&"0.q_proj".to_owned())); // not gated (high norm)
+        assert!(gated.contains(&"0.v_proj".to_owned())); // gated (low norm)
+        assert!(gated.contains(&"1.q_proj".to_owned())); // gated (at/below threshold)
+    }
+
+    #[test]
+    fn test_gradient_gating_with_real_backward() {
+        use tch::{Kind, nn::VarStore};
+        let vs = VarStore::new(Device::Cpu);
+        let root = vs.root();
+        let a = root
+            .sub("layer_0")
+            .sub("q_proj")
+            .kaiming_uniform("lora_a", &[4, 8]);
+        let b = root
+            .sub("layer_0")
+            .sub("q_proj")
+            .zeros("lora_b", &[8, 4]);
+        let x = Tensor::randn([2, 8], (Kind::Float, Device::Cpu));
+
+        // Forward + backward with requires_grad=true
+        let out = x.matmul(&a.tr()).matmul(&b.tr());
+        let loss = out.sum(Kind::Float);
+        loss.backward();
+        assert!(a.grad().defined());
+
+        // Zero grads, disable requires_grad, forward + backward
+        for (_, v) in vs.variables() {
+            if v.grad().defined() {
+                let _ = v.grad().zero_();
+            }
+        }
+        let _ = a.set_requires_grad(false);
+        let out2 = x.matmul(&a.tr()).matmul(&b.tr());
+        let loss2 = out2.sum(Kind::Float);
+        loss2.backward();
+        // a should have NO gradient (frozen)
+        assert!(
+            !a.grad().defined() || a.grad().abs().sum(Kind::Double).double_value(&[]) == 0.0
+        );
+        // b should still have gradient
+        assert!(b.grad().defined());
+
+        // Re-enable
+        let _ = a.set_requires_grad(true);
+    }
+
+    #[test]
+    fn test_parse_varstore_key() {
+        assert_eq!(
+            parse_varstore_key_to_delta_key("layer_0.q_proj.lora_a"),
+            Some("0.q_proj".to_owned())
+        );
+        assert_eq!(
+            parse_varstore_key_to_delta_key("layer_23.v_proj.lora_b"),
+            Some("23.v_proj".to_owned())
+        );
+        assert_eq!(parse_varstore_key_to_delta_key("invalid_key"), None);
+    }
+
+    #[test]
+    fn test_rank_oracle_config_defaults() {
+        let config = RankOracleConfig::default();
+        assert!(config.adaptation_interval > 0);
+        assert!(!config.auto_adapt); // conservative default
+        assert!(!config.rank_levels.is_empty());
+    }
+
+    #[test]
+    fn test_rank_oracle_produces_signals() {
+        use crate::runtime::ttn_profile::RankSignal;
+        let mut oracle = RankOracle::new(RankOracleConfig::default());
+        // Simulate: feed low utilization for 10 steps
+        for _ in 0..10 {
+            let mut utils = HashMap::new();
+            utils.insert("0.q_proj".to_owned(), 0.1);
+            utils.insert("0.v_proj".to_owned(), 0.9);
+            oracle.observe(&utils);
+        }
+        let signals = oracle.recommend();
+        assert_eq!(signals.get("0.q_proj"), Some(&RankSignal::Decrease));
+        assert_eq!(signals.get("0.v_proj"), Some(&RankSignal::Increase));
+    }
+
+    #[test]
+    fn test_rank_oracle_should_evaluate() {
+        let mut oracle = RankOracle::new(RankOracleConfig {
+            adaptation_interval: 3,
+            ..Default::default()
+        });
+        let utils: HashMap<String, f64> = HashMap::new();
+        oracle.observe(&utils); // 1
+        assert!(!oracle.should_evaluate());
+        oracle.observe(&utils); // 2
+        assert!(!oracle.should_evaluate());
+        oracle.observe(&utils); // 3
+        assert!(oracle.should_evaluate());
     }
 }

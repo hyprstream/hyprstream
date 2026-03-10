@@ -8,9 +8,10 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
-use tch::nn::{OptimizerConfig, VarStore};
+use tch::nn::VarStore;
 use tch::{Device, Kind, Tensor};
 use safetensors::tensor::{TensorView, SafeTensors};
+use super::muon::{MuonConfig, MuonState};
 
 /// Extract LoRA components from hierarchical tensor names
 /// e.g., "base_model.model.layers.5.self_attn.q_proj.lora_A.weight" -> Some((5, "q_proj", "lora_a"))
@@ -87,9 +88,13 @@ pub struct TenantDeltaConfig {
     #[serde(default = "default_max_accumulated_steps")]
     pub max_accumulated_steps: u64,
 
-    /// Weight decay factor for AdamW (default: 0.02)
+    /// Weight decay factor for optimizer (default: 0.02)
     #[serde(default = "default_decay_lambda")]
     pub decay_lambda: f64,
+
+    /// Muon momentum coefficient (default: 0.95)
+    #[serde(default = "default_muon_momentum_config")]
+    pub muon_momentum: f64,
 
     /// Per-layer rank/module override. Key = layer index.
     /// Layers not in map use the top-level `rank` and `target_modules`.
@@ -140,6 +145,9 @@ fn default_max_accumulated_steps() -> u64 {
 fn default_decay_lambda() -> f64 {
     0.02
 }
+fn default_muon_momentum_config() -> f64 {
+    0.95
+}
 
 impl Default for TenantDeltaConfig {
     fn default() -> Self {
@@ -151,6 +159,7 @@ impl Default for TenantDeltaConfig {
             learning_rate: default_learning_rate(),
             max_accumulated_steps: default_max_accumulated_steps(),
             decay_lambda: default_decay_lambda(),
+            muon_momentum: default_muon_momentum_config(),
             layer_overrides: None,
         }
     }
@@ -169,8 +178,10 @@ pub struct TenantDelta {
     pub lora_b: HashMap<String, Tensor>,
     /// VarStore owning all trainable parameters
     pub vs: VarStore,
-    /// AdamW optimizer over all trainable parameters
-    pub optimizer: tch::nn::Optimizer,
+    /// Per-parameter Muon optimizer state: VarStore path -> MuonState
+    pub muon_states: HashMap<String, MuonState>,
+    /// Muon optimizer configuration
+    pub muon_config: MuonConfig,
     /// Per-key scaling: "layer_idx.module_name" -> alpha / layer_rank
     /// Replaces the single `scaling` field for non-uniform rank support (C7 fix).
     pub scaling_map: HashMap<String, f64>,
@@ -202,8 +213,20 @@ pub struct TenantDelta {
     pub created_at: Instant,
     /// Hash of last CAS snapshot (if any)
     pub last_snapshot_hash: Option<String>,
-    /// Weight decay factor (used by AdamW)
+    /// Weight decay factor (used by Muon's decoupled weight decay)
     pub decay_lambda: f64,
+    /// Per-key effective rank (for narrow-based rank adaptation).
+    /// Key = "layer_idx.module_name", value = active rank (1..=allocated_rank).
+    /// Defaults to the allocated rank for each key.
+    pub effective_ranks: HashMap<String, usize>,
+    /// Per-key maximum (allocated) rank. Set at creation time, never changes.
+    max_ranks: HashMap<String, usize>,
+    /// Alpha value (stored for scaling recalculation on rank change)
+    alpha: f32,
+    /// Optional per-tenant rank oracle for runtime rank adaptation
+    pub rank_oracle: Option<super::ttt::RankOracle>,
+    /// Lifecycle state of any pending adaptation (Idle or Pending with snapshot).
+    pub adaptation_state: crate::training::adaptation_state::DeltaAdaptationState,
 }
 
 impl TenantDelta {
@@ -244,6 +267,8 @@ impl TenantDelta {
         let mut lora_a = HashMap::new();
         let mut lora_b = HashMap::new();
         let mut scaling_map = HashMap::new();
+        let mut effective_ranks = HashMap::new();
+        let mut max_ranks = HashMap::new();
 
         for layer_idx in 0..num_layers {
             // Determine layer-specific rank and modules
@@ -293,20 +318,22 @@ impl TenantDelta {
                 lora_b.insert(key.clone(), b);
 
                 // Per-key scaling: alpha / layer_rank (C7 fix)
-                scaling_map.insert(key, config.alpha as f64 / layer_rank as f64);
+                scaling_map.insert(key.clone(), config.alpha as f64 / layer_rank as f64);
+
+                // Track effective and max ranks for narrow-based adaptation
+                effective_ranks.insert(key.clone(), layer_rank);
+                max_ranks.insert(key, layer_rank);
             }
         }
 
-        // Build AdamW optimizer over all trainable parameters
-        let optimizer = tch::nn::AdamW {
-            beta1: 0.9,
-            beta2: 0.999,
-            wd: config.decay_lambda,
-            eps: 1e-8,
-            amsgrad: false,
-        }
-        .build(&vs, config.learning_rate)
-        .map_err(|e| anyhow!("Failed to create AdamW optimizer: {}", e))?;
+        // Build Muon optimizer state (created lazily on first step)
+        let muon_states = HashMap::new();
+        let muon_config = MuonConfig {
+            lr: config.learning_rate,
+            momentum: config.muon_momentum,
+            weight_decay: 0.0, // Muon orthogonalizes gradients; weight decay rarely needed
+            ..MuonConfig::default()
+        };
 
         let scaling = config.alpha as f64 / config.rank as f64;
         let now = Instant::now();
@@ -327,7 +354,8 @@ impl TenantDelta {
             lora_a,
             lora_b,
             vs,
-            optimizer,
+            muon_states,
+            muon_config,
             scaling_map,
             scaling,
             rank: config.rank,
@@ -343,6 +371,11 @@ impl TenantDelta {
             created_at: now,
             last_snapshot_hash: None,
             decay_lambda: config.decay_lambda,
+            effective_ranks,
+            max_ranks,
+            alpha: config.alpha,
+            rank_oracle: None,
+            adaptation_state: crate::training::adaptation_state::DeltaAdaptationState::Idle,
         })
     }
 
@@ -370,10 +403,16 @@ impl TenantDelta {
         // Per-key scaling (C7 fix): use per-key alpha/rank, fall back to global scaling
         let scaling = self.scaling_map.get(&key).copied().unwrap_or(self.scaling);
 
+        // Narrow to effective rank (view, no copy)
+        let eff_rank = self.effective_ranks.get(&key).copied()
+            .unwrap_or_else(|| a.size()[0] as usize) as i64;
+        let a_eff = a.narrow(0, 0, eff_rank); // [eff_rank, in_features]
+        let b_eff = b.narrow(1, 0, eff_rank); // [out_features, eff_rank]
+
         let x = x.to_kind(a.kind());
-        let intermediate = x.f_matmul(&a.tr())
+        let intermediate = x.f_matmul(&a_eff.tr())
             .map_err(|e| anyhow!("Delta forward matmul A failed for '{}': {}", key, e))?;
-        let output = intermediate.f_matmul(&b.tr())
+        let output = intermediate.f_matmul(&b_eff.tr())
             .map_err(|e| anyhow!("Delta forward matmul B failed for '{}': {}", key, e))?;
 
         Ok(output * scaling)
@@ -382,6 +421,11 @@ impl TenantDelta {
     /// Compute LoRA correction for 2D tensors at a specific layer: output += scaling * (x @ A^T) @ B^T
     ///
     /// Handles shape [batch*seq_len, features] used inside attention layers.
+    ///
+    /// **Multi-precision:** Input `x` is cast to `a.kind()` (always Float32) via `x.to_kind()`.
+    /// LoRA A/B are kept in Float32 regardless of the base model's dtype. This ensures
+    /// Newton-Schulz convergence in the Muon optimizer and gradient precision within
+    /// TTT's tight 1-5 step budget. See also `muon::ns_compute_kind()`.
     ///
     /// # Arguments
     /// * `x` - Input tensor [tokens, in_features]
@@ -400,10 +444,16 @@ impl TenantDelta {
         // Per-key scaling (C7 fix): use per-key alpha/rank, fall back to global scaling
         let scaling = self.scaling_map.get(&key).copied().unwrap_or(self.scaling);
 
+        // Narrow to effective rank (view, no copy)
+        let eff_rank = self.effective_ranks.get(&key).copied()
+            .unwrap_or_else(|| a.size()[0] as usize) as i64;
+        let a_eff = a.narrow(0, 0, eff_rank); // [eff_rank, in_features]
+        let b_eff = b.narrow(1, 0, eff_rank); // [out_features, eff_rank]
+
         let x = x.to_kind(a.kind());
-        let intermediate = x.f_matmul(&a.tr())
+        let intermediate = x.f_matmul(&a_eff.tr())
             .map_err(|e| anyhow!("Delta forward_2d matmul A failed for '{}': {}", key, e))?;
-        let output = intermediate.f_matmul(&b.tr())
+        let output = intermediate.f_matmul(&b_eff.tr())
             .map_err(|e| anyhow!("Delta forward_2d matmul B failed for '{}': {}", key, e))?;
 
         Ok(output * scaling)
@@ -433,9 +483,11 @@ impl TenantDelta {
         ratios
     }
 
-    /// Extract state dict (A and B tensors) for serialization
+    /// Extract state dict (A and B tensors, effective ranks, Muon momentum) for serialization
     ///
     /// Keys use the format `"layer_idx.module_name.lora_a"` / `"layer_idx.module_name.lora_b"`.
+    /// Effective ranks are stored as `"layer_idx.module_name.__effective_rank"` (scalar i64).
+    /// Muon momentum buffers are stored as `"layer_idx.module_name.__muon_momentum"`.
     pub fn extract_state_dict(&self) -> HashMap<String, Tensor> {
         let _guard = tch::no_grad_guard();
         let mut state = HashMap::new();
@@ -450,12 +502,25 @@ impl TenantDelta {
             }
         }
 
+        // Persist effective ranks as scalar metadata tensors
+        for (key, &rank) in &self.effective_ranks {
+            state.insert(format!("{}.__effective_rank", key), Tensor::from_slice(&[rank as i64]));
+        }
+
+        // Persist Muon momentum buffers
+        for (key, muon_state) in &self.muon_states {
+            if let Some(ref buf) = muon_state.momentum_buffer {
+                state.insert(format!("{}.__muon_momentum", key), buf.copy());
+            }
+        }
+
         state
     }
 
-    /// Load state dict (restore A and B tensors from a snapshot)
+    /// Load state dict (restore A/B tensors, effective ranks, and Muon momentum from a snapshot)
     ///
     /// Expects keys in format `"layer_idx.module_name.lora_a"` / `"layer_idx.module_name.lora_b"`.
+    /// Also restores `__effective_rank` and `__muon_momentum` metadata if present.
     pub fn load_state_dict(&mut self, state: &HashMap<String, Tensor>) -> Result<()> {
         let _guard = tch::no_grad_guard();
 
@@ -472,6 +537,27 @@ impl TenantDelta {
             if let Some(b_src) = state.get(&b_key) {
                 if let Some(b_dst) = self.lora_b.get_mut(&key) {
                     b_dst.copy_(b_src);
+                }
+            }
+        }
+
+        // Restore effective ranks from metadata tensors
+        for key in self.effective_ranks.keys().cloned().collect::<Vec<_>>() {
+            let meta_key = format!("{}.__effective_rank", key);
+            if let Some(t) = state.get(&meta_key) {
+                let rank = t.int64_value(&[]) as usize;
+                self.set_effective_rank(&key, rank);
+            }
+        }
+
+        // Restore Muon momentum buffers from metadata tensors
+        for (key, muon_state) in &mut self.muon_states {
+            let meta_key = format!("{}.__muon_momentum", key);
+            if let Some(t) = state.get(&meta_key) {
+                if let Some(ref mut buf) = muon_state.momentum_buffer {
+                    buf.copy_(t);
+                } else {
+                    muon_state.momentum_buffer = Some(t.copy());
                 }
             }
         }
@@ -513,6 +599,32 @@ impl TenantDelta {
         self.accumulated_steps = 0;
         self.request_count = 0;
         self.avg_loss_improvement = 0.0;
+        self.adaptation_state = crate::training::adaptation_state::DeltaAdaptationState::Idle;
+    }
+
+    /// Zero all gradients on trainable variables.
+    pub fn zero_grad(&self) {
+        for (_, var) in self.vs.variables() {
+            if var.grad().defined() {
+                let _ = var.grad().zero_();
+            }
+        }
+    }
+
+    /// Get the effective (active) rank for a key. Returns None if key doesn't exist.
+    pub fn effective_rank(&self, key: &str) -> Option<usize> {
+        self.effective_ranks.get(key).copied()
+    }
+
+    /// Set the effective rank for a key. Clamped to [1, max_rank].
+    /// Also updates the scaling factor for this key (alpha / effective_rank).
+    pub fn set_effective_rank(&mut self, key: &str, rank: usize) {
+        if let Some(&max_r) = self.max_ranks.get(key) {
+            let clamped = rank.clamp(1, max_r);
+            self.effective_ranks.insert(key.to_owned(), clamped);
+            // Recalculate scaling: alpha / effective_rank
+            self.scaling_map.insert(key.to_owned(), self.alpha as f64 / clamped as f64);
+        }
     }
 }
 
@@ -553,45 +665,53 @@ impl TenantDelta {
             let base_scaling = base_guard.scaling_map.get(key).copied().unwrap_or(base_guard.scaling);
             let tenant_scaling = tenant_guard.scaling_map.get(key).copied().unwrap_or(tenant_guard.scaling);
 
-            // Check if ranks match for this specific key
-            let base_rank = base_a.map(|a| a.size()[0]);
-            let tenant_rank = tenant_a.map(|a| a.size()[0]);
-            let ranks_match = base_rank == tenant_rank;
+            // Narrow to effective_rank before composition — matches forward_2d behavior.
+            // Without this, compose operates on dormant rank dimensions (near-zero values
+            // that waste FLOPs and may introduce noise from untrained parameters).
+            let narrow_a = |a: &Tensor, guard: &TenantDelta| -> Tensor {
+                let eff = guard.effective_ranks.get(key).copied()
+                    .unwrap_or_else(|| a.size()[0] as usize) as i64;
+                a.narrow(0, 0, eff)
+            };
+            let narrow_b = |b: &Tensor, guard: &TenantDelta| -> Tensor {
+                let eff = guard.effective_ranks.get(key).copied()
+                    .unwrap_or_else(|| b.size()[1] as usize) as i64;
+                b.narrow(1, 0, eff)
+            };
+
+            // Check if effective ranks match for this specific key
+            let base_eff_rank = base_a.map(|a| {
+                base_guard.effective_ranks.get(key).copied()
+                    .unwrap_or_else(|| a.size()[0] as usize)
+            });
+            let tenant_eff_rank = tenant_a.map(|a| {
+                tenant_guard.effective_ranks.get(key).copied()
+                    .unwrap_or_else(|| a.size()[0] as usize)
+            });
+            let ranks_match = base_eff_rank == tenant_eff_rank;
 
             match (base_a, tenant_a) {
                 (Some(ba), Some(ta)) if ranks_match => {
-                    // Same rank: add A matrices directly (pre-scaled)
-                    let base_effective_a = ba * base_scaling;
-                    let tenant_effective_a = ta * tenant_scaling;
+                    // Same effective rank: narrow then add A matrices directly (pre-scaled)
+                    let base_effective_a = narrow_a(ba, &base_guard) * base_scaling;
+                    let tenant_effective_a = narrow_a(ta, &tenant_guard) * tenant_scaling;
                     composed_a.insert(key.clone(), base_effective_a + tenant_effective_a);
                 }
                 (Some(ba), Some(ta)) => {
-                    // Different ranks: compute effective weight W_eff = s1*(B1 @ A1) + s2*(B2 @ A2)
-                    // then store as rank=out_dim identity-like decomposition: A=W_eff, B=I
-                    // Instead, we compute the combined effective correction directly.
-                    // We store the summed effective weight as A with B=identity,
-                    // but that changes dimensions. Better approach: compute W_eff and
-                    // store it with a thin SVD-like decomposition at the larger rank.
-                    //
-                    // Simplest correct approach: compute full effective weight per-key
-                    // and store as A=[out_dim, in_dim], B=I[out_dim, out_dim] with scaling=1.
-                    // But that's expensive. Instead, use the effective correction approach:
-                    // store the pre-computed W_eff = s1*(B1@A1) + s2*(B2@A2) in composed_a
-                    // with composed_b = I (identity) and scaling = 1.0.
-                    //
-                    // Actually, the cleanest approach is to just compute at forward time.
-                    // Store separate effective weights: A = W_eff, B = I (identity of out_dim).
+                    // Different effective ranks: narrow each to its effective rank, compute
+                    // W_eff = s1*(B1_eff @ A1_eff) + s2*(B2_eff @ A2_eff), store as A=W_eff, B=I.
                     #[allow(clippy::expect_used)] // invariant: B must exist when A exists
                     let bb = base_b.expect("base B must exist if base A exists");
                     #[allow(clippy::expect_used)]
                     let tb = tenant_b.expect("tenant B must exist if tenant A exists");
-                    // W_eff = s1*(B1^T @ (A1^T))^T + s2*(B2^T @ (A2^T))^T
-                    //       = s1*(B1 @ A1) + s2*(B2 @ A2)
-                    // A is [rank, in_dim], B is [out_dim, rank]
-                    // B @ A = [out_dim, in_dim]
-                    // B @ A = [out_dim, rank] @ [rank, in_dim] = [out_dim, in_dim]
-                    let base_w = bb.matmul(ba) * base_scaling;
-                    let tenant_w = tb.matmul(ta) * tenant_scaling;
+                    // Narrow to effective rank before matmul
+                    let ba_eff = narrow_a(ba, &base_guard);
+                    let bb_eff = narrow_b(bb, &base_guard);
+                    let ta_eff = narrow_a(ta, &tenant_guard);
+                    let tb_eff = narrow_b(tb, &tenant_guard);
+                    // B_eff @ A_eff = [out_dim, eff_rank] @ [eff_rank, in_dim] = [out_dim, in_dim]
+                    let base_w = bb_eff.matmul(&ba_eff) * base_scaling;
+                    let tenant_w = tb_eff.matmul(&ta_eff) * tenant_scaling;
                     let w_eff = base_w + tenant_w;
                     // forward_2d computes: scaling * (x @ A^T) @ B^T
                     // We want: x @ W_eff^T  (result shape [tokens, out_dim])
@@ -604,10 +724,10 @@ impl TenantDelta {
                     continue; // Skip the B match below, we already handled it
                 }
                 (Some(ba), None) => {
-                    composed_a.insert(key.clone(), ba * base_scaling);
+                    composed_a.insert(key.clone(), narrow_a(ba, &base_guard) * base_scaling);
                 }
                 (None, Some(ta)) => {
-                    composed_a.insert(key.clone(), ta * tenant_scaling);
+                    composed_a.insert(key.clone(), narrow_a(ta, &tenant_guard) * tenant_scaling);
                 }
                 (None, None) => {}
             }
@@ -616,13 +736,15 @@ impl TenantDelta {
             // (i.e., ranks matched or only one side had the key)
             match (base_b, tenant_b) {
                 (Some(bb), Some(tb)) => {
-                    composed_b.insert(key.clone(), (bb + tb).shallow_clone());
+                    let bb_eff = narrow_b(bb, &base_guard);
+                    let tb_eff = narrow_b(tb, &tenant_guard);
+                    composed_b.insert(key.clone(), &bb_eff + &tb_eff);
                 }
                 (Some(bb), None) => {
-                    composed_b.insert(key.clone(), bb.shallow_clone());
+                    composed_b.insert(key.clone(), narrow_b(bb, &base_guard));
                 }
                 (None, Some(tb)) => {
-                    composed_b.insert(key.clone(), tb.shallow_clone());
+                    composed_b.insert(key.clone(), narrow_b(tb, &tenant_guard));
                 }
                 (None, None) => {}
             }
@@ -640,17 +762,14 @@ impl TenantDelta {
         let rank = base_guard.rank.max(tenant_guard.rank);
         let num_layers = base_guard.num_layers.max(tenant_guard.num_layers);
         let vs = VarStore::new(device);
-        // Composed delta is non-trainable — dummy optimizer
-        let optimizer = tch::nn::AdamW {
-            beta1: 0.9, beta2: 0.999, wd: 0.0, eps: 1e-8, amsgrad: false,
-        }.build(&vs, 0.0).unwrap_or_else(|_| unreachable!("AdamW::build with valid VarStore"));
         let now = Instant::now();
 
         std::sync::Arc::new(parking_lot::Mutex::new(TenantDelta {
             lora_a: composed_a,
             lora_b: composed_b,
             vs,
-            optimizer,
+            muon_states: HashMap::new(),
+            muon_config: MuonConfig::default(),
             scaling_map: HashMap::new(), // scaling=1.0 already baked in during composition
             scaling: 1.0, // Already pre-scaled during composition
             rank,
@@ -666,6 +785,11 @@ impl TenantDelta {
             created_at: now,
             last_snapshot_hash: None,
             decay_lambda: 0.0,
+            effective_ranks: HashMap::new(),
+            max_ranks: HashMap::new(),
+            alpha: 1.0, // Already pre-scaled during composition
+            rank_oracle: None,
+            adaptation_state: crate::training::adaptation_state::DeltaAdaptationState::Idle,
         }))
     }
 }
@@ -811,9 +935,6 @@ impl TenantDelta {
         let target_modules: Vec<String> = module_names.into_iter().collect();
         let scaling = alpha as f64 / rank as f64;
         let vs = VarStore::new(device);
-        let optimizer = tch::nn::AdamW {
-            beta1: 0.9, beta2: 0.999, wd: 0.0, eps: 1e-8, amsgrad: false,
-        }.build(&vs, 0.0).map_err(|e| anyhow!("Failed to create optimizer: {}", e))?;
         let now = Instant::now();
 
         tracing::info!(
@@ -833,11 +954,19 @@ impl TenantDelta {
             })
             .collect();
 
+        // Build effective_ranks and max_ranks from loaded A matrices
+        let effective_ranks: HashMap<String, usize> = lora_a
+            .iter()
+            .map(|(key, a)| (key.clone(), a.size()[0] as usize))
+            .collect();
+        let max_ranks = effective_ranks.clone();
+
         Ok(Self {
             lora_a,
             lora_b,
             vs,
-            optimizer,
+            muon_states: HashMap::new(),
+            muon_config: MuonConfig::default(),
             scaling_map,
             scaling,
             rank,
@@ -853,6 +982,11 @@ impl TenantDelta {
             created_at: now,
             last_snapshot_hash: None,
             decay_lambda: 0.0,
+            effective_ranks,
+            max_ranks,
+            alpha,
+            rank_oracle: None,
+            adaptation_state: crate::training::adaptation_state::DeltaAdaptationState::Idle,
         })
     }
 }
@@ -1121,5 +1255,149 @@ mod tests {
         assert!(delta.has_module("q_proj", 1));
         assert!(delta.has_module("v_proj", 0));
         assert!(!delta.has_module("gate_proj", 0)); // not a target module
+    }
+
+    #[test]
+    fn test_effective_rank_default_is_max() {
+        let config = TenantDeltaConfig { rank: 8, ..Default::default() };
+        let dims = test_module_dims();
+        let delta = TenantDelta::new(&config, &dims, Device::Cpu, TEST_NUM_LAYERS).unwrap();
+
+        // Default effective rank should equal allocated rank
+        assert_eq!(delta.effective_rank("0.q_proj"), Some(8));
+        assert_eq!(delta.effective_rank("0.v_proj"), Some(8));
+        assert_eq!(delta.effective_rank("99.nonexistent"), None);
+    }
+
+    #[test]
+    fn test_effective_rank_forward() {
+        let config = TenantDeltaConfig { rank: 8, ..Default::default() };
+        let dims = test_module_dims();
+        let mut delta = TenantDelta::new(&config, &dims, Device::Cpu, TEST_NUM_LAYERS).unwrap();
+
+        let x = Tensor::randn([2, 512], (Kind::Float, Device::Cpu));
+
+        // Full rank forward
+        let out_full = delta.forward_2d(&x, "q_proj", 0).unwrap();
+        assert_eq!(out_full.size(), &[2, 512]);
+
+        // Set effective rank to 4 (half)
+        delta.set_effective_rank("0.q_proj", 4);
+        let out_narrow = delta.forward_2d(&x, "q_proj", 0).unwrap();
+        assert_eq!(out_narrow.size(), &[2, 512]); // output shape unchanged
+    }
+
+    #[test]
+    fn test_set_effective_rank_clamped() {
+        let config = TenantDeltaConfig { rank: 8, ..Default::default() };
+        let dims = test_module_dims();
+        let mut delta = TenantDelta::new(&config, &dims, Device::Cpu, TEST_NUM_LAYERS).unwrap();
+
+        // Setting eff_rank above max_rank should clamp to max
+        delta.set_effective_rank("0.q_proj", 32);
+        assert_eq!(delta.effective_rank("0.q_proj"), Some(8)); // clamped to allocated
+
+        // Setting eff_rank to 0 should clamp to 1 (minimum)
+        delta.set_effective_rank("0.q_proj", 0);
+        assert_eq!(delta.effective_rank("0.q_proj"), Some(1));
+    }
+
+    #[test]
+    fn test_effective_rank_scaling_adjusts() {
+        let config = TenantDeltaConfig { rank: 8, alpha: 4.0, ..Default::default() };
+        let dims = test_module_dims();
+        let mut delta = TenantDelta::new(&config, &dims, Device::Cpu, TEST_NUM_LAYERS).unwrap();
+
+        // Original scaling: alpha / rank = 4.0 / 8 = 0.5
+        let s0 = delta.scaling_map["0.q_proj"];
+        assert!((s0 - 0.5).abs() < 1e-9);
+
+        // Set effective rank to 4 -> scaling should be alpha / eff_rank = 4.0 / 4 = 1.0
+        delta.set_effective_rank("0.q_proj", 4);
+        let s1 = delta.scaling_map["0.q_proj"];
+        assert!((s1 - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_effective_rank_with_layer_overrides() {
+        let mut overrides = HashMap::new();
+        overrides.insert(0, LayerDeltaConfig {
+            rank: 16,
+            target_modules: vec!["q_proj".to_owned(), "v_proj".to_owned()],
+        });
+        let config = TenantDeltaConfig {
+            rank: 8,
+            layer_overrides: Some(overrides),
+            ..Default::default()
+        };
+        let dims = test_module_dims();
+        let delta = TenantDelta::new(&config, &dims, Device::Cpu, TEST_NUM_LAYERS).unwrap();
+
+        // Layer 0 allocated at 16, layer 1 at default 8
+        assert_eq!(delta.effective_rank("0.q_proj"), Some(16));
+        assert_eq!(delta.effective_rank("1.q_proj"), Some(8));
+    }
+
+    #[test]
+    fn test_state_dict_round_trip_preserves_effective_ranks() {
+        let config = TenantDeltaConfig { rank: 8, alpha: 4.0, ..Default::default() };
+        let dims = test_module_dims();
+        let mut delta = TenantDelta::new(&config, &dims, Device::Cpu, TEST_NUM_LAYERS).unwrap();
+
+        // Set non-default effective ranks
+        delta.set_effective_rank("0.q_proj", 4);
+        delta.set_effective_rank("1.v_proj", 2);
+
+        let state = delta.extract_state_dict();
+
+        // Verify metadata keys exist
+        assert!(state.contains_key("0.q_proj.__effective_rank"));
+        assert!(state.contains_key("1.v_proj.__effective_rank"));
+
+        // Load into a fresh delta
+        let mut delta2 = TenantDelta::new(&config, &dims, Device::Cpu, TEST_NUM_LAYERS).unwrap();
+        assert_eq!(delta2.effective_rank("0.q_proj"), Some(8)); // default
+        delta2.load_state_dict(&state).unwrap();
+
+        // Verify effective ranks restored
+        assert_eq!(delta2.effective_rank("0.q_proj"), Some(4));
+        assert_eq!(delta2.effective_rank("1.v_proj"), Some(2));
+        // Unchanged keys should keep default
+        assert_eq!(delta2.effective_rank("0.v_proj"), Some(8));
+    }
+
+    #[test]
+    fn test_state_dict_round_trip_preserves_muon_momentum() {
+        let config = TenantDeltaConfig { rank: 8, alpha: 4.0, ..Default::default() };
+        let dims = test_module_dims();
+        let mut delta = TenantDelta::new(&config, &dims, Device::Cpu, TEST_NUM_LAYERS).unwrap();
+
+        // Simulate a Muon step populating momentum for one key
+        let key = "0.q_proj".to_owned();
+        let fake_momentum = Tensor::randn([8, 512], (Kind::Float, Device::Cpu));
+        delta.muon_states.insert(key.clone(), super::super::muon::MuonState {
+            momentum_buffer: Some(fake_momentum.copy()),
+        });
+
+        let state = delta.extract_state_dict();
+
+        // Verify momentum key exists
+        assert!(state.contains_key("0.q_proj.__muon_momentum"));
+
+        // Load into a fresh delta that has the same Muon state key
+        let mut delta2 = TenantDelta::new(&config, &dims, Device::Cpu, TEST_NUM_LAYERS).unwrap();
+        delta2.muon_states.insert(key.clone(), super::super::muon::MuonState {
+            momentum_buffer: None,
+        });
+        delta2.load_state_dict(&state).unwrap();
+
+        // Verify momentum buffer restored
+        let restored = &delta2.muon_states[&key];
+        assert!(restored.momentum_buffer.is_some());
+        let diff: f64 = (restored.momentum_buffer.as_ref().unwrap() - &fake_momentum)
+            .abs()
+            .sum(Kind::Float)
+            .double_value(&[]);
+        assert!(diff < 1e-6, "Muon momentum should be preserved through state_dict round-trip");
     }
 }

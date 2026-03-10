@@ -638,14 +638,14 @@ impl ModelService {
     }
 
     // Training loop control - forward to InferenceService via ZMQ
-    async fn commit_adaptation(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
+    async fn writeback_adaptation(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
         let client = self.get_inference_client(model_ref_str, ctx).await?;
-        client.commit_adaptation().await
+        client.writeback_adaptation().await
     }
 
-    async fn rollback_adaptation(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
+    async fn evict_adaptation(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
         let client = self.get_inference_client(model_ref_str, ctx).await?;
-        client.rollback_adaptation().await
+        client.evict_adaptation().await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -656,16 +656,23 @@ impl ModelService {
         input: &str,
         gradient_steps: u32,
         learning_rate: f32,
-        auto_commit: bool,
+        adaptation_strategy: AdaptationStrategyEnum,
+        writeback_threshold: f32,
         client_ephemeral_pubkey: Option<[u8; 32]>,
     ) -> Result<StreamInfo> {
+        let strategy_str = match adaptation_strategy {
+            AdaptationStrategyEnum::AutoWriteback => "auto_writeback",
+            AdaptationStrategyEnum::AutoEvict => "auto_evict",
+            AdaptationStrategyEnum::Speculative => "speculative",
+            AdaptationStrategyEnum::WritebackIfAbove => "writeback_if_above",
+        };
         let client = self.get_inference_client(model_ref_str, ctx).await?;
-        client.train_step_stream(input, gradient_steps, learning_rate, auto_commit, client_ephemeral_pubkey).await
+        client.train_step_stream(input, gradient_steps, learning_rate, strategy_str, writeback_threshold, client_ephemeral_pubkey).await
     }
 
-    async fn reset_delta(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
+    async fn zero_delta(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
         let client = self.get_inference_client(model_ref_str, ctx).await?;
-        client.reset_delta().await
+        client.zero_delta().await
     }
 
     async fn get_delta_status_forward(
@@ -694,7 +701,7 @@ impl ModelService {
         commit_message: &str,
     ) -> Result<crate::services::generated::inference_client::ExportPeftResult> {
         let client = self.get_inference_client(model_ref_str, ctx).await?;
-        client.gen.export_peft_adapter(name, commit_message).await
+        client.gen.export_peft_adapter(name, commit_message, false).await
     }
 
 }
@@ -717,6 +724,7 @@ use crate::services::generated::model_client::{
     SaveAdaptationRequest, SaveAdaptationResponse,
     SnapshotDeltaResponse, TttExportRequest, TttExportResponse,
     WriteTttConfigRequest,
+    AdaptationStrategyEnum,
     // Adapter types
     AdapterInfo, AdapterMergeRequest,
     // Infer types
@@ -749,8 +757,14 @@ impl TttHandler for ModelService {
         model_ref: &str, data: &TrainStepRequest,
     ) -> Result<TrainStepResponse> {
         let client = self.get_inference_client(model_ref, ctx).await?;
+        let adaptation_strategy_str = match data.adaptation_strategy {
+            AdaptationStrategyEnum::AutoWriteback => "auto_writeback",
+            AdaptationStrategyEnum::AutoEvict => "auto_evict",
+            AdaptationStrategyEnum::Speculative => "speculative",
+            AdaptationStrategyEnum::WritebackIfAbove => "writeback_if_above",
+        };
         let r = client.gen.train_step(
-            &data.input, data.gradient_steps, data.learning_rate, data.auto_commit,
+            &data.input, data.gradient_steps, data.learning_rate, adaptation_strategy_str, data.writeback_threshold,
         ).await?;
         Ok(TrainStepResponse {
             avg_loss: r.avg_loss,
@@ -771,7 +785,7 @@ impl TttHandler for ModelService {
     ) -> Result<(crate::services::generated::model_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
         let info = self.train_step_stream(
                 model_ref, ctx, &data.input, data.gradient_steps, data.learning_rate,
-                data.auto_commit, ctx.ephemeral_pubkey,
+                data.adaptation_strategy, data.writeback_threshold, ctx.ephemeral_pubkey,
             ).await?;
         let stream_info = crate::services::generated::model_client::StreamInfo {
             stream_id: info.stream_id,
@@ -781,22 +795,22 @@ impl TttHandler for ModelService {
         Ok((stream_info, Box::pin(async {})))
     }
 
-    async fn handle_commit(
+    async fn handle_writeback(
         &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
     ) -> Result<()> {
-        self.commit_adaptation(model_ref, ctx).await
+        self.writeback_adaptation(model_ref, ctx).await
     }
 
-    async fn handle_rollback(
+    async fn handle_evict(
         &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
     ) -> Result<()> {
-        self.rollback_adaptation(model_ref, ctx).await
+        self.evict_adaptation(model_ref, ctx).await
     }
 
-    async fn handle_reset(
+    async fn handle_zero(
         &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
     ) -> Result<()> {
-        self.reset_delta(model_ref, ctx).await
+        self.zero_delta(model_ref, ctx).await
     }
 
     async fn handle_status(
@@ -825,7 +839,7 @@ impl TttHandler for ModelService {
     ) -> Result<SaveAdaptationResponse> {
         let client = self.get_inference_client(model_ref, ctx).await?;
         let r = client.gen.save_adaptation(
-            &data.name, &data.merge_strategy, data.merge_weight, &data.commit_message,
+            &data.name, &data.merge_strategy, data.merge_weight, &data.commit_message, data.git_commit,
         ).await?;
         Ok(SaveAdaptationResponse {
             adapter_name: r.adapter_name,
@@ -887,6 +901,8 @@ impl TttHandler for ModelService {
             max_grad_norm: if data.max_grad_norm > 0.0 { data.max_grad_norm } else { 1.0 },
             min_input_length: if data.min_input_length > 0 { data.min_input_length as usize } else { 32 },
             max_ttt_context: if data.max_ttt_context > 0 { data.max_ttt_context as usize } else { 512 },
+            rank_oracle: None,
+            gradient_gating: None,
         };
 
         let training_config = crate::config::HyprstreamTrainingConfig {
@@ -1571,6 +1587,7 @@ impl ModelZmqClient {
         client_ephemeral_pubkey: [u8; 32],
     ) -> Result<StreamInfo> {
         let images: Vec<Vec<u8>> = Vec::new();
+        let adaptation_strategy_str = if request.auto_commit { "auto_writeback" } else { "speculative" };
         let info = self.gen.infer(model_ref).generate_stream(
             request.prompt.as_str(),
             request.max_tokens as u32,
@@ -1586,7 +1603,8 @@ impl ModelZmqClient {
             request.ttt_enabled,
             request.ttt_gradient_steps,
             request.ttt_learning_rate,
-            request.auto_commit,
+            adaptation_strategy_str,
+            0.0f32, // writeback_threshold
             client_ephemeral_pubkey,
         ).await?;
         Ok(StreamInfo {
@@ -1678,14 +1696,22 @@ impl ModelZmqClient {
         input: &str,
         gradient_steps: u32,
         learning_rate: f32,
-        auto_commit: bool,
+        adaptation_strategy: AdaptationStrategyEnum,
+        writeback_threshold: f32,
         client_ephemeral_pubkey: [u8; 32],
     ) -> Result<StreamInfo> {
+        let (strategy_str, threshold) = match adaptation_strategy {
+            AdaptationStrategyEnum::AutoWriteback => ("auto_writeback", writeback_threshold),
+            AdaptationStrategyEnum::AutoEvict => ("auto_evict", writeback_threshold),
+            AdaptationStrategyEnum::Speculative => ("speculative", writeback_threshold),
+            AdaptationStrategyEnum::WritebackIfAbove => ("writeback_if_above", writeback_threshold),
+        };
         let info = self.gen.ttt(model_ref).train_stream(
             input,
             gradient_steps,
             learning_rate,
-            auto_commit,
+            strategy_str,
+            threshold,
             client_ephemeral_pubkey,
         ).await?;
         Ok(StreamInfo {
@@ -1728,7 +1754,7 @@ fn generate_request_from_data(data: &GenerateRequest) -> GenerationRequest {
         ttt_enabled: data.ttt_enabled,
         ttt_gradient_steps: data.ttt_gradient_steps,
         ttt_learning_rate: data.ttt_learning_rate,
-        auto_commit: data.auto_commit,
+        auto_commit: matches!(data.adaptation_strategy, AdaptationStrategyEnum::AutoWriteback),
     }
 }
 

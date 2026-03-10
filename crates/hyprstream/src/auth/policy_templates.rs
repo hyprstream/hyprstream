@@ -48,6 +48,40 @@ p, anonymous, *, model:*, query, allow
 p, anonymous, *, registry:*, query, allow
 "#),
         },
+        PolicyTemplate {
+            name: "ttt.user",
+            description: "TTT user: infer, query, write, and manage access on all models",
+            rules: Some(
+                r#"# TTT user — infer, query, write, manage on all models
+# NOTE: 'manage' scope covers both ttt.zero (resetDelta) and shutdown.
+# Task 11 will replace this with per-operation policies that gate shutdown
+# separately from delta management operations.
+p, ttt.user, *, model:*, infer, allow
+p, ttt.user, *, model:*, query, allow
+p, ttt.user, *, model:*, write, allow
+p, ttt.user, *, model:*, manage, allow
+"#,
+            ),
+        },
+        PolicyTemplate {
+            name: "ttt.agent",
+            description: "TTT agent: alias for ttt.user (compound ops via generateStream; no direct delta manipulation until Task 11)",
+            rules: Some(
+                r#"# ttt.agent is an alias for ttt.user (interim; Task 11 will restrict to compound ops only)
+g, ttt.agent, ttt.user
+"#,
+            ),
+        },
+        PolicyTemplate {
+            name: "ttt.privileged",
+            description: "TTT privileged: extends ttt.user with train scope for direct delta manipulation",
+            rules: Some(
+                r#"# ttt.privileged inherits ttt.user and adds train scope
+g, ttt.privileged, ttt.user
+p, ttt.privileged, *, model:*, train, allow
+"#,
+            ),
+        },
     ]
 }
 

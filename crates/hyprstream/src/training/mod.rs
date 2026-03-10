@@ -9,13 +9,20 @@
 //! - `checkpoint`: Checkpoint management with git integration
 //! - `data_loader`: Training data loading utilities
 
+pub mod adaptation_state;
 pub mod checkpoint;
 pub mod data_loader;
 pub mod delta_pool;
 pub mod merge;
+pub mod muon;
 pub mod quality_filter;
 pub mod tenant_delta;
 pub mod ttt;
+
+pub use adaptation_state::{
+    DeltaAdaptationState, AdaptationStrategy, GuardStatus, ResolveOutcome,
+    WritebackInfo, EvictedSnapshot,
+};
 
 pub use checkpoint::{
     CheckpointConfig, CheckpointInfo, CheckpointManager, CheckpointRequest, TrainingMetrics,
@@ -32,4 +39,4 @@ pub use tenant_delta::{TenantDelta, TenantDeltaConfig, SharedTenantDelta, serial
 
 pub use merge::{MergeStrategy, merge_state_dicts};
 
-pub use ttt::{TTTConfig, TTTContext, TTTOverrides, TTTResult, TTTVerifier, TestTimeTrainer};
+pub use ttt::{TTTConfig, TTTContext, TTTOverrides, TTTResult, TTTVerifier, TestTimeTrainer, RankOracle, RankOracleConfig, GradientGatingConfig};
