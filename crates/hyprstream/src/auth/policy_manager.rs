@@ -815,4 +815,34 @@ mod tests {
         // Different namespace should NOT match
         assert!(!pm.check_with_domain("alice", "*", "model:qwen3-small:main", "infer.generate").await);
     }
+
+    #[tokio::test]
+    async fn test_set_branch_visibility_adds_removes_rules() {
+        let pm = PolicyManager::new_in_memory().await.unwrap();
+
+        // Grant alice manage (ttt.writeback) on the model resource
+        pm.add_policy_with_domain("alice", "*", "model:qwen3:main", "ttt.writeback", "allow").await.unwrap();
+
+        // Initially bob cannot infer
+        assert!(!pm.check_with_domain("bob", "*", "model:qwen3:main", "infer.generate").await);
+
+        // Make public: add wildcard infer + query rules
+        pm.add_policy_with_domain("*", "*", "model:qwen3:main", "infer.generate", "allow").await.unwrap();
+        pm.add_policy_with_domain("*", "*", "model:qwen3:main", "query.status", "allow").await.unwrap();
+
+        // After making public, any user can infer and query
+        assert!(pm.check_with_domain("bob", "*", "model:qwen3:main", "infer.generate").await);
+        assert!(pm.check_with_domain("carol", "*", "model:qwen3:main", "query.status").await);
+
+        // Make private: remove wildcard rules
+        pm.remove_policy_with_domain("*", "*", "model:qwen3:main", "infer.generate", "allow").await.unwrap();
+        pm.remove_policy_with_domain("*", "*", "model:qwen3:main", "query.status", "allow").await.unwrap();
+
+        // After making private, unauthenticated users are denied again
+        assert!(!pm.check_with_domain("bob", "*", "model:qwen3:main", "infer.generate").await);
+        assert!(!pm.check_with_domain("carol", "*", "model:qwen3:main", "query.status").await);
+
+        // Alice still has manage access (her rule was not removed)
+        assert!(pm.check_with_domain("alice", "*", "model:qwen3:main", "ttt.writeback").await);
+    }
 }

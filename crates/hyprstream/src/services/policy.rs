@@ -13,7 +13,7 @@ use crate::services::generated::policy_client::{
     ApplyTemplate, ApplyDraft, RollbackPolicy, GetHistory, GetDiff,
     PolicyInfo, PolicyRule, Grouping,
     PolicyHistory, PolicyHistoryEntry, DraftStatus,
-    AddGrouping, RemoveGrouping,
+    AddGrouping, RemoveGrouping, SetBranchVisibility,
     dispatch_policy, serialize_response,
 };
 use anyhow::{anyhow, Result};
@@ -772,6 +772,64 @@ impl PolicyHandler for PolicyService {
 
         info!("Revoked role '{}' from '{}' (caller={})", data.role, data.user, caller);
         Ok(PolicyResponseVariant::RemoveGroupingResult(sha))
+    }
+
+    async fn handle_set_branch_visibility(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &SetBranchVisibility,
+    ) -> Result<PolicyResponseVariant> {
+        let caller = ctx.subject().to_string();
+        let resource = format!("model:{}:{}", data.model_name, data.branch_name);
+
+        // Require manage (ttt.writeback) on the model resource
+        let allowed = self.policy_manager.check_with_domain(
+            &caller,
+            "*",
+            &resource,
+            "ttt.writeback",
+        ).await;
+        if !allowed {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Unauthorized: {} cannot manage {}", caller, resource),
+                code: "UNAUTHORIZED".to_owned(),
+                details: String::new(),
+            }));
+        }
+
+        if data.public {
+            // Make public: add wildcard infer+query rules
+            let _ = self.policy_manager.add_policy_with_domain(
+                "*", "*", &resource, "infer.generate", "allow").await;
+            let _ = self.policy_manager.add_policy_with_domain(
+                "*", "*", &resource, "query.status", "allow").await;
+        } else {
+            // Make private: remove wildcard rules
+            let _ = self.policy_manager.remove_policy_with_domain(
+                "*", "*", &resource, "infer.generate", "allow").await;
+            let _ = self.policy_manager.remove_policy_with_domain(
+                "*", "*", &resource, "query.status", "allow").await;
+        }
+
+        let vis_str = if data.public { "public" } else { "private" };
+        let msg = format!(
+            "policy: set {}/{} visibility={} [by {}]",
+            data.model_name, data.branch_name, vis_str, caller
+        );
+        let sha = match self.stage_and_commit_policies(&msg).await {
+            Ok(sha) => sha,
+            Err(e) => {
+                warn!("Visibility set but commit failed: {}", e);
+                format!("(commit failed: {})", e)
+            }
+        };
+
+        info!(
+            "Set branch {}/{} to {} (caller={})",
+            data.model_name, data.branch_name, vis_str, caller
+        );
+        Ok(PolicyResponseVariant::SetBranchVisibilityResult(sha))
     }
 }
 
