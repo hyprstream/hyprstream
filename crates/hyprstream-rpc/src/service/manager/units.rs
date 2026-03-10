@@ -47,11 +47,13 @@ pub fn service_unit(service: &str) -> Result<String> {
     // Capture environment variables to forward to the service
     let ld_library_path = std::env::var("LD_LIBRARY_PATH").ok();
     let libtorch = std::env::var("LIBTORCH").ok();
+    let hyprstream_instance = std::env::var("HYPRSTREAM_INSTANCE").ok();
 
     // Build Environment= directives
     let env_directives = vec![
         ld_library_path.map(|v| format!("Environment=LD_LIBRARY_PATH={v}")),
         libtorch.map(|v| format!("Environment=LIBTORCH={v}")),
+        hyprstream_instance.map(|v| format!("Environment=HYPRSTREAM_INSTANCE={v}")),
     ]
     .into_iter()
     .flatten()
