@@ -35,7 +35,11 @@ pub enum ChatRole {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ChatHistoryEntry {
     pub role: ChatRole,
+    /// Visible response content (what gets sent back to the model as context).
     pub content: String,
+    /// Reasoning / thinking tokens, hidden by default (not sent to model).
+    #[serde(default)]
+    pub thinking: String,
 }
 
 /// Injected by `service.rs` — captures signing_key + model_ref.
@@ -84,6 +88,13 @@ pub struct ChatApp {
     pub session_id: Option<Uuid>,
     /// Fired after `StreamComplete` to persist `history`.
     save_hook: Option<SaveHook>,
+    /// True while currently inside a `<think>…</think>` block in the stream.
+    in_thinking: bool,
+    /// Whether to display thinking blocks expanded (Ctrl-O to toggle).
+    pub show_thinking: bool,
+    /// Error messages queued for the outer compositor to surface as toasts.
+    /// Drained by the event loop each tick (see shell_handlers.rs).
+    pub pending_toasts: Vec<String>,
 }
 
 impl ChatApp {
@@ -104,6 +115,9 @@ impl ChatApp {
             quit: false,
             session_id: None,
             save_hook: None,
+            in_thinking: false,
+            show_thinking: false,
+            pending_toasts: Vec::new(),
         }
     }
 
@@ -137,6 +151,35 @@ impl ChatApp {
             quit: false,
             session_id: Some(session_id),
             save_hook: Some(save_hook),
+            in_thinking: false,
+            show_thinking: false,
+            pending_toasts: Vec::new(),
+        }
+    }
+
+    /// Route a streamed token into `entry.thinking` or `entry.content` based on
+    /// `<think>`/`</think>` markers.  Handles markers appearing mid-token.
+    fn ingest_token(&mut self, token: &str) {
+        let Some(last) = self.history.last_mut() else { return };
+        let mut remaining = token;
+        while !remaining.is_empty() {
+            if self.in_thinking {
+                if let Some(end) = remaining.find("</think>") {
+                    last.thinking.push_str(&remaining[..end]);
+                    self.in_thinking = false;
+                    remaining = &remaining[end + "</think>".len()..];
+                } else {
+                    last.thinking.push_str(remaining);
+                    break;
+                }
+            } else if let Some(start) = remaining.find("<think>") {
+                last.content.push_str(&remaining[..start]);
+                self.in_thinking = true;
+                remaining = &remaining[start + "<think>".len()..];
+            } else {
+                last.content.push_str(remaining);
+                break;
+            }
         }
     }
 }
@@ -153,6 +196,12 @@ impl TerminalApp for ChatApp {
     }
 
     fn handle_input(&mut self, key: KeyPress) -> bool {
+        // Ctrl-O toggles thinking visibility in both modes.
+        if matches!(key, KeyPress::Char(0x0F)) {
+            self.show_thinking = !self.show_thinking;
+            return true;
+        }
+
         match self.mode {
             ChatMode::Input => match key {
                 KeyPress::Escape | KeyPress::F(10) => {
@@ -167,12 +216,15 @@ impl TerminalApp for ChatApp {
                     self.history.push(ChatHistoryEntry {
                         role: ChatRole::User,
                         content: user_content,
+                        thinking: String::new(),
                     });
                     self.history.push(ChatHistoryEntry {
                         role: ChatRole::Assistant,
                         content: String::new(),
+                        thinking: String::new(),
                     });
 
+                    // Only send content (not thinking) as model context.
                     let pairs: Vec<(String, String)> = self
                         .history
                         .iter()
@@ -189,6 +241,7 @@ impl TerminalApp for ChatApp {
                     self.mode = ChatMode::Streaming;
                     self.status = Some("Generating\u{2026}".to_owned());
                     self.scroll_offset = 0;
+                    self.in_thinking = false;
                     true
                 }
                 KeyPress::Backspace => {
@@ -196,7 +249,6 @@ impl TerminalApp for ChatApp {
                     true
                 }
                 KeyPress::Char(b) => {
-                    // Only accept printable ASCII in the input buffer.
                     if b.is_ascii_graphic() || b == b' ' {
                         self.input_buf.push(b as char);
                         true
@@ -229,39 +281,43 @@ impl TerminalApp for ChatApp {
         loop {
             match self.event_rx.try_recv() {
                 Ok(ChatEvent::Token(s)) => {
-                    if let Some(last) = self.history.last_mut() {
-                        last.content.push_str(&s);
-                    }
+                    self.ingest_token(&s);
                     redraw = true;
                 }
                 Ok(ChatEvent::StreamComplete) => {
                     self.mode = ChatMode::Input;
                     self.status = None;
+                    self.in_thinking = false;
                     if let Some(ref hook) = self.save_hook {
                         hook(&self.history);
                     }
                     redraw = true;
                 }
                 Ok(ChatEvent::StreamError(s)) => {
+                    self.pending_toasts.push(format!("Inference error: {s}"));
                     if let Some(last) = self.history.last_mut() {
                         last.content = format!("[Error: {s}]");
                     }
                     self.mode = ChatMode::Input;
                     self.status = None;
+                    self.in_thinking = false;
                     redraw = true;
                 }
                 Ok(ChatEvent::TemplateError(s)) => {
                     // Remove the empty assistant placeholder + user message.
                     self.history.pop();
                     self.history.pop();
+                    self.pending_toasts.push(format!("Model error: {s}"));
                     self.status = Some(s);
                     self.mode = ChatMode::Input;
+                    self.in_thinking = false;
                     redraw = true;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     if matches!(self.mode, ChatMode::Streaming) {
                         self.mode = ChatMode::Input;
+                        self.in_thinking = false;
                         redraw = true;
                     }
                     break;

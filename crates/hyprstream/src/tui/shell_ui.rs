@@ -214,7 +214,8 @@ fn draw_fkey_bar(frame: &mut Frame, area: Rect, mode: &ShellMode) {
         }
         ShellMode::ModelList => &[
             ("\u{2191}\u{2193}", "Navigate"),
-            ("Enter/C",          "Chat"),
+            ("c",                "Private"),
+            ("C/Enter",          "Server chat"),
             ("T",                "Terminal"),
             ("l/u",              "Load/Unload"),
             ("Esc",              "Close"),
@@ -260,10 +261,12 @@ fn draw_model_modal(frame: &mut Frame, full_area: Rect, state: &ShellClientState
     let list_area = Rect { height: inner.height.saturating_sub(2), ..inner };
 
     let hint = Paragraph::new(Line::from(vec![
-        Span::styled("Enter", theme::help_key()),
-        Span::styled("/",     theme::help_text()),
+        Span::styled("c",     theme::help_key()),
+        Span::styled(" private  ",  theme::help_text()),
         Span::styled("C",     theme::help_key()),
-        Span::styled(" chat  ",     theme::help_text()),
+        Span::styled("/",     theme::help_text()),
+        Span::styled("Enter", theme::help_key()),
+        Span::styled(" server  ",   theme::help_text()),
         Span::styled("T",     theme::help_key()),
         Span::styled(" terminal  ", theme::help_text()),
         Span::styled("l",     theme::help_key()),

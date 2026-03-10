@@ -104,6 +104,22 @@ impl PolicyService {
         self
     }
 
+    /// Parse operation from string
+    fn parse_operation(op_str: &str) -> Result<Operation> {
+        match op_str {
+            "infer" => Ok(Operation::Infer),
+            "train" => Ok(Operation::Train),
+            "query" => Ok(Operation::Query),
+            "write" => Ok(Operation::Write),
+            "serve" => Ok(Operation::Serve),
+            "manage" => Ok(Operation::Manage),
+            "context" => Ok(Operation::Context),
+            "spawn" => Ok(Operation::Spawn),
+            "create" => Ok(Operation::Create),
+            _ => Err(anyhow!("Unknown operation: {}", op_str)),
+        }
+    }
+
     /// Stage policies/ and commit with the given message via git2db.
     /// Returns the commit OID as a hex string.
     async fn stage_and_commit_policies(&self, message: &str) -> Result<String> {

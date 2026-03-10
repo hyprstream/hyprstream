@@ -36,6 +36,7 @@ pub struct PaneSummary {
     pub id: u32,
     pub cols: u16,
     pub rows: u16,
+    pub is_private: bool,
 }
 
 // ============================================================================
@@ -236,7 +237,7 @@ impl ShellClientState {
                         panes: win_info
                             .panes
                             .iter()
-                            .map(|p| PaneSummary { id: p.id, cols: p.cols, rows: p.rows })
+                            .map(|p| PaneSummary { id: p.id, cols: p.cols, rows: p.rows, is_private: false })
                             .collect(),
                     });
                     self.active_win = self.windows.len() - 1;
@@ -346,7 +347,7 @@ impl ShellClientState {
                         panes: win_info
                             .panes
                             .iter()
-                            .map(|p| PaneSummary { id: p.id, cols: p.cols, rows: p.rows })
+                            .map(|p| PaneSummary { id: p.id, cols: p.cols, rows: p.rows, is_private: false })
                             .collect(),
                     });
                     self.active_win = self.windows.len() - 1;
@@ -372,7 +373,7 @@ impl ShellClientState {
                         panes: win_info
                             .panes
                             .iter()
-                            .map(|p| PaneSummary { id: p.id, cols: p.cols, rows: p.rows })
+                            .map(|p| PaneSummary { id: p.id, cols: p.cols, rows: p.rows, is_private: false })
                             .collect(),
                     });
                     self.active_win = self.windows.len() - 1;
@@ -410,7 +411,7 @@ impl ShellClientState {
                         panes: win_info
                             .panes
                             .iter()
-                            .map(|p| PaneSummary { id: p.id, cols: p.cols, rows: p.rows })
+                            .map(|p| PaneSummary { id: p.id, cols: p.cols, rows: p.rows, is_private: false })
                             .collect(),
                     });
                     self.active_win = self.windows.len() - 1;
@@ -481,7 +482,7 @@ impl ShellClientState {
                         id: win_info.id, name: win_info.name,
                         active_pane_id: win_info.active_pane_id,
                         panes: win_info.panes.iter()
-                            .map(|p| PaneSummary { id: p.id, cols: p.cols, rows: p.rows })
+                            .map(|p| PaneSummary { id: p.id, cols: p.cols, rows: p.rows, is_private: false })
                             .collect(),
                     });
                     self.active_win = self.windows.len() - 1;

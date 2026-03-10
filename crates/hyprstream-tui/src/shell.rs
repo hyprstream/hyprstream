@@ -48,6 +48,7 @@ pub fn spawn_shell(cwd: Option<PathBuf>, cols: u16, rows: u16) -> io::Result<She
 
     let mut cmd = Command::new(&shell);
     cmd.stdin(slave_in).stdout(slave_out).stderr(slave_err);
+    cmd.env("TERM", "xterm-256color");
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }

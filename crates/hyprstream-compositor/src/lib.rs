@@ -28,10 +28,13 @@ pub mod theme;
 
 pub use background::{BackgroundState, BackgroundStyle, ALL_STYLES, PREVIEW_H, PREVIEW_W};
 pub use chrome::{
-    ChromeOutput, ModelEntry, PaneSummary, RpcRequest, ShellChrome, ShellMode, WindowSummary,
-    MENU_ITEMS, keypress_to_bytes,
+    ChromeOutput, ModelEntry, PaneSummary, RpcRequest, ShellChrome, ShellMode, Toast, ToastLevel,
+    WindowSummary, MENU_ITEMS, keypress_to_bytes,
 };
-pub use layout::{LayoutTree, PaneId, PaneSource, PaneState};
+pub use layout::{
+    CellUpdate, CursorState, FrameContent, FrameUpdate, LayoutTree, PaneId, PaneSource,
+    PaneState, PaneStorage, ScrollUpdate,
+};
 
 // ============================================================================
 // CompositorInput / CompositorOutput
@@ -39,8 +42,10 @@ pub use layout::{LayoutTree, PaneId, PaneSource, PaneState};
 
 /// Events delivered to the compositor from the event loop.
 pub enum CompositorInput {
-    /// ANSI frame bytes from TuiService for a server-managed pane.
+    /// ANSI frame bytes from TuiService for a server-managed pane (ANSI / WASM path).
     ServerFrame { pane_id: u32, ansi: Vec<u8> },
+    /// Decoded TuiFrame from TuiService (Capnp display mode, native CLI path).
+    ServerFrameCapnp { frame: FrameUpdate },
     /// Rendered ANSI bytes from a client-owned ChatApp (Phase 4).
     AppFrame { app_id: u32, ansi: Vec<u8> },
     /// Updated window list from TuiService.
@@ -88,7 +93,7 @@ impl Compositor {
         windows: Vec<WindowSummary>,
         models: Vec<ModelEntry>,
     ) -> Self {
-        let pane_rows = rows.saturating_sub(3);
+        let pane_rows = rows.saturating_sub(4);
         Self {
             chrome: ShellChrome::new(cols, pane_rows, session_id, viewer_id, windows, models),
             layout: LayoutTree::new(cols, pane_rows),
@@ -114,6 +119,11 @@ impl Compositor {
             CompositorInput::ServerFrame { pane_id, ansi } => {
                 let pane = self.layout.get_or_create_server(pane_id);
                 pane.feed(&ansi);
+                vec![CompositorOutput::Redraw]
+            }
+
+            CompositorInput::ServerFrameCapnp { frame } => {
+                self.layout.apply_server_frame(&frame);
                 vec![CompositorOutput::Redraw]
             }
 
@@ -158,7 +168,7 @@ impl Compositor {
             CompositorInput::Resize(cols, rows) => {
                 self.cols = cols;
                 self.rows = rows;
-                let pane_rows = rows.saturating_sub(3);
+                let pane_rows = rows.saturating_sub(4);
                 self.chrome.cols      = cols;
                 self.chrome.pane_rows = pane_rows;
                 self.layout.resize(cols, pane_rows);

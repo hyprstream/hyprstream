@@ -23,8 +23,9 @@ use zeroize::Zeroizing;
 
 use hyprstream_compositor::{
     Compositor, CompositorInput, CompositorOutput, ModelEntry, PaneSummary, RpcRequest,
-    WindowSummary,
+    ToastLevel, WindowSummary,
 };
+use hyprstream_compositor::layout::{CellUpdate, CursorState, FrameContent, FrameUpdate, ScrollUpdate};
 use hyprstream_tui::chat_app::{ChatApp, LoadHook, SaveHook};
 use hyprstream_tui::private_store::{FsBackend, StorageKey};
 use waxterm::app::TerminalApp;
@@ -51,11 +52,12 @@ pub async fn handle_shell_tui(
 
     let client = create_tui_client(signing_key);
     let (cols, rows) = terminal_size();
-    let pane_rows = rows.saturating_sub(3);
+    let pane_rows = rows.saturating_sub(4);
 
-    // Connect to session 0
+    // Connect to session 0 using Capnp display mode so the frame stream
+    // carries structured TuiFrame messages with pane_id for correct routing.
     let result = client
-        .connect(0, "ansi", cols, pane_rows)
+        .connect(0, "capnp", cols, pane_rows)
         .await
         .context("Failed to connect to TUI session. Is the TUI service running?")?;
 
@@ -77,7 +79,7 @@ pub async fn handle_shell_tui(
             id: w.id,
             name: w.name.clone(),
             active_pane_id: w.active_pane_id,
-            panes: w.panes.iter().map(|p| PaneSummary { id: p.id, cols: p.cols, rows: p.rows }).collect(),
+            panes: w.panes.iter().map(|p| PaneSummary { id: p.id, cols: p.cols, rows: p.rows, is_private: p.is_private }).collect(),
         })
         .collect();
 
@@ -91,6 +93,12 @@ pub async fn handle_shell_tui(
     };
     let (model_status_tx, mut model_status_rx) =
         tokio::sync::mpsc::channel::<(String, bool)>(32);
+
+    // Terminal resize channel — SIGWINCH handler → main event loop.
+    let (resize_tx, mut resize_rx) = tokio::sync::mpsc::channel::<(u16, u16)>(4);
+
+    // rows tracks the current terminal height and is updated on SIGWINCH.
+    let mut rows = rows;
 
     // Build compositor.
     let mut compositor = Compositor::new(cols, rows, session_id, viewer_id, windows, models);
@@ -163,6 +171,21 @@ pub async fn handle_shell_tui(
     let _ = terminal.clear();
 
     let input_parser = InputParser::new(vec![]);
+
+    // Redirect tracing to a log file so raw-mode rendering is not corrupted.
+    let log_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("hyprstream");
+    std::fs::create_dir_all(&log_dir).ok();
+    let file_appender = tracing_appender::rolling::never(&log_dir, "hyprstream-tui.log");
+    let (non_blocking, _log_guard) = tracing_appender::non_blocking(file_appender);
+    #[allow(unused_imports)]
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    let _subscriber_guard = tracing_subscriber::fmt()
+        .with_writer(non_blocking)
+        .with_ansi(false)
+        .set_default();
+
     let orig = enter_raw_mode()?;
 
     // Enable SGR mouse tracking.
@@ -184,8 +207,9 @@ pub async fn handle_shell_tui(
     let mut bg_tick = tokio::time::interval(std::time::Duration::from_millis(50));
     bg_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // SIGWINCH — forward terminal resize to TuiService.
+    // SIGWINCH — forward terminal resize to TuiService and compositor.
     let sigwinch_key = signing_key.clone();
+    let resize_tx_sigwinch = resize_tx.clone();
     let _sigwinch_handle = tokio::spawn(async move {
         use tokio::signal::unix::{signal, SignalKind};
         let mut sigwinch = match signal(SignalKind::window_change()) {
@@ -196,7 +220,11 @@ pub async fn handle_shell_tui(
         loop {
             sigwinch.recv().await;
             let (c, r) = terminal_size();
-            let _ = resize_rpc(&resize_client, c, r).await;
+            // Send pane dimensions to server (full rows minus 4 chrome rows),
+            // matching the initial connect() call which sends pane_rows not rows.
+            let _ = resize_rpc(&resize_client, c, r.saturating_sub(4)).await;
+            // Compositor needs full terminal rows to recalculate layout.
+            let _ = resize_tx_sigwinch.try_send((c, r));
         }
     });
 
@@ -207,10 +235,21 @@ pub async fn handle_shell_tui(
 
     loop {
         tokio::select! {
-            Some(ansi_data) = frame_rx.recv() => {
-                // All frames go to the active pane (single-stream model for Phase 0).
-                let pane_id = compositor.active_pane_id();
-                let outputs = compositor.handle(CompositorInput::ServerFrame { pane_id, ansi: ansi_data });
+            Some(frame_bytes) = frame_rx.recv() => {
+                // Decode structured TuiFrame (Capnp mode) and route by embedded pane_id.
+                let outputs = match decode_tui_frame(&frame_bytes) {
+                    Ok(mut frame) => {
+                        if frame.pane_id == 0 {
+                            frame.pane_id = compositor.active_pane_id();
+                        }
+                        compositor.handle(CompositorInput::ServerFrameCapnp { frame })
+                    }
+                    Err(_) => {
+                        // Fallback: treat as raw ANSI (shouldn't happen in Capnp mode).
+                        let pane_id = compositor.active_pane_id();
+                        compositor.handle(CompositorInput::ServerFrame { pane_id, ansi: frame_bytes })
+                    }
+                };
                 if dispatch_outputs(
                     &mut compositor, &client, &model_client,
                     &model_status_tx, &mut terminal,
@@ -243,7 +282,8 @@ pub async fn handle_shell_tui(
                         }
                         continue;
                     }
-                    let pane_top = 1u16;
+                    let pane_top = 2u16; // status bar (0) + titlebar (1)
+                    let pane_rows = rows.saturating_sub(4);
                     if row < pane_top || row >= pane_top + pane_rows {
                         continue;
                     }
@@ -276,7 +316,9 @@ pub async fn handle_shell_tui(
             }
 
             _ = bg_tick.tick() => {
-                if compositor.chrome.tick_bg() {
+                let bg_dirty = compositor.chrome.tick_bg();
+                let toast_dirty = compositor.chrome.tick_toasts();
+                if bg_dirty || toast_dirty {
                     let _ = terminal.draw(|f| compositor.render(f));
                 }
                 // Tick active ChatApps and collect frames / quit IDs.
@@ -285,6 +327,10 @@ pub async fn handle_shell_tui(
                 let mut quit_app_ids: Vec<u32> = Vec::new();
                 for (&pane_id, app) in active_apps.iter_mut() {
                     let dirty = app.tick(50);
+                    // Surface inference errors as compositor toasts.
+                    for msg in app.pending_toasts.drain(..) {
+                        compositor.chrome.push_toast(msg, ToastLevel::Error);
+                    }
                     if app.should_quit() {
                         quit_app_ids.push(pane_id);
                         continue;
@@ -318,6 +364,26 @@ pub async fn handle_shell_tui(
 
             Some((model_ref, loaded)) = model_status_rx.recv() => {
                 compositor.chrome.update_model_status(&model_ref, loaded);
+                if !loaded {
+                    compositor.chrome.push_toast(
+                        format!("Model load timed out: {model_ref}"),
+                        ToastLevel::Error,
+                    );
+                }
+                let _ = terminal.draw(|f| compositor.render(f));
+            }
+
+            Some((new_cols, new_rows)) = resize_rx.recv() => {
+                rows = new_rows;
+                // Resize the ratatui backend to the new dimensions.
+                terminal.backend_mut().resize(new_cols, new_rows);
+                let _ = terminal.clear();
+                let outputs = compositor.handle(CompositorInput::Resize(new_cols, new_rows));
+                if dispatch_outputs(
+                    &mut compositor, &client, &model_client,
+                    &model_status_tx, &mut terminal,
+                    &mut active_apps, &storage_key, signing_key, outputs,
+                ).await { break; }
                 let _ = terminal.draw(|f| compositor.render(f));
             }
 
@@ -417,40 +483,82 @@ async fn handle_rpc(
         }
 
         RpcRequest::CreateWindow { .. } => {
-            // Create window + spawn shell in its default pane.
+            // Create window + spawn shell, then advance active_win to the new window.
             if let Ok(win_info) = client.create_window().await {
-                let pane_id = win_info.active_pane_id;
-                let _ = spawn_shell_rpc(client, session_id, pane_id, "").await;
-                let _ = focus_window_rpc(client, win_info.id).await;
-                // Refresh window list.
-                return refresh_windows(client).await;
+                let new_win_id = win_info.id;
+                let _ = spawn_shell_rpc(client, session_id, win_info.active_pane_id, "").await;
+                let _ = focus_window_rpc(client, new_win_id).await;
+                let wins = list_windows_rpc(client).await.unwrap_or_default();
+                if let Some(idx) = wins.iter().position(|w| w.id == new_win_id) {
+                    compositor.chrome.active_win = idx;
+                }
+                return vec![CompositorInput::WindowList(wins)];
             }
             vec![]
         }
 
         RpcRequest::CloseWindow { window_id, .. } => {
+            // Collect pane IDs before the RPC removes the window from TuiState.
+            let pane_ids: Vec<u32> = compositor.chrome.windows
+                .iter()
+                .find(|w| w.id == window_id)
+                .map(|w| w.panes.iter().map(|p| p.id).collect())
+                .unwrap_or_default();
+            // Clean up client-owned ChatApps for any private panes in this window.
+            for id in &pane_ids {
+                active_apps.remove(id);
+            }
             let _ = close_window_rpc(client, window_id).await;
+            // Remove each pane's VT buffer from the client-side LayoutTree.
+            for id in pane_ids {
+                compositor.handle(CompositorInput::PaneClosed { pane_id: id });
+            }
             refresh_windows(client).await
         }
 
         RpcRequest::FocusWindow { window_id, .. } => {
-            let _ = focus_window_rpc(client, window_id).await;
+            if focus_window_rpc(client, window_id).await.is_ok() {
+                if let Some(idx) = compositor.chrome.windows.iter().position(|w| w.id == window_id) {
+                    compositor.chrome.active_win = idx;
+                }
+            }
             vec![]
         }
 
         RpcRequest::SpawnShell { pane_id, cwd, .. } => {
-            // Called after CreateWindow returns a new pane_id.
-            let _ = spawn_shell_rpc(client, session_id, pane_id, &cwd).await;
-            refresh_windows(client).await
+            if pane_id == 0 {
+                // pane_id == 0 means "new window" — create one and spawn the shell
+                // in its pane with the requested CWD (same pattern as SpawnServerChat).
+                if let Ok(win_info) = client.create_window().await {
+                    let new_win_id = win_info.id;
+                    let _ = focus_window_rpc(client, new_win_id).await;
+                    let _ = spawn_shell_rpc(client, session_id, win_info.active_pane_id, &cwd).await;
+                    let wins = list_windows_rpc(client).await.unwrap_or_default();
+                    if let Some(idx) = wins.iter().position(|w| w.id == new_win_id) {
+                        compositor.chrome.active_win = idx;
+                    }
+                    return vec![CompositorInput::WindowList(wins)];
+                }
+                vec![]
+            } else {
+                // pane_id given — spawn shell in the existing pane.
+                let _ = spawn_shell_rpc(client, session_id, pane_id, &cwd).await;
+                refresh_windows(client).await
+            }
         }
 
         RpcRequest::SpawnServerChat { model_ref, cols, rows, .. } => {
-            // Create a window, spawn chat app in its pane.
+            // Create a window, spawn chat app in its pane, then advance active_win.
             if let Ok(win_info) = client.create_window().await {
-                let pane_id = win_info.active_pane_id;
-                let _ = focus_window_rpc(client, win_info.id).await;
-                let _ = spawn_chat_app_rpc(client, session_id, &model_ref, cols, rows, pane_id).await;
-                return refresh_windows(client).await;
+                let new_win_id = win_info.id;
+                let _ = focus_window_rpc(client, new_win_id).await;
+                let _ = spawn_chat_app_rpc(client, session_id, &model_ref, cols, rows,
+                                           win_info.active_pane_id).await;
+                let wins = list_windows_rpc(client).await.unwrap_or_default();
+                if let Some(idx) = wins.iter().position(|w| w.id == new_win_id) {
+                    compositor.chrome.active_win = idx;
+                }
+                return vec![CompositorInput::WindowList(wins)];
             }
             vec![]
         }
@@ -530,21 +638,32 @@ async fn handle_rpc(
                             )
                         }
                         Err(e) => {
-                            tracing::warn!("Private store dir unavailable: {e}");
+                            compositor.chrome.push_toast(
+                                format!("Private store dir unavailable: {e}"),
+                                ToastLevel::Warn,
+                            );
                             ChatApp::new(name.clone(), cols, rows, make_chat_spawner(signing_key, &name))
                         }
                     };
                     active_apps.insert(pane_id, app);
                     compositor.chrome.private_panes.insert(pane_id);
-                    // Render initial frame immediately.
+                    // Register in layout so AppFrame / draw_content can reach it.
+                    compositor.layout.get_or_create_private(pane_id);
+                    // Refresh windows FIRST so chrome.windows includes the new private pane
+                    // before the first render — lock indicator is correct from frame 1.
+                    if let Ok(wins) = list_windows_rpc(client).await {
+                        compositor.handle(CompositorInput::WindowList(wins));
+                    }
+                    // Now render first frame — chrome.windows is up to date.
                     if let Some(a) = active_apps.get(&pane_id) {
                         let ansi = render_chat_app_to_ansi(a);
-                        return vec![CompositorInput::AppFrame { app_id: pane_id, ansi }];
+                        compositor.handle(CompositorInput::AppFrame { app_id: pane_id, ansi });
                     }
-                    refresh_windows(client).await
+                    // Return empty — dispatch_outputs picks up Redraw from AppFrame output.
+                    vec![]
                 }
                 Err(e) => {
-                    tracing::warn!("createPrivatePane RPC failed: {e}");
+                    compositor.chrome.push_toast(format!("Private chat: {e}"), ToastLevel::Error);
                     vec![]
                 }
             }
@@ -651,7 +770,7 @@ async fn fetch_models(
                     let branch = if wt.branch_name.is_empty() { "main".to_owned() } else { wt.branch_name };
                     let model_ref = format!("{}:{}", name, branch);
                     let path = rmd.join(&name).join("worktrees").join(&branch);
-                    ModelEntry { model_ref, path, loaded: false }
+                    ModelEntry { model_ref, path, loaded: false, loading: false }
                 })
                 .collect::<Vec<_>>()
             })
@@ -685,7 +804,7 @@ async fn list_windows_rpc(client: &TuiClient) -> anyhow::Result<Vec<WindowSummar
                 id: w.id,
                 name: w.name.clone(),
                 active_pane_id: w.active_pane_id,
-                panes: w.panes.iter().map(|p| PaneSummary { id: p.id, cols: p.cols, rows: p.rows }).collect(),
+                panes: w.panes.iter().map(|p| PaneSummary { id: p.id, cols: p.cols, rows: p.rows, is_private: p.is_private }).collect(),
             })
             .collect()),
         _ => anyhow::bail!("unexpected response"),
@@ -935,4 +1054,101 @@ fn render_chat_app_to_ansi(app: &ChatApp) -> Vec<u8> {
     };
     let _ = term.draw(|f| app.render(f));
     term.backend().writer().clone()
+}
+
+// ============================================================================
+// TuiFrame decoder — Capnp → FrameUpdate
+// ============================================================================
+
+/// Decode a serialized Cap'n Proto TuiFrame into a compositor `FrameUpdate`.
+///
+/// Called from the frame_rx arm in the event loop when connected in Capnp mode.
+/// The resulting `FrameUpdate` is passed to `CompositorInput::ServerFrameCapnp`.
+fn decode_tui_frame(data: &[u8]) -> anyhow::Result<FrameUpdate> {
+    use capnp::serialize;
+    use crate::tui_capnp;
+
+    let reader = serialize::read_message_from_flat_slice(
+        &mut &data[..],
+        capnp::message::ReaderOptions::default(),
+    )?;
+    let frame = reader.get_root::<tui_capnp::tui_frame::Reader<'_>>()?;
+
+    let pane_id    = frame.get_pane_id();
+    let generation = frame.get_generation();
+
+    let cursor = {
+        let c = frame.get_cursor()?;
+        CursorState { x: c.get_x(), y: c.get_y(), visible: c.get_visible() }
+    };
+
+    let content = match frame.which()? {
+        tui_capnp::tui_frame::Which::Full(full_r) => {
+            let full = full_r?;
+            let cols = full.get_cols();
+            let rows = full.get_rows();
+            let cells = full.get_cells()?.iter().map(|c| CellUpdate {
+                x: c.get_x(),
+                y: c.get_y(),
+                symbol: c.get_symbol().ok().and_then(|r| r.to_str().ok()).unwrap_or("").to_owned(),
+                fg:        unpack_color(c.get_fg()),
+                bg:        unpack_color(c.get_bg()),
+                modifiers: ratatui::style::Modifier::from_bits_truncate(c.get_modifiers()),
+            }).collect();
+            FrameContent::Full { cols, rows, cells }
+        }
+        tui_capnp::tui_frame::Which::Incremental(incr_r) => {
+            let incr = incr_r?;
+            let scrolls = incr.get_scrolls()?.iter().map(|s| ScrollUpdate {
+                top:    s.get_top(),
+                bottom: s.get_bottom(),
+                amount: s.get_amount(),
+            }).collect();
+            let deltas = incr.get_deltas()?.iter().map(|c| CellUpdate {
+                x: c.get_x(),
+                y: c.get_y(),
+                symbol: c.get_symbol().ok().and_then(|r| r.to_str().ok()).unwrap_or("").to_owned(),
+                fg:        unpack_color(c.get_fg()),
+                bg:        unpack_color(c.get_bg()),
+                modifiers: ratatui::style::Modifier::from_bits_truncate(c.get_modifiers()),
+            }).collect();
+            FrameContent::Incremental { scrolls, deltas }
+        }
+    };
+
+    Ok(FrameUpdate { pane_id, generation, cursor, content })
+}
+
+/// Unpack a u32 color (as encoded by `diff::pack_color`) into a ratatui Color.
+fn unpack_color(packed: u32) -> ratatui::style::Color {
+    use ratatui::style::Color;
+    if packed & 0x0200_0000 != 0 {
+        Color::Indexed((packed & 0xFF) as u8)
+    } else if packed & 0x0100_0000 != 0 {
+        Color::Rgb(
+            ((packed >> 16) & 0xFF) as u8,
+            ((packed >>  8) & 0xFF) as u8,
+            ( packed        & 0xFF) as u8,
+        )
+    } else {
+        match packed {
+            1  => Color::Black,
+            2  => Color::Red,
+            3  => Color::Green,
+            4  => Color::Yellow,
+            5  => Color::Blue,
+            6  => Color::Magenta,
+            7  => Color::Cyan,
+            8  => Color::Gray,
+            9  => Color::DarkGray,
+            10 => Color::LightRed,
+            11 => Color::LightGreen,
+            12 => Color::LightYellow,
+            13 => Color::LightBlue,
+            14 => Color::LightMagenta,
+            15 => Color::LightCyan,
+            16 => Color::White,
+            _  => Color::Reset,
+        }
+    }
 }

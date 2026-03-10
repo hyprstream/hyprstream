@@ -265,7 +265,9 @@ use write_ansi;
 /// Encode a frame diff as a Cap'n Proto TuiFrame message.
 ///
 /// Returns serialized bytes ready for streaming via `StreamPublisher`.
-pub fn encode_capnp(diff: &FrameDiff) -> Vec<u8> {
+/// `pane_id` is embedded in the TuiFrame so the client can route frames
+/// to the correct pane buffer without relying on server-side active pane state.
+pub fn encode_capnp(diff: &FrameDiff, pane_id: u32) -> Vec<u8> {
     use capnp::message::Builder;
     use capnp::serialize;
 
@@ -279,6 +281,7 @@ pub fn encode_capnp(diff: &FrameDiff) -> Vec<u8> {
                 .unwrap_or_default()
                 .as_millis() as u64,
         );
+        frame.set_pane_id(pane_id);
 
         // Cursor
         let mut cursor = frame.reborrow().init_cursor();

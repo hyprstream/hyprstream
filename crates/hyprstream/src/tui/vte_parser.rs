@@ -104,6 +104,7 @@ impl<'a> PanePerformer<'a> {
         let cols = self.cols();
         let top = self.scroll_top;
         let bottom = self.scroll_bottom;
+        let blank = self.blank_cell();
 
         if n == 0 || top >= bottom {
             return;
@@ -132,7 +133,7 @@ impl<'a> PanePerformer<'a> {
                 }
             } else {
                 for x in 0..cols {
-                    buf.buffer[(x, y)] = Cell::default();
+                    buf.buffer[(x, y)] = blank.clone();
                 }
             }
             buf.mark_dirty(y);
@@ -150,6 +151,7 @@ impl<'a> PanePerformer<'a> {
         let cols = self.cols();
         let top = self.scroll_top;
         let bottom = self.scroll_bottom;
+        let blank = self.blank_cell();
 
         if n == 0 || top >= bottom {
             return;
@@ -168,7 +170,7 @@ impl<'a> PanePerformer<'a> {
             } else {
                 // Clear new lines at top
                 for x in 0..cols {
-                    buf.buffer[(x, y)] = Cell::default();
+                    buf.buffer[(x, y)] = blank.clone();
                 }
             }
             buf.mark_dirty(y);
@@ -181,8 +183,21 @@ impl<'a> PanePerformer<'a> {
         });
     }
 
-    /// Erase cells in a region.
+    /// Return a blank Cell using the current SGR background colour.
+    ///
+    /// Per the VT specification, erase operations (ED, EL, ECH, ICH clear,
+    /// DCH clear, and scroll-cleared rows) fill cells with a space character
+    /// styled with the current background colour rather than the terminal
+    /// default.  Foreground and modifiers are reset to default.
+    fn blank_cell(&self) -> Cell {
+        let mut cell = Cell::default();
+        cell.set_style(Style::default().fg(Color::Reset).bg(self.sgr.bg));
+        cell
+    }
+
+    /// Erase cells in a region, filling them with the current background color.
     fn erase_region(&mut self, x1: u16, y1: u16, x2: u16, y2: u16) {
+        let blank = self.blank_cell();
         let buf = self.pane.active_buffer_mut();
         let width = buf.buffer.area().width;
         let height = buf.buffer.area().height;
@@ -190,7 +205,7 @@ impl<'a> PanePerformer<'a> {
             let start_x = if y == y1 { x1 } else { 0 };
             let end_x = if y == y2 { x2 } else { width.saturating_sub(1) };
             for x in start_x..=end_x.min(width.saturating_sub(1)) {
-                buf.buffer[(x, y)] = Cell::default();
+                buf.buffer[(x, y)] = blank.clone();
             }
             buf.mark_dirty(y);
         }
@@ -513,6 +528,7 @@ impl<'a> vte::Perform for PanePerformer<'a> {
                 let cols = self.cols();
                 let cx = self.pane.cursor.x;
                 let cy = self.pane.cursor.y;
+                let blank = self.blank_cell();
                 let buf = self.pane.active_buffer_mut();
                 // Shift cells right
                 for x in (cx..cols).rev() {
@@ -521,9 +537,9 @@ impl<'a> vte::Perform for PanePerformer<'a> {
                         buf.buffer[(x + n, cy)] = cell;
                     }
                 }
-                // Clear inserted cells
+                // Clear inserted cells with current background
                 for x in cx..cx.saturating_add(n).min(cols) {
-                    buf.buffer[(x, cy)] = Cell::default();
+                    buf.buffer[(x, cy)] = blank.clone();
                 }
                 buf.mark_dirty(cy);
             }
@@ -534,6 +550,7 @@ impl<'a> vte::Perform for PanePerformer<'a> {
                 let cols = self.cols();
                 let cx = self.pane.cursor.x;
                 let cy = self.pane.cursor.y;
+                let blank = self.blank_cell();
                 let buf = self.pane.active_buffer_mut();
                 // Shift cells left
                 for x in cx..cols {
@@ -541,7 +558,7 @@ impl<'a> vte::Perform for PanePerformer<'a> {
                         let cell = buf.buffer[(x + n, cy)].clone();
                         buf.buffer[(x, cy)] = cell;
                     } else {
-                        buf.buffer[(x, cy)] = Cell::default();
+                        buf.buffer[(x, cy)] = blank.clone();
                     }
                 }
                 buf.mark_dirty(cy);
@@ -956,5 +973,58 @@ mod tests {
         }
         assert_eq!(pane.primary.buffer[(0, 0)].fg, Color::Red);
         assert_eq!(pane.primary.buffer[(1, 0)].fg, Color::Reset);
+    }
+
+    #[test]
+    fn test_erase_preserves_background_color() {
+        // VT spec: EL (erase line) and ED (erase display) fill cells with
+        // the current SGR background color, not the terminal default.
+        let mut pane = make_pane();
+        {
+            let mut perf = PanePerformer::new(&mut pane);
+            // Set dark-blue background (like btop header bars), write some text,
+            // then erase to end of line — erased cells should keep the dark-blue bg.
+            perf.feed(b"\x1b[48;2;20;20;40m"); // dark-blue bg
+            perf.feed(b"ABC");
+            perf.feed(b"\x1b[1;4H");            // cursor to col 4
+            perf.feed(b"\x1b[K");               // EL: erase to EOL
+        }
+        // Cols 3..cols should have dark-blue bg (not Reset)
+        for x in 3..10u16 {
+            let cell = &pane.primary.buffer[(x, 0)];
+            assert_eq!(
+                cell.bg,
+                Color::Rgb(20, 20, 40),
+                "col {x} erase should preserve bg color, got {:?}",
+                cell.bg
+            );
+        }
+        // Written cells should also have the dark-blue bg
+        assert_eq!(pane.primary.buffer[(0, 0)].bg, Color::Rgb(20, 20, 40));
+    }
+
+    #[test]
+    fn test_scroll_up_preserves_background_color() {
+        // When lines scroll up, newly cleared rows at the bottom should
+        // use the current background color.  The pane is 20×10 so we need
+        // 11+ LF characters to actually scroll past the bottom margin.
+        let mut pane = make_pane();
+        {
+            let mut perf = PanePerformer::new(&mut pane);
+            perf.feed(b"\x1b[48;2;10;10;20m"); // set bg
+            // Move to last row then issue one more LF to trigger scroll
+            perf.feed(b"\x1b[10;1H");           // cursor to row 10 (bottom)
+            perf.feed(b"\n");                    // one LF → scroll up 1
+        }
+        // Bottom row (row 9, 0-indexed) should have been cleared with the
+        // current background color, not Color::Reset.
+        let last_row = (pane.primary.buffer.area().height - 1) as u16;
+        let cell = &pane.primary.buffer[(0, last_row)];
+        assert_eq!(
+            cell.bg,
+            Color::Rgb(10, 10, 20),
+            "scroll-cleared row should preserve bg, got {:?}",
+            cell.bg
+        );
     }
 }

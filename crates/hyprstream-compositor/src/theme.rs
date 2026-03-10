@@ -8,6 +8,9 @@ pub const CYAN: Color = Color::Rgb(0, 232, 252);
 pub const DIM: Color = Color::Rgb(112, 128, 160);
 pub const BG: Color = Color::Rgb(10, 10, 20);
 pub const BG_PANEL: Color = Color::Rgb(20, 20, 40);
+/// Per-window titlebar background — distinct hue from BG_PANEL to visually
+/// separate the window title row from the global status and F-key bars.
+pub const BG_TITLEBAR: Color = Color::Rgb(10, 22, 48);
 
 // ── Reusable styles ──
 
@@ -36,6 +39,14 @@ pub fn progress_filled() -> Style {
 
 pub fn border_style() -> Style {
     Style::default().fg(DIM)
+}
+
+pub fn titlebar_style() -> Style {
+    Style::default().fg(CYAN).bg(BG_TITLEBAR).add_modifier(Modifier::BOLD)
+}
+
+pub fn titlebar_dim_style() -> Style {
+    Style::default().fg(DIM).bg(BG_TITLEBAR)
 }
 
 pub fn help_key() -> Style {

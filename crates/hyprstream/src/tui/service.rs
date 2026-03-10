@@ -257,8 +257,11 @@ impl TuiService {
             Some(s) => s,
             None => return Ok((self.build_error_response(request_id, "session not found", "NOT_FOUND")?, None)),
         };
+        use crate::tui::state::PaneBackend;
         let windows: Vec<_> = session.windows.iter().map(|w| {
-            (w.id, w.name.clone(), w.panes.iter().map(|p| (p.id, p.size())).collect::<Vec<_>>(), w.active_pane_id)
+            (w.id, w.name.clone(),
+             w.panes.iter().map(|p| (p.id, p.size(), p.backend == PaneBackend::Private)).collect::<Vec<_>>(),
+             w.active_pane_id)
         }).collect();
 
         drop(state);
@@ -342,6 +345,7 @@ impl TuiService {
     }
 
     async fn handle_create_window(&self, request_id: u64) -> Result<Vec<u8>> {
+        use crate::tui::state::PaneBackend;
         let mut state = self.state.write().await;
         let session = state.sessions.last().map(|s| s.id);
         if let Some(sid) = session {
@@ -350,7 +354,9 @@ impl TuiService {
                     Some(w) => w,
                     None => return self.build_error_response(request_id, "window not found", "NOT_FOUND"),
                 };
-                let panes: Vec<_> = window.panes.iter().map(|p| (p.id, p.size(), p.title.clone())).collect();
+                let panes: Vec<_> = window.panes.iter()
+                    .map(|p| (p.id, p.size(), p.title.clone(), p.backend == PaneBackend::Private))
+                    .collect();
                 return self.build_window_response(request_id, window.id, &window.name, &panes);
             }
         }
@@ -397,9 +403,10 @@ impl TuiService {
         };
 
         if let Some(session) = state.session(sid) {
+            use crate::tui::state::PaneBackend;
             let windows: Vec<_> = session.windows.iter().map(|w| {
                 let panes: Vec<_> = w.panes.iter().map(|p| {
-                    (p.id, p.size(), p.title.clone())
+                    (p.id, p.size(), p.title.clone(), p.backend == PaneBackend::Private)
                 }).collect();
                 (w.id, w.name.clone(), panes, w.active_pane_id)
             }).collect();
@@ -416,12 +423,13 @@ impl TuiService {
                     w.set_name(name);
                     w.set_active_pane_id(*active_pane);
                     let mut pane_list = w.init_panes(panes.len() as u32);
-                    for (j, (pid, (cols, rows), title)) in panes.iter().enumerate() {
+                    for (j, (pid, (cols, rows), title, is_private)) in panes.iter().enumerate() {
                         let mut p = pane_list.reborrow().get(j as u32);
                         p.set_id(*pid);
                         p.set_cols(*cols);
                         p.set_rows(*rows);
                         p.set_title(title);
+                        p.set_is_private(*is_private);
                     }
                 }
             }
@@ -630,6 +638,19 @@ impl TuiService {
             }
         };
 
+        // Rename the window to "Shell" so the titlebar shows something meaningful.
+        {
+            let mut state = self.state.write().await;
+            if let Some(sess) = state.session_mut(sid) {
+                for win in &mut sess.windows {
+                    if win.panes.iter().any(|p| p.id == pane_id) {
+                        win.name = "Shell".to_owned();
+                        break;
+                    }
+                }
+            }
+        }
+
         // Send SpawnProcess command to the session's frame loop
         let sessions_reg = Arc::clone(&self.sessions);
         let continuation: Continuation = Box::pin(async move {
@@ -706,10 +727,19 @@ impl TuiService {
             let active_pane_id = if pane_id != 0 {
                 pane_id
             } else {
+                use crate::tui::state::PaneBackend;
                 state.session(sid)
                     .and_then(|s| s.active_window())
-                    .and_then(|w| w.active_pane())
-                    .map(|p| p.id)
+                    .and_then(|w| {
+                        // Prefer the active pane if it's not private; otherwise
+                        // fall back to the first non-private pane in the window.
+                        let ap = w.active_pane();
+                        if ap.map(|p| p.backend != PaneBackend::Private).unwrap_or(false) {
+                            ap.map(|p| p.id)
+                        } else {
+                            w.panes.iter().find(|p| p.backend != PaneBackend::Private).map(|p| p.id)
+                        }
+                    })
                     .unwrap_or(1)
             };
             (sid, active_pane_id)
@@ -821,6 +851,19 @@ impl TuiService {
         let config = waxterm::app::TerminalConfig::new().cols(cols).rows(rows);
         let process = super::process::spawn_app_process(app, config);
 
+        // Rename the window to "Shell" for a meaningful titlebar.
+        {
+            let mut state = self.state.write().await;
+            if let Some(sess) = state.session_mut(sid) {
+                for win in &mut sess.windows {
+                    if win.panes.iter().any(|p| p.id == active_pane_id) {
+                        win.name = "Shell".to_owned();
+                        break;
+                    }
+                }
+            }
+        }
+
         let sessions_reg = Arc::clone(&self.sessions);
         let continuation: Continuation = Box::pin(async move {
             let reg = sessions_reg.read().await;
@@ -865,15 +908,35 @@ impl TuiService {
             let active_pane_id = if pane_id != 0 {
                 pane_id
             } else {
+                use crate::tui::state::PaneBackend;
                 state
                     .session(sid)
                     .and_then(|s| s.active_window())
-                    .and_then(|w| w.active_pane())
-                    .map(|p| p.id)
+                    .and_then(|w| {
+                        let ap = w.active_pane();
+                        if ap.map(|p| p.backend != PaneBackend::Private).unwrap_or(false) {
+                            ap.map(|p| p.id)
+                        } else {
+                            w.panes.iter().find(|p| p.backend != PaneBackend::Private).map(|p| p.id)
+                        }
+                    })
                     .unwrap_or(1)
             };
             (sid, active_pane_id)
         };
+
+        // Rename the window to "Chat: model_ref" so the titlebar is meaningful.
+        {
+            let mut state = self.state.write().await;
+            if let Some(sess) = state.session_mut(sid) {
+                for win in &mut sess.windows {
+                    if win.panes.iter().any(|p| p.id == active_pane_id) {
+                        win.name = format!("Chat: {}", model_ref);
+                        break;
+                    }
+                }
+            }
+        }
 
         let model_ref = model_ref.to_owned();
         let sk = self.signing_key.clone();
@@ -1104,6 +1167,8 @@ impl TuiService {
                     pane.backend = PaneBackend::Private;
                     pane.title = name.to_owned();
                     window.panes.push(pane);
+                    // Do NOT change active_pane_id — the frame loop must keep
+                    // publishing the existing ShellApp pane (non-private).
                     next_id
                 } else {
                     return Err(anyhow::anyhow!("window {} not found in session {}", wid, sid));
@@ -1156,7 +1221,7 @@ impl TuiService {
         request_id: u64,
         viewer_id: u32,
         session_id: u32,
-        windows: &[(u32, String, Vec<(u32, (u16, u16))>, u32)],
+        windows: &[(u32, String, Vec<(u32, (u16, u16), bool)>, u32)],
         streams: &[(&str, &str, &[u8; 32])], // (topic, sub_endpoint, mac_key)
     ) -> Result<Vec<u8>> {
         let mut msg = Builder::new_default();
@@ -1183,12 +1248,13 @@ impl TuiService {
                 w.set_name(name);
                 w.set_active_pane_id(*active_pane);
                 let mut pane_list = w.init_panes(panes.len() as u32);
-                for (j, (pid, (cols, rows))) in panes.iter().enumerate() {
+                for (j, (pid, (cols, rows), is_private)) in panes.iter().enumerate() {
                     let mut p = pane_list.reborrow().get(j as u32);
                     p.set_id(*pid);
                     p.set_cols(*cols);
                     p.set_rows(*rows);
                     p.set_title("");
+                    p.set_is_private(*is_private);
                 }
             }
         }
@@ -1202,7 +1268,7 @@ impl TuiService {
         request_id: u64,
         window_id: u32,
         name: &str,
-        panes: &[(u32, (u16, u16), String)],
+        panes: &[(u32, (u16, u16), String, bool)],
     ) -> Result<Vec<u8>> {
         let mut msg = Builder::new_default();
         {
@@ -1211,14 +1277,15 @@ impl TuiService {
             let mut win = resp.init_create_window_result();
             win.set_id(window_id);
             win.set_name(name);
-            win.set_active_pane_id(panes.first().map(|(id, _, _)| *id).unwrap_or(0));
+            win.set_active_pane_id(panes.first().map(|(id, _, _, _)| *id).unwrap_or(0));
             let mut pane_list = win.init_panes(panes.len() as u32);
-            for (i, (pid, (cols, rows), title)) in panes.iter().enumerate() {
+            for (i, (pid, (cols, rows), title, is_private)) in panes.iter().enumerate() {
                 let mut p = pane_list.reborrow().get(i as u32);
                 p.set_id(*pid);
                 p.set_cols(*cols);
                 p.set_rows(*rows);
                 p.set_title(title);
+                p.set_is_private(*is_private);
             }
         }
         let mut buf = Vec::new();
@@ -1712,6 +1779,21 @@ pub(crate) async fn run_frame_loop(
                             v.cancel.cancel();
                             stdin_queues.lock().remove(&viewer_id);
                             debug!(viewer_id, session_id, "Viewer evicted by command");
+                            // When the last viewer disconnects, reap private panes.
+                            // Private panes are client-owned (ChatApp renders them locally);
+                            // retaining them server-side would show blank "window-N" tabs
+                            // to the next viewer who connects.
+                            if viewers.is_empty() {
+                                use crate::tui::state::PaneBackend;
+                                let mut st = state.write().await;
+                                if let Some(sess) = st.session_mut(session_id) {
+                                    for win in &mut sess.windows {
+                                        win.panes.retain(|p| p.backend != PaneBackend::Private);
+                                    }
+                                }
+                                has_damage = true;
+                                prev_cells.clear();
+                            }
                         }
                     }
                     FrameLoopCommand::SpawnProcess { pane_id, process } => {
@@ -1778,9 +1860,17 @@ pub(crate) async fn run_frame_loop(
                                     if let Some(session) = tui_state.session_mut(session_id) {
                                         // Search all windows for the pane
                                         for window in &mut session.windows {
-                                            if let Some(pane) = window.pane_mut(pane_id) {
-                                                let mut performer = vte_parser::PanePerformer::new(pane);
-                                                performer.feed(&data);
+                                            if let Some(idx) = window.panes.iter().position(|p| p.id == pane_id) {
+                                                let old_title = window.panes[idx].title.clone();
+                                                {
+                                                    let mut performer = vte_parser::PanePerformer::new(&mut window.panes[idx]);
+                                                    performer.feed(&data);
+                                                }
+                                                // Propagate OSC title changes (bash, vim, etc.) to window name.
+                                                let new_title = window.panes[idx].title.clone();
+                                                if !new_title.is_empty() && new_title != old_title {
+                                                    window.name = new_title;
+                                                }
                                                 got_output = true;
                                                 break;
                                             }
@@ -1908,7 +1998,7 @@ pub(crate) async fn run_frame_loop(
                         let needs_capnp = viewers.iter().any(|v| v.display_mode == DisplayMode::Capnp);
 
                         let ansi = if needs_ansi { Some(diff::encode_ansi(&frame_diff)) } else { None };
-                        let capnp = if needs_capnp { Some(diff::encode_capnp(&frame_diff)) } else { None };
+                        let capnp = if needs_capnp { Some(diff::encode_capnp(&frame_diff, pane_id)) } else { None };
 
                         // Snapshot cells for next incremental diff
                         let area = buf.buffer.area();

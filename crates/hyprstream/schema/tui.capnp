@@ -33,6 +33,9 @@ struct TuiFrame {
 
   # Cursor state after this frame
   cursor @4 :CursorInfo;
+
+  # Which pane this frame belongs to (0 = legacy fallback, use active pane)
+  paneId @5 :UInt32;
 }
 
 # Incremental frame: scroll operations + changed cells only
@@ -403,6 +406,9 @@ struct PaneInfo {
   cols @1 :UInt16;
   rows @2 :UInt16;
   title @3 :Text;
+  isPrivate @4 :Bool;
+  x @5 :UInt16;   # Left offset within window content area (0 = not split)
+  y @6 :UInt16;   # Top offset within window content area (0 = not split)
 }
 
 # Full display snapshot

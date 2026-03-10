@@ -54,44 +54,14 @@ pub fn draw(frame: &mut Frame, app: &ShellApp) {
 // ============================================================================
 
 fn draw_status_bar(frame: &mut Frame, area: Rect, app: &ShellApp) {
-    let clock = current_time_str();
-    let clock_width = clock.len() as u16 + 1; // +1 for trailing space
-
-    let left_w = area.width.saturating_sub(clock_width);
-    let left_area = Rect { width: left_w, ..area };
-    let right_area = Rect { x: area.x + left_w, width: clock_width, ..area };
-
-    let mut left_spans = vec![
-        Span::raw(" "),
-        Span::styled("HYPRSTREAM", theme::title_style()),
-    ];
+    let mut spans = vec![Span::raw("  ")];
     if let Some(status) = &app.load_status {
-        left_spans.push(Span::raw("  "));
-        left_spans.push(Span::styled(status.clone(), theme::help_text()));
+        spans.push(Span::styled(status.clone(), theme::help_text()));
     }
-
-    let bar = Paragraph::new(Line::from(left_spans))
-    .style(Style::default().bg(theme::BG_PANEL));
-    frame.render_widget(bar, left_area);
-
-    let clock_para = Paragraph::new(Line::from(vec![
-        Span::styled(clock, theme::help_text()),
-        Span::raw(" "),
-    ]))
-    .style(Style::default().bg(theme::BG_PANEL));
-    frame.render_widget(clock_para, right_area);
-}
-
-fn current_time_str() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let h = (secs / 3600) % 24;
-    let m = (secs / 60) % 60;
-    let s = secs % 60;
-    format!("{h:02}:{m:02}:{s:02}")
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::BG_PANEL)),
+        area,
+    );
 }
 
 // ============================================================================
@@ -207,7 +177,8 @@ fn draw_fkey_bar(frame: &mut Frame, area: Rect, mode: &ShellMode) {
         }
         ShellMode::ModelList => &[
             ("\u{2191}\u{2193}", "Navigate"),
-            ("Enter/C",          "Chat"),
+            ("c",                "Private"),
+            ("C/Enter",          "Server chat"),
             ("T",                "Terminal"),
             ("l/u",              "Load/Unload"),
             ("Esc",              "Close"),
@@ -253,8 +224,12 @@ fn draw_model_modal(frame: &mut Frame, full_area: Rect, app: &ShellApp) {
     let list_area = Rect { height: inner.height.saturating_sub(2), ..inner };
 
     let hint = Paragraph::new(Line::from(vec![
-        Span::styled("Enter", theme::help_key()),
+        Span::styled("c",     theme::help_key()),
+        Span::styled(" private  ",  theme::help_text()),
+        Span::styled("C",     theme::help_key()),
         Span::styled("/",     theme::help_text()),
+        Span::styled("Enter", theme::help_key()),
+        Span::styled(" server  ",   theme::help_text()),
         Span::styled("T",     theme::help_key()),
         Span::styled(" terminal  ", theme::help_text()),
         Span::styled("l",     theme::help_key()),
