@@ -9,11 +9,34 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Sandbox backend type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackendType {
+    /// Kata Containers (default — full VM isolation)
+    #[default]
+    Kata,
+    /// systemd-nspawn (lightweight container, rootless, host filesystem)
+    Nspawn,
+}
+
+impl std::fmt::Display for BackendType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Kata => write!(f, "kata"),
+            Self::Nspawn => write!(f, "nspawn"),
+        }
+    }
+}
+
 /// Top-level configuration for the workers crate
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 #[derive(Default)]
 pub struct WorkerConfig {
+    /// Sandbox backend to use for isolation
+    pub backend: BackendType,
+
     /// Pool configuration for VM management
     pub pool: PoolConfig,
 
@@ -272,5 +295,28 @@ mod tests {
         assert_eq!(HypervisorType::CloudHypervisor.to_string(), "cloud-hypervisor");
         #[cfg(feature = "dragonball")]
         assert_eq!(HypervisorType::Dragonball.to_string(), "dragonball");
+    }
+
+    #[test]
+    fn test_backend_type_default() {
+        assert_eq!(BackendType::default(), BackendType::Kata);
+    }
+
+    #[test]
+    fn test_backend_type_serialization() -> Result<(), Box<dyn std::error::Error>> {
+        let yaml = "backend: nspawn\n";
+        let config: WorkerConfig = serde_yaml::from_str(yaml)?;
+        assert_eq!(config.backend, BackendType::Nspawn);
+
+        let yaml = "backend: kata\n";
+        let config: WorkerConfig = serde_yaml::from_str(yaml)?;
+        assert_eq!(config.backend, BackendType::Kata);
+        Ok(())
+    }
+
+    #[test]
+    fn test_backend_type_display() {
+        assert_eq!(BackendType::Kata.to_string(), "kata");
+        assert_eq!(BackendType::Nspawn.to_string(), "nspawn");
     }
 }

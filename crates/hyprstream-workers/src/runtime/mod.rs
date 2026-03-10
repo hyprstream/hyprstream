@@ -20,8 +20,11 @@
 //!           └── Active sandboxes
 //! ```
 
+pub mod backend;
 mod client;
 mod container;
+pub mod kata_backend;
+pub mod nspawn;
 mod pool;
 mod sandbox;
 mod service;
@@ -54,12 +57,17 @@ pub use client::{
     LinuxContainerSecurityContext, Capability,
     AuthConfig as AuthConfigWire, StreamInfo,
     ImageInfo, ImageStatusResult,
+    LinuxContainerResources,
     // Hand-written types (from client.rs)
     ContainerFilter, ContainerMetadata, ContainerStatsFilter,
     KeyValue,
     PodSandboxFilter, PodSandboxMetadata, PodSandboxStatsFilter,
     RuntimeClient, StatusResponse,
 };
+// Backend trait and implementations
+pub use backend::{SandboxBackend, SandboxHandle};
+pub use kata_backend::{KataBackend, KataHandle};
+pub use nspawn::{NspawnBackend, NspawnConfig, NspawnHandle};
 // Domain entities (business logic only - not DTOs)
 pub use container::{Container, ContainerState};
 pub use pool::{PoolStats, SandboxPool};

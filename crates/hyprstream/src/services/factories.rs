@@ -254,12 +254,17 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
 fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating WorkerService");
 
-    use hyprstream_workers::config::{ImageConfig, PoolConfig};
+    use hyprstream_workers::config::{BackendType, ImageConfig, PoolConfig};
     use hyprstream_workers::image::RafsStore;
-    use hyprstream_workers::WorkerService;
+    use hyprstream_workers::{WorkerService, SandboxBackend, KataBackend, NspawnBackend, NspawnConfig};
 
     let config = load_config();
     let worker_quic_port = config.worker.as_ref().and_then(|w| w.quic_port);
+    let backend_type = config.worker.as_ref()
+        .map(|w| w.backend)
+        .unwrap_or_default();
+
+    info!("WorkerService using {} backend", backend_type);
 
     // Use default paths based on XDG directories
     let data_dir = dirs::data_local_dir()
@@ -293,10 +298,16 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 
     let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
 
+    // Construct the sandbox backend based on configuration
+    let backend: Arc<dyn SandboxBackend> = match backend_type {
+        BackendType::Kata => Arc::new(KataBackend::new(image_config, Arc::clone(&rafs_store))),
+        BackendType::Nspawn => Arc::new(NspawnBackend::new(NspawnConfig::default())),
+    };
+
     // Service includes infrastructure - directly Spawnable via blanket impl
     let mut worker_service = WorkerService::new(
         pool_config,
-        image_config,
+        backend,
         rafs_store,
         global_context(),
         ctx.transport("worker", SocketKind::Rep),

@@ -59,11 +59,11 @@ pub mod events;
 pub mod dbus;
 
 // Re-export main types
-pub use config::{HypervisorType, ImageConfig, PoolConfig, WorkerConfig, WorkflowConfig};
+pub use config::{BackendType, HypervisorType, ImageConfig, PoolConfig, WorkerConfig, WorkflowConfig};
 pub use error::WorkerError;
 
 // Re-export service types
-pub use runtime::{WorkerService, RuntimeClient};
+pub use runtime::{WorkerService, RuntimeClient, SandboxBackend, SandboxHandle, KataBackend, NspawnBackend, NspawnConfig};
 pub use image::{ImageClient, RafsStore};
 pub use workflow::{WorkflowService, WorkflowClient};
 pub use events::{

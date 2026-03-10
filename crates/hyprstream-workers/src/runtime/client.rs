@@ -43,6 +43,7 @@ pub use crate::generated::worker_client::{
     LinuxContainerSecurityContext, Capability,
     AuthConfig, StreamInfo,
     ImageInfo, ImageStatusResult,
+    LinuxContainerResources,
 };
 // Note: PodSandboxMetadata, ContainerMetadata, KeyValue, and Filter types
 // are hand-written below with extra functionality (serde, #[capnp(skip)], etc.)

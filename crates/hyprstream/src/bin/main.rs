@@ -1001,12 +1001,16 @@ fn handle_quick_command(
 
                     let _worker_handle = if !worker_already_running {
                         use hyprstream_workers::image::RafsStore;
+                        use hyprstream_workers::runtime::{SandboxBackend, KataBackend};
                         let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
+                        let backend: Arc<dyn SandboxBackend> = Arc::new(
+                            KataBackend::new(image_config, Arc::clone(&rafs_store)),
+                        );
                         let worker_transport =
                             TransportConfig::inproc("hyprstream/workers");
                         let mut worker_service = WorkerService::new(
                             pool_config,
-                            image_config,
+                            backend,
                             rafs_store,
                             global_context().clone(),
                             worker_transport,

@@ -1,23 +1,19 @@
-//! Pod Sandbox (Kata VM) types and lifecycle
+//! Pod Sandbox types and lifecycle
 //!
-//! A PodSandbox represents a Kata VM that can host multiple containers.
-//! Maps directly to Kubernetes CRI PodSandbox concept.
-//!
-//! The sandbox uses the Kata Containers `Hypervisor` trait for VM management,
-//! providing support for multiple hypervisors (Cloud Hypervisor, QEMU, Dragonball).
+//! A PodSandbox represents an isolated execution environment that can host
+//! multiple containers. The actual isolation mechanism is provided by a
+//! `SandboxBackend` (Kata VM, systemd-nspawn, etc.).
 
 use chrono::{DateTime, Utc};
-use kata_hypervisor::Hypervisor;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::worker_capnp;
 
+use super::backend::SandboxHandle;
 use super::client::KeyValue;
-// Use generated PodSandboxMetadata (matches what's in generated PodSandboxConfig/PodSandboxStatus)
 use crate::generated::worker_client::PodSandboxMetadata;
-use super::virtiofs::SandboxVirtiofs;
 
 /// Pod sandbox state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -48,17 +44,11 @@ impl From<worker_capnp::PodSandboxState> for PodSandboxState {
     }
 }
 
-// DTO types (PodSandboxConfig, DNSConfig, PortMapping, PodSandboxStatus, etc.)
-// are now imported from generated types via super::client
-
-/// Runtime representation of a pod sandbox (Kata VM)
+/// Runtime representation of a pod sandbox
 ///
-/// The sandbox owns a hypervisor handle from Kata's runtime-rs which manages
-/// the VM lifecycle. This provides support for multiple hypervisors:
-/// - Cloud Hypervisor
-/// - QEMU
-/// - Dragonball
-/// - Firecracker
+/// The sandbox stores an opaque `backend_handle` from the `SandboxBackend`
+/// that started it.  Callers can downcast to the concrete handle type
+/// (e.g. `KataHandle`, `NspawnHandle`) via `as_any()`.
 #[derive(Debug)]
 pub struct PodSandbox {
     /// Unique sandbox ID
@@ -73,32 +63,18 @@ pub struct PodSandbox {
     pub labels: Vec<KeyValue>,
     /// Annotations
     pub annotations: Vec<KeyValue>,
-    /// Runtime handler (e.g., "kata-clh", "kata-qemu")
+    /// Runtime handler (e.g., "kata", "nspawn")
     pub runtime_handler: String,
 
     // ─────────────────────────────────────────────────────────────────────────
-    // VM Management (via Kata runtime-rs Hypervisor trait)
+    // Backend-managed state
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Hypervisor handle for VM lifecycle management
-    /// Uses Kata's Hypervisor trait which abstracts Cloud Hypervisor, QEMU, etc.
-    pub(crate) hypervisor: Option<Arc<dyn Hypervisor>>,
+    /// Opaque handle from the `SandboxBackend` (holds hypervisor, PIDs, etc.)
+    pub(crate) backend_handle: Option<Arc<dyn SandboxHandle>>,
 
     /// Path to sandbox runtime directory
     pub(crate) sandbox_path: PathBuf,
-
-    /// Path to VM API socket (for hypervisor communication)
-    pub(crate) api_socket: Option<PathBuf>,
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Filesystem (Nydus RAFS via virtiofs)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// Path to virtiofs socket (for shared filesystem)
-    pub(crate) virtiofs_socket: Option<PathBuf>,
-
-    /// VirtioFS daemon serving RAFS to this VM
-    pub(crate) virtiofs_daemon: Option<Arc<SandboxVirtiofs>>,
 
     /// Image ID being served to this sandbox
     pub(crate) image_id: Option<String>,
@@ -114,21 +90,18 @@ impl Clone for PodSandbox {
             labels: self.labels.clone(),
             annotations: self.annotations.clone(),
             runtime_handler: self.runtime_handler.clone(),
-            hypervisor: self.hypervisor.clone(),
+            backend_handle: self.backend_handle.clone(),
             sandbox_path: self.sandbox_path.clone(),
-            api_socket: self.api_socket.clone(),
-            virtiofs_socket: self.virtiofs_socket.clone(),
-            virtiofs_daemon: self.virtiofs_daemon.clone(),
             image_id: self.image_id.clone(),
         }
     }
 }
 
 impl PodSandbox {
-    /// Create a new pod sandbox from configuration (uses generated PodSandboxConfig)
+    /// Create a new pod sandbox from configuration
     ///
-    /// The sandbox is created in the NotReady state. Call `set_hypervisor()`
-    /// and then start the VM to make it ready.
+    /// The sandbox is created in the NotReady state. The `SandboxBackend`
+    /// will populate `backend_handle` when it starts the sandbox.
     pub fn new(id: String, config: &super::client::PodSandboxConfig, sandbox_path: PathBuf) -> Self {
         Self {
             id,
@@ -138,11 +111,8 @@ impl PodSandbox {
             labels: config.labels.clone(),
             annotations: config.annotations.clone(),
             runtime_handler: "kata".to_owned(),
-            hypervisor: None,
+            backend_handle: None,
             sandbox_path,
-            api_socket: None,
-            virtiofs_socket: None,
-            virtiofs_daemon: None,
             image_id: None,
         }
     }
@@ -167,11 +137,8 @@ impl PodSandbox {
             labels,
             annotations,
             runtime_handler,
-            hypervisor: None,
+            backend_handle: None,
             sandbox_path: PathBuf::new(),
-            api_socket: None,
-            virtiofs_socket: None,
-            virtiofs_daemon: None,
             image_id: None,
         }
     }
@@ -181,25 +148,14 @@ impl PodSandbox {
         self.state == PodSandboxState::SandboxReady
     }
 
-    /// Get the hypervisor handle
-    pub fn hypervisor(&self) -> Option<&Arc<dyn Hypervisor>> {
-        self.hypervisor.as_ref()
+    /// Get the backend handle (for downcasting to concrete type)
+    pub fn backend_handle(&self) -> Option<&Arc<dyn SandboxHandle>> {
+        self.backend_handle.as_ref()
     }
 
-    /// Set the hypervisor handle
-    pub fn set_hypervisor(&mut self, hypervisor: Arc<dyn Hypervisor>) {
-        self.hypervisor = Some(hypervisor);
-    }
-
-    /// Get VM process IDs from the hypervisor
-    ///
-    /// Returns the PIDs of the hypervisor process(es) if the VM is running.
-    pub async fn get_pids(&self) -> Option<Vec<u32>> {
-        if let Some(ref hypervisor) = self.hypervisor {
-            hypervisor.get_pids().await.ok()
-        } else {
-            None
-        }
+    /// Set the backend handle
+    pub fn set_backend_handle(&mut self, handle: Arc<dyn SandboxHandle>) {
+        self.backend_handle = Some(handle);
     }
 
     /// Mark sandbox as ready
@@ -215,15 +171,5 @@ impl PodSandbox {
     /// Get the sandbox runtime directory path
     pub fn sandbox_path(&self) -> &PathBuf {
         &self.sandbox_path
-    }
-
-    /// Get the API socket path
-    pub fn api_socket(&self) -> Option<&PathBuf> {
-        self.api_socket.as_ref()
-    }
-
-    /// Set the API socket path
-    pub fn set_api_socket(&mut self, path: PathBuf) {
-        self.api_socket = Some(path);
     }
 }

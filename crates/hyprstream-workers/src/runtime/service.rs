@@ -17,7 +17,7 @@ use hyprstream_rpc::service::{AuthorizeFn, EnvelopeContext, ZmqService};
 use hyprstream_rpc::streaming::{StreamChannel, StreamPublisher};
 use hyprstream_rpc::transport::TransportConfig;
 
-use crate::config::{ImageConfig, PoolConfig};
+use crate::config::PoolConfig;
 use crate::error::{Result, WorkerError};
 use crate::events::{
     EventPublisher,
@@ -104,17 +104,13 @@ impl WorkerService {
     /// Must be called from within a tokio runtime context.
     pub fn new(
         pool_config: PoolConfig,
-        image_config: ImageConfig,
+        backend: Arc<dyn super::backend::SandboxBackend>,
         rafs_store: Arc<RafsStore>,
         context: Arc<zmq::Context>,
         transport: TransportConfig,
         signing_key: SigningKey,
     ) -> AnyhowResult<Self> {
-        let sandbox_pool = Arc::new(SandboxPool::new(
-            pool_config,
-            image_config,
-            Arc::clone(&rafs_store),
-        ));
+        let sandbox_pool = Arc::new(SandboxPool::new(pool_config, backend));
 
         // Create event publisher for worker lifecycle events
         let event_publisher = EventPublisher::new(&context, "worker")?;
@@ -323,8 +319,8 @@ impl WorkerService {
 
         let mut info = Vec::new();
         if verbose {
-            // Get PIDs from hypervisor (host-level VM management)
-            let pids = sandbox.get_pids().await;
+            // Get PIDs from backend (host-level sandbox management)
+            let pids = self.sandbox_pool.backend().get_pids(&sandbox).await.ok();
             let pid_str = pids.map_or_else(|| "none".to_owned(), |p| {
                 p.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join(",")
             });
@@ -480,11 +476,11 @@ impl WorkerService {
         // Future enhancement: Use hypervisor.add_device() to hot-add container-specific
         // filesystems or block devices if needed.
 
-        if let Some(ref _hypervisor) = sandbox.hypervisor {
+        if sandbox.backend_handle.is_some() {
             tracing::debug!(
                 container_id = %container_id,
                 sandbox_id = %sandbox_id,
-                "Container filesystem accessible via VM's virtiofs mount"
+                "Container filesystem accessible via sandbox's virtiofs mount"
             );
         }
 
@@ -1378,6 +1374,7 @@ impl ZmqService for WorkerService {
 #[allow(clippy::print_stderr)]
 mod tests {
     use super::*;
+    use crate::config::ImageConfig;
     use crate::runtime::{PodSandboxConfig, ContainerConfig};
     use hyprstream_rpc::crypto::generate_signing_keypair;
     use hyprstream_rpc::transport::TransportConfig;
@@ -1416,7 +1413,10 @@ mod tests {
         let transport = TransportConfig::inproc("test-worker-service");
         let (signing_key, _verifying_key) = generate_signing_keypair();
 
-        let service = WorkerService::new(pool_config, image_config, rafs_store, context, transport, signing_key)?;
+        let backend: Arc<dyn crate::runtime::backend::SandboxBackend> = Arc::new(
+            crate::runtime::kata_backend::KataBackend::new(image_config, Arc::clone(&rafs_store)),
+        );
+        let service = WorkerService::new(pool_config, backend, rafs_store, context, transport, signing_key)?;
         Ok((service, temp_dir))
     }
 
