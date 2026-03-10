@@ -25,6 +25,7 @@ use hyprstream_core::cli::{
     handle_status, handle_token_create, handle_unload, handle_training_batch,
     handle_training_checkpoint, handle_training_infer, handle_training_init, handle_worktree_add,
     handle_worktree_info, handle_worktree_list, handle_worktree_remove,
+    handle_user_list, handle_user_register, handle_user_remove, handle_user_show,
     load_or_generate_signing_key, AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
     // Worker handlers
     handle_images_df, handle_images_list, handle_images_pull, handle_images_rm,
@@ -36,7 +37,7 @@ use hyprstream_core::cli::{
     handle_service_start, handle_service_status,
     handle_service_stop, handle_service_uninstall,
 };
-use hyprstream_core::cli::commands::{PolicyCommand, RoleCommand, TokenCommand};
+use hyprstream_core::cli::commands::{PolicyCommand, RoleCommand, TokenCommand, UserCommand};
 
 #[cfg(feature = "experimental")]
 use hyprstream_core::cli::{handle_commit, handle_merge, handle_push, MergeOptions};
@@ -121,6 +122,13 @@ fn build_cli() -> ClapCommand {
     app = app.subcommand(
         <FlightArgs as ClapArgs>::augment_args(
             ClapCommand::new("flight").about("Flight SQL client to query datasets"),
+        ),
+    );
+
+    // User management (derive-based subcommands)
+    app = app.subcommand(
+        <UserCommand as ClapSubcommand>::augment_subcommands(
+            ClapCommand::new("user").about("Manage local user credentials"),
         ),
     );
 
@@ -1760,6 +1768,27 @@ fn main() -> Result<()> {
                             handle_service_install(&models_dir, &services, None, false, verbose).await
                         },
                     )?;
+                }
+            }
+        }
+
+        // ── User management ─────────────────────────────────────────────
+        Some(("user", sub_m)) => {
+            let cmd = UserCommand::from_arg_matches(sub_m)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let credentials_dir = ctx.models_dir().join(".registry").join("credentials");
+            match cmd {
+                UserCommand::Register { username, pubkey_base64 } => {
+                    handle_user_register(&credentials_dir, &username, &pubkey_base64)?;
+                }
+                UserCommand::List => {
+                    handle_user_list(&credentials_dir)?;
+                }
+                UserCommand::Remove { username, force } => {
+                    handle_user_remove(&credentials_dir, &username, force)?;
+                }
+                UserCommand::Show { username } => {
+                    handle_user_show(&credentials_dir, &username)?;
                 }
             }
         }

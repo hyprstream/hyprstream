@@ -4,12 +4,14 @@ pub mod flight;
 pub mod git;
 pub mod policy;
 pub mod training;
+pub mod user;
 pub mod worker;
 
 pub use flight::FlightArgs;
 pub use git::{GitAction, GitCommand};
 pub use policy::{PolicyCommand, RoleCommand, TokenCommand};
 pub use training::{TrainingAction, TrainingCommand};
+pub use user::UserCommand;
 pub use worker::{ImageCommand, WorkerAction};
 
 use clap::{Subcommand, ValueEnum};
