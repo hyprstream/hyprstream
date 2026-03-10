@@ -412,6 +412,12 @@ impl ModelService {
                 if let Some(ref aud) = self.expected_audience {
                     worker_config = worker_config.with_expected_audience(aud.clone());
                 }
+                if let Some(ref url) = self.local_issuer_url {
+                    worker_config = worker_config.with_local_issuer_url(url.clone());
+                }
+                if let Some(ref fed) = self.federation_key_source {
+                    worker_config = worker_config.with_federation_key_source(fed.clone());
+                }
                 let handle = spawner.spawn(worker_config).await
                     .map_err(|e| anyhow!("Failed to spawn inference worker {}: {}", idx, e))?;
                 worker_handles.push(handle);
@@ -435,6 +441,12 @@ impl ModelService {
             );
             if let Some(ref aud) = self.expected_audience {
                 service_config = service_config.with_expected_audience(aud.clone());
+            }
+            if let Some(ref url) = self.local_issuer_url {
+                service_config = service_config.with_local_issuer_url(url.clone());
+            }
+            if let Some(ref fed) = self.federation_key_source {
+                service_config = service_config.with_federation_key_source(fed.clone());
             }
             spawner.spawn(service_config).await
                 .map_err(|e| anyhow!("Failed to spawn inference service: {}", e))?
