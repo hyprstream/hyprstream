@@ -1811,6 +1811,14 @@ pub(crate) async fn run_frame_loop(
                         }
                     }
                     FrameLoopCommand::SpawnProcess { pane_id, process } => {
+                        // Kill any existing process on this pane before inserting
+                        // the new one — prevents orphaned threads when a pane is
+                        // reused (e.g. close + reopen with same ID).
+                        if let Some(old) = processes.remove(&pane_id) {
+                            let _ = old.input_tx.try_send(
+                                super::process::ProcessInput::Kill,
+                            );
+                        }
                         processes.insert(pane_id, process);
                     }
                     FrameLoopCommand::Resize { pane_id, cols, rows } => {

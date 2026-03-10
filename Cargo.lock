@@ -6042,6 +6042,7 @@ dependencies = [
  "dirs-next",
  "edtui",
  "hyprstream-compositor",
+ "landlock",
  "libc",
  "parking_lot 0.12.4",
  "rand 0.8.5",
@@ -6801,6 +6802,17 @@ dependencies = [
  "kvm-bindings 0.14.0",
  "libc",
  "vmm-sys-util 0.15.0",
+]
+
+[[package]]
+name = "landlock"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49fefd6652c57d68aaa32544a4c0e642929725bdc1fd929367cdeb673ab81088"
+dependencies = [
+ "enumflags2",
+ "libc",
+ "thiserror 2.0.17",
 ]
 
 [[package]]
