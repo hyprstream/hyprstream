@@ -71,13 +71,15 @@ pub async fn auth_middleware(
         // Extract iss from token payload without signature verification
         let iss = extract_iss_from_token(token);
 
-        let result = if iss.is_empty() || iss == state.resource_url {
+        // Local token: iss is empty (old token) OR matches our OAuth issuer URL OR matches our resource URL (belt-and-suspenders)
+        let is_local = iss.is_empty() || iss == state.oauth_issuer_url || iss == state.resource_url;
+        let result = if is_local {
             // Local token: verify with local key
             jwt::decode(token, &state.verifying_key, Some(&state.resource_url))
         } else {
             // Federated token: get key from trusted issuer resolver
             match state.federation_resolver.get_key(&iss).await {
-                Ok(key) => jwt::decode_with_key(token, &key, Some(&state.resource_url)),
+                Ok(key) => jwt::decode_with_key(token, &key, None),
                 Err(e) => {
                     debug!("Federation key resolution failed for issuer {}: {}", iss, e);
                     return unauthorized_response("Authentication failed", &www_authenticate);
@@ -88,7 +90,8 @@ pub async fn auth_middleware(
         match result {
             Ok(claims) => {
                 debug!("JWT validated for user: {}", claims.sub);
-                let user_str = if claims.iss.is_empty() || claims.iss == state.resource_url {
+                let is_local_claims = claims.iss.is_empty() || claims.iss == state.oauth_issuer_url || claims.iss == state.resource_url;
+                let user_str = if is_local_claims {
                     claims.sub.clone()
                 } else {
                     // Federated subject: "{iss}:{sub}" for Casbin policy matching
@@ -172,6 +175,10 @@ fn extract_iss_from_token(token: &str) -> String {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     let parts: Vec<&str> = token.splitn(3, '.').collect();
     if parts.len() < 2 {
+        return String::new();
+    }
+    // Guard against adversarially large payloads (real JWT payloads are < 1KB)
+    if parts[1].len() > 8192 {
         return String::new();
     }
     let payload_bytes = match URL_SAFE_NO_PAD.decode(parts[1]) {

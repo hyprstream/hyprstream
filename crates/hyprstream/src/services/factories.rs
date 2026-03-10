@@ -335,6 +335,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 
     // Create server state (blocking since we're in sync context)
     let resource_url = config.oai.resource_url();
+    let oauth_issuer_url = config.oauth.issuer_url();
     let server_state = tokio::task::block_in_place(|| {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(ServerState::new(
@@ -344,6 +345,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
             registry_client,
             ctx.signing_key().clone(),
             resource_url,
+            oauth_issuer_url,
             &config.oauth.trusted_issuers,
         ))
     })
@@ -556,6 +558,10 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                                 });
                             match token {
                                 Some(t) => {
+                                    // TODO(federation-wiring): MCP inline auth does not perform federation branching.
+                                    // Federated tokens presented to the MCP endpoint will be rejected unconditionally.
+                                    // Apply the same extract_iss_from_token / federation_resolver.get_key pattern
+                                    // used in server/middleware.rs auth_middleware to support federated clients here.
                                     match crate::auth::jwt::decode(t, &verifying_key, Some(mcp_resource_url.as_str())) {
                                         Ok(claims) => {
                                             tracing::debug!(%method, %uri, sub = %claims.sub, "MCP auth OK");
