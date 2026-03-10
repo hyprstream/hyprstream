@@ -27,11 +27,15 @@ impl CachedKey {
 /// Thread-safe (uses `Arc<RwLock<...>>`). Caches keys to avoid fetching
 /// on every request. Falls back to OIDC metadata discovery if no explicit
 /// JWKS URI is configured.
+///
+/// By default all JWKS URIs must use HTTPS with TLS certificate verification.
+/// Set `allow_http: true` in `TrustedIssuerConfig` on a per-issuer basis to
+/// permit plain HTTP (development / internal use only).
 pub struct FederationKeyResolver {
     /// issuer_url → cached key
     cache: RwLock<HashMap<String, CachedKey>>,
-    /// issuer_url → (optional jwks_uri_override, ttl)
-    config: HashMap<String, (Option<String>, Duration)>,
+    /// issuer_url → (optional jwks_uri_override, ttl, allow_http)
+    config: HashMap<String, (Option<String>, Duration, bool)>,
     http: reqwest::Client,
 }
 
@@ -47,6 +51,7 @@ impl FederationKeyResolver {
                     (
                         cfg.jwks_uri.clone(),
                         Duration::from_secs(cfg.jwks_cache_ttl_secs),
+                        cfg.allow_http,
                     ),
                 )
             })
@@ -54,6 +59,7 @@ impl FederationKeyResolver {
         Self {
             cache: RwLock::new(HashMap::new()),
             config,
+            // TLS certificate verification is enabled by default (reqwest default).
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
                 .build()
@@ -79,16 +85,17 @@ impl FederationKeyResolver {
         }
 
         // Fetch JWKS (outside read lock)
-        let (jwks_uri_override, ttl) = self
+        let (jwks_uri_override, ttl, allow_http) = self
             .config
             .get(issuer)
-            .map(|(u, t)| (u.clone(), *t))
+            .map(|(u, t, h)| (u.clone(), *t, *h))
             .ok_or_else(|| anyhow!("Issuer not in trusted list: {}", issuer))?;
 
         let jwks_uri = if let Some(uri) = jwks_uri_override {
+            self.check_scheme(&uri, allow_http)?;
             uri
         } else {
-            self.discover_jwks_uri(issuer).await?
+            self.discover_jwks_uri(issuer, allow_http).await?
         };
 
         let key = self.fetch_ed25519_key(&jwks_uri).await?;
@@ -109,7 +116,22 @@ impl FederationKeyResolver {
         Ok(key)
     }
 
-    async fn discover_jwks_uri(&self, issuer: &str) -> Result<String> {
+    /// Validate that `url` uses HTTPS unless `allow_http` is explicitly set.
+    fn check_scheme(&self, url: &str, allow_http: bool) -> Result<()> {
+        if !allow_http && !url.starts_with("https://") {
+            anyhow::bail!(
+                "JWKS URI must use HTTPS for security (got '{}'). \
+                 Set allow_http: true in trusted_issuers config to permit HTTP \
+                 (development / internal networks only).",
+                url
+            );
+        }
+        Ok(())
+    }
+
+    async fn discover_jwks_uri(&self, issuer: &str, allow_http: bool) -> Result<String> {
+        // Validate the issuer URL scheme before fetching AS metadata
+        self.check_scheme(issuer, allow_http)?;
         let meta_url = format!("{}/.well-known/oauth-authorization-server", issuer);
         let meta: serde_json::Value = self
             .http
@@ -118,10 +140,13 @@ impl FederationKeyResolver {
             .await?
             .json()
             .await?;
-        meta["jwks_uri"]
+        let jwks_uri = meta["jwks_uri"]
             .as_str()
             .map(str::to_owned)
-            .ok_or_else(|| anyhow!("No jwks_uri in AS metadata for {}", issuer))
+            .ok_or_else(|| anyhow!("No jwks_uri in AS metadata for {}", issuer))?;
+        // Validate the discovered jwks_uri scheme as well
+        self.check_scheme(&jwks_uri, allow_http)?;
+        Ok(jwks_uri)
     }
 
     async fn fetch_ed25519_key(&self, jwks_uri: &str) -> Result<VerifyingKey> {
@@ -170,6 +195,7 @@ mod tests {
             crate::config::TrustedIssuerConfig {
                 jwks_uri: Some("https://trusted.example.com/jwks".to_owned()),
                 jwks_cache_ttl_secs: 300,
+                allow_http: false,
             },
         );
         let resolver = FederationKeyResolver::new(&issuers);

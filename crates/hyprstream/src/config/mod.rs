@@ -547,6 +547,12 @@ pub struct TrustedIssuerConfig {
     /// How long to cache the JWKS before re-fetching (default: 300 seconds).
     #[serde(default = "default_jwks_cache_ttl")]
     pub jwks_cache_ttl_secs: u64,
+    /// Allow plain HTTP for JWKS fetches (default: false).
+    ///
+    /// **SECURITY WARNING:** Enabling this allows MITM attacks on the JWKS endpoint.
+    /// Only use for internal networks or local development. Never enable in production.
+    #[serde(default)]
+    pub allow_http: bool,
 }
 
 fn default_jwks_cache_ttl() -> u64 { 300 }
