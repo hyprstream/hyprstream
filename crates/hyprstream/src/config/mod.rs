@@ -537,6 +537,26 @@ impl MCPConfig {
 fn default_mcp_host() -> String { "0.0.0.0".to_owned() }
 fn default_mcp_port() -> u16 { 6790 }
 
+/// Configuration for a trusted external OIDC issuer.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TrustedIssuerConfig {
+    /// Override the JWKS URI directly (skips AS metadata discovery).
+    /// If absent, JWKS URI is auto-discovered from `{issuer}/.well-known/oauth-authorization-server`.
+    #[serde(default)]
+    pub jwks_uri: Option<String>,
+    /// How long to cache the JWKS before re-fetching (default: 300 seconds).
+    #[serde(default = "default_jwks_cache_ttl")]
+    pub jwks_cache_ttl_secs: u64,
+    /// Allow plain HTTP for JWKS fetches (default: false).
+    ///
+    /// **SECURITY WARNING:** Enabling this allows MITM attacks on the JWKS endpoint.
+    /// Only use for internal networks or local development. Never enable in production.
+    #[serde(default)]
+    pub allow_http: bool,
+}
+
+fn default_jwks_cache_ttl() -> u64 { 300 }
+
 /// OAuth 2.1 authorization server configuration
 ///
 /// Provides OAuth 2.1 (draft-ietf-oauth-v2-1-13) authorization for MCP and OAI services.
@@ -584,6 +604,12 @@ pub struct OAuthConfig {
     /// CORS configuration for the OAuth HTTP server
     #[serde(default = "default_oauth_cors")]
     pub cors: server::CorsConfig,
+
+    /// Trusted external OIDC issuers for federation.
+    /// Key = issuer URL (must match JWT `iss` claim exactly).
+    /// Value = configuration for fetching/caching that issuer's JWKS.
+    #[serde(default)]
+    pub trusted_issuers: std::collections::HashMap<String, TrustedIssuerConfig>,
 }
 
 fn default_oauth_cors() -> server::CorsConfig {
@@ -603,6 +629,7 @@ impl Default for OAuthConfig {
             tls_key: None,
             quic_port: None,
             cors: default_oauth_cors(),
+            trusted_issuers: std::collections::HashMap::new(),
         }
     }
 }

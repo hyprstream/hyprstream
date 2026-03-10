@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
+use crate::auth::user_store::UserStore;
 use crate::config::OAuthConfig;
 use crate::services::PolicyClient;
 
@@ -69,6 +70,10 @@ pub struct PendingDeviceCode {
     pub interval: u64,
     /// Last time the client polled for this code
     pub last_polled: Option<Instant>,
+    /// Random nonce for challenge-response auth (43 chars base64url of 32 bytes)
+    pub nonce: String,
+    /// Username of the person who approved this code (set on POST /verify success)
+    pub approved_by: Option<String>,
 }
 
 impl PendingDeviceCode {
@@ -81,6 +86,9 @@ impl PendingDeviceCode {
 #[derive(Debug, Clone)]
 pub struct RefreshTokenEntry {
     pub client_id: String,
+    /// JWT subject (username) of the token owner.
+    /// Used to re-issue the access token on refresh with the correct sub.
+    pub username: String,
     pub scopes: Vec<String>,
     pub resource: Option<String>,
     pub expires_at: Instant,
@@ -116,10 +124,15 @@ pub struct OAuthState {
     pub refresh_token_ttl: u32,
     /// HTTP client for fetching Client ID Metadata Documents
     pub http_client: reqwest::Client,
+    /// Raw Ed25519 verifying key bytes (32 bytes) for the JWKS endpoint.
+    pub verifying_key_bytes: [u8; 32],
+    /// User credential store for Ed25519 challenge-response device verification.
+    /// `None` when not configured (keyring unavailable or no credentials dir set).
+    pub user_store: Option<Arc<dyn UserStore + Send + Sync>>,
 }
 
 impl OAuthState {
-    pub fn new(config: &OAuthConfig, policy_client: PolicyClient) -> Self {
+    pub fn new(config: &OAuthConfig, policy_client: PolicyClient, verifying_key_bytes: [u8; 32]) -> Self {
         Self {
             clients: RwLock::new(HashMap::new()),
             pending_codes: RwLock::new(HashMap::new()),
@@ -135,7 +148,15 @@ impl OAuthState {
                 .timeout(Duration::from_secs(10))
                 .build()
                 .unwrap_or_default(),
+            verifying_key_bytes,
+            user_store: None,
         }
+    }
+
+    /// Attach a user credential store for Ed25519 challenge-response device verification.
+    pub fn with_user_store(mut self, store: Arc<dyn UserStore + Send + Sync>) -> Self {
+        self.user_store = Some(store);
+        self
     }
 
     /// Spawn a background task that sweeps expired codes every 30 seconds.

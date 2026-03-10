@@ -163,6 +163,10 @@ pub struct ModelServiceInner {
     transport: TransportConfig,
     /// Expected JWT audience for token validation (RFC 8707).
     expected_audience: Option<String>,
+    /// Local OAuth issuer URL for distinguishing local vs. federated JWTs.
+    local_issuer_url: Option<String>,
+    /// Federation key source for verifying externally-issued JWTs.
+    federation_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>>,
 }
 
 /// Model service that manages InferenceService lifecycle.
@@ -222,6 +226,8 @@ impl ModelService {
             context,
             transport,
             expected_audience: None,
+            local_issuer_url: None,
+            federation_key_source: None,
         })}
     }
 
@@ -235,6 +241,33 @@ impl ModelService {
         Arc::get_mut(&mut self.inner)
             .expect("with_expected_audience must be called before service is shared")
             .expected_audience = Some(audience);
+        self
+    }
+
+    /// Set the local OAuth issuer URL for distinguishing local vs. federated JWTs.
+    ///
+    /// # Panics
+    /// Panics if called after the service has been cloned (Arc refcount > 1).
+    #[allow(clippy::expect_used)]
+    pub fn with_local_issuer_url(mut self, url: String) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("with_local_issuer_url must be called before service is shared")
+            .local_issuer_url = Some(url);
+        self
+    }
+
+    /// Set the federation key source for verifying externally-issued JWTs.
+    ///
+    /// # Panics
+    /// Panics if called after the service has been cloned (Arc refcount > 1).
+    #[allow(clippy::expect_used)]
+    pub fn with_federation_key_source(
+        mut self,
+        src: std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>,
+    ) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("with_federation_key_source must be called before service is shared")
+            .federation_key_source = Some(src);
         self
     }
 
@@ -270,6 +303,8 @@ impl ModelService {
             context,
             transport,
             expected_audience: None,
+            local_issuer_url: None,
+            federation_key_source: None,
         })}
     }
 
@@ -377,6 +412,12 @@ impl ModelService {
                 if let Some(ref aud) = self.expected_audience {
                     worker_config = worker_config.with_expected_audience(aud.clone());
                 }
+                if let Some(ref url) = self.local_issuer_url {
+                    worker_config = worker_config.with_local_issuer_url(url.clone());
+                }
+                if let Some(ref fed) = self.federation_key_source {
+                    worker_config = worker_config.with_federation_key_source(fed.clone());
+                }
                 let handle = spawner.spawn(worker_config).await
                     .map_err(|e| anyhow!("Failed to spawn inference worker {}: {}", idx, e))?;
                 worker_handles.push(handle);
@@ -400,6 +441,12 @@ impl ModelService {
             );
             if let Some(ref aud) = self.expected_audience {
                 service_config = service_config.with_expected_audience(aud.clone());
+            }
+            if let Some(ref url) = self.local_issuer_url {
+                service_config = service_config.with_local_issuer_url(url.clone());
+            }
+            if let Some(ref fed) = self.federation_key_source {
+                service_config = service_config.with_federation_key_source(fed.clone());
             }
             spawner.spawn(service_config).await
                 .map_err(|e| anyhow!("Failed to spawn inference service: {}", e))?
@@ -1414,6 +1461,16 @@ impl crate::services::ZmqService for ModelService {
 
     fn expected_audience(&self) -> Option<&str> {
         self.expected_audience.as_deref()
+    }
+
+    fn local_issuer_url(&self) -> Option<&str> {
+        self.inner.local_issuer_url.as_deref()
+    }
+
+    fn federation_key_source(
+        &self,
+    ) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>> {
+        self.inner.federation_key_source.clone()
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {

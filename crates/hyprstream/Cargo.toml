@@ -129,6 +129,7 @@ notify = { version = "7", default-features = false, features = ["macos_kqueue"] 
 libc = "0.2"  # For system calls in overlay2 driver
 reflink-copy = "0.1"  # COW file copying (reflink when available)
 hyprstream-containedfs.workspace = true  # Path-contained filesystem operations
+age = { version = "0.11.2", features = ["armor"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 lru.workspace = true  # LRU cache for model caching and Git repository handles
@@ -143,6 +144,7 @@ blake3.workspace = true                  # Fast cryptographic hashing for checks
 tempfile.workspace = true                # Temporary files for model conversion
 base64.workspace = true                  # JWT token encoding
 ed25519-dalek.workspace = true           # JWT Ed25519 signatures
+keyring = { version = "3", features = ["linux-native"] }  # OS keyring — Linux keyutils
 curve25519-dalek.workspace = true        # Ristretto255 DH for stream authentication
 hkdf.workspace = true                    # HKDF key derivation
 subtle.workspace = true                  # Constant-time operations
@@ -155,6 +157,18 @@ url.workspace = true
 urlencoding.workspace = true
 half.workspace = true
 shellexpand.workspace = true
+
+# macOS/iOS: Keychain via apple-native
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+# Windows: Credential Manager via windows-native
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+# FreeBSD/OpenBSD: DBus Secret Service (requires libdbus-1-dev + a running daemon)
+[target.'cfg(any(target_os = "freebsd", target_os = "openbsd"))'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 
 [features]
 default = ["gittorrent", "xet", "systemd", "otel"]

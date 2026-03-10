@@ -4,12 +4,14 @@ pub mod flight;
 pub mod git;
 pub mod policy;
 pub mod training;
+pub mod user;
 pub mod worker;
 
 pub use flight::FlightArgs;
 pub use git::{GitAction, GitCommand};
-pub use policy::{PolicyCommand, TokenCommand};
+pub use policy::{PolicyCommand, RoleCommand, TokenCommand};
 pub use training::{TrainingAction, TrainingCommand};
+pub use user::UserCommand;
 pub use worker::{ImageCommand, WorkerAction};
 
 use clap::{Subcommand, ValueEnum};
@@ -150,6 +152,13 @@ pub enum Commands {
         #[command(subcommand)]
         action: ServiceAction,
     },
+
+    // TODO(task-12): sign-challenge CLI
+    // Add a `SignChallenge { user_code: String }` variant here.
+    // Handler: fetch nonce from GET /oauth/device/nonce?user_code={user_code},
+    // load signing key from keyring, compute challenge = "{username}:{user_code}:{nonce}",
+    // sign with ed25519_dalek, and print base64 signature.
+    // The nonce endpoint is already implemented at GET /oauth/device/nonce.
 }
 
 /// Service management actions

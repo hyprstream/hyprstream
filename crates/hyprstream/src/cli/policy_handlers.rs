@@ -395,63 +395,67 @@ pub async fn handle_token_create(
 }
 
 
-/// Load or generate the signing key from .registry/keys/signing.key
+/// Load or generate the Ed25519 signing key using the OS keyring exclusively.
 ///
-/// Security: avoids TOCTOU by opening the file directly instead of
-/// checking existence first. New keys are created with mode 0o600 at
-/// open(2) time so the private key is never world-readable on disk.
-pub async fn load_or_generate_signing_key(keys_dir: &Path) -> Result<SigningKey> {
-    use std::io::Read;
+/// Supported platforms:
+/// - Linux: kernel keyutils (`linux-native` feature)
+/// - macOS / iOS: Keychain (`apple-native` feature)
+/// - Windows: Credential Manager (`windows-native` feature)
+/// - FreeBSD / OpenBSD: DBus Secret Service (`sync-secret-service` + `crypto-rust` features)
+///
+/// For platforms without a supported keyring daemon, supply a client-provided
+/// credential store via [`keyring::set_default_credential_builder`] before
+/// calling this function.
+///
+/// The `_keys_dir` parameter is retained for API compatibility but unused;
+/// keys are stored exclusively in the OS keyring.
+pub async fn load_or_generate_signing_key(_keys_dir: &Path) -> Result<SigningKey> {
+    const SERVICE: &str = "hyprstream";
+    const KEY_NAME: &str = "signing-key";
 
-    let key_path = keys_dir.join("signing.key");
+    let entry = keyring::Entry::new(SERVICE, KEY_NAME).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to access OS keyring (service={SERVICE}, key={KEY_NAME}): {e}.\n\
+             On Linux, ensure kernel keyutils is available.\n\
+             On FreeBSD/OpenBSD, ensure a Secret Service daemon (e.g. gnome-keyring \
+             or kwallet) is running, or supply a custom credential store via \
+             keyring::set_default_credential_builder()."
+        )
+    })?;
 
-    // Try to open existing key first (no TOCTOU — single open call)
-    match std::fs::File::open(&key_path) {
-        Ok(mut file) => {
-            let mut key_bytes = Vec::new();
-            file.read_to_end(&mut key_bytes)?;
-            if key_bytes.len() != 32 {
-                anyhow::bail!("Invalid signing key file: expected 32 bytes, got {}", key_bytes.len());
-            }
-            let mut key_array = [0u8; 32];
-            key_array.copy_from_slice(&key_bytes);
-            let signing_key = SigningKey::from_bytes(&key_array);
-            info!("Loaded signing key from {:?}", key_path);
-            Ok(signing_key)
+    match entry.get_secret() {
+        Ok(bytes) if bytes.len() == 32 => {
+            let arr: [u8; 32] = bytes.try_into().map_err(|_| anyhow::anyhow!("unreachable: length already checked"))?;
+            info!("Loaded Ed25519 signing key from OS keyring");
+            return Ok(SigningKey::from_bytes(&arr));
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Generate new key — create directory with restricted permissions
-            tokio::fs::create_dir_all(keys_dir).await?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                tokio::fs::set_permissions(keys_dir, std::fs::Permissions::from_mode(0o700)).await?;
-            }
-
-            let signing_key = SigningKey::generate(&mut rand::thread_rng());
-
-            // Write key with mode 0o600 set at open(2) time — never world-readable
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(&key_path)?;
-                std::io::Write::write_all(&mut file, &signing_key.to_bytes())?;
-            }
-
-            #[cfg(not(unix))]
-            {
-                tokio::fs::write(&key_path, signing_key.to_bytes()).await?;
-            }
-
-            info!("Generated new signing key at {:?}", key_path);
-            Ok(signing_key)
+        Ok(_) => {
+            tracing::warn!("Keyring entry for signing key has wrong size; regenerating");
         }
-        Err(e) => Err(e.into()),
+        Err(keyring::Error::NoEntry) => {
+            // No key stored yet; generate a new one below
+        }
+        Err(e) => {
+            anyhow::bail!(
+                "OS keyring error while loading signing key: {e}.\n\
+                 Ensure the keyring daemon is accessible. On BSD without a \
+                 Secret Service daemon, supply a custom credential store via \
+                 keyring::set_default_credential_builder()."
+            );
+        }
     }
+
+    // Generate new key and persist it in the keyring
+    let key = SigningKey::generate(&mut rand::thread_rng());
+    entry.set_secret(&key.to_bytes()).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to store signing key in OS keyring: {e}.\n\
+             Ensure the keyring daemon is accessible, or supply a custom \
+             credential store via keyring::set_default_credential_builder()."
+        )
+    })?;
+    info!("Generated and stored new Ed25519 signing key in OS keyring");
+    Ok(key)
 }
 
 /// Parse duration string like "30d", "90d", "1y", "never"
@@ -509,6 +513,83 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 
 // Re-export policy templates from shared location
 pub use crate::auth::policy_templates::{PolicyTemplate, get_template, get_templates};
+
+// === Role handlers ===
+
+/// Handle `policy role add <user> <role>` - Assign a role to a user via RPC
+pub async fn handle_policy_role_add(
+    signing_key: &SigningKey,
+    user: &str,
+    role: &str,
+    dry_run: bool,
+) -> Result<()> {
+    if dry_run {
+        println!("Would add: g, {user}, {role}");
+        return Ok(());
+    }
+
+    let client = create_policy_client(signing_key);
+    let sha = client.add_grouping(user, role).await
+        .context("Failed to add role assignment via PolicyService. Are services running?")?;
+
+    println!("Role assigned. Commit: {}", &sha[..sha.len().min(8)]);
+    Ok(())
+}
+
+/// Handle `policy role remove <user> <role>` - Remove a role from a user via RPC
+pub async fn handle_policy_role_remove(
+    signing_key: &SigningKey,
+    user: &str,
+    role: &str,
+    force: bool,
+) -> Result<()> {
+    if !force {
+        print!("Remove role '{role}' from '{user}'? [y/N] ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let client = create_policy_client(signing_key);
+    let sha = client.remove_grouping(user, role).await
+        .context("Failed to remove role assignment via PolicyService. Are services running?")?;
+
+    println!("Role removed. Commit: {}", &sha[..sha.len().min(8)]);
+    Ok(())
+}
+
+/// Handle `policy role list` - List role assignments (g-lines) via RPC
+pub async fn handle_policy_role_list(
+    signing_key: &SigningKey,
+    user: Option<&str>,
+    role: Option<&str>,
+) -> Result<()> {
+    let client = create_policy_client(signing_key);
+    let policy_info = client.get_policy().await
+        .context("Failed to get policy from PolicyService. Are services running?")?;
+
+    let groupings: Vec<_> = policy_info.groupings.iter()
+        .filter(|g| user.is_none_or(|u| g.user == u))
+        .filter(|g| role.is_none_or(|r| g.role == r))
+        .collect();
+
+    if groupings.is_empty() {
+        println!("No role assignments found.");
+        return Ok(());
+    }
+
+    for g in groupings {
+        println!("g, {}, {}", g.user, g.role);
+    }
+
+    Ok(())
+}
 
 /// Handle `policy list-templates` - List available templates
 pub async fn handle_policy_list_templates() -> Result<()> {

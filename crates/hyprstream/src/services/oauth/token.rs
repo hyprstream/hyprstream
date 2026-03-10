@@ -147,7 +147,10 @@ async fn exchange_authorization_code(
     }
 
     tracing::info!(client_id = %params.client_id, "PKCE verified, issuing token");
-    issue_token_with_refresh(&state, &params.client_id, pending.scopes, pending.resource).await
+    // Use client_id as JWT sub for authorization_code flow: there is no interactive user
+    // login in this flow, so the token is issued to the client application identity.
+    let sub = params.client_id.clone();
+    issue_token_with_refresh(&state, &params.client_id, pending.scopes, pending.resource, &sub).await
 }
 
 /// Handle refresh_token grant type (OAuth 2.1 with rotation).
@@ -193,8 +196,8 @@ async fn exchange_refresh_token(
         );
     }
 
-    // Issue new access token + rotated refresh token with the stored scopes/resource
-    issue_token_with_refresh(&state, &entry.client_id, entry.scopes, entry.resource).await
+    // Issue new access token + rotated refresh token with the stored scopes/resource and original subject.
+    issue_token_with_refresh(&state, &entry.client_id, entry.scopes, entry.resource, &entry.username).await
 }
 
 /// Handle urn:ietf:params:oauth:grant-type:device_code grant type (RFC 8628 Section 3.4).
@@ -263,12 +266,24 @@ async fn exchange_device_code(
             let scopes = pending.scopes.clone();
             let resource = pending.resource.clone();
             let user_code = pending.user_code.clone();
+            // Use the approving user's username as the JWT subject.
+            // approved_by must be set when status is Approved; error defensively if missing.
+            let approved_by = match pending.approved_by.clone() {
+                Some(u) => u,
+                None => {
+                    return token_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "server_error",
+                        "Device code approved but no approver identity recorded",
+                    );
+                }
+            };
             device_codes.remove(&device_code);
             drop(device_codes);
             let mut user_code_map = state.device_code_by_user_code.write().await;
             user_code_map.remove(&user_code);
             drop(user_code_map);
-            issue_token_with_refresh(&state, &client_id, scopes, resource).await
+            issue_token_with_refresh(&state, &client_id, scopes, resource, &approved_by).await
         }
     }
 }
@@ -282,17 +297,23 @@ fn generate_refresh_token() -> String {
 }
 
 /// Issue a JWT access token via PolicyService, plus a rotated refresh token.
+///
+/// `sub` is the JWT subject (username). Must be non-empty:
+/// - authorization_code flow: pass the client_id (M2M, no interactive user login)
+/// - refresh_token flow: pass the original sub from the RefreshTokenEntry
+/// - device_code flow: pass the approving user's username (from challenge-response)
 async fn issue_token_with_refresh(
     state: &OAuthState,
     client_id: &str,
     scopes: Vec<String>,
     resource: Option<String>,
+    sub: &str,
 ) -> Response {
     let scope_str = scopes.join(" ");
 
     let result = state
         .policy_client
-        .issue_token(&scopes, state.token_ttl, resource.as_deref().unwrap_or_default(), "")
+        .issue_token(&scopes, state.token_ttl, resource.as_deref().unwrap_or_default(), sub)
         .await;
 
     match result {
@@ -307,6 +328,7 @@ async fn issue_token_with_refresh(
                 let mut tokens = state.refresh_tokens.write().await;
                 tokens.insert(refresh_token.clone(), RefreshTokenEntry {
                     client_id: client_id.to_owned(),
+                    username: sub.to_owned(),
                     scopes,
                     resource,
                     expires_at: Instant::now() + Duration::from_secs(state.refresh_token_ttl as u64),

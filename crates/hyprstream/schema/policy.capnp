@@ -46,6 +46,15 @@ struct PolicyRequest {
 
     # Check if there are uncommitted policy changes
     getDraftStatus @10 :Void $mcpScope(query) $mcpDescription("Check if there are uncommitted policy changes");
+
+    # Assign a role to a user
+    addGrouping @11 :AddGrouping $mcpScope(manage) $mcpDescription("Assign a role to a user");
+
+    # Remove a role from a user
+    removeGrouping @12 :RemoveGrouping $mcpScope(manage) $mcpDescription("Remove a role from a user");
+
+    # Set a model branch as public or private
+    setBranchVisibility @13 :SetBranchVisibility $mcpScope(manage) $mcpDescription("Set a model branch as public or private");
   }
 }
 
@@ -151,6 +160,15 @@ struct PolicyResponse {
 
     # Draft status (for getDraftStatus)
     getDraftStatusResult @11 :DraftStatus;
+
+    # Commit SHA from addGrouping
+    addGroupingResult @12 :Text;
+
+    # Commit SHA from removeGrouping
+    removeGroupingResult @13 :Text;
+
+    # Commit SHA from setBranchVisibility
+    setBranchVisibilityResult @14 :Text;
   }
 }
 
@@ -209,4 +227,23 @@ struct DraftStatus {
 # Policy commit history
 struct PolicyHistory {
   entries @0 :List(PolicyHistoryEntry);
+}
+
+# Parameters for assigning a role to a user
+struct AddGrouping {
+  user @0 :Text;
+  role @1 :Text;
+}
+
+# Parameters for removing a role from a user
+struct RemoveGrouping {
+  user @0 :Text;
+  role @1 :Text;
+}
+
+# Parameters for setting a model branch's public/private visibility
+struct SetBranchVisibility {
+  modelName  @0 :Text;
+  branchName @1 :Text;
+  public     @2 :Bool;
 }

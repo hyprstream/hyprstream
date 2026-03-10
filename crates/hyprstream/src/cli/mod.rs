@@ -18,6 +18,7 @@ pub mod schema_cli;
 pub mod service_handlers;
 pub mod systemd_setup;
 pub mod training_handlers;
+pub mod user_handlers;
 pub mod worker_handlers;
 pub mod worktree_handlers;
 
@@ -41,7 +42,11 @@ pub use policy_handlers::{
     handle_policy_apply, handle_policy_apply_template, handle_policy_check, handle_policy_diff,
     handle_policy_edit, handle_policy_history, handle_policy_list_templates, handle_policy_rollback,
     handle_policy_show, handle_token_create,
+    handle_policy_role_add, handle_policy_role_remove, handle_policy_role_list,
     load_or_generate_signing_key,
+};
+pub use user_handlers::{
+    handle_user_list, handle_user_register, handle_user_remove, handle_user_show,
 };
 pub use crate::auth::policy_templates::{PolicyTemplate, get_template, get_templates};
 pub use remote_handlers::{

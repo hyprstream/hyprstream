@@ -68,11 +68,44 @@ pub async fn auth_middleware(
 
     // Try JWT validation (stateless)
     if token.contains('.') {
-        match jwt::decode(token, &state.verifying_key, Some(&state.resource_url)) {
+        // Extract iss from token payload without signature verification
+        let iss = extract_iss_from_token(token);
+
+        // Local token: iss is empty (old token) OR matches our OAuth issuer URL OR matches our resource URL (belt-and-suspenders)
+        let is_local = iss.is_empty() || iss == state.oauth_issuer_url || iss == state.resource_url;
+        let result = if is_local {
+            // Local token: verify with local key
+            jwt::decode(token, &state.verifying_key, Some(&state.resource_url))
+        } else {
+            // Federated token: get key from trusted issuer resolver
+            match state.federation_resolver.get_key(&iss).await {
+                Ok(key) => jwt::decode_with_key(token, &key, None),
+                Err(e) => {
+                    debug!("Federation key resolution failed for issuer {}: {}", iss, e);
+                    return unauthorized_response("Authentication failed", &www_authenticate);
+                }
+            }
+        };
+
+        match result {
             Ok(claims) => {
                 debug!("JWT validated for user: {}", claims.sub);
+                let is_local_claims = claims.iss.is_empty() || claims.iss == state.oauth_issuer_url || claims.iss == state.resource_url;
+                let user_str = if is_local_claims {
+                    claims.sub.clone()
+                } else {
+                    // Federated subject: "{iss}:{sub}" for Casbin policy matching
+                    format!("{}:{}", claims.iss, claims.sub)
+                };
+                // Validate local subjects for safe characters. Federated subjects
+                // (containing "://") bypass this check — they are validated at JWT decode time.
+                let subject = hyprstream_rpc::Subject::new(&user_str);
+                if let Err(e) = subject.validate() {
+                    debug!("JWT sub validation failed: {}", e);
+                    return unauthorized_response("Authentication failed", &www_authenticate);
+                }
                 let user = AuthenticatedUser {
-                    user: claims.sub.clone(),
+                    user: user_str,
                     token: Some(token.to_owned()),
                     exp: Some(claims.exp),
                 };
@@ -80,8 +113,6 @@ pub async fn auth_middleware(
                 return next.run(request).await;
             }
             Err(e) => {
-                // SECURITY: Generic error message — don't reveal token state to attackers.
-                // Log specific error server-side for debugging.
                 debug!("JWT validation failed: {}", e);
                 return unauthorized_response("Authentication failed", &www_authenticate);
             }
@@ -143,6 +174,33 @@ fn unauthorized_response(message: &str, www_authenticate: &str) -> Response {
         );
     }
     response
+}
+
+/// Extract the `iss` claim from a JWT payload without signature verification.
+/// Exported for use in other middleware-like contexts (e.g. MCP inline auth).
+/// Returns an empty string on any parse failure.
+pub fn extract_iss_from_token(token: &str) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let parts: Vec<&str> = token.splitn(3, '.').collect();
+    if parts.len() < 2 {
+        return String::new();
+    }
+    // Guard against adversarially large payloads (real JWT payloads are < 1KB)
+    if parts[1].len() > 8192 {
+        return String::new();
+    }
+    let payload_bytes = match URL_SAFE_NO_PAD.decode(parts[1]) {
+        Ok(b) => b,
+        Err(_) => return String::new(),
+    };
+    let payload: serde_json::Value = match serde_json::from_slice(&payload_bytes) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+    payload.get("iss")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned()
 }
 
 /// CORS middleware configuration
@@ -234,4 +292,32 @@ pub fn cors_layer(config: &crate::server::state::CorsConfig) -> tower_http::cors
     }
 
     cors
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_iss_from_token() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+        // Craft a JWT with iss in payload: header.payload.sig
+        // payload = base64url({"iss":"https://node-a","sub":"alice","exp":9999999999,"iat":0})
+        let payload = URL_SAFE_NO_PAD.encode(
+            r#"{"iss":"https://node-a","sub":"alice","exp":9999999999,"iat":0}"#
+        );
+        let token = format!("eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.{}.fakesig", payload);
+        assert_eq!(extract_iss_from_token(&token), "https://node-a");
+
+        // Token without iss
+        let payload2 = URL_SAFE_NO_PAD.encode(
+            r#"{"sub":"alice","exp":9999999999,"iat":0}"#
+        );
+        let token2 = format!("eyJhbGciOiJFZERTQSJ9.{}.fakesig", payload2);
+        assert_eq!(extract_iss_from_token(&token2), "");
+
+        // Garbage input
+        assert_eq!(extract_iss_from_token("notavalidtoken"), "");
+    }
 }

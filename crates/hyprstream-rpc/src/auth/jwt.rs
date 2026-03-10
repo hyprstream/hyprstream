@@ -72,11 +72,29 @@ pub fn encode(claims: &Claims, signing_key: &SigningKey) -> String {
     format!("{signing_input}.{signature_b64}")
 }
 
-/// Decode and verify a JWT token
+/// Decode and verify a JWT token issued by the **local** node.
 ///
-/// Accepts a raw RFC 7519 JWT. Returns the claims if valid and not expired.
-/// If `expected_aud` is Some, validates the audience claim matches.
+/// For tokens from foreign issuers (federation), use [`decode_with_key`]
+/// with the key obtained from `FederationKeyResolver::get_key`.
 pub fn decode(token: &str, verifying_key: &VerifyingKey, expected_aud: Option<&str>) -> Result<Claims, JwtError> {
+    decode_inner(token, verifying_key, expected_aud)
+}
+
+/// Decode a JWT using a caller-supplied verifying key (for multi-issuer support).
+///
+/// Identical to `decode` but accepts any `VerifyingKey` — callers obtain the
+/// key from `FederationKeyResolver::get_key` for tokens whose `iss` does not
+/// match the local issuer.
+pub fn decode_with_key(
+    token: &str,
+    verifying_key: &VerifyingKey,
+    expected_aud: Option<&str>,
+) -> Result<Claims, JwtError> {
+    decode_inner(token, verifying_key, expected_aud)
+}
+
+/// Internal decode implementation shared by `decode` and `decode_with_key`.
+fn decode_inner(token: &str, verifying_key: &VerifyingKey, expected_aud: Option<&str>) -> Result<Claims, JwtError> {
     // Split into parts
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
@@ -104,6 +122,17 @@ pub fn decode(token: &str, verifying_key: &VerifyingKey, expected_aud: Option<&s
     verifying_key
         .verify(signing_input.as_bytes(), &signature)
         .map_err(|_| JwtError::InvalidSignature)?;
+
+    // Validate the JWT header `alg` field to prevent algorithm-agility attacks.
+    // We only accept EdDSA tokens; any other alg value is rejected.
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(header_b64)
+        .map_err(|_| JwtError::InvalidBase64)?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
+        .map_err(|e| JwtError::InvalidJson(e.to_string()))?;
+    if header.get("alg").and_then(|v| v.as_str()) != Some("EdDSA") {
+        return Err(JwtError::InvalidSignature);
+    }
 
     // Decode payload
     let payload_bytes = URL_SAFE_NO_PAD
@@ -154,4 +183,74 @@ pub fn decode_unverified(token: &str) -> Result<Claims, JwtError> {
 
     serde_json::from_slice(&payload_bytes)
         .map_err(|e| JwtError::InvalidJson(e.to_string()))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::auth::Claims;
+    use ed25519_dalek::SigningKey;
+
+    fn make_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    #[test]
+    fn test_decode_with_key_multi_issuer() {
+        // Simulate two nodes with separate signing keys.
+        let key_a = make_key(0xAA);
+        let key_b = make_key(0xBB);
+        let vk_a = key_a.verifying_key();
+
+        // Node A issues a JWT with iss = "https://node-a"
+        let claims = Claims::new("alice".to_owned(), 0, 9_999_999_999)
+            .with_issuer("https://node-a".to_owned());
+        let token = encode(&claims, &key_a);
+
+        // decode_with_key should accept the correct key
+        let decoded = decode_with_key(&token, &vk_a, None)
+            .expect("decode_with_key with correct key must succeed");
+        assert_eq!(decoded.iss, "https://node-a");
+        assert_eq!(decoded.sub, "alice");
+
+        // decode_with_key must reject the wrong key
+        let vk_b = key_b.verifying_key();
+        let result = decode_with_key(&token, &vk_b, None);
+        assert!(
+            matches!(result, Err(JwtError::InvalidSignature)),
+            "wrong key must yield InvalidSignature"
+        );
+    }
+
+    #[test]
+    fn test_decode_with_key_audience_validation() {
+        let key = make_key(0x01);
+        let vk = key.verifying_key();
+        let claims = Claims::new("bob".to_owned(), 0, 9_999_999_999)
+            .with_issuer("https://node-a".to_owned())
+            .with_audience(Some("https://node-b".to_owned()));
+        let token = encode(&claims, &key);
+
+        // Correct audience
+        decode_with_key(&token, &vk, Some("https://node-b"))
+            .expect("correct audience must succeed");
+
+        // Wrong audience
+        let result = decode_with_key(&token, &vk, Some("https://wrong"));
+        assert!(matches!(result, Err(JwtError::InvalidAudience)));
+    }
+
+    #[test]
+    fn test_decode_and_decode_with_key_are_equivalent() {
+        let key = make_key(0x42);
+        let vk = key.verifying_key();
+        let claims = Claims::new("carol".to_owned(), 0, 9_999_999_999);
+        let token = encode(&claims, &key);
+
+        let via_decode = decode(&token, &vk, None).unwrap();
+        let via_decode_with_key = decode_with_key(&token, &vk, None).unwrap();
+        assert_eq!(via_decode.sub, via_decode_with_key.sub);
+        assert_eq!(via_decode.exp, via_decode_with_key.exp);
+    }
 }

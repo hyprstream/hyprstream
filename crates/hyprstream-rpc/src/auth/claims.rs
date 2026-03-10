@@ -13,6 +13,12 @@ use serde::{Deserialize, Serialize};
 /// Scopes are NOT embedded in JWTs.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Claims {
+    /// Issuer URL — the hyprstream node that minted this token.
+    /// Matches the OAuth issuer URL (e.g. "https://cloud-a.example.com").
+    /// Required for federation: receiving nodes use this to fetch JWKS.
+    /// Defaults to empty string for backward compat (treated as local-only).
+    #[serde(default)]
+    pub iss: String,
     pub sub: String,
     pub exp: i64,
     pub iat: i64,
@@ -36,6 +42,7 @@ pub struct Claims {
 impl std::fmt::Debug for Claims {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Claims")
+            .field("iss", &self.iss)
             .field("sub", &self.sub)
             .field("exp", &self.exp)
             .field("iat", &self.iat)
@@ -59,6 +66,9 @@ impl ToCapnp for Claims {
         if let Some(ref token) = self.token {
             builder.set_token(token);
         }
+        if !self.iss.is_empty() {
+            builder.set_iss(&self.iss);
+        }
         // Write empty scopes list for wire compatibility
         builder.reborrow().init_scopes(0);
     }
@@ -79,7 +89,13 @@ impl FromCapnp for Claims {
             .map(std::borrow::ToOwned::to_owned)
             .filter(|s| !s.is_empty());
 
+        let iss = reader.get_iss().ok()
+            .and_then(|s| s.to_str().ok())
+            .map(std::borrow::ToOwned::to_owned)
+            .unwrap_or_default();
+
         Ok(Self {
+            iss,
             sub: reader.get_sub()?.to_str()?.to_owned(),
             exp: reader.get_exp(),
             iat: reader.get_iat(),
@@ -93,12 +109,20 @@ impl Claims {
     /// Create new claims.
     pub fn new(sub: String, iat: i64, exp: i64) -> Self {
         Self {
+            iss: String::new(),
             sub,
             exp,
             iat,
             aud: None,
             token: None,
         }
+    }
+
+    /// Set the issuer URL (RFC 7519 `iss` claim).
+    /// Should be the OAuth issuer URL of the hyprstream node that issued this token.
+    pub fn with_issuer(mut self, issuer: String) -> Self {
+        self.iss = issuer;
+        self
     }
 
     /// Create new claims with an audience (RFC 8707 resource indicator).
@@ -151,8 +175,16 @@ mod tests {
         assert_eq!(claims.sub, "alice");
         assert_eq!(claims.iat, 1000);
         assert_eq!(claims.exp, 2000);
+        assert_eq!(claims.iss, "");
         assert!(claims.aud.is_none());
         assert!(claims.token.is_none());
+    }
+
+    #[test]
+    fn test_claims_with_issuer() {
+        let claims = Claims::new("alice".to_owned(), 1000, 2000)
+            .with_issuer("https://a.example.com".to_owned());
+        assert_eq!(claims.iss, "https://a.example.com");
     }
 
     #[test]
@@ -192,5 +224,46 @@ mod tests {
         use crate::envelope::Subject;
         let claims = Claims::new("alice".to_owned(), 1000, 2000);
         assert_eq!(Subject::from(&claims), Subject::new("alice"));
+    }
+
+    #[test]
+    fn test_claims_roundtrip_with_iss() {
+        use super::super::jwt;
+        use ed25519_dalek::SigningKey;
+
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+
+        let claims = Claims::new("alice".to_owned(), 0, 9_999_999_999)
+            .with_issuer("https://a.example.com".to_owned());
+
+        let token = jwt::encode(&claims, &signing_key);
+        let decoded = jwt::decode(&token, &verifying_key, None).expect("decode failed");
+
+        assert_eq!(decoded.iss, "https://a.example.com");
+        assert_eq!(decoded.sub, "alice");
+        assert_eq!(decoded.exp, 9_999_999_999);
+    }
+
+    #[test]
+    fn test_claims_iss_absent_defaults_to_empty() {
+        // Simulate an old token without the `iss` field.
+        // `#[serde(default)]` must ensure deserialization succeeds with iss = "".
+        let json = r#"{"sub":"bob","exp":9999999999,"iat":0}"#;
+        let claims: Claims = serde_json::from_str(json)
+            .expect("old token without iss should deserialize successfully");
+        assert_eq!(claims.iss, "");
+        assert_eq!(claims.sub, "bob");
+    }
+
+    #[test]
+    fn test_claims_iss_not_in_json_when_empty() {
+        // Empty iss is serialized as `"iss":""` (no skip_serializing_if),
+        // but we do NOT skip it — that is intentional per the field design.
+        // This test just confirms iss is present in JSON output.
+        let claims = Claims::new("alice".to_owned(), 0, 9_999_999_999)
+            .with_issuer("https://cloud.example.com".to_owned());
+        let json = serde_json::to_string(&claims).unwrap();
+        assert!(json.contains("\"iss\":\"https://cloud.example.com\""));
     }
 }

@@ -1808,7 +1808,7 @@ where
     );
 
     // 2. Verify claims (E2E JWT, downgrade protection)
-    if let Err(e) = service.verify_claims(&ctx) {
+    if let Err(e) = service.verify_claims(&ctx).await {
         warn!(
             "{} claims verification failed for {} (id={}): {}",
             service.name(), ctx.subject(), request_id, e

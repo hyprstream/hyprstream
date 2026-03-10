@@ -19,11 +19,13 @@ use hyprstream_core::cli::{
     handle_branch, handle_checkout, handle_clone, handle_infer, handle_info, handle_list,
     handle_load, handle_notify_command, parse_filters, parse_status_filter, handle_policy_apply, handle_policy_apply_template, handle_policy_check,
     handle_policy_diff, handle_policy_edit, handle_policy_history, handle_policy_list_templates,
-    handle_policy_rollback, handle_policy_show, handle_pull, handle_remote_add, handle_remote_list,
+    handle_policy_rollback, handle_policy_show, handle_policy_role_add, handle_policy_role_remove,
+    handle_policy_role_list, handle_pull, handle_remote_add, handle_remote_list,
     handle_remote_remove, handle_remote_rename, handle_remote_set_url, handle_remove,
     handle_status, handle_token_create, handle_unload, handle_training_batch,
     handle_training_checkpoint, handle_training_infer, handle_training_init, handle_worktree_add,
     handle_worktree_info, handle_worktree_list, handle_worktree_remove,
+    handle_user_list, handle_user_register, handle_user_remove, handle_user_show,
     load_or_generate_signing_key, AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
     // Worker handlers
     handle_images_df, handle_images_list, handle_images_pull, handle_images_rm,
@@ -35,7 +37,7 @@ use hyprstream_core::cli::{
     handle_service_start, handle_service_status,
     handle_service_stop, handle_service_uninstall,
 };
-use hyprstream_core::cli::commands::{PolicyCommand, TokenCommand};
+use hyprstream_core::cli::commands::{PolicyCommand, RoleCommand, TokenCommand, UserCommand};
 
 #[cfg(feature = "experimental")]
 use hyprstream_core::cli::{handle_commit, handle_merge, handle_push, MergeOptions};
@@ -120,6 +122,13 @@ fn build_cli() -> ClapCommand {
     app = app.subcommand(
         <FlightArgs as ClapArgs>::augment_args(
             ClapCommand::new("flight").about("Flight SQL client to query datasets"),
+        ),
+    );
+
+    // User management (derive-based subcommands)
+    app = app.subcommand(
+        <UserCommand as ClapSubcommand>::augment_subcommands(
+            ClapCommand::new("user").about("Manage local user credentials"),
         ),
     );
 
@@ -881,6 +890,17 @@ fn handle_quick_command(
                         handle_policy_apply_template(&signing_key, &template, dry_run).await
                     }
                     PolicyCommand::ListTemplates => handle_policy_list_templates().await,
+                    PolicyCommand::Role { command } => match command {
+                        RoleCommand::Add { user, role, dry_run } => {
+                            handle_policy_role_add(&signing_key, &user, &role, dry_run).await
+                        }
+                        RoleCommand::Remove { user, role, force } => {
+                            handle_policy_role_remove(&signing_key, &user, &role, force).await
+                        }
+                        RoleCommand::List { user, role } => {
+                            handle_policy_role_list(&signing_key, user.as_deref(), role.as_deref()).await
+                        }
+                    },
                 }
             },
         ),
@@ -1319,13 +1339,19 @@ fn main() -> Result<()> {
                 let signing_key = load_or_generate_signing_key(&keys_dir).await?;
                 let verifying_key = signing_key.verifying_key();
 
+                let fed_src: Arc<dyn hyprstream_rpc::auth::FederationKeySource> =
+                    Arc::new(hyprstream_core::auth::FederationKeyResolver::new(
+                        &config.oauth.trusted_issuers,
+                    ));
                 let ctx = ServiceContext::new(
                     global_context(),
                     signing_key.clone(),
                     verifying_key,
                     false,
                     models_dir.clone(),
-                ).with_oauth_issuer(config.oauth.issuer_url());
+                )
+                .with_oauth_issuer(config.oauth.issuer_url())
+                .with_federation_key_source(fed_src);
 
                 let manager = InprocManager::new();
                 let mut handles = Vec::new();
@@ -1576,13 +1602,19 @@ fn main() -> Result<()> {
                                     load_or_generate_signing_key(&keys_dir).await?;
                                 let verifying_key = signing_key.verifying_key();
 
+                                let fed_src: Arc<dyn hyprstream_rpc::auth::FederationKeySource> =
+                                    Arc::new(hyprstream_core::auth::FederationKeyResolver::new(
+                                        &config.oauth.trusted_issuers,
+                                    ));
                                 let mut ctx = ServiceContext::new(
                                     global_context(),
                                     signing_key.clone(),
                                     verifying_key,
                                     ipc,
                                     models_dir.clone(),
-                                ).with_oauth_issuer(config.oauth.issuer_url());
+                                )
+                                .with_oauth_issuer(config.oauth.issuer_url())
+                                .with_federation_key_source(fed_src);
 
                                 // Wire QUIC shared config from --quic-bind or [quic] config
                                 let quic_cfg = if let Some(ref bind_addr) = quic_bind {
@@ -1748,6 +1780,27 @@ fn main() -> Result<()> {
                             handle_service_install(&models_dir, &services, None, false, verbose).await
                         },
                     )?;
+                }
+            }
+        }
+
+        // ── User management ─────────────────────────────────────────────
+        Some(("user", sub_m)) => {
+            let cmd = UserCommand::from_arg_matches(sub_m)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let credentials_dir = ctx.models_dir().join(".registry").join("credentials");
+            match cmd {
+                UserCommand::Register { username, pubkey_base64 } => {
+                    handle_user_register(&credentials_dir, &username, &pubkey_base64)?;
+                }
+                UserCommand::List => {
+                    handle_user_list(&credentials_dir)?;
+                }
+                UserCommand::Remove { username, force } => {
+                    handle_user_remove(&credentials_dir, &username, force)?;
+                }
+                UserCommand::Show { username } => {
+                    handle_user_show(&credentials_dir, &username)?;
                 }
             }
         }

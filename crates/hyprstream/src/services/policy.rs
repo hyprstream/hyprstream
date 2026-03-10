@@ -13,6 +13,7 @@ use crate::services::generated::policy_client::{
     ApplyTemplate, ApplyDraft, RollbackPolicy, GetHistory, GetDiff,
     PolicyInfo, PolicyRule, Grouping,
     PolicyHistory, PolicyHistoryEntry, DraftStatus,
+    AddGrouping, RemoveGrouping, SetBranchVisibility,
     dispatch_policy, serialize_response,
 };
 use anyhow::{anyhow, Result};
@@ -47,6 +48,10 @@ pub struct PolicyService {
     /// Default audience for issued tokens (OAuth issuer URL, shared instance identifier).
     /// Used when IssueToken.audience is empty, ensuring all tokens get an `aud` claim.
     default_audience: Option<String>,
+    /// Local OAuth issuer URL for distinguishing local vs. federated JWTs.
+    local_issuer_url: Option<String>,
+    /// Federation key source for verifying externally-issued JWTs.
+    federation_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>>,
     // Infrastructure (for Spawnable)
     context: Arc<zmq::Context>,
     transport: TransportConfig,
@@ -71,6 +76,8 @@ impl PolicyService {
             git2db,
             registry_repo_id,
             default_audience: None,
+            local_issuer_url: None,
+            federation_key_source: None,
             context,
             transport,
         }
@@ -82,18 +89,19 @@ impl PolicyService {
         self
     }
 
-    /// Parse operation from string
-    fn parse_operation(op_str: &str) -> Result<Operation> {
-        match op_str {
-            "infer" => Ok(Operation::Infer),
-            "train" => Ok(Operation::Train),
-            "query" => Ok(Operation::Query),
-            "write" => Ok(Operation::Write),
-            "serve" => Ok(Operation::Serve),
-            "manage" => Ok(Operation::Manage),
-            "context" => Ok(Operation::Context),
-            _ => Err(anyhow!("Unknown operation: {}", op_str)),
-        }
+    /// Set the local OAuth issuer URL for distinguishing local vs. federated JWTs.
+    pub fn with_local_issuer_url(mut self, url: String) -> Self {
+        self.local_issuer_url = Some(url);
+        self
+    }
+
+    /// Set the federation key source for verifying externally-issued JWTs.
+    pub fn with_federation_key_source(
+        mut self,
+        src: std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>,
+    ) -> Self {
+        self.federation_key_source = Some(src);
+        self
     }
 
     /// Stage policies/ and commit with the given message via git2db.
@@ -151,7 +159,7 @@ impl PolicyHandler for PolicyService {
             &subject.to_string(),
             "*",
             resource,
-            Self::parse_operation(operation).unwrap_or(Operation::Query),
+            operation,
         ).await;
         if allowed {
             Ok(())
@@ -171,24 +179,13 @@ impl PolicyHandler for PolicyService {
             data.subject, data.domain, data.resource, data.operation
         );
 
-        // Parse operation
-        let operation = match Self::parse_operation(&data.operation) {
-            Ok(op) => op,
-            Err(_) => {
-                return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                    message: format!("Invalid operation: {}", data.operation),
-                    code: "INVALID_OPERATION".to_owned(),
-                    details: String::new(),
-                }));
-            }
-        };
-
-        // Check authorization
+        // Check authorization — pass the operation string directly so dot-namespaced
+        // actions (e.g. "ttt.writeback") are forwarded verbatim to the Casbin enforcer.
         let allowed = self.policy_manager.check_with_domain(
             &data.subject,
             &data.domain,
             &data.resource,
-            operation,
+            &data.operation,
         ).await;
 
         debug!("Policy check result: allowed={}", allowed);
@@ -213,7 +210,7 @@ impl PolicyHandler for PolicyService {
                 &caller,
                 "*",
                 "policy:issue-token",
-                Operation::Manage,
+                Operation::Manage.as_str(),
             ).await;
             if !allowed {
                 return Ok(PolicyResponseVariant::Error(ErrorInfo {
@@ -265,11 +262,15 @@ impl PolicyHandler for PolicyService {
             self.default_audience.clone()
         };
 
+        // Populate iss with the OAuth issuer URL so federation peers can fetch JWKS.
+        // default_audience is the OAuth issuer URL (set via with_default_audience).
+        let issuer = self.default_audience.clone().unwrap_or_default();
         let claims = hyprstream_rpc::auth::Claims::new(
             subject,
             now,
             now + requested_ttl as i64,
-        ).with_audience(audience);
+        ).with_issuer(issuer)
+         .with_audience(audience);
 
         let token = crate::auth::jwt::encode(&claims, &self.signing_key);
 
@@ -326,10 +327,22 @@ impl PolicyHandler for PolicyService {
 
     async fn handle_apply_template(
         &self,
-        _ctx: &EnvelopeContext,
+        ctx: &EnvelopeContext,
         _request_id: u64,
         data: &ApplyTemplate,
     ) -> Result<PolicyResponseVariant> {
+        let caller = ctx.subject().to_string();
+        let allowed = self.policy_manager.check_with_domain(
+            &caller, "*", "policy:*", "ttt.writeback",
+        ).await;
+        if !allowed {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Unauthorized: {} cannot manage policy", caller),
+                code: "UNAUTHORIZED".into(),
+                details: String::new(),
+            }));
+        }
+
         info!("Applying policy template: {}", data.name);
 
         // Validate template exists
@@ -396,10 +409,22 @@ impl PolicyHandler for PolicyService {
 
     async fn handle_apply_draft(
         &self,
-        _ctx: &EnvelopeContext,
+        ctx: &EnvelopeContext,
         _request_id: u64,
         data: &ApplyDraft,
     ) -> Result<PolicyResponseVariant> {
+        let caller = ctx.subject().to_string();
+        let allowed = self.policy_manager.check_with_domain(
+            &caller, "*", "policy:*", "ttt.writeback",
+        ).await;
+        if !allowed {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Unauthorized: {} cannot manage policy", caller),
+                code: "UNAUTHORIZED".into(),
+                details: String::new(),
+            }));
+        }
+
         info!("Applying draft policy changes");
 
         // Validate current disk state
@@ -437,13 +462,39 @@ impl PolicyHandler for PolicyService {
 
     async fn handle_rollback(
         &self,
-        _ctx: &EnvelopeContext,
+        ctx: &EnvelopeContext,
         _request_id: u64,
         data: &RollbackPolicy,
     ) -> Result<PolicyResponseVariant> {
+        let caller = ctx.subject().to_string();
+        let allowed = self.policy_manager.check_with_domain(
+            &caller, "*", "policy:*", "ttt.writeback",
+        ).await;
+        if !allowed {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Unauthorized: {} cannot manage policy", caller),
+                code: "UNAUTHORIZED".into(),
+                details: String::new(),
+            }));
+        }
+
         info!("Rolling back policy to: {}", data.git_ref);
 
-        let git_ref = data.git_ref.clone();
+        // Validate git_ref to prevent shell injection or path traversal.
+        // Accept: 40-hex SHA, short SHA (7+ hex chars), or simple branch/tag names.
+        let git_ref = data.git_ref.trim().to_owned();
+        {
+            let valid = !git_ref.is_empty()
+                && git_ref.len() <= 256
+                && git_ref.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/' | '.'));
+            if !valid {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: format!("Invalid git ref '{}': only [a-zA-Z0-9._/-] allowed", git_ref),
+                    code: "INVALID_GIT_REF".into(),
+                    details: String::new(),
+                }));
+            }
+        }
 
         // Use git2 escape hatch to checkout policies/ from the target ref
         let reg = self.git2db.read().await;
@@ -506,10 +557,22 @@ impl PolicyHandler for PolicyService {
 
     async fn handle_get_history(
         &self,
-        _ctx: &EnvelopeContext,
+        ctx: &EnvelopeContext,
         _request_id: u64,
         data: &GetHistory,
     ) -> Result<PolicyResponseVariant> {
+        let caller = ctx.subject().to_string();
+        let allowed = self.policy_manager.check_with_domain(
+            &caller, "*", "policy:*", "ttt.writeback",
+        ).await;
+        if !allowed {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Unauthorized: {} cannot manage policy", caller),
+                code: "UNAUTHORIZED".into(),
+                details: String::new(),
+            }));
+        }
+
         let count = if data.count == 0 { 10 } else { data.count as usize };
 
         trace!("Getting policy history (count={})", count);
@@ -581,10 +644,22 @@ impl PolicyHandler for PolicyService {
 
     async fn handle_get_diff(
         &self,
-        _ctx: &EnvelopeContext,
+        ctx: &EnvelopeContext,
         _request_id: u64,
         data: &GetDiff,
     ) -> Result<PolicyResponseVariant> {
+        let caller = ctx.subject().to_string();
+        let allowed = self.policy_manager.check_with_domain(
+            &caller, "*", "policy:*", "ttt.writeback",
+        ).await;
+        if !allowed {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Unauthorized: {} cannot manage policy", caller),
+                code: "UNAUTHORIZED".into(),
+                details: String::new(),
+            }));
+        }
+
         let git_ref = if data.git_ref.is_empty() { "HEAD".to_owned() } else { data.git_ref.clone() };
 
         let reg = self.git2db.read().await;
@@ -627,9 +702,21 @@ impl PolicyHandler for PolicyService {
 
     async fn handle_get_draft_status(
         &self,
-        _ctx: &EnvelopeContext,
+        ctx: &EnvelopeContext,
         _request_id: u64,
     ) -> Result<PolicyResponseVariant> {
+        let caller = ctx.subject().to_string();
+        let allowed = self.policy_manager.check_with_domain(
+            &caller, "*", "policy:*", "ttt.writeback",
+        ).await;
+        if !allowed {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Unauthorized: {} cannot manage policy", caller),
+                code: "UNAUTHORIZED".into(),
+                details: String::new(),
+            }));
+        }
+
         let reg = self.git2db.read().await;
         let handle = reg.repo(&self.registry_repo_id)?;
         let repo = handle.open_repo()
@@ -658,6 +745,210 @@ impl PolicyHandler for PolicyService {
             has_changes,
             summary,
         }))
+    }
+
+    async fn handle_add_grouping(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &AddGrouping,
+    ) -> Result<PolicyResponseVariant> {
+        let caller = ctx.subject().to_string();
+
+        // Fine-grained permission check: caller must have ttt.writeback on policy:roles
+        let allowed = self.policy_manager.check_with_domain(
+            &caller,
+            "*",
+            "policy:roles",
+            "ttt.writeback",
+        ).await;
+        if !allowed {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!(
+                    "Subject '{}' is not authorized to manage role assignments",
+                    caller
+                ),
+                code: "UNAUTHORIZED".to_owned(),
+                details: "Requires 'ttt.writeback' permission on 'policy:roles'".to_owned(),
+            }));
+        }
+
+        // Validate inputs
+        if data.user.is_empty() || data.role.is_empty() {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "user and role must be non-empty".to_owned(),
+                code: "INVALID_INPUT".to_owned(),
+                details: String::new(),
+            }));
+        }
+
+        // Elevated roles require local identity
+        const ELEVATED_ROLES: &[&str] = &["ttt.privileged", "operator"];
+        if ELEVATED_ROLES.contains(&data.role.as_str()) && !ctx.identity.is_local() {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!(
+                    "Role '{}' is an elevated role and can only be assigned by local callers",
+                    data.role
+                ),
+                code: "UNAUTHORIZED".to_owned(),
+                details: "Elevated roles require local identity".to_owned(),
+            }));
+        }
+
+        // Non-local callers cannot assign roles to themselves
+        if !ctx.identity.is_local() && data.user == caller {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "Cannot assign roles to yourself".to_owned(),
+                code: "SELF_ASSIGNMENT".to_owned(),
+                details: "Non-local callers may not assign roles to themselves".to_owned(),
+            }));
+        }
+
+        // Apply the role assignment
+        self.policy_manager.add_role_for_user(&data.user, &data.role).await
+            .map_err(|e| anyhow!("Failed to add role: {}", e))?;
+
+        // Persist in-memory Casbin state to disk before staging
+        self.policy_manager.save().await
+            .map_err(|e| anyhow!("Failed to save policy after role grant: {}", e))?;
+
+        // Commit to git
+        let commit_msg = format!(
+            "policy: grant role {} to {} [by {}]",
+            data.role, data.user, caller
+        );
+        let sha = match self.stage_and_commit_policies(&commit_msg).await {
+            Ok(sha) => sha,
+            Err(e) => {
+                warn!("Role granted but commit failed: {}", e);
+                format!("(commit failed: {})", e)
+            }
+        };
+
+        info!("Granted role '{}' to '{}' (caller={})", data.role, data.user, caller);
+        Ok(PolicyResponseVariant::AddGroupingResult(sha))
+    }
+
+    async fn handle_remove_grouping(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &RemoveGrouping,
+    ) -> Result<PolicyResponseVariant> {
+        let caller = ctx.subject().to_string();
+
+        // Fine-grained permission check: caller must have ttt.writeback on policy:roles
+        let allowed = self.policy_manager.check_with_domain(
+            &caller,
+            "*",
+            "policy:roles",
+            "ttt.writeback",
+        ).await;
+        if !allowed {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!(
+                    "Subject '{}' is not authorized to manage role assignments",
+                    caller
+                ),
+                code: "UNAUTHORIZED".to_owned(),
+                details: "Requires 'ttt.writeback' permission on 'policy:roles'".to_owned(),
+            }));
+        }
+
+        // Validate inputs
+        if data.user.is_empty() || data.role.is_empty() {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "user and role must be non-empty".to_owned(),
+                code: "INVALID_INPUT".to_owned(),
+                details: String::new(),
+            }));
+        }
+
+        // Remove the role assignment
+        self.policy_manager.remove_role_for_user(&data.user, &data.role).await
+            .map_err(|e| anyhow!("Failed to remove role: {}", e))?;
+
+        // Persist in-memory Casbin state to disk before staging
+        self.policy_manager.save().await
+            .map_err(|e| anyhow!("Failed to save policy after role revoke: {}", e))?;
+
+        // Commit to git
+        let commit_msg = format!(
+            "policy: revoke role {} from {} [by {}]",
+            data.role, data.user, caller
+        );
+        let sha = match self.stage_and_commit_policies(&commit_msg).await {
+            Ok(sha) => sha,
+            Err(e) => {
+                warn!("Role revoked but commit failed: {}", e);
+                format!("(commit failed: {})", e)
+            }
+        };
+
+        info!("Revoked role '{}' from '{}' (caller={})", data.role, data.user, caller);
+        Ok(PolicyResponseVariant::RemoveGroupingResult(sha))
+    }
+
+    async fn handle_set_branch_visibility(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &SetBranchVisibility,
+    ) -> Result<PolicyResponseVariant> {
+        let caller = ctx.subject().to_string();
+        let resource = format!("model:{}:{}", data.model_name, data.branch_name);
+
+        // Require manage (ttt.writeback) on the model resource
+        let allowed = self.policy_manager.check_with_domain(
+            &caller,
+            "*",
+            &resource,
+            "ttt.writeback",
+        ).await;
+        if !allowed {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Unauthorized: {} cannot manage {}", caller, resource),
+                code: "UNAUTHORIZED".to_owned(),
+                details: String::new(),
+            }));
+        }
+
+        if data.public {
+            // Make public: add wildcard infer+query rules
+            let _ = self.policy_manager.add_policy_with_domain(
+                "*", "*", &resource, "infer.generate", "allow").await;
+            let _ = self.policy_manager.add_policy_with_domain(
+                "*", "*", &resource, "query.status", "allow").await;
+        } else {
+            // Make private: remove wildcard rules
+            let _ = self.policy_manager.remove_policy_with_domain(
+                "*", "*", &resource, "infer.generate", "allow").await;
+            let _ = self.policy_manager.remove_policy_with_domain(
+                "*", "*", &resource, "query.status", "allow").await;
+        }
+
+        // Persist in-memory Casbin state to disk before staging
+        self.policy_manager.save().await
+            .map_err(|e| anyhow!("Failed to save policy after visibility change: {}", e))?;
+
+        let vis_str = if data.public { "public" } else { "private" };
+        let msg = format!(
+            "policy: set {}/{} visibility={} [by {}]",
+            data.model_name, data.branch_name, vis_str, caller
+        );
+        let sha = match self.stage_and_commit_policies(&msg).await {
+            Ok(sha) => sha,
+            Err(e) => {
+                warn!("Visibility set but commit failed: {}", e);
+                format!("(commit failed: {})", e)
+            }
+        };
+
+        info!(
+            "Set branch {}/{} to {} (caller={})",
+            data.model_name, data.branch_name, vis_str, caller
+        );
+        Ok(PolicyResponseVariant::SetBranchVisibilityResult(sha))
     }
 }
 
@@ -690,6 +981,16 @@ impl ZmqService for PolicyService {
 
     fn expected_audience(&self) -> Option<&str> {
         self.default_audience.as_deref()
+    }
+
+    fn local_issuer_url(&self) -> Option<&str> {
+        self.local_issuer_url.as_deref()
+    }
+
+    fn federation_key_source(
+        &self,
+    ) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>> {
+        self.federation_key_source.clone()
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
@@ -786,19 +1087,3 @@ pub(crate) async fn watch_policy_file(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_operation() {
-        assert!(matches!(PolicyService::parse_operation("infer"), Ok(Operation::Infer)));
-        assert!(matches!(PolicyService::parse_operation("train"), Ok(Operation::Train)));
-        assert!(matches!(PolicyService::parse_operation("query"), Ok(Operation::Query)));
-        assert!(matches!(PolicyService::parse_operation("write"), Ok(Operation::Write)));
-        assert!(matches!(PolicyService::parse_operation("serve"), Ok(Operation::Serve)));
-        assert!(matches!(PolicyService::parse_operation("manage"), Ok(Operation::Manage)));
-        assert!(matches!(PolicyService::parse_operation("context"), Ok(Operation::Context)));
-        assert!(PolicyService::parse_operation("unknown").is_err());
-    }
-}
