@@ -1339,13 +1339,19 @@ fn main() -> Result<()> {
                 let signing_key = load_or_generate_signing_key(&keys_dir).await?;
                 let verifying_key = signing_key.verifying_key();
 
+                let fed_src_inproc: Arc<dyn hyprstream_rpc::auth::FederationKeySource> =
+                    Arc::new(hyprstream_core::auth::FederationKeyResolver::new(
+                        &config.oauth.trusted_issuers,
+                    ));
                 let ctx = ServiceContext::new(
                     global_context(),
                     signing_key.clone(),
                     verifying_key,
                     false,
                     models_dir.clone(),
-                ).with_oauth_issuer(config.oauth.issuer_url());
+                )
+                .with_oauth_issuer(config.oauth.issuer_url())
+                .with_federation_key_source(fed_src_inproc);
 
                 let manager = InprocManager::new();
                 let mut handles = Vec::new();
@@ -1596,13 +1602,19 @@ fn main() -> Result<()> {
                                     load_or_generate_signing_key(&keys_dir).await?;
                                 let verifying_key = signing_key.verifying_key();
 
+                                let fed_src_standalone: Arc<dyn hyprstream_rpc::auth::FederationKeySource> =
+                                    Arc::new(hyprstream_core::auth::FederationKeyResolver::new(
+                                        &config.oauth.trusted_issuers,
+                                    ));
                                 let mut ctx = ServiceContext::new(
                                     global_context(),
                                     signing_key.clone(),
                                     verifying_key,
                                     ipc,
                                     models_dir.clone(),
-                                ).with_oauth_issuer(config.oauth.issuer_url());
+                                )
+                                .with_oauth_issuer(config.oauth.issuer_url())
+                                .with_federation_key_source(fed_src_standalone);
 
                                 // Wire QUIC shared config from --quic-bind or [quic] config
                                 let quic_cfg = if let Some(ref bind_addr) = quic_bind {

@@ -102,6 +102,9 @@ pub struct ServiceContext {
     /// OAuth issuer URL for protected resource metadata (RFC 9728).
     /// When set, QUIC services serve `.well-known/oauth-protected-resource`.
     oauth_issuer_url: Option<String>,
+
+    /// Shared federation key resolver (None when no trusted_issuers are configured).
+    federation_key_source: Option<Arc<dyn crate::auth::FederationKeySource>>,
 }
 
 impl ServiceContext {
@@ -121,6 +124,7 @@ impl ServiceContext {
             models_dir,
             quic_shared: None,
             oauth_issuer_url: None,
+            federation_key_source: None,
         }
     }
 
@@ -151,6 +155,22 @@ impl ServiceContext {
     /// Get the OAuth issuer URL (if configured).
     pub fn oauth_issuer_url(&self) -> Option<&str> {
         self.oauth_issuer_url.as_deref()
+    }
+
+    /// Get the federation key source (if configured).
+    pub fn federation_key_source(
+        &self,
+    ) -> Option<Arc<dyn crate::auth::FederationKeySource>> {
+        self.federation_key_source.clone()
+    }
+
+    /// Set the shared federation key source for multi-issuer ZMQ token acceptance.
+    pub fn with_federation_key_source(
+        mut self,
+        src: Arc<dyn crate::auth::FederationKeySource>,
+    ) -> Self {
+        self.federation_key_source = Some(src);
+        self
     }
 
     /// Get the shared ZMQ context.
