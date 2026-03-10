@@ -206,7 +206,7 @@ impl ShellApp {
         load_fn: LoadFn,
         unload_fn: Box<dyn Fn(&str) -> bool + Send>,
     ) -> Self {
-        let pane_rows = rows.saturating_sub(3);
+        let pane_rows = rows.saturating_sub(2);
         let initial = PaneWindow::new("shell".to_owned(), None, cols, pane_rows)
             .unwrap_or_else(|e| panic!("Failed to spawn shell: {e}"));
 
@@ -242,7 +242,7 @@ impl ShellApp {
     }
 
     pub fn pane_rows(&self) -> u16 {
-        self.rows.saturating_sub(3)
+        self.rows.saturating_sub(2)
     }
 
     fn open_terminal(&mut self, cwd: Option<PathBuf>, title: String) {
@@ -297,37 +297,6 @@ impl ShellApp {
             }
         }
         match key {
-            KeyPress::F(12) => {
-                self.quit = true;
-                true
-            }
-            KeyPress::F(10) => {
-                self.mode = ShellMode::ModelList;
-                true
-            }
-            KeyPress::F(11) => {
-                self.saved_style = self.bg.style;
-                // Sync the SelectList cursor to the current style.
-                let idx = ALL_STYLES
-                    .iter()
-                    .position(|s| *s == self.bg.style)
-                    .unwrap_or(0);
-                *self.settings_list.items_mut() = ALL_STYLES.to_vec();
-                // Re-create with current index selected (cheapest approach).
-                self.settings_list = SelectList::new("Background", ALL_STYLES.to_vec())
-                    .with_selected(idx);
-                self.preview_bg.style = self.bg.style;
-                self.mode = ShellMode::Settings;
-                true
-            }
-            KeyPress::F(7) => {
-                self.open_terminal(None, "shell".to_owned());
-                true
-            }
-            KeyPress::F(8) => {
-                self.close_active();
-                true
-            }
             KeyPress::CtrlSpace => {
                 self.mode = ShellMode::StartMenu { selected: 0 };
                 true
@@ -400,12 +369,7 @@ impl ShellApp {
                 self.mode = ShellMode::Normal;
                 true
             }
-            WidgetResult::Pending => {
-                if matches!(key, KeyPress::F(10)) {
-                    self.mode = ShellMode::Normal;
-                }
-                true
-            }
+            WidgetResult::Pending => true,
         }
     }
 
@@ -566,34 +530,5 @@ impl TerminalApp for ShellApp {
     }
 }
 
-// ============================================================================
-// KeyPress → raw bytes (for forwarding to PTY)
-// ============================================================================
-
-pub fn keypress_to_bytes(key: KeyPress) -> Vec<u8> {
-    match key {
-        KeyPress::Char(b)    => vec![b],
-        KeyPress::Enter      => vec![b'\r'],
-        KeyPress::Backspace  => vec![0x7f],
-        KeyPress::Tab        => vec![b'\t'],
-        KeyPress::Escape     => vec![0x1b],
-        KeyPress::CtrlSpace  => vec![],  // consumed by chrome; never forward to PTY
-        KeyPress::ArrowUp    => b"\x1b[A".to_vec(),
-        KeyPress::ArrowDown  => b"\x1b[B".to_vec(),
-        KeyPress::ArrowRight => b"\x1b[C".to_vec(),
-        KeyPress::ArrowLeft  => b"\x1b[D".to_vec(),
-        KeyPress::F(1)  => b"\x1bOP".to_vec(),
-        KeyPress::F(2)  => b"\x1bOQ".to_vec(),
-        KeyPress::F(3)  => b"\x1bOR".to_vec(),
-        KeyPress::F(4)  => b"\x1bOS".to_vec(),
-        KeyPress::F(5)  => b"\x1b[15~".to_vec(),
-        KeyPress::F(6)  => b"\x1b[17~".to_vec(),
-        KeyPress::F(7)  => b"\x1b[18~".to_vec(),
-        KeyPress::F(8)  => b"\x1b[19~".to_vec(),
-        KeyPress::F(9)  => b"\x1b[20~".to_vec(),
-        KeyPress::F(10) => b"\x1b[21~".to_vec(),
-        KeyPress::F(11) => b"\x1b[23~".to_vec(),
-        KeyPress::F(12) => b"\x1b[24~".to_vec(),
-        KeyPress::F(_)  => vec![],
-    }
-}
+// Re-export from compositor (canonical implementation).
+pub use hyprstream_compositor::keypress_to_bytes;

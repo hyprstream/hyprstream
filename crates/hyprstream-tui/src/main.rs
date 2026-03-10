@@ -12,7 +12,7 @@ fn main() {
         Some("shell") => run_shell(args),
         Some("wizard") => run_wizard(),
         #[cfg(target_os = "wasi")]
-        Some("chat") => run_chat_wasi(),
+        Some("chat") => run_chat_wasi_v2(),
         #[cfg(target_os = "wasi")]
         _ => run_compositor_wasi(),
         #[cfg(not(target_os = "wasi"))]
@@ -239,21 +239,14 @@ fn osc_write_route(app_id: u32, data: &[u8]) {
 // WASI chat entry point (Phase W3)
 // ============================================================================
 
-/// Minimal private chat WASI entry point.
+/// WASM chat using ChatApp.
 ///
-/// Model name is argv[2] (e.g. `#bundle/hyprstream-tui.wasm chat qwen3.5`).
-/// Uses the same 9-byte framed stdin protocol as run_compositor_wasi:
-///   0x01 → keyboard bytes
-///   0x02 → resize
-///   0x03 → inference token UTF-8
-///   0x04 → inference complete
-///   0x05 → inference error UTF-8
-///
-/// Writes OSC 0xFD inference requests to stdout:
-///   ESC ] 0xFD <len:u32 LE> <json> BEL
+/// Uses ChatApp's push-based event methods (on_token, on_stream_complete, etc.)
+/// and submit_message_payload() for inference requests.
 #[cfg(target_os = "wasi")]
-fn run_chat_wasi() {
-    use hyprstream_tui::wasm_chat::{WasmChat, draw as chat_draw};
+fn run_chat_wasi_v2() {
+    use hyprstream_tui::chat_app::ChatApp;
+    use hyprstream_tui::chat_ui_wasm::draw as chat_draw;
     use std::io::Write;
     use waxterm::backend::AnsiBackend;
     use waxterm::input::{InputParser, KeyPress};
@@ -269,7 +262,7 @@ fn run_chat_wasi() {
     );
     let Ok(mut terminal) = ratatui::Terminal::new(backend) else { return };
 
-    let mut app = WasmChat::new(model_name, cols, rows);
+    let mut app = ChatApp::new_wasm(model_name, cols, rows);
     terminal.draw(|f| chat_draw(f, &app)).ok();
 
     let stdin = std::io::stdin();
@@ -316,13 +309,18 @@ fn run_chat_wasi() {
             }
             0x04 => {
                 // Inference complete
-                app.on_complete();
+                app.on_stream_complete();
                 needs_redraw = true;
             }
             0x05 => {
                 // Inference error
                 let msg = std::str::from_utf8(&data).unwrap_or("unknown error");
-                app.on_error(msg);
+                app.on_stream_error(msg.to_owned());
+                needs_redraw = true;
+            }
+            0x06 => {
+                // Inference cancelled
+                app.on_stream_cancelled();
                 needs_redraw = true;
             }
             _ => {}

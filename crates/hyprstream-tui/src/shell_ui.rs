@@ -5,8 +5,7 @@
 //! ┌─ status bar (1 row) ─────────────────────────────┐
 //! │  pane content (Min rows) — VT cells or background │
 //! │  [model/settings modal overlay]                   │
-//! ├─ window strip / taskbar (1 row) ─────────────────┤
-//! └─ F-key legend (1 row) ────────────────────────────┘
+//! └─ window strip / taskbar (1 row) ─────────────────┘
 //! ```
 
 #![cfg(not(target_os = "wasi"))]
@@ -32,14 +31,12 @@ pub fn draw(frame: &mut Frame, app: &ShellApp) {
         Constraint::Length(1), // status bar
         Constraint::Min(1),    // pane content / background
         Constraint::Length(1), // window strip
-        Constraint::Length(1), // F-key legend
     ])
     .split(area);
 
     draw_status_bar(frame, chunks[0], app);
     draw_content(frame, chunks[1], app);
     draw_window_strip(frame, chunks[2], app);
-    draw_fkey_bar(frame, chunks[3], &app.mode);
 
     match app.mode {
         ShellMode::ModelList              => draw_model_modal(frame, area, app),
@@ -195,57 +192,6 @@ fn draw_window_strip(frame: &mut Frame, area: Rect, app: &ShellApp) {
 }
 
 // ============================================================================
-// F-key legend
-// ============================================================================
-
-fn draw_fkey_bar(frame: &mut Frame, area: Rect, mode: &ShellMode) {
-    let keys: &[(&str, &str)] = match mode {
-        ShellMode::Normal | ShellMode::StartMenu { .. } => {
-            frame.render_widget(
-                Paragraph::new("").style(Style::default().bg(theme::BG_PANEL)),
-                area,
-            );
-            return;
-        }
-        ShellMode::ModelList => if cfg!(any(target_os = "linux", target_os = "openbsd")) {
-            &[
-                ("\u{2191}\u{2193}", "Navigate"),
-                ("c",                "Private"),
-                ("C/Enter",          "Server chat"),
-                ("T",                "Terminal"),
-                ("l/u",              "Load/Unload"),
-                ("Esc",              "Close"),
-            ] as &[_]
-        } else {
-            &[
-                ("\u{2191}\u{2193}", "Navigate"),
-                ("c",                "Private"),
-                ("C/Enter",          "Server chat"),
-                ("l/u",              "Load/Unload"),
-                ("Esc",              "Close"),
-            ] as &[_]
-        },
-        ShellMode::Settings => &[
-            ("\u{2191}\u{2193}", "Navigate"),
-            ("Enter",            "Select"),
-            ("Esc",              "Cancel"),
-        ],
-    };
-
-    let mut spans = Vec::new();
-    for (key, label) in keys {
-        spans.push(Span::styled(*key, theme::help_key()));
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(*label, theme::help_text()));
-        spans.push(Span::raw("  "));
-    }
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::BG_PANEL)),
-        area,
-    );
-}
-
-// ============================================================================
 // Model list modal
 // ============================================================================
 
@@ -310,12 +256,13 @@ fn draw_settings_modal(frame: &mut Frame, full_area: Rect, app: &ShellApp) {
     let inner = block.inner(modal);
     frame.render_widget(block, modal);
 
-    // Split vertically: list on top, preview below.
+    // Split vertically: list on top, preview in middle, hint at bottom.
     // List needs 1 (label) + 3 (items) + 1 (gap) = 5 rows minimum.
-    let list_height = 5u16.min(inner.height / 2);
+    let list_height = 5u16.min(inner.height.saturating_sub(1) / 2);
     let chunks = Layout::vertical([
         Constraint::Length(list_height),
         Constraint::Min(3),
+        Constraint::Length(1),
     ])
     .split(inner);
 
@@ -336,6 +283,25 @@ fn draw_settings_modal(frame: &mut Frame, full_area: Rect, app: &ShellApp) {
     let pw = preview_inner.width.min(PREVIEW_W);
     let preview_render = Rect { width: pw, ..preview_inner };
     app.preview_bg.render(frame, preview_render);
+
+    // Hint bar.
+    let hint_spans = vec![
+        Span::styled("\u{2191}\u{2193}", theme::help_key()),
+        Span::raw(" "),
+        Span::styled("Navigate", theme::help_text()),
+        Span::raw("  "),
+        Span::styled("Enter",    theme::help_key()),
+        Span::raw(" "),
+        Span::styled("Select",   theme::help_text()),
+        Span::raw("  "),
+        Span::styled("Esc",      theme::help_key()),
+        Span::raw(" "),
+        Span::styled("Cancel",   theme::help_text()),
+    ];
+    frame.render_widget(
+        Paragraph::new(Line::from(hint_spans)).style(Style::default().bg(theme::BG_PANEL)),
+        chunks[2],
+    );
 }
 
 // ============================================================================
@@ -345,7 +311,7 @@ fn draw_settings_modal(frame: &mut Frame, full_area: Rect, app: &ShellApp) {
 fn draw_start_menu(frame: &mut Frame, area: Rect, selected: usize) {
     let popup_w: u16 = 22;
     let popup_h: u16 = MENU_ITEMS.len() as u16 + 2;
-    let popup_y = area.height.saturating_sub(popup_h + 2);
+    let popup_y = area.height.saturating_sub(popup_h + 1);
     let popup = Rect {
         x: 0,
         y: popup_y,

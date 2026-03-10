@@ -1,21 +1,30 @@
-//! ChatApp — server-side LLM chat terminal application.
+//! ChatApp — LLM chat terminal application.
 //!
-//! Implements [`waxterm::app::TerminalApp`] so it can be spawned via
-//! `spawn_app_process` inside the TuiService frame loop.
+//! On native, implements [`waxterm::app::TerminalApp`] so it can be spawned via
+//! `spawn_app_process` inside the TuiService frame loop.  The inference
+//! background thread is injected as a [`StreamSpawner`] closure.
 //!
-//! The inference background thread is injected as a [`StreamSpawner`] closure
-//! built in `service.rs`, keeping `hyprstream-tui` free of `hyprstream` types.
+//! On WASM, works as a push-based state machine: the host calls `on_token()`,
+//! `on_stream_complete()`, etc. directly, and `submit_message_payload()` returns
+//! the serialized JSON request for the host to forward.
 
 use std::collections::VecDeque;
-use std::sync::mpsc;
-use std::time::Instant;
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use ratatui_textarea::TextArea;
-use waxterm::app::TerminalApp;
 use waxterm::input::KeyPress;
 
+#[cfg(not(target_os = "wasi"))]
+use std::sync::mpsc;
+#[cfg(not(target_os = "wasi"))]
+use std::time::Instant;
+#[cfg(not(target_os = "wasi"))]
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+#[cfg(not(target_os = "wasi"))]
+use ratatui_textarea::TextArea;
+#[cfg(not(target_os = "wasi"))]
+use waxterm::app::TerminalApp;
+
+#[cfg(not(target_os = "wasi"))]
 fn keypress_to_crossterm(key: KeyPress) -> Option<KeyEvent> {
     let (code, mods) = match key {
         KeyPress::Char(b) if b.is_ascii_graphic() || b == b' ' => {
@@ -50,6 +59,7 @@ fn keypress_to_crossterm(key: KeyPress) -> Option<KeyEvent> {
 // ============================================================================
 
 /// Events sent from the inference background thread to `ChatApp::tick`.
+#[cfg(not(target_os = "wasi"))]
 pub enum ChatEvent {
     Token(String),
     StreamComplete,
@@ -79,6 +89,7 @@ pub struct ChatHistoryEntry {
 
 /// One-shot cancellation handle returned by `StreamSpawner`.
 /// Calling it signals the background thread to abort the current stream.
+#[cfg(not(target_os = "wasi"))]
 pub type CancelHandle = Box<dyn FnOnce() + Send + 'static>;
 
 /// Injected by `service.rs` — captures signing_key + model_ref.
@@ -87,6 +98,7 @@ pub type CancelHandle = Box<dyn FnOnce() + Send + 'static>;
 /// user submits a message.  Returns a [`CancelHandle`] that aborts the stream.
 /// Must be `Send + 'static` because it is moved into the background thread
 /// spawned by `spawn_app_process`.
+#[cfg(not(target_os = "wasi"))]
 pub type StreamSpawner =
     Box<dyn Fn(Vec<(String, String)>, mpsc::SyncSender<ChatEvent>) -> CancelHandle + Send + 'static>;
 
@@ -104,6 +116,7 @@ pub type LoadHook = Box<dyn FnOnce() -> Option<Vec<ChatHistoryEntry>> + Send + '
 pub enum ChatMode {
     Input,
     Streaming,
+    #[cfg(not(target_os = "wasi"))]
     Editor,
 }
 
@@ -112,22 +125,29 @@ pub enum ChatMode {
 // ============================================================================
 
 /// Double-Esc close window: two Esc presses within this interval close the app.
+#[cfg(not(target_os = "wasi"))]
 const DOUBLE_ESC_MS: u128 = 1500;
 
 pub struct ChatApp {
     pub model_name: String,
     pub history: Vec<ChatHistoryEntry>,
+    #[cfg(not(target_os = "wasi"))]
     pub textarea: TextArea<'static>,
+    /// Simple input buffer for WASM (no TextArea available).
+    #[cfg(target_os = "wasi")]
+    pub input_buf: String,
     pub mode: ChatMode,
     /// Current text content held by the editor (set on Ctrl-E, read on Ctrl-S).
-    /// The actual edtui::EditorState is reconstructed per-render in chat_ui.rs
-    /// via a thread_local to avoid !Send issues with Rc inside EditorState.
+    #[cfg(not(target_os = "wasi"))]
     pub editor_text: String,
     /// Number of lines from the tail to scroll back (0 = show tail).
     pub scroll_offset: usize,
     pub status: Option<String>,
+    #[cfg(not(target_os = "wasi"))]
     event_rx: mpsc::Receiver<ChatEvent>,
+    #[cfg(not(target_os = "wasi"))]
     event_tx: mpsc::SyncSender<ChatEvent>,
+    #[cfg(not(target_os = "wasi"))]
     spawner: StreamSpawner,
     pub cols: u16,
     pub rows: u16,
@@ -144,16 +164,19 @@ pub struct ChatApp {
     /// Drained by the event loop each tick (see shell_handlers.rs).
     pub pending_toasts: Vec<String>,
     /// Cancel handle for the current in-flight stream. `None` when idle.
+    #[cfg(not(target_os = "wasi"))]
     cancel_handle: Option<CancelHandle>,
     /// Prompts queued while an inference is in flight.
     /// Each entry is the raw user text; it will be appended to history and
     /// dispatched as the next inference once the current stream completes.
     pub pending_prompts: VecDeque<String>,
     /// Timestamp of the last Esc press (for double-Esc-to-close detection).
+    #[cfg(not(target_os = "wasi"))]
     last_esc: Option<Instant>,
 }
 
 impl ChatApp {
+    #[cfg(not(target_os = "wasi"))]
     pub fn new(model_name: String, cols: u16, rows: u16, spawner: StreamSpawner) -> Self {
         let (event_tx, event_rx) = mpsc::sync_channel::<ChatEvent>(256);
         Self {
@@ -181,6 +204,29 @@ impl ChatApp {
         }
     }
 
+    /// Create a WASM-compatible ChatApp (no StreamSpawner, push-based events).
+    #[cfg(target_os = "wasi")]
+    pub fn new_wasm(model_name: String, cols: u16, rows: u16) -> Self {
+        Self {
+            model_name,
+            history: Vec::new(),
+            input_buf: String::new(),
+            mode: ChatMode::Input,
+            scroll_offset: 0,
+            status: None,
+            cols,
+            rows,
+            quit: false,
+            session_id: None,
+            save_hook: None,
+            in_thinking: false,
+            show_thinking: false,
+            pending_toasts: Vec::new(),
+            pending_prompts: VecDeque::new(),
+        }
+    }
+
+    #[cfg(not(target_os = "wasi"))]
     fn make_textarea() -> TextArea<'static> {
         use ratatui::style::{Color, Style};
         let mut ta = TextArea::default();
@@ -196,6 +242,7 @@ impl ChatApp {
     ///
     /// `load_hook` is called immediately to restore any prior conversation.
     /// `save_hook` is called after each `StreamComplete` to persist history.
+    #[cfg(not(target_os = "wasi"))]
     pub fn new_private(
         model_name: String,
         cols: u16,
@@ -260,6 +307,7 @@ impl ChatApp {
 
     /// Build history pairs (role, content) for the model, appending a new user
     /// message, and fire the spawner.  Stores the returned `CancelHandle`.
+    #[cfg(not(target_os = "wasi"))]
     fn submit_message(&mut self, user_text: String) {
         self.history.push(ChatHistoryEntry {
             role: ChatRole::User,
@@ -298,6 +346,7 @@ impl ChatApp {
     /// assistant reply.  The mode stays `Streaming` until the spawner thread
     /// acknowledges via `ChatEvent::StreamCancelled`, at which point `tick()`
     /// calls `on_stream_done()` to transition to `Input` / drain the queue.
+    #[cfg(not(target_os = "wasi"))]
     fn cancel_stream(&mut self) {
         if let Some(cancel) = self.cancel_handle.take() {
             cancel();
@@ -308,22 +357,159 @@ impl ChatApp {
     /// Called on StreamComplete / StreamCancelled: persist, then drain the
     /// pending queue if any prompts were typed while we were streaming.
     fn on_stream_done(&mut self) {
-        self.cancel_handle = None;
+        #[cfg(not(target_os = "wasi"))]
+        { self.cancel_handle = None; }
         self.in_thinking = false;
-        if let Some(next_text) = self.pending_prompts.pop_front() {
-            // Fire the next queued prompt immediately.
-            self.submit_message(next_text);
+        if let Some(_next_text) = self.pending_prompts.pop_front() {
+            #[cfg(not(target_os = "wasi"))]
+            self.submit_message(_next_text);
+            // On WASM, queue draining is handled by the host event loop.
         } else {
             self.mode = ChatMode::Input;
             self.status = None;
         }
     }
+
+    // ====================================================================
+    // Push-based event methods (for WASM and direct callers)
+    // ====================================================================
+
+    /// Ingest a streamed token from an external event source.
+    pub fn on_token(&mut self, token: &str) {
+        self.ingest_token(token);
+    }
+
+    /// Signal that the inference stream completed successfully.
+    pub fn on_stream_complete(&mut self) {
+        if let Some(ref hook) = self.save_hook {
+            hook(&self.history);
+        }
+        self.on_stream_done();
+    }
+
+    /// Signal that the inference stream was cancelled by the user.
+    pub fn on_stream_cancelled(&mut self) {
+        self.on_stream_done();
+    }
+
+    /// Signal an inference error.
+    pub fn on_stream_error(&mut self, msg: String) {
+        self.pending_toasts.push(format!("Inference error: {msg}"));
+        if let Some(last) = self.history.last_mut() {
+            last.content = format!("[Error: {msg}]");
+        }
+        #[cfg(not(target_os = "wasi"))]
+        { self.cancel_handle = None; }
+        self.in_thinking = false;
+        self.on_stream_done();
+    }
+
+    /// Signal a template application error.
+    pub fn on_template_error(&mut self, msg: String) {
+        // Remove the empty assistant placeholder + user message.
+        self.history.pop();
+        self.history.pop();
+        self.pending_toasts.push(format!("Model error: {msg}"));
+        #[cfg(not(target_os = "wasi"))]
+        { self.cancel_handle = None; }
+        self.in_thinking = false;
+        self.mode = ChatMode::Input;
+        self.status = Some(msg);
+    }
+
+    /// Build the inference request payload as a JSON string (for WASM OSC output).
+    ///
+    /// This returns the serialized request that the WASM host should forward to
+    /// the inference service.  Does NOT call the StreamSpawner.
+    pub fn submit_message_payload(&mut self, user_text: String) -> String {
+        self.history.push(ChatHistoryEntry {
+            role: ChatRole::User,
+            content: user_text,
+            thinking: String::new(),
+        });
+        self.history.push(ChatHistoryEntry {
+            role: ChatRole::Assistant,
+            content: String::new(),
+            thinking: String::new(),
+        });
+        self.mode = ChatMode::Streaming;
+        self.status = Some("Generating\u{2026}".to_owned());
+        self.scroll_offset = 0;
+        self.in_thinking = false;
+
+        let messages: Vec<serde_json::Value> = self
+            .history
+            .iter()
+            .filter(|e| !e.content.is_empty())
+            .map(|e| {
+                let role = match e.role {
+                    ChatRole::User => "user",
+                    ChatRole::Assistant => "assistant",
+                };
+                serde_json::json!({ "role": role, "content": e.content })
+            })
+            .collect();
+
+        serde_json::json!({
+            "model": self.model_name,
+            "messages": messages,
+            "stream": true,
+        })
+        .to_string()
+    }
+
+    /// Handle a keyboard key in WASM mode.
+    ///
+    /// Returns `Some(json)` when the user submits — the host should write the
+    /// JSON as an OSC 0xFD inference request.
+    #[cfg(target_os = "wasi")]
+    pub fn handle_key(&mut self, key: KeyPress) -> Option<String> {
+        if matches!(self.mode, ChatMode::Streaming) {
+            match key {
+                KeyPress::Escape | KeyPress::F(10) => { self.quit = true; }
+                _ => {}
+            }
+            return None;
+        }
+
+        match key {
+            KeyPress::Escape | KeyPress::F(10) => {
+                self.quit = true;
+                None
+            }
+            KeyPress::Enter => {
+                if self.input_buf.is_empty() {
+                    return None;
+                }
+                let user_msg = std::mem::take(&mut self.input_buf);
+                Some(self.submit_message_payload(user_msg))
+            }
+            KeyPress::Backspace => {
+                self.input_buf.pop();
+                None
+            }
+            KeyPress::Char(b) if b.is_ascii_graphic() || b == b' ' => {
+                self.input_buf.push(b as char);
+                None
+            }
+            KeyPress::ArrowUp => {
+                self.scroll_offset = self.scroll_offset.saturating_add(1);
+                None
+            }
+            KeyPress::ArrowDown => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                None
+            }
+            _ => None,
+        }
+    }
 }
 
 // ============================================================================
-// TerminalApp impl
+// TerminalApp impl (native only)
 // ============================================================================
 
+#[cfg(not(target_os = "wasi"))]
 impl TerminalApp for ChatApp {
     type Command = KeyPress;
 
@@ -521,42 +707,23 @@ impl TerminalApp for ChatApp {
         loop {
             match self.event_rx.try_recv() {
                 Ok(ChatEvent::Token(s)) => {
-                    self.ingest_token(&s);
+                    self.on_token(&s);
                     redraw = true;
                 }
                 Ok(ChatEvent::StreamComplete) => {
-                    if let Some(ref hook) = self.save_hook {
-                        hook(&self.history);
-                    }
-                    self.on_stream_done();
+                    self.on_stream_complete();
                     redraw = true;
                 }
                 Ok(ChatEvent::StreamCancelled) => {
-                    // The spawner acknowledged the cancel; on_stream_done handles
-                    // queue draining. The partial history was already removed by
-                    // cancel_stream() on the UI side.
-                    self.on_stream_done();
+                    self.on_stream_cancelled();
                     redraw = true;
                 }
                 Ok(ChatEvent::StreamError(s)) => {
-                    self.pending_toasts.push(format!("Inference error: {s}"));
-                    if let Some(last) = self.history.last_mut() {
-                        last.content = format!("[Error: {s}]");
-                    }
-                    self.cancel_handle = None;
-                    self.in_thinking = false;
-                    self.on_stream_done();
+                    self.on_stream_error(s);
                     redraw = true;
                 }
                 Ok(ChatEvent::TemplateError(s)) => {
-                    // Remove the empty assistant placeholder + user message.
-                    self.history.pop();
-                    self.history.pop();
-                    self.pending_toasts.push(format!("Model error: {s}"));
-                    self.cancel_handle = None;
-                    self.in_thinking = false;
-                    self.mode = ChatMode::Input;
-                    self.status = Some(s);
+                    self.on_template_error(s);
                     redraw = true;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,

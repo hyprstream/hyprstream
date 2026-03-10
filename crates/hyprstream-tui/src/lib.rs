@@ -5,16 +5,16 @@ pub use hyprstream_compositor::theme;
 
 pub mod private_store;
 
+pub mod chat_app;
+
 #[cfg(target_os = "wasi")]
-pub mod wasm_chat;
+pub mod chat_ui_wasm;
 
 pub mod cast_app;
 pub mod cast_player;
 pub mod cast_ui;
 pub mod wizard;
 
-#[cfg(not(target_os = "wasi"))]
-pub mod chat_app;
 #[cfg(not(target_os = "wasi"))]
 pub mod console_app;
 #[cfg(not(target_os = "wasi"))]
