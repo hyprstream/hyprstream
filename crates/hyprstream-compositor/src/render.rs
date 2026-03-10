@@ -22,7 +22,7 @@ use ratatui::Frame;
 use waxterm::avt_style::avt_pen_to_style;
 
 use crate::background::PREVIEW_W;
-use crate::chrome::{ShellChrome, ShellMode, ToastLevel, MENU_ITEMS};
+use crate::chrome::{ServiceMode, ShellChrome, ShellMode, ToastLevel, MENU_ITEMS};
 use crate::layout::{CursorState, LayoutTree, PaneStorage};
 use crate::theme;
 
@@ -61,6 +61,9 @@ pub fn draw(frame: &mut Frame, chrome: &ShellChrome, layout: &LayoutTree) {
         ShellMode::StartMenu { selected } => draw_start_menu(frame, area, selected),
         ShellMode::Console                => { /* drawn by shell_handlers (native) or wasm path */ }
         ShellMode::ConversationPicker { .. } => draw_conversation_picker(frame, area, chrome),
+        ShellMode::ServiceManager { selected } => draw_service_modal(frame, area, chrome, selected),
+        ShellMode::WorkerManager { sandbox_sel, container_sel, show_containers }
+            => draw_worker_modal(frame, area, chrome, sandbox_sel, container_sel, show_containers),
         ShellMode::Normal | ShellMode::Fullscreen => {}
     }
 
@@ -325,6 +328,8 @@ fn draw_fkey_bar(frame: &mut Frame, area: Rect, mode: &ShellMode) {
             ("Ctrl-F/Esc", "exit fullscreen"),
         ],
         ShellMode::Normal => &[
+            ("F5",  "svc"),
+            ("F6",  "wrk"),
             ("F7",  "new"),
             ("F8",  "close"),
             ("F9",  "log"),
@@ -354,6 +359,27 @@ fn draw_fkey_bar(frame: &mut Frame, area: Rect, mode: &ShellMode) {
             ("Enter",            "Select"),
             ("d",                "Delete"),
             ("Esc",              "Cancel"),
+        ],
+        ShellMode::ServiceManager { .. } => &[
+            ("\u{2191}\u{2193}", "Navigate"),
+            ("t",                "Start"),
+            ("s",                "Stop"),
+            ("r",                "Restart"),
+            ("a/S",              "All start/stop"),
+            ("i",                "Install"),
+            ("Esc",              "Close"),
+        ],
+        ShellMode::WorkerManager { show_containers: false, .. } => &[
+            ("\u{2191}\u{2193}", "Navigate"),
+            ("Enter/\u{2192}",   "Containers"),
+            ("x",                "Destroy"),
+            ("Esc",              "Close"),
+        ],
+        ShellMode::WorkerManager { show_containers: true, .. } => &[
+            ("\u{2191}\u{2193}", "Navigate"),
+            ("\u{2190}",         "Back"),
+            ("e",                "Exec"),
+            ("Esc",              "Close"),
         ],
     };
 
@@ -539,6 +565,321 @@ fn draw_conversation_picker(frame: &mut Frame, full_area: Rect, chrome: &ShellCh
 }
 
 // ============================================================================
+// Service Manager modal
+// ============================================================================
+
+fn draw_service_modal(frame: &mut Frame, full_area: Rect, chrome: &ShellChrome, selected: usize) {
+    let modal = centered_rect(72, 60, full_area);
+    render_modal(frame, modal, theme::modal_block(Line::from(" Services ")), |frame, inner| {
+        let hint_area = Rect { y: inner.y + inner.height.saturating_sub(1), height: 1, ..inner };
+        let list_area = Rect { height: inner.height.saturating_sub(2), ..inner };
+
+        // Hint bar
+        let hint = Paragraph::new(Line::from(vec![
+            Span::styled("t", theme::help_key()),
+            Span::styled(" start  ", theme::help_text()),
+            Span::styled("s", theme::help_key()),
+            Span::styled(" stop  ", theme::help_text()),
+            Span::styled("r", theme::help_key()),
+            Span::styled(" restart  ", theme::help_text()),
+            Span::styled("a", theme::help_key()),
+            Span::styled(" all start  ", theme::help_text()),
+            Span::styled("S", theme::help_key()),
+            Span::styled(" all stop  ", theme::help_text()),
+            Span::styled("i", theme::help_key()),
+            Span::styled(" install  ", theme::help_text()),
+            Span::styled("Esc", theme::help_key()),
+            Span::styled(" close", theme::help_text()),
+        ]))
+        .style(Style::default().bg(theme::BG_MODAL));
+        frame.render_widget(hint, hint_area);
+
+        if chrome.service_list.is_empty() {
+            frame.render_widget(
+                Paragraph::new(" (no services)")
+                    .style(Style::default().fg(theme::DIM).bg(theme::BG_MODAL)),
+                list_area,
+            );
+            return;
+        }
+
+        // Header
+        let header_area = Rect { height: 1, ..list_area };
+        let header = format!(
+            " {:<20} {:<10} {:<10} {:>8}",
+            "SERVICE", "STATE", "MODE", "PID"
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(header, Style::default().fg(theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD))))
+                .style(Style::default().bg(theme::BG_MODAL)),
+            header_area,
+        );
+
+        let rows_area = Rect {
+            y: list_area.y + 1,
+            height: list_area.height.saturating_sub(1),
+            ..list_area
+        };
+        let visible = rows_area.height as usize;
+        let n = chrome.service_list.len();
+        let scroll_offset = if selected >= visible { selected - visible + 1 } else { 0 };
+
+        for (i, svc) in chrome.service_list.iter().enumerate().skip(scroll_offset).take(visible) {
+            let row_y = rows_area.y + (i - scroll_offset) as u16;
+            let row_area = Rect { y: row_y, height: 1, ..rows_area };
+
+            let indicator = if svc.active { "\u{25cf}" } else { "\u{25cb}" }; // ● or ○
+            let state_str = if svc.active { "active" } else { "inactive" };
+            let mode_str = match &svc.mode {
+                ServiceMode::Systemd => "systemd",
+                ServiceMode::Daemon  => "daemon",
+                ServiceMode::Both    => "both",
+                ServiceMode::Stopped => "stopped",
+            };
+            let pid_str = match svc.pid {
+                Some(p) => format!("{}", p),
+                None    => "-".to_string(),
+            };
+            let prefix = if i == selected { "\u{25b8} " } else { "  " }; // ▸
+            let line_text = format!(
+                "{}{} {:<20} {:<10} {:<10} {:>8}",
+                prefix, indicator, svc.name, state_str, mode_str, pid_str
+            );
+
+            let (fg, bg) = if i == selected {
+                (theme::AMBER, theme::BG_PANEL)
+            } else if svc.active {
+                (Color::Green, theme::BG_MODAL)
+            } else {
+                (theme::DIM, theme::BG_MODAL)
+            };
+
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(line_text, Style::default().fg(fg))))
+                    .style(Style::default().bg(bg)),
+                row_area,
+            );
+        }
+
+        // Fill remaining rows
+        let rendered = n.saturating_sub(scroll_offset).min(visible);
+        for r in rendered..visible {
+            let row_area = Rect { y: rows_area.y + r as u16, height: 1, ..rows_area };
+            frame.render_widget(
+                Paragraph::new("").style(Style::default().bg(theme::BG_MODAL)),
+                row_area,
+            );
+        }
+    });
+}
+
+// ============================================================================
+// Worker Manager modal
+// ============================================================================
+
+fn draw_worker_modal(
+    frame: &mut Frame, full_area: Rect, chrome: &ShellChrome,
+    sandbox_sel: usize, container_sel: usize, show_containers: bool,
+) {
+    let modal = centered_rect(78, 65, full_area);
+    render_modal(frame, modal, theme::modal_block(Line::from(" Workers ")), |frame, inner| {
+        let hint_area = Rect { y: inner.y + inner.height.saturating_sub(1), height: 1, ..inner };
+
+        // Pool summary line
+        let summary_area = Rect { height: 1, ..inner };
+        let summary_text = if chrome.worker_pool_summary.is_empty() {
+            " Pool: (none)".to_string()
+        } else {
+            format!(" {}", chrome.worker_pool_summary)
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(summary_text, Style::default().fg(theme::DIM))))
+                .style(Style::default().bg(theme::BG_MODAL)),
+            summary_area,
+        );
+
+        let list_area = Rect {
+            y: inner.y + 1,
+            height: inner.height.saturating_sub(3), // -1 summary, -1 gap, -1 hint
+            ..inner
+        };
+
+        if !show_containers {
+            // Sandbox view
+            let hint = Paragraph::new(Line::from(vec![
+                Span::styled("\u{2191}\u{2193}", theme::help_key()),
+                Span::styled(" nav  ", theme::help_text()),
+                Span::styled("Enter/\u{2192}", theme::help_key()),
+                Span::styled(" containers  ", theme::help_text()),
+                Span::styled("x", theme::help_key()),
+                Span::styled(" destroy  ", theme::help_text()),
+                Span::styled("Esc", theme::help_key()),
+                Span::styled(" close", theme::help_text()),
+            ]))
+            .style(Style::default().bg(theme::BG_MODAL));
+            frame.render_widget(hint, hint_area);
+
+            if chrome.worker_list.is_empty() {
+                frame.render_widget(
+                    Paragraph::new(" (no sandboxes)")
+                        .style(Style::default().fg(theme::DIM).bg(theme::BG_MODAL)),
+                    list_area,
+                );
+                return;
+            }
+
+            // Header
+            let header_area = Rect { height: 1, ..list_area };
+            let header = format!(
+                " {:<12} {:<10} {:<10} {:>4} {:>5} {:>8}",
+                "ID", "STATE", "BACKEND", "CTRS", "CPU%", "MEM MB"
+            );
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(header, Style::default().fg(theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD))))
+                    .style(Style::default().bg(theme::BG_MODAL)),
+                header_area,
+            );
+
+            let rows_area = Rect {
+                y: list_area.y + 1,
+                height: list_area.height.saturating_sub(1),
+                ..list_area
+            };
+            let visible = rows_area.height as usize;
+            let n = chrome.worker_list.len();
+            let scroll_offset = if sandbox_sel >= visible { sandbox_sel - visible + 1 } else { 0 };
+
+            for (i, sb) in chrome.worker_list.iter().enumerate().skip(scroll_offset).take(visible) {
+                let row_y = rows_area.y + (i - scroll_offset) as u16;
+                let row_area = Rect { y: row_y, height: 1, ..rows_area };
+
+                let cpu_str = match sb.cpu_pct { Some(c) => format!("{}%", c), None => "-".to_string() };
+                let mem_str = match sb.mem_mb  { Some(m) => format!("{}", m),  None => "-".to_string() };
+                let prefix = if i == sandbox_sel { "\u{25b8} " } else { "  " };
+                let line_text = format!(
+                    "{}{:<12} {:<10} {:<10} {:>4} {:>5} {:>8}",
+                    prefix, sb.id, sb.state, sb.backend, sb.containers.len(), cpu_str, mem_str
+                );
+
+                let (fg, bg) = if i == sandbox_sel {
+                    (theme::AMBER, theme::BG_PANEL)
+                } else {
+                    (theme::DIM, theme::BG_MODAL)
+                };
+
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(line_text, Style::default().fg(fg))))
+                        .style(Style::default().bg(bg)),
+                    row_area,
+                );
+            }
+
+            let rendered = n.saturating_sub(scroll_offset).min(visible);
+            for r in rendered..visible {
+                let row_area = Rect { y: rows_area.y + r as u16, height: 1, ..rows_area };
+                frame.render_widget(
+                    Paragraph::new("").style(Style::default().bg(theme::BG_MODAL)),
+                    row_area,
+                );
+            }
+        } else {
+            // Container view for selected sandbox
+            let hint = Paragraph::new(Line::from(vec![
+                Span::styled("\u{2191}\u{2193}", theme::help_key()),
+                Span::styled(" nav  ", theme::help_text()),
+                Span::styled("\u{2190}", theme::help_key()),
+                Span::styled(" back  ", theme::help_text()),
+                Span::styled("e", theme::help_key()),
+                Span::styled(" exec  ", theme::help_text()),
+                Span::styled("Esc", theme::help_key()),
+                Span::styled(" close", theme::help_text()),
+            ]))
+            .style(Style::default().bg(theme::BG_MODAL));
+            frame.render_widget(hint, hint_area);
+
+            let sb = match chrome.worker_list.get(sandbox_sel) {
+                Some(sb) => sb,
+                None => return,
+            };
+
+            // Sub-header with sandbox ID
+            let sub_area = Rect { height: 1, ..list_area };
+            let sub_text = format!(" Sandbox: {} ({} containers)", sb.id, sb.containers.len());
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(sub_text, Style::default().fg(theme::CYAN))))
+                    .style(Style::default().bg(theme::BG_MODAL)),
+                sub_area,
+            );
+
+            // Column header
+            let hdr_area = Rect { y: list_area.y + 1, height: 1, ..list_area };
+            let header = format!(
+                " {:<12} {:<20} {:<10} {:>5} {:>8}",
+                "ID", "IMAGE", "STATE", "CPU%", "MEM MB"
+            );
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(header, Style::default().fg(theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD))))
+                    .style(Style::default().bg(theme::BG_MODAL)),
+                hdr_area,
+            );
+
+            let rows_area = Rect {
+                y: list_area.y + 2,
+                height: list_area.height.saturating_sub(2),
+                ..list_area
+            };
+            let visible = rows_area.height as usize;
+            let cn = sb.containers.len();
+            let scroll_offset = if container_sel >= visible { container_sel - visible + 1 } else { 0 };
+
+            if cn == 0 {
+                frame.render_widget(
+                    Paragraph::new(" (no containers)")
+                        .style(Style::default().fg(theme::DIM).bg(theme::BG_MODAL)),
+                    rows_area,
+                );
+                return;
+            }
+
+            for (i, ctr) in sb.containers.iter().enumerate().skip(scroll_offset).take(visible) {
+                let row_y = rows_area.y + (i - scroll_offset) as u16;
+                let row_area = Rect { y: row_y, height: 1, ..rows_area };
+
+                let cpu_str = match ctr.cpu_pct { Some(c) => format!("{}%", c), None => "-".to_string() };
+                let mem_str = match ctr.mem_mb  { Some(m) => format!("{}", m),  None => "-".to_string() };
+                let img = if ctr.image.len() > 18 { &ctr.image[..18] } else { &ctr.image };
+                let prefix = if i == container_sel { "\u{25b8} " } else { "  " };
+                let line_text = format!(
+                    "{}{:<12} {:<20} {:<10} {:>5} {:>8}",
+                    prefix, ctr.id, img, ctr.state, cpu_str, mem_str
+                );
+
+                let (fg, bg) = if i == container_sel {
+                    (theme::AMBER, theme::BG_PANEL)
+                } else {
+                    (theme::DIM, theme::BG_MODAL)
+                };
+
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(line_text, Style::default().fg(fg))))
+                        .style(Style::default().bg(bg)),
+                    row_area,
+                );
+            }
+
+            let rendered = cn.saturating_sub(scroll_offset).min(visible);
+            for r in rendered..visible {
+                let row_area = Rect { y: rows_area.y + r as u16, height: 1, ..rows_area };
+                frame.render_widget(
+                    Paragraph::new("").style(Style::default().bg(theme::BG_MODAL)),
+                    row_area,
+                );
+            }
+        }
+    });
+}
+
+// ============================================================================
 // Utility
 // ============================================================================
 
@@ -550,4 +891,158 @@ fn centered_rect(pct_w: u16, pct_h: u16, area: Rect) -> Rect {
         .flex(Flex::Center)
         .areas(v);
     h
+}
+
+// ============================================================================
+// Render smoke tests — verify no panics
+// ============================================================================
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use crate::chrome::{
+        ContainerEntry, ServiceEntry, ServiceMode, ShellMode, WorkerEntry,
+    };
+    use crate::Compositor;
+
+    fn make_compositor() -> Compositor {
+        Compositor::new(120, 40, 1, 1, vec![], vec![])
+    }
+
+    fn with_services(comp: &mut Compositor) {
+        comp.chrome.service_list = vec![
+            ServiceEntry { name: "oai".into(), active: true, mode: ServiceMode::Systemd, pid: Some(1234) },
+            ServiceEntry { name: "registry".into(), active: false, mode: ServiceMode::Stopped, pid: None },
+            ServiceEntry { name: "model".into(), active: true, mode: ServiceMode::Daemon, pid: Some(5678) },
+        ];
+    }
+
+    fn with_workers(comp: &mut Compositor) {
+        comp.chrome.worker_list = vec![WorkerEntry {
+            id: "abc123".into(), full_id: "abc12345".into(),
+            state: "Ready".into(), backend: "kata".into(),
+            cpu_pct: Some(25), mem_mb: Some(512),
+            containers: vec![
+                ContainerEntry {
+                    id: "ctr1".into(), full_id: "ctr1-full".into(),
+                    image: "hyprstream:latest".into(), state: "Running".into(),
+                    cpu_pct: Some(10), mem_mb: Some(256),
+                },
+            ],
+        }];
+        comp.chrome.worker_pool_summary = "1 sandbox, 1 container".into();
+    }
+
+    /// Render the compositor into a test terminal and return the buffer as a string.
+    fn render_to_string(comp: &Compositor) -> String {
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| comp.render(f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn render_normal_mode_no_panic() {
+        let comp = make_compositor();
+        let text = render_to_string(&comp);
+        assert!(text.contains("HYPRSTREAM"));
+    }
+
+    #[test]
+    fn render_service_modal_empty() {
+        let mut comp = make_compositor();
+        comp.chrome.mode = ShellMode::ServiceManager { selected: 0 };
+        let text = render_to_string(&comp);
+        assert!(text.contains("Services"));
+        assert!(text.contains("no services"));
+    }
+
+    #[test]
+    fn render_service_modal_with_entries() {
+        let mut comp = make_compositor();
+        with_services(&mut comp);
+        comp.chrome.mode = ShellMode::ServiceManager { selected: 1 };
+        let text = render_to_string(&comp);
+        assert!(text.contains("Services"));
+        assert!(text.contains("oai"));
+        assert!(text.contains("registry"));
+        assert!(text.contains("model"));
+    }
+
+    #[test]
+    fn render_service_modal_selection_beyond_list() {
+        let mut comp = make_compositor();
+        with_services(&mut comp);
+        // selected index out of range — should not panic
+        comp.chrome.mode = ShellMode::ServiceManager { selected: 100 };
+        let _text = render_to_string(&comp);
+    }
+
+    #[test]
+    fn render_worker_modal_empty() {
+        let mut comp = make_compositor();
+        comp.chrome.mode = ShellMode::WorkerManager { sandbox_sel: 0, container_sel: 0, show_containers: false };
+        let text = render_to_string(&comp);
+        assert!(text.contains("Workers"));
+        assert!(text.contains("no sandboxes"));
+    }
+
+    #[test]
+    fn render_worker_modal_sandbox_view() {
+        let mut comp = make_compositor();
+        with_workers(&mut comp);
+        comp.chrome.mode = ShellMode::WorkerManager { sandbox_sel: 0, container_sel: 0, show_containers: false };
+        let text = render_to_string(&comp);
+        assert!(text.contains("Workers"));
+        assert!(text.contains("abc123"));
+        assert!(text.contains("kata"));
+    }
+
+    #[test]
+    fn render_worker_modal_container_view() {
+        let mut comp = make_compositor();
+        with_workers(&mut comp);
+        comp.chrome.mode = ShellMode::WorkerManager { sandbox_sel: 0, container_sel: 0, show_containers: true };
+        let text = render_to_string(&comp);
+        assert!(text.contains("Workers"));
+        assert!(text.contains("ctr1"));
+        assert!(text.contains("hyprstream:latest"));
+    }
+
+    #[test]
+    fn render_worker_modal_selection_beyond_list() {
+        let mut comp = make_compositor();
+        with_workers(&mut comp);
+        comp.chrome.mode = ShellMode::WorkerManager { sandbox_sel: 99, container_sel: 99, show_containers: true };
+        let _text = render_to_string(&comp);
+    }
+
+    #[test]
+    fn render_small_terminal() {
+        // Very small terminal — modals should not panic even if area is tiny
+        let comp = Compositor::new(20, 5, 1, 1, vec![], vec![]);
+        let backend = ratatui::backend::TestBackend::new(20, 5);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| comp.render(f)).unwrap();
+    }
+
+    #[test]
+    fn render_service_modal_small_terminal() {
+        let mut comp = Compositor::new(30, 10, 1, 1, vec![], vec![]);
+        comp.chrome.service_list = vec![
+            ServiceEntry { name: "oai".into(), active: true, mode: ServiceMode::Systemd, pid: Some(1) },
+        ];
+        comp.chrome.mode = ShellMode::ServiceManager { selected: 0 };
+        let backend = ratatui::backend::TestBackend::new(30, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| comp.render(f)).unwrap();
+    }
 }

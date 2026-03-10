@@ -71,6 +71,7 @@ pub fn build_authorize_fn(policy_client: PolicyClient) -> AuthorizeFn {
 ///
 /// Provides `RuntimeClient` and `ImageClient` trait implementations via
 /// the generated scoped clients (runtime, sandbox, container, image).
+#[derive(Clone)]
 pub struct WorkerZmqClient {
     gen: GenWorkerClient,
 }
@@ -87,6 +88,11 @@ impl WorkerZmqClient {
         Self {
             gen: crate::services::core::create_service_client(endpoint, signing_key, identity),
         }
+    }
+
+    /// Attach claims for e2e verification. All subsequent calls include these claims.
+    pub fn with_claims(self, claims: hyprstream_rpc::auth::Claims) -> Self {
+        Self { gen: self.gen.with_claims(claims) }
     }
 
     /// Get the underlying generated client (for advanced use).
@@ -301,7 +307,7 @@ impl ImageClient for WorkerZmqClient {
     ) -> hyprstream_workers::error::Result<ImageStatusResult> {
         self.gen.image().status(image.clone(), verbose)
             .await
-            .map_err(|e| hyprstream_workers::error::WorkerError::ImageNotFound(e.to_string()))
+            .map_err(worker_err)
     }
 
     async fn pull_image(
@@ -336,6 +342,7 @@ const WORKFLOW_SERVICE_NAME: &str = "workflow";
 /// ZMQ client wrapping the generated `GenWorkflowClient` from the proc macro.
 ///
 /// Implements the `WorkflowClient` trait for orchestration operations.
+#[derive(Clone)]
 pub struct WorkflowZmqClient {
     gen: hyprstream_workers::workflow::GenWorkflowClient,
 }
@@ -352,6 +359,11 @@ impl WorkflowZmqClient {
         Self {
             gen: crate::services::core::create_service_client(endpoint, signing_key, identity),
         }
+    }
+
+    /// Attach claims for e2e verification. All subsequent calls include these claims.
+    pub fn with_claims(self, claims: hyprstream_rpc::auth::Claims) -> Self {
+        Self { gen: self.gen.with_claims(claims) }
     }
 
     /// Get the underlying generated client (for advanced use).

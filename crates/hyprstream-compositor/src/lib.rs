@@ -28,9 +28,9 @@ pub mod theme;
 
 pub use background::{BackgroundState, BackgroundStyle, ALL_STYLES, PREVIEW_H, PREVIEW_W};
 pub use chrome::{
-    ChromeOutput, ConversationPickerEntry, ModelEntry, PaneSummary, RpcRequest, ShellChrome,
-    ShellMode, Toast, ToastLevel, WindowSummary, MENU_ITEMS, keypress_to_bytes,
-    LOCAL_ID_BIT, is_local_id,
+    ChromeOutput, ContainerEntry, ConversationPickerEntry, ModelEntry, PaneSummary, RpcRequest,
+    ServiceEntry, ServiceMode, ShellChrome, ShellMode, Toast, ToastLevel, WindowSummary,
+    WorkerEntry, MENU_ITEMS, keypress_to_bytes, LOCAL_ID_BIT, is_local_id,
 };
 pub use layout::{
     CellUpdate, CursorState, FrameContent, FrameUpdate, LayoutTree, PaneId, PaneSource,
@@ -59,6 +59,13 @@ pub enum CompositorInput {
     Resize(u16, u16),
     /// A client-owned ChatApp exited (Phase 4).
     AppExited { app_id: u32 },
+    /// Updated service list from polling.
+    ServiceList(Vec<crate::chrome::ServiceEntry>),
+    /// Updated worker/sandbox list from polling.
+    WorkerList {
+        sandboxes: Vec<crate::chrome::WorkerEntry>,
+        pool_summary: String,
+    },
 }
 
 /// Actions returned by `Compositor::handle`.
@@ -192,6 +199,27 @@ impl Compositor {
                 self.chrome.cols      = pane_cols;
                 self.chrome.pane_rows = pane_rows;
                 self.layout.resize(pane_cols, pane_rows);
+                vec![CompositorOutput::Redraw]
+            }
+
+            CompositorInput::ServiceList(entries) => {
+                self.chrome.update_service_list(entries);
+                if let ShellMode::ServiceManager { ref mut selected } = self.chrome.mode {
+                    *selected = (*selected).min(self.chrome.service_list.len().saturating_sub(1));
+                }
+                vec![CompositorOutput::Redraw]
+            }
+
+            CompositorInput::WorkerList { sandboxes, pool_summary } => {
+                self.chrome.update_worker_list(sandboxes, pool_summary);
+                if let ShellMode::WorkerManager { ref mut sandbox_sel, ref mut container_sel, .. } = self.chrome.mode {
+                    *sandbox_sel = (*sandbox_sel).min(self.chrome.worker_list.len().saturating_sub(1));
+                    if let Some(sb) = self.chrome.worker_list.get(*sandbox_sel) {
+                        *container_sel = (*container_sel).min(sb.containers.len().saturating_sub(1));
+                    } else {
+                        *container_sel = 0;
+                    }
+                }
                 vec![CompositorOutput::Redraw]
             }
 

@@ -23,7 +23,7 @@ use zeroize::Zeroizing;
 
 use hyprstream_compositor::{
     Compositor, CompositorInput, CompositorOutput, ConversationPickerEntry, ModelEntry,
-    PaneSummary, RpcRequest, ToastLevel, WindowSummary,
+    PaneSummary, RpcRequest, ServiceEntry, ServiceMode, ToastLevel, WindowSummary,
 };
 use hyprstream_compositor::layout::{CellUpdate, CursorState, FrameContent, FrameUpdate, ScrollUpdate};
 use hyprstream_tui::chat_app::{ChatApp, LoadHook, SaveHook};
@@ -218,6 +218,12 @@ pub async fn handle_shell_tui(
     let mut bg_tick = tokio::time::interval(std::time::Duration::from_millis(50));
     bg_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Service/worker panel polling (5s, only active when modals are open).
+    let mut panel_refresh = tokio::time::interval(std::time::Duration::from_secs(5));
+    panel_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let (service_data_tx, mut service_data_rx) =
+        tokio::sync::mpsc::channel::<Vec<ServiceEntry>>(4);
+
     // SIGWINCH — forward terminal resize to TuiService and compositor.
     let sigwinch_key = signing_key.clone();
     let resize_tx_sigwinch = resize_tx.clone();
@@ -402,6 +408,26 @@ pub async fn handle_shell_tui(
                 composite_draw(&mut terminal, &compositor, &mut console_app);
             }
 
+            _ = panel_refresh.tick() => {
+                let is_svc = matches!(compositor.chrome.mode, hyprstream_compositor::ShellMode::ServiceManager { .. });
+                if is_svc {
+                    let tx = service_data_tx.clone();
+                    tokio::spawn(async move {
+                        let entries = poll_service_status().await;
+                        let _ = tx.try_send(entries);
+                    });
+                }
+            }
+
+            Some(entries) = service_data_rx.recv() => {
+                let outputs = compositor.handle(CompositorInput::ServiceList(entries));
+                if dispatch_outputs(
+                    &mut compositor, &client, &model_client,
+                    &model_status_tx, &mut terminal, &mut console_app,
+                    &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
+                ).await { break; }
+            }
+
             else => break,
         }
     }
@@ -467,6 +493,13 @@ async fn dispatch_outputs(
     for output in outputs {
         match output {
             CompositorOutput::Redraw => {
+                // Trigger immediate poll on first open of service/worker panels.
+                if matches!(compositor.chrome.mode, hyprstream_compositor::ShellMode::ServiceManager { .. })
+                    && compositor.chrome.service_list.is_empty()
+                {
+                    let entries = poll_service_status().await;
+                    compositor.chrome.update_service_list(entries);
+                }
                 composite_draw(terminal, compositor, console_app);
             }
             CompositorOutput::Quit => return true,
@@ -779,6 +812,89 @@ async fn handle_rpc(
             vec![]
         }
 
+        RpcRequest::ServiceStart { name } => {
+            match do_service_start(&name).await {
+                Ok(()) => compositor.chrome.push_toast(
+                    format!("Started {name}"), ToastLevel::Info,
+                ),
+                Err(e) => compositor.chrome.push_toast(
+                    format!("Start {name}: {e}"), ToastLevel::Error,
+                ),
+            }
+            let entries = poll_service_status().await;
+            vec![CompositorInput::ServiceList(entries)]
+        }
+        RpcRequest::ServiceStop { name } => {
+            match do_service_stop(&name).await {
+                Ok(()) => compositor.chrome.push_toast(
+                    format!("Stopped {name}"), ToastLevel::Info,
+                ),
+                Err(e) => compositor.chrome.push_toast(
+                    format!("Stop {name}: {e}"), ToastLevel::Error,
+                ),
+            }
+            let entries = poll_service_status().await;
+            vec![CompositorInput::ServiceList(entries)]
+        }
+        RpcRequest::ServiceRestart { name } => {
+            let _ = do_service_stop(&name).await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            match do_service_start(&name).await {
+                Ok(()) => compositor.chrome.push_toast(
+                    format!("Restarted {name}"), ToastLevel::Info,
+                ),
+                Err(e) => compositor.chrome.push_toast(
+                    format!("Restart {name}: {e}"), ToastLevel::Error,
+                ),
+            }
+            let entries = poll_service_status().await;
+            vec![CompositorInput::ServiceList(entries)]
+        }
+        RpcRequest::ServiceInstall => {
+            compositor.chrome.push_toast("Installing services...".to_owned(), ToastLevel::Info);
+            if hyprstream_rpc::has_systemd() {
+                if let Ok(manager) = hyprstream_rpc::detect_service_manager().await {
+                    for &svc in ALL_SERVICE_NAMES {
+                        let _ = manager.install(svc).await;
+                    }
+                }
+            }
+            compositor.chrome.push_toast("Install complete".to_owned(), ToastLevel::Info);
+            let entries = poll_service_status().await;
+            vec![CompositorInput::ServiceList(entries)]
+        }
+        RpcRequest::ServiceStopAll => {
+            for &svc in ALL_SERVICE_NAMES {
+                let _ = do_service_stop(svc).await;
+            }
+            compositor.chrome.push_toast("All services stopped".to_owned(), ToastLevel::Warn);
+            let entries = poll_service_status().await;
+            vec![CompositorInput::ServiceList(entries)]
+        }
+        RpcRequest::ServiceStartAll => {
+            for &svc in ALL_SERVICE_NAMES {
+                let _ = do_service_start(svc).await;
+            }
+            compositor.chrome.push_toast("All services started".to_owned(), ToastLevel::Info);
+            let entries = poll_service_status().await;
+            vec![CompositorInput::ServiceList(entries)]
+        }
+        RpcRequest::WorkerDestroySandbox { sandbox_id } => {
+            compositor.chrome.push_toast(
+                format!("Destroying {}...", &sandbox_id[..sandbox_id.len().min(8)]),
+                ToastLevel::Info,
+            );
+            // Worker RPC not yet wired — placeholder for Phase 6.
+            vec![]
+        }
+        RpcRequest::WorkerExecSync { sandbox_id: _, container_id, cmd } => {
+            compositor.chrome.push_toast(
+                format!("Exec in {}: {:?}", &container_id[..container_id.len().min(8)], cmd),
+                ToastLevel::Info,
+            );
+            // Worker RPC not yet wired — placeholder for Phase 6.
+            vec![]
+        }
         RpcRequest::Quit => vec![],
     }
 }
@@ -947,6 +1063,93 @@ async fn send_input_rpc(client: &TuiClient, viewer_id: u32, data: &[u8]) {
         if let Err(e) = client.call(p).await {
             tracing::debug!("sendInput failed: {e}");
         }
+    }
+}
+
+// ============================================================================
+// Service & Worker polling
+// ============================================================================
+
+const ALL_SERVICE_NAMES: &[&str] = &[
+    "oai", "registry", "model", "inference", "worker",
+    "policy", "mcp", "streams", "event", "tui",
+];
+
+/// Poll systemd and PID files for service status.
+async fn poll_service_status() -> Vec<ServiceEntry> {
+    let manager = if hyprstream_rpc::has_systemd() {
+        hyprstream_rpc::detect_service_manager().await.ok()
+    } else {
+        None
+    };
+    let runtime_dir = hyprstream_rpc::paths::runtime_dir();
+
+    let mut entries = Vec::with_capacity(ALL_SERVICE_NAMES.len());
+    for &name in ALL_SERVICE_NAMES {
+        let systemd_active = if let Some(ref mgr) = manager {
+            mgr.is_active(name).await.unwrap_or(false)
+        } else {
+            false
+        };
+
+        let (daemon_active, daemon_pid) = {
+            let pid_file = runtime_dir.join(format!("{name}.pid"));
+            if pid_file.exists() {
+                if let Ok(s) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = s.trim().parse::<i32>() {
+                        let alive = nix::sys::signal::kill(
+                            nix::unistd::Pid::from_raw(pid), None,
+                        ).is_ok();
+                        (alive, if alive { Some(pid as u32) } else { None })
+                    } else { (false, None) }
+                } else { (false, None) }
+            } else { (false, None) }
+        };
+
+        let (active, mode, pid) = match (systemd_active, daemon_active) {
+            (true, true)   => (true,  ServiceMode::Both,    daemon_pid),
+            (true, false)  => (true,  ServiceMode::Systemd, None),
+            (false, true)  => (true,  ServiceMode::Daemon,  daemon_pid),
+            (false, false) => (false, ServiceMode::Stopped, None),
+        };
+
+        entries.push(ServiceEntry { name: name.to_owned(), active, mode, pid });
+    }
+    entries
+}
+
+/// Start a single service (systemd or standalone fallback).
+async fn do_service_start(name: &str) -> anyhow::Result<()> {
+    if hyprstream_rpc::has_systemd() {
+        let manager = hyprstream_rpc::detect_service_manager().await?;
+        manager.start(name).await
+    } else {
+        let spawner = hyprstream_rpc::ProcessSpawner::standalone();
+        let exe = hyprstream_rpc::paths::executable_path()?;
+        let config = hyprstream_rpc::ProcessConfig::new(name, &exe)
+            .args(["service", "start", name, "--foreground", "--ipc"]);
+        spawner.spawn(config).await.map(|_| ()).map_err(Into::into)
+    }
+}
+
+/// Stop a single service (systemd or SIGTERM via PID file).
+async fn do_service_stop(name: &str) -> anyhow::Result<()> {
+    if hyprstream_rpc::has_systemd() {
+        let manager = hyprstream_rpc::detect_service_manager().await?;
+        manager.stop(name).await
+    } else {
+        let runtime_dir = hyprstream_rpc::paths::runtime_dir();
+        let pid_file = runtime_dir.join(format!("{name}.pid"));
+        if let Ok(s) = std::fs::read_to_string(&pid_file) {
+            if let Ok(pid) = s.trim().parse::<i32>() {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGTERM,
+                );
+                let _ = std::fs::remove_file(&pid_file);
+            }
+        }
+        Ok(())
     }
 }
 
