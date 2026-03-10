@@ -1339,7 +1339,7 @@ fn main() -> Result<()> {
                 let signing_key = load_or_generate_signing_key(&keys_dir).await?;
                 let verifying_key = signing_key.verifying_key();
 
-                let fed_src_inproc: Arc<dyn hyprstream_rpc::auth::FederationKeySource> =
+                let fed_src: Arc<dyn hyprstream_rpc::auth::FederationKeySource> =
                     Arc::new(hyprstream_core::auth::FederationKeyResolver::new(
                         &config.oauth.trusted_issuers,
                     ));
@@ -1351,7 +1351,7 @@ fn main() -> Result<()> {
                     models_dir.clone(),
                 )
                 .with_oauth_issuer(config.oauth.issuer_url())
-                .with_federation_key_source(fed_src_inproc);
+                .with_federation_key_source(fed_src);
 
                 let manager = InprocManager::new();
                 let mut handles = Vec::new();
@@ -1602,7 +1602,7 @@ fn main() -> Result<()> {
                                     load_or_generate_signing_key(&keys_dir).await?;
                                 let verifying_key = signing_key.verifying_key();
 
-                                let fed_src_standalone: Arc<dyn hyprstream_rpc::auth::FederationKeySource> =
+                                let fed_src: Arc<dyn hyprstream_rpc::auth::FederationKeySource> =
                                     Arc::new(hyprstream_core::auth::FederationKeyResolver::new(
                                         &config.oauth.trusted_issuers,
                                     ));
@@ -1614,7 +1614,7 @@ fn main() -> Result<()> {
                                     models_dir.clone(),
                                 )
                                 .with_oauth_issuer(config.oauth.issuer_url())
-                                .with_federation_key_source(fed_src_standalone);
+                                .with_federation_key_source(fed_src);
 
                                 // Wire QUIC shared config from --quic-bind or [quic] config
                                 let quic_cfg = if let Some(ref bind_addr) = quic_bind {
