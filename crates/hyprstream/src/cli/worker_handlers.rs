@@ -472,36 +472,19 @@ pub async fn handle_worker_terminal(
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use tokio::signal;
-    use hyprstream_rpc::streaming::{StreamHandle, StreamPayload};
+    use hyprstream_rpc::streaming::StreamPayload;
 
     info!(container_id = %container_id, "Attaching to container terminal");
 
-    // 1. Generate client DH keypair
-    let (client_secret, client_pubkey) = hyprstream_rpc::generate_ephemeral_keypair();
-    let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
-
-    // 2. Call Attach RPC with ephemeral pubkey — server does DH + pre-auth atomically
-    let attach_response = client.attach(container_id, client_pubkey_bytes).await?;
-
-    // 3. Create StreamHandle — DH, SUB socket, and HMAC verification all encapsulated
-    let zmq_ctx = crate::zmq::global_context();
-    let mut stream_handle = StreamHandle::new(
-        &zmq_ctx,
-        attach_response.stream_id.clone(),
-        &attach_response.endpoint,
-        &attach_response.server_pubkey,
-        &client_secret,
-        &client_pubkey_bytes,
-    )?;
+    // Attach RPC — DH keypair, SUB socket, and HMAC verification all managed internally.
+    let mut stream_handle = client.attach(container_id).await?;
 
     println!(
         "Attached to container {}\n\
          Stream ID: {}\n\
-         Endpoint: {}\n\
          Detach with: {}",
         truncate_id(container_id, 12),
-        truncate_id(&attach_response.stream_id, 16),
-        attach_response.endpoint,
+        truncate_id(stream_handle.stream_id(), 16),
         detach_keys,
     );
 

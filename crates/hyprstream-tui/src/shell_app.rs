@@ -10,13 +10,13 @@
 
 use std::path::PathBuf;
 
-use avt::Vt;
 use waxterm::app::TerminalApp;
 use waxterm::input::KeyPress;
 use waxterm::widgets::{SelectList, WidgetResult};
 
 use crate::background::{BackgroundState, BackgroundStyle, ALL_STYLES, PREVIEW_H, PREVIEW_W};
-use crate::shell::{kill_shell, spawn_shell, ShellInput, ShellWindow};
+use crate::shell::{kill_shell, spawn_shell, ShellInput};
+use crate::vt_pane::VtPane;
 
 type LoadFn = Box<dyn Fn(&str, ModelStatusSender) + Send>;
 
@@ -64,22 +64,27 @@ pub fn discover_models(registry: &std::path::Path) -> Vec<ModelEntry> {
 // Pane window
 // ============================================================================
 
-/// A running shell attached to an avt virtual terminal.
+/// A running shell attached to an avt virtual terminal via `VtPane`.
 pub struct PaneWindow {
     pub title: String,
-    /// VTE state (avt).
-    pub vt: Vt,
-    /// PTY channels.
-    pub shell: ShellWindow,
+    /// VT state + stdout channel.
+    pub pane: VtPane,
+    /// OS PID for SIGTERM on Drop.
+    shell_pid: u32,
+    /// Send input bytes or control signals to the shell.
+    input_tx: std::sync::mpsc::SyncSender<ShellInput>,
 }
 
 impl PaneWindow {
     pub fn new(title: String, cwd: Option<PathBuf>, cols: u16, rows: u16) -> std::io::Result<Self> {
         let shell = spawn_shell(cwd, cols, rows)?;
-        let vt = Vt::builder()
-            .size(cols as usize, rows as usize)
-            .build();
-        Ok(Self { title, vt, shell })
+        let pane = VtPane::new(cols, rows, shell.stdout_rx, None);
+        Ok(Self {
+            title,
+            pane,
+            shell_pid: shell.pid,
+            input_tx: shell.input_tx,
+        })
     }
 
     /// Drain stdout_rx into the VTE parser.
@@ -88,37 +93,26 @@ impl PaneWindow {
     /// - `got_data` — true if any bytes arrived (caller should redraw)
     /// - `is_dead`  — true if the channel disconnected (PTY process exited)
     pub fn drain(&mut self) -> (bool, bool) {
-        let mut got = false;
-        loop {
-            match self.shell.stdout_rx.try_recv() {
-                Ok(data) => {
-                    let s = String::from_utf8_lossy(&data);
-                    self.vt.feed_str(&s);
-                    got = true;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => return (got, false),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => return (got, true),
-            }
-        }
+        self.pane.drain()
     }
 
     /// Send raw bytes to the shell stdin.
     pub fn send_bytes(&self, data: Vec<u8>) {
-        let _ = self.shell.input_tx.send(ShellInput::Bytes(data));
+        let _ = self.input_tx.send(ShellInput::Bytes(data));
     }
 
     /// Resize the PTY and VT.
     pub fn resize(&mut self, cols: u16, rows: u16) {
-        self.vt.feed_str(&format!(
-            "\x1b[8;{rows};{cols}t"
-        ));
-        let _ = self.shell.input_tx.send(ShellInput::Resize { cols, rows });
+        // Shell-specific xterm escape to inform the VT of new dimensions.
+        self.pane.vt.feed_str(&format!("\x1b[8;{rows};{cols}t"));
+        self.pane.resize_vt(cols, rows);
+        let _ = self.input_tx.send(ShellInput::Resize { cols, rows });
     }
 }
 
 impl Drop for PaneWindow {
     fn drop(&mut self) {
-        kill_shell(self.shell.pid);
+        kill_shell(self.shell_pid);
     }
 }
 

@@ -101,8 +101,34 @@ impl WorkerZmqClient {
     }
 
     /// Attach to container I/O streams.
-    pub async fn attach(&self, container_id: &str, ephemeral_pubkey: [u8; 32]) -> Result<StreamInfo> {
-        self.gen.container().attach(container_id, &[], ephemeral_pubkey).await
+    ///
+    /// Generates an ephemeral DH keypair, performs the attach RPC, and returns
+    /// a ready-to-use `StreamHandle` with E2E HMAC verification.
+    ///
+    /// Follows the same pattern as `InferenceServiceClient::generate_stream_handle`.
+    pub async fn attach(&self, container_id: &str) -> Result<crate::services::rpc_types::StreamHandle> {
+        use hyprstream_rpc::crypto::generate_ephemeral_keypair;
+        use crate::zmq::global_context;
+
+        let (client_secret, client_pubkey) = generate_ephemeral_keypair();
+        let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
+
+        let info = self.gen.container().attach(container_id, &[], client_pubkey_bytes).await?;
+
+        if info.server_pubkey == [0u8; 32] {
+            anyhow::bail!(
+                "Server did not provide Ristretto255 public key - E2E authentication required"
+            );
+        }
+
+        crate::services::rpc_types::StreamHandle::new(
+            &global_context(),
+            info.stream_id,
+            &info.endpoint,
+            &info.server_pubkey,
+            &client_secret,
+            &client_pubkey_bytes,
+        )
     }
 
     /// Detach from container I/O streams.

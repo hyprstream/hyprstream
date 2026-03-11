@@ -20,6 +20,10 @@ pub mod console_app;
 #[cfg(not(target_os = "wasi"))]
 pub mod chat_ui;
 #[cfg(not(target_os = "wasi"))]
+pub mod vt_pane;
+#[cfg(not(target_os = "wasi"))]
+pub mod container_app;
+#[cfg(not(target_os = "wasi"))]
 pub mod shell;
 #[cfg(not(target_os = "wasi"))]
 pub mod shell_app;

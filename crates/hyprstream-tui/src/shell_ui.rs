@@ -15,7 +15,6 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Tabs};
 use ratatui::Frame;
-use waxterm::avt_style::avt_pen_to_style;
 
 use crate::background::PREVIEW_W;
 use crate::shell_app::{PaneWindow, ShellApp, ShellMode, MENU_ITEMS};
@@ -105,53 +104,7 @@ fn draw_content(frame: &mut Frame, area: Rect, app: &ShellApp) {
 }
 
 fn draw_pane(frame: &mut Frame, area: Rect, win: &PaneWindow) {
-    let max_lines = area.height as usize;
-
-    let lines: Vec<Line> = win
-        .vt
-        .view()
-        .take(max_lines)
-        .map(|line| {
-            let cells = line.cells();
-            if cells.is_empty() {
-                return Line::from("");
-            }
-            let mut spans: Vec<Span> = Vec::new();
-            let mut text = String::with_capacity(area.width as usize);
-            let mut pen = *cells[0].pen();
-
-            for cell in cells {
-                let cp = *cell.pen();
-                if cp != pen {
-                    if !text.is_empty() {
-                        spans.push(Span::styled(
-                            std::mem::take(&mut text),
-                            avt_pen_to_style(&pen),
-                        ));
-                    }
-                    pen = cp;
-                }
-                if cell.width() > 0 {
-                    text.push(cell.char());
-                }
-            }
-            if !text.is_empty() {
-                spans.push(Span::styled(text, avt_pen_to_style(&pen)));
-            }
-            Line::from(spans)
-        })
-        .collect();
-
-    let para = Paragraph::new(lines).style(Style::default().bg(theme::BG));
-    frame.render_widget(para, area);
-
-    // Cursor
-    let cursor = win.vt.cursor();
-    if cursor.visible {
-        let sx = area.x + (cursor.col as u16).min(area.width.saturating_sub(1));
-        let sy = area.y + (cursor.row as u16).min(area.height.saturating_sub(1));
-        frame.set_cursor_position((sx, sy));
-    }
+    hyprstream_compositor::render::draw_vt_cells(frame, area, &win.pane.vt);
 }
 
 // ============================================================================

@@ -11,8 +11,6 @@ use ratatui::{
     Frame,
 };
 
-use waxterm::avt_style::avt_pen_to_style;
-
 use crate::cast_app::CastPlayerApp;
 use crate::theme;
 
@@ -88,50 +86,8 @@ fn draw_playback(frame: &mut Frame, area: Rect, app: &CastPlayerApp) {
         .style(Style::default().bg(theme::BG));
 
     let inner = block.inner(area);
-    let max_lines = inner.height as usize;
-
-    let vt = app.player.vt();
-    let display_lines: Vec<Line> = vt
-        .view()
-        .take(max_lines)
-        .map(|line| {
-            let cells = line.cells();
-            if cells.is_empty() {
-                return Line::from("");
-            }
-
-            let mut spans: Vec<Span> = Vec::new();
-            let mut current_text = String::with_capacity(80);
-            let mut current_pen = *cells[0].pen();
-
-            for cell in cells {
-                let pen = *cell.pen();
-                if pen != current_pen {
-                    if !current_text.is_empty() {
-                        spans.push(Span::styled(
-                            std::mem::take(&mut current_text),
-                            avt_pen_to_style(&current_pen),
-                        ));
-                    }
-                    current_pen = pen;
-                }
-                if cell.width() > 0 {
-                    current_text.push(cell.char());
-                }
-            }
-
-            if !current_text.is_empty() {
-                spans.push(Span::styled(current_text, avt_pen_to_style(&current_pen)));
-            }
-
-            Line::from(spans)
-        })
-        .collect();
-
-    let playback = Paragraph::new(display_lines);
-
     frame.render_widget(block, area);
-    frame.render_widget(playback, inner);
+    hyprstream_compositor::render::draw_vt_cells(frame, inner, app.player.vt());
 }
 
 fn draw_progress(frame: &mut Frame, area: Rect, app: &CastPlayerApp) {

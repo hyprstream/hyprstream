@@ -28,8 +28,78 @@ use hyprstream_compositor::{
 use hyprstream_compositor::layout::{CellUpdate, CursorState, FrameContent, FrameUpdate, ScrollUpdate};
 use hyprstream_tui::chat_app::{ChatApp, LoadHook, SaveHook};
 use hyprstream_tui::console_app::ConsoleApp;
+use hyprstream_tui::container_app::ContainerTermApp;
 use hyprstream_tui::private_store::{FsBackend, StorageKey};
 use waxterm::app::TerminalApp;
+use waxterm::input::KeyPress;
+
+// ============================================================================
+// ActiveApp — client-owned app variants (ChatApp or ContainerTermApp)
+// ============================================================================
+
+enum ActiveApp {
+    Chat(Box<ChatApp>),
+    Container(Box<ContainerTermApp>),
+}
+
+impl ActiveApp {
+    fn tick(&mut self, delta_ms: u64) -> bool {
+        match self {
+            Self::Chat(a) => a.tick(delta_ms),
+            Self::Container(a) => a.tick(delta_ms),
+        }
+    }
+
+    fn should_quit(&self) -> bool {
+        match self {
+            Self::Chat(a) => a.should_quit(),
+            Self::Container(a) => a.should_quit(),
+        }
+    }
+
+    fn pending_toasts(&mut self) -> Vec<String> {
+        match self {
+            Self::Chat(a) => a.pending_toasts.drain(..).collect(),
+            Self::Container(a) => a.pending_toasts.drain(..).collect(),
+        }
+    }
+
+    fn cols(&self) -> u16 {
+        match self {
+            Self::Chat(a) => a.cols,
+            Self::Container(a) => a.cols,
+        }
+    }
+
+    fn rows(&self) -> u16 {
+        match self {
+            Self::Chat(a) => a.rows,
+            Self::Container(a) => a.rows,
+        }
+    }
+
+    fn render(&self, frame: &mut ratatui::Frame) {
+        match self {
+            Self::Chat(a) => a.render(frame),
+            Self::Container(a) => a.render(frame),
+        }
+    }
+
+    fn handle_input(&mut self, key: KeyPress) -> bool {
+        match self {
+            Self::Chat(a) => a.handle_input(key),
+            Self::Container(a) => a.handle_input(key),
+        }
+    }
+
+    fn as_chat_mut(&mut self) -> Option<&mut ChatApp> {
+        match self {
+            Self::Chat(a) => Some(a),
+            Self::Container(_) => None,
+        }
+    }
+
+}
 
 use crate::services::generated::tui_client::TuiClient;
 use crate::tui::shell_client::{
@@ -212,8 +282,8 @@ pub async fn handle_shell_tui(
     // Console overlay for log viewing (F9 / Ctrl-L).
     let mut console_app = ConsoleApp::new();
 
-    // Active client-owned ChatApps keyed by pane_id.
-    let mut active_apps: HashMap<u32, ChatApp> = HashMap::new();
+    // Active client-owned apps (ChatApp or ContainerTermApp) keyed by pane_id.
+    let mut active_apps: HashMap<u32, ActiveApp> = HashMap::new();
     // Local pane ID counter — high bit set to avoid collision with server IDs.
     let mut next_local_id: u32 = hyprstream_compositor::LOCAL_ID_BIT;
 
@@ -420,7 +490,7 @@ pub async fn handle_shell_tui(
                 for (&pane_id, app) in active_apps.iter_mut() {
                     let dirty = app.tick(50);
                     // Surface inference errors as compositor toasts.
-                    for msg in app.pending_toasts.drain(..) {
+                    for msg in app.pending_toasts() {
                         compositor.chrome.push_toast(msg, ToastLevel::Error);
                     }
                     if app.should_quit() {
@@ -428,11 +498,13 @@ pub async fn handle_shell_tui(
                         continue;
                     }
                     // Collect context-window reload requests from settings modal.
-                    if let Some(ctx) = app.requested_context_window.take() {
-                        pending_ctx_reloads.push((app.model_name.clone(), ctx));
+                    if let Some(chat) = app.as_chat_mut() {
+                        if let Some(ctx) = chat.requested_context_window.take() {
+                            pending_ctx_reloads.push((chat.model_name.clone(), ctx));
+                        }
                     }
                     if dirty {
-                        dirty_frames.push((pane_id, render_chat_app_to_ansi(app)));
+                        dirty_frames.push((pane_id, render_app_to_ansi(app)));
                     }
                 }
                 // Apply context-window reloads (model will reload with new context size).
@@ -481,6 +553,19 @@ pub async fn handle_shell_tui(
                 }
                 // Remove quitting apps.
                 for id in quit_app_ids {
+                    // Fire-and-forget detach for container apps.
+                    if let Some(ActiveApp::Container(ref c)) = active_apps.get(&id) {
+                        let cid = c.container_id.clone();
+                        let wc = worker_client.clone();
+                        std::thread::spawn(move || {
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build();
+                            if let Ok(rt) = rt {
+                                let _ = rt.block_on(wc.detach(&cid));
+                            }
+                        });
+                    }
                     active_apps.remove(&id);
                     compositor.chrome.private_panes.remove(&id);
                     let outputs = compositor.handle(CompositorInput::AppExited { app_id: id });
@@ -575,7 +660,7 @@ async fn dispatch_outputs(
     model_status_tx: &tokio::sync::mpsc::Sender<(String, bool)>,
     terminal: &mut ratatui::Terminal<AnsiBackend<AnsiWriter>>,
     console_app: &mut ConsoleApp,
-    active_apps: &mut HashMap<u32, ChatApp>,
+    active_apps: &mut HashMap<u32, ActiveApp>,
     next_local_id: &mut u32,
     storage_key: &StorageKey,
     signing_key: &SigningKey,
@@ -608,7 +693,7 @@ async fn dispatch_outputs(
                     let keys: Vec<waxterm::input::KeyPress> = InputParser::new(vec![]).parse(&data);
                     for key in keys {
                         if app.handle_input(key) {
-                            let ansi = render_chat_app_to_ansi(app);
+                            let ansi = render_app_to_ansi(app);
                             let outs = compositor.handle(CompositorInput::AppFrame { app_id, ansi });
                             for o in outs {
                                 if let CompositorOutput::Redraw = o {
@@ -632,7 +717,7 @@ async fn handle_rpc(
     model_client: &crate::services::ModelZmqClient,
     worker_client: &crate::services::WorkerZmqClient,
     model_status_tx: &tokio::sync::mpsc::Sender<(String, bool)>,
-    active_apps: &mut HashMap<u32, ChatApp>,
+    active_apps: &mut HashMap<u32, ActiveApp>,
     next_local_id: &mut u32,
     storage_key: &StorageKey,
     signing_key: &SigningKey,
@@ -842,7 +927,7 @@ async fn handle_rpc(
                 tool_descriptions,
                 hyprstream_tui::chat_app::ToolCallFormat::Qwen3Xml,
             );
-            active_apps.insert(pane_id, app);
+            active_apps.insert(pane_id, ActiveApp::Chat(Box::new(app)));
             compositor.chrome.private_panes.insert(pane_id);
             compositor.layout.get_or_create_private(pane_id);
 
@@ -874,7 +959,7 @@ async fn handle_rpc(
 
             // Render first frame.
             if let Some(a) = active_apps.get(&pane_id) {
-                let ansi = render_chat_app_to_ansi(a);
+                let ansi = render_app_to_ansi(a);
                 compositor.handle(CompositorInput::AppFrame { app_id: pane_id, ansi });
             }
             vec![]
@@ -1093,12 +1178,91 @@ async fn handle_rpc(
             }
             vec![]
         }
-        RpcRequest::AttachContainer { sandbox_id: _, container_id, cols: _, rows: _ } => {
-            // Phase W-III-a: stdout-only attach (ContainerTermApp not yet implemented)
-            let short = &container_id[..container_id.len().min(8)];
+        RpcRequest::AttachContainer { sandbox_id, container_id, cols, rows } => {
+            use hyprstream_rpc::streaming::StreamPayload;
+
+            let short_c = container_id[..container_id.len().min(8)].to_owned();
+            let short_s = sandbox_id[..sandbox_id.len().min(8)].to_owned();
+
+            // Attach RPC → returns ready-to-use StreamHandle (DH + SUB + HMAC managed internally).
+            let mut stream_handle = match worker_client.attach(&container_id).await {
+                Ok(h) => h,
+                Err(e) => {
+                    compositor.chrome.push_toast(
+                        format!("Attach failed: {e}"),
+                        ToastLevel::Error,
+                    );
+                    return vec![];
+                }
+            };
+
+            // Channel: stream reader thread → ContainerTermApp VtPane.
+            let (stdout_tx, stdout_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
+
+            // Spawn a thread with its own Tokio runtime to pump the stream.
+            std::thread::spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(r) => r,
+                    Err(_) => return,
+                };
+                rt.block_on(async move {
+                    while let Ok(Some(StreamPayload::Data(bytes))) = stream_handle.recv_next().await {
+                        if stdout_tx.send(bytes).is_err() {
+                            break; // ContainerTermApp dropped
+                        }
+                    }
+                });
+            });
+
+            // Create ContainerTermApp with the stdout channel.
+            let app = ContainerTermApp::new(
+                container_id.clone(),
+                sandbox_id.clone(),
+                cols,
+                rows,
+                stdout_rx,
+                None, // stdin not wired yet (Phase W-III-b)
+            );
+
+            // Allocate local pane ID.
+            let pane_id = *next_local_id;
+            *next_local_id = next_local_id.saturating_add(1);
+
+            active_apps.insert(pane_id, ActiveApp::Container(Box::new(app)));
+            compositor.chrome.private_panes.insert(pane_id);
+            compositor.layout.get_or_create_private(pane_id);
+
+            // Insert phantom window for the container terminal.
+            let win_name = format!("{short_s}:{short_c}");
+            let win_summary = WindowSummary {
+                id: pane_id,
+                name: win_name,
+                active_pane_id: pane_id,
+                panes: vec![PaneSummary {
+                    id: pane_id,
+                    cols,
+                    rows,
+                    is_private: true,
+                }],
+            };
+            compositor.chrome.windows.push(win_summary);
+            compositor.chrome.active_win = compositor.chrome.windows.len() - 1;
+
+            // Close the worker modal.
+            compositor.chrome.mode = hyprstream_compositor::chrome::ShellMode::Normal;
+
+            // Render initial frame.
+            if let Some(a) = active_apps.get(&pane_id) {
+                let ansi = render_app_to_ansi(a);
+                compositor.handle(CompositorInput::AppFrame { app_id: pane_id, ansi });
+            }
+
             compositor.chrome.push_toast(
-                format!("Attach to {short}: not yet implemented (Phase W-III-a)"),
-                ToastLevel::Warn,
+                format!("Attached to {short_c}"),
+                ToastLevel::Info,
             );
             vec![]
         }
@@ -1352,9 +1516,9 @@ fn private_store_dir() -> std::path::PathBuf {
     base.join("hyprstream").join("private").join("v1")
 }
 
-/// Render a `ChatApp` off-screen to an ANSI byte buffer.
-fn render_chat_app_to_ansi(app: &ChatApp) -> Vec<u8> {
-    let backend = AnsiBackend::new(Vec::<u8>::new(), app.cols, app.rows, false);
+/// Render an `ActiveApp` off-screen to an ANSI byte buffer.
+fn render_app_to_ansi(app: &ActiveApp) -> Vec<u8> {
+    let backend = AnsiBackend::new(Vec::<u8>::new(), app.cols(), app.rows(), false);
     let Ok(mut term) = ratatui::Terminal::new(backend) else {
         return Vec::new();
     };
