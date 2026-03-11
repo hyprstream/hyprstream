@@ -93,6 +93,11 @@ pub async fn handle_shell_tui(
         use hyprstream_rpc::envelope::RequestIdentity;
         crate::services::ModelZmqClient::new(signing_key.clone(), RequestIdentity::local())
     };
+    // Worker client for sandbox/container/image management.
+    let worker_client = {
+        use hyprstream_rpc::envelope::RequestIdentity;
+        crate::services::WorkerZmqClient::new(signing_key.clone(), RequestIdentity::local())
+    };
     let (model_status_tx, mut model_status_rx) =
         tokio::sync::mpsc::channel::<(String, bool)>(32);
 
@@ -217,6 +222,8 @@ pub async fn handle_shell_tui(
     win_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut bg_tick = tokio::time::interval(std::time::Duration::from_millis(50));
     bg_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut worker_refresh = tokio::time::interval(std::time::Duration::from_secs(5));
+    worker_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // SIGWINCH — forward terminal resize to TuiService and compositor.
     let sigwinch_key = signing_key.clone();
@@ -262,7 +269,7 @@ pub async fn handle_shell_tui(
                     }
                 };
                 if dispatch_outputs(
-                    &mut compositor, &client, &model_client,
+                    &mut compositor, &client, &model_client, &worker_client,
                     &model_status_tx, &mut terminal, &mut console_app,
                     &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
                 ).await { break; }
@@ -308,7 +315,7 @@ pub async fn handle_shell_tui(
                 for key in keys {
                     let outputs = compositor.handle(CompositorInput::KeyPress(key));
                     if dispatch_outputs(
-                        &mut compositor, &client, &model_client,
+                        &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
                     ).await {
@@ -323,10 +330,79 @@ pub async fn handle_shell_tui(
                 if let Ok(wins) = list_windows_rpc(&client).await {
                     let outputs = compositor.handle(CompositorInput::WindowList(wins));
                     if dispatch_outputs(
-                        &mut compositor, &client, &model_client,
+                        &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
                     ).await { break; }
+                }
+            }
+
+            _ = worker_refresh.tick() => {
+                if matches!(compositor.chrome.mode, hyprstream_compositor::ShellMode::WorkerManager { .. }) {
+                    use crate::services::worker::{RuntimeClient, ImageClient};
+                    // Poll sandboxes + containers
+                    if let Ok(sandbox_infos) = worker_client.list_pod_sandbox(None).await {
+                        let mut entries = Vec::new();
+                        for sb in &sandbox_infos {
+                            let short_id = if sb.id.len() > 8 { sb.id[..8].to_owned() } else { sb.id.clone() };
+                            let containers = match worker_client.list_containers(Some(&crate::services::worker::ContainerFilter {
+                                id: None,
+                                pod_sandbox_id: Some(sb.id.clone()),
+                                state: None,
+                                label_selector: Default::default(),
+                            })).await {
+                                Ok(cis) => cis.into_iter().map(|c| {
+                                    let c_short = if c.id.len() > 8 { c.id[..8].to_owned() } else { c.id.clone() };
+                                    hyprstream_compositor::ContainerEntry {
+                                        id: c_short,
+                                        full_id: c.id,
+                                        image: c.image.image,
+                                        state: format!("{:?}", c.state),
+                                        cpu_pct: None,
+                                        mem_mb: None,
+                                    }
+                                }).collect(),
+                                Err(_) => vec![],
+                            };
+                            entries.push(hyprstream_compositor::WorkerEntry {
+                                id: short_id,
+                                full_id: sb.id.clone(),
+                                state: format!("{:?}", sb.state),
+                                backend: sb.runtime_handler.clone(),
+                                cpu_pct: None,
+                                mem_mb: None,
+                                containers,
+                            });
+                        }
+                        let pool_summary = format!("{} sandboxes", entries.len());
+                        let outputs = compositor.handle(CompositorInput::WorkerList { sandboxes: entries, pool_summary });
+                        if dispatch_outputs(
+                            &mut compositor, &client, &model_client, &worker_client,
+                            &model_status_tx, &mut terminal, &mut console_app,
+                            &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
+                        ).await { break; }
+                    }
+                    // Poll images
+                    if let Ok(images) = worker_client.list_images(None).await {
+                        let entries: Vec<hyprstream_compositor::ImageEntry> = images.into_iter().map(|img| {
+                            let repo_tag = img.repo_tags.first().cloned().unwrap_or_else(|| "<none>".to_owned());
+                            let id = if img.id.len() > 12 { img.id[..12].to_owned() } else { img.id.clone() };
+                            hyprstream_compositor::ImageEntry {
+                                repo_tag,
+                                id,
+                                size_bytes: img.size,
+                                created: format!("{}s ago", std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+                                    .saturating_sub(img.uid as u64)),
+                            }
+                        }).collect();
+                        let outputs = compositor.handle(CompositorInput::WorkerImageList { images: entries });
+                        if dispatch_outputs(
+                            &mut compositor, &client, &model_client, &worker_client,
+                            &model_status_tx, &mut terminal, &mut console_app,
+                            &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
+                        ).await { break; }
+                    }
                 }
             }
 
@@ -340,6 +416,7 @@ pub async fn handle_shell_tui(
                 // Two-pass to avoid holding &mut active_apps while dispatching.
                 let mut dirty_frames: Vec<(u32, Vec<u8>)> = Vec::new();
                 let mut quit_app_ids: Vec<u32> = Vec::new();
+                let mut pending_ctx_reloads: Vec<(String, usize)> = Vec::new();
                 for (&pane_id, app) in active_apps.iter_mut() {
                     let dirty = app.tick(50);
                     // Surface inference errors as compositor toasts.
@@ -350,15 +427,54 @@ pub async fn handle_shell_tui(
                         quit_app_ids.push(pane_id);
                         continue;
                     }
+                    // Collect context-window reload requests from settings modal.
+                    if let Some(ctx) = app.requested_context_window.take() {
+                        pending_ctx_reloads.push((app.model_name.clone(), ctx));
+                    }
                     if dirty {
                         dirty_frames.push((pane_id, render_chat_app_to_ansi(app)));
                     }
+                }
+                // Apply context-window reloads (model will reload with new context size).
+                for (model_ref, ctx_window) in pending_ctx_reloads {
+                    use crate::services::model::ModelLoadConfig;
+                    let config = ModelLoadConfig {
+                        max_context: if ctx_window == 0 { None } else { Some(ctx_window) },
+                        kv_quant: None,
+                        num_inference_instances: None,
+                    };
+                    let ctx_label = if ctx_window == 0 {
+                        "model default".to_owned()
+                    } else {
+                        ctx_window.to_string()
+                    };
+                    compositor.chrome.push_toast(
+                        format!("Reloading {model_ref} with context {ctx_label}…"),
+                        ToastLevel::Info,
+                    );
+                    let _ = model_client.load(&model_ref, Some(&config)).await;
+                    let poll_client = model_client.clone();
+                    let poll_mr = model_ref.clone();
+                    let tx = model_status_tx.clone();
+                    tokio::spawn(async move {
+                        for _ in 0..60u32 {
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            match poll_client.status(&poll_mr).await {
+                                Ok(entries) if entries.iter().any(|e| e.status == "loaded") => {
+                                    let _ = tx.send((poll_mr, true)).await;
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                        let _ = tx.send((poll_mr, false)).await;
+                    });
                 }
                 // Feed dirty frames into compositor.
                 for (pane_id, ansi) in dirty_frames {
                     let outputs = compositor.handle(CompositorInput::AppFrame { app_id: pane_id, ansi });
                     if dispatch_outputs(
-                        &mut compositor, &client, &model_client,
+                        &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
                     ).await { should_exit = true; break; }
@@ -369,7 +485,7 @@ pub async fn handle_shell_tui(
                     compositor.chrome.private_panes.remove(&id);
                     let outputs = compositor.handle(CompositorInput::AppExited { app_id: id });
                     dispatch_outputs(
-                        &mut compositor, &client, &model_client,
+                        &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
                     ).await;
@@ -395,7 +511,7 @@ pub async fn handle_shell_tui(
                 let _ = terminal.clear();
                 let outputs = compositor.handle(CompositorInput::Resize(new_cols, new_rows));
                 if dispatch_outputs(
-                    &mut compositor, &client, &model_client,
+                    &mut compositor, &client, &model_client, &worker_client,
                     &model_status_tx, &mut terminal, &mut console_app,
                     &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
                 ).await { break; }
@@ -455,6 +571,7 @@ async fn dispatch_outputs(
     compositor: &mut Compositor,
     client: &TuiClient,
     model_client: &crate::services::ModelZmqClient,
+    worker_client: &crate::services::WorkerZmqClient,
     model_status_tx: &tokio::sync::mpsc::Sender<(String, bool)>,
     terminal: &mut ratatui::Terminal<AnsiBackend<AnsiWriter>>,
     console_app: &mut ConsoleApp,
@@ -472,7 +589,7 @@ async fn dispatch_outputs(
             CompositorOutput::Quit => return true,
             CompositorOutput::Rpc(req) => {
                 let feed_back = handle_rpc(
-                    compositor, client, model_client, model_status_tx,
+                    compositor, client, model_client, worker_client, model_status_tx,
                     active_apps, next_local_id, storage_key, signing_key, req,
                 ).await;
                 for input in feed_back {
@@ -513,6 +630,7 @@ async fn handle_rpc(
     compositor: &mut Compositor,
     client: &TuiClient,
     model_client: &crate::services::ModelZmqClient,
+    worker_client: &crate::services::WorkerZmqClient,
     model_status_tx: &tokio::sync::mpsc::Sender<(String, bool)>,
     active_apps: &mut HashMap<u32, ChatApp>,
     next_local_id: &mut u32,
@@ -648,6 +766,16 @@ async fn handle_rpc(
                 Some(s) => uuid::Uuid::parse_str(s).unwrap_or_else(|_| uuid::Uuid::new_v4()),
                 None => uuid::Uuid::new_v4(),
             };
+            // Fetch tool list once; used by both the spawner (for chat template)
+            // and the ChatApp (for dispatch + descriptions).
+            let (tool_caller, tool_descriptions, openai_tools) =
+                crate::tui::zmq_transport::make_tool_caller(signing_key);
+
+            // Shared gen_config Arc — passed to both the spawner and the ChatApp.
+            let gen_config = std::sync::Arc::new(parking_lot::RwLock::new(
+                hyprstream_tui::chat_app::ChatGenConfig::default(),
+            ));
+
             let storage_dir = private_store_dir();
             let app = match FsBackend::new(storage_dir) {
                 Ok(fs) => {
@@ -686,20 +814,34 @@ async fn handle_rpc(
                     let save_hook: SaveHook = Box::new(move |entries| {
                         let _ = save_store.save(&uuid_for_save, entries);
                     });
-                    let spawner = make_chat_spawner(signing_key, &model_ref);
+                    let spawner = crate::tui::zmq_transport::make_chat_spawner(
+                        signing_key, &model_ref, Some(openai_tools.clone()),
+                        std::sync::Arc::clone(&gen_config),
+                    );
                     ChatApp::new_private(
                         model_ref.clone(), cols, rows, spawner,
                         session_uuid, load_hook, save_hook,
                     )
+                    .with_gen_config(gen_config)
                 }
                 Err(e) => {
                     compositor.chrome.push_toast(
                         format!("Private store dir unavailable: {e}"),
                         ToastLevel::Warn,
                     );
-                    ChatApp::new(model_ref.clone(), cols, rows, make_chat_spawner(signing_key, &model_ref))
+                    let spawner = crate::tui::zmq_transport::make_chat_spawner(
+                        signing_key, &model_ref, Some(openai_tools.clone()),
+                        std::sync::Arc::clone(&gen_config),
+                    );
+                    ChatApp::new(model_ref.clone(), cols, rows, spawner)
+                        .with_gen_config(gen_config)
                 }
             };
+            let app = app.with_tool_caller(
+                tool_caller,
+                tool_descriptions,
+                hyprstream_tui::chat_app::ToolCallFormat::Qwen3Xml,
+            );
             active_apps.insert(pane_id, app);
             compositor.chrome.private_panes.insert(pane_id);
             compositor.layout.get_or_create_private(pane_id);
@@ -792,19 +934,172 @@ async fn handle_rpc(
             vec![]
         }
         RpcRequest::WorkerDestroySandbox { sandbox_id } => {
-            compositor.chrome.push_toast(
-                format!("Destroying {}...", &sandbox_id[..sandbox_id.len().min(8)]),
-                ToastLevel::Info,
-            );
-            // Worker RPC not yet wired — placeholder for Phase 6.
+            use crate::services::worker::RuntimeClient;
+            let short = &sandbox_id[..sandbox_id.len().min(8)];
+            compositor.chrome.push_toast(format!("Destroying {short}..."), ToastLevel::Info);
+            match worker_client.stop_pod_sandbox(&sandbox_id).await {
+                Ok(()) => {
+                    let _ = worker_client.remove_pod_sandbox(&sandbox_id).await;
+                    compositor.chrome.push_toast(format!("Destroyed {short}"), ToastLevel::Info);
+                }
+                Err(e) => {
+                    compositor.chrome.push_toast(format!("Destroy failed: {e}"), ToastLevel::Error);
+                }
+            }
             vec![]
         }
         RpcRequest::WorkerExecSync { sandbox_id: _, container_id, cmd } => {
+            use crate::services::worker::RuntimeClient;
+            let short = &container_id[..container_id.len().min(8)];
+            compositor.chrome.push_toast(format!("Exec in {short}: {:?}", cmd), ToastLevel::Info);
+            match worker_client.exec_sync(&container_id, &cmd, 30).await {
+                Ok(result) => {
+                    let stdout = String::from_utf8_lossy(&result.stdout);
+                    let msg = if stdout.len() > 60 { format!("{}…", &stdout[..60]) } else { stdout.to_string() };
+                    compositor.chrome.push_toast(format!("exec: {msg}"), ToastLevel::Info);
+                }
+                Err(e) => {
+                    compositor.chrome.push_toast(format!("exec failed: {e}"), ToastLevel::Error);
+                }
+            }
+            vec![]
+        }
+        RpcRequest::WorkerImageList => {
+            use crate::services::worker::ImageClient;
+            match worker_client.list_images(None).await {
+                Ok(images) => {
+                    let entries: Vec<hyprstream_compositor::ImageEntry> = images.into_iter().map(|img| {
+                        let repo_tag = img.repo_tags.first().cloned().unwrap_or_else(|| "<none>".to_owned());
+                        let id = if img.id.len() > 12 { img.id[..12].to_owned() } else { img.id.clone() };
+                        hyprstream_compositor::ImageEntry {
+                            repo_tag,
+                            id,
+                            size_bytes: img.size,
+                            created: format!("{}s ago", std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+                                .saturating_sub(img.uid as u64)),
+                        }
+                    }).collect();
+                    vec![CompositorInput::WorkerImageList { images: entries }]
+                }
+                Err(e) => {
+                    compositor.chrome.push_toast(format!("Image list failed: {e}"), ToastLevel::Warn);
+                    vec![]
+                }
+            }
+        }
+        RpcRequest::WorkerImagePull { image } => {
+            use crate::services::worker::ImageClient;
+            use crate::services::worker::ImageSpec;
+            compositor.chrome.push_toast(format!("Pulling {image}..."), ToastLevel::Info);
+            let spec = ImageSpec { image: image.clone(), annotations: Default::default(), runtime_handler: Default::default() };
+            match worker_client.pull_image(&spec, None).await {
+                Ok(ref_id) => {
+                    compositor.chrome.push_toast(format!("Pulled: {}", &ref_id[..ref_id.len().min(20)]), ToastLevel::Info);
+                }
+                Err(e) => {
+                    compositor.chrome.push_toast(format!("Pull failed: {e}"), ToastLevel::Error);
+                }
+            }
+            vec![]
+        }
+        RpcRequest::WorkerImageRemove { image } => {
+            use crate::services::worker::ImageClient;
+            use crate::services::worker::ImageSpec;
+            let spec = ImageSpec { image: image.clone(), annotations: Default::default(), runtime_handler: Default::default() };
+            match worker_client.remove_image(&spec).await {
+                Ok(()) => {
+                    compositor.chrome.push_toast(format!("Removed {image}"), ToastLevel::Info);
+                }
+                Err(e) => {
+                    compositor.chrome.push_toast(format!("Remove failed: {e}"), ToastLevel::Error);
+                }
+            }
+            vec![]
+        }
+        RpcRequest::WorkerCreateSandbox { hostname, backend, gpu } => {
+            use crate::services::worker::{RuntimeClient, PodSandboxConfig, KeyValue};
+            let mut annotations = vec![];
+            annotations.push(KeyValue { key: "io.hyprstream/runtime-handler".to_owned(), value: backend });
+            if gpu {
+                annotations.push(KeyValue { key: "hyprstream.io/gpu".to_owned(), value: "true".to_owned() });
+            }
+            let config = PodSandboxConfig {
+                hostname,
+                annotations,
+                ..Default::default()
+            };
+            match worker_client.run_pod_sandbox(&config).await {
+                Ok(sandbox_id) => {
+                    let short = &sandbox_id[..sandbox_id.len().min(8)];
+                    compositor.chrome.push_toast(format!("Created sandbox {short}"), ToastLevel::Info);
+                }
+                Err(e) => {
+                    compositor.chrome.push_toast(format!("Create sandbox failed: {e}"), ToastLevel::Error);
+                }
+            }
+            vec![]
+        }
+        RpcRequest::WorkerCreateContainer { sandbox_id, image, cmd, tty } => {
+            use crate::services::worker::{RuntimeClient, ContainerConfig, ImageSpec, PodSandboxConfig};
+            let short_sb = &sandbox_id[..sandbox_id.len().min(8)];
+            // PodSandboxStatusResponse has no config field — use default
+            let sandbox_config = PodSandboxConfig::default();
+            let container_config = ContainerConfig {
+                image: ImageSpec { image: image.clone(), annotations: Default::default(), runtime_handler: Default::default() },
+                command: cmd,
+                tty,
+                ..Default::default()
+            };
+            match worker_client.create_container(&sandbox_id, &container_config, &sandbox_config).await {
+                Ok(container_id) => {
+                    let short = &container_id[..container_id.len().min(8)];
+                    compositor.chrome.push_toast(format!("Created container {short} in {short_sb}"), ToastLevel::Info);
+                    // Auto-start
+                    if let Err(e) = worker_client.start_container(&container_id).await {
+                        compositor.chrome.push_toast(format!("Start failed: {e}"), ToastLevel::Error);
+                    }
+                }
+                Err(e) => {
+                    compositor.chrome.push_toast(format!("Create container failed: {e}"), ToastLevel::Error);
+                }
+            }
+            vec![]
+        }
+        RpcRequest::WorkerStartContainer { container_id } => {
+            use crate::services::worker::RuntimeClient;
+            let short = &container_id[..container_id.len().min(8)];
+            match worker_client.start_container(&container_id).await {
+                Ok(()) => compositor.chrome.push_toast(format!("Started {short}"), ToastLevel::Info),
+                Err(e) => compositor.chrome.push_toast(format!("Start failed: {e}"), ToastLevel::Error),
+            }
+            vec![]
+        }
+        RpcRequest::WorkerStopContainer { container_id } => {
+            use crate::services::worker::RuntimeClient;
+            let short = &container_id[..container_id.len().min(8)];
+            match worker_client.stop_container(&container_id, 10).await {
+                Ok(()) => compositor.chrome.push_toast(format!("Stopped {short}"), ToastLevel::Info),
+                Err(e) => compositor.chrome.push_toast(format!("Stop failed: {e}"), ToastLevel::Error),
+            }
+            vec![]
+        }
+        RpcRequest::WorkerRemoveContainer { container_id } => {
+            use crate::services::worker::RuntimeClient;
+            let short = &container_id[..container_id.len().min(8)];
+            match worker_client.remove_container(&container_id).await {
+                Ok(()) => compositor.chrome.push_toast(format!("Removed {short}"), ToastLevel::Info),
+                Err(e) => compositor.chrome.push_toast(format!("Remove failed: {e}"), ToastLevel::Error),
+            }
+            vec![]
+        }
+        RpcRequest::AttachContainer { sandbox_id: _, container_id, cols: _, rows: _ } => {
+            // Phase W-III-a: stdout-only attach (ContainerTermApp not yet implemented)
+            let short = &container_id[..container_id.len().min(8)];
             compositor.chrome.push_toast(
-                format!("Exec in {}: {:?}", &container_id[..container_id.len().min(8)], cmd),
-                ToastLevel::Info,
+                format!("Attach to {short}: not yet implemented (Phase W-III-a)"),
+                ToastLevel::Warn,
             );
-            // Worker RPC not yet wired — placeholder for Phase 6.
             vec![]
         }
         RpcRequest::Quit => vec![],
@@ -1029,17 +1324,7 @@ fn tab_index_at_col(windows: &[WindowSummary], col: u16) -> Option<usize> {
     None
 }
 
-// ============================================================================
-// Private chat helpers
-// ============================================================================
 
-/// Build a `StreamSpawner` — delegates to `tui::zmq_transport`.
-fn make_chat_spawner(
-    signing_key: &SigningKey,
-    model_ref: &str,
-) -> hyprstream_tui::chat_app::StreamSpawner {
-    crate::tui::zmq_transport::make_chat_spawner(signing_key, model_ref)
-}
 
 /// Derive a 32-byte AES-256 storage key from the Ed25519 signing key seed.
 ///

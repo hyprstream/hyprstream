@@ -62,8 +62,13 @@ pub fn draw(frame: &mut Frame, chrome: &ShellChrome, layout: &LayoutTree) {
         ShellMode::Console                => { /* drawn by shell_handlers (native) or wasm path */ }
         ShellMode::ConversationPicker { .. } => draw_conversation_picker(frame, area, chrome),
         ShellMode::ServiceManager { selected } => draw_service_modal(frame, area, chrome, selected),
-        ShellMode::WorkerManager { sandbox_sel, container_sel, show_containers }
-            => draw_worker_modal(frame, area, chrome, sandbox_sel, container_sel, show_containers),
+        ShellMode::WorkerManager { sandbox_sel, container_sel, show_containers, tab, image_sel, ref input_mode }
+            => {
+                draw_worker_modal(frame, area, chrome, sandbox_sel, container_sel, show_containers, tab, image_sel);
+                if let Some(dialog) = input_mode {
+                    draw_input_dialog(frame, area, dialog);
+                }
+            }
         ShellMode::Normal | ShellMode::Fullscreen => {}
     }
 
@@ -386,15 +391,34 @@ fn draw_fkey_bar(frame: &mut Frame, area: Rect, mode: &ShellMode) {
             ("i",                "Install"),
             ("Esc",              "Close"),
         ],
+        ShellMode::WorkerManager { ref input_mode, .. } if input_mode.is_some() => &[
+            ("\u{2191}\u{2193}", "Fields"),
+            ("Space",            "Toggle"),
+            ("Enter",            "Submit"),
+            ("Esc",              "Cancel"),
+        ],
+        ShellMode::WorkerManager { tab: crate::chrome::WorkerTab::Images, .. } => &[
+            ("Tab",              "Sandboxes"),
+            ("\u{2191}\u{2193}", "Navigate"),
+            ("p",                "Pull"),
+            ("x",                "Remove"),
+            ("Esc",              "Close"),
+        ],
         ShellMode::WorkerManager { show_containers: false, .. } => &[
+            ("Tab",              "Images"),
             ("\u{2191}\u{2193}", "Navigate"),
             ("Enter/\u{2192}",   "Containers"),
+            ("n",                "Create"),
             ("x",                "Destroy"),
             ("Esc",              "Close"),
         ],
         ShellMode::WorkerManager { show_containers: true, .. } => &[
             ("\u{2191}\u{2193}", "Navigate"),
             ("\u{2190}",         "Back"),
+            ("n",                "Create"),
+            ("t/s",              "Start/Stop"),
+            ("a",                "Attach"),
+            ("x",                "Remove"),
             ("e",                "Exec"),
             ("Esc",              "Close"),
         ],
@@ -694,16 +718,39 @@ fn draw_service_modal(frame: &mut Frame, full_area: Rect, chrome: &ShellChrome, 
 // Worker Manager modal
 // ============================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn draw_worker_modal(
     frame: &mut Frame, full_area: Rect, chrome: &ShellChrome,
     sandbox_sel: usize, container_sel: usize, show_containers: bool,
+    tab: crate::chrome::WorkerTab, image_sel: usize,
 ) {
     let modal = centered_rect(78, 65, full_area);
     render_modal(frame, modal, theme::modal_block(Line::from(" Workers ")), |frame, inner| {
         let hint_area = Rect { y: inner.y + inner.height.saturating_sub(1), height: 1, ..inner };
 
+        // Tab strip
+        let tab_area = Rect { height: 1, ..inner };
+        let tab_titles = vec![
+            if tab == crate::chrome::WorkerTab::Sandboxes {
+                Line::from(Span::styled(" Sandboxes ", theme::tab_active()))
+            } else {
+                Line::from(Span::styled(" Sandboxes ", theme::tab_inactive()))
+            },
+            if tab == crate::chrome::WorkerTab::Images {
+                Line::from(Span::styled(" Images ", theme::tab_active()))
+            } else {
+                Line::from(Span::styled(" Images ", theme::tab_inactive()))
+            },
+        ];
+        let tabs = Tabs::new(tab_titles)
+            .select(if tab == crate::chrome::WorkerTab::Sandboxes { 0 } else { 1 })
+            .highlight_style(theme::tab_active())
+            .divider(Span::styled("│", Style::default().fg(theme::DIM)))
+            .style(Style::default().bg(theme::BG_MODAL));
+        frame.render_widget(tabs, tab_area);
+
         // Pool summary line
-        let summary_area = Rect { height: 1, ..inner };
+        let summary_area = Rect { y: inner.y + 1, height: 1, ..inner };
         let summary_text = if chrome.worker_pool_summary.is_empty() {
             " Pool: (none)".to_string()
         } else {
@@ -716,10 +763,15 @@ fn draw_worker_modal(
         );
 
         let list_area = Rect {
-            y: inner.y + 1,
-            height: inner.height.saturating_sub(3), // -1 summary, -1 gap, -1 hint
+            y: inner.y + 2,
+            height: inner.height.saturating_sub(4), // -1 tabs, -1 summary, -1 gap, -1 hint
             ..inner
         };
+
+        if tab == crate::chrome::WorkerTab::Images {
+            draw_image_table(frame, list_area, hint_area, chrome, image_sel);
+            return;
+        }
 
         if !show_containers {
             // Sandbox view
@@ -897,6 +949,173 @@ fn draw_worker_modal(
 }
 
 // ============================================================================
+// Image table
+// ============================================================================
+
+fn draw_image_table(
+    frame: &mut Frame, list_area: Rect, hint_area: Rect,
+    chrome: &ShellChrome, image_sel: usize,
+) {
+    let hint = Paragraph::new(Line::from(vec![
+        Span::styled("\u{2191}\u{2193}", theme::help_key()),
+        Span::styled(" nav  ", theme::help_text()),
+        Span::styled("p", theme::help_key()),
+        Span::styled(" pull  ", theme::help_text()),
+        Span::styled("x", theme::help_key()),
+        Span::styled(" remove  ", theme::help_text()),
+        Span::styled("Tab", theme::help_key()),
+        Span::styled(" sandboxes  ", theme::help_text()),
+        Span::styled("Esc", theme::help_key()),
+        Span::styled(" close", theme::help_text()),
+    ]))
+    .style(Style::default().bg(theme::BG_MODAL));
+    frame.render_widget(hint, hint_area);
+
+    if chrome.image_list.is_empty() {
+        frame.render_widget(
+            Paragraph::new(" (no images)")
+                .style(Style::default().fg(theme::DIM).bg(theme::BG_MODAL)),
+            list_area,
+        );
+        return;
+    }
+
+    // Header
+    let header_area = Rect { height: 1, ..list_area };
+    let header = format!(
+        " {:<30} {:<14} {:>10} {}",
+        "REPOSITORY:TAG", "IMAGE ID", "SIZE", "CREATED"
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(header, Style::default().fg(theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD))))
+            .style(Style::default().bg(theme::BG_MODAL)),
+        header_area,
+    );
+
+    let rows_area = Rect {
+        y: list_area.y + 1,
+        height: list_area.height.saturating_sub(1),
+        ..list_area
+    };
+    let visible = rows_area.height as usize;
+    let n = chrome.image_list.len();
+    let scroll_offset = if image_sel >= visible { image_sel - visible + 1 } else { 0 };
+
+    for (i, img) in chrome.image_list.iter().enumerate().skip(scroll_offset).take(visible) {
+        let row_y = rows_area.y + (i - scroll_offset) as u16;
+        let row_area = Rect { y: row_y, height: 1, ..rows_area };
+
+        let tag = if img.repo_tag.len() > 28 { &img.repo_tag[..28] } else { &img.repo_tag };
+        let size_str = if img.size_bytes > 1_000_000_000 {
+            format!("{:.1} GB", img.size_bytes as f64 / 1_000_000_000.0)
+        } else {
+            format!("{:.1} MB", img.size_bytes as f64 / 1_000_000.0)
+        };
+        let prefix = if i == image_sel { "\u{25b8} " } else { "  " };
+        let line_text = format!(
+            "{}{:<30} {:<14} {:>10} {}",
+            prefix, tag, img.id, size_str, img.created
+        );
+
+        let (fg, bg) = if i == image_sel {
+            (theme::AMBER, theme::BG_PANEL)
+        } else {
+            (theme::DIM, theme::BG_MODAL)
+        };
+
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(line_text, Style::default().fg(fg))))
+                .style(Style::default().bg(bg)),
+            row_area,
+        );
+    }
+
+    let rendered = n.saturating_sub(scroll_offset).min(visible);
+    for r in rendered..visible {
+        let row_area = Rect { y: rows_area.y + r as u16, height: 1, ..rows_area };
+        frame.render_widget(
+            Paragraph::new("").style(Style::default().bg(theme::BG_MODAL)),
+            row_area,
+        );
+    }
+}
+
+// ============================================================================
+// Input dialog overlay
+// ============================================================================
+
+fn draw_input_dialog(
+    frame: &mut Frame, full_area: Rect,
+    dialog: &crate::chrome::InputDialog,
+) {
+    let h = (dialog.fields.len() as u16 * 2) + 4; // title + fields + padding + buttons
+    let w = 50u16.min(full_area.width.saturating_sub(4));
+    let popup = Rect {
+        x: full_area.x + (full_area.width.saturating_sub(w)) / 2,
+        y: full_area.y + (full_area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h.min(full_area.height),
+    };
+
+    let title = format!(" {} ", dialog.title);
+    render_modal(frame, popup, theme::modal_block(Line::from(title)), |frame, inner| {
+        for (i, field) in dialog.fields.iter().enumerate() {
+            let y = inner.y + (i as u16) * 2;
+            if y + 1 >= inner.y + inner.height { break; }
+
+            // Label
+            let label_area = Rect { y, height: 1, ..inner };
+            let is_focused = i == dialog.focused;
+            let label_style = if is_focused { theme::tab_active() } else { theme::help_text() };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(format!(" {}:", field.label), label_style)))
+                    .style(Style::default().bg(theme::BG_MODAL)),
+                label_area,
+            );
+
+            // Value
+            let val_area = Rect { y: y + 1, height: 1, ..inner };
+            let val_text = if field.is_toggle {
+                if field.toggle_val { " [x] Yes".to_string() } else { " [ ] No".to_string() }
+            } else if let Some(ref opts) = field.choices {
+                let v = opts.get(field.choice_idx).map(|s| s.as_str()).unwrap_or("");
+                format!(" < {} >", v)
+            } else {
+                let s = String::from_utf8_lossy(&field.buf);
+                if is_focused {
+                    format!(" {}_", s)
+                } else {
+                    format!(" {}", s)
+                }
+            };
+            let val_style = if is_focused {
+                Style::default().fg(Color::White).bg(theme::BG_PANEL)
+            } else {
+                Style::default().fg(theme::DIM).bg(theme::BG_MODAL)
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(val_text, val_style))),
+                val_area,
+            );
+        }
+
+        // Submit hint at bottom
+        let hint_y = inner.y + inner.height.saturating_sub(1);
+        let hint_area = Rect { y: hint_y, height: 1, ..inner };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("Enter", theme::help_key()),
+                Span::styled(" submit  ", theme::help_text()),
+                Span::styled("Esc", theme::help_key()),
+                Span::styled(" cancel", theme::help_text()),
+            ]))
+            .style(Style::default().bg(theme::BG_MODAL)),
+            hint_area,
+        );
+    });
+}
+
+// ============================================================================
 // Utility
 // ============================================================================
 
@@ -1006,7 +1225,7 @@ mod tests {
     #[test]
     fn render_worker_modal_empty() {
         let mut comp = make_compositor();
-        comp.chrome.mode = ShellMode::WorkerManager { sandbox_sel: 0, container_sel: 0, show_containers: false };
+        comp.chrome.mode = ShellMode::WorkerManager { sandbox_sel: 0, container_sel: 0, show_containers: false, tab: crate::chrome::WorkerTab::Sandboxes, image_sel: 0, input_mode: None };
         let text = render_to_string(&comp);
         assert!(text.contains("Workers"));
         assert!(text.contains("no sandboxes"));
@@ -1016,7 +1235,7 @@ mod tests {
     fn render_worker_modal_sandbox_view() {
         let mut comp = make_compositor();
         with_workers(&mut comp);
-        comp.chrome.mode = ShellMode::WorkerManager { sandbox_sel: 0, container_sel: 0, show_containers: false };
+        comp.chrome.mode = ShellMode::WorkerManager { sandbox_sel: 0, container_sel: 0, show_containers: false, tab: crate::chrome::WorkerTab::Sandboxes, image_sel: 0, input_mode: None };
         let text = render_to_string(&comp);
         assert!(text.contains("Workers"));
         assert!(text.contains("abc123"));
@@ -1027,7 +1246,7 @@ mod tests {
     fn render_worker_modal_container_view() {
         let mut comp = make_compositor();
         with_workers(&mut comp);
-        comp.chrome.mode = ShellMode::WorkerManager { sandbox_sel: 0, container_sel: 0, show_containers: true };
+        comp.chrome.mode = ShellMode::WorkerManager { sandbox_sel: 0, container_sel: 0, show_containers: true, tab: crate::chrome::WorkerTab::Sandboxes, image_sel: 0, input_mode: None };
         let text = render_to_string(&comp);
         assert!(text.contains("Workers"));
         assert!(text.contains("ctr1"));
@@ -1038,7 +1257,7 @@ mod tests {
     fn render_worker_modal_selection_beyond_list() {
         let mut comp = make_compositor();
         with_workers(&mut comp);
-        comp.chrome.mode = ShellMode::WorkerManager { sandbox_sel: 99, container_sel: 99, show_containers: true };
+        comp.chrome.mode = ShellMode::WorkerManager { sandbox_sel: 99, container_sel: 99, show_containers: true, tab: crate::chrome::WorkerTab::Sandboxes, image_sel: 0, input_mode: None };
         let _text = render_to_string(&comp);
     }
 

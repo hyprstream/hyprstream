@@ -28,9 +28,10 @@ pub mod theme;
 
 pub use background::{BackgroundState, BackgroundStyle, ALL_STYLES, PREVIEW_H, PREVIEW_W};
 pub use chrome::{
-    ChromeOutput, ContainerEntry, ConversationPickerEntry, ModelEntry, PaneSummary, RpcRequest,
+    ChromeOutput, ContainerEntry, ConversationPickerEntry, ImageEntry, InputDialog, InputField,
+    ModelEntry, PaneSummary, RpcRequest,
     ServiceEntry, ServiceMode, ShellChrome, ShellMode, Toast, ToastLevel, WindowSummary,
-    WorkerEntry, MENU_ITEMS, keypress_to_bytes, LOCAL_ID_BIT, is_local_id,
+    WorkerEntry, WorkerTab, MENU_ITEMS, keypress_to_bytes, LOCAL_ID_BIT, is_local_id,
 };
 pub use layout::{
     CellUpdate, CursorState, FrameContent, FrameUpdate, LayoutTree, PaneId, PaneSource,
@@ -65,6 +66,10 @@ pub enum CompositorInput {
     WorkerList {
         sandboxes: Vec<crate::chrome::WorkerEntry>,
         pool_summary: String,
+    },
+    /// Updated image list.
+    WorkerImageList {
+        images: Vec<crate::chrome::ImageEntry>,
     },
 }
 
@@ -219,6 +224,14 @@ impl Compositor {
                     } else {
                         *container_sel = 0;
                     }
+                }
+                vec![CompositorOutput::Redraw]
+            }
+
+            CompositorInput::WorkerImageList { images } => {
+                self.chrome.image_list = images;
+                if let ShellMode::WorkerManager { ref mut image_sel, .. } = self.chrome.mode {
+                    *image_sel = (*image_sel).min(self.chrome.image_list.len().saturating_sub(1));
                 }
                 vec![CompositorOutput::Redraw]
             }

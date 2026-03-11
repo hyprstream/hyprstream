@@ -938,14 +938,32 @@ impl TuiService {
 
         let model_ref = model_ref.to_owned();
 
-        let spawner = super::zmq_transport::make_chat_spawner(&self.signing_key, &model_ref);
+        let (tool_caller, tool_descriptions, openai_tools) =
+            super::zmq_transport::make_tool_caller(&self.signing_key);
+
+        let gen_config = std::sync::Arc::new(parking_lot::RwLock::new(
+            hyprstream_tui::chat_app::ChatGenConfig::default(),
+        ));
+        let spawner = super::zmq_transport::make_chat_spawner(
+            &self.signing_key,
+            &model_ref,
+            Some(openai_tools),
+            std::sync::Arc::clone(&gen_config),
+        );
 
         let app = hyprstream_tui::chat_app::ChatApp::new(
             model_ref.clone(),
             cols,
             rows,
             spawner,
-        );
+        )
+        .with_gen_config(gen_config)
+        .with_tool_caller(
+            tool_caller,
+            tool_descriptions,
+            hyprstream_tui::chat_app::ToolCallFormat::Qwen3Xml,
+        )
+        .with_server_spawned();
         let config = waxterm::app::TerminalConfig::new().cols(cols).rows(rows);
         let process = super::process::spawn_app_process(app, config);
 
