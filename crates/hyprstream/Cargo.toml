@@ -21,6 +21,7 @@ doctest = true
 name = "hyprstream"
 path = "src/bin/main.rs"
 
+
 [dependencies]
 # Arrow and DataFusion dependencies removed - focused on ML inference only
 bytes.workspace = true
@@ -46,6 +47,8 @@ serde_yaml.workspace = true
 git2.workspace = true  # Still needed by git2db internally
 git2db = { path = "../git2db", features = ["overlayfs"] }  # High-level git library with overlayfs
 hyprstream-rpc = { path = "../hyprstream-rpc" }  # RPC infrastructure (Cap'n Proto + ZMQ)
+hyprstream-discovery = { path = "../hyprstream-discovery" }  # Service discovery
+hyprstream-service = { path = "../hyprstream-service" }  # Service orchestration
 hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }  # RPC code generation proc macros
 hyprstream-flight = { path = "../hyprstream-flight" }  # Flight SQL server and client
 hyprstream-metrics = { path = "../hyprstream-metrics" }  # Metrics storage (for RegistryClient trait)

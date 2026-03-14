@@ -26,8 +26,7 @@ use anyhow::Context;
 use git2db::Git2DB;
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::{global as global_registry, SocketKind};
-use hyprstream_rpc::service::factory::ServiceContext;
-use hyprstream_rpc::service::spawner::{ProxyService, Spawnable};
+use hyprstream_service::{ProxyService, ServiceContext, Spawnable};
 use hyprstream_rpc::service_factory;
 use hyprstream_workers::endpoints;
 use tokio::sync::RwLock;
@@ -35,7 +34,7 @@ use tracing::info;
 
 use crate::auth::PolicyManager;
 use crate::config::{HyprConfig, TokenConfig};
-use crate::services::{DiscoveryService, McpService, McpConfig, PolicyService, PolicyClient, RegistryService, GenRegistryClient};
+use crate::services::{DiscoveryService, McpService, McpConfig, PolicyService, PolicyClient, RegistryService, RegistryClient};
 use crate::zmq::global_context;
 
 /// Load HyprConfig, falling back to default on error.
@@ -217,7 +216,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::local());
 
     // Create registry client
-    let registry_client: GenRegistryClient = crate::services::core::create_service_client(
+    let registry_client: RegistryClient = crate::services::core::create_service_client(
         &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
         ctx.signing_key().clone(),
         RequestIdentity::local(),
@@ -350,7 +349,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::local());
 
     // Create registry client
-    let registry_client: GenRegistryClient = crate::services::core::create_service_client(
+    let registry_client: RegistryClient = crate::services::core::create_service_client(
         &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
         ctx.signing_key().clone(),
         RequestIdentity::local(),
@@ -404,10 +403,10 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     let config = load_config();
 
     // Create registry client for dataset lookup (if default_dataset is configured)
-    // GenRegistryClient already implements hyprstream_metrics::RegistryClient
+    // RegistryClient already implements hyprstream_metrics::RegistryClient
     let registry_client: Option<Arc<dyn hyprstream_metrics::RegistryClient>> =
         if config.flight.default_dataset.is_some() {
-            let zmq_client: GenRegistryClient = crate::services::core::create_service_client(
+            let zmq_client: RegistryClient = crate::services::core::create_service_client(
                 &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
                 ctx.signing_key().clone(),
                 RequestIdentity::local(),
@@ -767,14 +766,15 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
 
     let config = load_config();
 
-    // Create policy client for authorization checks
+    // Create policy-based authorization provider
     let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::local());
+    let auth_provider = crate::services::discovery::PolicyAuthProvider::new(policy_client);
 
     let mut discovery_service = DiscoveryService::new(
         Arc::new(ctx.signing_key().clone()),
         global_context(),
         ctx.transport("discovery", SocketKind::Rep),
-    ).with_policy_client(policy_client);
+    ).with_auth_provider(Box::new(auth_provider));
     if let Some(issuer) = ctx.oauth_issuer_url() {
         discovery_service = discovery_service.with_oauth_issuer(issuer.to_owned());
         // Use the issuer URL as the audience for discovery tokens

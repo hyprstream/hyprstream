@@ -7,9 +7,10 @@
 //! - Memory-mapped disk persistence
 //! - FlightSQL interface for embeddings and similarity search
 
-// Re-export annotations_capnp and streaming_capnp from hyprstream-rpc (compiled once, shared by all crates)
+// Re-export annotations_capnp, streaming_capnp, and optional_capnp from hyprstream-rpc (compiled once, shared by all crates)
 pub use hyprstream_rpc::annotations_capnp;
 pub use hyprstream_rpc::streaming_capnp;
+pub use hyprstream_rpc::optional_capnp;
 
 // Cap'n Proto generated modules (must be at crate root for path resolution)
 // Note: common_capnp is in hyprstream-rpc crate (envelope types)

@@ -14,6 +14,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=schema/");
     println!("cargo:rerun-if-changed=../hyprstream-rpc/schema/streaming.capnp");
+    println!("cargo:rerun-if-changed=../hyprstream-rpc/schema/optional.capnp");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");
 
@@ -68,6 +69,7 @@ fn compile_capnp_schemas() {
             capnpc::CompilerCommand::new()
                 .src_prefix("schema")
                 .import_path(&rpc_schema_dir)
+                .import_path(schema_dir)
                 .file(&path)
                 .raw_code_generator_request_path(&cgr_path)  // ← Save CGR!
                 .run()

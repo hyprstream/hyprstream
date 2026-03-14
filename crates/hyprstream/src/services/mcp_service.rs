@@ -20,18 +20,19 @@
 //! 3. Backend services enforce authorization via Casbin policies
 
 use async_trait::async_trait;
-use crate::services::{ModelZmqClient, GenRegistryClient, PolicyClient};
+use crate::services::{ModelZmqClient, RegistryClient, PolicyClient};
 use http::header::AUTHORIZATION;
 use crate::services::generated::mcp_client::{
     McpHandler, McpResponseVariant, ToolDefinition, ServiceStatus,
     ToolList, ServiceMetrics, CallTool, dispatch_mcp, serialize_response,
     ErrorInfo,
 };
+use crate::services::generated::policy_client::PolicyCheck;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures::future::BoxFuture;
 use hyprstream_rpc::auth::jwt;
 use hyprstream_rpc::envelope::RequestIdentity;
-use hyprstream_rpc::service::factory::ServiceContext;
+use hyprstream_service::ServiceContext;
 use hyprstream_rpc::service::ZmqService;
 use hyprstream_rpc::streaming::{StreamHandle, StreamPayload};
 use hyprstream_rpc::transport::TransportConfig;
@@ -219,7 +220,7 @@ type ScopeInfo = (&'static str, &'static str, &'static str); // (scope_name, fie
 fn register_scoped_tools_recursive(
     reg: &mut ToolRegistry,
     service_name: &str,
-    nodes: &'static [hyprstream_rpc::service::metadata::ScopedClientTreeNode],
+    nodes: &'static [hyprstream_service::ScopedClientTreeNode],
     prefix: &str,
     parent_scopes: &[ScopeInfo],
 ) {
@@ -338,7 +339,7 @@ fn register_scoped_tools_recursive(
 
                             let stream_info_json = match service.as_str() {
                                 "registry" => {
-                                    let client: GenRegistryClient = crate::services::core::create_service_client(
+                                    let client: RegistryClient = crate::services::core::create_service_client(
                                         &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
                                         ctx.signing_key, ctx.identity.clone(),
                                     );
@@ -422,7 +423,7 @@ async fn dispatch_scoped_call(
 ) -> anyhow::Result<ToolResult> {
     let result = match service {
         "registry" => {
-            let client: GenRegistryClient = crate::services::core::create_service_client(
+            let client: RegistryClient = crate::services::core::create_service_client(
                 &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
                 ctx.signing_key.clone(), ctx.identity.clone(),
             );
@@ -489,7 +490,7 @@ fn register_streaming_tool(
 
                 let stream_info_json = match service.as_str() {
                     "registry" => {
-                        let client: GenRegistryClient = crate::services::core::create_service_client(
+                        let client: RegistryClient = crate::services::core::create_service_client(
                             &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
                             ctx.signing_key, ctx.identity.clone(),
                         );
@@ -583,7 +584,7 @@ async fn dispatch_schema_call(service: &str, method: &str, ctx: &ToolCallContext
             client.gen.call_method(method, &ctx.args).await
         }
         "registry" => {
-            let client: GenRegistryClient = crate::services::core::create_service_client(
+            let client: RegistryClient = crate::services::core::create_service_client(
                 &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
                 signing_key, identity,
             );
@@ -850,7 +851,7 @@ impl McpHandler for McpService {
         }
         // Delegate to policy service
         let subject = ctx.subject().to_string();
-        let allowed = self.policy_client.check(&subject, "*", resource, operation)
+        let allowed = self.policy_client.check(&PolicyCheck { subject: subject.clone(), domain: "*".to_owned(), resource: resource.to_owned(), operation: operation.to_owned() })
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!("MCP policy check failed for {}: {}", subject, e);

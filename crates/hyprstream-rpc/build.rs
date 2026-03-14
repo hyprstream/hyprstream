@@ -62,4 +62,16 @@ fn main() {
             panic!("failed to compile annotations.capnp: {e}");
         }
     }
+
+    // Compile optional schema (Option* union wrappers for scalar types)
+    let optional_schema = schema_dir.join("optional.capnp");
+    if optional_schema.exists() {
+        if let Err(e) = capnpc::CompilerCommand::new()
+            .src_prefix("schema")
+            .file(&optional_schema)
+            .run()
+        {
+            panic!("failed to compile optional.capnp: {e}");
+        }
+    }
 }

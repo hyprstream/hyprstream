@@ -8,6 +8,7 @@
 using import "/annotations.capnp".mcpScope;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".optional;
+using Opt = import "/optional.capnp";
 
 # Unified policy request with union discriminator (follows RegistryRequest pattern)
 struct PolicyRequest {
@@ -78,8 +79,8 @@ struct IssueToken {
   # Structured scopes: action:resource:identifier
   requestedScopes @0 :List(Text) $optional;
 
-  # Optional TTL in seconds (0 = use default)
-  ttl @1 :UInt32 $optional;
+  # Optional TTL in seconds (None = use default)
+  ttl @1 :Opt.OptionUint32;
 
   # RFC 8707 resource indicator for audience binding (empty = no binding)
   audience @2 :Text $optional;

@@ -22,15 +22,12 @@ pub fn make_chat_spawner(
     available_tools: Option<Vec<serde_json::Value>>,
     gen_config: Arc<RwLock<hyprstream_tui::chat_app::ChatGenConfig>>,
 ) -> hyprstream_tui::chat_app::StreamSpawner {
-    use hyprstream_rpc::crypto::generate_ephemeral_keypair;
     use hyprstream_rpc::envelope::RequestIdentity;
     use hyprstream_rpc::streaming::StreamPayload;
 
-    use crate::api::openai_compat::{ChatMessage, ToolCall, ToolCallFunction};
-    use crate::config::GenerationRequest;
+    use crate::services::generated::inference_client::{ChatMessage, ToolCall, ToolCallFunction};
+    use crate::runtime::GenerationRequest;
     use crate::services::model::ModelZmqClient;
-    use crate::services::rpc_types::StreamHandle;
-    use crate::zmq::global_context;
     use hyprstream_tui::chat_app::{ChatEvent, ChatHistoryEntry, ChatRole};
 
     let sk = signing_key.clone();
@@ -83,36 +80,28 @@ pub fn make_chat_spawner(
                     .map(|e| match e.role {
                         ChatRole::Tool => ChatMessage {
                             role: "tool".to_owned(),
-                            content: Some(e.content.clone()),
-                            function_call: None,
-                            tool_calls: None,
-                            tool_call_id: e.tool_call_id.clone(),
+                            content: e.content.clone(),
+                            tool_calls: vec![],
+                            tool_call_id: e.tool_call_id.clone().unwrap_or_default(),
                         },
                         ChatRole::Assistant if !e.tool_calls.is_empty() => ChatMessage {
                             role: "assistant".to_owned(),
-                            content: if e.content.is_empty() {
-                                None
-                            } else {
-                                Some(e.content.clone())
-                            },
-                            function_call: None,
-                            tool_calls: Some(
-                                e.tool_calls
-                                    .iter()
-                                    .map(|tc| ToolCall {
-                                        // Use the per-invocation correlation ID (not the
-                                        // function-name UUID) so two calls to the same
-                                        // tool have distinct tool_call_id values.
-                                        id: tc.id.clone(),
-                                        tool_type: "function".to_owned(),
-                                        function: ToolCallFunction {
-                                            name: tc.uuid.clone(),
-                                            arguments: tc.arguments.clone(),
-                                        },
-                                    })
-                                    .collect(),
-                            ),
-                            tool_call_id: None,
+                            content: e.content.clone(),
+                            tool_calls: e.tool_calls
+                                .iter()
+                                .map(|tc| ToolCall {
+                                    // Use the per-invocation correlation ID (not the
+                                    // function-name UUID) so two calls to the same
+                                    // tool have distinct tool_call_id values.
+                                    id: tc.id.clone(),
+                                    tool_type: "function".to_owned(),
+                                    function: ToolCallFunction {
+                                        name: tc.uuid.clone(),
+                                        arguments: tc.arguments.clone(),
+                                    },
+                                })
+                                .collect(),
+                            tool_call_id: String::new(),
                         },
                         ChatRole::User | ChatRole::Assistant => ChatMessage {
                             role: match e.role {
@@ -120,24 +109,26 @@ pub fn make_chat_spawner(
                                 _ => "assistant",
                             }
                             .to_owned(),
-                            content: if e.content.is_empty() {
-                                None
-                            } else {
-                                Some(e.content.clone())
-                            },
-                            function_call: None,
-                            tool_calls: None,
-                            tool_call_id: None,
+                            content: e.content.clone(),
+                            tool_calls: vec![],
+                            tool_call_id: String::new(),
                         },
                     })
                     .collect();
 
-                let tools_ref = tools_inner.as_ref();
-                let prompt = match model_client
-                    .apply_chat_template(&mr_inner, &messages, true, tools_ref)
+                let tools_json = tools_inner.as_ref()
+                    .map(|t| serde_json::to_string(t).unwrap_or_default())
+                    .unwrap_or_default();
+                let prompt = match model_client.gen
+                    .infer(&mr_inner)
+                    .apply_chat_template(&crate::services::generated::model_client::ApplyChatTemplateRequest {
+                        messages: messages.clone(),
+                        add_generation_prompt: true,
+                        tools_json: Some(tools_json.clone()).filter(|s| !s.is_empty()),
+                    })
                     .await
                 {
-                    Ok(p) => p,
+                    Ok(p) => crate::config::TemplatedPrompt::new(p),
                     Err(e) => {
                         let _ = tx.send(ChatEvent::TemplateError(e.to_string()));
                         return;
@@ -145,36 +136,20 @@ pub fn make_chat_spawner(
                 };
 
                 let req = GenerationRequest {
-                    prompt,
-                    max_tokens: gen_cfg.max_tokens,
-                    temperature: gen_cfg.temperature,
-                    top_p: gen_cfg.top_p,
-                    top_k: gen_cfg.top_k,
+                    prompt: prompt.into_inner(),
+                    max_tokens: Some(gen_cfg.max_tokens as u32),
+                    temperature: Some(gen_cfg.temperature),
+                    top_p: Some(gen_cfg.top_p),
+                    top_k: gen_cfg.top_k.map(|v| v as u32),
                     ..Default::default()
                 };
 
-                let (client_secret, client_pubkey) = generate_ephemeral_keypair();
-                let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
-
-                let stream_info = match model_client
-                    .infer_stream(&mr_inner, &req, client_pubkey_bytes)
-                    .await
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let _ = tx.send(ChatEvent::StreamError(e.to_string()));
-                        return;
-                    }
-                };
-
-                let mut handle = match StreamHandle::new(
-                    &global_context(),
-                    stream_info.stream_id,
-                    &stream_info.endpoint,
-                    &stream_info.server_pubkey,
-                    &client_secret,
-                    &client_pubkey_bytes,
-                ) {
+                let mc = model_client.clone();
+                let mr = mr_inner.clone();
+                let r = req.clone();
+                let mut handle = match crate::services::rpc_types::connect_stream_handle(|pubkey| async move {
+                    mc.infer_stream(&mr, &r, pubkey).await
+                }).await {
                     Ok(h) => h,
                     Err(e) => {
                         let _ = tx.send(ChatEvent::StreamError(e.to_string()));
@@ -299,7 +274,11 @@ pub fn make_tool_caller(
                     };
                     rt.block_on(async move {
                         match create_service_client::<GenMcpClient>(&endpoint, sk_c, RequestIdentity::local())
-                            .call_tool(&uuid_c, &arguments, "")
+                            .call_tool(&crate::services::generated::mcp_client::CallTool {
+                                tool_name: uuid_c,
+                                arguments,
+                                caller_identity: String::new(),
+                            })
                             .await
                         {
                             Ok(res) => {

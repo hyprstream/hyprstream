@@ -22,7 +22,7 @@ use tokio::process::Command;
 use uuid::Uuid;
 
 use super::{ProcessConfig, ProcessKind, SpawnedProcess, SpawnerBackend};
-use crate::error::{Result, RpcError};
+use hyprstream_rpc::error::{Result, RpcError};
 
 /// Systemd spawner backend using transient units.
 ///
@@ -328,7 +328,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires systemd"]
-    async fn test_spawn_and_stop() -> crate::Result<()> {
+    async fn test_spawn_and_stop() -> hyprstream_rpc::Result<()> {
         if !SystemdBackend::is_available() {
             println!("Systemd not available, skipping test");
             return Ok(());

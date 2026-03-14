@@ -73,6 +73,8 @@ pub struct FieldDef {
     pub section: FieldSection,
     /// Discriminant value for union fields (0xFFFF means non-union).
     pub discriminant_value: u16,
+    /// From `$serdeRename("...")` annotation: generates `#[serde(rename = "...")]` on the Rust field.
+    pub serde_rename: Option<String>,
 }
 
 /// Which section of a Cap'n Proto struct a field resides in.
@@ -101,6 +103,38 @@ impl StructDef {
     /// True if this struct is a pure union (has_union and no non-union fields).
     pub fn is_pure_union(&self) -> bool {
         self.has_union && self.non_union_fields().count() == 0
+    }
+
+    /// Returns the inner type name `T` if this struct is a valid `Option<T>` wrapper.
+    ///
+    /// Validates that the struct is a pure union with exactly two variants:
+    /// `none @0 :Void` and `some @1 :T`.
+    ///
+    /// This is more reliable than checking `name.starts_with("Option")` alone,
+    /// because it validates the actual structure rather than just the name.
+    pub fn option_inner_type(&self) -> Option<&str> {
+        if !self.is_pure_union() {
+            return None;
+        }
+        if self.discriminant_count != 2 {
+            return None;
+        }
+        let mut union_fields: Vec<&FieldDef> = self.fields.iter()
+            .filter(|f| f.discriminant_value != 0xFFFF)
+            .collect();
+        if union_fields.len() != 2 {
+            return None;
+        }
+        union_fields.sort_by_key(|f| f.discriminant_value);
+        let none_field = union_fields[0];
+        let some_field = union_fields[1];
+        if none_field.name != "none" || none_field.type_name != "Void" {
+            return None;
+        }
+        if some_field.name != "some" {
+            return None;
+        }
+        Some(&some_field.type_name)
     }
 }
 

@@ -18,7 +18,7 @@ use hyprstream_rpc::prelude::*;
 use std::io::Write;
 use tracing::info;
 
-use crate::services::generated::tui_client::{TuiClient, TuiResponseVariant};
+use crate::services::generated::tui_client::{TuiClient, TuiResponseVariant, ConnectRequest, DisplayMode};
 
 /// Create a TuiClient for RPC calls.
 ///
@@ -44,7 +44,7 @@ pub async fn handle_tui_attach(signing_key: &SigningKey, session_id: Option<u32>
     let (cols, rows) = terminal_size();
 
     // Connect to session via generated TuiClient
-    let result = client.connect(sid, "ansi", cols, rows).await
+    let result = client.connect(&ConnectRequest { session_id: sid, display_mode: DisplayMode::Ansi, cols, rows }).await
         .context("Failed to connect to TUI session. Is the TUI service running?")?;
 
     println!("Connected to session {} (viewer {})", result.session_id, result.viewer_id);
@@ -407,7 +407,7 @@ pub async fn handle_tui_play(
     let (cols, rows) = terminal_size();
 
     let result = client
-        .connect(session_id, "capnp", cols, rows)
+        .connect(&ConnectRequest { session_id, display_mode: DisplayMode::Capnp, cols, rows })
         .await
         .context("Failed to connect to TUI session. Is the TUI service running?")?;
 

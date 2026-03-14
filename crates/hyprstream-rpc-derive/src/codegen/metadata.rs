@@ -321,37 +321,27 @@ fn generate_json_method_dispatch_arm(
         },
         _ => {
             if let Some(sdef) = resolved.find_struct(&v.type_name) {
-                let settable_fields: Vec<&FieldDef> = sdef
-                    .non_union_fields()
-                    .filter(|f| !is_union_only_struct(&f.type_name, resolved))
-                    .collect();
+                let nuf: Vec<_> = sdef.non_union_fields().collect();
+                let is_void_wrapper = nuf.is_empty()
+                    || (nuf.len() == 1 && nuf[0].type_name == "Void");
 
-                let extractions: Vec<TokenStream> = settable_fields
-                    .iter()
-                    .map(|f| {
-                        let fname = format_ident!("{}", to_snake_case(&f.name));
-                        let fname_str = to_snake_case(&f.name);
-                        json_field_extraction_token(&fname, &fname_str, &f.type_name, f.optional, resolved)
-                    })
-                    .collect();
-
-                let args_list: Vec<TokenStream> = settable_fields
-                    .iter()
-                    .map(|f| {
-                        let fname = format_ident!("{}", to_snake_case(&f.name));
-                        if resolved.resolve_type(&f.type_name).is_by_ref {
-                            quote! { &#fname }
-                        } else {
-                            quote! { #fname }
+                if is_void_wrapper {
+                    // Void wrapper struct: call with no args
+                    quote! {
+                        #method_name_str => {
+                            let result = self.#method_name().await?;
+                            Ok(serde_json::to_value(&result)?)
                         }
-                    })
-                    .collect();
+                    }
+                } else {
+                    let data_name = format_ident!("{}", v.type_name);
 
-                quote! {
-                    #method_name_str => {
-                        #(#extractions)*
-                        let result = self.#method_name(#(#args_list),*).await?;
-                        Ok(serde_json::to_value(&result)?)
+                    quote! {
+                        #method_name_str => {
+                            let __req: #data_name = serde_json::from_value(args.clone())?;
+                            let result = self.#method_name(&__req).await?;
+                            Ok(serde_json::to_value(&result)?)
+                        }
                     }
                 }
             } else {
@@ -389,37 +379,26 @@ fn generate_json_streaming_dispatch_arm(
         },
         _ => {
             if let Some(sdef) = resolved.find_struct(&v.type_name) {
-                let settable_fields: Vec<&FieldDef> = sdef
-                    .non_union_fields()
-                    .filter(|f| !is_union_only_struct(&f.type_name, resolved))
-                    .collect();
+                let nuf: Vec<_> = sdef.non_union_fields().collect();
+                let is_void_wrapper = nuf.is_empty()
+                    || (nuf.len() == 1 && nuf[0].type_name == "Void");
 
-                let extractions: Vec<TokenStream> = settable_fields
-                    .iter()
-                    .map(|f| {
-                        let fname = format_ident!("{}", to_snake_case(&f.name));
-                        let fname_str = to_snake_case(&f.name);
-                        json_field_extraction_token(&fname, &fname_str, &f.type_name, f.optional, resolved)
-                    })
-                    .collect();
-
-                let args_list: Vec<TokenStream> = settable_fields
-                    .iter()
-                    .map(|f| {
-                        let fname = format_ident!("{}", to_snake_case(&f.name));
-                        if resolved.resolve_type(&f.type_name).is_by_ref {
-                            quote! { &#fname }
-                        } else {
-                            quote! { #fname }
+                if is_void_wrapper {
+                    quote! {
+                        #method_name_str => {
+                            let result = self.#method_name(ephemeral_pubkey).await?;
+                            Ok(serde_json::to_value(&result)?)
                         }
-                    })
-                    .collect();
+                    }
+                } else {
+                    let data_name = format_ident!("{}", v.type_name);
 
-                quote! {
-                    #method_name_str => {
-                        #(#extractions)*
-                        let result = self.#method_name(#(#args_list,)* ephemeral_pubkey).await?;
-                        Ok(serde_json::to_value(&result)?)
+                    quote! {
+                        #method_name_str => {
+                            let __req: #data_name = serde_json::from_value(args.clone())?;
+                            let result = self.#method_name(&__req, ephemeral_pubkey).await?;
+                            Ok(serde_json::to_value(&result)?)
+                        }
                     }
                 }
             } else {
@@ -807,170 +786,3 @@ fn generate_tree_consts(
     names_out.push(const_name);
 }
 
-/// Check if a type name refers to a union-only struct (no regular fields).
-fn is_union_only_struct(type_name: &str, resolved: &ResolvedSchema) -> bool {
-    if let Some(s) = resolved.find_struct(type_name) {
-        s.is_pure_union()
-    } else {
-        false
-    }
-}
-
-fn json_field_extraction_token(
-    fname: &syn::Ident,
-    fname_str: &str,
-    type_name: &str,
-    optional: bool,
-    resolved: &ResolvedSchema,
-) -> TokenStream {
-    let ct = resolved.resolve_type(type_name).capnp_type.clone();
-    match ct {
-        CapnpType::Text => if optional { quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_str()).unwrap_or("");
-        }} else { quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid string field '{}'", #fname_str))?;
-        }},
-        CapnpType::Bool => quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_bool()).unwrap_or(false);
-        },
-        CapnpType::UInt8 => if optional { quote! {
-            let #fname: u8 = args.get(#fname_str).and_then(|v| v.as_u64())
-                .unwrap_or(0).try_into().unwrap_or(0);
-        }} else { quote! {
-            let #fname: u8 = args.get(#fname_str).and_then(|v| v.as_u64())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid u8 field '{}'", #fname_str))?
-                .try_into().map_err(|_| anyhow::anyhow!("u8 overflow for field '{}'", #fname_str))?;
-        }},
-        CapnpType::UInt16 => if optional { quote! {
-            let #fname: u16 = args.get(#fname_str).and_then(|v| v.as_u64())
-                .unwrap_or(0).try_into().unwrap_or(0);
-        }} else { quote! {
-            let #fname: u16 = args.get(#fname_str).and_then(|v| v.as_u64())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid u16 field '{}'", #fname_str))?
-                .try_into().map_err(|_| anyhow::anyhow!("u16 overflow for field '{}'", #fname_str))?;
-        }},
-        CapnpType::UInt32 => if optional { quote! {
-            let #fname: u32 = args.get(#fname_str).and_then(|v| v.as_u64())
-                .unwrap_or(0).try_into().unwrap_or(0);
-        }} else { quote! {
-            let #fname: u32 = args.get(#fname_str).and_then(|v| v.as_u64())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid u32 field '{}'", #fname_str))?
-                .try_into().map_err(|_| anyhow::anyhow!("u32 overflow for field '{}'", #fname_str))?;
-        }},
-        CapnpType::UInt64 => if optional { quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_u64()).unwrap_or(0);
-        }} else { quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_u64())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid u64 field '{}'", #fname_str))?;
-        }},
-        CapnpType::Int8 => if optional { quote! {
-            let #fname: i8 = args.get(#fname_str).and_then(|v| v.as_i64())
-                .unwrap_or(0).try_into().unwrap_or(0);
-        }} else { quote! {
-            let #fname: i8 = args.get(#fname_str).and_then(|v| v.as_i64())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid i8 field '{}'", #fname_str))?
-                .try_into().map_err(|_| anyhow::anyhow!("i8 overflow for field '{}'", #fname_str))?;
-        }},
-        CapnpType::Int16 => if optional { quote! {
-            let #fname: i16 = args.get(#fname_str).and_then(|v| v.as_i64())
-                .unwrap_or(0).try_into().unwrap_or(0);
-        }} else { quote! {
-            let #fname: i16 = args.get(#fname_str).and_then(|v| v.as_i64())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid i16 field '{}'", #fname_str))?
-                .try_into().map_err(|_| anyhow::anyhow!("i16 overflow for field '{}'", #fname_str))?;
-        }},
-        CapnpType::Int32 => if optional { quote! {
-            let #fname: i32 = args.get(#fname_str).and_then(|v| v.as_i64())
-                .unwrap_or(0).try_into().unwrap_or(0);
-        }} else { quote! {
-            let #fname: i32 = args.get(#fname_str).and_then(|v| v.as_i64())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid i32 field '{}'", #fname_str))?
-                .try_into().map_err(|_| anyhow::anyhow!("i32 overflow for field '{}'", #fname_str))?;
-        }},
-        CapnpType::Int64 => if optional { quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_i64()).unwrap_or(0);
-        }} else { quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_i64())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid i64 field '{}'", #fname_str))?;
-        }},
-        CapnpType::Float32 => if optional { quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-        }} else { quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_f64())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid f32 field '{}'", #fname_str))? as f32;
-        }},
-        CapnpType::Float64 => if optional { quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_f64()).unwrap_or(0.0);
-        }} else { quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_f64())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid f64 field '{}'", #fname_str))?;
-        }},
-        CapnpType::Data => if optional { quote! {
-            let #fname: Vec<u8> = args.get(#fname_str).and_then(|v| v.as_str())
-                .map(|s| s.as_bytes().to_vec()).unwrap_or_default();
-        }} else { quote! {
-            let #fname: Vec<u8> = args.get(#fname_str).and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid data field '{}'", #fname_str))?
-                .as_bytes().to_vec();
-        }},
-        CapnpType::ListText => if optional { quote! {
-            let #fname: Vec<String> = args.get(#fname_str).and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                .unwrap_or_default();
-        }} else { quote! {
-            let #fname: Vec<String> = args.get(#fname_str).and_then(|v| v.as_array())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid array field '{}'", #fname_str))?
-                .iter().map(|v| v.as_str().map(String::from)
-                    .ok_or_else(|| anyhow::anyhow!("non-string element in array field '{}'", #fname_str)))
-                .collect::<Result<Vec<_>, _>>()?;
-        }},
-        CapnpType::ListData => if optional { quote! {
-            let #fname: Vec<Vec<u8>> = args.get(#fname_str).and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.as_bytes().to_vec())).collect())
-                .unwrap_or_default();
-        }} else { quote! {
-            let #fname: Vec<Vec<u8>> = args.get(#fname_str).and_then(|v| v.as_array())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid array field '{}'", #fname_str))?
-                .iter().map(|v| v.as_str().map(|s| s.as_bytes().to_vec())
-                    .ok_or_else(|| anyhow::anyhow!("non-string element in array field '{}'", #fname_str)))
-                .collect::<Result<Vec<_>, _>>()?;
-        }},
-        CapnpType::ListPrimitive(_) => {
-            let rust_type = rust_type_tokens(&ct.rust_owned_type());
-            quote! {
-                let #fname: #rust_type = serde_json::from_value(
-                    args.get(#fname_str).cloned().unwrap_or(serde_json::Value::Array(vec![]))
-                ).unwrap_or_default();
-            }
-        }
-        CapnpType::ListStruct(ref inner) => {
-            let data_name = format_ident!("{}", inner);
-            quote! {
-                let #fname: Vec<#data_name> = serde_json::from_value(
-                    args.get(#fname_str).cloned().unwrap_or(serde_json::Value::Array(vec![]))
-                ).unwrap_or_default();
-            }
-        }
-        CapnpType::Struct(ref name) => {
-            let data_name = format_ident!("{}", name);
-            quote! {
-                let #fname: #data_name = serde_json::from_value(
-                    args.get(#fname_str).cloned().unwrap_or_default()
-                ).unwrap_or_default();
-            }
-        }
-        CapnpType::Enum(_) => if optional { quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_str()).unwrap_or("");
-        }} else { quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid enum field '{}'", #fname_str))?;
-        }},
-        _ => if optional { quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_str()).unwrap_or("");
-        }} else { quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid field '{}'", #fname_str))?;
-        }},
-    }
-}

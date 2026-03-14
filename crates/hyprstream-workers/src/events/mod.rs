@@ -68,7 +68,7 @@ pub use subscriber::EventSubscriber;
 // Re-export spawner types for the recommended API:
 // let proxy = ProxyService::new("events", ctx, pub_transport, sub_transport);
 // let service = ServiceSpawner::threaded().spawn(proxy).await?;
-pub use hyprstream_rpc::service::spawner::{ProxyService, ServiceSpawner, SpawnedService};
+pub use hyprstream_service::{ProxyService, ServiceSpawner, SpawnedService};
 
 // Re-export endpoint types for convenience
 pub use endpoints::EndpointMode;

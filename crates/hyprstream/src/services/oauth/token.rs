@@ -22,6 +22,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::state::{DeviceCodeStatus, OAuthState, RefreshTokenEntry};
+use crate::services::generated::policy_client::IssueToken;
 
 /// Device code grant type URN (RFC 8628).
 const DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
@@ -313,7 +314,12 @@ async fn issue_token_with_refresh(
 
     let result = state
         .policy_client
-        .issue_token(&scopes, state.token_ttl, resource.as_deref().unwrap_or_default(), sub)
+        .issue_token(&IssueToken {
+            requested_scopes: Some(scopes.clone()),
+            ttl: Some(state.token_ttl),
+            audience: resource.clone(),
+            subject: Some(sub.to_owned()),
+        })
         .await;
 
     match result {

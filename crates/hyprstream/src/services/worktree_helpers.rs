@@ -6,6 +6,9 @@
 
 use crate::services::WorktreeClient;
 use crate::services::types::{OREAD, OWRITE, DMDIR};
+use crate::services::generated::registry_client::{
+    NpWalk, NpOpen, NpCreate, NpRead, NpWrite, NpClunk, NpRemove, NpStatReq,
+};
 use anyhow::Result;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -44,21 +47,21 @@ impl WorktreeClient {
         let wnames = split_path(path);
 
         // Walk to the file
-        let _walk_resp = self.walk(0, fid, &wnames).await?;
+        let _walk_resp = self.walk(&NpWalk { fid: 0, newfid: fid, wnames: wnames.clone() }).await?;
 
         // Stat to get file size (for pre-allocation)
-        let stat_resp = self.np_stat(fid).await?;
+        let stat_resp = self.np_stat(&NpStatReq { fid }).await?;
         let file_size = stat_resp.stat.length;
 
         // Open for reading
-        let open_resp = self.open(fid, OREAD).await?;
+        let open_resp = self.open(&NpOpen { fid, mode: OREAD }).await?;
         let iounit = open_resp.iounit;
 
         // Read loop — bounded by iounit per message
         let mut buf = Vec::with_capacity(file_size as usize);
         let mut offset = 0u64;
         loop {
-            let resp = self.read(fid, offset, iounit).await?;
+            let resp = self.read(&NpRead { fid, offset, count: iounit }).await?;
             if resp.data.is_empty() {
                 break; // EOF
             }
@@ -67,7 +70,7 @@ impl WorktreeClient {
         }
 
         // Clunk the fid
-        self.clunk(fid).await?;
+        self.clunk(&NpClunk { fid }).await?;
 
         Ok(buf)
     }
@@ -92,13 +95,13 @@ impl WorktreeClient {
         let parent_wnames: Vec<String> = parent_components.to_vec();
         if parent_wnames.is_empty() {
             // Root directory — walk with empty wnames
-            self.walk(0, fid, &[]).await?;
+            self.walk(&NpWalk { fid: 0, newfid: fid, wnames: vec![] }).await?;
         } else {
-            self.walk(0, fid, &parent_wnames).await?;
+            self.walk(&NpWalk { fid: 0, newfid: fid, wnames: parent_wnames.clone() }).await?;
         }
 
         // Create the file (opens it for writing)
-        let create_resp = self.create(fid, file_name, 0o644, OWRITE).await?;
+        let create_resp = self.create(&NpCreate { fid, name: file_name.clone(), perm: 0o644, mode: OWRITE }).await?;
         let iounit = create_resp.iounit;
 
         // Write in iounit-sized chunks
@@ -106,12 +109,12 @@ impl WorktreeClient {
         while offset < data.len() as u64 {
             let end = std::cmp::min(offset + iounit as u64, data.len() as u64);
             let chunk = &data[offset as usize..end as usize];
-            let write_resp = self.write(fid, offset, chunk).await?;
+            let write_resp = self.write(&NpWrite { fid, offset, data: chunk.to_vec() }).await?;
             offset += write_resp.count as u64;
         }
 
         // Clunk the fid
-        self.clunk(fid).await?;
+        self.clunk(&NpClunk { fid }).await?;
 
         Ok(())
     }
@@ -128,27 +131,27 @@ impl WorktreeClient {
         // Walk + create each component
         let mut current_fid = next_fid();
         // Start at root
-        self.walk(0, current_fid, &[]).await?;
+        self.walk(&NpWalk { fid: 0, newfid: current_fid, wnames: vec![] }).await?;
 
         for component in &components {
             let child_fid = next_fid();
             // Try to walk to the component first (it may already exist)
-            match self.walk(current_fid, child_fid, std::slice::from_ref(component)).await {
+            match self.walk(&NpWalk { fid: current_fid, newfid: child_fid, wnames: vec![component.clone()] }).await {
                 Ok(_) => {
                     // Directory exists, clunk the old fid and continue
-                    self.clunk(current_fid).await?;
+                    self.clunk(&NpClunk { fid: current_fid }).await?;
                     current_fid = child_fid;
                 }
                 Err(_) => {
                     // Directory doesn't exist — create it
-                    self.create(current_fid, component, DMDIR | 0o755, OREAD).await?;
+                    self.create(&NpCreate { fid: current_fid, name: component.clone(), perm: DMDIR | 0o755, mode: OREAD }).await?;
                     // After create, the fid now points to the new directory
                     // current_fid is mutated by the server (fid now = new dir)
                 }
             }
         }
 
-        self.clunk(current_fid).await?;
+        self.clunk(&NpClunk { fid: current_fid }).await?;
         Ok(())
     }
 
@@ -160,10 +163,10 @@ impl WorktreeClient {
         let wnames = split_path(path);
 
         // Try to walk to the path
-        match self.walk(0, fid, &wnames).await {
+        match self.walk(&NpWalk { fid: 0, newfid: fid, wnames: wnames.clone() }).await {
             Ok(_) => {
-                let stat_resp = self.np_stat(fid).await?;
-                self.clunk(fid).await?;
+                let stat_resp = self.np_stat(&NpStatReq { fid }).await?;
+                self.clunk(&NpClunk { fid }).await?;
 
                 let is_dir = (stat_resp.stat.qid.qtype & 0x80) != 0;
                 let modified_at = stat_resp.stat.mtime as i64;
@@ -193,8 +196,8 @@ impl WorktreeClient {
         let fid = next_fid();
         let wnames = split_path(path);
 
-        self.walk(0, fid, &wnames).await?;
-        self.remove(fid).await?;
+        self.walk(&NpWalk { fid: 0, newfid: fid, wnames: wnames.clone() }).await?;
+        self.remove(&NpRemove { fid }).await?;
 
         Ok(())
     }
@@ -218,8 +221,8 @@ impl WorktreeClient {
         let fid = next_fid();
         let wnames = split_path(path);
 
-        self.walk(0, fid, &wnames).await?;
-        let open_resp = self.open(fid, OREAD).await?;
+        self.walk(&NpWalk { fid: 0, newfid: fid, wnames: wnames.clone() }).await?;
+        let open_resp = self.open(&NpOpen { fid, mode: OREAD }).await?;
         let iounit = open_resp.iounit;
 
         // Read directory entries (9P encodes them as serialized stat entries)
@@ -228,7 +231,7 @@ impl WorktreeClient {
         let mut entries = Vec::new();
         let mut offset = 0u64;
         loop {
-            let resp = self.read(fid, offset, iounit).await?;
+            let resp = self.read(&NpRead { fid, offset, count: iounit }).await?;
             if resp.data.is_empty() {
                 break;
             }
@@ -255,7 +258,7 @@ impl WorktreeClient {
             offset += resp.data.len() as u64;
         }
 
-        self.clunk(fid).await?;
+        self.clunk(&NpClunk { fid }).await?;
         Ok(entries)
     }
 }

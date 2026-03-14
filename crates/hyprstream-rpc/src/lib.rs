@@ -74,6 +74,14 @@ pub mod annotations_capnp {
     include!(concat!(env!("OUT_DIR"), "/annotations_capnp.rs"));
 }
 
+pub mod optional_capnp {
+    #![allow(dead_code, unused_imports)]
+    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
+    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    include!(concat!(env!("OUT_DIR"), "/optional_capnp.rs"));
+}
+
 pub mod capnp;
 pub mod crypto;
 pub mod envelope;
@@ -89,7 +97,11 @@ pub mod auth;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod registry;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod resolver;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod service;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod zmq_context;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod streaming;
 #[cfg(not(target_arch = "wasm32"))]
@@ -137,7 +149,13 @@ pub use error::{EnvelopeError, EnvelopeResult, Result, RpcError};
 pub use hyprstream_rpc_derive::{authorize, service_factory, FromCapnp, ToCapnp};
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use service::{Continuation, EnvelopeContext, RequestLoop, ServiceClient, ServiceHandle, ZmqClient, ZmqService};
+pub use resolver::Resolver;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use registry::SocketKind;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use service::{Continuation, EnvelopeContext, RequestLoop, Spawnable, ServiceHandle, ZmqClient, ZmqService};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use streaming::{
@@ -147,21 +165,7 @@ pub use streaming::{
 };
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use service::spawner::{
-    ProcessBackend, ProcessConfig, ProcessKind, ProcessSpawner,
-    ProxyService, ServiceKind, ServiceMode, ServiceSpawner,
-    Spawnable, SpawnedProcess, SpawnedService, SpawnerBackend, StandaloneBackend,
-    SystemdBackend,
-};
-
-#[cfg(not(target_arch = "wasm32"))]
-pub use service::{detect_service_manager, ServiceManager, StandaloneManager};
-
-#[cfg(not(target_arch = "wasm32"))]
-pub use service::metadata::{MethodMeta, ParamMeta};
-
-#[cfg(all(not(target_arch = "wasm32"), feature = "systemd"))]
-pub use service::SystemdManager;
+pub use zmq_context::{global_context, create_service_client_base};
 
 // ============================================================================
 // Prelude (native only — too many native-only types)
@@ -182,24 +186,17 @@ pub mod prelude {
         MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
         // Error
         EnvelopeError, EnvelopeResult, Result, RpcError,
-        // Service
-        EnvelopeContext, RequestLoop, ServiceClient, ServiceHandle, ZmqClient, ZmqService,
+        // Service (transport)
+        EnvelopeContext, RequestLoop, ServiceHandle, ZmqClient, ZmqService,
         // Streaming
         StreamContext, StreamPublisher,
-        // Spawner
-        ProcessBackend, ProcessConfig, ProcessKind, ProcessSpawner,
-        ProxyService, ServiceKind, ServiceMode, ServiceSpawner,
-        Spawnable, SpawnedProcess, SpawnedService, SpawnerBackend, StandaloneBackend,
-        SystemdBackend,
-        // Service manager
-        detect_service_manager, ServiceManager, StandaloneManager,
     };
 
     #[cfg(not(feature = "fips"))]
     pub use crate::{generate_ephemeral_keypair, ristretto_dh, RistrettoPublic, RistrettoSecret};
 
-    #[cfg(feature = "systemd")]
-    pub use crate::SystemdManager;
+    // ZMQ context
+    pub use crate::zmq_context::{global_context, create_service_client_base};
 
     // Registry (with renamed imports for convenience)
     pub use crate::registry::{

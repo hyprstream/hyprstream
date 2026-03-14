@@ -45,7 +45,7 @@ use hyprstream_core::config::HyprConfig;
 use hyprstream_core::storage::{GitRef, ModelRef};
 
 // Registry and policy services - uses ZMQ-based services from hyprstream_core
-use hyprstream_core::services::{PolicyClient, GenRegistryClient};
+use hyprstream_core::services::{PolicyClient, RegistryClient};
 // Worker service for Kata-based workload execution
 use hyprstream_workers::runtime::WorkerService;
 use hyprstream_workers::workflow::WorkflowService;
@@ -54,7 +54,7 @@ use hyprstream_workers::{ImageConfig, PoolConfig, SpawnedService};
 use hyprstream_core::zmq::global_context;
 use std::sync::Arc;
 // Unified service manager API
-use hyprstream_rpc::service::{get_factory, InprocManager, ServiceContext, ServiceManager};
+use hyprstream_service::{get_factory, InprocManager, ServiceContext, ServiceManager};
 use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_rpc::{RequestIdentity, SigningKey, VerifyingKey};
 // Tracing imports (feature-gated)
@@ -1044,6 +1044,7 @@ fn handle_quick_command(
                     match action {
                         WorkerAction::List {
                             sandbox,
+                            container,
                             containers,
                             sandboxes,
                             state,
@@ -1052,6 +1053,7 @@ fn handle_quick_command(
                             handle_worker_list(
                                 &worker_client,
                                 sandbox,
+                                container,
                                 containers,
                                 sandboxes,
                                 state,
@@ -1393,7 +1395,7 @@ fn main() -> Result<()> {
 
     // Start ZMQ-based services and create keypair
     let (registry_client, mut _service_handles, _workflow_service, signing_key, verifying_key): (
-        GenRegistryClient,
+        RegistryClient,
         Vec<SpawnedService>,
         Option<Arc<WorkflowService>>,
         SigningKey,
@@ -1704,7 +1706,7 @@ fn main() -> Result<()> {
                                         println!("QUIC/WebTransport cert hash: {}", hash);
                                     }
 
-                                    let shared = hyprstream_rpc::service::QuicSharedConfig {
+                                    let shared = hyprstream_service::QuicSharedConfig {
                                         cert_der,
                                         key_der,
                                         base_ip: qc.socket_addr()?.ip(),
@@ -1727,7 +1729,7 @@ fn main() -> Result<()> {
                                 for svc_name in &service_names {
                                     let factory = get_factory(svc_name).ok_or_else(|| {
                                         let available: Vec<_> =
-                                            hyprstream_rpc::service::list_factories()
+                                            hyprstream_service::list_factories()
                                                 .map(|f| f.name)
                                                 .collect();
                                         anyhow::anyhow!(

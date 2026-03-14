@@ -10,7 +10,7 @@ use anyhow::{bail, Result};
 use clap::{Arg, ArgMatches, Command};
 use ed25519_dalek::SigningKey;
 use hyprstream_rpc::RequestIdentity;
-use hyprstream_rpc::service::metadata::ScopedClientTreeNode;
+use hyprstream_service::ScopedClientTreeNode;
 use serde_json::Value;
 
 use crate::services::generated::{
@@ -18,7 +18,7 @@ use crate::services::generated::{
 };
 use hyprstream_workers::generated::{worker_client, workflow_client};
 use crate::services::{
-    InferenceZmqClient, ModelZmqClient, PolicyClient, GenRegistryClient, WorkerZmqClient,
+    InferenceZmqClient, ModelZmqClient, PolicyClient, RegistryClient, WorkerZmqClient,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -75,7 +75,7 @@ macro_rules! extract_methods {
 }
 
 /// Convert a slice of MethodMeta into MethodView values.
-fn methods_to_views(methods: &[hyprstream_rpc::service::metadata::MethodMeta]) -> Vec<MethodView> {
+fn methods_to_views(methods: &[hyprstream_service::MethodMeta]) -> Vec<MethodView> {
     methods
         .iter()
         .map(|m| MethodView {
@@ -102,7 +102,7 @@ fn methods_to_views(methods: &[hyprstream_rpc::service::metadata::MethodMeta]) -
 
 /// Convert scoped metadata (service, scope, methods) into MethodView values.
 fn scoped_methods_to_views(
-    metadata_fn: hyprstream_rpc::service::metadata::ScopedSchemaMetadataFn,
+    metadata_fn: hyprstream_service::ScopedSchemaMetadataFn,
 ) -> Vec<MethodView> {
     let (_service_name, _scope_name, methods) = metadata_fn();
     methods_to_views(methods)
@@ -366,7 +366,7 @@ async fn dispatch_top_level(
 
     match service {
         "registry" => {
-            let client: GenRegistryClient = crate::services::create_service_client(
+            let client: RegistryClient = crate::services::create_service_client(
                 &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
                 signing_key, identity,
             );
@@ -406,7 +406,7 @@ async fn dispatch_scoped_dynamic(
 
     match service {
         "registry" => {
-            let client: GenRegistryClient = crate::services::create_service_client(
+            let client: RegistryClient = crate::services::create_service_client(
                 &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
                 signing_key, identity,
             );
@@ -418,7 +418,7 @@ async fn dispatch_scoped_dynamic(
         }
         "worker" => {
             let client = WorkerZmqClient::new(signing_key, identity);
-            client.gen().call_scoped_method(scope_chain, method, args).await
+            client.call_scoped_method(scope_chain, method, args).await
         }
         _ => bail!("Service '{}' has no scoped methods", service),
     }

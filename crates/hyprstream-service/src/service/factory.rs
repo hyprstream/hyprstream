@@ -7,7 +7,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use hyprstream_rpc::service::factory::{ServiceContext, ServiceFactory};
+//! use hyprstream_service::service::factory::{ServiceContext, ServiceFactory};
 //! use hyprstream_rpc_derive::service_factory;
 //!
 //! #[service_factory("policy")]
@@ -27,12 +27,12 @@ use std::sync::Arc;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
-use crate::envelope::RequestIdentity;
-use crate::registry::{global as global_registry, SocketKind};
+use hyprstream_rpc::envelope::RequestIdentity;
+use hyprstream_rpc::registry::{global as global_registry, SocketKind};
 use crate::service::metadata::SchemaMetadataFn;
 use crate::service::spawner::Spawnable;
-use crate::service::ZmqClient;
-use crate::transport::TransportConfig;
+use hyprstream_rpc::service::ZmqClient;
+use hyprstream_rpc::transport::TransportConfig;
 
 /// Shared QUIC/WebTransport configuration for all services.
 ///
@@ -56,7 +56,7 @@ impl QuicSharedConfig {
     /// Build a per-service `QuicLoopConfig` with the given port.
     ///
     /// Port 0 = ephemeral (OS-assigned).
-    pub fn for_service(&self, service_name: &str, port: u16) -> crate::service::QuicLoopConfig {
+    pub fn for_service(&self, service_name: &str, port: u16) -> hyprstream_rpc::service::QuicLoopConfig {
         let bind_addr = std::net::SocketAddr::new(self.base_ip, port);
         let metadata = self.oauth_issuer_url.as_ref().map(|issuer| {
             serde_json::json!({
@@ -65,7 +65,7 @@ impl QuicSharedConfig {
                 "bearer_methods_supported": ["header"],
             }).to_string().into_bytes()
         });
-        crate::service::QuicLoopConfig {
+        hyprstream_rpc::service::QuicLoopConfig {
             cert_der: self.cert_der.clone(),
             key_der: self.key_der.clone(),
             bind_addr,
@@ -214,7 +214,7 @@ impl ServiceContext {
     /// duplicated across factory functions.
     pub fn transport(&self, service: &str, kind: SocketKind) -> TransportConfig {
         if self.ipc {
-            let runtime_dir = crate::paths::runtime_dir();
+            let runtime_dir = hyprstream_rpc::paths::runtime_dir();
             TransportConfig::ipc(runtime_dir.join(format!("{service}.sock")))
         } else {
             global_registry().endpoint(service, kind)
@@ -244,11 +244,6 @@ impl ServiceContext {
         T::from_zmq(self.client(T::SERVICE_NAME))
     }
 
-    /// Get schema bytes for a service (if registered with a schema).
-    pub fn schema(&self, service: &str) -> Option<&'static [u8]> {
-        global_registry().service_schema(service)
-    }
-
     /// Wrap a ZmqService for spawning with a per-service QUIC port.
     ///
     /// - `quic_port: None` → use ephemeral port (0) when QUIC is globally enabled
@@ -258,7 +253,7 @@ impl ServiceContext {
     /// When `[quic] enabled = true` in config, all services get QUIC on
     /// auto-assigned ephemeral ports by default. Set an explicit port to
     /// control which port a service uses.
-    pub fn into_spawnable_quic<S: crate::service::ZmqService + Send + Sync + 'static>(
+    pub fn into_spawnable_quic<S: hyprstream_rpc::service::ZmqService + Send + Sync + 'static>(
         &self,
         service: S,
         quic_port: Option<u16>,
@@ -283,7 +278,7 @@ impl ServiceContext {
     /// Wrap a ZmqService for spawning, enabling QUIC when globally configured.
     ///
     /// Uses ephemeral port (0) for QUIC when `[quic] enabled = true`.
-    pub fn into_spawnable<S: crate::service::ZmqService + Send + Sync + 'static>(
+    pub fn into_spawnable<S: hyprstream_rpc::service::ZmqService + Send + Sync + 'static>(
         &self,
         service: S,
     ) -> Box<dyn Spawnable> {
@@ -291,17 +286,8 @@ impl ServiceContext {
     }
 }
 
-/// Trait for compile-time-safe service client construction.
-///
-/// Implement this trait to enable `ServiceContext::typed_client::<T>()`.
-/// Generated clients implement this automatically.
-pub trait ServiceClient: Sized {
-    /// The service name as registered in the endpoint registry.
-    const SERVICE_NAME: &'static str;
-
-    /// Construct this client from a base `ZmqClient`.
-    fn from_zmq(client: ZmqClient) -> Self;
-}
+// Re-export ServiceClient from hyprstream-rpc (canonical location)
+pub use hyprstream_rpc::service::ServiceClient;
 
 /// Factory function signature for creating services.
 ///
@@ -333,6 +319,9 @@ pub struct ServiceFactory {
     /// When set, returns `(service_name, &[MethodMeta])` derived from Cap'n Proto
     /// schema annotations. Used by PolicyService to discover supported scopes.
     pub metadata: Option<SchemaMetadataFn>,
+
+    /// Names of services that must be started before this one.
+    pub depends_on: &'static [&'static str],
 }
 
 impl ServiceFactory {
@@ -340,14 +329,14 @@ impl ServiceFactory {
     ///
     /// Called by the `#[service_factory]` macro-generated code.
     pub const fn new(name: &'static str, factory: ServiceFactoryFn) -> Self {
-        Self { name, factory, schema: None, metadata: None }
+        Self { name, factory, schema: None, metadata: None, depends_on: &[] }
     }
 
     /// Create a new service factory with schema bytes.
     ///
     /// Called by the `#[service_factory("name", schema = "...")]` macro-generated code.
     pub const fn with_schema(name: &'static str, factory: ServiceFactoryFn, schema: &'static [u8]) -> Self {
-        Self { name, factory, schema: Some(schema), metadata: None }
+        Self { name, factory, schema: Some(schema), metadata: None, depends_on: &[] }
     }
 
     /// Create a new service factory with schema bytes and metadata.
@@ -359,7 +348,7 @@ impl ServiceFactory {
         schema: &'static [u8],
         metadata: SchemaMetadataFn,
     ) -> Self {
-        Self { name, factory, schema: Some(schema), metadata: Some(metadata) }
+        Self { name, factory, schema: Some(schema), metadata: Some(metadata), depends_on: &[] }
     }
 }
 

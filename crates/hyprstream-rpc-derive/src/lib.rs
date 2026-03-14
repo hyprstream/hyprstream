@@ -1064,8 +1064,8 @@ pub fn register_scopes(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// # Usage
 ///
 /// ```ignore
-/// use hyprstream_rpc::service::factory::ServiceContext;
-/// use hyprstream_rpc::service::spawner::Spawnable;
+/// use hyprstream_service::ServiceContext;
+/// use hyprstream_rpc::service::Spawnable;
 /// use hyprstream_rpc_derive::service_factory;
 ///
 /// #[service_factory("policy")]
@@ -1090,7 +1090,7 @@ pub fn register_scopes(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// }
 ///
 /// inventory::submit! {
-///     hyprstream_rpc::service::factory::ServiceFactory::new(
+///     hyprstream_service::ServiceFactory::new(
 ///         "policy",
 ///         create_policy_service
 ///     )
@@ -1116,7 +1116,7 @@ pub fn service_factory(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #func
 
                 inventory::submit! {
-                    hyprstream_rpc::service::factory::ServiceFactory::with_metadata(
+                    hyprstream_service::ServiceFactory::with_metadata(
                         #name,
                         #func_name,
                         include_bytes!(#schema_path),
@@ -1130,7 +1130,7 @@ pub fn service_factory(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #func
 
                 inventory::submit! {
-                    hyprstream_rpc::service::factory::ServiceFactory::with_schema(
+                    hyprstream_service::ServiceFactory::with_schema(
                         #name,
                         #func_name,
                         include_bytes!(#schema_path)
@@ -1143,7 +1143,7 @@ pub fn service_factory(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #func
 
                 inventory::submit! {
-                    hyprstream_rpc::service::factory::ServiceFactory::new(
+                    hyprstream_service::ServiceFactory::new(
                         #name,
                         #func_name
                     )

@@ -63,9 +63,9 @@ pub use config::{BackendType, HypervisorType, ImageConfig, PoolConfig, WorkerCon
 pub use error::WorkerError;
 
 // Re-export service types
-pub use runtime::{WorkerService, RuntimeClient, SandboxBackend, SandboxHandle, KataBackend, NspawnBackend, NspawnConfig};
-pub use image::{ImageClient, RafsStore};
-pub use workflow::{WorkflowService, WorkflowClient};
+pub use runtime::{WorkerService, SandboxBackend, SandboxHandle, KataBackend, NspawnBackend, NspawnConfig};
+pub use image::RafsStore;
+pub use workflow::WorkflowService;
 pub use events::{
     // Spawner types (new API)
     ProxyService, ServiceSpawner, SpawnedService,

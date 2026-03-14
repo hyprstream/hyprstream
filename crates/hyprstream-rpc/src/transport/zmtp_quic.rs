@@ -1246,7 +1246,7 @@ where
     }
 }
 
-impl<S> crate::service::spawner::Spawnable for QuicServiceLoop<S>
+impl<S> crate::service::Spawnable for QuicServiceLoop<S>
 where
     S: crate::service::ZmqService + Send + Sync + 'static,
 {

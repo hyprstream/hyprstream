@@ -34,7 +34,9 @@
 //! authorization on all requests. The handler delegates to PolicyClient.
 
 use crate::services::PolicyClient;
-use crate::config::{GenerationRequest, ModelInfo, TrainingMode};
+use crate::config::TrainingMode;
+use crate::runtime::GenerationRequest;
+use crate::runtime::ModelInfo;
 use crate::inference_capnp;
 use crate::runtime::kv_cache::CacheOwner;
 use crate::runtime::model_config::ModelConfig;
@@ -536,8 +538,8 @@ impl InferenceService {
 
         // Initialize KV cache registry
         let model_info = RuntimeEngine::model_info(&engine);
-        let num_layers = model_info.num_hidden_layers.unwrap_or(32);
-        let max_seq_len = config.max_context.unwrap_or(model_info.context_length);
+        let num_layers = model_info.num_hidden_layers.unwrap_or(32) as usize;
+        let max_seq_len = config.max_context.unwrap_or(model_info.context_length) as usize;
         engine.initialize_kv_registry(num_layers, max_seq_len, config.kv_quant_type, None);
 
         info!(
@@ -1447,7 +1449,7 @@ impl InferenceService {
             (input_tokens, pre_snapshot, pre_muon, pre_eff_ranks)
         }; // guard dropped
 
-        let steps = if gradient_steps > 0 { gradient_steps as usize } else { ttt_trainer.config.gradient_steps };
+        let steps = if gradient_steps > 0 { gradient_steps as usize } else { ttt_trainer.config.gradient_steps as usize };
         let lr = if learning_rate > 0.0 { Some(learning_rate as f64) } else { None };
 
         // Phase 2: Await engine (no lock held — safe for spawn_local concurrency)
@@ -1969,7 +1971,9 @@ use crate::services::generated::inference_client::{
     ChatTemplateRequest, LoraConfig, TrainStepRequest, SaveAdaptationRequest, ExportPeftRequest,
     MergeLoraRequest, EmbedImagesRequest, EmbedImagesResponse,
     AdaptationStrategyEnum,
+    GenerationRequest as InfGenerationRequest,
 };
+use crate::services::generated::policy_client::PolicyCheck;
 // Conflicting names — use canonical path at usage sites:
 //   inference_client::GenerationResult, inference_client::ModelInfo, inference_client::StreamInfo
 
@@ -2000,7 +2004,7 @@ fn map_adaptation_strategy(
 impl InferenceHandler for InferenceService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
         let subject = ctx.subject();
-        let allowed = self.policy_client.check(&subject.to_string(), "*", resource, operation).await.unwrap_or_else(|e| {
+        let allowed = self.policy_client.check(&PolicyCheck { subject: subject.to_string(), domain: "*".to_owned(), resource: resource.to_owned(), operation: operation.to_owned() }).await.unwrap_or_else(|e| {
             warn!("Policy check failed for {} on {}: {} - denying access", subject, resource, e);
             false
         });
@@ -2016,30 +2020,13 @@ impl InferenceHandler for InferenceService {
         data: &crate::services::generated::inference_client::GenerationRequest,
     ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
         let subject = ctx.subject();
-        let request = GenerationRequest {
-            prompt: crate::config::TemplatedPrompt::new(data.prompt.clone()),
-            max_tokens: data.max_tokens as usize,
-            temperature: data.temperature,
-            top_p: data.top_p,
-            top_k: if data.top_k == 0 { None } else { Some(data.top_k as usize) },
-            repeat_penalty: data.repeat_penalty,
-            repeat_last_n: data.repeat_last_n as usize,
-            stop_tokens: data.stop_tokens.clone(),
-            seed: if data.seed == 0 { None } else { Some(data.seed) },
-            images: vec![],
-            timeout: if data.timeout_ms == 0 { None } else { Some(data.timeout_ms) },
-            collect_metrics: false,
-            ttt_enabled: data.ttt_enabled,
-            ttt_gradient_steps: data.ttt_gradient_steps,
-            ttt_learning_rate: data.ttt_learning_rate,
-            auto_commit: matches!(data.adaptation_strategy, AdaptationStrategyEnum::AutoWriteback),
-        };
+        let request = data.clone();
 
         // Build per-request TTT overrides from RPC fields
         let ttt_overrides = crate::training::ttt::TTTOverrides {
             enabled: if data.ttt_enabled { Some(true) } else { None },
-            gradient_steps: if data.ttt_gradient_steps > 0 { Some(data.ttt_gradient_steps) } else { None },
-            learning_rate: if data.ttt_learning_rate > 0.0 { Some(data.ttt_learning_rate) } else { None },
+            gradient_steps: data.ttt_gradient_steps,
+            learning_rate: data.ttt_learning_rate,
             adaptation_strategy: map_adaptation_strategy(data.adaptation_strategy, data.writeback_threshold),
             max_adaptation_ms: None,
         };
@@ -2076,20 +2063,9 @@ impl InferenceHandler for InferenceService {
     }
 
     async fn handle_model_info(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
-        let info = InferenceService::handle_model_info(self).await;
-        let has_lora = self.base_delta.lock().is_some();
-        Ok(InferenceResponseVariant::ModelInfoResult(crate::services::generated::inference_client::ModelInfo {
-            model_id: info.name,
-            architecture: info.architecture,
-            vocab_size: info.vocab_size as u32,
-            hidden_size: info.hidden_size as u32,
-            num_layers: info.num_hidden_layers.unwrap_or(0) as u32,
-            num_heads: info.num_attention_heads.unwrap_or(0) as u32,
-            max_sequence_length: info.context_length as u32,
-            quantization: info.quantization.unwrap_or_default(),
-            has_vision: false,
-            lora_loaded: has_lora,
-        }))
+        let mut info = InferenceService::handle_model_info(self).await;
+        info.lora_loaded = self.base_delta.lock().is_some();
+        Ok(InferenceResponseVariant::ModelInfoResult(info))
     }
 
     async fn handle_is_ready(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
@@ -2121,14 +2097,7 @@ impl InferenceHandler for InferenceService {
                 let tool_calls = if m.tool_calls.is_empty() {
                     None
                 } else {
-                    Some(m.tool_calls.iter().map(|tc| serde_json::json!({
-                        "id": tc.id,
-                        "type": tc.call_type,
-                        "function": {
-                            "name": tc.function_name,
-                            "arguments": tc.arguments,
-                        }
-                    })).collect())
+                    Some(m.tool_calls.clone())
                 };
                 crate::runtime::template_engine::ChatMessage {
                     role: m.role.clone(),
@@ -2139,11 +2108,9 @@ impl InferenceHandler for InferenceService {
             })
             .collect();
         // tools_json is passed as a JSON string via the schema; parse it here
-        let tools: Option<serde_json::Value> = if data.tools_json.is_empty() {
-            None
-        } else {
-            serde_json::from_str(&data.tools_json).ok()
-        };
+        let tools: Option<serde_json::Value> = data.tools_json.as_deref()
+            .filter(|s| !s.is_empty())
+            .and_then(|s| serde_json::from_str(s).ok());
         let result = InferenceService::handle_apply_chat_template(
             self, chat_messages, data.add_generation_prompt, tools.as_ref(),
         ).await?;
@@ -2276,8 +2243,8 @@ impl InferenceHandler for InferenceService {
             stream_ctx,
             subject,
             input: data.input.clone(),
-            gradient_steps: data.gradient_steps,
-            learning_rate: data.learning_rate,
+            gradient_steps: data.gradient_steps.unwrap_or(0),
+            learning_rate: data.learning_rate.unwrap_or(0.0),
             adaptation_strategy,
         };
 
@@ -2320,7 +2287,7 @@ impl InferenceHandler for InferenceService {
         data: &SaveAdaptationRequest,
     ) -> Result<InferenceResponseVariant> {
         let subject = ctx.subject();
-        let info = InferenceService::handle_save_adaptation(self, &subject, &data.name, &data.merge_strategy, data.merge_weight).await?;
+        let info = InferenceService::handle_save_adaptation(self, &subject, &data.name, data.merge_strategy.as_deref().unwrap_or(""), data.merge_weight.unwrap_or(0.0)).await?;
         Ok(InferenceResponseVariant::SaveAdaptationResult(SaveAdaptationResult {
             adapter_name: info.adapter_name,
             adapter_path: info.adapter_path,
@@ -2345,7 +2312,7 @@ impl InferenceHandler for InferenceService {
         data: &ExportPeftRequest,
     ) -> Result<InferenceResponseVariant> {
         let subject = ctx.subject();
-        let info = InferenceService::handle_export_peft_adapter(self, &subject, &data.name, &data.commit_message).await?;
+        let info = InferenceService::handle_export_peft_adapter(self, &subject, &data.name, data.commit_message.as_deref().unwrap_or("")).await?;
         Ok(InferenceResponseVariant::ExportPeftAdapterResult(ExportPeftResult {
             adapter_path: info.adapter_path,
             content_hash: info.content_hash,
@@ -2427,7 +2394,7 @@ impl InferenceHandler for InferenceService {
         let merge_strategy = data.merge_strategy.clone();
         let merge_weight = data.merge_weight;
         let continuation: hyprstream_rpc::service::Continuation = Box::pin(async move {
-            service.execute_save_adaptation_stream(stream_ctx, subject, name, merge_strategy, merge_weight).await;
+            service.execute_save_adaptation_stream(stream_ctx, subject, name, merge_strategy.unwrap_or_default(), merge_weight.unwrap_or(0.0)).await;
         });
         Ok((stream_info, continuation))
     }
@@ -2454,7 +2421,7 @@ impl InferenceHandler for InferenceService {
         let name = data.name.clone();
         let commit_message = data.commit_message.clone();
         let continuation: hyprstream_rpc::service::Continuation = Box::pin(async move {
-            service.execute_export_peft_adapter_stream(stream_ctx, subject, name, commit_message).await;
+            service.execute_export_peft_adapter_stream(stream_ctx, subject, name, commit_message.unwrap_or_default()).await;
         });
         Ok((stream_info, continuation))
     }
@@ -2645,7 +2612,7 @@ impl InferenceServiceConfig {
     }
 }
 
-impl hyprstream_rpc::service::spawner::Spawnable for InferenceServiceConfig {
+impl hyprstream_service::Spawnable for InferenceServiceConfig {
     fn name(&self) -> &str {
         "inference"
     }
@@ -2737,12 +2704,18 @@ impl hyprstream_rpc::service::spawner::Spawnable for InferenceServiceConfig {
 /// - The service verifies signatures before processing
 /// - Identity is included for authorization checks
 ///
-/// Wraps a generated `InferenceClient`. All methods delegate to the
-/// autogenerated typed client.
+/// Wraps a generated `InferenceClient`. Pure delegation methods are
+/// available via `Deref`; this struct adds domain-specific convenience
+/// methods with type translation.
 #[derive(Clone)]
 pub struct InferenceZmqClient {
     /// Generated typed client (handles all transport including streaming via call_with_options)
     pub(crate) gen: crate::services::generated::inference_client::InferenceClient,
+}
+
+impl std::ops::Deref for InferenceZmqClient {
+    type Target = crate::services::generated::inference_client::InferenceClient;
+    fn deref(&self) -> &Self::Target { &self.gen }
 }
 
 impl InferenceZmqClient {
@@ -2763,62 +2736,40 @@ impl InferenceZmqClient {
         Self { gen: self.gen.with_claims(claims) }
     }
 
-    /// Check if model is ready
-    pub async fn is_ready(&self) -> Result<bool> {
-        self.gen.is_ready().await
-    }
-
-    /// Get model info
-    pub async fn model_info(&self) -> Result<ModelInfo> {
-        let r = self.gen.model_info().await?;
-        Ok(ModelInfo {
-            name: r.model_id,
-            architecture: r.architecture,
-            vocab_size: r.vocab_size as usize,
-            hidden_size: r.hidden_size as usize,
-            num_hidden_layers: Some(r.num_layers as usize),
-            num_attention_heads: Some(r.num_heads as usize),
-            num_key_value_heads: None,
-            head_dim: None,
-            context_length: r.max_sequence_length as usize,
-            quantization: Some(r.quantization),
-            parameters: 0,
-            intermediate_size: None,
-        })
-    }
-
-    /// Health check
-    pub async fn health_check(&self) -> Result<()> {
+    /// Health check (discards status detail, returns Ok/Err).
+    ///
+    /// Named `health_check_ok` to avoid shadowing the generated `health_check()`
+    /// method on the Deref target (which returns the full status).
+    pub async fn health_check_ok(&self) -> Result<()> {
         let _status = self.gen.health_check().await?;
         Ok(())
     }
 
-    /// Start streaming generation with E2E authentication — delegates to generated client
+    /// Start streaming generation with E2E authentication.
+    /// Translates domain `GenerationRequest` to the generated `InfGenerationRequest`.
     pub async fn generate_stream(
         &self,
         request: &GenerationRequest,
         ephemeral_pubkey: Option<[u8; 32]>,
     ) -> Result<StreamInfo> {
-        let adaptation_strategy_str = if request.auto_commit { "auto_writeback" } else { "speculative" };
-        self.gen.generate_stream(
-            request.prompt.as_str(),
-            request.max_tokens as u32,
-            request.temperature,
-            request.top_p,
-            request.top_k.unwrap_or(0) as u32,
-            request.repeat_penalty,
-            request.repeat_last_n as u32,
-            &request.stop_tokens,
-            request.seed.unwrap_or(0),
-            &[], // images
-            request.timeout.unwrap_or(0),
-            request.ttt_enabled,
-            request.ttt_gradient_steps,
-            request.ttt_learning_rate,
-            adaptation_strategy_str,
-            0.0f32, // writeback_threshold (unused for non-writebackIfAbove strategies)
-            ephemeral_pubkey.unwrap_or([0u8; 32]),
-        ).await
+        self.gen.generate_stream(&InfGenerationRequest {
+            prompt: request.prompt.clone(),
+            max_tokens: request.max_tokens,
+            temperature: request.temperature,
+            top_p: request.top_p,
+            top_k: request.top_k,
+            repeat_penalty: request.repeat_penalty,
+            repeat_last_n: request.repeat_last_n,
+            stop_tokens: request.stop_tokens.clone(),
+            seed: request.seed,
+            images: request.images.clone(),
+            timeout_ms: request.timeout_ms,
+            ttt_enabled: request.ttt_enabled,
+            ttt_gradient_steps: request.ttt_gradient_steps,
+            ttt_learning_rate: request.ttt_learning_rate,
+            adaptation_strategy: request.adaptation_strategy,
+            writeback_threshold: request.writeback_threshold,
+        }, ephemeral_pubkey.unwrap_or([0u8; 32])).await.map(Into::into)
     }
 
     /// Start streaming generation with E2E authenticated handle.
@@ -2833,96 +2784,31 @@ impl InferenceZmqClient {
         &self,
         request: &GenerationRequest,
     ) -> Result<crate::services::rpc_types::StreamHandle> {
-        use hyprstream_rpc::crypto::generate_ephemeral_keypair;
-
-        let (client_secret, client_pubkey) = generate_ephemeral_keypair();
-        let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
-
-        let info = self.generate_stream(request, Some(client_pubkey_bytes)).await?;
-
-        if info.server_pubkey == [0u8; 32] {
-            anyhow::bail!(
-                "Server did not provide Ristretto255 public key - E2E authentication required"
-            );
-        }
-
-        // Use the canonical StreamHandle which performs DH key exchange internally
-        crate::services::rpc_types::StreamHandle::new(
-            &global_context(),
-            info.stream_id,
-            &info.endpoint,
-            &info.server_pubkey,
-            &client_secret,
-            &client_pubkey_bytes,
-        )
+        let this = self.clone();
+        let req = request.clone();
+        crate::services::rpc_types::connect_stream_handle(|pubkey| async move {
+            this.generate_stream(&req, Some(pubkey)).await
+        }).await
     }
 
-    /// Apply chat template — delegates to generated client
-    pub async fn apply_chat_template(
-        &self,
-        messages: &[crate::runtime::template_engine::ChatMessage],
-        add_generation_prompt: bool,
-    ) -> Result<String> {
-        self.apply_chat_template_with_tools(messages, add_generation_prompt, "").await
-    }
-
-    /// Apply chat template with tools — delegates to generated client
-    pub async fn apply_chat_template_with_tools(
-        &self,
-        messages: &[crate::runtime::template_engine::ChatMessage],
-        add_generation_prompt: bool,
-        tools_json: &str,
-    ) -> Result<String> {
-        use crate::services::generated::inference_client::{ChatMessage as CapnpMsg, ToolCallData};
-        let msg_data: Vec<CapnpMsg> = messages.iter().map(|m| {
-            let tool_calls: Vec<ToolCallData> = m.tool_calls.as_ref().map(|tcs| tcs.iter().map(|tc| {
-                ToolCallData {
-                    id: tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_owned(),
-                    call_type: tc.get("type").and_then(|v| v.as_str()).unwrap_or("function").to_owned(),
-                    function_name: tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_owned(),
-                    arguments: tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("").to_owned(),
-                }
-            }).collect()).unwrap_or_default();
-            CapnpMsg {
-                role: m.role.clone(),
-                content: m.content.clone().unwrap_or_default(),
-                tool_calls,
-                tool_call_id: m.tool_call_id.clone().unwrap_or_default(),
-            }
-        }).collect();
-        self.gen.apply_chat_template(&msg_data, add_generation_prompt, tools_json).await
-    }
-
-    /// Create a new LoRA adapter
+    /// Create a new LoRA adapter. Translates `TenantDeltaConfig` to `LoraConfig`.
     pub async fn create_lora(&self, config: &TenantDeltaConfig) -> Result<()> {
-        self.gen.create_lora(
-            config.rank as u32, config.alpha, config.dropout, &config.target_modules, config.learning_rate as f32,
-        ).await
+        self.gen.create_lora(&LoraConfig {
+            rank: config.rank as u32,
+            alpha: config.alpha,
+            dropout: config.dropout,
+            target_modules: config.target_modules.clone(),
+            learning_rate: config.learning_rate as f32,
+        }).await
     }
 
-    /// Load a LoRA adapter from a safetensors file (delegates via RPC).
-    pub async fn load_lora(&self, path: &str) -> Result<()> {
-        self.gen.load_lora(path).await
-    }
-
-    /// Save the current LoRA adapter to a safetensors file (delegates via RPC).
-    pub async fn save_lora(&self, path: &str) -> Result<()> {
-        self.gen.save_lora(path).await
-    }
-
-    /// Unload the current LoRA adapter (delegates via RPC).
-    pub async fn unload_lora(&self) -> Result<()> {
-        self.gen.unload_lora().await
-    }
-
-    /// Check if a LoRA adapter is loaded (delegates via RPC).
-    pub async fn has_lora(&self) -> Result<bool> {
-        self.gen.has_lora().await
-    }
-
-    /// Merge an on-disk adapter into the loaded base_delta (delegates via RPC).
+    /// Merge an on-disk adapter into the loaded base_delta.
     pub async fn merge_lora(&self, adapter_path: &str, weight: f32, strategy: &str) -> Result<()> {
-        self.gen.merge_lora(adapter_path, weight, strategy).await
+        self.gen.merge_lora(&MergeLoraRequest {
+            adapter_path: adapter_path.to_owned(),
+            weight,
+            strategy: strategy.to_owned(),
+        }).await
     }
 
     // Training loop control (TTT operations)
@@ -2955,44 +2841,21 @@ impl InferenceZmqClient {
         writeback_threshold: f32,
         ephemeral_pubkey: Option<[u8; 32]>,
     ) -> Result<StreamInfo> {
-        self.gen.train_step_stream(
-            input,
-            gradient_steps,
-            learning_rate,
-            adaptation_strategy,
+        self.gen.train_step_stream(&TrainStepRequest {
+            input: input.to_owned(),
+            gradient_steps: Some(gradient_steps).filter(|&v| v != 0),
+            learning_rate: Some(learning_rate).filter(|&v| v != 0.0),
+            adaptation_strategy: adaptation_strategy.to_owned(),
             writeback_threshold,
-            ephemeral_pubkey.unwrap_or([0u8; 32]),
-        ).await
+        }, ephemeral_pubkey.unwrap_or([0u8; 32])).await.map(Into::into)
     }
 
-    /// Set the current session ID for KV cache management
-    pub async fn set_session(&self, session_id: &str) -> Result<()> {
-        self.gen.set_session(session_id).await
-    }
-
-    /// Clear the current session's KV cache
-    pub async fn clear_session(&self) -> Result<()> {
-        self.gen.clear_session().await
-    }
-
-    /// Release a session's KV cache
-    pub async fn release_session(&self, session_id: &str) -> Result<()> {
-        self.gen.release_session(session_id).await
-    }
-
-    /// Compute vision embeddings for images — delegates to generated client
+    /// Compute vision embeddings for images.
     pub async fn embed(&self, images: &[Vec<u8>]) -> Result<Vec<Vec<f32>>> {
-        let response = self.gen.embed(images).await?;
+        let response = self.gen.embed(&EmbedImagesRequest {
+            images: images.to_vec(),
+        }).await?;
         Ok(response.embeddings)
-    }
-
-    /// Request service shutdown
-    pub async fn shutdown(&self) -> Result<()> {
-        match self.gen.shutdown().await? {
-            InferenceResponseVariant::Success => Ok(()),
-            InferenceResponseVariant::Error(ref e) => Err(anyhow!("{}", e.message)),
-            _ => Err(anyhow!("Unexpected response type")),
-        }
     }
 
 }

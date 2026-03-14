@@ -2,11 +2,17 @@
 // CLI handlers intentionally print to stdout/stderr for user interaction
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
-use crate::config::GenerationRequest;
-use crate::api::openai_compat::ChatMessage;
-use crate::services::{ModelZmqClient, GenRegistryClient};
+use crate::runtime::GenerationRequest;
+use crate::services::generated::inference_client::ChatMessage;
+use crate::services::generated::model_client::ApplyChatTemplateRequest;
+use crate::services::generated::notification_client::{SubscribeRequest, UnsubscribeRequest};
+use crate::services::generated::registry_client::{
+    BranchRequest, CheckoutRequest, CloneRequest, CreateWorktreeRequest,
+    RemoveWorktreeRequest, UpdateRequest,
+};
+use crate::services::{ModelZmqClient, RegistryClient};
 #[cfg(feature = "experimental")]
-use crate::services::generated::registry_client::FileChangeTypeEnum;
+use crate::services::generated::registry_client::FileChangeType;
 use crate::zmq::global_context;
 use crate::storage::ModelRef;
 #[cfg(feature = "experimental")]
@@ -22,7 +28,7 @@ use tracing::{debug, info, warn};
 
 /// Handle branch command
 pub async fn handle_branch(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model: &str,
     branch_name: &str,
     from_ref: Option<String>,
@@ -35,7 +41,10 @@ pub async fn handle_branch(
     let repo_client = registry.repo(&tracked.id);
 
     // Create branch via service
-    repo_client.create_branch(branch_name, from_ref.as_deref().unwrap_or("")).await
+    repo_client.create_branch(&BranchRequest {
+        branch_name: branch_name.to_owned(),
+        start_point: from_ref.as_deref().unwrap_or("").to_owned(),
+    }).await
         .map_err(|e| anyhow::anyhow!("Failed to create branch '{}': {}", branch_name, e))?;
 
     println!("✓ Created branch {branch_name}");
@@ -45,7 +54,9 @@ pub async fn handle_branch(
     }
 
     // Create worktree for the branch via service
-    repo_client.create_worktree(branch_name).await
+    repo_client.create_worktree(&CreateWorktreeRequest {
+        branch: branch_name.to_owned(),
+    }).await
         .map_err(|e| anyhow::anyhow!("Failed to create worktree: {}", e))?;
     println!("✓ Created worktree for branch {branch_name}");
 
@@ -65,7 +76,7 @@ pub async fn handle_branch(
 
 /// Handle checkout command
 pub async fn handle_checkout(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model_ref_str: &str,
     create_branch: bool,
     force: bool,
@@ -110,7 +121,10 @@ pub async fn handle_checkout(
     // If create_branch, create branch first
     if create_branch {
         if let crate::storage::GitRef::Branch(name) = &model_ref.git_ref {
-            repo_client.create_branch(name, &previous_oid).await
+            repo_client.create_branch(&BranchRequest {
+                branch_name: name.to_owned(),
+                start_point: previous_oid.clone(),
+            }).await
                 .map_err(|e| anyhow::anyhow!("Failed to create branch: {}", e))?;
         }
     }
@@ -121,7 +135,10 @@ pub async fn handle_checkout(
         crate::storage::GitRef::Branch(name) => name.clone(),
         _ => tracked.tracking_ref.clone(),
     };
-    repo_client.worktree(&worktree_name).checkout(&ref_spec, false).await
+    repo_client.worktree(&worktree_name).checkout(&CheckoutRequest {
+        ref_name: ref_spec.clone(),
+        create_branch: false,
+    }).await
         .map_err(|e| anyhow::anyhow!("Failed to checkout '{}': {}", ref_spec, e))?;
 
     // Get new HEAD
@@ -140,7 +157,7 @@ pub async fn handle_checkout(
 
 /// Handle status command
 pub async fn handle_status(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model: Option<String>,
     verbose: bool,
 ) -> Result<()> {
@@ -182,23 +199,23 @@ pub async fn handle_status(
 ///
 /// Git status --short style single-character indicator.
 #[cfg(feature = "experimental")]
-fn status_char(s: FileChangeTypeEnum) -> char {
+fn status_char(s: FileChangeType) -> char {
     match s {
-        FileChangeTypeEnum::None => ' ',
-        FileChangeTypeEnum::Added => 'A',
-        FileChangeTypeEnum::Modified => 'M',
-        FileChangeTypeEnum::Deleted => 'D',
-        FileChangeTypeEnum::Renamed => 'R',
-        FileChangeTypeEnum::Untracked => '?',
-        FileChangeTypeEnum::TypeChanged => 'T',
-        FileChangeTypeEnum::Conflicted => 'U',
+        FileChangeType::None => ' ',
+        FileChangeType::Added => 'A',
+        FileChangeType::Modified => 'M',
+        FileChangeType::Deleted => 'D',
+        FileChangeType::Renamed => 'R',
+        FileChangeType::Untracked => '?',
+        FileChangeType::TypeChanged => 'T',
+        FileChangeType::Conflicted => 'U',
     }
 }
 
 /// **EXPERIMENTAL**: This feature is behind the `experimental` flag.
 #[cfg(feature = "experimental")]
 pub async fn handle_commit(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model_ref_str: &str,
     message: &str,
     all: bool,
@@ -278,7 +295,7 @@ pub async fn handle_commit(
             }
         } else {
             // Show only staged files (index)
-            for file in detailed_status.files.iter().filter(|f| !matches!(f.index_status, FileChangeTypeEnum::None)) {
+            for file in detailed_status.files.iter().filter(|f| !matches!(f.index_status, FileChangeType::None)) {
                 println!("  {}  {}", status_char(file.index_status), file.path);
             }
         }
@@ -470,7 +487,7 @@ pub fn parse_status_filter(raw: &[String]) -> Result<std::collections::HashSet<S
 }
 
 pub async fn handle_list(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model_client: ModelZmqClient,
     filters: &[(String, regex::Regex)],
     status_filter: &std::collections::HashSet<String>,
@@ -601,7 +618,7 @@ pub async fn handle_list(
 /// Handle clone command with streaming progress
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_clone(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     repo_url: &str,
     name: Option<String>,
     branch: Option<String>,
@@ -661,7 +678,13 @@ pub async fn handle_clone(
         if verbose {
             warn!("Streaming clone failed, falling back to non-streaming: {}", e);
         }
-        registry.clone(repo_url, &model_name, shallow, clone_depth, branch.as_deref().unwrap_or("")).await
+        registry.clone(&CloneRequest {
+            url: repo_url.to_owned(),
+            name: model_name.clone(),
+            shallow,
+            depth: clone_depth,
+            branch: branch.as_deref().unwrap_or("").to_owned(),
+        }).await
             .map_err(|e| anyhow::anyhow!("Failed to clone model: {}", e))?;
     }
 
@@ -683,7 +706,9 @@ pub async fn handle_clone(
     if !quiet {
         println!("   Creating worktree for branch: {worktree_branch}");
     }
-    repo_client.create_worktree(&worktree_branch).await
+    repo_client.create_worktree(&CreateWorktreeRequest {
+        branch: worktree_branch.clone(),
+    }).await
         .map_err(|e| anyhow::anyhow!("Failed to create worktree: {}", e))?;
 
     if !quiet {
@@ -704,7 +729,7 @@ pub async fn handle_clone(
 /// Uses DH-authenticated streaming to receive clone progress updates.
 #[allow(clippy::too_many_arguments)]
 async fn clone_with_streaming(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     repo_url: &str,
     model_name: &str,
     shallow: bool,
@@ -719,7 +744,13 @@ async fn clone_with_streaming(
 
     // Call clone_stream to initiate streaming clone
     let stream_info = registry
-        .clone_stream(repo_url, model_name, shallow, depth, branch.unwrap_or(""), client_pubkey_bytes)
+        .clone_stream(&CloneRequest {
+            url: repo_url.to_owned(),
+            name: model_name.to_owned(),
+            shallow,
+            depth,
+            branch: branch.unwrap_or("").to_owned(),
+        }, client_pubkey_bytes)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to start streaming clone: {}", e))?;
 
@@ -833,7 +864,7 @@ async fn clone_with_streaming(
 ///
 /// TODO: Adapter listing still uses local filesystem access. Consider moving to ModelService.
 pub async fn handle_info(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model: &str,
     verbose: bool,
     adapters_only: bool,
@@ -1120,7 +1151,7 @@ pub async fn handle_info(
 /// This is a helper used by branch, clone, and worktree commands to apply
 /// policy templates when the --policy flag is specified.
 pub async fn apply_policy_template_to_model(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model: &str,
     template_name: &str,
 ) -> Result<()> {
@@ -1257,14 +1288,17 @@ pub async fn handle_infer(
     // Apply chat template to the prompt via ModelService
     let messages = vec![ChatMessage {
         role: "user".to_owned(),
-        content: Some(prompt.to_owned()),
-        function_call: None,
-        tool_calls: None,
-        tool_call_id: None,
+        content: prompt.to_owned(),
+        tool_calls: vec![],
+        tool_call_id: String::new(),
     }];
 
-    let formatted_prompt = match model_client.apply_chat_template(model_ref_str, &messages, true, None).await {
-        Ok(formatted) => formatted,
+    let formatted_prompt = match model_client.gen.infer(model_ref_str).apply_chat_template(&ApplyChatTemplateRequest {
+        messages: messages.clone(),
+        add_generation_prompt: true,
+        tools_json: Some(String::new()),
+    }).await {
+        Ok(prompt_str) => crate::config::TemplatedPrompt::new(prompt_str),
         Err(e) => {
             tracing::warn!("Could not apply chat template: {}. Using raw prompt.", e);
             crate::config::TemplatedPrompt::new(prompt.to_owned())
@@ -1272,64 +1306,39 @@ pub async fn handle_infer(
     };
 
     // Build generation request with CLI overrides (ModelService applies model defaults)
-    let mut request_builder = GenerationRequest::builder(formatted_prompt.into_inner())
-        .max_tokens(max_tokens.unwrap_or(2048));
-
-    // Apply CLI overrides only if specified
-    if let Some(t) = temperature {
-        request_builder = request_builder.temperature(t);
-    }
-    if let Some(p) = top_p {
-        request_builder = request_builder.top_p(p);
-    }
-    if let Some(k) = top_k {
-        request_builder = request_builder.top_k(Some(k));
-    }
-    if let Some(r) = repeat_penalty {
-        request_builder = request_builder.repeat_penalty(r);
-    }
-    if let Some(s) = seed {
-        request_builder = request_builder.seed(Some(s as u64));
-    }
+    let mut request = GenerationRequest {
+        prompt: formatted_prompt.into_inner(),
+        max_tokens: Some(max_tokens.unwrap_or(2048) as u32),
+        temperature,
+        top_p,
+        top_k: top_k.map(|v| v as u32),
+        repeat_penalty,
+        seed,
+        ..Default::default()
+    };
 
     // Add image path if provided (for multimodal models)
     if let Some(img_path) = image_path {
         info!("Using image: {}", img_path);
-        request_builder = request_builder.image_path(std::path::PathBuf::from(img_path));
+        let img_bytes = std::fs::read(&img_path)
+            .map_err(|e| anyhow::anyhow!("Failed to read image {}: {}", img_path, e))?;
+        request.images = Some(vec![img_bytes]);
     }
 
-    let request = request_builder.build();
-
     info!(
-        "Generating response: max_tokens={}, temperature={}, top_p={}, top_k={:?}, repeat_penalty={}",
+        "Generating response: max_tokens={:?}, temperature={:?}, top_p={:?}, top_k={:?}, repeat_penalty={:?}",
         request.max_tokens, request.temperature, request.top_p, request.top_k, request.repeat_penalty
     );
 
     // Generate via ModelService (handles model loading, adapter loading, training collection, auth)
     if !sync {
-        // Generate client ephemeral keypair for DH key exchange
-        let (client_secret, client_pubkey) = generate_ephemeral_keypair();
-        let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
-
-        // Start stream with client ephemeral pubkey
-        let stream_info = model_client.infer_stream(model_ref_str, &request, client_pubkey_bytes).await?;
-
-        debug!(
-            stream_id = %stream_info.stream_id,
-            endpoint = %stream_info.endpoint,
-            "Started inference stream"
-        );
-
-        // Create stream handle for receiving tokens (handles DH, subscription, verification)
-        let ctx = global_context();
-        let mut stream_handle = StreamHandle::new(
-            &ctx,
-            stream_info.stream_id.clone(),
-            &stream_info.endpoint,
-            &stream_info.server_pubkey,
-            &client_secret,
-            &client_pubkey_bytes,
-        )?;
+        // Start stream with E2E authenticated handle (DH key exchange)
+        let mc = model_client.clone();
+        let mr = model_ref_str.to_owned();
+        let req = request.clone();
+        let mut stream_handle = crate::services::rpc_types::connect_stream_handle(|pubkey| async move {
+            mc.infer_stream(&mr, &req, pubkey).await
+        }).await?;
 
         println!();
 
@@ -1361,18 +1370,12 @@ pub async fn handle_infer(
         println!();
     } else {
         // Non-streaming: collect stream into full response
-        let (client_secret, client_pubkey) = generate_ephemeral_keypair();
-        let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
-        let stream_info = model_client.infer_stream(model_ref_str, &request, client_pubkey_bytes).await?;
-        let ctx = global_context();
-        let mut handle = StreamHandle::new(
-            &ctx,
-            stream_info.stream_id.clone(),
-            &stream_info.endpoint,
-            &stream_info.server_pubkey,
-            &client_secret,
-            &client_pubkey_bytes,
-        )?;
+        let mc = model_client.clone();
+        let mr = model_ref_str.to_owned();
+        let req = request.clone();
+        let mut handle = crate::services::rpc_types::connect_stream_handle(|pubkey| async move {
+            mc.infer_stream(&mr, &req, pubkey).await
+        }).await?;
 
         let mut text = String::new();
         loop {
@@ -1427,26 +1430,16 @@ pub async fn handle_load(
     wait: Option<u64>,
     signing_key: SigningKey,
 ) -> Result<()> {
-    use crate::services::model::ModelLoadConfig;
-
     info!("Loading model: {}", model_ref_str);
 
     // Validate model reference format
     let model_ref = ModelRef::parse(model_ref_str)?;
 
-    // Build config if any options specified
-    let config = if max_context.is_some() || kv_quant != crate::runtime::kv_quant::KVQuantType::None {
-        Some(ModelLoadConfig {
-            max_context,
-            kv_quant: if kv_quant == crate::runtime::kv_quant::KVQuantType::None {
-                None
-            } else {
-                Some(kv_quant)
-            },
-            num_inference_instances: None,
-        })
-    } else {
+    let load_max_context = max_context.map(|v| v as u32);
+    let load_kv_quant = if kv_quant == crate::runtime::kv_quant::KVQuantType::None {
         None
+    } else {
+        Some(kv_quant)
     };
 
     // If --wait, subscribe to notifications BEFORE issuing load request
@@ -1463,11 +1456,11 @@ pub async fn handle_load(
             RequestIdentity::local(),
         );
 
-        let sub_resp = notif_client.subscribe(
-            &scope_pattern,
-            &sub_pub_bytes,
-            timeout_secs.min(3600) as u32,
-        ).await?;
+        let sub_resp = notif_client.subscribe(&SubscribeRequest {
+            scope_pattern: scope_pattern.clone(),
+            ephemeral_pubkey: sub_pub_bytes.to_vec(),
+            ttl_seconds: timeout_secs.min(3600) as u32,
+        }).await?;
 
         debug!(
             subscription_id = %sub_resp.subscription_id,
@@ -1498,8 +1491,7 @@ pub async fn handle_load(
     // drops before the spawned task executes.
     let model_client = ModelZmqClient::new(signing_key.clone(), RequestIdentity::local());
     let model_ref_owned = model_ref_str.to_owned();
-    let config_clone = config.clone();
-    match model_client.load(&model_ref_owned, config_clone.as_ref()).await {
+    match model_client.load(&model_ref_owned, load_max_context, load_kv_quant).await {
         Ok(_endpoint) => debug!("Load RPC accepted for {}", model_ref_owned),
         Err(e) => warn!("Load RPC failed for {}: {}", model_ref_owned, e),
     }
@@ -1531,7 +1523,9 @@ pub async fn handle_load(
         ).await;
 
         // Clean up subscription
-        let _ = notif_client.unsubscribe(&sub_resp.subscription_id).await;
+        let _ = notif_client.unsubscribe(&UnsubscribeRequest {
+            subscription_id: sub_resp.subscription_id.clone(),
+        }).await;
 
         match result {
             Ok(NotificationOutcome::Loaded { endpoint }) => {
@@ -1753,7 +1747,11 @@ async fn handle_notify_subscribe(
 
     // Subscribe with maximum TTL for long-running listeners
     let ttl = if timeout_secs == 0 { 3600u32 } else { (timeout_secs as u32).min(3600) };
-    let sub_resp = notif_client.subscribe(pattern, &sub_pub_bytes, ttl).await?;
+    let sub_resp = notif_client.subscribe(&SubscribeRequest {
+        scope_pattern: pattern.to_owned(),
+        ephemeral_pubkey: sub_pub_bytes.to_vec(),
+        ttl_seconds: ttl,
+    }).await?;
 
     eprintln!("Subscribed to: {}", pattern);
     eprintln!("  Subscription ID: {}", sub_resp.subscription_id);
@@ -1862,7 +1860,9 @@ async fn handle_notify_subscribe(
     }
 
     // Clean up
-    let _ = notif_client.unsubscribe(&sub_resp.subscription_id).await;
+    let _ = notif_client.unsubscribe(&UnsubscribeRequest {
+        subscription_id: sub_resp.subscription_id.clone(),
+    }).await;
     eprintln!("Received {} events", received);
 
     Ok(())
@@ -1893,7 +1893,7 @@ pub async fn handle_unload(
 /// **EXPERIMENTAL**: This feature is behind the `experimental` flag.
 #[cfg(feature = "experimental")]
 pub async fn handle_push(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model: &str,
     remote: Option<String>,
     branch: Option<String>,
@@ -1944,7 +1944,7 @@ pub async fn handle_push(
 /// - fetch_remote(remote, refspec)
 /// - merge_with_strategy(ref, strategy)
 pub async fn handle_pull(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model: &str,
     remote: Option<String>,
     branch: Option<String>,
@@ -1965,7 +1965,9 @@ pub async fn handle_pull(
 
     // Use RepositoryClient.update() to fetch and merge
     // Note: This does a basic fetch+merge, doesn't expose merge analysis or fast-forward control
-    repo_client.update(refspec.as_deref().unwrap_or("")).await?;
+    repo_client.update(&UpdateRequest {
+        refspec: refspec.as_deref().unwrap_or("").to_owned(),
+    }).await?;
 
     println!("✓ Pulled latest changes for model {model}");
     println!("  Remote: {remote_name}");
@@ -2012,7 +2014,7 @@ pub struct MergeOptions {
 /// resolution (--abort, --continue, --quit) still needs service layer implementation.
 #[cfg(feature = "experimental")]
 pub async fn handle_merge(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     target: &str,
     source: &str,
     options: MergeOptions,
@@ -2099,7 +2101,7 @@ pub async fn handle_merge(
 /// **EXPERIMENTAL**: This is behind the `experimental` flag.
 #[cfg(feature = "experimental")]
 async fn handle_merge_conflict_resolution(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     target: &str,
     options: MergeOptions,
 ) -> Result<()> {
@@ -2173,7 +2175,7 @@ async fn handle_merge_conflict_resolution(
 /// Removal is handled by the RegistryService which manages both
 /// registry entries and file cleanup.
 pub async fn handle_remove(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model: &str,
     force: bool,
     _registry_only: bool,
@@ -2228,7 +2230,10 @@ pub async fn handle_remove(
         }
 
         // Remove the worktree via service (pass branch name, not path)
-        repo_client.remove_worktree(&wt.branch_name, false).await
+        repo_client.remove_worktree(&RemoveWorktreeRequest {
+            branch: wt.branch_name.clone(),
+            force: false,
+        }).await
             .map_err(|e| anyhow::anyhow!("Failed to remove worktree: {}", e))?;
 
         println!("✓ Worktree '{}:{}' removed successfully", model_ref.model, branch);

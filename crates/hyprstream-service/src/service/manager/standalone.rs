@@ -126,7 +126,7 @@ impl ServiceManager for StandaloneManager {
         Ok(SpawnedService::subprocess(
             process.id.clone(),
             process,
-            crate::paths::service_pid_file(service.name()),
+            hyprstream_rpc::paths::service_pid_file(service.name()),
         ))
     }
 }

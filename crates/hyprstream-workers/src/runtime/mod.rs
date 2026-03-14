@@ -31,47 +31,51 @@ mod service;
 pub mod spawner;
 mod virtiofs;
 
-// Generated wire types re-exported from client (originally from worker_client)
-// Note: Filter types and Metadata are hand-written in client.rs with extra functionality
+// Generated wire types — canonical OCI/CRI-aligned names (no Gen*/Wire/Enum aliases)
 pub use client::{
     // Generated client
-    GenWorkerClient,
-    // Generated response/stats types
+    WorkerClient,
+    // Response types
     VersionInfo, RuntimeStatus, RuntimeCondition,
     PodSandboxStatusResponse, ContainerStatusResponse,
     ExecSyncResult,
+    // Stats types
     PodSandboxStats, PodSandboxAttributes, LinuxPodSandboxStats,
-    ContainerStats as ContainerStatsWire, ContainerAttributes,
+    ContainerStats, ContainerAttributes,
     CpuUsage, MemoryUsage, NetworkUsage, NetworkInterfaceUsage,
     ProcessUsage, FilesystemUsage, FilesystemIdentifier,
     Timestamp,
+    // Info types
     PodSandboxInfo, ContainerInfo,
-    // Generated enum types
-    PodSandboxStateEnum, ContainerStateEnum,
-    // Generated DTOs (now canonical - no duplicates)
+    // State enums (generated, with Hash + serde)
+    PodSandboxState, ContainerState,
+    // Config/request DTOs
     ImageSpec, PodSandboxConfig, PodSandboxStatus, PodSandboxNetworkStatus,
     ContainerConfig, ContainerStatus,
+    PodSandboxMetadata, ContainerMetadata,
     DNSConfig, PortMapping, LinuxPodSandboxConfig,
     LinuxSandboxSecurityContext,
     Mount, Device, LinuxContainerConfig,
     LinuxContainerSecurityContext, Capability,
-    AuthConfig as AuthConfigWire, StreamInfo,
+    AuthConfig, StreamInfo,
     ImageInfo, ImageStatusResult,
     LinuxContainerResources,
-    // Hand-written types (from client.rs)
-    ContainerFilter, ContainerMetadata, ContainerStatsFilter,
+    // Filter types (generated)
+    PodSandboxFilter, ContainerFilter,
+    PodSandboxStatsFilter, ContainerStatsFilter,
+    // Common types
     KeyValue,
-    PodSandboxFilter, PodSandboxMetadata, PodSandboxStatsFilter,
-    RuntimeClient, StatusResponse,
+    // Local composite
+    StatusResponse,
 };
 // Backend trait and implementations
 pub use backend::{SandboxBackend, SandboxHandle};
 pub use kata_backend::{KataBackend, KataHandle};
 pub use nspawn::{NspawnBackend, NspawnConfig, NspawnHandle};
-// Domain entities (business logic only - not DTOs)
-pub use container::{Container, ContainerState};
+// Domain entities (business logic only)
+pub use container::Container;
 pub use pool::{PoolStats, SandboxPool};
-pub use sandbox::{PodSandbox, PodSandboxState};
+pub use sandbox::PodSandbox;
 pub use service::WorkerService;
 // Re-export service infrastructure from hyprstream-rpc for convenience
 pub use hyprstream_rpc::service::{EnvelopeContext, ServiceHandle, ZmqService};

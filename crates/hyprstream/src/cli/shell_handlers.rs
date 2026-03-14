@@ -101,7 +101,7 @@ impl ActiveApp {
 
 }
 
-use crate::services::generated::tui_client::TuiClient;
+use crate::services::generated::tui_client::{TuiClient, ConnectRequest, DisplayMode};
 use crate::tui::shell_client::{
     close_window_rpc, focus_window_rpc, spawn_chat_app_rpc,
     spawn_shell_rpc,
@@ -129,7 +129,7 @@ pub async fn handle_shell_tui(
     // Connect to session 0 using Capnp display mode so the frame stream
     // carries structured TuiFrame messages with pane_id for correct routing.
     let result = client
-        .connect(0, "capnp", pane_cols, pane_rows)
+        .connect(&ConnectRequest { session_id: 0, display_mode: DisplayMode::Capnp, cols: pane_cols, rows: pane_rows })
         .await
         .context("Failed to connect to TUI session. Is the TUI service running?")?;
 
@@ -409,18 +409,16 @@ pub async fn handle_shell_tui(
 
             _ = worker_refresh.tick() => {
                 if matches!(compositor.chrome.mode, hyprstream_compositor::ShellMode::WorkerManager { .. }) {
-                    use crate::services::worker::{RuntimeClient, ImageClient};
+                    
                     // Poll sandboxes + containers
-                    if let Ok(sandbox_infos) = worker_client.list_pod_sandbox(None).await {
+                    if let Ok(sandbox_infos) = worker_client.sandbox().list(&crate::services::worker::PodSandboxFilter::default()).await {
                         let mut entries = Vec::new();
                         for sb in &sandbox_infos {
                             let short_id = if sb.id.len() > 8 { sb.id[..8].to_owned() } else { sb.id.clone() };
-                            let containers = match worker_client.list_containers(Some(&crate::services::worker::ContainerFilter {
-                                id: None,
-                                pod_sandbox_id: Some(sb.id.clone()),
-                                state: None,
-                                label_selector: Default::default(),
-                            })).await {
+                            let containers = match worker_client.container().list(&crate::services::worker::ContainerFilter {
+                                pod_sandbox_id: sb.id.clone(),
+                                ..Default::default()
+                            }).await {
                                 Ok(cis) => cis.into_iter().map(|c| {
                                     let c_short = if c.id.len() > 8 { c.id[..8].to_owned() } else { c.id.clone() };
                                     hyprstream_compositor::ContainerEntry {
@@ -453,7 +451,7 @@ pub async fn handle_shell_tui(
                         ).await { break; }
                     }
                     // Poll images
-                    if let Ok(images) = worker_client.list_images(None).await {
+                    if let Ok(images) = worker_client.image().list(&crate::services::worker::ImageFilter { image: crate::services::worker::ImageSpec::default() }).await {
                         let entries: Vec<hyprstream_compositor::ImageEntry> = images.into_iter().map(|img| {
                             let repo_tag = img.repo_tags.first().cloned().unwrap_or_else(|| "<none>".to_owned());
                             let id = if img.id.len() > 12 { img.id[..12].to_owned() } else { img.id.clone() };
@@ -509,12 +507,7 @@ pub async fn handle_shell_tui(
                 }
                 // Apply context-window reloads (model will reload with new context size).
                 for (model_ref, ctx_window) in pending_ctx_reloads {
-                    use crate::services::model::ModelLoadConfig;
-                    let config = ModelLoadConfig {
-                        max_context: if ctx_window == 0 { None } else { Some(ctx_window) },
-                        kv_quant: None,
-                        num_inference_instances: None,
-                    };
+                    let reload_max_context = if ctx_window == 0 { None } else { Some(ctx_window as u32) };
                     let ctx_label = if ctx_window == 0 {
                         "model default".to_owned()
                     } else {
@@ -524,7 +517,7 @@ pub async fn handle_shell_tui(
                         format!("Reloading {model_ref} with context {ctx_label}…"),
                         ToastLevel::Info,
                     );
-                    let _ = model_client.load(&model_ref, Some(&config)).await;
+                    let _ = model_client.load(&model_ref, reload_max_context, None).await;
                     let poll_client = model_client.clone();
                     let poll_mr = model_ref.clone();
                     let tx = model_status_tx.clone();
@@ -812,7 +805,7 @@ async fn handle_rpc(
         }
 
         RpcRequest::LoadModel { model_ref } => {
-            let _ = model_client.load(&model_ref, None).await;
+            let _ = model_client.load(&model_ref, None, None).await;
             // Spawn background polling task.
             let poll_client = model_client.clone();
             let poll_mr    = model_ref.clone();
@@ -1019,12 +1012,11 @@ async fn handle_rpc(
             vec![]
         }
         RpcRequest::WorkerDestroySandbox { sandbox_id } => {
-            use crate::services::worker::RuntimeClient;
             let short = &sandbox_id[..sandbox_id.len().min(8)];
             compositor.chrome.push_toast(format!("Destroying {short}..."), ToastLevel::Info);
-            match worker_client.stop_pod_sandbox(&sandbox_id).await {
+            match worker_client.sandbox().stop(&sandbox_id).await {
                 Ok(()) => {
-                    let _ = worker_client.remove_pod_sandbox(&sandbox_id).await;
+                    let _ = worker_client.sandbox().remove(&sandbox_id).await;
                     compositor.chrome.push_toast(format!("Destroyed {short}"), ToastLevel::Info);
                 }
                 Err(e) => {
@@ -1034,10 +1026,13 @@ async fn handle_rpc(
             vec![]
         }
         RpcRequest::WorkerExecSync { sandbox_id: _, container_id, cmd } => {
-            use crate::services::worker::RuntimeClient;
             let short = &container_id[..container_id.len().min(8)];
             compositor.chrome.push_toast(format!("Exec in {short}: {:?}", cmd), ToastLevel::Info);
-            match worker_client.exec_sync(&container_id, &cmd, 30).await {
+            match worker_client.container().exec(&crate::services::worker::ExecSyncRequest {
+                container_id: container_id.clone(),
+                cmd: cmd.clone(),
+                timeout: 30,
+            }).await {
                 Ok(result) => {
                     let stdout = String::from_utf8_lossy(&result.stdout);
                     let msg = if stdout.len() > 60 { format!("{}…", &stdout[..60]) } else { stdout.to_string() };
@@ -1050,8 +1045,7 @@ async fn handle_rpc(
             vec![]
         }
         RpcRequest::WorkerImageList => {
-            use crate::services::worker::ImageClient;
-            match worker_client.list_images(None).await {
+            match worker_client.image().list(&crate::services::worker::ImageFilter { image: crate::services::worker::ImageSpec::default() }).await {
                 Ok(images) => {
                     let entries: Vec<hyprstream_compositor::ImageEntry> = images.into_iter().map(|img| {
                         let repo_tag = img.repo_tags.first().cloned().unwrap_or_else(|| "<none>".to_owned());
@@ -1074,11 +1068,14 @@ async fn handle_rpc(
             }
         }
         RpcRequest::WorkerImagePull { image } => {
-            use crate::services::worker::ImageClient;
             use crate::services::worker::ImageSpec;
             compositor.chrome.push_toast(format!("Pulling {image}..."), ToastLevel::Info);
             let spec = ImageSpec { image: image.clone(), annotations: Default::default(), runtime_handler: Default::default() };
-            match worker_client.pull_image(&spec, None).await {
+            match worker_client.image().pull(&crate::services::worker::PullImageRequest {
+                image: spec,
+                auth: crate::services::worker::AuthConfig::default(),
+                sandbox_config: crate::services::worker::PodSandboxConfig::default(),
+            }).await {
                 Ok(ref_id) => {
                     compositor.chrome.push_toast(format!("Pulled: {}", &ref_id[..ref_id.len().min(20)]), ToastLevel::Info);
                 }
@@ -1089,10 +1086,9 @@ async fn handle_rpc(
             vec![]
         }
         RpcRequest::WorkerImageRemove { image } => {
-            use crate::services::worker::ImageClient;
             use crate::services::worker::ImageSpec;
             let spec = ImageSpec { image: image.clone(), annotations: Default::default(), runtime_handler: Default::default() };
-            match worker_client.remove_image(&spec).await {
+            match worker_client.image().remove(&spec).await {
                 Ok(()) => {
                     compositor.chrome.push_toast(format!("Removed {image}"), ToastLevel::Info);
                 }
@@ -1103,7 +1099,7 @@ async fn handle_rpc(
             vec![]
         }
         RpcRequest::WorkerCreateSandbox { hostname, backend, gpu } => {
-            use crate::services::worker::{RuntimeClient, PodSandboxConfig, KeyValue};
+            use crate::services::worker::{PodSandboxConfig, KeyValue};
             let mut annotations = vec![];
             annotations.push(KeyValue { key: "io.hyprstream/runtime-handler".to_owned(), value: backend });
             if gpu {
@@ -1114,7 +1110,7 @@ async fn handle_rpc(
                 annotations,
                 ..Default::default()
             };
-            match worker_client.run_pod_sandbox(&config).await {
+            match worker_client.sandbox().run(&config).await {
                 Ok(sandbox_id) => {
                     let short = &sandbox_id[..sandbox_id.len().min(8)];
                     compositor.chrome.push_toast(format!("Created sandbox {short}"), ToastLevel::Info);
@@ -1126,7 +1122,7 @@ async fn handle_rpc(
             vec![]
         }
         RpcRequest::WorkerCreateContainer { sandbox_id, image, cmd, tty } => {
-            use crate::services::worker::{RuntimeClient, ContainerConfig, ImageSpec, PodSandboxConfig};
+            use crate::services::worker::{ContainerConfig, ImageSpec, PodSandboxConfig};
             let short_sb = &sandbox_id[..sandbox_id.len().min(8)];
             // PodSandboxStatusResponse has no config field — use default
             let sandbox_config = PodSandboxConfig::default();
@@ -1136,12 +1132,16 @@ async fn handle_rpc(
                 tty,
                 ..Default::default()
             };
-            match worker_client.create_container(&sandbox_id, &container_config, &sandbox_config).await {
+            match worker_client.container().create(&crate::services::worker::CreateContainerRequest {
+                pod_sandbox_id: sandbox_id.clone(),
+                config: container_config,
+                sandbox_config,
+            }).await {
                 Ok(container_id) => {
                     let short = &container_id[..container_id.len().min(8)];
                     compositor.chrome.push_toast(format!("Created container {short} in {short_sb}"), ToastLevel::Info);
                     // Auto-start
-                    if let Err(e) = worker_client.start_container(&container_id).await {
+                    if let Err(e) = worker_client.container().start(&container_id).await {
                         compositor.chrome.push_toast(format!("Start failed: {e}"), ToastLevel::Error);
                     }
                 }
@@ -1152,27 +1152,27 @@ async fn handle_rpc(
             vec![]
         }
         RpcRequest::WorkerStartContainer { container_id } => {
-            use crate::services::worker::RuntimeClient;
             let short = &container_id[..container_id.len().min(8)];
-            match worker_client.start_container(&container_id).await {
+            match worker_client.container().start(&container_id).await {
                 Ok(()) => compositor.chrome.push_toast(format!("Started {short}"), ToastLevel::Info),
                 Err(e) => compositor.chrome.push_toast(format!("Start failed: {e}"), ToastLevel::Error),
             }
             vec![]
         }
         RpcRequest::WorkerStopContainer { container_id } => {
-            use crate::services::worker::RuntimeClient;
             let short = &container_id[..container_id.len().min(8)];
-            match worker_client.stop_container(&container_id, 10).await {
+            match worker_client.container().stop(&crate::services::worker::StopContainerRequest {
+                container_id: container_id.clone(),
+                timeout: 10,
+            }).await {
                 Ok(()) => compositor.chrome.push_toast(format!("Stopped {short}"), ToastLevel::Info),
                 Err(e) => compositor.chrome.push_toast(format!("Stop failed: {e}"), ToastLevel::Error),
             }
             vec![]
         }
         RpcRequest::WorkerRemoveContainer { container_id } => {
-            use crate::services::worker::RuntimeClient;
             let short = &container_id[..container_id.len().min(8)];
-            match worker_client.remove_container(&container_id).await {
+            match worker_client.container().remove(&container_id).await {
                 Ok(()) => compositor.chrome.push_toast(format!("Removed {short}"), ToastLevel::Info),
                 Err(e) => compositor.chrome.push_toast(format!("Remove failed: {e}"), ToastLevel::Error),
             }
@@ -1332,7 +1332,7 @@ async fn fetch_models(
     let registry_endpoint = hyprstream_rpc::registry::global()
         .endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep)
         .to_zmq_string();
-    let registry: crate::services::GenRegistryClient = crate::services::create_service_client(
+    let registry: crate::services::RegistryClient = crate::services::create_service_client(
         &registry_endpoint,
         signing_key.clone(),
         RequestIdentity::local(),

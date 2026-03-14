@@ -97,7 +97,7 @@ pub use core::{
 
 // Generated client types — the public API
 pub use generated::registry_client::{
-    RegistryClient as GenRegistryClient,
+    RegistryClient,
     RepositoryClient, WorktreeClient, CtlClient,
     TrackedRepository as GenTrackedRepository,
     WorktreeInfo as GenWorktreeInfo,
@@ -106,7 +106,7 @@ pub use generated::registry_client::{
     RWalk, ROpen, RRead, RWrite, RStat,
     NpStat as NpStatData, Qid as QidData,
     FileStatus, LogEntry, ValidationResult, FileInfo,
-    DocFormatEnum,
+    DocFormat,
 };
 
 // Remaining domain types
@@ -122,11 +122,11 @@ pub use registry::RegistryService;
 pub use policy::PolicyService;
 pub use generated::policy_client::PolicyClient;
 pub use model::{
-    ModelHealthInfo, ModelService, ModelServiceConfig, ModelStatusEntry, ModelStatusInfo,
+    ModelService, ModelServiceConfig,
     ModelZmqClient, MODEL_ENDPOINT,
 };
 pub use stream::StreamService;
-pub use worker::{WorkerZmqClient, WorkflowZmqClient, build_authorize_fn};
+pub use worker::{WorkerZmqClient, build_authorize_fn};
 pub use oauth::OAuthService;
 pub use oai::OAIService;
 pub use flight::FlightService;

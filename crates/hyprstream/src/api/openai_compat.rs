@@ -36,7 +36,6 @@ pub struct ChatCompletionRequest {
 pub struct ChatMessage {
     pub role: String,
     pub content: Option<String>,
-    pub function_call: Option<FunctionCall>,
     pub tool_calls: Option<Vec<ToolCall>>,
     pub tool_call_id: Option<String>,
 }
@@ -60,13 +59,6 @@ impl From<&ChatCompletionRequest> for crate::config::SamplingParams {
             timeout_ms: None,
         }
     }
-}
-
-/// Function call in chat
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FunctionCall {
-    pub name: String,
-    pub arguments: String,
 }
 
 /// Tool definition (OpenAI format)
@@ -103,21 +95,8 @@ pub struct ToolChoiceFunction {
     pub name: String,
 }
 
-/// Tool call made by the model (in response)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolCall {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub tool_type: String, // "function"
-    pub function: ToolCallFunction,
-}
-
-/// Tool call function details
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolCallFunction {
-    pub name: String,
-    pub arguments: String, // JSON string
-}
+/// Tool call made by the model (in response), re-exported from generated inference schema.
+pub use crate::services::generated::inference_client::{ToolCall, ToolCallFunction};
 
 /// Chat Completion Response
 #[derive(Debug, Clone, Serialize, Deserialize)]

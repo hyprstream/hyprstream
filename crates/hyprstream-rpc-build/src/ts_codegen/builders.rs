@@ -478,6 +478,17 @@ fn emit_field_setter(
                         field.type_name
                     ));
                 }
+            } else if let Some(sd) = structs.iter().find(|s| s.name == field.type_name) {
+                if let Some(inner_name) = sd.option_inner_type() {
+                    emit_option_setter(out, field, sd, inner_name, builder_var, value_expr, indent);
+                } else {
+                    // Unsupported pointer type — skip with comment
+                    out.push_str(&format!(
+                        "{indent}// {}: {} — not yet supported by runtime\n",
+                        to_camel_case(&field.name),
+                        field.type_name
+                    ));
+                }
             } else {
                 // Unsupported pointer type — skip with comment
                 out.push_str(&format!(
@@ -537,4 +548,46 @@ fn emit_struct_init(
         };
         emit_field_setter(out, "_ps", f, &value_expr, indent, &schema.enums, &schema.structs);
     }
+}
+
+/// Emit code to write an Option* wrapper struct at a pointer slot.
+///
+/// Generates: if value !== undefined, init the option struct and set the discriminant + inner value.
+/// Else: leave the pointer null (cap'n proto default = none).
+fn emit_option_setter(
+    out: &mut String,
+    field: &FieldDef,
+    opt_struct: &StructDef,
+    inner_type_name: &str,
+    builder_var: &str,
+    value_expr: &str,
+    indent: &str,
+) {
+    let disc_byte_off = opt_struct.discriminant_offset * 2;
+
+    out.push_str(&format!("{indent}if ({value_expr} !== undefined && {value_expr} !== null) {{\n"));
+    out.push_str(&format!(
+        "{indent}  const _opt = {builder_var}.initStruct({}, {}, {});\n",
+        field.slot_offset, opt_struct.data_words, opt_struct.pointer_words
+    ));
+    out.push_str(&format!("{indent}  _opt.setUint16({disc_byte_off}, 1);\n")); // some discriminant = 1
+
+    // For pointer-type inners (Text, Data), the 'some' field lives in the pointer section at index 0.
+    // For data-type scalars, use the slot_offset * type_size as byte offset.
+    if inner_type_name == "Text" {
+        out.push_str(&format!("{indent}  _opt.setText(0, {value_expr});\n"));
+    } else if inner_type_name == "Data" {
+        out.push_str(&format!("{indent}  _opt.setData(0, {value_expr});\n"));
+    } else if let Some(method) = super::setter_method(inner_type_name) {
+        // Find the 'some' field slot offset for computing the byte offset
+        let some_field = opt_struct.fields.iter().find(|f| f.name == "some");
+        if let Some(sf) = some_field {
+            let some_byte_off = super::data_byte_offset(sf);
+            out.push_str(&format!("{indent}  _opt.{method}({some_byte_off}, {value_expr});\n"));
+        }
+    }
+    // else: unsupported inner type (nested struct, etc.) — leave as-is with discriminant set
+
+    out.push_str(&format!("{indent}}}\n"));
+    out.push_str(&format!("{indent}// else: null pointer = none (cap'n proto default)\n"));
 }

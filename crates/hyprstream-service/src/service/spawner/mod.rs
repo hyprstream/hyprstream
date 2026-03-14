@@ -56,7 +56,7 @@ pub use systemd::SystemdBackend;
 
 use std::path::PathBuf;
 
-use crate::error::Result;
+use hyprstream_rpc::error::Result;
 
 /// Configuration for spawning a daemon process.
 #[derive(Debug, Clone)]

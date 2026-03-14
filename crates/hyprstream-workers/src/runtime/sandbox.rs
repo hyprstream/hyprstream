@@ -5,44 +5,12 @@
 //! `SandboxBackend` (Kata VM, systemd-nspawn, etc.).
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::worker_capnp;
-
 use super::backend::SandboxHandle;
-use super::client::KeyValue;
+use super::client::{KeyValue, PodSandboxState};
 use crate::generated::worker_client::PodSandboxMetadata;
-
-/// Pod sandbox state
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum PodSandboxState {
-    /// Sandbox is ready
-    SandboxReady,
-    /// Sandbox is not ready (stopped)
-    #[default]
-    SandboxNotReady,
-}
-
-impl From<PodSandboxState> for worker_capnp::PodSandboxState {
-    fn from(s: PodSandboxState) -> Self {
-        match s {
-            PodSandboxState::SandboxReady => worker_capnp::PodSandboxState::SandboxReady,
-            PodSandboxState::SandboxNotReady => worker_capnp::PodSandboxState::SandboxNotReady,
-        }
-    }
-}
-
-impl From<worker_capnp::PodSandboxState> for PodSandboxState {
-    fn from(s: worker_capnp::PodSandboxState) -> Self {
-        match s {
-            worker_capnp::PodSandboxState::SandboxReady => PodSandboxState::SandboxReady,
-            worker_capnp::PodSandboxState::SandboxNotReady => PodSandboxState::SandboxNotReady,
-        }
-    }
-}
 
 /// Runtime representation of a pod sandbox
 ///

@@ -3,14 +3,15 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use crate::cli::git_handlers::apply_policy_template_to_model;
-use crate::services::GenRegistryClient;
+use crate::services::RegistryClient;
+use crate::services::generated::registry_client::{CreateWorktreeRequest, RemoveWorktreeRequest};
 use anyhow::Result;
 use std::io::{self, Write};
 use tracing::info;
 
 /// Handle worktree add command - create worktree from existing branch
 pub async fn handle_worktree_add(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model: &str,
     branch: &str,
     policy_template: Option<String>,
@@ -52,7 +53,7 @@ pub async fn handle_worktree_add(
     }
 
     // Create worktree via service
-    repo_client.create_worktree(branch).await
+    repo_client.create_worktree(&CreateWorktreeRequest { branch: branch.to_owned() }).await
         .map_err(|e| anyhow::anyhow!("Failed to create worktree: {}", e))?;
 
     println!("Created worktree {model}/{branch}:");
@@ -68,7 +69,7 @@ pub async fn handle_worktree_add(
 
 /// Handle worktree list command
 pub async fn handle_worktree_list(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model: &str,
     show_all: bool,
 ) -> Result<()> {
@@ -132,7 +133,7 @@ pub async fn handle_worktree_list(
 
 /// Handle worktree info command
 pub async fn handle_worktree_info(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model: &str,
     branch: &str,
 ) -> Result<()> {
@@ -162,7 +163,7 @@ pub async fn handle_worktree_info(
 
 /// Handle worktree remove command
 pub async fn handle_worktree_remove(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model: &str,
     branch: &str,
     force: bool,
@@ -198,7 +199,7 @@ pub async fn handle_worktree_remove(
     }
 
     // Remove the worktree via service (pass branch name, not path)
-    repo_client.remove_worktree(branch, false).await
+    repo_client.remove_worktree(&RemoveWorktreeRequest { branch: branch.to_owned(), force: false }).await
         .map_err(|e| anyhow::anyhow!("Failed to remove worktree: {}", e))?;
 
     println!("Removed worktree {model}/{branch}");

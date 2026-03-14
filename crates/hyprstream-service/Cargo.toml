@@ -1,0 +1,59 @@
+[package]
+name = "hyprstream-service"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT"
+repository.workspace = true
+description = "Pluggable service orchestration for hyprstream (spawner, factory, manager)"
+
+[lib]
+crate-type = ["rlib"]  # rlib-only: OnceLock singletons must be shared workspace-wide
+
+[dependencies]
+# Workspace crates
+hyprstream-rpc = { path = "../hyprstream-rpc" }
+
+# Async runtime
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Process management
+nix = { workspace = true }
+uuid = { workspace = true }
+which = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+once_cell = { workspace = true }
+
+# ZMQ transport
+zmq = { workspace = true }
+zmq-sys = { workspace = true }
+
+# Ed25519 (for factory::ServiceContext)
+ed25519-dalek = { workspace = true }
+
+# Compile-time service registration
+inventory = { workspace = true }
+
+# Service management
+dirs = "5"
+systemd = { version = "0.10", optional = true }
+zbus_systemd = { version = "0.0.11", features = ["login1", "systemd1"], optional = true }
+
+[features]
+default = []
+systemd = ["dep:systemd", "dep:zbus_systemd"]
+
+[lints]
+workspace = true

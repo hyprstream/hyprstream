@@ -383,6 +383,7 @@ pub fn parse_field_line(line: &str) -> Option<FieldDef> {
         slot_offset: 0,
         section: FieldSection::Data,
         discriminant_value: 0xFFFF,
+        serde_rename: None,
     })
 }
 

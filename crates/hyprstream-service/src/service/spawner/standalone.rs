@@ -10,7 +10,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
 use super::{ProcessConfig, ProcessKind, SpawnedProcess, SpawnerBackend};
-use crate::error::{Result, RpcError};
+use hyprstream_rpc::error::{Result, RpcError};
 
 /// Standalone process spawner backend.
 ///
@@ -82,7 +82,7 @@ impl SpawnerBackend for StandaloneBackend {
             .insert(id.clone(), Arc::new(Mutex::new(child)));
 
         // Write PID file for daemon tracking
-        let pid_file = crate::paths::service_pid_file(&config.name);
+        let pid_file = hyprstream_rpc::paths::service_pid_file(&config.name);
         if let Some(parent) = pid_file.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -250,7 +250,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_spawn_and_stop() -> crate::Result<()> {
+    async fn test_spawn_and_stop() -> hyprstream_rpc::Result<()> {
         let backend = StandaloneBackend::new();
 
         // Spawn a simple process (sleep)

@@ -32,6 +32,7 @@ use crate::transport::TransportConfig;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// ZMQ socket type identifier for endpoint registration.
 ///
@@ -218,7 +219,10 @@ impl EndpointRegistry {
     /// Unregister a specific socket type for a service.
     ///
     /// If all socket types are removed, the service entry is deleted.
-    pub fn unregister(&self, name: &str, socket_kind: SocketKind) {
+    ///
+    /// D8: Only accessible within this crate — callers should use
+    /// `ServiceRegistration` RAII guard for ownership-enforced cleanup.
+    pub(crate) fn unregister(&self, name: &str, socket_kind: SocketKind) {
         let mut services = self.services.write();
         if let Some(entry) = services.get_mut(name) {
             entry.endpoints.remove(&socket_kind);
@@ -229,7 +233,8 @@ impl EndpointRegistry {
     }
 
     /// Unregister all socket types for a service.
-    pub fn unregister_all(&self, name: &str) {
+    #[allow(dead_code)]
+    pub(crate) fn unregister_all(&self, name: &str) {
         self.services.write().remove(name);
     }
 
@@ -284,7 +289,10 @@ impl EndpointRegistry {
     }
 
     /// Unregister a REP endpoint (backward compatible).
-    pub fn unregister_rep(&self, name: &str) {
+    ///
+    /// D8: `pub(crate)` — external callers must use `ServiceRegistration` RAII guard.
+    #[allow(dead_code)]
+    pub(crate) fn unregister_rep(&self, name: &str) {
         self.unregister(name, SocketKind::Rep);
     }
 
@@ -355,6 +363,17 @@ impl EndpointRegistry {
     }
 }
 
+// Implement Resolver for EndpointRegistry (local, sync-internally).
+//
+// EndpointRegistry::endpoint() is infallible — it always returns a default.
+// The async Resolver trait wraps this in Ok(...) for compatibility.
+#[async_trait::async_trait]
+impl crate::resolver::Resolver for EndpointRegistry {
+    async fn resolve(&self, name: &str, kind: SocketKind) -> anyhow::Result<TransportConfig> {
+        Ok(self.endpoint(name, kind))
+    }
+}
+
 // Global registry
 static REGISTRY: RwLock<Option<EndpointRegistry>> = RwLock::new(None);
 
@@ -370,6 +389,23 @@ pub fn init(mode: EndpointMode, runtime_dir: Option<PathBuf>) {
     let mut guard = REGISTRY.write();
     if guard.is_none() {
         *guard = Some(EndpointRegistry::new(mode, runtime_dir));
+        // Also set the global Resolver so async consumers can use the trait
+        crate::resolver::set_global(Arc::new(GlobalRegistryResolver));
+    }
+}
+
+/// Adapter that delegates `Resolver` calls to the global `EndpointRegistry`.
+///
+/// Installed automatically by `init()`. Allows async callers to resolve
+/// endpoints via the `Resolver` trait without holding a lock guard.
+struct GlobalRegistryResolver;
+
+#[async_trait::async_trait]
+impl crate::resolver::Resolver for GlobalRegistryResolver {
+    async fn resolve(&self, name: &str, kind: SocketKind) -> anyhow::Result<TransportConfig> {
+        let registry = try_global()
+            .ok_or_else(|| anyhow::anyhow!("EndpointRegistry not initialized — call init() first"))?;
+        Ok(registry.endpoint(name, kind))
     }
 }
 

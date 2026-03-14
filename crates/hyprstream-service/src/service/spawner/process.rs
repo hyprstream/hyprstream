@@ -8,7 +8,7 @@ use std::sync::Arc;
 use super::{
     ProcessBackend, ProcessConfig, SpawnedProcess, SpawnerBackend, StandaloneBackend, SystemdBackend,
 };
-use crate::error::Result;
+use hyprstream_rpc::error::Result;
 
 /// Unified process spawner.
 ///
@@ -186,7 +186,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_spawn_and_stop() -> crate::Result<()> {
+    async fn test_spawn_and_stop() -> hyprstream_rpc::Result<()> {
         let spawner = ProcessSpawner::new();
 
         let config = ProcessConfig::new("test-sleep", "sleep").args(["100"]);

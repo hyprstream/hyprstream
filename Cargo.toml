@@ -8,6 +8,8 @@ members = [
     "crates/hyprstream-flight",
     "crates/cas-serve",
     "crates/hyprstream-rpc",
+    "crates/hyprstream-service",
+    "crates/hyprstream-discovery",
     "crates/hyprstream-rpc-build",
     "crates/hyprstream-rpc-derive",
     "crates/hyprstream-workers",

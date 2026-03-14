@@ -27,7 +27,7 @@ pub use hyprstream_rpc::service::{CallOptions, Continuation, EnvelopeContext, Zm
 /// Create a generated service client with standard ZMQ boilerplate.
 ///
 /// Uses the global ZMQ context and derives the server verifying key from the signing key.
-pub fn create_service_client<C: hyprstream_rpc::service::factory::ServiceClient>(
+pub fn create_service_client<C: hyprstream_service::ServiceClient>(
     endpoint: &str,
     signing_key: SigningKey,
     identity: RequestIdentity,

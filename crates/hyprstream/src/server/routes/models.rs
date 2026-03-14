@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 /// Resolve a ModelRef to its worktree path (locally derived, not from RPC).
 async fn resolve_model_path(
-    registry: &crate::services::GenRegistryClient,
+    registry: &crate::services::RegistryClient,
     model_ref: &crate::storage::ModelRef,
 ) -> anyhow::Result<String> {
     let tracked = registry.get_by_name(&model_ref.model).await?;
@@ -79,7 +79,12 @@ async fn list_models(
     auth_user: Option<Extension<AuthenticatedUser>>,
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
-    if !state.policy_client.check(&user, "*", "registry:*", Operation::Query.as_str()).await.unwrap_or(false) {
+    if !state.policy_client.check(&crate::services::generated::policy_client::PolicyCheck {
+        subject: user.clone(),
+        domain: "*".to_owned(),
+        resource: "registry:*".to_owned(),
+        operation: Operation::Query.as_str().to_owned(),
+    }).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -139,7 +144,12 @@ async fn get_model_info(
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{id}");
-    if !state.policy_client.check(&user, "*", &resource, Operation::Query.as_str()).await.unwrap_or(false) {
+    if !state.policy_client.check(&crate::services::generated::policy_client::PolicyCheck {
+        subject: user.clone(),
+        domain: "*".to_owned(),
+        resource: resource.clone(),
+        operation: Operation::Query.as_str().to_owned(),
+    }).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -186,7 +196,12 @@ async fn download_model(
     Json(request): Json<DownloadModelRequest>,
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
-    if !state.policy_client.check(&user, "*", "registry:*", Operation::Write.as_str()).await.unwrap_or(false) {
+    if !state.policy_client.check(&crate::services::generated::policy_client::PolicyCheck {
+        subject: user.clone(),
+        domain: "*".to_owned(),
+        resource: "registry:*".to_owned(),
+        operation: Operation::Write.as_str().to_owned(),
+    }).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -255,7 +270,13 @@ async fn download_model(
     }
 
     // Use registry client to clone model (no duplicate service)
-    if let Err(e) = state.registry.clone(&request.uri, &model_name, true, 1, "").await {
+    if let Err(e) = state.registry.clone(&crate::services::generated::registry_client::CloneRequest {
+        url: request.uri.clone(),
+        name: model_name.clone(),
+        shallow: true,
+        depth: 1,
+        branch: String::new(),
+    }).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -297,7 +318,12 @@ async fn load_model(
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{id}");
-    if !state.policy_client.check(&user, "*", &resource, Operation::Manage.as_str()).await.unwrap_or(false) {
+    if !state.policy_client.check(&crate::services::generated::policy_client::PolicyCheck {
+        subject: user.clone(),
+        domain: "*".to_owned(),
+        resource: resource.clone(),
+        operation: Operation::Manage.as_str().to_owned(),
+    }).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -351,7 +377,12 @@ async fn unload_model(
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{id}");
-    if !state.policy_client.check(&user, "*", &resource, Operation::Manage.as_str()).await.unwrap_or(false) {
+    if !state.policy_client.check(&crate::services::generated::policy_client::PolicyCheck {
+        subject: user.clone(),
+        domain: "*".to_owned(),
+        resource: resource.clone(),
+        operation: Operation::Manage.as_str().to_owned(),
+    }).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -373,7 +404,12 @@ async fn refresh_cache(
     auth_user: Option<Extension<AuthenticatedUser>>,
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
-    if !state.policy_client.check(&user, "*", "registry:*", Operation::Manage.as_str()).await.unwrap_or(false) {
+    if !state.policy_client.check(&crate::services::generated::policy_client::PolicyCheck {
+        subject: user.clone(),
+        domain: "*".to_owned(),
+        resource: "registry:*".to_owned(),
+        operation: Operation::Manage.as_str().to_owned(),
+    }).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({

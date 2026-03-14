@@ -4,50 +4,10 @@
 //! Maps directly to Kubernetes CRI Container concept.
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 
-use crate::worker_capnp;
-
-use super::client::KeyValue;
+use super::client::{KeyValue, ContainerState};
 // Use generated ContainerMetadata (matches what's in generated ContainerConfig/ContainerStatus)
 use crate::generated::worker_client::ContainerMetadata;
-
-/// Container state
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ContainerState {
-    /// Container is being created
-    ContainerCreated,
-    /// Container is running
-    ContainerRunning,
-    /// Container has exited
-    ContainerExited,
-    /// Unknown state
-    #[default]
-    ContainerUnknown,
-}
-
-impl From<ContainerState> for worker_capnp::ContainerState {
-    fn from(s: ContainerState) -> Self {
-        match s {
-            ContainerState::ContainerCreated => worker_capnp::ContainerState::ContainerCreated,
-            ContainerState::ContainerRunning => worker_capnp::ContainerState::ContainerRunning,
-            ContainerState::ContainerExited => worker_capnp::ContainerState::ContainerExited,
-            ContainerState::ContainerUnknown => worker_capnp::ContainerState::ContainerUnknown,
-        }
-    }
-}
-
-impl From<worker_capnp::ContainerState> for ContainerState {
-    fn from(s: worker_capnp::ContainerState) -> Self {
-        match s {
-            worker_capnp::ContainerState::ContainerCreated => ContainerState::ContainerCreated,
-            worker_capnp::ContainerState::ContainerRunning => ContainerState::ContainerRunning,
-            worker_capnp::ContainerState::ContainerExited => ContainerState::ContainerExited,
-            worker_capnp::ContainerState::ContainerUnknown => ContainerState::ContainerUnknown,
-        }
-    }
-}
 
 // DTO types (ContainerConfig, ImageSpec, Mount, Device, ContainerStatus, etc.)
 // are now imported from generated types via super::client

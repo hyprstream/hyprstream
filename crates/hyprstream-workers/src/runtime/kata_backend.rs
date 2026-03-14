@@ -455,7 +455,7 @@ mod tests {
                 namespace: "default".to_owned(),
                 attempt: 0,
             },
-            state: super::super::sandbox::PodSandboxState::SandboxNotReady,
+            state: crate::runtime::PodSandboxState::SandboxNotReady,
             created_at: chrono::Utc::now(),
             labels: vec![],
             annotations: vec![],

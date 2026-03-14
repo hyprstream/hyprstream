@@ -39,7 +39,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use axum::{routing::{get, post}, Router};
 use hyprstream_rpc::registry::SocketKind;
-use hyprstream_rpc::service::spawner::Spawnable;
+use hyprstream_service::Spawnable;
 use hyprstream_rpc::transport::TransportConfig;
 use tokio::sync::Notify;
 use tracing::info;

@@ -3,7 +3,9 @@
 //! These types define the message format for communication between
 //! LocalInferenceClient and LocalInferenceService via channels.
 
-use crate::config::{GenerationRequest, GenerationResult, ModelInfo};
+use crate::config::GenerationResult;
+use crate::runtime::GenerationRequest;
+use crate::runtime::ModelInfo;
 use crate::training::TenantDeltaConfig;
 use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot};

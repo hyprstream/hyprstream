@@ -5,7 +5,7 @@
 //! in an idiomatic Rust way.
 
 use crate::config::HyprConfig;
-use crate::services::GenRegistryClient;
+use crate::services::RegistryClient;
 use std::sync::Arc;
 
 /// Application context passed to all command handlers
@@ -17,10 +17,10 @@ use std::sync::Arc;
 /// # Example
 ///
 /// ```rust,ignore
-/// use crate::services::GenRegistryClient;
+/// use crate::services::RegistryClient;
 ///
 /// // Start registry service ONCE at CLI level
-/// let client: GenRegistryClient = crate::services::core::create_service_client(
+/// let client: RegistryClient = crate::services::core::create_service_client(
 ///     &endpoint, signing_key, identity,
 /// );
 /// let context = AppContext::new(config, client);
@@ -34,7 +34,7 @@ pub struct AppContext {
     config: Arc<HyprConfig>,
 
     /// Shared registry client for all git operations
-    registry: GenRegistryClient,
+    registry: RegistryClient,
 }
 
 impl AppContext {
@@ -42,7 +42,7 @@ impl AppContext {
     ///
     /// The registry client should be started once in main() and shared
     /// across all components.
-    pub fn new(config: HyprConfig, registry: GenRegistryClient) -> Self {
+    pub fn new(config: HyprConfig, registry: RegistryClient) -> Self {
         Self {
             config: Arc::new(config),
             registry,
@@ -50,7 +50,7 @@ impl AppContext {
     }
 
     /// Alias for `new()` - maintained for backward compatibility.
-    pub fn with_client(config: HyprConfig, client: GenRegistryClient) -> Self {
+    pub fn with_client(config: HyprConfig, client: RegistryClient) -> Self {
         Self::new(config, client)
     }
 
@@ -60,7 +60,7 @@ impl AppContext {
     }
 
     /// Get the registry client
-    pub fn registry(&self) -> &GenRegistryClient {
+    pub fn registry(&self) -> &RegistryClient {
         &self.registry
     }
 

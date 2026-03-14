@@ -34,7 +34,6 @@ mod client;
 mod manifest;
 mod store;
 
-pub use client::ImageClient;
 pub use crate::generated::worker_client::{
     ImageSpec, ImageInfo, ImageStatusResult,
     AuthConfig, FilesystemUsage, FilesystemIdentifier,

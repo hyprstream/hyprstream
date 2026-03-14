@@ -28,15 +28,16 @@
 //! Default fallback: `inproc://hyprstream/model`
 
 use async_trait::async_trait;
-use crate::api::openai_compat::ChatMessage;
-use crate::config::{GenerationRequest, TemplatedPrompt};
+use crate::runtime::GenerationRequest;
 use crate::runtime::kv_quant::KVQuantType;
 use crate::runtime::RuntimeConfig;
 use crate::services::{
     rpc_types::StreamInfo, EnvelopeContext, InferenceZmqClient,
     NotificationClient, NotificationPublisher, PolicyClient,
 };
-use crate::services::GenRegistryClient;
+use crate::services::RegistryClient;
+use crate::services::generated::registry_client::{StageFilesRequest, CommitWithAuthorRequest};
+use crate::services::generated::policy_client::PolicyCheck;
 use hyprstream_rpc::envelope::RequestIdentity;
 use crate::storage::ModelRef;
 use anyhow::{anyhow, Result};
@@ -58,28 +59,6 @@ pub const MODEL_ENDPOINT: &str = "inproc://hyprstream/model";
 // ModelService (server-side)
 // ============================================================================
 
-/// Per-model runtime configuration for loading
-#[derive(Debug, Clone, Default)]
-pub struct ModelLoadConfig {
-    /// Maximum context length (None = use service default)
-    pub max_context: Option<usize>,
-    /// KV cache quantization type (None = use service default)
-    pub kv_quant: Option<KVQuantType>,
-    /// Number of inference service instances (default: 1).
-    /// Number of inference worker instances per model (default: 1).
-    ///
-    /// When > 1, a ROUTER/DEALER load balancer is spawned and N workers
-    /// connect to the DEALER backend for concurrent request handling.
-    /// Each worker loads its own copy of the model.
-    ///
-    /// **WARNING — experimental, stateless inference only:**
-    /// Multi-instance mode breaks session affinity (KV cache is per-worker),
-    /// pending TTT commit/rollback (per-worker state), and LoRA consistency
-    /// (base_delta is per-worker). Use only for throughput scaling on pure
-    /// stateless inference. TTT with shared DeltaPool works (pool is Arc-shared),
-    /// but commit/rollback and sessions require single-instance mode.
-    pub num_inference_instances: Option<usize>,
-}
 
 /// Information about a loaded model
 pub struct LoadedModel {
@@ -88,7 +67,7 @@ pub struct LoadedModel {
     /// ZMQ endpoint for this model's InferenceService
     pub endpoint: String,
     /// Handle to stop the InferenceService
-    pub service_handle: hyprstream_rpc::service::SpawnedService,
+    pub service_handle: hyprstream_service::SpawnedService,
     /// Client for communicating with the InferenceService
     pub client: InferenceZmqClient,
     /// When the model was loaded
@@ -114,7 +93,7 @@ pub struct ModelServiceConfig {
     /// Maximum number of models to keep loaded
     pub max_models: usize,
     /// Maximum context length for KV cache allocation
-    pub max_context: Option<usize>,
+    pub max_context: Option<u32>,
     /// KV cache quantization type
     pub kv_quant: KVQuantType,
     /// How to spawn InferenceService instances
@@ -151,7 +130,7 @@ pub struct ModelServiceInner {
     /// Notification publisher for model lifecycle events
     notification_publisher: NotificationPublisher,
     /// Registry client for resolving model paths
-    registry: GenRegistryClient,
+    registry: RegistryClient,
     /// Callback router for spawned mode (None for in-process)
     #[allow(dead_code)]
     callback_router: Option<crate::services::callback::CallbackRouter>,
@@ -199,7 +178,7 @@ impl ModelService {
         config: ModelServiceConfig,
         signing_key: SigningKey,
         policy_client: PolicyClient,
-        registry: GenRegistryClient,
+        registry: RegistryClient,
         context: Arc<zmq::Context>,
         transport: TransportConfig,
     ) -> Self {
@@ -276,7 +255,7 @@ impl ModelService {
         config: ModelServiceConfig,
         signing_key: SigningKey,
         policy_client: PolicyClient,
-        registry: GenRegistryClient,
+        registry: RegistryClient,
         callback_router: crate::services::callback::CallbackRouter,
         context: Arc<zmq::Context>,
         transport: TransportConfig,
@@ -309,7 +288,7 @@ impl ModelService {
     }
 
     /// Load a model by reference with optional per-model config, returns the inference endpoint
-    async fn load_model(&self, model_ref_str: &str, config: Option<ModelLoadConfig>) -> Result<String> {
+    async fn load_model(&self, model_ref_str: &str, max_context: Option<u32>, kv_quant: Option<KVQuantType>) -> Result<String> {
         // Check if already loaded
         {
             let mut cache = self.loaded_models.write().await;
@@ -357,10 +336,9 @@ impl ModelService {
         info!("Loading model {} at endpoint {}", model_ref_str, endpoint);
 
         // Create runtime config - use per-model config if provided, otherwise service defaults
-        let load_config = config.unwrap_or_default();
         let runtime_config = RuntimeConfig {
-            max_context: load_config.max_context.or(self.config.max_context),
-            kv_quant_type: load_config.kv_quant.unwrap_or(self.config.kv_quant),
+            max_context: max_context.or(self.config.max_context),
+            kv_quant_type: kv_quant.unwrap_or(self.config.kv_quant),
             ..Default::default()
         };
 
@@ -368,9 +346,8 @@ impl ModelService {
         let fs: Option<crate::services::WorktreeClient> = Some(repo_client.worktree(&branch_name));
 
         // Start InferenceService for this model via standard Spawnable infrastructure
-        let num_instances = load_config.num_inference_instances.unwrap_or(1).max(1);
         let zmq_ctx = Arc::clone(hyprstream_rpc::ZmqService::context(self));
-        let spawner = hyprstream_rpc::service::spawner::ServiceSpawner::threaded();
+        let spawner = hyprstream_service::ServiceSpawner::threaded();
 
         let service_handle = if num_instances > 1 {
             // Multi-instance: spawn ROUTER/DEALER load balancer + N workers.
@@ -534,31 +511,45 @@ impl ModelService {
         }
     }
 
+    /// Convert a TTTConfig to a generated OnlineTrainingConfig wire type.
+    fn ttt_config_to_wire(cfg: &crate::training::ttt::TTTConfig) -> GenOnlineTrainingConfig {
+        GenOnlineTrainingConfig {
+            enabled: cfg.enabled,
+            learning_rate: cfg.learning_rate,
+            gradient_steps: cfg.gradient_steps,
+            max_grad_norm: cfg.max_grad_norm,
+            min_input_length: cfg.min_input_length,
+            max_ttt_context: cfg.max_ttt_context,
+        }
+    }
+
     /// Return status entries for all known models (loaded + loading).
     /// Absence from this list means unloaded.
-    async fn model_status_all(&self) -> Vec<ModelStatusEntry> {
+    async fn model_status_all(&self) -> Vec<GenModelStatusEntry> {
         let cache = self.loaded_models.read().await;
         let pending = self.pending_loads.lock().await;
-        let mut entries: Vec<ModelStatusEntry> = cache
+        let mut entries: Vec<GenModelStatusEntry> = cache
             .iter()
-            .map(|(_, model)| ModelStatusEntry {
+            .map(|(_, model)| GenModelStatusEntry {
                 model_ref: model.model_ref.clone(),
                 status: "loaded".to_owned(),
                 endpoint: model.endpoint.clone(),
                 loaded_at: model.loaded_at.elapsed().as_millis() as i64,
                 last_used: model.last_used.elapsed().as_millis() as i64,
-                online_training_config: model.ttt_config.as_ref().map(OnlineTrainingConfigInfo::from),
+                online_training_config: model.ttt_config.as_ref()
+                    .map(Self::ttt_config_to_wire)
+                    .unwrap_or_default(),
             })
             .collect();
         for model_ref in pending.iter() {
             if !cache.contains(model_ref) {
-                entries.push(ModelStatusEntry {
+                entries.push(GenModelStatusEntry {
                     model_ref: model_ref.clone(),
                     status: "loading".to_owned(),
                     endpoint: String::new(),
                     loaded_at: 0,
                     last_used: 0,
-                    online_training_config: None,
+                    online_training_config: GenOnlineTrainingConfig::default(),
                 });
             }
         }
@@ -566,27 +557,29 @@ impl ModelService {
     }
 
     /// Return status entry for a specific model ref (0 or 1 element).
-    async fn model_status_single(&self, model_ref_str: &str) -> Vec<ModelStatusEntry> {
+    async fn model_status_single(&self, model_ref_str: &str) -> Vec<GenModelStatusEntry> {
         let cache = self.loaded_models.read().await;
         if let Some(model) = cache.peek(model_ref_str) {
-            return vec![ModelStatusEntry {
+            return vec![GenModelStatusEntry {
                 model_ref: model_ref_str.to_owned(),
                 status: "loaded".to_owned(),
                 endpoint: model.endpoint.clone(),
                 loaded_at: model.loaded_at.elapsed().as_millis() as i64,
                 last_used: model.last_used.elapsed().as_millis() as i64,
-                online_training_config: model.ttt_config.as_ref().map(OnlineTrainingConfigInfo::from),
+                online_training_config: model.ttt_config.as_ref()
+                    .map(Self::ttt_config_to_wire)
+                    .unwrap_or_default(),
             }];
         }
         let pending = self.pending_loads.lock().await;
         if pending.contains(model_ref_str) {
-            vec![ModelStatusEntry {
+            vec![GenModelStatusEntry {
                 model_ref: model_ref_str.to_owned(),
                 status: "loading".to_owned(),
                 endpoint: String::new(),
                 loaded_at: 0,
                 last_used: 0,
-                online_training_config: None,
+                online_training_config: GenOnlineTrainingConfig::default(),
             }]
         } else {
             vec![]
@@ -594,24 +587,23 @@ impl ModelService {
     }
 
     /// Get model status
-    async fn model_status(&self, model_ref_str: &str) -> ModelStatusInfo {
+    async fn model_status(&self, model_ref_str: &str) -> ModelStatusResponse {
         let cache = self.loaded_models.read().await;
         if let Some(model) = cache.peek(model_ref_str) {
-            ModelStatusInfo {
+            ModelStatusResponse {
                 loaded: true,
-                endpoint: Some(model.endpoint.clone()),
-                online_training_config: model.ttt_config.as_ref().map(OnlineTrainingConfigInfo::from),
+                endpoint: model.endpoint.clone(),
+                online_training_config: model.ttt_config.as_ref()
+                    .map(Self::ttt_config_to_wire)
+                    .unwrap_or_default(),
+                ..Default::default()
             }
         } else {
-            ModelStatusInfo {
-                loaded: false,
-                endpoint: None,
-                online_training_config: None,
-            }
+            ModelStatusResponse { loaded: false, ..Default::default() }
         }
     }
     async fn get_inference_client(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<InferenceZmqClient> {
-        let _endpoint = self.load_model(model_ref_str, None).await?;
+        let _endpoint = self.load_model(model_ref_str, None, None).await?;
         let mut cache = self.loaded_models.write().await;
         let model = cache
             .get_mut(model_ref_str)
@@ -625,41 +617,6 @@ impl ModelService {
     }
 
     /// Apply chat template via the model's InferenceService
-    async fn apply_chat_template(
-        &self,
-        model_ref_str: &str,
-        ctx: &EnvelopeContext,
-        messages: Vec<ChatMessage>,
-        add_generation_prompt: bool,
-        tools: Option<&serde_json::Value>,
-    ) -> Result<TemplatedPrompt> {
-        let client = self.get_inference_client(model_ref_str, ctx).await?;
-
-        // Convert ChatMessage to the template engine's format
-        let template_messages: Vec<crate::runtime::template_engine::ChatMessage> = messages
-            .iter()
-            .map(|m| crate::runtime::template_engine::ChatMessage {
-                role: m.role.clone(),
-                content: m.content.clone(),
-                tool_calls: m.tool_calls.as_ref().map(|tcs| {
-                    tcs.iter().map(|tc| serde_json::to_value(tc).unwrap_or_default()).collect()
-                }),
-                tool_call_id: m.tool_call_id.clone(),
-            })
-            .collect();
-
-        // Serialize tools to JSON string for transport over Cap'n Proto
-        let tools_json = tools.map(|t| serde_json::to_string(t).unwrap_or_default())
-            .unwrap_or_default();
-
-        // Call InferenceService's apply_chat_template
-        let prompt_str = client.apply_chat_template_with_tools(
-            &template_messages, add_generation_prompt, &tools_json,
-        ).await?;
-
-        Ok(TemplatedPrompt::new(prompt_str))
-    }
-
     /// Create a new LoRA adapter on the loaded model
     async fn create_lora(&self, model_ref_str: &str, ctx: &EnvelopeContext, config: crate::training::TenantDeltaConfig) -> Result<()> {
         let client = self.get_inference_client(model_ref_str, ctx).await?;
@@ -748,7 +705,10 @@ impl ModelService {
         commit_message: &str,
     ) -> Result<crate::services::generated::inference_client::ExportPeftResult> {
         let client = self.get_inference_client(model_ref_str, ctx).await?;
-        client.gen.export_peft_adapter(name, commit_message, false).await
+        client.gen.export_peft_adapter(&crate::services::generated::inference_client::ExportPeftRequest {
+            name: name.to_owned(),
+            commit_message: Some(commit_message.to_owned()),
+        }).await
     }
 
 }
@@ -764,7 +724,7 @@ use crate::services::generated::model_client::{
     StatusRequest,
     ModelStatusEntry as GenModelStatusEntry, OnlineTrainingConfig as GenOnlineTrainingConfig,
     // Top-level request types
-    LoadModelRequest, UnloadModelRequest, KVQuantTypeEnum,
+    LoadModelRequest, UnloadModelRequest, KVQuantType as GenKVQuantType,
     // TTT types
     InitLoraRequest, TrainStepRequest, TrainStepResponse,
     GetDeltaStatusResponse, ModuleNormRatio,
@@ -775,7 +735,7 @@ use crate::services::generated::model_client::{
     // Adapter types
     AdapterInfo, AdapterMergeRequest,
     // Infer types
-    GenerateRequest, ApplyChatTemplateRequest, ModelStatusResponse, OnlineTrainingConfig,
+    GenerateRequest, ApplyChatTemplateRequest, ModelStatusResponse,
     EmbedRequest, EmbedResponse,
 };
 // Conflicting names — use canonical path at usage sites:
@@ -790,10 +750,10 @@ impl TttHandler for ModelService {
     ) -> Result<()> {
         let config = crate::training::TenantDeltaConfig {
             rank: data.rank as usize,
-            alpha: data.alpha,
-            dropout: data.dropout,
+            alpha: data.alpha.unwrap_or(0.0),
+            dropout: data.dropout.unwrap_or(0.0),
             target_modules: data.target_modules.clone(),
-            learning_rate: data.learning_rate as f64,
+            learning_rate: data.learning_rate.unwrap_or(0.0) as f64,
             ..crate::training::TenantDeltaConfig::default()
         };
         self.create_lora(model_ref, ctx, config).await
@@ -804,15 +764,13 @@ impl TttHandler for ModelService {
         model_ref: &str, data: &TrainStepRequest,
     ) -> Result<TrainStepResponse> {
         let client = self.get_inference_client(model_ref, ctx).await?;
-        let adaptation_strategy_str = match data.adaptation_strategy {
-            AdaptationStrategyEnum::AutoWriteback => "auto_writeback",
-            AdaptationStrategyEnum::AutoEvict => "auto_evict",
-            AdaptationStrategyEnum::Speculative => "speculative",
-            AdaptationStrategyEnum::WritebackIfAbove => "writeback_if_above",
-        };
-        let r = client.gen.train_step(
-            &data.input, data.gradient_steps, data.learning_rate, adaptation_strategy_str, data.writeback_threshold,
-        ).await?;
+        let r = client.gen.train_step(&crate::services::generated::inference_client::TrainStepRequest {
+            input: data.input.clone(),
+            gradient_steps: data.gradient_steps,
+            learning_rate: data.learning_rate,
+            adaptation_strategy: data.adaptation_strategy,
+            writeback_threshold: data.writeback_threshold,
+        }).await?;
         Ok(TrainStepResponse {
             avg_loss: r.avg_loss,
             loss_improvement: r.loss_improvement,
@@ -831,15 +789,10 @@ impl TttHandler for ModelService {
         model_ref: &str, data: &TrainStepRequest,
     ) -> Result<(crate::services::generated::model_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
         let info = self.train_step_stream(
-                model_ref, ctx, &data.input, data.gradient_steps, data.learning_rate,
+                model_ref, ctx, &data.input, data.gradient_steps.unwrap_or(0), data.learning_rate.unwrap_or(0.0),
                 data.adaptation_strategy, data.writeback_threshold, ctx.ephemeral_pubkey,
             ).await?;
-        let stream_info = crate::services::generated::model_client::StreamInfo {
-            stream_id: info.stream_id,
-            endpoint: info.endpoint,
-            server_pubkey: info.server_pubkey,
-        };
-        Ok((stream_info, Box::pin(async {})))
+        Ok((info.into(), Box::pin(async {})))
     }
 
     async fn handle_writeback(
@@ -885,9 +838,12 @@ impl TttHandler for ModelService {
         model_ref: &str, data: &SaveAdaptationRequest,
     ) -> Result<SaveAdaptationResponse> {
         let client = self.get_inference_client(model_ref, ctx).await?;
-        let r = client.gen.save_adaptation(
-            &data.name, &data.merge_strategy, data.merge_weight, &data.commit_message, data.git_commit,
-        ).await?;
+        let r = client.gen.save_adaptation(&crate::services::generated::inference_client::SaveAdaptationRequest {
+            name: data.name.clone(),
+            merge_strategy: data.merge_strategy.clone(),
+            merge_weight: data.merge_weight,
+            commit_message: data.commit_message.clone(),
+        }).await?;
         Ok(SaveAdaptationResponse {
             adapter_name: r.adapter_name,
             adapter_path: r.adapter_path,
@@ -912,7 +868,7 @@ impl TttHandler for ModelService {
         &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &TttExportRequest,
     ) -> Result<TttExportResponse> {
-        let r = self.export_peft_adapter_forward(model_ref, ctx, &data.name, &data.commit_message).await?;
+        let r = self.export_peft_adapter_forward(model_ref, ctx, &data.name, data.commit_message.as_deref().unwrap_or("")).await?;
         Ok(TttExportResponse {
             adapter_path: r.adapter_path,
             content_hash: r.content_hash,
@@ -944,10 +900,10 @@ impl TttHandler for ModelService {
         // 2. Build HyprstreamTrainingConfig from request
         let ttt_config = crate::config::TTTTrainingConfig {
             learning_rate: if data.learning_rate > 0.0 { data.learning_rate } else { 3e-4 },
-            gradient_steps: if data.gradient_steps > 0 { data.gradient_steps as usize } else { 3 },
+            gradient_steps: if data.gradient_steps > 0 { data.gradient_steps } else { 3 },
             max_grad_norm: if data.max_grad_norm > 0.0 { data.max_grad_norm } else { 1.0 },
-            min_input_length: if data.min_input_length > 0 { data.min_input_length as usize } else { 32 },
-            max_ttt_context: if data.max_ttt_context > 0 { data.max_ttt_context as usize } else { 512 },
+            min_input_length: if data.min_input_length > 0 { data.min_input_length } else { 32 },
+            max_ttt_context: if data.max_ttt_context > 0 { data.max_ttt_context } else { 512 },
             rank_oracle: None,
             gradient_gating: None,
         };
@@ -970,12 +926,14 @@ impl TttHandler for ModelService {
 
         // 4. Stage and commit via worktree-scoped API
         let wt = repo_client.worktree(&branch_name);
-        wt.stage_files(&["config.json".to_owned()]).await?;
-        wt.commit_with_author(
-            "Update hyprstream_training config via RPC",
-            "hyprstream",
-            "noreply@hyprstream.dev",
-        ).await?;
+        wt.stage_files(&StageFilesRequest {
+            files: vec!["config.json".to_owned()],
+        }).await?;
+        wt.commit_with_author(&CommitWithAuthorRequest {
+            message: "Update hyprstream_training config via RPC".to_owned(),
+            author_name: "hyprstream".to_owned(),
+            author_email: "noreply@hyprstream.dev".to_owned(),
+        }).await?;
 
         info!("TTT config written for {}", model_ref);
 
@@ -988,7 +946,7 @@ impl TttHandler for ModelService {
             if is_loaded {
                 info!("Auto-reloading {} after TTT config change", model_ref);
                 self.unload_model(model_ref).await?;
-                self.load_model(model_ref, None).await?;
+                self.load_model(model_ref, None, None).await?;
             }
         }
 
@@ -1081,8 +1039,9 @@ impl AdapterHandler for ModelService {
         model_ref: &str, data: &AdapterMergeRequest,
     ) -> Result<()> {
         let client = self.get_inference_client(model_ref, ctx).await?;
-        let weight = if data.weight > 0.0 { data.weight } else { 1.0 };
-        let strategy = if data.strategy.is_empty() { "do_merge" } else { &data.strategy };
+        let weight = data.weight.filter(|&w| w > 0.0).unwrap_or(1.0);
+        let strategy_str = data.strategy.clone().unwrap_or_default();
+        let strategy = if strategy_str.is_empty() { "do_merge" } else { &strategy_str };
         client.merge_lora(&data.adapter_name, weight, strategy).await
     }
 }
@@ -1096,49 +1055,20 @@ impl InferHandler for ModelService {
         let request = generate_request_from_data(data);
         let client = self.get_inference_client(model_ref, ctx).await?;
         let info = client.generate_stream(&request, ctx.ephemeral_pubkey).await?;
-        let stream_info = crate::services::generated::model_client::StreamInfo {
-            stream_id: info.stream_id,
-            endpoint: info.endpoint,
-            server_pubkey: info.server_pubkey,
-        };
-        Ok((stream_info, Box::pin(async {})))
+        Ok((info.into(), Box::pin(async {})))
     }
 
     async fn handle_apply_chat_template(
         &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &ApplyChatTemplateRequest,
     ) -> Result<String> {
-        let chat_messages: Vec<ChatMessage> = data.messages.iter().map(|m| {
-            let tool_calls = if m.tool_calls.is_empty() {
-                None
-            } else {
-                Some(m.tool_calls.iter().map(|tc| crate::api::openai_compat::ToolCall {
-                    id: tc.id.clone(),
-                    tool_type: tc.call_type.clone(),
-                    function: crate::api::openai_compat::ToolCallFunction {
-                        name: tc.function_name.clone(),
-                        arguments: tc.arguments.clone(),
-                    },
-                }).collect())
-            };
-            ChatMessage {
-                role: m.role.clone(),
-                content: if m.content.is_empty() { None } else { Some(m.content.clone()) },
-                function_call: None,
-                tool_calls,
-                tool_call_id: if m.tool_call_id.is_empty() { None } else { Some(m.tool_call_id.clone()) },
-            }
-        }).collect();
-        // Parse tools from JSON string
-        let tools: Option<serde_json::Value> = if data.tools_json.is_empty() {
-            None
-        } else {
-            serde_json::from_str(&data.tools_json).ok()
-        };
-        let templated = self.apply_chat_template(
-            model_ref, ctx, chat_messages, data.add_generation_prompt, tools.as_ref(),
-        ).await?;
-        Ok(templated.as_str().to_owned())
+        let client = self.get_inference_client(model_ref, ctx).await?;
+        let prompt_str = client.gen.apply_chat_template(&crate::services::generated::inference_client::ChatTemplateRequest {
+            messages: data.messages.clone(),
+            add_generation_prompt: data.add_generation_prompt,
+            tools_json: data.tools_json.clone(),
+        }).await?;
+        Ok(prompt_str)
     }
 
     async fn handle_embed(
@@ -1157,22 +1087,7 @@ impl InferHandler for ModelService {
     async fn handle_status(
         &self, _ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
     ) -> Result<ModelStatusResponse> {
-        let status = self.model_status(model_ref).await;
-                let config = status.online_training_config.map(|c| OnlineTrainingConfig {
-                    enabled: c.enabled,
-                    learning_rate: c.learning_rate,
-                    gradient_steps: c.gradient_steps as u32,
-                    max_grad_norm: c.max_grad_norm,
-                    min_input_length: c.min_input_length as u32,
-                    max_ttt_context: c.max_ttt_context as u32,
-                }).unwrap_or_default();
-                Ok(ModelStatusResponse {
-                    loaded: status.loaded,
-                    memory_bytes: 0,
-                    session_count: 0,
-                    endpoint: status.endpoint.unwrap_or_default(),
-                    online_training_config: config,
-        })
+        Ok(self.model_status(model_ref).await)
     }
 }
 
@@ -1180,7 +1095,7 @@ impl InferHandler for ModelService {
 impl ModelHandler for ModelService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
         let subject = ctx.subject();
-        let allowed = self.policy_client.check(&subject.to_string(), "*", resource, operation).await.unwrap_or_else(|e| {
+        let allowed = self.policy_client.check(&PolicyCheck { subject: subject.to_string(), domain: "*".to_owned(), resource: resource.to_owned(), operation: operation.to_owned() }).await.unwrap_or_else(|e| {
             warn!("Policy check failed for {} on {}: {} - denying access", subject, resource, e);
             false
         });
@@ -1195,23 +1110,15 @@ impl ModelHandler for ModelService {
         &self, _ctx: &EnvelopeContext, _request_id: u64,
         data: &LoadModelRequest,
     ) -> Result<ModelResponseVariant> {
-        let max_ctx = match data.max_context {
-            0 => None,
-            n => Some(n as usize),
-        };
-        let kv_q = match data.kv_quant {
-            KVQuantTypeEnum::Int8 => Some(KVQuantType::Int8),
-            KVQuantTypeEnum::Nf4 => Some(KVQuantType::Nf4),
-            KVQuantTypeEnum::Fp4 => Some(KVQuantType::Fp4),
-            KVQuantTypeEnum::None => None,
-        };
-        let config = if max_ctx.is_some() || kv_q.is_some() {
-            Some(ModelLoadConfig { max_context: max_ctx, kv_quant: kv_q, num_inference_instances: None })
-        } else {
-            None
-        };
+        let max_ctx = data.max_context.filter(|&n| n != 0);
+        let kv_q = data.kv_quant.and_then(|q| match q {
+            GenKVQuantType::Int8 => Some(KVQuantType::Int8),
+            GenKVQuantType::Nf4 => Some(KVQuantType::Nf4),
+            GenKVQuantType::Fp4 => Some(KVQuantType::Fp4),
+            GenKVQuantType::None => None,
+        });
         let model_ref = &data.model_ref;
-        match self.load_model(model_ref, config).await {
+        match self.load_model(model_ref, max_ctx, kv_q).await {
             Ok(endpoint) => Ok(ModelResponseVariant::LoadResult(LoadedModelResponse {
                 model_ref: model_ref.to_owned(),
                 endpoint,
@@ -1248,24 +1155,7 @@ impl ModelHandler for ModelService {
         } else {
             self.model_status_single(&data.model_ref).await
         };
-        Ok(ModelResponseVariant::StatusResult(entries.into_iter().map(|m| {
-            let ttt = m.online_training_config.map(|c| GenOnlineTrainingConfig {
-                enabled: c.enabled,
-                learning_rate: c.learning_rate,
-                gradient_steps: c.gradient_steps as u32,
-                max_grad_norm: c.max_grad_norm,
-                min_input_length: c.min_input_length as u32,
-                max_ttt_context: c.max_ttt_context as u32,
-            }).unwrap_or_default();
-            GenModelStatusEntry {
-                model_ref: m.model_ref,
-                status: m.status,
-                endpoint: m.endpoint,
-                loaded_at: m.loaded_at,
-                last_used: m.last_used,
-                online_training_config: ttt,
-            }
-        }).collect()))
+        Ok(ModelResponseVariant::StatusResult(entries))
     }
 
     async fn handle_health_check(
@@ -1296,11 +1186,11 @@ struct ParsedLoadRequest {
 }
 
 impl ParsedLoadRequest {
-    fn to_config(&self) -> Option<ModelLoadConfig> {
+    fn to_load_params(&self) -> (Option<u32>, Option<KVQuantType>) {
         use crate::model_capnp::KVQuantType as CKV;
         let max_ctx = match self.max_context {
             0 => None,
-            n => Some(n as usize),
+            n => Some(n),
         };
         let kv_q = match self.kv_quant {
             CKV::Int8 => Some(KVQuantType::Int8),
@@ -1308,11 +1198,7 @@ impl ParsedLoadRequest {
             CKV::Fp4 => Some(KVQuantType::Fp4),
             CKV::None => None,
         };
-        if max_ctx.is_some() || kv_q.is_some() {
-            Some(ModelLoadConfig { max_context: max_ctx, kv_quant: kv_q, num_inference_instances: None })
-        } else {
-            None
-        }
+        (max_ctx, kv_q)
     }
 }
 
@@ -1322,6 +1208,8 @@ impl ModelService {
     fn try_parse_load_request(payload: &[u8]) -> Option<(u64, ParsedLoadRequest)> {
         use crate::model_capnp::model_request;
         use crate::model_capnp::KVQuantType as CKV;
+        use crate::optional_capnp::option_uint32;
+        use crate::model_capnp::option_k_v_quant_type;
         let reader = capnp::serialize::read_message(
             &mut std::io::Cursor::new(payload),
             capnp::message::ReaderOptions::new(),
@@ -1332,8 +1220,14 @@ impl ModelService {
             model_request::Which::Load(data) => {
                 let data = data.ok()?;
                 let model_ref = data.get_model_ref().ok()?.to_str().ok()?.to_owned();
-                let max_context = data.get_max_context();
-                let kv_quant = data.get_kv_quant().unwrap_or(CKV::None);
+                let max_context = match data.get_max_context().ok()?.which().ok()? {
+                    option_uint32::Which::None(()) => 0u32,
+                    option_uint32::Which::Some(v) => v,
+                };
+                let kv_quant = match data.get_kv_quant().ok()?.which().ok()? {
+                    option_k_v_quant_type::Which::None(()) => CKV::None,
+                    option_k_v_quant_type::Which::Some(v) => v.unwrap_or(CKV::None),
+                };
                 Some((request_id, ParsedLoadRequest { model_ref, max_context, kv_quant }))
             }
             _ => None,
@@ -1397,11 +1291,11 @@ impl crate::services::ZmqService for ModelService {
             self.pending_loads.lock().await.insert(model_ref.clone());
 
             let service = self.clone(); // Arc clone — cheap, 'static
-            let config = load_data.to_config();
+            let (load_max_context, load_kv_quant) = load_data.to_load_params();
             let continuation: crate::services::Continuation = Box::pin(async move {
                 let model_name = model_ref.split(':').next().unwrap_or(&model_ref);
                 let scope = format!("serve:model:{}", model_name);
-                match service.load_model(&model_ref, config).await {
+                match service.load_model(&model_ref, load_max_context, load_kv_quant).await {
                     Ok(endpoint) => {
                         service.pending_loads.lock().await.remove(&model_ref);
                         info!("Model {} loaded successfully at {}", model_ref, endpoint);
@@ -1487,66 +1381,38 @@ impl crate::services::ZmqService for ModelService {
 // Helper types
 // ============================================================================
 
-/// Status entry for a single model (loaded or loading).
-/// Absence from a status-all response means unloaded.
-#[derive(Clone)]
-pub struct ModelStatusEntry {
-    pub model_ref: String,
-    pub status: String,  // "loaded" | "loading"
-    pub endpoint: String,
-    pub loaded_at: i64,
-    pub last_used: i64,
-    pub online_training_config: Option<OnlineTrainingConfigInfo>,
-}
-
-/// Online training (TTT) configuration information
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct OnlineTrainingConfigInfo {
-    pub enabled: bool,
-    pub learning_rate: f64,
-    pub gradient_steps: usize,
-    pub max_grad_norm: f64,
-    pub min_input_length: usize,
-    pub max_ttt_context: usize,
-}
-
-impl From<&crate::training::ttt::TTTConfig> for OnlineTrainingConfigInfo {
-    fn from(config: &crate::training::ttt::TTTConfig) -> Self {
-        Self {
-            enabled: config.enabled,
-            learning_rate: config.learning_rate,
-            gradient_steps: config.gradient_steps,
-            max_grad_norm: config.max_grad_norm,
-            min_input_length: config.min_input_length,
-            max_ttt_context: config.max_ttt_context,
-        }
-    }
-}
-
-/// Model status information
-pub struct ModelStatusInfo {
-    pub loaded: bool,
-    pub endpoint: Option<String>,
-    pub online_training_config: Option<OnlineTrainingConfigInfo>,
-}
+// ModelStatusEntry, OnlineTrainingConfigInfo, ModelStatusInfo deleted — use generated types directly:
+// - GenModelStatusEntry = generated::model_client::ModelStatusEntry
+// - GenOnlineTrainingConfig = generated::model_client::OnlineTrainingConfig
+// - ModelStatusResponse = generated::model_client::ModelStatusResponse (infer-scoped)
 
 // ============================================================================
 // ModelZmqClient (client-side)
 // ============================================================================
 
-/// Wraps a generated `ModelClient`. All methods delegate to the autogenerated
-/// typed client which handles transport, serialization, and streaming.
+/// Wraps a generated `ModelClient`. Pure delegation methods are available
+/// via `Deref`; this struct adds domain-specific convenience methods with
+/// type translation and scoped client access.
 #[derive(Clone)]
 pub struct ModelZmqClient {
     /// Generated typed client (handles all transport including streaming via call_with_options)
     pub(crate) gen: crate::services::generated::model_client::ModelClient,
 }
 
+impl std::ops::Deref for ModelZmqClient {
+    type Target = crate::services::generated::model_client::ModelClient;
+    fn deref(&self) -> &Self::Target { &self.gen }
+}
 
 impl ModelZmqClient {
-    /// Create a new model client (endpoint from registry)
+    /// Create a new model client (endpoint from registry).
+    ///
+    /// D9: Uses `try_global()` with inproc fallback if registry not yet initialized.
     pub fn new(signing_key: SigningKey, identity: RequestIdentity) -> Self {
-        let endpoint = registry().endpoint("model", SocketKind::Rep).to_zmq_string();
+        let endpoint = hyprstream_rpc::registry::try_global()
+            .map(|r| r.endpoint("model", SocketKind::Rep))
+            .unwrap_or_else(|| hyprstream_rpc::transport::TransportConfig::inproc("hyprstream/model"))
+            .to_zmq_string();
         tracing::debug!("ModelZmqClient connecting to endpoint: {}", endpoint);
         Self::with_endpoint(&endpoint, signing_key, identity)
     }
@@ -1564,76 +1430,35 @@ impl ModelZmqClient {
     }
 
     /// Load a model — delegates to generated client
-    pub async fn load(&self, model_ref: &str, config: Option<&ModelLoadConfig>) -> Result<String> {
-        let (max_context, kv_quant_str) = match config {
-            Some(cfg) => {
-                let max_ctx = cfg.max_context.unwrap_or(0) as u32;
-                let kv_str = match cfg.kv_quant {
-                    Some(KVQuantType::None) | None => "none",
-                    Some(KVQuantType::Int8) => "int8",
-                    Some(KVQuantType::Nf4) => "nf4",
-                    Some(KVQuantType::Fp4) => "fp4",
-                };
-                (max_ctx, kv_str)
-            }
-            None => (0, "none"),
+    pub async fn load(&self, model_ref: &str, max_context: Option<u32>, kv_quant: Option<KVQuantType>) -> Result<String> {
+        let kv = match kv_quant {
+            Some(KVQuantType::Int8) => Some(GenKVQuantType::Int8),
+            Some(KVQuantType::Nf4) => Some(GenKVQuantType::Nf4),
+            Some(KVQuantType::Fp4) => Some(GenKVQuantType::Fp4),
+            Some(KVQuantType::None) | None => None,
         };
-        let data = self.gen.load(model_ref, max_context, kv_quant_str).await?;
+        let data = self.gen.load(&LoadModelRequest {
+            model_ref: model_ref.to_owned(),
+            max_context,
+            kv_quant: kv,
+        }).await?;
         Ok(data.endpoint)
     }
 
     /// Unload a model
     pub async fn unload(&self, model_ref: &str) -> Result<()> {
-        self.gen.unload(model_ref).await
+        self.gen.unload(&UnloadModelRequest { model_ref: model_ref.to_owned() }).await
     }
 
     /// Get status of all known models (model_ref = "") or a specific model.
     /// Absence from the result means the model is unloaded.
-    pub async fn status(&self, model_ref: &str) -> Result<Vec<ModelStatusEntry>> {
-        let data = self.gen.status(model_ref).await?;
-        Ok(data.into_iter().map(|m| {
-            let ttt = if m.online_training_config.enabled {
-                Some(OnlineTrainingConfigInfo {
-                    enabled: m.online_training_config.enabled,
-                    learning_rate: m.online_training_config.learning_rate,
-                    gradient_steps: m.online_training_config.gradient_steps as usize,
-                    max_grad_norm: m.online_training_config.max_grad_norm,
-                    min_input_length: m.online_training_config.min_input_length as usize,
-                    max_ttt_context: m.online_training_config.max_ttt_context as usize,
-                })
-            } else {
-                None
-            };
-            ModelStatusEntry {
-                model_ref: m.model_ref,
-                status: m.status,
-                endpoint: m.endpoint,
-                loaded_at: m.loaded_at,
-                last_used: m.last_used,
-                online_training_config: ttt,
-            }
-        }).collect())
+    pub async fn status(&self, model_ref: &str) -> Result<Vec<GenModelStatusEntry>> {
+        self.gen.status(&StatusRequest { model_ref: model_ref.to_owned() }).await
     }
 
     /// Get model status (infer-scoped, for per-model detailed status)
-    pub async fn infer_status(&self, model_ref: &str) -> Result<ModelStatusInfo> {
-        let data = self.gen.infer(model_ref).status().await?;
-        Ok(ModelStatusInfo {
-            loaded: data.loaded,
-            endpoint: if data.endpoint.is_empty() { None } else { Some(data.endpoint) },
-            online_training_config: if data.online_training_config.enabled {
-                Some(OnlineTrainingConfigInfo {
-                    enabled: data.online_training_config.enabled,
-                    learning_rate: data.online_training_config.learning_rate,
-                    gradient_steps: data.online_training_config.gradient_steps as usize,
-                    max_grad_norm: data.online_training_config.max_grad_norm,
-                    min_input_length: data.online_training_config.min_input_length as usize,
-                    max_ttt_context: data.online_training_config.max_ttt_context as usize,
-                })
-            } else {
-                None
-            },
-        })
+    pub async fn infer_status(&self, model_ref: &str) -> Result<ModelStatusResponse> {
+        self.gen.infer(model_ref).status().await
     }
 
     /// Start streaming inference with E2E authentication
@@ -1643,71 +1468,24 @@ impl ModelZmqClient {
         request: &GenerationRequest,
         client_ephemeral_pubkey: [u8; 32],
     ) -> Result<StreamInfo> {
-        let images: Vec<Vec<u8>> = Vec::new();
-        let adaptation_strategy_str = if request.auto_commit { "auto_writeback" } else { "speculative" };
-        let info = self.gen.infer(model_ref).generate_stream(
-            request.prompt.as_str(),
-            request.max_tokens as u32,
-            request.temperature,
-            request.top_p,
-            request.top_k.unwrap_or(0) as u32,
-            request.repeat_penalty,
-            request.repeat_last_n as u32,
-            &request.stop_tokens,
-            request.seed.unwrap_or(0),
-            &images,
-            request.timeout.unwrap_or(0),
-            request.ttt_enabled,
-            request.ttt_gradient_steps,
-            request.ttt_learning_rate,
-            adaptation_strategy_str,
-            0.0f32, // writeback_threshold
-            client_ephemeral_pubkey,
-        ).await?;
-        Ok(StreamInfo {
-            stream_id: info.stream_id,
-            endpoint: info.endpoint,
-            server_pubkey: info.server_pubkey,
-        })
-    }
-
-    /// Health check
-    pub async fn health_check(&self) -> Result<ModelHealthInfo> {
-        let data = self.gen.health_check().await?;
-        Ok(ModelHealthInfo {
-            status: data.status,
-            loaded_model_count: data.loaded_model_count,
-            max_models: data.max_models,
-            total_memory_bytes: data.total_memory_bytes,
-        })
-    }
-
-    /// Apply chat template — delegates to generated client (infer-scoped)
-    pub async fn apply_chat_template(
-        &self,
-        model_ref: &str,
-        messages: &[ChatMessage],
-        add_generation_prompt: bool,
-        tools: Option<&serde_json::Value>,
-    ) -> Result<TemplatedPrompt> {
-        let msg_data: Vec<crate::services::generated::model_client::ChatMessage> = messages.iter().map(|m| {
-            use crate::services::generated::model_client::{ChatMessage as CapnpMsg, ToolCallData};
-            CapnpMsg {
-                role: m.role.clone(),
-                content: m.content.as_deref().unwrap_or("").to_owned(),
-                tool_calls: m.tool_calls.as_ref().map(|tcs| tcs.iter().map(|tc| ToolCallData {
-                    id: tc.id.clone(),
-                    call_type: tc.tool_type.clone(),
-                    function_name: tc.function.name.clone(),
-                    arguments: tc.function.arguments.clone(),
-                }).collect()).unwrap_or_default(),
-                tool_call_id: m.tool_call_id.as_deref().unwrap_or("").to_owned(),
-            }
-        }).collect();
-        let tools_json = tools.map(|t| serde_json::to_string(t).unwrap_or_default())
-            .unwrap_or_default();
-        let prompt_str = self.gen.infer(model_ref).apply_chat_template(&msg_data, add_generation_prompt, &tools_json).await?;
-        Ok(TemplatedPrompt::new(prompt_str))
+        self.gen.infer(model_ref).generate_stream(&GenerateRequest {
+            prompt: request.prompt.clone(),
+            max_tokens: request.max_tokens,
+            temperature: request.temperature,
+            top_p: request.top_p,
+            top_k: request.top_k,
+            repeat_penalty: request.repeat_penalty,
+            repeat_last_n: request.repeat_last_n,
+            stop_tokens: request.stop_tokens.clone(),
+            seed: request.seed,
+            images: request.images.clone(),
+            timeout_ms: request.timeout_ms,
+            ttt_enabled: request.ttt_enabled,
+            ttt_gradient_steps: request.ttt_gradient_steps,
+            ttt_learning_rate: request.ttt_learning_rate,
+            adaptation_strategy: request.adaptation_strategy,
+            writeback_threshold: request.writeback_threshold,
+        }, client_ephemeral_pubkey).await.map(Into::into)
     }
 
     /// Initialize LoRA training infrastructure on a loaded model (ttt-scoped)
@@ -1720,7 +1498,13 @@ impl ModelZmqClient {
         target_modules: &[String],
         learning_rate: f32,
     ) -> Result<()> {
-        self.gen.ttt(model_ref).init(rank, alpha, dropout, target_modules, learning_rate).await
+        self.gen.ttt(model_ref).init(&InitLoraRequest {
+            rank,
+            alpha: Some(alpha),
+            dropout: Some(dropout),
+            target_modules: target_modules.to_vec(),
+            learning_rate: Some(learning_rate),
+        }).await
     }
 
     /// Load a LoRA adapter into the base_delta register (adapter-scoped)
@@ -1757,57 +1541,38 @@ impl ModelZmqClient {
         writeback_threshold: f32,
         client_ephemeral_pubkey: [u8; 32],
     ) -> Result<StreamInfo> {
-        let (strategy_str, threshold) = match adaptation_strategy {
-            AdaptationStrategyEnum::AutoWriteback => ("auto_writeback", writeback_threshold),
-            AdaptationStrategyEnum::AutoEvict => ("auto_evict", writeback_threshold),
-            AdaptationStrategyEnum::Speculative => ("speculative", writeback_threshold),
-            AdaptationStrategyEnum::WritebackIfAbove => ("writeback_if_above", writeback_threshold),
-        };
-        let info = self.gen.ttt(model_ref).train_stream(
-            input,
-            gradient_steps,
-            learning_rate,
-            strategy_str,
-            threshold,
-            client_ephemeral_pubkey,
-        ).await?;
-        Ok(StreamInfo {
-            stream_id: info.stream_id,
-            endpoint: info.endpoint,
-            server_pubkey: info.server_pubkey,
-        })
+        self.gen.ttt(model_ref).train_stream(&TrainStepRequest {
+            input: input.to_owned(),
+            gradient_steps: Some(gradient_steps).filter(|&v| v != 0),
+            learning_rate: Some(learning_rate).filter(|&v| v != 0.0),
+            adaptation_strategy,
+            writeback_threshold,
+        }, client_ephemeral_pubkey).await.map(Into::into)
     }
 
 }
 
-/// Health information from the model service
-#[derive(Debug, Clone)]
-pub struct ModelHealthInfo {
-    pub status: String,
-    pub loaded_model_count: u32,
-    pub max_models: u32,
-    pub total_memory_bytes: u64,
-}
+// ModelHealthInfo deleted — use generated ModelHealthStatus directly
 
 // ============================================================================
 // Serialization helpers
 // ============================================================================
 
-/// Convert GenerateRequest (typed, from scope handler) to GenerationRequest
+/// Convert GenerateRequest (model_client type) to GenerationRequest (inference_client type).
+/// Structurally identical — field-by-field copy.
 fn generate_request_from_data(data: &GenerateRequest) -> GenerationRequest {
     GenerationRequest {
-        prompt: TemplatedPrompt::new(data.prompt.clone()),
-        max_tokens: data.max_tokens as usize,
+        prompt: data.prompt.clone(),
+        max_tokens: data.max_tokens,
         temperature: data.temperature,
         top_p: data.top_p,
-        top_k: if data.top_k > 0 { Some(data.top_k as usize) } else { None },
+        top_k: data.top_k,
         repeat_penalty: data.repeat_penalty,
-        repeat_last_n: data.repeat_last_n as usize,
-        seed: if data.seed > 0 { Some(data.seed) } else { None },
+        repeat_last_n: data.repeat_last_n,
         stop_tokens: data.stop_tokens.clone(),
-        timeout: if data.timeout_ms > 0 { Some(data.timeout_ms) } else { None },
-        images: Vec::new(),
-        collect_metrics: false,
+        seed: data.seed,
+        images: data.images.clone(),
+        timeout_ms: data.timeout_ms,
         ttt_enabled: data.ttt_enabled,
         ttt_gradient_steps: data.ttt_gradient_steps,
         ttt_learning_rate: data.ttt_learning_rate,

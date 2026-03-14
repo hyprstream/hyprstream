@@ -36,8 +36,8 @@
 //! spawner.stop(&process).await?;
 //! ```
 
-// Re-export all spawner types from hyprstream-rpc
-pub use hyprstream_rpc::service::spawner::{
+// Re-export all spawner types from hyprstream-service
+pub use hyprstream_service::{
     // Core types
     StandaloneBackend,
     ProcessBackend,

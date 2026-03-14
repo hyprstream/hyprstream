@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 
-use crate::paths;
+use hyprstream_rpc::paths;
 
 /// Generate a systemd socket unit for a service
 ///

@@ -1,6 +1,6 @@
 //! Server state management
 
-use crate::services::{GenRegistryClient, ModelZmqClient, PolicyClient};
+use crate::services::{RegistryClient, ModelZmqClient, PolicyClient};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -21,7 +21,7 @@ pub struct ServerState {
     pub policy_client: PolicyClient,
 
     /// Registry client for model operations
-    pub registry: GenRegistryClient,
+    pub registry: RegistryClient,
 
     /// Server configuration (from unified config system)
     pub config: Arc<ServerConfig>,
@@ -85,7 +85,7 @@ impl ServerState {
         config: ServerConfig,
         model_client: ModelZmqClient,
         policy_client: PolicyClient,
-        registry: GenRegistryClient,
+        registry: RegistryClient,
         signing_key: SigningKey,
         resource_url: String,
         oauth_issuer_url: String,
@@ -100,7 +100,7 @@ impl ServerState {
             tracing::info!("Preloading {} models", config.preload_models.len());
             for model_name in &config.preload_models {
                 tracing::info!("Preloading model: {}", model_name);
-                match model_client.load(model_name, None).await {
+                match model_client.load(model_name, None, None).await {
                     Ok(_) => tracing::info!("Preloaded: {}", model_name),
                     Err(e) => tracing::warn!("Failed to preload model '{}': {}", model_name, e),
                 }

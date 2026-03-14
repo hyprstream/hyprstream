@@ -27,35 +27,30 @@ use crate::events::{
     serialize_sandbox_started, serialize_sandbox_stopped,
 };
 use crate::image::RafsStore;
-// Import generated wire types for handler signatures
+// Import generated wire types (canonical OCI-aligned names)
 use crate::generated::worker_client::{
-    ContainerFilter, ContainerStatsFilter,
+    // Filter + request types for handler signatures
     PodSandboxFilter, PodSandboxStatsFilter,
-    // Request types
+    ContainerFilter, ContainerStatsFilter,
     StatusRequest, PodSandboxStatusRequest, StopContainerRequest,
     ContainerStatusRequest, AttachRequest, ImageFilter, ImageStatusRequest,
 };
 use super::client::{
     StatusResponse, KeyValue,
-    // Generated wire types
     VersionInfo, RuntimeStatus, RuntimeCondition,
     ExecSyncResult,
     PodSandboxStats, PodSandboxAttributes, LinuxPodSandboxStats,
     ContainerStats, ContainerAttributes,
     PodSandboxInfo, ContainerInfo,
-    PodSandboxStateEnum, ContainerStateEnum, Timestamp, ImageSpec,
+    ContainerState, Timestamp, ImageSpec,
+    PodSandboxConfig, PodSandboxStatus,
+    ContainerConfig, ContainerStatus,
     StreamInfo,
 };
 // Domain entities (business logic)
-use super::container::{Container, ContainerState};
+use super::container::Container;
 use super::pool::SandboxPool;
-use super::sandbox::{PodSandbox, PodSandboxState};
-
-// Generated wire types (DTOs with ToCapnp/FromCapnp)
-use super::client::{
-    PodSandboxConfig, PodSandboxStatus,
-    ContainerConfig, ContainerStatus,
-};
+use super::sandbox::PodSandbox;
 use super::{RUNTIME_NAME, RUNTIME_VERSION};
 
 /// Service name for endpoint registry
@@ -330,24 +325,21 @@ impl WorkerService {
         Ok((PodSandboxStatus::from(&sandbox), info))
     }
 
-    /// List pod sandboxes (uses hand-written Filter with Option fields)
+    /// List pod sandboxes matching the given filter.
+    ///
+    /// Empty string fields mean "no filter". State filtering is not supported
+    /// over the wire (Cap'n Proto enum defaults make it ambiguous).
     pub async fn list_pod_sandbox(
         &self,
-        filter: Option<&super::client::PodSandboxFilter>,
+        filter: &PodSandboxFilter,
     ) -> Result<Vec<PodSandboxInfo>> {
         let mut sandboxes = self.sandbox_pool.list_active().await;
 
-        // Apply filters (hand-written Filter has Option<String> for id)
-        if let Some(f) = filter {
-            if let Some(id) = &f.id {
-                sandboxes.retain(|s| &s.id == id);
-            }
-            if let Some(state) = f.state {
-                sandboxes.retain(|s| s.state == state);
-            }
-            for kv in &f.label_selector {
-                sandboxes.retain(|s| s.labels.iter().any(|l| l.key == kv.key && l.value == kv.value));
-            }
+        if !filter.id.is_empty() {
+            sandboxes.retain(|s| s.id == filter.id);
+        }
+        for kv in &filter.label_selector {
+            sandboxes.retain(|s| s.labels.iter().any(|l| l.key == kv.key && l.value == kv.value));
         }
 
         Ok(sandboxes.iter().map(PodSandboxInfo::from).collect())
@@ -616,28 +608,25 @@ impl WorkerService {
         Ok((ContainerStatus::from(container), info))
     }
 
-    /// List containers (uses hand-written Filter with Option fields)
+    /// List containers matching the given filter.
+    ///
+    /// Empty string fields mean "no filter". State filtering is not supported
+    /// over the wire (Cap'n Proto enum defaults make it ambiguous).
     pub async fn list_containers(
         &self,
-        filter: Option<&super::client::ContainerFilter>,
+        filter: &ContainerFilter,
     ) -> Result<Vec<ContainerInfo>> {
         let containers = self.containers.read().await;
         let mut result: Vec<Container> = containers.values().cloned().collect();
 
-        // Apply filters (hand-written Filter has Option fields)
-        if let Some(f) = filter {
-            if let Some(id) = &f.id {
-                result.retain(|c| &c.id == id);
-            }
-            if let Some(sandbox_id) = &f.pod_sandbox_id {
-                result.retain(|c| &c.pod_sandbox_id == sandbox_id);
-            }
-            if let Some(state) = f.state {
-                result.retain(|c| c.state == state);
-            }
-            for kv in &f.label_selector {
-                result.retain(|c| c.labels.iter().any(|l| l.key == kv.key && l.value == kv.value));
-            }
+        if !filter.id.is_empty() {
+            result.retain(|c| c.id == filter.id);
+        }
+        if !filter.pod_sandbox_id.is_empty() {
+            result.retain(|c| c.pod_sandbox_id == filter.pod_sandbox_id);
+        }
+        for kv in &filter.label_selector {
+            result.retain(|c| c.labels.iter().any(|l| l.key == kv.key && l.value == kv.value));
         }
 
         Ok(result.iter().map(ContainerInfo::from).collect())
@@ -709,34 +698,28 @@ impl WorkerService {
         Ok(PodSandboxStats::from(&sandbox))
     }
 
-    /// List pod sandbox stats (uses hand-written Filter with Option fields)
+    /// List pod sandbox stats matching the given filter.
     pub async fn list_pod_sandbox_stats(
         &self,
-        filter: Option<&super::client::PodSandboxStatsFilter>,
+        filter: &PodSandboxStatsFilter,
     ) -> Result<Vec<PodSandboxStats>> {
         let sandboxes = self.sandbox_pool.list_active().await;
         let mut results = Vec::new();
 
         for sandbox in sandboxes {
-            // Apply filter (hand-written Filter has Option<String> for id)
-            if let Some(f) = filter {
-                if let Some(id) = &f.id {
-                    if &sandbox.id != id {
-                        continue;
-                    }
-                }
-                let mut matches_labels = true;
-                for kv in &f.label_selector {
-                    if !sandbox.labels.iter().any(|l| l.key == kv.key && l.value == kv.value) {
-                        matches_labels = false;
-                        break;
-                    }
-                }
-                if !matches_labels {
-                    continue;
+            if !filter.id.is_empty() && sandbox.id != filter.id {
+                continue;
+            }
+            let mut matches_labels = true;
+            for kv in &filter.label_selector {
+                if !sandbox.labels.iter().any(|l| l.key == kv.key && l.value == kv.value) {
+                    matches_labels = false;
+                    break;
                 }
             }
-
+            if !matches_labels {
+                continue;
+            }
             results.push(PodSandboxStats::from(&sandbox));
         }
 
@@ -755,39 +738,31 @@ impl WorkerService {
         Ok(ContainerStats::from(container))
     }
 
-    /// List container stats (uses hand-written Filter with Option fields)
+    /// List container stats matching the given filter.
     pub async fn list_container_stats(
         &self,
-        filter: Option<&super::client::ContainerStatsFilter>,
+        filter: &ContainerStatsFilter,
     ) -> Result<Vec<ContainerStats>> {
         let containers = self.containers.read().await;
         let mut results = Vec::new();
 
         for container in containers.values() {
-            // Apply filter (hand-written Filter has Option fields)
-            if let Some(f) = filter {
-                if let Some(id) = &f.id {
-                    if &container.id != id {
-                        continue;
-                    }
-                }
-                if let Some(sandbox_id) = &f.pod_sandbox_id {
-                    if &container.pod_sandbox_id != sandbox_id {
-                        continue;
-                    }
-                }
-                let mut matches_labels = true;
-                for kv in &f.label_selector {
-                    if !container.labels.iter().any(|l| l.key == kv.key && l.value == kv.value) {
-                        matches_labels = false;
-                        break;
-                    }
-                }
-                if !matches_labels {
-                    continue;
+            if !filter.id.is_empty() && container.id != filter.id {
+                continue;
+            }
+            if !filter.pod_sandbox_id.is_empty() && container.pod_sandbox_id != filter.pod_sandbox_id {
+                continue;
+            }
+            let mut matches_labels = true;
+            for kv in &filter.label_selector {
+                if !container.labels.iter().any(|l| l.key == kv.key && l.value == kv.value) {
+                    matches_labels = false;
+                    break;
                 }
             }
-
+            if !matches_labels {
+                continue;
+            }
             results.push(ContainerStats::from(container));
         }
 
@@ -988,10 +963,7 @@ impl From<&PodSandbox> for PodSandboxStatus {
         Self {
             id: s.id.clone(),
             metadata: s.metadata.clone(),
-            state: match s.state {
-                PodSandboxState::SandboxReady => PodSandboxStateEnum::SandboxReady,
-                PodSandboxState::SandboxNotReady => PodSandboxStateEnum::SandboxNotReady,
-            },
+            state: s.state,
             created_at: Timestamp {
                 seconds: s.created_at.timestamp(),
                 nanos: s.created_at.timestamp_subsec_nanos() as i32,
@@ -1010,10 +982,7 @@ impl From<&PodSandbox> for PodSandboxInfo {
         Self {
             id: s.id.clone(),
             metadata: s.metadata.clone(),
-            state: match s.state {
-                PodSandboxState::SandboxReady => PodSandboxStateEnum::SandboxReady,
-                PodSandboxState::SandboxNotReady => PodSandboxStateEnum::SandboxNotReady,
-            },
+            state: s.state,
             created_at: Timestamp {
                 seconds: s.created_at.timestamp(),
                 nanos: s.created_at.timestamp_subsec_nanos() as i32,
@@ -1044,12 +1013,7 @@ impl From<&Container> for ContainerStatus {
         Self {
             id: c.id.clone(),
             metadata: c.metadata.clone(),
-            state: match c.state {
-                ContainerState::ContainerCreated => ContainerStateEnum::ContainerCreated,
-                ContainerState::ContainerRunning => ContainerStateEnum::ContainerRunning,
-                ContainerState::ContainerExited => ContainerStateEnum::ContainerExited,
-                ContainerState::ContainerUnknown => ContainerStateEnum::ContainerUnknown,
-            },
+            state: c.state,
             created_at: Timestamp {
                 seconds: c.created_at.timestamp(),
                 nanos: c.created_at.timestamp_subsec_nanos() as i32,
@@ -1077,12 +1041,7 @@ impl From<&Container> for ContainerInfo {
             metadata: c.metadata.clone(),
             image: c.image.clone(),
             image_ref: String::new(),
-            state: match c.state {
-                ContainerState::ContainerCreated => ContainerStateEnum::ContainerCreated,
-                ContainerState::ContainerRunning => ContainerStateEnum::ContainerRunning,
-                ContainerState::ContainerExited => ContainerStateEnum::ContainerExited,
-                ContainerState::ContainerUnknown => ContainerStateEnum::ContainerUnknown,
-            },
+            state: c.state,
             created_at: Timestamp {
                 seconds: c.created_at.timestamp(),
                 nanos: c.created_at.timestamp_subsec_nanos() as i32,
@@ -1168,13 +1127,7 @@ impl SandboxHandler for WorkerService {
     }
 
     async fn handle_list(&self, _ctx: &EnvelopeContext, _request_id: u64, data: &PodSandboxFilter) -> AnyhowResult<Vec<PodSandboxInfo>> {
-        // Convert generated Filter to internal Filter with domain enums
-        let filter = super::client::PodSandboxFilter {
-            id: if data.id.is_empty() { None } else { Some(data.id.clone()) },
-            state: None, // state filtering handled internally if needed
-            label_selector: data.label_selector.clone(),
-        };
-        let sandboxes = self.list_pod_sandbox(Some(&filter)).await?;
+        let sandboxes = self.list_pod_sandbox(data).await?;
         Ok(sandboxes)
     }
 
@@ -1184,12 +1137,7 @@ impl SandboxHandler for WorkerService {
     }
 
     async fn handle_list_stats(&self, _ctx: &EnvelopeContext, _request_id: u64, filter: &PodSandboxStatsFilter) -> AnyhowResult<Vec<PodSandboxStats>> {
-        // Convert generated Filter to internal Filter
-        let internal_filter = super::client::PodSandboxStatsFilter {
-            id: if filter.id.is_empty() { None } else { Some(filter.id.clone()) },
-            label_selector: filter.label_selector.clone(),
-        };
-        let stats = self.list_pod_sandbox_stats(Some(&internal_filter)).await?;
+        let stats = self.list_pod_sandbox_stats(filter).await?;
         Ok(stats)
     }
 }
@@ -1222,14 +1170,7 @@ impl ContainerHandler for WorkerService {
     }
 
     async fn handle_list(&self, _ctx: &EnvelopeContext, _request_id: u64, data: &ContainerFilter) -> AnyhowResult<Vec<ContainerInfo>> {
-        // Convert generated Filter to internal Filter with domain enums
-        let filter = super::client::ContainerFilter {
-            id: if data.id.is_empty() { None } else { Some(data.id.clone()) },
-            pod_sandbox_id: if data.pod_sandbox_id.is_empty() { None } else { Some(data.pod_sandbox_id.clone()) },
-            state: None, // state filtering handled internally if needed
-            label_selector: data.label_selector.clone(),
-        };
-        let containers = self.list_containers(Some(&filter)).await?;
+        let containers = self.list_containers(data).await?;
         Ok(containers)
     }
 
@@ -1239,13 +1180,7 @@ impl ContainerHandler for WorkerService {
     }
 
     async fn handle_list_stats(&self, _ctx: &EnvelopeContext, _request_id: u64, data: &ContainerStatsFilter) -> AnyhowResult<Vec<ContainerStats>> {
-        // Convert generated Filter to internal Filter
-        let filter = super::client::ContainerStatsFilter {
-            id: if data.id.is_empty() { None } else { Some(data.id.clone()) },
-            pod_sandbox_id: if data.pod_sandbox_id.is_empty() { None } else { Some(data.pod_sandbox_id.clone()) },
-            label_selector: data.label_selector.clone(),
-        };
-        let stats = self.list_container_stats(Some(&filter)).await?;
+        let stats = self.list_container_stats(data).await?;
         Ok(stats)
     }
 
@@ -1375,7 +1310,7 @@ impl ZmqService for WorkerService {
 mod tests {
     use super::*;
     use crate::config::ImageConfig;
-    use crate::runtime::{PodSandboxConfig, ContainerConfig};
+    use crate::runtime::{PodSandboxConfig, PodSandboxState, ContainerConfig};
     use hyprstream_rpc::crypto::generate_signing_keypair;
     use hyprstream_rpc::transport::TransportConfig;
     use tempfile::TempDir;
@@ -1446,10 +1381,10 @@ mod tests {
 
         // Check status
         let (status, _info) = service.pod_sandbox_status(&sandbox_id, false).await?;
-        assert_eq!(status.state, PodSandboxStateEnum::SandboxReady);
+        assert_eq!(status.state, PodSandboxState::SandboxReady);
 
         // List sandboxes
-        let sandboxes = service.list_pod_sandbox(None).await?;
+        let sandboxes = service.list_pod_sandbox(&PodSandboxFilter::default()).await?;
         assert_eq!(sandboxes.len(), 1);
 
         // Stop and remove
@@ -1457,7 +1392,7 @@ mod tests {
         service.remove_pod_sandbox(&sandbox_id).await?;
 
         // Should be empty
-        let sandboxes = service.list_pod_sandbox(None).await?;
+        let sandboxes = service.list_pod_sandbox(&PodSandboxFilter::default()).await?;
         assert_eq!(sandboxes.len(), 0);
         Ok(())
     }
@@ -1494,17 +1429,17 @@ mod tests {
 
         // Check status
         let (status, _info) = service.container_status(&container_id, false).await?;
-        assert_eq!(status.state, ContainerStateEnum::ContainerCreated);
+        assert_eq!(status.state, ContainerState::ContainerCreated);
 
         // Start container
         service.start_container(&container_id).await?;
         let (status, _info) = service.container_status(&container_id, false).await?;
-        assert_eq!(status.state, ContainerStateEnum::ContainerRunning);
+        assert_eq!(status.state, ContainerState::ContainerRunning);
 
         // Stop container
         service.stop_container(&container_id, 30).await?;
         let (status, _info) = service.container_status(&container_id, false).await?;
-        assert_eq!(status.state, ContainerStateEnum::ContainerExited);
+        assert_eq!(status.state, ContainerState::ContainerExited);
 
         // Remove container
         service.remove_container(&container_id).await?;

@@ -8,7 +8,7 @@ use crate::auth::{Operation, PolicyManager};
 use crate::auth::policy_templates;
 use crate::services::{EnvelopeContext, ZmqService};
 use crate::services::generated::policy_client::{
-    ErrorInfo, PolicyClient, PolicyHandler, PolicyResponseVariant, TokenInfo, ScopeList,
+    ErrorInfo, PolicyHandler, PolicyResponseVariant, TokenInfo, ScopeList,
     PolicyCheck, IssueToken,
     ApplyTemplate, ApplyDraft, RollbackPolicy, GetHistory, GetDiff,
     PolicyInfo, PolicyRule, Grouping,
@@ -19,14 +19,10 @@ use crate::services::generated::policy_client::{
 use anyhow::{anyhow, Result};
 use git2db::{Git2DB, RepoId};
 use hyprstream_rpc::prelude::*;
-use hyprstream_rpc::registry::{global as registry, SocketKind};
 use hyprstream_rpc::transport::TransportConfig;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, trace, warn};
-
-/// Service name for endpoint registry
-const SERVICE_NAME: &str = "policy";
 
 // ============================================================================
 // PolicyService (server-side)
@@ -144,7 +140,7 @@ impl PolicyService {
 /// Scopes use flat format `action:service:*` — coarse-grained per OAuth convention.
 /// Fine-grained authorization is handled by Casbin resource patterns.
 fn compute_supported_scopes() -> Vec<String> {
-    use hyprstream_rpc::service::factory::list_factories;
+    use hyprstream_service::list_factories;
 
     let mut scopes = std::collections::BTreeSet::new();
 
@@ -219,7 +215,7 @@ impl PolicyHandler for PolicyService {
         // Determine subject: explicit subject (if provided and authorized) or envelope identity.
         // JWT sub must contain a bare username (e.g. "randy", "birdetta") — the identity
         // system adds the namespace prefix ("token:randy") when the JWT is decoded.
-        let subject = if !data.subject.is_empty() {
+        let subject = if let Some(ref subj) = data.subject.as_ref().filter(|s| !s.is_empty()) {
             // Explicit subject requires `manage` permission on `policy:issue-token`
             let caller = ctx.subject().to_string();
             let allowed = self.policy_manager.check_with_domain(
@@ -232,24 +228,20 @@ impl PolicyHandler for PolicyService {
                 return Ok(PolicyResponseVariant::Error(ErrorInfo {
                     message: format!(
                         "Subject '{}' is not authorized to issue tokens on behalf of '{}'",
-                        caller, data.subject
+                        caller, subj
                     ),
                     code: "UNAUTHORIZED_SUBJECT".to_owned(),
                     details: "Requires 'manage' permission on 'policy:issue-token'".to_owned(),
                 }));
             }
-            data.subject.clone()
+            (*subj).clone()
         } else {
             // Use bare username from the envelope identity.
             ctx.user().to_owned()
         };
 
         // Validate TTL
-        let requested_ttl = if data.ttl == 0 {
-            self.token_config.default_ttl_seconds
-        } else {
-            data.ttl
-        };
+        let requested_ttl = data.ttl.filter(|&t| t != 0).unwrap_or(self.token_config.default_ttl_seconds);
 
         const MIN_TTL_SECONDS: u32 = 60;
         if requested_ttl < MIN_TTL_SECONDS {
@@ -271,12 +263,8 @@ impl PolicyHandler for PolicyService {
         // Create and sign JWT with audience binding (RFC 8707)
         // Scopes are not embedded in JWT - Casbin enforces authorization server-side
         let now = chrono::Utc::now().timestamp();
-        let audience = if !data.audience.is_empty() {
-            Some(data.audience.clone())
-        } else {
-            // Default to instance-wide audience (OAuth issuer URL) so all tokens get an `aud` claim
-            self.default_audience.clone()
-        };
+        let audience = data.audience.as_ref().filter(|s| !s.is_empty()).cloned()
+            .or_else(|| self.default_audience.clone());
 
         // Populate iss with the OAuth issuer URL so federation peers can fetch JWKS.
         // default_audience is the OAuth issuer URL (set via with_default_audience).
@@ -453,12 +441,10 @@ impl PolicyHandler for PolicyService {
         }
 
         // Generate commit message
-        let commit_msg = if data.message.is_empty() {
+        let commit_msg = data.message.as_ref().filter(|s| !s.is_empty()).cloned().unwrap_or_else(|| {
             let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
             format!("policy: update access control rules ({timestamp})")
-        } else {
-            data.message.clone()
-        };
+        });
 
         // Stage and commit
         match self.stage_and_commit_policies(&commit_msg).await {
@@ -676,7 +662,7 @@ impl PolicyHandler for PolicyService {
             }));
         }
 
-        let git_ref = if data.git_ref.is_empty() { "HEAD".to_owned() } else { data.git_ref.clone() };
+        let git_ref = data.git_ref.as_ref().filter(|s| !s.is_empty()).cloned().unwrap_or_else(|| "HEAD".to_owned());
 
         let reg = self.git2db.read().await;
         let handle = reg.repo(&self.registry_repo_id)?;
@@ -1019,17 +1005,6 @@ impl ZmqService for PolicyService {
     }
 }
 
-// ============================================================================
-// PolicyClient construction (uses create_service_client pattern)
-// ============================================================================
-
-impl PolicyClient {
-    /// Create a new policy client (endpoint from registry)
-    pub fn new(signing_key: SigningKey, identity: RequestIdentity) -> Self {
-        let endpoint = registry().endpoint(SERVICE_NAME, SocketKind::Rep).to_zmq_string();
-        crate::services::core::create_service_client(&endpoint, signing_key, identity)
-    }
-}
 
 // ============================================================================
 // Policy file watcher (hot-reload)

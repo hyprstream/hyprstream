@@ -4,6 +4,8 @@ using import "/streaming.capnp".StreamInfo;
 using import "/annotations.capnp".optional;
 using import "/annotations.capnp".mcpScope;
 using import "/annotations.capnp".paramDescription;
+using import "/annotations.capnp".serdeRename;
+using Opt = import "/optional.capnp";
 
 # Cap'n Proto schema for inference service
 #
@@ -154,23 +156,23 @@ struct InferenceResponse {
 
 struct GenerationRequest {
   prompt @0 :Text;
-  maxTokens @1 :UInt32 $optional;
-  temperature @2 :Float32 $optional;
-  topP @3 :Float32 $optional;
-  topK @4 :UInt32 $optional;
-  repeatPenalty @5 :Float32 $optional;
-  repeatLastN @6 :UInt32 $optional;
+  maxTokens @1 :Opt.OptionUint32;
+  temperature @2 :Opt.OptionFloat32;
+  topP @3 :Opt.OptionFloat32;
+  topK @4 :Opt.OptionUint32;
+  repeatPenalty @5 :Opt.OptionFloat32;
+  repeatLastN @6 :Opt.OptionUint32;
   stopTokens @7 :List(Text) $optional;
-  seed @8 :UInt32 $optional;
+  seed @8 :Opt.OptionUint32;
   images @9 :List(Data) $optional;
-  timeoutMs @10 :UInt64 $optional;
+  timeoutMs @10 :Opt.OptionUint64;
 
   # Per-request TTT control (all optional — omit for server defaults)
   tttEnabled @11 :Bool
     $paramDescription("Override: enable/disable TTT for this request");
-  tttGradientSteps @12 :UInt32 $optional
-    $paramDescription("Override: number of gradient steps (0 = skip)");
-  tttLearningRate @13 :Float32 $optional
+  tttGradientSteps @12 :Opt.OptionUint32
+    $paramDescription("Override: number of gradient steps (None = skip)");
+  tttLearningRate @13 :Opt.OptionFloat32
     $paramDescription("Override: learning rate");
   adaptationStrategy @14 :AdaptationStrategy
     $paramDescription("How to handle the adaptation result. autoWriteback: accept if recommendation positive, evict if negative. autoEvict: always evict (eval mode). speculative: keep pending, client calls ttt.writeback or ttt.evict. writebackIfAbove: accept if loss_improvement exceeds writebackThreshold.");
@@ -243,17 +245,23 @@ struct ChatTemplateRequest {
   toolsJson @2 :Text $optional;  # JSON-serialized tools array (empty string = no tools)
 }
 
-struct ToolCallData {
+# Tool call function details
+struct ToolCallFunction {
+  name @0 :Text;
+  arguments @1 :Text;       # JSON string
+}
+
+# Tool call — nested structure matching openai_compat::ToolCall
+struct ToolCall {
   id @0 :Text;
-  callType @1 :Text;        # "function"
-  functionName @2 :Text;
-  arguments @3 :Text;        # JSON string (opaque, deserialized at consumption point)
+  toolType @1 :Text $serdeRename("type");   # "function"
+  function @2 :ToolCallFunction;
 }
 
 struct ChatMessage {
   role @0 :Text;
   content @1 :Text;
-  toolCalls @2 :List(ToolCallData);
+  toolCalls @2 :List(ToolCall);
   toolCallId @3 :Text;
 }
 
@@ -270,16 +278,20 @@ struct LoraConfig {
 # Model Info
 
 struct ModelInfo {
-  modelId @0 :Text;
+  name @0 :Text;
   architecture @1 :Text;
   vocabSize @2 :UInt32;
   hiddenSize @3 :UInt32;
-  numLayers @4 :UInt32;
-  numHeads @5 :UInt32;
-  maxSequenceLength @6 :UInt32;
-  quantization @7 :Text;
+  numHiddenLayers @4 :Opt.OptionUint32;
+  numAttentionHeads @5 :Opt.OptionUint32;
+  contextLength @6 :UInt32;
+  quantization @7 :Text $optional;
   hasVision @8 :Bool;
   loraLoaded @9 :Bool;
+  parameters @10 :Opt.OptionUint64;
+  intermediateSize @11 :Opt.OptionUint32;
+  numKeyValueHeads @12 :Opt.OptionUint32;
+  headDim @13 :Opt.OptionUint32;
 }
 
 # Health Status
@@ -298,8 +310,8 @@ struct HealthStatus {
 
 struct TrainStepRequest {
   input @0 :Text;
-  gradientSteps @1 :UInt32 $optional;
-  learningRate @2 :Float32 $optional;
+  gradientSteps @1 :Opt.OptionUint32;
+  learningRate @2 :Opt.OptionFloat32;
   adaptationStrategy @3 :AdaptationStrategy
     $paramDescription("How to handle the adaptation result. Same semantics as GenerationRequest.adaptationStrategy.");
   writebackThreshold @4 :Float32 $optional
@@ -321,7 +333,7 @@ struct TrainStepResult {
 struct SaveAdaptationRequest {
   name @0 :Text;
   mergeStrategy @1 :Text $optional;
-  mergeWeight @2 :Float32 $optional;
+  mergeWeight @2 :Opt.OptionFloat32;
   commitMessage @3 :Text $optional;
   gitCommit @4 :Bool $optional
     $paramDescription("If true, stage and commit the written file to the model repository after saving.");

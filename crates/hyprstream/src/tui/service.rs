@@ -186,7 +186,12 @@ impl TuiService {
         if let Some(ref policy_client) = self.policy_client {
             let subject = ctx.subject().to_string();
             let allowed = policy_client
-                .check(&subject, "*", resource, operation)
+                .check(&crate::services::generated::policy_client::PolicyCheck {
+                    subject: subject.clone(),
+                    domain: "*".to_owned(),
+                    resource: resource.to_owned(),
+                    operation: operation.to_owned(),
+                })
                 .await
                 .unwrap_or_else(|e| {
                     warn!("TUI policy check failed for {}: {}", subject, e);
@@ -751,7 +756,7 @@ impl TuiService {
             let registry_endpoint = hyprstream_rpc::registry::global()
                 .endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep)
                 .to_zmq_string();
-            let registry_client: crate::services::GenRegistryClient =
+            let registry_client: crate::services::RegistryClient =
                 crate::services::create_service_client(
                     &registry_endpoint,
                     self.signing_key.clone(),
@@ -808,7 +813,7 @@ impl TuiService {
                     let client = crate::services::ModelZmqClient::new(
                         sk.clone(), RequestIdentity::local(),
                     );
-                    let _ = client.load(&mr, None).await;
+                    let _ = client.load(&mr, None, None).await;
                 });
                 // Poll status in a background thread so we don't block the ShellApp.
                 let sk_poll = sk.clone();

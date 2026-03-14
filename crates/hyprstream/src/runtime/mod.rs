@@ -11,9 +11,19 @@ use std::path::Path;
 
 // Re-export everything from the unified config
 pub use crate::config::{
-    FinishReason, GenerationConfig, GenerationRequest, GenerationResult, HyprConfig,
-    ModelConfig, ModelInfo, RuntimeConfig,
+    FinishReason, GenerationConfig, GenerationResult, HyprConfig,
+    ModelConfig, RuntimeConfig,
 };
+
+/// Generation request — uses the generated Cap'n Proto struct directly.
+///
+/// All sampling parameters are `Option<T>` to represent "not specified",
+/// enabling clean precedence: Server defaults → Model defaults → User overrides.
+/// The engine resolves `None` to defaults at generation time.
+pub use crate::services::generated::inference_client::GenerationRequest;
+
+/// Model information — uses the generated Cap'n Proto struct directly.
+pub use crate::services::generated::inference_client::ModelInfo;
 
 pub mod architectures; // Architecture-specific model implementations (includes Janus placeholder utils)
 pub mod ttn_profile;  // TTN analysis pipeline: adaptive layer profiling + embedded profiles

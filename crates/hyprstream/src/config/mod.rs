@@ -900,7 +900,7 @@ pub struct RuntimeConfig {
     /// Maximum context length override for KV cache allocation.
     /// None = use model's max_position_embeddings (can be very large, e.g., 40K tokens)
     /// Some(n) = cap KV cache at n tokens (significantly reduces GPU memory)
-    pub max_context: Option<usize>,
+    pub max_context: Option<u32>,
     /// KV cache quantization type (None, INT8, NF4, FP4).
     /// Reduces GPU memory by 50-75% at slight quality cost.
     #[serde(default)]
@@ -939,7 +939,7 @@ impl Default for RuntimeConfig {
 
         let max_context = std::env::var("HYPRSTREAM_MAX_CONTEXT")
             .ok()
-            .and_then(|s| s.parse::<usize>().ok());
+            .and_then(|s| s.parse::<u32>().ok());
 
         let kv_quant_type = std::env::var("HYPRSTREAM_KV_QUANT")
             .ok()
@@ -1298,14 +1298,6 @@ impl HyprConfig {
     }
 
     /// Create generation request from config + prompt
-    ///
-    /// Note: The prompt should already be templated (via apply_chat_template).
-    pub fn create_request(&self, prompt: TemplatedPrompt) -> GenerationRequest {
-        let mut request = GenerationRequest::from(&self.generation);
-        request.prompt = prompt;
-        request
-    }
-
     /// Save configuration to default location
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
         let storage = StoragePaths::new()?;
@@ -1341,23 +1333,6 @@ impl HyprConfig {
 
         Ok(config)
     }
-}
-
-/// Model information returned after loading
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelInfo {
-    pub name: String,
-    pub parameters: u64,
-    pub context_length: usize,
-    pub vocab_size: usize,
-    pub hidden_size: usize,
-    pub intermediate_size: Option<usize>,
-    pub num_attention_heads: Option<usize>,
-    pub num_key_value_heads: Option<usize>,
-    pub head_dim: Option<usize>,
-    pub num_hidden_layers: Option<usize>,
-    pub architecture: String,
-    pub quantization: Option<String>,
 }
 
 /// A prompt string that has been processed through the chat template engine.
@@ -1397,44 +1372,6 @@ impl std::fmt::Display for TemplatedPrompt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
-}
-
-/// Generation request with all parameters
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct GenerationRequest {
-    pub prompt: TemplatedPrompt,
-    pub max_tokens: usize,
-    pub temperature: f32,
-    pub top_p: f32,
-    pub top_k: Option<usize>,
-    pub repeat_penalty: f32,
-    #[serde(default)]
-    pub repeat_last_n: usize,
-    pub stop_tokens: Vec<String>,
-    pub seed: Option<u32>,
-    /// Optional image paths for multimodal models
-    #[serde(default)]
-    pub images: Vec<String>,
-    // Async configuration fields
-    #[serde(default)]
-    pub timeout: Option<u64>, // Duration in milliseconds
-    /// Enable quality metrics collection for self-supervised training.
-    /// Default: false (disabled for performance - metrics add ~10x overhead)
-    #[serde(default)]
-    pub collect_metrics: bool,
-    // TTT (test-time training) overrides
-    /// Override: enable/disable TTT for this request
-    #[serde(default)]
-    pub ttt_enabled: bool,
-    /// Override: number of gradient steps (0 = use server default)
-    #[serde(default)]
-    pub ttt_gradient_steps: u32,
-    /// Override: learning rate (0.0 = use server default)
-    #[serde(default)]
-    pub ttt_learning_rate: f32,
-    /// If true, auto-commit adaptation based on quality gate
-    #[serde(default)]
-    pub auto_commit: bool,
 }
 
 /// Unified sampling parameters with Option fields for clean precedence merging.
@@ -1542,6 +1479,26 @@ impl SamplingParams {
         }
     }
 
+    /// Build a `GenerationRequest` from these sampling params and a prompt.
+    ///
+    /// Applies `SamplingParams` fields as `Option<T>` — `None` means "not specified",
+    /// letting the engine use its defaults.
+    pub fn into_generation_request(self, prompt: String) -> crate::services::generated::inference_client::GenerationRequest {
+        crate::services::generated::inference_client::GenerationRequest {
+            prompt,
+            max_tokens: self.max_tokens.map(|v| v as u32),
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k.map(|v| v as u32),
+            repeat_penalty: self.repeat_penalty,
+            repeat_last_n: self.repeat_last_n.map(|v| v as u32),
+            stop_tokens: self.stop_tokens,
+            seed: self.seed.map(|v| v as u32),
+            timeout_ms: self.timeout_ms,
+            ..Default::default()
+        }
+    }
+
     /// Resolve to concrete values with defaults
     pub fn resolve(self) -> ResolvedSamplingParams {
         ResolvedSamplingParams {
@@ -1583,139 +1540,6 @@ pub struct ResolvedSamplingParams {
     pub timeout_ms: u64,
 }
 
-/// Builder for generation requests using the unified SamplingParams precedence system
-pub struct GenerationRequestBuilder {
-    prompt: String,
-    params: SamplingParams,
-    images: Vec<String>,
-    collect_metrics: bool,
-}
-
-impl GenerationRequestBuilder {
-    pub fn new(prompt: impl Into<String>) -> Self {
-        Self {
-            prompt: prompt.into(),
-            params: SamplingParams::default(),
-            images: vec![],
-            collect_metrics: false, // Default: off for performance
-        }
-    }
-
-    /// Apply a config layer (server defaults, model defaults, or user overrides).
-    /// Later calls take precedence over earlier calls.
-    pub fn apply_config(mut self, config: &SamplingParams) -> Self {
-        self.params = self.params.merge(config.clone());
-        self
-    }
-    pub fn temperature(mut self, value: f32) -> Self {
-        self.params.temperature = Some(value);
-        self
-    }
-
-    pub fn max_tokens(mut self, value: usize) -> Self {
-        self.params.max_tokens = Some(value);
-        self
-    }
-
-    pub fn top_p(mut self, value: f32) -> Self {
-        self.params.top_p = Some(value);
-        self
-    }
-
-    pub fn top_k(mut self, value: Option<usize>) -> Self {
-        self.params.top_k = value;
-        self
-    }
-
-    pub fn repeat_penalty(mut self, value: f32) -> Self {
-        self.params.repeat_penalty = Some(value);
-        self
-    }
-
-    pub fn repeat_last_n(mut self, value: usize) -> Self {
-        self.params.repeat_last_n = Some(value);
-        self
-    }
-
-    pub fn stop_tokens(mut self, value: Vec<String>) -> Self {
-        self.params.stop_tokens = Some(value);
-        self
-    }
-
-    pub fn seed(mut self, value: Option<u64>) -> Self {
-        self.params.seed = value;
-        self
-    }
-
-    pub fn image_path(mut self, value: std::path::PathBuf) -> Self {
-        self.images.push(value.to_string_lossy().to_string());
-        self
-    }
-
-    pub fn images(mut self, value: Vec<String>) -> Self {
-        self.images = value;
-        self
-    }
-
-    // Async configuration methods
-    pub fn timeout(mut self, timeout: std::time::Duration) -> Self {
-        self.params.timeout_ms = Some(timeout.as_millis() as u64);
-        self
-    }
-
-    pub fn timeout_ms(mut self, timeout_ms: u64) -> Self {
-        self.params.timeout_ms = Some(timeout_ms);
-        self
-    }
-
-    pub fn build_v2(self) -> GenerationRequestV2 {
-        GenerationRequestV2 {
-            prompt: self.prompt,
-            params: self.params.resolve(),
-        }
-    }
-
-    /// Enable quality metrics collection (expensive - ~10x slowdown)
-    pub fn collect_metrics(mut self, value: bool) -> Self {
-        self.collect_metrics = value;
-        self
-    }
-
-    pub fn build(self) -> GenerationRequest {
-        let resolved = self.params.resolve();
-        GenerationRequest {
-            prompt: TemplatedPrompt::new(self.prompt),
-            max_tokens: resolved.max_tokens,
-            temperature: resolved.temperature,
-            top_p: resolved.top_p,
-            top_k: resolved.top_k,
-            repeat_penalty: resolved.repeat_penalty,
-            repeat_last_n: resolved.repeat_last_n,
-            stop_tokens: resolved.stop_tokens,
-            seed: resolved.seed.map(|s| s as u32),
-            images: self.images,
-            timeout: Some(resolved.timeout_ms),
-            collect_metrics: self.collect_metrics,
-            ttt_enabled: false,
-            ttt_gradient_steps: 0,
-            ttt_learning_rate: 0.0,
-            auto_commit: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct GenerationRequestV2 {
-    pub prompt: String,
-    pub params: ResolvedSamplingParams,
-}
-
-impl GenerationRequest {
-    pub fn builder(prompt: impl Into<String>) -> GenerationRequestBuilder {
-        GenerationRequestBuilder::new(prompt)
-    }
-}
-
 impl From<&crate::config::server::SamplingParamDefaults> for SamplingParams {
     fn from(defaults: &crate::config::server::SamplingParamDefaults) -> Self {
         Self {
@@ -1737,28 +1561,6 @@ impl From<&crate::config::server::SamplingParamDefaults> for SamplingParams {
     }
 }
 
-impl From<&GenerationConfig> for GenerationRequest {
-    fn from(config: &GenerationConfig) -> Self {
-        Self {
-            prompt: TemplatedPrompt::new(String::new()),
-            max_tokens: config.max_tokens,
-            temperature: config.temperature,
-            top_p: config.top_p,
-            top_k: config.top_k,
-            repeat_penalty: config.repeat_penalty,
-            repeat_last_n: 64, // Default repeat_last_n
-            stop_tokens: config.stop_tokens.clone(),
-            images: vec![],  // No images in conversion
-            seed: config.seed,
-            timeout: None, // Not in GenerationConfig
-            collect_metrics: false, // Default: off for performance
-            ttt_enabled: false,
-            ttt_gradient_steps: 0,
-            ttt_learning_rate: 0.0,
-            auto_commit: false,
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1777,17 +1579,20 @@ mod tests {
     }
 
     #[test]
-    fn test_generation_request_builder() {
-        let request = GenerationRequest::builder("test prompt")
-            .temperature(0.8)
-            .top_k(Some(30))
-            .max_tokens(1000)
-            .build();
+    fn test_sampling_params_into_generation_request() {
+        let params = SamplingParams {
+            temperature: Some(0.8),
+            top_k: Some(30),
+            max_tokens: Some(1000),
+            ..Default::default()
+        };
 
-        assert_eq!(request.prompt, TemplatedPrompt::new("test prompt".to_owned()));
-        assert_eq!(request.temperature, 0.8);
+        let request = params.into_generation_request("test prompt".to_owned());
+
+        assert_eq!(request.prompt, "test prompt");
+        assert_eq!(request.temperature, Some(0.8));
         assert_eq!(request.top_k, Some(30));
-        assert_eq!(request.max_tokens, 1000);
+        assert_eq!(request.max_tokens, Some(1000));
     }
 
     #[test]
@@ -1841,18 +1646,20 @@ mod tests {
             ..Default::default()
         };
 
-        let request = GenerationRequest::builder("test prompt")
-            .apply_config(&server_params)
-            .apply_config(&model_params)
-            .temperature(0.8)
-            .max_tokens(512)
-            .build();
+        let user_overrides = SamplingParams {
+            temperature: Some(0.8),
+            max_tokens: Some(512),
+            ..Default::default()
+        };
 
-        assert_eq!(request.prompt, TemplatedPrompt::new("test prompt".to_owned()));
-        assert_eq!(request.temperature, 0.8);
-        assert_eq!(request.max_tokens, 512);
-        assert_eq!(request.top_p, 0.95);
-        assert_eq!(request.repeat_penalty, 1.2);
+        let params = server_params.merge(model_params).merge(user_overrides);
+        let request = params.into_generation_request("test prompt".to_owned());
+
+        assert_eq!(request.prompt, "test prompt");
+        assert_eq!(request.temperature, Some(0.8));
+        assert_eq!(request.max_tokens, Some(512));
+        assert_eq!(request.top_p, Some(0.95));
+        assert_eq!(request.repeat_penalty, Some(1.2));
     }
 
     #[test]
@@ -2042,7 +1849,7 @@ pub struct TTTTrainingConfig {
 
     /// Number of gradient steps per input
     #[serde(default = "default_ttt_gradient_steps")]
-    pub gradient_steps: usize,
+    pub gradient_steps: u32,
 
     /// Maximum gradient norm for clipping
     #[serde(default = "default_ttt_max_grad_norm")]
@@ -2050,11 +1857,11 @@ pub struct TTTTrainingConfig {
 
     /// Minimum input length (tokens) to trigger TTT
     #[serde(default = "default_ttt_min_input_length")]
-    pub min_input_length: usize,
+    pub min_input_length: u32,
 
     /// Maximum input length to process for TTT
     #[serde(default = "default_ttt_max_context")]
-    pub max_ttt_context: usize,
+    pub max_ttt_context: u32,
 
     /// Rank oracle configuration (optional — omit to disable runtime rank adaptation)
     #[serde(default)]
@@ -2068,16 +1875,16 @@ pub struct TTTTrainingConfig {
 fn default_ttt_learning_rate() -> f64 {
     3e-4
 }
-fn default_ttt_gradient_steps() -> usize {
+fn default_ttt_gradient_steps() -> u32 {
     3
 }
 fn default_ttt_max_grad_norm() -> f64 {
     1.0
 }
-fn default_ttt_min_input_length() -> usize {
+fn default_ttt_min_input_length() -> u32 {
     32
 }
-fn default_ttt_max_context() -> usize {
+fn default_ttt_max_context() -> u32 {
     512
 }
 

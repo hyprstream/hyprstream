@@ -20,6 +20,9 @@ pub fn generate_service(service_name: &str, schema: &ParsedSchema, types_crate: 
     let response_enum = client::generate_response_enum(service_name, &resolved, types_crate);
     let client_struct = client::generate_client(service_name, &resolved, types_crate);
     let scoped_clients = scoped::generate_scoped_clients(service_name, &resolved, types_crate);
+    let service_traits = client::generate_service_traits(service_name, &resolved, types_crate);
+    let trait_impls = client::generate_trait_impls(service_name, &resolved, types_crate);
+    let constructors = client::generate_constructors(service_name);
 
     // Skip handler generation when types_crate is set (client-only mode)
     let handler = if types_crate.is_none() {
@@ -33,13 +36,16 @@ pub fn generate_service(service_name: &str, schema: &ParsedSchema, types_crate: 
     quote::quote! {
         use std::sync::Arc;
         use hyprstream_rpc::service::ZmqClient as ZmqClientBase;
-        use hyprstream_rpc::service::factory::ServiceClient;
+        use hyprstream_rpc::service::ServiceClient;
         use hyprstream_rpc::service::CallOptions;
 
         #data_structs
         #response_enum
         #client_struct
         #scoped_clients
+        #service_traits
+        #trait_impls
+        #constructors
         #handler
         #metadata_code
     }

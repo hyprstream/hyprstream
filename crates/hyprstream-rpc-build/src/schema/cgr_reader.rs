@@ -103,6 +103,7 @@ fn parse_cgr(
     let domain_type_id = find_annotation_id(&nodes, &node_map, "domainType");
     let fixed_size_id = find_annotation_id(&nodes, &node_map, "fixedSize");
     let optional_id = find_annotation_id(&nodes, &node_map, "optional");
+    let serde_rename_id = find_annotation_id(&nodes, &node_map, "serdeRename");
 
     let pascal = to_pascal_case(service_name);
     let request_name = format!("{pascal}Request");
@@ -153,6 +154,7 @@ fn parse_cgr(
         domain_type_id,
         fixed_size_id,
         optional_id,
+        serde_rename_id,
     )?;
 
     // Extract all enums (pass all_structs for imported type resolution)
@@ -517,6 +519,7 @@ fn extract_struct_from_node(
     domain_type_id: Option<u64>,
     fixed_size_id: Option<u64>,
     optional_id: Option<u64>,
+    serde_rename_id: Option<u64>,
     origin_file: Option<String>,
 ) -> Result<Option<StructDef>, String> {
     let struct_reader = match node.which() {
@@ -596,6 +599,14 @@ fn extract_struct_from_node(
             optional_id,
         );
 
+        let serde_rename = {
+            let sr = extract_annotation_text(
+                field.get_annotations().map_err(|e| format!("{e}"))?,
+                serde_rename_id,
+            );
+            if sr.is_empty() { None } else { Some(sr) }
+        };
+
         // For non-union fields, skip adding to fields if it's a union member
         // (union members are handled by the variant extraction path)
         // We include ALL fields now (including union members) for wire format completeness
@@ -608,6 +619,7 @@ fn extract_struct_from_node(
             slot_offset,
             section,
             discriminant_value: disc,
+            serde_rename,
         });
     }
 
@@ -643,6 +655,7 @@ fn extract_all_structs(
     domain_type_id: Option<u64>,
     fixed_size_id: Option<u64>,
     optional_id: Option<u64>,
+    serde_rename_id: Option<u64>,
 ) -> Result<Vec<StructDef>, String> {
     let file_prefix = format!("{service_name}.capnp:");
     let mut structs = Vec::new();
@@ -656,62 +669,80 @@ fn extract_all_structs(
         let node = nodes.get(info.index);
         if let Some(s) = extract_struct_from_node(
             node, info, node_map, mcp_desc_id, param_desc_id, domain_type_id, fixed_size_id,
-            optional_id, None,
+            optional_id, serde_rename_id, None,
         )? {
             structs.push(s);
         }
     }
 
-    // Pass 2: find imported structs referenced by local types but not yet extracted.
-    let local_names: std::collections::HashSet<String> =
+    // Pass 2 (iterative): find imported structs transitively referenced by any
+    // already-known struct (local or previously discovered imported).  We loop
+    // until no new types are added — typically 2–3 rounds for nested imports
+    // (e.g. ChatMessage → ToolCall → ToolCallFunction).
+    let mut known_names: std::collections::HashSet<String> =
         structs.iter().map(|s| s.name.clone()).collect();
-    let mut referenced_names: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    for s in &structs {
-        for f in &s.fields {
-            collect_type_refs(&f.type_name, &mut referenced_names);
-        }
-    }
 
-    // Also collect from union variant types of all local struct CGR nodes.
-    for info in node_map.values() {
-        if !info.display_name.starts_with(&file_prefix) {
-            continue;
+    loop {
+        let mut referenced_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        // Collect refs from fields of all known structs (local + imported).
+        for s in &structs {
+            for f in &s.fields {
+                collect_type_refs(&f.type_name, &mut referenced_names);
+            }
         }
-        let node = nodes.get(info.index);
-        if let Ok(capnp::schema_capnp::node::Struct(s)) = node.which() {
-            if let Ok(fields) = s.get_fields() {
-                for i in 0..fields.len() {
-                    let field = fields.get(i);
-                    if field.get_discriminant_value() != 0xFFFF {
-                        if let Ok(capnp::schema_capnp::field::Slot(slot)) = field.which() {
-                            if let Ok(type_reader) = slot.get_type() {
-                                let type_name = resolve_type_name(type_reader, node_map);
-                                collect_type_refs(&type_name, &mut referenced_names);
+
+        // Also collect from union variant fields of local CGR nodes.
+        for info in node_map.values() {
+            if !info.display_name.starts_with(&file_prefix) {
+                continue;
+            }
+            let node = nodes.get(info.index);
+            if let Ok(capnp::schema_capnp::node::Struct(s)) = node.which() {
+                if let Ok(fields) = s.get_fields() {
+                    for i in 0..fields.len() {
+                        let field = fields.get(i);
+                        if field.get_discriminant_value() != 0xFFFF {
+                            if let Ok(capnp::schema_capnp::field::Slot(slot)) = field.which() {
+                                if let Ok(type_reader) = slot.get_type() {
+                                    let type_name = resolve_type_name(type_reader, node_map);
+                                    collect_type_refs(&type_name, &mut referenced_names);
+                                }
                             }
                         }
                     }
                 }
             }
         }
-    }
 
-    // For each referenced type not in the local set, look it up in node_map
-    for ref_name in &referenced_names {
-        if local_names.contains(ref_name) || is_primitive_type(ref_name) {
-            continue;
-        }
-        if let Some(info) = node_map.values().find(|n| n.short_name == *ref_name) {
-            if !info.display_name.starts_with(&file_prefix) {
-                let origin = extract_file_stem(&info.display_name);
-                let node = nodes.get(info.index);
-                if let Some(s) = extract_struct_from_node(
-                    node, info, node_map, mcp_desc_id, param_desc_id, domain_type_id,
-                    fixed_size_id, optional_id, Some(origin),
-                )? {
-                    structs.push(s);
+        // Add any referenced types not yet in the known set.
+        let mut added = false;
+        for ref_name in &referenced_names {
+            if known_names.contains(ref_name) || is_primitive_type(ref_name) {
+                continue;
+            }
+            if let Some(info) = node_map.values().find(|n| n.short_name == *ref_name) {
+                if !info.display_name.starts_with(&file_prefix) {
+                    let origin = extract_file_stem(&info.display_name);
+                    let node = nodes.get(info.index);
+                    if let Some(s) = extract_struct_from_node(
+                        node, info, node_map, mcp_desc_id, param_desc_id, domain_type_id,
+                        fixed_size_id, optional_id, serde_rename_id, Some(origin),
+                    )? {
+                        known_names.insert(ref_name.clone());
+                        structs.push(s);
+                        added = true;
+                    }
+                } else {
+                    // Type is local — just mark it known so we don't revisit.
+                    known_names.insert(ref_name.clone());
                 }
             }
+        }
+
+        if !added {
+            break;
         }
     }
 

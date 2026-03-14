@@ -12,18 +12,55 @@ use hyprstream_rpc_build::util::{to_camel_case, to_pascal_case};
 
 use super::{capnp_to_ts_type, is_primitive};
 
+/// Check if any method in the schema returns StreamInfo (indicating streaming support needed).
+pub fn has_streaming_methods(schema: &ParsedSchema) -> bool {
+    schema
+        .response_variants
+        .iter()
+        .any(|v| v.type_name == "StreamInfo")
+        || schema
+            .scoped_clients
+            .iter()
+            .any(has_streaming_in_scoped)
+}
+
+fn has_streaming_in_scoped(sc: &ScopedClient) -> bool {
+    sc.inner_response_variants
+        .iter()
+        .any(|v| v.type_name == "StreamInfo")
+        || sc
+            .nested_clients
+            .iter()
+            .any(has_streaming_in_scoped)
+}
+
 /// Generate the transport interface, main client class, and scoped client classes.
 pub fn generate_client(out: &mut String, service_name: &str, schema: &ParsedSchema) {
     let pascal = to_pascal_case(service_name);
+
+    let has_streaming = has_streaming_methods(schema);
 
     // Transport interface
     out.push_str(&format!(
         "/** Transport interface for {pascal} RPC calls. */\n\
          export interface {pascal}Transport {{\n\
-         \x20 call(bytes: Uint8Array): Promise<Uint8Array>;\n\
-         \x20 nextId(): bigint;\n\
-         }}\n\n"
+         \x20 call(bytes: Uint8Array): Promise<Uint8Array>;\n"
     ));
+    if has_streaming {
+        out.push_str(
+            "  callStreaming(bytes: Uint8Array): Promise<{\n\
+             \x20   response: Uint8Array;\n\
+             \x20   blocks: ReadableStream<Uint8Array>;\n\
+             \x20   requestId: bigint;\n\
+             \x20   ephemeralPrivkey: Uint8Array;\n\
+             \x20   ephemeralPubkey: Uint8Array;\n\
+             \x20 }>;\n"
+        );
+    }
+    out.push_str(
+        "\x20 nextId(): bigint;\n\
+         }\n\n"
+    );
 
     // Main client class
     out.push_str(&format!(
@@ -58,9 +95,13 @@ pub fn generate_client(out: &mut String, service_name: &str, schema: &ParsedSche
             .response_variants
             .iter()
             .find(|v| v.name == resp_variant_name);
-        let return_type = resp_variant
-            .map(|v| capnp_to_ts_type(&v.type_name))
-            .unwrap_or_else(|| "unknown".into());
+        let resp_type_name = resp_variant.map(|v| v.type_name.as_str()).unwrap_or("unknown");
+        let is_streaming = resp_type_name == "StreamInfo";
+        let return_type = if is_streaming {
+            "StreamSubscription".into()
+        } else {
+            capnp_to_ts_type(resp_type_name)
+        };
 
         // Method signature
         let mut params = Vec::new();
@@ -89,22 +130,27 @@ pub fn generate_client(out: &mut String, service_name: &str, schema: &ParsedSche
             ));
         }
 
-        // Call transport and parse response
-        out.push_str("    const resp = await this.transport.call(bytes);\n");
-        out.push_str(&format!(
-            "    const parsed = parse{pascal}Response(resp);\n"
-        ));
+        if is_streaming {
+            // Streaming method: use callStreaming and return StreamSubscription
+            generate_streaming_body(out, &pascal, 0);
+        } else {
+            // Call transport and parse response
+            out.push_str("    const resp = await this.transport.call(bytes);\n");
+            out.push_str(&format!(
+                "    const parsed = parse{pascal}Response(resp);\n"
+            ));
 
-        // Error handling
-        out.push_str(
-            "    if (parsed.variant === 'error') {\n\
-             \x20     throw new Error((parsed.data as { message?: string })?.message ?? 'RPC error');\n\
-             \x20   }\n",
-        );
-        out.push_str(&format!(
-            "    return parsed.data as {};\n",
-            return_type
-        ));
+            // Error handling
+            out.push_str(
+                "    if (parsed.variant === 'error') {\n\
+                 \x20     throw new Error((parsed.data as { message?: string })?.message ?? 'RPC error');\n\
+                 \x20   }\n",
+            );
+            out.push_str(&format!(
+                "    return parsed.data as {};\n",
+                return_type
+            ));
+        }
         out.push_str("  }\n\n");
     }
 
@@ -229,9 +275,13 @@ fn generate_scoped_client(
             .inner_response_variants
             .iter()
             .find(|v| v.name == variant.name);
-        let return_type = resp_variant
-            .map(|v| capnp_to_ts_type(&v.type_name))
-            .unwrap_or_else(|| "unknown".into());
+        let resp_type_name = resp_variant.map(|v| v.type_name.as_str()).unwrap_or("unknown");
+        let is_streaming = resp_type_name == "StreamInfo";
+        let return_type = if is_streaming {
+            "StreamSubscription".into()
+        } else {
+            capnp_to_ts_type(resp_type_name)
+        };
 
         let mut params = Vec::new();
         if let Some(ps) = payload_struct {
@@ -265,43 +315,48 @@ fn generate_scoped_client(
             builder_args.join(", ")
         ));
 
-        // Call transport and parse outer response
-        out.push_str("    const resp = await this.transport.call(bytes);\n");
-        out.push_str(&format!(
-            "    const parsed = parse{pascal}Response(resp);\n"
-        ));
-
-        // Error handling at outer level
-        out.push_str(
-            "    if (parsed.variant === 'error') {\n\
-             \x20     throw new Error((parsed.data as { message?: string })?.message ?? 'RPC error');\n\
-             \x20   }\n",
-        );
-
-        // Unwrap through the scoped response chain.
-        // The parser returns nested { variant, data: { variant, data: ... } } for scoped responses.
-        // Each chain level adds one layer of wrapping.
-        let mut current_var = "parsed.data".to_owned();
-        for depth in 0..chain_depth {
-            let inner_var = format!("_r{depth}");
+        if is_streaming {
+            // Streaming method: use callStreaming and unwrap through scope chain to get StreamInfo
+            generate_streaming_body(out, &pascal, chain_depth);
+        } else {
+            // Call transport and parse outer response
+            out.push_str("    const resp = await this.transport.call(bytes);\n");
             out.push_str(&format!(
-                "    const {inner_var} = {current_var} as {{ variant: string; data: unknown }};\n"
+                "    const parsed = parse{pascal}Response(resp);\n"
             ));
 
-            if depth < chain_depth - 1 {
-                // Intermediate level: just unwrap to next level
-                current_var = format!("{inner_var}.data");
-            } else {
-                // Final scope level: check for error and return the method result
+            // Error handling at outer level
+            out.push_str(
+                "    if (parsed.variant === 'error') {\n\
+                 \x20     throw new Error((parsed.data as { message?: string })?.message ?? 'RPC error');\n\
+                 \x20   }\n",
+            );
+
+            // Unwrap through the scoped response chain.
+            // The parser returns nested { variant, data: { variant, data: ... } } for scoped responses.
+            // Each chain level adds one layer of wrapping.
+            let mut current_var = "parsed.data".to_owned();
+            for depth in 0..chain_depth {
+                let inner_var = format!("_r{depth}");
                 out.push_str(&format!(
-                    "    if ({inner_var}.variant === 'error') {{\n\
-                     \x20     throw new Error(({inner_var}.data as {{ message?: string }})?.message ?? 'RPC error');\n\
-                     \x20   }}\n"
+                    "    const {inner_var} = {current_var} as {{ variant: string; data: unknown }};\n"
                 ));
-                out.push_str(&format!(
-                    "    return {inner_var}.data as {};\n",
-                    return_type
-                ));
+
+                if depth < chain_depth - 1 {
+                    // Intermediate level: just unwrap to next level
+                    current_var = format!("{inner_var}.data");
+                } else {
+                    // Final scope level: check for error and return the method result
+                    out.push_str(&format!(
+                        "    if ({inner_var}.variant === 'error') {{\n\
+                         \x20     throw new Error(({inner_var}.data as {{ message?: string }})?.message ?? 'RPC error');\n\
+                         \x20   }}\n"
+                    ));
+                    out.push_str(&format!(
+                        "    return {inner_var}.data as {};\n",
+                        return_type
+                    ));
+                }
             }
         }
 
@@ -355,5 +410,58 @@ fn generate_scoped_client(
     new_ancestors.push(sc);
     for nc in &sc.nested_clients {
         generate_scoped_client(out, service_name, nc, &new_ancestors, schema);
+    }
+}
+
+/// Generate the body of a streaming method.
+///
+/// `chain_depth` is 0 for top-level methods (no scoped unwrapping needed),
+/// or N for scoped methods where N ancestor+scope layers must be unwrapped.
+fn generate_streaming_body(out: &mut String, pascal: &str, chain_depth: usize) {
+    // Use callStreaming to get response + block stream + ephemeral keys
+    out.push_str(
+        "    const { response, blocks, requestId, ephemeralPrivkey, ephemeralPubkey } = \
+         await this.transport.callStreaming(bytes);\n",
+    );
+    out.push_str(&format!(
+        "    const parsed = parse{pascal}Response(response);\n"
+    ));
+
+    // Error handling at outer level
+    out.push_str(
+        "    if (parsed.variant === 'error') {\n\
+         \x20     throw new Error((parsed.data as { message?: string })?.message ?? 'RPC error');\n\
+         \x20   }\n",
+    );
+
+    if chain_depth == 0 {
+        // Top-level streaming method: parsed.data is StreamInfo directly
+        out.push_str(
+            "    const streamInfo = parsed.data as StreamInfo;\n\
+             \x20   return createStreamSubscription(streamInfo, blocks, ephemeralPrivkey, ephemeralPubkey, requestId);\n",
+        );
+    } else {
+        // Scoped streaming method: unwrap through scope chain to get StreamInfo
+        let mut current_var = "parsed.data".to_owned();
+        for depth in 0..chain_depth {
+            let inner_var = format!("_r{depth}");
+            out.push_str(&format!(
+                "    const {inner_var} = {current_var} as {{ variant: string; data: unknown }};\n"
+            ));
+
+            if depth < chain_depth - 1 {
+                current_var = format!("{inner_var}.data");
+            } else {
+                out.push_str(&format!(
+                    "    if ({inner_var}.variant === 'error') {{\n\
+                     \x20     throw new Error(({inner_var}.data as {{ message?: string }})?.message ?? 'RPC error');\n\
+                     \x20   }}\n"
+                ));
+                out.push_str(&format!(
+                    "    const streamInfo = {inner_var}.data as StreamInfo;\n\
+                     \x20   return createStreamSubscription(streamInfo, blocks, ephemeralPrivkey, ephemeralPubkey, requestId);\n"
+                ));
+            }
+        }
     }
 }

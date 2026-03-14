@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 // Generated client types
 use crate::services::generated::registry_client::{
-    RegistryClient as GenRegistryClient, RegistryResponseVariant,
+    RegistryClient, RegistryResponseVariant,
     RegistryHandler, RepoHandler, WorktreeHandler, CtlHandler,
     dispatch_registry, serialize_response,
     StreamInfo, ErrorInfo, HealthStatus, DetailedStatusInfo, RemoteInfo,
@@ -48,9 +48,10 @@ use crate::services::generated::registry_client::{
     FileStatus, LogEntry, ValidationResult, FileInfo,
     CtlLogRequest, CtlDiffRequest, CtlCheckoutRequest,
     EditOpenRequest, EditApplyRequest,
-    DocFormatEnum,
+    DocFormat,
 };
-use crate::services::editing::{self, EditingTable, DocFormat};
+use crate::services::editing::{self, EditingTable};
+use crate::services::generated::policy_client::PolicyCheck;
 use automerge::ReadDoc as _;
 // Conflicting names — use canonical path at usage sites:
 //   registry_client::TrackedRepository, registry_client::RepositoryStatus, registry_client::WorktreeInfo
@@ -560,7 +561,7 @@ impl RegistryService {
     /// Check if a request is authorized (returns bool for generated handler methods).
     async fn is_authorized(&self, ctx: &EnvelopeContext, resource: &str, operation: Operation) -> bool {
         let subject = ctx.subject();
-        self.policy_client.check(&subject.to_string(), "*", resource, operation.as_str())
+        self.policy_client.check(&PolicyCheck { subject: subject.to_string(), domain: "*".to_owned(), resource: resource.to_owned(), operation: operation.as_str().to_owned() })
             .await
             .unwrap_or_else(|e| {
                 warn!("Policy check failed for {} on {}: {} - denying access", subject, resource, e);
@@ -1392,7 +1393,7 @@ impl RegistryHandler for RegistryService {
             // Policy gate: only include repos the caller has at least query access to
             let resource = format!("model:{}", name);
             let permitted = self.policy_client
-                .check(&subject, "*", &resource, "query")
+                .check(&PolicyCheck { subject: subject.clone(), domain: "*".to_owned(), resource: resource.clone(), operation: "query".to_owned() })
                 .await
                 .unwrap_or(true); // default allow if policy service unavailable
             if !permitted { continue; }
@@ -1713,28 +1714,6 @@ impl RegistryService {
         Ok(content)
     }
 
-    /// Convert generated DocFormatEnum to our editing DocFormat.
-    fn to_doc_format(fmt: DocFormatEnum) -> DocFormat {
-        match fmt {
-            DocFormatEnum::Toml => DocFormat::Toml,
-            DocFormatEnum::Json => DocFormat::Json,
-            DocFormatEnum::Yaml => DocFormat::Yaml,
-            DocFormatEnum::Csv => DocFormat::Csv,
-            DocFormatEnum::Text => DocFormat::Text,
-        }
-    }
-
-    /// Convert editing DocFormat to generated DocFormatEnum.
-    #[allow(dead_code)]
-    fn from_doc_format(fmt: DocFormat) -> DocFormatEnum {
-        match fmt {
-            DocFormat::Toml => DocFormatEnum::Toml,
-            DocFormat::Json => DocFormatEnum::Json,
-            DocFormat::Yaml => DocFormatEnum::Yaml,
-            DocFormat::Csv => DocFormatEnum::Csv,
-            DocFormat::Text => DocFormatEnum::Text,
-        }
-    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -1977,11 +1956,11 @@ impl CtlHandler for RegistryService {
             .and_then(|s| s.to_str())
             .unwrap_or("");
         let format = match ext {
-            "toml" => DocFormatEnum::Toml,
-            "json" => DocFormatEnum::Json,
-            "yaml" | "yml" => DocFormatEnum::Yaml,
-            "csv" => DocFormatEnum::Csv,
-            _ => DocFormatEnum::Text,
+            "toml" => DocFormat::Toml,
+            "json" => DocFormat::Json,
+            "yaml" | "yml" => DocFormat::Yaml,
+            "csv" => DocFormat::Csv,
+            _ => DocFormat::Text,
         };
 
         let editing = self.editing_table.fid_has_session(&subject, fid);
@@ -2011,7 +1990,7 @@ impl CtlHandler for RegistryService {
         let subject = ctx.subject().to_string();
         let rel_path = self.fid_rel_path(fid, &subject)?;
         let content = self.read_fid_content(repo_id, name, fid, &subject).await?;
-        let format = Self::to_doc_format(data.format);
+        let format = data.format;
 
         self.editing_table.open(
             &subject, fid, repo_id, name, &rel_path, format, &content,
@@ -2743,7 +2722,7 @@ use hyprstream_metrics::checkpoint::manager::{
 };
 
 #[async_trait]
-impl MetricsRegistryClient for GenRegistryClient {
+impl MetricsRegistryClient for RegistryClient {
     async fn get_by_name(
         &self,
         name: &str,
@@ -2765,7 +2744,11 @@ impl MetricsRegistryClient for GenRegistryClient {
         let path_str = path
             .to_str()
             .ok_or_else(|| MetricsRegistryError::Operation("Invalid path encoding".to_owned()))?;
-        self.register(path_str, name.unwrap_or(""), "")
+        self.register(&RegisterRequest {
+            path: path_str.to_owned(),
+            name: name.unwrap_or("").to_owned(),
+            tracking_ref: String::new(),
+        })
             .await
             .map(|_| ())
             .map_err(|e| MetricsRegistryError::Operation(e.to_string()))
@@ -2785,11 +2768,12 @@ mod tests {
     use crate::auth::PolicyManager;
     use crate::services::{PolicyService, PolicyClient};
     use hyprstream_rpc::crypto::generate_signing_keypair;
+    use hyprstream_service::ServiceManager;
     use tempfile::TempDir;
 
     #[tokio::test]
     async fn test_registry_service_health_check() {
-        use hyprstream_rpc::service::InprocManager;
+        use hyprstream_service::InprocManager;
         use hyprstream_rpc::transport::TransportConfig;
 
         let temp_dir = TempDir::new().expect("test: create temp dir");
@@ -2834,7 +2818,7 @@ mod tests {
         let mut handle = manager.spawn(Box::new(registry_service)).await.expect("test: start registry service");
 
         // Create signed client with matching key and local identity
-        let client: GenRegistryClient = crate::services::core::create_service_client(
+        let client: RegistryClient = crate::services::core::create_service_client(
             "inproc://test-registry-health",
             signing_key,
             RequestIdentity::local(),

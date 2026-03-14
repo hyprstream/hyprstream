@@ -33,7 +33,7 @@ use crate::config::FlightConfig as HyprFlightConfig;
 use anyhow::Result;
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::SocketKind;
-use hyprstream_rpc::service::spawner::Spawnable;
+use hyprstream_service::Spawnable;
 use hyprstream_rpc::transport::TransportConfig;
 use std::sync::Arc;
 use tokio::sync::Notify;

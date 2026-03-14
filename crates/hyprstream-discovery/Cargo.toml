@@ -1,0 +1,44 @@
+[package]
+name = "hyprstream-discovery"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT"
+repository.workspace = true
+description = "Service discovery and endpoint resolution for hyprstream"
+
+[lib]
+crate-type = ["rlib"]  # rlib-only: OnceLock singletons must be shared workspace-wide
+
+[dependencies]
+# Workspace crates
+hyprstream-rpc = { path = "../hyprstream-rpc" }
+hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }
+
+# Async runtime
+async-trait = { workspace = true }
+
+# Serialization
+capnp = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# ZMQ transport (needed for ZmqService impl)
+zmq = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Crypto (for signing keys)
+ed25519-dalek = { workspace = true }
+
+[build-dependencies]
+capnpc = { workspace = true }
+capnp = { workspace = true }
+serde_json = { workspace = true }
+hyprstream-rpc-build = { workspace = true }
+
+[lints]
+workspace = true

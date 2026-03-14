@@ -63,10 +63,12 @@ fn emit_struct_interface(out: &mut String, s: &StructDef) {
     for f in &non_union_fields {
         let ts = capnp_to_ts_type(&f.type_name);
         let opt = if f.optional { "?" } else { "" };
-        // Struct pointer fields are nullable (getStruct can return null)
+        // Struct pointer fields are nullable (getStruct can return null).
+        // Option* types already encode absence as `undefined` — don't add `| null`.
         let nullable = if matches!(f.section, FieldSection::Pointer)
             && !matches!(f.type_name.as_str(), "Text" | "Data")
             && !f.type_name.starts_with("List(")
+            && !f.type_name.starts_with("Option")
         {
             " | null"
         } else {

@@ -17,7 +17,7 @@ use crate::generated::workflow_client::{
     WorkflowHandler, dispatch_workflow, WorkflowResponseVariant,
     WorkflowDef as WorkflowDefWire, WorkflowInfo, WorkflowRun as WorkflowRunWire,
     JobRun as JobRunWire, StepRun as StepRunWire,
-    RunStatusEnum,
+    RunStatus as WireRunStatus,
     // Request types
     DispatchRequest, SubscribeRequest,
 };
@@ -47,23 +47,17 @@ pub(crate) struct WorkflowDef {
 pub(crate) struct WorkflowRun {
     pub id: String,
     pub workflow_id: String,
-    pub status: RunStatus,
+    pub status: WireRunStatus,
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub jobs: HashMap<String, JobRun>,
-}
-
-/// Internal run status
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RunStatus {
-    Queued,
 }
 
 /// Internal job run state
 #[derive(Debug, Clone)]
 pub(crate) struct JobRun {
     pub name: String,
-    pub status: RunStatus,
+    pub status: WireRunStatus,
     pub steps: Vec<StepRun>,
 }
 
@@ -71,7 +65,7 @@ pub(crate) struct JobRun {
 #[derive(Debug, Clone)]
 pub(crate) struct StepRun {
     pub name: String,
-    pub status: RunStatus,
+    pub status: WireRunStatus,
     pub exit_code: Option<i32>,
 }
 
@@ -309,7 +303,7 @@ impl WorkflowService {
         let run = WorkflowRun {
             id: run_id.clone(),
             workflow_id: workflow_id.clone(),
-            status: RunStatus::Queued,
+            status: WireRunStatus::Queued,
             started_at: None,
             completed_at: None,
             jobs: HashMap::new(),
@@ -375,27 +369,20 @@ impl WorkflowService {
 // WorkflowHandler Implementation — bridges generated types to business logic
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Convert internal RunStatus to generated RunStatusEnum
-fn to_status_enum(status: &RunStatus) -> RunStatusEnum {
-    match status {
-        RunStatus::Queued => RunStatusEnum::Queued,
-    }
-}
-
 /// Convert internal WorkflowRun to generated WorkflowRunWire
 fn to_run_data(run: &WorkflowRun) -> WorkflowRunWire {
     WorkflowRunWire {
         id: run.id.clone(),
         workflow_id: run.workflow_id.clone(),
-        status: to_status_enum(&run.status),
+        status: run.status,
         started_at: run.started_at.map(|t| t.timestamp()).unwrap_or(0),
         completed_at: run.completed_at.map(|t| t.timestamp()).unwrap_or(0),
         jobs: run.jobs.values().map(|j| JobRunWire {
             name: j.name.clone(),
-            status: to_status_enum(&j.status),
+            status: j.status,
             steps: j.steps.iter().map(|s| StepRunWire {
                 name: s.name.clone(),
-                status: to_status_enum(&s.status),
+                status: s.status,
                 exit_code: s.exit_code.unwrap_or(0),
             }).collect(),
         }).collect(),
