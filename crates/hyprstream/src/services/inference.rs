@@ -1970,7 +1970,7 @@ use crate::services::generated::inference_client::{
     SaveAdaptationResult, SnapshotDeltaResult, ExportPeftResult,
     ChatTemplateRequest, LoraConfig, TrainStepRequest, SaveAdaptationRequest, ExportPeftRequest,
     MergeLoraRequest, EmbedImagesRequest, EmbedImagesResponse,
-    AdaptationStrategyEnum,
+    AdaptationStrategy as AdaptationStrategyEnum,
     GenerationRequest as InfGenerationRequest,
 };
 use crate::services::generated::policy_client::PolicyCheck;
@@ -2027,7 +2027,7 @@ impl InferenceHandler for InferenceService {
             enabled: if data.ttt_enabled { Some(true) } else { None },
             gradient_steps: data.ttt_gradient_steps,
             learning_rate: data.ttt_learning_rate,
-            adaptation_strategy: map_adaptation_strategy(data.adaptation_strategy, data.writeback_threshold),
+            adaptation_strategy: map_adaptation_strategy(data.adaptation_strategy, data.writeback_threshold.unwrap_or(0.0)),
             max_adaptation_ms: None,
         };
 
@@ -2238,7 +2238,7 @@ impl InferenceHandler for InferenceService {
             server_pubkey,
         };
 
-        let adaptation_strategy = map_adaptation_strategy(data.adaptation_strategy, data.writeback_threshold);
+        let adaptation_strategy = map_adaptation_strategy(data.adaptation_strategy, data.writeback_threshold.unwrap_or(0.0));
         let pending = PendingWork::Training {
             stream_ctx,
             subject,
@@ -2829,15 +2829,12 @@ impl InferenceZmqClient {
     }
 
     /// Start streaming training step with E2E authentication — delegates to generated client.
-    ///
-    /// `adaptation_strategy` must be one of: "auto_writeback", "auto_evict",
-    /// "speculative", "writeback_if_above".
     pub async fn train_step_stream(
         &self,
         input: &str,
         gradient_steps: u32,
         learning_rate: f32,
-        adaptation_strategy: &str,
+        adaptation_strategy: AdaptationStrategyEnum,
         writeback_threshold: f32,
         ephemeral_pubkey: Option<[u8; 32]>,
     ) -> Result<StreamInfo> {
@@ -2845,8 +2842,8 @@ impl InferenceZmqClient {
             input: input.to_owned(),
             gradient_steps: Some(gradient_steps).filter(|&v| v != 0),
             learning_rate: Some(learning_rate).filter(|&v| v != 0.0),
-            adaptation_strategy: adaptation_strategy.to_owned(),
-            writeback_threshold,
+            adaptation_strategy,
+            writeback_threshold: Some(writeback_threshold).filter(|&v| v != 0.0),
         }, ephemeral_pubkey.unwrap_or([0u8; 32])).await.map(Into::into)
     }
 

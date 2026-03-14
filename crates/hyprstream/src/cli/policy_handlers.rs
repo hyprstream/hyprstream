@@ -15,6 +15,7 @@
 use crate::auth::{jwt, Claims};
 use crate::services::generated::policy_client::{
     PolicyClient, GetHistory, GetDiff, ApplyDraft, RollbackPolicy, PolicyCheck, ApplyTemplate,
+    AddGrouping, RemoveGrouping,
 };
 use anyhow::{Context, Result};
 use chrono::Duration;
@@ -531,7 +532,7 @@ pub async fn handle_policy_role_add(
     }
 
     let client = create_policy_client(signing_key);
-    let sha = client.add_grouping(user, role).await
+    let sha = client.add_grouping(&AddGrouping { user: user.to_owned(), role: role.to_owned() }).await
         .context("Failed to add role assignment via PolicyService. Are services running?")?;
 
     println!("Role assigned. Commit: {}", &sha[..sha.len().min(8)]);
@@ -559,7 +560,7 @@ pub async fn handle_policy_role_remove(
     }
 
     let client = create_policy_client(signing_key);
-    let sha = client.remove_grouping(user, role).await
+    let sha = client.remove_grouping(&RemoveGrouping { user: user.to_owned(), role: role.to_owned() }).await
         .context("Failed to remove role assignment via PolicyService. Are services running?")?;
 
     println!("Role removed. Commit: {}", &sha[..sha.len().min(8)]);

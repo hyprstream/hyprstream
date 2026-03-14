@@ -349,85 +349,27 @@ impl ModelService {
         let zmq_ctx = Arc::clone(hyprstream_rpc::ZmqService::context(self));
         let spawner = hyprstream_service::ServiceSpawner::threaded();
 
-        let service_handle = if num_instances > 1 {
-            // Multi-instance: spawn ROUTER/DEALER load balancer + N workers.
-            // WARNING: experimental — breaks session affinity, pending TTT
-            // commit/rollback, and LoRA consistency across workers.
-            warn!(
-                "Spawning {} inference instances for {} behind load balancer \
-                 (experimental: sessions, pending TTT, and LoRA state are per-worker)",
-                num_instances, model_ref_str
-            );
-
-            let frontend_transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(&endpoint);
-            let backend_endpoint = format!("inproc://hyprstream/inference-{safe_name}-backend");
-            let backend_transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(&backend_endpoint);
-
-            // Spawn load balancer (ROUTER frontend, DEALER backend)
-            let lb = hyprstream_rpc::service::spawner::LoadBalancerService::new(
-                format!("inference-{safe_name}-lb"),
-                Arc::clone(&zmq_ctx),
-                frontend_transport,
-                backend_transport.clone(),
-            );
-            let lb_handle = spawner.spawn(lb).await
-                .map_err(|e| anyhow!("Failed to spawn load balancer: {}", e))?;
-
-            // Spawn N worker instances, each connecting to the DEALER backend
-            let worker_transport = backend_transport.with_connect_mode();
-            let mut worker_handles = Vec::with_capacity(num_instances);
-            for idx in 0..num_instances {
-                let mut worker_config = crate::services::InferenceServiceConfig::new(
-                    &model_path,
-                    runtime_config.clone(),
-                    self.signing_key.verifying_key(),
-                    self.signing_key.clone(),
-                    Arc::clone(&zmq_ctx),
-                    worker_transport.clone(),
-                    fs.clone(),
-                );
-                if let Some(ref aud) = self.expected_audience {
-                    worker_config = worker_config.with_expected_audience(aud.clone());
-                }
-                if let Some(ref url) = self.local_issuer_url {
-                    worker_config = worker_config.with_local_issuer_url(url.clone());
-                }
-                if let Some(ref fed) = self.federation_key_source {
-                    worker_config = worker_config.with_federation_key_source(fed.clone());
-                }
-                let handle = spawner.spawn(worker_config).await
-                    .map_err(|e| anyhow!("Failed to spawn inference worker {}: {}", idx, e))?;
-                worker_handles.push(handle);
-            }
-
-            // Return the LB handle as the primary handle (stopping it stops the frontend)
-            // Workers are tracked but not individually managed
-            // TODO: Track worker handles for graceful shutdown
-            lb_handle
-        } else {
-            // Single instance: direct bind (zero overhead, current behavior)
-            let transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(&endpoint);
-            let mut service_config = crate::services::InferenceServiceConfig::new(
-                &model_path,
-                runtime_config,
-                self.signing_key.verifying_key(),
-                self.signing_key.clone(),
-                zmq_ctx,
-                transport,
-                fs,
-            );
-            if let Some(ref aud) = self.expected_audience {
-                service_config = service_config.with_expected_audience(aud.clone());
-            }
-            if let Some(ref url) = self.local_issuer_url {
-                service_config = service_config.with_local_issuer_url(url.clone());
-            }
-            if let Some(ref fed) = self.federation_key_source {
-                service_config = service_config.with_federation_key_source(fed.clone());
-            }
-            spawner.spawn(service_config).await
-                .map_err(|e| anyhow!("Failed to spawn inference service: {}", e))?
-        };
+        let transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(&endpoint);
+        let mut service_config = crate::services::InferenceServiceConfig::new(
+            &model_path,
+            runtime_config,
+            self.signing_key.verifying_key(),
+            self.signing_key.clone(),
+            zmq_ctx,
+            transport,
+            fs,
+        );
+        if let Some(ref aud) = self.expected_audience {
+            service_config = service_config.with_expected_audience(aud.clone());
+        }
+        if let Some(ref url) = self.local_issuer_url {
+            service_config = service_config.with_local_issuer_url(url.clone());
+        }
+        if let Some(ref fed) = self.federation_key_source {
+            service_config = service_config.with_federation_key_source(fed.clone());
+        }
+        let service_handle = spawner.spawn(service_config).await
+            .map_err(|e| anyhow!("Failed to spawn inference service: {}", e))?;
 
         // Create client for this service
         let client = InferenceZmqClient::with_endpoint(
@@ -664,14 +606,10 @@ impl ModelService {
         writeback_threshold: f32,
         client_ephemeral_pubkey: Option<[u8; 32]>,
     ) -> Result<StreamInfo> {
-        let strategy_str = match adaptation_strategy {
-            AdaptationStrategyEnum::AutoWriteback => "auto_writeback",
-            AdaptationStrategyEnum::AutoEvict => "auto_evict",
-            AdaptationStrategyEnum::Speculative => "speculative",
-            AdaptationStrategyEnum::WritebackIfAbove => "writeback_if_above",
-        };
         let client = self.get_inference_client(model_ref_str, ctx).await?;
-        client.train_step_stream(input, gradient_steps, learning_rate, strategy_str, writeback_threshold, client_ephemeral_pubkey).await
+        // Convert model_client enum to inference_client enum for the cross-service call
+        let inf_strategy = model_to_inference_strategy(adaptation_strategy);
+        client.train_step_stream(input, gradient_steps, learning_rate, inf_strategy, writeback_threshold, client_ephemeral_pubkey).await
     }
 
     async fn zero_delta(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
@@ -708,6 +646,7 @@ impl ModelService {
         client.gen.export_peft_adapter(&crate::services::generated::inference_client::ExportPeftRequest {
             name: name.to_owned(),
             commit_message: Some(commit_message.to_owned()),
+            git_commit: None,
         }).await
     }
 
@@ -731,13 +670,24 @@ use crate::services::generated::model_client::{
     SaveAdaptationRequest, SaveAdaptationResponse,
     SnapshotDeltaResponse, TttExportRequest, TttExportResponse,
     WriteTttConfigRequest,
-    AdaptationStrategyEnum,
+    AdaptationStrategy as AdaptationStrategyEnum,
     // Adapter types
     AdapterInfo, AdapterMergeRequest,
     // Infer types
     GenerateRequest, ApplyChatTemplateRequest, ModelStatusResponse,
     EmbedRequest, EmbedResponse,
 };
+/// Convert model_client::AdaptationStrategy to inference_client::AdaptationStrategy.
+/// Both enums are structurally identical but are distinct generated types.
+fn model_to_inference_strategy(s: AdaptationStrategyEnum) -> crate::services::generated::inference_client::AdaptationStrategy {
+    match s {
+        AdaptationStrategyEnum::AutoWriteback => crate::services::generated::inference_client::AdaptationStrategy::AutoWriteback,
+        AdaptationStrategyEnum::AutoEvict => crate::services::generated::inference_client::AdaptationStrategy::AutoEvict,
+        AdaptationStrategyEnum::Speculative => crate::services::generated::inference_client::AdaptationStrategy::Speculative,
+        AdaptationStrategyEnum::WritebackIfAbove => crate::services::generated::inference_client::AdaptationStrategy::WritebackIfAbove,
+    }
+}
+
 // Conflicting names — use canonical path at usage sites:
 //   model_client::LoadedModelInfo, model_client::StreamInfo,
 //   model_client::ChatMessage
@@ -768,7 +718,7 @@ impl TttHandler for ModelService {
             input: data.input.clone(),
             gradient_steps: data.gradient_steps,
             learning_rate: data.learning_rate,
-            adaptation_strategy: data.adaptation_strategy,
+            adaptation_strategy: model_to_inference_strategy(data.adaptation_strategy),
             writeback_threshold: data.writeback_threshold,
         }).await?;
         Ok(TrainStepResponse {
@@ -790,7 +740,7 @@ impl TttHandler for ModelService {
     ) -> Result<(crate::services::generated::model_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
         let info = self.train_step_stream(
                 model_ref, ctx, &data.input, data.gradient_steps.unwrap_or(0), data.learning_rate.unwrap_or(0.0),
-                data.adaptation_strategy, data.writeback_threshold, ctx.ephemeral_pubkey,
+                data.adaptation_strategy, data.writeback_threshold.unwrap_or(0.0), ctx.ephemeral_pubkey,
             ).await?;
         Ok((info.into(), Box::pin(async {})))
     }
@@ -843,6 +793,7 @@ impl TttHandler for ModelService {
             merge_strategy: data.merge_strategy.clone(),
             merge_weight: data.merge_weight,
             commit_message: data.commit_message.clone(),
+            git_commit: data.git_commit,
         }).await?;
         Ok(SaveAdaptationResponse {
             adapter_name: r.adapter_name,
@@ -1468,6 +1419,13 @@ impl ModelZmqClient {
         request: &GenerationRequest,
         client_ephemeral_pubkey: [u8; 32],
     ) -> Result<StreamInfo> {
+        // Convert inference_client::AdaptationStrategy to model_client::AdaptationStrategy
+        let model_strategy = match request.adaptation_strategy {
+            crate::services::generated::inference_client::AdaptationStrategy::AutoWriteback => AdaptationStrategyEnum::AutoWriteback,
+            crate::services::generated::inference_client::AdaptationStrategy::AutoEvict => AdaptationStrategyEnum::AutoEvict,
+            crate::services::generated::inference_client::AdaptationStrategy::Speculative => AdaptationStrategyEnum::Speculative,
+            crate::services::generated::inference_client::AdaptationStrategy::WritebackIfAbove => AdaptationStrategyEnum::WritebackIfAbove,
+        };
         self.gen.infer(model_ref).generate_stream(&GenerateRequest {
             prompt: request.prompt.clone(),
             max_tokens: request.max_tokens,
@@ -1483,7 +1441,7 @@ impl ModelZmqClient {
             ttt_enabled: request.ttt_enabled,
             ttt_gradient_steps: request.ttt_gradient_steps,
             ttt_learning_rate: request.ttt_learning_rate,
-            adaptation_strategy: request.adaptation_strategy,
+            adaptation_strategy: model_strategy,
             writeback_threshold: request.writeback_threshold,
         }, client_ephemeral_pubkey).await.map(Into::into)
     }
@@ -1546,7 +1504,7 @@ impl ModelZmqClient {
             gradient_steps: Some(gradient_steps).filter(|&v| v != 0),
             learning_rate: Some(learning_rate).filter(|&v| v != 0.0),
             adaptation_strategy,
-            writeback_threshold,
+            writeback_threshold: Some(writeback_threshold).filter(|&v| v != 0.0),
         }, client_ephemeral_pubkey).await.map(Into::into)
     }
 
@@ -1576,7 +1534,13 @@ fn generate_request_from_data(data: &GenerateRequest) -> GenerationRequest {
         ttt_enabled: data.ttt_enabled,
         ttt_gradient_steps: data.ttt_gradient_steps,
         ttt_learning_rate: data.ttt_learning_rate,
-        auto_commit: matches!(data.adaptation_strategy, AdaptationStrategyEnum::AutoWriteback),
+        adaptation_strategy: match data.adaptation_strategy {
+            AdaptationStrategyEnum::AutoWriteback => crate::services::generated::inference_client::AdaptationStrategy::AutoWriteback,
+            AdaptationStrategyEnum::AutoEvict => crate::services::generated::inference_client::AdaptationStrategy::AutoEvict,
+            AdaptationStrategyEnum::Speculative => crate::services::generated::inference_client::AdaptationStrategy::Speculative,
+            AdaptationStrategyEnum::WritebackIfAbove => crate::services::generated::inference_client::AdaptationStrategy::WritebackIfAbove,
+        },
+        writeback_threshold: data.writeback_threshold,
     }
 }
 

@@ -104,7 +104,7 @@ pub struct ServiceContext {
     oauth_issuer_url: Option<String>,
 
     /// Shared federation key resolver (None when no trusted_issuers are configured).
-    federation_key_source: Option<Arc<dyn crate::auth::FederationKeySource>>,
+    federation_key_source: Option<Arc<dyn hyprstream_rpc::auth::FederationKeySource>>,
 }
 
 impl ServiceContext {
@@ -160,14 +160,14 @@ impl ServiceContext {
     /// Get the federation key source (if configured).
     pub fn federation_key_source(
         &self,
-    ) -> Option<Arc<dyn crate::auth::FederationKeySource>> {
+    ) -> Option<Arc<dyn hyprstream_rpc::auth::FederationKeySource>> {
         self.federation_key_source.clone()
     }
 
     /// Set the shared federation key source for multi-issuer ZMQ token acceptance.
     pub fn with_federation_key_source(
         mut self,
-        src: Arc<dyn crate::auth::FederationKeySource>,
+        src: Arc<dyn hyprstream_rpc::auth::FederationKeySource>,
     ) -> Self {
         self.federation_key_source = Some(src);
         self

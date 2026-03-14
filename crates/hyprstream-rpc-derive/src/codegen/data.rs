@@ -469,6 +469,23 @@ fn generate_data_field_reader(
                     },
                 }
             }
+            CapnpType::Bool => {
+                // Bool $optional: false = None, true = Some(true)
+                // (Cap'n Proto default for Bool is false, so absent field = false)
+                let getter_name = format_ident!("get_{}", resolved.name(&field.name).snake);
+                quote! { #rust_name: { let v = reader.#getter_name(); if v { Some(v) } else { None } }, }
+            }
+            CapnpType::Float32 | CapnpType::Float64 => {
+                // Float $optional: 0.0 = None, non-zero = Some(val)
+                let getter_name = format_ident!("get_{}", resolved.name(&field.name).snake);
+                quote! { #rust_name: { let v = reader.#getter_name(); if v != 0.0 { Some(v) } else { None } }, }
+            }
+            CapnpType::UInt8 | CapnpType::UInt16 | CapnpType::UInt32 | CapnpType::UInt64
+            | CapnpType::Int8 | CapnpType::Int16 | CapnpType::Int32 | CapnpType::Int64 => {
+                // Integer $optional: 0 = None, non-zero = Some(val)
+                let getter_name = format_ident!("get_{}", resolved.name(&field.name).snake);
+                quote! { #rust_name: { let v = reader.#getter_name(); if v != 0 { Some(v) } else { None } }, }
+            }
             _ => inner, // Struct — not typically optional; fall through to non-optional
         }
     } else {

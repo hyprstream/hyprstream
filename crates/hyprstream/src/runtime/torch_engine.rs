@@ -1528,21 +1528,21 @@ impl TorchEngine {
 
         if let Some(q35) = model_any.downcast_ref::<crate::runtime::architectures::qwen3_5::Qwen3_5Model>() {
             let qcfg = q35.text_config();
-            let hidden = qcfg.hidden_size;
-            let nh = qcfg.num_attention_heads;
-            let hd = qcfg.head_dim;
+            let hidden = qcfg.hidden_size as usize;
+            let nh = qcfg.num_attention_heads as usize;
+            let hd = qcfg.head_dim as usize;
             // q_proj outputs num_heads * head_dim * 2 (first half = Q, second half = gate).
             // The LoRA delta targets only the Q half, so lora_b out_features = nh*hd (the half-dim).
             // o_proj in_features is also nh*hd (attention output after gate application).
             let q_half_dim = nh * hd;
 
             let gdn_out_proj_in = qcfg.linear_num_value_heads * qcfg.linear_value_head_dim;
-            let num_layers = qcfg.num_hidden_layers;
+            let num_layers = qcfg.num_hidden_layers as usize;
 
             let mut per_layer: std::collections::HashMap<usize, std::collections::HashMap<String, (usize, usize)>> =
                 std::collections::HashMap::new();
 
-            let nkv_out = qcfg.num_key_value_heads * hd;
+            let nkv_out = (qcfg.num_key_value_heads as usize) * hd;
             for (layer_idx, lt) in qcfg.layer_types.iter().enumerate() {
                 let mut layer_dims: std::collections::HashMap<String, (usize, usize)> =
                     std::collections::HashMap::new();

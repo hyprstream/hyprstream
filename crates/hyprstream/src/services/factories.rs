@@ -780,9 +780,8 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
         // Use the issuer URL as the audience for discovery tokens
         discovery_service = discovery_service.with_expected_audience(issuer.to_owned());
     }
-    if let Some(fed) = ctx.federation_key_source() {
-        discovery_service = discovery_service.with_federation_key_source(fed);
-    }
+    // TODO: DiscoveryService federation key source support
+    // (federation_key_source not yet implemented on DiscoveryService)
 
     Ok(ctx.into_spawnable_quic(discovery_service, config.discovery.quic_port))
 }
