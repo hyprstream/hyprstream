@@ -126,7 +126,19 @@ esac
 # Main execution
 BACKEND=$(detect_backend)
 
-# Validate the selected backend
+# Check if this is a single-backend AppImage (universal binary + single libtorch dir)
+if [[ -x "$APPDIR/usr/bin/hyprstream" ]] && [[ -d "$APPDIR/usr/lib/libtorch/lib" ]] && [[ ! -d "$APPDIR/usr/lib/$BACKEND/libtorch/lib" ]]; then
+    log_debug "Single-backend AppImage detected, using bundled backend"
+    export LD_LIBRARY_PATH="$APPDIR/usr/lib/libtorch/lib:${LD_LIBRARY_PATH:-}"
+    export LIBTORCH="$APPDIR/usr/lib/libtorch"
+    export LIBTORCH_BYPASS_VERSION_CHECK=1
+    log_debug "Launching hyprstream with single backend"
+    log_debug "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
+    log_debug "LIBTORCH: $LIBTORCH"
+    exec "$APPDIR/usr/bin/hyprstream" "$@"
+fi
+
+# Validate the selected backend (multi-backend AppImage)
 if ! validate_backend "$BACKEND"; then
     echo "Falling back to CPU backend..." >&2
     BACKEND="cpu"
