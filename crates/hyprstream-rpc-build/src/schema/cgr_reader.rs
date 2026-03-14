@@ -109,41 +109,6 @@ fn parse_cgr(
     let request_name = format!("{pascal}Request");
     let response_name = format!("{pascal}Response");
 
-    // Find request and response struct node IDs
-    let request_node_id = find_struct_node_id(&node_map, &request_name)
-        .ok_or_else(|| format!("Struct '{request_name}' not found in CGR"))?;
-    let response_node_id = find_struct_node_id(&node_map, &response_name)
-        .ok_or_else(|| format!("Struct '{response_name}' not found in CGR"))?;
-
-    let request_node = nodes.get(node_map[&request_node_id].index);
-    let response_node = nodes.get(node_map[&response_node_id].index);
-
-    // Extract union variants from request/response
-    let request_variants = extract_union_variants(
-        request_node,
-        &nodes,
-        &node_map,
-        mcp_desc_id,
-        param_desc_id,
-        mcp_scope_id,
-        cli_hidden_id,
-    )?;
-    let response_variants = extract_union_variants(
-        response_node,
-        &nodes,
-        &node_map,
-        mcp_desc_id,
-        param_desc_id,
-        mcp_scope_id,
-        cli_hidden_id,
-    )?;
-
-    if request_variants.is_empty() || response_variants.is_empty() {
-        return Err(format!(
-            "Schema '{service_name}' has empty request or response union"
-        ));
-    }
-
     // Extract all structs (for type resolution in codegen)
     let all_structs = extract_all_structs(
         &nodes,
@@ -160,23 +125,42 @@ fn parse_cgr(
     // Extract all enums (pass all_structs for imported type resolution)
     let enums = extract_all_enums(&nodes, &node_map, service_name, &all_structs)?;
 
-    // Detect scoped clients (nested union pattern)
-    let mut scoped_clients = detect_scoped_clients(
-        &request_variants,
-        &response_variants,
-        &all_structs,
-        &nodes,
-        &node_map,
-        mcp_desc_id,
-        param_desc_id,
-        mcp_scope_id,
-        cli_hidden_id,
-    )?;
+    // Find request and response struct node IDs — data-only schemas may not have them
+    let request_node_id = find_struct_node_id(&node_map, &request_name);
+    let response_node_id = find_struct_node_id(&node_map, &response_name);
 
-    // Recursively detect nested scoped clients (3rd level)
-    for sc in &mut scoped_clients {
-        detect_nested_scoped_clients_cgr(
-            sc,
+    let (request_variants, response_variants) = match (request_node_id, response_node_id) {
+        (Some(req_id), Some(resp_id)) => {
+            let request_node = nodes.get(node_map[&req_id].index);
+            let response_node = nodes.get(node_map[&resp_id].index);
+
+            let rv = extract_union_variants(
+                request_node, &nodes, &node_map,
+                mcp_desc_id, param_desc_id, mcp_scope_id, cli_hidden_id,
+            )?;
+            let rs = extract_union_variants(
+                response_node, &nodes, &node_map,
+                mcp_desc_id, param_desc_id, mcp_scope_id, cli_hidden_id,
+            )?;
+
+            if rv.is_empty() || rs.is_empty() {
+                (vec![], vec![])
+            } else {
+                (rv, rs)
+            }
+        }
+        _ => (vec![], vec![]),
+    };
+
+    let is_data_only = request_variants.is_empty();
+
+    // Detect scoped clients (nested union pattern) — skip for data-only schemas
+    let scoped_clients = if is_data_only {
+        Vec::new()
+    } else {
+        let mut sc = detect_scoped_clients(
+            &request_variants,
+            &response_variants,
             &all_structs,
             &nodes,
             &node_map,
@@ -185,21 +169,41 @@ fn parse_cgr(
             mcp_scope_id,
             cli_hidden_id,
         )?;
-    }
 
-    // Partition: save request/response root structs separately for codegen
-    let mut request_struct = None;
-    let mut response_struct = None;
-    let mut referenced = Vec::new();
-    for s in all_structs {
-        if s.name == request_name {
-            request_struct = Some(s);
-        } else if s.name == response_name {
-            response_struct = Some(s);
-        } else {
-            referenced.push(s);
+        // Recursively detect nested scoped clients (3rd level)
+        for s in &mut sc {
+            detect_nested_scoped_clients_cgr(
+                s,
+                &all_structs,
+                &nodes,
+                &node_map,
+                mcp_desc_id,
+                param_desc_id,
+                mcp_scope_id,
+                cli_hidden_id,
+            )?;
         }
-    }
+        sc
+    };
+
+    // Partition: for data-only schemas keep all structs; otherwise separate request/response
+    let (referenced, request_struct, response_struct) = if is_data_only {
+        (all_structs, None, None)
+    } else {
+        let mut req = None;
+        let mut resp = None;
+        let mut refs = Vec::new();
+        for s in all_structs {
+            if s.name == request_name {
+                req = Some(s);
+            } else if s.name == response_name {
+                resp = Some(s);
+            } else {
+                refs.push(s);
+            }
+        }
+        (refs, req, resp)
+    };
 
     Ok(ParsedSchema {
         request_variants,

@@ -82,8 +82,9 @@ pub use events::{
     EVENTS_PUB, EVENTS_SUB,
 };
 
-// Re-export annotations_capnp and streaming_capnp from hyprstream-rpc (compiled once, shared by all crates)
+// Re-export capnp modules from hyprstream-rpc (compiled once, shared by all crates)
 pub use hyprstream_rpc::annotations_capnp;
+pub use hyprstream_rpc::common_capnp;
 pub use hyprstream_rpc::streaming_capnp;
 
 /// Generated Cap'n Proto code for resource-scoped worker schema

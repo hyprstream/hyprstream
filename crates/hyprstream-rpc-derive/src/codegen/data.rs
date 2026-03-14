@@ -40,8 +40,14 @@ pub fn generate_data_structs(
     // instead of full struct + trait impls, avoiding duplicate definitions.
     const SERVICE_MODULES: &[&str] = &["inference", "model", "registry", "policy", "worker", "mcp"];
 
-    // Generate data structs with trait impls
-    let list_struct_types = collect_list_struct_types(resolved.raw);
+    // For data-only schemas (no request/response unions), generate ALL structs.
+    // For service schemas, only generate types referenced by variants.
+    let is_data_only = resolved.raw.request_variants.is_empty();
+    let list_struct_types = if is_data_only {
+        resolved.raw.structs.iter().map(|s| s.name.clone()).collect()
+    } else {
+        collect_list_struct_types(resolved.raw)
+    };
     for type_name in &list_struct_types {
         if let Some(s) = resolved.find_struct(type_name) {
             // Skip Option* wrapper structs — they become Option<T> fields, not standalone types
@@ -60,6 +66,24 @@ pub fn generate_data_structs(
                         pub type #data_name = super::#origin_mod::#data_name;
                     });
                     continue;
+                }
+
+                // Types originating from RPC infrastructure schemas (e.g. streaming.capnp)
+                // alias to the canonical type in hyprstream_rpc instead of generating duplicates.
+                const RPC_CRATE_MODULES: &[(&str, &str)] = &[
+                    ("streaming", "hyprstream_rpc::streaming"),
+                    ("common", "hyprstream_rpc::common_types"),
+                ];
+                if origin != service_name {
+                    if let Some((_, rpc_mod)) = RPC_CRATE_MODULES.iter().find(|(name, _)| *name == origin) {
+                        let data_name = format_ident!("{}", type_name);
+                        #[allow(clippy::expect_used)] // compile-time constant path
+                        let rpc_path: syn::Path = syn::parse_str(rpc_mod).expect("invalid RPC_CRATE_MODULES path");
+                        tokens.extend(quote! {
+                            pub type #data_name = #rpc_path::#data_name;
+                        });
+                        continue;
+                    }
                 }
             }
 
@@ -122,9 +146,16 @@ fn generate_data_struct(
                 .map(|inner_name| rust_type_tokens(&resolved.resolve_type(inner_name).rust_owned));
 
             let inner_type = if field.type_name == "Data" && field.fixed_size.is_some() {
-                let n = field.fixed_size.unwrap_or(0) as usize;
-                let ts: TokenStream = format!("[u8; {n}]").parse().unwrap_or_else(|_| quote! { Vec<u8> });
-                ts
+                let n = field.fixed_size.unwrap_or(0);
+                // Arrays > 32 don't implement Default/Serialize/Deserialize via derive,
+                // so use Vec<u8> in the struct. ToCapnp/FromCapnp handle length validation.
+                if n <= 32 {
+                    let n_usize = n as usize;
+                    let ts: TokenStream = format!("[u8; {n_usize}]").parse().unwrap_or_else(|_| quote! { Vec<u8> });
+                    ts
+                } else {
+                    quote! { Vec<u8> }
+                }
             } else {
                 rust_type_tokens(&resolved.resolve_type(&field.type_name).rust_owned)
             };
@@ -435,7 +466,26 @@ fn generate_data_field_reader(
                 quote! { #rust_name: { let v = reader.#getter_name()?.to_str()?; if v.is_empty() { None } else { Some(v.to_string()) } }, }
             }
             CapnpType::Data => {
-                quote! { #rust_name: { let v = reader.#getter_name()?; if v.is_empty() { None } else { Some(v.to_vec()) } }, }
+                if let Some(n) = field.fixed_size {
+                    let n_usize = n as usize;
+                    if n <= 32 {
+                        quote! { #rust_name: {
+                            let v = reader.#getter_name()?;
+                            if v.is_empty() { None } else {
+                                let mut arr = [0u8; #n_usize];
+                                arr.copy_from_slice(&v[..#n_usize]);
+                                Some(arr)
+                            }
+                        }, }
+                    } else {
+                        quote! { #rust_name: {
+                            let v = reader.#getter_name()?;
+                            if v.is_empty() { None } else { Some(v.to_vec()) }
+                        }, }
+                    }
+                } else {
+                    quote! { #rust_name: { let v = reader.#getter_name()?; if v.is_empty() { None } else { Some(v.to_vec()) } }, }
+                }
             }
             CapnpType::ListText => {
                 quote! {
@@ -486,7 +536,12 @@ fn generate_data_field_reader(
                 let getter_name = format_ident!("get_{}", resolved.name(&field.name).snake);
                 quote! { #rust_name: { let v = reader.#getter_name(); if v != 0 { Some(v) } else { None } }, }
             }
-            _ => inner, // Struct — not typically optional; fall through to non-optional
+            CapnpType::Struct(_) | CapnpType::Unknown(_) => {
+                // Struct $optional: read and wrap in Some unconditionally.
+                // Cap'n Proto struct fields always have a reader, so absence is represented as Default.
+                quote! { #rust_name: Some(hyprstream_rpc::capnp::FromCapnp::read_from(reader.#getter_name()?)?), }
+            }
+            _ => inner, // fall through
         }
     } else {
         inner
@@ -554,22 +609,39 @@ fn generate_data_field_reader_inner(
         CapnpType::Void => quote! { #rust_name: (), },
         CapnpType::Text => quote! { #rust_name: reader.#getter_name()?.to_str()?.to_string(), },
         CapnpType::Data if field.fixed_size.is_some() => {
-            let n = field.fixed_size.unwrap_or(0) as usize;
-            let n_lit = proc_macro2::Literal::usize_unsuffixed(n);
+            let n = field.fixed_size.unwrap_or(0);
+            let n_usize = n as usize;
+            let n_lit = proc_macro2::Literal::usize_unsuffixed(n_usize);
             let field_name_str = field.name.as_str();
-            quote! {
-                #rust_name: {
-                    let data = reader.#getter_name()?;
-                    if data.len() != #n_lit {
-                        anyhow::bail!(
-                            "{}: expected {} bytes, got {}",
-                            #field_name_str, #n_lit, data.len()
-                        );
-                    }
-                    let mut arr = [0u8; #n_lit];
-                    arr.copy_from_slice(data);
-                    arr
-                },
+            if n <= 32 {
+                quote! {
+                    #rust_name: {
+                        let data = reader.#getter_name()?;
+                        if data.len() != #n_lit {
+                            anyhow::bail!(
+                                "{}: expected {} bytes, got {}",
+                                #field_name_str, #n_lit, data.len()
+                            );
+                        }
+                        let mut arr = [0u8; #n_lit];
+                        arr.copy_from_slice(data);
+                        arr
+                    },
+                }
+            } else {
+                // N > 32: struct uses Vec<u8>, validate length
+                quote! {
+                    #rust_name: {
+                        let data = reader.#getter_name()?;
+                        if data.len() != #n_lit {
+                            anyhow::bail!(
+                                "{}: expected {} bytes, got {}",
+                                #field_name_str, #n_lit, data.len()
+                            );
+                        }
+                        data.to_vec()
+                    },
+                }
             }
         }
         CapnpType::Data => quote! { #rust_name: reader.#getter_name()?.to_vec(), },

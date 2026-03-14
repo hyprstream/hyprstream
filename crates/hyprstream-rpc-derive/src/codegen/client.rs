@@ -166,6 +166,10 @@ fn generate_trait_method(
         "Text" => vec![quote! { value: &str }],
         "Data" => vec![quote! { value: &[u8] }],
         "Bool" => vec![quote! { value: bool }],
+        t if CapnpType::classify_primitive(t).is_numeric() => {
+            let ty = rust_type_tokens(&CapnpType::classify_primitive(t).rust_owned_type());
+            vec![quote! { value: #ty }]
+        }
         struct_name => {
             if let Some(s) = resolved.find_struct(struct_name) {
                 let nuf: Vec<_> = s.non_union_fields().collect();
@@ -408,6 +412,10 @@ fn generate_trait_method_impl(
         "Text" => (vec![quote! { value: &str }], vec![quote! { value }]),
         "Data" => (vec![quote! { value: &[u8] }], vec![quote! { value }]),
         "Bool" => (vec![quote! { value: bool }], vec![quote! { value }]),
+        t if CapnpType::classify_primitive(t).is_numeric() => {
+            let ty = rust_type_tokens(&CapnpType::classify_primitive(t).rust_owned_type());
+            (vec![quote! { value: #ty }], vec![quote! { value }])
+        }
         struct_name => {
             if let Some(s) = resolved.find_struct(struct_name) {
                 let nuf: Vec<_> = s.non_union_fields().collect();
@@ -910,6 +918,25 @@ pub fn generate_request_method(
             quote! {
                 #[doc = #doc]
                 pub async fn #method_name(&self, value: bool #extra_param) -> anyhow::Result<#return_type> {
+                    let __request_id = self.next_id();
+                    let payload = hyprstream_rpc::serialize_message(|msg| {
+                        let mut req = msg.init_root::<#capnp_mod::#req_type::Builder>();
+                        req.set_id(__request_id);
+                        #outer_req_setup
+                        #setter
+                    })?;
+                    #call_expr
+                    #response_handling
+                }
+            }
+        }
+        t if CapnpType::classify_primitive(t).is_numeric() => {
+            let set_method = format_ident!("set_{}", to_snake_case(&variant.name));
+            let setter = quote! { req.#set_method(value); };
+            let ty = rust_type_tokens(&CapnpType::classify_primitive(t).rust_owned_type());
+            quote! {
+                #[doc = #doc]
+                pub async fn #method_name(&self, value: #ty #extra_param) -> anyhow::Result<#return_type> {
                     let __request_id = self.next_id();
                     let payload = hyprstream_rpc::serialize_message(|msg| {
                         let mut req = msg.init_root::<#capnp_mod::#req_type::Builder>();

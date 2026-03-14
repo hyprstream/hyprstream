@@ -6145,6 +6145,7 @@ dependencies = [
  "hkdf",
  "hmac 0.12.1",
  "http 1.3.1",
+ "hyprstream-rpc-build",
  "hyprstream-rpc-derive",
  "inventory",
  "js-sys",
@@ -6182,6 +6183,7 @@ name = "hyprstream-rpc-build"
 version = "0.1.0"
 dependencies = [
  "capnp",
+ "capnpc",
  "clap",
  "serde",
  "serde_json",

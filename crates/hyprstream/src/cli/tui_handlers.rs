@@ -18,7 +18,7 @@ use hyprstream_rpc::prelude::*;
 use std::io::Write;
 use tracing::info;
 
-use crate::services::generated::tui_client::{TuiClient, TuiResponseVariant, ConnectRequest, DisplayMode};
+use crate::services::generated::tui_client::{TuiClient, ConnectRequest, DisplayMode, SendInputRequest};
 
 /// Create a TuiClient for RPC calls.
 ///
@@ -28,7 +28,7 @@ pub fn create_tui_client(signing_key: &SigningKey) -> TuiClient {
     use hyprstream_rpc::registry::{global as registry, SocketKind};
 
     let endpoint = registry().endpoint("tui", SocketKind::Rep).to_zmq_string();
-    crate::services::create_service_client(&endpoint, signing_key.clone(), RequestIdentity::local())
+    TuiClient::with_endpoint(&endpoint, signing_key.clone(), RequestIdentity::local())
 }
 
 /// Attach to an existing TUI session.
@@ -203,18 +203,11 @@ async fn run_attach_loop(
                 }
 
                 // Forward input to TUI service via sendInput RPC
-                let request_id = client.next_id();
-                let payload = hyprstream_rpc::serialize_message(|msg| {
-                    let mut req = msg.init_root::<crate::tui_capnp::tui_request::Builder<'_>>();
-                    req.set_id(request_id);
-                    let mut send_input = req.init_send_input();
-                    send_input.set_viewer_id(viewer_id);
-                    send_input.set_data(&input);
-                });
-                if let Ok(payload) = payload {
-                    if let Err(e) = client.call(payload).await {
-                        tracing::debug!("sendInput failed: {}", e);
-                    }
+                if let Err(e) = client.send_input(&SendInputRequest {
+                    viewer_id,
+                    data: input.clone(),
+                }).await {
+                    tracing::debug!("sendInput failed: {}", e);
                 }
             }
             else => break,
@@ -249,50 +242,28 @@ pub async fn handle_tui_list(signing_key: &SigningKey) -> Result<()> {
 
     let client = create_tui_client(signing_key);
 
-    // list_windows takes a UInt32 (session_id), but codegen doesn't generate a
-    // typed client method for UInt32 variants. Build the request manually.
-    let request_id = client.next_id();
-    let payload = hyprstream_rpc::serialize_message(|msg| {
-        let mut req = msg.init_root::<crate::tui_capnp::tui_request::Builder<'_>>();
-        req.set_id(request_id);
-        req.set_list_windows(0); // session_id 0 = all
-    })?;
-    let response = client.call(payload).await
+    let window_list = client.list_windows(0).await
         .context("Failed to list windows. Is the TUI service running?")?;
 
-    // Parse the response
-    match TuiClient::parse_response(&response)? {
-        TuiResponseVariant::ListWindowsResult(window_list) => {
-            if window_list.windows.is_empty() {
-                println!("No active sessions.");
-                println!("\nCreate one with: hyprstream tui new");
-            } else {
-                println!("┌─────────────────────────────────────────────────┐");
-                println!("│ TUI Sessions                                    │");
-                println!("├──────┬──────────────────┬───────┬───────────────┤");
-                println!("│ ID   │ Name             │ Panes │ Active Pane   │");
-                println!("├──────┼──────────────────┼───────┼───────────────┤");
-                for win in &window_list.windows {
-                    println!(
-                        "│ {:4} │ {:16} │ {:5} │ {:13} │",
-                        win.id,
-                        truncate_str(&win.name, 16),
-                        win.panes.len(),
-                        win.active_pane_id,
-                    );
-                }
-                println!("└──────┴──────────────────┴───────┴───────────────┘");
-            }
+    if window_list.windows.is_empty() {
+        println!("No active sessions.");
+        println!("\nCreate one with: hyprstream tui new");
+    } else {
+        println!("┌─────────────────────────────────────────────────┐");
+        println!("│ TUI Sessions                                    │");
+        println!("├──────┬──────────────────┬───────┬───────────────┤");
+        println!("│ ID   │ Name             │ Panes │ Active Pane   │");
+        println!("├──────┼──────────────────┼───────┼───────────────┤");
+        for win in &window_list.windows {
+            println!(
+                "│ {:4} │ {:16} │ {:5} │ {:13} │",
+                win.id,
+                truncate_str(&win.name, 16),
+                win.panes.len(),
+                win.active_pane_id,
+            );
         }
-        TuiResponseVariant::Error(e) => {
-            eprintln!("Error: {} (code: {})", e.message, e.code);
-            if !e.details.is_empty() {
-                eprintln!("  Details: {}", e.details);
-            }
-        }
-        other => {
-            eprintln!("Unexpected response: {:?}", other);
-        }
+        println!("└──────┴──────────────────┴───────┴───────────────┘");
     }
 
     Ok(())
@@ -436,20 +407,11 @@ pub async fn handle_tui_play(
     let config = TerminalConfig::new().cols(pane_cols).rows(pane_rows);
     let process = crate::tui::process::spawn_app_process(app, config);
 
-    // Send SpawnProcess command via RPC
-    // For now, the play command connects and spawns directly.
-    // The TUI service frame loop will pick up the process via the command channel.
-    let request_id = client.next_id();
-    let payload = hyprstream_rpc::serialize_message(|msg| {
-        let mut req = msg.init_root::<crate::tui_capnp::tui_request::Builder<'_>>();
-        req.set_id(request_id);
-        // Use sendInput as a signal to indicate playback started.
-        // The actual process attachment is handled locally.
-        let mut send_input = req.init_send_input();
-        send_input.set_viewer_id(result.viewer_id);
-        send_input.set_data(b"");
-    })?;
-    let _ = client.call(payload).await;
+    // Signal playback started via empty sendInput
+    let _ = client.send_input(&SendInputRequest {
+        viewer_id: result.viewer_id,
+        data: vec![],
+    }).await;
 
     // The process lives in this CLI process. Forward its output to the TUI
     // service via sendInput RPC, and subscribe to streams[0] (stdin) for
@@ -617,37 +579,22 @@ pub async fn forward_process_output(
             None => break,
         };
 
-        let request_id = client.next_id();
-        let payload = hyprstream_rpc::serialize_message(|msg| {
-            let mut req =
-                msg.init_root::<crate::tui_capnp::tui_request::Builder<'_>>();
-            req.set_id(request_id);
-            let mut send_input = req.init_send_input();
-            send_input.set_viewer_id(viewer_id);
-            send_input.set_data(&data);
-        });
-        if let Ok(payload) = payload {
-            if let Err(e) = client.call(payload).await {
-                tracing::debug!("sendInput failed: {}", e);
-                break;
-            }
+        if let Err(e) = client.send_input(&SendInputRequest {
+            viewer_id,
+            data: data.clone(),
+        }).await {
+            tracing::debug!("sendInput failed: {}", e);
+            break;
         }
     }
 
     // Send disconnect RPC so TuiService evicts this viewer immediately.
     // This prevents stale viewer entries that would intercept stdin relay
     // for subsequent sessions after this process exits.
-    let request_id = client.next_id();
-    if let Ok(payload) = hyprstream_rpc::serialize_message(|msg| {
-        let mut req = msg.init_root::<crate::tui_capnp::tui_request::Builder<'_>>();
-        req.set_id(request_id);
-        req.set_disconnect(viewer_id);
-    }) {
-            let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            client.call(payload),
-        ).await;
-    }
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        client.disconnect(viewer_id),
+    ).await;
 
     resize_handle.abort();
     if let Some(h) = stdin_forward { h.abort(); }
@@ -663,28 +610,16 @@ pub async fn forward_process_output(
 
 /// Query the active pane size from the TUI service via list_windows RPC.
 async fn query_pane_size(client: &TuiClient) -> Result<(u16, u16)> {
-    let request_id = client.next_id();
-    let payload = hyprstream_rpc::serialize_message(|msg| {
-        let mut req = msg.init_root::<crate::tui_capnp::tui_request::Builder<'_>>();
-        req.set_id(request_id);
-        req.set_list_windows(0); // session_id 0 = all
-    })?;
-    let response = client.call(payload).await?;
-
-    match TuiClient::parse_response(&response)? {
-        TuiResponseVariant::ListWindowsResult(window_list) => {
-            if let Some(win) = window_list.windows.first() {
-                if let Some(pane) = win.panes.iter().find(|p| p.id == win.active_pane_id) {
-                    return Ok((pane.cols, pane.rows));
-                }
-                if let Some(pane) = win.panes.first() {
-                    return Ok((pane.cols, pane.rows));
-                }
-            }
-            anyhow::bail!("no panes found")
+    let window_list = client.list_windows(0).await?;
+    if let Some(win) = window_list.windows.first() {
+        if let Some(pane) = win.panes.iter().find(|p| p.id == win.active_pane_id) {
+            return Ok((pane.cols, pane.rows));
         }
-        _ => anyhow::bail!("unexpected response"),
+        if let Some(pane) = win.panes.first() {
+            return Ok((pane.cols, pane.rows));
+        }
     }
+    anyhow::bail!("no panes found")
 }
 
 /// Truncate a string with ellipsis if too long.

@@ -58,32 +58,23 @@ fn compile_capnp_schemas() {
         return;
     }
 
-    // Note: common.capnp (identity, envelope) is in hyprstream-rpc crate
-    for name in ["events", "inference", "registry", "policy", "model", "mcp", "worker", "discovery", "notification", "tui"] {
-        let path = schema_dir.join(format!("{name}.capnp"));
-        if path.exists() {
-            let cgr_path = Path::new(&out_dir).join(format!("{name}.cgr"));
-            let metadata_path = Path::new(&out_dir).join(format!("{name}_metadata.json"));
+    let out_path = Path::new(&out_dir);
+    let schemas = ["events", "inference", "registry", "policy", "model", "mcp", "notification", "tui"];
 
-            // 1. Compile to Rust AND save raw CodeGeneratorRequest
-            capnpc::CompilerCommand::new()
-                .src_prefix("schema")
-                .import_path(&rpc_schema_dir)
-                .import_path(schema_dir)
-                .file(&path)
-                .raw_code_generator_request_path(&cgr_path)  // ← Save CGR!
-                .run()
-                .unwrap_or_else(|e| panic!("failed to compile {name}.capnp: {e}"));
+    // Compile schemas with CGR + metadata extraction
+    hyprstream_rpc_build::compile_schemas(
+        schema_dir,
+        out_path,
+        &[&rpc_schema_dir, schema_dir],
+        &schemas,
+    );
 
-            // 2. Parse CGR and extract schema metadata with annotations
-            if let Err(e) = hyprstream_rpc_build::parse_schema_and_extract_annotations(&cgr_path, &metadata_path, name) {
-                println!("cargo:warning=Failed to parse schema for {name}: {e}");
-                println!("cargo:warning=Falling back to text parsing (annotations not available)");
-            }
-
-            // 3. Copy CGR to stable codegen-out/ for TypeScript codegen
-            let codegen_dir = Path::new(&manifest_dir).join("../../codegen-out");
-            let _ = std::fs::create_dir_all(&codegen_dir);
+    // Copy CGR files to stable codegen-out/ for TypeScript codegen
+    let codegen_dir = Path::new(&manifest_dir).join("../../codegen-out");
+    let _ = std::fs::create_dir_all(&codegen_dir);
+    for name in &schemas {
+        let cgr_path = out_path.join(format!("{name}.cgr"));
+        if cgr_path.exists() {
             let _ = std::fs::copy(&cgr_path, codegen_dir.join(format!("{name}.cgr")));
         }
     }

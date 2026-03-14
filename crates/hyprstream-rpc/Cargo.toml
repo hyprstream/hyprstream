@@ -94,6 +94,7 @@ systemd = ["dep:systemd"]
 
 [build-dependencies]
 capnpc = { workspace = true }
+hyprstream-rpc-build = { path = "../hyprstream-rpc-build" }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

@@ -15,8 +15,19 @@ use crate::schema::types::ParsedSchema;
 /// and resolves capnp module paths through the external crate.
 pub fn generate_service(service_name: &str, schema: &ParsedSchema, types_crate: Option<&syn::Path>, scope_handlers: bool) -> proc_macro2::TokenStream {
     let resolved = ResolvedSchema::from(schema);
+    let is_data_only = resolved.raw.request_variants.is_empty();
 
     let data_structs = data::generate_data_structs(&resolved, service_name, types_crate);
+
+    if is_data_only {
+        // Data-only schema: only emit data structs (no client, handler, metadata)
+        return quote::quote! {
+            #data_structs
+        };
+    }
+
+    let metadata_code = metadata::generate_metadata(service_name, &resolved, types_crate);
+
     let response_enum = client::generate_response_enum(service_name, &resolved, types_crate);
     let client_struct = client::generate_client(service_name, &resolved, types_crate);
     let scoped_clients = scoped::generate_scoped_clients(service_name, &resolved, types_crate);
@@ -30,8 +41,6 @@ pub fn generate_service(service_name: &str, schema: &ParsedSchema, types_crate: 
     } else {
         proc_macro2::TokenStream::new()
     };
-
-    let metadata_code = metadata::generate_metadata(service_name, &resolved, types_crate);
 
     quote::quote! {
         use std::sync::Arc;

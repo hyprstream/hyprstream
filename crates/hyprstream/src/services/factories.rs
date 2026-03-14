@@ -216,8 +216,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::local());
 
     // Create registry client
-    let registry_client: RegistryClient = crate::services::core::create_service_client(
-        &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
+    let registry_client: RegistryClient = RegistryClient::new(
         ctx.signing_key().clone(),
         RequestIdentity::local(),
     );
@@ -339,18 +338,18 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     info!("Creating OAIService");
 
     use crate::server::state::ServerState;
-    use crate::services::{ModelZmqClient, OAIService};
+    use crate::services::generated::model_client::ModelClient;
+    use crate::services::OAIService;
 
     // Load full config for OAI settings
     let config = load_config();
 
     // Create ZMQ clients for Model and Policy services
-    let model_client = ModelZmqClient::new(ctx.signing_key().clone(), RequestIdentity::local());
+    let model_client = ModelClient::new(ctx.signing_key().clone(), RequestIdentity::local());
     let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::local());
 
     // Create registry client
-    let registry_client: RegistryClient = crate::services::core::create_service_client(
-        &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
+    let registry_client: RegistryClient = RegistryClient::new(
         ctx.signing_key().clone(),
         RequestIdentity::local(),
     );
@@ -406,8 +405,7 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     // RegistryClient already implements hyprstream_metrics::RegistryClient
     let registry_client: Option<Arc<dyn hyprstream_metrics::RegistryClient>> =
         if config.flight.default_dataset.is_some() {
-            let zmq_client: RegistryClient = crate::services::core::create_service_client(
-                &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
+            let zmq_client: RegistryClient = RegistryClient::new(
                 ctx.signing_key().clone(),
                 RequestIdentity::local(),
             );
@@ -760,7 +758,7 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 ///
 /// This service exposes the EndpointRegistry so remote clients can discover
 /// registered services, their endpoints, socket kinds, and schemas.
-#[service_factory("discovery", schema = "../../schema/discovery.capnp", metadata = crate::services::generated::discovery_client::schema_metadata)]
+#[service_factory("discovery", schema = "../../../hyprstream-discovery/schema/discovery.capnp", metadata = hyprstream_discovery::generated::discovery_client::schema_metadata)]
 fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating DiscoveryService");
 

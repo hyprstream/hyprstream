@@ -7,6 +7,7 @@
 # socket kinds, and schemas.
 # Uses REQ/REP pattern. Runs on multi-threaded runtime.
 
+using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".mcpScope;
 using import "/annotations.capnp".mcpDescription;
 
@@ -80,13 +81,6 @@ struct DiscoveryResponse {
     # Removed: listStreamsResult
     listStreamsResult @9 :Void;
   }
-}
-
-# Error Information
-struct ErrorInfo {
-  message @0 :Text;
-  code @1 :Text;
-  details @2 :Text;
 }
 
 # Summary of a registered service

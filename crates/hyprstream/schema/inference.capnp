@@ -1,5 +1,6 @@
 @0xa8c9e2f1d3b5a7c0;
 
+using import "/common.capnp".ErrorInfo;
 using import "/streaming.capnp".StreamInfo;
 using import "/annotations.capnp".optional;
 using import "/annotations.capnp".mcpScope;
@@ -269,10 +270,10 @@ struct ChatMessage {
 
 struct LoraConfig {
   rank @0 :UInt32;
-  alpha @1 :Float32;
-  dropout @2 :Float32;
+  alpha @1 :Opt.OptionFloat32 $paramDescription("LoRA alpha scaling factor");
+  dropout @2 :Opt.OptionFloat32 $paramDescription("Dropout rate during training");
   targetModules @3 :List(Text);
-  learningRate @4 :Float32;
+  learningRate @4 :Opt.OptionFloat32 $paramDescription("Learning rate for training (default: 1e-4)");
 }
 
 # Model Info
@@ -390,9 +391,9 @@ struct ExportPeftResult {
 # Merge LoRA Request (adapter.merge → inference internal)
 
 struct MergeLoraRequest {
-  adapterPath @0 :Text;    # relative path to adapter dir (e.g. "adapters/demo-1-rust-ttt")
-  weight @1 :Float32;      # merge weight 0.0-1.0, default 1.0
-  strategy @2 :Text;       # "replace", "additive", or "do_merge" (default: "do_merge")
+  adapterPath @0 :Text $paramDescription("Adapter directory name or relative path to merge");
+  weight @1 :Opt.OptionFloat32 $paramDescription("Merge weight 0.0-1.0 (default: 1.0 = full merge)");
+  strategy @2 :Text $optional $paramDescription("Merge strategy: 'replace', 'additive', or 'do_merge' (default: 'do_merge')");
 }
 
 # Vision embedding request (raw image bytes)
@@ -409,14 +410,6 @@ struct EmbedImagesResponse {
 # TTN layer profile result (JSON-encoded to avoid complex capnp map types)
 struct LayerProfileResult {
   json @0 :Text;   # JSON-encoded LayerProfile (serde_json::to_string_pretty)
-}
-
-# Error Information
-
-struct ErrorInfo {
-  message @0 :Text;
-  code @1 :Text;
-  details @2 :Text;
 }
 
 # Structured capacity error for TTT delta limits

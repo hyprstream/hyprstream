@@ -34,11 +34,7 @@ pub mod mcp_client {
     hyprstream_rpc_derive::generate_rpc_service!("mcp", scope_handlers);
 }
 
-pub mod discovery_client {
-    #![allow(dead_code, unused_imports, unused_variables)]
-    #![allow(clippy::all)]
-    hyprstream_rpc_derive::generate_rpc_service!("discovery", scope_handlers);
-}
+pub use hyprstream_discovery::generated::discovery_client;
 
 pub mod notification_client {
     #![allow(dead_code, unused_imports, unused_variables)]

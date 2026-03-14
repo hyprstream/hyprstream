@@ -82,6 +82,13 @@ pub mod optional_capnp {
     include!(concat!(env!("OUT_DIR"), "/optional_capnp.rs"));
 }
 
+pub mod common_types {
+    #![allow(dead_code, unused_imports, unused_variables)]
+    #![allow(clippy::all)]
+    extern crate self as hyprstream_rpc;
+    hyprstream_rpc_derive::generate_rpc_service!("common");
+}
+
 pub mod capnp;
 pub mod crypto;
 pub mod envelope;

@@ -15,8 +15,9 @@
 //! hyprstream              factory creates DiscoveryService, injects AuthorizationProvider
 //! ```
 
-// Re-export shared capnp modules so generated code's `crate::annotations_capnp` resolves
+// Re-export shared capnp modules so generated code's `crate::*_capnp` resolves
 pub use hyprstream_rpc::annotations_capnp;
+pub use hyprstream_rpc::common_capnp;
 
 // Cap'n Proto generated module
 pub mod discovery_capnp {

@@ -7,6 +7,7 @@
 # and MCP-controllable display surfaces.
 # Uses REQ/REP pattern. Runs on thread spawner (ratatui Buffer is !Send).
 
+using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".mcpScope;
 using import "/annotations.capnp".mcpDescription;
 
@@ -351,13 +352,6 @@ struct TuiResponse {
     # CreatePrivatePane result: the assigned pane_id
     createPrivatePaneResult @18 :UInt32;
   }
-}
-
-# Error information
-struct ErrorInfo {
-  message @0 :Text;
-  code @1 :Text;
-  details @2 :Text;
 }
 
 # Connection result

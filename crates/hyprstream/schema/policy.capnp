@@ -5,6 +5,7 @@
 # The policy service handles authorization checks via Casbin.
 # Uses REQ/REP pattern. Runs on multi-threaded runtime.
 
+using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".mcpScope;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".optional;
@@ -177,13 +178,6 @@ struct PolicyResponse {
 struct TokenInfo {
   token @0 :Text;      # Signed JWT token (stateless validation)
   expiresAt @1 :Int64;
-}
-
-# Error Information
-struct ErrorInfo {
-  message @0 :Text;
-  code @1 :Text;
-  details @2 :Text;
 }
 
 # List of supported authorization scopes

@@ -101,7 +101,7 @@ impl ActiveApp {
 
 }
 
-use crate::services::generated::tui_client::{TuiClient, ConnectRequest, DisplayMode};
+use crate::services::generated::tui_client::{TuiClient, ConnectRequest, DisplayMode, SpawnChromeShellRequest, ResizeRequest, SendInputRequest};
 use crate::tui::shell_client::{
     close_window_rpc, focus_window_rpc, spawn_chat_app_rpc,
     spawn_shell_rpc,
@@ -161,12 +161,12 @@ pub async fn handle_shell_tui(
     // Model load-status channel (background polling → event loop).
     let model_client = {
         use hyprstream_rpc::envelope::RequestIdentity;
-        crate::services::ModelZmqClient::new(signing_key.clone(), RequestIdentity::local())
+        crate::services::generated::model_client::ModelClient::new(signing_key.clone(), RequestIdentity::local())
     };
     // Worker client for sandbox/container/image management.
     let worker_client = {
         use hyprstream_rpc::envelope::RequestIdentity;
-        crate::services::WorkerZmqClient::new(signing_key.clone(), RequestIdentity::local())
+        hyprstream_workers::runtime::WorkerClient::new(signing_key.clone(), RequestIdentity::local())
     };
     let (model_status_tx, mut model_status_rx) =
         tokio::sync::mpsc::channel::<(String, bool)>(32);
@@ -517,14 +517,18 @@ pub async fn handle_shell_tui(
                         format!("Reloading {model_ref} with context {ctx_label}…"),
                         ToastLevel::Info,
                     );
-                    let _ = model_client.load(&model_ref, reload_max_context, None).await;
+                    let _ = model_client.load(&crate::services::generated::model_client::LoadModelRequest {
+                        model_ref: model_ref.clone(),
+                        max_context: reload_max_context,
+                        kv_quant: None,
+                    }).await;
                     let poll_client = model_client.clone();
                     let poll_mr = model_ref.clone();
                     let tx = model_status_tx.clone();
                     tokio::spawn(async move {
                         for _ in 0..60u32 {
                             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                            match poll_client.status(&poll_mr).await {
+                            match poll_client.status(&crate::services::generated::model_client::StatusRequest { model_ref: poll_mr.clone() }).await {
                                 Ok(entries) if entries.iter().any(|e| e.status == "loaded") => {
                                     let _ = tx.send((poll_mr, true)).await;
                                     return;
@@ -555,7 +559,7 @@ pub async fn handle_shell_tui(
                                 .enable_all()
                                 .build();
                             if let Ok(rt) = rt {
-                                let _ = rt.block_on(wc.detach(&cid));
+                                let _ = rt.block_on(wc.container().detach(&cid));
                             }
                         });
                     }
@@ -648,8 +652,8 @@ fn composite_draw(
 async fn dispatch_outputs(
     compositor: &mut Compositor,
     client: &TuiClient,
-    model_client: &crate::services::ModelZmqClient,
-    worker_client: &crate::services::WorkerZmqClient,
+    model_client: &crate::services::generated::model_client::ModelClient,
+    worker_client: &hyprstream_workers::runtime::WorkerClient,
     model_status_tx: &tokio::sync::mpsc::Sender<(String, bool)>,
     terminal: &mut ratatui::Terminal<AnsiBackend<AnsiWriter>>,
     console_app: &mut ConsoleApp,
@@ -707,8 +711,8 @@ async fn dispatch_outputs(
 async fn handle_rpc(
     compositor: &mut Compositor,
     client: &TuiClient,
-    model_client: &crate::services::ModelZmqClient,
-    worker_client: &crate::services::WorkerZmqClient,
+    model_client: &crate::services::generated::model_client::ModelClient,
+    worker_client: &hyprstream_workers::runtime::WorkerClient,
     model_status_tx: &tokio::sync::mpsc::Sender<(String, bool)>,
     active_apps: &mut HashMap<u32, ActiveApp>,
     next_local_id: &mut u32,
@@ -805,7 +809,11 @@ async fn handle_rpc(
         }
 
         RpcRequest::LoadModel { model_ref } => {
-            let _ = model_client.load(&model_ref, None, None).await;
+            let _ = model_client.load(&crate::services::generated::model_client::LoadModelRequest {
+                model_ref: model_ref.clone(),
+                max_context: None,
+                kv_quant: None,
+            }).await;
             // Spawn background polling task.
             let poll_client = model_client.clone();
             let poll_mr    = model_ref.clone();
@@ -813,7 +821,7 @@ async fn handle_rpc(
             tokio::spawn(async move {
                 for _ in 0..60u32 {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    match poll_client.status(&poll_mr).await {
+                    match poll_client.status(&crate::services::generated::model_client::StatusRequest { model_ref: poll_mr.clone() }).await {
                         Ok(entries) if entries.iter().any(|e| e.status == "loaded") => {
                             let _ = tx.send((poll_mr, true)).await;
                             return;
@@ -827,7 +835,7 @@ async fn handle_rpc(
         }
 
         RpcRequest::UnloadModel { model_ref } => {
-            let ok = model_client.unload(&model_ref).await.is_ok();
+            let ok = model_client.unload(&crate::services::generated::model_client::UnloadModelRequest { model_ref: model_ref.clone() }).await.is_ok();
             if ok {
                 compositor.chrome.update_model_status(&model_ref, false);
             }
@@ -1185,7 +1193,11 @@ async fn handle_rpc(
             let short_s = sandbox_id[..sandbox_id.len().min(8)].to_owned();
 
             // Attach RPC → returns ready-to-use StreamHandle (DH + SUB + HMAC managed internally).
-            let mut stream_handle = match worker_client.attach(&container_id).await {
+            use hyprstream_workers::generated::worker_client::ContainerRpc;
+            let mut stream_handle = match ContainerRpc::attach(&worker_client.container(), &crate::services::worker::AttachRequest {
+                container_id: container_id.clone(),
+                fds: vec![],
+            }).await {
                 Ok(h) => h,
                 Err(e) => {
                     compositor.chrome.push_toast(
@@ -1300,18 +1312,13 @@ pub async fn handle_tui_shell(
     let registry_dir = if registry_dir.exists() { registry_dir } else { models_dir.to_path_buf() };
     let registry_str = registry_dir.to_string_lossy().into_owned();
 
-    let request_id = client.next_id();
-    let payload = hyprstream_rpc::serialize_message(|msg| {
-        let mut req = msg.init_root::<crate::tui_capnp::tui_request::Builder<'_>>();
-        req.set_id(request_id);
-        let mut spawn = req.init_spawn_chrome_shell();
-        spawn.set_session_id(session_id);
-        spawn.set_registry_dir(&registry_str);
-        spawn.set_cols(cols);
-        spawn.set_rows(rows);
-        spawn.set_pane_id(0);
-    })?;
-    client.call(payload).await.context("spawnChromeShell RPC failed")?;
+    client.spawn_chrome_shell(&SpawnChromeShellRequest {
+        session_id,
+        registry_dir: registry_str,
+        cols,
+        rows,
+        pane_id: 0,
+    }).await.context("spawnChromeShell RPC failed")?;
 
     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?
         .recv()
@@ -1332,21 +1339,22 @@ async fn fetch_models(
     let registry_endpoint = hyprstream_rpc::registry::global()
         .endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep)
         .to_zmq_string();
-    let registry: crate::services::RegistryClient = crate::services::create_service_client(
+    let registry: crate::services::RegistryClient = crate::services::RegistryClient::with_endpoint(
         &registry_endpoint,
         signing_key.clone(),
         RequestIdentity::local(),
     );
-    let model_client_for_status = crate::services::ModelZmqClient::new(
+    let model_client_for_status = crate::services::generated::model_client::ModelClient::new(
         signing_key.clone(),
         RequestIdentity::local(),
     );
     let registry_models_dir = models_dir.to_path_buf();
     let status_timeout = std::time::Duration::from_millis(500);
 
+    let all_status_req = crate::services::generated::model_client::StatusRequest { model_ref: String::new() };
     let (repos_result, status_result) = tokio::join!(
         registry.list(),
-        tokio::time::timeout(status_timeout, model_client_for_status.status("")),
+        tokio::time::timeout(status_timeout, model_client_for_status.status(&all_status_req)),
     );
 
     let status_map: std::collections::HashMap<String, bool> = match status_result {
@@ -1385,55 +1393,29 @@ async fn fetch_models(
 // ============================================================================
 
 async fn list_windows_rpc(client: &TuiClient) -> anyhow::Result<Vec<WindowSummary>> {
-    use crate::services::generated::tui_client::TuiResponseVariant;
-    let request_id = client.next_id();
-    let payload = hyprstream_rpc::serialize_message(|msg| {
-        let mut req = msg.init_root::<crate::tui_capnp::tui_request::Builder<'_>>();
-        req.set_id(request_id);
-        req.set_list_windows(0);
-    })?;
-    let response = client.call(payload).await?;
-    match TuiClient::parse_response(&response)? {
-        TuiResponseVariant::ListWindowsResult(list) => Ok(list
-            .windows
-            .iter()
-            .map(|w| WindowSummary {
-                id: w.id,
-                name: w.name.clone(),
-                active_pane_id: w.active_pane_id,
-                panes: w.panes.iter().map(|p| PaneSummary { id: p.id, cols: p.cols, rows: p.rows, is_private: p.is_private }).collect(),
-            })
-            .collect()),
-        _ => anyhow::bail!("unexpected response"),
-    }
+    let list = client.list_windows(0).await?;
+    Ok(list
+        .windows
+        .iter()
+        .map(|w| WindowSummary {
+            id: w.id,
+            name: w.name.clone(),
+            active_pane_id: w.active_pane_id,
+            panes: w.panes.iter().map(|p| PaneSummary { id: p.id, cols: p.cols, rows: p.rows, is_private: p.is_private }).collect(),
+        })
+        .collect())
 }
 
 async fn resize_rpc(client: &TuiClient, cols: u16, rows: u16) -> anyhow::Result<()> {
-    let request_id = client.next_id();
-    let payload = hyprstream_rpc::serialize_message(|msg| {
-        let mut req = msg.init_root::<crate::tui_capnp::tui_request::Builder<'_>>();
-        req.set_id(request_id);
-        let mut r = req.init_resize();
-        r.set_cols(cols);
-        r.set_rows(rows);
-    })?;
-    client.call(payload).await?;
-    Ok(())
+    client.resize(&ResizeRequest { cols, rows }).await
 }
 
 async fn send_input_rpc(client: &TuiClient, viewer_id: u32, data: &[u8]) {
-    let request_id = client.next_id();
-    let payload = hyprstream_rpc::serialize_message(|msg| {
-        let mut req = msg.init_root::<crate::tui_capnp::tui_request::Builder<'_>>();
-        req.set_id(request_id);
-        let mut send_input = req.init_send_input();
-        send_input.set_viewer_id(viewer_id);
-        send_input.set_data(data);
-    });
-    if let Ok(p) = payload {
-        if let Err(e) = client.call(p).await {
-            tracing::debug!("sendInput failed: {e}");
-        }
+    if let Err(e) = client.send_input(&SendInputRequest {
+        viewer_id,
+        data: data.to_vec(),
+    }).await {
+        tracing::debug!("sendInput failed: {e}");
     }
 }
 
