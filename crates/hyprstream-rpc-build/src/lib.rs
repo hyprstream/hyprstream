@@ -7,10 +7,50 @@
 //! - Metadata JSON extraction for proc-macro annotation merging
 //! - TypeScript codegen from parsed schemas (via the `hyprstream-ts-codegen` binary)
 
+#![allow(clippy::print_stdout)] // cargo:warning= directives require println!
+
 pub mod schema;
 pub mod util;
 
 use std::path::Path;
+
+/// Compile Cap'n Proto schemas with CGR + metadata extraction.
+///
+/// For each schema name, compiles `{schema_dir}/{name}.capnp` via capnpc,
+/// saves the raw CGR to `{out_dir}/{name}.cgr`, and extracts annotation
+/// metadata to `{out_dir}/{name}_metadata.json`.
+///
+/// `import_paths` are passed to capnpc for resolving `using import` directives.
+pub fn compile_schemas(
+    schema_dir: &Path,
+    out_dir: &Path,
+    import_paths: &[&Path],
+    names: &[&str],
+) {
+    for name in names {
+        let path = schema_dir.join(format!("{name}.capnp"));
+        if !path.exists() {
+            continue;
+        }
+
+        let cgr_path = out_dir.join(format!("{name}.cgr"));
+        let metadata_path = out_dir.join(format!("{name}_metadata.json"));
+
+        let mut cmd = capnpc::CompilerCommand::new();
+        cmd.src_prefix(schema_dir);
+        for ip in import_paths {
+            cmd.import_path(ip);
+        }
+        cmd.file(&path)
+            .raw_code_generator_request_path(&cgr_path)
+            .run()
+            .unwrap_or_else(|e| panic!("Failed to compile {name}.capnp: {e}"));
+
+        if let Err(e) = parse_schema_and_extract_annotations(&cgr_path, &metadata_path, name) {
+            println!("cargo:warning=Failed to parse schema for {name}: {e}");
+        }
+    }
+}
 
 /// Parse a CodeGeneratorRequest CGR file and extract schema metadata with annotations.
 ///

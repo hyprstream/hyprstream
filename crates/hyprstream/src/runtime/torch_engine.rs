@@ -1,9 +1,10 @@
 //! PyTorch-based inference engine using tch-rs
 
 use crate::config::{
-    FinishReason, GenerationConfig, GenerationRequest, GenerationResult, ModelInfo, RuntimeConfig,
-    TemplatedPrompt,
+    FinishReason, GenerationConfig, GenerationResult, RuntimeConfig,
 };
+use crate::runtime::GenerationRequest;
+use crate::runtime::ModelInfo;
 use crate::runtime::tensor_sampling::TensorSampler;
 use crate::runtime::template_engine::{ChatMessage, TemplateEngine};
 use crate::runtime::architectures::ModelOperations;
@@ -121,7 +122,7 @@ impl TorchEngine {
         &mut self,
         num_layers: usize,
         max_seq_len: usize,
-        quant_type: crate::runtime::kv_quant::KVQuantType,
+        quant_type: crate::runtime::KVQuantType,
         memory_budget: Option<usize>,
     ) {
         let config = crate::runtime::kv_cache::CacheConfig::new(num_layers, max_seq_len)
@@ -308,16 +309,11 @@ impl TorchEngine {
             model_info: Arc::new(Mutex::new(ModelInfo {
                 name: "unloaded".to_owned(),
                 architecture: "unknown".to_owned(),
-                parameters: 0,
+                parameters: Some(0),
                 context_length: 2048,
                 vocab_size: 32000,
                 hidden_size: 768,
-                intermediate_size: None,
-                num_attention_heads: None,
-                num_key_value_heads: None,
-                head_dim: None,
-                num_hidden_layers: None,
-                quantization: None,
+                ..Default::default()
             })),
             active_lora: Arc::new(Mutex::new(None)),
             sampler: TensorSampler::new(device),
@@ -384,7 +380,7 @@ impl TorchEngine {
         }
 
         // Get context window from model info that was populated from config
-        let context_window = self.model_info.lock().context_length;
+        let context_window = self.model_info.lock().context_length as usize;
 
         // Initialize context state
         {
@@ -445,7 +441,7 @@ impl TorchEngine {
         let config = ModelConfig::load(model_path, &empty_weights)?;
 
         // Effective context length (CLI override or model default)
-        let effective_max_context = self.config.max_context.unwrap_or(config.max_position_embeddings);
+        let effective_max_context = self.config.max_context.map(|v| v as usize).unwrap_or(config.max_position_embeddings);
         if self.config.max_context.is_some() {
             info!("Using max_context override: {} tokens (model default: {})", effective_max_context, config.max_position_embeddings);
         }
@@ -496,14 +492,14 @@ impl TorchEngine {
         // Update ModelInfo with actual values from config
         {
             let mut model_info = self.model_info.lock();
-            model_info.hidden_size = config.hidden_size;
-            model_info.intermediate_size = Some(config.intermediate_size);
-            model_info.num_attention_heads = Some(config.num_attention_heads);
-            model_info.num_key_value_heads = Some(config.num_key_value_heads);
-            model_info.head_dim = Some(config.head_dim);
-            model_info.num_hidden_layers = Some(config.num_hidden_layers);
-            model_info.vocab_size = config.vocab_size;
-            model_info.context_length = effective_max_context;
+            model_info.hidden_size = config.hidden_size as u32;
+            model_info.intermediate_size = Some(config.intermediate_size as u32);
+            model_info.num_attention_heads = Some(config.num_attention_heads as u32);
+            model_info.num_key_value_heads = Some(config.num_key_value_heads as u32);
+            model_info.head_dim = Some(config.head_dim as u32);
+            model_info.num_hidden_layers = Some(config.num_hidden_layers as u32);
+            model_info.vocab_size = config.vocab_size as u32;
+            model_info.context_length = effective_max_context as u32;
             model_info.architecture = config.model_type.clone();
         }
 
@@ -513,7 +509,7 @@ impl TorchEngine {
             model_path,
             &self.device,
             tch::Kind::BFloat16,
-            self.config.max_context,
+            self.config.max_context.map(|v| v as usize),
             self.config.kv_quant_type,
         ).await?;
         let factory_time = factory_start.elapsed();
@@ -549,7 +545,7 @@ impl TorchEngine {
             // Get model's configured vocab size
             let model_vocab_size = {
                 let model_info = self.model_info.lock();
-                model_info.vocab_size
+                model_info.vocab_size as usize
             };
 
             // Apply model-specific tokenizer configuration if model is loaded
@@ -1092,22 +1088,14 @@ impl RuntimeEngine for TorchEngine {
         );
 
         let request = GenerationRequest {
-            prompt: TemplatedPrompt::new(formatted_prompt),
-            max_tokens,
-            temperature: self.generation_config.temperature,
-            top_p: self.generation_config.top_p,
-            top_k: self.generation_config.top_k,
-            repeat_penalty: self.generation_config.repeat_penalty,
-            repeat_last_n: 64, // Default
-            stop_tokens: self.generation_config.stop_tokens.clone(),
-            seed: None,
-            images: Vec::new(),
-            timeout: None,
-            collect_metrics: false, // Default: off for performance
-            ttt_enabled: false,
-            ttt_gradient_steps: 0,
-            ttt_learning_rate: 0.0,
-            auto_commit: false,
+            prompt: formatted_prompt,
+            max_tokens: Some(max_tokens as u32),
+            temperature: Some(self.generation_config.temperature),
+            top_p: Some(self.generation_config.top_p),
+            top_k: self.generation_config.top_k.map(|v| v as u32),
+            repeat_penalty: Some(self.generation_config.repeat_penalty),
+            stop_tokens: Some(self.generation_config.stop_tokens.clone()),
+            ..Default::default()
         };
 
         let result = self.generate_with_params(request).await?;
@@ -1316,7 +1304,7 @@ impl TorchEngine {
     /// # Example
     /// ```no_run
     /// use futures::StreamExt;
-    /// use hyprstream_core::config::GenerationRequest;
+    /// use hyprstream_core::runtime::GenerationRequest;
     ///
     /// # async fn example(engine: &hyprstream_core::runtime::torch_engine::TorchEngine) -> anyhow::Result<()> {
     /// let request = GenerationRequest::default();
@@ -1338,8 +1326,8 @@ impl TorchEngine {
         }
 
         // Apply server defaults if not specified in request
-        if request.timeout.is_none() {
-            request.timeout = Some(self.config.default_generation_timeout_ms);
+        if request.timeout_ms.is_none() {
+            request.timeout_ms = Some(self.config.default_generation_timeout_ms);
         }
 
         TextStream::new(self, request)
@@ -1359,8 +1347,8 @@ impl TorchEngine {
             self.set_seed(seed as u64);
         }
 
-        if request.timeout.is_none() {
-            request.timeout = Some(self.config.default_generation_timeout_ms);
+        if request.timeout_ms.is_none() {
+            request.timeout_ms = Some(self.config.default_generation_timeout_ms);
         }
 
         TextStream::new_with_delta(self, request, delta)
@@ -1484,20 +1472,21 @@ impl TorchEngine {
     /// Supported modules: q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj
     pub fn get_lora_module_dims(&self) -> Result<std::collections::HashMap<String, (usize, usize)>> {
         let model_info = self.model_info.lock();
-        let hidden_size = model_info.hidden_size;
+        let hidden_size = model_info.hidden_size as usize;
 
         let num_heads = model_info.num_attention_heads
-            .ok_or_else(|| anyhow!("num_attention_heads not set in ModelInfo"))?;
+            .ok_or_else(|| anyhow!("num_attention_heads not set in ModelInfo"))? as usize;
         let num_kv_heads = model_info.num_key_value_heads
-            .unwrap_or(num_heads);
+            .unwrap_or(num_heads as u32) as usize;
         let head_dim = model_info.head_dim
+            .map(|d| d as usize)
             .unwrap_or(hidden_size / num_heads);
 
         let q_out = num_heads * head_dim;
         let kv_out = num_kv_heads * head_dim;
 
         let intermediate_size = if let Some(intermediate) = model_info.intermediate_size {
-            intermediate
+            intermediate as usize
         } else {
             match model_info.architecture.as_str() {
                 "Qwen2ForCausalLM" => (hidden_size as f32 * 2.6667) as usize,
@@ -1539,21 +1528,21 @@ impl TorchEngine {
 
         if let Some(q35) = model_any.downcast_ref::<crate::runtime::architectures::qwen3_5::Qwen3_5Model>() {
             let qcfg = q35.text_config();
-            let hidden = qcfg.hidden_size;
-            let nh = qcfg.num_attention_heads;
-            let hd = qcfg.head_dim;
+            let hidden = qcfg.hidden_size as usize;
+            let nh = qcfg.num_attention_heads as usize;
+            let hd = qcfg.head_dim as usize;
             // q_proj outputs num_heads * head_dim * 2 (first half = Q, second half = gate).
             // The LoRA delta targets only the Q half, so lora_b out_features = nh*hd (the half-dim).
             // o_proj in_features is also nh*hd (attention output after gate application).
             let q_half_dim = nh * hd;
 
             let gdn_out_proj_in = qcfg.linear_num_value_heads * qcfg.linear_value_head_dim;
-            let num_layers = qcfg.num_hidden_layers;
+            let num_layers = qcfg.num_hidden_layers as usize;
 
             let mut per_layer: std::collections::HashMap<usize, std::collections::HashMap<String, (usize, usize)>> =
                 std::collections::HashMap::new();
 
-            let nkv_out = qcfg.num_key_value_heads * hd;
+            let nkv_out = (qcfg.num_key_value_heads as usize) * hd;
             for (layer_idx, lt) in qcfg.layer_types.iter().enumerate() {
                 let mut layer_dims: std::collections::HashMap<String, (usize, usize)> =
                     std::collections::HashMap::new();
@@ -1980,11 +1969,11 @@ impl<'a> TextStream<'a> {
         request: GenerationRequest,
         delta: Option<std::sync::Arc<parking_lot::Mutex<crate::training::TenantDelta>>>,
     ) -> Result<Self> {
-        let prompt_tokens = engine.tokenize(request.prompt.as_str())?;
+        let prompt_tokens = engine.tokenize(&request.prompt)?;
         let prompt_len = prompt_tokens.len();
 
         let tokenizer = engine.get_tokenizer()?;
-        let stop_token_ids: Vec<u32> = request.stop_tokens
+        let stop_token_ids: Vec<u32> = request.stop_tokens.as_deref().unwrap_or(&[])
             .iter()
             .filter_map(|stop_str| {
                 let encoding = tokenizer.encode(stop_str.as_str(), false).ok()?;
@@ -2003,11 +1992,7 @@ impl<'a> TextStream<'a> {
 
         engine.clear_kv_cache();
 
-        let repeat_last_n = if request.repeat_last_n > 0 {
-            request.repeat_last_n
-        } else {
-            64
-        };
+        let repeat_last_n = request.repeat_last_n.map(|v| v as usize).filter(|&v| v > 0).unwrap_or(64);
 
         // Use Arc for safe tokenizer sharing
         // This Arc is REQUIRED by the TextStream struct - see the comment on the tokenizer field
@@ -2054,10 +2039,10 @@ impl<'a> TextStream<'a> {
 
         // PERF: Pre-create sampling params to avoid struct allocation per token
         let sampling_params = SamplingParams {
-            temperature: request.temperature,
-            top_p: request.top_p,
-            top_k: request.top_k,
-            repeat_penalty: request.repeat_penalty,
+            temperature: request.temperature.unwrap_or(0.7),
+            top_p: request.top_p.unwrap_or(0.95),
+            top_k: request.top_k.map(|v| v as usize),
+            repeat_penalty: request.repeat_penalty.unwrap_or(1.0),
         };
 
         // PERF: Cache vocab_size to avoid lock acquisition per token
@@ -2070,7 +2055,7 @@ impl<'a> TextStream<'a> {
             last_generated: None,
             recent_tokens: VecDeque::with_capacity(repeat_last_n),
             repeat_last_n,
-            max_tokens: request.max_tokens,
+            max_tokens: request.max_tokens.unwrap_or(2048) as usize,
             stop_token_ids,
             tokenizer: tokenizer_arc,
             decode_stream,
@@ -2081,8 +2066,8 @@ impl<'a> TextStream<'a> {
             start_time: std::time::Instant::now(),
             finished: false,
             finish_reason: None,
-            timeout_ms: request.timeout,
-            collect_metrics: request.collect_metrics,
+            timeout_ms: request.timeout_ms,
+            collect_metrics: false, // Server-side concern, not per-request
             metrics_accumulator: crate::runtime::generation_metrics::GenerationMetricsAccumulator::new(),
             // PERF: Cached values initialized here, avoid per-token recomputation
             sampling_params,

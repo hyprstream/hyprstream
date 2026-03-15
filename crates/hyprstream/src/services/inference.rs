@@ -34,12 +34,14 @@
 //! authorization on all requests. The handler delegates to PolicyClient.
 
 use crate::services::PolicyClient;
-use crate::config::{GenerationRequest, ModelInfo, TrainingMode};
+use crate::config::TrainingMode;
+use crate::runtime::GenerationRequest;
+use crate::runtime::ModelInfo;
 use crate::inference_capnp;
 use crate::runtime::kv_cache::CacheOwner;
 use crate::runtime::model_config::ModelConfig;
 use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
-use crate::services::rpc_types::StreamInfo;
+
 use crate::services::EnvelopeContext;
 use crate::services::WorktreeClient;
 use crate::training::{DeltaPool, TenantDeltaConfig, TTTConfig, TestTimeTrainer};
@@ -87,10 +89,10 @@ enum PendingWork {
         subject: Subject,
         /// Text to train on
         input: String,
-        /// Number of gradient steps
-        gradient_steps: u32,
-        /// Learning rate override (0 = use default)
-        learning_rate: f32,
+        /// Number of gradient steps (None = use model default)
+        gradient_steps: Option<u32>,
+        /// Learning rate override (None = use model default)
+        learning_rate: Option<f32>,
         /// How to handle the adaptation result
         adaptation_strategy: crate::training::adaptation_state::AdaptationStrategy,
     },
@@ -200,40 +202,8 @@ impl std::ops::Deref for InferenceService {
 unsafe impl Send for InferenceServiceInner {}
 unsafe impl Sync for InferenceServiceInner {}
 
-/// Delta status information returned by getDeltaStatus
-pub struct DeltaStatusInfo {
-    pub exists: bool,
-    pub accumulated_steps: u64,
-    pub max_accumulated_steps: u64,
-    pub request_count: u64,
-    pub avg_loss_improvement: f32,
-    pub memory_bytes: u64,
-    pub last_snapshot_hash: String,
-    pub delta_norm_ratios: std::collections::HashMap<String, f64>,
-    pub has_pending: bool,
-}
-
-/// Save adaptation result information
-pub struct SaveAdaptationInfo {
-    pub adapter_name: String,
-    pub adapter_path: String,
-    pub content_hash: String,
-    pub merge_strategy: String,
-}
-
-/// Snapshot delta result information
-pub struct SnapshotDeltaInfo {
-    pub content_hash: String,
-    pub size_bytes: u64,
-    pub accumulated_steps: u64,
-    pub request_count: u64,
-}
-
-/// Export PEFT adapter result information
-pub struct ExportPeftInfo {
-    pub adapter_path: String,
-    pub content_hash: String,
-}
+// Intermediate response structs (DeltaStatusInfo, SaveAdaptationResult, SnapshotDeltaResult,
+// ExportPeftResult) eliminated — handlers return generated types directly.
 
 impl InferenceService {
     /// Start inference service in callback mode
@@ -536,8 +506,8 @@ impl InferenceService {
 
         // Initialize KV cache registry
         let model_info = RuntimeEngine::model_info(&engine);
-        let num_layers = model_info.num_hidden_layers.unwrap_or(32);
-        let max_seq_len = config.max_context.unwrap_or(model_info.context_length);
+        let num_layers = model_info.num_hidden_layers.unwrap_or(32) as usize;
+        let max_seq_len = config.max_context.unwrap_or(model_info.context_length) as usize;
         engine.initialize_kv_registry(num_layers, max_seq_len, config.kv_quant_type, None);
 
         info!(
@@ -1419,8 +1389,8 @@ impl InferenceService {
         &self,
         subject: &Subject,
         input: &str,
-        gradient_steps: u32,
-        learning_rate: f32,
+        gradient_steps: Option<u32>,
+        learning_rate: Option<f32>,
         strategy: crate::training::adaptation_state::AdaptationStrategy,
     ) -> Result<crate::training::ttt::TTTResult> {
         let ttt_trainer = self.ttt_trainer.as_ref()
@@ -1447,8 +1417,8 @@ impl InferenceService {
             (input_tokens, pre_snapshot, pre_muon, pre_eff_ranks)
         }; // guard dropped
 
-        let steps = if gradient_steps > 0 { gradient_steps as usize } else { ttt_trainer.config.gradient_steps };
-        let lr = if learning_rate > 0.0 { Some(learning_rate as f64) } else { None };
+        let steps = gradient_steps.map(|g| g as usize).unwrap_or(ttt_trainer.config.gradient_steps as usize);
+        let lr = learning_rate.map(|l| l as f64);
 
         // Phase 2: Await engine (no lock held — safe for spawn_local concurrency)
         let engine = self.engine.read();
@@ -1519,14 +1489,14 @@ impl InferenceService {
         Ok(())
     }
 
-    /// Get status of a tenant's delta
-    fn handle_get_delta_status(&self, subject: &Subject) -> Result<DeltaStatusInfo> {
+    /// Get status of a tenant's delta — returns generated DeltaStatusResult directly.
+    fn handle_get_delta_status(&self, subject: &Subject) -> Result<DeltaStatusResult> {
         if let Some(pool) = &self.delta_pool {
             if let Some(delta_arc) = pool.get(subject) {
                 let delta = delta_arc.lock();
                 let norm_ratios = delta.delta_norm_ratio(pool.base_weight_norms());
                 let has_pending = delta.adaptation_state.is_pending();
-                return Ok(DeltaStatusInfo {
+                return Ok(DeltaStatusResult {
                     exists: true,
                     accumulated_steps: delta.accumulated_steps,
                     max_accumulated_steps: delta.max_accumulated_steps,
@@ -1534,13 +1504,16 @@ impl InferenceService {
                     avg_loss_improvement: delta.avg_loss_improvement as f32,
                     memory_bytes: delta.memory_bytes() as u64,
                     last_snapshot_hash: delta.last_snapshot_hash.clone().unwrap_or_default(),
-                    delta_norm_ratios: norm_ratios,
+                    delta_norm_ratios: norm_ratios.into_iter().map(|(name, ratio)| ModuleNormRatio {
+                        module_name: name,
+                        ratio: ratio as f32,
+                    }).collect(),
                     has_pending,
                 });
             }
         }
 
-        Ok(DeltaStatusInfo {
+        Ok(DeltaStatusResult {
             exists: false,
             accumulated_steps: 0,
             max_accumulated_steps: 0,
@@ -1548,7 +1521,7 @@ impl InferenceService {
             avg_loss_improvement: 0.0,
             memory_bytes: 0,
             last_snapshot_hash: String::new(),
-            delta_norm_ratios: std::collections::HashMap::new(),
+            delta_norm_ratios: vec![],
             has_pending: false,
         })
     }
@@ -1563,7 +1536,7 @@ impl InferenceService {
         name: &str,
         merge_strategy_name: &str,
         merge_weight: f32,
-    ) -> Result<SaveAdaptationInfo> {
+    ) -> Result<SaveAdaptationResult> {
         use crate::training::{MergeStrategy, merge_state_dicts};
 
         let pool = self.delta_pool.as_ref()
@@ -1652,7 +1625,7 @@ impl InferenceService {
             subject, adapter_name, result_path, actual_strategy
         );
 
-        Ok(SaveAdaptationInfo {
+        Ok(SaveAdaptationResult {
             adapter_name: adapter_name.clone(),
             adapter_path: result_path,
             content_hash: String::new(),
@@ -1661,7 +1634,7 @@ impl InferenceService {
     }
 
     /// Snapshot a tenant's delta to a file
-    async fn handle_snapshot_delta(&self, subject: &Subject) -> Result<SnapshotDeltaInfo> {
+    async fn handle_snapshot_delta(&self, subject: &Subject) -> Result<SnapshotDeltaResult> {
         let pool = self.delta_pool.as_ref()
             .ok_or_else(|| anyhow!("Delta pool not initialized"))?;
 
@@ -1690,7 +1663,7 @@ impl InferenceService {
         let mut delta = delta_arc.lock();
         delta.last_snapshot_hash = Some(path_str.clone());
 
-        Ok(SnapshotDeltaInfo {
+        Ok(SnapshotDeltaResult {
             content_hash: path_str,
             size_bytes,
             accumulated_steps: delta.accumulated_steps,
@@ -1707,7 +1680,7 @@ impl InferenceService {
         subject: &Subject,
         name: &str,
         _commit_message: &str,
-    ) -> Result<ExportPeftInfo> {
+    ) -> Result<ExportPeftResult> {
         let pool = self.delta_pool.as_ref()
             .ok_or_else(|| anyhow!("Delta pool not initialized"))?;
 
@@ -1773,7 +1746,7 @@ impl InferenceService {
             subject, adapter_name, safetensors_bytes.len()
         );
 
-        Ok(ExportPeftInfo {
+        Ok(ExportPeftResult {
             adapter_path: dir_path,
             content_hash: String::new(),
         })
@@ -1968,15 +1941,16 @@ use crate::services::generated::inference_client::{
     SaveAdaptationResult, SnapshotDeltaResult, ExportPeftResult,
     ChatTemplateRequest, LoraConfig, TrainStepRequest, SaveAdaptationRequest, ExportPeftRequest,
     MergeLoraRequest, EmbedImagesRequest, EmbedImagesResponse,
-    AdaptationStrategyEnum,
+    AdaptationStrategy as AdaptationStrategyEnum,
 };
+use crate::services::generated::policy_client::PolicyCheck;
 // Conflicting names — use canonical path at usage sites:
 //   inference_client::GenerationResult, inference_client::ModelInfo, inference_client::StreamInfo
 
 /// Map a capnp AdaptationStrategyEnum + optional threshold to the internal AdaptationStrategy.
 fn map_adaptation_strategy(
     capnp_strategy: AdaptationStrategyEnum,
-    writeback_threshold: f32,
+    writeback_threshold: Option<f32>,
 ) -> crate::training::adaptation_state::AdaptationStrategy {
     match capnp_strategy {
         AdaptationStrategyEnum::AutoWriteback => {
@@ -1990,7 +1964,7 @@ fn map_adaptation_strategy(
         }
         AdaptationStrategyEnum::WritebackIfAbove => {
             crate::training::adaptation_state::AdaptationStrategy::WritebackIfAbove {
-                threshold: writeback_threshold,
+                threshold: writeback_threshold.unwrap_or(0.0),
             }
         }
     }
@@ -2000,7 +1974,7 @@ fn map_adaptation_strategy(
 impl InferenceHandler for InferenceService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
         let subject = ctx.subject();
-        let allowed = self.policy_client.check(&subject.to_string(), "*", resource, operation).await.unwrap_or_else(|e| {
+        let allowed = self.policy_client.check(&PolicyCheck { subject: subject.to_string(), domain: "*".to_owned(), resource: resource.to_owned(), operation: operation.to_owned() }).await.unwrap_or_else(|e| {
             warn!("Policy check failed for {} on {}: {} - denying access", subject, resource, e);
             false
         });
@@ -2016,30 +1990,13 @@ impl InferenceHandler for InferenceService {
         data: &crate::services::generated::inference_client::GenerationRequest,
     ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
         let subject = ctx.subject();
-        let request = GenerationRequest {
-            prompt: crate::config::TemplatedPrompt::new(data.prompt.clone()),
-            max_tokens: data.max_tokens as usize,
-            temperature: data.temperature,
-            top_p: data.top_p,
-            top_k: if data.top_k == 0 { None } else { Some(data.top_k as usize) },
-            repeat_penalty: data.repeat_penalty,
-            repeat_last_n: data.repeat_last_n as usize,
-            stop_tokens: data.stop_tokens.clone(),
-            seed: if data.seed == 0 { None } else { Some(data.seed) },
-            images: vec![],
-            timeout: if data.timeout_ms == 0 { None } else { Some(data.timeout_ms) },
-            collect_metrics: false,
-            ttt_enabled: data.ttt_enabled,
-            ttt_gradient_steps: data.ttt_gradient_steps,
-            ttt_learning_rate: data.ttt_learning_rate,
-            auto_commit: matches!(data.adaptation_strategy, AdaptationStrategyEnum::AutoWriteback),
-        };
+        let request = data.clone();
 
         // Build per-request TTT overrides from RPC fields
         let ttt_overrides = crate::training::ttt::TTTOverrides {
             enabled: if data.ttt_enabled { Some(true) } else { None },
-            gradient_steps: if data.ttt_gradient_steps > 0 { Some(data.ttt_gradient_steps) } else { None },
-            learning_rate: if data.ttt_learning_rate > 0.0 { Some(data.ttt_learning_rate) } else { None },
+            gradient_steps: data.ttt_gradient_steps,
+            learning_rate: data.ttt_learning_rate,
             adaptation_strategy: map_adaptation_strategy(data.adaptation_strategy, data.writeback_threshold),
             max_adaptation_ms: None,
         };
@@ -2076,20 +2033,9 @@ impl InferenceHandler for InferenceService {
     }
 
     async fn handle_model_info(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
-        let info = InferenceService::handle_model_info(self).await;
-        let has_lora = self.base_delta.lock().is_some();
-        Ok(InferenceResponseVariant::ModelInfoResult(crate::services::generated::inference_client::ModelInfo {
-            model_id: info.name,
-            architecture: info.architecture,
-            vocab_size: info.vocab_size as u32,
-            hidden_size: info.hidden_size as u32,
-            num_layers: info.num_hidden_layers.unwrap_or(0) as u32,
-            num_heads: info.num_attention_heads.unwrap_or(0) as u32,
-            max_sequence_length: info.context_length as u32,
-            quantization: info.quantization.unwrap_or_default(),
-            has_vision: false,
-            lora_loaded: has_lora,
-        }))
+        let mut info = InferenceService::handle_model_info(self).await;
+        info.lora_loaded = self.base_delta.lock().is_some();
+        Ok(InferenceResponseVariant::ModelInfoResult(info))
     }
 
     async fn handle_is_ready(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
@@ -2121,14 +2067,7 @@ impl InferenceHandler for InferenceService {
                 let tool_calls = if m.tool_calls.is_empty() {
                     None
                 } else {
-                    Some(m.tool_calls.iter().map(|tc| serde_json::json!({
-                        "id": tc.id,
-                        "type": tc.call_type,
-                        "function": {
-                            "name": tc.function_name,
-                            "arguments": tc.arguments,
-                        }
-                    })).collect())
+                    Some(m.tool_calls.clone())
                 };
                 crate::runtime::template_engine::ChatMessage {
                     role: m.role.clone(),
@@ -2139,11 +2078,9 @@ impl InferenceHandler for InferenceService {
             })
             .collect();
         // tools_json is passed as a JSON string via the schema; parse it here
-        let tools: Option<serde_json::Value> = if data.tools_json.is_empty() {
-            None
-        } else {
-            serde_json::from_str(&data.tools_json).ok()
-        };
+        let tools: Option<serde_json::Value> = data.tools_json.as_deref()
+            .filter(|s| !s.is_empty())
+            .and_then(|s| serde_json::from_str(s).ok());
         let result = InferenceService::handle_apply_chat_template(
             self, chat_messages, data.add_generation_prompt, tools.as_ref(),
         ).await?;
@@ -2154,13 +2091,14 @@ impl InferenceHandler for InferenceService {
         &self, _ctx: &EnvelopeContext, _request_id: u64,
         data: &LoraConfig,
     ) -> Result<InferenceResponseVariant> {
+        let defaults = crate::training::TenantDeltaConfig::default();
         let config = crate::training::TenantDeltaConfig {
             rank: data.rank as usize,
-            alpha: data.alpha,
-            dropout: data.dropout,
+            alpha: data.alpha.unwrap_or(defaults.alpha),
+            dropout: data.dropout.unwrap_or(defaults.dropout),
             target_modules: data.target_modules.clone(),
-            learning_rate: data.learning_rate as f64,
-            ..crate::training::TenantDeltaConfig::default()
+            learning_rate: data.learning_rate.map(|v| v as f64).unwrap_or(defaults.learning_rate),
+            ..defaults
         };
         InferenceService::handle_create_lora(self, config).await?;
         Ok(InferenceResponseVariant::CreateLoraResult)
@@ -2298,21 +2236,8 @@ impl InferenceHandler for InferenceService {
 
     async fn handle_get_delta_status(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
         let subject = ctx.subject();
-        let info = InferenceService::handle_get_delta_status(self, &subject)?;
-        Ok(InferenceResponseVariant::GetDeltaStatusResult(DeltaStatusResult {
-            exists: info.exists,
-            accumulated_steps: info.accumulated_steps,
-            max_accumulated_steps: info.max_accumulated_steps,
-            request_count: info.request_count,
-            avg_loss_improvement: info.avg_loss_improvement,
-            memory_bytes: info.memory_bytes,
-            last_snapshot_hash: info.last_snapshot_hash,
-            delta_norm_ratios: info.delta_norm_ratios.into_iter().map(|(name, ratio)| ModuleNormRatio {
-                module_name: name,
-                ratio: ratio as f32,
-            }).collect(),
-            has_pending: info.has_pending,
-        }))
+        let result = InferenceService::handle_get_delta_status(self, &subject)?;
+        Ok(InferenceResponseVariant::GetDeltaStatusResult(result))
     }
 
     async fn handle_save_adaptation(
@@ -2320,24 +2245,14 @@ impl InferenceHandler for InferenceService {
         data: &SaveAdaptationRequest,
     ) -> Result<InferenceResponseVariant> {
         let subject = ctx.subject();
-        let info = InferenceService::handle_save_adaptation(self, &subject, &data.name, &data.merge_strategy, data.merge_weight).await?;
-        Ok(InferenceResponseVariant::SaveAdaptationResult(SaveAdaptationResult {
-            adapter_name: info.adapter_name,
-            adapter_path: info.adapter_path,
-            content_hash: info.content_hash,
-            merge_strategy: info.merge_strategy,
-        }))
+        let result = InferenceService::handle_save_adaptation(self, &subject, &data.name, data.merge_strategy.as_deref().unwrap_or(""), data.merge_weight.unwrap_or(0.0)).await?;
+        Ok(InferenceResponseVariant::SaveAdaptationResult(result))
     }
 
     async fn handle_snapshot_delta(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
         let subject = ctx.subject();
-        let info = InferenceService::handle_snapshot_delta(self, &subject).await?;
-        Ok(InferenceResponseVariant::SnapshotDeltaResult(SnapshotDeltaResult {
-            content_hash: info.content_hash,
-            size_bytes: info.size_bytes,
-            accumulated_steps: info.accumulated_steps,
-            request_count: info.request_count,
-        }))
+        let result = InferenceService::handle_snapshot_delta(self, &subject).await?;
+        Ok(InferenceResponseVariant::SnapshotDeltaResult(result))
     }
 
     async fn handle_export_peft_adapter(
@@ -2345,19 +2260,16 @@ impl InferenceHandler for InferenceService {
         data: &ExportPeftRequest,
     ) -> Result<InferenceResponseVariant> {
         let subject = ctx.subject();
-        let info = InferenceService::handle_export_peft_adapter(self, &subject, &data.name, &data.commit_message).await?;
-        Ok(InferenceResponseVariant::ExportPeftAdapterResult(ExportPeftResult {
-            adapter_path: info.adapter_path,
-            content_hash: info.content_hash,
-        }))
+        let result = InferenceService::handle_export_peft_adapter(self, &subject, &data.name, data.commit_message.as_deref().unwrap_or("")).await?;
+        Ok(InferenceResponseVariant::ExportPeftAdapterResult(result))
     }
 
     async fn handle_merge_lora(
         &self, _ctx: &EnvelopeContext, _request_id: u64,
         data: &MergeLoraRequest,
     ) -> Result<InferenceResponseVariant> {
-        let weight = if data.weight > 0.0 { data.weight } else { 1.0 };
-        let strategy = if data.strategy.is_empty() { "do_merge" } else { &data.strategy };
+        let weight = data.weight.filter(|&w| w > 0.0).unwrap_or(1.0);
+        let strategy = data.strategy.as_deref().filter(|s| !s.is_empty()).unwrap_or("do_merge");
         self.merge_lora(Path::new(&data.adapter_path), weight, strategy).await?;
         Ok(InferenceResponseVariant::MergeLoraResult)
     }
@@ -2376,13 +2288,14 @@ impl InferenceHandler for InferenceService {
     ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
         let (stream_info, stream_ctx) = self.setup_stream(ctx).await?;
         let service = self.clone();
+        let defaults = crate::training::TenantDeltaConfig::default();
         let config = crate::training::TenantDeltaConfig {
             rank: data.rank as usize,
-            alpha: data.alpha,
-            dropout: data.dropout,
+            alpha: data.alpha.unwrap_or(defaults.alpha),
+            dropout: data.dropout.unwrap_or(defaults.dropout),
             target_modules: data.target_modules.clone(),
-            learning_rate: data.learning_rate as f64,
-            ..crate::training::TenantDeltaConfig::default()
+            learning_rate: data.learning_rate.map(|v| v as f64).unwrap_or(defaults.learning_rate),
+            ..defaults
         };
         let continuation: hyprstream_rpc::service::Continuation = Box::pin(async move {
             service.execute_create_lora_stream(stream_ctx, config).await;
@@ -2427,7 +2340,7 @@ impl InferenceHandler for InferenceService {
         let merge_strategy = data.merge_strategy.clone();
         let merge_weight = data.merge_weight;
         let continuation: hyprstream_rpc::service::Continuation = Box::pin(async move {
-            service.execute_save_adaptation_stream(stream_ctx, subject, name, merge_strategy, merge_weight).await;
+            service.execute_save_adaptation_stream(stream_ctx, subject, name, merge_strategy.unwrap_or_default(), merge_weight.unwrap_or(0.0)).await;
         });
         Ok((stream_info, continuation))
     }
@@ -2454,7 +2367,7 @@ impl InferenceHandler for InferenceService {
         let name = data.name.clone();
         let commit_message = data.commit_message.clone();
         let continuation: hyprstream_rpc::service::Continuation = Box::pin(async move {
-            service.execute_export_peft_adapter_stream(stream_ctx, subject, name, commit_message).await;
+            service.execute_export_peft_adapter_stream(stream_ctx, subject, name, commit_message.unwrap_or_default()).await;
         });
         Ok((stream_info, continuation))
     }
@@ -2466,8 +2379,8 @@ impl InferenceHandler for InferenceService {
         let (stream_info, stream_ctx) = self.setup_stream(ctx).await?;
         let service = self.clone();
         let adapter_path = data.adapter_path.clone();
-        let weight = if data.weight > 0.0 { data.weight } else { 1.0 };
-        let strategy = if data.strategy.is_empty() { "do_merge".to_owned() } else { data.strategy.clone() };
+        let weight = data.weight.filter(|&w| w > 0.0).unwrap_or(1.0);
+        let strategy = data.strategy.as_deref().filter(|s| !s.is_empty()).unwrap_or("do_merge").to_owned();
         let continuation: hyprstream_rpc::service::Continuation = Box::pin(async move {
             service.execute_merge_lora_stream(stream_ctx, adapter_path, weight, strategy).await;
         });
@@ -2645,7 +2558,7 @@ impl InferenceServiceConfig {
     }
 }
 
-impl hyprstream_rpc::service::spawner::Spawnable for InferenceServiceConfig {
+impl hyprstream_service::Spawnable for InferenceServiceConfig {
     fn name(&self) -> &str {
         "inference"
     }
@@ -2728,274 +2641,7 @@ impl hyprstream_rpc::service::spawner::Spawnable for InferenceServiceConfig {
     }
 }
 
-/// Client for the inference service
-///
-/// # Security
-///
-/// All requests are wrapped in `SignedEnvelope` for authentication:
-/// - Requests are signed with the client's Ed25519 signing key
-/// - The service verifies signatures before processing
-/// - Identity is included for authorization checks
-///
-/// Wraps a generated `InferenceClient`. All methods delegate to the
-/// autogenerated typed client.
-#[derive(Clone)]
-pub struct InferenceZmqClient {
-    /// Generated typed client (handles all transport including streaming via call_with_options)
-    pub(crate) gen: crate::services::generated::inference_client::InferenceClient,
-}
-
-impl InferenceZmqClient {
-    /// Create a new inference client with signing credentials
-    pub fn new(signing_key: SigningKey, identity: RequestIdentity) -> Self {
-        Self::with_endpoint(INFERENCE_ENDPOINT, signing_key, identity)
-    }
-
-    /// Create an inference client connected to a specific endpoint
-    pub fn with_endpoint(endpoint: &str, signing_key: SigningKey, identity: RequestIdentity) -> Self {
-        Self {
-            gen: crate::services::core::create_service_client(endpoint, signing_key, identity),
-        }
-    }
-
-    /// Attach claims for e2e verification. All subsequent calls include these claims.
-    pub fn with_claims(self, claims: hyprstream_rpc::auth::Claims) -> Self {
-        Self { gen: self.gen.with_claims(claims) }
-    }
-
-    /// Check if model is ready
-    pub async fn is_ready(&self) -> Result<bool> {
-        self.gen.is_ready().await
-    }
-
-    /// Get model info
-    pub async fn model_info(&self) -> Result<ModelInfo> {
-        let r = self.gen.model_info().await?;
-        Ok(ModelInfo {
-            name: r.model_id,
-            architecture: r.architecture,
-            vocab_size: r.vocab_size as usize,
-            hidden_size: r.hidden_size as usize,
-            num_hidden_layers: Some(r.num_layers as usize),
-            num_attention_heads: Some(r.num_heads as usize),
-            num_key_value_heads: None,
-            head_dim: None,
-            context_length: r.max_sequence_length as usize,
-            quantization: Some(r.quantization),
-            parameters: 0,
-            intermediate_size: None,
-        })
-    }
-
-    /// Health check
-    pub async fn health_check(&self) -> Result<()> {
-        let _status = self.gen.health_check().await?;
-        Ok(())
-    }
-
-    /// Start streaming generation with E2E authentication — delegates to generated client
-    pub async fn generate_stream(
-        &self,
-        request: &GenerationRequest,
-        ephemeral_pubkey: Option<[u8; 32]>,
-    ) -> Result<StreamInfo> {
-        let adaptation_strategy_str = if request.auto_commit { "auto_writeback" } else { "speculative" };
-        self.gen.generate_stream(
-            request.prompt.as_str(),
-            request.max_tokens as u32,
-            request.temperature,
-            request.top_p,
-            request.top_k.unwrap_or(0) as u32,
-            request.repeat_penalty,
-            request.repeat_last_n as u32,
-            &request.stop_tokens,
-            request.seed.unwrap_or(0),
-            &[], // images
-            request.timeout.unwrap_or(0),
-            request.ttt_enabled,
-            request.ttt_gradient_steps,
-            request.ttt_learning_rate,
-            adaptation_strategy_str,
-            0.0f32, // writeback_threshold (unused for non-writebackIfAbove strategies)
-            ephemeral_pubkey.unwrap_or([0u8; 32]),
-        ).await
-    }
-
-    /// Start streaming generation with E2E authenticated handle.
-    ///
-    /// Returns the canonical `StreamHandle` from hyprstream-rpc which provides:
-    /// - `recv_next().await` for async receive with HMAC verification
-    /// - `futures::Stream` impl for composability with `StreamExt::next().await`
-    ///
-    /// Use `StreamChunkMessage::from_stream_payload()` to convert received
-    /// `StreamPayload` values to inference-specific message types.
-    pub async fn generate_stream_handle(
-        &self,
-        request: &GenerationRequest,
-    ) -> Result<crate::services::rpc_types::StreamHandle> {
-        use hyprstream_rpc::crypto::generate_ephemeral_keypair;
-
-        let (client_secret, client_pubkey) = generate_ephemeral_keypair();
-        let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
-
-        let info = self.generate_stream(request, Some(client_pubkey_bytes)).await?;
-
-        if info.server_pubkey == [0u8; 32] {
-            anyhow::bail!(
-                "Server did not provide Ristretto255 public key - E2E authentication required"
-            );
-        }
-
-        // Use the canonical StreamHandle which performs DH key exchange internally
-        crate::services::rpc_types::StreamHandle::new(
-            &global_context(),
-            info.stream_id,
-            &info.endpoint,
-            &info.server_pubkey,
-            &client_secret,
-            &client_pubkey_bytes,
-        )
-    }
-
-    /// Apply chat template — delegates to generated client
-    pub async fn apply_chat_template(
-        &self,
-        messages: &[crate::runtime::template_engine::ChatMessage],
-        add_generation_prompt: bool,
-    ) -> Result<String> {
-        self.apply_chat_template_with_tools(messages, add_generation_prompt, "").await
-    }
-
-    /// Apply chat template with tools — delegates to generated client
-    pub async fn apply_chat_template_with_tools(
-        &self,
-        messages: &[crate::runtime::template_engine::ChatMessage],
-        add_generation_prompt: bool,
-        tools_json: &str,
-    ) -> Result<String> {
-        use crate::services::generated::inference_client::{ChatMessage as CapnpMsg, ToolCallData};
-        let msg_data: Vec<CapnpMsg> = messages.iter().map(|m| {
-            let tool_calls: Vec<ToolCallData> = m.tool_calls.as_ref().map(|tcs| tcs.iter().map(|tc| {
-                ToolCallData {
-                    id: tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_owned(),
-                    call_type: tc.get("type").and_then(|v| v.as_str()).unwrap_or("function").to_owned(),
-                    function_name: tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_owned(),
-                    arguments: tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("").to_owned(),
-                }
-            }).collect()).unwrap_or_default();
-            CapnpMsg {
-                role: m.role.clone(),
-                content: m.content.clone().unwrap_or_default(),
-                tool_calls,
-                tool_call_id: m.tool_call_id.clone().unwrap_or_default(),
-            }
-        }).collect();
-        self.gen.apply_chat_template(&msg_data, add_generation_prompt, tools_json).await
-    }
-
-    /// Create a new LoRA adapter
-    pub async fn create_lora(&self, config: &TenantDeltaConfig) -> Result<()> {
-        self.gen.create_lora(
-            config.rank as u32, config.alpha, config.dropout, &config.target_modules, config.learning_rate as f32,
-        ).await
-    }
-
-    /// Load a LoRA adapter from a safetensors file (delegates via RPC).
-    pub async fn load_lora(&self, path: &str) -> Result<()> {
-        self.gen.load_lora(path).await
-    }
-
-    /// Save the current LoRA adapter to a safetensors file (delegates via RPC).
-    pub async fn save_lora(&self, path: &str) -> Result<()> {
-        self.gen.save_lora(path).await
-    }
-
-    /// Unload the current LoRA adapter (delegates via RPC).
-    pub async fn unload_lora(&self) -> Result<()> {
-        self.gen.unload_lora().await
-    }
-
-    /// Check if a LoRA adapter is loaded (delegates via RPC).
-    pub async fn has_lora(&self) -> Result<bool> {
-        self.gen.has_lora().await
-    }
-
-    /// Merge an on-disk adapter into the loaded base_delta (delegates via RPC).
-    pub async fn merge_lora(&self, adapter_path: &str, weight: f32, strategy: &str) -> Result<()> {
-        self.gen.merge_lora(adapter_path, weight, strategy).await
-    }
-
-    // Training loop control (TTT operations)
-
-    /// Write back a pending TTT adaptation
-    pub async fn writeback_adaptation(&self) -> Result<()> {
-        self.gen.ttt_writeback().await
-    }
-
-    /// Evict a pending TTT adaptation
-    pub async fn evict_adaptation(&self) -> Result<()> {
-        self.gen.ttt_evict().await
-    }
-
-    /// Zero a tenant's delta accumulator
-    pub async fn zero_delta(&self) -> Result<()> {
-        self.gen.ttt_zero().await
-    }
-
-    /// Start streaming training step with E2E authentication — delegates to generated client.
-    ///
-    /// `adaptation_strategy` must be one of: "auto_writeback", "auto_evict",
-    /// "speculative", "writeback_if_above".
-    pub async fn train_step_stream(
-        &self,
-        input: &str,
-        gradient_steps: u32,
-        learning_rate: f32,
-        adaptation_strategy: &str,
-        writeback_threshold: f32,
-        ephemeral_pubkey: Option<[u8; 32]>,
-    ) -> Result<StreamInfo> {
-        self.gen.train_step_stream(
-            input,
-            gradient_steps,
-            learning_rate,
-            adaptation_strategy,
-            writeback_threshold,
-            ephemeral_pubkey.unwrap_or([0u8; 32]),
-        ).await
-    }
-
-    /// Set the current session ID for KV cache management
-    pub async fn set_session(&self, session_id: &str) -> Result<()> {
-        self.gen.set_session(session_id).await
-    }
-
-    /// Clear the current session's KV cache
-    pub async fn clear_session(&self) -> Result<()> {
-        self.gen.clear_session().await
-    }
-
-    /// Release a session's KV cache
-    pub async fn release_session(&self, session_id: &str) -> Result<()> {
-        self.gen.release_session(session_id).await
-    }
-
-    /// Compute vision embeddings for images — delegates to generated client
-    pub async fn embed(&self, images: &[Vec<u8>]) -> Result<Vec<Vec<f32>>> {
-        let response = self.gen.embed(images).await?;
-        Ok(response.embeddings)
-    }
-
-    /// Request service shutdown
-    pub async fn shutdown(&self) -> Result<()> {
-        match self.gen.shutdown().await? {
-            InferenceResponseVariant::Success => Ok(()),
-            InferenceResponseVariant::Error(ref e) => Err(anyhow!("{}", e.message)),
-            _ => Err(anyhow!("Unexpected response type")),
-        }
-    }
-
-}
+// InferenceZmqClient removed — use generated InferenceClient + InferenceRpc trait directly.
 
 // ============================================================================
 // StreamChunkMessage - Client-side stream message handling

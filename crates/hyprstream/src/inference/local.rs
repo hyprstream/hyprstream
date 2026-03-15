@@ -24,7 +24,9 @@ use std::path::{Path, PathBuf};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::config::{GenerationRequest, GenerationResult, ModelInfo};
+use crate::config::GenerationResult;
+use crate::runtime::GenerationRequest;
+use crate::runtime::ModelInfo;
 use crate::training::TenantDeltaConfig;
 use crate::runtime::kv_cache::CacheOwner;
 use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
@@ -129,8 +131,8 @@ impl LocalInferenceService {
         // Initialize KV cache registry for session-based cache isolation
         // This enables concurrent inference with isolated context per session
         let model_info = engine.model_info();
-        let num_layers = model_info.num_hidden_layers.unwrap_or(32);
-        let max_seq_len = config.max_context.unwrap_or(model_info.context_length);
+        let num_layers = model_info.num_hidden_layers.unwrap_or(32) as usize;
+        let max_seq_len = config.max_context.unwrap_or(model_info.context_length) as usize;
         engine.initialize_kv_registry(
             num_layers,
             max_seq_len,

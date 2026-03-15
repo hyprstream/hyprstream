@@ -5,9 +5,11 @@
 # The policy service handles authorization checks via Casbin.
 # Uses REQ/REP pattern. Runs on multi-threaded runtime.
 
+using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".mcpScope;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".optional;
+using Opt = import "/optional.capnp";
 
 # Unified policy request with union discriminator (follows RegistryRequest pattern)
 struct PolicyRequest {
@@ -78,8 +80,8 @@ struct IssueToken {
   # Structured scopes: action:resource:identifier
   requestedScopes @0 :List(Text) $optional;
 
-  # Optional TTL in seconds (0 = use default)
-  ttl @1 :UInt32 $optional;
+  # Optional TTL in seconds (None = use default)
+  ttl @1 :Opt.OptionUint32;
 
   # RFC 8707 resource indicator for audience binding (empty = no binding)
   audience @2 :Text $optional;
@@ -176,13 +178,6 @@ struct PolicyResponse {
 struct TokenInfo {
   token @0 :Text;      # Signed JWT token (stateless validation)
   expiresAt @1 :Int64;
-}
-
-# Error Information
-struct ErrorInfo {
-  message @0 :Text;
-  code @1 :Text;
-  details @2 :Text;
 }
 
 # List of supported authorization scopes

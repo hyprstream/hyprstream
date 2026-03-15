@@ -117,8 +117,7 @@ impl CapnpType {
             Self::ListData => "Vec<Vec<u8>>".into(),
             Self::ListPrimitive(inner) => format!("Vec<{}>", inner.rust_owned_type()),
             Self::ListStruct(inner) => format!("Vec<{inner}>"),
-            Self::Struct(name) => name.clone(),
-            Self::Enum(name) => format!("{name}Enum"),
+            Self::Struct(name) | Self::Enum(name) => name.clone(),
         }
     }
 
@@ -220,8 +219,8 @@ mod tests {
         vec![StructDef {
             name: "ModelInfo".into(),
             fields: vec![
-                FieldDef { name: "name".into(), type_name: "Text".into(), description: String::new(), fixed_size: None, optional: false, slot_offset: 0, section: FieldSection::Pointer, discriminant_value: 0xFFFF },
-                FieldDef { name: "size".into(), type_name: "UInt64".into(), description: String::new(), fixed_size: None, optional: false, slot_offset: 0, section: FieldSection::Data, discriminant_value: 0xFFFF },
+                FieldDef { name: "name".into(), type_name: "Text".into(), description: String::new(), fixed_size: None, optional: false, slot_offset: 0, section: FieldSection::Pointer, discriminant_value: 0xFFFF, serde_rename: None },
+                FieldDef { name: "size".into(), type_name: "UInt64".into(), description: String::new(), fixed_size: None, optional: false, slot_offset: 0, section: FieldSection::Data, discriminant_value: 0xFFFF, serde_rename: None },
             ],
             has_union: false,
             domain_type: None,
@@ -325,7 +324,7 @@ mod tests {
             "Vec<ModelInfo>"
         );
         assert_eq!(CapnpType::Struct("ModelInfo".into()).rust_owned_type(), "ModelInfo");
-        assert_eq!(CapnpType::Enum("Status".into()).rust_owned_type(), "StatusEnum");
+        assert_eq!(CapnpType::Enum("Status".into()).rust_owned_type(), "Status");
     }
 
     #[test]

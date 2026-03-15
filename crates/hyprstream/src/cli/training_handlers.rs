@@ -17,12 +17,16 @@ use crate::config::{
     TTTTrainingConfig,
 };
 use crate::runtime::model_config::ModelConfig;
-use crate::runtime::template_engine::ChatMessage;
-use crate::services::{InferenceServiceConfig, InferenceZmqClient, GenRegistryClient, WorktreeClient, INFERENCE_ENDPOINT};
+use crate::services::generated::inference_client::{ChatMessage, ChatTemplateRequest};
+use crate::services::generated::registry_client::{
+    BranchRequest, CreateWorktreeRequest, StageFilesRequest, CommitRequest, PushRequest,
+};
+use crate::services::{InferenceServiceConfig, RegistryClient, WorktreeClient, INFERENCE_ENDPOINT};
+use crate::services::generated::inference_client::InferenceClient;
 use crate::storage::ModelRef;
 use crate::zmq::global_context;
-use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::{RequestIdentity, SigningKey, VerifyingKey};
+use hyprstream_service::ServiceSpawner;
 use std::path::PathBuf;
 
 /// Handle `training init` command
@@ -30,7 +34,7 @@ use std::path::PathBuf;
 /// Initializes a LoRA adapter for training. Optionally creates a new branch/worktree.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_training_init(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model_ref_str: &str,
     branch_name: Option<String>,
     adapter_name: Option<String>,
@@ -56,7 +60,7 @@ pub async fn handle_training_init(
         // Create branch from model_ref's git_ref
         let from_ref = model_ref.git_ref.to_ref_string();
         repo_client
-            .create_branch(&new_branch, from_ref.as_deref().unwrap_or(""))
+            .create_branch(&BranchRequest { branch_name: new_branch.clone(), start_point: from_ref.as_deref().unwrap_or("").to_owned() })
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create branch: {}", e))?;
         println!(
@@ -66,7 +70,7 @@ pub async fn handle_training_init(
         );
 
         // Create worktree for new branch
-        repo_client.create_worktree(&new_branch).await
+        repo_client.create_worktree(&CreateWorktreeRequest { branch: new_branch.clone() }).await
             .map_err(|e| anyhow::anyhow!("Failed to create worktree: {}", e))?;
         println!("✓ Created worktree for branch {new_branch}");
 
@@ -317,7 +321,7 @@ fn save_training_config(
 /// Runs inference with TTT enabled, making dirty writes to adapter weights.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_training_infer(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model_ref_str: &str,
     prompt: &str,
     image_path: Option<String>,
@@ -369,7 +373,7 @@ pub async fn handle_training_infer(
 
     // Configure runtime
     let runtime_config = RuntimeConfig {
-        max_context,
+        max_context: max_context.map(|v| v as u32),
         kv_quant_type: kv_quant.into(),
         ..Default::default()
     };
@@ -390,12 +394,12 @@ pub async fn handle_training_infer(
         .map_err(|e| anyhow::anyhow!("Failed to spawn inference service: {}", e))?;
 
     // Create client for service communication
-    let client = InferenceZmqClient::new(signing_key, RequestIdentity::local());
+    let client = InferenceClient::new(signing_key, RequestIdentity::local());
 
     // Apply chat template
-    let messages = vec![ChatMessage { role: "user".into(), content: Some(prompt.into()), ..Default::default() }];
+    let messages = vec![ChatMessage { role: "user".into(), content: prompt.into(), tool_calls: vec![], tool_call_id: String::new() }];
 
-    let formatted_prompt = match client.apply_chat_template(&messages, true).await {
+    let formatted_prompt = match client.apply_chat_template(&ChatTemplateRequest { messages: messages.clone(), add_generation_prompt: true, tools_json: Some(String::new()) }).await {
         Ok(formatted) => formatted,
         Err(e) => {
             warn!("Could not apply chat template: {}. Using raw prompt.", e);
@@ -404,35 +408,35 @@ pub async fn handle_training_infer(
     };
 
     // Build generation request
-    let sampling_params = crate::config::SamplingParams::from_model_path(&model_path)
+    let mut params = crate::config::SamplingParams::from_model_path(&model_path)
         .await
         .unwrap_or_default();
-    let mut request_builder = crate::runtime::GenerationRequest::builder(formatted_prompt)
-        .apply_config(&sampling_params);
 
     if let Some(t) = temperature {
-        request_builder = request_builder.temperature(t);
+        params.temperature = Some(t);
     }
     if let Some(p) = top_p {
-        request_builder = request_builder.top_p(p);
+        params.top_p = Some(p);
     }
     if let Some(k) = top_k {
-        request_builder = request_builder.top_k(Some(k));
+        params.top_k = Some(k);
     }
     if let Some(r) = repeat_penalty {
-        request_builder = request_builder.repeat_penalty(r);
+        params.repeat_penalty = Some(r);
     }
     if let Some(m) = max_tokens {
-        request_builder = request_builder.max_tokens(m);
+        params.max_tokens = Some(m);
     }
+
+    let mut request = params.into_generation_request(formatted_prompt);
 
     // Add image path if provided (for multimodal models)
     if let Some(img_path) = image_path {
         info!("Using image: {}", img_path);
-        request_builder = request_builder.image_path(std::path::PathBuf::from(img_path));
+        let img_bytes = std::fs::read(&img_path)
+            .map_err(|e| anyhow::anyhow!("Failed to read image {}: {}", img_path, e))?;
+        request.images = Some(vec![img_bytes]);
     }
-
-    let request = request_builder.build();
 
     // Generate with TTT
     if sync {
@@ -443,7 +447,10 @@ pub async fn handle_training_infer(
         // Stream tokens live to stdout
         use hyprstream_rpc::streaming::StreamPayload;
         use std::io::Write;
-        let mut handle = client.generate_stream_handle(&request).await?;
+        let mut handle = {
+            use crate::services::generated::inference_client::InferenceRpc;
+            InferenceRpc::generate_stream(&client, &request).await?
+        };
         println!();
         loop {
             match handle.recv_next().await? {
@@ -491,12 +498,13 @@ fn ensure_ttt_enabled(model_path: &std::path::Path) -> Result<()> {
 ///
 /// Replaces the removed `InferenceZmqClient::generate()` sync method.
 async fn collect_inference_stream(
-    client: &InferenceZmqClient,
+    client: &InferenceClient,
     request: &crate::runtime::GenerationRequest,
 ) -> Result<crate::config::GenerationResult> {
     use hyprstream_rpc::streaming::StreamPayload;
 
-    let mut handle = client.generate_stream_handle(request).await?;
+    use crate::services::generated::inference_client::InferenceRpc;
+    let mut handle = InferenceRpc::generate_stream(client, request).await?;
     let mut text = String::new();
 
     loop {
@@ -544,7 +552,7 @@ async fn collect_inference_stream(
 /// Each file's content is sent as a generation request, triggering TTT adaptation.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_training_batch(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model_ref_str: &str,
     input_files: Vec<String>,
     input_dir: Option<PathBuf>,
@@ -652,7 +660,7 @@ pub async fn handle_training_batch(
     // Start InferenceService with TTT enabled
     println!("Starting InferenceService for {model_ref_str}...");
     let runtime_config = RuntimeConfig {
-        max_context,
+        max_context: max_context.map(|v| v as u32),
         kv_quant_type: kv_quant.into(),
         ..Default::default()
     };
@@ -672,7 +680,7 @@ pub async fn handle_training_batch(
     let mut service_handle = spawner.spawn(service_config).await
         .map_err(|e| anyhow::anyhow!("Failed to spawn inference service: {}", e))?;
 
-    let client = InferenceZmqClient::new(signing_key, RequestIdentity::local());
+    let client = InferenceClient::new(signing_key, RequestIdentity::local());
 
     // Get adapter info for checkpoint saves
     let adapter_manager = AdapterManager::new(&model_path);
@@ -712,10 +720,12 @@ pub async fn handle_training_batch(
             _ => chunk.clone(), // "text" format - use as-is
         };
 
-        let request = crate::runtime::GenerationRequest::builder(prompt)
-            .max_tokens(max_tokens)
-            .temperature(0.7)
-            .build();
+        let request = crate::runtime::GenerationRequest {
+            prompt,
+            max_tokens: Some(max_tokens as u32),
+            temperature: Some(0.7),
+            ..Default::default()
+        };
 
         // Send generation request via collect-stream — InferenceService applies TTT during this call
         match collect_inference_stream(&client, &request).await {
@@ -774,7 +784,7 @@ pub async fn handle_training_batch(
 ///
 /// Commits dirty adapter changes to git.
 pub async fn handle_training_checkpoint(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model_ref_str: &str,
     message: Option<String>,
     push: bool,
@@ -836,7 +846,7 @@ pub async fn handle_training_checkpoint(
 
     // Use worktree-scoped client for staging and commit
     let wt = repo_client.worktree(&branch_for_fs);
-    wt.stage_files(&files_to_stage).await
+    wt.stage_files(&StageFilesRequest { files: files_to_stage.clone() }).await
         .map_err(|e| anyhow::anyhow!("Failed to stage files: {}", e))?;
 
     // Create commit using service layer
@@ -848,7 +858,7 @@ pub async fn handle_training_checkpoint(
         )
     });
 
-    let commit_id = wt.commit(&commit_message, "", "").await
+    let commit_id = wt.commit(&CommitRequest { message: commit_message, author: String::new(), email: String::new() }).await
         .map_err(|e| anyhow::anyhow!("Failed to create commit: {}", e))?;
 
     println!("\n✓ Created commit: {}", &commit_id[..8.min(commit_id.len())]);
@@ -862,7 +872,7 @@ pub async fn handle_training_checkpoint(
             model_ref.git_ref,
             model_ref.git_ref
         );
-        repo_client.push(remote, &refspec, false).await
+        repo_client.push(&PushRequest { remote: remote.to_owned(), refspec, force: false }).await
             .map_err(|e| anyhow::anyhow!("Failed to push: {}", e))?;
         println!("✓ Pushed to {remote}");
     }

@@ -426,7 +426,11 @@ fn emit_pointer_read_expr(
         None => {
             // Non-list pointer: Struct, Text, Data, or unknown
             if let Some(sd) = schema.structs.iter().find(|s| s.name == field.type_name) {
-                emit_struct_pointer_expr(reader_var, field.slot_offset, sd, schema, depth)
+                if let Some(inner_name) = sd.option_inner_type() {
+                    emit_option_read_expr(reader_var, field, sd, inner_name, schema)
+                } else {
+                    emit_struct_pointer_expr(reader_var, field.slot_offset, sd, schema, depth)
+                }
             } else if field.type_name == "Text" || field.type_name == "Data" {
                 let method = super::getter_method(&field.type_name);
                 format!("{reader_var}.{method}({})", field.slot_offset)
@@ -636,4 +640,41 @@ fn emit_struct_read(
         "      return {{ {fields_str}{comma}variant: '{variant_name}', data: _data }};\n"
     ));
     out.push_str("    }\n");
+}
+
+/// Generate an inline expression that reads an Option* wrapper struct pointer.
+///
+/// Returns `T | undefined`: reads the struct pointer, checks the discriminant,
+/// and returns the inner value if discriminant == 1 (some), else `undefined`.
+fn emit_option_read_expr(
+    reader_var: &str,
+    field: &FieldDef,
+    opt_struct: &StructDef,
+    inner_type_name: &str,
+    _schema: &ParsedSchema,
+) -> String {
+    let disc_byte_off = opt_struct.discriminant_offset * 2;
+
+    let read_val = if inner_type_name == "Text" {
+        "_optR.getText(0)".to_owned()
+    } else if inner_type_name == "Data" {
+        "_optR.getData(0)".to_owned()
+    } else {
+        // Data-section scalar: find the 'some' field to get its byte offset
+        let some_field = opt_struct.fields.iter().find(|f| f.name == "some");
+        if let Some(sf) = some_field {
+            let some_byte_off = super::data_byte_offset(sf);
+            let getter = super::getter_method(inner_type_name);
+            format!("_optR.{getter}({some_byte_off})")
+        } else {
+            "undefined".to_owned()
+        }
+    };
+
+    format!(
+        "(() => {{ const _optR = {reader_var}.getStruct({}, {}, {}); \
+         if (!_optR) return undefined; \
+         return _optR.getUint16({disc_byte_off}) === 1 ? {read_val} : undefined; }})()",
+        field.slot_offset, opt_struct.data_words, opt_struct.pointer_words
+    )
 }

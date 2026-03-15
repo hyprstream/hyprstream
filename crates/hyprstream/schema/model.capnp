@@ -1,10 +1,33 @@
 @0xd4e5f6a7b8c9d0e1;
 
+using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".paramDescription;
 using import "/annotations.capnp".mcpScope;
 using import "/annotations.capnp".optional;
+using import "/annotations.capnp".serdeRename;
 using import "/streaming.capnp".StreamInfo;
+using import "/inference.capnp".ChatMessage;
+using import "/inference.capnp".ToolCall;
+using import "/inference.capnp".ToolCallFunction;
+# Shared types — defined once in inference.capnp, imported here
+using import "/inference.capnp".AdaptationStrategy;
+using import "/inference.capnp".GenerationRequest;
+using import "/inference.capnp".TrainStepRequest;
+using import "/inference.capnp".TrainStepResult;
+using import "/inference.capnp".SaveAdaptationRequest;
+using import "/inference.capnp".SaveAdaptationResult;
+using import "/inference.capnp".DeltaStatusResult;
+using import "/inference.capnp".SnapshotDeltaResult;
+using import "/inference.capnp".ExportPeftRequest;
+using import "/inference.capnp".ExportPeftResult;
+using import "/inference.capnp".ModuleNormRatio;
+using import "/inference.capnp".ChatTemplateRequest;
+using import "/inference.capnp".EmbedImagesRequest;
+using import "/inference.capnp".EmbedImagesResponse;
+using import "/inference.capnp".LoraConfig;
+using import "/inference.capnp".MergeLoraRequest;
+using Opt = import "/optional.capnp";
 
 # Cap'n Proto schema for model service
 #
@@ -18,17 +41,6 @@ using import "/streaming.capnp".StreamInfo;
 # use the same name suffixed with "Result" to avoid Cap'n Proto naming
 # collisions. The code generator strips "Result" to pair them.
 # Scoped ops are nested under ttt/adapter/infer with matching Result variants.
-
-enum AdaptationStrategy {
-  autoWriteback @0;
-  # Write back to delta if recommendation positive, evict if negative.
-  autoEvict @1;
-  # Always evict after generation — eval/benchmark mode.
-  speculative @2;
-  # Keep pending; client calls ttt.writeback or ttt.evict explicitly.
-  writebackIfAbove @3;
-  # Write back if loss_improvement exceeds writebackThreshold, else evict.
-}
 
 struct ModelRequest {
   # Request ID for tracking
@@ -58,7 +70,7 @@ struct ModelRequest {
 struct TttRequest {
   modelRef @0 :Text;
   union {
-    init @1 :InitLoraRequest
+    init @1 :LoraConfig
       $mcpDescription("Initialize the training infrastructure (LoRA parameters, optimizer, delta pool) on a loaded model. Required before ttt.train or TTT-enabled inference. Configure rank, alpha, target modules, and learning rate.");
     train @2 :TrainStepRequest
       $mcpDescription("Run TTT gradient steps on input text WITHOUT generating a response. Pure training — use for pre-training on domain text before asking questions. Returns loss metrics and recommendation. Use adaptationStrategy=speculative to keep pending, then call ttt.writeback or ttt.evict.");
@@ -76,7 +88,7 @@ struct TttRequest {
       $mcpDescription("Merge the tenant delta accumulator into an on-disk adapter file using a configurable merge strategy (replace/additive/do_merge). For incremental refinement of existing adapters. Call ttt.status first to verify quality. The result is committed to the model's git repository.");
     snapshot @9 :Void
       $mcpDescription("Snapshot the tenant delta accumulator to content-addressed storage without merging into an adapter file.");
-    export @10 :TttExportRequest
+    export @10 :ExportPeftRequest
       $mcpDescription("Export the tenant delta accumulator as a standalone PEFT-compatible adapter directory (adapter_config.json + adapter_model.safetensors). For interop with HuggingFace and external tools. The exported adapter can be reloaded via adapter.load.");
     writeTttConfig @11 :WriteTttConfigRequest
       $mcpDescription("Write hyprstream_training configuration to the model worktree's config.json and optionally reload. Required before ttt.train or TTT-enabled inference. Sets training mode to test_time_training and configures LoRA rank/alpha, target modules, and learning rate.");
@@ -104,7 +116,7 @@ struct AdapterRequest {
       $mcpDescription("Check if a LoRA adapter is currently loaded in the base_delta register.");
     inspect @4 :Text
       $mcpDescription("Validate an on-disk PEFT adapter directory and return its metadata (rank, alpha, target modules, base model). Does not load anything into memory.");
-    merge @5 :AdapterMergeRequest
+    merge @5 :MergeLoraRequest
       $mcpDescription("Read a PEFT adapter from disk and merge it into the currently loaded base_delta register using a configurable merge strategy (replace/additive/do_merge). Requires an adapter already loaded via adapter.load.");
   }
 }
@@ -117,13 +129,13 @@ struct AdapterRequest {
 struct InferRequest {
   modelRef @0 :Text;
   union {
-    generateStream @1 :GenerateRequest
+    generateStream @1 :GenerationRequest
       $mcpDescription("Run inference with automatic domain adaptation. When TTT is enabled, the model adapts to your prompt BEFORE generating — the response is always produced using the adapted weights, even when adaptationStrategy=speculative. Check onlineTrainingMetrics.recommendation in the response, then call ttt.writeback (if true) or ttt.evict (if false) within the pending rollback window (default 60 seconds). If you call generateStream again before resolving a pending adaptation, the new adaptation stacks on top and evict will restore to the state before the first pending adaptation. Pending adaptations auto-evict after the timeout if writeback/evict is not called.");
-    applyChatTemplate @2 :ApplyChatTemplateRequest
+    applyChatTemplate @2 :ChatTemplateRequest
       $mcpDescription("Apply chat template to messages for a loaded model");
     status @3 :Void
       $mcpDescription("Get detailed status information about a model including online training configuration");
-    embed @4 :EmbedRequest
+    embed @4 :EmbedImagesRequest
       $mcpDescription("Compute embeddings for one or more images. Returns embedding vectors from the model's vision encoder (e.g. SigLIP). Synchronous — returns all embeddings in a single response.");
   }
 }
@@ -154,15 +166,15 @@ struct TttResponse {
   union {
     error @0 :ErrorInfo;
     init @1 :Void;
-    train @2 :TrainStepResponse;
+    train @2 :TrainStepResult;
     trainStream @3 :StreamInfo;
     writeback @4 :Void;
     evict @5 :Void;
     zero @6 :Void;
-    status @7 :GetDeltaStatusResponse;
-    save @8 :SaveAdaptationResponse;
-    snapshot @9 :SnapshotDeltaResponse;
-    export @10 :TttExportResponse;
+    status @7 :DeltaStatusResult;
+    save @8 :SaveAdaptationResult;
+    snapshot @9 :SnapshotDeltaResult;
+    export @10 :ExportPeftResult;
     writeTttConfig @11 :Void;
   }
 }
@@ -186,15 +198,8 @@ struct InferResponse {
     generateStream @1 :StreamInfo;
     applyChatTemplate @2 :Text;
     status @3 :ModelStatusResponse;
-    embed @4 :EmbedResponse;
+    embed @4 :EmbedImagesResponse;
   }
-}
-
-# Error information
-struct ErrorInfo {
-  message @0 :Text;
-  code @1 :Text;
-  details @2 :Text;
 }
 
 # KV cache quantization type
@@ -205,55 +210,18 @@ enum KVQuantType {
   fp4 @3;       # 4-bit FloatingPoint quantization
 }
 
+struct OptionKVQuantType { union { none @0 :Void; some @1 :KVQuantType; } }
+
 # Load model request with optional runtime configuration
 struct LoadModelRequest {
   modelRef @0 :Text $paramDescription("Model reference in format name:branch (e.g., 'qwen3-small:main')");
-  maxContext @1 :UInt32 $optional $paramDescription("Maximum context length (0 = use default)");
-  kvQuant @2 :KVQuantType $optional $paramDescription("KV cache quantization type");
+  maxContext @1 :Opt.OptionUint32 $paramDescription("Maximum context length (None = use default)");
+  kvQuant @2 :OptionKVQuantType $paramDescription("KV cache quantization type");
 }
 
 # Unload model request
 struct UnloadModelRequest {
   modelRef @0 :Text;
-}
-
-# Generation request (routes to InferenceService)
-# Fields match inference.capnp::GenerationRequest for transparent MCP/JSON bridging.
-struct GenerateRequest {
-  prompt @0 :Text;
-  maxTokens @1 :UInt32 $optional;
-  temperature @2 :Float32 $optional;
-  topP @3 :Float32 $optional;
-  topK @4 :UInt32 $optional;
-  repeatPenalty @5 :Float32 $optional;
-  repeatLastN @6 :UInt32 $optional;
-  stopTokens @7 :List(Text) $optional;
-  seed @8 :UInt32 $optional;
-  images @9 :List(Data) $optional;
-  timeoutMs @10 :UInt64 $optional;
-
-  # Per-request TTT control (all optional — omit for server defaults)
-  tttEnabled @11 :Bool $paramDescription("Override: enable/disable TTT for this request");
-  tttGradientSteps @12 :UInt32 $optional $paramDescription("Override: number of gradient steps (0 = skip)");
-  tttLearningRate @13 :Float32 $optional $paramDescription("Override: learning rate");
-  adaptationStrategy @14 :AdaptationStrategy
-    $paramDescription("How to handle the adaptation result. autoWriteback: accept if recommendation positive, evict if negative. autoEvict: always evict (eval mode). speculative: keep pending, client calls ttt.writeback or ttt.evict. writebackIfAbove: accept if loss_improvement exceeds writebackThreshold.");
-  writebackThreshold @15 :Float32 $optional
-    $paramDescription("Loss improvement threshold for writebackIfAbove strategy. Ignored for other strategies.");
-}
-
-# Embedding request for vision models (e.g. SigLIP)
-struct EmbedRequest {
-  # Raw image bytes (PNG/JPEG/RGB) — one entry per image
-  images @0 :List(Data);
-}
-
-# Embedding response
-struct EmbedResponse {
-  # One embedding vector per input image
-  embeddings @0 :List(List(Float32));
-  # Embedding dimensionality (e.g. 384, 768)
-  dimensions @1 :UInt32;
 }
 
 # Response when model is loaded
@@ -310,124 +278,18 @@ struct ModelHealthStatus {
   totalMemoryBytes @3 :UInt64;
 }
 
-# Tool call data for threading through RPC
-struct ToolCallData {
-  id @0 :Text;
-  callType @1 :Text;        # "function"
-  functionName @2 :Text;
-  arguments @3 :Text;        # JSON string (opaque, deserialized at consumption point)
-}
+# ChatMessage, ToolCall, ToolCallFunction, ChatTemplateRequest,
+# EmbedImagesRequest, EmbedImagesResponse imported from inference.capnp
 
-# Chat message for template application
-struct ChatMessage {
-  role @0 :Text;     # "system", "user", "assistant", "tool"
-  content @1 :Text;  # Message content (empty string = None)
-  toolCalls @2 :List(ToolCallData);
-  toolCallId @3 :Text;  # For "tool" role messages (empty string = None)
-}
-
-# Apply chat template request
-struct ApplyChatTemplateRequest {
-  messages @0 :List(ChatMessage);
-  addGenerationPrompt @1 :Bool;  # Whether to add assistant prompt at end
-  toolsJson @2 :Text $optional;  # JSON-serialized tools array (empty string = no tools)
-}
-
-# LoRA training initialization configuration
-struct InitLoraRequest {
-  rank @0 :UInt32 $paramDescription("LoRA rank (e.g., 8, 16, 32)");
-  alpha @1 :Float32 $optional $paramDescription("LoRA alpha scaling factor");
-  dropout @2 :Float32 $optional $paramDescription("Dropout rate during training");
-  targetModules @3 :List(Text) $paramDescription("Model layers to apply LoRA (e.g., ['q_proj','v_proj'])");
-  learningRate @4 :Float32 $optional $paramDescription("Learning rate for training (default: 1e-4)");
-}
+# LoraConfig and MergeLoraRequest imported from inference.capnp
 
 # =============================================================================
-# Training Loop Control (TTT commit/rollback/train)
+# Training Loop Control, Persistence, TTT Export
 # =============================================================================
-
-struct TrainStepRequest {
-  input @0 :Text $paramDescription("Text to train on (NTP loss)");
-  gradientSteps @1 :UInt32 $optional $paramDescription("Number of gradient steps (default: 3)");
-  learningRate @2 :Float32 $optional $paramDescription("Learning rate override (0 = use default)");
-  adaptationStrategy @3 :AdaptationStrategy
-    $paramDescription("How to handle the adaptation result. Same semantics as GenerateRequest.adaptationStrategy.");
-  writebackThreshold @4 :Float32 $optional
-    $paramDescription("Loss improvement threshold for writebackIfAbove strategy.");
-}
-
-struct TrainStepResponse {
-  avgLoss @0 :Float32;
-  lossImprovement @1 :Float32;
-  stepsPerformed @2 :UInt32;
-  adaptationTimeMs @3 :UInt64;
-  initialPerplexity @4 :Float32;
-  finalPerplexity @5 :Float32;
-  recommendation @6 :Bool;    # Server's commit/rollback recommendation
-  committed @7 :Bool;         # Whether it was auto-committed
-  gradientClipped @8 :Bool;
-}
-
-# =============================================================================
-# Persistence Operations (delta status/save/snapshot)
-# =============================================================================
-
-struct GetDeltaStatusResponse {
-  exists @0 :Bool;
-  accumulatedSteps @1 :UInt64
-    $paramDescription("Total gradient steps committed to this delta. Counts toward maxAccumulatedSteps.");
-  maxAccumulatedSteps @2 :UInt64
-    $paramDescription("Hard capacity ceiling. When accumulatedSteps reaches this value, further TTT adaptation via generateStream is silently skipped (generation still proceeds with the existing delta). Call ttt.save/ttt.export then ttt.reset to free capacity.");
-  requestCount @3 :UInt64;
-  avgLossImprovement @4 :Float32;
-  memoryBytes @5 :UInt64;
-  lastSnapshotHash @6 :Text;
-  deltaNormRatios @7 :List(ModuleNormRatio);
-  hasPending @8 :Bool
-    $paramDescription("Whether a pending adaptation awaits writeback or evict. Point-in-time snapshot — may become stale if the timeout expires before you act. Call ttt.writeback or ttt.evict to resolve.");
-}
-
-struct ModuleNormRatio {
-  moduleName @0 :Text;
-  ratio @1 :Float32;
-}
-
-struct SaveAdaptationRequest {
-  name @0 :Text $paramDescription("Adapter name for the saved file");
-  mergeStrategy @1 :Text $optional $paramDescription("Merge strategy: 'replace', 'additive', 'do_merge' (default)");
-  mergeWeight @2 :Float32 $optional $paramDescription("Merge weight 0.0-1.0 (default: 0.3)");
-  commitMessage @3 :Text $optional $paramDescription("Non-empty triggers git commit");
-  gitCommit @4 :Bool $optional
-    $paramDescription("If true, stage and commit the written file to the model repository after saving.");
-}
-
-struct SaveAdaptationResponse {
-  adapterName @0 :Text;
-  adapterPath @1 :Text;
-  contentHash @2 :Text;
-  mergeStrategy @3 :Text;
-}
-
-struct SnapshotDeltaResponse {
-  contentHash @0 :Text;
-  sizeBytes @1 :UInt64;
-  accumulatedSteps @2 :UInt64;
-  requestCount @3 :UInt64;
-}
-
-# =============================================================================
-# TTT Export (delta → PEFT adapter)
-# =============================================================================
-
-struct TttExportRequest {
-  name @0 :Text $paramDescription("PEFT adapter directory name");
-  commitMessage @1 :Text $optional $paramDescription("Git commit message (optional)");
-}
-
-struct TttExportResponse {
-  adapterPath @0 :Text;
-  contentHash @1 :Text;
-}
+#
+# TrainStepRequest, TrainStepResult, SaveAdaptationRequest, SaveAdaptationResult,
+# DeltaStatusResult, SnapshotDeltaResult, ExportPeftRequest, ExportPeftResult,
+# ModuleNormRatio, and AdaptationStrategy are all imported from inference.capnp.
 
 # Write TTT configuration to model's config.json
 struct WriteTttConfigRequest {
@@ -453,12 +315,6 @@ struct AdapterInfo {
   loraAlpha @3 :Float32;
   targetModules @4 :List(Text);
   baseModel @5 :Text;         # base_model_name_or_path from config
-}
-
-struct AdapterMergeRequest {
-  adapterName @0 :Text $paramDescription("Adapter directory name to merge");
-  weight @1 :Float32 $optional $paramDescription("Merge weight 0.0-1.0 (default: 1.0 = full merge)");
-  strategy @2 :Text $optional $paramDescription("Merge strategy: 'replace', 'additive', or 'do_merge' (default: 'do_merge')");
 }
 
 # =============================================================================

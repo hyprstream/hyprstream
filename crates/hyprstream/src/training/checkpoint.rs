@@ -381,9 +381,15 @@ impl CheckpointManager {
         // Determine worktree branch name
         let wt_branch = if let Some(ref branch_name) = branch {
             // create_branch may fail if it already exists — that's fine
-            let _ = repo_client.create_branch(branch_name, "").await;
+            let _ = repo_client.create_branch(&crate::services::generated::registry_client::BranchRequest {
+                branch_name: branch_name.clone(),
+                start_point: String::new(),
+            }).await;
             // Checkout within the worktree
-            repo_client.worktree(branch_name).checkout(branch_name, false)
+            repo_client.worktree(branch_name).checkout(&crate::services::generated::registry_client::CheckoutRequest {
+                ref_name: branch_name.clone(),
+                create_branch: false,
+            })
                 .await
                 .map_err(|e| anyhow!("Failed to checkout branch '{}': {}", branch_name, e))?;
             branch_name.clone()
@@ -423,7 +429,9 @@ impl CheckpointManager {
         }
 
         let files_owned: Vec<String> = files_to_stage.iter().map(|s| (*s).to_owned()).collect();
-        wt.stage_files(&files_owned)
+        wt.stage_files(&crate::services::generated::registry_client::StageFilesRequest {
+                files: files_owned,
+            })
             .await
             .map_err(|e| anyhow!("Failed to stage files: {}", e))?;
 
@@ -437,7 +445,11 @@ impl CheckpointManager {
             )
         });
 
-        let oid = wt.commit(&commit_message, "", "")
+        let oid = wt.commit(&crate::services::generated::registry_client::CommitRequest {
+                message: commit_message,
+                author: String::new(),
+                email: String::new(),
+            })
             .await
             .map_err(|e| anyhow!("Failed to commit: {}", e))?;
 
@@ -713,8 +725,14 @@ impl CheckpointManager {
         // Determine worktree branch name
         let wt_branch = if let Some(branch) = branch_name {
             // create_branch may fail if it already exists — that's fine
-            let _ = repo_client.create_branch(branch, "").await;
-            repo_client.worktree(branch).checkout(branch, false)
+            let _ = repo_client.create_branch(&crate::services::generated::registry_client::BranchRequest {
+                branch_name: branch.clone(),
+                start_point: String::new(),
+            }).await;
+            repo_client.worktree(branch).checkout(&crate::services::generated::registry_client::CheckoutRequest {
+                ref_name: branch.clone(),
+                create_branch: false,
+            })
                 .await
                 .map_err(|e| anyhow!("Failed to checkout branch '{}': {}", branch, e))?;
             branch.clone()
@@ -724,10 +742,12 @@ impl CheckpointManager {
         let wt = repo_client.worktree(&wt_branch);
 
         // Stage checkpoint files
-        wt.stage_files(&[
-                ".checkpoints/checkpoint.safetensors".to_owned(),
-                ".checkpoints/checkpoint.json".to_owned(),
-            ])
+        wt.stage_files(&crate::services::generated::registry_client::StageFilesRequest {
+                files: vec![
+                    ".checkpoints/checkpoint.safetensors".to_owned(),
+                    ".checkpoints/checkpoint.json".to_owned(),
+                ],
+            })
             .await
             .map_err(|e| anyhow!("Failed to stage checkpoint files: {}", e))?;
 
@@ -738,7 +758,11 @@ impl CheckpointManager {
             format!("Training checkpoint step {step}")
         };
 
-        wt.commit(&message, "", "")
+        wt.commit(&crate::services::generated::registry_client::CommitRequest {
+                message,
+                author: String::new(),
+                email: String::new(),
+            })
             .await
             .map_err(|e| anyhow!("Failed to commit: {}", e))?;
 
@@ -750,7 +774,10 @@ impl CheckpointManager {
                 format!("checkpoint-step-{step}")
             };
 
-            let _ = repo_client.create_tag(&tag_name, "").await;
+            let _ = repo_client.create_tag(&crate::services::generated::registry_client::CreateTagRequest {
+                name: tag_name,
+                target: String::new(),
+            }).await;
         }
 
         Ok(())

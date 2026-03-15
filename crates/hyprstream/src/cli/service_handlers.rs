@@ -64,7 +64,7 @@ pub async fn handle_service_install(
 
     // 3. Install/update systemd units if available
     if hyprstream_rpc::has_systemd() {
-        let manager = hyprstream_rpc::detect_service_manager().await?;
+        let manager = hyprstream_service::detect_service_manager().await?;
 
         // If --start, stop all target services first so they pick up changes
         if start {
@@ -101,12 +101,12 @@ pub async fn handle_service_install(
         let exe = hyprstream_rpc::paths::installed_executable_path()
             .unwrap_or_else(|| hyprstream_rpc::paths::executable_path().unwrap_or_default());
 
-        let spawner = hyprstream_rpc::ProcessSpawner::standalone();
+        let spawner = hyprstream_service::ProcessSpawner::standalone();
 
         for service in &target_services {
             print!("    \u{25CB} {}... ", service);
 
-            let config = hyprstream_rpc::ProcessConfig::new(service, &exe)
+            let config = hyprstream_service::ProcessConfig::new(service, &exe)
                 .args(["service", "start", service, "--foreground", "--ipc"]);
 
             match spawner.spawn(config).await {
@@ -142,7 +142,7 @@ pub async fn handle_service_uninstall(
         return Ok(());
     }
 
-    let manager = hyprstream_rpc::detect_service_manager().await?;
+    let manager = hyprstream_service::detect_service_manager().await?;
 
     println!("Uninstalling hyprstream services...\n");
 
@@ -179,7 +179,7 @@ pub async fn handle_service_start(
 
     // Use systemd if available and --daemon not specified
     if hyprstream_rpc::has_systemd() && !daemon {
-        let manager = hyprstream_rpc::detect_service_manager().await?;
+        let manager = hyprstream_service::detect_service_manager().await?;
 
         println!("Starting services (systemd)...\n");
 
@@ -194,13 +194,13 @@ pub async fn handle_service_start(
         // Standalone mode: spawn processes in background
         println!("Starting services (standalone)...\n");
 
-        let spawner = hyprstream_rpc::ProcessSpawner::standalone();
+        let spawner = hyprstream_service::ProcessSpawner::standalone();
         let exe = hyprstream_rpc::paths::executable_path()?;
 
         for service in &target_services {
             print!("  \u{25CB} {}... ", service);
 
-            let config = hyprstream_rpc::ProcessConfig::new(service, &exe)
+            let config = hyprstream_service::ProcessConfig::new(service, &exe)
                 .args(["service", "start", service, "--foreground", "--ipc"]);
 
             match spawner.spawn(config).await {
@@ -234,7 +234,7 @@ pub async fn handle_service_stop(
 
     // Try systemd if available
     if hyprstream_rpc::has_systemd() {
-        let manager = hyprstream_rpc::detect_service_manager().await?;
+        let manager = hyprstream_service::detect_service_manager().await?;
 
         for service in &target_services {
             print!("  \u{25CB} {} (systemd)... ", service);
@@ -315,7 +315,7 @@ pub async fn handle_service_status(
 
     let runtime_dir = hyprstream_rpc::paths::runtime_dir();
     let manager = if hyprstream_rpc::has_systemd() {
-        Some(hyprstream_rpc::detect_service_manager().await?)
+        Some(hyprstream_service::detect_service_manager().await?)
     } else {
         None
     };
@@ -386,7 +386,7 @@ pub async fn handle_service_status(
 ///
 /// Extracted from the old `handle_service_repair` so it can be called as part
 /// of `handle_service_install` without the surrounding summary chrome.
-async fn run_repair_checks(
+pub(crate) async fn run_repair_checks(
     models_dir: &Path,
     verbose: bool,
 ) -> Result<()> {
@@ -617,14 +617,14 @@ async fn run_repair_checks(
     Ok(())
 }
 
-enum CheckStatus {
+pub(crate) enum CheckStatus {
     Ok,
     Fixed,
     Warn,
     Fail,
 }
 
-fn print_check(label: &str, status: CheckStatus, detail: &str) {
+pub(crate) fn print_check(label: &str, status: CheckStatus, detail: &str) {
     let (icon, color) = match status {
         CheckStatus::Ok => ("\u{2713}", "\x1b[32m"),    // green checkmark
         CheckStatus::Fixed => ("\u{2713}", "\x1b[33m"),  // yellow checkmark (fixed)

@@ -44,3 +44,11 @@ annotation fixedSize(field) :UInt32;
 # Mark a field as optional in MCP tool schemas.
 # Optional fields use type-appropriate defaults when absent (0 for numbers, "" for text, [] for lists).
 annotation optional(field) :Void;
+
+# Domain type path — generated client returns this Rust type via FromCapnp::read_from().
+# Usage: struct Foo $domainType("runtime::VersionResponse") { ... }
+annotation domainType(struct) :Text;
+
+# Serde field rename — generates #[serde(rename = "...")] on the Rust field.
+# Usage: toolType @1 :Text $serdeRename("type");
+annotation serdeRename(field) :Text;

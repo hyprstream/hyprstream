@@ -36,6 +36,10 @@ pub enum Operation {
     Manage,
     /// Context-augmented generation (c)
     Context,
+    /// Spawn a process or task (p)
+    Spawn,
+    /// Create a resource (r)
+    Create,
 }
 
 impl Operation {
@@ -49,6 +53,8 @@ impl Operation {
             Operation::Serve => 's',
             Operation::Manage => 'm',
             Operation::Context => 'c',
+            Operation::Spawn => 'p',
+            Operation::Create => 'r',
         }
     }
 
@@ -81,6 +87,8 @@ impl Operation {
             Operation::Serve   => "serve.api",
             Operation::Manage  => "ttt.writeback",
             Operation::Context => "context.augment",
+            Operation::Spawn   => "spawn",
+            Operation::Create  => "create",
         }
     }
 
@@ -99,6 +107,8 @@ impl Operation {
             "persist.save" | "persist.export" | "persist.snapshot" | "write" => Some(Self::Write),
             "context.augment" | "context" => Some(Self::Context),
             "serve.api" | "serve" => Some(Self::Serve),
+            "spawn" => Some(Self::Spawn),
+            "create" => Some(Self::Create),
             _ => None,
         }
     }
@@ -113,6 +123,8 @@ impl Operation {
             's' => Some(Operation::Serve),
             'm' => Some(Operation::Manage),
             'c' => Some(Operation::Context),
+            'p' => Some(Operation::Spawn),
+            'r' => Some(Operation::Create),
             _ => None,
         }
     }

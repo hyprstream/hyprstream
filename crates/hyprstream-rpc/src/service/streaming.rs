@@ -812,7 +812,7 @@ fn send_multipart(socket: &zmq::Socket, frames: &[Vec<u8>]) -> Result<()> {
 ///
 /// This allows StreamService to be spawned by ServiceSpawner in the same way
 /// as other proxy services (ProxyService, etc.)
-impl crate::service::spawner::Spawnable for StreamService {
+impl crate::service::Spawnable for StreamService {
     fn name(&self) -> &str {
         &self.name
     }

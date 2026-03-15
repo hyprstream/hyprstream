@@ -1,140 +1,16 @@
-//! Core service infrastructure for ZMQ-based services
-//!
-//! Provides the foundation for REQ/REP services and clients using ZMQ.
-//! Uses TMQ for async I/O - services run as async tasks with proper epoll integration.
-//!
-//! # Envelope-Based Security
-//!
-//! All requests are wrapped in `SignedEnvelope` for authentication:
-//! - Service infrastructure unwraps and verifies signatures before dispatching
-//! - Handlers receive `EnvelopeContext` with verified identity
-//! - Services use `ctx.subject()` for policy checks and resource isolation
-//!
-//! # Note
-//!
-//! The core types (`EnvelopeContext`, `ZmqService`, `ZmqClient`)
-//! are now defined in `hyprstream-rpc` and re-exported here for backward compatibility.
-//!
-//! This module provides convenience constructors that use the global ZMQ context.
+//! Core service infrastructure — re-exports from `hyprstream-rpc`.
 
-use crate::zmq::global_context;
-use anyhow::Result;
-use hyprstream_rpc::prelude::*;
-
-// Re-export core types from hyprstream-rpc
-pub use hyprstream_rpc::service::{CallOptions, Continuation, EnvelopeContext, ZmqClient as ZmqClientBase, ZmqService};
-
-/// Create a generated service client with standard ZMQ boilerplate.
-///
-/// Uses the global ZMQ context and derives the server verifying key from the signing key.
-pub fn create_service_client<C: hyprstream_rpc::service::factory::ServiceClient>(
-    endpoint: &str,
-    signing_key: SigningKey,
-    identity: RequestIdentity,
-) -> C {
-    let server_verifying_key = signing_key.verifying_key();
-    let base = ZmqClientBase::new(
-        endpoint, global_context(), signing_key, server_verifying_key, identity,
-    );
-    C::from_zmq(base)
-}
-
-/// Authenticated ZMQ client with automatic request signing and response verification.
-///
-/// This is a convenience wrapper around `hyprstream_rpc::ZmqClient` that
-/// automatically uses the global ZMQ context for `inproc://` connectivity.
-///
-/// For direct context control, use `ZmqClientBase` from hyprstream-rpc.
-///
-/// # E2E Authentication
-///
-/// - **Requests**: Automatically signed with Ed25519
-/// - **Responses**: Automatically verified against server's public key
-///
-/// There is NO way to receive unverified response data.
-///
-/// # Usage
-///
-/// Use extension traits (`RegistryOps`, `InferenceOps`) to add service-specific
-/// methods to this client:
-///
-/// ```ignore
-/// use crate::services::{ZmqClient, RegistryOps};
-///
-/// let client = ZmqClient::new("inproc://hyprstream/registry", signing_key, server_verifying_key, identity);
-/// let repos = client.list().await?;  // RegistryOps method
-/// ```
-pub struct ZmqClient {
-    inner: ZmqClientBase,
-}
-
-impl ZmqClient {
-    /// Create a new client with signing credentials and server verification key.
-    ///
-    /// Uses the global ZMQ context for `inproc://` connectivity.
-    ///
-    /// # Arguments
-    /// * `endpoint` - ZMQ endpoint (e.g., `inproc://hyprstream/registry`)
-    /// * `signing_key` - Ed25519 signing key for request authentication
-    /// * `server_verifying_key` - Server's Ed25519 public key for response verification
-    /// * `identity` - Identity to include in requests (for authorization)
-    ///
-    /// # Security
-    ///
-    /// The `server_verifying_key` is MANDATORY. All responses are verified
-    /// against this key before being returned. There is no way to bypass verification.
-    pub fn new(endpoint: &str, signing_key: SigningKey, server_verifying_key: VerifyingKey, identity: RequestIdentity) -> Self {
-        Self {
-            inner: ZmqClientBase::new(endpoint, global_context(), signing_key, server_verifying_key, identity),
-        }
-    }
-
-    /// Get the next request ID (monotonically increasing).
-    pub fn next_id(&self) -> u64 {
-        self.inner.next_id()
-    }
-
-    /// Get the endpoint this client is connected to.
-    pub fn endpoint(&self) -> &str {
-        self.inner.endpoint()
-    }
-
-    /// Get the identity used for requests.
-    pub fn identity(&self) -> &RequestIdentity {
-        self.inner.identity()
-    }
-
-    /// Get the signing key.
-    pub fn signing_key(&self) -> &SigningKey {
-        self.inner.signing_key()
-    }
-
-    /// Get the server's verifying key for response verification.
-    pub fn server_verifying_key(&self) -> &VerifyingKey {
-        self.inner.server_verifying_key()
-    }
-
-    /// Sign and send a request.
-    ///
-    /// All requests are automatically wrapped in `SignedEnvelope`.
-    /// This ensures every call is authenticated - no bypass possible.
-    ///
-    /// # Arguments
-    /// * `payload` - Request payload bytes
-    /// * `opts` - Call options (timeout, claims, ephemeral_pubkey)
-    ///
-    /// Uses TMQ with the global context for proper `inproc://` support.
-    pub async fn call(&self, payload: Vec<u8>, opts: hyprstream_rpc::service::CallOptions) -> Result<Vec<u8>> {
-        self.inner.call(payload, opts).await
-    }
-}
+pub use hyprstream_rpc::service::{CallOptions, Continuation, EnvelopeContext, ZmqClient, ZmqService};
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::print_stdout)]
 mod tests {
     use super::*;
+    use crate::zmq::global_context;
+    use anyhow::Result;
     use std::sync::Arc;
     use hyprstream_rpc::crypto::generate_signing_keypair;
+    use hyprstream_rpc::prelude::*;
     use hyprstream_rpc::service::RequestLoop;
     use hyprstream_rpc::transport::TransportConfig;
 
@@ -196,7 +72,7 @@ mod tests {
             let mut handle = runner.run(service).await.expect("test: start service");
 
             // Use ZmqClient with server's verifying key for response verification
-            let client = ZmqClient::new(&endpoint, signing_key, verifying_key, RequestIdentity::local());
+            let client = ZmqClient::new(&endpoint, global_context(), signing_key, verifying_key, RequestIdentity::local());
             let response = client.call(b"hello".to_vec(), CallOptions::default()).await.expect("test: call");
 
             // Response should start with "from <user>:"
@@ -228,7 +104,7 @@ mod tests {
 
             // Sign request with different key than service expects
             // But verify responses with server's key
-            let client = ZmqClient::new(&endpoint, client_signing_key, server_verifying_key, RequestIdentity::local());
+            let client = ZmqClient::new(&endpoint, global_context(), client_signing_key, server_verifying_key, RequestIdentity::local());
             let result = client.call(b"should fail".to_vec(), CallOptions::default()).await;
 
             // Request should be rejected by server

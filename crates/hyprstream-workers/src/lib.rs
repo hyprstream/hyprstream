@@ -59,13 +59,13 @@ pub mod events;
 pub mod dbus;
 
 // Re-export main types
-pub use config::{HypervisorType, ImageConfig, PoolConfig, WorkerConfig, WorkflowConfig};
+pub use config::{BackendType, HypervisorType, ImageConfig, PoolConfig, WorkerConfig, WorkflowConfig};
 pub use error::WorkerError;
 
 // Re-export service types
-pub use runtime::{WorkerService, RuntimeClient};
-pub use image::{ImageClient, RafsStore};
-pub use workflow::{WorkflowService, WorkflowClient};
+pub use runtime::{WorkerService, SandboxBackend, SandboxHandle, KataBackend, NspawnBackend, NspawnConfig};
+pub use image::RafsStore;
+pub use workflow::WorkflowService;
 pub use events::{
     // Spawner types (new API)
     ProxyService, ServiceSpawner, SpawnedService,
@@ -82,8 +82,9 @@ pub use events::{
     EVENTS_PUB, EVENTS_SUB,
 };
 
-// Re-export annotations_capnp and streaming_capnp from hyprstream-rpc (compiled once, shared by all crates)
+// Re-export capnp modules from hyprstream-rpc (compiled once, shared by all crates)
 pub use hyprstream_rpc::annotations_capnp;
+pub use hyprstream_rpc::common_capnp;
 pub use hyprstream_rpc::streaming_capnp;
 
 /// Generated Cap'n Proto code for resource-scoped worker schema

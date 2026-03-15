@@ -1,5 +1,6 @@
 @0xd4e6f8a2b1c3d5e7;
 
+using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".mcpScope;
 using import "/annotations.capnp".mcpDescription;
 using import "/streaming.capnp".StreamInfo;
@@ -434,14 +435,6 @@ struct HealthStatus {
   worktreeCount @2 :UInt32;
   cacheHits @3 :UInt64;
   cacheMisses @4 :UInt64;
-}
-
-# Error Information
-
-struct ErrorInfo {
-  message @0 :Text;
-  code @1 :Text;
-  details @2 :Text;
 }
 
 # Remote Operations

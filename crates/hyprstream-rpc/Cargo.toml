@@ -79,25 +79,22 @@ parking_lot = { workspace = true }
 once_cell = { workspace = true }
 inventory = "0.3"
 
-# Process spawning
+# System utilities
 nix = { workspace = true }
 dashmap = { workspace = true }
-which = { workspace = true }
 uuid = { workspace = true }
 webpki-roots = "0.26"
-
-# Service management
 dirs = "5"
 systemd = { version = "0.10", optional = true }
-zbus_systemd = { version = "0.0.11", features = ["login1", "systemd1"], optional = true }
 
 [features]
 default = []
 fips = ["p256", "hkdf", "hmac"]  # FIPS mode uses P-256 + HKDF-SHA256 + HMAC-SHA256
-systemd = ["dep:systemd", "dep:zbus_systemd"]
+systemd = ["dep:systemd"]
 
 [build-dependencies]
 capnpc = { workspace = true }
+hyprstream-rpc-build = { path = "../hyprstream-rpc-build" }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

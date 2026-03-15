@@ -137,7 +137,7 @@ unsafe impl Sync for LinearProjection {}
 
 /// Calculate padded vocabulary size to multiple of 64 (for performance optimization)
 #[inline]
-fn calculate_padded_vocab_size(vocab_size: usize) -> usize {
+fn calculate_padded_vocab_size(vocab_size: u32) -> u32 {
     vocab_size.div_ceil(64) * 64
 }
 
@@ -147,25 +147,25 @@ pub struct LlamaConfig {
     /// Llama version (1, 2, or 3)
     pub version: u8,
     /// Number of attention heads for queries
-    pub num_attention_heads: usize,
+    pub num_attention_heads: u32,
     /// Number of key-value heads (for GQA in Llama 2/3)
-    pub num_key_value_heads: usize,
+    pub num_key_value_heads: u32,
     /// Hidden dimension size
-    pub hidden_size: usize,
+    pub hidden_size: u32,
     /// Head dimension
-    pub head_dim: usize,
+    pub head_dim: u32,
     /// Intermediate size for FFN
-    pub intermediate_size: usize,
+    pub intermediate_size: u32,
     /// Maximum position embeddings
-    pub max_position_embeddings: usize,
+    pub max_position_embeddings: u32,
     /// RMSNorm epsilon
     pub rms_norm_eps: f32,
     /// Vocabulary size (may be padded)
-    pub vocab_size: usize,
+    pub vocab_size: u32,
     /// Original vocabulary size (before padding)
-    pub original_vocab_size: usize,
+    pub original_vocab_size: u32,
     /// Number of hidden layers
-    pub num_hidden_layers: usize,
+    pub num_hidden_layers: u32,
     /// RoPE theta
     pub rope_theta: f32,
     /// RoPE scaling (for Llama 3)
@@ -281,31 +281,31 @@ impl LlamaConfig {
 
 impl ArchitectureConfig for LlamaConfig {
     fn num_attention_heads(&self) -> usize {
-        self.num_attention_heads
+        self.num_attention_heads as usize
     }
 
     fn num_key_value_heads(&self) -> usize {
-        self.num_key_value_heads
+        self.num_key_value_heads as usize
     }
 
     fn hidden_size(&self) -> usize {
-        self.hidden_size
+        self.hidden_size as usize
     }
 
     fn intermediate_size(&self) -> usize {
-        self.intermediate_size
+        self.intermediate_size as usize
     }
 
     fn head_dim(&self) -> usize {
-        self.head_dim
+        self.head_dim as usize
     }
 
     fn vocab_size(&self) -> usize {
-        self.vocab_size
+        self.vocab_size as usize
     }
 
     fn max_position_embeddings(&self) -> usize {
-        self.max_position_embeddings
+        self.max_position_embeddings as usize
     }
 
     fn rope_theta(&self) -> Option<f32> {
@@ -313,7 +313,7 @@ impl ArchitectureConfig for LlamaConfig {
     }
 
     fn rope_dim(&self) -> Option<usize> {
-        Some(self.head_dim)
+        Some(self.head_dim as usize)
     }
 
     fn layer_norm_eps(&self) -> f32 {
@@ -1047,7 +1047,7 @@ impl LlamaModel {
     ) -> Result<Self> {
         // Parse config from weights if possible, otherwise use defaults
         let config = Self::detect_config_from_weights(weights)?;
-        Self::from_weights_with_config(weights, config, device, dtype, crate::runtime::kv_quant::KVQuantType::None)
+        Self::from_weights_with_config(weights, config, device, dtype, crate::runtime::KVQuantType::None)
     }
 
     /// Create Llama model with explicit config (allows Qwen models to override)
@@ -1058,7 +1058,7 @@ impl LlamaModel {
         mut config: LlamaConfig,
         device: &Device,
         dtype: DType,
-        kv_quant_type: crate::runtime::kv_quant::KVQuantType,
+        kv_quant_type: crate::runtime::KVQuantType,
     ) -> Result<Self> {
         tracing::info!(
             "[from_weights_with_config] Received config.max_position_embeddings = {}, kv_quant = {:?}",
@@ -1071,7 +1071,7 @@ impl LlamaModel {
             .get("model.embed_tokens.weight")
             .or_else(|| weights.get("embed_tokens.weight"))
             .map(|w| {
-                let vocab_size = w.size()[0] as usize;
+                let vocab_size = w.size()[0] as u32;
                 let hidden_size = w.size()[1];
 
                 // Pad vocabulary size to multiple of 64 for models that need it
@@ -1119,7 +1119,7 @@ impl LlamaModel {
             .or_else(|| weights.get("model.lm_head.weight"))
             .map(|w| {
                 // LM head is stored as [vocab_size, hidden_size] in HuggingFace
-                let vocab_size = w.size()[0] as usize;
+                let vocab_size = w.size()[0] as u32;
                 let hidden_size = w.size()[1];
 
                 // Pad vocabulary size to multiple of 64 (like SGLang does for Qwen)
@@ -1176,7 +1176,7 @@ impl LlamaModel {
         // Build transformer layers incrementally, freeing weight tensors as we go
         // This reduces peak memory by ~50% (7.7GB savings for Qwen3-4B)
         let mut layers = Vec::new();
-        for layer_idx in 0..config.num_hidden_layers {
+        for layer_idx in 0..config.num_hidden_layers as usize {
             if let Some(layer) = Self::build_layer(layer_idx, weights, &config, device)? {
                 layers.push(layer);
             }
@@ -1193,7 +1193,7 @@ impl LlamaModel {
             Some(std::sync::Arc::new(parking_lot::Mutex::new(
                 crate::runtime::kv_cache::KVCacheManager::new(
                     layers.len(),
-                    config.max_position_embeddings,
+                    config.max_position_embeddings as usize,
                     kv_quant_type,
                 ),
             )))
@@ -1231,9 +1231,9 @@ impl LlamaModel {
         {
             let shape = embed.size();
             if shape.len() >= 2 {
-                config.vocab_size = shape[0] as usize;
-                config.original_vocab_size = shape[0] as usize;  // Initially same
-                config.hidden_size = shape[1] as usize;
+                config.vocab_size = shape[0] as u32;
+                config.original_vocab_size = shape[0] as u32;  // Initially same
+                config.hidden_size = shape[1] as u32;
 
                 // Detect Gemma3 by vocab size (262144) and set specific parameters
                 if config.vocab_size == 262144 {
@@ -1258,7 +1258,7 @@ impl LlamaModel {
             .filter(|k| k.contains("layers.") && k.contains(".self_attn.q_proj"))
             .count();
         if layer_count > 0 {
-            config.num_hidden_layers = layer_count;
+            config.num_hidden_layers = layer_count as u32;
         }
 
         // Get attention heads from q_proj and k_proj shapes
@@ -1267,7 +1267,7 @@ impl LlamaModel {
             if q_shape.len() >= 2 {
                 // shape[0] is output dim (num_heads * head_dim)
                 // shape[1] is hidden_size
-                config.hidden_size = q_shape[1] as usize;
+                config.hidden_size = q_shape[1] as u32;
                 let q_proj_out_dim = q_shape[0] as usize;
 
                 // Also check k_proj to detect GQA (Grouped Query Attention)
@@ -1299,9 +1299,9 @@ impl LlamaModel {
 
                 for &head_dim in &possible_head_dims {
                     if q_proj_out_dim.is_multiple_of(head_dim) && k_proj_out_dim % head_dim == 0 {
-                        config.num_attention_heads = q_proj_out_dim / head_dim;
-                        config.num_key_value_heads = k_proj_out_dim / head_dim;
-                        config.head_dim = head_dim;
+                        config.num_attention_heads = (q_proj_out_dim / head_dim) as u32;
+                        config.num_key_value_heads = (k_proj_out_dim / head_dim) as u32;
+                        config.head_dim = head_dim as u32;
                         found_config = true;
                         tracing::info!("Detected attention config: Q={} heads, KV={} heads, dim={}, total Q={}", 
                                      config.num_attention_heads, config.num_key_value_heads, 
@@ -1472,9 +1472,9 @@ impl LlamaModel {
         };
 
         let self_attn = LlamaAttention {
-            num_heads: config.num_attention_heads,
-            num_kv_heads: config.num_key_value_heads,
-            head_dim: config.head_dim,
+            num_heads: config.num_attention_heads as usize,
+            num_kv_heads: config.num_key_value_heads as usize,
+            head_dim: config.head_dim as usize,
             q_proj,
             k_proj,
             v_proj,
@@ -1554,27 +1554,27 @@ impl LlamaModel {
 
         let mut config = LlamaConfig {
             version,
-            num_attention_heads: json["num_attention_heads"].as_u64().unwrap_or(32) as usize,
+            num_attention_heads: json["num_attention_heads"].as_u64().unwrap_or(32) as u32,
             num_key_value_heads: json
                 .get("num_key_value_heads")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or_else(|| json["num_attention_heads"].as_u64().unwrap_or(32))
-                as usize,
-            hidden_size: json["hidden_size"].as_u64().unwrap_or(4096) as usize,
+                as u32,
+            hidden_size: json["hidden_size"].as_u64().unwrap_or(4096) as u32,
             head_dim: json
                 .get("head_dim")
                 .and_then(serde_json::Value::as_u64)
-                .map(|v| v as usize)
+                .map(|v| v as u32)
                 .unwrap_or_else(|| {
                     // If head_dim not specified, calculate from hidden_size / num_attention_heads
                     let heads = json
                         .get("num_attention_heads")
                         .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(32) as usize;
+                        .unwrap_or(32) as u32;
                     let hidden = json
                         .get("hidden_size")
                         .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(4096) as usize;
+                        .unwrap_or(4096) as u32;
                     // Common head_dim values are 64, 128, 256
                     if hidden.is_multiple_of(heads * 256) {
                         256
@@ -1586,13 +1586,13 @@ impl LlamaModel {
                         128 // Default fallback
                     }
                 }),
-            intermediate_size: json["intermediate_size"].as_u64().unwrap_or(11008) as usize,
+            intermediate_size: json["intermediate_size"].as_u64().unwrap_or(11008) as u32,
             max_position_embeddings: json["max_position_embeddings"].as_u64().unwrap_or(4096)
-                as usize,
+                as u32,
             rms_norm_eps: json["rms_norm_eps"].as_f64().unwrap_or(1e-5) as f32,
-            vocab_size: json["vocab_size"].as_u64().unwrap_or(32000) as usize,
-            original_vocab_size: json["vocab_size"].as_u64().unwrap_or(32000) as usize,  // Initially same
-            num_hidden_layers: json["num_hidden_layers"].as_u64().unwrap_or(32) as usize,
+            vocab_size: json["vocab_size"].as_u64().unwrap_or(32000) as u32,
+            original_vocab_size: json["vocab_size"].as_u64().unwrap_or(32000) as u32,  // Initially same
+            num_hidden_layers: json["num_hidden_layers"].as_u64().unwrap_or(32) as u32,
             rope_theta: json
                 .get("rope_theta")
                 .and_then(serde_json::Value::as_f64)
@@ -1784,7 +1784,7 @@ impl LlamaModel {
         let padded_vocab_size = self.config.vocab_size;
         if padded_vocab_size > original_vocab_size && original_vocab_size > 0 {
             let logits_shape = hidden_states.size();
-            let actual_vocab_size = logits_shape[logits_shape.len() - 1] as usize;
+            let actual_vocab_size = logits_shape[logits_shape.len() - 1] as u32;
 
             if actual_vocab_size == padded_vocab_size {
                 let mask_start = original_vocab_size as i64;
@@ -1985,7 +1985,7 @@ impl ModelOperations for LlamaModel {
         let original_vocab_size = self.config.original_vocab_size;
         if padded_vocab_size > original_vocab_size && original_vocab_size > 0 {
             let logits_shape = hidden_states.size();
-            let actual_vocab_size = logits_shape[logits_shape.len() - 1] as usize;
+            let actual_vocab_size = logits_shape[logits_shape.len() - 1] as u32;
 
             if actual_vocab_size == padded_vocab_size {
                 let mask_start = original_vocab_size as i64;
@@ -2167,7 +2167,7 @@ impl ModelOperations for LlamaModel {
     }
 
     fn num_layers(&self) -> usize {
-        self.config.num_hidden_layers
+        self.config.num_hidden_layers as usize
     }
 
     fn apply_rope(&self, _tensor: &Tensor, _position_ids: &Tensor) -> Result<Tensor> {

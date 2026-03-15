@@ -1,5 +1,8 @@
 @0xb1c2d3e4f5a6b7c8;
 
+using import "annotations.capnp".fixedSize;
+using import "annotations.capnp".optional;
+
 # Common Cap'n Proto types for hyprstream RPC
 #
 # This schema defines identity and envelope types used across all services.
@@ -34,7 +37,7 @@ struct ApiTokenIdentity {
 # Remote peer identity (CURVE authenticated)
 struct PeerIdentity {
   name @0 :Text;       # Registered peer name (e.g., "gpu-server-1")
-  curveKey @1 :Data;   # CURVE public key (32 bytes)
+  curveKey @1 :Data $fixedSize(32);   # CURVE public key (32 bytes)
 }
 
 # Unsigned request data - this is what gets signed
@@ -45,10 +48,10 @@ struct RequestEnvelope {
   requestId @0 :UInt64;            # Unique request ID for correlation
   identity @1 :RequestIdentity;    # Who is making the request (service identity)
   payload @2 :Data;                # Serialized inner request (RegistryRequest, etc.)
-  ephemeralPubkey @3 :Data;        # Ristretto255/P-256 public key for stream HMAC (optional, 32 bytes)
-  nonce @4 :Data;                  # 16 random bytes for replay protection
+  ephemeralPubkey @3 :Data $fixedSize(32) $optional;  # Ristretto255/P-256 public key for stream HMAC
+  nonce @4 :Data $fixedSize(16);   # 16 random bytes for replay protection
   timestamp @5 :Int64;             # Unix millis, for expiration check
-  claims @6 :Claims;               # User authorization claims (protected by envelope signature)
+  claims @6 :Claims $optional;     # User authorization claims (protected by envelope signature)
 }
 
 # Signed wrapper - signature covers serialized RequestEnvelope bytes
@@ -60,8 +63,8 @@ struct RequestEnvelope {
 # Verification: Ed25519.verify(signerPubkey, serialize(envelope), signature)
 struct SignedEnvelope {
   envelope @0 :RequestEnvelope;    # The data being signed
-  signature @1 :Data;              # Ed25519 signature (64 bytes) over serialized envelope
-  signerPubkey @2 :Data;           # Ed25519 public key (32 bytes)
+  signature @1 :Data $fixedSize(64);   # Ed25519 signature (64 bytes) over serialized envelope
+  signerPubkey @2 :Data $fixedSize(32);  # Ed25519 public key (32 bytes)
 }
 
 # Signed response envelope
@@ -74,8 +77,8 @@ struct SignedEnvelope {
 struct ResponseEnvelope {
   requestId @0 :UInt64;    # Correlates with RequestEnvelope.requestId
   payload @1 :Data;        # Serialized inner response
-  signature @2 :Data;      # Ed25519 signature (64 bytes)
-  signerPubkey @3 :Data;   # Ed25519 public key (32 bytes)
+  signature @2 :Data $fixedSize(64);   # Ed25519 signature (64 bytes)
+  signerPubkey @3 :Data $fixedSize(32);  # Ed25519 public key (32 bytes)
 }
 
 # Authorization subject — bare username or "anonymous".
@@ -127,4 +130,11 @@ struct Claims {
 struct Timestamp {
   seconds @0 :Int64;   # Seconds since Unix epoch (1970-01-01T00:00:00Z)
   nanos @1 :Int32;     # Nanosecond offset [0, 999999999]
+}
+
+# Standard error response used across all services
+struct ErrorInfo {
+  message @0 :Text;
+  code @1 :Text;
+  details @2 :Text;
 }

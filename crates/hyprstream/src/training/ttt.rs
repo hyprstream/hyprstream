@@ -43,7 +43,7 @@ pub struct TTTConfig {
     /// More steps = better adaptation but higher latency
     /// Recommended: 1-5
     #[serde(default = "default_gradient_steps")]
-    pub gradient_steps: usize,
+    pub gradient_steps: u32,
 
     /// Maximum gradient norm for clipping
     #[serde(default = "default_max_grad_norm")]
@@ -52,12 +52,12 @@ pub struct TTTConfig {
     /// Minimum input length (tokens) to trigger TTT
     /// Short inputs don't benefit from adaptation
     #[serde(default = "default_min_input_length")]
-    pub min_input_length: usize,
+    pub min_input_length: u32,
 
     /// Maximum input length to process for TTT
     /// Truncates very long inputs to control latency
     #[serde(default = "default_max_ttt_context")]
-    pub max_ttt_context: usize,
+    pub max_ttt_context: u32,
 
     /// Whether TTT is enabled
     #[serde(default = "default_enabled")]
@@ -106,16 +106,16 @@ pub struct TTTConfig {
 fn default_learning_rate() -> f64 {
     3e-4
 }
-fn default_gradient_steps() -> usize {
+fn default_gradient_steps() -> u32 {
     3
 }
 fn default_max_grad_norm() -> f64 {
     1.0
 }
-fn default_min_input_length() -> usize {
+fn default_min_input_length() -> u32 {
     32
 }
-fn default_max_ttt_context() -> usize {
+fn default_max_ttt_context() -> u32 {
     512
 }
 fn default_enabled() -> bool {
@@ -639,7 +639,7 @@ impl TestTimeTrainer {
         }
 
         if !self.config.adaptive_steps {
-            return self.config.gradient_steps;
+            return self.config.gradient_steps as usize;
         }
 
         if perplexity < self.config.tau_skip {
@@ -699,7 +699,7 @@ impl TestTimeTrainer {
         }
 
         // Check minimum length
-        if input_tokens.len() < self.config.min_input_length {
+        if input_tokens.len() < self.config.min_input_length as usize {
             return Ok((
                 TTTResult::skipped(&format!(
                     "Input too short: {} < {} tokens",
@@ -720,11 +720,11 @@ impl TestTimeTrainer {
 
         // Track whether input was truncated
         let tokens_provided = input_tokens.len();
-        let was_truncated = tokens_provided > self.config.max_ttt_context;
+        let was_truncated = tokens_provided > self.config.max_ttt_context as usize;
 
         // Truncate if too long (use last N tokens for recency)
         let tokens: Vec<u32> = if was_truncated {
-            input_tokens[input_tokens.len() - self.config.max_ttt_context..].to_vec()
+            input_tokens[input_tokens.len() - self.config.max_ttt_context as usize..].to_vec()
         } else {
             input_tokens.to_vec()
         };
@@ -1119,10 +1119,10 @@ impl TestTimeTrainer {
         let start = Instant::now();
 
         let tokens_provided = input_tokens.len();
-        let was_truncated = tokens_provided > self.config.max_ttt_context;
+        let was_truncated = tokens_provided > self.config.max_ttt_context as usize;
 
         let tokens: Vec<u32> = if was_truncated {
-            input_tokens[input_tokens.len() - self.config.max_ttt_context..].to_vec()
+            input_tokens[input_tokens.len() - self.config.max_ttt_context as usize..].to_vec()
         } else {
             input_tokens.to_vec()
         };

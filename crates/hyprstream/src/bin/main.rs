@@ -11,7 +11,7 @@ use tracing::info;
 
 // Core application imports
 use hyprstream_core::cli::commands::{
-    ExecutionMode, FlightArgs, ImageCommand, ServiceAction, TrainingAction, WorkerAction,
+    ExecutionMode, FlightArgs, ImageCommand, ServiceAction, TrainingAction, TuiAction, WorkerAction,
 };
 use hyprstream_core::cli::quick::{QuickCommand, RemoteQuickCommand, WorktreeQuickCommand};
 use hyprstream_core::cli::schema_cli;
@@ -45,7 +45,7 @@ use hyprstream_core::config::HyprConfig;
 use hyprstream_core::storage::{GitRef, ModelRef};
 
 // Registry and policy services - uses ZMQ-based services from hyprstream_core
-use hyprstream_core::services::{PolicyClient, GenRegistryClient};
+use hyprstream_core::services::{PolicyClient, RegistryClient};
 // Worker service for Kata-based workload execution
 use hyprstream_workers::runtime::WorkerService;
 use hyprstream_workers::workflow::WorkflowService;
@@ -54,7 +54,7 @@ use hyprstream_workers::{ImageConfig, PoolConfig, SpawnedService};
 use hyprstream_core::zmq::global_context;
 use std::sync::Arc;
 // Unified service manager API
-use hyprstream_rpc::service::{get_factory, InprocManager, ServiceContext, ServiceManager};
+use hyprstream_service::{get_factory, InprocManager, ServiceContext, ServiceManager};
 use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_rpc::{RequestIdentity, SigningKey, VerifyingKey};
 // Tracing imports (feature-gated)
@@ -118,6 +118,13 @@ fn build_cli() -> ClapCommand {
         ),
     );
 
+    // TUI display server (derive-based subcommands)
+    app = app.subcommand(
+        <TuiAction as ClapSubcommand>::augment_subcommands(
+            ClapCommand::new("tui").about("TUI display server \u{2014} terminal multiplexer with session persistence"),
+        ),
+    );
+
     // Flight SQL client (derive-based args)
     app = app.subcommand(
         <FlightArgs as ClapArgs>::augment_args(
@@ -130,6 +137,43 @@ fn build_cli() -> ClapCommand {
         <UserCommand as ClapSubcommand>::augment_subcommands(
             ClapCommand::new("user").about("Manage local user credentials"),
         ),
+    );
+
+    // Interactive setup wizard
+    app = app.subcommand(
+        ClapCommand::new("wizard")
+            .about("Interactive setup wizard — configure policies, users, and API tokens")
+            .arg(
+                Arg::new("non_interactive")
+                    .long("non-interactive")
+                    .short('y')
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Accept defaults without prompting"),
+            )
+            .arg(
+                Arg::new("start")
+                    .long("start")
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Start services after setup"),
+            )
+            .arg(
+                Arg::new("tui")
+                    .long("tui")
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Use TUI wizard with GPU detection and install phase"),
+            ),
+    );
+
+    // Self-update
+    app = app.subcommand(
+        ClapCommand::new("update")
+            .about("Check for and install updates")
+            .arg(
+                Arg::new("cleanup")
+                    .long("cleanup")
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Remove old version worktrees"),
+            ),
     );
 
     app
@@ -376,7 +420,7 @@ fn handle_quick_command(
             || async move {
                 let keys_dir = ctx.models_dir().join(".registry").join("keys");
                 let signing_key = load_or_generate_signing_key(&keys_dir).await?;
-                let model_client = hyprstream_core::services::ModelZmqClient::new(
+                let model_client = hyprstream_core::services::generated::model_client::ModelClient::new(
                     signing_key,
                     RequestIdentity::local(),
                 );
@@ -957,12 +1001,16 @@ fn handle_quick_command(
 
                     let _worker_handle = if !worker_already_running {
                         use hyprstream_workers::image::RafsStore;
+                        use hyprstream_workers::runtime::{SandboxBackend, KataBackend};
                         let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
+                        let backend: Arc<dyn SandboxBackend> = Arc::new(
+                            KataBackend::new(image_config, Arc::clone(&rafs_store)),
+                        );
                         let worker_transport =
                             TransportConfig::inproc("hyprstream/workers");
                         let mut worker_service = WorkerService::new(
                             pool_config,
-                            image_config,
+                            backend,
                             rafs_store,
                             global_context().clone(),
                             worker_transport,
@@ -989,13 +1037,14 @@ fn handle_quick_command(
                         None
                     };
 
-                    use hyprstream_core::services::WorkerZmqClient;
+                    use hyprstream_workers::runtime::WorkerClient;
                     let worker_client =
-                        WorkerZmqClient::new(signing_key, RequestIdentity::local());
+                        WorkerClient::new(signing_key, RequestIdentity::local());
 
                     match action {
                         WorkerAction::List {
                             sandbox,
+                            container,
                             containers,
                             sandboxes,
                             state,
@@ -1004,6 +1053,7 @@ fn handle_quick_command(
                             handle_worker_list(
                                 &worker_client,
                                 sandbox,
+                                container,
                                 containers,
                                 sandboxes,
                                 state,
@@ -1182,6 +1232,25 @@ fn main() -> Result<()> {
         eprintln!("Please check for unsafe RefCell usage or race conditions.");
     }));
 
+    // Check if we should re-exec into an installed GPU variant.
+    // Uses Unix execve() to replace this process with the GPU-optimized binary.
+    // The binary path comes from our own data directory (not user input).
+    {
+        let data_dir = dirs::data_local_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("hyprstream");
+        if let Some((variant_id, version)) =
+            hyprstream_core::cli::update_handlers::check_should_reexec(&data_dir)
+        {
+            hyprstream_core::cli::update_handlers::re_exec_variant(
+                &data_dir,
+                &variant_id,
+                &version,
+            );
+            // re_exec_variant never returns
+        }
+    }
+
     // Parse CLI arguments using builder API
     let matches = build_cli().get_matches();
 
@@ -1326,7 +1395,7 @@ fn main() -> Result<()> {
 
     // Start ZMQ-based services and create keypair
     let (registry_client, mut _service_handles, _workflow_service, signing_key, verifying_key): (
-        GenRegistryClient,
+        RegistryClient,
         Vec<SpawnedService>,
         Option<Arc<WorkflowService>>,
         SigningKey,
@@ -1401,8 +1470,7 @@ fn main() -> Result<()> {
                         None
                     };
 
-                let client = hyprstream_core::services::create_service_client(
-                    &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
+                let client = hyprstream_core::services::RegistryClient::new(
                     signing_key.clone(),
                     RequestIdentity::local(),
                 );
@@ -1424,8 +1492,7 @@ fn main() -> Result<()> {
                 let signing_key = load_or_generate_signing_key(&keys_dir).await?;
                 let verifying_key = signing_key.verifying_key();
 
-                let client = hyprstream_core::services::create_service_client(
-                    &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
+                let client = hyprstream_core::services::RegistryClient::new(
                     signing_key.clone(),
                     RequestIdentity::local(),
                 );
@@ -1637,7 +1704,7 @@ fn main() -> Result<()> {
                                         println!("QUIC/WebTransport cert hash: {}", hash);
                                     }
 
-                                    let shared = hyprstream_rpc::service::QuicSharedConfig {
+                                    let shared = hyprstream_service::QuicSharedConfig {
                                         cert_der,
                                         key_der,
                                         base_ip: qc.socket_addr()?.ip(),
@@ -1660,7 +1727,7 @@ fn main() -> Result<()> {
                                 for svc_name in &service_names {
                                     let factory = get_factory(svc_name).ok_or_else(|| {
                                         let available: Vec<_> =
-                                            hyprstream_rpc::service::list_factories()
+                                            hyprstream_service::list_factories()
                                                 .map(|f| f.name)
                                                 .collect();
                                         anyhow::anyhow!(
@@ -1805,6 +1872,48 @@ fn main() -> Result<()> {
             }
         }
 
+        // ── TUI display server ──────────────────────────────────────────
+        Some(("tui", sub_m)) => {
+            let action = TuiAction::from_arg_matches(sub_m)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: true,
+                },
+                || async move {
+                    use hyprstream_core::cli::tui_handlers;
+
+                    // Load signing key for RPC authentication
+                    let data_dir = dirs::data_local_dir()
+                        .unwrap_or_else(|| std::path::PathBuf::from("."))
+                        .join("hyprstream");
+                    let keys_dir = data_dir.join("keys");
+                    let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+
+                    match action {
+                        TuiAction::Attach { session } => {
+                            let sid = if session == 0 { None } else { Some(session) };
+                            tui_handlers::handle_tui_attach(&signing_key, sid).await
+                        }
+                        TuiAction::New => tui_handlers::handle_tui_new(&signing_key).await,
+                        TuiAction::List => tui_handlers::handle_tui_list(&signing_key).await,
+                        TuiAction::Detach => tui_handlers::handle_tui_detach().await,
+                        TuiAction::Play { cast_file, session, loop_playback } => {
+                            tui_handlers::handle_tui_play(&signing_key, &cast_file, session, loop_playback).await
+                        }
+                        TuiAction::Shell { session } => {
+                            let models_dir = config_for_service.models_dir().clone();
+                            hyprstream_core::cli::shell_handlers::handle_tui_shell(
+                                &signing_key, &models_dir, session,
+                            ).await
+                        }
+                    }
+                },
+            )?;
+        }
+
         // ── Flight SQL client ───────────────────────────────────────────
         Some(("flight", sub_m)) => {
             let args = FlightArgs::from_arg_matches(sub_m)
@@ -1852,9 +1961,72 @@ fn main() -> Result<()> {
             )?;
         }
 
-        // ── No subcommand / help ────────────────────────────────────────
+        // ── Interactive setup wizard ─────────────────────────────────────
+        Some(("wizard", sub_m)) => {
+            let tui_mode = sub_m.get_flag("tui");
+            let non_interactive = sub_m.get_flag("non_interactive");
+            let start_services = sub_m.get_flag("start");
+            let models_dir = config_for_service.models_dir().clone();
+            let services = config_for_service.services.startup.clone();
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: true,
+                },
+                || async move {
+                    if tui_mode {
+                        hyprstream_core::cli::handle_wizard_tui(&models_dir).await
+                    } else {
+                        hyprstream_core::cli::handle_wizard(
+                            &models_dir,
+                            &services,
+                            non_interactive,
+                            start_services,
+                        )
+                        .await
+                    }
+                },
+            )?;
+        }
+
+        // ── Self-update ──────────────────────────────────────────────────
+        Some(("update", sub_m)) => {
+            let cleanup = sub_m.get_flag("cleanup");
+            let models_dir = config_for_service.models_dir().clone();
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: true,
+                },
+                || async move {
+                    hyprstream_core::cli::update_handlers::handle_update(&models_dir, cleanup).await
+                },
+            )?;
+        }
+
+        // ── No subcommand → wizard (first run) or ShellClient ──────────
         _ => {
-            build_cli().print_help()?;
+            let models_dir = config_for_service.models_dir().clone();
+            if hyprstream_core::cli::bootstrap_manager::is_first_run(&models_dir) {
+                with_runtime(
+                    RuntimeConfig { device: DeviceConfig::request_cpu(), multi_threaded: true },
+                    || async move {
+                        hyprstream_core::cli::handle_wizard_tui(&models_dir).await
+                    },
+                )?;
+            } else {
+                with_runtime(
+                    RuntimeConfig { device: DeviceConfig::request_cpu(), multi_threaded: true },
+                    || {
+                        let md = models_dir.clone();
+                        async move {
+                            let keys_dir = md.join(".registry").join("keys");
+                            let sk = load_or_generate_signing_key(&keys_dir).await?;
+                            hyprstream_core::cli::shell_handlers::handle_shell_tui(&sk, &md).await
+                        }
+                    },
+                )?;
+            }
         }
     };
 

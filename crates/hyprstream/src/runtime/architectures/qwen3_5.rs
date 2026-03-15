@@ -10,7 +10,7 @@ use super::llama::{LlamaMLP, LinearProjection};
 use super::qwen3_5_vision::{Qwen3_5VisionConfig, Qwen3_5VisionEncoder};
 use super::{ModelArchitecture, ModelOperations};
 use crate::runtime::kv_cache::KVCacheManager;
-use crate::runtime::kv_quant::KVQuantType;
+use crate::runtime::KVQuantType;
 use crate::runtime::model_config::ModelConfig;
 use crate::runtime::rope::RoPE;
 use crate::runtime::tensor_helpers::{dims3, dims4};
@@ -26,14 +26,14 @@ use tracing::info;
 
 /// Qwen3.5 text backbone configuration
 pub struct Qwen3_5TextConfig {
-    pub hidden_size: usize,
-    pub num_hidden_layers: usize,
-    pub num_attention_heads: usize,
-    pub num_key_value_heads: usize,
-    pub head_dim: usize,
-    pub intermediate_size: usize,
-    pub vocab_size: usize,
-    pub max_position_embeddings: usize,
+    pub hidden_size: u32,
+    pub num_hidden_layers: u32,
+    pub num_attention_heads: u32,
+    pub num_key_value_heads: u32,
+    pub head_dim: u32,
+    pub intermediate_size: u32,
+    pub vocab_size: u32,
+    pub max_position_embeddings: u32,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
     /// Fraction of head_dim to rotate (0.25 → rotary_dim = head_dim/4)
@@ -60,13 +60,13 @@ pub struct Qwen3_5TextConfig {
 }
 
 impl ArchitectureConfig for Qwen3_5TextConfig {
-    fn num_attention_heads(&self) -> usize { self.num_attention_heads }
-    fn num_key_value_heads(&self) -> usize { self.num_key_value_heads }
-    fn hidden_size(&self) -> usize { self.hidden_size }
-    fn intermediate_size(&self) -> usize { self.intermediate_size }
-    fn head_dim(&self) -> usize { self.head_dim }
-    fn vocab_size(&self) -> usize { self.vocab_size }
-    fn max_position_embeddings(&self) -> usize { self.max_position_embeddings }
+    fn num_attention_heads(&self) -> usize { self.num_attention_heads as usize }
+    fn num_key_value_heads(&self) -> usize { self.num_key_value_heads as usize }
+    fn hidden_size(&self) -> usize { self.hidden_size as usize }
+    fn intermediate_size(&self) -> usize { self.intermediate_size as usize }
+    fn head_dim(&self) -> usize { self.head_dim as usize }
+    fn vocab_size(&self) -> usize { self.vocab_size as usize }
+    fn max_position_embeddings(&self) -> usize { self.max_position_embeddings as usize }
     fn rope_theta(&self) -> Option<f32> { Some(self.rope_theta) }
     fn rope_dim(&self) -> Option<usize> { Some(self.rotary_dim) }
     fn layer_norm_eps(&self) -> f32 { self.rms_norm_eps }
@@ -106,14 +106,14 @@ impl Qwen3_5TextConfig {
         };
 
         Self {
-            hidden_size: cfg.hidden_size,
-            num_hidden_layers: cfg.num_hidden_layers,
-            num_attention_heads: cfg.num_attention_heads,
-            num_key_value_heads: cfg.num_key_value_heads,
-            head_dim: cfg.head_dim,
-            intermediate_size: cfg.intermediate_size,
-            vocab_size: cfg.vocab_size,
-            max_position_embeddings: max_pos,
+            hidden_size: cfg.hidden_size as u32,
+            num_hidden_layers: cfg.num_hidden_layers as u32,
+            num_attention_heads: cfg.num_attention_heads as u32,
+            num_key_value_heads: cfg.num_key_value_heads as u32,
+            head_dim: cfg.head_dim as u32,
+            intermediate_size: cfg.intermediate_size as u32,
+            vocab_size: cfg.vocab_size as u32,
+            max_position_embeddings: max_pos as u32,
             rms_norm_eps: cfg.rms_norm_eps,
             rope_theta: cfg.rope_theta,
             partial_rotary_factor,
@@ -793,12 +793,12 @@ impl Qwen3_5FullAttention {
             o_proj: LinearProjection::take(weights, &format!("{prefix}.o_proj.weight"))?,
             q_norm: Qwen3_5RMSNorm::new(q_norm_weight, cfg.rms_norm_eps),
             k_norm: Qwen3_5RMSNorm::new(k_norm_weight, cfg.rms_norm_eps),
-            num_heads: cfg.num_attention_heads,
-            num_kv_heads: cfg.num_key_value_heads,
-            head_dim: cfg.head_dim,
+            num_heads: cfg.num_attention_heads as usize,
+            num_kv_heads: cfg.num_key_value_heads as usize,
+            head_dim: cfg.head_dim as usize,
             rotary_dim: cfg.rotary_dim,
             rope_theta: cfg.rope_theta,
-            max_pos: cfg.max_position_embeddings,
+            max_pos: cfg.max_position_embeddings as usize,
             layer_idx,
         })
     }
@@ -1292,7 +1292,7 @@ impl Qwen3_5Model {
             None
         };
 
-        let num_layers = cfg.num_hidden_layers;
+        let num_layers = cfg.num_hidden_layers as usize;
         let mut layers = Vec::with_capacity(num_layers);
 
         for idx in 0..num_layers {
@@ -1347,7 +1347,7 @@ impl Qwen3_5Model {
         let kv_cache = Some(Arc::new(parking_lot::Mutex::new(
             crate::runtime::kv_cache::KVCacheManager::new(
                 num_layers,
-                cfg.max_position_embeddings,
+                cfg.max_position_embeddings as usize,
                 _kv_quant_type,
             ),
         )));
@@ -1726,7 +1726,7 @@ impl ModelOperations for Qwen3_5Model {
     }
 
     fn num_layers(&self) -> usize {
-        self.config.num_hidden_layers
+        self.config.num_hidden_layers as usize
     }
 
     fn decode_layer(

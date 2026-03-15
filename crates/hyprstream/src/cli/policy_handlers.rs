@@ -13,7 +13,10 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use crate::auth::{jwt, Claims};
-use crate::services::generated::policy_client::PolicyClient;
+use crate::services::generated::policy_client::{
+    PolicyClient, GetHistory, GetDiff, ApplyDraft, RollbackPolicy, PolicyCheck, ApplyTemplate,
+    AddGrouping, RemoveGrouping,
+};
 use anyhow::{Context, Result};
 use chrono::Duration;
 use ed25519_dalek::SigningKey;
@@ -106,7 +109,7 @@ pub async fn handle_policy_history(
     _oneline: bool,
 ) -> Result<()> {
     let client = create_policy_client(signing_key);
-    let history = client.get_history(count as u32).await
+    let history = client.get_history(&GetHistory { count: count as u32 }).await
         .context("Failed to get policy history from PolicyService. Are services running?")?;
 
     if history.entries.is_empty() {
@@ -177,7 +180,7 @@ pub async fn handle_policy_diff(
     let client = create_policy_client(signing_key);
     let git_ref = against.as_deref().unwrap_or("");
 
-    let diff_text = client.get_diff(git_ref).await
+    let diff_text = client.get_diff(&GetDiff { git_ref: Some(git_ref.to_owned()) }).await
         .context("Failed to get diff from PolicyService. Are services running?")?;
 
     if diff_text.is_empty() {
@@ -221,7 +224,7 @@ pub async fn handle_policy_apply(
     }
 
     // Show what would be committed
-    let diff_text = client.get_diff("").await
+    let diff_text = client.get_diff(&GetDiff { git_ref: Some(String::new()) }).await
         .context("Failed to get diff from PolicyService.")?;
 
     println!("Changes to be applied ({}):", draft.summary);
@@ -245,7 +248,7 @@ pub async fn handle_policy_apply(
         format!("policy: update access control rules ({timestamp})")
     });
 
-    let result_msg = client.apply_draft(&commit_msg).await
+    let result_msg = client.apply_draft(&ApplyDraft { message: Some(commit_msg) }).await
         .context("Failed to apply draft via PolicyService.")?;
 
     println!("✓ Policy applied successfully.");
@@ -264,7 +267,7 @@ pub async fn handle_policy_rollback(
 
     if dry_run {
         // Use history RPC to show what we'd be rolling back to
-        let history = client.get_history(20).await
+        let history = client.get_history(&GetHistory { count: 20 }).await
             .context("Failed to get history from PolicyService. Are services running?")?;
 
         // Find the matching entry
@@ -291,7 +294,7 @@ pub async fn handle_policy_rollback(
     }
 
     // Use PolicyService RPC
-    let result_msg = client.rollback(git_ref).await
+    let result_msg = client.rollback(&RollbackPolicy { git_ref: git_ref.to_owned() }).await
         .context("Failed to rollback via PolicyService. Are services running?")?;
 
     println!();
@@ -310,7 +313,7 @@ pub async fn handle_policy_check(
 ) -> Result<()> {
     let client = create_policy_client(signing_key);
 
-    let allowed = client.check(user, "*", resource, action).await
+    let allowed = client.check(&PolicyCheck { subject: user.to_owned(), domain: "*".to_owned(), resource: resource.to_owned(), operation: action.to_owned() }).await
         .context("Failed to check policy via PolicyService. Are services running?")?;
 
     println!("User:     {user}");
@@ -413,7 +416,21 @@ pub async fn load_or_generate_signing_key(_keys_dir: &Path) -> Result<SigningKey
     const SERVICE: &str = "hyprstream";
     const KEY_NAME: &str = "signing-key";
 
-    let entry = keyring::Entry::new(SERVICE, KEY_NAME).map_err(|e| {
+    let entry = keyring::Entry::new(SERVICE, KEY_NAME).or_else(|_| {
+        // On Linux, the session keyring may be revoked (common in systemd user
+        // sessions after the original login session ends). Try to join/create
+        // a new session keyring and retry.
+        #[cfg(target_os = "linux")]
+        {
+            tracing::debug!("session keyring unavailable, creating new session");
+            // KEYCTL_JOIN_SESSION_KEYRING = 1, NULL name = create anonymous session
+            let rc = unsafe { libc::syscall(libc::SYS_keyctl, 1i32, std::ptr::null::<u8>()) };
+            if rc >= 0 {
+                return keyring::Entry::new(SERVICE, KEY_NAME);
+            }
+        }
+        keyring::Entry::new(SERVICE, KEY_NAME)
+    }).map_err(|e| {
         anyhow::anyhow!(
             "Failed to access OS keyring (service={SERVICE}, key={KEY_NAME}): {e}.\n\
              On Linux, ensure kernel keyutils is available.\n\
@@ -529,7 +546,7 @@ pub async fn handle_policy_role_add(
     }
 
     let client = create_policy_client(signing_key);
-    let sha = client.add_grouping(user, role).await
+    let sha = client.add_grouping(&AddGrouping { user: user.to_owned(), role: role.to_owned() }).await
         .context("Failed to add role assignment via PolicyService. Are services running?")?;
 
     println!("Role assigned. Commit: {}", &sha[..sha.len().min(8)]);
@@ -557,7 +574,7 @@ pub async fn handle_policy_role_remove(
     }
 
     let client = create_policy_client(signing_key);
-    let sha = client.remove_grouping(user, role).await
+    let sha = client.remove_grouping(&RemoveGrouping { user: user.to_owned(), role: role.to_owned() }).await
         .context("Failed to remove role assignment via PolicyService. Are services running?")?;
 
     println!("Role removed. Commit: {}", &sha[..sha.len().min(8)]);
@@ -641,7 +658,7 @@ pub async fn handle_policy_apply_template(
 
     // Use PolicyService RPC to apply the template (writes file, validates, stages, commits)
     let client = create_policy_client(signing_key);
-    let result_msg = client.apply_template(template_name).await
+    let result_msg = client.apply_template(&ApplyTemplate { name: template_name.to_owned() }).await
         .context("Failed to apply template via PolicyService. Are services running?")?;
 
     println!();

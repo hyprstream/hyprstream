@@ -6,6 +6,7 @@
 # pubkey exchange and routes encrypted capsules — never sees plaintext.
 # Uses REQ/REP pattern with Continuation for async delivery fanout.
 
+using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".mcpScope;
 using import "/annotations.capnp".mcpDescription;
 
@@ -115,12 +116,6 @@ struct SubscriptionInfo {
 
 struct SubscriptionList {
   subscriptions @0 :List(SubscriptionInfo);
-}
-
-struct ErrorInfo {
-  message @0 :Text;
-  code @1 :Text;
-  details @2 :Text;
 }
 
 struct PingInfo {

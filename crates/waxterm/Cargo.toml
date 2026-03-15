@@ -1,0 +1,26 @@
+[package]
+name = "waxterm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Run ratatui apps natively and in the browser via WASI"
+
+[dependencies]
+ratatui = { version = "0.30", default-features = false }
+
+[target.'cfg(not(target_os = "wasi"))'.dependencies]
+libc = "0.2"
+
+[features]
+default = []
+tokio = ["dep:tokio"]
+avt = ["dep:avt"]
+
+[dependencies.avt]
+version = "0.17"
+optional = true
+
+[dependencies.tokio]
+version = "1"
+features = ["rt", "sync"]
+optional = true

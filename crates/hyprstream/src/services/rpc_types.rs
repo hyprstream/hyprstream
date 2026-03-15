@@ -6,14 +6,14 @@
 use anyhow::Result;
 
 // ============================================================================
-// StreamInfo — re-exported from generated inference_client
+// StreamInfo — canonical type from hyprstream-rpc
 // ============================================================================
 
-/// Re-export generated StreamInfo as the canonical StreamInfo type.
-///
-/// The `$fixedSize(32)` annotation on `serverPubkey` in streaming.capnp
-/// generates `server_pubkey: [u8; 32]` with validated FromCapnp deserialization.
-pub use crate::services::generated::inference_client::StreamInfo;
+pub use hyprstream_rpc::streaming::StreamInfo;
+
+// ChatMessage / ToolCall / ToolCallFunction are now unified:
+// model_client re-exports them as `pub type` aliases from inference_client.
+// No cross-client From impls needed.
 
 // ============================================================================
 // StreamBlock Types - Re-exported from hyprstream-rpc
@@ -30,6 +30,10 @@ pub use hyprstream_rpc::streaming::{
     StreamPayloadData,
     StreamVerifier,
 };
+
+// connect_stream_handle / inference_stream_handle removed — generated streaming
+// trait methods (InferRpc, RegistryRpc, ContainerRpc, etc.) encapsulate DH
+// key exchange internally and return StreamHandle directly.
 
 // ============================================================================
 // Inference-Specific Stream Types

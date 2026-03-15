@@ -1,6 +1,7 @@
 //! CLI handlers for adaptive ML inference server
 
-use crate::services::GenRegistryClient;
+use crate::services::RegistryClient;
+use crate::services::generated::registry_client::CreateTagRequest;
 use crate::training::{CheckpointManager, WeightFormat, WeightSnapshot};
 use ::config::{Config, File};
 use reqwest::Client;
@@ -291,7 +292,7 @@ pub async fn handle_pretrain(
 
 /// Handle checkpoint write command
 pub async fn handle_write_checkpoint(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model_id: String,
     _name: Option<String>,
     step: Option<usize>,
@@ -343,7 +344,7 @@ pub async fn handle_write_checkpoint(
 
 /// Handle checkpoint commit command
 pub async fn handle_commit_checkpoint(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     checkpoint_path: String,
     message: Option<String>,
     branch: Option<String>,
@@ -399,7 +400,7 @@ pub async fn handle_commit_checkpoint(
     // Create tag if requested
     if let Some(tag_name) = tag {
         if let Some(client) = &repo_client {
-            client.create_tag(&tag_name, "").await.map_err(|e| {
+            client.create_tag(&CreateTagRequest { name: tag_name.clone(), target: String::new() }).await.map_err(|e| {
                 error!("Failed to create tag '{}': {}", tag_name, e);
                 e
             })?;

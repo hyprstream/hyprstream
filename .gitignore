@@ -9,7 +9,7 @@ codegen-out
 models
 libtorch
 .cargo
-
+/src
 # AppImage build artifacts
 appimage/libtorch-cache/
 appimage/build/

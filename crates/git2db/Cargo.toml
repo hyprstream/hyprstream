@@ -83,8 +83,8 @@ default = ["reflink", "xet-storage"]
 experimental = []
 # Enable detailed tracing
 tracing-detail = []
-# Enable gittorrent transport support
-gittorrent-transport = ["gittorrent"]
+# Enable gittorrent transport support (also enables it in git-xet-filter)
+gittorrent-transport = ["gittorrent", "git-xet-filter/gittorrent-transport"]
 # Enable XET large file storage support
 xet-storage = ["git-xet-filter/xet-storage", "data", "cas_client", "cas_object", "merklehash", "sha2"]
 # Enable overlayfs worktree support (Linux-only, space-efficient CoW)

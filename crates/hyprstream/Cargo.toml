@@ -21,6 +21,7 @@ doctest = true
 name = "hyprstream"
 path = "src/bin/main.rs"
 
+
 [dependencies]
 # Arrow and DataFusion dependencies removed - focused on ML inference only
 bytes.workspace = true
@@ -46,6 +47,8 @@ serde_yaml.workspace = true
 git2.workspace = true  # Still needed by git2db internally
 git2db = { path = "../git2db", features = ["overlayfs"] }  # High-level git library with overlayfs
 hyprstream-rpc = { path = "../hyprstream-rpc" }  # RPC infrastructure (Cap'n Proto + ZMQ)
+hyprstream-discovery = { path = "../hyprstream-discovery" }  # Service discovery
+hyprstream-service = { path = "../hyprstream-service" }  # Service orchestration
 hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }  # RPC code generation proc macros
 hyprstream-flight = { path = "../hyprstream-flight" }  # Flight SQL server and client
 hyprstream-metrics = { path = "../hyprstream-metrics" }  # Metrics storage (for RegistryClient trait)
@@ -53,6 +56,7 @@ hyprstream-workers = { path = "../hyprstream-workers" }  # Worker runtime (Kata 
 inventory.workspace = true  # Service factory registration
 gittorrent = { workspace = true, optional = true }  # P2P transport
 clap.workspace = true
+inquire = "0.7"
 tracing.workspace = true
 tracing-opentelemetry = { workspace = true, optional = true }
 opentelemetry = { workspace = true, optional = true }
@@ -71,6 +75,8 @@ schemars = "1.2"
 
 tracing-log.workspace = true
 tracing-appender.workspace = true
+tui-logger = { version = "0.18", default-features = false }
+log = "0.4"
 bincode.workspace = true
 tokio-stream.workspace = true
 hex.workspace = true
@@ -130,6 +136,13 @@ libc = "0.2"  # For system calls in overlay2 driver
 reflink-copy = "0.1"  # COW file copying (reflink when available)
 hyprstream-containedfs.workspace = true  # Path-contained filesystem operations
 age = { version = "0.11.2", features = ["armor"] }
+hyprstream-tui = { path = "../hyprstream-tui" }  # Setup wizard TUI (WizardBackend trait + WizardApp)
+hyprstream-compositor = { path = "../hyprstream-compositor" }  # Pure TUI compositor (chrome state machine)
+waxterm = { path = "../waxterm", features = ["avt"] }  # Terminal abstraction for TUI rendering
+avt = "0.17"  # VTE for ShellClient pane rendering
+ratatui = { version = "0.30", default-features = false }  # TUI framework for pane buffers
+vte = "0.13"  # VT100/ANSI escape sequence parser for TUI pane ingestion
+rtrb = "0.3"  # SPSC ring buffer for VTE parser thread
 
 [target.'cfg(target_os = "linux")'.dependencies]
 lru.workspace = true  # LRU cache for model caching and Git repository handles
@@ -180,7 +193,7 @@ gittorrent = ["dep:gittorrent", "git2db/gittorrent-transport"]  # Enable P2P mod
 download-libtorch = ["tch/download-libtorch"]
 overlayfs = ["git2db/overlayfs"]  # Enable overlayfs-backed worktrees (delegated to git2db)
 systemd = ["hyprstream-rpc/systemd", "hyprstream-workers/systemd", "dep:listenfd"]  # Systemd integration (socket activation, service units)
-experimental = []  # EXPERIMENTAL: Enable git write operations (commit/push/merge - need service layer implementation)
+experimental = ["hyprstream-compositor/experimental"]  # EXPERIMENTAL: Enable service/worker panels, git write operations
 
 [build-dependencies]
 capnpc.workspace = true  # Cap'n Proto schema compiler

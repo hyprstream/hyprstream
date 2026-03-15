@@ -16,15 +16,12 @@ pub use worker::{ImageCommand, WorkerAction};
 
 use clap::{Subcommand, ValueEnum};
 
-use crate::runtime::kv_quant::KVQuantType;
+use crate::runtime::KVQuantType;
 
-/// KV cache quantization type for inference
+/// KV cache quantization type for CLI argument parsing.
 ///
-/// Quantization reduces GPU memory usage at a slight quality cost:
-/// - `none`: Full precision (default)
-/// - `int8`: 50% memory savings, minimal quality loss
-/// - `nf4`: 75% memory savings, best quality for 4-bit
-/// - `fp4`: 75% memory savings, standard 4-bit quantization
+/// Thin wrapper for `clap::ValueEnum` (can't derive on foreign types).
+/// Converts to the generated `KVQuantType` via `From`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KVQuantArg {
@@ -159,6 +156,56 @@ pub enum Commands {
     // load signing key from keyring, compute challenge = "{username}:{user_code}:{nonce}",
     // sign with ed25519_dalek, and print base64 signature.
     // The nonce endpoint is already implemented at GET /oauth/device/nonce.
+
+    /// TUI display server — terminal multiplexer with session persistence
+    Tui {
+        #[command(subcommand)]
+        action: TuiAction,
+    },
+}
+
+/// TUI display server actions
+#[derive(Subcommand)]
+pub enum TuiAction {
+    /// Attach to an existing session (or create new if none exist)
+    Attach {
+        /// Session ID to attach to (0 = most recent)
+        #[arg(default_value = "0")]
+        session: u32,
+    },
+
+    /// Create a new session
+    New,
+
+    /// List active sessions
+    List,
+
+    /// Detach from current session
+    Detach,
+
+    /// Play an asciicast v2 recording in a TUI pane
+    Play {
+        /// Path to the .cast file
+        cast_file: std::path::PathBuf,
+
+        /// Session ID to play in (0 = most recent)
+        #[arg(long, default_value = "0")]
+        session: u32,
+
+        /// Loop playback continuously instead of exiting when finished
+        #[arg(long, short = 'l')]
+        loop_playback: bool,
+    },
+
+    /// Run hyprstream as an interactive shell client embedded in a TUI pane
+    ///
+    /// Renders the full ShellClient chrome (status bar, window tabs, F-key legend)
+    /// into a TuiService pane. Useful for Playwright/WebTransport testing.
+    Shell {
+        /// Session ID (0 = most recent)
+        #[arg(long, default_value = "0")]
+        session: u32,
+    },
 }
 
 /// Service management actions

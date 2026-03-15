@@ -37,7 +37,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::Notify;
-use tracing::{debug, error, trace};
+use tracing::{debug, error, trace, warn};
 
 // Re-export pure framing types from zmtp_framing (single source of truth).
 pub use crate::zmtp_framing::{ZmqSocketType, GREETING_SIZE, ZMTP_VERSION_MAJOR, ZMTP_VERSION_MINOR, MECHANISM_NULL};
@@ -1246,7 +1246,7 @@ where
     }
 }
 
-impl<S> crate::service::spawner::Spawnable for QuicServiceLoop<S>
+impl<S> crate::service::Spawnable for QuicServiceLoop<S>
 where
     S: crate::service::ZmqService + Send + Sync + 'static,
 {
@@ -1333,6 +1333,8 @@ pub struct WebTransportServer {
     endpoint: quinn::Endpoint,
     /// Serialized RFC 9728 metadata JSON for GET /.well-known/oauth-protected-resource
     protected_resource_json: Option<Vec<u8>>,
+    /// DER-encoded server certificate (for cert-hash endpoint)
+    cert_der: Vec<u8>,
 }
 
 /// Concrete h3-quinn stream types used throughout WebTransportServer.
@@ -1359,14 +1361,14 @@ impl WebTransportServer {
         cert_der: Vec<u8>,
         key_der: Vec<u8>,
     ) -> Result<Self> {
-        let tls = webtransport_tls_config(cert_der, key_der)?;
+        let tls = webtransport_tls_config(cert_der.clone(), key_der)?;
         let quic_cfg = quinn::ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(tls)
                 .map_err(|e| anyhow!("QUIC server config failed: {}", e))?
         ));
         let endpoint = quinn::Endpoint::server(quic_cfg, addr)?;
 
-        Ok(Self { endpoint, protected_resource_json: None })
+        Ok(Self { endpoint, protected_resource_json: None, cert_der })
     }
 
     /// Set RFC 9728 Protected Resource Metadata served at /.well-known/oauth-protected-resource.
@@ -1398,6 +1400,7 @@ impl WebTransportServer {
         S: crate::service::ZmqService + 'static,
     {
         let metadata_json = self.protected_resource_json.map(Arc::new);
+        let cert_hash_hex = Arc::new(cert_hash_hex(&self.cert_der));
 
         loop {
             tokio::select! {
@@ -1407,11 +1410,12 @@ impl WebTransportServer {
                     let nonce_cache = Arc::clone(&nonce_cache);
                     let signing_key = signing_key.clone();
                     let metadata = metadata_json.clone();
+                    let cert_hash = Arc::clone(&cert_hash_hex);
 
                     tokio::task::spawn_local(async move {
                         if let Err(e) = Self::handle_connection(
                             incoming, service, server_pubkey, signing_key,
-                            nonce_cache, metadata,
+                            nonce_cache, metadata, cert_hash,
                         ).await {
                             debug!("H3 connection error: {}", e);
                         }
@@ -1437,6 +1441,7 @@ impl WebTransportServer {
         signing_key: ed25519_dalek::SigningKey,
         nonce_cache: Arc<crate::envelope::InMemoryNonceCache>,
         metadata_json: Option<Arc<Vec<u8>>>,
+        cert_hash_hex: Arc<String>,
     ) -> Result<()>
     where
         S: crate::service::ZmqService + 'static,
@@ -1477,7 +1482,7 @@ impl WebTransportServer {
                         break; // session consumed the connection
                     } else {
                         // Regular HTTP/3 request
-                        Self::handle_http_request(req, stream, metadata_json.as_ref()).await?;
+                        Self::handle_http_request(req, stream, metadata_json.as_ref(), &cert_hash_hex).await?;
                         // Continue accepting more requests on this connection
                     }
                 }
@@ -1491,11 +1496,12 @@ impl WebTransportServer {
         Ok(())
     }
 
-    /// Serve HTTP/3 requests: `.well-known/oauth-protected-resource` and `/health`.
+    /// Serve HTTP/3 requests: `.well-known/*` endpoints and `/health`.
     async fn handle_http_request(
         req: http::Request<()>,
         mut stream: H3QuinnRequestStream,
         metadata_json: Option<&Arc<Vec<u8>>>,
+        cert_hash_hex: &str,
     ) -> Result<()> {
         let (status, content_type, body) = match req.uri().path() {
             "/.well-known/oauth-protected-resource" => {
@@ -1504,6 +1510,9 @@ impl WebTransportServer {
                 } else {
                     (http::StatusCode::NOT_FOUND, "text/plain", b"Not configured".to_vec())
                 }
+            }
+            "/.well-known/tui-cert-hash" => {
+                (http::StatusCode::OK, "text/plain", cert_hash_hex.as_bytes().to_vec())
             }
             "/health" => (http::StatusCode::OK, "text/plain", b"ok".to_vec()),
             _ => (http::StatusCode::NOT_FOUND, "text/plain", b"Not found".to_vec()),
@@ -1554,7 +1563,7 @@ impl WebTransportServer {
                 }
                 Ok(Some(h3_webtransport::server::AcceptedBi::Request(req, stream))) => {
                     // HTTP/3 request within WebTransport session
-                    if let Err(e) = Self::handle_http_request(req, stream, metadata_json.as_ref()).await {
+                    if let Err(e) = Self::handle_http_request(req, stream, metadata_json.as_ref(), "").await {
                         debug!("WebTransport in-session HTTP request error: {}", e);
                     }
                 }
@@ -1568,7 +1577,13 @@ impl WebTransportServer {
         Ok(())
     }
 
-    /// Handle a single WebTransport bidi stream: length-prefixed Cap'n Proto RPC.
+    /// Handle a single WebTransport bidi stream: length-prefixed Cap'n Proto RPC
+    /// or stream subscription (detected by payload format).
+    ///
+    /// Detection: A Cap'n Proto SignedEnvelope starts with a segment table where the
+    /// first 4 bytes are typically 0x00000000 (1 segment). A subscription topic is a
+    /// short UTF-8 hex string (10-100 bytes). We try RPC first; on envelope verification
+    /// failure, fall back to subscription.
     async fn handle_wt_stream<S>(
         stream: WtBidiStream,
         service: Rc<S>,
@@ -1581,9 +1596,6 @@ impl WebTransportServer {
     {
         use h3::quic::BidiStream as H3BidiStream;
         let (mut send, mut recv) = H3BidiStream::split(stream);
-
-        // WebTransport streams don't need ZMTP handshake - we send raw Cap'n Proto.
-        // This is a simplification since both ends are controlled code (not libzmq peers).
 
         // Read request bytes (length-prefixed)
         const MAX_WEBTRANSPORT_REQUEST_SIZE: usize = 16 * 1024 * 1024;
@@ -1600,35 +1612,173 @@ impl WebTransportServer {
         let mut request_buf = vec![0u8; len];
         recv.read_exact(&mut request_buf).await?;
 
-        // Process through WebTransport pipeline (AnySigner: TLS 1.3 provides transport auth)
-        let (response_bytes, continuation) = process_request(
-            &request_buf,
-            &*service,
-            EnvelopeVerification::AnySigner,
-            &signing_key,
-            &nonce_cache,
-        ).await?;
+        // Detect whether this is an RPC envelope or a subscription topic.
+        // A Cap'n Proto SignedEnvelope starts with a segment table: the first 4 bytes
+        // are 0x00000000 (segment_count - 1 = 0 for single-segment messages).
+        // A subscription topic is a UTF-8 string that won't start with 4 null bytes.
+        let is_capnp = request_buf.len() >= 4 && request_buf[..4] == [0, 0, 0, 0];
 
-        // Write response length + bytes
-        send.write_all(&(response_bytes.len() as u32).to_be_bytes()).await?;
-        send.write_all(&response_bytes).await?;
-        send.shutdown().await?;
+        if is_capnp {
+            // RPC path: process as signed envelope
+            match process_request(
+                &request_buf,
+                &*service,
+                EnvelopeVerification::AnySigner,
+                &signing_key,
+                &nonce_cache,
+            ).await {
+                Ok((response_bytes, continuation)) => {
+                    send.write_all(&(response_bytes.len() as u32).to_be_bytes()).await?;
+                    send.write_all(&response_bytes).await?;
+                    send.shutdown().await?;
 
-        // Handle continuation if present (for streaming)
-        if let Some(cont) = continuation {
-            tokio::task::spawn_local(cont);
+                    if let Some(cont) = continuation {
+                        tokio::task::spawn_local(cont);
+                    }
+                }
+                Err(e) => {
+                    debug!("WebTransport RPC error: {}", e);
+                }
+            }
+        } else {
+            // Subscription path: topic string
+            debug!("WebTransport stream: detected subscription topic ({} bytes)", request_buf.len());
+            Self::handle_stream_subscription(send, &request_buf).await?;
         }
 
         Ok(())
     }
+
+    /// Handle a stream subscription on a WebTransport bidi stream.
+    ///
+    /// The client sends a length-prefixed UTF-8 topic string. We create a ZMQ SUB
+    /// socket, subscribe to that topic on the XPUB endpoint, and forward multipart
+    /// StreamBlock messages as length-prefixed blocks back to the WebTransport stream.
+    ///
+    /// Wire format (per block written to WebTransport):
+    ///   [4-byte BE length] [capnp StreamBlock bytes]
+    async fn handle_stream_subscription<W>(
+        mut send: W,
+        topic_bytes: &[u8],
+    ) -> Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        use crate::registry::{global as endpoint_registry, SocketKind};
+
+        // Decode topic from request buffer (UTF-8 string)
+        let topic = std::str::from_utf8(topic_bytes)
+            .map_err(|e| anyhow!("Invalid UTF-8 subscription topic: {}", e))?;
+
+        debug!(topic = %topic, "WebTransport stream subscription started");
+
+        // Get XPUB endpoint for the streams service
+        let sub_endpoint = endpoint_registry()
+            .endpoint("streams", SocketKind::Sub)
+            .to_zmq_string();
+
+        // Spawn ZMQ SUB recv on a dedicated thread to avoid blocking the
+        // Quinn/H3 event loop (which runs on the same local set).
+        // Messages are forwarded via an async channel.
+        let (block_tx, mut block_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let topic_owned = topic.to_owned();
+        let sub_endpoint_owned = sub_endpoint.clone();
+
+        std::thread::spawn(move || {
+            let zmq_ctx = zmq::Context::new();
+            let sub_socket = match zmq_ctx.socket(zmq::SUB) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Failed to create SUB socket: {}", e);
+                    return;
+                }
+            };
+            if let Err(e) = sub_socket.connect(&sub_endpoint_owned) {
+                warn!("SUB connect failed: {} endpoint={}", e, sub_endpoint_owned);
+                return;
+            }
+            if let Err(e) = sub_socket.set_subscribe(topic_owned.as_bytes()) {
+                warn!("SUB set_subscribe failed: {}", e);
+                return;
+            }
+            let _ = sub_socket.set_linger(0);
+            let _ = sub_socket.set_rcvtimeo(100);
+
+            loop {
+                if block_tx.is_closed() {
+                    break;
+                }
+
+                // Receive multipart: [topic, capnp_block, mac?]
+                let _topic_frame = match sub_socket.recv_bytes(0) {
+                    Ok(bytes) => bytes,
+                    Err(zmq::Error::EAGAIN) => continue,
+                    Err(e) => {
+                        warn!("ZMQ SUB recv error: {}", e);
+                        break;
+                    }
+                };
+
+                let has_more = sub_socket.get_rcvmore().unwrap_or(false);
+                if !has_more {
+                    continue;
+                }
+
+                let capnp_block = match sub_socket.recv_bytes(0) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!("ZMQ SUB recv capnp error: {}", e);
+                        break;
+                    }
+                };
+
+                // Drain remaining frames (MAC etc)
+                while sub_socket.get_rcvmore().unwrap_or(false) {
+                    let _ = sub_socket.recv_bytes(0);
+                }
+
+                // Send to async side; if channel full or closed, stop
+                if block_tx.blocking_send(capnp_block).is_err() {
+                    break;
+                }
+            }
+        });
+
+        debug!(topic = %topic, endpoint = %sub_endpoint, "ZMQ SUB connected for WebTransport bridge");
+
+        // Async forward loop: channel → WebTransport send stream
+        while let Some(capnp_block) = block_rx.recv().await {
+            let len = capnp_block.len() as u32;
+            if let Err(e) = send.write_all(&len.to_be_bytes()).await {
+                debug!(topic = %topic, "WebTransport send error: {}", e);
+                break;
+            }
+            if let Err(e) = send.write_all(&capnp_block).await {
+                debug!(topic = %topic, "WebTransport send error: {}", e);
+                break;
+            }
+        }
+
+        debug!(topic = %topic, "WebTransport stream subscription ended");
+        Ok(())
+    }
 }
 
-/// Compute SHA-256 hash of certificate for browser `serverCertificateHashes`.
+/// Compute SHA-256 hash of certificate for browser `serverCertificateHashes` (base64).
 pub fn cert_hash(cert_der: &[u8]) -> String {
     use base64::Engine;
     use sha2::{Sha256, Digest};
     let hash = Sha256::digest(cert_der);
     base64::engine::general_purpose::STANDARD.encode(hash)
+}
+
+/// Compute SHA-256 hash of certificate as hex string.
+///
+/// Used by `/.well-known/tui-cert-hash` — tests expect hex encoding.
+pub fn cert_hash_hex(cert_der: &[u8]) -> String {
+    use sha2::{Sha256, Digest};
+    let hash = Sha256::digest(cert_der);
+    hex::encode(hash)
 }
 
 // ============================================================================

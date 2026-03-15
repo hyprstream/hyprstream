@@ -32,7 +32,7 @@
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use hyprstream_rpc::service::spawner::{ProxyService, ServiceSpawner};
+    use hyprstream_service::{ProxyService, ServiceSpawner};
     use crate::events::endpoints;
 
     #[tokio::test]

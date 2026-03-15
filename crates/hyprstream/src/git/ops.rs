@@ -8,7 +8,7 @@ use anyhow::{anyhow, Result};
 use git2::Repository;
 use std::path::Path;
 
-use crate::services::generated::registry_client::{DetailedStatusInfo, FileChangeTypeEnum, FileStatusInfo};
+use crate::services::generated::registry_client::{DetailedStatusInfo, FileChangeType, FileStatusInfo};
 
 // === Commit Operations ===
 
@@ -184,34 +184,34 @@ pub fn detailed_status(repo: &Repository) -> Result<DetailedStatusInfo> {
 
             // Index status
             let index_status = if status.contains(git2::Status::INDEX_NEW) {
-                FileChangeTypeEnum::Added
+                FileChangeType::Added
             } else if status.contains(git2::Status::INDEX_MODIFIED) {
-                FileChangeTypeEnum::Modified
+                FileChangeType::Modified
             } else if status.contains(git2::Status::INDEX_DELETED) {
-                FileChangeTypeEnum::Deleted
+                FileChangeType::Deleted
             } else if status.contains(git2::Status::INDEX_RENAMED) {
-                FileChangeTypeEnum::Renamed
+                FileChangeType::Renamed
             } else if status.contains(git2::Status::INDEX_TYPECHANGE) {
-                FileChangeTypeEnum::TypeChanged
+                FileChangeType::TypeChanged
             } else {
-                FileChangeTypeEnum::None
+                FileChangeType::None
             };
 
             // Worktree status
             let worktree_status = if status.contains(git2::Status::WT_NEW) {
-                FileChangeTypeEnum::Untracked
+                FileChangeType::Untracked
             } else if status.contains(git2::Status::WT_MODIFIED) {
-                FileChangeTypeEnum::Modified
+                FileChangeType::Modified
             } else if status.contains(git2::Status::WT_DELETED) {
-                FileChangeTypeEnum::Deleted
+                FileChangeType::Deleted
             } else if status.contains(git2::Status::WT_RENAMED) {
-                FileChangeTypeEnum::Renamed
+                FileChangeType::Renamed
             } else if status.contains(git2::Status::WT_TYPECHANGE) {
-                FileChangeTypeEnum::TypeChanged
+                FileChangeType::TypeChanged
             } else if status.contains(git2::Status::CONFLICTED) {
-                FileChangeTypeEnum::Conflicted
+                FileChangeType::Conflicted
             } else {
-                FileChangeTypeEnum::None
+                FileChangeType::None
             };
 
             files.push(FileStatusInfo {

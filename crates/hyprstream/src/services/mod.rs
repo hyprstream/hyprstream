@@ -92,12 +92,11 @@ pub mod worker;
 
 pub use core::{
     CallOptions, Continuation, EnvelopeContext, ZmqClient, ZmqService,
-    create_service_client,
 };
 
 // Generated client types — the public API
 pub use generated::registry_client::{
-    RegistryClient as GenRegistryClient,
+    RegistryClient,
     RepositoryClient, WorktreeClient, CtlClient,
     TrackedRepository as GenTrackedRepository,
     WorktreeInfo as GenWorktreeInfo,
@@ -106,7 +105,7 @@ pub use generated::registry_client::{
     RWalk, ROpen, RRead, RWrite, RStat,
     NpStat as NpStatData, Qid as QidData,
     FileStatus, LogEntry, ValidationResult, FileInfo,
-    DocFormatEnum,
+    DocFormat,
 };
 
 // Remaining domain types
@@ -117,16 +116,16 @@ pub use types::{
     FsDirEntryInfo,
 };
 
-pub use inference::{InferenceService, InferenceServiceConfig, InferenceZmqClient, INFERENCE_ENDPOINT};
+pub use inference::{InferenceService, InferenceServiceConfig, INFERENCE_ENDPOINT};
+pub use generated::inference_client::InferenceClient;
 pub use registry::RegistryService;
 pub use policy::PolicyService;
 pub use generated::policy_client::PolicyClient;
-pub use model::{
-    ModelHealthInfo, ModelService, ModelServiceConfig, ModelStatusEntry, ModelStatusInfo,
-    ModelZmqClient, MODEL_ENDPOINT,
-};
+pub use model::{ModelService, ModelServiceConfig, MODEL_ENDPOINT};
+pub use generated::model_client::ModelClient;
 pub use stream::StreamService;
-pub use worker::{WorkerZmqClient, WorkflowZmqClient, build_authorize_fn};
+pub use worker::build_authorize_fn;
+pub use hyprstream_workers::runtime::WorkerClient;
 pub use oauth::OAuthService;
 pub use oai::OAIService;
 pub use flight::FlightService;

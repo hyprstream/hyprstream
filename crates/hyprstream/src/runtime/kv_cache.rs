@@ -31,7 +31,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tch::Device;
 use tch::{Kind as DType, Tensor};
 
-use super::kv_quant::KVQuantType;
+use super::KVQuantType;
 use super::torch_utils::{estimate_tensor_size_mb, safe_zeros};
 
 // ============================================================================

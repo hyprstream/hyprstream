@@ -8,17 +8,19 @@ use anyhow::{bail, Result};
 use std::io::{self, Write};
 use tracing::info;
 
-use hyprstream_workers::image::{AuthConfig, ImageClient, ImageSpec};
-use hyprstream_workers::runtime::{
-    ContainerConfig, ContainerFilter,
-    ContainerState, ContainerStateEnum, ContainerStatsWire, KeyValue, Timestamp,
-    PodSandboxConfig, PodSandboxFilter, PodSandboxState, PodSandboxStateEnum,
-    PodSandboxStats, RuntimeClient,
+use crate::services::worker::{
+    ContainerConfig, ContainerFilter, ContainerStatsFilter,
+    ContainerState, ContainerStats, KeyValue, Timestamp,
+    ImageSpec, PodSandboxConfig, PodSandboxFilter,
+    PodSandboxState, PodSandboxStats,
+    // Request types for scoped client calls
+    PodSandboxStatusRequest, CreateContainerRequest, StopContainerRequest,
+    ContainerStatusRequest, ExecSyncRequest,
+    ImageFilter, ImageStatusRequest, PullImageRequest,
 };
-// Use the generated ContainerMetadata to match generated ContainerConfig's field type
-use hyprstream_workers::generated::worker_client::ContainerMetadata;
+use hyprstream_workers::runtime::ContainerMetadata;
 
-use crate::services::WorkerZmqClient;
+use hyprstream_workers::runtime::WorkerClient;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // List Command
@@ -26,46 +28,47 @@ use crate::services::WorkerZmqClient;
 
 /// Handle `worker list` command
 pub async fn handle_worker_list(
-    client: &WorkerZmqClient,
+    client: &WorkerClient,
     sandbox_filter: Option<String>,
+    container_filter: Option<String>,
     containers_only: bool,
     sandboxes_only: bool,
-    state_filter: Option<String>,
+    _state_filter: Option<String>,
     _verbose: bool,
 ) -> Result<()> {
     if !containers_only {
         // List sandboxes
-        let filter = sandbox_filter.as_ref().map(|id| PodSandboxFilter {
-            id: Some(id.clone()),
-            state: parse_sandbox_state(&state_filter),
-            label_selector: Default::default(),
-        });
+        let filter = PodSandboxFilter {
+            id: sandbox_filter.clone().unwrap_or_default(),
+            ..Default::default()
+        };
 
-        let sandboxes = client.list_pod_sandbox(filter.as_ref()).await?;
+        let sandboxes = client.sandbox().list(&filter).await?;
 
-        if !sandboxes.is_empty() || sandboxes_only {
+        if !sandboxes.is_empty() {
             println!("SANDBOX ID                              STATE           CREATED");
             for sb in &sandboxes {
                 let state = match sb.state {
-                    PodSandboxStateEnum::SandboxReady => "Ready",
-                    PodSandboxStateEnum::SandboxNotReady => "NotReady",
+                    PodSandboxState::SandboxReady => "Ready",
+                    PodSandboxState::SandboxNotReady => "NotReady",
                 };
                 let id_short = truncate_id(&sb.id, 36);
                 println!("{:<40}{:<16}{}", id_short, state, format_timestamp(sb.created_at.clone()));
             }
+        } else if sandboxes_only {
+            println!("No sandboxes found.");
         }
     }
 
     if !sandboxes_only {
         // List containers
-        let filter = sandbox_filter.as_ref().map(|id| ContainerFilter {
-            id: None,
-            pod_sandbox_id: Some(id.clone()),
-            state: parse_container_state(&state_filter),
-            label_selector: Default::default(),
-        });
+        let filter = ContainerFilter {
+            id: container_filter.unwrap_or_default(),
+            pod_sandbox_id: sandbox_filter.clone().unwrap_or_default(),
+            ..Default::default()
+        };
 
-        let containers = client.list_containers(filter.as_ref()).await?;
+        let containers = client.container().list(&filter).await?;
 
         if !containers.is_empty() {
             if !containers_only {
@@ -76,10 +79,10 @@ pub async fn handle_worker_list(
             );
             for c in &containers {
                 let state = match c.state {
-                    ContainerStateEnum::ContainerCreated => "Created",
-                    ContainerStateEnum::ContainerRunning => "Running",
-                    ContainerStateEnum::ContainerExited => "Exited",
-                    ContainerStateEnum::ContainerUnknown => "Unknown",
+                    ContainerState::ContainerCreated => "Created",
+                    ContainerState::ContainerRunning => "Running",
+                    ContainerState::ContainerExited => "Exited",
+                    ContainerState::ContainerUnknown => "Unknown",
                 };
                 let id_short = truncate_id(&c.id, 36);
                 let image = if c.image.image.is_empty() { "-" } else { &c.image.image };
@@ -89,13 +92,6 @@ pub async fn handle_worker_list(
                     "{id_short:<40}{image_short:<32}{state:<16}{sandbox_short}"
                 );
             }
-        }
-    }
-
-    if sandboxes_only {
-        let sandboxes = client.list_pod_sandbox(None).await?;
-        if sandboxes.is_empty() {
-            println!("No sandboxes found.");
         }
     }
 
@@ -109,7 +105,7 @@ pub async fn handle_worker_list(
 /// Handle `worker run` command
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_worker_run(
-    client: &WorkerZmqClient,
+    client: &WorkerClient,
     image: &str,
     command: Vec<String>,
     sandbox_id: Option<String>,
@@ -129,9 +125,16 @@ pub async fn handle_worker_run(
     };
 
     // Check if image exists locally, pull if not
-    if client.image_status(&image_spec, false).await.is_err() {
+    if client.image().status(&ImageStatusRequest {
+        image: image_spec.clone(),
+        verbose: false,
+    }).await.is_err() {
         println!("Pulling image {image}...");
-        client.pull_image(&image_spec, None).await?;
+        client.image().pull(&PullImageRequest {
+            image: image_spec.clone(),
+            auth: Default::default(),
+            sandbox_config: PodSandboxConfig::default(),
+        }).await?;
         println!("Image pulled");
     }
 
@@ -140,7 +143,7 @@ pub async fn handle_worker_run(
         id
     } else {
         let config = PodSandboxConfig::default();
-        let id = client.run_pod_sandbox(&config).await?;
+        let id = client.sandbox().run(&config).await?;
         println!("Created sandbox {}", truncate_id(&id, 12));
         id
     };
@@ -169,10 +172,14 @@ pub async fn handle_worker_run(
 
     // 4. Create and start container
     let container_id = client
-        .create_container(&sandbox_id, &container_config, &PodSandboxConfig::default())
+        .container().create(&CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.clone(),
+            config: container_config,
+            sandbox_config: PodSandboxConfig::default(),
+        })
         .await?;
 
-    client.start_container(&container_id).await?;
+    client.container().start(&container_id).await?;
 
     if detach {
         println!("{container_id}");
@@ -181,8 +188,11 @@ pub async fn handle_worker_run(
 
         // Wait for container to exit
         loop {
-            let status = client.container_status(&container_id, false).await?;
-            if status.status.state == ContainerStateEnum::ContainerExited {
+            let status = client.container().status(&ContainerStatusRequest {
+                container_id: container_id.clone(),
+                verbose: false,
+            }).await?;
+            if status.status.state == ContainerState::ContainerExited {
                 println!(
                     "Container exited with code {:?}",
                     status.status.exit_code
@@ -193,7 +203,7 @@ pub async fn handle_worker_run(
         }
 
         if auto_remove {
-            client.remove_container(&container_id).await?;
+            client.container().remove(&container_id).await?;
             println!("Container removed");
         }
     }
@@ -207,7 +217,7 @@ pub async fn handle_worker_run(
 
 /// Handle `worker stop` command
 pub async fn handle_worker_stop(
-    client: &WorkerZmqClient,
+    client: &WorkerClient,
     id: &str,
     timeout: i64,
     force: bool,
@@ -215,15 +225,21 @@ pub async fn handle_worker_stop(
     info!(id = %id, timeout = %timeout, force = %force, "Stopping");
 
     // Try as container first
-    if client.container_status(id, false).await.is_ok() {
+    if client.container().status(&ContainerStatusRequest {
+        container_id: id.to_owned(),
+        verbose: false,
+    }).await.is_ok() {
         let actual_timeout = if force { 0 } else { timeout };
-        client.stop_container(id, actual_timeout).await?;
+        client.container().stop(&StopContainerRequest {
+            container_id: id.to_owned(),
+            timeout: actual_timeout,
+        }).await?;
         println!("{id}");
         return Ok(());
     }
 
     // Try as sandbox
-    client.stop_pod_sandbox(id).await?;
+    client.sandbox().stop(id).await?;
     println!("{id}");
     Ok(())
 }
@@ -233,10 +249,10 @@ pub async fn handle_worker_stop(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Handle `worker start` command
-pub async fn handle_worker_start(client: &WorkerZmqClient, container_id: &str) -> Result<()> {
+pub async fn handle_worker_start(client: &WorkerClient, container_id: &str) -> Result<()> {
     info!(container_id = %container_id, "Starting container");
 
-    client.start_container(container_id).await?;
+    client.container().start(container_id).await?;
     println!("{container_id}");
     Ok(())
 }
@@ -246,15 +262,18 @@ pub async fn handle_worker_start(client: &WorkerZmqClient, container_id: &str) -
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Handle `worker restart` command
-pub async fn handle_worker_restart(client: &WorkerZmqClient, id: &str, timeout: i64) -> Result<()> {
+pub async fn handle_worker_restart(client: &WorkerClient, id: &str, timeout: i64) -> Result<()> {
     info!(id = %id, "Restarting");
 
     // Stop then start
     handle_worker_stop(client, id, timeout, false).await?;
 
     // For containers, we can restart
-    if client.container_status(id, false).await.is_ok() {
-        client.start_container(id).await?;
+    if client.container().status(&ContainerStatusRequest {
+        container_id: id.to_owned(),
+        verbose: false,
+    }).await.is_ok() {
+        client.container().start(id).await?;
     } else {
         // For sandboxes, need to recreate
         bail!("Sandbox restart not supported - use rm + run");
@@ -270,31 +289,40 @@ pub async fn handle_worker_restart(client: &WorkerZmqClient, id: &str, timeout: 
 
 /// Handle `worker rm` command
 pub async fn handle_worker_rm(
-    client: &WorkerZmqClient,
+    client: &WorkerClient,
     ids: Vec<String>,
     force: bool,
 ) -> Result<()> {
     for id in ids {
         // Try as container first
-        if let Ok(status) = client.container_status(&id, false).await {
-            if status.status.state == ContainerStateEnum::ContainerRunning {
+        if let Ok(status) = client.container().status(&ContainerStatusRequest {
+            container_id: id.clone(),
+            verbose: false,
+        }).await {
+            if status.status.state == ContainerState::ContainerRunning {
                 if force {
-                    client.stop_container(&id, 0).await?;
+                    client.container().stop(&StopContainerRequest {
+                        container_id: id.clone(),
+                        timeout: 0,
+                    }).await?;
                 } else {
                     bail!("Container {} is running. Use -f to force.", id);
                 }
             }
-            client.remove_container(&id).await?;
+            client.container().remove(&id).await?;
             println!("{id}");
             continue;
         }
 
         // Try as sandbox
-        if client.pod_sandbox_status(&id, false).await.is_ok() {
+        if client.sandbox().status(&PodSandboxStatusRequest {
+            pod_sandbox_id: id.clone(),
+            verbose: false,
+        }).await.is_ok() {
             if force {
-                let _ = client.stop_pod_sandbox(&id).await;
+                let _ = client.sandbox().stop(&id).await;
             }
-            client.remove_pod_sandbox(&id).await?;
+            client.sandbox().remove(&id).await?;
             println!("{id}");
             continue;
         }
@@ -310,16 +338,19 @@ pub async fn handle_worker_rm(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Handle `worker status` command
-pub async fn handle_worker_status(client: &WorkerZmqClient, id: &str, verbose: bool) -> Result<()> {
+pub async fn handle_worker_status(client: &WorkerClient, id: &str, verbose: bool) -> Result<()> {
     // Try as container
-    if let Ok(status) = client.container_status(id, verbose).await {
+    if let Ok(status) = client.container().status(&ContainerStatusRequest {
+        container_id: id.to_owned(),
+        verbose,
+    }).await {
         println!("Type: Container");
         println!("ID: {}", status.status.id);
         println!("State: {:?}", status.status.state);
         let image_str = if status.status.image.image.is_empty() { "-" } else { &status.status.image.image };
         println!("Image: {image_str}");
         println!("Created: {}", format_timestamp(status.status.created_at));
-        if status.status.state == ContainerStateEnum::ContainerExited {
+        if status.status.state == ContainerState::ContainerExited {
             println!("Exit Code: {}", status.status.exit_code);
         }
         if verbose {
@@ -330,7 +361,10 @@ pub async fn handle_worker_status(client: &WorkerZmqClient, id: &str, verbose: b
     }
 
     // Try as sandbox
-    let status = client.pod_sandbox_status(id, verbose).await?;
+    let status = client.sandbox().status(&PodSandboxStatusRequest {
+        pod_sandbox_id: id.to_owned(),
+        verbose,
+    }).await?;
     println!("Type: Sandbox");
     println!("ID: {}", status.status.id);
     println!("State: {:?}", status.status.state);
@@ -349,7 +383,7 @@ pub async fn handle_worker_status(client: &WorkerZmqClient, id: &str, verbose: b
 
 /// Handle `worker stats` command
 pub async fn handle_worker_stats(
-    client: &WorkerZmqClient,
+    client: &WorkerClient,
     ids: Vec<String>,
     no_header: bool,
 ) -> Result<()> {
@@ -362,15 +396,15 @@ pub async fn handle_worker_stats(
 
     if ids.is_empty() {
         // Get all container stats
-        let stats = client.list_container_stats(None).await?;
+        let stats = client.container().list_stats(&ContainerStatsFilter::default()).await?;
         for s in stats {
             print_container_stats(&s.attributes.id, &s);
         }
     } else {
         for id in ids {
-            if let Ok(s) = client.container_stats(&id).await {
+            if let Ok(s) = client.container().stats(&id).await {
                 print_container_stats(&id, &s);
-            } else if let Ok(s) = client.pod_sandbox_stats(&id).await {
+            } else if let Ok(s) = client.sandbox().stats(&id).await {
                 print_sandbox_stats(&id, &s);
             }
         }
@@ -379,7 +413,7 @@ pub async fn handle_worker_stats(
     Ok(())
 }
 
-fn print_container_stats(id: &str, stats: &ContainerStatsWire) {
+fn print_container_stats(id: &str, stats: &ContainerStats) {
     let cpu_pct = format!("{:.2}%", stats.cpu.usage_nano_cores as f64 / 1e9 * 100.0);
     let mem = format!(
         "{} / {}",
@@ -427,7 +461,7 @@ fn print_sandbox_stats(id: &str, stats: &PodSandboxStats) {
 
 /// Handle `worker exec` command
 pub async fn handle_worker_exec(
-    client: &WorkerZmqClient,
+    client: &WorkerClient,
     container_id: &str,
     command: Vec<String>,
     timeout: i64,
@@ -436,7 +470,11 @@ pub async fn handle_worker_exec(
         bail!("No command specified");
     }
 
-    let result = client.exec_sync(container_id, &command, timeout).await?;
+    let result = client.container().exec(&ExecSyncRequest {
+        container_id: container_id.to_owned(),
+        cmd: command,
+        timeout,
+    }).await?;
 
     // Print stdout
     if !result.stdout.is_empty() {
@@ -465,43 +503,30 @@ pub async fn handle_worker_exec(
 /// - StreamHandle encapsulates DH key exchange, subscription, and HMAC verification
 /// - Handles detach sequence (default: Ctrl-])
 pub async fn handle_worker_terminal(
-    client: &WorkerZmqClient,
+    client: &WorkerClient,
     container_id: &str,
     detach_keys: &str,
 ) -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use tokio::signal;
-    use hyprstream_rpc::streaming::{StreamHandle, StreamPayload};
+    use hyprstream_rpc::streaming::StreamPayload;
 
     info!(container_id = %container_id, "Attaching to container terminal");
 
-    // 1. Generate client DH keypair
-    let (client_secret, client_pubkey) = hyprstream_rpc::generate_ephemeral_keypair();
-    let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
-
-    // 2. Call Attach RPC with ephemeral pubkey — server does DH + pre-auth atomically
-    let attach_response = client.attach(container_id, client_pubkey_bytes).await?;
-
-    // 3. Create StreamHandle — DH, SUB socket, and HMAC verification all encapsulated
-    let zmq_ctx = crate::zmq::global_context();
-    let mut stream_handle = StreamHandle::new(
-        &zmq_ctx,
-        attach_response.stream_id.clone(),
-        &attach_response.endpoint,
-        &attach_response.server_pubkey,
-        &client_secret,
-        &client_pubkey_bytes,
-    )?;
+    // Attach RPC — DH keypair, SUB socket, and HMAC verification all managed internally.
+    use hyprstream_workers::generated::worker_client::ContainerRpc;
+    let mut stream_handle = ContainerRpc::attach(&client.container(), &crate::services::worker::AttachRequest {
+        container_id: container_id.to_owned(),
+        fds: vec![],
+    }).await?;
 
     println!(
         "Attached to container {}\n\
          Stream ID: {}\n\
-         Endpoint: {}\n\
          Detach with: {}",
         truncate_id(container_id, 12),
-        truncate_id(&attach_response.stream_id, 16),
-        attach_response.endpoint,
+        truncate_id(stream_handle.stream_id(), 16),
         detach_keys,
     );
 
@@ -629,8 +654,8 @@ fn parse_detach_keys(keys: &str) -> u8 {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Handle `worker images list` command
-pub async fn handle_images_list(client: &WorkerZmqClient, _verbose: bool) -> Result<()> {
-    let images = client.list_images(None).await?;
+pub async fn handle_images_list(client: &WorkerClient, _verbose: bool) -> Result<()> {
+    let images = client.image().list(&ImageFilter { image: ImageSpec::default() }).await?;
 
     println!(
         "{:<48}{:<16}{:<16}{:<12}",
@@ -650,7 +675,7 @@ pub async fn handle_images_list(client: &WorkerZmqClient, _verbose: bool) -> Res
 
 /// Handle `worker images pull` command
 pub async fn handle_images_pull(
-    client: &WorkerZmqClient,
+    client: &WorkerClient,
     image: &str,
     username: Option<String>,
     password: Option<String>,
@@ -664,18 +689,22 @@ pub async fn handle_images_pull(
     };
 
     let auth = match (username, password) {
-        (Some(u), Some(p)) => Some(AuthConfig {
+        (Some(u), Some(p)) => crate::services::worker::AuthConfig {
             username: u,
             password: p,
             auth: String::new(),
             server_address: String::new(),
             identity_token: String::new(),
             registry_token: String::new(),
-        }),
-        _ => None,
+        },
+        _ => Default::default(),
     };
 
-    let id = client.pull_image(&image_spec, auth.as_ref()).await?;
+    let id = client.image().pull(&PullImageRequest {
+        image: image_spec,
+        auth,
+        sandbox_config: PodSandboxConfig::default(),
+    }).await?;
     println!("Pulled {} ({})", image, truncate_id(&id, 12));
 
     Ok(())
@@ -683,7 +712,7 @@ pub async fn handle_images_pull(
 
 /// Handle `worker images rm` command
 pub async fn handle_images_rm(
-    client: &WorkerZmqClient,
+    client: &WorkerClient,
     images: Vec<String>,
     _force: bool,
 ) -> Result<()> {
@@ -694,7 +723,7 @@ pub async fn handle_images_rm(
             runtime_handler: String::new(),
         };
 
-        client.remove_image(&image_spec).await?;
+        client.image().remove(&image_spec).await?;
         println!("Deleted: {img}");
     }
 
@@ -702,8 +731,8 @@ pub async fn handle_images_rm(
 }
 
 /// Handle `worker images df` command
-pub async fn handle_images_df(client: &WorkerZmqClient) -> Result<()> {
-    let usage = client.image_fs_info().await?;
+pub async fn handle_images_df(client: &WorkerClient) -> Result<()> {
+    let usage = client.image().fs_info().await?;
 
     println!(
         "{:<16}{:<16}{:<16}{:<16}",
@@ -741,27 +770,6 @@ fn print_kv_info(info: &[KeyValue]) {
     for kv in info {
         println!("  {}: {}", kv.key, kv.value);
     }
-}
-
-fn parse_sandbox_state(filter: &Option<String>) -> Option<PodSandboxState> {
-    filter.as_ref().and_then(|s| {
-        match s.to_lowercase().as_str() {
-            "ready" => Some(PodSandboxState::SandboxReady),
-            "not-ready" | "notready" => Some(PodSandboxState::SandboxNotReady),
-            _ => None,
-        }
-    })
-}
-
-fn parse_container_state(filter: &Option<String>) -> Option<ContainerState> {
-    filter.as_ref().and_then(|s| {
-        match s.to_lowercase().as_str() {
-            "created" => Some(ContainerState::ContainerCreated),
-            "running" => Some(ContainerState::ContainerRunning),
-            "exited" => Some(ContainerState::ContainerExited),
-            _ => None,
-        }
-    })
 }
 
 fn format_size(bytes: u64) -> String {

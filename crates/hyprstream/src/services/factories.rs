@@ -26,8 +26,7 @@ use anyhow::Context;
 use git2db::Git2DB;
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::{global as global_registry, SocketKind};
-use hyprstream_rpc::service::factory::ServiceContext;
-use hyprstream_rpc::service::spawner::{ProxyService, Spawnable};
+use hyprstream_service::{ProxyService, ServiceContext, Spawnable};
 use hyprstream_rpc::service_factory;
 use hyprstream_workers::endpoints;
 use tokio::sync::RwLock;
@@ -35,7 +34,7 @@ use tracing::info;
 
 use crate::auth::PolicyManager;
 use crate::config::{HyprConfig, TokenConfig};
-use crate::services::{DiscoveryService, McpService, McpConfig, PolicyService, PolicyClient, RegistryService, GenRegistryClient};
+use crate::services::{DiscoveryService, McpService, McpConfig, PolicyService, PolicyClient, RegistryService, RegistryClient};
 use crate::zmq::global_context;
 
 /// Load HyprConfig, falling back to default on error.
@@ -217,8 +216,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::local());
 
     // Create registry client
-    let registry_client: GenRegistryClient = crate::services::core::create_service_client(
-        &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
+    let registry_client: RegistryClient = RegistryClient::new(
         ctx.signing_key().clone(),
         RequestIdentity::local(),
     );
@@ -254,12 +252,17 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
 fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating WorkerService");
 
-    use hyprstream_workers::config::{ImageConfig, PoolConfig};
+    use hyprstream_workers::config::{BackendType, ImageConfig, PoolConfig};
     use hyprstream_workers::image::RafsStore;
-    use hyprstream_workers::WorkerService;
+    use hyprstream_workers::{WorkerService, SandboxBackend, KataBackend, NspawnBackend, NspawnConfig};
 
     let config = load_config();
     let worker_quic_port = config.worker.as_ref().and_then(|w| w.quic_port);
+    let backend_type = config.worker.as_ref()
+        .map(|w| w.backend)
+        .unwrap_or_default();
+
+    info!("WorkerService using {} backend", backend_type);
 
     // Use default paths based on XDG directories
     let data_dir = dirs::data_local_dir()
@@ -293,10 +296,16 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 
     let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
 
+    // Construct the sandbox backend based on configuration
+    let backend: Arc<dyn SandboxBackend> = match backend_type {
+        BackendType::Kata => Arc::new(KataBackend::new(image_config, Arc::clone(&rafs_store))),
+        BackendType::Nspawn => Arc::new(NspawnBackend::new(NspawnConfig::default())),
+    };
+
     // Service includes infrastructure - directly Spawnable via blanket impl
     let mut worker_service = WorkerService::new(
         pool_config,
-        image_config,
+        backend,
         rafs_store,
         global_context(),
         ctx.transport("worker", SocketKind::Rep),
@@ -329,18 +338,18 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     info!("Creating OAIService");
 
     use crate::server::state::ServerState;
-    use crate::services::{ModelZmqClient, OAIService};
+    use crate::services::generated::model_client::ModelClient;
+    use crate::services::OAIService;
 
     // Load full config for OAI settings
     let config = load_config();
 
     // Create ZMQ clients for Model and Policy services
-    let model_client = ModelZmqClient::new(ctx.signing_key().clone(), RequestIdentity::local());
+    let model_client = ModelClient::new(ctx.signing_key().clone(), RequestIdentity::local());
     let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::local());
 
     // Create registry client
-    let registry_client: GenRegistryClient = crate::services::core::create_service_client(
-        &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
+    let registry_client: RegistryClient = RegistryClient::new(
         ctx.signing_key().clone(),
         RequestIdentity::local(),
     );
@@ -393,11 +402,10 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     let config = load_config();
 
     // Create registry client for dataset lookup (if default_dataset is configured)
-    // GenRegistryClient already implements hyprstream_metrics::RegistryClient
+    // RegistryClient already implements hyprstream_metrics::RegistryClient
     let registry_client: Option<Arc<dyn hyprstream_metrics::RegistryClient>> =
         if config.flight.default_dataset.is_some() {
-            let zmq_client: GenRegistryClient = crate::services::core::create_service_client(
-                &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
+            let zmq_client: RegistryClient = RegistryClient::new(
                 ctx.signing_key().clone(),
                 RequestIdentity::local(),
             );
@@ -708,6 +716,41 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// TUI Service Factory
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Factory for TuiService (terminal multiplexer display server)
+///
+/// This service provides a terminal multiplexer with session persistence,
+/// multi-pane layouts, and remote access via ZMQ RPC and WebTransport.
+#[service_factory("tui", schema = "../../schema/tui.capnp")]
+fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+    info!("Creating TuiService");
+
+    use crate::tui::{TuiState, service::TuiService};
+
+    let config = load_config();
+    let tui_config = &config.tui;
+
+    let state = Arc::new(RwLock::new(TuiState::new(
+        80,
+        24,
+        tui_config.scrollback_lines,
+    )));
+
+    let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::local());
+
+    let tui_service = TuiService::new(
+        state,
+        global_context(),
+        ctx.transport("tui", SocketKind::Rep),
+        ctx.signing_key().clone(),
+    ).with_policy_client(policy_client);
+
+    Ok(ctx.into_spawnable_quic(tui_service, tui_config.quic_port))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Discovery Service Factory
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -715,28 +758,28 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 ///
 /// This service exposes the EndpointRegistry so remote clients can discover
 /// registered services, their endpoints, socket kinds, and schemas.
-#[service_factory("discovery", schema = "../../schema/discovery.capnp", metadata = crate::services::generated::discovery_client::schema_metadata)]
+#[service_factory("discovery", schema = "../../../hyprstream-discovery/schema/discovery.capnp", metadata = hyprstream_discovery::generated::discovery_client::schema_metadata)]
 fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating DiscoveryService");
 
     let config = load_config();
 
-    // Create policy client for authorization checks
+    // Create policy-based authorization provider
     let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::local());
+    let auth_provider = crate::services::discovery::PolicyAuthProvider::new(policy_client);
 
     let mut discovery_service = DiscoveryService::new(
         Arc::new(ctx.signing_key().clone()),
         global_context(),
         ctx.transport("discovery", SocketKind::Rep),
-    ).with_policy_client(policy_client);
+    ).with_auth_provider(Box::new(auth_provider));
     if let Some(issuer) = ctx.oauth_issuer_url() {
         discovery_service = discovery_service.with_oauth_issuer(issuer.to_owned());
         // Use the issuer URL as the audience for discovery tokens
         discovery_service = discovery_service.with_expected_audience(issuer.to_owned());
     }
-    if let Some(fed) = ctx.federation_key_source() {
-        discovery_service = discovery_service.with_federation_key_source(fed);
-    }
+    // TODO: DiscoveryService federation key source support
+    // (federation_key_source not yet implemented on DiscoveryService)
 
     Ok(ctx.into_spawnable_quic(discovery_service, config.discovery.quic_port))
 }

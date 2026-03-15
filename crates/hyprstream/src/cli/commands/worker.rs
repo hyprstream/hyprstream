@@ -17,6 +17,9 @@ pub enum WorkerAction {
         /// Filter by sandbox ID
         #[arg(long)]
         sandbox: Option<String>,
+        /// Filter by container ID
+        #[arg(long)]
+        container: Option<String>,
         /// Show only containers (not sandboxes)
         #[arg(long)]
         containers: bool,

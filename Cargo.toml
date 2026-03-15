@@ -8,10 +8,15 @@ members = [
     "crates/hyprstream-flight",
     "crates/cas-serve",
     "crates/hyprstream-rpc",
+    "crates/hyprstream-service",
+    "crates/hyprstream-discovery",
     "crates/hyprstream-rpc-build",
     "crates/hyprstream-rpc-derive",
     "crates/hyprstream-workers",
     "crates/hyprstream-containedfs",
+    "crates/waxterm",
+    "crates/hyprstream-compositor",
+    "crates/hyprstream-tui",
 ]
 # bitsandbytes-sys is standalone - only built when bnb feature is enabled
 exclude = ["crates/bitsandbytes-sys"]

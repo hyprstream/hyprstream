@@ -5,25 +5,31 @@
 //! - `EnvelopeContext` - Verified request context passed to handlers
 //! - `ServiceHandle` - Handle for managing running services
 //! - `RpcService`, `RpcHandler` - Lower-level RPC traits
-//! - `spawner` - Process and service spawning abstractions
-//! - `manager` - Service lifecycle management (systemd/standalone)
+//!
+//! Spawner, factory, and manager have moved to the `hyprstream-service` crate.
+//! Metadata types remain here (used by proc macro codegen across all crates).
 
 mod traits;
 mod zmq;
-pub mod spawner;
-pub mod manager;
 pub mod streaming;
-pub mod factory;
+pub mod spawnable;
 pub mod metadata;
 
 pub use traits::{RpcHandler, RpcRequest, RpcService};
 #[allow(deprecated)]
 pub use zmq::{AuthorizeFn, CallOptions, Continuation, EnvelopeContext, QuicLoopConfig, ServiceHandle, RequestLoop, UnifiedRequestLoop, ZmqClient, ZmqService};
 pub use streaming::StreamService;
-pub use spawner::{InprocManager, Spawnable, SpawnedService};
-pub use factory::{get_factory, list_factories, QuicSharedConfig, ServiceClient, ServiceContext, ServiceFactory};
+pub use spawnable::Spawnable;
+pub use metadata::{MethodMeta, ParamMeta, SchemaMetadataFn, ScopedSchemaMetadataFn, ScopedClientTreeNode};
 
-// Re-export service manager types
-pub use manager::{detect as detect_service_manager, ServiceManager, StandaloneManager};
-#[cfg(feature = "systemd")]
-pub use manager::SystemdManager;
+/// Trait for generated service clients that can be constructed from a base `ZmqClient`.
+///
+/// Implement this trait to enable `ServiceContext::typed_client::<T>()`.
+/// Generated clients implement this automatically via `generate_rpc_service!`.
+pub trait ServiceClient: Sized {
+    /// The service name as registered in the endpoint registry.
+    const SERVICE_NAME: &'static str;
+
+    /// Construct this client from a base `ZmqClient`.
+    fn from_zmq(client: ZmqClient) -> Self;
+}

@@ -10,7 +10,7 @@ use tch::{Device, Kind as DType, Tensor};
 use tracing::{debug, info, instrument};
 
 use super::architectures::{gemma::GemmaModel, llama::LlamaModel, ModelOperations};
-use super::kv_quant::KVQuantType;
+use super::KVQuantType;
 use super::model_config::{ModelArchitecture, ModelConfig};
 use super::torch_utils::{safe_to_device, estimate_tensor_size_mb};
 use crate::services::WorktreeClient;
@@ -647,16 +647,16 @@ impl ModelFactory {
         // Convert unified config to LlamaConfig
         let llama_config = LlamaConfig {
             version: config.version as u8,
-            num_attention_heads: config.num_attention_heads,
-            num_key_value_heads: config.num_key_value_heads,
-            hidden_size: config.hidden_size,
-            head_dim: config.head_dim,
-            intermediate_size: config.intermediate_size,
-            max_position_embeddings: effective_max_pos,
+            num_attention_heads: config.num_attention_heads as u32,
+            num_key_value_heads: config.num_key_value_heads as u32,
+            hidden_size: config.hidden_size as u32,
+            head_dim: config.head_dim as u32,
+            intermediate_size: config.intermediate_size as u32,
+            max_position_embeddings: effective_max_pos as u32,
             rms_norm_eps: config.rms_norm_eps,
-            vocab_size: config.vocab_size,
-            original_vocab_size: config.vocab_size,  // Will be updated if padding is applied
-            num_hidden_layers: config.num_hidden_layers,
+            vocab_size: config.vocab_size as u32,
+            original_vocab_size: config.vocab_size as u32,  // Will be updated if padding is applied
+            num_hidden_layers: config.num_hidden_layers as u32,
             rope_theta: config.rope_theta,
             rope_scaling: None,
             hidden_activation: config.hidden_activation,
@@ -734,16 +734,16 @@ impl ModelFactory {
             // Use Llama config for the language model
             language_config: Box::new(super::architectures::llama::LlamaConfig {
                 version: 3,
-                num_attention_heads: config.num_attention_heads,
-                num_key_value_heads: config.num_key_value_heads,
-                hidden_size: config.hidden_size,
-                head_dim: config.head_dim,
-                intermediate_size: config.intermediate_size,
-                max_position_embeddings: effective_max_pos,
+                num_attention_heads: config.num_attention_heads as u32,
+                num_key_value_heads: config.num_key_value_heads as u32,
+                hidden_size: config.hidden_size as u32,
+                head_dim: config.head_dim as u32,
+                intermediate_size: config.intermediate_size as u32,
+                max_position_embeddings: effective_max_pos as u32,
                 rms_norm_eps: config.rms_norm_eps,
-                vocab_size: config.vocab_size,
-                original_vocab_size: config.vocab_size,
-                num_hidden_layers: config.num_hidden_layers,
+                vocab_size: config.vocab_size as u32,
+                original_vocab_size: config.vocab_size as u32,
+                num_hidden_layers: config.num_hidden_layers as u32,
                 rope_theta: config.rope_theta,
                 rope_scaling: None,  // TODO: Convert from config.rope_scaling
                 hidden_activation: config.hidden_activation.clone(),

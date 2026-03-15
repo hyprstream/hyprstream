@@ -25,7 +25,6 @@ use capnp::message::Builder as CapnpBuilder;
 use capnp::serialize as capnp_serialize;
 use hyprstream_rpc::crypto::notification::pubkey_fingerprint;
 use hyprstream_rpc::prelude::*;
-use hyprstream_rpc::registry::{global as registry, SocketKind};
 use hyprstream_rpc::streaming::StreamChannel;
 use hyprstream_rpc::transport::TransportConfig;
 use parking_lot::RwLock;
@@ -33,6 +32,7 @@ use tracing::{debug, error, trace, warn};
 use uuid::Uuid;
 
 use crate::services::{Continuation, EnvelopeContext, PolicyClient, ZmqService};
+use crate::services::generated::policy_client::PolicyCheck;
 use crate::services::generated::notification_client::{
     NotificationClient, NotificationHandler, NotificationResponseVariant,
     ErrorInfo, PingInfo,
@@ -46,8 +46,6 @@ use crate::services::generated::notification_client::{
 
 use hyprstream_rpc::crypto::rerandomize_pubkey;
 
-/// Service name for endpoint registry.
-const SERVICE_NAME: &str = "notification";
 
 /// Default subscription TTL (10 minutes).
 const DEFAULT_TTL_SECS: u32 = 600;
@@ -397,7 +395,7 @@ impl NotificationHandler for NotificationService {
         if let Some(ref policy_client) = self.policy_client {
             let subject = ctx.subject().to_string();
             let allowed = policy_client
-                .check(&subject, "*", resource, operation)
+                .check(&PolicyCheck { subject: subject.clone(), domain: "*".to_owned(), resource: resource.to_owned(), operation: operation.to_owned() })
                 .await
                 .unwrap_or_else(|e| {
                     warn!("Notification policy check failed for {}: {}", subject, e);
@@ -845,13 +843,6 @@ impl ZmqService for NotificationService {
 // NotificationClient construction
 // ============================================================================
 
-impl NotificationClient {
-    /// Create a new notification client (endpoint from registry).
-    pub fn new(signing_key: SigningKey, identity: RequestIdentity) -> Self {
-        let endpoint = registry().endpoint(SERVICE_NAME, SocketKind::Rep).to_zmq_string();
-        crate::services::core::create_service_client(&endpoint, signing_key, identity)
-    }
-}
 
 // ============================================================================
 // NotificationPublisher (hand-written crypto wrapper)
@@ -901,7 +892,10 @@ impl NotificationPublisher {
         let pub_bytes = ephemeral_pub.to_bytes();
 
         // Phase 1: publishIntent → get blinded subscriber pubkeys
-        let intent_resp = self.client.publish_intent(scope, &pub_bytes).await?;
+        let intent_resp = self.client.publish_intent(&PublishIntentRequest {
+            scope: scope.to_owned(),
+            publisher_pubkey: pub_bytes.to_vec(),
+        }).await?;
 
         let blinded_pubkeys: Vec<[u8; 32]> = intent_resp.recipient_pubkeys.iter()
             .filter_map(|pk| {
@@ -938,12 +932,12 @@ impl NotificationPublisher {
             }
         }).collect();
 
-        let deliver_resp = self.client.deliver(
-            &intent_resp.intent_id,
-            &capsules,
-            &encrypted.ciphertext,
-            &encrypted.nonce,
-        ).await?;
+        let deliver_resp = self.client.deliver(&DeliverRequest {
+            intent_id: intent_resp.intent_id.clone(),
+            capsules,
+            encrypted_payload: encrypted.ciphertext.clone(),
+            nonce: encrypted.nonce.to_vec(),
+        }).await?;
 
         Ok(deliver_resp.delivered_count)
     }

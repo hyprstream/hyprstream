@@ -35,7 +35,7 @@ use crate::server::tls::{resolve_rustls_config, serve_app};
 use anyhow::Result;
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::SocketKind;
-use hyprstream_rpc::service::spawner::Spawnable;
+use hyprstream_service::Spawnable;
 use hyprstream_rpc::transport::TransportConfig;
 use std::net::SocketAddr;
 use std::sync::Arc;

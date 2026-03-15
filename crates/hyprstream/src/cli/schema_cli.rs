@@ -10,16 +10,17 @@ use anyhow::{bail, Result};
 use clap::{Arg, ArgMatches, Command};
 use ed25519_dalek::SigningKey;
 use hyprstream_rpc::RequestIdentity;
-use hyprstream_rpc::service::metadata::ScopedClientTreeNode;
+use hyprstream_service::ScopedClientTreeNode;
 use serde_json::Value;
 
 use crate::services::generated::{
     inference_client, model_client, policy_client, registry_client,
 };
 use hyprstream_workers::generated::{worker_client, workflow_client};
-use crate::services::{
-    InferenceZmqClient, ModelZmqClient, PolicyClient, GenRegistryClient, WorkerZmqClient,
-};
+use crate::services::{PolicyClient, RegistryClient};
+use crate::services::generated::inference_client::InferenceClient;
+use crate::services::generated::model_client::ModelClient;
+use hyprstream_workers::runtime::WorkerClient;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MethodSchemaLike trait — unifies per-module MethodSchema types
@@ -75,7 +76,7 @@ macro_rules! extract_methods {
 }
 
 /// Convert a slice of MethodMeta into MethodView values.
-fn methods_to_views(methods: &[hyprstream_rpc::service::metadata::MethodMeta]) -> Vec<MethodView> {
+fn methods_to_views(methods: &[hyprstream_service::MethodMeta]) -> Vec<MethodView> {
     methods
         .iter()
         .map(|m| MethodView {
@@ -102,7 +103,7 @@ fn methods_to_views(methods: &[hyprstream_rpc::service::metadata::MethodMeta]) -
 
 /// Convert scoped metadata (service, scope, methods) into MethodView values.
 fn scoped_methods_to_views(
-    metadata_fn: hyprstream_rpc::service::metadata::ScopedSchemaMetadataFn,
+    metadata_fn: hyprstream_service::ScopedSchemaMetadataFn,
 ) -> Vec<MethodView> {
     let (_service_name, _scope_name, methods) = metadata_fn();
     methods_to_views(methods)
@@ -366,19 +367,18 @@ async fn dispatch_top_level(
 
     match service {
         "registry" => {
-            let client: GenRegistryClient = crate::services::create_service_client(
-                &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
+            let client: RegistryClient = RegistryClient::new(
                 signing_key, identity,
             );
             client.call_method(method, args).await
         }
         "model" => {
-            let client = ModelZmqClient::new(signing_key, identity);
-            client.gen.call_method(method, args).await
+            let client = ModelClient::new(signing_key, identity);
+            client.call_method(method, args).await
         }
         "inference" => {
-            let client = InferenceZmqClient::new(signing_key, identity);
-            client.gen.call_method(method, args).await
+            let client = InferenceClient::new(signing_key, identity);
+            client.call_method(method, args).await
         }
         "policy" => {
             let client = PolicyClient::new(signing_key, identity);
@@ -406,19 +406,18 @@ async fn dispatch_scoped_dynamic(
 
     match service {
         "registry" => {
-            let client: GenRegistryClient = crate::services::create_service_client(
-                &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
+            let client: RegistryClient = RegistryClient::new(
                 signing_key, identity,
             );
             client.call_scoped_method(scope_chain, method, args).await
         }
         "model" => {
-            let client = ModelZmqClient::new(signing_key, identity);
-            client.gen.call_scoped_method(scope_chain, method, args).await
+            let client = ModelClient::new(signing_key, identity);
+            client.call_scoped_method(scope_chain, method, args).await
         }
         "worker" => {
-            let client = WorkerZmqClient::new(signing_key, identity);
-            client.gen().call_scoped_method(scope_chain, method, args).await
+            let client = WorkerClient::new(signing_key, identity);
+            client.call_scoped_method(scope_chain, method, args).await
         }
         _ => bail!("Service '{}' has no scoped methods", service),
     }

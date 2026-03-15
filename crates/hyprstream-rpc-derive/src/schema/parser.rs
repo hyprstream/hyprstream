@@ -13,16 +13,20 @@ pub fn parse_capnp_schema(text: &str, service_name: &str) -> Option<ParsedSchema
 
     let has_request = structs_parsed.iter().any(|s| s.name == request_struct_name);
     let has_response = structs_parsed.iter().any(|s| s.name == response_struct_name);
-    if !has_request || !has_response {
-        return None;
-    }
 
-    let request_variants = parse_union_variants(text, &request_struct_name);
-    let response_variants = parse_union_variants(text, &response_struct_name);
+    let (request_variants, response_variants) = if has_request && has_response {
+        let rv = parse_union_variants(text, &request_struct_name);
+        let rs = parse_union_variants(text, &response_struct_name);
+        if rv.is_empty() || rs.is_empty() {
+            (vec![], vec![])
+        } else {
+            (rv, rs)
+        }
+    } else {
+        (vec![], vec![])
+    };
 
-    if request_variants.is_empty() || response_variants.is_empty() {
-        return None;
-    }
+    let is_data_only = request_variants.is_empty();
 
     // Detect scoped clients from nested union patterns
     let mut scoped_clients = Vec::new();
@@ -82,10 +86,14 @@ pub fn parse_capnp_schema(text: &str, service_name: &str) -> Option<ParsedSchema
         detect_nested_scoped_clients(text, sc, &structs_parsed);
     }
 
-    let referenced: Vec<StructDef> = structs_parsed
-        .into_iter()
-        .filter(|s| s.name != request_struct_name && s.name != response_struct_name)
-        .collect();
+    let referenced: Vec<StructDef> = if is_data_only {
+        structs_parsed
+    } else {
+        structs_parsed
+            .into_iter()
+            .filter(|s| s.name != request_struct_name && s.name != response_struct_name)
+            .collect()
+    };
 
     Some(ParsedSchema {
         request_variants,
@@ -383,6 +391,7 @@ pub fn parse_field_line(line: &str) -> Option<FieldDef> {
         slot_offset: 0,
         section: FieldSection::Data,
         discriminant_value: 0xFFFF,
+        serde_rename: None,
     })
 }
 
@@ -1023,9 +1032,13 @@ struct ErrorInfo {
     }
 
     #[test]
-    fn parse_returns_none_for_missing_schema() {
-        let result = parse_capnp_schema("struct Foo { }", "policy");
-        assert!(result.is_none());
+    fn parse_data_only_schema() {
+        let result = parse_capnp_schema("struct Foo { value @0 :UInt32; }", "foo");
+        let schema = result.expect("data-only schema should parse");
+        assert!(schema.request_variants.is_empty());
+        assert!(schema.response_variants.is_empty());
+        assert_eq!(schema.structs.len(), 1);
+        assert_eq!(schema.structs[0].name, "Foo");
     }
 
     #[test]

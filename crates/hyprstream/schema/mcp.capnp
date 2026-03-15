@@ -10,6 +10,7 @@
 # - Tool discovery and introspection
 # - Internal tool invocation for other hyprstream services
 
+using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".mcpScope;
 using import "/annotations.capnp".mcpDescription;
 
@@ -155,14 +156,3 @@ struct ToolResult {
   errorMessage @2 :Text;
 }
 
-# Error information
-struct ErrorInfo {
-  # Human-readable error message
-  message @0 :Text;
-
-  # Error code (e.g., "INVALID_REQUEST", "INTERNAL_ERROR")
-  code @1 :Text;
-
-  # Additional error details
-  details @2 :Text;
-}

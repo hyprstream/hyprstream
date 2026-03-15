@@ -20,18 +20,20 @@
 //! 3. Backend services enforce authorization via Casbin policies
 
 use async_trait::async_trait;
-use crate::services::{ModelZmqClient, GenRegistryClient, PolicyClient};
+use crate::services::{RegistryClient, PolicyClient};
+use crate::services::generated::model_client::ModelClient;
 use http::header::AUTHORIZATION;
 use crate::services::generated::mcp_client::{
     McpHandler, McpResponseVariant, ToolDefinition, ServiceStatus,
     ToolList, ServiceMetrics, CallTool, dispatch_mcp, serialize_response,
     ErrorInfo,
 };
+use crate::services::generated::policy_client::PolicyCheck;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures::future::BoxFuture;
 use hyprstream_rpc::auth::jwt;
 use hyprstream_rpc::envelope::RequestIdentity;
-use hyprstream_rpc::service::factory::ServiceContext;
+use hyprstream_service::ServiceContext;
 use hyprstream_rpc::service::ZmqService;
 use hyprstream_rpc::streaming::{StreamHandle, StreamPayload};
 use hyprstream_rpc::transport::TransportConfig;
@@ -219,7 +221,7 @@ type ScopeInfo = (&'static str, &'static str, &'static str); // (scope_name, fie
 fn register_scoped_tools_recursive(
     reg: &mut ToolRegistry,
     service_name: &str,
-    nodes: &'static [hyprstream_rpc::service::metadata::ScopedClientTreeNode],
+    nodes: &'static [hyprstream_service::ScopedClientTreeNode],
     prefix: &str,
     parent_scopes: &[ScopeInfo],
 ) {
@@ -338,15 +340,14 @@ fn register_scoped_tools_recursive(
 
                             let stream_info_json = match service.as_str() {
                                 "registry" => {
-                                    let client: GenRegistryClient = crate::services::core::create_service_client(
-                                        &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
+                                    let client: RegistryClient = RegistryClient::new(
                                         ctx.signing_key, ctx.identity.clone(),
                                     );
                                     client.call_scoped_streaming_method(&scope_refs, &method, &ctx.args, client_pubkey_bytes).await?
                                 }
                                 "model" => {
-                                    let client = ModelZmqClient::new(ctx.signing_key, ctx.identity.clone());
-                                    client.gen.call_scoped_streaming_method(&scope_refs, &method, &ctx.args, client_pubkey_bytes).await?
+                                    let client = ModelClient::new(ctx.signing_key, ctx.identity.clone());
+                                    client.call_scoped_streaming_method(&scope_refs, &method, &ctx.args, client_pubkey_bytes).await?
                                 }
                                 _ => anyhow::bail!("No scoped streaming dispatch for service: {service}"),
                             };
@@ -422,15 +423,14 @@ async fn dispatch_scoped_call(
 ) -> anyhow::Result<ToolResult> {
     let result = match service {
         "registry" => {
-            let client: GenRegistryClient = crate::services::core::create_service_client(
-                &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
+            let client: RegistryClient = RegistryClient::new(
                 ctx.signing_key.clone(), ctx.identity.clone(),
             );
             client.call_scoped_method(scopes, method, &ctx.args).await?
         }
         "model" => {
-            let client = ModelZmqClient::new(ctx.signing_key.clone(), ctx.identity.clone());
-            client.gen.call_scoped_method(scopes, method, &ctx.args).await?
+            let client = ModelClient::new(ctx.signing_key.clone(), ctx.identity.clone());
+            client.call_scoped_method(scopes, method, &ctx.args).await?
         }
         _ => anyhow::bail!("No scoped dispatch for service: {service}"),
     };
@@ -489,15 +489,14 @@ fn register_streaming_tool(
 
                 let stream_info_json = match service.as_str() {
                     "registry" => {
-                        let client: GenRegistryClient = crate::services::core::create_service_client(
-                            &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
+                        let client: RegistryClient = RegistryClient::new(
                             ctx.signing_key, ctx.identity.clone(),
                         );
                         client.call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?
                     }
                     "model" => {
-                        let client = ModelZmqClient::new(ctx.signing_key, ctx.identity.clone());
-                        client.gen.call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?
+                        let client = ModelClient::new(ctx.signing_key, ctx.identity.clone());
+                        client.call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?
                     }
                     _ => anyhow::bail!("No streaming support for service: {}", service),
                 };
@@ -579,12 +578,11 @@ async fn dispatch_schema_call(service: &str, method: &str, ctx: &ToolCallContext
 
     match service {
         "model" => {
-            let client = ModelZmqClient::new(signing_key, identity);
-            client.gen.call_method(method, &ctx.args).await
+            let client = ModelClient::new(signing_key, identity);
+            client.call_method(method, &ctx.args).await
         }
         "registry" => {
-            let client: GenRegistryClient = crate::services::core::create_service_client(
-                &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
+            let client: RegistryClient = RegistryClient::new(
                 signing_key, identity,
             );
             client.call_method(method, &ctx.args).await
@@ -850,7 +848,7 @@ impl McpHandler for McpService {
         }
         // Delegate to policy service
         let subject = ctx.subject().to_string();
-        let allowed = self.policy_client.check(&subject, "*", resource, operation)
+        let allowed = self.policy_client.check(&PolicyCheck { subject: subject.clone(), domain: "*".to_owned(), resource: resource.to_owned(), operation: operation.to_owned() })
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!("MCP policy check failed for {}: {}", subject, e);
@@ -870,8 +868,8 @@ impl McpHandler for McpService {
     ) -> anyhow::Result<McpResponseVariant> {
         let loaded_model_count = {
             // Status check uses local identity (internal health check, no user context)
-            let client = ModelZmqClient::new(self.signing_key.clone(), RequestIdentity::local());
-            client.status("").await
+            let client = ModelClient::new(self.signing_key.clone(), RequestIdentity::local());
+            client.status(&crate::services::generated::model_client::StatusRequest { model_ref: String::new() }).await
                 .map(|models| models.len() as u32)
                 .unwrap_or(0)
         };
