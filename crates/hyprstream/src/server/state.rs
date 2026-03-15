@@ -1,6 +1,7 @@
 //! Server state management
 
-use crate::services::{RegistryClient, ModelZmqClient, PolicyClient};
+use crate::services::{RegistryClient, PolicyClient};
+use crate::services::generated::model_client::{ModelClient, LoadModelRequest};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -15,7 +16,7 @@ pub use hyprstream_metrics::storage::context::{ContextRecord, ContextStore, Sear
 #[derive(Clone)]
 pub struct ServerState {
     /// Model client for inference operations via ZMQ
-    pub model_client: ModelZmqClient,
+    pub model_client: ModelClient,
 
     /// Policy client for authorization checks via ZMQ
     pub policy_client: PolicyClient,
@@ -83,7 +84,7 @@ impl ServerState {
     /// respective services in main.rs.
     pub async fn new(
         config: ServerConfig,
-        model_client: ModelZmqClient,
+        model_client: ModelClient,
         policy_client: PolicyClient,
         registry: RegistryClient,
         signing_key: SigningKey,
@@ -100,7 +101,11 @@ impl ServerState {
             tracing::info!("Preloading {} models", config.preload_models.len());
             for model_name in &config.preload_models {
                 tracing::info!("Preloading model: {}", model_name);
-                match model_client.load(model_name, None, None).await {
+                match model_client.load(&LoadModelRequest {
+                    model_ref: model_name.to_owned(),
+                    max_context: None,
+                    kv_quant: None,
+                }).await {
                     Ok(_) => tracing::info!("Preloaded: {}", model_name),
                     Err(e) => tracing::warn!("Failed to preload model '{}': {}", model_name, e),
                 }

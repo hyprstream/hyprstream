@@ -757,19 +757,20 @@ impl TuiService {
                 .endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep)
                 .to_zmq_string();
             let registry_client: crate::services::RegistryClient =
-                crate::services::create_service_client(
+                crate::services::RegistryClient::with_endpoint(
                     &registry_endpoint,
                     self.signing_key.clone(),
                     RequestIdentity::local(),
                 );
-            let model_client_for_status = crate::services::ModelZmqClient::new(
+            let model_client_for_status = crate::services::generated::model_client::ModelClient::new(
                 self.signing_key.clone(),
                 RequestIdentity::local(),
             );
             let status_timeout = std::time::Duration::from_millis(500);
+            let all_status_req = crate::services::generated::model_client::StatusRequest { model_ref: String::new() };
             let (repos_result, status_result) = tokio::join!(
                 registry_client.list(),
-                tokio::time::timeout(status_timeout, model_client_for_status.status("")),
+                tokio::time::timeout(status_timeout, model_client_for_status.status(&all_status_req)),
             );
             let status_map: std::collections::HashMap<String, bool> = match status_result {
                 Ok(Ok(entries)) => entries.into_iter()
@@ -810,10 +811,14 @@ impl TuiService {
                 let h   = handle_load.clone();
                 // Submit load — returns "accepted" immediately (Continuation pattern).
                 h.block_on(async {
-                    let client = crate::services::ModelZmqClient::new(
+                    let client = crate::services::generated::model_client::ModelClient::new(
                         sk.clone(), RequestIdentity::local(),
                     );
-                    let _ = client.load(&mr, None, None).await;
+                    let _ = client.load(&crate::services::generated::model_client::LoadModelRequest {
+                        model_ref: mr.clone(),
+                        max_context: None,
+                        kv_quant: None,
+                    }).await;
                 });
                 // Poll status in a background thread so we don't block the ShellApp.
                 let sk_poll = sk.clone();
@@ -823,10 +828,10 @@ impl TuiService {
                     for _ in 0..60u32 {   // max ~2 minutes (60 × 2 s)
                         std::thread::sleep(std::time::Duration::from_secs(2));
                         let loaded = h_poll.block_on(async {
-                            let client = crate::services::ModelZmqClient::new(
+                            let client = crate::services::generated::model_client::ModelClient::new(
                                 sk_poll.clone(), RequestIdentity::local(),
                             );
-                            client.status(&mr_poll).await
+                            client.status(&crate::services::generated::model_client::StatusRequest { model_ref: mr_poll.clone() }).await
                                 .is_ok_and(|es| es.iter().any(|e| e.status == "loaded"))
                         });
                         if loaded {
@@ -845,8 +850,8 @@ impl TuiService {
             let sk = sk_unload.clone();
             let mr = model_ref.to_owned();
             handle_unload.block_on(async move {
-                let client = crate::services::ModelZmqClient::new(sk, RequestIdentity::local());
-                client.unload(&mr).await.is_ok()
+                let client = crate::services::generated::model_client::ModelClient::new(sk, RequestIdentity::local());
+                client.unload(&crate::services::generated::model_client::UnloadModelRequest { model_ref: mr.clone() }).await.is_ok()
             })
         });
 

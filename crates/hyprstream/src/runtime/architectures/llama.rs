@@ -1047,7 +1047,7 @@ impl LlamaModel {
     ) -> Result<Self> {
         // Parse config from weights if possible, otherwise use defaults
         let config = Self::detect_config_from_weights(weights)?;
-        Self::from_weights_with_config(weights, config, device, dtype, crate::runtime::kv_quant::KVQuantType::None)
+        Self::from_weights_with_config(weights, config, device, dtype, crate::runtime::KVQuantType::None)
     }
 
     /// Create Llama model with explicit config (allows Qwen models to override)
@@ -1058,7 +1058,7 @@ impl LlamaModel {
         mut config: LlamaConfig,
         device: &Device,
         dtype: DType,
-        kv_quant_type: crate::runtime::kv_quant::KVQuantType,
+        kv_quant_type: crate::runtime::KVQuantType,
     ) -> Result<Self> {
         tracing::info!(
             "[from_weights_with_config] Received config.max_position_embeddings = {}, kv_quant = {:?}",

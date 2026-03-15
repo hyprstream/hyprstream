@@ -27,7 +27,7 @@ use crate::{
     runtime::GenerationRequest,
     runtime::CacheOwner,
     server::{state::ServerState, AuthenticatedUser},
-    services::ModelZmqClient,
+    services::generated::model_client::ModelClient,
 };
 
 use hyprstream_rpc::RequestIdentity;
@@ -101,16 +101,12 @@ struct CollectedResult {
 /// fixes the bug where `infer()` hardcoded `ttt_metrics: None` — the completion
 /// metadata from the stream includes all fields including TTT metrics.
 async fn collect_stream_to_result(
-    model_client: &ModelZmqClient,
+    model_client: &ModelClient,
     model_ref: &str,
     request: &GenerationRequest,
 ) -> anyhow::Result<CollectedResult> {
-    let client = model_client.clone();
-    let mr = model_ref.to_owned();
-    let req = request.clone();
-    let mut handle = crate::services::rpc_types::connect_stream_handle(|pubkey| async move {
-        client.infer_stream(&mr, &req, pubkey).await
-    }).await?;
+    use crate::services::generated::model_client::InferRpc;
+    let mut handle = InferRpc::generate_stream(&model_client.infer(model_ref), request).await?;
 
     use futures::StreamExt;
     use hyprstream_rpc::streaming::StreamPayload;
@@ -423,8 +419,8 @@ async fn chat_completions(
         .unwrap_or_default();
     let templated_prompt = match state
         .model_client
-        .gen.infer(&request.model)
-        .apply_chat_template(&crate::services::generated::model_client::ApplyChatTemplateRequest {
+        .infer(&request.model)
+        .apply_chat_template(&crate::services::generated::model_client::ChatTemplateRequest {
             messages: rpc_messages.clone(),
             add_generation_prompt: true,
             tools_json: Some(tools_str.clone()).filter(|s| !s.is_empty()),
@@ -469,7 +465,7 @@ async fn chat_completions(
 
     // Call inference via collect-stream (per-request ZMQ client preserves caller identity for TTT delta routing)
     let identity = identity_from_user(&user);
-    let model_client = ModelZmqClient::new((*state.signing_key).clone(), identity);
+    let model_client = ModelClient::new((*state.signing_key).clone(), identity);
     let claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
     let result = collect_stream_to_result(&model_client.with_claims(claims), &request.model, &gen_request).await;
 
@@ -631,9 +627,9 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
         let tools_str = tools_json.as_ref()
             .map(|t| serde_json::to_string(t).unwrap_or_default())
             .unwrap_or_default();
-        let templated_prompt = match state.model_client.gen
+        let templated_prompt = match state.model_client
             .infer(&model_name)
-            .apply_chat_template(&crate::services::generated::model_client::ApplyChatTemplateRequest {
+            .apply_chat_template(&crate::services::generated::model_client::ChatTemplateRequest {
                 messages: rpc_messages.clone(),
                 add_generation_prompt: true,
                 tools_json: Some(tools_str.clone()).filter(|s| !s.is_empty()),
@@ -668,14 +664,11 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
 
         // Start ZMQ stream with per-request client (preserves caller identity for TTT delta routing)
         let identity = identity_from_user(&user);
-        let model_client = ModelZmqClient::new((*state.signing_key).clone(), identity);
+        let model_client = ModelClient::new((*state.signing_key).clone(), identity);
         let claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
         let client = model_client.with_claims(claims);
-        let mn = model_name.clone();
-        let req = gen_request.clone();
-        let mut stream_handle = match crate::services::rpc_types::connect_stream_handle(|pubkey| async move {
-            client.infer_stream(&mn, &req, pubkey).await
-        }).await {
+        use crate::services::generated::model_client::InferRpc;
+        let mut stream_handle = match InferRpc::generate_stream(&client.infer(&model_name), &gen_request).await {
             Ok(h) => h,
             Err(e) => {
                 error!("Failed to start ZMQ stream: {}", e);
@@ -959,8 +952,8 @@ async fn completions(
 
     let templated_prompt = match state
         .model_client
-        .gen.infer(&request.model)
-        .apply_chat_template(&crate::services::generated::model_client::ApplyChatTemplateRequest {
+        .infer(&request.model)
+        .apply_chat_template(&crate::services::generated::model_client::ChatTemplateRequest {
             messages: rpc_messages.clone(),
             add_generation_prompt: true,
             tools_json: None,
@@ -994,7 +987,7 @@ async fn completions(
 
     // Call inference via collect-stream (per-request ZMQ client preserves caller identity for TTT delta routing)
     let identity = identity_from_user(&user);
-    let model_client = ModelZmqClient::new((*state.signing_key).clone(), identity);
+    let model_client = ModelClient::new((*state.signing_key).clone(), identity);
     let claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
     let result = collect_stream_to_result(&model_client.with_claims(claims), &request.model, &gen_request).await;
 

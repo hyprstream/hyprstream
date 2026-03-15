@@ -16,15 +16,12 @@ pub use worker::{ImageCommand, WorkerAction};
 
 use clap::{Subcommand, ValueEnum};
 
-use crate::runtime::kv_quant::KVQuantType;
+use crate::runtime::KVQuantType;
 
-/// KV cache quantization type for inference
+/// KV cache quantization type for CLI argument parsing.
 ///
-/// Quantization reduces GPU memory usage at a slight quality cost:
-/// - `none`: Full precision (default)
-/// - `int8`: 50% memory savings, minimal quality loss
-/// - `nf4`: 75% memory savings, best quality for 4-bit
-/// - `fp4`: 75% memory savings, standard 4-bit quantization
+/// Thin wrapper for `clap::ValueEnum` (can't derive on foreign types).
+/// Converts to the generated `KVQuantType` via `From`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KVQuantArg {

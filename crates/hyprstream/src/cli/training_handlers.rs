@@ -21,7 +21,8 @@ use crate::services::generated::inference_client::{ChatMessage, ChatTemplateRequ
 use crate::services::generated::registry_client::{
     BranchRequest, CreateWorktreeRequest, StageFilesRequest, CommitRequest, PushRequest,
 };
-use crate::services::{InferenceServiceConfig, InferenceZmqClient, RegistryClient, WorktreeClient, INFERENCE_ENDPOINT};
+use crate::services::{InferenceServiceConfig, RegistryClient, WorktreeClient, INFERENCE_ENDPOINT};
+use crate::services::generated::inference_client::InferenceClient;
 use crate::storage::ModelRef;
 use crate::zmq::global_context;
 use hyprstream_rpc::{RequestIdentity, SigningKey, VerifyingKey};
@@ -393,12 +394,12 @@ pub async fn handle_training_infer(
         .map_err(|e| anyhow::anyhow!("Failed to spawn inference service: {}", e))?;
 
     // Create client for service communication
-    let client = InferenceZmqClient::new(signing_key, RequestIdentity::local());
+    let client = InferenceClient::new(signing_key, RequestIdentity::local());
 
     // Apply chat template
     let messages = vec![ChatMessage { role: "user".into(), content: prompt.into(), tool_calls: vec![], tool_call_id: String::new() }];
 
-    let formatted_prompt = match client.gen.apply_chat_template(&ChatTemplateRequest { messages: messages.clone(), add_generation_prompt: true, tools_json: Some(String::new()) }).await {
+    let formatted_prompt = match client.apply_chat_template(&ChatTemplateRequest { messages: messages.clone(), add_generation_prompt: true, tools_json: Some(String::new()) }).await {
         Ok(formatted) => formatted,
         Err(e) => {
             warn!("Could not apply chat template: {}. Using raw prompt.", e);
@@ -446,7 +447,10 @@ pub async fn handle_training_infer(
         // Stream tokens live to stdout
         use hyprstream_rpc::streaming::StreamPayload;
         use std::io::Write;
-        let mut handle = client.generate_stream_handle(&request).await?;
+        let mut handle = {
+            use crate::services::generated::inference_client::InferenceRpc;
+            InferenceRpc::generate_stream(&client, &request).await?
+        };
         println!();
         loop {
             match handle.recv_next().await? {
@@ -494,12 +498,13 @@ fn ensure_ttt_enabled(model_path: &std::path::Path) -> Result<()> {
 ///
 /// Replaces the removed `InferenceZmqClient::generate()` sync method.
 async fn collect_inference_stream(
-    client: &InferenceZmqClient,
+    client: &InferenceClient,
     request: &crate::runtime::GenerationRequest,
 ) -> Result<crate::config::GenerationResult> {
     use hyprstream_rpc::streaming::StreamPayload;
 
-    let mut handle = client.generate_stream_handle(request).await?;
+    use crate::services::generated::inference_client::InferenceRpc;
+    let mut handle = InferenceRpc::generate_stream(client, request).await?;
     let mut text = String::new();
 
     loop {
@@ -675,7 +680,7 @@ pub async fn handle_training_batch(
     let mut service_handle = spawner.spawn(service_config).await
         .map_err(|e| anyhow::anyhow!("Failed to spawn inference service: {}", e))?;
 
-    let client = InferenceZmqClient::new(signing_key, RequestIdentity::local());
+    let client = InferenceClient::new(signing_key, RequestIdentity::local());
 
     // Get adapter info for checkpoint saves
     let adapter_manager = AdapterManager::new(&model_path);

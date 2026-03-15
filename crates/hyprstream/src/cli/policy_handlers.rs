@@ -416,7 +416,21 @@ pub async fn load_or_generate_signing_key(_keys_dir: &Path) -> Result<SigningKey
     const SERVICE: &str = "hyprstream";
     const KEY_NAME: &str = "signing-key";
 
-    let entry = keyring::Entry::new(SERVICE, KEY_NAME).map_err(|e| {
+    let entry = keyring::Entry::new(SERVICE, KEY_NAME).or_else(|_| {
+        // On Linux, the session keyring may be revoked (common in systemd user
+        // sessions after the original login session ends). Try to join/create
+        // a new session keyring and retry.
+        #[cfg(target_os = "linux")]
+        {
+            tracing::debug!("session keyring unavailable, creating new session");
+            // KEYCTL_JOIN_SESSION_KEYRING = 1, NULL name = create anonymous session
+            let rc = unsafe { libc::syscall(libc::SYS_keyctl, 1i32, std::ptr::null::<u8>()) };
+            if rc >= 0 {
+                return keyring::Entry::new(SERVICE, KEY_NAME);
+            }
+        }
+        keyring::Entry::new(SERVICE, KEY_NAME)
+    }).map_err(|e| {
         anyhow::anyhow!(
             "Failed to access OS keyring (service={SERVICE}, key={KEY_NAME}): {e}.\n\
              On Linux, ensure kernel keyutils is available.\n\

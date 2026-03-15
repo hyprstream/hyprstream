@@ -420,7 +420,7 @@ fn handle_quick_command(
             || async move {
                 let keys_dir = ctx.models_dir().join(".registry").join("keys");
                 let signing_key = load_or_generate_signing_key(&keys_dir).await?;
-                let model_client = hyprstream_core::services::ModelZmqClient::new(
+                let model_client = hyprstream_core::services::generated::model_client::ModelClient::new(
                     signing_key,
                     RequestIdentity::local(),
                 );
@@ -1037,9 +1037,9 @@ fn handle_quick_command(
                         None
                     };
 
-                    use hyprstream_core::services::WorkerZmqClient;
+                    use hyprstream_workers::runtime::WorkerClient;
                     let worker_client =
-                        WorkerZmqClient::new(signing_key, RequestIdentity::local());
+                        WorkerClient::new(signing_key, RequestIdentity::local());
 
                     match action {
                         WorkerAction::List {
@@ -1470,8 +1470,7 @@ fn main() -> Result<()> {
                         None
                     };
 
-                let client = hyprstream_core::services::create_service_client(
-                    &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
+                let client = hyprstream_core::services::RegistryClient::new(
                     signing_key.clone(),
                     RequestIdentity::local(),
                 );
@@ -1493,8 +1492,7 @@ fn main() -> Result<()> {
                 let signing_key = load_or_generate_signing_key(&keys_dir).await?;
                 let verifying_key = signing_key.verifying_key();
 
-                let client = hyprstream_core::services::create_service_client(
-                    &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
+                let client = hyprstream_core::services::RegistryClient::new(
                     signing_key.clone(),
                     RequestIdentity::local(),
                 );

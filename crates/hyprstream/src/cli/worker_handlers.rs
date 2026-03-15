@@ -20,7 +20,7 @@ use crate::services::worker::{
 };
 use hyprstream_workers::runtime::ContainerMetadata;
 
-use crate::services::WorkerZmqClient;
+use hyprstream_workers::runtime::WorkerClient;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // List Command
@@ -28,7 +28,7 @@ use crate::services::WorkerZmqClient;
 
 /// Handle `worker list` command
 pub async fn handle_worker_list(
-    client: &WorkerZmqClient,
+    client: &WorkerClient,
     sandbox_filter: Option<String>,
     container_filter: Option<String>,
     containers_only: bool,
@@ -105,7 +105,7 @@ pub async fn handle_worker_list(
 /// Handle `worker run` command
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_worker_run(
-    client: &WorkerZmqClient,
+    client: &WorkerClient,
     image: &str,
     command: Vec<String>,
     sandbox_id: Option<String>,
@@ -217,7 +217,7 @@ pub async fn handle_worker_run(
 
 /// Handle `worker stop` command
 pub async fn handle_worker_stop(
-    client: &WorkerZmqClient,
+    client: &WorkerClient,
     id: &str,
     timeout: i64,
     force: bool,
@@ -249,7 +249,7 @@ pub async fn handle_worker_stop(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Handle `worker start` command
-pub async fn handle_worker_start(client: &WorkerZmqClient, container_id: &str) -> Result<()> {
+pub async fn handle_worker_start(client: &WorkerClient, container_id: &str) -> Result<()> {
     info!(container_id = %container_id, "Starting container");
 
     client.container().start(container_id).await?;
@@ -262,7 +262,7 @@ pub async fn handle_worker_start(client: &WorkerZmqClient, container_id: &str) -
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Handle `worker restart` command
-pub async fn handle_worker_restart(client: &WorkerZmqClient, id: &str, timeout: i64) -> Result<()> {
+pub async fn handle_worker_restart(client: &WorkerClient, id: &str, timeout: i64) -> Result<()> {
     info!(id = %id, "Restarting");
 
     // Stop then start
@@ -289,7 +289,7 @@ pub async fn handle_worker_restart(client: &WorkerZmqClient, id: &str, timeout: 
 
 /// Handle `worker rm` command
 pub async fn handle_worker_rm(
-    client: &WorkerZmqClient,
+    client: &WorkerClient,
     ids: Vec<String>,
     force: bool,
 ) -> Result<()> {
@@ -338,7 +338,7 @@ pub async fn handle_worker_rm(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Handle `worker status` command
-pub async fn handle_worker_status(client: &WorkerZmqClient, id: &str, verbose: bool) -> Result<()> {
+pub async fn handle_worker_status(client: &WorkerClient, id: &str, verbose: bool) -> Result<()> {
     // Try as container
     if let Ok(status) = client.container().status(&ContainerStatusRequest {
         container_id: id.to_owned(),
@@ -383,7 +383,7 @@ pub async fn handle_worker_status(client: &WorkerZmqClient, id: &str, verbose: b
 
 /// Handle `worker stats` command
 pub async fn handle_worker_stats(
-    client: &WorkerZmqClient,
+    client: &WorkerClient,
     ids: Vec<String>,
     no_header: bool,
 ) -> Result<()> {
@@ -461,7 +461,7 @@ fn print_sandbox_stats(id: &str, stats: &PodSandboxStats) {
 
 /// Handle `worker exec` command
 pub async fn handle_worker_exec(
-    client: &WorkerZmqClient,
+    client: &WorkerClient,
     container_id: &str,
     command: Vec<String>,
     timeout: i64,
@@ -503,7 +503,7 @@ pub async fn handle_worker_exec(
 /// - StreamHandle encapsulates DH key exchange, subscription, and HMAC verification
 /// - Handles detach sequence (default: Ctrl-])
 pub async fn handle_worker_terminal(
-    client: &WorkerZmqClient,
+    client: &WorkerClient,
     container_id: &str,
     detach_keys: &str,
 ) -> Result<()> {
@@ -515,7 +515,11 @@ pub async fn handle_worker_terminal(
     info!(container_id = %container_id, "Attaching to container terminal");
 
     // Attach RPC — DH keypair, SUB socket, and HMAC verification all managed internally.
-    let mut stream_handle = client.attach(container_id).await?;
+    use hyprstream_workers::generated::worker_client::ContainerRpc;
+    let mut stream_handle = ContainerRpc::attach(&client.container(), &crate::services::worker::AttachRequest {
+        container_id: container_id.to_owned(),
+        fds: vec![],
+    }).await?;
 
     println!(
         "Attached to container {}\n\
@@ -650,7 +654,7 @@ fn parse_detach_keys(keys: &str) -> u8 {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Handle `worker images list` command
-pub async fn handle_images_list(client: &WorkerZmqClient, _verbose: bool) -> Result<()> {
+pub async fn handle_images_list(client: &WorkerClient, _verbose: bool) -> Result<()> {
     let images = client.image().list(&ImageFilter { image: ImageSpec::default() }).await?;
 
     println!(
@@ -671,7 +675,7 @@ pub async fn handle_images_list(client: &WorkerZmqClient, _verbose: bool) -> Res
 
 /// Handle `worker images pull` command
 pub async fn handle_images_pull(
-    client: &WorkerZmqClient,
+    client: &WorkerClient,
     image: &str,
     username: Option<String>,
     password: Option<String>,
@@ -708,7 +712,7 @@ pub async fn handle_images_pull(
 
 /// Handle `worker images rm` command
 pub async fn handle_images_rm(
-    client: &WorkerZmqClient,
+    client: &WorkerClient,
     images: Vec<String>,
     _force: bool,
 ) -> Result<()> {
@@ -727,7 +731,7 @@ pub async fn handle_images_rm(
 }
 
 /// Handle `worker images df` command
-pub async fn handle_images_df(client: &WorkerZmqClient) -> Result<()> {
+pub async fn handle_images_df(client: &WorkerClient) -> Result<()> {
     let usage = client.image().fs_info().await?;
 
     println!(

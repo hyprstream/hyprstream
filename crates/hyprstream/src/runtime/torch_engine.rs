@@ -122,7 +122,7 @@ impl TorchEngine {
         &mut self,
         num_layers: usize,
         max_seq_len: usize,
-        quant_type: crate::runtime::kv_quant::KVQuantType,
+        quant_type: crate::runtime::KVQuantType,
         memory_budget: Option<usize>,
     ) {
         let config = crate::runtime::kv_cache::CacheConfig::new(num_layers, max_seq_len)

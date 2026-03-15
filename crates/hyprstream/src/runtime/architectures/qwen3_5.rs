@@ -10,7 +10,7 @@ use super::llama::{LlamaMLP, LinearProjection};
 use super::qwen3_5_vision::{Qwen3_5VisionConfig, Qwen3_5VisionEncoder};
 use super::{ModelArchitecture, ModelOperations};
 use crate::runtime::kv_cache::KVCacheManager;
-use crate::runtime::kv_quant::KVQuantType;
+use crate::runtime::KVQuantType;
 use crate::runtime::model_config::ModelConfig;
 use crate::runtime::rope::RoPE;
 use crate::runtime::tensor_helpers::{dims3, dims4};

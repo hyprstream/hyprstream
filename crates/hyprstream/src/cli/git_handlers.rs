@@ -4,13 +4,14 @@
 
 use crate::runtime::GenerationRequest;
 use crate::services::generated::inference_client::ChatMessage;
-use crate::services::generated::model_client::ApplyChatTemplateRequest;
+use crate::services::generated::model_client::ChatTemplateRequest;
 use crate::services::generated::notification_client::{SubscribeRequest, UnsubscribeRequest};
 use crate::services::generated::registry_client::{
     BranchRequest, CheckoutRequest, CloneRequest, CreateWorktreeRequest,
     RemoveWorktreeRequest, UpdateRequest,
 };
-use crate::services::{ModelZmqClient, RegistryClient};
+use crate::services::RegistryClient;
+use crate::services::generated::model_client::{ModelClient, LoadModelRequest, UnloadModelRequest, StatusRequest};
 #[cfg(feature = "experimental")]
 use crate::services::generated::registry_client::FileChangeType;
 use crate::zmq::global_context;
@@ -19,7 +20,7 @@ use crate::storage::ModelRef;
 use crate::storage::GitRef;
 use anyhow::{bail, Result};
 use hyprstream_rpc::prelude::*;
-use hyprstream_rpc::streaming::{StreamHandle, StreamPayload};
+use hyprstream_rpc::streaming::StreamPayload;
 use hyprstream_rpc::crypto::generate_ephemeral_keypair;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -488,16 +489,17 @@ pub fn parse_status_filter(raw: &[String]) -> Result<std::collections::HashSet<S
 
 pub async fn handle_list(
     registry: &RegistryClient,
-    model_client: ModelZmqClient,
+    model_client: ModelClient,
     filters: &[(String, regex::Regex)],
     status_filter: &std::collections::HashSet<String>,
 ) -> Result<()> {
     info!("Listing models");
 
     // Fetch registry list and model service status in parallel
+    let all_status_req = StatusRequest { model_ref: String::new() };
     let (repos_result, status_result) = tokio::join!(
         registry.list(),
-        model_client.status(""),
+        model_client.status(&all_status_req),
     );
 
     let repos = repos_result
@@ -738,40 +740,16 @@ async fn clone_with_streaming(
     quiet: bool,
     verbose: bool,
 ) -> Result<()> {
-    // Generate ephemeral keypair for DH key exchange
-    let (client_secret, client_pubkey) = generate_ephemeral_keypair();
-    let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
-
-    // Call clone_stream to initiate streaming clone
-    let stream_info = registry
-        .clone_stream(&CloneRequest {
+    use crate::services::generated::registry_client::RegistryRpc;
+    let mut stream_handle = RegistryRpc::clone_stream(registry, &CloneRequest {
             url: repo_url.to_owned(),
             name: model_name.to_owned(),
             shallow,
             depth,
             branch: branch.unwrap_or("").to_owned(),
-        }, client_pubkey_bytes)
+        })
         .await
         .map_err(|e| anyhow::anyhow!("Failed to start streaming clone: {}", e))?;
-
-    if verbose {
-        debug!(
-            stream_id = %stream_info.stream_id,
-            endpoint = %stream_info.endpoint,
-            "Started streaming clone"
-        );
-    }
-
-    // Create stream handle for receiving progress
-    let ctx = global_context();
-    let mut stream_handle = StreamHandle::new(
-        &ctx,
-        stream_info.stream_id.clone(),
-        &stream_info.endpoint,
-        &stream_info.server_pubkey,
-        &client_secret,
-        &client_pubkey_bytes,
-    )?;
 
     if !quiet {
         print!("   Progress: ");
@@ -1283,7 +1261,7 @@ pub async fn handle_infer(
     let _ = ModelRef::parse(model_ref_str)?;
 
     // ModelService is already running (started by main.rs in inproc mode, or by systemd in ipc-systemd mode).
-    let model_client = ModelZmqClient::new(signing_key.clone(), RequestIdentity::local());
+    let model_client = ModelClient::new(signing_key.clone(), RequestIdentity::local());
 
     // Apply chat template to the prompt via ModelService
     let messages = vec![ChatMessage {
@@ -1293,7 +1271,7 @@ pub async fn handle_infer(
         tool_call_id: String::new(),
     }];
 
-    let formatted_prompt = match model_client.gen.infer(model_ref_str).apply_chat_template(&ApplyChatTemplateRequest {
+    let formatted_prompt = match model_client.infer(model_ref_str).apply_chat_template(&ChatTemplateRequest {
         messages: messages.clone(),
         add_generation_prompt: true,
         tools_json: Some(String::new()),
@@ -1333,12 +1311,8 @@ pub async fn handle_infer(
     // Generate via ModelService (handles model loading, adapter loading, training collection, auth)
     if !sync {
         // Start stream with E2E authenticated handle (DH key exchange)
-        let mc = model_client.clone();
-        let mr = model_ref_str.to_owned();
-        let req = request.clone();
-        let mut stream_handle = crate::services::rpc_types::connect_stream_handle(|pubkey| async move {
-            mc.infer_stream(&mr, &req, pubkey).await
-        }).await?;
+        use crate::services::generated::model_client::InferRpc;
+        let mut stream_handle = InferRpc::generate_stream(&model_client.infer(model_ref_str), &request).await?;
 
         println!();
 
@@ -1370,12 +1344,8 @@ pub async fn handle_infer(
         println!();
     } else {
         // Non-streaming: collect stream into full response
-        let mc = model_client.clone();
-        let mr = model_ref_str.to_owned();
-        let req = request.clone();
-        let mut handle = crate::services::rpc_types::connect_stream_handle(|pubkey| async move {
-            mc.infer_stream(&mr, &req, pubkey).await
-        }).await?;
+        use crate::services::generated::model_client::InferRpc;
+        let mut handle = InferRpc::generate_stream(&model_client.infer(model_ref_str), &request).await?;
 
         let mut text = String::new();
         loop {
@@ -1426,7 +1396,7 @@ pub async fn handle_infer(
 pub async fn handle_load(
     model_ref_str: &str,
     max_context: Option<usize>,
-    kv_quant: crate::runtime::kv_quant::KVQuantType,
+    kv_quant: crate::runtime::KVQuantType,
     wait: Option<u64>,
     signing_key: SigningKey,
 ) -> Result<()> {
@@ -1436,7 +1406,7 @@ pub async fn handle_load(
     let model_ref = ModelRef::parse(model_ref_str)?;
 
     let load_max_context = max_context.map(|v| v as u32);
-    let load_kv_quant = if kv_quant == crate::runtime::kv_quant::KVQuantType::None {
+    let load_kv_quant = if kv_quant == crate::runtime::KVQuantType::None {
         None
     } else {
         Some(kv_quant)
@@ -1489,10 +1459,14 @@ pub async fn handle_load(
     // (Continuation pattern), so this completes in milliseconds.
     // fire-and-forget via tokio::spawn caused the task to never run: the CLI runtime
     // drops before the spawned task executes.
-    let model_client = ModelZmqClient::new(signing_key.clone(), RequestIdentity::local());
+    let model_client = ModelClient::new(signing_key.clone(), RequestIdentity::local());
     let model_ref_owned = model_ref_str.to_owned();
-    match model_client.load(&model_ref_owned, load_max_context, load_kv_quant).await {
-        Ok(_endpoint) => debug!("Load RPC accepted for {}", model_ref_owned),
+    match model_client.load(&LoadModelRequest {
+        model_ref: model_ref_owned.clone(),
+        max_context: load_max_context,
+        kv_quant: load_kv_quant.filter(|q| *q != crate::runtime::KVQuantType::None),
+    }).await {
+        Ok(_) => debug!("Load RPC accepted for {}", model_ref_owned),
         Err(e) => warn!("Load RPC failed for {}: {}", model_ref_owned, e),
     }
 
@@ -1500,7 +1474,7 @@ pub async fn handle_load(
     if let Some(max_ctx) = max_context {
         println!("  Max context: {}", max_ctx);
     }
-    if kv_quant != crate::runtime::kv_quant::KVQuantType::None {
+    if kv_quant != crate::runtime::KVQuantType::None {
         println!("  KV quantization: {:?}", kv_quant);
     }
 
@@ -1879,9 +1853,9 @@ pub async fn handle_unload(
     // Validate model reference format
     let _ = ModelRef::parse(model_ref_str)?;
 
-    let model_client = ModelZmqClient::new(signing_key, RequestIdentity::local());
+    let model_client = ModelClient::new(signing_key, RequestIdentity::local());
 
-    model_client.unload(model_ref_str).await?;
+    model_client.unload(&UnloadModelRequest { model_ref: model_ref_str.to_owned() }).await?;
 
     println!("✓ Model {} unloaded", model_ref_str);
 

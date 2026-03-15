@@ -8,7 +8,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use ed25519_dalek::SigningKey;
 
-/// Build a `StreamSpawner` that drives inference via `ModelZmqClient`.
+/// Build a `StreamSpawner` that drives inference via `ModelClient`.
 ///
 /// Spawns a dedicated OS thread with a single-threaded Tokio runtime per
 /// user message.  Applies the chat template, starts an authenticated inference
@@ -27,7 +27,7 @@ pub fn make_chat_spawner(
 
     use crate::services::generated::inference_client::{ChatMessage, ToolCall, ToolCallFunction};
     use crate::runtime::GenerationRequest;
-    use crate::services::model::ModelZmqClient;
+    use crate::services::generated::model_client::ModelClient;
     use hyprstream_tui::chat_app::{ChatEvent, ChatHistoryEntry, ChatRole};
 
     let sk = signing_key.clone();
@@ -61,7 +61,7 @@ pub fn make_chat_spawner(
 
             rt.block_on(async move {
                 let model_client =
-                    ModelZmqClient::new(sk_inner.clone(), RequestIdentity::local());
+                    ModelClient::new(sk_inner.clone(), RequestIdentity::local());
 
                 // Map ChatHistoryEntry → ChatMessage, handling all roles.
                 // Skip the trailing empty assistant placeholder — it's only a
@@ -119,9 +119,9 @@ pub fn make_chat_spawner(
                 let tools_json = tools_inner.as_ref()
                     .map(|t| serde_json::to_string(t).unwrap_or_default())
                     .unwrap_or_default();
-                let prompt = match model_client.gen
+                let prompt = match model_client
                     .infer(&mr_inner)
-                    .apply_chat_template(&crate::services::generated::model_client::ApplyChatTemplateRequest {
+                    .apply_chat_template(&crate::services::generated::model_client::ChatTemplateRequest {
                         messages: messages.clone(),
                         add_generation_prompt: true,
                         tools_json: Some(tools_json.clone()).filter(|s| !s.is_empty()),
@@ -144,12 +144,8 @@ pub fn make_chat_spawner(
                     ..Default::default()
                 };
 
-                let mc = model_client.clone();
-                let mr = mr_inner.clone();
-                let r = req.clone();
-                let mut handle = match crate::services::rpc_types::connect_stream_handle(|pubkey| async move {
-                    mc.infer_stream(&mr, &r, pubkey).await
-                }).await {
+                use crate::services::generated::model_client::InferRpc;
+                let mut handle = match InferRpc::generate_stream(&model_client.infer(&mr_inner), &req).await {
                     Ok(h) => h,
                     Err(e) => {
                         let _ = tx.send(ChatEvent::StreamError(e.to_string()));
@@ -212,7 +208,6 @@ pub fn make_tool_caller(
 ) -> (hyprstream_tui::chat_app::ToolCaller, HashMap<String, String>, Vec<serde_json::Value>) {
     use hyprstream_rpc::envelope::RequestIdentity;
     use hyprstream_rpc::registry::{global as registry, SocketKind};
-    use crate::services::create_service_client;
     use crate::services::generated::mcp_client::McpClient as GenMcpClient;
     use hyprstream_tui::chat_app::ChatEvent;
 
@@ -231,7 +226,7 @@ pub fn make_tool_caller(
                 .ok()?;
             rt.block_on(async move {
                 let gen: GenMcpClient =
-                    create_service_client(&endpoint, sk_fetch, RequestIdentity::local());
+                    GenMcpClient::with_endpoint(&endpoint, sk_fetch, RequestIdentity::local());
                 let tool_list = gen.list_tools().await.ok()?;
                 let mut descs = HashMap::new();
                 let mut tools = Vec::new();
@@ -273,7 +268,7 @@ pub fn make_tool_caller(
                         Err(e) => return format!("error: {e}"),
                     };
                     rt.block_on(async move {
-                        match create_service_client::<GenMcpClient>(&endpoint, sk_c, RequestIdentity::local())
+                        match GenMcpClient::with_endpoint(&endpoint, sk_c, RequestIdentity::local())
                             .call_tool(&crate::services::generated::mcp_client::CallTool {
                                 tool_name: uuid_c,
                                 arguments,

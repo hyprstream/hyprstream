@@ -20,8 +20,8 @@ use std::sync::Arc;
 /// use crate::services::RegistryClient;
 ///
 /// // Start registry service ONCE at CLI level
-/// let client: RegistryClient = crate::services::core::create_service_client(
-///     &endpoint, signing_key, identity,
+/// let client: RegistryClient = RegistryClient::new(
+///     signing_key, identity,
 /// );
 /// let context = AppContext::new(config, client);
 ///

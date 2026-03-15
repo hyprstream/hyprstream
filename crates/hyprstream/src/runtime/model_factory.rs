@@ -10,7 +10,7 @@ use tch::{Device, Kind as DType, Tensor};
 use tracing::{debug, info, instrument};
 
 use super::architectures::{gemma::GemmaModel, llama::LlamaModel, ModelOperations};
-use super::kv_quant::KVQuantType;
+use super::KVQuantType;
 use super::model_config::{ModelArchitecture, ModelConfig};
 use super::torch_utils::{safe_to_device, estimate_tensor_size_mb};
 use crate::services::WorktreeClient;
