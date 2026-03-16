@@ -12,10 +12,13 @@ use ed25519_dalek::SigningKey;
 use inquire::{Confirm, Select, Text};
 
 use crate::auth::policy_templates::{get_templates, PolicyTemplate};
-use crate::auth::{jwt, write_policy_file, Claims, PolicyManager};
-use crate::cli::policy_handlers::load_or_generate_signing_key;
+use crate::auth::{write_policy_file, LocalKeyStore, PolicyManager, UserStore};
+use crate::cli::policy_handlers::{
+    ensure_user_identity, load_or_generate_signing_key, mint_local_token, parse_duration,
+};
 use crate::cli::service_handlers::{
-    handle_service_start, print_check, run_repair_checks, CheckStatus,
+    build_version, format_size, handle_service_start, is_binary_installed, print_check,
+    run_repair_checks, CheckStatus, InstallPlan,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -58,6 +61,17 @@ impl WizardState {
 
     fn keys_dir(&self) -> PathBuf {
         self.models_dir.join(".registry").join("keys")
+    }
+
+    fn credentials_dir(&self) -> PathBuf {
+        crate::config::HyprConfig::load()
+            .map(|c| c.config_dir().join("credentials"))
+            .unwrap_or_else(|_|
+                dirs::config_dir()
+                    .unwrap_or_else(|| self.models_dir.clone())
+                    .join("hyprstream")
+                    .join("credentials")
+            )
     }
 }
 
@@ -138,19 +152,22 @@ pub async fn handle_wizard(
 
     let mut state = WizardState::new(models_dir.to_path_buf());
 
-    // Phase 1: Bootstrap environment
+    // Phase 1: Environment bootstrap
     phase_bootstrap(&mut state, non_interactive).await?;
 
-    // Phase 2: Policy template selection
+    // Phase 2: Binary installation
+    phase_binary_install(&mut state, non_interactive)?;
+
+    // Phase 3: Policy template selection
     phase_policy_templates(&mut state, non_interactive).await?;
 
-    // Phase 3: User/role creation
+    // Phase 4: User/role creation
     phase_users(&mut state, non_interactive).await?;
 
-    // Phase 4: Token generation
+    // Phase 5: Token generation
     phase_tokens(&mut state, non_interactive).await?;
 
-    // Phase 5: Service startup
+    // Phase 6: Service startup
     phase_services(&state, config_services, non_interactive, start_services).await?;
 
     // Summary
@@ -180,11 +197,117 @@ async fn phase_bootstrap(state: &mut WizardState, _non_interactive: bool) -> Res
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Phase 2: Policy Templates
+// Phase 2: Binary Installation
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn phase_binary_install(_state: &mut WizardState, non_interactive: bool) -> Result<()> {
+    println!("  Phase 2: Binary Installation");
+    println!("  {}", "-".repeat(40));
+    println!();
+
+    // Check if already installed via current_exe() (kernel-verified path)
+    if let Some(installed_path) = is_binary_installed() {
+        let version = build_version();
+        print_check(
+            "Binary",
+            CheckStatus::Ok,
+            &format!("installed ({version}) at {}", installed_path.display()),
+        );
+        println!();
+        return Ok(());
+    }
+
+    // Not installed — prepare install plan (detect, validate, check space)
+    let plan = match InstallPlan::prepare() {
+        Ok(p) => p,
+        Err(e) => {
+            print_check(
+                "Binary",
+                CheckStatus::Warn,
+                &format!("cannot prepare: {e}"),
+            );
+            println!();
+            return Ok(());
+        }
+    };
+
+    // Display plan details
+    println!(
+        "    Source: {} ({}, {})",
+        plan.source.display(),
+        plan.type_label(),
+        format_size(plan.source_size),
+    );
+    println!("    Target: {}/hyprstream", plan.bin_dir.display());
+
+    if plan.available_space > 0 {
+        println!("    Disk:   {} available", format_size(plan.available_space));
+    }
+    println!();
+
+    // Check if there's enough space
+    if !plan.has_sufficient_space() {
+        print_check(
+            "Binary",
+            CheckStatus::Warn,
+            &format!(
+                "insufficient disk space ({} needed, {} available)",
+                format_size(plan.source_size),
+                format_size(plan.available_space),
+            ),
+        );
+        println!();
+        return Ok(());
+    }
+
+    // Prompt user (or auto-accept in non-interactive mode)
+    let should_install = if non_interactive {
+        true
+    } else {
+        Confirm::new("  Install hyprstream to your PATH?")
+            .with_default(true)
+            .prompt()
+            .unwrap_or(false)
+    };
+
+    if !should_install {
+        println!("    Skipping binary installation.");
+        println!();
+        return Ok(());
+    }
+
+    // Execute the plan
+    match plan.execute() {
+        Ok(result) => {
+            print_check(
+                "Binary",
+                CheckStatus::Ok,
+                &format!(
+                    "installed ({}) to {}",
+                    result.type_label(),
+                    result.bin_dir.join("hyprstream").display()
+                ),
+            );
+            println!("    Version store: {}", result.version_dir.display());
+            if !result.updated_profiles.is_empty() {
+                println!("    PATH updated:  {}", result.updated_profiles.join(", "));
+            }
+        }
+        Err(e) => {
+            print_check("Binary", CheckStatus::Fail, &format!("installation failed: {e}"));
+        }
+    }
+
+    println!();
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 3: Policy Templates
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn phase_policy_templates(state: &mut WizardState, non_interactive: bool) -> Result<()> {
-    println!("  Phase 2: Policy Template");
+    println!("  Phase 3: Policy Template");
     println!("  {}", "-".repeat(40));
     println!();
 
@@ -298,22 +421,99 @@ async fn apply_template(state: &mut WizardState, template: &PolicyTemplate) -> R
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Phase 3: Users
+// Phase 4: Users
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn phase_users(state: &mut WizardState, non_interactive: bool) -> Result<()> {
-    println!("  Phase 3: Users & Roles");
+    println!("  Phase 4: Users & Roles");
     println!("  {}", "-".repeat(40));
     println!();
 
+    let pm = PolicyManager::new(&state.policies_dir()).await
+        .context("Failed to load PolicyManager")?;
+
+    let credentials_dir = state.credentials_dir();
+    let mut user_store = LocalKeyStore::load(&credentials_dir)
+        .context("Failed to open credential store")?;
+
+    // Separate Casbin subjects into local (bare names) vs federated/OIDC (contain "://")
+    let existing_policies = pm.get_policy().await;
+    let local_policy_users: std::collections::BTreeSet<String> = existing_policies.iter()
+        .filter_map(|rule| rule.first())
+        .filter(|s| *s != "*" && !s.contains("://"))
+        .cloned()
+        .collect();
+
+    let federated_subjects: std::collections::BTreeSet<String> = existing_policies.iter()
+        .filter_map(|rule| rule.first())
+        .filter(|s| s.contains("://"))
+        .cloned()
+        .collect();
+
+    let registered_users: std::collections::BTreeSet<String> =
+        user_store.list_users().into_iter().collect();
+
+    // Section 1: Local users (UserStore is authoritative)
+    if !registered_users.is_empty() || !local_policy_users.is_empty() {
+        println!("    Local users:");
+        for user in &registered_users {
+            let has_policy = local_policy_users.contains(user.as_str());
+            if has_policy {
+                print_check(user, CheckStatus::Ok, "identity + policy");
+            } else {
+                print_check(user, CheckStatus::Warn, "identity only — add policy rules");
+            }
+        }
+        // Orphaned local policies: in Casbin but not in UserStore
+        for user in local_policy_users.difference(&registered_users) {
+            print_check(user, CheckStatus::Warn,
+                "orphaned policy — no local identity (run 'hyprstream user register <username>')");
+        }
+        println!();
+    }
+
+    // Section 2: Federated/OIDC policy subjects (informational only)
+    if !federated_subjects.is_empty() {
+        println!("    Federated/OIDC policy subjects:");
+        for subject in &federated_subjects {
+            print_check(subject, CheckStatus::Info, "externally authenticated");
+        }
+        println!();
+    }
+
+    let local_user = hyprstream_rpc::envelope::RequestIdentity::local()
+        .user()
+        .to_owned();
+
+    // Non-interactive: auto-create admin if no local users exist in UserStore
     if non_interactive {
-        println!("    Skipping user creation (non-interactive mode).");
+        if registered_users.is_empty() {
+            // Register identity FIRST — UserStore is authoritative
+            let (_sk, vk) = ensure_user_identity()?;
+            user_store.register(&local_user, vk)
+                .context("Failed to register identity")?;
+
+            pm.add_policy_with_domain(&local_user, "*", "*", "*", "allow")
+                .await
+                .context("Failed to add admin policy")?;
+            pm.save().await.context("Failed to save policies")?;
+
+            print_check(&local_user, CheckStatus::Ok, "admin (identity + policy)");
+            state.users_created.push(UserRecord {
+                username: local_user,
+                role: "admin".to_owned(),
+            });
+        } else {
+            println!("    Local users already configured. Skipping.");
+        }
         println!();
         return Ok(());
     }
 
-    let add_users = Confirm::new("  Add a user?")
-        .with_default(true)
+    // Interactive: default YES only if no registered local users (UserStore is authoritative)
+    let has_local_users = !registered_users.is_empty();
+    let add_users = Confirm::new("  Add a local user?")
+        .with_default(!has_local_users)
         .prompt()
         .unwrap_or(false);
 
@@ -322,9 +522,6 @@ async fn phase_users(state: &mut WizardState, non_interactive: bool) -> Result<(
         println!();
         return Ok(());
     }
-
-    let pm = PolicyManager::new(&state.policies_dir()).await
-        .context("Failed to load PolicyManager")?;
 
     loop {
         // Username
@@ -337,6 +534,23 @@ async fn phase_users(state: &mut WizardState, non_interactive: bool) -> Result<(
             continue;
         }
         let username = username.trim().to_owned();
+
+        if local_policy_users.contains(username.as_str()) {
+            println!("    Note: '{}' already has policy rules. New permissions will be added.", username);
+        }
+
+        // Register local identity BEFORE adding any Casbin policies (Step 3)
+        if username == local_user {
+            if user_store.get_pubkey(&username)?.is_none() {
+                let (_sk, vk) = ensure_user_identity()?;
+                user_store.register(&username, vk)?;
+                print_check(&username, CheckStatus::Ok, "identity registered (OAuth ready)");
+            } else {
+                print_check(&username, CheckStatus::Ok, "identity already registered");
+            }
+        } else {
+            println!("    To enable OAuth for '{}': run 'hyprstream user register' on their machine.", username);
+        }
 
         // Role selection
         let mut role_options: Vec<String> = PREDEFINED_ROLES
@@ -399,6 +613,9 @@ async fn phase_users(state: &mut WizardState, non_interactive: bool) -> Result<(
             });
         }
 
+        // Save policies after each user's Casbin policies are added (Step 6)
+        pm.save().await.context("Failed to save policies")?;
+
         // Ask to add another
         let add_another = Confirm::new("  Add another user?")
             .with_default(false)
@@ -410,18 +627,16 @@ async fn phase_users(state: &mut WizardState, non_interactive: bool) -> Result<(
         }
     }
 
-    // Save policies to disk
-    pm.save().await.context("Failed to save policies")?;
     println!();
     Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Phase 4: Tokens
+// Phase 5: Tokens
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn phase_tokens(state: &mut WizardState, non_interactive: bool) -> Result<()> {
-    println!("  Phase 4: API Tokens");
+    println!("  Phase 5: API Tokens");
     println!("  {}", "-".repeat(40));
     println!();
 
@@ -518,18 +733,10 @@ fn generate_token(
     username: &str,
     duration_str: &str,
 ) -> Result<()> {
-    let duration = match duration_str {
-        "30d" => chrono::Duration::days(30),
-        "1y" => chrono::Duration::days(365),
-        "never" => chrono::Duration::days(365 * 100),
-        // "90d" and any other
-        _ => chrono::Duration::days(90),
-    };
+    let duration = parse_duration(duration_str)?
+        .unwrap_or_else(|| chrono::Duration::days(90));
 
-    let now = chrono::Utc::now().timestamp();
-    let exp = (chrono::Utc::now() + duration).timestamp();
-    let claims = Claims::new(username.to_owned(), now, exp);
-    let token = jwt::encode(&claims, signing_key);
+    let (token, exp) = mint_local_token(signing_key, username, duration);
 
     let expires_display = if duration_str == "never" {
         "never".to_owned()
@@ -564,7 +771,7 @@ fn generate_token(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Phase 5: Services
+// Phase 6: Services
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn phase_services(
@@ -573,7 +780,7 @@ async fn phase_services(
     non_interactive: bool,
     start_flag: bool,
 ) -> Result<()> {
-    println!("  Phase 5: Services");
+    println!("  Phase 6: Services");
     println!("  {}", "-".repeat(40));
     println!();
 

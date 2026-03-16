@@ -150,12 +150,23 @@ pub enum Commands {
         action: ServiceAction,
     },
 
-    // TODO(task-12): sign-challenge CLI
-    // Add a `SignChallenge { user_code: String }` variant here.
-    // Handler: fetch nonce from GET /oauth/device/nonce?user_code={user_code},
-    // load signing key from keyring, compute challenge = "{username}:{user_code}:{nonce}",
-    // sign with ed25519_dalek, and print base64 signature.
-    // The nonce endpoint is already implemented at GET /oauth/device/nonce.
+    /// Sign an Ed25519 challenge for OAuth device or auth code flow
+    ///
+    /// Device flow:    hyprstream sign-challenge ABCD-EFGH
+    /// Auth code flow: hyprstream sign-challenge --nonce <n> --code-challenge <cc>
+    SignChallenge {
+        /// User code from device flow (e.g., ABCD-EFGH)
+        user_code: Option<String>,
+        /// Nonce from the browser authorization challenge form
+        #[arg(long)]
+        nonce: Option<String>,
+        /// PKCE code_challenge from the browser authorization URL
+        #[arg(long)]
+        code_challenge: Option<String>,
+        /// OAuth server URL (default: from config or http://localhost:6791)
+        #[arg(long)]
+        server: Option<String>,
+    },
 
     /// TUI display server — terminal multiplexer with session persistence
     Tui {

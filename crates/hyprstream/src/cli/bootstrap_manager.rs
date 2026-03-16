@@ -10,15 +10,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
 use anyhow::Context;
+use tracing;
 use ed25519_dalek::SigningKey;
 
 use hyprstream_tui::wizard::backend::*;
 
-use crate::auth::jwt;
 use crate::auth::policy_templates::{get_template, get_templates};
-use crate::auth::{Claims, PolicyManager, write_policy_file};
+use crate::auth::{LocalKeyStore, PolicyManager, UserStore, write_policy_file};
 use crate::cli::gpu_detect;
-use crate::cli::policy_handlers::load_or_generate_signing_key;
+use crate::cli::policy_handlers::{
+    ensure_user_identity, load_or_generate_signing_key, mint_local_token, parse_duration,
+};
 
 
 /// Pre-service bootstrap manager for the wizard TUI.
@@ -75,12 +77,13 @@ impl Drop for BootstrapManager {
 /// Returns true if this is the first run (no signing key exists yet).
 ///
 /// Used by the no-args entry point to decide between wizard and ShellClient.
-pub fn is_first_run(models_dir: &std::path::Path) -> bool {
-    !models_dir
-        .join(".registry")
-        .join("keys")
-        .join("signing.key")
-        .exists()
+/// Checks the OS keyring directly — the canonical store for signing keys.
+pub fn is_first_run(_models_dir: &std::path::Path) -> bool {
+    let entry = match keyring::Entry::new("hyprstream", "signing-key") {
+        Ok(e) => e,
+        Err(_) => return true,
+    };
+    matches!(entry.get_secret(), Err(keyring::Error::NoEntry))
 }
 
 impl BootstrapManager {
@@ -115,6 +118,54 @@ impl BootstrapManager {
 
     fn keys_dir(&self) -> PathBuf {
         self.models_dir.join(".registry").join("keys")
+    }
+
+    fn credentials_dir(&self) -> PathBuf {
+        crate::config::HyprConfig::load()
+            .map(|c| c.config_dir().join("credentials"))
+            .unwrap_or_else(|_|
+                dirs::config_dir()
+                    .unwrap_or_else(|| self.models_dir.clone())
+                    .join("hyprstream")
+                    .join("credentials")
+            )
+    }
+
+    /// Register user identity in UserStore for the local OS user.
+    fn register_local_identity(&mut self, username: &str) {
+        if username != self.local_username().as_str() {
+            return;
+        }
+        let credentials_dir = self.credentials_dir();
+        let mut store = match LocalKeyStore::load(&credentials_dir) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    username, ?credentials_dir,
+                    "Failed to load UserStore during bootstrap — user OAuth identity will not be registered: {e}"
+                );
+                return;
+            }
+        };
+        if store.get_pubkey(username).ok().flatten().is_some() {
+            return; // already registered
+        }
+        let (_sk, vk) = match ensure_user_identity() {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!(
+                    username,
+                    "Failed to generate/load user identity key — user OAuth identity will not be registered: {e}"
+                );
+                return;
+            }
+        };
+        if let Err(e) = store.register(username, vk) {
+            tracing::warn!(
+                username,
+                "Failed to register user identity in UserStore — user OAuth identity will not be registered: {e}"
+            );
+        }
     }
 
     /// Ensure the signing key is loaded.
@@ -281,6 +332,9 @@ impl WizardBackend for BootstrapManager {
     }
 
     fn add_user(&mut self, username: &str, role: &str) {
+        // Register identity first — UserStore is authoritative
+        self.register_local_identity(username);
+
         self.ensure_policy_manager();
         if let Some(ref pm) = self.policy_manager {
             let rules = predefined_role_rules(role);
@@ -296,6 +350,9 @@ impl WizardBackend for BootstrapManager {
     }
 
     fn add_user_custom(&mut self, username: &str, resource: &str, actions: &[String]) {
+        // Register identity first — UserStore is authoritative
+        self.register_local_identity(username);
+
         self.ensure_policy_manager();
         if let Some(ref pm) = self.policy_manager {
             let _ = self.rt.block_on(async {
@@ -327,17 +384,11 @@ impl WizardBackend for BootstrapManager {
             }
         };
 
-        let duration_secs = match duration {
-            "30d" => 30 * 86400,
-            "1y" => 365 * 86400,
-            "never" => 365 * 100 * 86400,
-            _ => 90 * 86400, // 90d default
-        };
+        let dur = parse_duration(duration)
+            .unwrap_or_else(|_| Some(chrono::Duration::days(90)))
+            .unwrap_or_else(|| chrono::Duration::days(90));
 
-        let now = chrono::Utc::now().timestamp();
-        let exp = now + duration_secs;
-        let claims = Claims::new(username.to_owned(), now, exp);
-        let token = jwt::encode(&claims, signing_key);
+        let (token, exp) = mint_local_token(signing_key, username, dur);
 
         let expires = if duration == "never" {
             "never".to_owned()

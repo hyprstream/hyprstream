@@ -35,6 +35,9 @@ pub struct PendingAuthCode {
     pub resource: Option<String>,
     pub created_at: Instant,
     pub expires_at: Instant,
+    /// Authenticated username from Ed25519 challenge-response on the consent page.
+    /// Used as the JWT `sub` claim for the issued token.
+    pub username: String,
 }
 
 impl PendingAuthCode {
@@ -106,6 +109,9 @@ pub struct OAuthState {
     pub clients: RwLock<HashMap<String, RegisteredClient>>,
     /// Pending authorization codes (single-use, 60s TTL)
     pub pending_codes: RwLock<HashMap<String, PendingAuthCode>>,
+    /// Pending authorize nonces (single-use, 5-min TTL).
+    /// Proves a nonce was issued by this server and hasn't been replayed.
+    pub pending_nonces: RwLock<HashMap<String, Instant>>,
     /// Pending device authorization codes (RFC 8628), keyed by device_code
     pub pending_device_codes: RwLock<HashMap<String, PendingDeviceCode>>,
     /// Reverse lookup: user_code -> device_code
@@ -129,6 +135,12 @@ pub struct OAuthState {
     /// User credential store for Ed25519 challenge-response device verification.
     /// `None` when not configured (keyring unavailable or no credentials dir set).
     pub user_store: Option<Arc<dyn UserStore + Send + Sync>>,
+    /// Ed25519 signing key for signing entity configurations (OpenID Federation 1.0).
+    /// `None` when not configured.
+    pub signing_key: Option<ed25519_dalek::SigningKey>,
+    /// OpenID Federation 1.0 Trust Anchor URLs.
+    /// Included as `authority_hints` in the entity configuration JWT.
+    pub authority_hints: Vec<String>,
 }
 
 impl OAuthState {
@@ -136,6 +148,7 @@ impl OAuthState {
         Self {
             clients: RwLock::new(HashMap::new()),
             pending_codes: RwLock::new(HashMap::new()),
+            pending_nonces: RwLock::new(HashMap::new()),
             pending_device_codes: RwLock::new(HashMap::new()),
             device_code_by_user_code: RwLock::new(HashMap::new()),
             refresh_tokens: RwLock::new(HashMap::new()),
@@ -150,12 +163,20 @@ impl OAuthState {
                 .unwrap_or_default(),
             verifying_key_bytes,
             user_store: None,
+            signing_key: None,
+            authority_hints: config.authority_hints.clone(),
         }
     }
 
     /// Attach a user credential store for Ed25519 challenge-response device verification.
     pub fn with_user_store(mut self, store: Arc<dyn UserStore + Send + Sync>) -> Self {
         self.user_store = Some(store);
+        self
+    }
+
+    /// Attach the signing key for OpenID Federation 1.0 entity configuration signing.
+    pub fn with_signing_key(mut self, key: ed25519_dalek::SigningKey) -> Self {
+        self.signing_key = Some(key);
         self
     }
 
@@ -170,6 +191,13 @@ impl OAuthState {
                 {
                     let mut codes = state.pending_codes.write().await;
                     codes.retain(|_, code| !code.is_expired());
+                }
+
+                // Sweep expired authorize nonces (5-min TTL)
+                {
+                    let now = Instant::now();
+                    let mut nonces = state.pending_nonces.write().await;
+                    nonces.retain(|_, expiry| *expiry > now);
                 }
 
                 // Sweep expired device codes

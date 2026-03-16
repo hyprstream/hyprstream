@@ -147,10 +147,9 @@ async fn exchange_authorization_code(
         );
     }
 
-    tracing::info!(client_id = %params.client_id, "PKCE verified, issuing token");
-    // Use client_id as JWT sub for authorization_code flow: there is no interactive user
-    // login in this flow, so the token is issued to the client application identity.
-    let sub = params.client_id.clone();
+    tracing::info!(client_id = %params.client_id, username = %pending.username, "PKCE verified, issuing token");
+    // Use the authenticated username as JWT sub (set during Ed25519 challenge-response on consent page).
+    let sub = pending.username.clone();
     issue_token_with_refresh(&state, &params.client_id, pending.scopes, pending.resource, &sub).await
 }
 
@@ -293,14 +292,14 @@ async fn exchange_device_code(
 fn generate_refresh_token() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
 /// Issue a JWT access token via PolicyService, plus a rotated refresh token.
 ///
 /// `sub` is the JWT subject (username). Must be non-empty:
-/// - authorization_code flow: pass the client_id (M2M, no interactive user login)
+/// - authorization_code flow: pass `pending.username` (the Ed25519-authenticated user from the consent page)
 /// - refresh_token flow: pass the original sub from the RefreshTokenEntry
 /// - device_code flow: pass the approving user's username (from challenge-response)
 async fn issue_token_with_refresh(

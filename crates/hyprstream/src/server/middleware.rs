@@ -77,9 +77,13 @@ pub async fn auth_middleware(
             // Local token: verify with local key
             jwt::decode(token, &state.verifying_key, Some(&state.resource_url))
         } else {
-            // Federated token: get key from trusted issuer resolver
+            // Federated token: pre-check trust before acquiring async lock
+            if !state.federation_resolver.is_trusted(&iss) {
+                debug!("Untrusted federation issuer: {}", iss);
+                return unauthorized_response("Authentication failed", &www_authenticate);
+            }
             match state.federation_resolver.get_key(&iss).await {
-                Ok(key) => jwt::decode_with_key(token, &key, None),
+                Ok(key) => jwt::decode_with_key(token, &key, Some(&state.resource_url)),
                 Err(e) => {
                     debug!("Federation key resolution failed for issuer {}: {}", iss, e);
                     return unauthorized_response("Authentication failed", &www_authenticate);

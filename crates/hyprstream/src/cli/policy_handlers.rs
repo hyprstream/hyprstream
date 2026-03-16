@@ -354,14 +354,8 @@ pub async fn handle_token_create(
         format!("token-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"))
     });
 
-    // Create JWT claims with bare username as subject.
-    // Scopes are not embedded in JWT - Casbin enforces authorization server-side.
-    let now = chrono::Utc::now().timestamp();
-    let exp = (chrono::Utc::now() + duration).timestamp();
-    let claims = Claims::new(user.to_owned(), now, exp);
-
-    // Encode and sign the JWT
-    let token = jwt::encode(&claims, signing_key);
+    // Mint JWT with proper iss/aud claims for OAI middleware compatibility
+    let (token, exp) = mint_local_token(signing_key, user, duration);
 
     // Display the token (only shown once)
     println!();
@@ -463,7 +457,7 @@ pub async fn load_or_generate_signing_key(_keys_dir: &Path) -> Result<SigningKey
     }
 
     // Generate new key and persist it in the keyring
-    let key = SigningKey::generate(&mut rand::thread_rng());
+    let key = SigningKey::generate(&mut rand::rngs::OsRng);
     entry.set_secret(&key.to_bytes()).map_err(|e| {
         anyhow::anyhow!(
             "Failed to store signing key in OS keyring: {e}.\n\
@@ -475,12 +469,107 @@ pub async fn load_or_generate_signing_key(_keys_dir: &Path) -> Result<SigningKey
     Ok(key)
 }
 
+/// Mint a JWT locally with proper iss/aud claims.
+///
+/// Sets `iss` to the OAuth issuer URL and `aud` to the OAI resource URL,
+/// matching the claim structure expected by the OAI HTTP middleware.
+/// Does NOT require a running PolicyService — signs directly with the local key.
+pub(crate) fn mint_local_token(
+    signing_key: &SigningKey,
+    subject: &str,
+    duration: Duration,
+) -> (String, i64) {
+    let now = chrono::Utc::now().timestamp();
+    let exp = now + duration.num_seconds();
+
+    let config = crate::config::HyprConfig::load();
+    let (issuer, audience) = match config {
+        Ok(ref c) => (c.oauth.issuer_url(), c.oai.resource_url()),
+        Err(_) => {
+            // Fallback to defaults when config is not available
+            ("http://localhost:6791".to_owned(), "http://localhost:6789".to_owned())
+        }
+    };
+
+    let claims = Claims::new(subject.to_owned(), now, exp)
+        .with_issuer(issuer)
+        .with_audience(Some(audience));
+
+    let token = jwt::encode(&claims, signing_key);
+    (token, exp)
+}
+
+/// Keyring service name used for all hyprstream keyring entries.
+pub(crate) const KEYRING_SERVICE: &str = "hyprstream";
+/// Keyring key name for the user's Ed25519 signing key (for OAuth device flow challenges).
+// The `user-signing-key` is separate from the node `signing-key`:
+// - `signing-key`: server identity — signs JWTs and RPC envelopes
+// - `user-signing-key`: client identity — signs OAuth device flow challenges
+pub(crate) const KEYRING_USER_KEY_NAME: &str = "user-signing-key";
+
+/// Ensure the local user has an Ed25519 identity keypair.
+///
+/// If a keypair already exists in the OS keyring, returns the existing
+/// verifying key. Otherwise generates a new keypair, stores the private
+/// key in the keyring, and returns the public key for UserStore registration.
+///
+/// This key is per-OS-user (not per-hyprstream-user). The wizard only
+/// registers it for the local admin. Other users generate their own keys.
+pub(crate) fn ensure_user_identity() -> Result<(SigningKey, ed25519_dalek::VerifyingKey)> {
+    const SERVICE: &str = KEYRING_SERVICE;
+    const KEY_NAME: &str = KEYRING_USER_KEY_NAME;
+
+    let entry = keyring::Entry::new(SERVICE, KEY_NAME).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to access OS keyring for user identity (service={SERVICE}, key={KEY_NAME}): {e}.\n\
+             On Linux, ensure kernel keyutils is available.\n\
+             On FreeBSD/OpenBSD, ensure a Secret Service daemon is running."
+        )
+    })?;
+
+    match entry.get_secret() {
+        Ok(bytes) if bytes.len() == 32 => {
+            let arr: [u8; 32] = bytes.try_into()
+                .map_err(|_| anyhow::anyhow!("unreachable: length already checked"))?;
+            let sk = SigningKey::from_bytes(&arr);
+            info!("Loaded user identity key from OS keyring");
+            Ok((sk.clone(), sk.verifying_key()))
+        }
+        Ok(bad) => {
+            anyhow::bail!(
+                "Keyring entry '{KEY_NAME}' has wrong size ({} bytes, expected 32).\n\
+                 This indicates corruption. Remove it manually and re-run:\n\
+                 - Linux:   keyctl purge user hyprstream:{KEY_NAME}\n\
+                 - macOS:   security delete-generic-password -s hyprstream -a {KEY_NAME}\n\
+                 - Windows: cmdkey /delete:hyprstream:{KEY_NAME}",
+                bad.len()
+            );
+        }
+        Err(keyring::Error::NoEntry) => {
+            let sk = SigningKey::generate(&mut rand::rngs::OsRng);
+            entry.set_secret(&sk.to_bytes()).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to store user identity key in OS keyring: {e}.\n\
+                     Ensure the keyring daemon is accessible."
+                )
+            })?;
+            info!("Generated and stored new user identity key in OS keyring");
+            Ok((sk.clone(), sk.verifying_key()))
+        }
+        Err(e) => anyhow::bail!("OS keyring error while loading user identity key: {e}"),
+    }
+}
+
 /// Parse duration string like "30d", "90d", "1y", "never"
-fn parse_duration(s: &str) -> Result<Option<Duration>> {
+pub(crate) fn parse_duration(s: &str) -> Result<Option<Duration>> {
     let s = s.trim().to_lowercase();
 
-    if s == "never" || s.is_empty() {
+    if s.is_empty() {
         return Ok(None);
+    }
+
+    if s == "never" {
+        return Ok(Some(Duration::days(36500))); // ~100 years
     }
 
     let (num_str, unit) = if s.ends_with('d') {

@@ -76,25 +76,32 @@ pub fn encode(claims: &Claims, signing_key: &SigningKey) -> String {
 ///
 /// For tokens from foreign issuers (federation), use [`decode_with_key`]
 /// with the key obtained from `FederationKeyResolver::get_key`.
+///
+/// Uses strict audience validation: if `expected_aud` is `Some`, the token
+/// must have a matching `aud` claim (absent `aud` is rejected).
 pub fn decode(token: &str, verifying_key: &VerifyingKey, expected_aud: Option<&str>) -> Result<Claims, JwtError> {
-    decode_inner(token, verifying_key, expected_aud)
+    decode_inner(token, verifying_key, expected_aud, false)
 }
 
 /// Decode a JWT using a caller-supplied verifying key (for multi-issuer support).
 ///
-/// Identical to `decode` but accepts any `VerifyingKey` — callers obtain the
-/// key from `FederationKeyResolver::get_key` for tokens whose `iss` does not
-/// match the local issuer.
+/// Uses lenient audience validation: if `expected_aud` is `Some`, a wrong `aud`
+/// is rejected but an absent `aud` is accepted. This allows federated tokens
+/// from issuers that don't set `aud` while still rejecting cross-node replay
+/// attacks from issuers that do.
 pub fn decode_with_key(
     token: &str,
     verifying_key: &VerifyingKey,
     expected_aud: Option<&str>,
 ) -> Result<Claims, JwtError> {
-    decode_inner(token, verifying_key, expected_aud)
+    decode_inner(token, verifying_key, expected_aud, true)
 }
 
 /// Internal decode implementation shared by `decode` and `decode_with_key`.
-fn decode_inner(token: &str, verifying_key: &VerifyingKey, expected_aud: Option<&str>) -> Result<Claims, JwtError> {
+///
+/// `lenient_aud`: when true, accepts tokens with no `aud` claim even when
+/// `expected_aud` is `Some`. Wrong `aud` is always rejected.
+fn decode_inner(token: &str, verifying_key: &VerifyingKey, expected_aud: Option<&str>, lenient_aud: bool) -> Result<Claims, JwtError> {
     // Split into parts
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
@@ -156,8 +163,9 @@ fn decode_inner(token: &str, verifying_key: &VerifyingKey, expected_aud: Option<
     // Validate audience if expected
     if let Some(expected) = expected_aud {
         match &claims.aud {
-            Some(aud) if aud == expected => {}
-            _ => return Err(JwtError::InvalidAudience),
+            Some(aud) if aud == expected => {}        // correct audience
+            None if lenient_aud => {}                 // absent — accept in lenient mode
+            Some(_) | None => return Err(JwtError::InvalidAudience), // wrong or absent audience
         }
     }
 
@@ -252,5 +260,51 @@ mod tests {
         let via_decode_with_key = decode_with_key(&token, &vk, None).unwrap();
         assert_eq!(via_decode.sub, via_decode_with_key.sub);
         assert_eq!(via_decode.exp, via_decode_with_key.exp);
+    }
+
+    #[test]
+    fn test_decode_strict_rejects_absent_audience() {
+        // Local tokens (via decode) must have aud present when expected
+        let key = make_key(0x10);
+        let vk = key.verifying_key();
+        let claims = Claims::new("dave".to_owned(), 0, 9_999_999_999);
+        let token = encode(&claims, &key);
+
+        let result = decode(&token, &vk, Some("http://localhost:6789"));
+        assert!(
+            matches!(result, Err(JwtError::InvalidAudience)),
+            "strict mode must reject absent aud"
+        );
+    }
+
+    #[test]
+    fn test_decode_with_key_lenient_accepts_absent_audience() {
+        // Federated tokens (via decode_with_key) accept absent aud
+        let key = make_key(0x20);
+        let vk = key.verifying_key();
+        let claims = Claims::new("eve".to_owned(), 0, 9_999_999_999)
+            .with_issuer("https://remote-node".to_owned());
+        let token = encode(&claims, &key);
+
+        // Lenient mode: absent aud is accepted
+        decode_with_key(&token, &vk, Some("http://localhost:6789"))
+            .expect("lenient mode must accept absent aud");
+    }
+
+    #[test]
+    fn test_decode_with_key_lenient_rejects_wrong_audience() {
+        // Federated tokens with wrong aud must still be rejected
+        let key = make_key(0x30);
+        let vk = key.verifying_key();
+        let claims = Claims::new("frank".to_owned(), 0, 9_999_999_999)
+            .with_issuer("https://node-a".to_owned())
+            .with_audience(Some("https://node-b".to_owned()));
+        let token = encode(&claims, &key);
+
+        let result = decode_with_key(&token, &vk, Some("https://node-c"));
+        assert!(
+            matches!(result, Err(JwtError::InvalidAudience)),
+            "lenient mode must reject wrong aud"
+        );
     }
 }

@@ -132,7 +132,16 @@ impl UserStore for LocalKeyStore {
     }
 
     fn register(&mut self, username: &str, pubkey: VerifyingKey) -> Result<()> {
+        if username.contains(':') {
+            anyhow::bail!("Username '{}' must not contain ':'", username);
+        }
         let b64 = STANDARD.encode(pubkey.as_bytes());
+        if self.data.users.contains_key(username) {
+            tracing::warn!(
+                "Overwriting existing public key for user '{}' in credential store",
+                username
+            );
+        }
         self.data.users.insert(username.to_owned(), b64);
         self.encrypt_and_write()
     }
@@ -151,6 +160,7 @@ impl UserStore for LocalKeyStore {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
@@ -229,6 +239,19 @@ mod tests {
         let mut users = store.list_users();
         users.sort();
         assert_eq!(users, vec!["alice", "bob"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_register_rejects_colon_in_username() -> Result<()> {
+        let dir = TempDir::new()?;
+        let identity = age::x25519::Identity::generate();
+        let mut store = make_store_with_identity(dir.path(), identity);
+        let key = SigningKey::generate(&mut rand::thread_rng()).verifying_key();
+        let result = store.register("bad:user", key);
+        assert!(result.is_err(), "register should reject usernames with ':'");
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("must not contain"), "error message should mention colon restriction");
         Ok(())
     }
 }

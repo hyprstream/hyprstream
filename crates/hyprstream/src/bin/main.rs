@@ -22,7 +22,7 @@ use hyprstream_core::cli::{
     handle_policy_rollback, handle_policy_show, handle_policy_role_add, handle_policy_role_remove,
     handle_policy_role_list, handle_pull, handle_remote_add, handle_remote_list,
     handle_remote_remove, handle_remote_rename, handle_remote_set_url, handle_remove,
-    handle_status, handle_token_create, handle_unload, handle_training_batch,
+    handle_sign_challenge, handle_status, handle_token_create, handle_unload, handle_training_batch,
     handle_training_checkpoint, handle_training_infer, handle_training_init, handle_worktree_add,
     handle_worktree_info, handle_worktree_list, handle_worktree_remove,
     handle_user_list, handle_user_register, handle_user_remove, handle_user_show,
@@ -161,6 +161,36 @@ fn build_cli() -> ClapCommand {
                     .long("tui")
                     .action(clap::ArgAction::SetTrue)
                     .help("Use TUI wizard with GPU detection and install phase"),
+            ),
+    );
+
+    // Sign challenge (OAuth device flow and auth code flow)
+    app = app.subcommand(
+        ClapCommand::new("sign-challenge")
+            .about("Sign an Ed25519 challenge for OAuth device or auth code flow")
+            .arg(
+                Arg::new("user_code")
+                    .index(1)
+                    .required(false)
+                    .help("User code from device flow (e.g., ABCD-EFGH)"),
+            )
+            .arg(
+                Arg::new("nonce")
+                    .long("nonce")
+                    .required(false)
+                    .help("Nonce from the browser authorization challenge form"),
+            )
+            .arg(
+                Arg::new("code_challenge")
+                    .long("code-challenge")
+                    .required(false)
+                    .help("PKCE code_challenge from the browser authorization URL"),
+            )
+            .arg(
+                Arg::new("server")
+                    .long("server")
+                    .required(false)
+                    .help("OAuth server URL (default: from config or http://localhost:6791)"),
             ),
     );
 
@@ -1957,6 +1987,23 @@ fn main() -> Result<()> {
                         );
                     }
                     Ok(())
+                },
+            )?;
+        }
+
+        // ── Sign OAuth challenge ─────────────────────────────────────────
+        Some(("sign-challenge", sub_m)) => {
+            let user_code = sub_m.get_one::<String>("user_code").cloned();
+            let nonce = sub_m.get_one::<String>("nonce").cloned();
+            let code_challenge = sub_m.get_one::<String>("code_challenge").cloned();
+            let server = sub_m.get_one::<String>("server").cloned();
+            with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: false,
+                },
+                || async move {
+                    handle_sign_challenge(user_code, nonce, code_challenge, server).await
                 },
             )?;
         }

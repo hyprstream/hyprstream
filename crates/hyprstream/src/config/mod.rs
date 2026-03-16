@@ -614,6 +614,13 @@ pub struct OAuthConfig {
     /// Value = configuration for fetching/caching that issuer's JWKS.
     #[serde(default)]
     pub trusted_issuers: std::collections::HashMap<String, TrustedIssuerConfig>,
+
+    /// OpenID Federation 1.0 Trust Anchor URLs (optional).
+    /// When set, included as `authority_hints` in the entity configuration JWT,
+    /// making this node discoverable within the named federations.
+    /// Example: `["https://federation.example.org"]`
+    #[serde(default)]
+    pub authority_hints: Vec<String>,
 }
 
 fn default_oauth_cors() -> server::CorsConfig {
@@ -634,6 +641,7 @@ impl Default for OAuthConfig {
             quic_port: None,
             cors: default_oauth_cors(),
             trusted_issuers: std::collections::HashMap::new(),
+            authority_hints: Vec::new(),
         }
     }
 }
