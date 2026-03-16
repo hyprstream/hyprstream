@@ -1,4 +1,7 @@
 fn main() {
+    // Compile compositor_ipc.capnp for WASI IPC protocol
+    compile_capnp();
+
     // Emit compile-time libtorch metadata for the wizard's environment detection.
     // These are read by `backend.rs` via `env!()`.
 
@@ -25,6 +28,23 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LIBTORCH_ABI");
     println!("cargo:rerun-if-env-changed=LIBTORCH_VARIANT");
     println!("cargo:rerun-if-env-changed=LIBTORCH");
+}
+
+fn compile_capnp() {
+    println!("cargo:rerun-if-changed=../hyprstream/schema/compositor_ipc.capnp");
+
+    let schema_dir = std::path::Path::new("../hyprstream/schema");
+    let capnp_file = schema_dir.join("compositor_ipc.capnp");
+
+    if !capnp_file.exists() {
+        return;
+    }
+
+    capnpc::CompilerCommand::new()
+        .src_prefix(schema_dir)
+        .file(&capnp_file)
+        .run()
+        .expect("Failed to compile compositor_ipc.capnp");
 }
 
 fn detect_variant_from_path(path: &str) -> String {

@@ -83,18 +83,16 @@ fn default_models_dir() -> std::path::PathBuf {
 // WASI compositor entry point (Phase W2)
 // ============================================================================
 
-/// Reads the framed stdin protocol, drives `Compositor`, writes ANSI to stdout,
-/// and emits OSC-framed IPC for RpcRequest and RouteInput.
+/// Reads capnp `CompositorIpcIn` messages from stdin, drives `Compositor`,
+/// writes pure ANSI to stdout, and emits capnp `CompositorIpcOut` messages
+/// to a Wanix named pipe at `rpc/data`.
 ///
-/// Frame format (9-byte header, all integers little-endian):
-///   [type:u8][id:u32][len:u32][data:len]
-///
-/// Outbound OSC:
-///   RpcRequest:  ESC ] 0xFE <len:u32 LE> <json>   BEL
-///   RouteInput:  ESC ] 0xFF <app_id:u32 LE> <len:u32 LE> <data>  BEL
+/// Wire format (both directions):
+///   [4B little-endian message length][capnp single-segment bytes, no segment table]
 #[cfg(target_os = "wasi")]
 fn run_compositor_wasi() {
     use hyprstream_compositor::{Compositor, CompositorInput, CompositorOutput, WindowSummary};
+    use hyprstream_tui::compositor_ipc_capnp::compositor_ipc_in;
     use std::io::{Read, Write};
     use waxterm::backend::AnsiBackend;
     use waxterm::input::{InputParser, KeyPress};
@@ -112,64 +110,70 @@ fn run_compositor_wasi() {
     let mut compositor = Compositor::new(cols, rows, 0, 0, vec![], vec![]);
     terminal.draw(|f| compositor.render(f)).ok();
 
+    // Open IPC output pipe (Wanix named pipe created by host via `bind #| rpc`)
+    let mut ipc_out: Option<std::fs::File> = std::fs::OpenOptions::new()
+        .write(true)
+        .open("rpc/data")
+        .ok();
+
     let stdin = std::io::stdin();
     let mut stdin = stdin.lock();
-    let mut header = [0u8; 9];
 
     loop {
-        if read_exact(&mut stdin, &mut header).is_err() { break }
+        let data = match read_capnp_frame(&mut stdin) {
+            Ok(d) => d,
+            Err(_) => break,
+        };
 
-        let msg_type = header[0];
-        let id       = u32::from_le_bytes(header[1..5].try_into().unwrap());
-        let len      = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
-
-        let mut data = vec![0u8; len];
-        if read_exact(&mut stdin, &mut data).is_err() { break }
+        let reader = match capnp_reader_from_segment(&data) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let Ok(msg) = reader.get_root::<compositor_ipc_in::Reader<'_>>() else { continue };
+        let Ok(which) = msg.which() else { continue };
 
         let mut needs_redraw = false;
 
-        match msg_type {
-            // 0x01 — ANSI frame from TuiService pane
-            0x01 => {
-                let outs = compositor.handle(CompositorInput::ServerFrame { pane_id: id, ansi: data });
-                dispatch_outputs(outs, &mut compositor, &mut terminal, &mut needs_redraw);
+        match which {
+            compositor_ipc_in::AnsiFrame(Ok(frame)) => {
+                let pane_id = frame.get_id();
+                let ansi = frame.get_data().unwrap_or_default().to_vec();
+                let outs = compositor.handle(CompositorInput::ServerFrame { pane_id, ansi });
+                let quit = dispatch_compositor_outputs(outs, &mut compositor, &mut terminal, &mut needs_redraw, &mut ipc_out);
+                if quit { return }
             }
-            // 0x02 — raw keyboard bytes
-            0x02 => {
+            compositor_ipc_in::Keyboard(Ok(data_bytes)) => {
                 let parser: InputParser<KeyPress> = InputParser::new(vec![]);
-                for key in parser.parse(&data) {
+                for key in parser.parse(data_bytes) {
                     let outs = compositor.handle(CompositorInput::KeyPress(key));
-                    let quit = dispatch_outputs(outs, &mut compositor, &mut terminal, &mut needs_redraw);
+                    let quit = dispatch_compositor_outputs(outs, &mut compositor, &mut terminal, &mut needs_redraw, &mut ipc_out);
                     if quit { return }
                 }
             }
-            // 0x03 — resize: cols:u16 LE, rows:u16 LE, 4 bytes padding
-            0x03 if data.len() >= 4 => {
-                cols = u16::from_le_bytes([data[0], data[1]]);
-                rows = u16::from_le_bytes([data[2], data[3]]);
+            compositor_ipc_in::Resize(Ok(resize)) => {
+                cols = resize.get_cols();
+                rows = resize.get_rows();
                 terminal.backend_mut().resize(cols, rows);
                 let outs = compositor.handle(CompositorInput::Resize(cols, rows));
-                dispatch_outputs(outs, &mut compositor, &mut terminal, &mut needs_redraw);
+                dispatch_compositor_outputs(outs, &mut compositor, &mut terminal, &mut needs_redraw, &mut ipc_out);
             }
-            // 0x04 — ANSI frame from ChatApp (Phase W3)
-            0x04 => {
-                let outs = compositor.handle(CompositorInput::AppFrame { app_id: id, ansi: data });
-                dispatch_outputs(outs, &mut compositor, &mut terminal, &mut needs_redraw);
+            compositor_ipc_in::AppFrame(Ok(frame)) => {
+                let app_id = frame.get_id();
+                let ansi = frame.get_data().unwrap_or_default().to_vec();
+                let outs = compositor.handle(CompositorInput::AppFrame { app_id, ansi });
+                dispatch_compositor_outputs(outs, &mut compositor, &mut terminal, &mut needs_redraw, &mut ipc_out);
             }
-            // 0x05 — window list JSON
-            0x05 => {
-                if let Ok(wins) = serde_json::from_slice::<Vec<WindowSummary>>(&data) {
+            compositor_ipc_in::WindowList(Ok(data_bytes)) => {
+                if let Ok(wins) = serde_json::from_slice::<Vec<WindowSummary>>(data_bytes) {
                     let outs = compositor.handle(CompositorInput::WindowList(wins));
-                    dispatch_outputs(outs, &mut compositor, &mut terminal, &mut needs_redraw);
+                    dispatch_compositor_outputs(outs, &mut compositor, &mut terminal, &mut needs_redraw, &mut ipc_out);
                 }
             }
-            // 0x06 — pane closed
-            0x06 => {
-                let outs = compositor.handle(CompositorInput::PaneClosed { pane_id: id });
-                dispatch_outputs(outs, &mut compositor, &mut terminal, &mut needs_redraw);
+            compositor_ipc_in::PaneClosed(pane_id) => {
+                let outs = compositor.handle(CompositorInput::PaneClosed { pane_id });
+                dispatch_compositor_outputs(outs, &mut compositor, &mut terminal, &mut needs_redraw, &mut ipc_out);
             }
-            // 0x07 — session reset
-            0x07 => {
+            compositor_ipc_in::SessionReset(()) => {
                 compositor = Compositor::new(cols, rows, 0, 0, vec![], vec![]);
                 needs_redraw = true;
             }
@@ -182,20 +186,41 @@ fn run_compositor_wasi() {
     }
 }
 
-/// Returns `true` if the session should exit (Quit output).
+/// Dispatch compositor outputs: Redraw, RPC (via capnp pipe), RouteInput (via capnp pipe), Quit.
+/// Returns `true` if the session should exit.
 #[cfg(target_os = "wasi")]
-fn dispatch_outputs(
+fn dispatch_compositor_outputs(
     outs: Vec<hyprstream_compositor::CompositorOutput>,
     _compositor: &mut hyprstream_compositor::Compositor,
     terminal: &mut ratatui::Terminal<waxterm::backend::AnsiBackend<std::io::BufWriter<std::io::Stdout>>>,
     needs_redraw: &mut bool,
+    ipc_out: &mut Option<std::fs::File>,
 ) -> bool {
     use hyprstream_compositor::CompositorOutput;
+    use hyprstream_tui::compositor_ipc_capnp::compositor_ipc_out;
+
     for out in outs {
         match out {
             CompositorOutput::Redraw => *needs_redraw = true,
-            CompositorOutput::Rpc(req) => osc_write_rpc(&req),
-            CompositorOutput::RouteInput { app_id, data } => osc_write_route(app_id, &data),
+            CompositorOutput::Rpc(req) => {
+                let json = serde_json::to_vec(&req).unwrap_or_default();
+                let mut builder = capnp::message::Builder::new_default();
+                builder.init_root::<compositor_ipc_out::Builder<'_>>()
+                    .set_rpc_request(&json);
+                if write_capnp_message(ipc_out, &builder).is_err() {
+                    *ipc_out = None; // EPIPE — stop writing
+                }
+            }
+            CompositorOutput::RouteInput { app_id, data } => {
+                let mut builder = capnp::message::Builder::new_default();
+                let mut root = builder.init_root::<compositor_ipc_out::Builder<'_>>();
+                let mut route = root.init_route_input();
+                route.set_app_id(app_id);
+                route.set_data(&data);
+                if write_capnp_message(ipc_out, &builder).is_err() {
+                    *ipc_out = None; // EPIPE — stop writing
+                }
+            }
             CompositorOutput::Quit => {
                 terminal.draw(|_| {}).ok(); // flush
                 return true;
@@ -205,49 +230,20 @@ fn dispatch_outputs(
     false
 }
 
-/// Encode `req` as  ESC ] 0xFE <len:u32 LE> <json> BEL  on stdout.
-#[cfg(target_os = "wasi")]
-fn osc_write_rpc(req: &hyprstream_compositor::RpcRequest) {
-    use std::io::Write;
-    let json = serde_json::to_vec(req).unwrap_or_default();
-    let len  = json.len() as u32;
-    let mut out = std::io::stdout();
-    let _ = out.write_all(b"\x1b]");
-    let _ = out.write_all(&[0xFEu8]);
-    let _ = out.write_all(&len.to_le_bytes());
-    let _ = out.write_all(&json);
-    let _ = out.write_all(b"\x07");
-    let _ = out.flush();
-}
-
-/// Encode route input as  ESC ] 0xFF <app_id:u32 LE> <len:u32 LE> <data> BEL  on stdout.
-#[cfg(target_os = "wasi")]
-fn osc_write_route(app_id: u32, data: &[u8]) {
-    use std::io::Write;
-    let len = data.len() as u32;
-    let mut out = std::io::stdout();
-    let _ = out.write_all(b"\x1b]");
-    let _ = out.write_all(&[0xFFu8]);
-    let _ = out.write_all(&app_id.to_le_bytes());
-    let _ = out.write_all(&len.to_le_bytes());
-    let _ = out.write_all(data);
-    let _ = out.write_all(b"\x07");
-    let _ = out.flush();
-}
-
 // ============================================================================
 // WASI chat entry point (Phase W3)
 // ============================================================================
 
-/// WASM chat using ChatApp.
+/// WASM chat using ChatApp with capnp IPC.
 ///
-/// Uses ChatApp's push-based event methods (on_token, on_stream_complete, etc.)
-/// and submit_message_payload() for inference requests.
+/// Reads `ChatAppIpcIn` capnp messages from stdin, drives ChatApp,
+/// writes pure ANSI to stdout, and emits `ChatAppIpcOut` messages
+/// to a Wanix named pipe.
 #[cfg(target_os = "wasi")]
 fn run_chat_wasi_v2() {
     use hyprstream_tui::chat_app::ChatApp;
     use hyprstream_tui::chat_ui_wasm::draw as chat_draw;
-    use std::io::Write;
+    use hyprstream_tui::compositor_ipc_capnp::{chat_app_ipc_in, chat_app_ipc_out};
     use waxterm::backend::AnsiBackend;
     use waxterm::input::{InputParser, KeyPress};
 
@@ -265,61 +261,69 @@ fn run_chat_wasi_v2() {
     let mut app = ChatApp::new_wasm(model_name, cols, rows);
     terminal.draw(|f| chat_draw(f, &app)).ok();
 
+    // Open IPC output pipe for inference requests
+    let mut ipc_out: Option<std::fs::File> = std::fs::OpenOptions::new()
+        .write(true)
+        .open("rpc/data")
+        .ok();
+
     let stdin = std::io::stdin();
     let mut stdin = stdin.lock();
-    let mut header = [0u8; 9];
 
     loop {
-        if read_exact(&mut stdin, &mut header).is_err() { break }
+        let data = match read_capnp_frame(&mut stdin) {
+            Ok(d) => d,
+            Err(_) => break,
+        };
 
-        let msg_type = header[0];
-        let len = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
-        let mut data = vec![0u8; len];
-        if read_exact(&mut stdin, &mut data).is_err() { break }
+        let reader = match capnp_reader_from_segment(&data) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let Ok(msg) = reader.get_root::<chat_app_ipc_in::Reader<'_>>() else { continue };
+        let Ok(which) = msg.which() else { continue };
 
         let mut needs_redraw = false;
 
-        match msg_type {
-            0x01 => {
-                // Keyboard bytes from compositor RouteInput
+        match which {
+            chat_app_ipc_in::Keyboard(Ok(key_data)) => {
                 let parser: InputParser<KeyPress> = InputParser::new(vec![]);
-                for key in parser.parse(&data) {
+                for key in parser.parse(key_data) {
                     if let Some(req_json) = app.handle_key(key) {
-                        osc_write_inference(&req_json);
+                        // Write inference request via capnp IPC pipe
+                        let mut builder = capnp::message::Builder::new_default();
+                        builder.init_root::<chat_app_ipc_out::Builder<'_>>()
+                            .set_inference_request(req_json.as_bytes());
+                        if write_capnp_message(&mut ipc_out, &builder).is_err() {
+                            ipc_out = None;
+                        }
                     }
                     needs_redraw = true;
                     if app.quit { break }
                 }
                 if app.quit { break }
             }
-            0x02 if data.len() >= 4 => {
-                cols = u16::from_le_bytes([data[0], data[1]]);
-                rows = u16::from_le_bytes([data[2], data[3]]);
+            chat_app_ipc_in::Resize(Ok(resize)) => {
+                cols = resize.get_cols();
+                rows = resize.get_rows();
                 app.cols = cols;
                 app.rows = rows;
                 terminal.backend_mut().resize(cols, rows);
                 needs_redraw = true;
             }
-            0x03 => {
-                // Inference token
-                if let Ok(s) = std::str::from_utf8(&data) {
-                    app.on_token(s);
-                    needs_redraw = true;
-                }
+            chat_app_ipc_in::InferenceToken(Ok(token)) => {
+                app.on_token(token);
+                needs_redraw = true;
             }
-            0x04 => {
-                // Inference complete
+            chat_app_ipc_in::InferenceComplete(()) => {
                 app.on_stream_complete();
                 needs_redraw = true;
             }
-            0x05 => {
-                // Inference error
-                let msg = std::str::from_utf8(&data).unwrap_or("unknown error");
-                app.on_stream_error(msg.to_owned());
+            chat_app_ipc_in::InferenceError(Ok(err_msg)) => {
+                app.on_stream_error(err_msg.to_owned());
                 needs_redraw = true;
             }
-            0x06 => {
-                // Inference cancelled
+            chat_app_ipc_in::InferenceCancel(()) => {
                 app.on_stream_cancelled();
                 needs_redraw = true;
             }
@@ -332,19 +336,65 @@ fn run_chat_wasi_v2() {
     }
 }
 
-/// Write an inference request as  ESC ] 0xFD <len:u32 LE> <json> BEL  on stdout.
+// ============================================================================
+// Capnp IPC helpers
+// ============================================================================
+
+/// Read a length-prefixed capnp frame: [4B LE length][raw segment bytes].
 #[cfg(target_os = "wasi")]
-fn osc_write_inference(json: &str) {
+fn read_capnp_frame(r: &mut impl std::io::Read) -> std::io::Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    read_exact(r, &mut len_buf)?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    let mut data = vec![0u8; len];
+    read_exact(r, &mut data)?;
+    Ok(data)
+}
+
+/// Create a capnp message reader from raw single-segment bytes (no segment table).
+///
+/// Prepends the standard capnp segment table header (single segment) so that
+/// `read_message_from_flat_slice` can parse it.
+#[cfg(target_os = "wasi")]
+fn capnp_reader_from_segment(
+    raw: &[u8],
+) -> capnp::Result<capnp::message::Reader<capnp::serialize::OwnedSegments>> {
+    // Pad to word boundary if needed
+    let padded_len = (raw.len() + 7) & !7;
+    let word_count = (padded_len / 8) as u32;
+
+    // Build segment table: [segment_count - 1 = 0][segment_0_word_count]
+    let mut buf = Vec::with_capacity(8 + padded_len);
+    buf.extend_from_slice(&0u32.to_le_bytes()); // 1 segment
+    buf.extend_from_slice(&word_count.to_le_bytes());
+    buf.extend_from_slice(raw);
+    // Zero-pad to word boundary
+    buf.resize(8 + padded_len, 0);
+
+    capnp::serialize::read_message_from_flat_slice(
+        &mut &buf[..],
+        capnp::message::ReaderOptions::default(),
+    )
+}
+
+/// Write a capnp message as [4B LE length][raw segment bytes] to a pipe.
+/// Returns `Err` on EPIPE (pipe closed by reader).
+#[cfg(target_os = "wasi")]
+fn write_capnp_message(
+    pipe: &mut Option<std::fs::File>,
+    builder: &capnp::message::Builder<capnp::message::HeapAllocator>,
+) -> std::io::Result<()> {
     use std::io::Write;
-    let bytes = json.as_bytes();
-    let len = bytes.len() as u32;
-    let mut out = std::io::stdout();
-    let _ = out.write_all(b"\x1b]");
-    let _ = out.write_all(&[0xFDu8]);
-    let _ = out.write_all(&len.to_le_bytes());
-    let _ = out.write_all(bytes);
-    let _ = out.write_all(b"\x07");
-    let _ = out.flush();
+    let Some(ref mut f) = pipe else {
+        return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+    };
+    let segments = builder.get_segments_for_output();
+    // Single-segment assumption (default HeapAllocator produces one segment)
+    let segment = segments.first().ok_or(std::io::ErrorKind::InvalidData)?;
+    let len = segment.len() as u32;
+    f.write_all(&len.to_le_bytes())?;
+    f.write_all(segment)?;
+    f.flush()
 }
 
 /// Read exactly `buf.len()` bytes from `r`, retrying on short reads.

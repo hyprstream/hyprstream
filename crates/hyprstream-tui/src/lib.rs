@@ -3,6 +3,13 @@
 pub use hyprstream_compositor::background;
 pub use hyprstream_compositor::theme;
 
+/// Generated Cap'n Proto types for compositor/ChatApp IPC.
+#[cfg(target_os = "wasi")]
+pub mod compositor_ipc_capnp {
+    #![allow(dead_code, unused_imports, clippy::all)]
+    include!(concat!(env!("OUT_DIR"), "/compositor_ipc_capnp.rs"));
+}
+
 pub mod private_store;
 
 pub mod chat_app;
