@@ -390,6 +390,118 @@ fn find_inner_struct_name(
 }
 
 // ---------------------------------------------------------------------------
+// Standalone struct builders
+// ---------------------------------------------------------------------------
+
+/// Generate standalone builder functions for all union-bearing structs in a schema.
+///
+/// Unlike service builders (which build `{Service}Request` messages with an `id` field
+/// and scoped client chains), these generate raw `Uint8Array` serialization for any
+/// struct that contains a union. One exported function per union variant:
+/// `build{StructName}_{variant}(nonUnionFields..., payload?): Uint8Array`.
+///
+/// Skips Option* wrapper structs (none/some unions used for optional field encoding).
+pub fn generate_struct_builders(out: &mut String, schema: &ParsedSchema) {
+    for sd in &schema.structs {
+        if !sd.has_union || sd.option_inner_type().is_some() {
+            continue;
+        }
+
+        let non_union_fields: Vec<&FieldDef> = sd
+            .fields
+            .iter()
+            .filter(|f| f.discriminant_value == 0xFFFF)
+            .collect();
+
+        let union_fields: Vec<&FieldDef> = sd
+            .fields
+            .iter()
+            .filter(|f| f.discriminant_value != 0xFFFF)
+            .collect();
+
+        let disc_byte_off = sd.discriminant_offset * 2;
+
+        for variant in &union_fields {
+            let is_void = variant.type_name == "Void";
+            let is_prim = is_primitive(&variant.type_name) && !is_void;
+            let payload_struct = if !is_void && !is_prim {
+                schema.structs.iter().find(|s| s.name == variant.type_name)
+            } else {
+                None
+            };
+
+            let fn_name = format!("build{}_{}", sd.name, variant.name);
+
+            // Parameters: non-union fields + optional payload
+            let mut params = Vec::new();
+            for f in &non_union_fields {
+                params.push(format!(
+                    "{}: {}",
+                    to_camel_case(&f.name),
+                    capnp_to_ts_type(&f.type_name)
+                ));
+            }
+            if !is_void {
+                if let Some(ps) = payload_struct {
+                    params.push(format!("p: {}", ps.name));
+                } else if is_prim {
+                    params.push(format!("p: {}", capnp_to_ts_type(&variant.type_name)));
+                }
+            }
+
+            out.push_str(&format!(
+                "export function {fn_name}({}): Uint8Array {{\n",
+                params.join(", ")
+            ));
+            let extra_words = std::cmp::max(8usize, sd.pointer_words as usize * 16);
+            out.push_str(&format!(
+                "  const msg = CapnpArena.intoWasm({}, {}, {extra_words});\n",
+                sd.data_words, sd.pointer_words
+            ));
+
+            // Set non-union fields
+            for f in &non_union_fields {
+                emit_field_setter(
+                    out,
+                    "msg",
+                    f,
+                    &to_camel_case(&f.name),
+                    "  ",
+                    &schema.enums,
+                    &schema.structs,
+                );
+            }
+
+            // Set discriminant
+            out.push_str(&format!(
+                "  msg.setUint16({disc_byte_off}, {}); // {}\n",
+                variant.discriminant_value, variant.name
+            ));
+
+            // Set variant payload
+            if is_void {
+                // Nothing
+            } else if is_prim {
+                emit_field_setter(
+                    out,
+                    "msg",
+                    variant,
+                    "p",
+                    "  ",
+                    &schema.enums,
+                    &schema.structs,
+                );
+            } else if let Some(ps) = payload_struct {
+                emit_struct_init(out, variant, ps, "msg", "p", "  ", schema);
+            }
+
+            out.push_str("  return msg.finish();\n");
+            out.push_str("}\n\n");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Field emission helpers
 // ---------------------------------------------------------------------------
 

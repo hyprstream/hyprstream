@@ -59,7 +59,7 @@ fn compile_capnp_schemas() {
     }
 
     let out_path = Path::new(&out_dir);
-    let schemas = ["events", "inference", "registry", "policy", "model", "mcp", "notification", "tui"];
+    let schemas = ["events", "inference", "registry", "policy", "model", "mcp", "notification", "tui", "compositor_ipc"];
 
     // Compile schemas with CGR + metadata extraction
     hyprstream_rpc_build::compile_schemas(

@@ -192,6 +192,167 @@ pub fn generate_parsers(out: &mut String, service_name: &str, schema: &ParsedSch
     out.push_str("}\n\n");
 }
 
+// ---------------------------------------------------------------------------
+// Standalone struct parsers
+// ---------------------------------------------------------------------------
+
+/// Generate standalone parser functions for all union-bearing structs in a schema.
+///
+/// Unlike service parsers (which parse `{Service}Response` messages with scoped
+/// response unwrapping), these parse any union struct from raw bytes.
+/// One exported function per struct: `parse{StructName}(bytes): {StructName}Result`.
+///
+/// Skips Option* wrapper structs.
+pub fn generate_struct_parsers(out: &mut String, schema: &ParsedSchema) {
+    for sd in &schema.structs {
+        if !sd.has_union || sd.option_inner_type().is_some() {
+            continue;
+        }
+
+        let non_union_fields: Vec<&FieldDef> = sd
+            .fields
+            .iter()
+            .filter(|f| f.discriminant_value == 0xFFFF)
+            .collect();
+
+        let union_fields: Vec<&FieldDef> = sd
+            .fields
+            .iter()
+            .filter(|f| f.discriminant_value != 0xFFFF)
+            .collect();
+
+        let disc_byte_off = sd.discriminant_offset * 2;
+
+        // Result interface
+        out.push_str(&format!("export interface {}Result {{\n", sd.name));
+        for f in &non_union_fields {
+            out.push_str(&format!(
+                "  {}: {};\n",
+                to_camel_case(&f.name),
+                capnp_to_ts_type(&f.type_name)
+            ));
+        }
+        out.push_str("  variant: string;\n");
+        out.push_str("  data: unknown;\n");
+        out.push_str("}\n\n");
+
+        // Parser function
+        out.push_str(&format!(
+            "export function parse{}(bytes: Uint8Array): {}Result {{\n",
+            sd.name, sd.name
+        ));
+        out.push_str(&format!(
+            "  const reader = new CapnpReader(bytes, {}, {});\n",
+            sd.data_words, sd.pointer_words
+        ));
+
+        // Read non-union fields
+        for f in &non_union_fields {
+            emit_reader_field(out, "reader", f, &to_camel_case(&f.name), "  ", schema);
+        }
+
+        // Read discriminant
+        out.push_str(&format!(
+            "  const _disc = reader.getUint16({disc_byte_off});\n"
+        ));
+        out.push_str("  switch (_disc) {\n");
+
+        for variant in &union_fields {
+            out.push_str(&format!(
+                "    case {}: // {}\n",
+                variant.discriminant_value, variant.name
+            ));
+
+            if variant.type_name == "Void" {
+                emit_return(out, &non_union_fields, &variant.name, "undefined");
+            } else if variant.type_name == "Bool" {
+                let byte_off = data_byte_offset(variant);
+                let bit = bool_bit_index(variant);
+                emit_return(
+                    out,
+                    &non_union_fields,
+                    &variant.name,
+                    &format!("reader.getBool({byte_off}, {bit})"),
+                );
+            } else if is_data_scalar(&variant.type_name) {
+                let byte_off = data_byte_offset(variant);
+                let method = super::getter_method(&variant.type_name);
+                emit_return(
+                    out,
+                    &non_union_fields,
+                    &variant.name,
+                    &format!("reader.{method}({byte_off})"),
+                );
+            } else if variant.type_name == "Text" {
+                emit_return(
+                    out,
+                    &non_union_fields,
+                    &variant.name,
+                    &format!("reader.getText({})", variant.slot_offset),
+                );
+            } else if variant.type_name == "Data" {
+                emit_return(
+                    out,
+                    &non_union_fields,
+                    &variant.name,
+                    &format!("reader.getData({})", variant.slot_offset),
+                );
+            } else if variant.type_name.starts_with("List(Text") {
+                emit_return(
+                    out,
+                    &non_union_fields,
+                    &variant.name,
+                    &format!("reader.getTextList({})", variant.slot_offset),
+                );
+            } else if let Some(inner) = super::extract_list_inner_type(&variant.type_name) {
+                if let Some(isd) = schema.structs.iter().find(|s| s.name == inner) {
+                    emit_struct_list_read(
+                        out,
+                        "reader",
+                        variant,
+                        isd,
+                        &non_union_fields,
+                        &variant.name,
+                        schema,
+                    );
+                } else {
+                    emit_return(out, &non_union_fields, &variant.name, "[]");
+                }
+            } else {
+                // Struct type
+                if let Some(struct_def) = schema.structs.iter().find(|s| s.name == variant.type_name)
+                {
+                    emit_struct_read(
+                        out,
+                        "reader",
+                        variant,
+                        struct_def,
+                        &non_union_fields,
+                        &variant.name,
+                        schema,
+                    );
+                } else {
+                    emit_return(out, &non_union_fields, &variant.name, "null");
+                }
+            }
+        }
+
+        // Default case
+        let default_fields: Vec<String> = non_union_fields
+            .iter()
+            .map(|f| to_camel_case(&f.name))
+            .collect();
+        let fields_str = default_fields.join(", ");
+        let comma = if fields_str.is_empty() { "" } else { ", " };
+        out.push_str("    default:\n");
+        out.push_str(&format!(
+            "      return {{ {fields_str}{comma}variant: 'unknown', data: null }};\n"
+        ));
+        out.push_str("  }\n");
+        out.push_str("}\n\n");
+    }
+}
+
 /// Emit code to parse a scoped response variant (inner union within a struct).
 fn emit_scoped_response_parse(
     out: &mut String,
