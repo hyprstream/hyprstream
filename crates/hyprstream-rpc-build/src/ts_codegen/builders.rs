@@ -81,8 +81,11 @@ pub fn generate_builders(out: &mut String, service_name: &str, schema: &ParsedSc
             "function {fn_name}({}): Uint8Array {{\n",
             params.join(", ")
         ));
+        // Estimate slack for pointer targets: 16 words (128 B) per pointer field.
+        // grow() handles overflow automatically via wasm.alloc/dealloc.
+        let extra_words = std::cmp::max(8usize, req_struct.pointer_words as usize * 16);
         out.push_str(&format!(
-            "  const msg = new CapnpMessageBuilder({}, {});\n",
+            "  const msg = CapnpArena.intoWasm({}, {}, {extra_words});\n",
             req_struct.data_words, req_struct.pointer_words
         ));
 
@@ -208,8 +211,9 @@ fn generate_scoped_builders(
             "function {fn_name}({}): Uint8Array {{\n",
             params.join(", ")
         ));
+        let extra_words = std::cmp::max(8usize, root_struct.pointer_words as usize * 16);
         out.push_str(&format!(
-            "  const msg = new CapnpMessageBuilder({}, {});\n",
+            "  const msg = CapnpArena.intoWasm({}, {}, {extra_words});\n",
             root_struct.data_words, root_struct.pointer_words
         ));
 
