@@ -48,5 +48,11 @@ pub mod tui_client {
     hyprstream_rpc_derive::generate_rpc_service!("tui", scope_handlers);
 }
 
+pub mod metrics_client {
+    #![allow(dead_code, unused_imports, unused_variables)]
+    #![allow(clippy::all)]
+    hyprstream_rpc_derive::generate_rpc_service!("metrics", scope_handlers);
+}
+
 // worker_client — use hyprstream_workers::generated::worker_client instead.
 // workflow_client — use hyprstream_workers::generated::workflow_client instead.

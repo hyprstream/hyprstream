@@ -123,6 +123,10 @@ pub struct HyprConfig {
     #[serde(default)]
     pub tui: TuiServiceConfig,
 
+    /// Metrics service configuration (DuckDB/DataFusion ingest + query)
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+
     /// Hex-encoded Ed25519 node signing key bytes (bypasses OS keyring lookup).
     ///
     /// **TEST USE ONLY.** Set via `HYPRSTREAM__SIGNING_KEY` env var to inject a
@@ -860,6 +864,41 @@ impl Default for TuiServiceConfig {
     }
 }
 
+/// Metrics service configuration (DuckDB-backed time-series ingest + DataFusion query).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsConfig {
+    /// DuckDB connection string. ":memory:" for in-process, or a file path.
+    /// Use the same path as flight config to share data between services.
+    #[serde(default = "default_metrics_db")]
+    pub db_path: String,
+
+    /// Background checkpoint interval in seconds. 0 = disabled.
+    #[serde(default = "default_checkpoint_interval_secs")]
+    pub checkpoint_interval_secs: u64,
+
+    /// QUIC/WebTransport port. None = no QUIC.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
+}
+
+fn default_metrics_db() -> String {
+    ":memory:".to_owned()
+}
+
+fn default_checkpoint_interval_secs() -> u64 {
+    300
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            db_path: default_metrics_db(),
+            checkpoint_interval_secs: default_checkpoint_interval_secs(),
+            quic_port: None,
+        }
+    }
+}
+
 /// Service management configuration
 ///
 /// Controls which services are started at startup in ipc-systemd mode.
@@ -896,6 +935,7 @@ fn default_startup_services() -> Vec<String> {
         "discovery".to_owned(), // Endpoint discovery (RFC 9728 metadata)
         "mcp".to_owned(),       // Model Context Protocol service
         "tui".to_owned(),       // Terminal multiplexer display server
+        "metrics".to_owned(),   // Metrics ingest and query (DuckDB/DataFusion)
     ]
 }
 
@@ -1094,6 +1134,7 @@ pub struct HyprConfigBuilder {
     policy: PolicyServiceConfig,
     discovery: DiscoveryServiceConfig,
     tui: TuiServiceConfig,
+    metrics: MetricsConfig,
 }
 
 impl HyprConfigBuilder {
@@ -1122,6 +1163,7 @@ impl HyprConfigBuilder {
             policy: PolicyServiceConfig::default(),
             discovery: DiscoveryServiceConfig::default(),
             tui: TuiServiceConfig::default(),
+            metrics: MetricsConfig::default(),
         }
     }
 
@@ -1150,6 +1192,7 @@ impl HyprConfigBuilder {
             policy: config.policy,
             discovery: config.discovery,
             tui: config.tui,
+            metrics: config.metrics,
         }
     }
 
@@ -1190,6 +1233,7 @@ impl HyprConfigBuilder {
             policy: self.policy,
             discovery: self.discovery,
             tui: self.tui,
+            metrics: self.metrics,
             signing_key: None,
         }
     }

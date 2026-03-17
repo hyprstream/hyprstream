@@ -810,3 +810,54 @@ fn create_notification_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn S
 
     Ok(ctx.into_spawnable(notification_service))
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Metrics Service Factory
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Factory for MetricsService (DuckDB-backed time-series ingest + DataFusion query)
+#[service_factory("metrics", schema = "../../schema/metrics.capnp", metadata = crate::services::generated::metrics_client::schema_metadata)]
+fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+    info!("Creating MetricsService");
+
+    use crate::services::MetricsService;
+    use hyprstream_metrics::query::QueryOrchestrator;
+    use hyprstream_metrics::storage::duckdb::DuckDbBackend;
+
+    let config = load_config();
+    let mc = &config.metrics;
+
+    let backend = Arc::new(
+        DuckDbBackend::new(mc.db_path.clone(), Default::default(), None)
+            .map_err(|e| anyhow::anyhow!("DuckDbBackend init: {e}"))?,
+    );
+
+    let orchestrator = Arc::new(
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(QueryOrchestrator::new(
+                    backend as Arc<dyn hyprstream_metrics::StorageBackend>,
+                ))
+        })
+        .map_err(|e| anyhow::anyhow!("QueryOrchestrator init: {e}"))?,
+    );
+
+    let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::local());
+
+    let mut metrics_service = MetricsService::new(
+        orchestrator,
+        global_context(),
+        ctx.transport("metrics", SocketKind::Rep),
+        ctx.signing_key().clone(),
+        policy_client,
+    );
+    if let Some(issuer) = ctx.oauth_issuer_url() {
+        metrics_service = metrics_service.with_expected_audience(issuer.to_owned());
+        metrics_service = metrics_service.with_local_issuer_url(issuer.to_owned());
+    }
+    if let Some(fed) = ctx.federation_key_source() {
+        metrics_service = metrics_service.with_federation_key_source(fed);
+    }
+
+    Ok(ctx.into_spawnable_quic(metrics_service, mc.quic_port))
+}
