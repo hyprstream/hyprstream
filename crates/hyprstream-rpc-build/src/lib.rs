@@ -9,6 +9,7 @@
 
 #![allow(clippy::print_stdout)] // cargo:warning= directives require println!
 
+pub mod backend;
 pub mod schema;
 pub mod util;
 

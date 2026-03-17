@@ -10,6 +10,22 @@
 use hyprstream_rpc_build::schema::types::{FieldDef, ParsedSchema, ScopedClient};
 use hyprstream_rpc_build::util::{to_camel_case, to_pascal_case};
 
+/// Emit an error-variant check that throws an `Error` with the RPC error message.
+///
+/// Generates:
+/// ```text
+/// if ({parsed_var}.variant === 'error') {
+///   throw new Error(({parsed_var}.data as { message?: string })?.message ?? 'RPC error');
+/// }
+/// ```
+fn emit_error_throw(out: &mut String, parsed_var: &str) {
+    out.push_str(&format!(
+        "    if ({parsed_var}.variant === 'error') {{\n\
+         \x20     throw new Error(({parsed_var}.data as {{ message?: string }})?.message ?? 'RPC error');\n\
+         \x20   }}\n"
+    ));
+}
+
 use super::{capnp_to_ts_type, is_primitive};
 
 /// Check if any method in the schema returns StreamInfo (indicating streaming support needed).
@@ -141,11 +157,7 @@ pub fn generate_client(out: &mut String, service_name: &str, schema: &ParsedSche
             ));
 
             // Error handling
-            out.push_str(
-                "    if (parsed.variant === 'error') {\n\
-                 \x20     throw new Error((parsed.data as { message?: string })?.message ?? 'RPC error');\n\
-                 \x20   }\n",
-            );
+            emit_error_throw(out, "parsed");
             out.push_str(&format!(
                 "    return parsed.data as {};\n",
                 return_type
@@ -326,11 +338,7 @@ fn generate_scoped_client(
             ));
 
             // Error handling at outer level
-            out.push_str(
-                "    if (parsed.variant === 'error') {\n\
-                 \x20     throw new Error((parsed.data as { message?: string })?.message ?? 'RPC error');\n\
-                 \x20   }\n",
-            );
+            emit_error_throw(out, "parsed");
 
             // Unwrap through the scoped response chain.
             // The parser returns nested { variant, data: { variant, data: ... } } for scoped responses.
@@ -347,11 +355,7 @@ fn generate_scoped_client(
                     current_var = format!("{inner_var}.data");
                 } else {
                     // Final scope level: check for error and return the method result
-                    out.push_str(&format!(
-                        "    if ({inner_var}.variant === 'error') {{\n\
-                         \x20     throw new Error(({inner_var}.data as {{ message?: string }})?.message ?? 'RPC error');\n\
-                         \x20   }}\n"
-                    ));
+                    emit_error_throw(out, &inner_var);
                     out.push_str(&format!(
                         "    return {inner_var}.data as {};\n",
                         return_type
@@ -428,11 +432,7 @@ fn generate_streaming_body(out: &mut String, pascal: &str, chain_depth: usize) {
     ));
 
     // Error handling at outer level
-    out.push_str(
-        "    if (parsed.variant === 'error') {\n\
-         \x20     throw new Error((parsed.data as { message?: string })?.message ?? 'RPC error');\n\
-         \x20   }\n",
-    );
+    emit_error_throw(out, "parsed");
 
     if chain_depth == 0 {
         // Top-level streaming method: parsed.data is StreamInfo directly
@@ -452,11 +452,7 @@ fn generate_streaming_body(out: &mut String, pascal: &str, chain_depth: usize) {
             if depth < chain_depth - 1 {
                 current_var = format!("{inner_var}.data");
             } else {
-                out.push_str(&format!(
-                    "    if ({inner_var}.variant === 'error') {{\n\
-                     \x20     throw new Error(({inner_var}.data as {{ message?: string }})?.message ?? 'RPC error');\n\
-                     \x20   }}\n"
-                ));
+                emit_error_throw(out, &inner_var);
                 out.push_str(&format!(
                     "    const streamInfo = {inner_var}.data as StreamInfo;\n\
                      \x20   return createStreamSubscription(streamInfo, blocks, ephemeralPrivkey, ephemeralPubkey, requestId);\n"

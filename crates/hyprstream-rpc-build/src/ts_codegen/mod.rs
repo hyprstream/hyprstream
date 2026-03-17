@@ -13,26 +13,31 @@ mod client;
 
 use std::path::Path;
 
-use hyprstream_rpc_build::schema::types::{FieldDef, FieldSection, ParsedSchema};
-use hyprstream_rpc_build::util::to_pascal_case;
+use hyprstream_rpc_build::backend::CodegenBackend;
+use hyprstream_rpc_build::schema::types::{EnumDef, FieldDef, FieldSection, ParsedSchema};
+use hyprstream_rpc_build::util::{to_camel_case, to_pascal_case};
 
-/// Generate all TypeScript files from parsed schemas.
+/// Generate all output files from parsed schemas using the given backend.
 #[allow(clippy::print_stdout)]
-pub fn generate_all(schemas: &[(String, ParsedSchema)], output_dir: &Path) {
-    // 1. Generate capnp.ts runtime (shared across all services)
-    let capnp_ts = message::generate_capnp_runtime();
-    let capnp_path = output_dir.join("capnp.ts");
-    std::fs::write(&capnp_path, capnp_ts).expect("Failed to write capnp.ts");
-    println!("  Generated capnp.ts");
+pub fn generate_all<B: CodegenBackend>(
+    backend: &B,
+    schemas: &[(String, ParsedSchema)],
+    output_dir: &Path,
+) {
+    // 1. Runtime file (e.g. capnp.ts)
+    let (runtime_name, runtime_content) = backend.runtime_file();
+    let runtime_path = output_dir.join(&runtime_name);
+    std::fs::write(&runtime_path, runtime_content).expect("Failed to write runtime file");
+    println!("  Generated {runtime_name}");
 
-    // 2. Generate per-schema files
+    // 2. Per-schema service files
     let mut all_names = Vec::new();
     let mut client_names = Vec::new();
     for (name, schema) in schemas {
-        let ts = generate_service_file(name, schema);
-        let filename = format!("{name}.ts");
+        let content = backend.generate_service_file(name, schema);
+        let filename = format!("{name}.{}", backend.file_extension());
         let path = output_dir.join(&filename);
-        std::fs::write(&path, ts).expect("Failed to write service file");
+        std::fs::write(&path, content).expect("Failed to write service file");
         println!("  Generated {filename}");
         all_names.push(name.clone());
         if schema.request_struct.is_some() {
@@ -40,11 +45,12 @@ pub fn generate_all(schemas: &[(String, ParsedSchema)], output_dir: &Path) {
         }
     }
 
-    // 3. Generate index.ts with re-exports
-    let index_ts = generate_index(&all_names, &client_names);
-    let index_path = output_dir.join("index.ts");
-    std::fs::write(&index_path, index_ts).expect("Failed to write index.ts");
-    println!("  Generated index.ts");
+    // 3. Optional index/manifest file
+    if let Some((index_name, index_content)) = backend.index_file(&all_names, &client_names) {
+        let index_path = output_dir.join(&index_name);
+        std::fs::write(&index_path, index_content).expect("Failed to write index file");
+        println!("  Generated {index_name}");
+    }
 }
 
 /// Generate a single TypeScript file for a schema.
@@ -246,24 +252,106 @@ fn extract_list_inner_type(type_name: &str) -> Option<&str> {
 }
 
 /// Check if a capnp type name is a primitive (not a struct reference).
+///
+/// Delegates to `is_primitive_capnp_type` in `schema::types` — the canonical
+/// implementation shared with the CGR reader.
 pub(crate) fn is_primitive(type_name: &str) -> bool {
-    matches!(
-        type_name,
-        "Void"
-            | "Bool"
-            | "Text"
-            | "Data"
-            | "UInt8"
-            | "UInt16"
-            | "UInt32"
-            | "UInt64"
-            | "Int8"
-            | "Int16"
-            | "Int32"
-            | "Int64"
-            | "Float32"
-            | "Float64"
-    ) || type_name.starts_with("List(")
+    hyprstream_rpc_build::schema::types::is_primitive_capnp_type(type_name)
+}
+
+/// Build a TypeScript array literal from an enum's variants (camelCase names as strings).
+///
+/// Example output: `['active', 'inactive', 'pending']`
+fn enum_ordinal_array(ed: &EnumDef) -> String {
+    let variants: Vec<String> = ed
+        .variants
+        .iter()
+        .map(|(name, _)| format!("'{}'", to_camel_case(name)))
+        .collect();
+    format!("[{}]", variants.join(", "))
+}
+
+/// Emit a `setUint16` call that converts a TypeScript string enum to its wire ordinal.
+///
+/// Generates: `{indent}{builder_var}.setUint16({byte_off}, [...].indexOf({value_expr}));`
+pub(crate) fn emit_enum_setter(
+    out: &mut String,
+    indent: &str,
+    builder_var: &str,
+    byte_off: u32,
+    value_expr: &str,
+    ed: &EnumDef,
+) {
+    out.push_str(&format!(
+        "{indent}{builder_var}.setUint16({byte_off}, {}.indexOf({value_expr}));\n",
+        enum_ordinal_array(ed)
+    ));
+}
+
+/// Return a TypeScript expression that reads a UInt16 ordinal and maps it to a string enum.
+///
+/// Example output: `(['active', 'inactive'][reader.getUint16(4)] ?? 'unknown') as Status`
+pub(crate) fn emit_enum_getter_expr(
+    reader_var: &str,
+    byte_off: u32,
+    type_name: &str,
+    ed: &EnumDef,
+) -> String {
+    format!(
+        "({}[{reader_var}.getUint16({byte_off})] ?? 'unknown') as {type_name}",
+        enum_ordinal_array(ed)
+    )
+}
+
+// ---------------------------------------------------------------------------
+// TypeScript backend
+// ---------------------------------------------------------------------------
+
+/// TypeScript code generation backend.
+///
+/// Wraps the existing TypeScript emitters and implements the language-agnostic
+/// `CodegenBackend` trait, enabling `generate_all` to be called generically.
+pub struct TypeScriptBackend;
+
+impl CodegenBackend for TypeScriptBackend {
+    fn map_type(&self, capnp_type: &str) -> String {
+        capnp_to_ts_type(capnp_type)
+    }
+
+    fn setter_method(&self, type_name: &str) -> Option<String> {
+        setter_method(type_name).map(str::to_owned)
+    }
+
+    fn getter_expr(&self, reader_var: &str, field: &FieldDef) -> String {
+        // Simplified expression for the trait surface.
+        // Full dispatch (enums, structs, lists) is handled by the emitter functions.
+        let method = getter_method(&field.type_name);
+        format!("{reader_var}.{method}({})", field.slot_offset)
+    }
+
+    fn default_value(&self, type_name: &str) -> String {
+        default_value_expr(type_name).to_owned()
+    }
+
+    fn generate_service_file(&self, service_name: &str, schema: &ParsedSchema) -> String {
+        generate_service_file(service_name, schema)
+    }
+
+    fn runtime_file(&self) -> (String, String) {
+        ("capnp.ts".to_owned(), message::generate_capnp_runtime())
+    }
+
+    fn file_extension(&self) -> &str {
+        "ts"
+    }
+
+    fn index_file(
+        &self,
+        all_names: &[String],
+        client_names: &[String],
+    ) -> Option<(String, String)> {
+        Some(("index.ts".to_owned(), generate_index(all_names, client_names)))
+    }
 }
 
 /// Generate index.ts with re-exports.

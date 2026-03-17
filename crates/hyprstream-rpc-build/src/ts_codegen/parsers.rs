@@ -20,11 +20,7 @@ pub fn generate_parsers(out: &mut String, service_name: &str, schema: &ParsedSch
 
     let pascal = to_pascal_case(service_name);
 
-    let non_union_fields: Vec<&FieldDef> = resp_struct
-        .fields
-        .iter()
-        .filter(|f| f.discriminant_value == 0xFFFF)
-        .collect();
+    let non_union_fields: Vec<&FieldDef> = resp_struct.non_union_fields().collect();
 
     let disc_byte_off = resp_struct.discriminant_offset * 2;
 
@@ -228,17 +224,8 @@ pub fn generate_struct_parsers(out: &mut String, schema: &ParsedSchema) {
             continue;
         }
 
-        let non_union_fields: Vec<&FieldDef> = sd
-            .fields
-            .iter()
-            .filter(|f| f.discriminant_value == 0xFFFF)
-            .collect();
-
-        let union_fields: Vec<&FieldDef> = sd
-            .fields
-            .iter()
-            .filter(|f| f.discriminant_value != 0xFFFF)
-            .collect();
+        let non_union_fields: Vec<&FieldDef> = sd.non_union_fields().collect();
+        let union_fields: Vec<&FieldDef> = sd.union_fields().collect();
 
         let disc_byte_off = sd.discriminant_offset * 2;
 
@@ -617,12 +604,8 @@ fn emit_struct_pointer_expr(
         // Union struct pointer — generate discriminant switch inside an IIFE
         let disc_byte_off = sd.discriminant_offset * 2;
 
-        let non_union_fields: Vec<&FieldDef> = sd.fields.iter()
-            .filter(|f| f.discriminant_value == 0xFFFF)
-            .collect();
-        let union_fields: Vec<&FieldDef> = sd.fields.iter()
-            .filter(|f| f.discriminant_value != 0xFFFF)
-            .collect();
+        let non_union_fields: Vec<&FieldDef> = sd.non_union_fields().collect();
+        let union_fields: Vec<&FieldDef> = sd.union_fields().collect();
 
         let mut s = format!(
             "(() => {{ const {var_name} = {reader_var}.getStruct({slot}, {}, {}); if (!{var_name}) return null;\n",
@@ -662,9 +645,7 @@ fn emit_struct_pointer_expr(
         s
     } else {
         let fields: Vec<String> = sd
-            .fields
-            .iter()
-            .filter(|sf| sf.discriminant_value == 0xFFFF)
+            .non_union_fields()
             .map(|sf| {
                 let camel = to_camel_case(&sf.name);
                 let read = emit_struct_element_field_read_inner(&var_name, sf, schema, depth + 1);
@@ -753,13 +734,7 @@ fn emit_struct_element_field_read_inner(
             } else if !super::is_data_scalar(&field.type_name) {
                 // Enum type — stored as UInt16 in data section
                 if let Some(ed) = schema.enums.iter().find(|e| e.name == field.type_name) {
-                    let array = ed
-                        .variants
-                        .iter()
-                        .map(|(v, _)| format!("'{}'", to_camel_case(v)))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!("([{array}][{reader_var}.getUint16({byte_off})] ?? 'unknown') as {}", field.type_name)
+                    super::emit_enum_getter_expr(reader_var, byte_off, &field.type_name, ed)
                 } else {
                     format!("{reader_var}.getUint16({byte_off})")
                 }
@@ -788,9 +763,7 @@ fn emit_struct_list_field_expr(
     }
 
     let fields: Vec<String> = sd
-        .fields
-        .iter()
-        .filter(|f| f.discriminant_value == 0xFFFF)
+        .non_union_fields()
         .map(|f| {
             let camel = to_camel_case(&f.name);
             let read = emit_struct_element_field_read_inner("_el", f, schema, 0);
@@ -815,16 +788,8 @@ fn emit_union_struct_list_field_expr(
 ) -> String {
     let disc_byte_off = sd.discriminant_offset * 2;
 
-    let non_union_fields: Vec<&FieldDef> = sd
-        .fields
-        .iter()
-        .filter(|f| f.discriminant_value == 0xFFFF)
-        .collect();
-    let union_fields: Vec<&FieldDef> = sd
-        .fields
-        .iter()
-        .filter(|f| f.discriminant_value != 0xFFFF)
-        .collect();
+    let non_union_fields: Vec<&FieldDef> = sd.non_union_fields().collect();
+    let union_fields: Vec<&FieldDef> = sd.union_fields().collect();
 
     let mut s = format!(
         "{reader_var}.getStructList({slot}, {}, {}).map(_el => {{\n",
@@ -911,16 +876,8 @@ fn emit_reader_field(
             } else if !super::is_data_scalar(&field.type_name) {
                 // Enum type — stored as UInt16 in data section
                 if let Some(ed) = schema.enums.iter().find(|e| e.name == field.type_name) {
-                    let array = ed
-                        .variants
-                        .iter()
-                        .map(|(v, _)| format!("'{}'", to_camel_case(v)))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    out.push_str(&format!(
-                        "{indent}const {local_name} = ([{array}][{reader_var}.getUint16({byte_off})] ?? 'unknown') as {};\n",
-                        field.type_name
-                    ));
+                    let expr = super::emit_enum_getter_expr(reader_var, byte_off, &field.type_name, ed);
+                    out.push_str(&format!("{indent}const {local_name} = {expr};\n"));
                 } else {
                     out.push_str(&format!(
                         "{indent}const {local_name} = {reader_var}.getUint16({byte_off});\n"
@@ -978,11 +935,7 @@ fn emit_struct_read(
         ptr_field.slot_offset, struct_def.data_words, struct_def.pointer_words
     ));
 
-    let visible_fields: Vec<&FieldDef> = struct_def
-        .fields
-        .iter()
-        .filter(|f| f.discriminant_value == 0xFFFF)
-        .collect();
+    let visible_fields: Vec<&FieldDef> = struct_def.non_union_fields().collect();
 
     out.push_str("      const _data = _s ? {\n");
     for sf in &visible_fields {
@@ -1028,13 +981,7 @@ fn emit_option_read_expr(
             let some_byte_off = super::data_byte_offset(sf);
             // Enum types are stored as UInt16 — generate array lookup + cast
             if let Some(ed) = schema.enums.iter().find(|e| e.name == inner_type_name) {
-                let array = ed
-                    .variants
-                    .iter()
-                    .map(|(v, _)| format!("'{}'", to_camel_case(v)))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("([{array}][_optR.getUint16({some_byte_off})] ?? 'unknown') as {inner_type_name}")
+                super::emit_enum_getter_expr("_optR", some_byte_off, inner_type_name, ed)
             } else {
                 let getter = super::getter_method(inner_type_name);
                 format!("_optR.{getter}({some_byte_off})")

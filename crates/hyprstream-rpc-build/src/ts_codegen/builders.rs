@@ -21,11 +21,7 @@ pub fn generate_builders(out: &mut String, service_name: &str, schema: &ParsedSc
     let pascal = to_pascal_case(service_name);
 
     // Non-union fields from the root request struct (e.g., `id`)
-    let non_union_fields: Vec<&FieldDef> = req_struct
-        .fields
-        .iter()
-        .filter(|f| f.discriminant_value == 0xFFFF)
-        .collect();
+    let non_union_fields: Vec<&FieldDef> = req_struct.non_union_fields().collect();
 
     // Discriminant byte offset (discriminant_offset is in u16 units)
     let disc_byte_off = req_struct.discriminant_offset * 2;
@@ -423,17 +419,8 @@ pub fn generate_struct_builders(out: &mut String, schema: &ParsedSchema) {
             continue;
         }
 
-        let non_union_fields: Vec<&FieldDef> = sd
-            .fields
-            .iter()
-            .filter(|f| f.discriminant_value == 0xFFFF)
-            .collect();
-
-        let union_fields: Vec<&FieldDef> = sd
-            .fields
-            .iter()
-            .filter(|f| f.discriminant_value != 0xFFFF)
-            .collect();
+        let non_union_fields: Vec<&FieldDef> = sd.non_union_fields().collect();
+        let union_fields: Vec<&FieldDef> = sd.union_fields().collect();
 
         let disc_byte_off = sd.discriminant_offset * 2;
 
@@ -627,15 +614,7 @@ fn emit_field_setter(
                 // Enum type — stored as UInt16, needs ordinal conversion
                 let enum_def = enums.iter().find(|e| e.name == field.type_name);
                 if let Some(ed) = enum_def {
-                    let variants: Vec<String> = ed
-                        .variants
-                        .iter()
-                        .map(|(name, _)| format!("'{}'", to_camel_case(name)))
-                        .collect();
-                    out.push_str(&format!(
-                        "{indent}{builder_var}.setUint16({byte_off}, [{}].indexOf({value_expr}));\n",
-                        variants.join(", ")
-                    ));
+                    super::emit_enum_setter(out, indent, builder_var, byte_off, value_expr, ed);
                 } else {
                     out.push_str(&format!(
                         "{indent}{builder_var}.setUint16({byte_off}, {value_expr} as unknown as number);\n"
@@ -863,11 +842,7 @@ fn emit_union_element_setter(
     counter: &mut u32,
 ) {
     let disc_byte_off = sd.discriminant_offset * 2;
-    let union_fields: Vec<&FieldDef> = sd
-        .fields
-        .iter()
-        .filter(|f| f.discriminant_value != 0xFFFF)
-        .collect();
+    let union_fields: Vec<&FieldDef> = sd.union_fields().collect();
 
     out.push_str(&format!("{indent}switch ({value_var}.variant) {{\n"));
     for uf in &union_fields {
