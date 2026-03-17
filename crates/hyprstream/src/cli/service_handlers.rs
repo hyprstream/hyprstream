@@ -715,16 +715,20 @@ impl InstallPlan {
         std::fs::create_dir_all(&self.version_dir)
             .with_context(|| format!("Failed to create directory: {}", self.version_dir.display()))?;
 
-        // Copy binary to versioned directory
+        // Copy binary to versioned directory (skip if already in place)
         let versioned_binary = self.version_dir.join(self.filename);
-        remove_if_exists(&versioned_binary)?;
-        std::fs::copy(&self.source, &versioned_binary).with_context(|| {
-            format!(
-                "Failed to copy {} -> {}",
-                self.source.display(),
-                versioned_binary.display()
-            )
-        })?;
+        let same_file = std::fs::canonicalize(&self.source).ok()
+            == std::fs::canonicalize(&versioned_binary).ok();
+        if !same_file {
+            remove_if_exists(&versioned_binary)?;
+            std::fs::copy(&self.source, &versioned_binary).with_context(|| {
+                format!(
+                    "Failed to copy {} -> {}",
+                    self.source.display(),
+                    versioned_binary.display()
+                )
+            })?;
+        }
 
         #[cfg(unix)]
         {
