@@ -31,7 +31,11 @@ WantedBy=sockets.target
 /// when ready via sd_notify.
 ///
 /// Environment variables (LD_LIBRARY_PATH, LIBTORCH) are captured from
-/// the process environment and forwarded to the service unit.
+/// the process environment and forwarded to the service unit, **unless** the
+/// target executable is an AppImage. AppImages bundle their own libtorch and
+/// set up library paths via `AppRun` at launch time — hardcoding the mount path
+/// from the installer process would produce a stale `/tmp/.mount_hyprst*/` path
+/// that no longer exists when the service starts later.
 ///
 /// Executable path priority for systemd units:
 /// 1. Installed binary at `~/.local/bin/hyprstream` (stable, survives updates)
@@ -44,17 +48,38 @@ pub fn service_unit(service: &str) -> Result<String> {
         .unwrap_or_else(paths::executable_path)
         .context("Failed to get executable path")?;
 
-    // Capture environment variables to forward to the service
-    let ld_library_path = std::env::var("LD_LIBRARY_PATH").ok();
-    let libtorch = std::env::var("LIBTORCH").ok();
+    // AppImages bundle libtorch and configure LD_LIBRARY_PATH themselves via
+    // AppRun. Emitting LD_LIBRARY_PATH/LIBTORCH from the installer's environment
+    // would hardcode a stale /tmp/.mount_hyprst*/ path that is invalid when
+    // services start. Skip those vars if the target binary is an AppImage.
+    let is_appimage = std::env::var("APPIMAGE").is_ok()
+        || exec
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case("appimage"))
+            .unwrap_or(false)
+        || exec
+            .read_link()
+            .ok()
+            .and_then(|t| t.extension().map(|e| e.eq_ignore_ascii_case("appimage")))
+            .unwrap_or(false);
+
     let hyprstream_instance = std::env::var("HYPRSTREAM_INSTANCE").ok();
 
     // Build Environment= directives
-    let env_directives = vec![
-        ld_library_path.map(|v| format!("Environment=LD_LIBRARY_PATH={v}")),
-        libtorch.map(|v| format!("Environment=LIBTORCH={v}")),
-        hyprstream_instance.map(|v| format!("Environment=HYPRSTREAM_INSTANCE={v}")),
-    ]
+    let env_directives = if is_appimage {
+        // AppImage manages its own libtorch — only forward instance namespace.
+        vec![hyprstream_instance.map(|v| format!("Environment=HYPRSTREAM_INSTANCE={v}"))]
+    } else {
+        vec![
+            std::env::var("LD_LIBRARY_PATH")
+                .ok()
+                .map(|v| format!("Environment=LD_LIBRARY_PATH={v}")),
+            std::env::var("LIBTORCH")
+                .ok()
+                .map(|v| format!("Environment=LIBTORCH={v}")),
+            hyprstream_instance.map(|v| format!("Environment=HYPRSTREAM_INSTANCE={v}")),
+        ]
+    }
     .into_iter()
     .flatten()
     .collect::<Vec<_>>()

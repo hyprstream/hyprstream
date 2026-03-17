@@ -11,6 +11,16 @@ use std::collections::HashMap;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
+/// Resolve the executable path to use when spawning subprocess services.
+///
+/// Prefers `$APPIMAGE` (the stable AppImage file) over `current_exe()` (which
+/// returns the ephemeral `/tmp/.mount_hyprst*/usr/bin/hyprstream` path inside
+/// the AppImage mount). Systemd exec'ing the mount path directly bypasses
+/// `AppRun`, so libtorch and other bundled libraries are not found.
+fn spawnable_exe() -> Result<std::path::PathBuf> {
+    hyprstream_rpc::paths::executable_path().map_err(Into::into)
+}
+
 /// Standalone service manager
 ///
 /// Spawns services via ProcessSpawner, which auto-detects systemd-run availability.
@@ -52,10 +62,10 @@ impl ServiceManager for StandaloneManager {
     }
 
     async fn start(&self, service: &str) -> Result<()> {
-        let exe = std::env::current_exe()?;
+        let exe = spawnable_exe()?;
 
         let config = ProcessConfig::new(service, exe)
-            .args(["service", service, "--ipc"]);
+            .args(["service", "start", service, "--foreground"]);
 
         let process = self.spawner.spawn(config).await?;
 
@@ -104,10 +114,10 @@ impl ServiceManager for StandaloneManager {
 
     async fn spawn(&self, service: Box<dyn Spawnable>) -> Result<SpawnedService> {
         // For standalone mode, spawn as subprocess
-        let exe = std::env::current_exe()?;
+        let exe = spawnable_exe()?;
 
         let config = ProcessConfig::new(service.name(), exe)
-            .args(["service", service.name(), "--ipc"]);
+            .args(["service", "start", service.name(), "--foreground"]);
 
         let process = self.spawner.spawn(config).await?;
 
