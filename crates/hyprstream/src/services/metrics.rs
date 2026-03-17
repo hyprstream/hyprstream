@@ -10,11 +10,12 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use futures::StreamExt;
 use hyprstream_metrics::aggregation::{AggregateFunction, GroupBy, TimeWindow};
 use hyprstream_metrics::metrics::{MetricRecord, create_record_batch, get_metrics_schema};
 use hyprstream_metrics::query::QueryOrchestrator;
 use hyprstream_metrics::storage::view::{AggregationSpec, ViewDefinition};
+#[allow(unused_imports)]
+use hyprstream_metrics::StorageBackend as _;
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::streaming::StreamChannel;
 use hyprstream_rpc::transport::TransportConfig;
@@ -42,7 +43,8 @@ use crate::services::generated::metrics_client::{
 struct MetricsInner {
     orchestrator: Arc<QueryOrchestrator>,
     stream_channel: StreamChannel,
-    stream_endpoint: String,
+    // stream_endpoint is resolved lazily from EndpointRegistry on first query_stream call.
+    // This avoids requiring the registry to be initialized at service construction time.
 }
 
 // ============================================================================
@@ -70,13 +72,11 @@ impl MetricsService {
         policy_client: PolicyClient,
     ) -> Self {
         let stream_channel = StreamChannel::new(Arc::clone(&context), signing_key.clone());
-        let stream_endpoint = stream_channel.stream_endpoint();
 
         Self {
             inner: Arc::new(MetricsInner {
                 orchestrator,
                 stream_channel,
-                stream_endpoint,
             }),
             policy_client,
             context,
@@ -144,8 +144,8 @@ fn build_sql(q: &MetricQuery) -> Result<String> {
         AggregationFunc::RawSql | AggregationFunc::Count => "CAST(COUNT(*) AS DOUBLE)",
         AggregationFunc::Sum => "SUM(value_running_window_sum)",
         AggregationFunc::Avg => "AVG(value_running_window_avg)",
-        AggregationFunc::Min => "MIN(value_running_window_sum)",
-        AggregationFunc::Max => "MAX(value_running_window_sum)",
+        AggregationFunc::Min => "MIN(value_running_window_avg)",
+        AggregationFunc::Max => "MAX(value_running_window_avg)",
     };
 
     let group_select = if q.group_by.is_empty() {
@@ -154,8 +154,13 @@ fn build_sql(q: &MetricQuery) -> Result<String> {
         format!(", {}", q.group_by.join(", "))
     };
 
+    // For aggregate queries: SELECT value + group_by columns only.
+    // timestamp is NOT included — it is not in GROUP BY and can't appear in SELECT with aggregates.
+    // AggregateRow.timestamp will be 0 for structured aggregate queries (use raw SQL to project it).
+    // NOTE: timestamp is stored and compared in milliseconds (Unix epoch ms).
+    // The MetricRecord.timestamp field, ingest path, and window filter all use ms.
     let mut sql = format!(
-        "SELECT {agg} AS value, timestamp{group_select} FROM metrics"
+        "SELECT {agg} AS value{group_select} FROM metrics"
     );
 
     if !q.metric_id.is_empty() {
@@ -218,6 +223,13 @@ impl MetricsHandler for MetricsService {
         _request_id: u64,
         data: &IngestRequest,
     ) -> Result<MetricsResponseVariant> {
+        // Validate before building the batch so callers get a clear rejection.
+        for (i, r) in data.records.iter().enumerate() {
+            if r.metric_id.is_empty() {
+                anyhow::bail!("record[{i}]: metric_id must not be empty");
+            }
+        }
+
         let rust_records: Vec<MetricRecord> = data.records
             .iter()
             .map(|r| MetricRecord {
@@ -249,12 +261,18 @@ impl MetricsHandler for MetricsService {
         q: &MetricQuery,
     ) -> Result<MetricsResponseVariant> {
         let sql = build_sql(q)?;
-        let batches = self
-            .inner
-            .orchestrator
-            .query_collect(&sql)
+        // Use DuckDB directly — DataFusionPlanner registers tables as empty MemTables
+        // so orchestrator.query_collect() always returns no rows for non-empty tables.
+        let storage = self.inner.orchestrator.storage();
+        let handle = storage
+            .prepare_sql(&sql)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let batch = storage
+            .query_sql(&handle)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let batches = [batch];
 
         let mut rows: Vec<AggregateRow> = Vec::new();
         for batch in &batches {
@@ -277,7 +295,9 @@ impl MetricsHandler for MetricsService {
                     let val = col.as_any()
                         .downcast_ref::<hyprstream_metrics::arrow::array::StringArray>()
                         .ok_or_else(|| anyhow::anyhow!(
-                            "group_by column {:?} has non-String type {:?}; only String columns are supported",
+                            "group_by column {:?} has type {:?}; only Utf8/String columns are \
+                             supported for group_by (metrics schema: metric_id is Utf8; \
+                             timestamp and value_running_window_count are Int64 — not groupable)",
                             col_name, col.data_type()
                         ))?
                         .value(i)
@@ -301,6 +321,9 @@ impl MetricsHandler for MetricsService {
         _request_id: u64,
         q: &MetricQuery,
     ) -> Result<(StreamInfo, Continuation)> {
+        if q.ephemeral_pubkey.is_empty() {
+            anyhow::bail!("queryStream requires a 32-byte ephemeral_pubkey (Ristretto255)");
+        }
         let sql = build_sql(q)?;
 
         let stream_ctx = self
@@ -311,7 +334,7 @@ impl MetricsHandler for MetricsService {
 
         let stream_info = StreamInfo {
             stream_id: stream_ctx.stream_id().to_owned(),
-            endpoint: self.inner.stream_endpoint.clone(),
+            endpoint: self.inner.stream_channel.stream_endpoint(),
             server_pubkey: *stream_ctx.server_pubkey(),
         };
         let inner = Arc::clone(&self.inner);
@@ -326,27 +349,32 @@ impl MetricsHandler for MetricsService {
                     let sql = sql.clone();
                     async move {
                         let result = async {
-                            let mut query_stream = inner
-                                .orchestrator
-                                .query(&sql)
+                            // Use DuckDB directly — DataFusionPlanner registers tables
+                            // as empty MemTables, so orchestrator.query() returns no rows.
+                            let storage = inner.orchestrator.storage();
+                            let handle = storage
+                                .prepare_sql(&sql)
+                                .await
+                                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                            let batch = storage
+                                .query_sql(&handle)
                                 .await
                                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-                            // Accumulate all batches into one Arrow IPC stream so
-                            // clients can open a single StreamReader over the result.
-                            // Even zero-row results must emit a valid IPC stream
-                            // (schema + EOS marker) so the client StreamReader initialises.
-                            let metrics_schema = Arc::new(get_metrics_schema());
+                            // Emit a valid Arrow IPC stream (schema + rows + EOS).
+                            // Always use the actual query result schema — aggregate queries
+                            // produce a different schema than the raw metrics table schema.
+                            // Zero-row results still emit a valid schema + EOS header.
+                            let result_schema = batch.schema();
                             let mut buf = Vec::new();
                             let mut writer =
                                 hyprstream_metrics::arrow::ipc::writer::StreamWriter::try_new(
                                     &mut buf,
-                                    &metrics_schema,
+                                    &result_schema,
                                 )
                                 .map_err(|e| anyhow::anyhow!("IPC writer: {e}"))?;
 
-                            while let Some(batch_result) = query_stream.next().await {
-                                let batch = batch_result.map_err(|e| anyhow::anyhow!("{e}"))?;
+                            if batch.num_rows() > 0 {
                                 writer
                                     .write(&batch)
                                     .map_err(|e| anyhow::anyhow!("IPC write: {e}"))?;
@@ -425,8 +453,9 @@ impl MetricsHandler for MetricsService {
         let source_table = "metrics".to_owned();
 
         // raw SQL view creation is not supported — ViewDefinition has no raw-SQL constructor.
-        if !q.sql.is_empty() {
-            anyhow::bail!("create_view with raw SQL is not supported; use structured query fields");
+        // Reject both: explicit raw SQL string, and RawSql aggregation with no aggregation spec.
+        if !q.sql.is_empty() || q.aggregation == AggregationFunc::RawSql {
+            anyhow::bail!("create_view with raw SQL or RawSql aggregation is not supported; use a structured aggregation function");
         }
 
         let schema = Arc::new(get_metrics_schema());
@@ -510,20 +539,48 @@ impl MetricsHandler for MetricsService {
         _ctx: &EnvelopeContext,
         _request_id: u64,
     ) -> Result<MetricsResponseVariant> {
-        let result = self
-            .inner
-            .orchestrator
-            .query_collect("SELECT COUNT(*) AS cnt FROM metrics")
-            .await;
+        // Use DuckDB directly — DataFusionPlanner registers tables as empty MemTables.
+        let storage = self.inner.orchestrator.storage();
+        let result = async {
+            let handle = storage
+                .prepare_sql("SELECT COUNT(*) AS cnt FROM metrics")
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            storage
+                .query_sql(&handle)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        }
+        .await;
+        let result = result.map(|b| vec![b]);
 
         let (ok, row_count) = match result {
             Ok(batches) => {
-                let cnt = batches
-                    .first()
-                    .and_then(|b| b.column_by_name("cnt"))
-                    .and_then(|c| c.as_any().downcast_ref::<hyprstream_metrics::arrow::array::Int64Array>())
-                    .map(|c| c.value(0) as u64)
-                    .unwrap_or(0);
+                // DuckDB may return Int64 or UInt64 for COUNT(*) depending on version/context.
+                let col = batches.first().and_then(|b| b.column_by_name("cnt"));
+                let cnt = match col {
+                    None => {
+                        tracing::warn!("health: COUNT query returned no 'cnt' column");
+                        0
+                    }
+                    Some(c) => {
+                        let v = c.as_any()
+                            .downcast_ref::<hyprstream_metrics::arrow::array::Int64Array>()
+                            .map(|a| a.value(0) as u64)
+                            .or_else(|| {
+                                c.as_any()
+                                    .downcast_ref::<hyprstream_metrics::arrow::array::UInt64Array>()
+                                    .map(|a| a.value(0))
+                            });
+                        if v.is_none() {
+                            tracing::warn!(
+                                dtype = ?c.data_type(),
+                                "health: COUNT column has unexpected Arrow type; defaulting to 0"
+                            );
+                        }
+                        v.unwrap_or(0)
+                    }
+                };
                 (true, cnt)
             }
             Err(_) => (false, 0),
@@ -589,5 +646,375 @@ impl ZmqService for MetricsService {
             details: String::new(),
         });
         serialize_response(request_id, &variant).unwrap_or_default()
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use hyprstream_metrics::query::QueryOrchestrator;
+    use hyprstream_metrics::storage::duckdb::DuckDbBackend;
+    use hyprstream_rpc::crypto::generate_signing_keypair;
+    use hyprstream_rpc::envelope::RequestIdentity;
+    use hyprstream_rpc::transport::TransportConfig;
+    use hyprstream_service::{InprocManager, ServiceManager};
+
+    use crate::auth::PolicyManager;
+    use crate::services::generated::metrics_client::{
+        AggregationFunc, IngestRequest, MetricQuery, MetricRecord as CMetricRecord,
+        MetricsClient, ViewSpec,
+    };
+    use crate::services::{PolicyClient, PolicyService};
+    use crate::zmq::global_context;
+
+    /// Spin up an in-memory MetricsService and return a typed client + InprocManager handle.
+    async fn start_metrics_service(
+        tag: &str,
+    ) -> (MetricsClient, InprocManager) {
+        let (signing_key, _vk) = generate_signing_keypair();
+        let context = global_context();
+
+        // Permissive policy service so authorize() always passes.
+        let policy_tag = format!("test-policy-{tag}");
+        let policy_manager = Arc::new(
+            PolicyManager::permissive()
+                .await
+                .expect("permissive policy manager"),
+        );
+        let git2db = Arc::new(tokio::sync::RwLock::new(
+            git2db::Git2DB::open(tempfile::TempDir::new().unwrap().path())
+                .await
+                .expect("git2db open"),
+        ));
+        let policy_svc = PolicyService::new(
+            policy_manager,
+            Arc::new(signing_key.clone()),
+            crate::config::TokenConfig::default(),
+            git2db,
+            context.clone(),
+            TransportConfig::inproc(&policy_tag),
+        );
+        let manager = InprocManager::new();
+        manager
+            .spawn(Box::new(policy_svc))
+            .await
+            .expect("spawn policy service");
+
+        let policy_client = PolicyClient::with_endpoint(
+            &format!("inproc://{policy_tag}"),
+            signing_key.clone(),
+            RequestIdentity::local(),
+        );
+
+        // In-memory DuckDB backend + metrics table creation.
+        let backend = Arc::new(
+            DuckDbBackend::new(":memory:".to_owned(), Default::default(), None)
+                .expect("DuckDbBackend"),
+        );
+        // Create the metrics table before handing backend to orchestrator.
+        let schema = hyprstream_metrics::metrics::get_metrics_schema();
+        backend
+            .create_table("metrics", &schema)
+            .await
+            .expect("create metrics table");
+        let orchestrator = Arc::new(
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(QueryOrchestrator::new(
+                    backend as Arc<dyn hyprstream_metrics::StorageBackend>,
+                ))
+            })
+            .expect("QueryOrchestrator"),
+        );
+
+        let svc_tag = format!("test-metrics-{tag}");
+        let service = MetricsService::new(
+            orchestrator,
+            context.clone(),
+            TransportConfig::inproc(&svc_tag),
+            signing_key.clone(),
+            policy_client,
+        );
+        manager
+            .spawn(Box::new(service))
+            .await
+            .expect("spawn metrics service");
+
+        let client = MetricsClient::with_endpoint(
+            &format!("inproc://{svc_tag}"),
+            signing_key,
+            RequestIdentity::local(),
+        );
+
+        (client, manager)
+    }
+
+    // ── health ────────────────────────────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_health_fresh_db() {
+        let (client, _mgr) = start_metrics_service("health-fresh").await;
+        let info = client.health().await.expect("health on fresh DB");
+        // Table exists (created in test helper) but is empty.
+        assert!(info.ok, "expected ok=true — table exists even when empty");
+        assert_eq!(info.row_count, 0, "expected 0 rows on fresh DB");
+        assert_eq!(info.backend_type, "duckdb");
+    }
+
+    // ── ingest + health ───────────────────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_ingest_and_health() {
+        let (client, _mgr) = start_metrics_service("ingest-health").await;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        let req = IngestRequest {
+            records: vec![
+                CMetricRecord {
+                    metric_id: "cpu.usage".to_owned(),
+                    timestamp: now,
+                    value_window_sum: 42.0,
+                    value_window_avg: 42.0,
+                    value_window_count: 1,
+                },
+                CMetricRecord {
+                    metric_id: "cpu.usage".to_owned(),
+                    timestamp: now + 1000,
+                    value_window_sum: 58.0,
+                    value_window_avg: 58.0,
+                    value_window_count: 1,
+                },
+            ],
+        };
+
+        client.ingest(&req).await.expect("ingest");
+
+        let info = client.health().await.expect("health after ingest");
+        assert!(info.ok, "expected ok=true after ingest");
+        assert_eq!(info.row_count, 2, "expected 2 rows");
+    }
+
+    // ── query ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_query_count() {
+        let (client, _mgr) = start_metrics_service("query-count").await;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        client
+            .ingest(&IngestRequest {
+                records: vec![CMetricRecord {
+                    metric_id: "mem.rss".to_owned(),
+                    timestamp: now,
+                    value_window_sum: 1024.0,
+                    value_window_avg: 1024.0,
+                    value_window_count: 1,
+                }],
+            })
+            .await
+            .expect("ingest");
+
+        let rows = client
+            .query(&MetricQuery {
+                sql: String::new(),
+                metric_id: "mem.rss".to_owned(),
+                window_secs: 0,
+                aggregation: AggregationFunc::Count,
+                group_by: vec![],
+                limit_rows: 0,
+                ephemeral_pubkey: vec![],
+            })
+            .await
+            .expect("query count");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].value as u64, 1, "COUNT should be 1");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_query_sum() {
+        let (client, _mgr) = start_metrics_service("query-sum").await;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        client
+            .ingest(&IngestRequest {
+                records: vec![
+                    CMetricRecord {
+                        metric_id: "disk.io".to_owned(),
+                        timestamp: now,
+                        value_window_sum: 100.0,
+                        value_window_avg: 100.0,
+                        value_window_count: 1,
+                    },
+                    CMetricRecord {
+                        metric_id: "disk.io".to_owned(),
+                        timestamp: now + 500,
+                        value_window_sum: 200.0,
+                        value_window_avg: 200.0,
+                        value_window_count: 1,
+                    },
+                ],
+            })
+            .await
+            .expect("ingest");
+
+        let rows = client
+            .query(&MetricQuery {
+                sql: String::new(),
+                metric_id: "disk.io".to_owned(),
+                window_secs: 0,
+                aggregation: AggregationFunc::Sum,
+                group_by: vec![],
+                limit_rows: 0,
+                ephemeral_pubkey: vec![],
+            })
+            .await
+            .expect("query sum");
+
+        assert_eq!(rows.len(), 1);
+        assert!((rows[0].value - 300.0).abs() < 1e-6, "SUM should be 300.0, got {}", rows[0].value);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_query_raw_sql() {
+        let (client, _mgr) = start_metrics_service("query-raw").await;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        client
+            .ingest(&IngestRequest {
+                records: vec![CMetricRecord {
+                    metric_id: "net.rx".to_owned(),
+                    timestamp: now,
+                    value_window_sum: 500.0,
+                    value_window_avg: 500.0,
+                    value_window_count: 1,
+                }],
+            })
+            .await
+            .expect("ingest");
+
+        let rows = client
+            .query(&MetricQuery {
+                sql: "SELECT CAST(COUNT(*) AS DOUBLE) AS value FROM metrics".to_owned(),
+                metric_id: String::new(),
+                window_secs: 0,
+                aggregation: AggregationFunc::RawSql,
+                group_by: vec![],
+                limit_rows: 0,
+                ephemeral_pubkey: vec![],
+            })
+            .await
+            .expect("query raw sql");
+
+        assert_eq!(rows.len(), 1, "raw SQL COUNT should return one row");
+        assert_eq!(rows[0].value as u64, 1, "raw SQL COUNT should be 1");
+    }
+
+    // ── view management ───────────────────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_create_list_drop_view() {
+        let (client, _mgr) = start_metrics_service("views").await;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        client
+            .ingest(&IngestRequest {
+                records: vec![CMetricRecord {
+                    metric_id: "cpu.usage".to_owned(),
+                    timestamp: now,
+                    value_window_sum: 75.0,
+                    value_window_avg: 75.0,
+                    value_window_count: 1,
+                }],
+            })
+            .await
+            .expect("ingest");
+
+        // Create
+        client
+            .create_view(&ViewSpec {
+                name: "cpu_sum_view".to_owned(),
+                query: MetricQuery {
+                    sql: String::new(),
+                    metric_id: "cpu.usage".to_owned(),
+                    window_secs: 0,
+                    aggregation: AggregationFunc::Sum,
+                    group_by: vec![],
+                    limit_rows: 0,
+                    ephemeral_pubkey: vec![],
+                },
+            })
+            .await
+            .expect("create_view");
+
+        // List
+        let views = client.list_views().await.expect("list_views");
+        assert!(
+            views.iter().any(|v| v.name == "cpu_sum_view"),
+            "cpu_sum_view should appear in list"
+        );
+
+        // Drop
+        client.drop_view("cpu_sum_view").await.expect("drop_view");
+
+        let views_after = client.list_views().await.expect("list_views after drop");
+        assert!(
+            !views_after.iter().any(|v| v.name == "cpu_sum_view"),
+            "cpu_sum_view should be gone after drop"
+        );
+    }
+
+    // ── validation ────────────────────────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_invalid_identifier_rejected() {
+        let (client, _mgr) = start_metrics_service("validation").await;
+
+        // SQL injection attempt via drop_view name
+        let err = client.drop_view("view; DROP TABLE metrics; --").await;
+        assert!(err.is_err(), "invalid identifier should be rejected");
+
+        // SQL injection via view creation name
+        let err2 = client
+            .create_view(&ViewSpec {
+                name: "bad name!".to_owned(),
+                query: MetricQuery {
+                    sql: String::new(),
+                    metric_id: String::new(),
+                    window_secs: 0,
+                    aggregation: AggregationFunc::Count,
+                    group_by: vec![],
+                    limit_rows: 0,
+                    ephemeral_pubkey: vec![],
+                },
+            })
+            .await;
+        assert!(err2.is_err(), "invalid view name should be rejected");
     }
 }
