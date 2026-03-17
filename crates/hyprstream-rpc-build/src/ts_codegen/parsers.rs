@@ -196,16 +196,35 @@ pub fn generate_parsers(out: &mut String, service_name: &str, schema: &ParsedSch
 // Standalone struct parsers
 // ---------------------------------------------------------------------------
 
-/// Generate standalone parser functions for all union-bearing structs in a schema.
+/// Generate standalone parser functions for all structs in a schema.
 ///
-/// Unlike service parsers (which parse `{Service}Response` messages with scoped
-/// response unwrapping), these parse any union struct from raw bytes.
-/// One exported function per struct: `parse{StructName}(bytes): {StructName}Result`.
+/// For union-bearing structs: `parse{StructName}(bytes): {StructName}Result`
+/// (discriminated union return with `{ variant, data }` fields).
 ///
-/// Skips Option* wrapper structs.
+/// For non-union structs: `parse{StructName}(bytes): StructName`
+/// (returns the struct interface directly).
+///
+/// Skips Option* wrapper structs and service request/response structs.
 pub fn generate_struct_parsers(out: &mut String, schema: &ParsedSchema) {
     for sd in &schema.structs {
-        if !sd.has_union || sd.option_inner_type().is_some() {
+        if sd.option_inner_type().is_some() {
+            continue;
+        }
+        // Skip service request/response structs (handled by generate_parsers)
+        if schema
+            .request_struct
+            .as_ref()
+            .is_some_and(|rs| rs.name == sd.name)
+            || schema
+                .response_struct
+                .as_ref()
+                .is_some_and(|rs| rs.name == sd.name)
+        {
+            continue;
+        }
+
+        if !sd.has_union {
+            generate_plain_struct_parser(out, sd, schema);
             continue;
         }
 
@@ -226,10 +245,22 @@ pub fn generate_struct_parsers(out: &mut String, schema: &ParsedSchema) {
         // Result interface
         out.push_str(&format!("export interface {}Result {{\n", sd.name));
         for f in &non_union_fields {
+            let ts_type = capnp_to_ts_type(&f.type_name);
+            // Struct pointer fields may be null when the capnp pointer is null.
+            let ts_type = if f.section == FieldSection::Pointer
+                && !f.type_name.starts_with("List(")
+                && f.type_name != "Text"
+                && f.type_name != "Data"
+                && !super::is_primitive(&f.type_name)
+            {
+                format!("{ts_type} | null")
+            } else {
+                ts_type
+            };
             out.push_str(&format!(
                 "  {}: {};\n",
                 to_camel_case(&f.name),
-                capnp_to_ts_type(&f.type_name)
+                ts_type
             ));
         }
         out.push_str("  variant: string;\n");
@@ -353,6 +384,38 @@ pub fn generate_struct_parsers(out: &mut String, schema: &ParsedSchema) {
     }
 }
 
+/// Generate a parser function for a non-union struct.
+///
+/// `export function parse{StructName}(bytes: Uint8Array): StructName`
+fn generate_plain_struct_parser(out: &mut String, sd: &StructDef, schema: &ParsedSchema) {
+    out.push_str(&format!(
+        "export function parse{}(bytes: Uint8Array): {} {{\n",
+        sd.name, sd.name
+    ));
+    out.push_str(&format!(
+        "  const reader = new CapnpReader(bytes, {}, {});\n",
+        sd.data_words, sd.pointer_words
+    ));
+
+    // Gensym counter: _f{n} locals are always valid identifiers regardless of field name.
+    // This avoids reserved-word collisions (function, arguments, ...) and name-capture
+    // bugs (a field named "reader" would shadow the CapnpReader local above).
+    let mut field_pairs: Vec<(String, String)> = Vec::new();
+    for (n, f) in sd.fields.iter().enumerate() {
+        let camel = to_camel_case(&f.name);
+        let local = format!("_f{n}");
+        emit_reader_field(out, "reader", f, &local, "  ", schema);
+        field_pairs.push((camel, local));
+    }
+
+    let props: Vec<String> = field_pairs
+        .iter()
+        .map(|(key, local)| format!("{key}: {local}"))
+        .collect();
+    out.push_str(&format!("  return {{ {} }};\n", props.join(", ")));
+    out.push_str("}\n\n");
+}
+
 /// Emit code to parse a scoped response variant (inner union within a struct).
 fn emit_scoped_response_parse(
     out: &mut String,
@@ -471,10 +534,15 @@ fn emit_scoped_response_parse(
 }
 
 /// Generate an inline expression to read an inner variant's data.
-fn emit_inner_variant_read(
+///
+/// `reader_var` is the variable name of the reader to use (e.g., "_inner", "_el").
+/// `depth` is threaded through to `emit_struct_pointer_expr` to avoid `_p{n}` TDZ collisions.
+fn emit_inner_variant_read_from(
+    reader_var: &str,
     field: Option<&FieldDef>,
     type_name: &str,
     schema: &ParsedSchema,
+    depth: usize,
 ) -> String {
     let Some(f) = field else {
         return "null".into();
@@ -485,23 +553,23 @@ fn emit_inner_variant_read(
         "Bool" => {
             let byte_off = data_byte_offset(f);
             let bit = bool_bit_index(f);
-            format!("_inner.getBool({byte_off}, {bit})")
+            format!("{reader_var}.getBool({byte_off}, {bit})")
         }
-        "Text" => format!("_inner.getText({})", f.slot_offset),
-        "Data" => format!("_inner.getData({})", f.slot_offset),
+        "Text" => format!("{reader_var}.getText({})", f.slot_offset),
+        "Data" => format!("{reader_var}.getData({})", f.slot_offset),
         t if is_data_scalar(t) => {
             let byte_off = data_byte_offset(f);
             let method = super::getter_method(type_name);
-            format!("_inner.{method}({byte_off})")
+            format!("{reader_var}.{method}({byte_off})")
         }
         t if t.starts_with("List(Text") => {
-            format!("_inner.getTextList({})", f.slot_offset)
+            format!("{reader_var}.getTextList({})", f.slot_offset)
         }
         t if t.starts_with("List(") => {
             // List(Struct) — read as mapped array
             let inner = super::extract_list_inner_type(t).unwrap_or("");
             if let Some(sd) = schema.structs.iter().find(|s| s.name == inner) {
-                emit_struct_list_field_expr("_inner", f.slot_offset, sd, schema)
+                emit_struct_list_field_expr(reader_var, f.slot_offset, sd, schema)
             } else {
                 "[]".into()
             }
@@ -509,12 +577,21 @@ fn emit_inner_variant_read(
         _ => {
             // Struct — read its fields as an object via getStruct
             if let Some(sd) = schema.structs.iter().find(|s| s.name == type_name) {
-                emit_struct_pointer_expr("_inner", f.slot_offset, sd, schema, 0)
+                emit_struct_pointer_expr(reader_var, f.slot_offset, sd, schema, depth)
             } else {
                 "null".into()
             }
         }
     }
+}
+
+/// Convenience wrapper using `_inner` as the reader variable (for scoped response parsing).
+fn emit_inner_variant_read(
+    field: Option<&FieldDef>,
+    type_name: &str,
+    schema: &ParsedSchema,
+) -> String {
+    emit_inner_variant_read_from("_inner", field, type_name, schema, 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -535,20 +612,70 @@ fn emit_struct_pointer_expr(
         return "null".into(); // guard against hypothetical recursive schemas
     }
     let var_name = format!("_p{depth}");
-    let fields: Vec<String> = sd
-        .fields
-        .iter()
-        .filter(|sf| sf.discriminant_value == 0xFFFF)
-        .map(|sf| {
-            let camel = to_camel_case(&sf.name);
-            let read = emit_struct_element_field_read_inner(&var_name, sf, schema, depth + 1);
-            format!("{camel}: {read}")
-        })
-        .collect();
-    format!(
-        "(() => {{ const {var_name} = {reader_var}.getStruct({slot}, {}, {}); return {var_name} ? {{ {} }} : null; }})()",
-        sd.data_words, sd.pointer_words, fields.join(", ")
-    )
+
+    if sd.has_union {
+        // Union struct pointer — generate discriminant switch inside an IIFE
+        let disc_byte_off = sd.discriminant_offset * 2;
+
+        let non_union_fields: Vec<&FieldDef> = sd.fields.iter()
+            .filter(|f| f.discriminant_value == 0xFFFF)
+            .collect();
+        let union_fields: Vec<&FieldDef> = sd.fields.iter()
+            .filter(|f| f.discriminant_value != 0xFFFF)
+            .collect();
+
+        let mut s = format!(
+            "(() => {{ const {var_name} = {reader_var}.getStruct({slot}, {}, {}); if (!{var_name}) return null;\n",
+            sd.data_words, sd.pointer_words
+        );
+
+        // Read non-union fields
+        let mut nuf_names = Vec::new();
+        for f in &non_union_fields {
+            let camel = to_camel_case(&f.name);
+            let read = emit_struct_element_field_read_inner(&var_name, f, schema, depth + 1);
+            s.push_str(&format!("  const {camel} = {read};\n"));
+            nuf_names.push(camel);
+        }
+
+        let nuf_str = nuf_names.join(", ");
+        let nuf_comma = if nuf_str.is_empty() { "" } else { ", " };
+
+        s.push_str(&format!("  const _disc = {var_name}.getUint16({disc_byte_off});\n"));
+        s.push_str("  switch (_disc) {\n");
+
+        for uf in &union_fields {
+            s.push_str(&format!("    case {}: {{\n", uf.discriminant_value));
+            let data_expr = emit_inner_variant_read_from(&var_name, Some(uf), &uf.type_name, schema, depth + 1);
+            s.push_str(&format!(
+                "      return {{ {nuf_str}{nuf_comma}variant: '{}' as const, data: {data_expr} }};\n",
+                uf.name
+            ));
+            s.push_str("    }\n");
+        }
+
+        s.push_str(&format!(
+            "    default: return {{ {nuf_str}{nuf_comma}variant: 'unknown' as const, data: null }};\n"
+        ));
+        s.push_str("  }\n");
+        s.push_str("})()");
+        s
+    } else {
+        let fields: Vec<String> = sd
+            .fields
+            .iter()
+            .filter(|sf| sf.discriminant_value == 0xFFFF)
+            .map(|sf| {
+                let camel = to_camel_case(&sf.name);
+                let read = emit_struct_element_field_read_inner(&var_name, sf, schema, depth + 1);
+                format!("{camel}: {read}")
+            })
+            .collect();
+        format!(
+            "(() => {{ const {var_name} = {reader_var}.getStruct({slot}, {}, {}); return {var_name} ? {{ {} }} : null; }})()",
+            sd.data_words, sd.pointer_words, fields.join(", ")
+        )
+    }
 }
 
 /// Generate an inline read expression for a single struct field (thin wrapper).
@@ -577,11 +704,14 @@ fn emit_pointer_read_expr(
             format!("{reader_var}.getDataList({})", field.slot_offset)
         }
         Some(inner) => {
-            // List(Struct) — look up struct def, map elements
+            // List(Struct) — look up struct def, map elements.
+            // For primitive lists (List(Int64), List(UInt32), etc.) we don't yet have
+            // a runtime getter, so emit a typed empty array to satisfy TypeScript.
             if let Some(isd) = schema.structs.iter().find(|s| s.name == inner) {
                 emit_struct_list_field_expr(reader_var, field.slot_offset, isd, schema)
             } else {
-                "[]".into()
+                let elem_ts = super::capnp_to_ts_type(inner);
+                format!("([] as {elem_ts}[])")
             }
         }
         None => {
@@ -629,7 +759,7 @@ fn emit_struct_element_field_read_inner(
                         .map(|(v, _)| format!("'{}'", to_camel_case(v)))
                         .collect::<Vec<_>>()
                         .join(", ");
-                    format!("[{array}][{reader_var}.getUint16({byte_off})] ?? 'unknown'")
+                    format!("([{array}][{reader_var}.getUint16({byte_off})] ?? 'unknown') as {}", field.type_name)
                 } else {
                     format!("{reader_var}.getUint16({byte_off})")
                 }
@@ -644,12 +774,19 @@ fn emit_struct_element_field_read_inner(
 }
 
 /// Generate an inline expression that reads a List(Struct) and maps elements to objects.
+///
+/// For non-union structs: maps to `{ field1, field2, ... }`.
+/// For union structs: maps to `{ variant, data, ...nonUnionFields }` via discriminant switch.
 fn emit_struct_list_field_expr(
     reader_var: &str,
     slot: u32,
     sd: &StructDef,
     schema: &ParsedSchema,
 ) -> String {
+    if sd.has_union {
+        return emit_union_struct_list_field_expr(reader_var, slot, sd, schema);
+    }
+
     let fields: Vec<String> = sd
         .fields
         .iter()
@@ -664,6 +801,69 @@ fn emit_struct_list_field_expr(
         "{reader_var}.getStructList({}, {}, {}).map(_el => ({{ {} }}))",
         slot, sd.data_words, sd.pointer_words, fields.join(", ")
     )
+}
+
+/// Generate a multi-line expression for reading a List(UnionStruct).
+///
+/// Each element is parsed as `{ variant: string; data: unknown }` with optional
+/// non-union fields (for mixed structs like TuiFrame).
+fn emit_union_struct_list_field_expr(
+    reader_var: &str,
+    slot: u32,
+    sd: &StructDef,
+    schema: &ParsedSchema,
+) -> String {
+    let disc_byte_off = sd.discriminant_offset * 2;
+
+    let non_union_fields: Vec<&FieldDef> = sd
+        .fields
+        .iter()
+        .filter(|f| f.discriminant_value == 0xFFFF)
+        .collect();
+    let union_fields: Vec<&FieldDef> = sd
+        .fields
+        .iter()
+        .filter(|f| f.discriminant_value != 0xFFFF)
+        .collect();
+
+    let mut s = format!(
+        "{reader_var}.getStructList({slot}, {}, {}).map(_el => {{\n",
+        sd.data_words, sd.pointer_words
+    );
+
+    // Read non-union fields
+    let mut nuf_names = Vec::new();
+    for f in &non_union_fields {
+        let camel = to_camel_case(&f.name);
+        let read = emit_struct_element_field_read_inner("_el", f, schema, 0);
+        s.push_str(&format!("    const {camel} = {read};\n"));
+        nuf_names.push(camel);
+    }
+
+    let nuf_str = nuf_names.join(", ");
+    let nuf_comma = if nuf_str.is_empty() { "" } else { ", " };
+
+    s.push_str(&format!("    const _disc = _el.getUint16({disc_byte_off});\n"));
+    s.push_str("    switch (_disc) {\n");
+
+    for uf in &union_fields {
+        s.push_str(&format!(
+            "      case {}: // {}\n",
+            uf.discriminant_value, uf.name
+        ));
+        let data_expr = emit_inner_variant_read_from("_el", Some(uf), &uf.type_name, schema, 0);
+        s.push_str(&format!(
+            "        return {{ {nuf_str}{nuf_comma}variant: '{}', data: {data_expr} }};\n",
+            uf.name
+        ));
+    }
+
+    s.push_str(&format!(
+        "      default:\n        return {{ {nuf_str}{nuf_comma}variant: 'unknown', data: null }};\n"
+    ));
+    s.push_str("    }\n");
+    s.push_str("  })");
+    s
 }
 
 /// Emit a top-level List(Struct) variant read wrapped in a block.
@@ -718,7 +918,8 @@ fn emit_reader_field(
                         .collect::<Vec<_>>()
                         .join(", ");
                     out.push_str(&format!(
-                        "{indent}const {local_name} = [{array}][{reader_var}.getUint16({byte_off})] ?? 'unknown';\n"
+                        "{indent}const {local_name} = ([{array}][{reader_var}.getUint16({byte_off})] ?? 'unknown') as {};\n",
+                        field.type_name
                     ));
                 } else {
                     out.push_str(&format!(
@@ -812,7 +1013,7 @@ fn emit_option_read_expr(
     field: &FieldDef,
     opt_struct: &StructDef,
     inner_type_name: &str,
-    _schema: &ParsedSchema,
+    schema: &ParsedSchema,
 ) -> String {
     let disc_byte_off = opt_struct.discriminant_offset * 2;
 
@@ -821,12 +1022,23 @@ fn emit_option_read_expr(
     } else if inner_type_name == "Data" {
         "_optR.getData(0)".to_owned()
     } else {
-        // Data-section scalar: find the 'some' field to get its byte offset
+        // Data-section scalar or enum: find the 'some' field to get its byte offset
         let some_field = opt_struct.fields.iter().find(|f| f.name == "some");
         if let Some(sf) = some_field {
             let some_byte_off = super::data_byte_offset(sf);
-            let getter = super::getter_method(inner_type_name);
-            format!("_optR.{getter}({some_byte_off})")
+            // Enum types are stored as UInt16 — generate array lookup + cast
+            if let Some(ed) = schema.enums.iter().find(|e| e.name == inner_type_name) {
+                let array = ed
+                    .variants
+                    .iter()
+                    .map(|(v, _)| format!("'{}'", to_camel_case(v)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("([{array}][_optR.getUint16({some_byte_off})] ?? 'unknown') as {inner_type_name}")
+            } else {
+                let getter = super::getter_method(inner_type_name);
+                format!("_optR.{getter}({some_byte_off})")
+            }
         } else {
             "undefined".to_owned()
         }

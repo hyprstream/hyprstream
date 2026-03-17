@@ -63,6 +63,17 @@ impl LocalKeyStore {
     }
 
     fn load_or_generate_identity() -> Result<age::x25519::Identity> {
+        // Check for test bypass via config before touching the OS keyring.
+        // Set HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY=<age-secret-key-...> to inject a key.
+        if let Ok(cfg) = crate::config::HyprConfig::load() {
+            if let Some(ref age_key) = cfg.oauth.credential_store_key {
+                return age_key
+                    .trim()
+                    .parse::<age::x25519::Identity>()
+                    .map_err(|e| anyhow!("HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY: invalid age identity: {:?}", e));
+            }
+        }
+
         let entry = keyring::Entry::new(Self::KEYRING_SERVICE, Self::KEYRING_KEY_NAME)
             .context("Failed to access keyring for credential store key")?;
 

@@ -161,6 +161,21 @@ fn handle_auth_code_flow(
 /// Load the user's Ed25519 signing key from the OS keyring.
 /// Returns (signing_key, username).
 fn load_user_signing_key() -> Result<(ed25519_dalek::SigningKey, String)> {
+    // Check for test bypass via config before touching the OS keyring.
+    // Set HYPRSTREAM__OAUTH__USER_SIGNING_KEY=<hex32> to inject a pre-generated key.
+    if let Ok(cfg) = crate::config::HyprConfig::load() {
+        if let Some(ref hex_key) = cfg.oauth.user_signing_key {
+            let bytes = hex::decode(hex_key)
+                .map_err(|e| anyhow::anyhow!("HYPRSTREAM__OAUTH__USER_SIGNING_KEY: invalid hex: {e}"))?;
+            let arr: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("HYPRSTREAM__OAUTH__USER_SIGNING_KEY: expected 32 bytes"))?;
+            let sk = ed25519_dalek::SigningKey::from_bytes(&arr);
+            let username = hyprstream_rpc::envelope::RequestIdentity::local().user().to_owned();
+            return Ok((sk, username));
+        }
+    }
+
     let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER_KEY_NAME).map_err(|e| {
         anyhow::anyhow!(
             "Failed to access OS keyring for user identity: {e}.\n\

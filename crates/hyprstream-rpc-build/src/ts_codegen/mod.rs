@@ -246,7 +246,7 @@ fn extract_list_inner_type(type_name: &str) -> Option<&str> {
 }
 
 /// Check if a capnp type name is a primitive (not a struct reference).
-fn is_primitive(type_name: &str) -> bool {
+pub(crate) fn is_primitive(type_name: &str) -> bool {
     matches!(
         type_name,
         "Void"

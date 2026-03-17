@@ -407,6 +407,19 @@ pub async fn handle_token_create(
 /// The `_keys_dir` parameter is retained for API compatibility but unused;
 /// keys are stored exclusively in the OS keyring.
 pub async fn load_or_generate_signing_key(_keys_dir: &Path) -> Result<SigningKey> {
+    // Check for test bypass via config before touching the OS keyring.
+    // Set HYPRSTREAM__SIGNING_KEY=<hex32> to inject a pre-generated key.
+    if let Ok(cfg) = crate::config::HyprConfig::load() {
+        if let Some(ref hex_key) = cfg.signing_key {
+            let bytes = hex::decode(hex_key)
+                .map_err(|e| anyhow::anyhow!("HYPRSTREAM__SIGNING_KEY: invalid hex: {e}"))?;
+            let arr: [u8; 32] = bytes.try_into()
+                .map_err(|_| anyhow::anyhow!("HYPRSTREAM__SIGNING_KEY: expected 32 bytes"))?;
+            tracing::info!("Using node signing key from config (test bypass)");
+            return Ok(SigningKey::from_bytes(&arr));
+        }
+    }
+
     const SERVICE: &str = "hyprstream";
     const KEY_NAME: &str = "signing-key";
 
@@ -516,6 +529,21 @@ pub(crate) const KEYRING_USER_KEY_NAME: &str = "user-signing-key";
 /// This key is per-OS-user (not per-hyprstream-user). The wizard only
 /// registers it for the local admin. Other users generate their own keys.
 pub(crate) fn ensure_user_identity() -> Result<(SigningKey, ed25519_dalek::VerifyingKey)> {
+    // Check for test bypass via config before touching the OS keyring.
+    // Set HYPRSTREAM__OAUTH__USER_SIGNING_KEY=<hex32> to inject a pre-generated key.
+    if let Ok(cfg) = crate::config::HyprConfig::load() {
+        if let Some(ref hex_key) = cfg.oauth.user_signing_key {
+            let bytes = hex::decode(hex_key)
+                .map_err(|e| anyhow::anyhow!("HYPRSTREAM__OAUTH__USER_SIGNING_KEY: invalid hex: {e}"))?;
+            let arr: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("HYPRSTREAM__OAUTH__USER_SIGNING_KEY: expected 32 bytes"))?;
+            let sk = SigningKey::from_bytes(&arr);
+            info!("Using user signing key from config (test bypass)");
+            return Ok((sk.clone(), sk.verifying_key()));
+        }
+    }
+
     const SERVICE: &str = KEYRING_SERVICE;
     const KEY_NAME: &str = KEYRING_USER_KEY_NAME;
 

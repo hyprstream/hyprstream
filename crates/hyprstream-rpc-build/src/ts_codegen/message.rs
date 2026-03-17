@@ -456,12 +456,12 @@ export class CapnpArena {
  * Builder for a sub-struct within a message.
  */
 export class StructBuilder {
-  private msg: CapnpMessageBuilder;
+  private msg: CapnpArena;
   private dataOffset: number;
   private ptrOffset: number;
 
   constructor(
-    msg: CapnpMessageBuilder,
+    msg: CapnpArena,
     structStart: number,
     dataWords: number,
     _ptrWords: number,
@@ -495,6 +495,14 @@ export class StructBuilder {
 
   setUint64(byteOffset: number, value: bigint): void {
     this.msg._getBuf().setBigUint64(this.dataOffset + byteOffset, value, true);
+  }
+
+  setInt8(byteOffset: number, value: number): void {
+    this.msg._getBuf().setInt8(this.dataOffset + byteOffset, value);
+  }
+
+  setInt16(byteOffset: number, value: number): void {
+    this.msg._getBuf().setInt16(this.dataOffset + byteOffset, value, true);
   }
 
   setInt32(byteOffset: number, value: number): void {
@@ -959,6 +967,14 @@ export class StructReader {
 
   getUint64(byteOffset: number): bigint {
     return this.buf.getBigUint64(this.dataOffset + byteOffset, true);
+  }
+
+  getInt8(byteOffset: number): number {
+    return this.buf.getInt8(this.dataOffset + byteOffset);
+  }
+
+  getInt16(byteOffset: number): number {
+    return this.buf.getInt16(this.dataOffset + byteOffset, true);
   }
 
   getInt32(byteOffset: number): number {

@@ -158,10 +158,10 @@ pub enum Commands {
         /// User code from device flow (e.g., ABCD-EFGH)
         user_code: Option<String>,
         /// Nonce from the browser authorization challenge form
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         nonce: Option<String>,
         /// PKCE code_challenge from the browser authorization URL
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         code_challenge: Option<String>,
         /// OAuth server URL (default: from config or http://localhost:6791)
         #[arg(long)]
