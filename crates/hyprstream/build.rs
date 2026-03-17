@@ -59,20 +59,24 @@ fn compile_capnp_schemas() {
     }
 
     let out_path = Path::new(&out_dir);
-    let schemas = ["events", "inference", "registry", "policy", "model", "mcp", "notification", "tui"];
+    let import_paths: &[&Path] = &[&rpc_schema_dir, schema_dir];
 
-    // Compile schemas with CGR + metadata extraction
-    hyprstream_rpc_build::compile_schemas(
-        schema_dir,
-        out_path,
-        &[&rpc_schema_dir, schema_dir],
-        &schemas,
-    );
+    // Schemas from hyprstream/schema/
+    let schemas = ["events", "inference", "registry", "policy", "model", "mcp", "notification", "tui", "compositor_ipc"];
+
+    // Schemas from hyprstream-rpc/schema/ (need TS codegen but live in the RPC crate)
+    let rpc_schemas = ["streaming"];
+
+    // Compile hyprstream schemas
+    hyprstream_rpc_build::compile_schemas(schema_dir, out_path, import_paths, &schemas);
+
+    // Compile hyprstream-rpc schemas with rpc_schema_dir as src_prefix
+    hyprstream_rpc_build::compile_schemas(&rpc_schema_dir, out_path, import_paths, &rpc_schemas);
 
     // Copy CGR files to stable codegen-out/ for TypeScript codegen
     let codegen_dir = Path::new(&manifest_dir).join("../../codegen-out");
     let _ = std::fs::create_dir_all(&codegen_dir);
-    for name in &schemas {
+    for name in schemas.iter().chain(rpc_schemas.iter()) {
         let cgr_path = out_path.join(format!("{name}.cgr"));
         if cgr_path.exists() {
             let _ = std::fs::copy(&cgr_path, codegen_dir.join(format!("{name}.cgr")));

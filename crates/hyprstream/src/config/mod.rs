@@ -122,6 +122,14 @@ pub struct HyprConfig {
     /// TUI display server configuration
     #[serde(default)]
     pub tui: TuiServiceConfig,
+
+    /// Hex-encoded Ed25519 node signing key bytes (bypasses OS keyring lookup).
+    ///
+    /// **TEST USE ONLY.** Set via `HYPRSTREAM__SIGNING_KEY` env var to inject a
+    /// pre-generated key in isolated test environments where a keyring daemon is
+    /// unavailable. Never set this in production config files.
+    #[serde(default, skip_serializing)]
+    pub signing_key: Option<String>,
 }
 
 /// TLS configuration for HTTP services (OAI, OAuth, MCP).
@@ -614,6 +622,30 @@ pub struct OAuthConfig {
     /// Value = configuration for fetching/caching that issuer's JWKS.
     #[serde(default)]
     pub trusted_issuers: std::collections::HashMap<String, TrustedIssuerConfig>,
+
+    /// OpenID Federation 1.0 Trust Anchor URLs (optional).
+    /// When set, included as `authority_hints` in the entity configuration JWT,
+    /// making this node discoverable within the named federations.
+    /// Example: `["https://federation.example.org"]`
+    #[serde(default)]
+    pub authority_hints: Vec<String>,
+
+    /// age x25519 identity string for the credential store (bypasses OS keyring lookup).
+    ///
+    /// **TEST USE ONLY.** Set via `HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY` env var.
+    /// Allows isolated test environments to encrypt/decrypt `users.toml.age` without
+    /// a keyring daemon. Never set this in production config files.
+    #[serde(default, skip_serializing)]
+    pub credential_store_key: Option<String>,
+
+    /// Hex-encoded Ed25519 private key bytes for the local user identity (bypasses OS keyring).
+    ///
+    /// **TEST USE ONLY.** Set via `HYPRSTREAM__OAUTH__USER_SIGNING_KEY` env var.
+    /// Allows the `sign-challenge` CLI and wizard to use a pre-generated key in
+    /// isolated test environments without a keyring daemon.
+    /// Never set this in production config files.
+    #[serde(default, skip_serializing)]
+    pub user_signing_key: Option<String>,
 }
 
 fn default_oauth_cors() -> server::CorsConfig {
@@ -634,6 +666,9 @@ impl Default for OAuthConfig {
             quic_port: None,
             cors: default_oauth_cors(),
             trusted_issuers: std::collections::HashMap::new(),
+            authority_hints: Vec::new(),
+            credential_store_key: None,
+            user_signing_key: None,
         }
     }
 }
@@ -1155,6 +1190,7 @@ impl HyprConfigBuilder {
             policy: self.policy,
             discovery: self.discovery,
             tui: self.tui,
+            signing_key: None,
         }
     }
 

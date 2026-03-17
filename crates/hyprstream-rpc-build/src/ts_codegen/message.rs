@@ -15,15 +15,41 @@ pub fn generate_capnp_runtime() -> String {
 // List pointer:   [offset_words:30 | 0b01:2] [element_size:3 | element_count:29]
 // Text/Data:      List(UInt8) with NUL terminator for Text
 
+import { getHyprstreamWasm } from '../../wasm/hyprstream-rpc/HyprstreamWasm';
+
 const WORD_SIZE = 8;
 
+// Module-level singletons — avoid per-call allocation
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
 /**
- * Single-segment Cap'n Proto message builder.
- *
- * Allocates a flat buffer and writes struct fields at known offsets.
- * Pointers (Text, Data, List, Struct) are appended after the root struct.
+ * WeakMap from the Uint8Array returned by CapnpArena.finish() to the arena that
+ * produced it.  Used by call() in client.ts to detect WASM-backed payloads and
+ * invoke sign_envelope_into without an extra copy.
  */
-export class CapnpMessageBuilder {
+const _wasmArenaMap = new WeakMap<Uint8Array, CapnpArena>();
+
+/**
+ * Return the CapnpArena that produced `view`, if it was WASM-backed.
+ * Used by HyprstreamClient.call() to detect zero-copy payloads.
+ */
+export function getArenaForView(view: Uint8Array): CapnpArena | undefined {
+  return _wasmArenaMap.get(view);
+}
+
+/**
+ * Single-segment Cap'n Proto message builder / arena.
+ *
+ * Two construction modes:
+ *   new CapnpArena(dataWords, ptrWords)               — JS-heap backed (Phase 1)
+ *   CapnpArena.intoWasm(dataWords, ptrWords, extra)   — WASM-memory backed (Phase 2)
+ *
+ * WASM-backed arenas allow sign_envelope_into to sign the payload in-place
+ * (no JS→WASM copy) and return a SharedArrayBuffer view that stays valid
+ * across the async WebTransport send.
+ */
+export class CapnpArena {
   private buf: DataView;
   private raw: Uint8Array;
   /** Total allocated size in bytes */
@@ -36,41 +62,114 @@ export class CapnpMessageBuilder {
   private readonly rootPtrOffset: number;
   private readonly dataWords: number;
   private readonly ptrWords: number;
+  /** Non-zero when backed by WASM linear memory (pointer value from wasm.alloc). */
+  private _wasmPtr: number = 0;
+  /** Original allocation size in bytes (needed for wasm.dealloc). */
+  private _wasmCapacity: number = 0;
 
   /**
-   * @param dataWords Number of 64-bit words in the root struct data section
-   * @param ptrWords  Number of pointers in the root struct pointer section
+   * JS-heap constructor.
+   *
+   * @param dataWords  Number of 64-bit words in the root struct data section
+   * @param ptrWords   Number of pointers in the root struct pointer section
+   * @param externalRaw  Optional externally-allocated buffer (WASM-backed path)
+   * @param wasmPtr    WASM linear-memory pointer matching externalRaw (WASM-backed path)
    */
-  constructor(dataWords: number, ptrWords: number) {
+  constructor(
+    dataWords: number,
+    ptrWords: number,
+    externalRaw?: Uint8Array,
+    wasmPtr?: number,
+  ) {
     this.dataWords = dataWords;
     this.ptrWords = ptrWords;
 
-    // Initial capacity: message header (8B) + struct pointer (8B) + struct body
-    // We'll grow as needed when appending pointer targets
     const structSize = (dataWords + ptrWords) * WORD_SIZE;
-    // Message header: 4B segment_count (0) + 4B segment_size
-    // Then a struct pointer (8B) pointing to the root struct
-    // Then the root struct body
-    const headerSize = 8; // segment table
-    this.capacity = headerSize + structSize + 1024; // extra space for pointer targets
-    this.raw = new Uint8Array(this.capacity);
-    this.buf = new DataView(this.raw.buffer);
+    // Standard Cap'n Proto format:
+    //   Bytes 0-7:   segment table [num_segments-1=0, segment_size_words]
+    //   Bytes 8-15:  root struct pointer (written by finish())
+    //   Bytes 16+:   root struct data section + pointer section
+    const HEADER = 16; // segment table (8B) + root struct pointer slot (8B)
 
-    // Root struct starts right after the message header
-    // (No struct pointer needed — the root is implicitly at offset 0 of segment)
-    this.rootDataOffset = headerSize;
-    this.rootPtrOffset = headerSize + dataWords * WORD_SIZE;
-    this.allocOffset = headerSize + structSize;
+    if (externalRaw !== undefined && wasmPtr !== undefined) {
+      this.raw = externalRaw;
+      this.capacity = externalRaw.byteLength;
+      this._wasmPtr = wasmPtr;
+      this._wasmCapacity = externalRaw.byteLength;
+    } else {
+      this.capacity = HEADER + structSize + 1024;
+      this.raw = new Uint8Array(this.capacity);
+      this._wasmPtr = 0;
+      this._wasmCapacity = 0;
+    }
+    this.buf = new DataView(this.raw.buffer, this.raw.byteOffset, this.raw.byteLength);
+
+    this.rootDataOffset = HEADER;                            // 16
+    this.rootPtrOffset  = HEADER + dataWords * WORD_SIZE;   // 16 + dw*8
+    this.allocOffset    = HEADER + structSize;               // 16 + (dw+pw)*8
   }
 
-  /** Ensure capacity for `needed` more bytes. */
+  /**
+   * Create a WASM-memory-backed arena.
+   *
+   * The arena allocates `(2 + dataWords + ptrWords + extraWords) * 8` bytes from
+   * WASM linear memory (via wasm.alloc).  finish() returns a subarray view into
+   * that SharedArrayBuffer — valid across async WebTransport sends.
+   *
+   * Call releaseWasm() (or let call() in client.ts do it) to free the WASM memory.
+   *
+   * @param dataWords  Root struct data words
+   * @param ptrWords   Root struct pointer words
+   * @param extraWords Slack for pointer targets (Text/Data/Struct allocations).
+   *                   Defaults to 16 (128 B).  grow() handles overflow automatically.
+   */
+  static intoWasm(dataWords: number, ptrWords: number, extraWords: number = 16): CapnpArena {
+    const wasm = getHyprstreamWasm();
+    // 2 header words (segment table + root ptr slot) + struct + extra
+    const totalBytes = (2 + dataWords + ptrWords + extraWords) * WORD_SIZE;
+    const ptr = wasm.alloc(totalBytes);
+    const view = new Uint8Array(wasm.memory.buffer, ptr, totalBytes);
+    return new CapnpArena(dataWords, ptrWords, view, ptr);
+  }
+
+  /** WASM linear-memory pointer, or 0 if JS-heap backed. */
+  backingPtr(): number { return this._wasmPtr; }
+
+  /** The raw backing buffer (for diagnostics / direct access). */
+  backingBuffer(): Uint8Array { return this.raw; }
+
+  /**
+   * Free the WASM linear-memory backing (if WASM-backed).
+   * Called automatically by HyprstreamClient.call() after the signed envelope
+   * has been handed to the transport.  Safe to call multiple times.
+   */
+  releaseWasm(): void {
+    if (this._wasmPtr !== 0) {
+      getHyprstreamWasm().dealloc(this._wasmPtr, this._wasmCapacity);
+      this._wasmPtr = 0;
+    }
+  }
+
+  /** Ensure capacity for `needed` more bytes, growing if necessary. */
   private ensureCapacity(needed: number): void {
     if (this.allocOffset + needed <= this.capacity) return;
     const newCap = Math.max(this.capacity * 2, this.allocOffset + needed + 256);
-    const newBuf = new Uint8Array(newCap);
-    newBuf.set(this.raw);
-    this.raw = newBuf;
-    this.buf = new DataView(this.raw.buffer);
+    if (this._wasmPtr !== 0) {
+      // WASM-backed: alloc new WASM buffer, copy, dealloc old
+      const wasm = getHyprstreamWasm();
+      const newPtr = wasm.alloc(newCap);
+      const newRaw = new Uint8Array(wasm.memory.buffer, newPtr, newCap);
+      newRaw.set(this.raw.subarray(0, this.allocOffset));
+      wasm.dealloc(this._wasmPtr, this._wasmCapacity);
+      this._wasmPtr = newPtr;
+      this._wasmCapacity = newCap;
+      this.raw = newRaw;
+    } else {
+      const newBuf = new Uint8Array(newCap);
+      newBuf.set(this.raw);
+      this.raw = newBuf;
+    }
+    this.buf = new DataView(this.raw.buffer, this.raw.byteOffset, this.raw.byteLength);
     this.capacity = newCap;
   }
 
@@ -140,7 +239,7 @@ export class CapnpMessageBuilder {
    * Encodes as a list of bytes with NUL terminator.
    */
   setText(ptrIndex: number, value: string): void {
-    const encoded = new TextEncoder().encode(value);
+    const encoded = encoder.encode(value);
     const byteLen = encoded.length + 1; // +1 for NUL
     const wordLen = Math.ceil(byteLen / WORD_SIZE);
 
@@ -233,7 +332,7 @@ export class CapnpMessageBuilder {
     for (let i = 0; i < values.length; i++) {
       const elementPtrOffset = tagOffset + WORD_SIZE + i * elementWords * WORD_SIZE;
       // Write text data after all elements
-      const encoded = new TextEncoder().encode(values[i]);
+      const encoded = encoder.encode(values[i]);
       const byteLen = encoded.length + 1;
       const wordLen = Math.ceil(byteLen / WORD_SIZE);
 
@@ -318,17 +417,30 @@ export class CapnpMessageBuilder {
     return builders;
   }
 
-  /** Finalize the message and return the wire-format bytes. */
+  /** Finalize the message and return the wire-format bytes (view, no copy). */
   finish(): Uint8Array {
-    // Calculate segment size in words
-    const segmentBytes = this.allocOffset - 8; // subtract header
+    // Write root struct pointer at bytes 8-15.
+    // The root struct data starts at byte 16 = 0 words after the end of this pointer word.
+    // Struct pointer: lo = (offsetWords << 2) | 0b00, hi = dataWords | (ptrWords << 16)
+    this.buf.setUint32(8, 0, true); // lo: offset_words=0, type=struct(0b00)
+    this.buf.setUint32(12, (this.dataWords & 0xffff) | ((this.ptrWords & 0xffff) << 16), true);
+
+    // Segment covers bytes 8..allocOffset (everything after the 8-byte segment table).
+    const segmentBytes = this.allocOffset - 8;
     const segmentWords = Math.ceil(segmentBytes / WORD_SIZE);
 
-    // Write message header
+    // Write segment table
     this.buf.setUint32(0, 0, true); // segment count - 1 = 0 (single segment)
     this.buf.setUint32(4, segmentWords, true);
 
-    return this.raw.slice(0, 8 + segmentWords * WORD_SIZE);
+    const view = this.raw.subarray(0, 8 + segmentWords * WORD_SIZE);
+
+    // Register WASM-backed views so client.ts can detect zero-copy payloads.
+    if (this._wasmPtr !== 0) {
+      _wasmArenaMap.set(view, this);
+    }
+
+    return view;
   }
 
   /** Access the underlying buffer (for StructBuilder). */
@@ -344,12 +456,12 @@ export class CapnpMessageBuilder {
  * Builder for a sub-struct within a message.
  */
 export class StructBuilder {
-  private msg: CapnpMessageBuilder;
+  private msg: CapnpArena;
   private dataOffset: number;
   private ptrOffset: number;
 
   constructor(
-    msg: CapnpMessageBuilder,
+    msg: CapnpArena,
     structStart: number,
     dataWords: number,
     _ptrWords: number,
@@ -385,6 +497,14 @@ export class StructBuilder {
     this.msg._getBuf().setBigUint64(this.dataOffset + byteOffset, value, true);
   }
 
+  setInt8(byteOffset: number, value: number): void {
+    this.msg._getBuf().setInt8(this.dataOffset + byteOffset, value);
+  }
+
+  setInt16(byteOffset: number, value: number): void {
+    this.msg._getBuf().setInt16(this.dataOffset + byteOffset, value, true);
+  }
+
   setInt32(byteOffset: number, value: number): void {
     this.msg._getBuf().setInt32(this.dataOffset + byteOffset, value, true);
   }
@@ -402,7 +522,7 @@ export class StructBuilder {
   }
 
   setText(ptrIndex: number, value: string): void {
-    const encoded = new TextEncoder().encode(value);
+    const encoded = encoder.encode(value);
     const byteLen = encoded.length + 1;
     const wordLen = Math.ceil(byteLen / WORD_SIZE);
 
@@ -499,7 +619,7 @@ export class StructBuilder {
 
     for (let i = 0; i < values.length; i++) {
       const elementPtrOffset = tagOffset + WORD_SIZE + i * elementWords * WORD_SIZE;
-      const encoded = new TextEncoder().encode(values[i]);
+      const encoded = encoder.encode(values[i]);
       const byteLen = encoded.length + 1;
       const wordLen = Math.ceil(byteLen / WORD_SIZE);
 
@@ -578,10 +698,24 @@ export class CapnpReader {
     this.buf = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     this.dataWords = dataWords;
 
-    // Parse message header: segment_count-1 (should be 0), segment_size
-    // Root struct starts at offset 8 (after the 8-byte header)
-    this.rootDataOffset = 8;
-    this.rootPtrOffset = 8 + dataWords * WORD_SIZE;
+    // Standard Cap'n Proto format (capnp-rust serialize::write_message):
+    //   Bytes 0-7:  segment table [num_segments-1=0, segment_size_words]
+    //   Bytes 8-15: root struct pointer [offset_words:30 | 0b00:2] [dataWords:16 | ptrWords:16]
+    //   Bytes 16+:  root struct data (when pointer offset_words=0)
+    //
+    // Parse the root struct pointer at byte 8 to find the actual struct data offset.
+    // offset_words=0 means struct data immediately follows the pointer at byte 16.
+    let rootDataOffset = 8; // fallback for malformed messages
+    if (bytes.length >= 16) {
+      const rootPtrLo = this.buf.getUint32(8, true);
+      if ((rootPtrLo & 3) === 0) {
+        // Struct pointer: upper 30 bits are signed offset_words from end of pointer to struct data
+        const offsetWords = rootPtrLo >> 2; // arithmetic right shift (sign-preserving in JS)
+        rootDataOffset = 16 + offsetWords * 8;
+      }
+    }
+    this.rootDataOffset = rootDataOffset;
+    this.rootPtrOffset = rootDataOffset + dataWords * WORD_SIZE;
   }
 
   // --- Data section getters ---
@@ -649,8 +783,7 @@ export class CapnpReader {
 
     // Text is NUL-terminated, so actual string length is byteCount - 1
     const strLen = byteCount > 0 ? byteCount - 1 : 0;
-    const slice = this.raw.slice(targetOffset, targetOffset + strLen);
-    return new TextDecoder().decode(slice);
+    return decoder.decode(this.raw.subarray(targetOffset, targetOffset + strLen));
   }
 
   /** Read a Data pointer at the given pointer index. Returns empty array if null. */
@@ -668,7 +801,7 @@ export class CapnpReader {
     const byteCount = hi >>> 3;
     const targetOffset = ptrOffset + WORD_SIZE + offsetWords * WORD_SIZE;
 
-    return this.raw.slice(targetOffset, targetOffset + byteCount);
+    return this.raw.subarray(targetOffset, targetOffset + byteCount);
   }
 
   /** Read a struct pointer and return a StructReader. Returns null if pointer is null. */
@@ -724,7 +857,7 @@ export class CapnpReader {
       const byteCount = elemHi >>> 3;
       const textOffset = elemOffset + WORD_SIZE + elemOffsetWords * WORD_SIZE;
       const strLen = byteCount > 0 ? byteCount - 1 : 0;
-      results.push(new TextDecoder().decode(this.raw.slice(textOffset, textOffset + strLen)));
+      results.push(decoder.decode(this.raw.subarray(textOffset, textOffset + strLen)));
     }
 
     return results;
@@ -764,7 +897,7 @@ export class CapnpReader {
       const elemOffsetWords = (elemLo >> 2) | 0;
       const byteCount = elemHi >>> 3;
       const dataOffset = elemOffset + WORD_SIZE + elemOffsetWords * WORD_SIZE;
-      results.push(this.raw.slice(dataOffset, dataOffset + byteCount));
+      results.push(this.raw.subarray(dataOffset, dataOffset + byteCount));
     }
 
     return results;
@@ -836,6 +969,14 @@ export class StructReader {
     return this.buf.getBigUint64(this.dataOffset + byteOffset, true);
   }
 
+  getInt8(byteOffset: number): number {
+    return this.buf.getInt8(this.dataOffset + byteOffset);
+  }
+
+  getInt16(byteOffset: number): number {
+    return this.buf.getInt16(this.dataOffset + byteOffset, true);
+  }
+
   getInt32(byteOffset: number): number {
     return this.buf.getInt32(this.dataOffset + byteOffset, true);
   }
@@ -866,7 +1007,7 @@ export class StructReader {
     const byteCount = hi >>> 3;
     const targetOffset = ptrOffset + WORD_SIZE + offsetWords * WORD_SIZE;
     const strLen = byteCount > 0 ? byteCount - 1 : 0;
-    return new TextDecoder().decode(this.raw.slice(targetOffset, targetOffset + strLen));
+    return decoder.decode(this.raw.subarray(targetOffset, targetOffset + strLen));
   }
 
   getData(ptrIndex: number): Uint8Array {
@@ -883,7 +1024,7 @@ export class StructReader {
     const byteCount = hi >>> 3;
     const targetOffset = ptrOffset + WORD_SIZE + offsetWords * WORD_SIZE;
 
-    return this.raw.slice(targetOffset, targetOffset + byteCount);
+    return this.raw.subarray(targetOffset, targetOffset + byteCount);
   }
 
   getStruct(ptrIndex: number, dataWords: number, ptrWords: number): StructReader | null {
@@ -927,7 +1068,7 @@ export class StructReader {
       const byteCount = elemHi >>> 3;
       const textOffset = elemOffset + WORD_SIZE + elemOffsetWords * WORD_SIZE;
       const strLen = byteCount > 0 ? byteCount - 1 : 0;
-      results.push(new TextDecoder().decode(this.raw.slice(textOffset, textOffset + strLen)));
+      results.push(decoder.decode(this.raw.subarray(textOffset, textOffset + strLen)));
     }
     return results;
   }
@@ -958,7 +1099,7 @@ export class StructReader {
       const elemOffsetWords = (elemLo >> 2) | 0;
       const byteCount = elemHi >>> 3;
       const dataOffset = elemOffset + WORD_SIZE + elemOffsetWords * WORD_SIZE;
-      results.push(this.raw.slice(dataOffset, dataOffset + byteCount));
+      results.push(this.raw.subarray(dataOffset, dataOffset + byteCount));
     }
     return results;
   }
@@ -992,5 +1133,8 @@ export class StructReader {
     return results;
   }
 }
+
+/** Backwards-compatible alias — prefer CapnpArena for new code. */
+export const CapnpMessageBuilder = CapnpArena;
 "##.to_owned()
 }

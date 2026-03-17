@@ -131,7 +131,7 @@ sqlparser = "0.39.0"
 json-threat-protection = "0.1.1"
 
 # System utilities
-nix = { version = "0.27", features = ["process", "signal", "user"] }
+nix = { version = "0.27", features = ["fs", "process", "signal", "user"] }
 users = "0.11"
 rlimit = "0.10"
 clap = { version = "4.4", features = ["derive", "env"] }

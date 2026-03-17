@@ -32,30 +32,27 @@ pub async fn handle_service_install(
     run_repair_checks(models_dir, verbose).await?;
     println!();
 
-    // Show executable path being used
-    if let Ok(appimage) = std::env::var("APPIMAGE") {
-        println!("  Executable: {} (AppImage)", appimage);
-    } else if let Ok(exe) = std::env::current_exe() {
-        println!("  Executable: {}", exe.display());
-    }
-    println!();
-
     // 2. Install command alias to user's executable directory
     println!("  Installing command...");
-    match install_command_alias() {
-        Ok((bin_dir, version_dir, is_appimage, updated_profiles)) => {
-            let type_str = if is_appimage { "AppImage" } else { "binary" };
-            println!("    {} ({})", version_dir.display(), type_str);
-            println!(
-                "    {} -> ...",
-                bin_dir.join("hyprstream.appimage").display()
-            );
-            println!(
-                "    {} -> hyprstream.appimage",
-                bin_dir.join("hyprstream").display()
-            );
-            if !updated_profiles.is_empty() {
-                println!("    PATH updated: {}", updated_profiles.join(" "));
+    match InstallPlan::prepare() {
+        Ok(plan) => {
+            println!("    Source: {} ({})", plan.source.display(), plan.type_label());
+            match plan.execute() {
+                Ok(result) => {
+                    println!("    {} ({})", result.version_dir.display(), result.type_label());
+                    println!(
+                        "    {} -> ...",
+                        result.bin_dir.join("hyprstream.appimage").display()
+                    );
+                    println!(
+                        "    {} -> hyprstream.appimage",
+                        result.bin_dir.join("hyprstream").display()
+                    );
+                    if !result.updated_profiles.is_empty() {
+                        println!("    PATH updated: {}", result.updated_profiles.join(" "));
+                    }
+                }
+                Err(e) => println!("    install failed ({})", e),
             }
         }
         Err(e) => println!("    skipped ({})", e),
@@ -622,6 +619,7 @@ pub(crate) enum CheckStatus {
     Fixed,
     Warn,
     Fail,
+    Info,
 }
 
 pub(crate) fn print_check(label: &str, status: CheckStatus, detail: &str) {
@@ -630,6 +628,7 @@ pub(crate) fn print_check(label: &str, status: CheckStatus, detail: &str) {
         CheckStatus::Fixed => ("\u{2713}", "\x1b[33m"),  // yellow checkmark (fixed)
         CheckStatus::Warn => ("\u{26A0}", "\x1b[33m"),   // yellow warning
         CheckStatus::Fail => ("\u{2717}", "\x1b[31m"),   // red X
+        CheckStatus::Info => ("\u{25CB}", "\x1b[36m"),   // cyan circle (informational)
     };
     println!("  {color}{icon}\x1b[0m {:<20} {detail}", label);
 }
@@ -644,7 +643,7 @@ pub(crate) fn print_check(label: &str, status: CheckStatus, detail: &str) {
 /// Example: `0.1.0-alpha-7+main.gabc1234.dirty`
 ///
 /// Uses BUILD_VERSION from build.rs, falls back to CARGO_PKG_VERSION.
-fn build_version() -> &'static str {
+pub(crate) fn build_version() -> &'static str {
     option_env!("BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
 }
 
@@ -652,100 +651,312 @@ fn build_version() -> &'static str {
 // Command alias installation helpers
 // =============================================================================
 
-/// Install hyprstream binary/AppImage to versioned directory with symlinks
+// =============================================================================
+// InstallPlan: unified binary installation pipeline
+// =============================================================================
+
+/// Plan for installing the hyprstream binary/AppImage.
 ///
-/// Structure:
-/// ```text
-/// ~/.local/share/hyprstream/versions/$VERSION/hyprstream[.appimage]
-/// ~/.local/bin/hyprstream.appimage -> ../share/hyprstream/versions/$VERSION/hyprstream.appimage
-/// ~/.local/bin/hyprstream -> hyprstream.appimage
-/// ```
-///
-/// Returns (bin_dir, version_dir, is_appimage, updated_profiles) for output.
-fn install_command_alias() -> Result<(PathBuf, PathBuf, bool, Vec<String>)> {
-    let version = build_version();
+/// Separates detection and validation (`prepare()`) from side effects (`execute()`).
+/// Both `service install` and the wizard share this pipeline.
+pub(crate) struct InstallPlan {
+    pub(crate) source: PathBuf,
+    pub(crate) is_appimage: bool,
+    pub(crate) source_size: u64,
+    pub(crate) version: &'static str,
+    pub(crate) filename: &'static str,
+    pub(crate) version_dir: PathBuf,
+    pub(crate) bin_dir: PathBuf,
+    pub(crate) available_space: u64,
+}
 
-    // Get directories using paths module
-    let local_bin = hyprstream_rpc::paths::bin_dir()
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine user executable directory"))?;
-    let ver_dir = hyprstream_rpc::paths::version_dir(version)
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine version directory"))?;
+/// Result of a successful `InstallPlan::execute()`.
+pub(crate) struct InstallResult {
+    pub(crate) bin_dir: PathBuf,
+    pub(crate) version_dir: PathBuf,
+    pub(crate) is_appimage: bool,
+    pub(crate) updated_profiles: Vec<String>,
+}
 
-    std::fs::create_dir_all(&local_bin)
-        .with_context(|| format!("Failed to create directory: {}", local_bin.display()))?;
-    std::fs::create_dir_all(&ver_dir)
-        .with_context(|| format!("Failed to create directory: {}", ver_dir.display()))?;
+impl InstallPlan {
+    /// Detect source, validate it, resolve paths, check disk space.
+    /// No side effects — safe to call and discard.
+    pub(crate) fn prepare() -> Result<Self> {
+        let (source, is_appimage) = binary_copy_source()?;
+        let source_size = validate_source(&source)?;
 
-    // Get source: $APPIMAGE if available (stable path), otherwise current_exe()
-    let (source, is_appimage) = if let Ok(appimage_env) = std::env::var("APPIMAGE") {
-        (PathBuf::from(&appimage_env), true)
-    } else {
-        let exe = std::env::current_exe().context("Failed to get current executable path")?;
-        let is_appimage = is_appimage_file(&exe).unwrap_or(false);
-        (exe, is_appimage)
-    };
+        let version = build_version();
+        let filename = if is_appimage { "hyprstream.appimage" } else { "hyprstream" };
 
-    // Determine filenames based on type
-    let filename = if is_appimage {
-        "hyprstream.appimage"
-    } else {
-        "hyprstream"
-    };
+        let bin_dir = hyprstream_rpc::paths::bin_dir()
+            .ok_or_else(|| anyhow::anyhow!("Cannot determine user executable directory"))?;
+        let version_dir = hyprstream_rpc::paths::version_dir(version)
+            .ok_or_else(|| anyhow::anyhow!("Cannot determine version directory"))?;
 
-    // Copy binary to versioned directory
-    let versioned_binary = ver_dir.join(filename);
-    remove_if_exists(&versioned_binary)?;
-    std::fs::copy(&source, &versioned_binary).with_context(|| {
-        format!(
-            "Failed to copy {} -> {}",
-            source.display(),
-            versioned_binary.display()
-        )
-    })?;
+        let available_space = available_space(&version_dir).unwrap_or(0);
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&versioned_binary, std::fs::Permissions::from_mode(0o755))?;
+        Ok(Self {
+            source,
+            is_appimage,
+            source_size,
+            version,
+            filename,
+            version_dir,
+            bin_dir,
+            available_space,
+        })
     }
 
-    // Create symlinks in ~/.local/bin/
-    let bin_appimage = local_bin.join("hyprstream.appimage");
-    let bin_hyprstream = local_bin.join("hyprstream");
+    /// Execute the install: copy, symlink, update shell profiles.
+    /// Consumes the plan to prevent double-execution.
+    pub(crate) fn execute(self) -> Result<InstallResult> {
+        std::fs::create_dir_all(&self.bin_dir)
+            .with_context(|| format!("Failed to create directory: {}", self.bin_dir.display()))?;
+        std::fs::create_dir_all(&self.version_dir)
+            .with_context(|| format!("Failed to create directory: {}", self.version_dir.display()))?;
 
-    // Calculate relative path from bin to versioned binary
-    // ~/.local/bin/ -> ~/.local/share/hyprstream/versions/$VERSION/
-    let relative_path = Path::new("..")
-        .join("share")
-        .join("hyprstream")
-        .join("versions")
-        .join(version)
-        .join(filename);
+        // Copy binary to versioned directory
+        let versioned_binary = self.version_dir.join(self.filename);
+        remove_if_exists(&versioned_binary)?;
+        std::fs::copy(&self.source, &versioned_binary).with_context(|| {
+            format!(
+                "Failed to copy {} -> {}",
+                self.source.display(),
+                versioned_binary.display()
+            )
+        })?;
 
-    // Remove old symlinks/files
-    remove_if_exists(&bin_appimage)?;
-    remove_if_exists(&bin_hyprstream)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&versioned_binary, std::fs::Permissions::from_mode(0o755))?;
+        }
 
-    // Create symlinks
-    #[cfg(unix)]
-    {
-        // hyprstream.appimage -> ../share/hyprstream/versions/$VERSION/hyprstream[.appimage]
-        std::os::unix::fs::symlink(&relative_path, &bin_appimage)
-            .with_context(|| format!("Failed to create symlink: {}", bin_appimage.display()))?;
+        // Create symlinks in bin_dir
+        let bin_appimage = self.bin_dir.join("hyprstream.appimage");
+        let bin_hyprstream = self.bin_dir.join("hyprstream");
 
-        // hyprstream -> hyprstream.appimage
-        std::os::unix::fs::symlink(Path::new("hyprstream.appimage"), &bin_hyprstream)
-            .with_context(|| format!("Failed to create symlink: {}", bin_hyprstream.display()))?;
+        // Calculate relative path from bin to versioned binary
+        let relative_path = Path::new("..")
+            .join("share")
+            .join("hyprstream")
+            .join("versions")
+            .join(self.version)
+            .join(self.filename);
+
+        remove_if_exists(&bin_appimage)?;
+        remove_if_exists(&bin_hyprstream)?;
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&relative_path, &bin_appimage)
+                .with_context(|| format!("Failed to create symlink: {}", bin_appimage.display()))?;
+            std::os::unix::fs::symlink(Path::new("hyprstream.appimage"), &bin_hyprstream)
+                .with_context(|| format!("Failed to create symlink: {}", bin_hyprstream.display()))?;
+        }
+
+        let updated_profiles = if let Some(home) = dirs::home_dir() {
+            update_shell_profiles(&home, &self.bin_dir).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        Ok(InstallResult {
+            bin_dir: self.bin_dir,
+            version_dir: self.version_dir,
+            is_appimage: self.is_appimage,
+            updated_profiles,
+        })
     }
 
-    // Update shell profiles for PATH
-    let updated_profiles = if let Some(home) = dirs::home_dir() {
-        update_shell_profiles(&home, &local_bin).unwrap_or_default()
+    pub(crate) fn has_sufficient_space(&self) -> bool {
+        self.available_space == 0 || self.available_space >= self.source_size + 1024 * 1024
+    }
+
+    pub(crate) fn type_label(&self) -> &'static str {
+        if self.is_appimage { "AppImage" } else { "binary" }
+    }
+}
+
+impl InstallResult {
+    pub(crate) fn type_label(&self) -> &'static str {
+        if self.is_appimage { "AppImage" } else { "binary" }
+    }
+}
+
+// =============================================================================
+// Source detection and validation helpers
+// =============================================================================
+
+/// Get the copy source: `$APPIMAGE` if set, otherwise `argv[0]`.
+///
+/// `$APPIMAGE` is set by the AppImage runtime and points to the stable
+/// AppImage file (not the temporary FUSE mount). `argv[0]` preserves
+/// what the shell resolved.
+fn binary_copy_source() -> Result<(PathBuf, bool)> {
+    if let Ok(appimage) = std::env::var("APPIMAGE") {
+        let path = PathBuf::from(&appimage);
+        if path.exists() {
+            return Ok((path, true));
+        }
+    }
+
+    // Fall back to argv[0]
+    let argv0 = std::env::args_os()
+        .next()
+        .context("No argv[0] available")?;
+    let path = PathBuf::from(&argv0);
+
+    // Resolve relative paths against CWD
+    let path = if path.is_relative() {
+        std::env::current_dir()?.join(&path)
     } else {
-        Vec::new()
+        path
     };
 
-    Ok((local_bin, ver_dir, is_appimage, updated_profiles))
+    let is_appimage = is_appimage_file(&path).unwrap_or(false);
+    Ok((path, is_appimage))
+}
+
+/// Validate the source file before copying:
+/// - Must be a regular file (not symlink, directory, device, etc.)
+/// - Must not be empty
+/// - Must be owned by current user or root
+fn validate_source(path: &Path) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = std::fs::symlink_metadata(path)
+        .with_context(|| format!("Cannot stat source: {}", path.display()))?;
+
+    if !meta.file_type().is_file() {
+        anyhow::bail!(
+            "Source is not a regular file: {} (type: {:?})",
+            path.display(),
+            meta.file_type()
+        );
+    }
+
+    let size = meta.len();
+    if size == 0 {
+        anyhow::bail!("Source file is empty: {}", path.display());
+    }
+
+    // Ownership: must be current user or root
+    let file_uid = meta.uid();
+    let my_uid = nix::unistd::getuid().as_raw();
+    if file_uid != my_uid && file_uid != 0 {
+        anyhow::bail!(
+            "Source file owned by uid {} (expected {} or root): {}",
+            file_uid,
+            my_uid,
+            path.display()
+        );
+    }
+
+    Ok(size)
+}
+
+/// Check available disk space at the given path using `statvfs`.
+pub(crate) fn available_space(path: &Path) -> Result<u64> {
+    let check_path = if path.exists() {
+        path.to_path_buf()
+    } else {
+        path.ancestors()
+            .find(|p| p.exists())
+            .unwrap_or_else(|| Path::new("/"))
+            .to_path_buf()
+    };
+    let stat = nix::sys::statvfs::statvfs(&check_path)
+        .with_context(|| format!("statvfs failed on {}", check_path.display()))?;
+    Ok(stat.blocks_available() as u64 * stat.fragment_size() as u64)
+}
+
+/// Format a byte count as a human-readable string (powers of 1024, matching `df -h`).
+pub(crate) fn format_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+
+    if bytes >= GIB {
+        let val = bytes as f64 / GIB as f64;
+        if val >= 100.0 { format!("{:.0} GB", val) } else { format!("{:.1} GB", val) }
+    } else if bytes >= MIB {
+        let val = bytes as f64 / MIB as f64;
+        if val >= 100.0 { format!("{:.0} MB", val) } else { format!("{:.1} MB", val) }
+    } else if bytes >= KIB {
+        format!("{:.0} KB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+/// Check if the running binary is already in a known installed location.
+///
+/// Uses `current_exe()` (reads `/proc/self/exe` on Linux — kernel-maintained,
+/// cannot be spoofed) to determine the real binary path, then checks if it
+/// lives under any of the standard install locations.
+pub(crate) fn is_binary_installed() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let canonical = exe.canonicalize().ok()?;
+
+    // Check 1: Under the XDG data dir version store
+    if let Some(versions_dir) = hyprstream_rpc::paths::versions_dir() {
+        if let Ok(versions_canonical) = versions_dir.canonicalize() {
+            if canonical.starts_with(&versions_canonical) {
+                return Some(canonical);
+            }
+        }
+    }
+
+    // Check 2: Under the XDG executable dir
+    if let Some(bin_dir) = dirs::executable_dir() {
+        if let Ok(bin_canonical) = bin_dir.canonicalize() {
+            if canonical.starts_with(&bin_canonical) {
+                return Some(canonical);
+            }
+        }
+    }
+
+    // Check 3: ~/bin (traditional Unix)
+    if let Some(home) = dirs::home_dir() {
+        let home_bin = home.join("bin");
+        if let Ok(home_bin_canonical) = home_bin.canonicalize() {
+            if canonical.starts_with(&home_bin_canonical) {
+                return Some(canonical);
+            }
+        }
+
+        // Check 4: ~/Applications (AppImage community convention)
+        let applications = home.join("Applications");
+        if let Ok(app_canonical) = applications.canonicalize() {
+            if canonical.starts_with(&app_canonical) {
+                return Some(canonical);
+            }
+        }
+    }
+
+    // Check 5: Inode match against any PATH entry
+    if let Ok(exe_meta) = std::fs::metadata(&canonical) {
+        use std::os::unix::fs::MetadataExt;
+        let exe_dev = exe_meta.dev();
+        let exe_ino = exe_meta.ino();
+
+        if let Ok(path_var) = std::env::var("PATH") {
+            for dir in path_var.split(':') {
+                if dir.is_empty() || !Path::new(dir).is_absolute() {
+                    continue;
+                }
+                let candidate = Path::new(dir).join("hyprstream");
+                if let Ok(meta) = std::fs::metadata(&candidate) {
+                    if meta.dev() == exe_dev && meta.ino() == exe_ino {
+                        return Some(canonical);
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Check if a file is an AppImage by reading its magic bytes
@@ -753,7 +964,7 @@ fn install_command_alias() -> Result<(PathBuf, PathBuf, bool, Vec<String>)> {
 /// AppImage Type 2 has:
 /// - ELF magic at offset 0: 0x7f 'E' 'L' 'F'
 /// - AppImage magic at offset 8: 'A' 'I' 0x02
-fn is_appimage_file(path: &Path) -> Result<bool> {
+pub(crate) fn is_appimage_file(path: &Path) -> Result<bool> {
     use std::io::Read;
 
     let mut file = std::fs::File::open(path)

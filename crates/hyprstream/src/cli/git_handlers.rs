@@ -507,7 +507,7 @@ pub async fn handle_list(
 
     if repos.is_empty() {
         println!("No models found.");
-        println!("Try: hyprstream clone https://huggingface.co/Qwen/Qwen2-1.5B-Instruct");
+        println!("Try: hyprstream clone https://huggingface.co/Qwen/Qwen3-0.6B");
         return Ok(());
     }
 

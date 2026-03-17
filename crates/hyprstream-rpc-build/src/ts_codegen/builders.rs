@@ -81,14 +81,20 @@ pub fn generate_builders(out: &mut String, service_name: &str, schema: &ParsedSc
             "function {fn_name}({}): Uint8Array {{\n",
             params.join(", ")
         ));
+        // Estimate slack for pointer targets: 16 words (128 B) per pointer field.
+        // grow() handles overflow automatically via wasm.alloc/dealloc.
+        let extra_words = std::cmp::max(8usize, req_struct.pointer_words as usize * 16);
         out.push_str(&format!(
-            "  const msg = new CapnpMessageBuilder({}, {});\n",
+            "  const msg = CapnpArena.intoWasm({}, {}, {extra_words});\n",
             req_struct.data_words, req_struct.pointer_words
         ));
 
+        // Per-function gensym counter — unique IDs for list builder variables
+        let mut counter = 0u32;
+
         // Set non-union fields
         for f in &non_union_fields {
-            emit_field_setter(out, "msg", f, &to_camel_case(&f.name), "  ", &schema.enums, &schema.structs);
+            emit_field_setter(out, "msg", f, &to_camel_case(&f.name), "  ", &schema.enums, &schema.structs, &mut counter);
         }
 
         // Set discriminant
@@ -102,11 +108,11 @@ pub fn generate_builders(out: &mut String, service_name: &str, schema: &ParsedSc
             // Nothing
         } else if is_prim {
             if let Some(vf) = variant_field {
-                emit_field_setter(out, "msg", vf, "p", "  ", &schema.enums, &schema.structs);
+                emit_field_setter(out, "msg", vf, "p", "  ", &schema.enums, &schema.structs, &mut counter);
             }
         } else if let Some(ps) = payload_struct {
             if let Some(vf) = variant_field {
-                emit_struct_init(out, vf, ps, "msg", "p", "  ", schema);
+                emit_struct_init(out, vf, ps, "msg", "p", "  ", schema, &mut counter);
             }
         }
 
@@ -208,14 +214,18 @@ fn generate_scoped_builders(
             "function {fn_name}({}): Uint8Array {{\n",
             params.join(", ")
         ));
+        let extra_words = std::cmp::max(8usize, root_struct.pointer_words as usize * 16);
         out.push_str(&format!(
-            "  const msg = new CapnpMessageBuilder({}, {});\n",
+            "  const msg = CapnpArena.intoWasm({}, {}, {extra_words});\n",
             root_struct.data_words, root_struct.pointer_words
         ));
 
+        // Per-function gensym counter — unique IDs for list builder variables
+        let mut counter = 0u32;
+
         // Set root non-union fields
         for f in root_non_union_fields {
-            emit_field_setter(out, "msg", f, &to_camel_case(&f.name), "  ", &schema.enums, &schema.structs);
+            emit_field_setter(out, "msg", f, &to_camel_case(&f.name), "  ", &schema.enums, &schema.structs, &mut counter);
         }
 
         // Build the chain: root → ancestors → current → method
@@ -247,7 +257,7 @@ fn generate_scoped_builders(
 
                 // Set scope fields on this level's struct
                 for sf in &level.scope_fields {
-                    emit_field_setter(out, &var_name, sf, &to_camel_case(&sf.name), "  ", &schema.enums, &schema.structs);
+                    emit_field_setter(out, &var_name, sf, &to_camel_case(&sf.name), "  ", &schema.enums, &schema.structs, &mut counter);
                 }
 
                 builder_var = var_name;
@@ -277,9 +287,9 @@ fn generate_scoped_builders(
                 if is_void {
                     // Nothing
                 } else if is_prim {
-                    emit_field_setter(out, &builder_var, mf, "p", "  ", &schema.enums, &schema.structs);
+                    emit_field_setter(out, &builder_var, mf, "p", "  ", &schema.enums, &schema.structs, &mut counter);
                 } else if let Some(ps) = payload_struct {
-                    emit_struct_init(out, mf, ps, &builder_var, "p", "  ", schema);
+                    emit_struct_init(out, mf, ps, &builder_var, "p", "  ", schema, &mut counter);
                 }
             }
         }
@@ -386,10 +396,209 @@ fn find_inner_struct_name(
 }
 
 // ---------------------------------------------------------------------------
+// Standalone struct builders
+// ---------------------------------------------------------------------------
+
+/// Generate standalone builder functions for all structs in a schema.
+///
+/// For union-bearing structs: one exported function per union variant:
+/// `build{StructName}_{variant}(nonUnionFields..., payload?): Uint8Array`.
+///
+/// For non-union structs: one exported function:
+/// `build{StructName}(p: StructName): Uint8Array`.
+///
+/// Skips Option* wrapper structs and service request/response structs.
+pub fn generate_struct_builders(out: &mut String, schema: &ParsedSchema) {
+    for sd in &schema.structs {
+        if sd.option_inner_type().is_some() {
+            continue;
+        }
+        // Skip service request/response structs (handled by generate_builders)
+        if is_service_struct(sd, schema) {
+            continue;
+        }
+
+        if !sd.has_union {
+            generate_plain_struct_builder(out, sd, schema);
+            continue;
+        }
+
+        let non_union_fields: Vec<&FieldDef> = sd
+            .fields
+            .iter()
+            .filter(|f| f.discriminant_value == 0xFFFF)
+            .collect();
+
+        let union_fields: Vec<&FieldDef> = sd
+            .fields
+            .iter()
+            .filter(|f| f.discriminant_value != 0xFFFF)
+            .collect();
+
+        let disc_byte_off = sd.discriminant_offset * 2;
+
+        for variant in &union_fields {
+            let is_void = variant.type_name == "Void";
+            let is_prim = is_primitive(&variant.type_name) && !is_void;
+            let payload_struct = if !is_void && !is_prim {
+                schema.structs.iter().find(|s| s.name == variant.type_name)
+            } else {
+                None
+            };
+
+            let fn_name = format!("build{}_{}", sd.name, variant.name);
+
+            // Parameters: non-union fields + optional payload
+            let mut params = Vec::new();
+            for f in &non_union_fields {
+                params.push(format!(
+                    "{}: {}",
+                    to_camel_case(&f.name),
+                    capnp_to_ts_type(&f.type_name)
+                ));
+            }
+            if !is_void {
+                if let Some(ps) = payload_struct {
+                    params.push(format!("p: {}", ps.name));
+                } else if is_prim {
+                    params.push(format!("p: {}", capnp_to_ts_type(&variant.type_name)));
+                }
+            }
+
+            out.push_str(&format!(
+                "export function {fn_name}({}): Uint8Array {{\n",
+                params.join(", ")
+            ));
+            let extra_words = std::cmp::max(8usize, sd.pointer_words as usize * 16);
+            out.push_str(&format!(
+                "  const msg = CapnpArena.intoWasm({}, {}, {extra_words});\n",
+                sd.data_words, sd.pointer_words
+            ));
+
+            // Per-function gensym counter — unique IDs for list builder variables
+            let mut counter = 0u32;
+
+            // Set non-union fields
+            for f in &non_union_fields {
+                emit_field_setter(
+                    out,
+                    "msg",
+                    f,
+                    &to_camel_case(&f.name),
+                    "  ",
+                    &schema.enums,
+                    &schema.structs,
+                    &mut counter,
+                );
+            }
+
+            // Set discriminant
+            out.push_str(&format!(
+                "  msg.setUint16({disc_byte_off}, {}); // {}\n",
+                variant.discriminant_value, variant.name
+            ));
+
+            // Set variant payload
+            if is_void {
+                // Nothing
+            } else if is_prim {
+                emit_field_setter(
+                    out,
+                    "msg",
+                    variant,
+                    "p",
+                    "  ",
+                    &schema.enums,
+                    &schema.structs,
+                    &mut counter,
+                );
+            } else if let Some(ps) = payload_struct {
+                emit_struct_init(out, variant, ps, "msg", "p", "  ", schema, &mut counter);
+            }
+
+            out.push_str("  return msg.finish();\n");
+            out.push_str("}\n\n");
+        }
+    }
+}
+
+/// Generate a single builder function for a non-union struct.
+///
+/// `export function build{StructName}(p: StructName): Uint8Array`
+fn generate_plain_struct_builder(out: &mut String, sd: &StructDef, schema: &ParsedSchema) {
+    let fn_name = format!("build{}", sd.name);
+
+    out.push_str(&format!(
+        "export function {fn_name}(p: {}): Uint8Array {{\n",
+        sd.name
+    ));
+    let extra_words = std::cmp::max(8usize, sd.pointer_words as usize * 16);
+    out.push_str(&format!(
+        "  const msg = CapnpArena.intoWasm({}, {}, {extra_words});\n",
+        sd.data_words, sd.pointer_words
+    ));
+
+    let mut counter = 0u32;
+    for f in &sd.fields {
+        let raw_expr = format!("p.{}", to_camel_case(&f.name));
+        // Optional fields carry `T | undefined`; coalesce to the capnp default so
+        // TypeScript strict mode doesn't reject passing `T | undefined` to a setter.
+        let value_expr = if f.optional {
+            let default = if f.section == FieldSection::Data
+                && !is_data_scalar(&f.type_name)
+                && f.type_name != "Bool"
+            {
+                schema
+                    .enums
+                    .iter()
+                    .find(|e| e.name == f.type_name)
+                    .and_then(|e| e.variants.first())
+                    .map(|(name, _)| format!("'{}'", to_camel_case(name)))
+                    .unwrap_or_else(|| "0".into())
+            } else {
+                super::default_value_expr(&f.type_name).to_owned()
+            };
+            format!("{raw_expr} ?? {default}")
+        } else {
+            raw_expr
+        };
+        emit_field_setter(
+            out,
+            "msg",
+            f,
+            &value_expr,
+            "  ",
+            &schema.enums,
+            &schema.structs,
+            &mut counter,
+        );
+    }
+
+    out.push_str("  return msg.finish();\n");
+    out.push_str("}\n\n");
+}
+
+/// Check if a struct is the service request or response struct (handled by generate_builders).
+fn is_service_struct(sd: &StructDef, schema: &ParsedSchema) -> bool {
+    schema
+        .request_struct
+        .as_ref()
+        .is_some_and(|rs| rs.name == sd.name)
+        || schema
+            .response_struct
+            .as_ref()
+            .is_some_and(|rs| rs.name == sd.name)
+}
+
+// ---------------------------------------------------------------------------
 // Field emission helpers
 // ---------------------------------------------------------------------------
 
 /// Emit a setter call for a field on a builder variable.
+///
+/// `counter` is a per-function gensym counter. Each List(Struct) field claims the
+/// next ID (`_sl{n}`, `_sv{n}`, `_si{n}`) and increments the counter, guaranteeing
+/// unique variable names across all nesting levels within a single builder function.
 fn emit_field_setter(
     out: &mut String,
     builder_var: &str,
@@ -398,6 +607,7 @@ fn emit_field_setter(
     indent: &str,
     enums: &[EnumDef],
     structs: &[StructDef],
+    counter: &mut u32,
 ) {
     match field.section {
         FieldSection::Data => {
@@ -440,11 +650,15 @@ fn emit_field_setter(
                     field.slot_offset
                 ));
             } else if let Some(inner) = super::extract_list_inner_type(&field.type_name) {
-                // List(Struct) — init struct list and set each element's fields
+                // List(Struct) — init struct list and set each element's fields.
+                // Claim a unique ID from the per-function counter so nested lists at
+                // the same capnp pointer slot never shadow each other (TDZ collision).
                 if let Some(sd) = structs.iter().find(|s| s.name == inner) {
-                    let sl = format!("_sl{}", field.slot_offset);
-                    let sv = format!("_sv{}", field.slot_offset);
-                    let si = format!("_si{}", field.slot_offset);
+                    let id = *counter;
+                    *counter += 1;
+                    let sl = format!("_sl{id}");
+                    let sv = format!("_sv{id}");
+                    let si = format!("_si{id}");
                     out.push_str(&format!("{indent}{{\n"));
                     out.push_str(&format!(
                         "{indent}  const {sl} = {builder_var}.initStructList({}, {value_expr}.length, {}, {});\n",
@@ -453,6 +667,7 @@ fn emit_field_setter(
                     out.push_str(&format!(
                         "{indent}  {value_expr}.forEach(({sv}, {si}) => {{\n"
                     ));
+                    // Set non-union fields
                     for sf in &sd.fields {
                         if sf.discriminant_value != 0xFFFF {
                             continue;
@@ -467,6 +682,22 @@ fn emit_field_setter(
                             &format!("{indent}    "),
                             enums,
                             structs,
+                            counter,
+                        );
+                    }
+                    // Handle union variants in list elements
+                    if sd.has_union {
+                        let inner_builder = format!("{sl}[{si}]");
+                        let inner_indent = format!("{indent}    ");
+                        emit_union_element_setter(
+                            out,
+                            sd,
+                            &inner_builder,
+                            &sv,
+                            &inner_indent,
+                            enums,
+                            structs,
+                            counter,
                         );
                     }
                     out.push_str(&format!("{indent}  }});\n"));
@@ -482,12 +713,36 @@ fn emit_field_setter(
                 if let Some(inner_name) = sd.option_inner_type() {
                     emit_option_setter(out, field, sd, inner_name, builder_var, value_expr, indent);
                 } else {
-                    // Unsupported pointer type — skip with comment
+                    // Non-option struct pointer — init and set fields.
+                    // Use gensym counter for the local variable to avoid TDZ collisions
+                    // when the same slot_offset appears in nested or sibling struct pointers.
+                    let sp_id = *counter;
+                    *counter += 1;
+                    let sp_var = format!("_sp{sp_id}");
                     out.push_str(&format!(
-                        "{indent}// {}: {} — not yet supported by runtime\n",
-                        to_camel_case(&field.name),
-                        field.type_name
+                        "{indent}if ({value_expr} != null) {{\n"
                     ));
+                    out.push_str(&format!(
+                        "{indent}  const {sp_var} = {builder_var}.initStruct({}, {}, {});\n",
+                        field.slot_offset, sd.data_words, sd.pointer_words
+                    ));
+                    for sf in &sd.fields {
+                        if sf.discriminant_value != 0xFFFF {
+                            continue;
+                        }
+                        let val_expr = format!("{value_expr}.{}", to_camel_case(&sf.name));
+                        emit_field_setter(
+                            out,
+                            &sp_var,
+                            sf,
+                            &val_expr,
+                            &format!("{indent}  "),
+                            enums,
+                            structs,
+                            counter,
+                        );
+                    }
+                    out.push_str(&format!("{indent}}}\n"));
                 }
             } else {
                 // Unsupported pointer type — skip with comment
@@ -514,6 +769,7 @@ fn emit_struct_init(
     param_name: &str,
     indent: &str,
     schema: &ParsedSchema,
+    counter: &mut u32,
 ) {
     out.push_str(&format!(
         "{indent}const _ps = {builder_var}.initStruct({}, {}, {});\n",
@@ -546,7 +802,7 @@ fn emit_struct_init(
         } else {
             raw_expr
         };
-        emit_field_setter(out, "_ps", f, &value_expr, indent, &schema.enums, &schema.structs);
+        emit_field_setter(out, "_ps", f, &value_expr, indent, &schema.enums, &schema.structs, counter);
     }
 }
 
@@ -590,4 +846,82 @@ fn emit_option_setter(
 
     out.push_str(&format!("{indent}}}\n"));
     out.push_str(&format!("{indent}// else: null pointer = none (cap'n proto default)\n"));
+}
+
+/// Emit a switch statement that writes union discriminant + variant payload for a list element.
+///
+/// Used when a List(Struct) field contains a union struct (e.g., `List(StreamPayload)`).
+/// The element parameter is `{ variant: string; data: unknown }`.
+fn emit_union_element_setter(
+    out: &mut String,
+    sd: &StructDef,
+    builder_var: &str,
+    value_var: &str,
+    indent: &str,
+    enums: &[EnumDef],
+    structs: &[StructDef],
+    counter: &mut u32,
+) {
+    let disc_byte_off = sd.discriminant_offset * 2;
+    let union_fields: Vec<&FieldDef> = sd
+        .fields
+        .iter()
+        .filter(|f| f.discriminant_value != 0xFFFF)
+        .collect();
+
+    out.push_str(&format!("{indent}switch ({value_var}.variant) {{\n"));
+    for uf in &union_fields {
+        let ci = format!("{indent}  "); // case indent
+        let bi = format!("{indent}    "); // body indent
+        out.push_str(&format!("{ci}case '{}':\n", uf.name));
+        out.push_str(&format!(
+            "{bi}{builder_var}.setUint16({disc_byte_off}, {}); // {}\n",
+            uf.discriminant_value, uf.name
+        ));
+
+        if uf.type_name == "Void" {
+            // Nothing to set
+        } else if uf.section == FieldSection::Data && is_data_scalar(&uf.type_name) {
+            let byte_off = data_byte_offset(uf);
+            if let Some(method) = super::setter_method(&uf.type_name) {
+                out.push_str(&format!(
+                    "{bi}{builder_var}.{method}({byte_off}, {value_var}.data as {});\n",
+                    capnp_to_ts_type(&uf.type_name)
+                ));
+            }
+        } else if uf.type_name == "Text" {
+            out.push_str(&format!(
+                "{bi}{builder_var}.setText({}, {value_var}.data as string);\n",
+                uf.slot_offset
+            ));
+        } else if uf.type_name == "Data" {
+            out.push_str(&format!(
+                "{bi}{builder_var}.setData({}, {value_var}.data as Uint8Array);\n",
+                uf.slot_offset
+            ));
+        } else if let Some(ps) = structs.iter().find(|s| s.name == uf.type_name) {
+            // Struct variant — init sub-struct and set its non-union fields
+            out.push_str(&format!("{bi}{{\n"));
+            out.push_str(&format!(
+                "{bi}  const _ups = {builder_var}.initStruct({}, {}, {});\n",
+                uf.slot_offset, ps.data_words, ps.pointer_words
+            ));
+            out.push_str(&format!(
+                "{bi}  const _upd = {value_var}.data as {};\n",
+                ps.name
+            ));
+            for sf in &ps.fields {
+                if sf.discriminant_value != 0xFFFF {
+                    continue;
+                }
+                let val_expr = format!("_upd.{}", to_camel_case(&sf.name));
+                emit_field_setter(out, "_ups", sf, &val_expr, &format!("{bi}  "), enums, structs, counter);
+            }
+            out.push_str(&format!("{bi}}}\n"));
+        }
+
+        out.push_str(&format!("{bi}break;\n"));
+    }
+    out.push_str(&format!("{indent}  default: break;\n"));
+    out.push_str(&format!("{indent}}}\n"));
 }

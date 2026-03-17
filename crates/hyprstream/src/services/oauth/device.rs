@@ -15,11 +15,15 @@ use axum::{
     response::{Html, IntoResponse, Response},
     Form, Json,
 };
-use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::RngCore;
 use serde::Deserialize;
 
+use super::challenge;
 use super::state::{DeviceCodeStatus, OAuthState, PendingDeviceCode};
+
+/// Re-export html_escape from the shared challenge module.
+pub(crate) use challenge::html_escape;
 
 /// Device code TTL in seconds (10 minutes).
 const DEVICE_CODE_TTL_SECS: u64 = 600;
@@ -71,7 +75,7 @@ pub async fn device_authorize(
 
     // Generate device_code (32 bytes, URL-safe base64)
     let mut device_code_bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut device_code_bytes);
+    rand::rngs::OsRng.fill_bytes(&mut device_code_bytes);
     let device_code = URL_SAFE_NO_PAD.encode(device_code_bytes);
 
     // Generate user_code (8 uppercase alphanumeric, formatted XXXX-XXXX)
@@ -79,7 +83,7 @@ pub async fn device_authorize(
 
     // Generate nonce (32 bytes, URL-safe base64, no padding → 43 chars)
     let mut nonce_bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = URL_SAFE_NO_PAD.encode(nonce_bytes);
 
     let scopes: Vec<String> = params
@@ -193,10 +197,17 @@ pub async fn verify_get(
 }
 
 /// POST /oauth/device/verify — Handle Ed25519 challenge-response verification
+///
+/// Returns HTML for browser clients and JSON for CLI clients (detected via `Accept: application/json`).
+/// The `sign-challenge` CLI sends `Accept: application/json` to get structured errors
+/// instead of having to parse HTML.
 pub async fn verify_post(
     State(state): State<Arc<OAuthState>>,
+    headers: axum::http::HeaderMap,
     Form(form): Form<VerifyForm>,
 ) -> Response {
+    let json_client = wants_json(&headers);
+
     // Normalize: strip dash, uppercase
     let normalized = form.user_code.replace('-', "").to_uppercase();
 
@@ -209,12 +220,7 @@ pub async fn verify_post(
     let device_code = match device_code {
         Some(dc) => dc,
         None => {
-            let html = render_verify_page(
-                &form.user_code,
-                "",
-                Some("Invalid or expired code. Please try again."),
-            );
-            return Html(html).into_response();
+            return verify_err(json_client, &form.user_code, "", "Invalid or expired code. Please try again.");
         }
     };
 
@@ -223,117 +229,41 @@ pub async fn verify_post(
         let device_codes = state.pending_device_codes.read().await;
         match device_codes.get(&device_code) {
             Some(pending) if pending.is_expired() => {
-                let html = render_verify_page(
-                    &form.user_code,
-                    "",
-                    Some("This code has expired. Please request a new one."),
-                );
-                return Html(html).into_response();
+                return verify_err(json_client, &form.user_code, "", "This code has expired. Please request a new one.");
             }
             Some(pending) if pending.status != DeviceCodeStatus::Pending => {
-                let html = render_verify_page(
-                    &form.user_code,
-                    "",
-                    Some("This code has already been used."),
-                );
-                return Html(html).into_response();
+                return verify_err(json_client, &form.user_code, "", "This code has already been used.");
             }
             Some(pending) => pending.nonce.clone(),
             None => {
-                let html = render_verify_page(
-                    &form.user_code,
-                    "",
-                    Some("Invalid or expired code. Please try again."),
-                );
-                return Html(html).into_response();
+                return verify_err(json_client, &form.user_code, "", "Invalid or expired code. Please try again.");
             }
         }
     };
 
-    // Validate username does not contain ':' — the challenge format is
-    // "{username}:{user_code}:{nonce}" and a colon in the username would
-    // make the challenge string ambiguous.
-    if form.username.contains(':') {
-        let html = render_verify_page(
-            &form.user_code,
-            &nonce,
-            Some("Username must not contain ':'"),
-        );
-        return Html(html).into_response();
-    }
-
     // Reconstruct the challenge string: "{username}:{user_code}:{nonce}"
     // user_code here is the normalized (no-dash) form stored internally
-    let challenge = format!("{}:{}:{}", form.username, normalized, nonce);
+    let challenge_str = format!("{}:{}:{}", form.username, normalized, nonce);
 
-    // Decode the base64 signature
-    let sig_bytes = match STANDARD.decode(&form.signature) {
-        Ok(b) => b,
-        Err(_) => {
-            let html = render_verify_page(
-                &form.user_code,
-                &nonce,
-                Some("Invalid signature encoding (expected base64)."),
-            );
-            return Html(html).into_response();
-        }
-    };
-
-    // Convert to ed25519 Signature (must be exactly 64 bytes)
-    let sig_array: [u8; 64] = match sig_bytes.try_into() {
-        Ok(arr) => arr,
-        Err(_) => {
-            let html = render_verify_page(
-                &form.user_code,
-                &nonce,
-                Some("Invalid signature length (expected 64 bytes / 88 base64 chars)."),
-            );
-            return Html(html).into_response();
-        }
-    };
-    let signature = ed25519_dalek::Signature::from_bytes(&sig_array);
-
-    // Look up user's public key from UserStore
+    // Look up user credential store
     let user_store = match state.user_store.as_ref() {
         Some(s) => s,
         None => {
-            let html = render_verify_page(
-                &form.user_code,
-                &nonce,
-                Some("User credential store not configured on this server."),
-            );
-            return Html(html).into_response();
-        }
-    };
-    let pubkey = match user_store.get_pubkey(&form.username) {
-        Ok(Some(pk)) => pk,
-        Ok(None) => {
-            let html = render_verify_page(
-                &form.user_code,
-                &nonce,
-                Some("Unknown user. Please contact your administrator."),
-            );
-            return Html(html).into_response();
-        }
-        Err(e) => {
-            tracing::error!(username = %form.username, error = %e, "UserStore lookup error");
-            let html = render_verify_page(
-                &form.user_code,
-                &nonce,
-                Some("Internal error looking up user credentials."),
-            );
-            return Html(html).into_response();
+            return verify_err(json_client, &form.user_code, &nonce, "User credential store not configured on this server.");
         }
     };
 
-    // Verify the Ed25519 signature
-    if pubkey.verify_strict(challenge.as_bytes(), &signature).is_err() {
-        let html = render_verify_page(
-            &form.user_code,
-            &nonce,
-            Some("Invalid signature. Ensure you signed the correct challenge string."),
-        );
-        return Html(html).into_response();
+    // Verify Ed25519 challenge-response using the shared helper
+    if let Err(e) = challenge::verify_ed25519_response(
+        user_store.as_ref(),
+        &form.username,
+        &challenge_str,
+        &form.signature,
+    ) {
+        if matches!(e, challenge::ChallengeError::UserStoreError(_)) {
+            tracing::error!(username = %form.username, "UserStore lookup error during device verify");
+        }
+        return verify_err(json_client, &form.user_code, &nonce, e.message());
     }
 
     // Signature valid — approve the device code and record who approved it
@@ -361,19 +291,40 @@ pub async fn verify_post(
 
     match result {
         Ok(()) => {
-            let html = render_result_page(true, &form.username);
-            Html(html).into_response()
+            if json_client {
+                (StatusCode::OK, Json(serde_json::json!({"status": "approved", "username": form.username}))).into_response()
+            } else {
+                Html(render_result_page(true, &form.username)).into_response()
+            }
         }
-        Err(msg) => {
-            let html = render_verify_page(&form.user_code, &nonce, Some(msg));
-            Html(html).into_response()
-        }
+        Err(msg) => verify_err(json_client, &form.user_code, &nonce, msg),
+    }
+}
+
+/// Return true if the client prefers JSON responses (`Accept: application/json`).
+fn wants_json(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.contains("application/json"))
+        .unwrap_or(false)
+}
+
+/// Return an error response — JSON for CLI clients, HTML for browser clients.
+fn verify_err(json_client: bool, user_code: &str, nonce: &str, msg: &str) -> Response {
+    if json_client {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "verification_failed", "error_description": msg})),
+        ).into_response()
+    } else {
+        Html(render_verify_page(user_code, nonce, Some(msg))).into_response()
     }
 }
 
 /// GET /oauth/device/nonce — JSON nonce endpoint for CLI sign-challenge helper.
 ///
-/// Returns: `{"user_code": "...", "nonce": "...", "challenge_prefix": "USERNAME"}`
+/// Returns: `{"user_code": "...", "nonce": "..."}`
 /// The full challenge to sign is: `"{username}:{user_code}:{nonce}"`
 pub async fn device_nonce(
     State(state): State<Arc<OAuthState>>,
@@ -422,7 +373,6 @@ pub async fn device_nonce(
             Json(serde_json::json!({
                 "user_code": user_code,
                 "nonce": pending.nonce,
-                "challenge_template": "{username}:{user_code}:{nonce}",
             })),
         )
             .into_response(),
@@ -438,12 +388,11 @@ pub async fn device_nonce(
 /// Uses characters that are unambiguous (no 0/O, 1/I/L).
 fn generate_user_code() -> String {
     const CHARSET: &[u8] = b"ABCDEFGHJKMNPQRSTVWXYZ23456789";
-    let mut rng = rand::thread_rng();
     let mut code = String::with_capacity(8);
     for _ in 0..8 {
         let mut byte = [0u8; 1];
         loop {
-            rng.fill_bytes(&mut byte);
+            rand::rngs::OsRng.fill_bytes(&mut byte);
             let idx = byte[0] as usize;
             if idx < (256 / CHARSET.len()) * CHARSET.len() {
                 code.push(CHARSET[idx % CHARSET.len()] as char);
@@ -476,15 +425,6 @@ fn device_error(status: StatusCode, error: &str, description: &str) -> Response 
         })),
     )
         .into_response()
-}
-
-/// HTML-escape a string for safe embedding in HTML attributes and text.
-pub(crate) fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#x27;")
 }
 
 /// Render a generic user-code entry page (shown when no user_code provided in URL).

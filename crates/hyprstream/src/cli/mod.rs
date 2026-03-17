@@ -19,6 +19,7 @@ pub mod remote_handlers;
 pub mod schema_cli;
 pub mod service_handlers;
 pub mod shell_handlers;
+pub mod sign_challenge;
 pub mod systemd_setup;
 pub mod training_handlers;
 pub mod tui_handlers;
@@ -69,6 +70,7 @@ pub use service_handlers::{
     handle_service_install,
     handle_service_uninstall, handle_service_start, handle_service_stop, handle_service_status,
 };
+pub use sign_challenge::handle_sign_challenge;
 pub use wizard_handlers::{handle_wizard, handle_wizard_tui};
 
 /// Device preference strategy

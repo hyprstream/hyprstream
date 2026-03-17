@@ -27,7 +27,9 @@
 //! ```
 
 pub mod authorize;
+pub mod challenge;
 pub mod device;
+pub mod federation_entity;
 pub mod jwks;
 pub mod metadata;
 pub mod registration;
@@ -79,6 +81,10 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             get(device::verify_get).post(device::verify_post),
         )
         .route("/oauth/device/nonce", get(device::device_nonce))
+        .route(
+            "/.well-known/openid-federation",
+            get(federation_entity::entity_configuration),
+        )
         .layer(axum::middleware::from_fn(|req: axum::extract::Request, next: axum::middleware::Next| async move {
             let method = req.method().clone();
             let uri = req.uri().clone();
@@ -195,7 +201,7 @@ impl Spawnable for OAuthService {
             // async I/O (TMQ) registers socket FDs with THIS runtime's epoll.
             // Creating it in the factory (main runtime) would cause hangs.
             let policy_client = PolicyClient::new(
-                self.signing_key,
+                self.signing_key.clone(),
                 hyprstream_rpc::RequestIdentity::local(),
             );
 
@@ -234,6 +240,7 @@ impl Spawnable for OAuthService {
             if let Some(store) = user_store {
                 oauth_state = oauth_state.with_user_store(store);
             }
+            oauth_state = oauth_state.with_signing_key(self.signing_key.clone());
             let state = Arc::new(oauth_state);
             state.spawn_code_sweeper();
 

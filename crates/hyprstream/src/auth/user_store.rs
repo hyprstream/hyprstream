@@ -63,6 +63,17 @@ impl LocalKeyStore {
     }
 
     fn load_or_generate_identity() -> Result<age::x25519::Identity> {
+        // Check for test bypass via config before touching the OS keyring.
+        // Set HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY=<age-secret-key-...> to inject a key.
+        if let Ok(cfg) = crate::config::HyprConfig::load() {
+            if let Some(ref age_key) = cfg.oauth.credential_store_key {
+                return age_key
+                    .trim()
+                    .parse::<age::x25519::Identity>()
+                    .map_err(|e| anyhow!("HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY: invalid age identity: {:?}", e));
+            }
+        }
+
         let entry = keyring::Entry::new(Self::KEYRING_SERVICE, Self::KEYRING_KEY_NAME)
             .context("Failed to access keyring for credential store key")?;
 
@@ -132,7 +143,16 @@ impl UserStore for LocalKeyStore {
     }
 
     fn register(&mut self, username: &str, pubkey: VerifyingKey) -> Result<()> {
+        if username.contains(':') {
+            anyhow::bail!("Username '{}' must not contain ':'", username);
+        }
         let b64 = STANDARD.encode(pubkey.as_bytes());
+        if self.data.users.contains_key(username) {
+            tracing::warn!(
+                "Overwriting existing public key for user '{}' in credential store",
+                username
+            );
+        }
         self.data.users.insert(username.to_owned(), b64);
         self.encrypt_and_write()
     }
@@ -151,6 +171,7 @@ impl UserStore for LocalKeyStore {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
@@ -229,6 +250,19 @@ mod tests {
         let mut users = store.list_users();
         users.sort();
         assert_eq!(users, vec!["alice", "bob"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_register_rejects_colon_in_username() -> Result<()> {
+        let dir = TempDir::new()?;
+        let identity = age::x25519::Identity::generate();
+        let mut store = make_store_with_identity(dir.path(), identity);
+        let key = SigningKey::generate(&mut rand::thread_rng()).verifying_key();
+        let result = store.register("bad:user", key);
+        assert!(result.is_err(), "register should reject usernames with ':'");
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("must not contain"), "error message should mention colon restriction");
         Ok(())
     }
 }

@@ -20,6 +20,7 @@ ratatui = { version = "0.30", default-features = false, features = ["layout-cach
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 waxterm = { path = "../waxterm", features = ["avt"] }
+capnp = { workspace = true }
 anyhow = { version = "1" }
 aes-gcm = "0.10"
 parking_lot = "0.12"
@@ -37,6 +38,9 @@ tui-logger = { version = "0.18", default-features = false }
 ratatui-textarea = { version = "0.8", default-features = false }
 edtui = { version = "0.11" }
 crossterm = { version = "0.29", default-features = false }
+
+[build-dependencies]
+capnpc = { workspace = true }
 
 [profile.release]
 opt-level = "s"
