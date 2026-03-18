@@ -15,17 +15,22 @@ Easy to get started: [download](https://github.com/hyprstream/hyprstream/release
 
 ### Core Features
 
-- **Inference API**: Providing compatibility with OpenAI's OpenAPI specification.
-- **LLM Inference & Training**: Supporting the dense Qwen3 model architecture.
-- **Optional Hardware Acceleration**: Auto-detects your optional NVIDIA or AMD GPU, and packages the appropriate Torch dependencies.
+- **Frontend-ready**: Use the included TUI for easy of use and share terminals with collaborators and agents.
+- **Collaborative**: Multi-user, multi-agent interfaces through a high-speed compositing multiplexer.
+- **LLM Inference & Training**: Supporting the dense Qwen3.5 and Qwen3 model architectures.
+- **Test Time Training**: Models train models using MCP tools, test-time-training, and the Muon optimizer.
+- **Security-minded**: Zero-trust cryptographic architecture with ZK stream proxies, Casbin Policy, and OpenID integration.
+- **Industry-compatible**: Providing compatibility with OpenAI's OpenAPI specification.
+- **Hardware Accelerated**: NVIDIA CUDA and AMD ROCm support, universal binary.
 - **Version Controlled**: Manages source and weights with Git, compatible with HuggingFace.
 - **Systemd Integration** - Optional user-level service management for background workers, long-running services, and containers.
-- **Production Ready**: Built on stable PyTorch C++ API (libtorch) for reliability
+- **Powered by Torch**: Built on stable PyTorch C++ API (libtorch) using `tch-rs`.
 
 ### Experimental Features
 
 - **[Workers](docs/workers-architecture.md)** - Isolated workload execution using Kata microvms with cloud-hypervisor.
 - **[Workflows]** - Git workflow file support for local continous integration, deployment, and functions-as-a-service.
+- **[Metrics]** - Structured knowledge engine and time-series aggregation database powered by DuckDB, ADBC, and Flight.
 
 ## Installation
 
@@ -37,8 +42,14 @@ Download the [Universal AppImage](https://github.com/hyprstream/hyprstream/relea
 
 ```bash
 # Download and install (Universal recommended)
-chmod +x hyprstream-v0.2.0-x86_64.AppImage
-./hyprstream-v0.2.0-x86_64.AppImage service install
+chmod +x hyprstream-v0.3.0-x86_64.AppImage
+
+# Installer Path (v0.4.0+):
+
+./hyprstream-v0.4.0-x86_64.AppImage wizard # add `-y` for autoinstall
+
+# Manual path (< v0.3.0):
+./hyprstream-v0.3.0-x86_64.AppImage service install
 
 # Add to PATH
 export PATH="$HOME/.local/bin:$PATH"
