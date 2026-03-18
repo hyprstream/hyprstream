@@ -17,8 +17,8 @@ use crate::cli::policy_handlers::{
     ensure_user_identity, load_or_generate_signing_key, mint_local_token, parse_duration,
 };
 use crate::cli::service_handlers::{
-    build_version, format_size, handle_service_start, is_binary_installed, print_check,
-    run_repair_checks, CheckStatus, InstallPlan,
+    build_version, format_size, handle_service_install, handle_service_start,
+    is_binary_installed, print_check, run_repair_checks, CheckStatus, InstallPlan,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -775,7 +775,7 @@ fn generate_token(
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn phase_services(
-    _state: &WizardState,
+    state: &WizardState,
     config_services: &[String],
     non_interactive: bool,
     start_flag: bool,
@@ -783,6 +783,11 @@ async fn phase_services(
     println!("  Phase 6: Services");
     println!("  {}", "-".repeat(40));
     println!();
+
+    // Always install/update systemd units so they reflect the current binary and service list.
+    if hyprstream_rpc::has_systemd() {
+        handle_service_install(&state.models_dir, config_services, None, false, false).await?;
+    }
 
     let should_start = if start_flag {
         true
