@@ -11,7 +11,7 @@ HyprStream is an agentic cloud infrastructure for applications that learn, build
 
 Users may communicate with open weight and custom LLMs via Hyprstream with an OpenAI API.
 
-Easy to get started: [download](https://github.com/hyprstream/hyprstream/releases/tag/v0.2.0) the AppImage and it auto-detects your NVIDIA or ROCm GPU. See [docs/quickstart.md](docs/quickstart.md) for a full walkthrough.
+Easy to get started: [download](https://github.com/hyprstream/hyprstream/releases/) the AppImage and it auto-detects your NVIDIA or ROCm GPU. See [docs/quickstart.md](docs/quickstart.md) for a full walkthrough.
 
 ### Core Features
 
