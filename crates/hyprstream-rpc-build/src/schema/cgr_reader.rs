@@ -871,6 +871,100 @@ fn extract_all_enums(
 // Scoped client detection
 // ---------------------------------------------------------------------------
 
+/// Try to build a `ScopedClient` for a single request variant.
+///
+/// Returns `Ok(Some(client))` when the variant matches the scoped-client pattern:
+/// the variant's type is a struct with a union, and a matching `{name}Result`
+/// response variant exists with non-empty inner union variants.
+///
+/// Returns `Ok(None)` for any variant that doesn't match (primitive types,
+/// structs without unions, missing response counterparts, etc.).
+///
+/// `require_scope_fields` — when `true`, skips structs whose non-union field
+/// list is empty.  Used for nested client detection: a nested scope must have
+/// at least one curried field to distinguish it from a plain method.
+#[allow(clippy::too_many_arguments)]
+fn build_scoped_client_for_variant(
+    req_variant: &UnionVariant,
+    response_variants: &[UnionVariant],
+    all_structs: &[StructDef],
+    nodes: &capnp::struct_list::Reader<capnp::schema_capnp::node::Owned>,
+    node_map: &BTreeMap<u64, NodeInfo>,
+    mcp_desc_id: Option<u64>,
+    param_desc_id: Option<u64>,
+    mcp_scope_id: Option<u64>,
+    cli_hidden_id: Option<u64>,
+    require_scope_fields: bool,
+) -> Result<Option<ScopedClient>, String> {
+    if is_primitive_capnp_type(&req_variant.type_name) {
+        return Ok(None);
+    }
+
+    let inner_struct = match all_structs.iter().find(|s| s.name == req_variant.type_name) {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+
+    if !inner_struct.has_union {
+        return Ok(None);
+    }
+
+    // Nested scoped clients must have at least one non-union scope field.
+    if require_scope_fields && inner_struct.non_union_fields().next().is_none() {
+        return Ok(None);
+    }
+
+    let resp_variant_name = format!("{}Result", req_variant.name);
+    let resp_variant = match response_variants.iter().find(|v| v.name == resp_variant_name) {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+
+    let inner_node_id = match find_struct_node_id(node_map, &req_variant.type_name) {
+        Some(id) => id,
+        None => return Ok(None),
+    };
+    let inner_node = nodes.get(node_map[&inner_node_id].index);
+    let inner_req_variants = extract_union_variants(
+        inner_node, nodes, node_map, mcp_desc_id, param_desc_id, mcp_scope_id, cli_hidden_id,
+    )?;
+
+    let resp_node_id = match find_struct_node_id(node_map, &resp_variant.type_name) {
+        Some(id) => id,
+        None => return Ok(None),
+    };
+    let resp_node = nodes.get(node_map[&resp_node_id].index);
+    let inner_resp_variants = extract_union_variants(
+        resp_node, nodes, node_map, mcp_desc_id, param_desc_id, mcp_scope_id, cli_hidden_id,
+    )?;
+
+    if inner_req_variants.is_empty() || inner_resp_variants.is_empty() {
+        return Ok(None);
+    }
+
+    let client_name = if req_variant.type_name.ends_with("Request") {
+        format!(
+            "{}Client",
+            &req_variant.type_name[..req_variant.type_name.len() - 7]
+        )
+    } else {
+        format!("{}Client", req_variant.type_name)
+    };
+
+    // Scope fields = non-union fields from the inner struct
+    let scope_fields: Vec<FieldDef> = inner_struct.non_union_fields().cloned().collect();
+
+    Ok(Some(ScopedClient {
+        factory_name: req_variant.name.clone(),
+        client_name,
+        scope_fields,
+        inner_request_variants: inner_req_variants,
+        inner_response_variants: inner_resp_variants,
+        capnp_inner_response: to_snake_case(&resp_variant.type_name),
+        nested_clients: Vec::new(),
+    }))
+}
+
 /// Detect scoped clients from the request/response pattern.
 #[allow(clippy::too_many_arguments)]
 fn detect_scoped_clients(
@@ -887,76 +981,20 @@ fn detect_scoped_clients(
     let mut scoped = Vec::new();
 
     for req_variant in request_variants {
-        if is_primitive_type(&req_variant.type_name) {
-            continue;
+        if let Some(sc) = build_scoped_client_for_variant(
+            req_variant,
+            response_variants,
+            all_structs,
+            nodes,
+            node_map,
+            mcp_desc_id,
+            param_desc_id,
+            mcp_scope_id,
+            cli_hidden_id,
+            false, // top-level: don't require non-empty scope fields
+        )? {
+            scoped.push(sc);
         }
-
-        let inner_struct = match all_structs.iter().find(|s| s.name == req_variant.type_name) {
-            Some(s) => s,
-            None => continue,
-        };
-
-        if !inner_struct.has_union {
-            continue;
-        }
-
-        let resp_variant_name = format!("{}Result", req_variant.name);
-        let resp_variant = match response_variants
-            .iter()
-            .find(|v| v.name == resp_variant_name)
-        {
-            Some(v) => v,
-            None => continue,
-        };
-
-        let inner_node_id = match find_struct_node_id(node_map, &req_variant.type_name) {
-            Some(id) => id,
-            None => continue,
-        };
-        let inner_node = nodes.get(node_map[&inner_node_id].index);
-        let inner_req_variants = extract_union_variants(
-            inner_node, nodes, node_map, mcp_desc_id, param_desc_id, mcp_scope_id, cli_hidden_id,
-        )?;
-
-        let resp_node_id = match find_struct_node_id(node_map, &resp_variant.type_name) {
-            Some(id) => id,
-            None => continue,
-        };
-        let resp_node = nodes.get(node_map[&resp_node_id].index);
-        let inner_resp_variants = extract_union_variants(
-            resp_node, nodes, node_map, mcp_desc_id, param_desc_id, mcp_scope_id, cli_hidden_id,
-        )?;
-
-        if inner_req_variants.is_empty() || inner_resp_variants.is_empty() {
-            continue;
-        }
-
-        let client_name = if req_variant.type_name.ends_with("Request") {
-            format!(
-                "{}Client",
-                &req_variant.type_name[..req_variant.type_name.len() - 7]
-            )
-        } else {
-            format!("{}Client", req_variant.type_name)
-        };
-
-        // Scope fields = non-union fields from the inner struct
-        let scope_fields: Vec<FieldDef> = inner_struct
-            .fields
-            .iter()
-            .filter(|f| f.discriminant_value == 0xFFFF)
-            .cloned()
-            .collect();
-
-        scoped.push(ScopedClient {
-            factory_name: req_variant.name.clone(),
-            client_name,
-            scope_fields,
-            inner_request_variants: inner_req_variants,
-            inner_response_variants: inner_resp_variants,
-            capnp_inner_response: to_snake_case(&resp_variant.type_name),
-            nested_clients: Vec::new(),
-        });
     }
 
     Ok(scoped)
@@ -978,84 +1016,21 @@ fn detect_nested_scoped_clients_cgr(
     let mut nested_factory_names = Vec::new();
 
     for req_variant in &parent.inner_request_variants {
-        if is_primitive_type(&req_variant.type_name) {
-            continue;
+        if let Some(sc) = build_scoped_client_for_variant(
+            req_variant,
+            &parent.inner_response_variants,
+            all_structs,
+            nodes,
+            node_map,
+            mcp_desc_id,
+            param_desc_id,
+            mcp_scope_id,
+            cli_hidden_id,
+            true, // nested: require at least one non-union scope field
+        )? {
+            nested_factory_names.push(req_variant.name.clone());
+            nested.push(sc);
         }
-
-        let inner_struct = match all_structs.iter().find(|s| s.name == req_variant.type_name) {
-            Some(s) => s,
-            None => continue,
-        };
-
-        // Check has_union and has scope fields
-        let non_union_fields: Vec<&FieldDef> = inner_struct
-            .fields
-            .iter()
-            .filter(|f| f.discriminant_value == 0xFFFF)
-            .collect();
-
-        if !inner_struct.has_union || non_union_fields.is_empty() {
-            continue;
-        }
-
-        let resp_variant_name = format!("{}Result", req_variant.name);
-        let resp_variant = match parent
-            .inner_response_variants
-            .iter()
-            .find(|v| v.name == resp_variant_name)
-        {
-            Some(v) => v,
-            None => continue,
-        };
-
-        let inner_node_id = match find_struct_node_id(node_map, &req_variant.type_name) {
-            Some(id) => id,
-            None => continue,
-        };
-        let inner_node = nodes.get(node_map[&inner_node_id].index);
-        let inner_req_variants = extract_union_variants(
-            inner_node, nodes, node_map, mcp_desc_id, param_desc_id, mcp_scope_id, cli_hidden_id,
-        )?;
-
-        let resp_node_id = match find_struct_node_id(node_map, &resp_variant.type_name) {
-            Some(id) => id,
-            None => continue,
-        };
-        let resp_node = nodes.get(node_map[&resp_node_id].index);
-        let inner_resp_variants = extract_union_variants(
-            resp_node, nodes, node_map, mcp_desc_id, param_desc_id, mcp_scope_id, cli_hidden_id,
-        )?;
-
-        if inner_req_variants.is_empty() || inner_resp_variants.is_empty() {
-            continue;
-        }
-
-        let client_name = if req_variant.type_name.ends_with("Request") {
-            format!(
-                "{}Client",
-                &req_variant.type_name[..req_variant.type_name.len() - 7]
-            )
-        } else {
-            format!("{}Client", req_variant.type_name)
-        };
-
-        let scope_fields: Vec<FieldDef> = inner_struct
-            .fields
-            .iter()
-            .filter(|f| f.discriminant_value == 0xFFFF)
-            .cloned()
-            .collect();
-
-        nested_factory_names.push(req_variant.name.clone());
-        nested.push(ScopedClient {
-            factory_name: req_variant.name.clone(),
-            client_name,
-            scope_fields,
-            inner_request_variants: inner_req_variants,
-            inner_response_variants: inner_resp_variants,
-            capnp_inner_response: to_snake_case(&resp_variant.type_name),
-            nested_clients: Vec::new(),
-        });
     }
 
     // Filter out nested-scope variants from parent's inner variants
@@ -1089,22 +1064,9 @@ fn detect_nested_scoped_clients_cgr(
 }
 
 /// Check if a type name is a primitive (not a struct reference).
+///
+/// Delegates to `is_primitive_capnp_type` in `schema::types` — the canonical
+/// implementation. Kept for backward compatibility with existing callers.
 pub fn is_primitive_type(type_name: &str) -> bool {
-    matches!(
-        type_name,
-        "Void"
-            | "Text"
-            | "Data"
-            | "Bool"
-            | "UInt8"
-            | "UInt16"
-            | "UInt32"
-            | "UInt64"
-            | "Int8"
-            | "Int16"
-            | "Int32"
-            | "Int64"
-            | "Float32"
-            | "Float64"
-    ) || type_name.starts_with("List(")
+    is_primitive_capnp_type(type_name)
 }

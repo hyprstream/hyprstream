@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+mod py_codegen;
 mod ts_codegen;
 
 #[derive(Parser)]
@@ -89,7 +90,7 @@ fn main() {
     std::fs::create_dir_all(&cli.output_dir).expect("Failed to create output directory");
 
     // Generate TypeScript
-    ts_codegen::generate_all(&schemas, &cli.output_dir);
+    ts_codegen::generate_all(&ts_codegen::TypeScriptBackend, &schemas, &cli.output_dir);
 
     println!(
         "\nGenerated {} service files in {}",

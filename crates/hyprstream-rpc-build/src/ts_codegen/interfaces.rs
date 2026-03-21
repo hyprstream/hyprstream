@@ -37,19 +37,11 @@ fn emit_enum(out: &mut String, e: &EnumDef) {
 /// (no non-union fields except possibly in scoped patterns) get an interface
 /// with just the non-union fields if any.
 fn emit_struct_interface(out: &mut String, s: &StructDef) {
-    let non_union_fields: Vec<_> = s
-        .fields
-        .iter()
-        .filter(|f| f.discriminant_value == 0xFFFF)
-        .collect();
+    let non_union_fields: Vec<_> = s.non_union_fields().collect();
 
     // Pure union envelopes — emit as a discriminated union type alias
     if non_union_fields.is_empty() && s.has_union {
-        let union_fields: Vec<_> = s
-            .fields
-            .iter()
-            .filter(|f| f.discriminant_value != 0xFFFF)
-            .collect();
+        let union_fields: Vec<_> = s.union_fields().collect();
         if !union_fields.is_empty() {
             out.push_str(&format!(
                 "export type {} = {{ variant: string; data: unknown }};\n\n",

@@ -100,6 +100,14 @@ impl StructDef {
         self.fields.iter().filter(|f| f.discriminant_value == 0xFFFF)
     }
 
+    /// Fields that ARE union members (discriminant_value != 0xFFFF).
+    ///
+    /// These are the variant arms of a union within the struct.
+    /// Each has a distinct `discriminant_value` that identifies which arm is active.
+    pub fn union_fields(&self) -> impl Iterator<Item = &FieldDef> {
+        self.fields.iter().filter(|f| f.discriminant_value != 0xFFFF)
+    }
+
     /// True if this struct is a pure union (has_union and no non-union fields).
     pub fn is_pure_union(&self) -> bool {
         self.has_union && self.non_union_fields().count() == 0
@@ -119,9 +127,7 @@ impl StructDef {
         if self.discriminant_count != 2 {
             return None;
         }
-        let mut union_fields: Vec<&FieldDef> = self.fields.iter()
-            .filter(|f| f.discriminant_value != 0xFFFF)
-            .collect();
+        let mut union_fields: Vec<&FieldDef> = self.union_fields().collect();
         if union_fields.len() != 2 {
             return None;
         }
@@ -136,6 +142,31 @@ impl StructDef {
         }
         Some(&some_field.type_name)
     }
+}
+
+/// Check if a Cap'n Proto type name is a primitive (not a struct reference).
+///
+/// Returns true for all scalar types, `Void`, `Text`, `Data`, and `List(...)`.
+/// Includes `Void` — callers that need to exclude it (e.g., setter dispatch)
+/// should additionally check `type_name != "Void"`.
+pub fn is_primitive_capnp_type(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "Void"
+            | "Bool"
+            | "Text"
+            | "Data"
+            | "UInt8"
+            | "UInt16"
+            | "UInt32"
+            | "UInt64"
+            | "Int8"
+            | "Int16"
+            | "Int32"
+            | "Int64"
+            | "Float32"
+            | "Float64"
+    ) || type_name.starts_with("List(")
 }
 
 #[derive(Debug, Serialize, Deserialize)]
