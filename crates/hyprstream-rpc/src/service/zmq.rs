@@ -84,6 +84,13 @@ pub struct EnvelopeContext {
     /// neither has been applied (e.g., AnySigner/WebTransport callers).
     key_derived_subject: Subject,
 
+    /// Authorization subject resolved from a verified JWT token.
+    ///
+    /// Set by `verify_claims()` after it determines whether the token is
+    /// local (bare subject: `"alice"`) or federated (`"https://node-a:alice"`).
+    /// `None` until `verify_claims()` runs, or when no JWT is present.
+    pub(crate) jwt_subject: Option<Subject>,
+
     /// Raw signer pubkey bytes from the verified `SignedEnvelope`.
     /// Cryptographically verified by Ed25519 signature check.
     pub signer_pubkey: [u8; 32],
@@ -105,6 +112,7 @@ impl EnvelopeContext {
             ephemeral_pubkey: envelope.ephemeral_pubkey().copied(),
             claims: envelope.envelope.claims.clone(),
             key_derived_subject: Subject::anonymous(),
+            jwt_subject: None,
             signer_pubkey: envelope.signer_pubkey,
         }
     }
@@ -121,6 +129,7 @@ impl EnvelopeContext {
             ephemeral_pubkey: envelope.ephemeral_pubkey().copied(),
             claims: envelope.envelope.claims.clone(),
             key_derived_subject: Subject::new("system"),
+            jwt_subject: None,
             signer_pubkey: envelope.signer_pubkey,
         }
     }
@@ -141,6 +150,7 @@ impl EnvelopeContext {
             ephemeral_pubkey: envelope.ephemeral_pubkey().copied(),
             claims: envelope.envelope.claims.clone(),
             key_derived_subject,
+            jwt_subject: None,
             signer_pubkey: envelope.signer_pubkey,
         }
     }
@@ -161,6 +171,7 @@ impl EnvelopeContext {
             ephemeral_pubkey: None,
             claims: None,
             key_derived_subject: Subject::new("system"),
+            jwt_subject: None,
             signer_pubkey: [0u8; 32],
         }
     }
@@ -181,12 +192,13 @@ impl EnvelopeContext {
         if !self.key_derived_subject.is_anonymous() {
             return self.key_derived_subject.clone();
         }
-        // JWT upgrade for external callers (AnySigner / WebTransport).
-        // Subject::from(&Claims) handles federation via the iss field (Phase 7).
-        match &self.claims {
-            Some(c) if c.token.is_some() => Subject::from(c),
-            _ => Subject::anonymous(),
+        // JWT upgrade: use the pre-resolved subject set by verify_claims(), which
+        // correctly distinguishes local tokens (bare sub) from federated ones
+        // (iss:sub format).  Falls back to anonymous if no JWT was verified.
+        if let Some(ref s) = self.jwt_subject {
+            return s.clone();
         }
+        Subject::anonymous()
     }
 
     /// Get the bare username string.
@@ -337,20 +349,19 @@ pub trait ZmqService: 'static {
     /// E2E JWT verification with federation and downgrade attack protection.
     ///
     /// Called by `process_request` after envelope signature verification.
+    /// Takes `&mut EnvelopeContext` to store the resolved `jwt_subject` directly,
+    /// which correctly distinguishes local tokens (bare `sub`) from federated
+    /// ones (`iss:sub` format) using this service's `local_issuer_url()`.
     /// Async because federated key resolution may require an HTTP JWKS fetch.
-    async fn verify_claims(&self, ctx: &EnvelopeContext) -> anyhow::Result<()> {
+    async fn verify_claims(&self, ctx: &mut EnvelopeContext) -> anyhow::Result<()> {
         if let Some(claims) = ctx.claims() {
-            // A token is local when iss matches the configured local OAuth
-            // issuer URL, OR when iss is empty AND no issuer URL is configured
-            // (legacy / unconfigured deployments only).  When a local issuer
-            // URL is set, an empty iss is rejected — it cannot bypass issuer
-            // binding by omitting the field.
-            let is_local = match self.local_issuer_url() {
-                Some(local) => claims.iss == local,
-                None => claims.iss.is_empty(),
+            let local_url = self.local_issuer_url();
+            let local_issuers: &[&str] = match local_url {
+                Some(ref u) => std::slice::from_ref(u),
+                None => &[],
             };
 
-            if is_local {
+            if claims.is_local_to(local_issuers) {
                 // --- Local token path ---
                 match claims.verify_token(&self.verifying_key(), self.expected_audience()) {
                     Ok(Some(verified)) => {
@@ -437,6 +448,13 @@ pub trait ZmqService: 'static {
                     );
                     anyhow::bail!("Federated claims issuer mismatch");
                 }
+            }
+
+            // Derive the authorization subject via Claims::subject(), which
+            // produces bare "sub" for local tokens and "iss:sub" for federated ones.
+            let s = claims.subject(local_issuers);
+            if !s.is_anonymous() {
+                ctx.jwt_subject = Some(s);
             }
         }
         Ok(())

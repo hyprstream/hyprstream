@@ -101,7 +101,29 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     let policy_manager = Arc::new(
         tokio::task::block_in_place(|| {
             let rt = tokio::runtime::Handle::current();
-            rt.block_on(PolicyManager::new(&policies_dir))
+            rt.block_on(async {
+                let pm = PolicyManager::new(&policies_dir).await?;
+                // Idempotent migration: ensure required bootstrap rules are present.
+                // These rules are in DEFAULT_POLICY_CSV for new installs; existing
+                // deployments need them added once.
+                let rules = pm.get_policy().await;
+                let has_system = rules.iter().any(|r| r.first().map(|s| s == "system").unwrap_or(false));
+                let has_anon_tui = rules.iter().any(|r| {
+                    r.len() >= 3 && r[0] == "anonymous" && r[2] == "tui:*"
+                });
+                if !has_system {
+                    let _ = pm.add_policy_with_domain("system", "*", "*", "*", "allow").await;
+                    tracing::info!("policy migration: added 'system' full-access grant");
+                }
+                if !has_anon_tui {
+                    let _ = pm.add_policy_with_domain("anonymous", "*", "tui:*", "*", "allow").await;
+                    tracing::info!("policy migration: added 'anonymous' TUI access grant");
+                }
+                if !has_system || !has_anon_tui {
+                    let _ = pm.save().await;
+                }
+                Ok::<_, anyhow::Error>(pm)
+            })
         })
         .context("Failed to initialize policy manager")?,
     );
@@ -600,12 +622,9 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                                 });
                             match token {
                                 Some(t) => {
-                                    // Federation branching: same logic as server/middleware.rs auth_middleware.
                                     let iss = crate::server::middleware::extract_iss_from_token(t);
-                                    let is_local = iss.is_empty()
-                                        || iss == mcp_oauth_issuer
-                                        || iss == mcp_resource_url;
-                                    let result = if is_local {
+                                    let local_issuers: &[&str] = &[mcp_oauth_issuer.as_str()];
+                                    let result = if hyprstream_rpc::auth::is_local_iss(&iss, local_issuers) {
                                         crate::auth::jwt::decode(t, &verifying_key, Some(mcp_resource_url.as_str()))
                                     } else {
                                         match federation_resolver.get_key(&iss).await {

@@ -1929,7 +1929,7 @@ where
     //
     // FixedSigner: all callers sign with the node key → key_derived_subject = "system".
     // AnySigner: external callers (WebTransport) use their own key → Anonymous until JWT.
-    let (ctx, payload) = match match verification {
+    let (mut ctx, payload) = match match verification {
         EnvelopeVerification::FixedSigner(pubkey) =>
             if let Some(registry) = service.key_registry() {
                 crate::envelope::unwrap_envelope_with_registry(raw_bytes, pubkey, nonce_cache, &*registry)
@@ -1965,7 +1965,7 @@ where
     );
 
     // 2. Verify claims (E2E JWT, downgrade protection)
-    if let Err(e) = service.verify_claims(&ctx).await {
+    if let Err(e) = service.verify_claims(&mut ctx).await {
         warn!(
             "{} claims verification failed for {} (id={}): {}",
             service.name(), ctx.subject(), request_id, e

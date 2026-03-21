@@ -146,6 +146,10 @@ const DEFAULT_POLICY_CSV: &str = r#"# Hyprstream Access Control Policy — deny-
 # The 'system' subject (local node key → inproc/IPC callers) has full access.
 p, system, *, *, *, allow
 #
+# The TUI display server is a local-only service; anonymous browser clients
+# (connecting via WebTransport from localhost) may access TUI resources.
+p, anonymous, *, tui:*, *, allow
+#
 # No other access is granted until you apply a policy template:
 #
 #   hyprstream quick policy apply-template local             # local CLI full access
