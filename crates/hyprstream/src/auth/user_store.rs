@@ -51,7 +51,7 @@ impl LocalKeyStore {
         std::fs::create_dir_all(credentials_dir)?;
         let path = credentials_dir.join("users.toml.age");
 
-        let identity = Self::load_or_generate_identity()?;
+        let identity = Self::load_or_generate_identity(&path)?;
 
         let data = if path.exists() {
             Self::decrypt_and_parse(&path, &identity)?
@@ -62,7 +62,17 @@ impl LocalKeyStore {
         Ok(Self { path, data, identity })
     }
 
-    fn load_or_generate_identity() -> Result<age::x25519::Identity> {
+    /// Load the age identity from the OS keyring, or generate a new one on first run.
+    ///
+    /// `store_path` is the path of the `users.toml.age` file. When it already exists
+    /// on disk, a missing keyring entry is a hard error — generating a new key would
+    /// produce a "NoMatchingKeys" decryption failure.
+    ///
+    /// Recovery: set `HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY=<age-secret-key-...>`
+    /// in the environment to inject the original key, or delete the credential store
+    /// file to start fresh.
+    fn load_or_generate_identity(store_path: &Path) -> Result<age::x25519::Identity> {
+        let store_file_exists = store_path.exists();
         // Check for test bypass via config before touching the OS keyring.
         // Set HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY=<age-secret-key-...> to inject a key.
         if let Ok(cfg) = crate::config::HyprConfig::load() {
@@ -83,7 +93,21 @@ impl LocalKeyStore {
                 s.parse::<age::x25519::Identity>()
                     .map_err(|e| anyhow!("Failed to parse credential store key: {:?}", e))
             }
+            Err(keyring::Error::NoEntry) if store_file_exists => {
+                // The encrypted store exists but the decryption key is gone from the keyring.
+                // Generating a new key would produce "NoMatchingKeys" — fail with a clear message.
+                Err(anyhow!(
+                    "Credential store key not found in OS keyring.\n\
+                     The store file exists at {:?} but cannot be decrypted.\n\
+                     Recovery options:\n\
+                     - Set HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY=<age-secret-key-...> \
+                       if you have a backup of the original key.\n\
+                     - Delete that file to start fresh (existing users will be lost).",
+                    store_path
+                ))
+            }
             Err(keyring::Error::NoEntry) => {
+                // First run — no store file, safe to generate a new key.
                 let identity = age::x25519::Identity::generate();
                 let secret_str = identity.to_string();
                 entry

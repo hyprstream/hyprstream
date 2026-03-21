@@ -452,7 +452,7 @@ fn handle_quick_command(
                 let signing_key = load_or_generate_signing_key(&keys_dir).await?;
                 let model_client = hyprstream_core::services::generated::model_client::ModelClient::new(
                     signing_key,
-                    RequestIdentity::local(),
+                    RequestIdentity::anonymous(),
                 );
                 let filters = parse_filters(&filter)?;
                 let status_filter = parse_status_filter(&status)?;
@@ -1050,7 +1050,7 @@ fn handle_quick_command(
                         // Wire up policy-backed authorization
                         let worker_policy_client = PolicyClient::new(
                             signing_key.clone(),
-                            RequestIdentity::local(),
+                            RequestIdentity::anonymous(),
                         );
                         worker_service.set_authorize_fn(
                             hyprstream_core::services::build_authorize_fn(worker_policy_client),
@@ -1069,7 +1069,7 @@ fn handle_quick_command(
 
                     use hyprstream_workers::runtime::WorkerClient;
                     let worker_client =
-                        WorkerClient::new(signing_key, RequestIdentity::local());
+                        WorkerClient::new(signing_key, RequestIdentity::anonymous());
 
                     match action {
                         WorkerAction::List {
@@ -1484,7 +1484,7 @@ fn main() -> Result<()> {
                         // Wire up policy-backed authorization
                         let wf_policy_client = PolicyClient::new(
                             signing_key.clone(),
-                            RequestIdentity::local(),
+                            RequestIdentity::anonymous(),
                         );
                         wf_svc.set_authorize_fn(
                             hyprstream_core::services::build_authorize_fn(wf_policy_client),
@@ -1502,7 +1502,7 @@ fn main() -> Result<()> {
 
                 let client = hyprstream_core::services::RegistryClient::new(
                     signing_key.clone(),
-                    RequestIdentity::local(),
+                    RequestIdentity::anonymous(),
                 );
 
                 Ok::<_, anyhow::Error>((
@@ -1524,7 +1524,7 @@ fn main() -> Result<()> {
 
                 let client = hyprstream_core::services::RegistryClient::new(
                     signing_key.clone(),
-                    RequestIdentity::local(),
+                    RequestIdentity::anonymous(),
                 );
 
                 Ok::<_, anyhow::Error>((client, Vec::new(), None, signing_key, verifying_key))
@@ -1642,7 +1642,7 @@ fn main() -> Result<()> {
                                         load_or_generate_signing_key(&keys_dir).await?;
                                     let policy_client = PolicyClient::new(
                                         signing_key.clone(),
-                                        hyprstream_rpc::RequestIdentity::local(),
+                                        hyprstream_rpc::RequestIdentity::anonymous(),
                                     );
 
                                     let runtime_config =

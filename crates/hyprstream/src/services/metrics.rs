@@ -197,9 +197,6 @@ fn build_sql(q: &MetricQuery) -> Result<String> {
 #[async_trait(?Send)]
 impl MetricsHandler for MetricsService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
-        if ctx.identity.is_local() {
-            return Ok(());
-        }
         let subject = ctx.subject().to_string();
         let allowed = self.policy_client
             .check(&PolicyCheck {
@@ -710,7 +707,7 @@ mod tests {
         let policy_client = PolicyClient::with_endpoint(
             &format!("inproc://{policy_tag}"),
             signing_key.clone(),
-            RequestIdentity::local(),
+            RequestIdentity::anonymous(),
         );
 
         // In-memory DuckDB backend + metrics table creation.
@@ -749,7 +746,7 @@ mod tests {
         let client = MetricsClient::with_endpoint(
             &format!("inproc://{svc_tag}"),
             signing_key,
-            RequestIdentity::local(),
+            RequestIdentity::anonymous(),
         );
 
         (client, manager)

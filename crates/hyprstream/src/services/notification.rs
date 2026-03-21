@@ -389,25 +389,21 @@ impl NotificationService {
 #[async_trait(?Send)]
 impl NotificationHandler for NotificationService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
-        if ctx.identity.is_local() {
-            return Ok(());
-        }
-        if let Some(ref policy_client) = self.policy_client {
-            let subject = ctx.subject().to_string();
-            let allowed = policy_client
-                .check(&PolicyCheck { subject: subject.clone(), domain: "*".to_owned(), resource: resource.to_owned(), operation: operation.to_owned() })
-                .await
-                .unwrap_or_else(|e| {
-                    warn!("Notification policy check failed for {}: {}", subject, e);
-                    false
-                });
-            if allowed {
-                Ok(())
-            } else {
-                anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource)
-            }
-        } else {
+        let subject = ctx.subject().to_string();
+        let policy_client = self.policy_client.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Authorization denied: no policy client configured")
+        })?;
+        let allowed = policy_client
+            .check(&PolicyCheck { subject: subject.clone(), domain: "*".to_owned(), resource: resource.to_owned(), operation: operation.to_owned() })
+            .await
+            .unwrap_or_else(|e| {
+                warn!("Notification policy check failed for {}: {}", subject, e);
+                false
+            });
+        if allowed {
             Ok(())
+        } else {
+            anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource)
         }
     }
 

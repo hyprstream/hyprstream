@@ -17,7 +17,7 @@ impl PolicyTemplate {
         if let Some(rules) = self.rules {
             rules.to_owned()
         } else if self.name == "local" {
-            let user = hyprstream_rpc::envelope::RequestIdentity::local().user().to_owned();
+            let user = hyprstream_rpc::envelope::RequestIdentity::anonymous().user().to_owned();
             format!("# Full access for {user}\np, {user}, *, *, *, allow\n")
         } else {
             String::new()

@@ -101,13 +101,14 @@ pub fn generate_nonce() -> [u8; 16] {
 /// Identity of a request sender.
 ///
 /// This enum represents the different ways a client can authenticate.
-/// The identity determines the "user" for Casbin policy checks.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The identity is preserved for logging only; authorization decisions use
+/// `EnvelopeContext::subject()`, which is derived from the verified Ed25519
+/// signer key via `KeyRegistry`.
+///
+/// Note: The `Local` variant has been removed. Any `Local` identity received
+/// over the wire is silently downgraded to `Anonymous` in `FromCapnp`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum RequestIdentity {
-    /// Local process on the same machine.
-    /// User is the OS username (trusted).
-    Local { user: String },
-
     /// Authenticated via API token.
     /// User is from the token record.
     ApiToken { user: String, token_name: String },
@@ -121,18 +122,11 @@ pub enum RequestIdentity {
 
     /// No authentication provided.
     /// User is "anonymous".
+    #[default]
     Anonymous,
 }
 
 impl RequestIdentity {
-    /// Create a local identity using the current OS username (native only).
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn local() -> Self {
-        Self::Local {
-            user: whoami::username(),
-        }
-    }
-
     /// Create an API token identity.
     pub fn api_token(user: impl Into<String>, token_name: impl Into<String>) -> Self {
         Self::ApiToken {
@@ -156,20 +150,14 @@ impl RequestIdentity {
 
     /// Extract the bare username string.
     ///
-    /// This is the canonical form used for Casbin policy checks.
-    /// All identity types produce bare usernames (no prefix).
+    /// This is the canonical form used for logging only.
+    /// Authorization decisions must use `EnvelopeContext::subject()`.
     pub fn user(&self) -> &str {
         match self {
-            // Both Local and ApiToken have a user field
-            Self::Local { user } | Self::ApiToken { user, .. } => user,
+            Self::ApiToken { user, .. } => user,
             Self::Peer { name, .. } => name,
             Self::Anonymous => "anonymous",
         }
-    }
-
-    /// Check if this is a local (trusted) identity.
-    pub fn is_local(&self) -> bool {
-        matches!(self, Self::Local { .. })
     }
 
     /// Check if this is authenticated (not anonymous).
@@ -178,17 +166,9 @@ impl RequestIdentity {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-impl Default for RequestIdentity {
-    fn default() -> Self {
-        Self::local()
-    }
-}
-
 impl std::fmt::Display for RequestIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Local { user } => write!(f, "local:{user}"),
             Self::ApiToken { user, token_name } => write!(f, "token:{user}:{token_name}"),
             Self::Peer { name, .. } => write!(f, "peer:{name}"),
             Self::Anonymous => write!(f, "anonymous"),
@@ -331,7 +311,57 @@ impl From<&RequestIdentity> for Subject {
 
 impl From<&Claims> for Subject {
     fn from(claims: &Claims) -> Self {
-        Subject::new(claims.sub.clone())
+        // Phase 7: Federated subjects use "iss:sub" format so that
+        // "alice@node-a" and local "alice" never collide in Casbin policy.
+        if claims.iss.is_empty() {
+            Subject::new(claims.sub.clone())
+        } else {
+            Subject::federated(&claims.iss, &claims.sub)
+        }
+    }
+}
+
+/// Registry mapping Ed25519 signer public keys to authorization subjects.
+///
+/// The primary purpose is mapping the node's own signing key to
+/// `Subject::new("system")`, which Casbin grants broad permissions via
+/// `p, system, *, *, *, allow`. All other keys default to `Subject::anonymous()`.
+///
+/// # Security
+///
+/// The signer public key is taken from the *verified* `SignedEnvelope.signer_pubkey`
+/// field — i.e., from after Ed25519 signature verification passes. It is not
+/// caller-asserted payload data.
+pub trait KeyRegistry: Send + Sync {
+    /// Resolve a verified signer public key to an authorization subject.
+    fn resolve(&self, signer_pubkey: &[u8; 32]) -> Subject;
+}
+
+/// Single-key registry mapping the local node's signing key to `Subject::new("system")`.
+///
+/// Create one per service using the node's `VerifyingKey`. All inproc/IPC callers
+/// that sign with this key resolve to `"system"`, which Casbin grants full
+/// permissions. All other signer keys resolve to `Subject::anonymous()`.
+pub struct NodeKeyRegistry {
+    node_pubkey: [u8; 32],
+}
+
+impl NodeKeyRegistry {
+    /// Create a registry from the node's Ed25519 verifying key.
+    pub fn new(key: &VerifyingKey) -> Self {
+        Self {
+            node_pubkey: key.to_bytes(),
+        }
+    }
+}
+
+impl KeyRegistry for NodeKeyRegistry {
+    fn resolve(&self, signer_pubkey: &[u8; 32]) -> Subject {
+        if signer_pubkey == &self.node_pubkey {
+            Subject::new("system")
+        } else {
+            Subject::anonymous()
+        }
     }
 }
 
@@ -359,10 +389,6 @@ impl ToCapnp for RequestIdentity {
 
     fn write_to(&self, builder: &mut Self::Builder<'_>) {
         match self {
-            Self::Local { user } => {
-                let mut local = builder.reborrow().init_local();
-                local.set_user(user);
-            }
             Self::ApiToken { user, token_name } => {
                 let mut api_token = builder.reborrow().init_api_token();
                 api_token.set_user(user);
@@ -387,12 +413,10 @@ impl FromCapnp for RequestIdentity {
         use common_capnp::request_identity::Which;
 
         match reader.which()? {
-            Which::Local(local) => {
-                let local = local?;
-                Ok(Self::Local {
-                    user: local.get_user()?.to_str()?.to_owned(),
-                })
-            }
+            // Wire backward compat: Local was removed from the Rust enum.
+            // Both Local and Anonymous wire variants produce Anonymous — authorization
+            // comes from the verified Ed25519 signer key, not this field.
+            Which::Local(_) | Which::Anonymous(()) => Ok(Self::Anonymous),
             Which::ApiToken(api_token) => {
                 let api_token = api_token?;
                 Ok(Self::ApiToken {
@@ -416,7 +440,6 @@ impl FromCapnp for RequestIdentity {
                     curve_key,
                 })
             }
-            Which::Anonymous(()) => Ok(Self::Anonymous),
         }
     }
 }
@@ -478,12 +501,6 @@ impl RequestEnvelope {
     pub fn with_claims(mut self, claims: Claims) -> Self {
         self.claims = Some(claims);
         self
-    }
-
-    /// Create an envelope for a local request.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn local(payload: Vec<u8>) -> Self {
-        Self::new(RequestIdentity::local(), payload)
     }
 
     /// Create an envelope for an API token authenticated request.
@@ -597,7 +614,7 @@ impl RequestEnvelope {
 /// use hyprstream_rpc::crypto::SigningKey;
 ///
 /// // Create and sign
-/// let envelope = RequestEnvelope::local(payload);
+/// let envelope = RequestEnvelope::anonymous(payload);
 /// let signed = SignedEnvelope::new_signed(envelope, &signing_key);
 ///
 /// // Verify
@@ -1195,7 +1212,12 @@ pub fn unwrap_and_verify(
     Ok((signed, payload))
 }
 
-/// Unwrap and verify a SignedEnvelope, returning `EnvelopeContext` + payload.
+/// Unwrap and verify a FixedSigner envelope, returning `EnvelopeContext` + payload.
+///
+/// Sets `key_derived_subject = Subject::new("system")` on the context, so
+/// `EnvelopeContext::subject()` returns `"system"` for any caller that passes
+/// signature verification against `server_pubkey`. Use this for inproc/IPC
+/// callers that share the node's signing key.
 ///
 /// Native only — `EnvelopeContext` requires the `service` module.
 #[cfg(not(target_arch = "wasm32"))]
@@ -1205,7 +1227,7 @@ pub fn unwrap_envelope(
     nonce_cache: &dyn NonceCache,
 ) -> Result<(crate::service::EnvelopeContext, Vec<u8>)> {
     let (signed, payload) = unwrap_and_verify(request, server_pubkey, nonce_cache)?;
-    let ctx = crate::service::EnvelopeContext::from_verified(&signed);
+    let ctx = crate::service::EnvelopeContext::from_verified_as_system(&signed);
     Ok((ctx, payload))
 }
 
@@ -1244,6 +1266,40 @@ pub fn unwrap_envelope_any_signer(
 ) -> Result<(crate::service::EnvelopeContext, Vec<u8>)> {
     let (signed, payload) = unwrap_and_verify_any_signer(request, nonce_cache)?;
     let ctx = crate::service::EnvelopeContext::from_verified(&signed);
+    Ok((ctx, payload))
+}
+
+/// Unwrap and verify a FixedSigner envelope, setting `key_derived_subject = system`.
+///
+/// Used for inproc/IPC callers who sign with the node key. Sets
+/// `Subject::new("system")` as the key-derived subject so that
+/// `EnvelopeContext::subject()` returns `"system"` regardless of any
+/// caller-asserted `RequestIdentity` field in the envelope.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn unwrap_envelope_as_system(
+    request: &[u8],
+    server_pubkey: &VerifyingKey,
+    nonce_cache: &dyn NonceCache,
+) -> Result<(crate::service::EnvelopeContext, Vec<u8>)> {
+    let (signed, payload) = unwrap_and_verify(request, server_pubkey, nonce_cache)?;
+    let ctx = crate::service::EnvelopeContext::from_verified_as_system(&signed);
+    Ok((ctx, payload))
+}
+
+/// Unwrap and verify, resolving the subject via a `KeyRegistry`.
+///
+/// More flexible variant that allows custom key→subject mappings. Use this
+/// when a service needs to distinguish multiple trusted keys (e.g., federated
+/// peer nodes each mapping to their own system subject).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn unwrap_envelope_with_registry(
+    request: &[u8],
+    server_pubkey: &VerifyingKey,
+    nonce_cache: &dyn NonceCache,
+    registry: &dyn KeyRegistry,
+) -> Result<(crate::service::EnvelopeContext, Vec<u8>)> {
+    let (signed, payload) = unwrap_and_verify(request, server_pubkey, nonce_cache)?;
+    let ctx = crate::service::EnvelopeContext::from_verified_with_registry(&signed, registry);
     Ok((ctx, payload))
 }
 
@@ -1316,19 +1372,10 @@ mod tests {
     }
 
     #[test]
-    fn test_local_identity() {
-        let identity = RequestIdentity::local();
-        assert!(identity.is_local());
-        assert!(identity.is_authenticated());
-        assert!(!identity.user().is_empty());
-    }
-
-    #[test]
     fn test_api_token_identity() {
         let identity = RequestIdentity::api_token("bob", "ci-token");
         assert_eq!(identity.user(), "bob");
         assert!(identity.is_authenticated());
-        assert!(!identity.is_local());
     }
 
     #[test]
@@ -1348,12 +1395,6 @@ mod tests {
 
     #[test]
     fn test_identity_user_extraction() {
-        // Local identity
-        let local = RequestIdentity::Local {
-            user: "alice".into(),
-        };
-        assert_eq!(local.user(), "alice");
-
         // API token identity
         let token = RequestIdentity::ApiToken {
             user: "bob".into(),
@@ -1372,21 +1413,22 @@ mod tests {
         let anon = RequestIdentity::Anonymous;
         assert_eq!(anon.user(), "anonymous");
 
-        // All identity types for the same user produce equal subjects
-        let alice_local = RequestIdentity::Local {
+        // Different identity types for the same user produce equal subjects
+        let alice_token = RequestIdentity::ApiToken {
             user: "alice".into(),
+            token_name: "ci".into(),
         };
         let alice_peer = RequestIdentity::Peer {
             name: "alice".into(),
             curve_key: [0u8; 32],
         };
-        assert_eq!(Subject::from(&alice_local), Subject::from(&alice_peer));
+        assert_eq!(Subject::from(&alice_token), Subject::from(&alice_peer));
     }
 
     #[test]
     fn test_request_envelope() {
-        let envelope = RequestEnvelope::local(vec![1, 2, 3]);
-        assert!(!envelope.user().is_empty());
+        let envelope = RequestEnvelope::anonymous(vec![1, 2, 3]);
+        assert_eq!(envelope.user(), "anonymous");
         assert_eq!(envelope.payload, vec![1, 2, 3]);
         assert!(envelope.request_id > 0);
         assert!(envelope.timestamp > 0);
@@ -1396,14 +1438,14 @@ mod tests {
     #[test]
     fn test_request_envelope_with_ephemeral_pubkey() {
         let pubkey = [42u8; 32];
-        let envelope = RequestEnvelope::local(vec![]).with_ephemeral_pubkey(pubkey);
+        let envelope = RequestEnvelope::anonymous(vec![]).with_ephemeral_pubkey(pubkey);
         assert_eq!(envelope.ephemeral_pubkey, Some(pubkey));
     }
 
     #[test]
     fn test_request_id_increments() {
-        let e1 = RequestEnvelope::local(vec![]);
-        let e2 = RequestEnvelope::local(vec![]);
+        let e1 = RequestEnvelope::anonymous(vec![]);
+        let e2 = RequestEnvelope::anonymous(vec![]);
         assert!(e2.request_id > e1.request_id);
     }
 
@@ -1421,7 +1463,7 @@ mod tests {
         let (signing_key, verifying_key) = generate_signing_keypair();
         let nonce_cache = TestNonceCache::new();
 
-        let envelope = RequestEnvelope::local(vec![1, 2, 3, 4]);
+        let envelope = RequestEnvelope::anonymous(vec![1, 2, 3, 4]);
         let signed = SignedEnvelope::new_signed(envelope, &signing_key);
 
         // Verify should succeed
@@ -1435,7 +1477,7 @@ mod tests {
         let (_, wrong_verifying_key) = generate_signing_keypair();
         let nonce_cache = TestNonceCache::new();
 
-        let envelope = RequestEnvelope::local(vec![1, 2, 3, 4]);
+        let envelope = RequestEnvelope::anonymous(vec![1, 2, 3, 4]);
         let signed = SignedEnvelope::new_signed(envelope, &signing_key);
 
         // Verify with wrong key should fail
@@ -1448,7 +1490,7 @@ mod tests {
         let (signing_key, verifying_key) = generate_signing_keypair();
         let nonce_cache = TestNonceCache::new();
 
-        let envelope = RequestEnvelope::local(vec![1, 2, 3, 4]);
+        let envelope = RequestEnvelope::anonymous(vec![1, 2, 3, 4]);
         let signed = SignedEnvelope::new_signed(envelope, &signing_key);
 
         // First verify succeeds
@@ -1476,21 +1518,22 @@ mod tests {
     }
 
     #[test]
-    fn test_capnp_roundtrip_local() -> anyhow::Result<()> {
+    fn test_capnp_local_wire_downgrade() -> anyhow::Result<()> {
+        // Wire backward compat: a peer running old code may send Local identity.
+        // Verify that FromCapnp silently downgrades it to Anonymous.
         use capnp::message::Builder;
 
-        let identity = RequestIdentity::local();
-
-        // Serialize
         let mut message = Builder::new_default();
         let mut builder = message.init_root::<common_capnp::request_identity::Builder>();
-        identity.write_to(&mut builder);
+        // Write the Local variant directly via the Cap'n Proto builder (no Rust variant needed).
+        let mut local = builder.reborrow().init_local();
+        local.set_user("alice");
 
-        // Deserialize
         let reader = builder.into_reader();
         let decoded = RequestIdentity::read_from(reader)?;
 
-        assert_eq!(identity, decoded);
+        // Must be downgraded — Local is no longer trusted.
+        assert_eq!(decoded, RequestIdentity::Anonymous);
         Ok(())
     }
 
@@ -1574,7 +1617,7 @@ mod tests {
         use capnp::message::Builder;
 
         let (signing_key, verifying_key) = generate_signing_keypair();
-        let envelope = RequestEnvelope::local(vec![1, 2, 3]);
+        let envelope = RequestEnvelope::anonymous(vec![1, 2, 3]);
         let signed = SignedEnvelope::new_signed(envelope, &signing_key);
 
         let mut message = Builder::new_default();
@@ -1600,9 +1643,6 @@ mod tests {
 
     #[test]
     fn test_subject_from_identity() {
-        let local = RequestIdentity::Local { user: "alice".into() };
-        assert_eq!(Subject::from(&local), Subject::new("alice"));
-
         let token = RequestIdentity::ApiToken { user: "bob".into(), token_name: "ci".into() };
         assert_eq!(Subject::from(&token), Subject::new("bob"));
 
@@ -1676,9 +1716,9 @@ mod tests {
         assert_eq!(set.len(), 2);
 
         // Same user from different identity types produces equal subjects
-        let from_local = Subject::from(&RequestIdentity::Local { user: "alice".into() });
         let from_token = Subject::from(&RequestIdentity::ApiToken { user: "alice".into(), token_name: "ci".into() });
-        assert_eq!(from_local, from_token);
+        let from_peer = Subject::from(&RequestIdentity::Peer { name: "alice".into(), curve_key: [0u8; 32] });
+        assert_eq!(from_token, from_peer);
     }
 
     #[test]

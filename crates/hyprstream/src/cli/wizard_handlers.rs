@@ -350,7 +350,7 @@ async fn phase_policy_templates(state: &mut WizardState, non_interactive: bool) 
     }
 
     // Build selection options
-    let local_user = hyprstream_rpc::envelope::RequestIdentity::local()
+    let local_user = hyprstream_rpc::envelope::RequestIdentity::anonymous()
         .user()
         .to_owned();
 
@@ -481,7 +481,7 @@ async fn phase_users(state: &mut WizardState, non_interactive: bool) -> Result<(
         println!();
     }
 
-    let local_user = hyprstream_rpc::envelope::RequestIdentity::local()
+    let local_user = hyprstream_rpc::envelope::RequestIdentity::anonymous()
         .user()
         .to_owned();
 
@@ -658,7 +658,7 @@ async fn phase_tokens(state: &mut WizardState, non_interactive: bool) -> Result<
 
     // In non-interactive mode, generate a token for the local user
     if non_interactive {
-        let local_user = hyprstream_rpc::envelope::RequestIdentity::local()
+        let local_user = hyprstream_rpc::envelope::RequestIdentity::anonymous()
             .user()
             .to_owned();
 
@@ -669,7 +669,7 @@ async fn phase_tokens(state: &mut WizardState, non_interactive: bool) -> Result<
 
     // If no users created, ask if they want to create a token for the local user
     if users_for_tokens.is_empty() {
-        let local_user = hyprstream_rpc::envelope::RequestIdentity::local()
+        let local_user = hyprstream_rpc::envelope::RequestIdentity::anonymous()
             .user()
             .to_owned();
 

@@ -207,30 +207,27 @@ impl TuiService {
 
     /// Check authorization via PolicyClient.
     ///
-    /// Local callers are always permitted. Remote callers require a policy
-    /// allowance; if no PolicyClient is configured, remote callers are also
-    /// permitted (backward-compat for local-only deployments).
+    /// All callers are authorized via Casbin: system (node key) gets full access,
+    /// external callers require explicit policy grants.
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
-        if ctx.identity.is_local() {
-            return Ok(());
-        }
-        if let Some(ref policy_client) = self.policy_client {
-            let subject = ctx.subject().to_string();
-            let allowed = policy_client
-                .check(&crate::services::generated::policy_client::PolicyCheck {
-                    subject: subject.clone(),
-                    domain: "*".to_owned(),
-                    resource: resource.to_owned(),
-                    operation: operation.to_owned(),
-                })
-                .await
-                .unwrap_or_else(|e| {
-                    warn!("TUI policy check failed for {}: {}", subject, e);
-                    false
-                });
-            if !allowed {
-                anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource);
-            }
+        let subject = ctx.subject().to_string();
+        let policy_client = self.policy_client.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Authorization denied: no policy client configured")
+        })?;
+        let allowed = policy_client
+            .check(&crate::services::generated::policy_client::PolicyCheck {
+                subject: subject.clone(),
+                domain: "*".to_owned(),
+                resource: resource.to_owned(),
+                operation: operation.to_owned(),
+            })
+            .await
+            .unwrap_or_else(|e| {
+                warn!("TUI policy check failed for {}: {}", subject, e);
+                false
+            });
+        if !allowed {
+            anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource);
         }
         Ok(())
     }
@@ -800,11 +797,11 @@ impl TuiService {
                 crate::services::RegistryClient::with_endpoint(
                     &registry_endpoint,
                     self.signing_key.clone(),
-                    RequestIdentity::local(),
+                    RequestIdentity::anonymous(),
                 );
             let model_client_for_status = crate::services::generated::model_client::ModelClient::new(
                 self.signing_key.clone(),
-                RequestIdentity::local(),
+                RequestIdentity::anonymous(),
             );
             let status_timeout = std::time::Duration::from_millis(500);
             let all_status_req = crate::services::generated::model_client::StatusRequest { model_ref: String::new() };
@@ -852,7 +849,7 @@ impl TuiService {
                 // Submit load — returns "accepted" immediately (Continuation pattern).
                 h.block_on(async {
                     let client = crate::services::generated::model_client::ModelClient::new(
-                        sk.clone(), RequestIdentity::local(),
+                        sk.clone(), RequestIdentity::anonymous(),
                     );
                     let _ = client.load(&crate::services::generated::model_client::LoadModelRequest {
                         model_ref: mr.clone(),
@@ -869,7 +866,7 @@ impl TuiService {
                         std::thread::sleep(std::time::Duration::from_secs(2));
                         let loaded = h_poll.block_on(async {
                             let client = crate::services::generated::model_client::ModelClient::new(
-                                sk_poll.clone(), RequestIdentity::local(),
+                                sk_poll.clone(), RequestIdentity::anonymous(),
                             );
                             client.status(&crate::services::generated::model_client::StatusRequest { model_ref: mr_poll.clone() }).await
                                 .is_ok_and(|es| es.iter().any(|e| e.status == "loaded"))
@@ -890,7 +887,7 @@ impl TuiService {
             let sk = sk_unload.clone();
             let mr = model_ref.to_owned();
             handle_unload.block_on(async move {
-                let client = crate::services::generated::model_client::ModelClient::new(sk, RequestIdentity::local());
+                let client = crate::services::generated::model_client::ModelClient::new(sk, RequestIdentity::anonymous());
                 client.unload(&crate::services::generated::model_client::UnloadModelRequest { model_ref: mr.clone() }).await.is_ok()
             })
         });

@@ -190,7 +190,7 @@ impl ModelService {
         };
         let cache_size = NonZeroUsize::new(config.max_models).unwrap_or(DEFAULT_CACHE_SIZE);
 
-        let notif_client = NotificationClient::new(signing_key.clone(), RequestIdentity::local());
+        let notif_client = NotificationClient::new(signing_key.clone(), RequestIdentity::anonymous());
         let notification_publisher = NotificationPublisher::new(notif_client, signing_key.clone());
 
         Self { inner: Arc::new(ModelServiceInner {
@@ -267,7 +267,7 @@ impl ModelService {
         };
         let cache_size = NonZeroUsize::new(config.max_models).unwrap_or(DEFAULT_CACHE_SIZE);
 
-        let notif_client = NotificationClient::new(signing_key.clone(), RequestIdentity::local());
+        let notif_client = NotificationClient::new(signing_key.clone(), RequestIdentity::anonymous());
         let notification_publisher = NotificationPublisher::new(notif_client, signing_key.clone());
 
         Self { inner: Arc::new(ModelServiceInner {
@@ -404,7 +404,7 @@ impl ModelService {
         let client = InferenceClient::with_endpoint(
             &endpoint,
             self.signing_key.clone(),
-            RequestIdentity::local(),
+            RequestIdentity::anonymous(),
         );
 
         // Load TTT config from model's config.json (if TTT is enabled)

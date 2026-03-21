@@ -202,7 +202,7 @@ impl Spawnable for OAuthService {
             // Creating it in the factory (main runtime) would cause hangs.
             let policy_client = PolicyClient::new(
                 self.signing_key.clone(),
-                hyprstream_rpc::RequestIdentity::local(),
+                hyprstream_rpc::RequestIdentity::anonymous(),
             );
 
             // Attempt to load the user credential store for Ed25519 device verification.

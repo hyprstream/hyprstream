@@ -61,7 +61,7 @@ pub fn make_chat_spawner(
 
             rt.block_on(async move {
                 let model_client =
-                    ModelClient::new(sk_inner.clone(), RequestIdentity::local());
+                    ModelClient::new(sk_inner.clone(), RequestIdentity::anonymous());
 
                 // Map ChatHistoryEntry → ChatMessage, handling all roles.
                 // Skip the trailing empty assistant placeholder — it's only a
@@ -234,7 +234,7 @@ pub fn make_tool_caller(
                 .ok()?;
             rt.block_on(async move {
                 let gen: GenMcpClient =
-                    GenMcpClient::with_endpoint(&endpoint, sk_fetch, RequestIdentity::local());
+                    GenMcpClient::with_endpoint(&endpoint, sk_fetch, RequestIdentity::anonymous());
                 let tool_list = gen.list_tools().await.ok()?;
                 let mut descs = HashMap::new();
                 let mut tools = Vec::new();
@@ -276,7 +276,7 @@ pub fn make_tool_caller(
                         Err(e) => return format!("error: {e}"),
                     };
                     rt.block_on(async move {
-                        match GenMcpClient::with_endpoint(&endpoint, sk_c, RequestIdentity::local())
+                        match GenMcpClient::with_endpoint(&endpoint, sk_c, RequestIdentity::anonymous())
                             .call_tool(&crate::services::generated::mcp_client::CallTool {
                                 tool_name: uuid_c,
                                 arguments,

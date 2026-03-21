@@ -1915,7 +1915,7 @@ fn build_stream_register_envelope(
     }
 
     // Wrap in SignedEnvelope
-    let mut envelope = RequestEnvelope::new(RequestIdentity::local(), inner_bytes);
+    let mut envelope = RequestEnvelope::new(RequestIdentity::anonymous(), inner_bytes);
     if let Some(c) = claims {
         envelope = envelope.with_claims(c);
     }

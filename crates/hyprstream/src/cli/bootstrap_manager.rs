@@ -439,7 +439,7 @@ impl WizardBackend for BootstrapManager {
     }
 
     fn local_username(&self) -> String {
-        hyprstream_rpc::envelope::RequestIdentity::local()
+        hyprstream_rpc::envelope::RequestIdentity::anonymous()
             .user()
             .to_owned()
     }

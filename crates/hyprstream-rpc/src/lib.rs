@@ -141,11 +141,15 @@ pub use crypto::{
 pub use crypto::{generate_ephemeral_keypair, ristretto_dh, RistrettoPublic, RistrettoSecret};
 
 pub use envelope::{
-    unwrap_and_verify, InMemoryNonceCache, NonceCache, RequestEnvelope, RequestIdentity,
-    ResponseEnvelope, SignedEnvelope, Subject, MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
+    unwrap_and_verify, InMemoryNonceCache, KeyRegistry, NodeKeyRegistry, NonceCache,
+    RequestEnvelope, RequestIdentity, ResponseEnvelope, SignedEnvelope, Subject,
+    MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
 };
 #[cfg(not(target_arch = "wasm32"))]
-pub use envelope::unwrap_envelope;
+pub use envelope::{
+    unwrap_envelope, unwrap_envelope_as_system, unwrap_envelope_with_registry,
+    unwrap_envelope_any_signer,
+};
 pub use error::{EnvelopeError, EnvelopeResult, Result, RpcError};
 
 // ============================================================================

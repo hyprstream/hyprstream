@@ -768,25 +768,25 @@ impl PolicyHandler for PolicyService {
             }));
         }
 
-        // Elevated roles require local identity
+        // Elevated roles require system identity (node key / inproc caller)
         const ELEVATED_ROLES: &[&str] = &["ttt.privileged", "operator"];
-        if ELEVATED_ROLES.contains(&data.role.as_str()) && !ctx.identity.is_local() {
+        if ELEVATED_ROLES.contains(&data.role.as_str()) && ctx.subject() != Subject::new("system") {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: format!(
-                    "Role '{}' is an elevated role and can only be assigned by local callers",
+                    "Role '{}' is an elevated role and can only be assigned by the system",
                     data.role
                 ),
                 code: "UNAUTHORIZED".to_owned(),
-                details: "Elevated roles require local identity".to_owned(),
+                details: "Elevated roles require system identity (node signing key)".to_owned(),
             }));
         }
 
-        // Non-local callers cannot assign roles to themselves
-        if !ctx.identity.is_local() && data.user == caller {
+        // Non-system callers cannot assign roles to themselves
+        if ctx.subject() != Subject::new("system") && data.user == caller {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: "Cannot assign roles to yourself".to_owned(),
                 code: "SELF_ASSIGNMENT".to_owned(),
-                details: "Non-local callers may not assign roles to themselves".to_owned(),
+                details: "Non-system callers may not assign roles to themselves".to_owned(),
             }));
         }
 

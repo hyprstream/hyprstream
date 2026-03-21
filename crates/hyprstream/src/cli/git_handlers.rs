@@ -1261,7 +1261,7 @@ pub async fn handle_infer(
     let _ = ModelRef::parse(model_ref_str)?;
 
     // ModelService is already running (started by main.rs in inproc mode, or by systemd in ipc-systemd mode).
-    let model_client = ModelClient::new(signing_key.clone(), RequestIdentity::local());
+    let model_client = ModelClient::new(signing_key.clone(), RequestIdentity::anonymous());
 
     // Apply chat template to the prompt via ModelService
     let messages = vec![ChatMessage {
@@ -1423,7 +1423,7 @@ pub async fn handle_load(
 
         let notif_client = crate::services::NotificationClient::new(
             signing_key.clone(),
-            RequestIdentity::local(),
+            RequestIdentity::anonymous(),
         );
 
         let sub_resp = notif_client.subscribe(&SubscribeRequest {
@@ -1459,7 +1459,7 @@ pub async fn handle_load(
     // (Continuation pattern), so this completes in milliseconds.
     // fire-and-forget via tokio::spawn caused the task to never run: the CLI runtime
     // drops before the spawned task executes.
-    let model_client = ModelClient::new(signing_key.clone(), RequestIdentity::local());
+    let model_client = ModelClient::new(signing_key.clone(), RequestIdentity::anonymous());
     let model_ref_owned = model_ref_str.to_owned();
     match model_client.load(&LoadModelRequest {
         model_ref: model_ref_owned.clone(),
@@ -1716,7 +1716,7 @@ async fn handle_notify_subscribe(
 
     let notif_client = crate::services::NotificationClient::new(
         signing_key,
-        RequestIdentity::local(),
+        RequestIdentity::anonymous(),
     );
 
     // Subscribe with maximum TTL for long-running listeners
@@ -1853,7 +1853,7 @@ pub async fn handle_unload(
     // Validate model reference format
     let _ = ModelRef::parse(model_ref_str)?;
 
-    let model_client = ModelClient::new(signing_key, RequestIdentity::local());
+    let model_client = ModelClient::new(signing_key, RequestIdentity::anonymous());
 
     model_client.unload(&UnloadModelRequest { model_ref: model_ref_str.to_owned() }).await?;
 
