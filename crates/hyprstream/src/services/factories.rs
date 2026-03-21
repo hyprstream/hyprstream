@@ -740,12 +740,16 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 
     let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::local());
 
-    let tui_service = TuiService::new(
+    let mut tui_service = TuiService::new(
         state,
         global_context(),
         ctx.transport("tui", SocketKind::Rep),
         ctx.signing_key().clone(),
     ).with_policy_client(policy_client);
+
+    if let Some(issuer) = ctx.oauth_issuer_url() {
+        tui_service = tui_service.with_local_issuer_url(issuer.to_owned());
+    }
 
     Ok(ctx.into_spawnable_quic(tui_service, tui_config.quic_port))
 }

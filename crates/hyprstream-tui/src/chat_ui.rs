@@ -350,7 +350,14 @@ fn draw_fkey_bar(frame: &mut Frame, area: Rect, app: &ChatApp) {
 
     let line = if show_status {
         let msg = app.status.as_deref().unwrap_or("");
-        Line::from(Span::styled(format!("  {msg}"), theme::help_text()))
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled("Enter", theme::help_key()),
+            Span::raw(" "),
+            Span::styled("Send", theme::help_text()),
+            Span::raw("  "),
+            Span::styled(msg.to_owned(), theme::help_text()),
+        ])
     } else if matches!(app.mode, ChatMode::Streaming) {
         let mut spans = vec![Span::raw("  ")];
         // Suppress "Esc Cancel" while tool calls are in-flight — Esc cannot

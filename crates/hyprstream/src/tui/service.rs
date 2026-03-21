@@ -146,6 +146,9 @@ pub struct TuiService {
     stdin_queues: StdinQueues,
     /// Optional policy client for authorization checks.
     policy_client: Option<PolicyClient>,
+    /// Local OAuth issuer URL — JWTs whose `iss` matches this are treated as
+    /// locally-issued tokens rather than federated ones.
+    local_issuer_url: Option<String>,
 }
 
 impl TuiService {
@@ -165,12 +168,19 @@ impl TuiService {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             stdin_queues: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             policy_client: None,
+            local_issuer_url: None,
         }
     }
 
     /// Attach a PolicyClient for Casbin authorization.
     pub fn with_policy_client(mut self, client: PolicyClient) -> Self {
         self.policy_client = Some(client);
+        self
+    }
+
+    /// Set the local OAuth issuer URL so that locally-issued JWTs are accepted.
+    pub fn with_local_issuer_url(mut self, url: String) -> Self {
+        self.local_issuer_url = Some(url);
         self
     }
 
@@ -240,6 +250,9 @@ impl TuiService {
             session_id
         };
 
+        // Track pane resize: if a pane was resized, notify its process via the
+        // frame loop after registration so attached ChatApp/shell gets the new size.
+        let mut resized_pane: Option<u32> = None;
         if cols > 0 && rows > 0 {
             state.default_cols = cols;
             state.default_rows = rows;
@@ -250,6 +263,7 @@ impl TuiService {
                         let (cur_cols, cur_rows) = pane.size();
                         if cur_cols != cols || cur_rows != rows {
                             pane.resize(cols, rows);
+                            resized_pane = Some(pane.id);
                         }
                     }
                 }
@@ -343,6 +357,11 @@ impl TuiService {
                 warn!(viewer_id, "Failed to register viewer: {}", e);
             } else {
                 debug!(viewer_id, session_id = sid, "Viewer registration sent");
+            }
+            // If the pane was resized, notify the attached process so it redraws
+            // at the new terminal size (e.g. ChatApp spawned before viewer connected).
+            if let Some(pane_id) = resized_pane {
+                let _ = sender.send(FrameLoopCommand::Resize { pane_id, cols, rows });
             }
         });
 
@@ -906,7 +925,7 @@ impl TuiService {
         rows: u16,
         pane_id: u32,
     ) -> Result<(Vec<u8>, Option<Continuation>)> {
-        let (sid, active_pane_id) = {
+        let (sid, active_pane_id, cols, rows) = {
             let state = self.state.read().await;
             let sid = if session_id == 0 {
                 state.sessions.last().map(|s| s.id).unwrap_or(1)
@@ -930,7 +949,16 @@ impl TuiService {
                     })
                     .unwrap_or(1)
             };
-            (sid, active_pane_id)
+            // Use the pane's actual dimensions from TuiState rather than the
+            // RPC-supplied cols/rows, so the ChatApp matches the live pane size
+            // regardless of when viewers connect and resize the pane.
+            let pane_size = state
+                .session(sid)
+                .and_then(|s| s.windows.iter().find(|w| w.panes.iter().any(|p| p.id == active_pane_id)))
+                .and_then(|w| w.panes.iter().find(|p| p.id == active_pane_id))
+                .map(super::state::TuiPane::size);
+            let (cols, rows) = pane_size.unwrap_or((cols, rows));
+            (sid, active_pane_id, cols, rows)
         };
 
         // Rename the window to "Chat: model_ref" so the titlebar is meaningful.
@@ -971,7 +999,26 @@ impl TuiService {
         .with_tool_caller(
             tool_caller,
             tool_descriptions,
-            hyprstream_tui::chat_app::ToolCallFormat::Qwen3Xml,
+            crate::storage::ModelRef::parse(&model_ref)
+                .ok()
+                .and_then(|mr| {
+                    let branch = match &mr.git_ref {
+                        crate::storage::GitRef::Branch(name) => name.clone(),
+                        _ => "main".to_owned(),
+                    };
+                    crate::storage::StoragePaths::new().ok()
+                        .and_then(|sp| sp.worktree_path(&mr.model, &branch).ok())
+                })
+                .map(|path| {
+                    let arch = crate::runtime::model_config::ModelConfig::detect_architecture(&path);
+                    match crate::api::tools::ToolCallFormat::from_architecture(&arch) {
+                        crate::api::tools::ToolCallFormat::Qwen3Xml    => hyprstream_tui::chat_app::ToolCallFormat::Qwen3Xml,
+                        crate::api::tools::ToolCallFormat::LlamaJson   => hyprstream_tui::chat_app::ToolCallFormat::LlamaJson,
+                        crate::api::tools::ToolCallFormat::MistralJson => hyprstream_tui::chat_app::ToolCallFormat::MistralJson,
+                        crate::api::tools::ToolCallFormat::None        => hyprstream_tui::chat_app::ToolCallFormat::None,
+                    }
+                })
+                .unwrap_or(hyprstream_tui::chat_app::ToolCallFormat::Qwen3Xml),
         )
         .with_server_spawned();
         let config = waxterm::app::TerminalConfig::new().cols(cols).rows(rows);
@@ -1398,6 +1445,10 @@ impl ZmqService for TuiService {
 
     fn expected_audience(&self) -> Option<&str> {
         None
+    }
+
+    fn local_issuer_url(&self) -> Option<&str> {
+        self.local_issuer_url.as_deref()
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {

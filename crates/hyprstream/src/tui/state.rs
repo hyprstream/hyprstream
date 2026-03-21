@@ -609,8 +609,10 @@ impl TuiState {
             self.default_scrollback,
         );
         session.windows.push(window);
+        session.active_window_id = window_id;
 
         let _ = self.event_tx.send(TuiEvent::WindowCreated { session_id, window_id });
+        let _ = self.event_tx.send(TuiEvent::WindowFocused { session_id, window_id });
         Some(window_id)
     }
 
