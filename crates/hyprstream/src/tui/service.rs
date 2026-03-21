@@ -146,9 +146,13 @@ pub struct TuiService {
     stdin_queues: StdinQueues,
     /// Optional policy client for authorization checks.
     policy_client: Option<PolicyClient>,
+    /// Expected audience (resource URL) for JWT validation.
+    expected_audience: Option<String>,
     /// Local OAuth issuer URL — JWTs whose `iss` matches this are treated as
     /// locally-issued tokens rather than federated ones.
     local_issuer_url: Option<String>,
+    /// Federation key source for verifying externally-issued JWTs.
+    federation_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>>,
 }
 
 impl TuiService {
@@ -168,7 +172,9 @@ impl TuiService {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             stdin_queues: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             policy_client: None,
+            expected_audience: None,
             local_issuer_url: None,
+            federation_key_source: None,
         }
     }
 
@@ -178,9 +184,24 @@ impl TuiService {
         self
     }
 
+    /// Set the expected audience (resource URL) for JWT validation.
+    pub fn with_expected_audience(mut self, audience: String) -> Self {
+        self.expected_audience = Some(audience);
+        self
+    }
+
     /// Set the local OAuth issuer URL so that locally-issued JWTs are accepted.
     pub fn with_local_issuer_url(mut self, url: String) -> Self {
         self.local_issuer_url = Some(url);
+        self
+    }
+
+    /// Set the federation key source for verifying externally-issued JWTs.
+    pub fn with_federation_key_source(
+        mut self,
+        src: std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>,
+    ) -> Self {
+        self.federation_key_source = Some(src);
         self
     }
 
@@ -1444,11 +1465,17 @@ impl ZmqService for TuiService {
     }
 
     fn expected_audience(&self) -> Option<&str> {
-        None
+        self.expected_audience.as_deref()
     }
 
     fn local_issuer_url(&self) -> Option<&str> {
         self.local_issuer_url.as_deref()
+    }
+
+    fn federation_key_source(
+        &self,
+    ) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>> {
+        self.federation_key_source.clone()
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {

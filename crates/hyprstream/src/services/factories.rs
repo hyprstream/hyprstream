@@ -749,6 +749,10 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 
     if let Some(issuer) = ctx.oauth_issuer_url() {
         tui_service = tui_service.with_local_issuer_url(issuer.to_owned());
+        tui_service = tui_service.with_expected_audience(issuer.to_owned());
+    }
+    if let Some(fed) = ctx.federation_key_source() {
+        tui_service = tui_service.with_federation_key_source(fed);
     }
 
     Ok(ctx.into_spawnable_quic(tui_service, tui_config.quic_port))
