@@ -718,6 +718,10 @@ impl ChatApp {
     pub fn on_stream_complete(&mut self) {
         #[cfg(not(target_os = "wasi"))]
         {
+            // Always persist — Tool messages are already in history at this point.
+            if let Some(ref hook) = self.save_hook {
+                hook(&self.history);
+            }
             if self.pending_tool_calls > 0 {
                 // Mid-agentic loop: generation ended (naturally or before the cancel
                 // signal arrived).  Don't drain the prompt queue or transition to Input
@@ -727,9 +731,6 @@ impl ChatApp {
                 self.in_tool_call = false;
                 self.tool_call_buf.clear();
                 return;
-            }
-            if let Some(ref hook) = self.save_hook {
-                hook(&self.history);
             }
         }
         #[cfg(target_os = "wasi")]
@@ -783,12 +784,25 @@ impl ChatApp {
 
     /// Signal a template application error.
     pub fn on_template_error(&mut self, msg: String) {
-        // Pop entries until a User entry is found and removed.  This handles both
-        // initial generation (history tail: [User, empty-Assistant]) and agentic
-        // re-generation (tail: [User, Assistant+tool_calls, Tool…, empty-Assistant]).
-        while let Some(entry) = self.history.pop() {
-            if matches!(entry.role, ChatRole::User) {
-                break;
+        // The last entry is always the empty assistant placeholder pushed by
+        // start_generation().  Pop only that entry to preserve any Tool messages
+        // from a preceding agentic round (so context is intact on retry).
+        // Fall back to popping until User if the history shape is unexpected.
+        let tail_is_empty_assistant = self.history.last().map(|e| {
+            matches!(e.role, ChatRole::Assistant)
+                && e.content.is_empty()
+                && e.tool_calls.is_empty()
+        }).unwrap_or(false);
+        if tail_is_empty_assistant {
+            self.history.pop();
+        } else {
+            while let Some(entry) = self.history.pop() {
+                if matches!(entry.role, ChatRole::User) {
+                    // Put the user message back — we only want to remove
+                    // assistant/tool entries, not the user's input.
+                    self.history.push(entry);
+                    break;
+                }
             }
         }
         self.pending_toasts.push(format!("Model error: {msg}"));

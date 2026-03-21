@@ -232,7 +232,7 @@ impl ServiceContext {
             self.zmq_context.clone(),
             self.signing_key.clone(),
             self.verifying_key,
-            RequestIdentity::local(),
+            RequestIdentity::anonymous(),
         )
     }
 

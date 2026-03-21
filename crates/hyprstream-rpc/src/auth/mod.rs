@@ -14,7 +14,7 @@ pub mod scope;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod scope_registry;
 
-pub use claims::Claims;
+pub use claims::{Claims, is_local_iss};
 #[cfg(not(target_arch = "wasm32"))]
 pub use federation::FederationKeySource;
 pub use jwt::{decode, decode_with_key, encode, JwtError};

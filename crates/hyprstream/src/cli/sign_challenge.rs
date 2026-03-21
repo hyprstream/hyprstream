@@ -171,7 +171,7 @@ fn load_user_signing_key() -> Result<(ed25519_dalek::SigningKey, String)> {
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("HYPRSTREAM__OAUTH__USER_SIGNING_KEY: expected 32 bytes"))?;
             let sk = ed25519_dalek::SigningKey::from_bytes(&arr);
-            let username = hyprstream_rpc::envelope::RequestIdentity::local().user().to_owned();
+            let username = hyprstream_rpc::envelope::RequestIdentity::anonymous().user().to_owned();
             return Ok((sk, username));
         }
     }
@@ -202,7 +202,7 @@ fn load_user_signing_key() -> Result<(ed25519_dalek::SigningKey, String)> {
     let arr: [u8; 32] = bytes.try_into().map_err(|_| anyhow::anyhow!("unreachable"))?;
     let sk = ed25519_dalek::SigningKey::from_bytes(&arr);
 
-    let username = hyprstream_rpc::envelope::RequestIdentity::local()
+    let username = hyprstream_rpc::envelope::RequestIdentity::anonymous()
         .user()
         .to_owned();
 

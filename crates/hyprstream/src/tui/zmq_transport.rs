@@ -61,7 +61,7 @@ pub fn make_chat_spawner(
 
             rt.block_on(async move {
                 let model_client =
-                    ModelClient::new(sk_inner.clone(), RequestIdentity::local());
+                    ModelClient::new(sk_inner.clone(), RequestIdentity::anonymous());
 
                 // Map ChatHistoryEntry → ChatMessage, handling all roles.
                 // Skip the trailing empty assistant placeholder — it's only a
@@ -119,18 +119,26 @@ pub fn make_chat_spawner(
                 let tools_json = tools_inner.as_ref()
                     .map(|t| serde_json::to_string(t).unwrap_or_default())
                     .unwrap_or_default();
-                let prompt = match model_client
-                    .infer(&mr_inner)
-                    .apply_chat_template(&crate::services::generated::model_client::ChatTemplateRequest {
-                        messages: messages.clone(),
-                        add_generation_prompt: true,
-                        tools_json: Some(tools_json.clone()).filter(|s| !s.is_empty()),
-                    })
-                    .await
-                {
-                    Ok(p) => crate::config::TemplatedPrompt::new(p),
-                    Err(e) => {
+                let template_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    model_client
+                        .infer(&mr_inner)
+                        .apply_chat_template(&crate::services::generated::model_client::ChatTemplateRequest {
+                            messages: messages.clone(),
+                            add_generation_prompt: true,
+                            tools_json: Some(tools_json.clone()).filter(|s| !s.is_empty()),
+                        }),
+                ).await;
+                let prompt = match template_result {
+                    Ok(Ok(p)) => crate::config::TemplatedPrompt::new(p),
+                    Ok(Err(e)) => {
                         let _ = tx.send(ChatEvent::TemplateError(e.to_string()));
+                        return;
+                    }
+                    Err(_elapsed) => {
+                        let _ = tx.send(ChatEvent::TemplateError(
+                            "chat template timed out after 15s — model service may be busy".to_owned(),
+                        ));
                         return;
                     }
                 };
@@ -226,7 +234,7 @@ pub fn make_tool_caller(
                 .ok()?;
             rt.block_on(async move {
                 let gen: GenMcpClient =
-                    GenMcpClient::with_endpoint(&endpoint, sk_fetch, RequestIdentity::local());
+                    GenMcpClient::with_endpoint(&endpoint, sk_fetch, RequestIdentity::anonymous());
                 let tool_list = gen.list_tools().await.ok()?;
                 let mut descs = HashMap::new();
                 let mut tools = Vec::new();
@@ -268,7 +276,7 @@ pub fn make_tool_caller(
                         Err(e) => return format!("error: {e}"),
                     };
                     rt.block_on(async move {
-                        match GenMcpClient::with_endpoint(&endpoint, sk_c, RequestIdentity::local())
+                        match GenMcpClient::with_endpoint(&endpoint, sk_c, RequestIdentity::anonymous())
                             .call_tool(&crate::services::generated::mcp_client::CallTool {
                                 tool_name: uuid_c,
                                 arguments,

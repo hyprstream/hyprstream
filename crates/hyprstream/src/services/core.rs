@@ -72,7 +72,7 @@ mod tests {
             let mut handle = runner.run(service).await.expect("test: start service");
 
             // Use ZmqClient with server's verifying key for response verification
-            let client = ZmqClient::new(&endpoint, global_context(), signing_key, verifying_key, RequestIdentity::local());
+            let client = ZmqClient::new(&endpoint, global_context(), signing_key, verifying_key, RequestIdentity::anonymous());
             let response = client.call(b"hello".to_vec(), CallOptions::default()).await.expect("test: call");
 
             // Response should start with "from <user>:"
@@ -104,7 +104,7 @@ mod tests {
 
             // Sign request with different key than service expects
             // But verify responses with server's key
-            let client = ZmqClient::new(&endpoint, global_context(), client_signing_key, server_verifying_key, RequestIdentity::local());
+            let client = ZmqClient::new(&endpoint, global_context(), client_signing_key, server_verifying_key, RequestIdentity::anonymous());
             let result = client.call(b"should fail".to_vec(), CallOptions::default()).await;
 
             // Request should be rejected by server

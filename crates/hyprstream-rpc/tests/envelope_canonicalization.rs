@@ -7,14 +7,12 @@ fn test_envelope_serialization_deterministic() {
     // Create identical envelopes
     let envelope1 = RequestEnvelope {
         request_id: 123,
-        identity: RequestIdentity::Local {
-            user: "test-user".to_owned(),
-        },
+        identity: RequestIdentity::Anonymous,
         payload: vec![1, 2, 3, 4, 5],
         ephemeral_pubkey: None,
         nonce: [42u8; 16],
         timestamp: 1234567890,
-        claims: None, // claims field replaced jwt_token
+        claims: None,
     };
 
     let envelope2 = envelope1.clone();
@@ -41,9 +39,7 @@ fn test_envelope_signature_verification_stable() {
 
     let envelope = RequestEnvelope {
         request_id: 456,
-        identity: RequestIdentity::Local {
-            user: "signer".to_owned(),
-        },
+        identity: RequestIdentity::Anonymous,
         payload: vec![9, 8, 7],
         ephemeral_pubkey: Some([1u8; 32]),
         nonce: [99u8; 16],
@@ -138,7 +134,7 @@ fn test_envelope_with_claims_deterministic() {
         ephemeral_pubkey: Some([77u8; 32]),
         nonce: [123u8; 16],
         timestamp: 5555555555,
-        claims: None, // Using None for test simplicity (claims replaces jwt_token)
+        claims: None,
     };
 
     // Multiple serializations must produce identical bytes
@@ -154,9 +150,7 @@ fn test_envelope_with_claims_deterministic() {
 fn test_envelope_different_data_different_bytes() {
     let envelope1 = RequestEnvelope {
         request_id: 100,
-        identity: RequestIdentity::Local {
-            user: "user1".to_owned(),
-        },
+        identity: RequestIdentity::Anonymous,
         payload: vec![1, 2, 3],
         ephemeral_pubkey: None,
         nonce: [1u8; 16],
@@ -166,9 +160,7 @@ fn test_envelope_different_data_different_bytes() {
 
     let envelope2 = RequestEnvelope {
         request_id: 200,
-        identity: RequestIdentity::Local {
-            user: "user2".to_owned(),
-        },
+        identity: RequestIdentity::Anonymous,
         payload: vec![4, 5, 6],
         ephemeral_pubkey: None,
         nonce: [2u8; 16],

@@ -438,25 +438,11 @@ impl InferenceService {
         let req = reader.get_root::<inference_capnp::inference_request::Reader>()?;
         let request_id = req.get_id();
 
-        // Create a context for the handler (callback mode uses local identity)
-        // Note: Callback mode doesn't use signed envelopes, so we construct context directly
-        use hyprstream_rpc::envelope::RequestEnvelope;
-        use hyprstream_rpc::crypto::signing::generate_signing_keypair;
-
-        let envelope = RequestEnvelope {
-            request_id,
-            identity: RequestIdentity::local(),
-            payload: vec![],
-            ephemeral_pubkey: None,
-            nonce: [0u8; 16],
-            timestamp: chrono::Utc::now().timestamp_millis(),
-            claims: None,
-        };
-
-        // Create a minimal signed envelope for context extraction
-        let (signing_key, _) = generate_signing_keypair();
-        let signed = hyprstream_rpc::envelope::SignedEnvelope::new_signed(envelope, &signing_key);
-        let ctx = EnvelopeContext::from_verified(&signed);
+        // Create a system-identity context for the internal callback.
+        // Callback mode is an inproc self-call — it does not go through the ZMQ
+        // envelope pipeline, so we construct the context directly with
+        // from_verified_as_system to ensure subject() == "system".
+        let ctx = EnvelopeContext::from_callback_system(request_id);
 
         // Dispatch via generated handler — propagate continuation
         dispatch_inference(self, &ctx, request_data).await
@@ -2594,7 +2580,7 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
             // so ZMQ sockets are registered with the correct reactor.
             let policy_client = PolicyClient::new(
                 self.policy_signing_key,
-                hyprstream_rpc::envelope::RequestIdentity::local(),
+                hyprstream_rpc::envelope::RequestIdentity::anonymous(),
             );
 
             // GPU initialization happens HERE, on the service thread

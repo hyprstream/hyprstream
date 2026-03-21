@@ -636,7 +636,7 @@ impl McpService {
             tool_reg.by_uuid.len(),
         );
 
-        let policy_client = PolicyClient::new(config.signing_key.clone(), RequestIdentity::local());
+        let policy_client = PolicyClient::new(config.signing_key.clone(), RequestIdentity::anonymous());
 
         Ok(Self {
             registry: Arc::new(tool_reg),
@@ -721,7 +721,7 @@ impl McpService {
                         }
                     }
                 }
-                None => RequestIdentity::local(),
+                None => RequestIdentity::anonymous(),
             }
         }
     }
@@ -842,11 +842,8 @@ impl ServerHandler for McpService {
 #[async_trait::async_trait(?Send)]
 impl McpHandler for McpService {
     async fn authorize(&self, ctx: &crate::services::EnvelopeContext, resource: &str, operation: &str) -> anyhow::Result<()> {
-        // Local callers are always authorized
-        if ctx.identity.is_local() {
-            return Ok(());
-        }
-        // Delegate to policy service
+        // All callers are authorized via Casbin: system (node key) gets full access,
+        // external callers via JWT-derived subjects.
         let subject = ctx.subject().to_string();
         let allowed = self.policy_client.check(&PolicyCheck { subject: subject.clone(), domain: "*".to_owned(), resource: resource.to_owned(), operation: operation.to_owned() })
             .await
@@ -868,7 +865,7 @@ impl McpHandler for McpService {
     ) -> anyhow::Result<McpResponseVariant> {
         let loaded_model_count = {
             // Status check uses local identity (internal health check, no user context)
-            let client = ModelClient::new(self.signing_key.clone(), RequestIdentity::local());
+            let client = ModelClient::new(self.signing_key.clone(), RequestIdentity::anonymous());
             client.status(&crate::services::generated::model_client::StatusRequest { model_ref: String::new() }).await
                 .map(|models| models.len() as u32)
                 .unwrap_or(0)

@@ -1925,10 +1925,17 @@ where
     use capnp::serialize;
     use tracing::warn;
 
-    // 1. Unwrap and verify SignedEnvelope based on verification mode
-    let (ctx, payload) = match match verification {
+    // 1. Unwrap and verify SignedEnvelope based on verification mode.
+    //
+    // FixedSigner: all callers sign with the node key → key_derived_subject = "system".
+    // AnySigner: external callers (WebTransport) use their own key → Anonymous until JWT.
+    let (mut ctx, payload) = match match verification {
         EnvelopeVerification::FixedSigner(pubkey) =>
-            crate::envelope::unwrap_envelope(raw_bytes, pubkey, nonce_cache),
+            if let Some(registry) = service.key_registry() {
+                crate::envelope::unwrap_envelope_with_registry(raw_bytes, pubkey, nonce_cache, &*registry)
+            } else {
+                crate::envelope::unwrap_envelope_as_system(raw_bytes, pubkey, nonce_cache)
+            },
         EnvelopeVerification::AnySigner =>
             crate::envelope::unwrap_envelope_any_signer(raw_bytes, nonce_cache),
     } {
@@ -1958,7 +1965,7 @@ where
     );
 
     // 2. Verify claims (E2E JWT, downgrade protection)
-    if let Err(e) = service.verify_claims(&ctx).await {
+    if let Err(e) = service.verify_claims(&mut ctx).await {
         warn!(
             "{} claims verification failed for {} (id={}): {}",
             service.name(), ctx.subject(), request_id, e

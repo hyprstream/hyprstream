@@ -71,9 +71,8 @@ pub async fn auth_middleware(
         // Extract iss from token payload without signature verification
         let iss = extract_iss_from_token(token);
 
-        // Local token: iss is empty (old token) OR matches our OAuth issuer URL OR matches our resource URL (belt-and-suspenders)
-        let is_local = iss.is_empty() || iss == state.oauth_issuer_url || iss == state.resource_url;
-        let result = if is_local {
+        let local_issuers: &[&str] = &[&*state.oauth_issuer_url];
+        let result = if hyprstream_rpc::auth::is_local_iss(&iss, local_issuers) {
             // Local token: verify with local key
             jwt::decode(token, &state.verifying_key, Some(&state.resource_url))
         } else {
@@ -94,20 +93,20 @@ pub async fn auth_middleware(
         match result {
             Ok(claims) => {
                 debug!("JWT validated for user: {}", claims.sub);
-                let is_local_claims = claims.iss.is_empty() || claims.iss == state.oauth_issuer_url || claims.iss == state.resource_url;
-                let user_str = if is_local_claims {
-                    claims.sub.clone()
-                } else {
-                    // Federated subject: "{iss}:{sub}" for Casbin policy matching
-                    format!("{}:{}", claims.iss, claims.sub)
-                };
+                let subject = claims.subject(local_issuers);
                 // Validate local subjects for safe characters. Federated subjects
                 // (containing "://") bypass this check — they are validated at JWT decode time.
-                let subject = hyprstream_rpc::Subject::new(&user_str);
                 if let Err(e) = subject.validate() {
                     debug!("JWT sub validation failed: {}", e);
                     return unauthorized_response("Authentication failed", &www_authenticate);
                 }
+                let user_str = match subject.name() {
+                    Some(n) => n.to_owned(),
+                    None => {
+                        debug!("JWT has empty sub");
+                        return unauthorized_response("Authentication failed", &www_authenticate);
+                    }
+                };
                 let user = AuthenticatedUser {
                     user: user_str,
                     token: Some(token.to_owned()),

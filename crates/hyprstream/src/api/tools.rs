@@ -45,7 +45,7 @@ impl ToolCallFormat {
     /// Select the tool-call format from an architecture name string.
     pub fn from_architecture_str(arch: &str) -> Self {
         match arch.to_lowercase().as_str() {
-            "qwen" | "qwen2" | "qwen3" => Self::Qwen3Xml,
+            "qwen" | "qwen2" | "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" => Self::Qwen3Xml,
             "llama" | "llama2" | "llama3" => Self::LlamaJson,
             "mistral" | "mixtral" => Self::MistralJson,
             _ => Self::None,

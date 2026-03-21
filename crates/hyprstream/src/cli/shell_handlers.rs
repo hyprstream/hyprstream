@@ -161,12 +161,12 @@ pub async fn handle_shell_tui(
     // Model load-status channel (background polling → event loop).
     let model_client = {
         use hyprstream_rpc::envelope::RequestIdentity;
-        crate::services::generated::model_client::ModelClient::new(signing_key.clone(), RequestIdentity::local())
+        crate::services::generated::model_client::ModelClient::new(signing_key.clone(), RequestIdentity::anonymous())
     };
     // Worker client for sandbox/container/image management.
     let worker_client = {
         use hyprstream_rpc::envelope::RequestIdentity;
-        hyprstream_workers::runtime::WorkerClient::new(signing_key.clone(), RequestIdentity::local())
+        hyprstream_workers::runtime::WorkerClient::new(signing_key.clone(), RequestIdentity::anonymous())
     };
     let (model_status_tx, mut model_status_rx) =
         tokio::sync::mpsc::channel::<(String, bool)>(32);
@@ -1342,11 +1342,11 @@ async fn fetch_models(
     let registry: crate::services::RegistryClient = crate::services::RegistryClient::with_endpoint(
         &registry_endpoint,
         signing_key.clone(),
-        RequestIdentity::local(),
+        RequestIdentity::anonymous(),
     );
     let model_client_for_status = crate::services::generated::model_client::ModelClient::new(
         signing_key.clone(),
-        RequestIdentity::local(),
+        RequestIdentity::anonymous(),
     );
     let registry_models_dir = models_dir.to_path_buf();
     let status_timeout = std::time::Duration::from_millis(500);

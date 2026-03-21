@@ -63,7 +63,11 @@ pub struct EnvelopeContext {
     /// Unique request ID for correlation and logging
     pub request_id: u64,
 
-    /// Verified identity of the requester (after signature verification)
+    /// Claimed identity from the envelope (caller-asserted, NOT authoritative).
+    ///
+    /// This field is preserved for logging and legacy compatibility only.
+    /// Authorization decisions MUST use `subject()`, which is derived from
+    /// the verified Ed25519 signer key via `KeyRegistry`.
     pub identity: RequestIdentity,
 
     /// Ephemeral public key for stream HMAC derivation (if streaming)
@@ -72,31 +76,129 @@ pub struct EnvelopeContext {
     /// User claims from envelope (protected by envelope signature)
     /// Already verified by envelope signature verification
     claims: Option<crate::auth::Claims>,
+
+    /// Authorization subject derived from the verified Ed25519 signer key.
+    ///
+    /// Set by `from_verified_as_system()` (FixedSigner path) or
+    /// `from_verified_with_registry()` (custom registry). `Anonymous` when
+    /// neither has been applied (e.g., AnySigner/WebTransport callers).
+    key_derived_subject: Subject,
+
+    /// Authorization subject resolved from a verified JWT token.
+    ///
+    /// Set by `verify_claims()` after it determines whether the token is
+    /// local (bare subject: `"alice"`) or federated (`"https://node-a:alice"`).
+    /// `None` until `verify_claims()` runs, or when no JWT is present.
+    pub(crate) jwt_subject: Option<Subject>,
+
+    /// Raw signer pubkey bytes from the verified `SignedEnvelope`.
+    /// Cryptographically verified by Ed25519 signature check.
+    pub signer_pubkey: [u8; 32],
 }
 
 impl EnvelopeContext {
-    /// Create context from a verified SignedEnvelope.
+    /// Create context from a verified SignedEnvelope (AnySigner path).
     ///
-    /// This should only be called after signature verification succeeds.
-    pub fn from_verified(envelope: &SignedEnvelope) -> Self {
+    /// `key_derived_subject` is `Anonymous`. Use `from_verified_as_system()` for
+    /// FixedSigner/inproc callers or `from_verified_with_registry()` for custom
+    /// key mappings.
+    ///
+    /// `pub(crate)` — external callers should use the named constructors above
+    /// to make the trust level explicit.
+    pub(crate) fn from_verified(envelope: &SignedEnvelope) -> Self {
         Self {
             request_id: envelope.request_id(),
             identity: envelope.identity().clone(),
             ephemeral_pubkey: envelope.ephemeral_pubkey().copied(),
             claims: envelope.envelope.claims.clone(),
+            key_derived_subject: Subject::anonymous(),
+            jwt_subject: None,
+            signer_pubkey: envelope.signer_pubkey,
         }
     }
 
-    /// Get the typed authorization subject.
+    /// Create context for a FixedSigner (inproc/IPC) caller.
     ///
-    /// Uses Claims subject only when an embedded JWT token is present (gateway
-    /// forwarding scenario). Without a verified JWT, `claims.sub` is unverified
-    /// user input and MUST NOT be trusted — use the transport identity instead.
-    pub fn subject(&self) -> Subject {
-        match &self.claims {
-            Some(c) if c.token.is_some() => Subject::from(c),
-            _ => Subject::from(&self.identity),
+    /// Sets `key_derived_subject = Subject::new("system")`, so `subject()` always
+    /// returns `"system"` for this context regardless of any caller-asserted
+    /// `RequestIdentity` field. Used in `process_request` for the ZMQ path.
+    pub fn from_verified_as_system(envelope: &SignedEnvelope) -> Self {
+        Self {
+            request_id: envelope.request_id(),
+            identity: envelope.identity().clone(),
+            ephemeral_pubkey: envelope.ephemeral_pubkey().copied(),
+            claims: envelope.envelope.claims.clone(),
+            key_derived_subject: Subject::new("system"),
+            jwt_subject: None,
+            signer_pubkey: envelope.signer_pubkey,
         }
+    }
+
+    /// Create context using a `KeyRegistry` to resolve the signer's subject.
+    ///
+    /// The registry maps the verified `signer_pubkey` to an authorization subject.
+    /// This is the general form; `from_verified_as_system` is a convenience wrapper
+    /// that uses `NodeKeyRegistry`.
+    pub fn from_verified_with_registry(
+        envelope: &SignedEnvelope,
+        registry: &dyn crate::envelope::KeyRegistry,
+    ) -> Self {
+        let key_derived_subject = registry.resolve(&envelope.signer_pubkey);
+        Self {
+            request_id: envelope.request_id(),
+            identity: envelope.identity().clone(),
+            ephemeral_pubkey: envelope.ephemeral_pubkey().copied(),
+            claims: envelope.envelope.claims.clone(),
+            key_derived_subject,
+            jwt_subject: None,
+            signer_pubkey: envelope.signer_pubkey,
+        }
+    }
+
+    /// Create a system-identity context for internal callbacks that bypass the ZMQ envelope pipeline.
+    ///
+    /// Used by services that make inproc self-calls without a real `SignedEnvelope`
+    /// (e.g., `InferenceService` callback mode). Sets `key_derived_subject = "system"`
+    /// so that `subject()` correctly returns the system subject for authorization.
+    ///
+    /// `signer_pubkey` is zeroed because there is no real envelope; the system subject
+    /// is asserted directly and is trusted because this constructor is only reachable
+    /// from internal code paths that never cross a network boundary.
+    pub fn from_callback_system(request_id: u64) -> Self {
+        Self {
+            request_id,
+            identity: RequestIdentity::Anonymous,
+            ephemeral_pubkey: None,
+            claims: None,
+            key_derived_subject: Subject::new("system"),
+            jwt_subject: None,
+            signer_pubkey: [0u8; 32],
+        }
+    }
+
+    /// Get the cryptographically-verified authorization subject.
+    ///
+    /// Resolution order:
+    /// 1. Key-derived subject (from verified Ed25519 signer key via `KeyRegistry`).
+    ///    For FixedSigner/inproc callers this is always `Subject::new("system")`.
+    /// 2. JWT upgrade: if the envelope carries a verified JWT token, use its subject.
+    ///    Federated JWTs (`iss` non-empty) produce `Subject::federated(iss, sub)`.
+    /// 3. `Subject::anonymous()` — no verified identity.
+    ///
+    /// The caller-asserted `RequestIdentity` field is never consulted for
+    /// authorization. It is preserved only for logging.
+    pub fn subject(&self) -> Subject {
+        // Prefer key-derived subject (cryptographically proven via signer key)
+        if !self.key_derived_subject.is_anonymous() {
+            return self.key_derived_subject.clone();
+        }
+        // JWT upgrade: use the pre-resolved subject set by verify_claims(), which
+        // correctly distinguishes local tokens (bare sub) from federated ones
+        // (iss:sub format).  Falls back to anonymous if no JWT was verified.
+        if let Some(ref s) = self.jwt_subject {
+            return s.clone();
+        }
+        Subject::anonymous()
     }
 
     /// Get the bare username string.
@@ -235,20 +337,31 @@ pub trait ZmqService: 'static {
         None
     }
 
+    /// Key registry for resolving verified signer public keys to subjects.
+    ///
+    /// Return `None` (default) to use the automatic `FixedSigner → system`
+    /// resolution in `process_request`. Override to provide custom key→subject
+    /// mappings (e.g., for multi-key or peer-trust scenarios).
+    fn key_registry(&self) -> Option<std::sync::Arc<dyn crate::envelope::KeyRegistry>> {
+        None
+    }
+
     /// E2E JWT verification with federation and downgrade attack protection.
     ///
     /// Called by `process_request` after envelope signature verification.
+    /// Takes `&mut EnvelopeContext` to store the resolved `jwt_subject` directly,
+    /// which correctly distinguishes local tokens (bare `sub`) from federated
+    /// ones (`iss:sub` format) using this service's `local_issuer_url()`.
     /// Async because federated key resolution may require an HTTP JWKS fetch.
-    async fn verify_claims(&self, ctx: &EnvelopeContext) -> anyhow::Result<()> {
+    async fn verify_claims(&self, ctx: &mut EnvelopeContext) -> anyhow::Result<()> {
         if let Some(claims) = ctx.claims() {
-            // A token is local when iss is empty (legacy / intra-cluster) OR
-            // matches the configured local OAuth issuer URL.
-            let is_local = claims.iss.is_empty()
-                || self
-                    .local_issuer_url()
-                    .map_or(false, |local| local == claims.iss);
+            let local_url = self.local_issuer_url();
+            let local_issuers: &[&str] = match local_url {
+                Some(ref u) => std::slice::from_ref(u),
+                None => &[],
+            };
 
-            if is_local {
+            if claims.is_local_to(local_issuers) {
                 // --- Local token path ---
                 match claims.verify_token(&self.verifying_key(), self.expected_audience()) {
                     Ok(Some(verified)) => {
@@ -270,16 +383,8 @@ pub trait ZmqService: 'static {
                         }
                     }
                     Ok(None) => {
-                        // SECURITY: Non-local requests MUST carry a JWT.
-                        if !ctx.identity.is_local() {
-                            tracing::warn!(
-                                "Non-local request with claims but no JWT token: \
-                                 sub={}, identity={:?}",
-                                claims.sub,
-                                ctx.identity
-                            );
-                            anyhow::bail!("JWT token required for non-local requests");
-                        }
+                        // No JWT token — subject is derived from the signer key via
+                        // KeyRegistry (FixedSigner callers → "system"). No bypass needed.
                     }
                     Err(e) => {
                         tracing::warn!("E2E JWT verification failed: {}", e);
@@ -343,6 +448,13 @@ pub trait ZmqService: 'static {
                     );
                     anyhow::bail!("Federated claims issuer mismatch");
                 }
+            }
+
+            // Derive the authorization subject via Claims::subject(), which
+            // produces bare "sub" for local tokens and "iss:sub" for federated ones.
+            let s = claims.subject(local_issuers);
+            if !s.is_anonymous() {
+                ctx.jwt_subject = Some(s);
             }
         }
         Ok(())
@@ -1321,7 +1433,7 @@ mod tests {
             let mut handle = runner.run(service).await?;
 
             // Use ZmqClient with server's verifying key for response verification
-            let client = ZmqClient::new(&endpoint, context, signing_key, verifying_key, RequestIdentity::local());
+            let client = ZmqClient::new(&endpoint, context, signing_key, verifying_key, RequestIdentity::anonymous());
             let response = client.call(b"hello".to_vec(), CallOptions::default()).await?;
 
             // Response should start with "from <user>:"
@@ -1358,7 +1470,7 @@ mod tests {
 
             // Sign request with different key than service expects
             // But verify responses with server's key
-            let client = ZmqClient::new(&endpoint, context, client_signing_key, server_verifying_key, RequestIdentity::local());
+            let client = ZmqClient::new(&endpoint, context, client_signing_key, server_verifying_key, RequestIdentity::anonymous());
             let result = client
                 .call(b"should fail".to_vec(), CallOptions::default())
                 .await;
@@ -1404,7 +1516,7 @@ mod tests {
 
             // Client expects responses signed by a DIFFERENT key than server uses
             // This simulates a MITM attack or misconfigured client
-            let client = ZmqClient::new(&endpoint, context, server_signing_key, different_verifying_key, RequestIdentity::local());
+            let client = ZmqClient::new(&endpoint, context, server_signing_key, different_verifying_key, RequestIdentity::anonymous());
             let result = client
                 .call(b"should fail verification".to_vec(), CallOptions::default())
                 .await;

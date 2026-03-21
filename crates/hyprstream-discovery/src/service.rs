@@ -146,9 +146,11 @@ fn socket_kind_to_string(kind: SocketKind) -> &'static str {
 #[async_trait(?Send)]
 impl DiscoveryHandler for DiscoveryService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
-        // D7: is_local() bypass for read operations only.
+        // System (node key) bypass for read operations only.
         // Write operations (manage scope) always go through Casbin.
-        if ctx.identity.is_local() && operation == "query" {
+        if ctx.subject() == hyprstream_rpc::envelope::Subject::new("system")
+            && operation == "query"
+        {
             return Ok(());
         }
         // Delegate to authorization provider if available

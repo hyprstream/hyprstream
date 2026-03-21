@@ -7,6 +7,24 @@ use crate::capnp::{ToCapnp, FromCapnp};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+/// Returns true if `iss` belongs to a local node.
+///
+/// Used for pre-decode key routing (before a `Claims` object exists) and by
+/// [`Claims::is_local_to`] for post-decode subject derivation — both use
+/// identical criteria so routing and subject resolution are always consistent.
+///
+/// Rules:
+/// - If `local_issuers` is non-empty: `iss` must exactly match one entry.
+/// - If `local_issuers` is empty (unconfigured node): only an empty `iss` is
+///   accepted as local; any non-empty `iss` is treated as federated.
+pub fn is_local_iss(iss: &str, local_issuers: &[&str]) -> bool {
+    if local_issuers.is_empty() {
+        iss.is_empty()
+    } else {
+        local_issuers.contains(&iss)
+    }
+}
+
 /// JWT claims for authentication.
 ///
 /// Note: Authorization is enforced via Casbin policies server-side.
@@ -162,6 +180,29 @@ impl Claims {
     pub fn is_expired(&self) -> bool {
         chrono::Utc::now().timestamp() > self.exp + 5
     }
+
+    /// True if this token was issued by a local node.
+    ///
+    /// Delegates to [`is_local_iss`] using this token's `iss` field.
+    pub fn is_local_to(&self, local_issuers: &[&str]) -> bool {
+        is_local_iss(&self.iss, local_issuers)
+    }
+
+    /// Derive the Casbin authorization subject from these claims.
+    ///
+    /// Local tokens (issued by this node) produce bare subjects (`"alice"`)
+    /// matching existing Casbin rules.  Federated tokens produce namespaced
+    /// subjects (`"https://other.node:alice"`) to prevent cross-node spoofing.
+    pub fn subject(&self, local_issuers: &[&str]) -> crate::envelope::Subject {
+        if self.sub.is_empty() {
+            return crate::envelope::Subject::anonymous();
+        }
+        if self.is_local_to(local_issuers) {
+            crate::envelope::Subject::new(self.sub.clone())
+        } else {
+            crate::envelope::Subject::federated(&self.iss, &self.sub)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -224,6 +265,37 @@ mod tests {
         use crate::envelope::Subject;
         let claims = Claims::new("alice".to_owned(), 1000, 2000);
         assert_eq!(Subject::from(&claims), Subject::new("alice"));
+    }
+
+    #[test]
+    fn test_claims_is_local_to() {
+        let local = Claims::new("alice".to_owned(), 0, 9999)
+            .with_issuer("https://local.example.com".to_owned());
+        let federated = Claims::new("bob".to_owned(), 0, 9999)
+            .with_issuer("https://other.example.com".to_owned());
+        let legacy = Claims::new("carol".to_owned(), 0, 9999); // empty iss
+
+        assert!(local.is_local_to(&["https://local.example.com"]));
+        assert!(!local.is_local_to(&["https://other.example.com"]));
+        assert!(!federated.is_local_to(&["https://local.example.com"]));
+        // Empty iss is local only when no local issuers configured
+        assert!(legacy.is_local_to(&[]));
+        assert!(!legacy.is_local_to(&["https://local.example.com"]));
+    }
+
+    #[test]
+    fn test_claims_subject_method() {
+        use crate::envelope::Subject;
+
+        let local = Claims::new("alice".to_owned(), 0, 9999)
+            .with_issuer("https://node.example.com".to_owned());
+        let federated = Claims::new("bob".to_owned(), 0, 9999)
+            .with_issuer("https://other.example.com".to_owned());
+        let no_sub = Claims::new(String::new(), 0, 9999);
+
+        assert_eq!(local.subject(&["https://node.example.com"]), Subject::new("alice"));
+        assert_eq!(federated.subject(&["https://node.example.com"]), Subject::federated("https://other.example.com", "bob"));
+        assert_eq!(no_sub.subject(&[]), Subject::anonymous());
     }
 
     #[test]

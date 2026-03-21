@@ -363,7 +363,7 @@ async fn dispatch_top_level(
     args: &Value,
     signing_key: SigningKey,
 ) -> Result<Value> {
-    let identity = RequestIdentity::local();
+    let identity = RequestIdentity::anonymous();
 
     match service {
         "registry" => {
@@ -402,7 +402,7 @@ async fn dispatch_scoped_dynamic(
     args: &Value,
     signing_key: SigningKey,
 ) -> Result<Value> {
-    let identity = RequestIdentity::local();
+    let identity = RequestIdentity::anonymous();
 
     match service {
         "registry" => {

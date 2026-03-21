@@ -130,16 +130,27 @@ m = (g(r.sub, p.sub) || keyMatch(r.sub, p.sub)) && \
     (p.act == "*" || keyMatch(r.act, p.act))
 "#;
 
-/// Default policy rules: deny-by-default (no allow rules)
+/// Default policy rules: deny-by-default with system grant
 ///
 /// All access is denied until the operator explicitly configures policy via:
 ///   hyprstream quick policy apply-template local    # grant local CLI full access
 ///   hyprstream quick policy apply-template public-inference  # open inference API
 ///
+/// The `system` subject (derived from the node's Ed25519 signing key) is granted
+/// full access. This allows inproc/IPC callers (CLI, services) to function without
+/// requiring explicit policy configuration.
+///
 /// Policy format: p, subject, domain, resource, action, effect
 const DEFAULT_POLICY_CSV: &str = r#"# Hyprstream Access Control Policy — deny-by-default
 #
-# No access is granted until you apply a policy template:
+# The 'system' subject (local node key → inproc/IPC callers) has full access.
+p, system, *, *, *, allow
+#
+# The TUI display server is a local-only service; anonymous browser clients
+# (connecting via WebTransport from localhost) may access TUI resources.
+p, anonymous, *, tui:*, *, allow
+#
+# No other access is granted until you apply a policy template:
 #
 #   hyprstream quick policy apply-template local             # local CLI full access
 #   hyprstream quick policy apply-template public-inference  # anonymous inference

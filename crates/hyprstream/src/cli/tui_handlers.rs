@@ -28,7 +28,7 @@ pub fn create_tui_client(signing_key: &SigningKey) -> TuiClient {
     use hyprstream_rpc::registry::{global as registry, SocketKind};
 
     let endpoint = registry().endpoint("tui", SocketKind::Rep).to_zmq_string();
-    TuiClient::with_endpoint(&endpoint, signing_key.clone(), RequestIdentity::local())
+    TuiClient::with_endpoint(&endpoint, signing_key.clone(), RequestIdentity::anonymous())
 }
 
 /// Attach to an existing TUI session.
