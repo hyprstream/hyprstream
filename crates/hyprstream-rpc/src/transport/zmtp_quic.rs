@@ -1926,7 +1926,7 @@ where
     use tracing::warn;
 
     // 1. Unwrap and verify SignedEnvelope based on verification mode
-    let (ctx, payload) = match match verification {
+    let (mut ctx, payload) = match match verification {
         EnvelopeVerification::FixedSigner(pubkey) =>
             crate::envelope::unwrap_envelope(raw_bytes, pubkey, nonce_cache),
         EnvelopeVerification::AnySigner =>
@@ -1948,6 +1948,21 @@ where
             return Ok((bytes, None));
         }
     };
+
+    // P0 security: external (AnySigner/WebTransport) callers cannot self-assert
+    // Local identity — that trust is reserved for inproc/IPC connections where
+    // the caller shares the same process or machine trust boundary.  Downgrade
+    // any Local claim from an external caller to Anonymous; their authenticated
+    // identity must come from a verified JWT in the Claims field.
+    if matches!(verification, EnvelopeVerification::AnySigner)
+        && matches!(ctx.identity, crate::envelope::RequestIdentity::Local { .. })
+    {
+        warn!(
+            "{} downgrading Local identity to Anonymous for external (AnySigner) caller",
+            service.name()
+        );
+        ctx.identity = crate::envelope::RequestIdentity::Anonymous;
+    }
 
     let request_id = ctx.request_id;
     debug!(

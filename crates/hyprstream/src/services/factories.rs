@@ -320,6 +320,10 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     worker_service.set_authorize_fn(super::worker::build_authorize_fn(policy_client));
     if let Some(issuer) = ctx.oauth_issuer_url() {
         worker_service.set_expected_audience(issuer.to_owned());
+        worker_service.set_local_issuer_url(issuer.to_owned());
+    }
+    if let Some(fed) = ctx.federation_key_source() {
+        worker_service.set_federation_key_source(fed);
     }
 
     Ok(ctx.into_spawnable_quic(worker_service, worker_quic_port))
@@ -605,7 +609,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                                         crate::auth::jwt::decode(t, &verifying_key, Some(mcp_resource_url.as_str()))
                                     } else {
                                         match federation_resolver.get_key(&iss).await {
-                                            Ok(key) => crate::auth::jwt::decode_with_key(t, &key, None),
+                                            Ok(key) => crate::auth::jwt::decode_with_key(t, &key, Some(mcp_resource_url.as_str())),
                                             Err(e) => {
                                                 tracing::debug!(%method, %uri, issuer = %iss, error = %e, "MCP federation key resolution failed");
                                                 let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();

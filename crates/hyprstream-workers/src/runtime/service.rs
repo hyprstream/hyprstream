@@ -91,6 +91,11 @@ pub struct WorkerService {
     authorize_fn: Option<AuthorizeFn>,
     /// Expected JWT audience for token validation (RFC 8707).
     expected_audience: Option<String>,
+    /// Local OAuth issuer URL — JWTs whose `iss` matches this are treated as
+    /// locally-issued tokens rather than federated ones.
+    local_issuer_url: Option<String>,
+    /// Federation key source for verifying externally-issued JWTs.
+    federation_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>>,
 }
 
 impl WorkerService {
@@ -125,6 +130,8 @@ impl WorkerService {
             signing_key,
             authorize_fn: None,
             expected_audience: None,
+            local_issuer_url: None,
+            federation_key_source: None,
         })
     }
 
@@ -136,6 +143,19 @@ impl WorkerService {
     /// Set the expected JWT audience for token validation.
     pub fn set_expected_audience(&mut self, audience: String) {
         self.expected_audience = Some(audience);
+    }
+
+    /// Set the local OAuth issuer URL so that locally-issued JWTs are accepted.
+    pub fn set_local_issuer_url(&mut self, url: String) {
+        self.local_issuer_url = Some(url);
+    }
+
+    /// Set the federation key source for verifying externally-issued JWTs.
+    pub fn set_federation_key_source(
+        &mut self,
+        src: std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>,
+    ) {
+        self.federation_key_source = Some(src);
     }
 
     /// Initialize the service (start warm pool)
@@ -1302,6 +1322,16 @@ impl ZmqService for WorkerService {
 
     fn expected_audience(&self) -> Option<&str> {
         self.expected_audience.as_deref()
+    }
+
+    fn local_issuer_url(&self) -> Option<&str> {
+        self.local_issuer_url.as_deref()
+    }
+
+    fn federation_key_source(
+        &self,
+    ) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>> {
+        self.federation_key_source.clone()
     }
 }
 

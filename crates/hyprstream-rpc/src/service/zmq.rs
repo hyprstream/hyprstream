@@ -241,12 +241,15 @@ pub trait ZmqService: 'static {
     /// Async because federated key resolution may require an HTTP JWKS fetch.
     async fn verify_claims(&self, ctx: &EnvelopeContext) -> anyhow::Result<()> {
         if let Some(claims) = ctx.claims() {
-            // A token is local when iss is empty (legacy / intra-cluster) OR
-            // matches the configured local OAuth issuer URL.
-            let is_local = claims.iss.is_empty()
-                || self
-                    .local_issuer_url()
-                    .map_or(false, |local| local == claims.iss);
+            // A token is local when iss matches the configured local OAuth
+            // issuer URL, OR when iss is empty AND no issuer URL is configured
+            // (legacy / unconfigured deployments only).  When a local issuer
+            // URL is set, an empty iss is rejected — it cannot bypass issuer
+            // binding by omitting the field.
+            let is_local = match self.local_issuer_url() {
+                Some(local) => claims.iss == local,
+                None => claims.iss.is_empty(),
+            };
 
             if is_local {
                 // --- Local token path ---
