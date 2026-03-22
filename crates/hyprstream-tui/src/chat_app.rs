@@ -93,6 +93,9 @@ impl Default for ChatGenConfig {
 pub enum ToolCallFormat {
     /// Qwen3 XML: `<tool_call>{"name":…,"arguments":…}</tool_call>`
     Qwen3Xml,
+    /// Qwen3.5 XML parameter format:
+    /// `<tool_call><function=NAME><parameter=KEY>value</parameter>…</function></tool_call>`
+    Qwen35XmlParam,
     /// Llama 3.1+: `<|python_tag|>` prefix + JSON
     LlamaJson,
     /// Mistral: `[TOOL_CALLS]` prefix + JSON array
@@ -534,12 +537,78 @@ impl ChatApp {
 
     // ── Tool call state machine helpers ──────────────────────────────────────
 
-    /// Parse the buffered tool call JSON and return `(uuid, arguments_json)`.
+    /// Parse the buffered tool call content and return `(function_name, arguments_json)`.
+    ///
+    /// Tries JSON first (Hermes/nous format), then falls back to the Qwen3.5
+    /// XML parameter format (`<function=NAME><parameter=KEY>value</parameter></function>`).
     fn parse_tool_call_buf(buf: &str) -> Option<(String, String)> {
-        let call_data: serde_json::Value = serde_json::from_str(buf.trim()).ok()?;
-        let uuid = call_data["name"].as_str()?.to_owned();
-        let arguments = serde_json::to_string(&call_data["arguments"]).ok()?;
-        Some((uuid, arguments))
+        let trimmed = buf.trim();
+
+        // Try JSON format first (Qwen3/Hermes: {"name": ..., "arguments": ...})
+        if let Ok(call_data) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            let name = call_data["name"].as_str()?.to_owned();
+            let arguments = serde_json::to_string(&call_data["arguments"]).ok()?;
+            return Some((name, arguments));
+        }
+
+        // Fall back to Qwen3.5 XML parameter format:
+        //   <function=get_weather>
+        //   <parameter=location>NYC</parameter>
+        //   </function>
+        if trimmed.contains("<function=") {
+            return Self::parse_xml_param_tool_call(trimmed);
+        }
+
+        None
+    }
+
+    /// Parse a single Qwen3.5 XML parameter-format tool call block.
+    fn parse_xml_param_tool_call(buf: &str) -> Option<(String, String)> {
+        // Extract function name from <function=NAME>
+        let func_start = buf.find("<function=")?;
+        let name_start = func_start + "<function=".len();
+        let name_end = buf[name_start..].find('>')? + name_start;
+        let name = buf[name_start..name_end].trim().to_owned();
+        if name.is_empty() {
+            return None;
+        }
+
+        // Extract the body between <function=NAME> and </function>
+        let body_start = name_end + 1;
+        let body_end = buf.find("</function>").unwrap_or(buf.len());
+        let body = &buf[body_start..body_end];
+
+        // Extract <parameter=KEY>VALUE</parameter> pairs
+        let mut args = serde_json::Map::new();
+        let mut search_from = 0;
+        while let Some(param_start) = body[search_from..].find("<parameter=") {
+            let abs_start = search_from + param_start;
+            let key_start = abs_start + "<parameter=".len();
+            let key_end = match body[key_start..].find('>') {
+                Some(p) => key_start + p,
+                None => break,
+            };
+            let key = body[key_start..key_end].trim().to_owned();
+
+            let value_start = key_end + 1;
+            let value_end = match body[value_start..].find("</parameter>") {
+                Some(p) => value_start + p,
+                None => break,
+            };
+            let value = body[value_start..value_end].trim();
+
+            if !key.is_empty() {
+                // Try JSON parse for numbers/bools/objects, fall back to string
+                let json_val = serde_json::from_str::<serde_json::Value>(value)
+                    .unwrap_or_else(|_| serde_json::Value::String(value.to_owned()));
+                args.insert(key, json_val);
+            }
+
+            search_from = value_end + "</parameter>".len();
+        }
+
+        let arguments = serde_json::to_string(&serde_json::Value::Object(args)).ok()?;
+        Some((name, arguments))
     }
 
     // ── ingest_token ─────────────────────────────────────────────────────────
@@ -555,10 +624,11 @@ impl ChatApp {
 
         // Cache format-derived markers before mutably borrowing history.
         let open_marker: Option<(&'static str, &'static str)> = match self.tool_call_format {
-            ToolCallFormat::Qwen3Xml    => Some(("<tool_call>", "</tool_call>")),
-            ToolCallFormat::LlamaJson   => Some(("<|python_tag|>", "")),
-            ToolCallFormat::MistralJson => Some(("[TOOL_CALLS]", "")),
-            ToolCallFormat::None        => None,
+            ToolCallFormat::Qwen3Xml      => Some(("<tool_call>", "</tool_call>")),
+            ToolCallFormat::Qwen35XmlParam => Some(("<tool_call>", "</tool_call>")),
+            ToolCallFormat::LlamaJson     => Some(("<|python_tag|>", "")),
+            ToolCallFormat::MistralJson   => Some(("[TOOL_CALLS]", "")),
+            ToolCallFormat::None          => None,
         };
 
         let Some(last) = self.history.last_mut() else { return detected };
