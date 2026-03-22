@@ -425,6 +425,153 @@ pub fn dequantize_4bit_fp32(input: &[u8], state: &QuantState) -> Result<Vec<f32>
 }
 
 // ============================================================================
+// GPU-Native Quantization (BF16/FP16 — no CPU round-trip)
+// ============================================================================
+
+/// Quantize BF16 GPU data using 8-bit blockwise quantization.
+///
+/// `input_ptr` must point to BF16 data on GPU. `absmax_ptr` must point to
+/// pre-allocated f32 GPU memory of size `ceil(n / blocksize)`. `output_ptr`
+/// must point to pre-allocated u8 GPU memory of size `n`. `code_ptr` must
+/// point to the 256-entry f32 codebook on GPU.
+///
+/// All pointers must be valid GPU pointers. This function launches a GPU kernel
+/// and returns immediately (async on the default stream).
+///
+/// # Safety
+/// All pointers must be valid GPU device pointers with sufficient allocation.
+pub unsafe fn quantize_blockwise_bf16_gpu(
+    code_ptr: *mut f32,
+    input_ptr: *mut c_void,
+    absmax_ptr: *mut f32,
+    output_ptr: *mut u8,
+    blocksize: i32,
+    n: i32,
+) {
+    cquantize_blockwise_bf16(code_ptr, input_ptr, absmax_ptr, output_ptr, blocksize, n);
+}
+
+/// Dequantize 8-bit blockwise data to BF16 on GPU.
+///
+/// `input_ptr` must point to quantized u8 data on GPU. Output is written to
+/// `output_ptr` as BF16 on GPU. No CPU transfer occurs.
+///
+/// # Safety
+/// All pointers must be valid GPU device pointers with sufficient allocation.
+pub unsafe fn dequantize_blockwise_bf16_gpu(
+    code_ptr: *mut f32,
+    input_ptr: *mut u8,
+    absmax_ptr: *mut f32,
+    output_ptr: *mut c_void,
+    blocksize: i32,
+    n: i32,
+) {
+    cdequantize_blockwise_bf16(
+        code_ptr, input_ptr, absmax_ptr, output_ptr,
+        blocksize, n, ptr::null_mut(),
+    );
+}
+
+/// Quantize FP16 GPU data using 8-bit blockwise quantization.
+///
+/// # Safety
+/// All pointers must be valid GPU device pointers with sufficient allocation.
+pub unsafe fn quantize_blockwise_fp16_gpu(
+    code_ptr: *mut f32,
+    input_ptr: *mut c_void,
+    absmax_ptr: *mut f32,
+    output_ptr: *mut u8,
+    blocksize: i32,
+    n: i32,
+) {
+    cquantize_blockwise_fp16(code_ptr, input_ptr, absmax_ptr, output_ptr, blocksize, n);
+}
+
+/// Dequantize 8-bit blockwise data to FP16 on GPU.
+///
+/// # Safety
+/// All pointers must be valid GPU device pointers with sufficient allocation.
+pub unsafe fn dequantize_blockwise_fp16_gpu(
+    code_ptr: *mut f32,
+    input_ptr: *mut u8,
+    absmax_ptr: *mut f32,
+    output_ptr: *mut c_void,
+    blocksize: i32,
+    n: i32,
+) {
+    cdequantize_blockwise_fp16(
+        code_ptr, input_ptr, absmax_ptr, output_ptr,
+        blocksize, n, ptr::null_mut(),
+    );
+}
+
+/// Quantize BF16 GPU data using 4-bit NF4 quantization.
+///
+/// # Safety
+/// All pointers must be valid GPU device pointers with sufficient allocation.
+pub unsafe fn quantize_4bit_nf4_bf16_gpu(
+    code_ptr: *mut f32,
+    input_ptr: *mut c_void,
+    absmax_ptr: *mut f32,
+    output_ptr: *mut u8,
+    blocksize: i32,
+    n: i32,
+) {
+    cquantize_blockwise_bf16_nf4(code_ptr, input_ptr, absmax_ptr, output_ptr, blocksize, n);
+}
+
+/// Dequantize 4-bit NF4 data to BF16 on GPU.
+///
+/// # Safety
+/// All pointers must be valid GPU device pointers with sufficient allocation.
+pub unsafe fn dequantize_4bit_nf4_bf16_gpu(
+    code_ptr: *mut f32,
+    input_ptr: *mut u8,
+    absmax_ptr: *mut f32,
+    output_ptr: *mut c_void,
+    blocksize: i32,
+    n: i32,
+) {
+    cdequantize_blockwise_bf16_nf4(
+        code_ptr, input_ptr, absmax_ptr, output_ptr,
+        blocksize, n, ptr::null_mut(),
+    );
+}
+
+/// Quantize BF16 GPU data using 4-bit FP4 quantization.
+///
+/// # Safety
+/// All pointers must be valid GPU device pointers with sufficient allocation.
+pub unsafe fn quantize_4bit_fp4_bf16_gpu(
+    code_ptr: *mut f32,
+    input_ptr: *mut c_void,
+    absmax_ptr: *mut f32,
+    output_ptr: *mut u8,
+    blocksize: i32,
+    n: i32,
+) {
+    cquantize_blockwise_bf16_fp4(code_ptr, input_ptr, absmax_ptr, output_ptr, blocksize, n);
+}
+
+/// Dequantize 4-bit FP4 data to BF16 on GPU.
+///
+/// # Safety
+/// All pointers must be valid GPU device pointers with sufficient allocation.
+pub unsafe fn dequantize_4bit_fp4_bf16_gpu(
+    code_ptr: *mut f32,
+    input_ptr: *mut u8,
+    absmax_ptr: *mut f32,
+    output_ptr: *mut c_void,
+    blocksize: i32,
+    n: i32,
+) {
+    cdequantize_blockwise_bf16_fp4(
+        code_ptr, input_ptr, absmax_ptr, output_ptr,
+        blocksize, n, ptr::null_mut(),
+    );
+}
+
+// ============================================================================
 // CPU Fallback Functions
 // ============================================================================
 

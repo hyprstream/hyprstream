@@ -602,26 +602,41 @@ struct QuantizedTensor {
 
 #[cfg(feature = "bnb")]
 impl QuantizedTensor {
-    /// Quantize a tensor using the specified quantization type
+    /// Quantize a tensor using the specified quantization type.
+    ///
+    /// If the tensor is on a GPU (CUDA/ROCm) and is BF16 or FP16, uses the
+    /// GPU-native bitsandbytes kernels directly — no CPU round-trip. For CPU
+    /// tensors or f32 dtype, falls back to the CPU quantization path.
     fn from_tensor(tensor: &Tensor, quant_type: KVQuantType) -> Result<Self> {
         let shape = tensor.size();
         let dtype = tensor.kind();
         let device = tensor.device();
 
-        // Move to CPU and convert to f32 for quantization
+        if quant_type == KVQuantType::None {
+            return Err(anyhow!("Cannot create QuantizedTensor with KVQuantType::None"));
+        }
+
+        // GPU-native path: BF16/FP16 on CUDA/ROCm → quantize directly on GPU
+        let use_gpu_path = device != Device::Cpu
+            && (dtype == DType::BFloat16 || dtype == DType::Half)
+            && quant_type == KVQuantType::Int8;
+
+        if use_gpu_path {
+            return Self::from_tensor_gpu(tensor, &shape, dtype, device);
+        }
+
+        // CPU fallback path: copy to CPU, convert to f32, quantize
         let cpu_tensor = tensor
             .to_device(Device::Cpu)
             .to_kind(DType::Float)
             .contiguous();
         let numel = cpu_tensor.numel();
 
-        // Extract f32 data from tensor
         let mut f32_data = vec![0.0f32; numel];
         cpu_tensor
             .f_copy_data(&mut f32_data, numel)
             .map_err(|e| anyhow!("Failed to copy tensor data: {:?}", e))?;
 
-        // Quantize based on type
         let (data, state) = match quant_type {
             KVQuantType::Int8 => bitsandbytes_sys::quantize_blockwise_fp32(&f32_data, QUANT_BLOCKSIZE)
                 .map_err(|e| anyhow!("Int8 quantization failed: {:?}", e))?,
@@ -629,33 +644,110 @@ impl QuantizedTensor {
                 .map_err(|e| anyhow!("NF4 quantization failed: {:?}", e))?,
             KVQuantType::Fp4 => bitsandbytes_sys::quantize_4bit_fp4_fp32(&f32_data, QUANT_BLOCKSIZE)
                 .map_err(|e| anyhow!("FP4 quantization failed: {:?}", e))?,
-            KVQuantType::None => {
-                return Err(anyhow!(
-                    "Cannot create QuantizedTensor with KVQuantType::None"
-                ));
-            }
+            KVQuantType::None => unreachable!(),
         };
 
         tracing::trace!(
-            "Quantized tensor: {} elements, shape {:?} -> {} bytes ({:.1}% of f32)",
-            numel,
-            shape,
-            data.len(),
+            "Quantized tensor (CPU path): {} elements, shape {:?} -> {} bytes ({:.1}% of f32)",
+            numel, shape, data.len(),
             (data.len() as f64 / (numel * 4) as f64) * 100.0
         );
 
-        Ok(Self {
-            data,
-            state,
-            shape,
-            dtype,
-            device,
-        })
+        Ok(Self { data, state, shape, dtype, device })
     }
 
-    /// Dequantize back to a tensor
+    /// GPU-native quantization: operates directly on GPU BF16/FP16 tensors.
+    ///
+    /// Uses bitsandbytes CUDA/HIP kernels. The code/absmax arrays are created
+    /// as CPU Vecs (they're small metadata), while the quantization kernel reads
+    /// from GPU input and writes to a GPU-resident output tensor. We then copy
+    /// the small quantized result back to CPU for storage (the quantized data
+    /// is ~8x smaller than the original, so this copy is cheap).
+    fn from_tensor_gpu(
+        tensor: &Tensor,
+        shape: &[i64],
+        dtype: DType,
+        device: Device,
+    ) -> Result<Self> {
+        let numel = tensor.numel();
+        let contiguous = tensor.contiguous();
+
+        // Create quantization state (CPU — small metadata)
+        let mut state = bitsandbytes_sys::QuantState::new_8bit(numel, QUANT_BLOCKSIZE);
+
+        // Allocate GPU output tensor for quantized data
+        let output_tensor = Tensor::zeros(
+            [numel as i64],
+            (DType::Uint8, device),
+        );
+
+        // Allocate GPU tensors for code and absmax
+        let code_tensor = Tensor::from_slice(&state.code).to_device(device);
+        let absmax_tensor = Tensor::zeros(
+            [state.absmax.len() as i64],
+            (DType::Float, device),
+        );
+
+        // Call GPU-native kernel
+        unsafe {
+            let input_ptr = contiguous.data_ptr() as *mut std::ffi::c_void;
+            let code_ptr = code_tensor.data_ptr() as *mut f32;
+            let absmax_ptr = absmax_tensor.data_ptr() as *mut f32;
+            let output_ptr = output_tensor.data_ptr() as *mut u8;
+
+            match dtype {
+                DType::BFloat16 => bitsandbytes_sys::quantize_blockwise_bf16_gpu(
+                    code_ptr, input_ptr, absmax_ptr, output_ptr,
+                    QUANT_BLOCKSIZE as i32, numel as i32,
+                ),
+                DType::Half => bitsandbytes_sys::quantize_blockwise_fp16_gpu(
+                    code_ptr, input_ptr, absmax_ptr, output_ptr,
+                    QUANT_BLOCKSIZE as i32, numel as i32,
+                ),
+                _ => unreachable!("GPU path only for BF16/FP16"),
+            }
+        }
+
+        // Copy small results back to CPU for storage
+        // quantized data: numel bytes (8x smaller than BF16 input)
+        // absmax: n_blocks * 4 bytes (tiny)
+        let mut data = vec![0u8; numel];
+        output_tensor
+            .to_device(Device::Cpu)
+            .f_copy_data(&mut data, numel)
+            .map_err(|e| anyhow!("Failed to copy quantized data: {:?}", e))?;
+
+        let mut absmax = vec![0.0f32; state.absmax.len()];
+        absmax_tensor
+            .to_device(Device::Cpu)
+            .f_copy_data(&mut absmax, state.absmax.len())
+            .map_err(|e| anyhow!("Failed to copy absmax: {:?}", e))?;
+        state.absmax = absmax;
+
+        tracing::trace!(
+            "Quantized tensor (GPU path, {:?}): {} elements -> {} bytes ({:.1}% of original)",
+            dtype, numel, data.len(),
+            (data.len() as f64 / (numel as f64 * dtype_element_size(dtype) as f64)) * 100.0
+        );
+
+        Ok(Self { data, state, shape: shape.to_vec(), dtype, device })
+    }
+
+    /// Dequantize back to a tensor.
+    ///
+    /// If the target device is GPU and dtype is BF16/FP16, uses GPU-native
+    /// dequantization to avoid the CPU→f32→GPU round-trip.
     fn to_tensor(&self) -> Result<Tensor> {
-        // Dequantize based on quantization type
+        // GPU-native dequant path
+        let use_gpu_path = self.device != Device::Cpu
+            && (self.dtype == DType::BFloat16 || self.dtype == DType::Half)
+            && !self.state.is_4bit;
+
+        if use_gpu_path {
+            return self.to_tensor_gpu();
+        }
+
+        // CPU fallback path
         let f32_data = if self.state.is_4bit {
             match self.state.quant_type {
                 Some(bitsandbytes_sys::QuantType::Nf4) => {
@@ -682,6 +774,55 @@ impl QuantizedTensor {
         let tensor = cpu_tensor.to_kind(self.dtype).to_device(self.device);
 
         Ok(tensor)
+    }
+
+    /// GPU-native dequantization: produces BF16/FP16 tensor directly on GPU.
+    ///
+    /// Copies the small quantized data + absmax to GPU, then calls the
+    /// bitsandbytes BF16/FP16 dequant kernel. Output is GPU-resident in the
+    /// original dtype — no f32 intermediate, no CPU→GPU dtype conversion.
+    fn to_tensor_gpu(&self) -> Result<Tensor> {
+        let numel = self.state.n_elements;
+
+        // Copy quantized data and absmax to GPU (small: ~numel bytes + n_blocks*4 bytes)
+        let quant_tensor = Tensor::from_slice(&self.data).to_device(self.device);
+        let code_tensor = Tensor::from_slice(&self.state.code).to_device(self.device);
+        let absmax_tensor = Tensor::from_slice(&self.state.absmax).to_device(self.device);
+
+        // Allocate output tensor on GPU in original dtype
+        let output_tensor = Tensor::zeros(
+            [numel as i64],
+            (self.dtype, self.device),
+        );
+
+        unsafe {
+            let quant_ptr = quant_tensor.data_ptr() as *mut u8;
+            let code_ptr = code_tensor.data_ptr() as *mut f32;
+            let absmax_ptr = absmax_tensor.data_ptr() as *mut f32;
+            let output_ptr = output_tensor.data_ptr() as *mut std::ffi::c_void;
+
+            match self.dtype {
+                DType::BFloat16 => bitsandbytes_sys::dequantize_blockwise_bf16_gpu(
+                    code_ptr, quant_ptr, absmax_ptr, output_ptr,
+                    self.state.blocksize as i32, numel as i32,
+                ),
+                DType::Half => bitsandbytes_sys::dequantize_blockwise_fp16_gpu(
+                    code_ptr, quant_ptr, absmax_ptr, output_ptr,
+                    self.state.blocksize as i32, numel as i32,
+                ),
+                _ => unreachable!("GPU dequant path only for BF16/FP16"),
+            }
+        }
+
+        // Reshape to original shape
+        let result = output_tensor.reshape(&self.shape);
+
+        tracing::trace!(
+            "Dequantized tensor (GPU path, {:?}): {} bytes -> {} elements",
+            self.dtype, self.data.len(), numel
+        );
+
+        Ok(result)
     }
 
     /// Get memory usage in bytes
