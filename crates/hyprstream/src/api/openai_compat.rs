@@ -330,6 +330,96 @@ pub struct ErrorDetail {
     pub code: Option<String>,
 }
 
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
 
+    #[test]
+    fn test_multi_turn_message_serialization() {
+        // Build a 3-turn conversation and verify JSON round-trip
+        let messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: Some("Hello".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: Some("Hi! How can I help?".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("Tell me about Rust.".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
 
+        // Serialize to JSON
+        let json = serde_json::to_string(&messages).unwrap();
+
+        // Deserialize back
+        let parsed: Vec<ChatMessage> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].role, "user");
+        assert_eq!(parsed[0].content.as_deref(), Some("Hello"));
+        assert_eq!(parsed[1].role, "assistant");
+        assert_eq!(parsed[2].content.as_deref(), Some("Tell me about Rust."));
+    }
+
+    #[test]
+    fn test_tool_use_conversation_flow_serialization() {
+        // Full tool use conversation matching OpenAI API format
+        let request_json = r#"{
+            "model": "qwen3:main",
+            "messages": [
+                {"role": "user", "content": "What's the weather in NYC?"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_123", "type": "function", "function": {"name": "get_weather", "arguments": "{\"location\":\"NYC\"}"}}
+                ]},
+                {"role": "tool", "content": "{\"temperature\": 72}", "tool_call_id": "call_123"},
+                {"role": "user", "content": "And in LA?"}
+            ],
+            "tools": [
+                {"type": "function", "function": {"name": "get_weather", "description": "Get weather", "parameters": {"type": "object"}}}
+            ]
+        }"#;
+
+        // Deserialize the full request
+        let request: ChatCompletionRequest = serde_json::from_str(request_json).unwrap();
+
+        assert_eq!(request.messages.len(), 4);
+        assert_eq!(request.model, "qwen3:main");
+
+        // Verify user message
+        assert_eq!(request.messages[0].role, "user");
+        assert_eq!(request.messages[0].content.as_deref(), Some("What's the weather in NYC?"));
+
+        // Verify assistant message with tool calls
+        assert_eq!(request.messages[1].role, "assistant");
+        assert!(request.messages[1].content.is_none(), "assistant content should be null for tool-call-only");
+        let tool_calls = request.messages[1].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_123");
+        assert_eq!(tool_calls[0].function.name, "get_weather");
+
+        // Verify tool response
+        assert_eq!(request.messages[2].role, "tool");
+        assert_eq!(request.messages[2].tool_call_id.as_deref(), Some("call_123"));
+        assert!(request.messages[2].content.as_ref().unwrap().contains("72"));
+
+        // Verify follow-up
+        assert_eq!(request.messages[3].role, "user");
+        assert_eq!(request.messages[3].content.as_deref(), Some("And in LA?"));
+
+        // Verify tools
+        let tools = request.tools.as_ref().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "get_weather");
+    }
+}
 

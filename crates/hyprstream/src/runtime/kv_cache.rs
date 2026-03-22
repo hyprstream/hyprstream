@@ -2276,4 +2276,61 @@ mod tests {
         // With a 1-byte budget and no actual GPU memory, both should be offloaded/removed
         // The exact behavior depends on memory_usage() returning >0 for non-empty caches
     }
+
+    // ========================================================================
+    // Multi-turn prefix matching simulation tests
+    // ========================================================================
+
+    #[test]
+    fn test_prefix_match_multi_turn_simulation() {
+        let mut manager = KVCacheManager::new(2, 1024, KVQuantType::None);
+
+        // Simulate tokenized prompts growing across conversation turns.
+        // Each turn's prompt includes all prior history + new message.
+
+        // Turn 1: [sys sys sys user1 user1]
+        let turn1_tokens = vec![10, 20, 30, 100, 101];
+        manager.set_cached_tokens(turn1_tokens.clone());
+
+        // Turn 2: [sys sys sys user1 user1 asst1 asst1 user2]
+        // The first 5 tokens match turn 1
+        let turn2_tokens = vec![10, 20, 30, 100, 101, 200, 201, 102];
+        assert_eq!(manager.prefix_match_len(&turn2_tokens), 5);
+
+        // After turn 2 completes, update cached tokens
+        manager.set_cached_tokens(turn2_tokens.clone());
+
+        // Turn 3: [sys sys sys user1 user1 asst1 asst1 user2 asst2 user3]
+        // The first 8 tokens match turn 2
+        let turn3_tokens = vec![10, 20, 30, 100, 101, 200, 201, 102, 202, 103];
+        assert_eq!(manager.prefix_match_len(&turn3_tokens), 8);
+
+        // Verify no match if conversation diverges at the start
+        let divergent = vec![99, 20, 30, 100, 101];
+        manager.set_cached_tokens(turn3_tokens);
+        assert_eq!(manager.prefix_match_len(&divergent), 0);
+    }
+
+    #[test]
+    fn test_prefix_match_with_tool_call_in_history() {
+        let mut manager = KVCacheManager::new(2, 1024, KVQuantType::None);
+
+        // Turn 1: [sys user1_ask_weather]
+        let turn1_tokens = vec![10, 100, 101];
+        manager.set_cached_tokens(turn1_tokens);
+
+        // Turn 2 includes tool call and response in history:
+        // [sys user1_ask_weather asst_toolcall tool_resp user2_followup]
+        // Prefix match = 3 (sys + user1 tokens)
+        let turn2_tokens = vec![10, 100, 101, 200, 201, 202, 300, 301, 110, 111];
+        assert_eq!(manager.prefix_match_len(&turn2_tokens), 3);
+
+        // After turn 2, cache the full sequence
+        manager.set_cached_tokens(turn2_tokens.clone());
+
+        // Turn 3: same prefix as turn 2 + new user message
+        // [sys user1_ask_weather asst_toolcall tool_resp user2_followup asst2 user3]
+        let turn3_tokens = vec![10, 100, 101, 200, 201, 202, 300, 301, 110, 111, 210, 120];
+        assert_eq!(manager.prefix_match_len(&turn3_tokens), 10);
+    }
 }

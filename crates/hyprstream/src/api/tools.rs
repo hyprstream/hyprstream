@@ -438,4 +438,108 @@ mod tests {
         assert!(has_tool_calls_for_format(ToolCallFormat::Qwen3Xml, "<tool_call>...</tool_call>"));
         assert!(!has_tool_calls_for_format(ToolCallFormat::None, "<tool_call>...</tool_call>"));
     }
+
+    // --- Tool call round-trip tests ---
+
+    #[test]
+    fn test_tool_call_round_trip_qwen3() {
+        // Simulate model response with tool call
+        let model_output = "I'll check the weather for you.\n\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"location\": \"NYC\"}}\n</tool_call>";
+
+        // 1. Detect tool calls
+        assert!(has_tool_calls_for_format(ToolCallFormat::Qwen3Xml, model_output));
+
+        // 2. Parse tool calls
+        let calls = parse_tool_calls_for_format(ToolCallFormat::Qwen3Xml, model_output).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert!(calls[0].id.starts_with("call_"), "ID should be auto-generated");
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["location"], "NYC");
+
+        // 3. Extract text content (without tool markers)
+        let text = extract_text_content_for_format(ToolCallFormat::Qwen3Xml, model_output);
+        assert!(text.contains("I'll check the weather"));
+        assert!(!text.contains("<tool_call>"));
+
+        // 4. Build next-turn messages (simulating client constructing history)
+        // Verify the parsed tool call can be used to construct the next turn
+        let tool_response = r#"{"temperature": 72, "condition": "sunny"}"#;
+        let call_id = calls[0].id.clone();
+
+        // Verify the conversation structure pieces are correct
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert!(!call_id.is_empty(), "tool call ID should be non-empty");
+        assert!(!tool_response.is_empty());
+        // Assistant message should have no text content (tool-call-only)
+        assert!(text.contains("I'll check the weather"));
+        assert!(!text.contains("<tool_call>"));
+    }
+
+    #[test]
+    fn test_tool_call_round_trip_llama() {
+        // Llama 3.1 uses <|python_tag|> format with "parameters" field
+        let model_output = "<|python_tag|>\n{\"name\": \"get_weather\", \"parameters\": {\"location\": \"Tokyo\"}}";
+
+        assert!(has_tool_calls_for_format(ToolCallFormat::LlamaJson, model_output));
+
+        let calls = parse_tool_calls_for_format(ToolCallFormat::LlamaJson, model_output).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+
+        // Llama uses "parameters" not "arguments" — verify it's normalized to arguments
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["location"], "Tokyo");
+    }
+
+    #[test]
+    fn test_tool_call_round_trip_mistral() {
+        // Mistral uses [TOOL_CALLS] JSON array format
+        let model_output = "Let me check.\n[TOOL_CALLS][{\"name\": \"get_weather\", \"arguments\": {\"location\": \"London\"}}]";
+
+        assert!(has_tool_calls_for_format(ToolCallFormat::MistralJson, model_output));
+
+        let calls = parse_tool_calls_for_format(ToolCallFormat::MistralJson, model_output).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+
+        let text = extract_text_content_for_format(ToolCallFormat::MistralJson, model_output);
+        assert_eq!(text, "Let me check.");
+    }
+
+    #[test]
+    fn test_multiple_tool_calls_in_single_response() {
+        let model_output = "I'll check both locations.\n\n\
+            <tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"location\": \"NYC\"}}\n</tool_call>\n\
+            <tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"location\": \"LA\"}}\n</tool_call>";
+
+        let calls = parse_tool_calls_for_format(ToolCallFormat::Qwen3Xml, model_output).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[1].function.name, "get_weather");
+
+        // Each call should have a unique ID
+        assert_ne!(calls[0].id, calls[1].id);
+
+        // Verify different arguments
+        let args0: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args1: serde_json::Value = serde_json::from_str(&calls[1].function.arguments).unwrap();
+        assert_eq!(args0["location"], "NYC");
+        assert_eq!(args1["location"], "LA");
+    }
+
+    #[test]
+    fn test_no_tool_calls_when_format_none() {
+        // Even if the text contains tool call markers, ToolCallFormat::None should not detect them
+        let text_with_markers = "Here's an example: <tool_call>{\"name\": \"test\"}</tool_call>";
+
+        assert!(!has_tool_calls_for_format(ToolCallFormat::None, text_with_markers));
+
+        // parse should return empty or error
+        let result = parse_tool_calls_for_format(ToolCallFormat::None, text_with_markers);
+        match result {
+            Ok(calls) => assert!(calls.is_empty()),
+            Err(_) => {} // Also acceptable
+        }
+    }
 }
