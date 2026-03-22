@@ -2054,7 +2054,11 @@ impl InferenceHandler for InferenceService {
                 let tool_calls = if m.tool_calls.is_empty() {
                     None
                 } else {
-                    Some(m.tool_calls.clone())
+                    // Convert RPC ToolCall (arguments: String) to TemplateToolCall
+                    // (arguments: Value) so templates can iterate with |items.
+                    Some(m.tool_calls.iter()
+                        .map(crate::runtime::template_engine::TemplatToolCall::from)
+                        .collect())
                 };
                 crate::runtime::template_engine::ChatMessage {
                     role: m.role.clone(),

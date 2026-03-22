@@ -19,9 +19,47 @@ pub struct ChatMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<crate::services::generated::inference_client::ToolCall>>,
+    pub tool_calls: Option<Vec<TemplatToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+}
+
+/// Tool call representation for template rendering.
+///
+/// Unlike the RPC/OpenAI `ToolCall` (where `arguments` is a JSON string),
+/// this type stores `arguments` as a `serde_json::Value` so that Jinja2
+/// templates can iterate with `|items` (e.g. Qwen3.5's template does
+/// `for args_name, args_value in tool_call.arguments|items`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemplatToolCall {
+    pub id: String,
+    #[serde(rename = "type", default)]
+    pub tool_type: String,
+    pub function: TemplateToolCallFunction,
+}
+
+/// Tool call function with parsed arguments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemplateToolCallFunction {
+    pub name: String,
+    /// Arguments as a structured JSON value (not a string).
+    /// Parsed from the RPC `ToolCallFunction.arguments` JSON string
+    /// at the ChatMessage conversion boundary.
+    pub arguments: serde_json::Value,
+}
+
+impl From<&crate::services::generated::inference_client::ToolCall> for TemplatToolCall {
+    fn from(tc: &crate::services::generated::inference_client::ToolCall) -> Self {
+        Self {
+            id: tc.id.clone(),
+            tool_type: tc.tool_type.clone(),
+            function: TemplateToolCallFunction {
+                name: tc.function.name.clone(),
+                arguments: serde_json::from_str(&tc.function.arguments)
+                    .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
+            },
+        }
+    }
 }
 
 /// Template configuration loaded from tokenizer_config.json
@@ -157,7 +195,9 @@ impl TemplateEngine {
             None => Value::UNDEFINED,
         };
 
-        // Render the template
+        // Render the template.
+        // Messages use TemplateToolCall (with parsed arguments as Value, not String)
+        // so templates can iterate arguments with |items.
         let rendered = tmpl.render(context! {
             messages => messages,
             tools => tools_value,
