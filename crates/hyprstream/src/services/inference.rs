@@ -494,7 +494,8 @@ impl InferenceService {
         let model_info = RuntimeEngine::model_info(&engine);
         let num_layers = model_info.num_hidden_layers.unwrap_or(32) as usize;
         let max_seq_len = config.max_context.unwrap_or(model_info.context_length) as usize;
-        engine.initialize_kv_registry(num_layers, max_seq_len, config.kv_quant_type, None);
+        let kv_budget = engine.compute_kv_budget();
+        engine.initialize_kv_registry(num_layers, max_seq_len, config.kv_quant_type, kv_budget);
 
         info!(
             "KV cache registry initialized: {} layers, max_seq_len={}",
@@ -1142,8 +1143,8 @@ impl InferenceService {
 
         let expiry_secs = ctx.claims()
             .map(|c| c.exp - chrono::Utc::now().timestamp())
-            .unwrap_or(300)
-            .max(60);
+            .unwrap_or(600)
+            .max(600);
         let claims = ctx.claims().cloned();
 
         let stream_ctx = stream_channel.prepare_stream_with_claims(client_pub_bytes, expiry_secs, claims).await?;
@@ -1990,8 +1991,8 @@ impl InferenceHandler for InferenceService {
         // Calculate expiry from claims
         let expiry_secs = ctx.claims()
             .map(|c| c.exp - chrono::Utc::now().timestamp())
-            .unwrap_or(300)
-            .max(60);
+            .unwrap_or(600)
+            .max(600);
 
         let client_ephemeral_pubkey = ctx.ephemeral_pubkey();
         let claims = ctx.claims().cloned();
@@ -2177,8 +2178,8 @@ impl InferenceHandler for InferenceService {
 
         let expiry_secs = ctx.claims()
             .map(|c| c.exp - chrono::Utc::now().timestamp())
-            .unwrap_or(300)
-            .max(60);
+            .unwrap_or(600)
+            .max(600);
         let claims = ctx.claims().cloned();
 
         let stream_ctx = stream_channel.prepare_stream_with_claims(client_pub_bytes, expiry_secs, claims).await?;
