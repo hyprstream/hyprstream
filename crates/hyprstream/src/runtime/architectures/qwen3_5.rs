@@ -181,11 +181,9 @@ fn cat_projs(projs: Vec<LinearProjection>) -> LinearProjection {
                     let ss = s.size();
                     let br = ws[0] / ss[0];
                     let bc = ws[1] / ss[1];
-                    let s_exp = s.to_kind(tch::Kind::BFloat16)
-                        .view([ss[0], 1, ss[1], 1])
-                        .expand([ss[0], br, ss[1], bc], false)
-                        .reshape([ws[0], ws[1]]);
-                    w_bf * s_exp
+                    let w_4d = w_bf.view([ss[0], br, ss[1], bc]);
+                    let s_4d = s.to_kind(tch::Kind::BFloat16).view([ss[0], 1, ss[1], 1]);
+                    (w_4d * s_4d).reshape([ws[0], ws[1]])
                 } else {
                     w_bf
                 }
@@ -214,12 +212,9 @@ fn dequant_batched(w: &Tensor, scale: Option<&Tensor>) -> Tensor {
                 let ss = s.size();   // [k, in/bs, out/bs]
                 let br = ws[1] / ss[1];
                 let bc = ws[2] / ss[2];
-                let s_exp = s
-                    .to_kind(tch::Kind::BFloat16)
-                    .view([ss[0], ss[1], 1, ss[2], 1])
-                    .expand([ss[0], ss[1], br, ss[2], bc], false)
-                    .reshape([ws[0], ws[1], ws[2]]);
-                &w_bf * &s_exp
+                let w_5d = w_bf.view([ss[0], ss[1], br, ss[2], bc]);
+                let s_5d = s.to_kind(tch::Kind::BFloat16).view([ss[0], ss[1], 1, ss[2], 1]);
+                (&w_5d * &s_5d).reshape([ws[0], ws[1], ws[2]])
             } else {
                 w_bf
             }
@@ -1277,11 +1272,9 @@ impl Qwen3_5Model {
                         let ss = s.size();     // [vocab/128, hidden/128]
                         let br = ws[0] / ss[0];
                         let bc = ws[1] / ss[1];
-                        let s_exp = s.to_kind(tch::Kind::BFloat16)
-                            .view([ss[0], 1i64, ss[1], 1i64])
-                            .expand([ss[0], br, ss[1], bc], false)
-                            .reshape([ws[0], ws[1]]);
-                        Some(w_bf * s_exp)
+                        let w_4d = w_bf.view([ss[0], br, ss[1], bc]);
+                        let s_4d = s.to_kind(tch::Kind::BFloat16).view([ss[0], 1i64, ss[1], 1i64]);
+                        Some((w_4d * s_4d).reshape([ws[0], ws[1]]))
                     } else {
                         Some(w_bf)
                     }

@@ -38,20 +38,30 @@ impl ModelFactory {
         let file_content = std::fs::read(&file_to_check)?;
         let tensors = safetensors::SafeTensors::deserialize(&file_content)?;
 
-        // Check the first few tensors to determine predominant dtype
+        // Check the first few tensors to determine predominant dtype.
+        // FP8 models store quantized weights as FP8 but use BF16 for compute
+        // (activations, KV cache, non-quantized modules). We detect FP8 separately
+        // and return BF16 as the compute dtype.
         let mut f16_count = 0;
         let mut bf16_count = 0;
         let mut f32_count = 0;
+        let mut fp8_count = 0;
 
         for (_, tensor) in tensors.tensors().into_iter().take(10) {
             match tensor.dtype() {
                 safetensors::Dtype::F16 => f16_count += 1,
-                safetensors::Dtype::BF16
-                | safetensors::Dtype::F8_E4M3
-                | safetensors::Dtype::F8_E5M2 => bf16_count += 1,
+                safetensors::Dtype::BF16 => bf16_count += 1,
+                safetensors::Dtype::F8_E4M3
+                | safetensors::Dtype::F8_E5M2 => fp8_count += 1,
                 safetensors::Dtype::F32 => f32_count += 1,
                 _ => {},
             }
+        }
+
+        // FP8 models: weights are FP8 but compute dtype is BF16
+        if fp8_count > 0 && fp8_count >= bf16_count && fp8_count >= f16_count {
+            info!("Detected FP8 quantized model (storage: FP8, compute dtype: BF16)");
+            return Ok(tch::Kind::BFloat16);
         }
 
         // Return the most common dtype
@@ -378,6 +388,8 @@ impl ModelFactory {
                 safetensors::Dtype::BF16 => tch::Kind::BFloat16,
                 safetensors::Dtype::F16 => tch::Kind::Half,
                 safetensors::Dtype::F64 => tch::Kind::Double,
+                safetensors::Dtype::F8_E4M3 => tch::Kind::Float8e4m3fn,
+                safetensors::Dtype::F8_E5M2 => tch::Kind::Float8e5m2,
                 // F32 and other types default to Float
                 _ => tch::Kind::Float,
             };

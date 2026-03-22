@@ -67,14 +67,14 @@ impl LinearProjection {
                     let ss = scale.size();   // [in/128, out/128]
                     let block_r = ws[0] / ss[0];
                     let block_c = ws[1] / ss[1];
-                    // weight_scale_inv stores the per-block multiplier: dequant = fp8 * scale
-                    // (values ~0.0002 mean max_abs ≈ 448 * 0.0002 ≈ 0.09, typical for NN weights)
-                    let s_exp = scale
-                        .to_kind(tch::Kind::BFloat16)
-                        .view([ss[0], 1, ss[1], 1])
-                        .expand([ss[0], block_r, ss[1], block_c], false)
-                        .reshape([ws[0], ws[1]]);
-                    w_bf16 * s_exp
+                    // Block-wise dequantization via 4D broadcast multiply.
+                    // The scale is broadcast across block dimensions without materializing
+                    // a full [in, out] expanded copy — PyTorch's CUDA kernel reads from
+                    // the stride-zero view directly. The multiply output is contiguous,
+                    // so the final reshape back to 2D is zero-copy.
+                    let w_4d = w_bf16.view([ss[0], block_r, ss[1], block_c]);
+                    let s_4d = scale.to_kind(tch::Kind::BFloat16).view([ss[0], 1, ss[1], 1]);
+                    (w_4d * s_4d).reshape([ws[0], ws[1]])
                 } else {
                     w_bf16
                 }
