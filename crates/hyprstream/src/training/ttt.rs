@@ -76,6 +76,12 @@ pub struct TTTConfig {
     #[serde(default = "default_tau_heavy")]
     pub tau_heavy: f32,
 
+    /// Perplexity ceiling above which adaptation is skipped (likely adversarial/garbage input).
+    /// Very high perplexity indicates the input is far from the model's training distribution
+    /// and gradient steps would be noise or potentially adversarial weight poisoning.
+    #[serde(default = "default_tau_reject")]
+    pub tau_reject: f32,
+
     /// Minimum loss improvement to consider adaptation beneficial (confidence gate)
     #[serde(default = "default_delta_min")]
     pub delta_min: f32,
@@ -130,6 +136,9 @@ fn default_tau_light() -> f32 {
 fn default_tau_heavy() -> f32 {
     50.0
 }
+fn default_tau_reject() -> f32 {
+    200.0  // Perplexity > 200 is likely adversarial or garbage — skip TTT entirely
+}
 fn default_delta_min() -> f32 {
     0.01
 }
@@ -137,10 +146,10 @@ fn default_adaptive_steps() -> bool {
     true
 }
 fn default_max_adaptation_ms() -> u64 {
-    20_000
+    5_000  // 5 seconds — sufficient for H100 (5-7 steps), marginal for RTX 4090 (3-5 steps)
 }
 fn default_max_gradient_steps() -> usize {
-    50
+    10  // Safety ceiling for client overrides; perplexity gating caps at 5 steps anyway
 }
 fn default_pending_rollback_ms() -> u64 {
     60_000
@@ -356,6 +365,7 @@ impl Default for TTTConfig {
             tau_skip: default_tau_skip(),
             tau_light: default_tau_light(),
             tau_heavy: default_tau_heavy(),
+            tau_reject: default_tau_reject(),
             delta_min: default_delta_min(),
             adaptive_steps: default_adaptive_steps(),
             max_adaptation_ms: default_max_adaptation_ms(),
@@ -642,7 +652,11 @@ impl TestTimeTrainer {
             return self.config.gradient_steps as usize;
         }
 
-        if perplexity < self.config.tau_skip {
+        if perplexity > self.config.tau_reject {
+            tracing::info!("Skipping TTT: perplexity {:.1} exceeds tau_reject {:.1} (likely adversarial/garbage)",
+                perplexity, self.config.tau_reject);
+            0 // Input too far from distribution — skip
+        } else if perplexity < self.config.tau_skip {
             0 // Input already well-modeled
         } else if perplexity < self.config.tau_light {
             1 // Light adaptation
@@ -1374,8 +1388,9 @@ mod tests {
         assert_eq!(config.min_input_length, 32);
         assert_eq!(config.max_ttt_context, 512);
         assert!(config.enabled);
-        assert_eq!(config.max_adaptation_ms, 20_000);
-        assert_eq!(config.max_gradient_steps, 50);
+        assert_eq!(config.max_adaptation_ms, 5_000);
+        assert_eq!(config.max_gradient_steps, 10);
+        assert!((config.tau_reject - 200.0).abs() < 0.1);
     }
 
     #[test]

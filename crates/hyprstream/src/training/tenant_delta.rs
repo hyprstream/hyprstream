@@ -137,16 +137,19 @@ fn default_target_modules() -> Vec<String> {
     vec!["q_proj".to_owned(), "v_proj".to_owned()]
 }
 fn default_learning_rate() -> f64 {
-    3e-4
+    1e-3  // Muon's Newton-Schulz amplifies effective step ~22x for rank-8 B matrices;
+          // 1e-3 gives effective step ~0.023, 3x the previous 3e-4 while staying stable.
 }
 fn default_max_accumulated_steps() -> u64 {
     300
 }
 fn default_decay_lambda() -> f64 {
-    0.02
+    0.0  // Weight decay fights LoRA-B (initialized to zero) — keep off by default.
+         // The field is now wired to MuonConfig.weight_decay so it works if configured.
 }
 fn default_muon_momentum_config() -> f64 {
-    0.95
+    0.9  // Reduced from 0.95 to match higher LR. Product lr*momentum/(1-momentum)
+         // stays controlled: 1e-3 * 0.9/0.1 = 0.009.
 }
 
 impl Default for TenantDeltaConfig {
@@ -331,7 +334,7 @@ impl TenantDelta {
         let muon_config = MuonConfig {
             lr: config.learning_rate,
             momentum: config.muon_momentum,
-            weight_decay: 0.0, // Muon orthogonalizes gradients; weight decay rarely needed
+            weight_decay: config.decay_lambda, // Wired from config; default 0.0 (off)
             ..MuonConfig::default()
         };
 
