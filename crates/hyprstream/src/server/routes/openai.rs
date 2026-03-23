@@ -424,6 +424,7 @@ async fn chat_completions(
             messages: rpc_messages.clone(),
             add_generation_prompt: true,
             tools_json: Some(tools_str.clone()).filter(|s| !s.is_empty()),
+            max_tokens: request.max_tokens.map(|v| v as u32),
         })
         .await
     {
@@ -633,6 +634,7 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                 messages: rpc_messages.clone(),
                 add_generation_prompt: true,
                 tools_json: Some(tools_str.clone()).filter(|s| !s.is_empty()),
+                max_tokens: request.max_tokens.map(|v| v as u32),
             })
             .await
         {
@@ -957,6 +959,7 @@ async fn completions(
             messages: rpc_messages.clone(),
             add_generation_prompt: true,
             tools_json: None,
+            max_tokens: request.max_tokens.map(|v| v as u32),
         })
         .await
     {
