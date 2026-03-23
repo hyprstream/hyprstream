@@ -788,7 +788,7 @@ async fn handle_rpc(
         }
 
         RpcRequest::CloseWindow { window_id, .. } => {
-            // Collect pane IDs before the RPC removes the window from TuiState.
+            // Collect pane IDs before removing the window.
             let pane_ids: Vec<u32> = compositor.chrome.windows
                 .iter()
                 .find(|w| w.id == window_id)
@@ -797,6 +797,18 @@ async fn handle_rpc(
             // Clean up client-owned ChatApps for any private panes in this window.
             for id in &pane_ids {
                 active_apps.remove(id);
+                compositor.chrome.private_panes.remove(id);
+            }
+            // Remove the window from chrome immediately so the tab disappears
+            // and the background animation resumes without waiting for server confirmation.
+            if let Some(win_idx) = compositor.chrome.windows.iter().position(|w| w.id == window_id) {
+                compositor.chrome.windows.remove(win_idx);
+                if compositor.chrome.windows.is_empty() {
+                    compositor.chrome.active_win = 0;
+                } else {
+                    compositor.chrome.active_win =
+                        compositor.chrome.active_win.min(compositor.chrome.windows.len() - 1);
+                }
             }
             let _ = close_window_rpc(client, window_id).await;
             // Remove each pane's VT buffer from the client-side LayoutTree.
