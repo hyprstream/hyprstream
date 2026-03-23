@@ -1111,38 +1111,54 @@ impl InferenceService {
     /// Groups messages into atomic truncation units (assistant+tool_call groups
     /// are indivisible), estimates token cost per group, and drops oldest
     /// non-system groups until the total fits in `max_seq_len - reserve_tokens`.
+    ///
+    /// Returns an error if even the system prompt + the last message group
+    /// exceeds the budget — the caller should surface this to the client.
     fn truncate_messages_to_budget(
         &self,
         messages: Vec<crate::runtime::template_engine::ChatMessage>,
         reserve_tokens: usize,
-    ) -> Vec<crate::runtime::template_engine::ChatMessage> {
-        use crate::runtime::template_engine::ChatMessage;
-
+    ) -> Result<Vec<crate::runtime::template_engine::ChatMessage>> {
         let info = self.engine.read().model_info();
         let max_seq_len = info.context_length as usize;
         let budget = max_seq_len.saturating_sub(reserve_tokens);
         if budget == 0 {
-            return messages;
+            return Ok(messages);
         }
 
-        // Estimate per-message token cost (content tokens + ~6 framing tokens per message)
+        // Estimate per-message token cost
         const FRAMING_OVERHEAD: usize = 6; // <|im_start|>role\n...<|im_end|>\n
         let tokenizer = match self.engine.read().get_tokenizer() {
             Ok(t) => t,
-            Err(_) => return messages, // Can't tokenize — skip truncation
+            Err(_) => return Ok(messages), // Can't tokenize — skip truncation
         };
 
         let msg_costs: Vec<usize> = messages.iter().map(|m| {
+            // Count content tokens
             let content_tokens = m.content.as_deref()
                 .and_then(|c| tokenizer.encode(c, false).ok())
                 .map(|e| e.get_ids().len())
                 .unwrap_or(0);
-            content_tokens + FRAMING_OVERHEAD
+
+            // Count tool_calls tokens (function name + serialized arguments)
+            let tool_call_tokens = m.tool_calls.as_ref().map_or(0, |tcs| {
+                tcs.iter().map(|tc| {
+                    let call_str = format!(
+                        "{}({})", tc.function.name,
+                        serde_json::to_string(&tc.function.arguments).unwrap_or_default()
+                    );
+                    tokenizer.encode(call_str.as_str(), false).ok()
+                        .map(|e| e.get_ids().len())
+                        .unwrap_or(10) // conservative fallback
+                }).sum::<usize>()
+            });
+
+            content_tokens + tool_call_tokens + FRAMING_OVERHEAD
         }).collect();
 
         let total: usize = msg_costs.iter().sum();
         if total <= budget {
-            return messages; // Fits — no truncation needed
+            return Ok(messages); // Fits — no truncation needed
         }
 
         // Group messages into atomic truncation units.
@@ -1152,7 +1168,6 @@ impl InferenceService {
         while i < messages.len() {
             let m = &messages[i];
             if m.role == "assistant" && m.tool_calls.as_ref().map_or(false, |tc| !tc.is_empty()) {
-                // Collect tool call IDs from this assistant message
                 let tool_ids: std::collections::HashSet<&str> = m.tool_calls.as_ref().unwrap()
                     .iter().map(|tc| tc.id.as_str()).collect();
                 let mut indices = vec![i];
@@ -1177,6 +1192,20 @@ impl InferenceService {
         let has_system = messages.first().map(|m| m.role == "system").unwrap_or(false);
         let system_cost = if has_system { groups[0].0 } else { 0 };
         let start = if has_system { 1 } else { 0 };
+
+        // Check if system + last group exceeds budget
+        if groups.len() > start {
+            let last_group_cost = groups.last().map(|(c, _)| *c).unwrap_or(0);
+            if system_cost + last_group_cost > budget {
+                return Err(anyhow::anyhow!(
+                    "Input exceeds context window: system prompt (~{} tokens) + last message (~{} tokens) = ~{} tokens, \
+                     but only {} tokens available (max_seq_len={}, reserved for generation={}). \
+                     Reduce message size or use a model with a larger context window.",
+                    system_cost, last_group_cost, system_cost + last_group_cost,
+                    budget, max_seq_len, reserve_tokens
+                ));
+            }
+        }
 
         let mut kept_cost = system_cost;
         let mut keep_from = groups.len();
@@ -1207,7 +1236,7 @@ impl InferenceService {
             );
         }
 
-        kept_indices.into_iter().map(|i| messages[i].clone()).collect()
+        Ok(kept_indices.into_iter().map(|i| messages[i].clone()).collect())
     }
 
     /// Handle create LoRA
@@ -2179,8 +2208,9 @@ impl InferenceHandler for InferenceService {
 
         // Context truncation: when maxTokens is set, drop oldest non-system messages
         // so the rendered prompt fits in max_seq_len - maxTokens.
+        // Returns error if even system + last message exceeds the budget.
         let chat_messages = if let Some(reserve) = data.max_tokens {
-            self.truncate_messages_to_budget(chat_messages, reserve as usize)
+            self.truncate_messages_to_budget(chat_messages, reserve as usize)?
         } else {
             chat_messages
         };

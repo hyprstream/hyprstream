@@ -80,7 +80,8 @@ pub struct TenantDeltaConfig {
     #[serde(default = "default_target_modules")]
     pub target_modules: Vec<String>,
 
-    /// Learning rate for optimizer (default: 3e-4)
+    /// Learning rate for Muon optimizer (default: 1e-3).
+    /// Muon's Newton-Schulz amplifies effective step ~22x for rank-8 LoRA B matrices.
     #[serde(default = "default_learning_rate")]
     pub learning_rate: f64,
 
@@ -88,11 +89,14 @@ pub struct TenantDeltaConfig {
     #[serde(default = "default_max_accumulated_steps")]
     pub max_accumulated_steps: u64,
 
-    /// Weight decay factor for optimizer (default: 0.02)
+    /// Weight decay factor for Muon optimizer (default: 0.0).
+    /// Decoupled weight decay applied as `p *= (1 - lr * decay_lambda)` per step.
+    /// Keep at 0.0 for LoRA-B (zero-initialized) — decay fights learned adaptation.
     #[serde(default = "default_decay_lambda")]
     pub decay_lambda: f64,
 
-    /// Muon momentum coefficient (default: 0.95)
+    /// Muon momentum coefficient (default: 0.9).
+    /// Lower values reduce oscillation risk with higher learning rates.
     #[serde(default = "default_muon_momentum_config")]
     pub muon_momentum: f64,
 
