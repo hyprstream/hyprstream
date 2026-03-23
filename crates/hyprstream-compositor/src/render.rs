@@ -66,6 +66,7 @@ pub fn draw(frame: &mut Frame, chrome: &ShellChrome, layout: &LayoutTree) {
                     draw_input_dialog(frame, area, dialog);
                 }
             }
+        ShellMode::PreChatSettings(ref state) => draw_pre_chat_settings(frame, area, state),
         ShellMode::Normal | ShellMode::Fullscreen => {}
     }
 
@@ -486,6 +487,8 @@ fn draw_conversation_picker(frame: &mut Frame, full_area: Rect, chrome: &ShellCh
         let hint = Paragraph::new(Line::from(vec![
             Span::styled("Enter", theme::help_key()),
             Span::styled(" select  ",  theme::help_text()),
+            Span::styled("s",     theme::help_key()),
+            Span::styled(" settings  ",  theme::help_text()),
             Span::styled("d",     theme::help_key()),
             Span::styled(" delete  ",  theme::help_text()),
             Span::styled("Esc",   theme::help_key()),
@@ -1014,6 +1017,65 @@ fn draw_input_dialog(
 }
 
 // ============================================================================
+// Pre-chat settings modal
+// ============================================================================
+
+/// Pre-chat settings percentage constants (avoids constructing a dummy ShellMode).
+const PRE_CHAT_SETTINGS_PCT: (u16, u16) = (55, 45);
+
+fn draw_pre_chat_settings(
+    frame: &mut Frame,
+    full_area: Rect,
+    state: &crate::chrome::PreChatSettingsState,
+) {
+    let (pw, ph) = PRE_CHAT_SETTINGS_PCT;
+    let modal = centered_rect(pw, ph, full_area);
+
+    // Truncate long model refs to fit the modal title.
+    let max_ref_len = 40;
+    let ref_display = if state.model_ref.len() > max_ref_len {
+        format!("{}\u{2026}", &state.model_ref[..state.model_ref.char_indices()
+            .nth(max_ref_len).map_or(state.model_ref.len(), |(i, _)| i)])
+    } else {
+        state.model_ref.clone()
+    };
+    let title = format!(" Settings \u{2014} {} ", ref_display);
+
+    render_modal(frame, modal, theme::modal_block(Line::from(title)), |frame, inner| {
+        let hint_area = Rect { y: inner.y + inner.height.saturating_sub(1), height: 1, ..inner };
+        let form_area = Rect { height: inner.height.saturating_sub(2), ..inner };
+
+        state.form.render(frame, form_area);
+
+        let editing = state.form.is_editing();
+        let hint = if editing {
+            Paragraph::new(Line::from(vec![
+                Span::styled("\u{2190}\u{2192}", theme::help_key()),
+                Span::styled(" cursor  ", theme::help_text()),
+                Span::styled("Enter", theme::help_key()),
+                Span::styled(" accept  ", theme::help_text()),
+                Span::styled("Esc", theme::help_key()),
+                Span::styled(" revert", theme::help_text()),
+            ]))
+        } else {
+            Paragraph::new(Line::from(vec![
+                Span::styled("\u{2191}\u{2193}", theme::help_key()),
+                Span::styled(" select  ", theme::help_text()),
+                Span::styled("\u{2190}\u{2192}", theme::help_key()),
+                Span::styled(" adjust  ", theme::help_text()),
+                Span::styled("0-9", theme::help_key()),
+                Span::styled(" type  ", theme::help_text()),
+                Span::styled("Enter", theme::help_key()),
+                Span::styled(" confirm  ", theme::help_text()),
+                Span::styled("Esc", theme::help_key()),
+                Span::styled(" cancel", theme::help_text()),
+            ]))
+        };
+        frame.render_widget(hint.style(Style::default().bg(theme::BG_MODAL)), hint_area);
+    });
+}
+
+// ============================================================================
 // Utility
 // ============================================================================
 
@@ -1036,6 +1098,7 @@ pub(crate) fn modal_percentages(mode: &ShellMode) -> Option<(u16, u16)> {
         ShellMode::ConversationPicker { .. } => Some((55, 60)),
         ShellMode::ServiceManager { .. }  => Some((72, 60)),
         ShellMode::WorkerManager { .. }   => Some((78, 65)),
+        ShellMode::PreChatSettings(_)    => Some(PRE_CHAT_SETTINGS_PCT),
         _ => None,
     }
 }

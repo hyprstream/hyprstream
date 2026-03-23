@@ -22,9 +22,17 @@ use waxterm::input::InputParser;
 use zeroize::Zeroizing;
 
 use hyprstream_compositor::{
-    Compositor, CompositorInput, CompositorOutput, ConversationPickerEntry, ModelEntry,
-    PaneSummary, RpcRequest, ToastLevel, WindowSummary,
+    Compositor, CompositorInput, CompositorOutput, ConversationKind,
+    ConversationPickerEntry, GenerationDefaults, ModelEntry, PaneSummary, RpcRequest,
+    ToastLevel, WindowSummary,
 };
+
+/// Status update from the model polling background task.
+struct ModelStatusUpdate {
+    model_ref: String,
+    loaded: bool,
+    gen_defaults: GenerationDefaults,
+}
 use hyprstream_compositor::layout::{CellUpdate, CursorState, FrameContent, FrameUpdate, ScrollUpdate};
 use hyprstream_tui::chat_app::{ChatApp, LoadHook, SaveHook};
 use hyprstream_tui::console_app::ConsoleApp;
@@ -169,7 +177,7 @@ pub async fn handle_shell_tui(
         hyprstream_workers::runtime::WorkerClient::new(signing_key.clone(), RequestIdentity::anonymous())
     };
     let (model_status_tx, mut model_status_rx) =
-        tokio::sync::mpsc::channel::<(String, bool)>(32);
+        tokio::sync::mpsc::channel::<ModelStatusUpdate>(32);
 
     // Terminal resize channel — SIGWINCH handler → main event loop.
     let (resize_tx, mut resize_rx) = tokio::sync::mpsc::channel::<(u16, u16)>(4);
@@ -555,22 +563,7 @@ pub async fn handle_shell_tui(
                         max_context: reload_max_context,
                         kv_quant: None,
                     }).await;
-                    let poll_client = model_client.clone();
-                    let poll_mr = model_ref.clone();
-                    let tx = model_status_tx.clone();
-                    tokio::spawn(async move {
-                        for _ in 0..60u32 {
-                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                            match poll_client.status(&crate::services::generated::model_client::StatusRequest { model_ref: poll_mr.clone() }).await {
-                                Ok(entries) if entries.iter().any(|e| e.status == "loaded") => {
-                                    let _ = tx.send((poll_mr, true)).await;
-                                    return;
-                                }
-                                _ => {}
-                            }
-                        }
-                        let _ = tx.send((poll_mr, false)).await;
-                    });
+                    spawn_model_load_poll(model_client.clone(), model_ref.clone(), model_status_tx.clone());
                 }
                 // Feed dirty frames into compositor.
                 for (pane_id, ansi) in dirty_frames {
@@ -608,7 +601,14 @@ pub async fn handle_shell_tui(
                 if should_exit { break; }
             }
 
-            Some((model_ref, loaded)) = model_status_rx.recv() => {
+            Some(update) = model_status_rx.recv() => {
+                let ModelStatusUpdate { model_ref, loaded, gen_defaults } = update;
+                // Update gen_defaults on the model entry.
+                for entry in compositor.chrome.model_list.items_mut() {
+                    if entry.model_ref == model_ref {
+                        entry.gen_defaults = gen_defaults.clone();
+                    }
+                }
                 let follow_up = compositor.chrome.update_model_status(&model_ref, loaded);
                 if !loaded {
                     compositor.chrome.push_toast(
@@ -699,7 +699,7 @@ async fn dispatch_outputs(
     client: &TuiClient,
     model_client: &crate::services::generated::model_client::ModelClient,
     worker_client: &hyprstream_workers::runtime::WorkerClient,
-    model_status_tx: &tokio::sync::mpsc::Sender<(String, bool)>,
+    model_status_tx: &tokio::sync::mpsc::Sender<ModelStatusUpdate>,
     terminal: &mut ratatui::Terminal<AnsiBackend<AnsiWriter>>,
     console_app: &mut ConsoleApp,
     active_apps: &mut HashMap<u32, ActiveApp>,
@@ -758,7 +758,7 @@ async fn handle_rpc(
     client: &TuiClient,
     model_client: &crate::services::generated::model_client::ModelClient,
     worker_client: &hyprstream_workers::runtime::WorkerClient,
-    model_status_tx: &tokio::sync::mpsc::Sender<(String, bool)>,
+    model_status_tx: &tokio::sync::mpsc::Sender<ModelStatusUpdate>,
     active_apps: &mut HashMap<u32, ActiveApp>,
     next_local_id: &mut u32,
     storage_key: &StorageKey,
@@ -871,23 +871,7 @@ async fn handle_rpc(
                 max_context: None,
                 kv_quant: None,
             }).await;
-            // Spawn background polling task.
-            let poll_client = model_client.clone();
-            let poll_mr    = model_ref.clone();
-            let tx         = model_status_tx.clone();
-            tokio::spawn(async move {
-                for _ in 0..60u32 {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    match poll_client.status(&crate::services::generated::model_client::StatusRequest { model_ref: poll_mr.clone() }).await {
-                        Ok(entries) if entries.iter().any(|e| e.status == "loaded") => {
-                            let _ = tx.send((poll_mr, true)).await;
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-                let _ = tx.send((poll_mr, false)).await;
-            });
+            spawn_model_load_poll(model_client.clone(), model_ref, model_status_tx.clone());
             vec![]
         }
 
@@ -899,7 +883,7 @@ async fn handle_rpc(
             vec![]
         }
 
-        RpcRequest::LocalPrivateChat { model_ref, cols, rows, resume_uuid } => {
+        RpcRequest::LocalPrivateChat { model_ref, cols, rows, resume_uuid, gen_defaults } => {
             // Allocate a local pane ID in the high-bit range to avoid
             // collision with server-allocated IDs (which start at 1).
             let pane_id = *next_local_id;
@@ -915,9 +899,21 @@ async fn handle_rpc(
                 crate::tui::zmq_transport::make_tool_caller(signing_key);
 
             // Shared gen_config Arc — passed to both the spawner and the ChatApp.
-            let gen_config = std::sync::Arc::new(parking_lot::RwLock::new(
-                hyprstream_tui::chat_app::ChatGenConfig::default(),
-            ));
+            // Use model-specific defaults from RPC if available, otherwise fall back.
+            let chat_gen_cfg = match gen_defaults {
+                Some(gd) => {
+                    let d = hyprstream_tui::chat_app::ChatGenConfig::default();
+                    hyprstream_tui::chat_app::ChatGenConfig {
+                        max_tokens: gd.max_tokens.unwrap_or(d.max_tokens),
+                        temperature: gd.temperature.unwrap_or(d.temperature),
+                        top_p: gd.top_p.unwrap_or(d.top_p),
+                        top_k: gd.top_k.or(d.top_k),
+                        context_window: gd.context_window,
+                    }
+                }
+                None => hyprstream_tui::chat_app::ChatGenConfig::default(),
+            };
+            let gen_config = std::sync::Arc::new(parking_lot::RwLock::new(chat_gen_cfg));
 
             let storage_dir = private_store_dir();
             let app = match FsBackend::new(storage_dir) {
@@ -1044,7 +1040,7 @@ async fn handle_rpc(
                     store.list_conversations(&model_ref)
                         .into_iter()
                         .map(|meta| ConversationPickerEntry {
-                            uuid: meta.uuid.to_string(),
+                            kind: ConversationKind::Resume { uuid: meta.uuid.to_string() },
                             label: meta.label.unwrap_or_else(|| format!("Chat: {}", meta.model_ref)),
                             last_active: meta.last_active,
                         })
@@ -1424,9 +1420,13 @@ async fn fetch_models(
         tokio::time::timeout(status_timeout, model_client_for_status.status(&all_status_req)),
     );
 
-    let status_map: std::collections::HashMap<String, bool> = match status_result {
+    let status_map: std::collections::HashMap<String, (bool, GenerationDefaults)> = match status_result {
         Ok(Ok(entries)) => entries.into_iter()
-            .map(|e| (e.model_ref, e.status == "loaded"))
+            .map(|e| {
+                let loaded = e.status == "loaded";
+                let gd = wire_gen_defaults_to_compositor(&e.generation_defaults);
+                (e.model_ref, (loaded, gd))
+            })
             .collect(),
         _ => std::collections::HashMap::new(),
     };
@@ -1442,12 +1442,15 @@ async fn fetch_models(
                     let branch = if wt.branch_name.is_empty() { "main".to_owned() } else { wt.branch_name };
                     let model_ref = format!("{}:{}", name, branch);
                     let path = rmd.join(&name).join("worktrees").join(&branch);
-                    ModelEntry { model_ref, path, loaded: false, loading: false }
+                    ModelEntry { model_ref, path, loaded: false, loading: false, gen_defaults: Default::default() }
                 })
                 .collect::<Vec<_>>()
             })
             .map(|mut entry| {
-                entry.loaded = *status_map.get(&entry.model_ref).unwrap_or(&false);
+                if let Some((loaded, gd)) = status_map.get(&entry.model_ref) {
+                    entry.loaded = *loaded;
+                    entry.gen_defaults = gd.clone();
+                }
                 entry
             })
             .collect(),
@@ -1538,6 +1541,58 @@ fn tab_index_at_col(windows: &[WindowSummary], col: u16) -> Option<usize> {
 }
 
 
+
+/// Convert the wire GenerationDefaults (7 fields) to the compositor's
+/// GenerationDefaults (5 fields).
+///
+/// Intentionally dropped from the wire type:
+///   - `repeat_penalty`: not exposed in the pre-chat settings modal
+///   - `stop_tokens`: handled at the engine layer, not user-configurable
+///   - `do_sample`: inferred from temperature > 0
+///
+/// `context_window` is set to `None` because it is a load-time parameter
+/// configured via `LoadModelRequest.maxContext`, not a generation default.
+fn wire_gen_defaults_to_compositor(
+    wire: &crate::services::generated::model_client::GenerationDefaults,
+) -> GenerationDefaults {
+    GenerationDefaults {
+        temperature: wire.temperature,
+        top_p: wire.top_p,
+        top_k: wire.top_k.map(|v| v as usize),
+        max_tokens: wire.max_tokens.map(|v| v as usize),
+        context_window: None,
+    }
+}
+
+/// Spawn a background task that polls model status every 2s until loaded (or timeout).
+/// Sends a `ModelStatusUpdate` through `tx` when the model loads or after 120s timeout.
+fn spawn_model_load_poll(
+    poll_client: crate::services::generated::model_client::ModelClient,
+    model_ref: String,
+    tx: tokio::sync::mpsc::Sender<ModelStatusUpdate>,
+) {
+    tokio::spawn(async move {
+        for _ in 0..60u32 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            if let Ok(entries) = poll_client.status(
+                &crate::services::generated::model_client::StatusRequest {
+                    model_ref: model_ref.clone(),
+                },
+            ).await {
+                if let Some(entry) = entries.iter().find(|e| e.status == "loaded") {
+                    let gd = wire_gen_defaults_to_compositor(&entry.generation_defaults);
+                    let _ = tx.send(ModelStatusUpdate {
+                        model_ref, loaded: true, gen_defaults: gd,
+                    }).await;
+                    return;
+                }
+            }
+        }
+        let _ = tx.send(ModelStatusUpdate {
+            model_ref, loaded: false, gen_defaults: GenerationDefaults::default(),
+        }).await;
+    });
+}
 
 /// Derive a 32-byte AES-256 storage key from the Ed25519 signing key seed.
 ///

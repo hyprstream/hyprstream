@@ -44,6 +44,11 @@ impl<T: Display + Clone> SelectList<T> {
         self
     }
 
+    /// Read-only reference to items.
+    pub fn items(&self) -> &[T] {
+        &self.items
+    }
+
     /// Mutable reference to items, for updating status in place.
     pub fn items_mut(&mut self) -> &mut Vec<T> {
         &mut self.items

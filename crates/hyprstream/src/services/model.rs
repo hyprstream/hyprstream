@@ -77,6 +77,8 @@ pub struct LoadedModel {
     pub last_used: Instant,
     /// Online training (TTT) configuration (if enabled)
     pub ttt_config: Option<crate::training::ttt::TTTConfig>,
+    /// Generation parameter defaults from model's generation_config.json
+    pub generation_defaults: crate::config::SamplingParams,
 }
 
 /// How InferenceService instances are spawned
@@ -425,6 +427,11 @@ impl ModelService {
                 }
             });
 
+        // Load generation parameter defaults from model's generation_config.json
+        let generation_defaults = crate::config::SamplingParams::from_model_path(&model_path)
+            .await
+            .unwrap_or_default();
+
         // Check if we need to evict
         {
             let mut cache = self.loaded_models.write().await;
@@ -450,6 +457,7 @@ impl ModelService {
                     loaded_at: Instant::now(),
                     last_used: Instant::now(),
                     ttt_config,
+                    generation_defaults,
                 },
             );
         }
@@ -493,6 +501,19 @@ impl ModelService {
         }
     }
 
+    /// Convert SamplingParams to a generated GenerationDefaults wire type.
+    fn sampling_params_to_wire(params: &crate::config::SamplingParams) -> GenGenerationDefaults {
+        GenGenerationDefaults {
+            temperature: params.temperature,
+            top_p: params.top_p,
+            top_k: params.top_k.map(|v| v as u32),
+            max_tokens: params.max_tokens.map(|v| v as u32),
+            repeat_penalty: params.repeat_penalty,
+            stop_tokens: params.stop_tokens.clone().unwrap_or_default(),
+            do_sample: params.do_sample,
+        }
+    }
+
     /// Return status entries for all known models (loaded + loading).
     /// Absence from this list means unloaded.
     async fn model_status_all(&self) -> Vec<GenModelStatusEntry> {
@@ -509,6 +530,7 @@ impl ModelService {
                 online_training_config: model.ttt_config.as_ref()
                     .map(Self::ttt_config_to_wire)
                     .unwrap_or_default(),
+                generation_defaults: Self::sampling_params_to_wire(&model.generation_defaults),
             })
             .collect();
         for model_ref in pending.iter() {
@@ -520,6 +542,7 @@ impl ModelService {
                     loaded_at: 0,
                     last_used: 0,
                     online_training_config: GenOnlineTrainingConfig::default(),
+                    generation_defaults: GenGenerationDefaults::default(),
                 });
             }
         }
@@ -539,6 +562,7 @@ impl ModelService {
                 online_training_config: model.ttt_config.as_ref()
                     .map(Self::ttt_config_to_wire)
                     .unwrap_or_default(),
+                generation_defaults: Self::sampling_params_to_wire(&model.generation_defaults),
             }];
         }
         let pending = self.pending_loads.lock().await;
@@ -550,6 +574,7 @@ impl ModelService {
                 loaded_at: 0,
                 last_used: 0,
                 online_training_config: GenOnlineTrainingConfig::default(),
+                generation_defaults: GenGenerationDefaults::default(),
             }]
         } else {
             vec![]
@@ -660,6 +685,7 @@ use crate::services::generated::model_client::{
     LoadedModelResponse, ErrorInfo, ModelHealthStatus,
     StatusRequest,
     ModelStatusEntry as GenModelStatusEntry, OnlineTrainingConfig as GenOnlineTrainingConfig,
+    GenerationDefaults as GenGenerationDefaults,
     // Top-level request types
     LoadModelRequest, UnloadModelRequest,
     // TTT types (names follow inference.capnp via using-import)

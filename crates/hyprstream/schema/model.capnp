@@ -235,6 +235,18 @@ struct StatusRequest {
   modelRef @0 :Text;
 }
 
+# Generation parameter defaults from the model's generation_config.json.
+# All fields are optional — None means the model has no opinion (use server default).
+struct GenerationDefaults {
+  temperature   @0 :Opt.OptionFloat32;
+  topP          @1 :Opt.OptionFloat32;
+  topK          @2 :Opt.OptionUint32;
+  maxTokens     @3 :Opt.OptionUint32;
+  repeatPenalty @4 :Opt.OptionFloat32;
+  stopTokens    @5 :List(Text);
+  doSample      @6 :Opt.OptionBool;
+}
+
 # Status entry for a single model (loaded or loading)
 # Absence from the list means unloaded.
 struct ModelStatusEntry {
@@ -244,6 +256,7 @@ struct ModelStatusEntry {
   loadedAt   @3 :Int64;   # ms elapsed since load (0 if loading)
   lastUsed   @4 :Int64;   # ms elapsed since last use (0 if loading)
   onlineTrainingConfig @5 :OnlineTrainingConfig;
+  generationDefaults   @6 :GenerationDefaults;
 }
 
 # Online Training (Test-Time Training) configuration

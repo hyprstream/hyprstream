@@ -28,10 +28,11 @@ pub mod theme;
 
 pub use background::{BackgroundState, BackgroundStyle, ALL_STYLES, PREVIEW_H, PREVIEW_W};
 pub use chrome::{
-    ChromeOutput, ContainerEntry, ConversationPickerEntry, ImageEntry, InputDialog, InputField,
-    ModelEntry, PaneSummary, RpcRequest,
-    ServiceEntry, ServiceMode, ShellChrome, ShellMode, Toast, ToastLevel, WindowSummary,
-    WorkerEntry, WorkerTab, MENU_ITEMS, keypress_to_bytes, LOCAL_ID_BIT, is_local_id,
+    ChromeOutput, ContainerEntry, ConversationKind, ConversationPickerEntry,
+    GenerationDefaults, ImageEntry, InputDialog, InputField, ModelEntry, PaneSummary,
+    PreChatSettingsState, PreChatType, RpcRequest, ServiceEntry, ServiceMode, ShellChrome,
+    ShellMode, Toast, ToastLevel, WindowSummary, WorkerEntry, WorkerTab, MENU_ITEMS,
+    keypress_to_bytes, LOCAL_ID_BIT, is_local_id,
 };
 pub use layout::{
     CellUpdate, CursorState, FrameContent, FrameUpdate, LayoutTree, PaneId, PaneSource,
@@ -345,7 +346,8 @@ impl Compositor {
             | ShellMode::Settings
             | ShellMode::ConversationPicker { .. }
             | ShellMode::ServiceManager { .. }
-            | ShellMode::WorkerManager { .. } => {
+            | ShellMode::WorkerManager { .. }
+            | ShellMode::PreChatSettings(_) => {
                 let (pct_w, pct_h) = match modal_percentages(&self.chrome.mode) {
                     Some(p) => p,
                     None => return vec![],
@@ -475,8 +477,8 @@ mod tests {
     fn mouse_click_model_list_item() {
         use crate::render::{centered_rect, modal_percentages};
         let models = vec![
-            ModelEntry { model_ref: "a:main".into(), path: "/tmp".into(), loaded: true, loading: false },
-            ModelEntry { model_ref: "b:main".into(), path: "/tmp".into(), loaded: true, loading: false },
+            ModelEntry { model_ref: "a:main".into(), path: "/tmp".into(), loaded: true, loading: false, gen_defaults: GenerationDefaults::default() },
+            ModelEntry { model_ref: "b:main".into(), path: "/tmp".into(), loaded: true, loading: false, gen_defaults: GenerationDefaults::default() },
         ];
         let mut comp = Compositor::new(120, 40, 1, 1, vec![], models);
         comp.chrome.mode = ShellMode::ModelList;

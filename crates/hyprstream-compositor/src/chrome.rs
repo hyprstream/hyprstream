@@ -151,13 +151,32 @@ pub struct ContainerEntry {
     pub mem_mb: Option<u64>,
 }
 
-/// A model repo entry.
-#[derive(Clone)]
+/// Generation parameter defaults from the model's generation_config.json,
+/// served via the model status RPC. All fields are Option — None means
+/// "model has no opinion, use server default."
+/// Adjusting a None field via the settings UI promotes it to Some.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct GenerationDefaults {
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<usize>,
+    pub max_tokens: Option<usize>,
+    pub context_window: Option<usize>,
+}
+
+impl GenerationDefaults {
+    /// Number of user-adjustable fields in the pre-chat settings modal.
+    /// Must match the fields array in render.rs and the match arms in apply_gen_field_delta.
+    pub const NUM_FIELDS: usize = 5;
+}
+
+#[derive(Clone, Debug)]
 pub struct ModelEntry {
     pub model_ref: String,
     pub path: PathBuf,
     pub loaded: bool,
     pub loading: bool,
+    pub gen_defaults: GenerationDefaults,
 }
 
 impl std::fmt::Display for ModelEntry {
@@ -194,11 +213,21 @@ pub struct PaneSummary {
 // ShellMode
 // ============================================================================
 
+/// What kind of conversation picker entry this is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConversationKind {
+    /// Create a new private (client-owned, encrypted) conversation.
+    NewPrivate,
+    /// Create a new server-side conversation.
+    NewServer,
+    /// Resume an existing conversation by UUID.
+    Resume { uuid: String },
+}
+
 /// Entry in the conversation picker.
 #[derive(Clone, Debug)]
 pub struct ConversationPickerEntry {
-    /// UUID as string (avoids uuid dependency in compositor).
-    pub uuid: String,
+    pub kind: ConversationKind,
     pub label: String,
     pub last_active: u64,
 }
@@ -238,6 +267,52 @@ pub enum ShellMode {
         image_sel: usize,
         input_mode: Option<InputDialog>,
     },
+    /// Pre-chat generation settings before starting a new conversation.
+    PreChatSettings(Box<PreChatSettingsState>),
+}
+
+/// State for the pre-chat settings modal.
+pub struct PreChatSettingsState {
+    pub model_ref: String,
+    pub defaults: GenerationDefaults,
+    pub form: waxterm::widgets::SettingsForm,
+    pub chat_type: PreChatType,
+}
+
+/// Build a SettingsForm from GenerationDefaults.
+pub fn build_settings_form(defaults: &GenerationDefaults) -> waxterm::widgets::SettingsForm {
+    use waxterm::widgets::NumericField;
+    waxterm::widgets::SettingsForm::new(vec![
+        NumericField::new("Max Tokens").integer().range(64.0, 32768.0).step(64.0)
+            .value(defaults.max_tokens.map(|v| v as f64)).none_label("default"),
+        NumericField::new("Temperature").float(2).range(0.0, 2.0).step(0.05)
+            .value(defaults.temperature.map(|v| v as f64)).none_label("default"),
+        NumericField::new("Top-P").float(2).range(0.05, 1.0).step(0.05)
+            .value(defaults.top_p.map(|v| v as f64)).none_label("default"),
+        NumericField::new("Top-K").integer().range(1.0, 200.0).step(1.0)
+            .value(defaults.top_k.map(|v| v as f64)).none_label("off"),
+        NumericField::new("Context Window").integer().range(512.0, 131072.0).step(512.0)
+            .value(defaults.context_window.map(|v| v as f64)).none_label("model default"),
+    ])
+}
+
+/// Extract GenerationDefaults from a SettingsForm's current values.
+pub fn form_to_generation_defaults(form: &waxterm::widgets::SettingsForm) -> GenerationDefaults {
+    let vals = form.values();
+    GenerationDefaults {
+        max_tokens: vals.first().copied().flatten().map(|v| v as usize),
+        temperature: vals.get(1).copied().flatten().map(|v| v as f32),
+        top_p: vals.get(2).copied().flatten().map(|v| v as f32),
+        top_k: vals.get(3).copied().flatten().map(|v| v as usize),
+        context_window: vals.get(4).copied().flatten().map(|v| v as usize),
+    }
+}
+
+/// Whether the new conversation is private or server-side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreChatType {
+    Private,
+    Server,
 }
 
 /// Menu items: (label, chord hint shown in popup).
@@ -290,6 +365,7 @@ pub enum RpcRequest {
         cols: u16,
         rows: u16,
         pane_id: u32,
+        gen_defaults: Option<GenerationDefaults>,
     },
     /// Client-local private chat — no server round-trip required.
     /// If `resume_uuid` is Some, resumes an existing conversation.
@@ -298,6 +374,7 @@ pub enum RpcRequest {
         cols: u16,
         rows: u16,
         resume_uuid: Option<String>,
+        gen_defaults: Option<GenerationDefaults>,
     },
     /// Delete a private conversation (UUID as string).
     DeleteConversation {
@@ -575,6 +652,7 @@ impl ShellChrome {
                     }
                     self.handle_worker_manager(key, sandbox_sel, container_sel, show_containers, tab, image_sel)
                 }
+            ShellMode::PreChatSettings(_) => self.handle_pre_chat_settings(key),
         }
     }
 
@@ -889,12 +967,12 @@ impl ShellChrome {
     ) {
         let mut items = vec![
             ConversationPickerEntry {
-                uuid: "new-private".to_owned(),
+                kind: ConversationKind::NewPrivate,
                 label: "\u{1f512} New conversation \u{2014} private".to_owned(),
                 last_active: u64::MAX, // sort first
             },
             ConversationPickerEntry {
-                uuid: "new-server".to_owned(),
+                kind: ConversationKind::NewServer,
                 label: "\u{1f310} New conversation \u{2014} server".to_owned(),
                 last_active: u64::MAX - 1, // sort second
             },
@@ -912,12 +990,33 @@ impl ShellChrome {
             _ => return vec![],
         };
 
-        // 'd' — delete selected conversation (stays in picker)
+        // 's' — open pre-chat settings (only on new-conversation entries)
+        if matches!(key, KeyPress::Char(b's' | b'S')) {
+            if let Some(entry) = list.selected_item() {
+                let chat_type = match entry.kind {
+                    ConversationKind::NewPrivate => Some(PreChatType::Private),
+                    ConversationKind::NewServer  => Some(PreChatType::Server),
+                    ConversationKind::Resume { .. } => None,
+                };
+                if let Some(chat_type) = chat_type {
+                    let defaults = self.gen_defaults_for(&model_ref);
+                    let form = build_settings_form(&defaults);
+                    self.mode = ShellMode::PreChatSettings(Box::new(PreChatSettingsState {
+                        model_ref: model_ref.clone(),
+                        defaults,
+                        form,
+                        chat_type,
+                    }));
+                    return vec![ChromeOutput::Redraw];
+                }
+            }
+        }
+
+        // 'd' — delete selected conversation (only on resume entries)
         if matches!(key, KeyPress::Char(b'd' | b'D')) {
             let idx = list.selected_index();
             if let Some(entry) = list.selected_item().cloned() {
-                if entry.uuid != "new-private" && entry.uuid != "new-server" {
-                    let uuid = entry.uuid.clone();
+                if let ConversationKind::Resume { uuid } = entry.kind {
                     let mr = model_ref.clone();
                     list.items_mut().remove(idx);
                     list.clamp_selected();
@@ -939,22 +1038,89 @@ impl ShellChrome {
                 let cols = self.cols;
                 let rows = self.pane_rows;
                 self.mode = ShellMode::Normal;
-                if entry.uuid == "new-server" {
-                    vec![ChromeOutput::Rpc(RpcRequest::SpawnServerChat {
-                        session_id: self.session_id,
-                        model_ref, cols, rows, pane_id: 0,
-                    })]
-                } else {
-                    let resume = if entry.uuid == "new-private" { None } else { Some(entry.uuid) };
-                    vec![ChromeOutput::Rpc(RpcRequest::LocalPrivateChat {
-                        model_ref, cols, rows, resume_uuid: resume,
-                    })]
+                match entry.kind {
+                    ConversationKind::NewServer => {
+                        let gen_defs = self.gen_defaults_for(&model_ref);
+                        vec![ChromeOutput::Rpc(RpcRequest::SpawnServerChat {
+                            session_id: self.session_id,
+                            model_ref, cols, rows, pane_id: 0,
+                            gen_defaults: Some(gen_defs),
+                        })]
+                    }
+                    ConversationKind::NewPrivate => {
+                        let gen_defs = self.gen_defaults_for(&model_ref);
+                        vec![ChromeOutput::Rpc(RpcRequest::LocalPrivateChat {
+                            model_ref, cols, rows, resume_uuid: None,
+                            gen_defaults: Some(gen_defs),
+                        })]
+                    }
+                    ConversationKind::Resume { uuid } => {
+                        vec![ChromeOutput::Rpc(RpcRequest::LocalPrivateChat {
+                            model_ref, cols, rows, resume_uuid: Some(uuid),
+                            gen_defaults: None,
+                        })]
+                    }
                 }
             }
             WidgetResult::Pending => {
                 if matches!(key, KeyPress::Escape) {
                     self.mode = ShellMode::Normal;
                 }
+                vec![ChromeOutput::Redraw]
+            }
+        }
+    }
+
+    /// Look up generation defaults for a model from the model list.
+    fn gen_defaults_for(&self, model_ref: &str) -> GenerationDefaults {
+        self.model_list.items().iter()
+            .find(|e| e.model_ref == model_ref)
+            .map(|e| e.gen_defaults.clone())
+            .unwrap_or_default()
+    }
+
+    // ── PreChatSettings mode ───────────────────────────────────────────────
+
+    /// Handle key input in the pre-chat generation settings modal.
+    /// Delegates to the SettingsForm widget for field navigation and editing.
+    /// Escape (when not editing a field) re-emits ListConversations to rebuild the picker.
+    fn handle_pre_chat_settings(&mut self, key: KeyPress) -> Vec<ChromeOutput> {
+        let state = match &mut self.mode {
+            ShellMode::PreChatSettings(s) => s,
+            _ => return vec![],
+        };
+
+        match state.form.handle_key(&key) {
+            waxterm::widgets::WidgetResult::Confirmed(()) => {
+                let cols = self.cols;
+                let rows = self.pane_rows;
+                let mr = state.model_ref.clone();
+                let gen_defs = form_to_generation_defaults(&state.form);
+                let chat_type = state.chat_type;
+                self.mode = ShellMode::Normal;
+                match chat_type {
+                    PreChatType::Server => {
+                        vec![ChromeOutput::Rpc(RpcRequest::SpawnServerChat {
+                            session_id: self.session_id,
+                            model_ref: mr, cols, rows, pane_id: 0,
+                            gen_defaults: Some(gen_defs),
+                        })]
+                    }
+                    PreChatType::Private => {
+                        vec![ChromeOutput::Rpc(RpcRequest::LocalPrivateChat {
+                            model_ref: mr, cols, rows,
+                            resume_uuid: None,
+                            gen_defaults: Some(gen_defs),
+                        })]
+                    }
+                }
+            }
+            waxterm::widgets::WidgetResult::Cancelled => {
+                let mr = state.model_ref.clone();
+                self.mode = ShellMode::Normal;
+                vec![ChromeOutput::Rpc(RpcRequest::ListConversations { model_ref: mr })]
+            }
+            waxterm::widgets::WidgetResult::Pending => {
                 vec![ChromeOutput::Redraw]
             }
         }
@@ -1870,9 +2036,9 @@ mod tests {
 
     fn make_chrome_with_models() -> ShellChrome {
         let models = vec![
-            ModelEntry { model_ref: "loaded:main".into(), path: "/tmp".into(), loaded: true, loading: false },
-            ModelEntry { model_ref: "unloaded:main".into(), path: "/tmp".into(), loaded: false, loading: false },
-            ModelEntry { model_ref: "loading:main".into(), path: "/tmp".into(), loaded: false, loading: true },
+            ModelEntry { model_ref: "loaded:main".into(), path: "/tmp".into(), loaded: true, loading: false, gen_defaults: GenerationDefaults::default() },
+            ModelEntry { model_ref: "unloaded:main".into(), path: "/tmp".into(), loaded: false, loading: false, gen_defaults: GenerationDefaults::default() },
+            ModelEntry { model_ref: "loading:main".into(), path: "/tmp".into(), loaded: false, loading: true, gen_defaults: GenerationDefaults::default() },
         ];
         ShellChrome::new(120, 40, 1, 1, vec![], models)
     }
