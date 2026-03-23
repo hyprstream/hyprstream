@@ -244,6 +244,8 @@ struct ChatTemplateRequest {
   messages @0 :List(ChatMessage);
   addGenerationPrompt @1 :Bool;
   toolsJson @2 :Text $optional;  # JSON-serialized tools array (empty string = no tools)
+  maxTokens @3 :Opt.OptionUint32
+      $paramDescription("Tokens reserved for generation. When set, oldest non-system messages are truncated so the rendered prompt fits in max_seq_len - maxTokens.");
 }
 
 # Tool call function details

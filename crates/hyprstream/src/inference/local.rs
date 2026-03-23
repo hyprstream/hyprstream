@@ -133,11 +133,12 @@ impl LocalInferenceService {
         let model_info = engine.model_info();
         let num_layers = model_info.num_hidden_layers.unwrap_or(32) as usize;
         let max_seq_len = config.max_context.unwrap_or(model_info.context_length) as usize;
+        let kv_budget = engine.compute_kv_budget();
         engine.initialize_kv_registry(
             num_layers,
             max_seq_len,
             config.kv_quant_type,
-            None, // No memory budget limit for now
+            kv_budget,
         );
         info!(
             "KV cache registry initialized: {} layers, max_seq_len={}",

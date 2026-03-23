@@ -494,7 +494,8 @@ impl InferenceService {
         let model_info = RuntimeEngine::model_info(&engine);
         let num_layers = model_info.num_hidden_layers.unwrap_or(32) as usize;
         let max_seq_len = config.max_context.unwrap_or(model_info.context_length) as usize;
-        engine.initialize_kv_registry(num_layers, max_seq_len, config.kv_quant_type, None);
+        let kv_budget = engine.compute_kv_budget();
+        engine.initialize_kv_registry(num_layers, max_seq_len, config.kv_quant_type, kv_budget);
 
         info!(
             "KV cache registry initialized: {} layers, max_seq_len={}",
@@ -1105,6 +1106,140 @@ impl InferenceService {
             .apply_chat_template(&messages, add_generation_prompt, tools)
     }
 
+    /// Truncate messages to fit within the context budget.
+    ///
+    /// Groups messages into atomic truncation units (assistant+tool_call groups
+    /// are indivisible), estimates token cost per group, and drops oldest
+    /// non-system groups until the total fits in `max_seq_len - reserve_tokens`.
+    ///
+    /// Returns an error if even the system prompt + the last message group
+    /// exceeds the budget — the caller should surface this to the client.
+    fn truncate_messages_to_budget(
+        &self,
+        messages: Vec<crate::runtime::template_engine::ChatMessage>,
+        reserve_tokens: usize,
+    ) -> Result<Vec<crate::runtime::template_engine::ChatMessage>> {
+        let info = self.engine.read().model_info();
+        let max_seq_len = info.context_length as usize;
+        let budget = max_seq_len.saturating_sub(reserve_tokens);
+        if budget == 0 {
+            return Ok(messages);
+        }
+
+        // Estimate per-message token cost
+        const FRAMING_OVERHEAD: usize = 6; // <|im_start|>role\n...<|im_end|>\n
+        let tokenizer = match self.engine.read().get_tokenizer() {
+            Ok(t) => t,
+            Err(_) => return Ok(messages), // Can't tokenize — skip truncation
+        };
+
+        let msg_costs: Vec<usize> = messages.iter().map(|m| {
+            // Count content tokens
+            let content_tokens = m.content.as_deref()
+                .and_then(|c| tokenizer.encode(c, false).ok())
+                .map(|e| e.get_ids().len())
+                .unwrap_or(0);
+
+            // Count tool_calls tokens (function name + serialized arguments)
+            let tool_call_tokens = m.tool_calls.as_ref().map_or(0, |tcs| {
+                tcs.iter().map(|tc| {
+                    let call_str = format!(
+                        "{}({})", tc.function.name,
+                        serde_json::to_string(&tc.function.arguments).unwrap_or_default()
+                    );
+                    tokenizer.encode(call_str.as_str(), false).ok()
+                        .map(|e| e.get_ids().len())
+                        .unwrap_or(10) // conservative fallback
+                }).sum::<usize>()
+            });
+
+            content_tokens + tool_call_tokens + FRAMING_OVERHEAD
+        }).collect();
+
+        let total: usize = msg_costs.iter().sum();
+        if total <= budget {
+            return Ok(messages); // Fits — no truncation needed
+        }
+
+        // Group messages into atomic truncation units.
+        // An assistant with tool_calls + its matching tool responses = one group.
+        let mut groups: Vec<(usize, Vec<usize>)> = Vec::new(); // (group_cost, message_indices)
+        let mut i = 0;
+        while i < messages.len() {
+            let m = &messages[i];
+            if m.role == "assistant" && m.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty()) {
+                let tool_ids: std::collections::HashSet<&str> = m.tool_calls.as_deref()
+                    .unwrap_or_default()
+                    .iter().map(|tc| tc.id.as_str()).collect();
+                let mut indices = vec![i];
+                let mut cost = msg_costs[i];
+                let mut j = i + 1;
+                while j < messages.len() && messages[j].role == "tool"
+                    && messages[j].tool_call_id.as_deref()
+                        .is_some_and(|id| tool_ids.contains(id)) {
+                    indices.push(j);
+                    cost += msg_costs[j];
+                    j += 1;
+                }
+                groups.push((cost, indices));
+                i = j;
+            } else {
+                groups.push((msg_costs[i], vec![i]));
+                i += 1;
+            }
+        }
+
+        // Find cutoff: keep system groups + as many recent groups as fit
+        let has_system = messages.first().map(|m| m.role == "system").unwrap_or(false);
+        let system_cost = if has_system { groups[0].0 } else { 0 };
+        let start = if has_system { 1 } else { 0 };
+
+        // Check if system + last group exceeds budget
+        if groups.len() > start {
+            let last_group_cost = groups.last().map(|(c, _)| *c).unwrap_or(0);
+            if system_cost + last_group_cost > budget {
+                return Err(anyhow::anyhow!(
+                    "Input exceeds context window: system prompt (~{} tokens) + last message (~{} tokens) = ~{} tokens, \
+                     but only {} tokens available (max_seq_len={}, reserved for generation={}). \
+                     Reduce message size or use a model with a larger context window.",
+                    system_cost, last_group_cost, system_cost + last_group_cost,
+                    budget, max_seq_len, reserve_tokens
+                ));
+            }
+        }
+
+        let mut kept_cost = system_cost;
+        let mut keep_from = groups.len();
+        for i in (start..groups.len()).rev() {
+            if kept_cost + groups[i].0 <= budget {
+                kept_cost += groups[i].0;
+                keep_from = i;
+            } else {
+                break;
+            }
+        }
+
+        // Build truncated message list
+        let mut kept_indices: Vec<usize> = Vec::new();
+        if has_system {
+            kept_indices.extend(&groups[0].1);
+        }
+        for g in &groups[keep_from..] {
+            kept_indices.extend(&g.1);
+        }
+        kept_indices.sort();
+
+        let dropped = messages.len() - kept_indices.len();
+        if dropped > 0 {
+            tracing::info!(
+                "Context truncation: dropped {} messages ({} → ~{} tokens, budget: {}, max_seq_len: {}, reserve: {})",
+                dropped, total, kept_cost, budget, max_seq_len, reserve_tokens
+            );
+        }
+
+        Ok(kept_indices.into_iter().map(|i| messages[i].clone()).collect())
+    }
+
     /// Handle create LoRA
     async fn handle_create_lora(&self, config: TenantDeltaConfig) -> Result<()> {
         // Propagate target modules to the delta pool so new deltas
@@ -1142,8 +1277,8 @@ impl InferenceService {
 
         let expiry_secs = ctx.claims()
             .map(|c| c.exp - chrono::Utc::now().timestamp())
-            .unwrap_or(300)
-            .max(60);
+            .unwrap_or(600)
+            .max(600);
         let claims = ctx.claims().cloned();
 
         let stream_ctx = stream_channel.prepare_stream_with_claims(client_pub_bytes, expiry_secs, claims).await?;
@@ -1990,8 +2125,8 @@ impl InferenceHandler for InferenceService {
         // Calculate expiry from claims
         let expiry_secs = ctx.claims()
             .map(|c| c.exp - chrono::Utc::now().timestamp())
-            .unwrap_or(300)
-            .max(60);
+            .unwrap_or(600)
+            .max(600);
 
         let client_ephemeral_pubkey = ctx.ephemeral_pubkey();
         let claims = ctx.claims().cloned();
@@ -2053,7 +2188,11 @@ impl InferenceHandler for InferenceService {
                 let tool_calls = if m.tool_calls.is_empty() {
                     None
                 } else {
-                    Some(m.tool_calls.clone())
+                    // Convert RPC ToolCall (arguments: String) to TemplateToolCall
+                    // (arguments: Value) so templates can iterate with |items.
+                    Some(m.tool_calls.iter()
+                        .map(crate::runtime::template_engine::TemplatToolCall::from)
+                        .collect())
                 };
                 crate::runtime::template_engine::ChatMessage {
                     role: m.role.clone(),
@@ -2067,6 +2206,16 @@ impl InferenceHandler for InferenceService {
         let tools: Option<serde_json::Value> = data.tools_json.as_deref()
             .filter(|s| !s.is_empty())
             .and_then(|s| serde_json::from_str(s).ok());
+
+        // Context truncation: when maxTokens is set, drop oldest non-system messages
+        // so the rendered prompt fits in max_seq_len - maxTokens.
+        // Returns error if even system + last message exceeds the budget.
+        let chat_messages = if let Some(reserve) = data.max_tokens {
+            self.truncate_messages_to_budget(chat_messages, reserve as usize)?
+        } else {
+            chat_messages
+        };
+
         let result = InferenceService::handle_apply_chat_template(
             self, chat_messages, data.add_generation_prompt, tools.as_ref(),
         ).await?;
@@ -2177,8 +2326,8 @@ impl InferenceHandler for InferenceService {
 
         let expiry_secs = ctx.claims()
             .map(|c| c.exp - chrono::Utc::now().timestamp())
-            .unwrap_or(300)
-            .max(60);
+            .unwrap_or(600)
+            .max(600);
         let claims = ctx.claims().cloned();
 
         let stream_ctx = stream_channel.prepare_stream_with_claims(client_pub_bytes, expiry_secs, claims).await?;

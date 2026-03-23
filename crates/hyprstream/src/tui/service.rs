@@ -1030,10 +1030,11 @@ impl TuiService {
                 .map(|path| {
                     let arch = crate::runtime::model_config::ModelConfig::detect_architecture(&path);
                     match crate::api::tools::ToolCallFormat::from_architecture(&arch) {
-                        crate::api::tools::ToolCallFormat::Qwen3Xml    => hyprstream_tui::chat_app::ToolCallFormat::Qwen3Xml,
-                        crate::api::tools::ToolCallFormat::LlamaJson   => hyprstream_tui::chat_app::ToolCallFormat::LlamaJson,
-                        crate::api::tools::ToolCallFormat::MistralJson => hyprstream_tui::chat_app::ToolCallFormat::MistralJson,
-                        crate::api::tools::ToolCallFormat::None        => hyprstream_tui::chat_app::ToolCallFormat::None,
+                        crate::api::tools::ToolCallFormat::Qwen3Xml      => hyprstream_tui::chat_app::ToolCallFormat::Qwen3Xml,
+                        crate::api::tools::ToolCallFormat::Qwen35XmlParam => hyprstream_tui::chat_app::ToolCallFormat::Qwen35XmlParam,
+                        crate::api::tools::ToolCallFormat::LlamaJson     => hyprstream_tui::chat_app::ToolCallFormat::LlamaJson,
+                        crate::api::tools::ToolCallFormat::MistralJson   => hyprstream_tui::chat_app::ToolCallFormat::MistralJson,
+                        crate::api::tools::ToolCallFormat::None          => hyprstream_tui::chat_app::ToolCallFormat::None,
                     }
                 })
                 .unwrap_or(hyprstream_tui::chat_app::ToolCallFormat::Qwen3Xml),

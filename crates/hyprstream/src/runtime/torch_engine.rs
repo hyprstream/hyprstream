@@ -137,6 +137,45 @@ impl TorchEngine {
         );
     }
 
+    /// Compute a KV cache memory budget based on model size and available GPU memory.
+    ///
+    /// Uses `HYPRSTREAM_KV_BUDGET_MB` env var if set, otherwise estimates:
+    /// GPU total (from common card sizes) minus model weights, times 0.7.
+    /// Returns None on CPU (no budget needed).
+    pub fn compute_kv_budget(&self) -> Option<usize> {
+        if self.device == Device::Cpu {
+            return None;
+        }
+
+        // Check for explicit override
+        if let Ok(mb_str) = std::env::var("HYPRSTREAM_KV_BUDGET_MB") {
+            if let Ok(mb) = mb_str.parse::<usize>() {
+                tracing::info!("KV cache budget from HYPRSTREAM_KV_BUDGET_MB: {} MB", mb);
+                return Some(mb * 1024 * 1024);
+            }
+        }
+
+        let model_bytes = self.model_memory_usage();
+
+        // Estimate total GPU memory from common card sizes.
+        // Without cudaMemGetInfo FFI, we use a conservative heuristic:
+        // assume the GPU has enough memory to hold the model + some headroom.
+        // We estimate total VRAM as model_bytes * 1.75 (model is typically ~55-60% of VRAM).
+        // This is conservative — on larger GPUs it underestimates, leaving more headroom.
+        let estimated_total = model_bytes * 7 / 4; // 1.75x model size
+        let remaining = estimated_total.saturating_sub(model_bytes);
+        let budget = remaining * 7 / 10; // 70% of remaining
+
+        tracing::info!(
+            "KV cache budget: {} MB (estimated from {} MB model weights, ~{} MB total VRAM)",
+            budget / (1024 * 1024),
+            model_bytes / (1024 * 1024),
+            estimated_total / (1024 * 1024),
+        );
+
+        Some(budget)
+    }
+
     /// Get the KV cache registry (for external access)
     pub fn kv_registry(&self) -> Option<Arc<crate::runtime::kv_cache::KVCacheRegistry>> {
         self.kv_cache_registry.clone()
@@ -211,6 +250,33 @@ impl TorchEngine {
         if let Some(registry) = &self.kv_cache_registry {
             registry.evict_to_budget();
         }
+    }
+
+    /// Swap the active session's KV cache into the model.
+    ///
+    /// If an active session owner is set and the registry is initialized,
+    /// retrieves (or creates) the session's cache from the registry and
+    /// installs it in the model via `set_kv_cache()`. Returns true if
+    /// a session cache was swapped in.
+    pub fn swap_session_cache(&self) -> bool {
+        let owner = match self.active_cache_owner.lock().clone() {
+            Some(o) => o,
+            None => return false,
+        };
+        let registry = match &self.kv_cache_registry {
+            Some(r) => r,
+            None => return false,
+        };
+        let model_arc = match &self.persistent_model {
+            Some(m) => m,
+            None => return false,
+        };
+
+        let session_cache = registry.get_or_create(owner);
+        let mut model = model_arc.lock();
+        model.set_kv_cache(session_cache);
+        tracing::debug!("Swapped session KV cache into model");
+        true
     }
 
     /// Estimate model memory usage in bytes.
@@ -792,7 +858,6 @@ impl TorchEngine {
         &self,
         input_ids: &[i64],
         start_pos: usize,
-        use_cache: bool,
     ) -> Result<Tensor> {
         // Use the persistent model instance
         let model_arc = self
@@ -804,14 +869,12 @@ impl TorchEngine {
             return Err(anyhow!("Model not properly initialized"));
         }
 
-        // For KV cached generation, only process new tokens after initial prompt
-        let tokens_to_process = if use_cache && start_pos > 0 {
-            // Only process the last token (the newly generated one)
-            &input_ids[input_ids.len() - 1..]
-        } else {
-            // Process all tokens (initial prompt or no caching)
-            input_ids
-        };
+        // Process all provided tokens. The caller is responsible for passing
+        // only the tokens that need processing:
+        // - Decode mode: caller passes &[last_token] (single token)
+        // - Partial prefill: caller passes &prompt_tokens[prefix_len..] (new suffix)
+        // - Full prefill: caller passes &prompt_tokens (all tokens)
+        let tokens_to_process = input_ids;
 
         // Convert to tensor
         let input_tensor = Tensor::from_slice(tokens_to_process)
@@ -847,7 +910,6 @@ impl TorchEngine {
         &self,
         input_ids: &[i64],
         start_pos: usize,
-        use_cache: bool,
         delta: Option<&crate::training::TenantDelta>,
     ) -> Result<Tensor> {
         let model_arc = self
@@ -859,13 +921,8 @@ impl TorchEngine {
             return Err(anyhow!("Model not properly initialized"));
         }
 
-        let tokens_to_process = if use_cache && start_pos > 0 {
-            &input_ids[input_ids.len() - 1..]
-        } else {
-            input_ids
-        };
-
-        let input_tensor = Tensor::from_slice(tokens_to_process)
+        // Process all provided tokens — caller passes the appropriate slice
+        let input_tensor = Tensor::from_slice(input_ids)
             .to_kind(tch::Kind::Int64)
             .to_device(self.device)
             .unsqueeze(0);
@@ -1914,6 +1971,8 @@ pub struct TextStream<'a> {
     >,
 
     prompt_len: usize,
+    /// Position from which prefill should start (0 = full prefill, >0 = partial via prefix cache hit)
+    prefill_start_pos: usize,
     /// KV cache position tracking for this stream
     /// Each stream has exclusive access via &mut self, so no atomic needed
     kv_cache_position: usize,
@@ -1990,7 +2049,55 @@ impl<'a> TextStream<'a> {
             })
             .collect();
 
-        engine.clear_kv_cache();
+        // Evict LRU session caches if memory budget is exceeded.
+        // This must happen before allocating/swapping in a new cache.
+        engine.evict_session_caches();
+
+        // Session cache management with prefix detection:
+        // If an active session exists, swap its KV cache into the model and check
+        // if the new prompt shares a prefix with the cached tokens. This avoids
+        // re-computing attention for unchanged conversation history.
+        let prefill_start_pos = if engine.swap_session_cache() {
+            // Session cache swapped in — check for prefix match
+            let prefix_len = if let Some(model_arc) = &engine.persistent_model {
+                let model = model_arc.lock();
+                if let Some(cache) = model.get_kv_cache() {
+                    let cache_guard = cache.lock();
+                    let matched = cache_guard.prefix_match_len(&prompt_tokens);
+                    if matched > 0 {
+                        tracing::info!(
+                            "Prefix cache hit: {} of {} tokens reusable (skipping {:.0}% of prefill)",
+                            matched, prompt_len,
+                            (matched as f64 / prompt_len as f64) * 100.0
+                        );
+                    }
+                    matched
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+
+            if prefix_len > 0 && prefix_len <= prompt_len {
+                // Truncate cache to the matched prefix (discard stale suffix from prior turn)
+                if let Some(model_arc) = &engine.persistent_model {
+                    let model = model_arc.lock();
+                    if let Some(cache) = model.get_kv_cache() {
+                        let cache_guard = cache.lock();
+                        cache_guard.truncate_to(prefix_len);
+                    }
+                }
+                prefix_len
+            } else {
+                // No match — clear and start fresh
+                engine.clear_kv_cache();
+                0
+            }
+        } else {
+            engine.clear_kv_cache();
+            0
+        };
 
         let repeat_last_n = request.repeat_last_n.map(|v| v as usize).filter(|&v| v > 0).unwrap_or(64);
 
@@ -2060,6 +2167,7 @@ impl<'a> TextStream<'a> {
             tokenizer: tokenizer_arc,
             decode_stream,
             prompt_len,
+            prefill_start_pos,
             // KV cache starts with prompt already in it after first forward
             kv_cache_position: prompt_len,
             tokens_generated: 0,
@@ -2148,6 +2256,27 @@ impl<'a> TextStream<'a> {
     ///
     /// Uses exponential moving average with alpha=0.3 to smooth rate measurements.
     /// This handles initial acceleration gracefully without needing warmup hacks.
+    /// Save the current token sequence (prompt + generated) to the session KV cache.
+    ///
+    /// Called when generation finishes so the next turn can detect prefix overlap.
+    fn save_cached_tokens(&self) {
+        if let Some(model_arc) = &self.engine.persistent_model {
+            let model = model_arc.lock();
+            if let Some(cache) = model.get_kv_cache() {
+                let mut cache_guard = cache.lock();
+                // Save the prompt token IDs for prefix matching on the next turn.
+                // We only save the prompt (not generated tokens) because the next turn's
+                // prompt will include the assistant's response via the chat template —
+                // so the entire current prompt becomes a prefix of the next turn's prompt.
+                cache_guard.set_cached_tokens(self.prompt_tokens.clone());
+                tracing::debug!(
+                    "Saved {} cached tokens for prefix matching on next turn",
+                    cache_guard.cached_token_count()
+                );
+            }
+        }
+    }
+
     fn update_ema_rate(&mut self) {
         let now = std::time::Instant::now();
 
@@ -2173,7 +2302,11 @@ impl<'a> TextStream<'a> {
     fn sample_next_token(&mut self) -> Result<u32> {
         // Determine KV position for this forward pass
         let current_kv_pos = if self.tokens_generated == 0 {
-            0 // Initial position is 0
+            if self.prefill_start_pos > 0 {
+                self.prefill_start_pos // Resume from prefix cache hit
+            } else {
+                0 // Full prefill from start
+            }
         } else {
             self.kv_cache_position
         };
@@ -2182,13 +2315,37 @@ impl<'a> TextStream<'a> {
         let delta_guard = self.delta.as_ref().map(|d| d.lock());
 
         let logits = if self.tokens_generated == 0 {
-            // PREFILL: Process full prompt and capture timing
+            // PREFILL: Process prompt (full or partial based on prefix cache hit)
             let prefill_start = std::time::Instant::now();
-            let result = if delta_guard.is_some() {
-                let delta_ref = delta_guard.as_deref();
-                self.engine.forward_with_delta_full(&self.prompt_tokens, delta_ref)?
+
+            let result = if self.prefill_start_pos > 0 && self.prefill_start_pos < self.prompt_tokens.len() {
+                // PARTIAL PREFILL: prefix is cached, only forward new tokens
+                let new_tokens = &self.prompt_tokens[self.prefill_start_pos..];
+                tracing::info!(
+                    "Partial prefill: processing {} new tokens (skipped {} cached)",
+                    new_tokens.len(), self.prefill_start_pos
+                );
+                if delta_guard.is_some() {
+                    let delta_ref = delta_guard.as_deref();
+                    self.engine.forward_with_delta_cached(
+                        new_tokens,
+                        self.prefill_start_pos,
+                        delta_ref,
+                    )?
+                } else {
+                    self.engine.forward_cached(
+                        new_tokens,
+                        self.prefill_start_pos,
+                    )?
+                }
             } else {
-                self.engine.forward(&self.prompt_tokens)?
+                // FULL PREFILL: no prefix cache hit
+                if delta_guard.is_some() {
+                    let delta_ref = delta_guard.as_deref();
+                    self.engine.forward_with_delta_full(&self.prompt_tokens, delta_ref)?
+                } else {
+                    self.engine.forward(&self.prompt_tokens)?
+                }
             };
             let prefill_elapsed = prefill_start.elapsed();
 
@@ -2196,14 +2353,24 @@ impl<'a> TextStream<'a> {
             self.prefill_time_ms = Some(prefill_elapsed.as_millis() as u64);
             self.first_token_time = Some(std::time::Instant::now());
 
+            let prefill_token_count = if self.prefill_start_pos > 0 {
+                self.prompt_tokens.len() - self.prefill_start_pos
+            } else {
+                self.prompt_tokens.len()
+            };
             tracing::info!(
-                "📊 PREFILL: {} tokens in {:?} ({:.2} tok/sec){}",
-                self.prompt_tokens.len(),
+                "PREFILL: {} tokens in {:?} ({:.2} tok/sec){}{}",
+                prefill_token_count,
                 prefill_elapsed,
                 if prefill_elapsed.as_secs_f32() > 0.0 {
-                    self.prompt_tokens.len() as f32 / prefill_elapsed.as_secs_f32()
+                    prefill_token_count as f32 / prefill_elapsed.as_secs_f32()
                 } else {
                     0.0
+                },
+                if self.prefill_start_pos > 0 {
+                    format!(" [prefix cached: {} tokens]", self.prefill_start_pos)
+                } else {
+                    String::new()
                 },
                 if delta_guard.is_some() { " [delta-aware]" } else { "" }
             );
@@ -2227,14 +2394,12 @@ impl<'a> TextStream<'a> {
                 self.engine.forward_with_delta_cached(
                     &[last_token],
                     current_kv_pos,
-                    true,
                     delta_ref,
                 )?
             } else {
                 self.engine.forward_cached(
                     &[last_token],
                     current_kv_pos,
-                    true,
                 )?
             }
         };
@@ -2507,5 +2672,13 @@ impl<'a> Stream for TextStream<'a> {
                 }
             }
         }
+    }
+}
+
+impl<'a> Drop for TextStream<'a> {
+    fn drop(&mut self) {
+        // Save token IDs to the session cache for prefix matching on the next turn.
+        // This runs on all exit paths (EOS, stop token, max tokens, timeout, error).
+        self.save_cached_tokens();
     }
 }
