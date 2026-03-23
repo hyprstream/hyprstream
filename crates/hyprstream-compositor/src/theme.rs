@@ -1,7 +1,7 @@
 //! Color constants and reusable styles for hyprstream TUI applications.
 
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders};
 
 // ── Palette ──
@@ -17,6 +17,13 @@ pub const LOCK_COLOR: Color = Color::Rgb(136, 170, 255);
 
 // ── Block factories ──
 
+/// Width of the close button " x " rendered in block titlebars (including padding).
+pub const CLOSE_BUTTON_WIDTH: u16 = 3;
+
+fn close_button() -> Line<'static> {
+    Line::from(Span::styled(" x ", Style::default().fg(DIM))).right_aligned()
+}
+
 /// Rounded border block for pane windows, with focus-sensitive border color.
 pub fn window_block(title: Line<'_>, focused: bool) -> Block<'_> {
     Block::new()
@@ -24,6 +31,7 @@ pub fn window_block(title: Line<'_>, focused: bool) -> Block<'_> {
         .border_type(BorderType::Rounded)
         .border_style(if focused { border_focused_style() } else { border_style() })
         .title(title)
+        .title_top(close_button())
         .style(Style::default().bg(BG))
 }
 
@@ -34,6 +42,7 @@ pub fn modal_block(title: Line<'_>) -> Block<'_> {
         .border_type(BorderType::Rounded)
         .border_style(border_focused_style())
         .title(title)
+        .title_top(close_button())
         .style(Style::default().bg(BG_MODAL))
 }
 

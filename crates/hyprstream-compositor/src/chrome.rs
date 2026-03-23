@@ -241,12 +241,31 @@ pub enum ShellMode {
 }
 
 /// Menu items: (label, chord hint shown in popup).
+#[cfg(feature = "experimental")]
 pub const MENU_ITEMS: &[(&str, &str)] = &[
     ("New",        "N"),
     ("Close",      "Q"),
     ("Cycle",      "Tab"),
     ("Models",     "M"),
+    ("Log",        "L"),
+    ("Workers",    "W"),
+    ("Services",   "V"),
     ("Settings",   "S"),
+    ("Fullscreen", "F"),
+    ("Disconnect", "D"),
+];
+
+/// Menu items: (label, chord hint shown in popup).
+#[cfg(not(feature = "experimental"))]
+pub const MENU_ITEMS: &[(&str, &str)] = &[
+    ("New",        "N"),
+    ("Close",      "Q"),
+    ("Cycle",      "Tab"),
+    ("Models",     "M"),
+    ("Log",        "L"),
+    ("Workers",    "W"),
+    ("Settings",   "S"),
+    ("Fullscreen", "F"),
     ("Disconnect", "D"),
 ];
 
@@ -541,40 +560,6 @@ impl ShellChrome {
 
     fn handle_normal(&mut self, key: KeyPress) -> Vec<ChromeOutput> {
         match key {
-            KeyPress::F(12) => vec![ChromeOutput::Rpc(RpcRequest::Quit)],
-            KeyPress::F(9) => {
-                self.console_scroll = self.console_log.len().saturating_sub(1);
-                self.mode = ShellMode::Console;
-                vec![ChromeOutput::Redraw]
-            }
-            KeyPress::F(10) => {
-                self.mode = ShellMode::ModelList;
-                vec![ChromeOutput::Redraw]
-            }
-            KeyPress::F(11) => {
-                self.saved_style = self.bg.style;
-                let idx = ALL_STYLES.iter().position(|s| *s == self.bg.style).unwrap_or(0);
-                self.settings_list = SelectList::new("Background", ALL_STYLES.to_vec())
-                    .with_selected(idx);
-                self.preview_bg.style = self.bg.style;
-                self.mode = ShellMode::Settings;
-                vec![ChromeOutput::Redraw]
-            }
-            KeyPress::F(7) => {
-                let sid = self.session_id;
-                vec![ChromeOutput::Rpc(RpcRequest::CreateWindow { session_id: sid })]
-            }
-            KeyPress::F(8) => {
-                if let Some(win) = self.windows.get(self.active_win) {
-                    let sid = self.session_id;
-                    let wid = win.id;
-                    return vec![ChromeOutput::Rpc(RpcRequest::CloseWindow {
-                        session_id: sid,
-                        window_id: wid,
-                    })];
-                }
-                vec![]
-            }
             KeyPress::CtrlSpace => {
                 self.mode = ShellMode::StartMenu { selected: 0 };
                 vec![ChromeOutput::Redraw]
@@ -587,18 +572,6 @@ impl ShellChrome {
             KeyPress::Char(0x02) => {
                 // Ctrl-B — handled at event loop level; chrome does nothing.
                 vec![]
-            }
-            #[cfg(feature = "experimental")]
-            KeyPress::F(5) => {
-                self.mode = ShellMode::ServiceManager { selected: 0 };
-                vec![ChromeOutput::Redraw]
-            }
-            KeyPress::F(6) => {
-                self.mode = ShellMode::WorkerManager {
-                    sandbox_sel: 0, container_sel: 0, show_containers: false,
-                    tab: WorkerTab::Sandboxes, image_sel: 0, input_mode: None,
-                };
-                vec![ChromeOutput::Redraw]
             }
             key => {
                 let bytes = keypress_to_bytes(key);
@@ -704,9 +677,6 @@ impl ShellChrome {
                 })]
             }
             WidgetResult::Pending => {
-                if matches!(key, KeyPress::F(10)) {
-                    self.mode = ShellMode::Normal;
-                }
                 vec![ChromeOutput::Redraw]
             }
         }
@@ -717,12 +687,26 @@ impl ShellChrome {
     fn handle_start_menu(&mut self, key: KeyPress, selected: usize) -> Vec<ChromeOutput> {
         let n = MENU_ITEMS.len();
         let chord: Option<usize> = match key {
-            KeyPress::Char(b'n' | b'N') => Some(0),
-            KeyPress::Char(b'q' | b'Q') => Some(1),
-            KeyPress::Tab               => Some(2),
-            KeyPress::Char(b'm' | b'M') => Some(3),
-            KeyPress::Char(b's' | b'S') => Some(4),
-            KeyPress::Char(b'd' | b'D') => Some(5),
+            KeyPress::Char(b'n' | b'N') => Some(0),  // New
+            KeyPress::Char(b'q' | b'Q') => Some(1),  // Close
+            KeyPress::Tab               => Some(2),   // Cycle
+            KeyPress::Char(b'm' | b'M') => Some(3),  // Models
+            KeyPress::Char(b'l' | b'L') => Some(4),  // Log
+            KeyPress::Char(b'w' | b'W') => Some(5),  // Workers
+            #[cfg(feature = "experimental")]
+            KeyPress::Char(b'v' | b'V') => Some(6),  // Services
+            KeyPress::Char(b's' | b'S') => {
+                #[cfg(feature = "experimental")]     { Some(7) }
+                #[cfg(not(feature = "experimental"))] { Some(6) }
+            }
+            KeyPress::Char(b'f' | b'F') => {
+                #[cfg(feature = "experimental")]     { Some(8) }
+                #[cfg(not(feature = "experimental"))] { Some(7) }
+            }
+            KeyPress::Char(b'd' | b'D') => {
+                #[cfg(feature = "experimental")]     { Some(9) }
+                #[cfg(not(feature = "experimental"))] { Some(8) }
+            }
             _ => None,
         };
         if let Some(idx) = chord {
@@ -752,6 +736,23 @@ impl ShellChrome {
 
     fn execute_menu_action(&mut self, idx: usize) -> Vec<ChromeOutput> {
         let sid = self.session_id;
+
+        // Indices for items that shift when "Services" is present (experimental).
+        #[cfg(feature = "experimental")]
+        const SERVICES_IDX: usize = 6;
+        #[cfg(feature = "experimental")]
+        const SETTINGS_IDX: usize = 7;
+        #[cfg(not(feature = "experimental"))]
+        const SETTINGS_IDX: usize = 6;
+        #[cfg(feature = "experimental")]
+        const FULLSCREEN_IDX: usize = 8;
+        #[cfg(not(feature = "experimental"))]
+        const FULLSCREEN_IDX: usize = 7;
+        #[cfg(feature = "experimental")]
+        const DISCONNECT_IDX: usize = 9;
+        #[cfg(not(feature = "experimental"))]
+        const DISCONNECT_IDX: usize = 8;
+
         match idx {
             0 => vec![ChromeOutput::Rpc(RpcRequest::CreateWindow { session_id: sid })],
             1 => {
@@ -783,6 +784,25 @@ impl ShellChrome {
                 vec![ChromeOutput::Redraw]
             }
             4 => {
+                // Log (console)
+                self.console_scroll = self.console_log.len().saturating_sub(1);
+                self.mode = ShellMode::Console;
+                vec![ChromeOutput::Redraw]
+            }
+            5 => {
+                // Workers
+                self.mode = ShellMode::WorkerManager {
+                    sandbox_sel: 0, container_sel: 0, show_containers: false,
+                    tab: WorkerTab::Sandboxes, image_sel: 0, input_mode: None,
+                };
+                vec![ChromeOutput::Redraw]
+            }
+            #[cfg(feature = "experimental")]
+            SERVICES_IDX => {
+                self.mode = ShellMode::ServiceManager { selected: 0 };
+                vec![ChromeOutput::Redraw]
+            }
+            SETTINGS_IDX => {
                 self.saved_style = self.bg.style;
                 let i = ALL_STYLES.iter().position(|s| *s == self.bg.style).unwrap_or(0);
                 self.settings_list = SelectList::new("Background", ALL_STYLES.to_vec())
@@ -791,7 +811,11 @@ impl ShellChrome {
                 self.mode = ShellMode::Settings;
                 vec![ChromeOutput::Redraw]
             }
-            5 => vec![ChromeOutput::Rpc(RpcRequest::Quit)],
+            FULLSCREEN_IDX => {
+                self.mode = ShellMode::Fullscreen;
+                vec![ChromeOutput::Redraw]
+            }
+            DISCONNECT_IDX => vec![ChromeOutput::Rpc(RpcRequest::Quit)],
             _ => vec![],
         }
     }
@@ -811,7 +835,7 @@ impl ShellChrome {
                 }
                 vec![ChromeOutput::Redraw]
             }
-            KeyPress::Escape | KeyPress::F(9) => {
+            KeyPress::Escape => {
                 self.mode = ShellMode::Normal;
                 vec![ChromeOutput::Redraw]
             }
@@ -959,7 +983,7 @@ impl ShellChrome {
             KeyPress::Char(b'i') => {
                 vec![ChromeOutput::Rpc(RpcRequest::ServiceInstall)]
             }
-            KeyPress::Escape | KeyPress::F(5) => {
+            KeyPress::Escape => {
                 self.mode = ShellMode::Normal;
                 vec![ChromeOutput::Redraw]
             }
@@ -1045,7 +1069,7 @@ impl ShellChrome {
                     }
                     vec![]
                 }
-                KeyPress::Escape | KeyPress::F(6) => {
+                KeyPress::Escape => {
                     self.mode = ShellMode::Normal;
                     vec![ChromeOutput::Redraw]
                 }
@@ -1205,7 +1229,7 @@ impl ShellChrome {
                 }
                 vec![]
             }
-            KeyPress::Escape | KeyPress::F(6) => {
+            KeyPress::Escape => {
                 self.mode = ShellMode::Normal;
                 vec![ChromeOutput::Redraw]
             }
@@ -1469,9 +1493,10 @@ mod tests {
 
     #[cfg(feature = "experimental")]
     #[test]
-    fn f5_opens_service_manager() {
+    fn start_menu_v_opens_service_manager() {
         let mut chrome = make_chrome();
-        let out = chrome.handle_key(KeyPress::F(5));
+        chrome.mode = ShellMode::StartMenu { selected: 0 };
+        let out = chrome.handle_key(KeyPress::Char(b'v'));
         assert!(matches!(chrome.mode, ShellMode::ServiceManager { selected: 0 }));
         assert!(out.iter().any(|o| matches!(o, ChromeOutput::Redraw)));
     }
@@ -1484,15 +1509,6 @@ mod tests {
         let out = chrome.handle_key(KeyPress::Escape);
         assert!(matches!(chrome.mode, ShellMode::Normal));
         assert!(out.iter().any(|o| matches!(o, ChromeOutput::Redraw)));
-    }
-
-    #[cfg(feature = "experimental")]
-    #[test]
-    fn service_manager_f5_toggles_off() {
-        let mut chrome = make_chrome();
-        chrome.mode = ShellMode::ServiceManager { selected: 1 };
-        chrome.handle_key(KeyPress::F(5));
-        assert!(matches!(chrome.mode, ShellMode::Normal));
     }
 
     #[cfg(feature = "experimental")]
@@ -1644,12 +1660,13 @@ mod tests {
         assert_eq!(chrome.service_list.len(), 1);
     }
 
-    // ── F6 Worker Manager ───────────────────────────────────────────────────
+    // ── Worker Manager (via Ctrl-Space → W) ─────────────────────────────────
 
     #[test]
-    fn f6_opens_worker_manager() {
+    fn start_menu_w_opens_worker_manager() {
         let mut chrome = make_chrome();
-        let out = chrome.handle_key(KeyPress::F(6));
+        chrome.mode = ShellMode::StartMenu { selected: 0 };
+        let out = chrome.handle_key(KeyPress::Char(b'w'));
         assert!(matches!(chrome.mode, ShellMode::WorkerManager { sandbox_sel: 0, container_sel: 0, show_containers: false, tab: WorkerTab::Sandboxes, image_sel: 0, input_mode: None }));
         assert!(out.iter().any(|o| matches!(o, ChromeOutput::Redraw)));
     }
@@ -1659,14 +1676,6 @@ mod tests {
         let mut chrome = make_chrome();
         chrome.mode = ShellMode::WorkerManager { sandbox_sel: 0, container_sel: 0, show_containers: false, tab: WorkerTab::Sandboxes, image_sel: 0, input_mode: None };
         chrome.handle_key(KeyPress::Escape);
-        assert!(matches!(chrome.mode, ShellMode::Normal));
-    }
-
-    #[test]
-    fn worker_manager_f6_toggles_off() {
-        let mut chrome = make_chrome();
-        chrome.mode = ShellMode::WorkerManager { sandbox_sel: 1, container_sel: 0, show_containers: false, tab: WorkerTab::Sandboxes, image_sel: 0, input_mode: None };
-        chrome.handle_key(KeyPress::F(6));
         assert!(matches!(chrome.mode, ShellMode::Normal));
     }
 
@@ -1799,5 +1808,39 @@ mod tests {
         } else {
             panic!("mode should still be WorkerManager");
         }
+    }
+
+    // ── Start menu chord tests ───────────────────────────────────────────────
+
+    #[test]
+    fn start_menu_l_opens_console() {
+        let mut chrome = make_chrome();
+        chrome.mode = ShellMode::StartMenu { selected: 0 };
+        let out = chrome.handle_key(KeyPress::Char(b'l'));
+        assert!(matches!(chrome.mode, ShellMode::Console));
+        assert!(out.iter().any(|o| matches!(o, ChromeOutput::Redraw)));
+    }
+
+    #[test]
+    fn start_menu_f_enters_fullscreen() {
+        let mut chrome = make_chrome();
+        chrome.mode = ShellMode::StartMenu { selected: 0 };
+        let out = chrome.handle_key(KeyPress::Char(b'f'));
+        assert!(matches!(chrome.mode, ShellMode::Fullscreen));
+        assert!(out.iter().any(|o| matches!(o, ChromeOutput::Redraw)));
+    }
+
+    #[test]
+    fn f_keys_pass_through_in_normal() {
+        let mut chrome = make_chrome();
+        // F9 should pass through to the active pane as escape sequence bytes.
+        let out = chrome.handle_key(KeyPress::F(9));
+        assert!(
+            out.iter().any(|o| matches!(o,
+                ChromeOutput::Rpc(RpcRequest::SendInput { data, .. })
+                    if *data == b"\x1b[20~"
+            )),
+            "F9 should produce SendInput with VT escape sequence"
+        );
     }
 }

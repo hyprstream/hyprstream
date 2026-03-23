@@ -123,7 +123,7 @@ pub async fn handle_shell_tui(
 
     let client = create_tui_client(signing_key);
     let (cols, rows) = terminal_size();
-    let pane_rows = rows.saturating_sub(5); // status(1) + top border(1) + bottom border(1) + strip(1) + fkeys(1)
+    let pane_rows = rows.saturating_sub(4); // status(1) + top border(1) + bottom border(1) + strip(1)
     let pane_cols = cols.saturating_sub(2); // left + right border
 
     // Connect to session 0 using Capnp display mode so the frame stream
@@ -308,9 +308,9 @@ pub async fn handle_shell_tui(
         loop {
             sigwinch.recv().await;
             let (c, r) = terminal_size();
-            // Send pane dimensions to server (full rows minus 5 chrome rows, cols minus 2 borders),
+            // Send pane dimensions to server (full rows minus 4 chrome rows, cols minus 2 borders),
             // matching the initial connect() call which sends pane dimensions not terminal dimensions.
-            let _ = resize_rpc(&resize_client, c.saturating_sub(2), r.saturating_sub(5)).await;
+            let _ = resize_rpc(&resize_client, c.saturating_sub(2), r.saturating_sub(4)).await;
             // Compositor needs full terminal rows to recalculate layout.
             let _ = resize_tx_sigwinch.try_send((c, r));
         }
@@ -356,11 +356,36 @@ pub async fn handle_shell_tui(
                 }
                 if should_exit { break; }
 
-                // SGR mouse — window strip tab click.
+                // SGR mouse click handling.
                 if let Some((col, row)) = parse_sgr_mouse_click(&raw) {
-                    let win_strip_row = rows.saturating_sub(2);
+                    // Close button on windows/modals — handled by compositor.
+                    let close_outputs = compositor.handle(CompositorInput::MouseClick { col, row });
+                    if !close_outputs.is_empty() {
+                        if dispatch_outputs(
+                            &mut compositor, &client, &model_client, &worker_client,
+                            &model_status_tx, &mut terminal, &mut console_app,
+                            &mut active_apps, &mut next_local_id, &storage_key, signing_key, close_outputs,
+                        ).await { break; }
+                        continue;
+                    }
+
+                    // Window strip: [Ctrl-Space] label + tab clicks.
+                    let win_strip_row = rows.saturating_sub(1);
                     if row == win_strip_row {
-                        if let Some(idx) = tab_index_at_col(&compositor.chrome.windows, col) {
+                        const STRIP_LABEL_W: u16 = 14;
+                        if col < STRIP_LABEL_W {
+                            // Click on [Ctrl-Space] label — open start menu.
+                            let outs = compositor.chrome.handle_key(waxterm::input::KeyPress::CtrlSpace);
+                            let mut should_redraw = false;
+                            for co in outs {
+                                if let hyprstream_compositor::ChromeOutput::Redraw = co {
+                                    should_redraw = true;
+                                }
+                            }
+                            if should_redraw {
+                                composite_draw(&mut terminal, &compositor, &mut console_app);
+                            }
+                        } else if let Some(idx) = tab_index_at_col(&compositor.chrome.windows, col - STRIP_LABEL_W) {
                             compositor.chrome.active_win = idx;
                             if let Some(w) = compositor.chrome.windows.get(idx) {
                                 let wid = w.id;
@@ -370,11 +395,13 @@ pub async fn handle_shell_tui(
                         }
                         continue;
                     }
+
+                    // Pass-through clicks in the pane area to the terminal.
                     let (pane_top, pane_rows) =
                         if matches!(compositor.chrome.mode, hyprstream_compositor::ShellMode::Fullscreen) {
                             (0u16, rows)
                         } else {
-                            (2u16, rows.saturating_sub(5))
+                            (2u16, rows.saturating_sub(4))
                         };
                     if row < pane_top || row >= pane_top + pane_rows {
                         continue;

@@ -10,8 +10,7 @@
 //! ╭─ 🔒 Name ──────────────────────────────────────╮  ← pane block top border (title)
 //! │  pane content (Min rows) — VT cells or background │
 //! ╰───────────────────────────────────────────────────╯  ← pane block bottom border
-//! ├─ window strip / taskbar (1 row) ─────────────────┤
-//! └─ F-key legend (1 row) ────────────────────────────┘
+//! └─ [Ctrl-Space] window1 │ window2 (1 row) ─────────┘
 //! ```
 
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
@@ -42,18 +41,16 @@ pub fn draw(frame: &mut Frame, chrome: &ShellChrome, layout: &LayoutTree) {
         return;
     }
 
-    let [status, pane_block, strip, fkeys] = Layout::vertical([
+    let [status, pane_block, strip] = Layout::vertical([
         Constraint::Length(1), // global status bar
         Constraint::Min(1),    // pane block (border + content + bottom border)
         Constraint::Length(1), // window strip
-        Constraint::Length(1), // F-key legend
     ])
     .areas(area);
 
     draw_status_bar(frame, status, chrome);
     draw_pane_block(frame, pane_block, chrome, layout);
     draw_window_strip(frame, strip, chrome);
-    draw_fkey_bar(frame, fkeys, &chrome.mode);
 
     match chrome.mode {
         ShellMode::ModelList              => draw_model_modal(frame, area, chrome),
@@ -78,7 +75,7 @@ pub fn draw(frame: &mut Frame, chrome: &ShellChrome, layout: &LayoutTree) {
             x: area.x,
             y: area.y + 1, // below status bar
             width: area.width,
-            height: area.height.saturating_sub(3), // above strip + fkeys
+            height: area.height.saturating_sub(2), // above strip
         };
         draw_toasts(frame, toast_area, chrome);
     }
@@ -279,11 +276,27 @@ pub fn draw_vt_cells(frame: &mut Frame, area: Rect, vt: &avt::Vt) {
 // ============================================================================
 
 fn draw_window_strip(frame: &mut Frame, area: Rect, chrome: &ShellChrome) {
+    // [Ctrl-Space] label on the left, window tabs on the right.
+    let label = " [Ctrl-Space] ";
+    let label_w = label.len() as u16;
+    let label_area = Rect { width: label_w.min(area.width), ..area };
+    let tabs_area = Rect {
+        x: area.x + label_w.min(area.width),
+        width: area.width.saturating_sub(label_w),
+        ..area
+    };
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(label, theme::help_key())))
+            .style(Style::default().bg(theme::BG_PANEL)),
+        label_area,
+    );
+
     if chrome.windows.is_empty() {
         frame.render_widget(
             Paragraph::new(" [no windows]")
                 .style(Style::default().fg(theme::DIM).bg(theme::BG_PANEL)),
-            area,
+            tabs_area,
         );
         return;
     }
@@ -313,128 +326,7 @@ fn draw_window_strip(frame: &mut Frame, area: Rect, chrome: &ShellChrome) {
         .divider(Span::styled("│", Style::default().fg(theme::DIM)))
         .style(Style::default().bg(theme::BG_PANEL));
 
-    frame.render_widget(tabs, area);
-}
-
-// ============================================================================
-// F-key legend
-// ============================================================================
-
-fn draw_fkey_bar(frame: &mut Frame, area: Rect, mode: &ShellMode) {
-    let keys: &[(&str, &str)] = match mode {
-        ShellMode::StartMenu { .. } => {
-            frame.render_widget(
-                Paragraph::new("").style(Style::default().bg(theme::BG_PANEL)),
-                area,
-            );
-            return;
-        }
-        ShellMode::Fullscreen => &[
-            ("Ctrl-F/Esc", "exit fullscreen"),
-        ],
-        ShellMode::Normal => {
-            #[cfg(feature = "experimental")]
-            {
-                &[
-                    ("F5",  "svc"),
-                    ("F6",  "wrk"),
-                    ("F7",  "new"),
-                    ("F8",  "close"),
-                    ("F9",  "log"),
-                    ("F10", "models"),
-                    ("F11", "settings"),
-                    ("F12", "quit"),
-                ]
-            }
-            #[cfg(not(feature = "experimental"))]
-            {
-                &[
-                    ("F6",  "wrk"),
-                    ("F7",  "new"),
-                    ("F8",  "close"),
-                    ("F9",  "log"),
-                    ("F10", "models"),
-                    ("F11", "settings"),
-                    ("F12", "quit"),
-                ]
-            }
-        }
-        ShellMode::Console => &[
-            ("\u{2191}\u{2193}", "scroll"),
-            ("F9/Esc",           "close"),
-        ],
-        ShellMode::ModelList => &[
-            ("\u{2191}\u{2193}", "Navigate"),
-            ("c",                "Chat \u{1f512}"),
-            ("C/Enter",          "Chat"),
-            ("T",                "Terminal"),
-            ("l/u",              "Load/Unload"),
-            ("Esc",              "Close"),
-        ],
-        ShellMode::Settings => &[
-            ("\u{2191}\u{2193}", "Navigate"),
-            ("Enter",            "Select"),
-            ("Esc",              "Cancel"),
-        ],
-        ShellMode::ConversationPicker { .. } => &[
-            ("\u{2191}\u{2193}", "Navigate"),
-            ("Enter",            "Select"),
-            ("d",                "Delete"),
-            ("Esc",              "Cancel"),
-        ],
-        ShellMode::ServiceManager { .. } => &[
-            ("\u{2191}\u{2193}", "Navigate"),
-            ("t",                "Start"),
-            ("s",                "Stop"),
-            ("r",                "Restart"),
-            ("a/S",              "All start/stop"),
-            ("i",                "Install"),
-            ("Esc",              "Close"),
-        ],
-        ShellMode::WorkerManager { ref input_mode, .. } if input_mode.is_some() => &[
-            ("\u{2191}\u{2193}", "Fields"),
-            ("Space",            "Toggle"),
-            ("Enter",            "Submit"),
-            ("Esc",              "Cancel"),
-        ],
-        ShellMode::WorkerManager { tab: crate::chrome::WorkerTab::Images, .. } => &[
-            ("Tab",              "Sandboxes"),
-            ("\u{2191}\u{2193}", "Navigate"),
-            ("p",                "Pull"),
-            ("x",                "Remove"),
-            ("Esc",              "Close"),
-        ],
-        ShellMode::WorkerManager { show_containers: false, .. } => &[
-            ("Tab",              "Images"),
-            ("\u{2191}\u{2193}", "Navigate"),
-            ("Enter/\u{2192}",   "Containers"),
-            ("n",                "Create"),
-            ("x",                "Destroy"),
-            ("Esc",              "Close"),
-        ],
-        ShellMode::WorkerManager { show_containers: true, .. } => &[
-            ("\u{2191}\u{2193}", "Navigate"),
-            ("\u{2190}",         "Back"),
-            ("n",                "Create"),
-            ("t/s",              "Start/Stop"),
-            ("a",                "Attach"),
-            ("x",                "Remove"),
-            ("e",                "Exec"),
-            ("Esc",              "Close"),
-        ],
-    };
-
-    let mut spans = Vec::new();
-    for (key, label) in keys {
-        spans.push(Span::styled(*key, theme::help_key()));
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(*label, theme::help_text()));
-        spans.push(Span::raw("  "));
-    }
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::BG_PANEL)),
-        area,
-    );
+    frame.render_widget(tabs, tabs_area);
 }
 
 // ============================================================================
@@ -506,9 +398,9 @@ fn draw_settings_modal(frame: &mut Frame, full_area: Rect, chrome: &ShellChrome)
 // ============================================================================
 
 fn draw_start_menu(frame: &mut Frame, area: Rect, selected: usize) {
-    let popup_w: u16 = 22;
+    let popup_w: u16 = 26;
     let popup_h: u16 = MENU_ITEMS.len() as u16 + 2;
-    let popup_y = area.height.saturating_sub(popup_h + 2);
+    let popup_y = area.height.saturating_sub(popup_h + 1);
     let popup = Rect {
         x: 0,
         y: popup_y,
@@ -518,9 +410,11 @@ fn draw_start_menu(frame: &mut Frame, area: Rect, selected: usize) {
 
     frame.render_widget(Clear, popup);
 
+    let close_btn = Line::from(Span::styled(" x ", Style::default().fg(theme::DIM))).right_aligned();
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::border_style())
+        .title_top(close_btn)
         .style(Style::default().bg(theme::BG_PANEL));
 
     let inner = block.inner(popup);
