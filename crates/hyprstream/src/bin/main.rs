@@ -1250,15 +1250,15 @@ fn main() -> Result<()> {
     // CUDA allocator optimizations — must be set before any tch/libtorch init.
     // Expandable segments reduces fragmentation from growing KV cache tensors.
     // Garbage collection threshold triggers proactive reclamation at 80% usage.
-    if std::env::var("HIP_VISIBLE_DEVICES").is_err() {
-        if std::env::var("PYTORCH_CUDA_ALLOC_CONF").is_err() {
-            // SAFETY: single-threaded at this point (before any thread spawning)
-            unsafe {
-                std::env::set_var(
-                    "PYTORCH_CUDA_ALLOC_CONF",
-                    "expandable_segments:True,garbage_collection_threshold:0.8",
-                );
-            }
+    if std::env::var("HIP_VISIBLE_DEVICES").is_err()
+        && std::env::var("PYTORCH_CUDA_ALLOC_CONF").is_err()
+    {
+        // SAFETY: single-threaded at this point (before any thread spawning)
+        unsafe {
+            std::env::set_var(
+                "PYTORCH_CUDA_ALLOC_CONF",
+                "expandable_segments:True,garbage_collection_threshold:0.8",
+            );
         }
     }
 

@@ -274,7 +274,7 @@ pub fn parse_qwen35_xml_tool_calls(text: &str) -> Result<Vec<ToolCall>, anyhow::
                 // Try to parse value as JSON first (numbers, booleans, objects,
                 // arrays).  Fall back to a plain JSON string on failure.
                 let json_val = serde_json::from_str::<Value>(&value)
-                    .unwrap_or_else(|_| Value::String(value));
+                    .unwrap_or(Value::String(value));
                 args.insert(key, json_val);
             }
 
@@ -953,9 +953,8 @@ I'll have the results shortly."#;
 
         // parse should return empty or error
         let result = parse_tool_calls_for_format(ToolCallFormat::None, text_with_markers);
-        match result {
-            Ok(calls) => assert!(calls.is_empty()),
-            Err(_) => {} // Also acceptable
+        if let Ok(calls) = result {
+            assert!(calls.is_empty());
         }
     }
 

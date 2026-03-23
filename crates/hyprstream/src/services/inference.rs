@@ -1167,15 +1167,16 @@ impl InferenceService {
         let mut i = 0;
         while i < messages.len() {
             let m = &messages[i];
-            if m.role == "assistant" && m.tool_calls.as_ref().map_or(false, |tc| !tc.is_empty()) {
-                let tool_ids: std::collections::HashSet<&str> = m.tool_calls.as_ref().unwrap()
+            if m.role == "assistant" && m.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty()) {
+                let tool_ids: std::collections::HashSet<&str> = m.tool_calls.as_deref()
+                    .unwrap_or_default()
                     .iter().map(|tc| tc.id.as_str()).collect();
                 let mut indices = vec![i];
                 let mut cost = msg_costs[i];
                 let mut j = i + 1;
                 while j < messages.len() && messages[j].role == "tool"
                     && messages[j].tool_call_id.as_deref()
-                        .map_or(false, |id| tool_ids.contains(id)) {
+                        .is_some_and(|id| tool_ids.contains(id)) {
                     indices.push(j);
                     cost += msg_costs[j];
                     j += 1;

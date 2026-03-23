@@ -927,11 +927,10 @@ async fn handle_rpc(
             let tool_format = {
                 use crate::api::tools::ToolCallFormat;
                 match ToolCallFormat::from_model_ref(&model_ref) {
-                    ToolCallFormat::Qwen3Xml      => hyprstream_tui::chat_app::ToolCallFormat::Qwen3Xml,
+                    ToolCallFormat::Qwen3Xml | ToolCallFormat::None => hyprstream_tui::chat_app::ToolCallFormat::Qwen3Xml,
                     ToolCallFormat::Qwen35XmlParam => hyprstream_tui::chat_app::ToolCallFormat::Qwen35XmlParam,
                     ToolCallFormat::LlamaJson     => hyprstream_tui::chat_app::ToolCallFormat::LlamaJson,
                     ToolCallFormat::MistralJson   => hyprstream_tui::chat_app::ToolCallFormat::MistralJson,
-                    ToolCallFormat::None          => hyprstream_tui::chat_app::ToolCallFormat::Qwen3Xml, // default
                 }
             };
             let app = app.with_tool_caller(
