@@ -334,7 +334,8 @@ fn draw_window_strip(frame: &mut Frame, area: Rect, chrome: &ShellChrome) {
 // ============================================================================
 
 fn draw_model_modal(frame: &mut Frame, full_area: Rect, chrome: &ShellChrome) {
-    let modal = centered_rect(60, 70, full_area);
+    let (pw, ph) = modal_percentages(&ShellMode::ModelList).unwrap();
+    let modal = centered_rect(pw, ph, full_area);
     render_modal(frame, modal, theme::modal_block(Line::from(" Models ")), |frame, inner| {
         let hint_area = Rect { y: inner.y + inner.height.saturating_sub(1), height: 1, ..inner };
         let list_area = Rect { height: inner.height.saturating_sub(2), ..inner };
@@ -363,7 +364,8 @@ fn draw_model_modal(frame: &mut Frame, full_area: Rect, chrome: &ShellChrome) {
 // ============================================================================
 
 fn draw_settings_modal(frame: &mut Frame, full_area: Rect, chrome: &ShellChrome) {
-    let modal = centered_rect(50, 65, full_area);
+    let (pw, ph) = modal_percentages(&ShellMode::Settings).unwrap();
+    let modal = centered_rect(pw, ph, full_area);
     render_modal(frame, modal, theme::modal_block(Line::from(" Settings ")), |frame, inner| {
         let list_height = 5u16.min(inner.height / 2);
         let [list_area, preview_outer] = Layout::vertical([
@@ -474,7 +476,8 @@ fn draw_conversation_picker(frame: &mut Frame, full_area: Rect, chrome: &ShellCh
         ShellMode::ConversationPicker { model_ref, list } => (model_ref, list),
         _ => return,
     };
-    let modal = centered_rect(55, 60, full_area);
+    let (pw, ph) = modal_percentages(&chrome.mode).unwrap();
+    let modal = centered_rect(pw, ph, full_area);
     let title = format!(" {} — Conversations ", model_ref);
     render_modal(frame, modal, theme::modal_block(Line::from(title)), |frame, inner| {
         let hint_area = Rect { y: inner.y + inner.height.saturating_sub(1), height: 1, ..inner };
@@ -500,7 +503,8 @@ fn draw_conversation_picker(frame: &mut Frame, full_area: Rect, chrome: &ShellCh
 // ============================================================================
 
 fn draw_service_modal(frame: &mut Frame, full_area: Rect, chrome: &ShellChrome, selected: usize) {
-    let modal = centered_rect(72, 60, full_area);
+    let (pw, ph) = modal_percentages(&ShellMode::ServiceManager { selected: 0 }).unwrap();
+    let modal = centered_rect(pw, ph, full_area);
     render_modal(frame, modal, theme::modal_block(Line::from(" Services ")), |frame, inner| {
         let hint_area = Rect { y: inner.y + inner.height.saturating_sub(1), height: 1, ..inner };
         let list_area = Rect { height: inner.height.saturating_sub(2), ..inner };
@@ -614,7 +618,11 @@ fn draw_worker_modal(
     sandbox_sel: usize, container_sel: usize, show_containers: bool,
     tab: crate::chrome::WorkerTab, image_sel: usize,
 ) {
-    let modal = centered_rect(78, 65, full_area);
+    let (pw, ph) = modal_percentages(&ShellMode::WorkerManager {
+        sandbox_sel: 0, container_sel: 0, show_containers: false,
+        tab: crate::chrome::WorkerTab::Sandboxes, image_sel: 0, input_mode: None,
+    }).unwrap();
+    let modal = centered_rect(pw, ph, full_area);
     render_modal(frame, modal, theme::modal_block(Line::from(" Workers ")), |frame, inner| {
         let hint_area = Rect { y: inner.y + inner.height.saturating_sub(1), height: 1, ..inner };
 
@@ -1009,7 +1017,7 @@ fn draw_input_dialog(
 // Utility
 // ============================================================================
 
-fn centered_rect(pct_w: u16, pct_h: u16, area: Rect) -> Rect {
+pub(crate) fn centered_rect(pct_w: u16, pct_h: u16, area: Rect) -> Rect {
     let [v] = Layout::vertical([Constraint::Percentage(pct_h)])
         .flex(Flex::Center)
         .areas(area);
@@ -1017,6 +1025,19 @@ fn centered_rect(pct_w: u16, pct_h: u16, area: Rect) -> Rect {
         .flex(Flex::Center)
         .areas(v);
     h
+}
+
+/// Modal geometry percentages (pct_w, pct_h) — single source of truth.
+/// Used by both rendering and mouse hit-testing.
+pub(crate) fn modal_percentages(mode: &ShellMode) -> Option<(u16, u16)> {
+    match mode {
+        ShellMode::ModelList              => Some((60, 70)),
+        ShellMode::Settings               => Some((50, 65)),
+        ShellMode::ConversationPicker { .. } => Some((55, 60)),
+        ShellMode::ServiceManager { .. }  => Some((72, 60)),
+        ShellMode::WorkerManager { .. }   => Some((78, 65)),
+        _ => None,
+    }
 }
 
 // ============================================================================

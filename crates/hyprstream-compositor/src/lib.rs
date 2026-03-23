@@ -275,6 +275,7 @@ impl Compositor {
     /// Handle a mouse click at terminal position (col, row), 0-indexed.
     /// Checks for close-button clicks, menu item clicks, and modal list clicks.
     fn handle_mouse_click(&mut self, col: u16, row: u16) -> Vec<CompositorOutput> {
+        use crate::render::{centered_rect, modal_percentages};
         use crate::theme::CLOSE_BUTTON_WIDTH;
 
         match self.chrome.mode {
@@ -326,8 +327,8 @@ impl Compositor {
                     return self.dispatch_chrome(out);
                 }
 
-                // Click outside popup — dismiss.
-                if col >= popup_w || row < popup_y {
+                // Click outside popup — dismiss (including bottom gap below popup).
+                if col >= popup_w || row < popup_y || row >= popup_y + popup_h {
                     let out = self.chrome.handle_key(waxterm::input::KeyPress::Escape);
                     return self.dispatch_chrome(out);
                 }
@@ -335,21 +336,19 @@ impl Compositor {
                 vec![]
             }
 
+            // Console is rendered by shell_handlers with different geometry.
+            // No click handling (keyboard Escape only).
+            ShellMode::Console => vec![],
+
             // Modals: close button, list item clicks, click-outside-to-dismiss.
             ShellMode::ModelList
             | ShellMode::Settings
             | ShellMode::ConversationPicker { .. }
             | ShellMode::ServiceManager { .. }
-            | ShellMode::WorkerManager { .. }
-            | ShellMode::Console => {
-                let (pct_w, pct_h) = match self.chrome.mode {
-                    ShellMode::ModelList              => (60, 70),
-                    ShellMode::Settings               => (50, 65),
-                    ShellMode::ConversationPicker { .. } => (55, 60),
-                    ShellMode::ServiceManager { .. }  => (72, 60),
-                    ShellMode::WorkerManager { .. }   => (75, 70),
-                    ShellMode::Console                => (90, 70),
-                    _ => return vec![],
+            | ShellMode::WorkerManager { .. } => {
+                let (pct_w, pct_h) = match modal_percentages(&self.chrome.mode) {
+                    Some(p) => p,
+                    None => return vec![],
                 };
                 let area = ratatui::layout::Rect::new(0, 0, self.cols, self.rows);
                 let modal = centered_rect(pct_w, pct_h, area);
@@ -372,8 +371,6 @@ impl Compositor {
                 }
 
                 // Click on a list item inside the modal.
-                // SelectList renders: label row, then item rows.
-                // Modal inner area starts 1 row below top border.
                 let first_item_row = modal.y + 2; // border(1) + label(1)
                 let inside_cols = col > modal.x && col < modal.x + modal.width - 1;
 
@@ -388,7 +385,11 @@ impl Compositor {
                             }
                         }
                         ShellMode::Settings => {
-                            if idx < self.chrome.settings_list.items_mut().len() {
+                            // Clamp to visible list area (Settings has a constrained list height).
+                            let inner_h = modal.height.saturating_sub(2);
+                            let list_height = 5u16.min(inner_h / 2);
+                            let max_visible = list_height.saturating_sub(1) as usize;
+                            if idx < self.chrome.settings_list.items_mut().len() && idx < max_visible {
                                 self.chrome.settings_list.set_selected(idx);
                                 let out = self.chrome.handle_key(waxterm::input::KeyPress::Enter);
                                 return self.dispatch_chrome(out);
@@ -402,16 +403,15 @@ impl Compositor {
                             }
                         }
                         ShellMode::ServiceManager { ref mut selected } => {
+                            // ServiceManager is informational — click selects only, no confirm.
                             if idx < self.chrome.service_list.len() {
                                 *selected = idx;
-                                let out = self.chrome.handle_key(waxterm::input::KeyPress::Enter);
-                                return self.dispatch_chrome(out);
+                                return vec![CompositorOutput::Redraw];
                             }
                         }
                         ShellMode::WorkerManager { ref mut sandbox_sel, show_containers: false, .. } => {
                             if idx < self.chrome.worker_list.len() {
                                 *sandbox_sel = idx;
-                                // Enter expands to container view; dispatch it.
                                 let out = self.chrome.handle_key(waxterm::input::KeyPress::Enter);
                                 return self.dispatch_chrome(out);
                             }
@@ -425,19 +425,6 @@ impl Compositor {
             _ => vec![],
         }
     }
-}
-
-/// Compute a centered rectangle as a percentage of the given area.
-/// Matches the `centered_rect` in `render.rs`.
-fn centered_rect(pct_w: u16, pct_h: u16, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
-    use ratatui::layout::{Constraint, Flex, Layout};
-    let [v] = Layout::vertical([Constraint::Percentage(pct_h)])
-        .flex(Flex::Center)
-        .areas(area);
-    let [h] = Layout::horizontal([Constraint::Percentage(pct_w)])
-        .flex(Flex::Center)
-        .areas(v);
-    h
 }
 
 #[cfg(test)]
@@ -486,23 +473,68 @@ mod tests {
 
     #[test]
     fn mouse_click_model_list_item() {
+        use crate::render::{centered_rect, modal_percentages};
         let models = vec![
             ModelEntry { model_ref: "a:main".into(), path: "/tmp".into(), loaded: true, loading: false },
             ModelEntry { model_ref: "b:main".into(), path: "/tmp".into(), loaded: true, loading: false },
         ];
         let mut comp = Compositor::new(120, 40, 1, 1, vec![], models);
         comp.chrome.mode = ShellMode::ModelList;
-        // Compute modal position.
         let area = ratatui::layout::Rect::new(0, 0, 120, 40);
-        let modal = centered_rect(60, 70, area);
+        let (pw, ph) = modal_percentages(&ShellMode::ModelList).unwrap();
+        let modal = centered_rect(pw, ph, area);
         let first_item_row = modal.y + 2; // border + label
-        let item_col = modal.x + 2; // inside border
+        let item_col = modal.x + 2;
         // Click on second item (index 1 = "b:main").
         let out = comp.handle(CompositorInput::MouseClick { col: item_col, row: first_item_row + 1 });
-        // b:main is loaded → should emit ListConversations.
         assert!(out.iter().any(|o| matches!(o,
             CompositorOutput::Rpc(RpcRequest::ListConversations { ref model_ref })
                 if model_ref == "b:main"
         )));
+    }
+
+    #[test]
+    fn mouse_click_close_button_on_pane() {
+        use crate::theme::CLOSE_BUTTON_WIDTH;
+        let wins = vec![WindowSummary {
+            id: 1, name: "w".into(), active_pane_id: 1,
+            panes: vec![PaneSummary { id: 1, cols: 80, rows: 24, is_private: false }],
+        }];
+        let mut comp = Compositor::new(120, 40, 1, 1, wins, vec![]);
+        // Close button at row 1, cols [width-1-3 .. width-2] = [116, 117, 118]
+        let out = comp.handle(CompositorInput::MouseClick {
+            col: 120 - 1 - CLOSE_BUTTON_WIDTH + 1, // 117
+            row: 1,
+        });
+        assert!(out.iter().any(|o| matches!(o, CompositorOutput::Rpc(RpcRequest::CloseWindow { .. }))));
+    }
+
+    #[test]
+    fn mouse_click_close_button_on_modal() {
+        use crate::render::{centered_rect, modal_percentages};
+        use crate::theme::CLOSE_BUTTON_WIDTH;
+        let mut comp = make_compositor();
+        comp.chrome.mode = ShellMode::ModelList;
+        let area = ratatui::layout::Rect::new(0, 0, 120, 40);
+        let (pw, ph) = modal_percentages(&ShellMode::ModelList).unwrap();
+        let modal = centered_rect(pw, ph, area);
+        let out = comp.handle(CompositorInput::MouseClick {
+            col: modal.x + modal.width - 1 - CLOSE_BUTTON_WIDTH + 1,
+            row: modal.y,
+        });
+        assert!(matches!(comp.chrome.mode, ShellMode::Normal));
+        assert!(out.iter().any(|o| matches!(o, CompositorOutput::Redraw)));
+    }
+
+    #[test]
+    fn mouse_click_bottom_gap_dismisses_start_menu() {
+        let mut comp = make_compositor();
+        comp.chrome.mode = ShellMode::StartMenu { selected: 0 };
+        // Click on the window strip row directly below the popup.
+        let popup_h = MENU_ITEMS.len() as u16 + 2;
+        let popup_y = 40u16.saturating_sub(popup_h + 1);
+        let out = comp.handle(CompositorInput::MouseClick { col: 5, row: popup_y + popup_h });
+        assert!(matches!(comp.chrome.mode, ShellMode::Normal));
+        assert!(out.iter().any(|o| matches!(o, CompositorOutput::Redraw)));
     }
 }

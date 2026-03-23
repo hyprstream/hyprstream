@@ -196,6 +196,7 @@ pub async fn handle_shell_tui(
     sub_socket.connect(&sub_endpoint)?;
     sub_socket.set_subscribe(topic.as_bytes())?;
     sub_socket.set_linger(0)?;
+    sub_socket.set_rcvtimeo(1000)?; // 1s timeout so recv unblocks periodically for shutdown
 
     let _recv_handle = tokio::task::spawn_blocking(move || {
         let mut verifier = StreamVerifier::new(mac_key, topic);
@@ -203,6 +204,11 @@ pub async fn handle_shell_tui(
             let mut frames: Vec<Vec<u8>> = Vec::with_capacity(3);
             match sub_socket.recv_bytes(0) {
                 Ok(f) => frames.push(f),
+                Err(zmq::Error::EAGAIN) => {
+                    // Timeout — check if the receiver is still alive.
+                    if frame_tx.is_closed() { return; }
+                    continue;
+                }
                 Err(_) => break,
             }
             while sub_socket.get_rcvmore().unwrap_or(false) {
@@ -639,6 +645,9 @@ pub async fn handle_shell_tui(
             else => break,
         }
     }
+
+    // Abort background tasks that would otherwise block shutdown.
+    _sigwinch_handle.abort();
 
     // Disable mouse tracking.
     {

@@ -437,9 +437,13 @@ impl ShellChrome {
         if let Some(ref pending) = self.pending_picker_model {
             if pending == model_ref {
                 if loaded {
-                    let mr = pending.clone();
-                    self.pending_picker_model = None;
-                    return Some(RpcRequest::ListConversations { model_ref: mr });
+                    // Only auto-open picker if user is still in a relevant context.
+                    if matches!(self.mode, ShellMode::ModelList | ShellMode::Normal) {
+                        let mr = pending.clone();
+                        self.pending_picker_model = None;
+                        return Some(RpcRequest::ListConversations { model_ref: mr });
+                    }
+                    // User navigated to another modal — leave pending for later.
                 } else {
                     // Load failed — clear pending.
                     self.pending_picker_model = None;

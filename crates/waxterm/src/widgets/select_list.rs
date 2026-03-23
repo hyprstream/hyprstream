@@ -148,4 +148,17 @@ mod tests {
         let mut list = SelectList::new("Pick:", vec!["a"]);
         assert_eq!(list.handle_key(&KeyPress::Escape), WidgetResult::<&str>::Cancelled);
     }
+
+    #[test]
+    fn test_set_selected() {
+        let mut list = SelectList::new("Pick:", vec!["a", "b", "c"]);
+        list.set_selected(2);
+        assert_eq!(list.selected_index(), 2);
+        // Beyond bounds — should be ignored.
+        list.set_selected(99);
+        assert_eq!(list.selected_index(), 2);
+        // Set back to 0.
+        list.set_selected(0);
+        assert_eq!(list.selected_index(), 0);
+    }
 }
