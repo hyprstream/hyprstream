@@ -373,6 +373,8 @@ pub struct ShellChrome {
     pub worker_pool_summary: String,
     /// Image list for the Images tab.
     pub image_list: Vec<ImageEntry>,
+    /// Model ref waiting for load to complete before opening conversation picker.
+    pub pending_picker_model: Option<String>,
 }
 
 impl ShellChrome {
@@ -413,11 +415,13 @@ impl ShellChrome {
             worker_list: Vec::new(),
             worker_pool_summary: String::new(),
             image_list: Vec::new(),
+            pending_picker_model: None,
         }
     }
 
     /// Update model loaded status (called from background polling results).
-    pub fn update_model_status(&mut self, model_ref: &str, loaded: bool) {
+    /// Returns a follow-up RPC if a conversation picker was pending for this model.
+    pub fn update_model_status(&mut self, model_ref: &str, loaded: bool) -> Option<RpcRequest> {
         let mut was_loading = false;
         for entry in self.model_list.items_mut() {
             if entry.model_ref == model_ref {
@@ -429,6 +433,20 @@ impl ShellChrome {
         if was_loading && loaded {
             self.push_toast(format!("Loaded {model_ref}"), ToastLevel::Info);
         }
+        // Check if a conversation picker was waiting for this model.
+        if let Some(ref pending) = self.pending_picker_model {
+            if pending == model_ref {
+                if loaded {
+                    let mr = pending.clone();
+                    self.pending_picker_model = None;
+                    return Some(RpcRequest::ListConversations { model_ref: mr });
+                } else {
+                    // Load failed — clear pending.
+                    self.pending_picker_model = None;
+                }
+            }
+        }
+        None
     }
 
     /// Update window list (called when TuiService reports window changes).
@@ -594,7 +612,7 @@ impl ShellChrome {
     // ── ModelList mode ───────────────────────────────────────────────────────
 
     fn handle_model_list(&mut self, key: KeyPress) -> Vec<ChromeOutput> {
-        // l — submit load request
+        // l — submit load request (power-user preload, no pending picker)
         if matches!(key, KeyPress::Char(b'l' | b'L')) {
             if let Some(model) = self.model_list.selected_item().cloned() {
                 let model_ref = model.model_ref.clone();
@@ -614,41 +632,12 @@ impl ShellChrome {
                 return vec![ChromeOutput::Rpc(RpcRequest::UnloadModel { model_ref })];
             }
         }
-        // c (lowercase) — private chat (client-owned, encrypted history)
-        if matches!(key, KeyPress::Char(b'c')) {
-            if let Some(model) = self.model_list.selected_item().cloned() {
-                let model_ref = model.model_ref.clone();
-                self.mode = ShellMode::Normal;
-                return vec![ChromeOutput::Rpc(RpcRequest::ListConversations {
-                    model_ref,
-                })];
-            }
-        }
-        // C (shift) / Enter — server-side chat
-        let is_server_chat = matches!(key, KeyPress::Enter | KeyPress::Char(b'C'));
-        if is_server_chat {
-            if let Some(model) = self.model_list.selected_item().cloned() {
-                let sid  = self.session_id;
-                let cols = self.cols;
-                let rows = self.pane_rows;
-                let mref = model.model_ref.clone();
-                self.mode = ShellMode::Normal;
-                // SpawnServerChat handler creates its own window; no separate CreateWindow.
-                return vec![ChromeOutput::Rpc(RpcRequest::SpawnServerChat {
-                    session_id: sid,
-                    model_ref: mref,
-                    cols, rows,
-                    pane_id: 0,
-                })];
-            }
-        }
         // T — terminal in model worktree
         if matches!(key, KeyPress::Char(b't' | b'T')) {
             if let Some(model) = self.model_list.selected_item().cloned() {
                 let cwd = model.path.to_string_lossy().into_owned();
                 let sid = self.session_id;
                 self.mode = ShellMode::Normal;
-                // SpawnShell handler creates its own window when pane_id == 0.
                 return vec![ChromeOutput::Rpc(RpcRequest::SpawnShell {
                     session_id: sid,
                     pane_id: 0,
@@ -659,26 +648,44 @@ impl ShellChrome {
 
         match self.model_list.handle_key(&key) {
             WidgetResult::Cancelled => {
+                self.pending_picker_model = None;
                 self.mode = ShellMode::Normal;
                 vec![ChromeOutput::Redraw]
             }
             WidgetResult::Confirmed(model) => {
-                let sid  = self.session_id;
-                let cols = self.cols;
-                let rows = self.pane_rows;
-                let mref = model.model_ref.clone();
-                self.mode = ShellMode::Normal;
-                // SpawnServerChat handler creates its own window; no separate CreateWindow.
-                vec![ChromeOutput::Rpc(RpcRequest::SpawnServerChat {
-                    session_id: sid,
-                    model_ref: mref,
-                    cols, rows,
-                    pane_id: 0,
-                })]
+                self.enter_chat_for_model(&model)
             }
             WidgetResult::Pending => {
                 vec![ChromeOutput::Redraw]
             }
+        }
+    }
+
+    /// Unified Enter handler: auto-load if needed, then open conversation picker.
+    fn enter_chat_for_model(&mut self, model: &ModelEntry) -> Vec<ChromeOutput> {
+        let model_ref = model.model_ref.clone();
+        if model.loaded {
+            // Model ready — open conversation picker immediately.
+            self.mode = ShellMode::Normal;
+            vec![ChromeOutput::Rpc(RpcRequest::ListConversations { model_ref })]
+        } else if model.loading {
+            // Already loading — stash pending picker, stay in ModelList.
+            self.pending_picker_model = Some(model_ref.clone());
+            self.push_toast(
+                format!("Waiting for {model_ref} to load\u{2026}"),
+                ToastLevel::Info,
+            );
+            vec![ChromeOutput::Redraw]
+        } else {
+            // Not loaded — auto-load and stash pending picker.
+            self.pending_picker_model = Some(model_ref.clone());
+            self.push_toast(format!("Loading {model_ref}\u{2026}"), ToastLevel::Info);
+            for entry in self.model_list.items_mut() {
+                if entry.model_ref == model_ref {
+                    entry.loading = true;
+                }
+            }
+            vec![ChromeOutput::Rpc(RpcRequest::LoadModel { model_ref })]
         }
     }
 
@@ -734,7 +741,7 @@ impl ShellChrome {
         vec![ChromeOutput::Redraw]
     }
 
-    fn execute_menu_action(&mut self, idx: usize) -> Vec<ChromeOutput> {
+    pub(crate) fn execute_menu_action(&mut self, idx: usize) -> Vec<ChromeOutput> {
         let sid = self.session_id;
 
         // Indices for items that shift when "Services" is present (experimental).
@@ -876,13 +883,20 @@ impl ShellChrome {
         model_ref: String,
         conversations: Vec<ConversationPickerEntry>,
     ) {
-        let mut items = vec![ConversationPickerEntry {
-            uuid: "new".to_owned(),
-            label: "[New conversation]".to_owned(),
-            last_active: u64::MAX, // sort first
-        }];
+        let mut items = vec![
+            ConversationPickerEntry {
+                uuid: "new-private".to_owned(),
+                label: "\u{1f512} New conversation \u{2014} private".to_owned(),
+                last_active: u64::MAX, // sort first
+            },
+            ConversationPickerEntry {
+                uuid: "new-server".to_owned(),
+                label: "\u{1f310} New conversation \u{2014} server".to_owned(),
+                last_active: u64::MAX - 1, // sort second
+            },
+        ];
         items.extend(conversations);
-        let list = SelectList::new(format!("{} — Conversations", model_ref), items);
+        let list = SelectList::new(format!("{} \u{2014} Conversations", model_ref), items);
         self.mode = ShellMode::ConversationPicker { model_ref, list };
     }
 
@@ -898,7 +912,7 @@ impl ShellChrome {
         if matches!(key, KeyPress::Char(b'd' | b'D')) {
             let idx = list.selected_index();
             if let Some(entry) = list.selected_item().cloned() {
-                if entry.uuid != "new" {
+                if entry.uuid != "new-private" && entry.uuid != "new-server" {
                     let uuid = entry.uuid.clone();
                     let mr = model_ref.clone();
                     list.items_mut().remove(idx);
@@ -918,16 +932,20 @@ impl ShellChrome {
                 vec![ChromeOutput::Redraw]
             }
             WidgetResult::Confirmed(entry) => {
-                let resume = if entry.uuid == "new" { None } else { Some(entry.uuid) };
                 let cols = self.cols;
                 let rows = self.pane_rows;
                 self.mode = ShellMode::Normal;
-                vec![ChromeOutput::Rpc(RpcRequest::LocalPrivateChat {
-                    model_ref,
-                    cols,
-                    rows,
-                    resume_uuid: resume,
-                })]
+                if entry.uuid == "new-server" {
+                    vec![ChromeOutput::Rpc(RpcRequest::SpawnServerChat {
+                        session_id: self.session_id,
+                        model_ref, cols, rows, pane_id: 0,
+                    })]
+                } else {
+                    let resume = if entry.uuid == "new-private" { None } else { Some(entry.uuid) };
+                    vec![ChromeOutput::Rpc(RpcRequest::LocalPrivateChat {
+                        model_ref, cols, rows, resume_uuid: resume,
+                    })]
+                }
             }
             WidgetResult::Pending => {
                 if matches!(key, KeyPress::Escape) {
@@ -1842,5 +1860,123 @@ mod tests {
             )),
             "F9 should produce SendInput with VT escape sequence"
         );
+    }
+
+    // ── Unified chat flow tests ──────────────────────────────────────────────
+
+    fn make_chrome_with_models() -> ShellChrome {
+        let models = vec![
+            ModelEntry { model_ref: "loaded:main".into(), path: "/tmp".into(), loaded: true, loading: false },
+            ModelEntry { model_ref: "unloaded:main".into(), path: "/tmp".into(), loaded: false, loading: false },
+            ModelEntry { model_ref: "loading:main".into(), path: "/tmp".into(), loaded: false, loading: true },
+        ];
+        ShellChrome::new(120, 40, 1, 1, vec![], models)
+    }
+
+    #[test]
+    fn model_list_enter_loaded_emits_list_conversations() {
+        let mut chrome = make_chrome_with_models();
+        chrome.mode = ShellMode::ModelList;
+        // Select the first model (loaded:main) and press Enter.
+        let out = chrome.handle_key(KeyPress::Enter);
+        assert!(matches!(chrome.mode, ShellMode::Normal));
+        assert!(out.iter().any(|o| matches!(o,
+            ChromeOutput::Rpc(RpcRequest::ListConversations { ref model_ref })
+                if model_ref == "loaded:main"
+        )));
+        assert!(chrome.pending_picker_model.is_none());
+    }
+
+    #[test]
+    fn model_list_enter_unloaded_emits_load_and_stashes_pending() {
+        let mut chrome = make_chrome_with_models();
+        chrome.mode = ShellMode::ModelList;
+        // Navigate to unloaded:main (index 1).
+        chrome.handle_key(KeyPress::ArrowDown);
+        let out = chrome.handle_key(KeyPress::Enter);
+        // Should emit LoadModel, not ListConversations.
+        assert!(out.iter().any(|o| matches!(o,
+            ChromeOutput::Rpc(RpcRequest::LoadModel { ref model_ref })
+                if model_ref == "unloaded:main"
+        )));
+        assert_eq!(chrome.pending_picker_model.as_deref(), Some("unloaded:main"));
+    }
+
+    #[test]
+    fn model_list_enter_loading_stashes_pending_no_rpc() {
+        let mut chrome = make_chrome_with_models();
+        chrome.mode = ShellMode::ModelList;
+        // Navigate to loading:main (index 2).
+        chrome.handle_key(KeyPress::ArrowDown);
+        chrome.handle_key(KeyPress::ArrowDown);
+        let out = chrome.handle_key(KeyPress::Enter);
+        // Should only redraw, no RPC.
+        assert!(!out.iter().any(|o| matches!(o, ChromeOutput::Rpc(..))));
+        assert_eq!(chrome.pending_picker_model.as_deref(), Some("loading:main"));
+    }
+
+    #[test]
+    fn update_model_status_opens_picker_when_pending() {
+        let mut chrome = make_chrome_with_models();
+        chrome.pending_picker_model = Some("unloaded:main".into());
+        let follow_up = chrome.update_model_status("unloaded:main", true);
+        assert!(matches!(follow_up, Some(RpcRequest::ListConversations { ref model_ref }) if model_ref == "unloaded:main"));
+        assert!(chrome.pending_picker_model.is_none());
+    }
+
+    #[test]
+    fn update_model_status_clears_pending_on_timeout() {
+        let mut chrome = make_chrome_with_models();
+        chrome.pending_picker_model = Some("unloaded:main".into());
+        let follow_up = chrome.update_model_status("unloaded:main", false);
+        assert!(follow_up.is_none());
+        assert!(chrome.pending_picker_model.is_none());
+    }
+
+    #[test]
+    fn model_list_escape_clears_pending() {
+        let mut chrome = make_chrome_with_models();
+        chrome.mode = ShellMode::ModelList;
+        chrome.pending_picker_model = Some("unloaded:main".into());
+        chrome.handle_key(KeyPress::Escape);
+        assert!(matches!(chrome.mode, ShellMode::Normal));
+        assert!(chrome.pending_picker_model.is_none());
+    }
+
+    #[test]
+    fn conversation_picker_new_server_emits_spawn_server_chat() {
+        let mut chrome = make_chrome_with_models();
+        chrome.open_conversation_picker("loaded:main".into(), vec![]);
+        // Select "New conversation — server" (index 1) and confirm.
+        chrome.handle_key(KeyPress::ArrowDown);
+        let out = chrome.handle_key(KeyPress::Enter);
+        assert!(matches!(chrome.mode, ShellMode::Normal));
+        assert!(out.iter().any(|o| matches!(o,
+            ChromeOutput::Rpc(RpcRequest::SpawnServerChat { ref model_ref, .. })
+                if model_ref == "loaded:main"
+        )));
+    }
+
+    #[test]
+    fn conversation_picker_new_private_emits_local_private_chat() {
+        let mut chrome = make_chrome_with_models();
+        chrome.open_conversation_picker("loaded:main".into(), vec![]);
+        // First item is "New conversation — private" (index 0), press Enter.
+        let out = chrome.handle_key(KeyPress::Enter);
+        assert!(matches!(chrome.mode, ShellMode::Normal));
+        assert!(out.iter().any(|o| matches!(o,
+            ChromeOutput::Rpc(RpcRequest::LocalPrivateChat { ref model_ref, resume_uuid: None, .. })
+                if model_ref == "loaded:main"
+        )));
+    }
+
+    #[test]
+    fn conversation_picker_cannot_delete_sentinels() {
+        let mut chrome = make_chrome_with_models();
+        chrome.open_conversation_picker("loaded:main".into(), vec![]);
+        // Try to delete first entry (sentinel).
+        let out = chrome.handle_key(KeyPress::Char(b'd'));
+        // Should NOT emit DeleteConversation.
+        assert!(!out.iter().any(|o| matches!(o, ChromeOutput::Rpc(RpcRequest::DeleteConversation { .. }))));
     }
 }

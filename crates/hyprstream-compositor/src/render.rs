@@ -340,10 +340,6 @@ fn draw_model_modal(frame: &mut Frame, full_area: Rect, chrome: &ShellChrome) {
         let list_area = Rect { height: inner.height.saturating_sub(2), ..inner };
 
         let hint = Paragraph::new(Line::from(vec![
-            Span::styled("c",     theme::help_key()),
-            Span::styled(" chat \u{1f512}  ",  theme::help_text()),
-            Span::styled("C",     theme::help_key()),
-            Span::styled("/",     theme::help_text()),
             Span::styled("Enter", theme::help_key()),
             Span::styled(" chat  ",     theme::help_text()),
             Span::styled("T",     theme::help_key()),

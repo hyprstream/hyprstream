@@ -273,15 +273,14 @@ impl Compositor {
     }
 
     /// Handle a mouse click at terminal position (col, row), 0-indexed.
-    /// Checks for close-button clicks on pane windows and modals.
+    /// Checks for close-button clicks, menu item clicks, and modal list clicks.
     fn handle_mouse_click(&mut self, col: u16, row: u16) -> Vec<CompositorOutput> {
         use crate::theme::CLOSE_BUTTON_WIDTH;
 
         match self.chrome.mode {
-            // Pane window close button: top border is row 1, " x " occupies
-            // cols [width-1-CLOSE_BUTTON_WIDTH .. width-2] inside the border.
+            // Pane window close button: top border is row 1.
             ShellMode::Normal => {
-                let pane_top_row = 1u16; // row 0 = status bar, row 1 = pane block top border
+                let pane_top_row = 1u16;
                 if row == pane_top_row
                     && col >= self.cols.saturating_sub(1 + CLOSE_BUTTON_WIDTH)
                     && col < self.cols.saturating_sub(1)
@@ -296,14 +295,53 @@ impl Compositor {
                 }
                 vec![]
             }
-            // Modal close button: send Escape to dismiss.
+
+            // Start menu: close button, item clicks, click-outside-to-dismiss.
+            ShellMode::StartMenu { .. } => {
+                let popup_w: u16 = 26;
+                let popup_h: u16 = MENU_ITEMS.len() as u16 + 2;
+                let popup_y = self.rows.saturating_sub(popup_h + 1);
+                let inner_y = popup_y + 1;
+                let inner_x = 1u16;
+                let inner_right = popup_w.saturating_sub(1);
+
+                // Close button on popup top border.
+                if row == popup_y
+                    && col >= popup_w.saturating_sub(1 + CLOSE_BUTTON_WIDTH)
+                    && col < popup_w.saturating_sub(1)
+                {
+                    let out = self.chrome.handle_key(waxterm::input::KeyPress::Escape);
+                    return self.dispatch_chrome(out);
+                }
+
+                // Click on a menu item row.
+                if row >= inner_y
+                    && row < inner_y + MENU_ITEMS.len() as u16
+                    && col >= inner_x
+                    && col < inner_right
+                {
+                    let item_idx = (row - inner_y) as usize;
+                    self.chrome.mode = ShellMode::Normal;
+                    let out = self.chrome.execute_menu_action(item_idx);
+                    return self.dispatch_chrome(out);
+                }
+
+                // Click outside popup — dismiss.
+                if col >= popup_w || row < popup_y {
+                    let out = self.chrome.handle_key(waxterm::input::KeyPress::Escape);
+                    return self.dispatch_chrome(out);
+                }
+
+                vec![]
+            }
+
+            // Modals: close button, list item clicks, click-outside-to-dismiss.
             ShellMode::ModelList
             | ShellMode::Settings
             | ShellMode::ConversationPicker { .. }
             | ShellMode::ServiceManager { .. }
             | ShellMode::WorkerManager { .. }
             | ShellMode::Console => {
-                // Compute modal rect using the same percentages as render.rs.
                 let (pct_w, pct_h) = match self.chrome.mode {
                     ShellMode::ModelList              => (60, 70),
                     ShellMode::Settings               => (50, 65),
@@ -315,7 +353,8 @@ impl Compositor {
                 };
                 let area = ratatui::layout::Rect::new(0, 0, self.cols, self.rows);
                 let modal = centered_rect(pct_w, pct_h, area);
-                // Close button is at top-right of modal border.
+
+                // Close button on modal top border.
                 if row == modal.y
                     && col >= modal.x + modal.width.saturating_sub(1 + CLOSE_BUTTON_WIDTH)
                     && col < modal.x + modal.width.saturating_sub(1)
@@ -323,20 +362,64 @@ impl Compositor {
                     let out = self.chrome.handle_key(waxterm::input::KeyPress::Escape);
                     return self.dispatch_chrome(out);
                 }
-                vec![]
-            }
-            // Start menu popup close button.
-            ShellMode::StartMenu { .. } => {
-                let popup_w: u16 = 26;
-                let popup_h: u16 = MENU_ITEMS.len() as u16 + 2;
-                let popup_y = self.rows.saturating_sub(popup_h + 1);
-                if row == popup_y
-                    && col >= popup_w.saturating_sub(1 + CLOSE_BUTTON_WIDTH)
-                    && col < popup_w.saturating_sub(1)
+
+                // Click outside modal — dismiss.
+                if col < modal.x || col >= modal.x + modal.width
+                    || row < modal.y || row >= modal.y + modal.height
                 {
                     let out = self.chrome.handle_key(waxterm::input::KeyPress::Escape);
                     return self.dispatch_chrome(out);
                 }
+
+                // Click on a list item inside the modal.
+                // SelectList renders: label row, then item rows.
+                // Modal inner area starts 1 row below top border.
+                let first_item_row = modal.y + 2; // border(1) + label(1)
+                let inside_cols = col > modal.x && col < modal.x + modal.width - 1;
+
+                if inside_cols && row >= first_item_row {
+                    let idx = (row - first_item_row) as usize;
+                    match self.chrome.mode {
+                        ShellMode::ModelList => {
+                            if idx < self.chrome.model_list.items_mut().len() {
+                                self.chrome.model_list.set_selected(idx);
+                                let out = self.chrome.handle_key(waxterm::input::KeyPress::Enter);
+                                return self.dispatch_chrome(out);
+                            }
+                        }
+                        ShellMode::Settings => {
+                            if idx < self.chrome.settings_list.items_mut().len() {
+                                self.chrome.settings_list.set_selected(idx);
+                                let out = self.chrome.handle_key(waxterm::input::KeyPress::Enter);
+                                return self.dispatch_chrome(out);
+                            }
+                        }
+                        ShellMode::ConversationPicker { ref mut list, .. } => {
+                            if idx < list.items_mut().len() {
+                                list.set_selected(idx);
+                                let out = self.chrome.handle_key(waxterm::input::KeyPress::Enter);
+                                return self.dispatch_chrome(out);
+                            }
+                        }
+                        ShellMode::ServiceManager { ref mut selected } => {
+                            if idx < self.chrome.service_list.len() {
+                                *selected = idx;
+                                let out = self.chrome.handle_key(waxterm::input::KeyPress::Enter);
+                                return self.dispatch_chrome(out);
+                            }
+                        }
+                        ShellMode::WorkerManager { ref mut sandbox_sel, show_containers: false, .. } => {
+                            if idx < self.chrome.worker_list.len() {
+                                *sandbox_sel = idx;
+                                // Enter expands to container view; dispatch it.
+                                let out = self.chrome.handle_key(waxterm::input::KeyPress::Enter);
+                                return self.dispatch_chrome(out);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
                 vec![]
             }
             _ => vec![],
@@ -355,4 +438,71 @@ fn centered_rect(pct_w: u16, pct_h: u16, area: ratatui::layout::Rect) -> ratatui
         .flex(Flex::Center)
         .areas(v);
     h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_compositor() -> Compositor {
+        Compositor::new(120, 40, 1, 1, vec![], vec![])
+    }
+
+    #[test]
+    fn mouse_click_start_menu_item() {
+        let mut comp = make_compositor();
+        comp.chrome.mode = ShellMode::StartMenu { selected: 0 };
+        // Menu items start at inner_y = popup_y + 1.
+        // popup_h = MENU_ITEMS.len() + 2; popup_y = 40 - popup_h - 1
+        let popup_h = MENU_ITEMS.len() as u16 + 2;
+        let popup_y = 40u16.saturating_sub(popup_h + 1);
+        let first_item_row = popup_y + 1;
+        // Click on item 3 (Models).
+        let out = comp.handle(CompositorInput::MouseClick { col: 5, row: first_item_row + 3 });
+        // Models action opens ModelList mode.
+        assert!(matches!(comp.chrome.mode, ShellMode::ModelList));
+        assert!(out.iter().any(|o| matches!(o, CompositorOutput::Redraw)));
+    }
+
+    #[test]
+    fn mouse_click_outside_start_menu_dismisses() {
+        let mut comp = make_compositor();
+        comp.chrome.mode = ShellMode::StartMenu { selected: 0 };
+        // Click far right (outside the 26-wide popup).
+        let out = comp.handle(CompositorInput::MouseClick { col: 80, row: 20 });
+        assert!(matches!(comp.chrome.mode, ShellMode::Normal));
+        assert!(out.iter().any(|o| matches!(o, CompositorOutput::Redraw)));
+    }
+
+    #[test]
+    fn mouse_click_outside_modal_dismisses() {
+        let mut comp = make_compositor();
+        comp.chrome.mode = ShellMode::ModelList;
+        // Click at (0, 0) — outside the centered modal.
+        let out = comp.handle(CompositorInput::MouseClick { col: 0, row: 0 });
+        assert!(matches!(comp.chrome.mode, ShellMode::Normal));
+        assert!(out.iter().any(|o| matches!(o, CompositorOutput::Redraw)));
+    }
+
+    #[test]
+    fn mouse_click_model_list_item() {
+        let models = vec![
+            ModelEntry { model_ref: "a:main".into(), path: "/tmp".into(), loaded: true, loading: false },
+            ModelEntry { model_ref: "b:main".into(), path: "/tmp".into(), loaded: true, loading: false },
+        ];
+        let mut comp = Compositor::new(120, 40, 1, 1, vec![], models);
+        comp.chrome.mode = ShellMode::ModelList;
+        // Compute modal position.
+        let area = ratatui::layout::Rect::new(0, 0, 120, 40);
+        let modal = centered_rect(60, 70, area);
+        let first_item_row = modal.y + 2; // border + label
+        let item_col = modal.x + 2; // inside border
+        // Click on second item (index 1 = "b:main").
+        let out = comp.handle(CompositorInput::MouseClick { col: item_col, row: first_item_row + 1 });
+        // b:main is loaded → should emit ListConversations.
+        assert!(out.iter().any(|o| matches!(o,
+            CompositorOutput::Rpc(RpcRequest::ListConversations { ref model_ref })
+                if model_ref == "b:main"
+        )));
+    }
 }

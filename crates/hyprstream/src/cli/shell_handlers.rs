@@ -603,12 +603,21 @@ pub async fn handle_shell_tui(
             }
 
             Some((model_ref, loaded)) = model_status_rx.recv() => {
-                compositor.chrome.update_model_status(&model_ref, loaded);
+                let follow_up = compositor.chrome.update_model_status(&model_ref, loaded);
                 if !loaded {
                     compositor.chrome.push_toast(
                         format!("Model load timed out: {model_ref}"),
                         ToastLevel::Error,
                     );
+                }
+                // Dispatch follow-up RPC (e.g., ListConversations when pending picker resolves).
+                if let Some(rpc_req) = follow_up {
+                    dispatch_outputs(
+                        &mut compositor, &client, &model_client, &worker_client,
+                        &model_status_tx, &mut terminal, &mut console_app,
+                        &mut active_apps, &mut next_local_id, &storage_key, signing_key,
+                        vec![CompositorOutput::Rpc(rpc_req)],
+                    ).await;
                 }
                 composite_draw(&mut terminal, &compositor, &mut console_app);
             }

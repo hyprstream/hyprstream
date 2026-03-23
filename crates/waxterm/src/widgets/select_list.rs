@@ -49,6 +49,13 @@ impl<T: Display + Clone> SelectList<T> {
         &mut self.items
     }
 
+    /// Set the selected index (clamped to bounds).
+    pub fn set_selected(&mut self, idx: usize) {
+        if idx < self.items.len() {
+            self.selected = idx;
+        }
+    }
+
     /// Clamp the selected index to be within bounds after items are removed.
     pub fn clamp_selected(&mut self) {
         if !self.items.is_empty() {
