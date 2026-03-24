@@ -144,13 +144,6 @@ pub async fn handle_shell_tui(
     let session_id = result.session_id;
     let viewer_id  = result.viewer_id;
 
-    // Auto-spawn shell in the first pane if there is one.
-    if let Some(win) = result.windows.first() {
-        if let Some(pane) = win.panes.first() {
-            let _ = spawn_shell_rpc(&client, session_id, pane.id, "").await;
-        }
-    }
-
     // Build initial window list.
     let windows: Vec<WindowSummary> = result
         .windows
