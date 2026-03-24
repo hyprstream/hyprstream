@@ -1623,7 +1623,8 @@ pub fn keypress_to_bytes(key: KeyPress) -> Vec<u8> {
         KeyPress::F(10) => b"\x1b[21~".to_vec(),
         KeyPress::F(11) => b"\x1b[23~".to_vec(),
         KeyPress::F(12) => b"\x1b[24~".to_vec(),
-        KeyPress::F(_) | KeyPress::CtrlSpace => vec![],
+        KeyPress::F(_) | KeyPress::CtrlSpace
+        | KeyPress::ScrollUp | KeyPress::ScrollDown => vec![],
     }
 }
 

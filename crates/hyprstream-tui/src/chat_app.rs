@@ -998,29 +998,12 @@ impl TerminalApp for ChatApp {
             // ── Input mode ──────────────────────────────────────────────────
             ChatMode::Input => match key {
                 KeyPress::Escape => {
-                    if let Some(prev) = self.last_esc {
-                        if prev.elapsed().as_millis() < DOUBLE_ESC_MS {
-                            self.quit = true;
-                            return true;
-                        }
-                    }
-                    self.last_esc = Some(Instant::now());
-                    self.status = Some("Press Esc again to close".to_owned());
-                    true
-                }
-                KeyPress::F(10) => {
-                    self.quit = true;
-                    true
+                    // No-op. Use Ctrl+Space → Q to close via compositor menu.
+                    false
                 }
                 KeyPress::Char(0x05) => {
                     self.editor_text = self.textarea.lines().join("\n");
                     self.mode = ChatMode::Editor;
-                    true
-                }
-                // 's' opens settings modal when textarea is empty.
-                KeyPress::Char(b's') if self.textarea.lines().iter().all(|l| l.is_empty()) => {
-                    self.settings_draft = self.gen_config.read().clone();
-                    self.mode = ChatMode::Settings { selected_field: 0 };
                     true
                 }
                 KeyPress::Enter => {
@@ -1057,12 +1040,16 @@ impl TerminalApp for ChatApp {
                     self.textarea.move_cursor(ratatui_textarea::CursorMove::Forward);
                     true
                 }
-                KeyPress::ArrowUp => {
-                    self.scroll_offset = self.scroll_offset.saturating_add(1);
+                KeyPress::ArrowUp | KeyPress::ScrollUp => {
+                    self.scroll_offset = self.scroll_offset.saturating_add(
+                        if matches!(key, KeyPress::ScrollUp) { 3 } else { 1 },
+                    );
                     true
                 }
-                KeyPress::ArrowDown => {
-                    self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                KeyPress::ArrowDown | KeyPress::ScrollDown => {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(
+                        if matches!(key, KeyPress::ScrollDown) { 3 } else { 1 },
+                    );
                     true
                 }
                 _ => false,
@@ -1116,12 +1103,16 @@ impl TerminalApp for ChatApp {
                     self.textarea.move_cursor(ratatui_textarea::CursorMove::Forward);
                     true
                 }
-                KeyPress::ArrowUp => {
-                    self.scroll_offset = self.scroll_offset.saturating_add(1);
+                KeyPress::ArrowUp | KeyPress::ScrollUp => {
+                    self.scroll_offset = self.scroll_offset.saturating_add(
+                        if matches!(key, KeyPress::ScrollUp) { 3 } else { 1 },
+                    );
                     true
                 }
-                KeyPress::ArrowDown => {
-                    self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                KeyPress::ArrowDown | KeyPress::ScrollDown => {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(
+                        if matches!(key, KeyPress::ScrollDown) { 3 } else { 1 },
+                    );
                     true
                 }
                 _ => false,
