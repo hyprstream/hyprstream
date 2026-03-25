@@ -12,6 +12,7 @@ pub use hyprstream_rpc::annotations_capnp;
 pub use hyprstream_rpc::common_capnp;
 pub use hyprstream_rpc::streaming_capnp;
 pub use hyprstream_rpc::optional_capnp;
+pub use hyprstream_rpc::nine_capnp;
 
 // Cap'n Proto generated modules (must be at crate root for path resolution)
 // Note: common_capnp is in hyprstream-rpc crate (envelope types)
