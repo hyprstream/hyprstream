@@ -189,6 +189,30 @@ impl Namespace {
         }
     }
 
+    /// Write to a ctl file and read the response. Walk + open(RDWR) + write + read + clunk.
+    ///
+    /// This is the Plan9 ctl pattern: write a command, read the response, all on
+    /// the same fid so the response buffer is available after the write.
+    pub fn ctl(&self, path: &str, data: &[u8], caller: &Subject) -> Result<Vec<u8>, VfsError> {
+        let (target, remainder) = self.resolve(path)?;
+        match target {
+            MountTarget::Local(mount) => {
+                let components: Vec<&str> = split_path(&remainder);
+                let mut fid = mount.walk(&components, caller).map_err(VfsError::Io)?;
+                mount.open(&mut fid, 2, caller).map_err(VfsError::Io)?; // ORDWR
+                mount.write(&fid, 0, data, caller).map_err(VfsError::Io)?;
+                let resp = mount.read(&fid, 0, 64 * 1024, caller).map_err(VfsError::Io)?;
+                mount.clunk(fid, caller);
+                Ok(resp)
+            }
+            MountTarget::Service(_) => {
+                Err(VfsError::TransportUnavailable(
+                    "service transport not yet implemented".to_owned(),
+                ))
+            }
+        }
+    }
+
     /// List directory entries. Walk + open(read) + readdir + clunk.
     pub fn ls(&self, path: &str, caller: &Subject) -> Result<Vec<DirEntry>, VfsError> {
         // Special case: ls "/" shows all mount prefixes as directories.

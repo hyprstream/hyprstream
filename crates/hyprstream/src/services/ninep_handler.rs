@@ -756,4 +756,144 @@ mod tests {
         assert_eq!(content, b"loaded\n");
         tree.clunk(fid2, "alice");
     }
+
+    // ── VFS integration tests ───────────────────────────────────────────────
+
+    #[test]
+    fn vfs_cat_reads_synthetic_file() {
+        use hyprstream_vfs::{Namespace, MountTarget, Subject};
+        use std::sync::Arc;
+
+        let tree = make_tree();
+        let mut ns = Namespace::new();
+        ns.mount("/srv/model", MountTarget::Local(Arc::new(tree))).unwrap();
+
+        let caller = Subject::new("alice");
+        let data = ns.cat("/srv/model/test-model/status", &caller).unwrap();
+        assert_eq!(data, b"loaded\n");
+    }
+
+    #[test]
+    fn vfs_ctl_writes_and_reads_response() {
+        use hyprstream_vfs::{Namespace, MountTarget, Subject};
+        use std::sync::Arc;
+
+        let tree = make_tree();
+        let mut ns = Namespace::new();
+        ns.mount("/srv/model", MountTarget::Local(Arc::new(tree))).unwrap();
+
+        let caller = Subject::new("alice");
+
+        // ctl: write command + read response in one fid lifecycle.
+        let resp = ns.ctl("/srv/model/test-model/ctl", b"load", &caller).unwrap();
+        assert_eq!(resp, b"ok: load");
+    }
+
+    #[test]
+    fn vfs_ls_lists_directory() {
+        use hyprstream_vfs::{Namespace, MountTarget, Subject};
+        use std::sync::Arc;
+
+        let tree = make_tree();
+        let mut ns = Namespace::new();
+        ns.mount("/srv/model", MountTarget::Local(Arc::new(tree))).unwrap();
+
+        let caller = Subject::new("alice");
+        let entries = ns.ls("/srv/model/test-model", &caller).unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"status"));
+        assert!(names.contains(&"ctl"));
+    }
+
+    #[test]
+    fn vfs_dynamic_dir_with_namespace() {
+        use hyprstream_vfs::{Namespace, MountTarget, Subject};
+        use std::sync::Arc;
+
+        // Build a dynamic tree (like the model service would).
+        let tree = SyntheticTree::new(SyntheticNode::DynamicDir {
+            list: Box::new(|| vec![
+                SyntheticDirEntry { name: "qwen3:main".into(), is_dir: true, size: 0 },
+            ]),
+            resolve: Box::new(|_name| {
+                let mut children = HashMap::new();
+                children.insert("status".to_owned(), SyntheticNode::ReadFile(
+                    Box::new(|| b"loaded\n".to_vec()),
+                ));
+                children.insert("defaults".to_owned(), SyntheticNode::ReadFile(
+                    Box::new(|| b"{\"temperature\": 0.7}\n".to_vec()),
+                ));
+                children.insert("ctl".to_owned(), SyntheticNode::CtlFile {
+                    handler: Box::new(|data| {
+                        let cmd = String::from_utf8_lossy(data);
+                        Ok(format!("ctl: {}\n", cmd.trim()).into_bytes())
+                    }),
+                });
+                Some(SyntheticNode::Dir { children })
+            }),
+        });
+
+        let mut ns = Namespace::new();
+        ns.mount("/srv/model", MountTarget::Local(Arc::new(tree))).unwrap();
+
+        let caller = Subject::new("alice");
+
+        // Read model status through the VFS.
+        let status = ns.cat("/srv/model/qwen3:main/status", &caller).unwrap();
+        assert_eq!(status, b"loaded\n");
+
+        // Read model defaults.
+        let defaults = ns.cat("/srv/model/qwen3:main/defaults", &caller).unwrap();
+        assert!(defaults.starts_with(b"{\"temperature\""));
+
+        // Write to ctl and read response (single fid lifecycle).
+        let resp = ns.ctl("/srv/model/qwen3:main/ctl", b"load", &caller).unwrap();
+        assert_eq!(resp, b"ctl: load\n");
+    }
+
+    #[test]
+    fn vfs_tenant_isolation() {
+        use hyprstream_vfs::{Namespace, MountTarget, Subject};
+        use std::sync::Arc;
+
+        let tree = make_tree();
+        let mut ns = Namespace::new();
+        ns.mount("/srv/model", MountTarget::Local(Arc::new(tree))).unwrap();
+
+        let alice = Subject::new("alice");
+        let bob = Subject::new("bob");
+
+        // Both tenants can read (cat does walk+open+read+clunk atomically).
+        let data_a = ns.cat("/srv/model/test-model/status", &alice).unwrap();
+        let data_b = ns.cat("/srv/model/test-model/status", &bob).unwrap();
+        assert_eq!(data_a, data_b);
+        assert_eq!(data_a, b"loaded\n");
+    }
+
+    #[test]
+    fn vfs_namespace_fork_isolation() {
+        use hyprstream_vfs::{Namespace, MountTarget, Subject};
+        use std::sync::Arc;
+
+        let tree = make_tree();
+        let mut ns = Namespace::new();
+        ns.mount("/srv/model", MountTarget::Local(Arc::new(tree))).unwrap();
+        ns.mount("/srv/worker", MountTarget::Local(Arc::new(
+            SyntheticTree::new(SyntheticNode::Dir { children: HashMap::new() }),
+        ))).unwrap();
+
+        let caller = Subject::new("alice");
+
+        // Fork and restrict.
+        let mut sandbox = ns.fork();
+        sandbox.unmount("/srv/worker");
+
+        // Parent can access both.
+        assert!(ns.cat("/srv/model/test-model/status", &caller).is_ok());
+        assert!(ns.ls("/srv/worker", &caller).is_ok());
+
+        // Child can access model but not worker.
+        assert!(sandbox.cat("/srv/model/test-model/status", &caller).is_ok());
+        assert!(sandbox.ls("/srv/worker", &caller).is_err());
+    }
 }
