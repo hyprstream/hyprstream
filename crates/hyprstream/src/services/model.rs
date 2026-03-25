@@ -149,6 +149,8 @@ pub struct ModelServiceInner {
     local_issuer_url: Option<String>,
     /// Federation key source for verifying externally-issued JWTs.
     federation_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>>,
+    /// Persistent 9P synthetic tree for the fs scope (lazily initialized).
+    fs_tree: std::sync::OnceLock<crate::services::ninep_handler::SyntheticTree>,
 }
 
 /// Model service that manages InferenceService lifecycle.
@@ -210,6 +212,7 @@ impl ModelService {
             expected_audience: None,
             local_issuer_url: None,
             federation_key_source: None,
+            fs_tree: std::sync::OnceLock::new(),
         })}
     }
 
@@ -287,6 +290,7 @@ impl ModelService {
             expected_audience: None,
             local_issuer_url: None,
             federation_key_source: None,
+            fs_tree: std::sync::OnceLock::new(),
         })}
     }
 
@@ -1069,6 +1073,11 @@ use crate::services::generated::model_client::{
 use crate::services::ninep_handler::{SyntheticTree, SyntheticNode, SyntheticDirEntry, SyntheticQid};
 
 impl ModelService {
+    /// Get the persistent synthetic 9P tree (lazily initialized).
+    fn fs_tree(&self) -> &SyntheticTree {
+        self.inner.fs_tree.get_or_init(|| self.build_fs_tree())
+    }
+
     /// Build a synthetic 9P tree from current model service state.
     fn build_fs_tree(&self) -> SyntheticTree {
         let inner_list = Arc::clone(&self.inner);
@@ -1128,9 +1137,9 @@ impl FsHandler for ModelService {
     async fn handle_walk(&self, ctx: &EnvelopeContext, _request_id: u64,
         _model_ref: &str, data: &NpWalk,
     ) -> Result<RWalk> {
-        let tree = self.build_fs_tree();
+        let tree = self.fs_tree();
         let owner = ctx.subject().to_string();
-        let (_fid, qid) = tree.walk(&data.wnames, &owner)
+        let (_fid, qid) = tree.walk(&data.wnames, &owner, Some(data.newfid))
             .map_err(|e| anyhow::anyhow!(e))?;
         Ok(RWalk { qid: Self::qid_to_gen(&qid) })
     }
@@ -1138,7 +1147,7 @@ impl FsHandler for ModelService {
     async fn handle_open(&self, ctx: &EnvelopeContext, _request_id: u64,
         _model_ref: &str, data: &NpOpen,
     ) -> Result<ROpen> {
-        let tree = self.build_fs_tree();
+        let tree = self.fs_tree();
         let owner = ctx.subject().to_string();
         // Re-walk to get the fid, then open.
         let (qid, iounit) = tree.open(data.fid, data.mode, &owner)
@@ -1149,7 +1158,7 @@ impl FsHandler for ModelService {
     async fn handle_read(&self, ctx: &EnvelopeContext, _request_id: u64,
         _model_ref: &str, data: &NpRead,
     ) -> Result<RRead> {
-        let tree = self.build_fs_tree();
+        let tree = self.fs_tree();
         let owner = ctx.subject().to_string();
         let bytes = tree.read(data.fid, data.offset, data.count, &owner)
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -1159,7 +1168,7 @@ impl FsHandler for ModelService {
     async fn handle_write(&self, ctx: &EnvelopeContext, _request_id: u64,
         _model_ref: &str, data: &NpWrite,
     ) -> Result<RWrite> {
-        let tree = self.build_fs_tree();
+        let tree = self.fs_tree();
         let owner = ctx.subject().to_string();
         let count = tree.write(data.fid, data.offset, &data.data, &owner)
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -1169,7 +1178,7 @@ impl FsHandler for ModelService {
     async fn handle_clunk(&self, ctx: &EnvelopeContext, _request_id: u64,
         _model_ref: &str, data: &NpClunk,
     ) -> Result<()> {
-        let tree = self.build_fs_tree();
+        let tree = self.fs_tree();
         let owner = ctx.subject().to_string();
         tree.clunk(data.fid, &owner);
         Ok(())
@@ -1178,7 +1187,7 @@ impl FsHandler for ModelService {
     async fn handle_stat(&self, ctx: &EnvelopeContext, _request_id: u64,
         _model_ref: &str, data: &NpStatReq,
     ) -> Result<RStat> {
-        let tree = self.build_fs_tree();
+        let tree = self.fs_tree();
         let owner = ctx.subject().to_string();
         let (qid, name) = tree.stat(data.fid, &owner)
             .map_err(|e| anyhow::anyhow!(e))?;

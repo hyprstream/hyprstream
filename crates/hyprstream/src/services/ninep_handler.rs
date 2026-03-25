@@ -147,11 +147,12 @@ impl SyntheticFidTable {
             count.fetch_sub(1, AcqRel);
             return Err("global fid limit reached");
         }
-        // Retry on collision (counter wrap).
+        // Retry on collision using atomic entry() to avoid TOCTOU.
         for _ in 0..1000 {
             let fid = self.next_fid.fetch_add(1, Relaxed);
             if fid == 0 { continue; } // 0 is reserved for root
-            if !self.fids.contains_key(&fid) {
+            if let dashmap::mapref::entry::Entry::Vacant(_) = self.fids.entry(fid) {
+                // Fid is available — caller will insert via insert_at().
                 return Ok(fid);
             }
         }
@@ -173,13 +174,19 @@ impl SyntheticFidTable {
     }
 
     fn take(&self, fid: u32, owner: &str) -> Result<FidEntry, &'static str> {
-        let (_, entry) = self.fids.remove(&fid).ok_or("fid not found")?;
-        if entry.owner != owner {
-            // Put it back — wrong owner.
-            self.fids.insert(fid, entry);
-            return Err("fid not owned by caller");
+        // Atomic remove-if-owned to avoid TOCTOU between remove and ownership check.
+        let removed = self.fids.remove_if(&fid, |_, entry| entry.owner == owner);
+        match removed {
+            Some((_, entry)) => Ok(entry),
+            None => {
+                // Either fid doesn't exist or wrong owner.
+                if self.fids.contains_key(&fid) {
+                    Err("fid not owned by caller")
+                } else {
+                    Err("fid not found")
+                }
+            }
         }
-        Ok(entry)
     }
 
     fn remove(&self, fid: u32, owner: &str) {
@@ -241,9 +248,30 @@ impl SyntheticTree {
         }
     }
 
-    /// Walk path components from root, allocating a new fid.
-    pub fn walk(&self, wnames: &[String], owner: &str) -> Result<(u32, SyntheticQid), String> {
-        let fid = self.fid_table.alloc_fid(owner).map_err(str::to_owned)?;
+    /// Walk path components from root.
+    ///
+    /// If `newfid` is Some and > 0, uses the client-chosen fid (9P protocol).
+    /// If `newfid` is None or 0, auto-allocates a server-side fid.
+    pub fn walk(&self, wnames: &[String], owner: &str, newfid: Option<u32>) -> Result<(u32, SyntheticQid), String> {
+        let fid = match newfid {
+            Some(f) if f > 0 => {
+                // Client-chosen fid — check not already in use, count against limits.
+                if self.fid_table.fids.contains_key(&f) {
+                    return Err("fid already in use".to_owned());
+                }
+                use std::sync::atomic::Ordering::{AcqRel, Acquire};
+                let count = self.fid_table.client_counts
+                    .entry(owner.to_owned())
+                    .or_insert_with(|| AtomicU32::new(0));
+                if count.fetch_update(AcqRel, Acquire, |c| {
+                    if c >= crate::services::types::MAX_FIDS_PER_CLIENT { None } else { Some(c + 1) }
+                }).is_err() {
+                    return Err("too many open fids".to_owned());
+                }
+                f
+            }
+            _ => self.fid_table.alloc_fid(owner).map_err(str::to_owned)?,
+        };
 
         let (qid, resolved) = if wnames.is_empty() {
             (SyntheticQid::dir("/"), ResolvedNode::Static(vec![]))
@@ -561,7 +589,7 @@ impl hyprstream_vfs::LocalMount for SyntheticTree {
     fn walk(&self, components: &[&str], caller: &hyprstream_rpc::Subject) -> Result<hyprstream_vfs::LocalFid, String> {
         let wnames: Vec<String> = components.iter().map(|s| (*s).to_owned()).collect();
         let owner = caller.to_string();
-        let (fid, _qid) = self.walk(&wnames, &owner)?;
+        let (fid, _qid) = self.walk(&wnames, &owner, None)?;
         Ok(hyprstream_vfs::LocalFid::new(fid))
     }
 
@@ -641,7 +669,7 @@ mod tests {
     #[test]
     fn walk_and_read_file() {
         let tree = make_tree();
-        let (fid, qid) = tree.walk(&["test-model".into(), "status".into()], "alice").unwrap();
+        let (fid, qid) = tree.walk(&["test-model".into(), "status".into()], "alice", None).unwrap();
         assert_eq!(qid.qtype, QTFILE);
         tree.open(fid, OREAD, "alice").unwrap();
         let data = tree.read(fid, 0, 1024, "alice").unwrap();
@@ -652,7 +680,7 @@ mod tests {
     #[test]
     fn walk_root_and_readdir() {
         let tree = make_tree();
-        let (fid, qid) = tree.walk(&[], "alice").unwrap();
+        let (fid, qid) = tree.walk(&[], "alice", None).unwrap();
         assert_eq!(qid.qtype, QTDIR);
         tree.open(fid, OREAD, "alice").unwrap();
         let data = tree.read(fid, 0, 4096, "alice").unwrap();
@@ -663,7 +691,7 @@ mod tests {
     #[test]
     fn ctl_write_then_read() {
         let tree = make_tree();
-        let (fid, _) = tree.walk(&["test-model".into(), "ctl".into()], "alice").unwrap();
+        let (fid, _) = tree.walk(&["test-model".into(), "ctl".into()], "alice", None).unwrap();
         tree.open(fid, OWRITE, "alice").unwrap();
         let written = tree.write(fid, 0, b"load", "alice").unwrap();
         assert_eq!(written, 4);
@@ -676,7 +704,7 @@ mod tests {
     #[test]
     fn fid_ownership_enforced() {
         let tree = make_tree();
-        let (fid, _) = tree.walk(&["test-model".into(), "status".into()], "alice").unwrap();
+        let (fid, _) = tree.walk(&["test-model".into(), "status".into()], "alice", None).unwrap();
         assert!(tree.open(fid, OREAD, "bob").is_err());
         tree.clunk(fid, "alice");
     }
@@ -684,13 +712,13 @@ mod tests {
     #[test]
     fn walk_not_found() {
         let tree = make_tree();
-        assert!(tree.walk(&["nonexistent".into()], "alice").is_err());
+        assert!(tree.walk(&["nonexistent".into()], "alice", None).is_err());
     }
 
     #[test]
     fn stat_returns_qid() {
         let tree = make_tree();
-        let (fid, _) = tree.walk(&["test-model".into(), "status".into()], "alice").unwrap();
+        let (fid, _) = tree.walk(&["test-model".into(), "status".into()], "alice", None).unwrap();
         let (qid, _name) = tree.stat(fid, "alice").unwrap();
         assert_eq!(qid.qtype, QTFILE);
         tree.clunk(fid, "alice");
@@ -713,7 +741,7 @@ mod tests {
         });
 
         // Walk into dynamic dir root.
-        let (fid, qid) = tree.walk(&[], "alice").unwrap();
+        let (fid, qid) = tree.walk(&[], "alice", None).unwrap();
         assert_eq!(qid.qtype, QTDIR);
         tree.open(fid, OREAD, "alice").unwrap();
         let data = tree.read(fid, 0, 4096, "alice").unwrap();
@@ -721,7 +749,7 @@ mod tests {
         tree.clunk(fid, "alice");
 
         // Walk to a dynamic child's file.
-        let (fid2, qid2) = tree.walk(&["model-a".into(), "status".into()], "alice").unwrap();
+        let (fid2, qid2) = tree.walk(&["model-a".into(), "status".into()], "alice", None).unwrap();
         assert_eq!(qid2.qtype, QTFILE);
         tree.open(fid2, OREAD, "alice").unwrap();
         let content = tree.read(fid2, 0, 1024, "alice").unwrap();
