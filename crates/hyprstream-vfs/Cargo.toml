@@ -6,8 +6,8 @@ license.workspace = true
 description = "Plan9-inspired VFS namespace multiplexer for hyprstream"
 
 [dependencies]
-# Async runtime (needed for cat/ls/echo convenience methods)
-tokio = { workspace = true, features = ["sync"] }
+# RPC types (Subject for caller identity)
+hyprstream-rpc = { path = "../hyprstream-rpc" }
 
 # Error handling
 anyhow = { workspace = true }

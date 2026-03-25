@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use hyprstream_rpc::Subject;
 use crate::local_mount::{DirEntry, LocalMount};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -149,19 +150,18 @@ impl Namespace {
     // ── Convenience methods ─────────────────────────────────────────────────
 
     /// Read the entire contents of a file. Walk + open + read-all + clunk.
-    pub fn cat(&self, path: &str) -> Result<Vec<u8>, VfsError> {
+    pub fn cat(&self, path: &str, caller: &Subject) -> Result<Vec<u8>, VfsError> {
         let (target, remainder) = self.resolve(path)?;
         match target {
             MountTarget::Local(mount) => {
                 let components: Vec<&str> = split_path(&remainder);
-                let mut fid = mount.walk(&components).map_err(VfsError::Io)?;
-                mount.open(&mut fid, 0).map_err(VfsError::Io)?; // OREAD
-                let data = mount.read(&fid, 0, 64 * 1024).map_err(VfsError::Io)?;
-                mount.clunk(fid);
+                let mut fid = mount.walk(&components, caller).map_err(VfsError::Io)?;
+                mount.open(&mut fid, 0, caller).map_err(VfsError::Io)?; // OREAD
+                let data = mount.read(&fid, 0, 64 * 1024, caller).map_err(VfsError::Io)?;
+                mount.clunk(fid, caller);
                 Ok(data)
             }
             MountTarget::Service(_transport) => {
-                // Phase 3+: serialize NpWalk/NpOpen/NpRead/NpClunk via transport.
                 Err(VfsError::TransportUnavailable(
                     "service transport not yet implemented".to_owned(),
                 ))
@@ -170,15 +170,15 @@ impl Namespace {
     }
 
     /// Write data to a file. Walk + open(write) + write + clunk.
-    pub fn echo(&self, path: &str, data: &[u8]) -> Result<(), VfsError> {
+    pub fn echo(&self, path: &str, data: &[u8], caller: &Subject) -> Result<(), VfsError> {
         let (target, remainder) = self.resolve(path)?;
         match target {
             MountTarget::Local(mount) => {
                 let components: Vec<&str> = split_path(&remainder);
-                let mut fid = mount.walk(&components).map_err(VfsError::Io)?;
-                mount.open(&mut fid, 1).map_err(VfsError::Io)?; // OWRITE
-                mount.write(&fid, 0, data).map_err(VfsError::Io)?;
-                mount.clunk(fid);
+                let mut fid = mount.walk(&components, caller).map_err(VfsError::Io)?;
+                mount.open(&mut fid, 1, caller).map_err(VfsError::Io)?; // OWRITE
+                mount.write(&fid, 0, data, caller).map_err(VfsError::Io)?;
+                mount.clunk(fid, caller);
                 Ok(())
             }
             MountTarget::Service(_) => {
@@ -190,7 +190,7 @@ impl Namespace {
     }
 
     /// List directory entries. Walk + open(read) + readdir + clunk.
-    pub fn ls(&self, path: &str) -> Result<Vec<DirEntry>, VfsError> {
+    pub fn ls(&self, path: &str, caller: &Subject) -> Result<Vec<DirEntry>, VfsError> {
         // Special case: ls "/" shows all mount prefixes as directories.
         if path == "/" || path.is_empty() {
             return Ok(self.root_dir_entries());
@@ -200,10 +200,10 @@ impl Namespace {
         match target {
             MountTarget::Local(mount) => {
                 let components: Vec<&str> = split_path(&remainder);
-                let mut fid = mount.walk(&components).map_err(VfsError::Io)?;
-                mount.open(&mut fid, 0).map_err(VfsError::Io)?;
-                let entries = mount.readdir(&fid).map_err(VfsError::Io)?;
-                mount.clunk(fid);
+                let mut fid = mount.walk(&components, caller).map_err(VfsError::Io)?;
+                mount.open(&mut fid, 0, caller).map_err(VfsError::Io)?;
+                let entries = mount.readdir(&fid, caller).map_err(VfsError::Io)?;
+                mount.clunk(fid, caller);
                 Ok(entries)
             }
             MountTarget::Service(_) => {
@@ -300,27 +300,27 @@ mod tests {
     }
 
     impl LocalMount for MemMount {
-        fn walk(&self, components: &[&str]) -> Result<LocalFid, String> {
+        fn walk(&self, components: &[&str], _caller: &Subject) -> Result<LocalFid, String> {
             let path = components.join("/");
             Ok(LocalFid::new(MemFid { path, is_open: false }))
         }
 
-        fn open(&self, fid: &mut LocalFid, _mode: u8) -> Result<(), String> {
+        fn open(&self, fid: &mut LocalFid, _mode: u8, _caller: &Subject) -> Result<(), String> {
             let inner = fid.downcast_mut::<MemFid>().ok_or("bad fid")?;
             inner.is_open = true;
             Ok(())
         }
 
-        fn read(&self, fid: &LocalFid, _offset: u64, _count: u32) -> Result<Vec<u8>, String> {
+        fn read(&self, fid: &LocalFid, _offset: u64, _count: u32, _caller: &Subject) -> Result<Vec<u8>, String> {
             let inner = fid.downcast_ref::<MemFid>().ok_or("bad fid")?;
             self.files.get(&inner.path).cloned().ok_or_else(|| format!("not found: {}", inner.path))
         }
 
-        fn write(&self, _fid: &LocalFid, _offset: u64, _data: &[u8]) -> Result<u32, String> {
+        fn write(&self, _fid: &LocalFid, _offset: u64, _data: &[u8], _caller: &Subject) -> Result<u32, String> {
             Ok(_data.len() as u32)
         }
 
-        fn readdir(&self, fid: &LocalFid) -> Result<Vec<DirEntry>, String> {
+        fn readdir(&self, fid: &LocalFid, _caller: &Subject) -> Result<Vec<DirEntry>, String> {
             let inner = fid.downcast_ref::<MemFid>().ok_or("bad fid")?;
             let prefix = if inner.path.is_empty() { String::new() } else { format!("{}/", inner.path) };
             let mut entries = Vec::new();
@@ -334,13 +334,15 @@ mod tests {
             Ok(entries)
         }
 
-        fn stat(&self, fid: &LocalFid) -> Result<Stat, String> {
+        fn stat(&self, fid: &LocalFid, _caller: &Subject) -> Result<Stat, String> {
             let inner = fid.downcast_ref::<MemFid>().ok_or("bad fid")?;
             Ok(Stat { qtype: 0, size: 0, name: inner.path.clone(), mtime: 0 })
         }
 
-        fn clunk(&self, _fid: LocalFid) {}
+        fn clunk(&self, _fid: LocalFid, _caller: &Subject) {}
     }
+
+    fn test_subject() -> Subject { Subject::new("test") }
 
     #[test]
     fn mount_and_cat() {
@@ -348,7 +350,7 @@ mod tests {
         let mount = Arc::new(MemMount::new(vec![("temperature", b"0.7\n")]));
         ns.mount("/config", MountTarget::Local(mount)).unwrap();
 
-        let data = ns.cat("/config/temperature").unwrap();
+        let data = ns.cat("/config/temperature", &test_subject()).unwrap();
         assert_eq!(data, b"0.7\n");
     }
 
@@ -359,7 +361,7 @@ mod tests {
         ns.mount("/srv/mcp", MountTarget::Local(Arc::new(MemMount::new(vec![])))).unwrap();
         ns.mount("/config", MountTarget::Local(Arc::new(MemMount::new(vec![])))).unwrap();
 
-        let entries = ns.ls("/").unwrap();
+        let entries = ns.ls("/", &test_subject()).unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"srv"));
         assert!(names.contains(&"config"));
@@ -373,8 +375,7 @@ mod tests {
         ns.mount("/srv", MountTarget::Local(srv)).unwrap();
         ns.mount("/srv/model", MountTarget::Local(nested)).unwrap();
 
-        // /srv/model/status should match /srv/model (longer prefix), not /srv.
-        let data = ns.cat("/srv/model/status").unwrap();
+        let data = ns.cat("/srv/model/status", &test_subject()).unwrap();
         assert_eq!(data, b"loaded");
     }
 
@@ -405,21 +406,18 @@ mod tests {
         let mut child = ns.fork();
         child.unmount("/srv/worker");
 
-        // Parent still has both.
         assert_eq!(ns.mount_prefixes().len(), 2);
-        // Child only has model.
         assert_eq!(child.mount_prefixes().len(), 1);
         assert_eq!(child.mount_prefixes()[0], "/srv/model");
 
-        // Child can still read from model.
-        let data = child.cat("/srv/model/status").unwrap();
+        let data = child.cat("/srv/model/status", &test_subject()).unwrap();
         assert_eq!(data, b"loaded");
     }
 
     #[test]
     fn not_found() {
         let ns = Namespace::new();
-        assert!(matches!(ns.cat("/nonexistent/file"), Err(VfsError::NotFound(_))));
+        assert!(matches!(ns.cat("/nonexistent/file", &test_subject()), Err(VfsError::NotFound(_))));
     }
 
     #[test]
@@ -428,7 +426,6 @@ mod tests {
         let mount = Arc::new(MemMount::new(vec![("ctl", b"")]));
         ns.mount("/cmd", MountTarget::Local(mount)).unwrap();
 
-        // echo doesn't fail (MemMount write returns Ok).
-        assert!(ns.echo("/cmd/ctl", b"load qwen3:main").is_ok());
+        assert!(ns.echo("/cmd/ctl", b"load qwen3:main", &test_subject()).is_ok());
     }
 }

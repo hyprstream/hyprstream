@@ -17,5 +17,6 @@
 mod local_mount;
 mod namespace;
 
+pub use hyprstream_rpc::Subject;
 pub use local_mount::{DirEntry, LocalFid, LocalMount, Stat};
 pub use namespace::{BindFlag, MountTarget, Namespace, VfsError};

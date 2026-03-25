@@ -558,31 +558,33 @@ fn encode_dir_entries(entries: &[SyntheticDirEntry], max_bytes: u32) -> Vec<u8> 
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl hyprstream_vfs::LocalMount for SyntheticTree {
-    fn walk(&self, components: &[&str]) -> Result<hyprstream_vfs::LocalFid, String> {
+    fn walk(&self, components: &[&str], caller: &hyprstream_rpc::Subject) -> Result<hyprstream_vfs::LocalFid, String> {
         let wnames: Vec<String> = components.iter().map(|s| (*s).to_owned()).collect();
-        let (fid, _qid) = self.walk(&wnames, "local")?;
+        let owner = caller.to_string();
+        let (fid, _qid) = self.walk(&wnames, &owner)?;
         Ok(hyprstream_vfs::LocalFid::new(fid))
     }
 
-    fn open(&self, fid: &mut hyprstream_vfs::LocalFid, mode: u8) -> Result<(), String> {
+    fn open(&self, fid: &mut hyprstream_vfs::LocalFid, mode: u8, caller: &hyprstream_rpc::Subject) -> Result<(), String> {
         let fid_u32 = *fid.downcast_ref::<u32>().ok_or("invalid fid type")?;
-        self.open(fid_u32, mode, "local")?;
+        let owner = caller.to_string();
+        self.open(fid_u32, mode, &owner)?;
         Ok(())
     }
 
-    fn read(&self, fid: &hyprstream_vfs::LocalFid, offset: u64, count: u32) -> Result<Vec<u8>, String> {
+    fn read(&self, fid: &hyprstream_vfs::LocalFid, offset: u64, count: u32, caller: &hyprstream_rpc::Subject) -> Result<Vec<u8>, String> {
         let fid_u32 = *fid.downcast_ref::<u32>().ok_or("invalid fid type")?;
-        self.read(fid_u32, offset, count, "local")
+        self.read(fid_u32, offset, count, &caller.to_string())
     }
 
-    fn write(&self, fid: &hyprstream_vfs::LocalFid, offset: u64, data: &[u8]) -> Result<u32, String> {
+    fn write(&self, fid: &hyprstream_vfs::LocalFid, offset: u64, data: &[u8], caller: &hyprstream_rpc::Subject) -> Result<u32, String> {
         let fid_u32 = *fid.downcast_ref::<u32>().ok_or("invalid fid type")?;
-        self.write(fid_u32, offset, data, "local")
+        self.write(fid_u32, offset, data, &caller.to_string())
     }
 
-    fn readdir(&self, fid: &hyprstream_vfs::LocalFid) -> Result<Vec<hyprstream_vfs::DirEntry>, String> {
+    fn readdir(&self, fid: &hyprstream_vfs::LocalFid, caller: &hyprstream_rpc::Subject) -> Result<Vec<hyprstream_vfs::DirEntry>, String> {
         let fid_u32 = *fid.downcast_ref::<u32>().ok_or("invalid fid type")?;
-        let entries = self.readdir_entries(fid_u32, "local")?;
+        let entries = self.readdir_entries(fid_u32, &caller.to_string())?;
         Ok(entries.into_iter().map(|e| hyprstream_vfs::DirEntry {
             name: e.name,
             is_dir: e.is_dir,
@@ -590,9 +592,9 @@ impl hyprstream_vfs::LocalMount for SyntheticTree {
         }).collect())
     }
 
-    fn stat(&self, fid: &hyprstream_vfs::LocalFid) -> Result<hyprstream_vfs::Stat, String> {
+    fn stat(&self, fid: &hyprstream_vfs::LocalFid, caller: &hyprstream_rpc::Subject) -> Result<hyprstream_vfs::Stat, String> {
         let fid_u32 = *fid.downcast_ref::<u32>().ok_or("invalid fid type")?;
-        let (qid, name) = self.stat(fid_u32, "local")?;
+        let (qid, name) = self.stat(fid_u32, &caller.to_string())?;
         Ok(hyprstream_vfs::Stat {
             qtype: qid.qtype,
             size: 0,
@@ -601,9 +603,9 @@ impl hyprstream_vfs::LocalMount for SyntheticTree {
         })
     }
 
-    fn clunk(&self, fid: hyprstream_vfs::LocalFid) {
+    fn clunk(&self, fid: hyprstream_vfs::LocalFid, caller: &hyprstream_rpc::Subject) {
         if let Some(fid_u32) = fid.downcast_ref::<u32>() {
-            self.clunk(*fid_u32, "local");
+            self.clunk(*fid_u32, &caller.to_string());
         }
     }
 }
