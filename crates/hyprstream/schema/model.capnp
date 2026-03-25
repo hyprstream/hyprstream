@@ -66,9 +66,36 @@ struct ModelRequest {
 
 # 9P filesystem scope for model service.
 # Exposes model status, defaults, ctl, and chat/* as synthetic files.
+# Uses the same scoped-handler pattern as WorktreeRequest in registry.capnp:
+# modelRef is the scope field (curried by the generated client), and the
+# inner union provides individual 9P operations as separate handler methods.
 struct ModelFsRequest {
   modelRef @0 :Text $paramDescription("Model reference (e.g., 'qwen3:main'). Empty for root directory.");
-  request @1 :Nine.NpRequest;
+  union {
+    walk @1 :Nine.NpWalk $mcpDescription("Walk path components to get a fid");
+    open @2 :Nine.NpOpen $mcpDescription("Open a walked fid for I/O");
+    read @3 :Nine.NpRead $mcpDescription("Read from an opened fid");
+    write @4 :Nine.NpWrite $mcpDescription("Write to an opened fid");
+    clunk @5 :Nine.NpClunk $mcpDescription("Release a fid");
+    stat @6 :Nine.NpStatReq $mcpDescription("Get file metadata");
+    create @7 :Nine.NpCreate $mcpDescription("Create a file/dir under a directory fid");
+    remove @8 :Nine.NpRemove $mcpDescription("Remove a file/dir");
+  }
+}
+
+# 9P filesystem response for model service.
+struct ModelFsResponse {
+  union {
+    error @0 :ErrorInfo;
+    walk @1 :Nine.RWalk;
+    open @2 :Nine.ROpen;
+    read @3 :Nine.RRead;
+    write @4 :Nine.RWrite;
+    clunk @5 :Void;
+    stat @6 :Nine.RStat;
+    create @7 :Nine.ROpen;
+    remove @8 :Void;
+  }
 }
 
 # =============================================================================
@@ -169,7 +196,7 @@ struct ModelResponse {
     tttResult @6 :TttResponse;
     adapterResult @7 :AdapterResponse;
     inferResult @8 :InferResponse;
-    fsResult @9 :Nine.NpResponse;
+    fsResult @9 :ModelFsResponse;
   }
 }
 

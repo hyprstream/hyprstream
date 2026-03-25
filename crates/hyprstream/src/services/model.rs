@@ -1054,17 +1054,159 @@ impl ModelHandler for ModelService {
                     total_memory_bytes: 0,
                 }))
     }
+}
 
-    async fn handle_fs(
-        &self, _ctx: &EnvelopeContext, _request_id: u64,
-        data: &crate::services::generated::model_client::ModelFsRequest,
-    ) -> Result<ModelResponseVariant> {
-        // TODO: implement 9P dispatch via SyntheticTree.
-        // The tree will expose: {ref}/status, {ref}/defaults, {ref}/ctl, {ref}/chat/*
-        // For now, log the request and return an error.
-        let model_ref = &data.model_ref;
-        tracing::debug!("model fs request for {model_ref}: not yet implemented");
-        anyhow::bail!("model fs scope not yet implemented for {model_ref}")
+// ═══════════════════════════════════════════════════════════════════════════════
+// 9P Filesystem Handler (FsHandler trait)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+use crate::services::generated::model_client::{
+    NpWalk, NpOpen, NpRead, NpWrite, NpClunk, NpStatReq, NpCreate, NpRemove,
+    RWalk, ROpen, RRead, RWrite, RStat,
+    Qid as GenQid, NpStat as GenNpStat,
+    FsHandler,
+};
+use crate::services::ninep_handler::{SyntheticTree, SyntheticNode, SyntheticDirEntry, SyntheticQid};
+
+impl ModelService {
+    /// Build a synthetic 9P tree from current model service state.
+    fn build_fs_tree(&self) -> SyntheticTree {
+        let inner_list = Arc::clone(&self.inner);
+        let inner_resolve = Arc::clone(&self.inner);
+
+        SyntheticTree::new(SyntheticNode::DynamicDir {
+            list: Box::new(move || {
+                let cache = inner_list.loaded_models.blocking_read();
+                let pending = inner_list.pending_loads.blocking_lock();
+                let mut entries: Vec<SyntheticDirEntry> = cache
+                    .iter()
+                    .map(|(name, _)| SyntheticDirEntry { name: name.clone(), is_dir: true, size: 0 })
+                    .collect();
+                for name in pending.iter() {
+                    if !cache.contains(name) {
+                        entries.push(SyntheticDirEntry { name: name.clone(), is_dir: true, size: 0 });
+                    }
+                }
+                entries
+            }),
+            resolve: Box::new(move |ref_name| {
+                let cache = inner_resolve.loaded_models.blocking_read();
+                let is_loaded = cache.contains(ref_name);
+                let defaults_json = if let Some(model) = cache.peek(ref_name) {
+                    serde_json::to_vec_pretty(&model.generation_defaults).unwrap_or_default()
+                } else {
+                    b"{}".to_vec()
+                };
+                let status_str = if is_loaded { "loaded" } else { "unloaded" };
+
+                let mut children = std::collections::HashMap::new();
+                let status_owned = status_str.to_owned();
+                children.insert("status".to_owned(), SyntheticNode::ReadFile(
+                    Box::new(move || format!("{status_owned}\n").into_bytes()),
+                ));
+                children.insert("defaults".to_owned(), SyntheticNode::ReadFile(
+                    Box::new(move || defaults_json.clone()),
+                ));
+                children.insert("ctl".to_owned(), SyntheticNode::CtlFile {
+                    handler: Box::new(|data| {
+                        let cmd = String::from_utf8_lossy(data).trim().to_owned();
+                        Ok(format!("ctl: {cmd}\n").into_bytes())
+                    }),
+                });
+                Some(SyntheticNode::Dir { children })
+            }),
+        })
+    }
+
+    fn qid_to_gen(qid: &SyntheticQid) -> GenQid {
+        GenQid { qtype: qid.qtype, version: qid.version, path: qid.path }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl FsHandler for ModelService {
+    async fn handle_walk(&self, ctx: &EnvelopeContext, _request_id: u64,
+        _model_ref: &str, data: &NpWalk,
+    ) -> Result<RWalk> {
+        let tree = self.build_fs_tree();
+        let owner = ctx.subject().to_string();
+        let (_fid, qid) = tree.walk(&data.wnames, &owner)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Ok(RWalk { qid: Self::qid_to_gen(&qid) })
+    }
+
+    async fn handle_open(&self, ctx: &EnvelopeContext, _request_id: u64,
+        _model_ref: &str, data: &NpOpen,
+    ) -> Result<ROpen> {
+        let tree = self.build_fs_tree();
+        let owner = ctx.subject().to_string();
+        // Re-walk to get the fid, then open.
+        let (qid, iounit) = tree.open(data.fid, data.mode, &owner)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Ok(ROpen { qid: Self::qid_to_gen(&qid), iounit })
+    }
+
+    async fn handle_read(&self, ctx: &EnvelopeContext, _request_id: u64,
+        _model_ref: &str, data: &NpRead,
+    ) -> Result<RRead> {
+        let tree = self.build_fs_tree();
+        let owner = ctx.subject().to_string();
+        let bytes = tree.read(data.fid, data.offset, data.count, &owner)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Ok(RRead { data: bytes })
+    }
+
+    async fn handle_write(&self, ctx: &EnvelopeContext, _request_id: u64,
+        _model_ref: &str, data: &NpWrite,
+    ) -> Result<RWrite> {
+        let tree = self.build_fs_tree();
+        let owner = ctx.subject().to_string();
+        let count = tree.write(data.fid, data.offset, &data.data, &owner)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Ok(RWrite { count })
+    }
+
+    async fn handle_clunk(&self, ctx: &EnvelopeContext, _request_id: u64,
+        _model_ref: &str, data: &NpClunk,
+    ) -> Result<()> {
+        let tree = self.build_fs_tree();
+        let owner = ctx.subject().to_string();
+        tree.clunk(data.fid, &owner);
+        Ok(())
+    }
+
+    async fn handle_stat(&self, ctx: &EnvelopeContext, _request_id: u64,
+        _model_ref: &str, data: &NpStatReq,
+    ) -> Result<RStat> {
+        let tree = self.build_fs_tree();
+        let owner = ctx.subject().to_string();
+        let (qid, name) = tree.stat(data.fid, &owner)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Ok(RStat {
+            stat: GenNpStat {
+                qid: Self::qid_to_gen(&qid),
+                mode: if qid.qtype & 0x80 != 0 { 0o040755 } else { 0o100644 },
+                atime: 0,
+                mtime: 0,
+                length: 0,
+                name,
+                uid: String::new(),
+                gid: String::new(),
+                muid: String::new(),
+            },
+        })
+    }
+
+    async fn handle_create(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        _model_ref: &str, _data: &NpCreate,
+    ) -> Result<ROpen> {
+        anyhow::bail!("create not supported on model fs")
+    }
+
+    async fn handle_remove(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        _model_ref: &str, _data: &NpRemove,
+    ) -> Result<()> {
+        anyhow::bail!("remove not supported on model fs")
     }
 }
 
