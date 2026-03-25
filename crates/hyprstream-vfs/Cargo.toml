@@ -1,0 +1,13 @@
+[package]
+name = "hyprstream-vfs"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Plan9-inspired VFS namespace multiplexer for hyprstream"
+
+[dependencies]
+# Async runtime (needed for cat/ls/echo convenience methods)
+tokio = { workspace = true, features = ["sync"] }
+
+# Error handling
+anyhow = { workspace = true }

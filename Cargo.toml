@@ -17,6 +17,7 @@ members = [
     "crates/waxterm",
     "crates/hyprstream-compositor",
     "crates/hyprstream-tui",
+    "crates/hyprstream-vfs",
 ]
 # bitsandbytes-sys is standalone - only built when bnb feature is enabled
 exclude = ["crates/bitsandbytes-sys"]
