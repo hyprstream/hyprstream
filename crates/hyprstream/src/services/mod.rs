@@ -87,6 +87,7 @@ pub mod oauth;
 pub mod oai;
 pub mod policy;
 pub mod registry;
+pub mod ninep_handler;
 pub mod rpc_types;
 pub mod stream;
 pub mod worker;
