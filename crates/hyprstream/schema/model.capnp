@@ -28,6 +28,7 @@ using import "/inference.capnp".EmbedImagesResponse;
 using import "/inference.capnp".LoraConfig;
 using import "/inference.capnp".MergeLoraRequest;
 using Opt = import "/optional.capnp";
+using Nine = import "/nine.capnp";
 
 # Cap'n Proto schema for model service
 #
@@ -57,7 +58,17 @@ struct ModelRequest {
     ttt @5 :TttRequest;         # Test-time training operations
     adapter @6 :AdapterRequest; # Adapter management (load/unload/inspect/merge)
     infer @7 :InferRequest;     # Inference operations
+
+    # 9P filesystem access (scoped by modelRef)
+    fs @8 :ModelFsRequest;
   }
+}
+
+# 9P filesystem scope for model service.
+# Exposes model status, defaults, ctl, and chat/* as synthetic files.
+struct ModelFsRequest {
+  modelRef @0 :Text $paramDescription("Model reference (e.g., 'qwen3:main'). Empty for root directory.");
+  request @1 :Nine.NpRequest;
 }
 
 # =============================================================================
@@ -158,6 +169,7 @@ struct ModelResponse {
     tttResult @6 :TttResponse;
     adapterResult @7 :AdapterResponse;
     inferResult @8 :InferResponse;
+    fsResult @9 :Nine.NpResponse;
   }
 }
 

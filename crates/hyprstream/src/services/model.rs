@@ -1054,6 +1054,18 @@ impl ModelHandler for ModelService {
                     total_memory_bytes: 0,
                 }))
     }
+
+    async fn handle_fs(
+        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        data: &crate::services::generated::model_client::ModelFsRequest,
+    ) -> Result<ModelResponseVariant> {
+        // TODO: implement 9P dispatch via SyntheticTree.
+        // The tree will expose: {ref}/status, {ref}/defaults, {ref}/ctl, {ref}/chat/*
+        // For now, log the request and return an error.
+        let model_ref = &data.model_ref;
+        tracing::debug!("model fs request for {model_ref}: not yet implemented");
+        anyhow::bail!("model fs scope not yet implemented for {model_ref}")
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
