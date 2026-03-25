@@ -133,17 +133,30 @@ impl SyntheticFidTable {
     }
 
     fn alloc_fid(&self, owner: &str) -> Result<u32, &'static str> {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
         let count = self.client_counts
             .entry(owner.to_owned())
             .or_insert_with(|| AtomicU32::new(0));
-        if count.load(Relaxed) >= crate::services::types::MAX_FIDS_PER_CLIENT {
+        // Atomic check-and-increment to prevent exceeding per-client limit on ARM.
+        if count.fetch_update(AcqRel, Acquire, |c| {
+            if c >= crate::services::types::MAX_FIDS_PER_CLIENT { None } else { Some(c + 1) }
+        }).is_err() {
             return Err("too many open fids");
         }
         if self.fids.len() as u32 >= crate::services::types::MAX_FIDS_GLOBAL {
+            count.fetch_sub(1, AcqRel);
             return Err("global fid limit reached");
         }
-        count.fetch_add(1, Relaxed);
-        Ok(self.next_fid.fetch_add(1, Relaxed))
+        // Retry on collision (counter wrap).
+        for _ in 0..1000 {
+            let fid = self.next_fid.fetch_add(1, Relaxed);
+            if fid == 0 { continue; } // 0 is reserved for root
+            if !self.fids.contains_key(&fid) {
+                return Ok(fid);
+            }
+        }
+        count.fetch_sub(1, AcqRel);
+        Err("fid allocation failed after retries")
     }
 
     fn insert(&self, fid: u32, entry: FidEntry) {
@@ -273,57 +286,116 @@ impl SyntheticTree {
     }
 
     /// Read from an opened fid.
+    ///
+    /// For Static resolved nodes, the DashMap guard is dropped before calling
+    /// the content-generation closure to avoid holding shard locks during I/O.
+    /// For Dynamic nodes (captured closures), the guard is held — closures
+    /// MUST be non-blocking (in-memory operations only).
     pub fn read(&self, fid: u32, offset: u64, count: u32, owner: &str) -> Result<Vec<u8>, String> {
-        let entry = self.fid_table.get_verified(fid, owner)?;
-        match &entry.state {
-            FidState::Opened { resolved, response_buf, .. } => {
-                // If there's buffered ctl response data, drain it.
-                {
-                    let mut buf = response_buf.lock();
-                    if !buf.is_empty() {
-                        let n = std::cmp::min(count as usize, buf.len());
-                        let data: Vec<u8> = buf.drain(..n).collect();
-                        return Ok(data);
-                    }
+        // First, check for buffered ctl response data (quick path, minimal lock scope).
+        {
+            let entry = self.fid_table.get_verified(fid, owner)?;
+            if let FidState::Opened { response_buf, .. } = &entry.state {
+                let mut buf = response_buf.lock();
+                if !buf.is_empty() {
+                    let n = std::cmp::min(count as usize, buf.len());
+                    let data: Vec<u8> = buf.drain(..n).collect();
+                    return Ok(data);
                 }
-
-                // Resolve the node — either from static tree or cached dynamic.
-                let node = match resolved {
-                    ResolvedNode::Static(path) => self.resolve_node(path),
-                    ResolvedNode::Dynamic(node) => Some(node),
-                };
-
-                match node {
-                    Some(SyntheticNode::ReadFile(gen)) => {
-                        let content = gen();
-                        let start = std::cmp::min(offset as usize, content.len());
-                        let end = std::cmp::min(start + count as usize, content.len());
-                        Ok(content[start..end].to_vec())
-                    }
-                    Some(SyntheticNode::Dir { children }) => {
-                        if offset > 0 { return Ok(vec![]); }
-                        Ok(encode_dir_entries(
-                            &children.keys().map(|k| SyntheticDirEntry {
-                                name: k.clone(),
-                                is_dir: matches!(children.get(k), Some(SyntheticNode::Dir { .. } | SyntheticNode::DynamicDir { .. })),
-                                size: 0,
-                            }).collect::<Vec<_>>(),
-                            count,
-                        ))
-                    }
-                    Some(SyntheticNode::DynamicDir { list, .. }) => {
-                        if offset > 0 { return Ok(vec![]); }
-                        Ok(encode_dir_entries(&list(), count))
-                    }
-                    Some(SyntheticNode::CtlFile { .. }) => Ok(vec![]),
-                    None => Err("path not found in tree".to_owned()),
-                }
+            } else {
+                return Err("fid not open".to_owned());
             }
-            _ => Err("fid not open".to_owned()),
+        } // DashMap guard dropped here.
+
+        // For Static paths, extract the path and drop the guard before resolving.
+        let entry = self.fid_table.get_verified(fid, owner)?;
+        let resolved = match &entry.state {
+            FidState::Opened { resolved, .. } => resolved,
+            _ => return Err("fid not open".to_owned()),
+        };
+
+        match resolved {
+            ResolvedNode::Static(path) => {
+                let path_clone = path.clone();
+                drop(entry); // Release DashMap guard before calling closures.
+                let node = self.resolve_node(&path_clone);
+                self.read_from_node(node, offset, count)
+            }
+            ResolvedNode::Dynamic(node) => {
+                // Guard held — closures must be non-blocking.
+                self.read_from_node(Some(node), offset, count)
+            }
         }
     }
 
+    fn read_from_node(&self, node: Option<&SyntheticNode>, offset: u64, count: u32) -> Result<Vec<u8>, String> {
+        match node {
+            Some(SyntheticNode::ReadFile(gen)) => {
+                let content = gen();
+                let start = std::cmp::min(offset as usize, content.len());
+                let end = std::cmp::min(start + count as usize, content.len());
+                Ok(content[start..end].to_vec())
+            }
+            Some(SyntheticNode::Dir { children }) => {
+                if offset > 0 { return Ok(vec![]); }
+                Ok(encode_dir_entries(
+                    &children.keys().map(|k| SyntheticDirEntry {
+                        name: k.clone(),
+                        is_dir: matches!(children.get(k), Some(SyntheticNode::Dir { .. } | SyntheticNode::DynamicDir { .. })),
+                        size: 0,
+                    }).collect::<Vec<_>>(),
+                    count,
+                ))
+            }
+            Some(SyntheticNode::DynamicDir { list, .. }) => {
+                if offset > 0 { return Ok(vec![]); }
+                Ok(encode_dir_entries(&list(), count))
+            }
+            Some(SyntheticNode::CtlFile { .. }) => Ok(vec![]),
+            None => Err("path not found in tree".to_owned()),
+        }
+    }
+
+    /// Read directory entries as structured data (for LocalMount bridge).
+    pub fn readdir_entries(&self, fid: u32, owner: &str) -> Result<Vec<SyntheticDirEntry>, String> {
+        let entry = self.fid_table.get_verified(fid, owner)?;
+        let resolved = match &entry.state {
+            FidState::Opened { resolved, .. } => resolved,
+            _ => return Err("fid not open".to_owned()),
+        };
+
+        match resolved {
+            ResolvedNode::Static(path) => {
+                let path_clone = path.clone();
+                drop(entry);
+                let node = self.resolve_node(&path_clone);
+                self.readdir_from_node(node)
+            }
+            ResolvedNode::Dynamic(node) => self.readdir_from_node(Some(node)),
+        }
+    }
+
+    fn readdir_from_node(&self, node: Option<&SyntheticNode>) -> Result<Vec<SyntheticDirEntry>, String> {
+        match node {
+            Some(SyntheticNode::Dir { children }) => {
+                Ok(children.keys().map(|k| SyntheticDirEntry {
+                    name: k.clone(),
+                    is_dir: matches!(children.get(k), Some(SyntheticNode::Dir { .. } | SyntheticNode::DynamicDir { .. })),
+                    size: 0,
+                }).collect())
+            }
+            Some(SyntheticNode::DynamicDir { list, .. }) => Ok(list()),
+            _ => Err("not a directory".to_owned()),
+        }
+    }
+
+    /// Maximum ctl response buffer size per fid (256 KB).
+    const MAX_RESPONSE_BUF: usize = 256 * 1024;
+
     /// Write to an opened fid.
+    ///
+    /// For ctl files, the handler closure is invoked and the response is buffered
+    /// for subsequent reads. Response buffer is capped at MAX_RESPONSE_BUF.
     pub fn write(&self, fid: u32, _offset: u64, data: &[u8], owner: &str) -> Result<u32, String> {
         let entry = self.fid_table.get_verified(fid, owner)?;
         match &entry.state {
@@ -340,7 +412,10 @@ impl SyntheticTree {
                         let result = handler(data)?;
                         let written = data.len() as u32;
                         let mut buf = response_buf.lock();
-                        buf.extend(result);
+                        // Clear old response on new write (Plan9 convention: each write is a new command).
+                        buf.clear();
+                        let cap = Self::MAX_RESPONSE_BUF.min(result.len());
+                        buf.extend(&result[..cap]);
                         Ok(written)
                     }
                     _ => Err("path not writable".to_owned()),
@@ -476,6 +551,61 @@ fn encode_dir_entries(entries: &[SyntheticDirEntry], max_bytes: u32) -> Vec<u8> 
         wire.extend_from_slice(&entry.size.to_le_bytes());
     }
     wire
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LocalMount implementation — bridges SyntheticTree to the VFS crate
+// ─────────────────────────────────────────────────────────────────────────────
+
+impl hyprstream_vfs::LocalMount for SyntheticTree {
+    fn walk(&self, components: &[&str]) -> Result<hyprstream_vfs::LocalFid, String> {
+        let wnames: Vec<String> = components.iter().map(|s| (*s).to_owned()).collect();
+        let (fid, _qid) = self.walk(&wnames, "local")?;
+        Ok(hyprstream_vfs::LocalFid::new(fid))
+    }
+
+    fn open(&self, fid: &mut hyprstream_vfs::LocalFid, mode: u8) -> Result<(), String> {
+        let fid_u32 = *fid.downcast_ref::<u32>().ok_or("invalid fid type")?;
+        self.open(fid_u32, mode, "local")?;
+        Ok(())
+    }
+
+    fn read(&self, fid: &hyprstream_vfs::LocalFid, offset: u64, count: u32) -> Result<Vec<u8>, String> {
+        let fid_u32 = *fid.downcast_ref::<u32>().ok_or("invalid fid type")?;
+        self.read(fid_u32, offset, count, "local")
+    }
+
+    fn write(&self, fid: &hyprstream_vfs::LocalFid, offset: u64, data: &[u8]) -> Result<u32, String> {
+        let fid_u32 = *fid.downcast_ref::<u32>().ok_or("invalid fid type")?;
+        self.write(fid_u32, offset, data, "local")
+    }
+
+    fn readdir(&self, fid: &hyprstream_vfs::LocalFid) -> Result<Vec<hyprstream_vfs::DirEntry>, String> {
+        let fid_u32 = *fid.downcast_ref::<u32>().ok_or("invalid fid type")?;
+        let entries = self.readdir_entries(fid_u32, "local")?;
+        Ok(entries.into_iter().map(|e| hyprstream_vfs::DirEntry {
+            name: e.name,
+            is_dir: e.is_dir,
+            size: e.size,
+        }).collect())
+    }
+
+    fn stat(&self, fid: &hyprstream_vfs::LocalFid) -> Result<hyprstream_vfs::Stat, String> {
+        let fid_u32 = *fid.downcast_ref::<u32>().ok_or("invalid fid type")?;
+        let (qid, name) = self.stat(fid_u32, "local")?;
+        Ok(hyprstream_vfs::Stat {
+            qtype: qid.qtype,
+            size: 0,
+            name,
+            mtime: 0,
+        })
+    }
+
+    fn clunk(&self, fid: hyprstream_vfs::LocalFid) {
+        if let Some(fid_u32) = fid.downcast_ref::<u32>() {
+            self.clunk(*fid_u32, "local");
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

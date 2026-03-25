@@ -302,17 +302,17 @@ mod tests {
     impl LocalMount for MemMount {
         fn walk(&self, components: &[&str]) -> Result<LocalFid, String> {
             let path = components.join("/");
-            Ok(LocalFid(Box::new(MemFid { path, is_open: false })))
+            Ok(LocalFid::new(MemFid { path, is_open: false }))
         }
 
         fn open(&self, fid: &mut LocalFid, _mode: u8) -> Result<(), String> {
-            let inner = fid.0.downcast_mut::<MemFid>().ok_or("bad fid")?;
+            let inner = fid.downcast_mut::<MemFid>().ok_or("bad fid")?;
             inner.is_open = true;
             Ok(())
         }
 
         fn read(&self, fid: &LocalFid, _offset: u64, _count: u32) -> Result<Vec<u8>, String> {
-            let inner = fid.0.downcast_ref::<MemFid>().ok_or("bad fid")?;
+            let inner = fid.downcast_ref::<MemFid>().ok_or("bad fid")?;
             self.files.get(&inner.path).cloned().ok_or_else(|| format!("not found: {}", inner.path))
         }
 
@@ -321,7 +321,7 @@ mod tests {
         }
 
         fn readdir(&self, fid: &LocalFid) -> Result<Vec<DirEntry>, String> {
-            let inner = fid.0.downcast_ref::<MemFid>().ok_or("bad fid")?;
+            let inner = fid.downcast_ref::<MemFid>().ok_or("bad fid")?;
             let prefix = if inner.path.is_empty() { String::new() } else { format!("{}/", inner.path) };
             let mut entries = Vec::new();
             for key in self.files.keys() {
@@ -335,7 +335,7 @@ mod tests {
         }
 
         fn stat(&self, fid: &LocalFid) -> Result<Stat, String> {
-            let inner = fid.0.downcast_ref::<MemFid>().ok_or("bad fid")?;
+            let inner = fid.downcast_ref::<MemFid>().ok_or("bad fid")?;
             Ok(Stat { qtype: 0, size: 0, name: inner.path.clone(), mtime: 0 })
         }
 

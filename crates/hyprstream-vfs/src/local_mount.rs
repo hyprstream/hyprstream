@@ -1,8 +1,25 @@
 //! Local mount trait — in-process 9P operations without network transport.
 
 /// Opaque fid handle from a local mount.
-#[allow(dead_code)] // Field accessed via downcast in LocalMount impls.
-pub struct LocalFid(pub(crate) Box<dyn std::any::Any + Send + Sync>);
+/// Opaque fid handle from a local mount.
+pub struct LocalFid(Box<dyn std::any::Any + Send + Sync>);
+
+impl LocalFid {
+    /// Create a new LocalFid wrapping an arbitrary Send+Sync value.
+    pub fn new<T: std::any::Any + Send + Sync>(val: T) -> Self {
+        Self(Box::new(val))
+    }
+
+    /// Downcast to a concrete type (immutable).
+    pub fn downcast_ref<T: std::any::Any>(&self) -> Option<&T> {
+        self.0.downcast_ref()
+    }
+
+    /// Downcast to a concrete type (mutable).
+    pub fn downcast_mut<T: std::any::Any>(&mut self) -> Option<&mut T> {
+        self.0.downcast_mut()
+    }
+}
 
 /// Directory entry.
 #[derive(Clone, Debug)]
