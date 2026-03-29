@@ -309,6 +309,15 @@ pub struct ChatApp {
     pub pending_tool_calls: usize,
     /// Spinner frame index — incremented each tick while tool calls are in flight.
     pub spinner_tick: u32,
+
+    // ── VFS namespace for / command routing ──────────────────────────────────
+
+    /// VFS namespace for / path commands. None on WASM.
+    vfs: Option<std::sync::Arc<hyprstream_vfs::Namespace>>,
+    /// Caller identity for VFS operations.
+    vfs_subject: hyprstream_vfs::Subject,
+    /// Tcl shell for / command evaluation. !Send/!Sync (molt Value uses Rc).
+    tcl_shell: Option<hyprstream_tcl::TclShell>,
 }
 
 impl ChatApp {
@@ -348,6 +357,9 @@ impl ChatApp {
             tool_call_buf: String::new(),
             pending_tool_calls: 0,
             spinner_tick: 0,
+            vfs: None,
+            vfs_subject: hyprstream_vfs::Subject::anonymous(),
+            tcl_shell: None,
         }
     }
 
@@ -375,6 +387,9 @@ impl ChatApp {
             in_tool_call: false,
             tool_call_buf: String::new(),
             spinner_tick: 0,
+            vfs: None,
+            vfs_subject: hyprstream_vfs::Subject::anonymous(),
+            tcl_shell: None,
         }
     }
 
@@ -448,6 +463,9 @@ impl ChatApp {
             tool_call_buf: String::new(),
             pending_tool_calls: 0,
             spinner_tick: 0,
+            vfs: None,
+            vfs_subject: hyprstream_vfs::Subject::anonymous(),
+            tcl_shell: None,
         }
     }
 
@@ -465,6 +483,17 @@ impl ChatApp {
     #[cfg(not(target_os = "wasi"))]
     pub fn with_server_spawned(mut self) -> Self {
         self.is_server_spawned = true;
+        self
+    }
+
+    /// Attach a VFS namespace for `/path` command routing.
+    pub fn with_vfs(mut self, ns: std::sync::Arc<hyprstream_vfs::Namespace>, subject: hyprstream_vfs::Subject) -> Self {
+        self.tcl_shell = Some(hyprstream_tcl::TclShell::new(
+            std::sync::Arc::clone(&ns),
+            subject.clone(),
+        ));
+        self.vfs = Some(ns);
+        self.vfs_subject = subject;
         self
     }
 
@@ -688,6 +717,60 @@ impl ChatApp {
         }
 
         detected
+    }
+
+    // ── VFS helpers ──────────────────────────────────────────────────────────
+
+    /// Display a system-level message in the chat history (VFS output, errors).
+    fn push_system_message(&mut self, msg: &str) {
+        self.history.push(ChatHistoryEntry {
+            role: ChatRole::Assistant,
+            content: msg.to_owned(),
+            thinking: String::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        });
+        self.scroll_offset = 0;
+    }
+
+    /// Handle a `/`-prefixed command by evaluating it as Tcl against the VFS.
+    ///
+    /// Bare paths (e.g. `/srv/model/status`) are treated as `cat /srv/model/status`.
+    /// Commands (e.g. `/ls /srv/model`) are evaluated directly.
+    fn handle_vfs_command(&mut self, input: &str) {
+        let Some(shell) = &mut self.tcl_shell else {
+            self.push_system_message("VFS not available");
+            return;
+        };
+
+        // Show the command in history.
+        self.history.push(ChatHistoryEntry {
+            role: ChatRole::User,
+            content: input.to_owned(),
+            thinking: String::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        });
+
+        // Strip leading '/' and decide: bare path vs command.
+        let stripped = input.trim_start_matches('/');
+        let script = if !stripped.contains(' ') && stripped.contains('/') {
+            // Bare path like /srv/model/status → cat it.
+            format!("cat {input}")
+        } else {
+            // Command like /ls /srv or /help → eval as-is.
+            stripped.to_owned()
+        };
+
+        match shell.eval(&script) {
+            Ok(output) if !output.is_empty() => {
+                self.push_system_message(&output);
+            }
+            Ok(_) => {} // Empty output — nothing to display.
+            Err(e) => {
+                self.push_system_message(&format!("error: {e}"));
+            }
+        }
     }
 
     // ── Submit helpers ────────────────────────────────────────────────────────
@@ -1014,7 +1097,21 @@ impl TerminalApp for ChatApp {
                     }
                     self.textarea = Self::make_textarea();
                     self.last_esc = None;
-                    self.submit_message(user_content);
+
+                    // VFS path routing: /path → cat from namespace.
+                    if user_content.starts_with('/') && !user_content.starts_with("//") {
+                        self.handle_vfs_command(&user_content);
+                        return true;
+                    }
+
+                    // Escape: // → / (send to model with leading slash).
+                    let content = if let Some(stripped) = user_content.strip_prefix("//") {
+                        format!("/{stripped}")
+                    } else {
+                        user_content
+                    };
+
+                    self.submit_message(content);
                     true
                 }
                 KeyPress::Backspace => {

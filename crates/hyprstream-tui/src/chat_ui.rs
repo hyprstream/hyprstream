@@ -391,6 +391,7 @@ fn draw_fkey_bar(frame: &mut Frame, area: Rect, app: &ChatApp) {
     } else {
         let keys: &[(&str, &str)] = &[
             ("Enter", "Send"),
+            ("/path", "VFS"),
             ("Ctrl-J", "Newline"),
             ("\u{2191}\u{2193}", "Scroll"),
             ("Ctrl-E", "Editor"),

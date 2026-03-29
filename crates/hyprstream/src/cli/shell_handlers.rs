@@ -286,6 +286,149 @@ pub async fn handle_shell_tui(
     // Derive storage key for private chat sessions.
     let storage_key = derive_storage_key(signing_key);
 
+    // Derive VFS subject from the signing key's public key — real identity, not anonymous.
+    let vfs_subject = {
+        let vk = signing_key.verifying_key();
+        let pubkey_hex = hex::encode(vk.as_bytes());
+        hyprstream_rpc::Subject::new(pubkey_hex)
+    };
+
+    // Build VFS namespace for `/path` routing in ChatApps.
+    let vfs_ns = {
+        use crate::services::ninep_handler::{SyntheticNode, SyntheticTree};
+
+        let mut ns = hyprstream_vfs::Namespace::new();
+
+        // Mount an empty model tree — services register dynamically later.
+        let model_tree = SyntheticTree::new(SyntheticNode::Dir {
+            children: std::collections::HashMap::new(),
+        });
+        let _ = ns.mount("/srv/model", hyprstream_vfs::MountTarget::Local(
+            std::sync::Arc::new(model_tree),
+        ));
+
+        // Wrap in Arc, then build /bin/ with Weak captures to avoid circular ref.
+        // Weak doesn't block Arc::get_mut, so we can still mount after.
+        let mut ns = std::sync::Arc::new(ns);
+        let weak = std::sync::Arc::downgrade(&ns);
+        let subj = vfs_subject.clone();
+
+        let bin_tree = {
+            let mut children = std::collections::HashMap::new();
+
+            // /bin/cat — write path(s), read file contents.
+            let w = weak.clone();
+            let s = subj.clone();
+            children.insert("cat".to_owned(), SyntheticNode::CtlFile {
+                handler: Box::new(move |data| {
+                    let ns = w.upgrade().ok_or("namespace dropped")?;
+                    let input = std::str::from_utf8(data).map_err(|e| e.to_string())?;
+                    let mut out = Vec::new();
+                    for path in input.split_whitespace() {
+                        out.extend_from_slice(
+                            &ns.cat(path, &s).map_err(|e| e.to_string())?,
+                        );
+                    }
+                    Ok(out)
+                }),
+            });
+
+            // /bin/ls — write path, read directory listing.
+            let w = weak.clone();
+            let s = subj.clone();
+            children.insert("ls".to_owned(), SyntheticNode::CtlFile {
+                handler: Box::new(move |data| {
+                    let ns = w.upgrade().ok_or("namespace dropped")?;
+                    let input = std::str::from_utf8(data).map_err(|e| e.to_string())?;
+                    let path = input.trim();
+                    let path = if path.is_empty() { "/" } else { path };
+                    let entries = ns.ls(path, &s).map_err(|e| e.to_string())?;
+                    let listing: Vec<String> = entries.iter().map(|e| {
+                        if e.is_dir { format!("{}/", e.name) } else { e.name.clone() }
+                    }).collect();
+                    Ok(listing.join("\n").into_bytes())
+                }),
+            });
+
+            // /bin/help — read-only, lists available commands.
+            let w = weak.clone();
+            let s = subj.clone();
+            children.insert("help".to_owned(), SyntheticNode::CtlFile {
+                handler: Box::new(move |_data| {
+                    let mut out = String::from("VFS commands:\n");
+                    out.push_str("  cat <path>           read file contents\n");
+                    out.push_str("  ls [path]            list directory\n");
+                    out.push_str("  echo <path> <data>   write to file\n");
+                    out.push_str("  ctl <path> <cmd>     control file (write+read)\n");
+                    out.push_str("  mount [prefix]       list mount points\n");
+                    out.push_str("  help                 this message\n");
+                    if let Some(ns) = w.upgrade() {
+                        if let Ok(entries) = ns.ls("/bin", &s) {
+                            if !entries.is_empty() {
+                                out.push_str("\nCommands (/bin/):\n");
+                                for entry in &entries {
+                                    out.push_str(&format!("  {}\n", entry.name));
+                                }
+                            }
+                        }
+                    }
+                    Ok(out.into_bytes())
+                }),
+            });
+
+            // /bin/mount — read-only, lists mount prefixes.
+            let w = weak.clone();
+            children.insert("mount".to_owned(), SyntheticNode::CtlFile {
+                handler: Box::new(move |_data| {
+                    let ns = w.upgrade().ok_or("namespace dropped")?;
+                    Ok(ns.mount_prefixes().join("\n").into_bytes())
+                }),
+            });
+
+            SyntheticTree::new(SyntheticNode::Dir { children })
+        };
+
+        // /env/ — session variables as files (Plan9 per-process /env/).
+        let env_store: std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<String, String>>> =
+            std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
+
+        let env_tree = {
+            use crate::services::ninep_handler::SyntheticDirEntry;
+
+            let store_list = env_store.clone();
+            let store_resolve = env_store.clone();
+
+            SyntheticTree::new(SyntheticNode::DynamicDir {
+                list: Box::new(move || {
+                    store_list.read().keys().map(|k| SyntheticDirEntry {
+                        name: k.clone(),
+                        is_dir: false,
+                        size: 0,
+                    }).collect()
+                }),
+                resolve: Box::new(move |name| {
+                    let store = store_resolve.clone();
+                    let key = name.to_owned();
+                    Some(SyntheticNode::ReadFile(Box::new(move || {
+                        store.read().get(&key).cloned().unwrap_or_default().into_bytes()
+                    })))
+                }),
+            })
+        };
+
+        // Mount /bin/ and /env/ — Arc::get_mut works because only Weak refs exist (no strong clones).
+        if let Some(ns_mut) = std::sync::Arc::get_mut(&mut ns) {
+            let _ = ns_mut.mount("/bin", hyprstream_vfs::MountTarget::Local(
+                std::sync::Arc::new(bin_tree),
+            ));
+            let _ = ns_mut.mount("/env", hyprstream_vfs::MountTarget::Local(
+                std::sync::Arc::new(env_tree),
+            ));
+        }
+
+        ns
+    };
+
     // Console overlay for log viewing (F9 / Ctrl-L).
     let mut console_app = ConsoleApp::new();
 
@@ -348,7 +491,8 @@ pub async fn handle_shell_tui(
                 if dispatch_outputs(
                     &mut compositor, &client, &model_client, &worker_client,
                     &model_status_tx, &mut terminal, &mut console_app,
-                    &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
+                    &mut active_apps, &mut next_local_id, &storage_key, signing_key,
+                    &vfs_ns, &vfs_subject, outputs,
                 ).await { break; }
             }
 
@@ -371,7 +515,8 @@ pub async fn handle_shell_tui(
                         if dispatch_outputs(
                             &mut compositor, &client, &model_client, &worker_client,
                             &model_status_tx, &mut terminal, &mut console_app,
-                            &mut active_apps, &mut next_local_id, &storage_key, signing_key, close_outputs,
+                            &mut active_apps, &mut next_local_id, &storage_key, signing_key,
+                            &vfs_ns, &vfs_subject, close_outputs,
                         ).await { break; }
                         continue;
                     }
@@ -421,7 +566,8 @@ pub async fn handle_shell_tui(
                     if dispatch_outputs(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
-                        &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
+                        &mut active_apps, &mut next_local_id, &storage_key, signing_key,
+                        &vfs_ns, &vfs_subject, outputs,
                     ).await {
                         should_exit = true;
                         break;
@@ -436,7 +582,8 @@ pub async fn handle_shell_tui(
                     if dispatch_outputs(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
-                        &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
+                        &mut active_apps, &mut next_local_id, &storage_key, signing_key,
+                        &vfs_ns, &vfs_subject, outputs,
                     ).await { break; }
                 }
             }
@@ -481,7 +628,8 @@ pub async fn handle_shell_tui(
                         if dispatch_outputs(
                             &mut compositor, &client, &model_client, &worker_client,
                             &model_status_tx, &mut terminal, &mut console_app,
-                            &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
+                            &mut active_apps, &mut next_local_id, &storage_key, signing_key,
+                            &vfs_ns, &vfs_subject, outputs,
                         ).await { break; }
                     }
                     // Poll images
@@ -502,7 +650,8 @@ pub async fn handle_shell_tui(
                         if dispatch_outputs(
                             &mut compositor, &client, &model_client, &worker_client,
                             &model_status_tx, &mut terminal, &mut console_app,
-                            &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
+                            &mut active_apps, &mut next_local_id, &storage_key, signing_key,
+                            &vfs_ns, &vfs_subject, outputs,
                         ).await { break; }
                     }
                 }
@@ -564,7 +713,8 @@ pub async fn handle_shell_tui(
                     if dispatch_outputs(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
-                        &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
+                        &mut active_apps, &mut next_local_id, &storage_key, signing_key,
+                        &vfs_ns, &vfs_subject, outputs,
                     ).await { should_exit = true; break; }
                 }
                 // Remove quitting apps.
@@ -588,7 +738,8 @@ pub async fn handle_shell_tui(
                     dispatch_outputs(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
-                        &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
+                        &mut active_apps, &mut next_local_id, &storage_key, signing_key,
+                        &vfs_ns, &vfs_subject, outputs,
                     ).await;
                 }
                 if should_exit { break; }
@@ -615,6 +766,7 @@ pub async fn handle_shell_tui(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &mut next_local_id, &storage_key, signing_key,
+                        &vfs_ns, &vfs_subject,
                         vec![CompositorOutput::Rpc(rpc_req)],
                     ).await;
                 }
@@ -630,7 +782,8 @@ pub async fn handle_shell_tui(
                 if dispatch_outputs(
                     &mut compositor, &client, &model_client, &worker_client,
                     &model_status_tx, &mut terminal, &mut console_app,
-                    &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
+                    &mut active_apps, &mut next_local_id, &storage_key, signing_key,
+                    &vfs_ns, &vfs_subject, outputs,
                 ).await { break; }
                 composite_draw(&mut terminal, &compositor, &mut console_app);
             }
@@ -699,6 +852,8 @@ async fn dispatch_outputs(
     next_local_id: &mut u32,
     storage_key: &StorageKey,
     signing_key: &SigningKey,
+    vfs_ns: &std::sync::Arc<hyprstream_vfs::Namespace>,
+    vfs_subject: &hyprstream_rpc::Subject,
     outputs: Vec<CompositorOutput>,
 ) -> bool {
     for output in outputs {
@@ -710,7 +865,8 @@ async fn dispatch_outputs(
             CompositorOutput::Rpc(req) => {
                 let feed_back = handle_rpc(
                     compositor, client, model_client, worker_client, model_status_tx,
-                    active_apps, next_local_id, storage_key, signing_key, req,
+                    active_apps, next_local_id, storage_key, signing_key,
+                    &vfs_ns, &vfs_subject, req,
                 ).await;
                 for input in feed_back {
                     let follow = compositor.handle(input);
@@ -756,6 +912,8 @@ async fn handle_rpc(
     next_local_id: &mut u32,
     storage_key: &StorageKey,
     signing_key: &SigningKey,
+    vfs_ns: &std::sync::Arc<hyprstream_vfs::Namespace>,
+    vfs_subject: &hyprstream_rpc::Subject,
     req: RpcRequest,
 ) -> Vec<CompositorInput> {
     let session_id = compositor.chrome.session_id;
@@ -948,13 +1106,14 @@ async fn handle_rpc(
                     });
                     let spawner = crate::tui::zmq_transport::make_chat_spawner(
                         signing_key, &model_ref, Some(openai_tools.clone()),
-                        std::sync::Arc::clone(&gen_config),
+                        gen_config.clone(),
                     );
                     ChatApp::new_private(
                         model_ref.clone(), cols, rows, spawner,
                         session_uuid, load_hook, save_hook,
                     )
                     .with_gen_config(gen_config)
+                    .with_vfs(vfs_ns.clone(), vfs_subject.clone())
                 }
                 Err(e) => {
                     compositor.chrome.push_toast(
@@ -963,10 +1122,11 @@ async fn handle_rpc(
                     );
                     let spawner = crate::tui::zmq_transport::make_chat_spawner(
                         signing_key, &model_ref, Some(openai_tools.clone()),
-                        std::sync::Arc::clone(&gen_config),
+                        gen_config.clone(),
                     );
                     ChatApp::new(model_ref.clone(), cols, rows, spawner)
                         .with_gen_config(gen_config)
+                        .with_vfs(vfs_ns.clone(), vfs_subject.clone())
                 }
             };
             // Detect tool call format from the model reference name.

@@ -86,7 +86,7 @@ struct MountEntry {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Reserved prefixes that can only be mounted with LocalMount.
-const LOCAL_ONLY: &[&str] = &["/config", "/private", "/env", "/dev", "/proc"];
+const LOCAL_ONLY: &[&str] = &["/config", "/private", "/env", "/dev", "/proc", "/bin"];
 
 /// Client-side namespace. Maps path prefixes to mount targets.
 ///
@@ -291,7 +291,9 @@ fn normalize_prefix(prefix: &str) -> String {
 }
 
 fn split_path(path: &str) -> Vec<&str> {
-    path.split('/').filter(|s| !s.is_empty()).collect()
+    path.split('/')
+        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+        .collect()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

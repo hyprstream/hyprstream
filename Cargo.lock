@@ -5926,6 +5926,7 @@ dependencies = [
  "hyprstream-rpc-derive",
  "hyprstream-service",
  "hyprstream-tui",
+ "hyprstream-vfs",
  "hyprstream-workers",
  "image",
  "indicatif",
@@ -6230,6 +6231,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyprstream-tcl"
+version = "0.1.0"
+dependencies = [
+ "hyprstream-vfs",
+ "molt",
+]
+
+[[package]]
 name = "hyprstream-tui"
 version = "0.1.0"
 dependencies = [
@@ -6242,6 +6251,8 @@ dependencies = [
  "dirs-next",
  "edtui",
  "hyprstream-compositor",
+ "hyprstream-tcl",
+ "hyprstream-vfs",
  "landlock",
  "libc",
  "parking_lot 0.12.4",
@@ -6254,6 +6265,14 @@ dependencies = [
  "uuid 1.18.1",
  "waxterm",
  "zeroize",
+]
+
+[[package]]
+name = "hyprstream-vfs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hyprstream-rpc",
 ]
 
 [[package]]
@@ -8147,6 +8166,15 @@ dependencies = [
  "smallvec",
  "tagptr",
  "uuid 1.18.1",
+]
+
+[[package]]
+name = "molt"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6ff0d27c6261b74d65ab819de1b163d29917d9f95cf995e5845b6c953e516bc"
+dependencies = [
+ "indexmap 1.9.3",
 ]
 
 [[package]]
