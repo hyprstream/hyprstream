@@ -21,7 +21,7 @@ use molt::types::*;
 use molt::Interp;
 
 /// Context stored in the molt interpreter via `save_context()`.
-pub(crate) struct VfsContext {
+pub(crate) struct ShellContext {
     pub ns: Arc<Namespace>,
     pub subject: Subject,
 }
@@ -69,7 +69,7 @@ impl TclShell {
         }
         interp.set_recursion_limit(100);
 
-        let ctx = VfsContext { ns, subject };
+        let ctx = ShellContext { ns, subject };
         let ctx_id = interp.save_context(ctx);
         builtins::register_all(&mut interp, ctx_id);
         Self { interp, ctx_id }
@@ -109,7 +109,7 @@ impl TclShell {
         if cmd_name.contains('/') || cmd_name.contains("..") {
             return Err(format!("invalid command name \"{cmd_name}\""));
         }
-        let ctx = self.interp.context::<VfsContext>(self.ctx_id);
+        let ctx = self.interp.context::<ShellContext>(self.ctx_id);
         let cmd_path = format!("/bin/{cmd_name}");
         let args = script
             .trim()
@@ -143,7 +143,7 @@ fn extract_unknown_command(msg: &str) -> Option<String> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use hyprstream_vfs::{DirEntry, LocalFid, LocalMount, MountTarget, Stat};
+    use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
     use std::collections::HashMap;
 
     /// Minimal in-memory mount for testing.
@@ -167,60 +167,68 @@ mod tests {
         write_buf: Vec<u8>,
     }
 
-    impl LocalMount for MemMount {
-        fn walk(&self, components: &[&str], _caller: &Subject) -> Result<LocalFid, String> {
+    impl Mount for MemMount {
+        fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
             let path = components.join("/");
             // Check file exists (or is a prefix of existing files for dirs).
             let exists = self.files.contains_key(&path)
                 || self.files.keys().any(|k| k.starts_with(&format!("{path}/")));
             if !exists && !path.is_empty() {
-                return Err(format!("not found: {path}"));
+                return Err(MountError::NotFound(path));
             }
-            Ok(LocalFid::new(MemFid {
+            Ok(Fid::new(MemFid {
                 path,
                 write_buf: Vec::new(),
             }))
         }
 
-        fn open(&self, _fid: &mut LocalFid, _mode: u8, _caller: &Subject) -> Result<(), String> {
+        fn open(&self, _fid: &mut Fid, _mode: u8, _caller: &Subject) -> Result<(), MountError> {
             Ok(())
         }
 
         fn read(
             &self,
-            fid: &LocalFid,
-            _offset: u64,
+            fid: &Fid,
+            offset: u64,
             _count: u32,
             _caller: &Subject,
-        ) -> Result<Vec<u8>, String> {
-            let inner = fid.downcast_ref::<MemFid>().ok_or("bad fid")?;
-            // If there's a write buffer (ctl pattern), return that.
+        ) -> Result<Vec<u8>, MountError> {
+            let inner = fid.downcast_ref::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            // If there's a write buffer (ctl pattern), return that then clear via offset.
             if !inner.write_buf.is_empty() {
-                return Ok(inner.write_buf.clone());
+                let start = offset as usize;
+                if start >= inner.write_buf.len() {
+                    return Ok(vec![]);
+                }
+                return Ok(inner.write_buf[start..].to_vec());
             }
-            self.files
-                .get(&inner.path)
-                .cloned()
-                .ok_or_else(|| format!("not found: {}", inner.path))
+            match self.files.get(&inner.path) {
+                Some(data) => {
+                    let start = offset as usize;
+                    if start >= data.len() { return Ok(vec![]); }
+                    Ok(data[start..].to_vec())
+                }
+                None => Err(MountError::NotFound(inner.path.clone())),
+            }
         }
 
         fn write(
             &self,
-            fid: &LocalFid,
+            fid: &Fid,
             _offset: u64,
             data: &[u8],
             _caller: &Subject,
-        ) -> Result<u32, String> {
+        ) -> Result<u32, MountError> {
             // For ctl files: store the "response" as the uppercased write data.
-            let inner = fid.downcast_ref::<MemFid>().ok_or("bad fid")?;
+            let inner = fid.downcast_ref::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             // SAFETY: MemFid write_buf mutation — test-only, single-threaded.
             let fid_ptr = inner as *const MemFid as *mut MemFid;
             unsafe { (*fid_ptr).write_buf = format!("ok: {}", String::from_utf8_lossy(data)).into_bytes() };
             Ok(data.len() as u32)
         }
 
-        fn readdir(&self, fid: &LocalFid, _caller: &Subject) -> Result<Vec<DirEntry>, String> {
-            let inner = fid.downcast_ref::<MemFid>().ok_or("bad fid")?;
+        fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
+            let inner = fid.downcast_ref::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             let prefix = if inner.path.is_empty() {
                 String::new()
             } else {
@@ -234,6 +242,7 @@ mod tests {
                             name: rest.to_owned(),
                             is_dir: false,
                             size: 0,
+                            stat: None,
                         });
                     }
                 } else if inner.path.is_empty() && !key.contains('/') {
@@ -241,14 +250,15 @@ mod tests {
                         name: key.clone(),
                         is_dir: false,
                         size: 0,
+                        stat: None,
                     });
                 }
             }
             Ok(entries)
         }
 
-        fn stat(&self, fid: &LocalFid, _caller: &Subject) -> Result<Stat, String> {
-            let inner = fid.downcast_ref::<MemFid>().ok_or("bad fid")?;
+        fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
+            let inner = fid.downcast_ref::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             Ok(Stat {
                 qtype: 0,
                 size: 0,
@@ -257,7 +267,7 @@ mod tests {
             })
         }
 
-        fn clunk(&self, _fid: LocalFid, _caller: &Subject) {}
+        fn clunk(&self, _fid: Fid, _caller: &Subject) {}
     }
 
     fn test_subject() -> Subject {
@@ -270,15 +280,15 @@ mod tests {
             ("temperature", b"0.7"),
             ("status", b"loaded"),
         ]));
-        ns.mount("/config", MountTarget::Local(mount)).unwrap();
+        ns.mount("/config", mount).unwrap();
 
         let model_mount = Arc::new(MemMount::new(vec![("status", b"loaded")]));
-        ns.mount("/srv/model", MountTarget::Local(model_mount))
+        ns.mount("/srv/model", model_mount)
             .unwrap();
 
         // /bin/ mount with a ctl file (Plan9 PATH model).
         let bin_mount = Arc::new(MemMount::new(vec![("load", b"")]));
-        ns.mount("/bin", MountTarget::Local(bin_mount)).unwrap();
+        ns.mount("/bin", bin_mount).unwrap();
 
         TclShell::new(Arc::new(ns), test_subject())
     }

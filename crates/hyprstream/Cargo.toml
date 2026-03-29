@@ -53,7 +53,7 @@ hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }  # RPC code genera
 hyprstream-flight = { path = "../hyprstream-flight" }  # Flight SQL server and client
 hyprstream-metrics = { path = "../hyprstream-metrics" }  # Metrics storage (for RegistryClient trait)
 hyprstream-workers = { path = "../hyprstream-workers" }  # Worker runtime (Kata containers)
-hyprstream-vfs = { path = "../hyprstream-vfs" }  # VFS namespace (LocalMount trait)
+hyprstream-vfs = { path = "../hyprstream-vfs" }  # VFS namespace (Mount trait)
 inventory.workspace = true  # Service factory registration
 gittorrent = { workspace = true, optional = true }  # P2P transport
 clap.workspace = true

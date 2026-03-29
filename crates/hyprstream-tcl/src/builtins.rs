@@ -1,14 +1,14 @@
 //! VFS builtins for the Tcl shell.
 //!
 //! Each command is a `CommandFunc` registered via `add_context_command`.
-//! VFS state is accessed via `interp.context::<VfsContext>(ctx_id)`.
+//! VFS state is accessed via `interp.context::<ShellContext>(ctx_id)`.
 
 use molt::molt_err;
 use molt::molt_ok;
 use molt::types::*;
 use molt::Interp;
 
-use crate::VfsContext;
+use crate::ShellContext;
 
 /// Register all VFS builtins on the interpreter.
 pub fn register_all(interp: &mut Interp, ctx_id: ContextID) {
@@ -27,7 +27,7 @@ fn cmd_cat(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResult
     let mut output = String::new();
     // Collect paths first, then borrow context — avoids holding &mut Interp across iterations.
     let paths: Vec<String> = argv[1..].iter().map(|v| v.to_string()).collect();
-    let ctx = interp.context::<VfsContext>(ctx_id);
+    let ctx = interp.context::<ShellContext>(ctx_id);
 
     for path in &paths {
         match ctx.ns.cat(path, &ctx.subject) {
@@ -50,7 +50,7 @@ fn cmd_ls(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResult 
         "/".to_owned()
     };
 
-    let ctx = interp.context::<VfsContext>(ctx_id);
+    let ctx = interp.context::<ShellContext>(ctx_id);
     match ctx.ns.ls(&path, &ctx.subject) {
         Ok(entries) => {
             let lines: Vec<String> = entries
@@ -75,7 +75,7 @@ fn cmd_echo(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResul
 
     let path = argv[1].to_string();
     let data = argv[2].to_string();
-    let ctx = interp.context::<VfsContext>(ctx_id);
+    let ctx = interp.context::<ShellContext>(ctx_id);
 
     match ctx.ns.echo(&path, data.as_bytes(), &ctx.subject) {
         Ok(()) => molt_ok!(),
@@ -91,7 +91,7 @@ fn cmd_ctl(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResult
     let cmd_parts: Vec<String> = argv[2..].iter().map(|v| v.to_string()).collect();
     let cmd_str = cmd_parts.join(" ");
 
-    let ctx = interp.context::<VfsContext>(ctx_id);
+    let ctx = interp.context::<ShellContext>(ctx_id);
     match ctx.ns.ctl(&path, cmd_str.as_bytes(), &ctx.subject) {
         Ok(resp) => {
             let text = String::from_utf8_lossy(&resp);
@@ -114,7 +114,7 @@ fn cmd_help(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResul
     out.push_str("  mount [prefix]       list mount points\n");
     out.push_str("  help                 this message\n");
 
-    let ctx = interp.context::<VfsContext>(ctx_id);
+    let ctx = interp.context::<ShellContext>(ctx_id);
     if let Ok(entries) = ctx.ns.ls("/bin", &ctx.subject) {
         if !entries.is_empty() {
             out.push_str("\nCommands (/bin/):\n");
@@ -131,7 +131,7 @@ fn cmd_help(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResul
 fn cmd_mount(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResult {
     molt::check_args(1, argv, 1, 2, "?prefix?")?;
 
-    let ctx = interp.context::<VfsContext>(ctx_id);
+    let ctx = interp.context::<ShellContext>(ctx_id);
     let prefixes = ctx.ns.mount_prefixes();
 
     if argv.len() == 1 {

@@ -295,7 +295,7 @@ pub async fn handle_shell_tui(
 
     // Build VFS namespace for `/path` routing in ChatApps.
     let vfs_ns = {
-        use crate::services::ninep_handler::{SyntheticNode, SyntheticTree};
+        use crate::services::fs::{SyntheticNode, SyntheticTree};
 
         let mut ns = hyprstream_vfs::Namespace::new();
 
@@ -303,9 +303,9 @@ pub async fn handle_shell_tui(
         let model_tree = SyntheticTree::new(SyntheticNode::Dir {
             children: std::collections::HashMap::new(),
         });
-        let _ = ns.mount("/srv/model", hyprstream_vfs::MountTarget::Local(
+        let _ = ns.mount("/srv/model",
             std::sync::Arc::new(model_tree),
-        ));
+        );
 
         // Wrap in Arc, then build /bin/ with Weak captures to avoid circular ref.
         // Weak doesn't block Arc::get_mut, so we can still mount after.
@@ -393,17 +393,16 @@ pub async fn handle_shell_tui(
             std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
 
         let env_tree = {
-            use crate::services::ninep_handler::SyntheticDirEntry;
-
             let store_list = env_store.clone();
             let store_resolve = env_store.clone();
 
             SyntheticTree::new(SyntheticNode::DynamicDir {
                 list: Box::new(move || {
-                    store_list.read().keys().map(|k| SyntheticDirEntry {
+                    store_list.read().keys().map(|k| hyprstream_vfs::DirEntry {
                         name: k.clone(),
                         is_dir: false,
                         size: 0,
+                        stat: None,
                     }).collect()
                 }),
                 resolve: Box::new(move |name| {
@@ -418,12 +417,12 @@ pub async fn handle_shell_tui(
 
         // Mount /bin/ and /env/ — Arc::get_mut works because only Weak refs exist (no strong clones).
         if let Some(ns_mut) = std::sync::Arc::get_mut(&mut ns) {
-            let _ = ns_mut.mount("/bin", hyprstream_vfs::MountTarget::Local(
+            let _ = ns_mut.mount("/bin",
                 std::sync::Arc::new(bin_tree),
-            ));
-            let _ = ns_mut.mount("/env", hyprstream_vfs::MountTarget::Local(
+            );
+            let _ = ns_mut.mount("/env",
                 std::sync::Arc::new(env_tree),
-            ));
+            );
         }
 
         ns

@@ -87,7 +87,7 @@ pub mod oauth;
 pub mod oai;
 pub mod policy;
 pub mod registry;
-pub mod ninep_handler;
+pub mod fs;
 pub mod rpc_types;
 pub mod stream;
 pub mod worker;
@@ -117,6 +117,7 @@ pub use types::{
     QTDIR, QTFILE, OREAD, OWRITE, ORDWR, OTRUNC, ORCLOSE, DMDIR,
     FsDirEntryInfo,
 };
+// Open mode constants also re-exported from hyprstream-vfs::mount for VFS consumers.
 
 pub use inference::{InferenceService, InferenceServiceConfig, INFERENCE_ENDPOINT};
 pub use generated::inference_client::InferenceClient;

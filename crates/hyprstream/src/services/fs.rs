@@ -14,19 +14,12 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 
-use crate::services::types::{DEFAULT_IOUNIT, QTDIR, QTFILE, OWRITE, ORDWR};
+use crate::services::types::{DEFAULT_IOUNIT, QTDIR, QTFILE};
+use hyprstream_vfs::DirEntry;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Synthetic node types
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// A directory entry returned by readdir.
-#[derive(Clone, Debug)]
-pub struct SyntheticDirEntry {
-    pub name: String,
-    pub is_dir: bool,
-    pub size: u64,
-}
 
 /// A node in the synthetic file tree.
 pub enum SyntheticNode {
@@ -36,7 +29,7 @@ pub enum SyntheticNode {
     },
     /// Directory whose children are computed dynamically (e.g., model list).
     DynamicDir {
-        list: Box<dyn Fn() -> Vec<SyntheticDirEntry> + Send + Sync>,
+        list: Box<dyn Fn() -> Vec<DirEntry> + Send + Sync>,
         /// Resolve a child name to a subtree (called after walk finds a dynamic entry).
         resolve: Box<dyn Fn(&str) -> Option<SyntheticNode> + Send + Sync>,
     },
@@ -367,10 +360,11 @@ impl SyntheticTree {
             Some(SyntheticNode::Dir { children }) => {
                 if offset > 0 { return Ok(vec![]); }
                 Ok(encode_dir_entries(
-                    &children.keys().map(|k| SyntheticDirEntry {
+                    &children.keys().map(|k| DirEntry {
                         name: k.clone(),
                         is_dir: matches!(children.get(k), Some(SyntheticNode::Dir { .. } | SyntheticNode::DynamicDir { .. })),
                         size: 0,
+                        stat: None,
                     }).collect::<Vec<_>>(),
                     count,
                 ))
@@ -384,8 +378,8 @@ impl SyntheticTree {
         }
     }
 
-    /// Read directory entries as structured data (for LocalMount bridge).
-    pub fn readdir_entries(&self, fid: u32, owner: &str) -> Result<Vec<SyntheticDirEntry>, String> {
+    /// Read directory entries as structured data (for Mount bridge).
+    pub fn readdir_entries(&self, fid: u32, owner: &str) -> Result<Vec<DirEntry>, String> {
         let entry = self.fid_table.get_verified(fid, owner)?;
         let resolved = match &entry.state {
             FidState::Opened { resolved, .. } => resolved,
@@ -403,13 +397,14 @@ impl SyntheticTree {
         }
     }
 
-    fn readdir_from_node(&self, node: Option<&SyntheticNode>) -> Result<Vec<SyntheticDirEntry>, String> {
+    fn readdir_from_node(&self, node: Option<&SyntheticNode>) -> Result<Vec<DirEntry>, String> {
         match node {
             Some(SyntheticNode::Dir { children }) => {
-                Ok(children.keys().map(|k| SyntheticDirEntry {
+                Ok(children.keys().map(|k| DirEntry {
                     name: k.clone(),
                     is_dir: matches!(children.get(k), Some(SyntheticNode::Dir { .. } | SyntheticNode::DynamicDir { .. })),
                     size: 0,
+                    stat: None,
                 }).collect())
             }
             Some(SyntheticNode::DynamicDir { list, .. }) => Ok(list()),
@@ -428,7 +423,8 @@ impl SyntheticTree {
         let entry = self.fid_table.get_verified(fid, owner)?;
         match &entry.state {
             FidState::Opened { resolved, mode, response_buf, .. } => {
-                if *mode != OWRITE && *mode != ORDWR {
+                let base_mode = *mode & 0x03;
+                if base_mode != hyprstream_vfs::OWRITE && base_mode != hyprstream_vfs::ORDWR {
                     return Err("fid not open for writing".to_owned());
                 }
                 let node = match resolved {
@@ -565,7 +561,7 @@ impl SyntheticTree {
 }
 
 /// Encode directory entries in the 9P wire format used by the registry.
-fn encode_dir_entries(entries: &[SyntheticDirEntry], max_bytes: u32) -> Vec<u8> {
+fn encode_dir_entries(entries: &[DirEntry], max_bytes: u32) -> Vec<u8> {
     let mut wire = Vec::new();
     for entry in entries {
         let name_bytes = entry.name.as_bytes();
@@ -582,47 +578,43 @@ fn encode_dir_entries(entries: &[SyntheticDirEntry], max_bytes: u32) -> Vec<u8> 
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LocalMount implementation — bridges SyntheticTree to the VFS crate
+// Mount implementation — bridges SyntheticTree to the VFS crate
 // ─────────────────────────────────────────────────────────────────────────────
 
-impl hyprstream_vfs::LocalMount for SyntheticTree {
-    fn walk(&self, components: &[&str], caller: &hyprstream_rpc::Subject) -> Result<hyprstream_vfs::LocalFid, String> {
+impl hyprstream_vfs::Mount for SyntheticTree {
+    fn walk(&self, components: &[&str], caller: &hyprstream_rpc::Subject) -> Result<hyprstream_vfs::Fid, hyprstream_vfs::MountError> {
         let wnames: Vec<String> = components.iter().map(|s| (*s).to_owned()).collect();
         let owner = caller.to_string();
-        let (fid, _qid) = self.walk(&wnames, &owner, None)?;
-        Ok(hyprstream_vfs::LocalFid::new(fid))
+        let (fid, _qid) = self.walk(&wnames, &owner, None).map_err(|e| hyprstream_vfs::MountError::NotFound(e))?;
+        Ok(hyprstream_vfs::Fid::new(fid))
     }
 
-    fn open(&self, fid: &mut hyprstream_vfs::LocalFid, mode: u8, caller: &hyprstream_rpc::Subject) -> Result<(), String> {
-        let fid_u32 = *fid.downcast_ref::<u32>().ok_or("invalid fid type")?;
+    fn open(&self, fid: &mut hyprstream_vfs::Fid, mode: u8, caller: &hyprstream_rpc::Subject) -> Result<(), hyprstream_vfs::MountError> {
+        let fid_u32 = *fid.downcast_ref::<u32>().ok_or_else(|| hyprstream_vfs::MountError::InvalidArgument("invalid fid type".into()))?;
         let owner = caller.to_string();
-        self.open(fid_u32, mode, &owner)?;
+        self.open(fid_u32, mode, &owner).map_err(|e| hyprstream_vfs::MountError::Io(e))?;
         Ok(())
     }
 
-    fn read(&self, fid: &hyprstream_vfs::LocalFid, offset: u64, count: u32, caller: &hyprstream_rpc::Subject) -> Result<Vec<u8>, String> {
-        let fid_u32 = *fid.downcast_ref::<u32>().ok_or("invalid fid type")?;
-        self.read(fid_u32, offset, count, &caller.to_string())
+    fn read(&self, fid: &hyprstream_vfs::Fid, offset: u64, count: u32, caller: &hyprstream_rpc::Subject) -> Result<Vec<u8>, hyprstream_vfs::MountError> {
+        let fid_u32 = *fid.downcast_ref::<u32>().ok_or_else(|| hyprstream_vfs::MountError::InvalidArgument("invalid fid type".into()))?;
+        self.read(fid_u32, offset, count, &caller.to_string()).map_err(|e| hyprstream_vfs::MountError::Io(e))
     }
 
-    fn write(&self, fid: &hyprstream_vfs::LocalFid, offset: u64, data: &[u8], caller: &hyprstream_rpc::Subject) -> Result<u32, String> {
-        let fid_u32 = *fid.downcast_ref::<u32>().ok_or("invalid fid type")?;
-        self.write(fid_u32, offset, data, &caller.to_string())
+    fn write(&self, fid: &hyprstream_vfs::Fid, offset: u64, data: &[u8], caller: &hyprstream_rpc::Subject) -> Result<u32, hyprstream_vfs::MountError> {
+        let fid_u32 = *fid.downcast_ref::<u32>().ok_or_else(|| hyprstream_vfs::MountError::InvalidArgument("invalid fid type".into()))?;
+        self.write(fid_u32, offset, data, &caller.to_string()).map_err(|e| hyprstream_vfs::MountError::Io(e))
     }
 
-    fn readdir(&self, fid: &hyprstream_vfs::LocalFid, caller: &hyprstream_rpc::Subject) -> Result<Vec<hyprstream_vfs::DirEntry>, String> {
-        let fid_u32 = *fid.downcast_ref::<u32>().ok_or("invalid fid type")?;
-        let entries = self.readdir_entries(fid_u32, &caller.to_string())?;
-        Ok(entries.into_iter().map(|e| hyprstream_vfs::DirEntry {
-            name: e.name,
-            is_dir: e.is_dir,
-            size: e.size,
-        }).collect())
+    fn readdir(&self, fid: &hyprstream_vfs::Fid, caller: &hyprstream_rpc::Subject) -> Result<Vec<hyprstream_vfs::DirEntry>, hyprstream_vfs::MountError> {
+        let fid_u32 = *fid.downcast_ref::<u32>().ok_or_else(|| hyprstream_vfs::MountError::InvalidArgument("invalid fid type".into()))?;
+        let entries = self.readdir_entries(fid_u32, &caller.to_string()).map_err(|e| hyprstream_vfs::MountError::Io(e))?;
+        Ok(entries)
     }
 
-    fn stat(&self, fid: &hyprstream_vfs::LocalFid, caller: &hyprstream_rpc::Subject) -> Result<hyprstream_vfs::Stat, String> {
-        let fid_u32 = *fid.downcast_ref::<u32>().ok_or("invalid fid type")?;
-        let (qid, name) = self.stat(fid_u32, &caller.to_string())?;
+    fn stat(&self, fid: &hyprstream_vfs::Fid, caller: &hyprstream_rpc::Subject) -> Result<hyprstream_vfs::Stat, hyprstream_vfs::MountError> {
+        let fid_u32 = *fid.downcast_ref::<u32>().ok_or_else(|| hyprstream_vfs::MountError::InvalidArgument("invalid fid type".into()))?;
+        let (qid, name) = self.stat(fid_u32, &caller.to_string()).map_err(|e| hyprstream_vfs::MountError::Io(e))?;
         Ok(hyprstream_vfs::Stat {
             qtype: qid.qtype,
             size: 0,
@@ -631,7 +623,7 @@ impl hyprstream_vfs::LocalMount for SyntheticTree {
         })
     }
 
-    fn clunk(&self, fid: hyprstream_vfs::LocalFid, caller: &hyprstream_rpc::Subject) {
+    fn clunk(&self, fid: hyprstream_vfs::Fid, caller: &hyprstream_rpc::Subject) {
         if let Some(fid_u32) = fid.downcast_ref::<u32>() {
             self.clunk(*fid_u32, &caller.to_string());
         }
@@ -647,6 +639,7 @@ impl hyprstream_vfs::LocalMount for SyntheticTree {
 mod tests {
     use super::*;
     use crate::services::types::OREAD;
+    use hyprstream_vfs::OWRITE;
 
     fn make_tree() -> SyntheticTree {
         let mut children = HashMap::new();
@@ -728,8 +721,8 @@ mod tests {
     fn dynamic_dir() {
         let tree = SyntheticTree::new(SyntheticNode::DynamicDir {
             list: Box::new(|| vec![
-                SyntheticDirEntry { name: "model-a".into(), is_dir: true, size: 0 },
-                SyntheticDirEntry { name: "model-b".into(), is_dir: true, size: 0 },
+                DirEntry { name: "model-a".into(), is_dir: true, size: 0, stat: None },
+                DirEntry { name: "model-b".into(), is_dir: true, size: 0, stat: None },
             ]),
             resolve: Box::new(|_name| {
                 let mut children = HashMap::new();
@@ -761,12 +754,12 @@ mod tests {
 
     #[test]
     fn vfs_cat_reads_synthetic_file() {
-        use hyprstream_vfs::{Namespace, MountTarget, Subject};
+        use hyprstream_vfs::{Namespace, Subject};
         use std::sync::Arc;
 
         let tree = make_tree();
         let mut ns = Namespace::new();
-        ns.mount("/srv/model", MountTarget::Local(Arc::new(tree))).unwrap();
+        ns.mount("/srv/model", Arc::new(tree)).unwrap();
 
         let caller = Subject::new("alice");
         let data = ns.cat("/srv/model/test-model/status", &caller).unwrap();
@@ -775,12 +768,12 @@ mod tests {
 
     #[test]
     fn vfs_ctl_writes_and_reads_response() {
-        use hyprstream_vfs::{Namespace, MountTarget, Subject};
+        use hyprstream_vfs::{Namespace, Subject};
         use std::sync::Arc;
 
         let tree = make_tree();
         let mut ns = Namespace::new();
-        ns.mount("/srv/model", MountTarget::Local(Arc::new(tree))).unwrap();
+        ns.mount("/srv/model", Arc::new(tree)).unwrap();
 
         let caller = Subject::new("alice");
 
@@ -791,12 +784,12 @@ mod tests {
 
     #[test]
     fn vfs_ls_lists_directory() {
-        use hyprstream_vfs::{Namespace, MountTarget, Subject};
+        use hyprstream_vfs::{Namespace, Subject};
         use std::sync::Arc;
 
         let tree = make_tree();
         let mut ns = Namespace::new();
-        ns.mount("/srv/model", MountTarget::Local(Arc::new(tree))).unwrap();
+        ns.mount("/srv/model", Arc::new(tree)).unwrap();
 
         let caller = Subject::new("alice");
         let entries = ns.ls("/srv/model/test-model", &caller).unwrap();
@@ -807,13 +800,13 @@ mod tests {
 
     #[test]
     fn vfs_dynamic_dir_with_namespace() {
-        use hyprstream_vfs::{Namespace, MountTarget, Subject};
+        use hyprstream_vfs::{Namespace, Subject};
         use std::sync::Arc;
 
         // Build a dynamic tree (like the model service would).
         let tree = SyntheticTree::new(SyntheticNode::DynamicDir {
             list: Box::new(|| vec![
-                SyntheticDirEntry { name: "qwen3:main".into(), is_dir: true, size: 0 },
+                DirEntry { name: "qwen3:main".into(), is_dir: true, size: 0, stat: None },
             ]),
             resolve: Box::new(|_name| {
                 let mut children = HashMap::new();
@@ -834,7 +827,7 @@ mod tests {
         });
 
         let mut ns = Namespace::new();
-        ns.mount("/srv/model", MountTarget::Local(Arc::new(tree))).unwrap();
+        ns.mount("/srv/model", Arc::new(tree)).unwrap();
 
         let caller = Subject::new("alice");
 
@@ -853,12 +846,12 @@ mod tests {
 
     #[test]
     fn vfs_tenant_isolation() {
-        use hyprstream_vfs::{Namespace, MountTarget, Subject};
+        use hyprstream_vfs::{Namespace, Subject};
         use std::sync::Arc;
 
         let tree = make_tree();
         let mut ns = Namespace::new();
-        ns.mount("/srv/model", MountTarget::Local(Arc::new(tree))).unwrap();
+        ns.mount("/srv/model", Arc::new(tree)).unwrap();
 
         let alice = Subject::new("alice");
         let bob = Subject::new("bob");
@@ -872,15 +865,15 @@ mod tests {
 
     #[test]
     fn vfs_namespace_fork_isolation() {
-        use hyprstream_vfs::{Namespace, MountTarget, Subject};
+        use hyprstream_vfs::{Namespace, Subject};
         use std::sync::Arc;
 
         let tree = make_tree();
         let mut ns = Namespace::new();
-        ns.mount("/srv/model", MountTarget::Local(Arc::new(tree))).unwrap();
-        ns.mount("/srv/worker", MountTarget::Local(Arc::new(
+        ns.mount("/srv/model", Arc::new(tree)).unwrap();
+        ns.mount("/srv/worker", Arc::new(
             SyntheticTree::new(SyntheticNode::Dir { children: HashMap::new() }),
-        ))).unwrap();
+        )).unwrap();
 
         let caller = Subject::new("alice");
 

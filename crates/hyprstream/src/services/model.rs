@@ -150,7 +150,7 @@ pub struct ModelServiceInner {
     /// Federation key source for verifying externally-issued JWTs.
     federation_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>>,
     /// Persistent 9P synthetic tree for the fs scope (lazily initialized).
-    fs_tree: std::sync::OnceLock<crate::services::ninep_handler::SyntheticTree>,
+    fs_tree: std::sync::OnceLock<crate::services::fs::SyntheticTree>,
 }
 
 /// Model service that manages InferenceService lifecycle.
@@ -1070,7 +1070,8 @@ use crate::services::generated::model_client::{
     Qid as GenQid, NpStat as GenNpStat,
     FsHandler,
 };
-use crate::services::ninep_handler::{SyntheticTree, SyntheticNode, SyntheticDirEntry, SyntheticQid};
+use crate::services::fs::{SyntheticTree, SyntheticNode, SyntheticQid};
+use hyprstream_vfs::DirEntry;
 
 impl ModelService {
     /// Get the persistent synthetic 9P tree (lazily initialized).
@@ -1087,13 +1088,13 @@ impl ModelService {
             list: Box::new(move || {
                 let cache = inner_list.loaded_models.blocking_read();
                 let pending = inner_list.pending_loads.blocking_lock();
-                let mut entries: Vec<SyntheticDirEntry> = cache
+                let mut entries: Vec<DirEntry> = cache
                     .iter()
-                    .map(|(name, _)| SyntheticDirEntry { name: name.clone(), is_dir: true, size: 0 })
+                    .map(|(name, _)| DirEntry { name: name.clone(), is_dir: true, size: 0, stat: None })
                     .collect();
                 for name in pending.iter() {
                     if !cache.contains(name) {
-                        entries.push(SyntheticDirEntry { name: name.clone(), is_dir: true, size: 0 });
+                        entries.push(DirEntry { name: name.clone(), is_dir: true, size: 0, stat: None });
                     }
                 }
                 entries
