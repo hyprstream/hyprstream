@@ -13,12 +13,15 @@
 //! per ChatApp or shell session.
 
 mod builtins;
+pub mod mount;
 
 use std::sync::Arc;
 
 use hyprstream_vfs::{Namespace, Subject};
 use molt::types::*;
 use molt::Interp;
+
+pub use mount::{create_mount_channel, TclCommand, TclMount};
 
 /// Context stored in the molt interpreter via `save_context()`.
 pub(crate) struct ShellContext {
@@ -106,6 +109,45 @@ impl TclShell {
     /// Set to 0 for unlimited (not recommended for untrusted input).
     pub fn set_instruction_limit(&mut self, limit: usize) {
         self.interp.set_instruction_limit(limit);
+    }
+
+    /// Process one command from the mount channel.
+    ///
+    /// Called from the owner thread's event loop (e.g., `ChatApp::tick()`).
+    /// Each command carries a oneshot response channel; the caller blocks
+    /// until we send the reply.
+    pub fn process_command(&mut self, cmd: TclCommand) {
+        match cmd {
+            TclCommand::Eval { script, resp } => {
+                let _ = resp.send(self.eval(&script));
+            }
+            TclCommand::ListVars { resp } => {
+                let names: Vec<String> = self
+                    .interp
+                    .vars_in_scope()
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect();
+                let _ = resp.send(names);
+            }
+            TclCommand::GetVar { name, resp } => {
+                let val = self.interp.scalar(&name).ok().map(|v| v.to_string());
+                let _ = resp.send(val);
+            }
+            TclCommand::ListProcs { resp } => {
+                let names: Vec<String> = self
+                    .interp
+                    .proc_names()
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect();
+                let _ = resp.send(names);
+            }
+            TclCommand::GetProc { name, resp } => {
+                let body = self.interp.proc_body(&name).ok().map(|v| v.to_string());
+                let _ = resp.send(body);
+            }
+        }
     }
 
     /// Try resolving an unknown command via `/bin/{name}` (Plan9 PATH model).

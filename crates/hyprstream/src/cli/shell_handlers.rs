@@ -294,7 +294,8 @@ pub async fn handle_shell_tui(
     };
 
     // Build VFS namespace for `/path` routing in ChatApps.
-    let vfs_ns = {
+    #[allow(clippy::type_complexity)]
+    let (vfs_ns, tcl_mount_rx): (std::sync::Arc<hyprstream_vfs::Namespace>, std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>) = {
         use crate::services::fs::{SyntheticNode, SyntheticTree};
 
         let mut ns = hyprstream_vfs::Namespace::new();
@@ -418,7 +419,12 @@ pub async fn handle_shell_tui(
             })
         };
 
-        // Mount /bin/ and /env/ — Arc::get_mut works because only Weak refs exist (no strong clones).
+        // Create /lang/tcl mount channel — the TclMount exposes interpreter state
+        // as files. The receiver is polled by ChatApp::tick().
+        let (tcl_mount_tx, tcl_mount_rx) = hyprstream_tcl::create_mount_channel();
+        let tcl_mount = std::sync::Arc::new(hyprstream_tcl::TclMount::new(tcl_mount_tx));
+
+        // Mount /bin/, /env/, /lang/tcl — Arc::get_mut works because only Weak refs exist (no strong clones).
         if let Some(ns_mut) = std::sync::Arc::get_mut(&mut ns) {
             let _ = ns_mut.mount("/bin",
                 std::sync::Arc::new(bin_tree),
@@ -426,9 +432,10 @@ pub async fn handle_shell_tui(
             let _ = ns_mut.mount("/env",
                 std::sync::Arc::new(env_tree),
             );
+            let _ = ns_mut.mount("/lang/tcl", tcl_mount);
         }
 
-        ns
+        (ns, std::sync::Arc::new(std::sync::Mutex::new(tcl_mount_rx)))
     };
 
     // Console overlay for log viewing (F9 / Ctrl-L).
@@ -494,7 +501,7 @@ pub async fn handle_shell_tui(
                     &mut compositor, &client, &model_client, &worker_client,
                     &model_status_tx, &mut terminal, &mut console_app,
                     &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                    &vfs_ns, &vfs_subject, outputs,
+                    &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
                 ).await { break; }
             }
 
@@ -518,7 +525,7 @@ pub async fn handle_shell_tui(
                             &mut compositor, &client, &model_client, &worker_client,
                             &model_status_tx, &mut terminal, &mut console_app,
                             &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                            &vfs_ns, &vfs_subject, close_outputs,
+                            &vfs_ns, &vfs_subject, &tcl_mount_rx, close_outputs,
                         ).await { break; }
                         continue;
                     }
@@ -569,7 +576,7 @@ pub async fn handle_shell_tui(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                        &vfs_ns, &vfs_subject, outputs,
+                        &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
                     ).await {
                         should_exit = true;
                         break;
@@ -585,7 +592,7 @@ pub async fn handle_shell_tui(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                        &vfs_ns, &vfs_subject, outputs,
+                        &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
                     ).await { break; }
                 }
             }
@@ -631,7 +638,7 @@ pub async fn handle_shell_tui(
                             &mut compositor, &client, &model_client, &worker_client,
                             &model_status_tx, &mut terminal, &mut console_app,
                             &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                            &vfs_ns, &vfs_subject, outputs,
+                            &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
                         ).await { break; }
                     }
                     // Poll images
@@ -653,7 +660,7 @@ pub async fn handle_shell_tui(
                             &mut compositor, &client, &model_client, &worker_client,
                             &model_status_tx, &mut terminal, &mut console_app,
                             &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                            &vfs_ns, &vfs_subject, outputs,
+                            &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
                         ).await { break; }
                     }
                 }
@@ -716,7 +723,7 @@ pub async fn handle_shell_tui(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                        &vfs_ns, &vfs_subject, outputs,
+                        &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
                     ).await { should_exit = true; break; }
                 }
                 // Remove quitting apps.
@@ -741,7 +748,7 @@ pub async fn handle_shell_tui(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                        &vfs_ns, &vfs_subject, outputs,
+                        &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
                     ).await;
                 }
                 if should_exit { break; }
@@ -768,7 +775,7 @@ pub async fn handle_shell_tui(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                        &vfs_ns, &vfs_subject,
+                        &vfs_ns, &vfs_subject, &tcl_mount_rx,
                         vec![CompositorOutput::Rpc(rpc_req)],
                     ).await;
                 }
@@ -785,7 +792,7 @@ pub async fn handle_shell_tui(
                     &mut compositor, &client, &model_client, &worker_client,
                     &model_status_tx, &mut terminal, &mut console_app,
                     &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                    &vfs_ns, &vfs_subject, outputs,
+                    &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
                 ).await { break; }
                 composite_draw(&mut terminal, &compositor, &mut console_app);
             }
@@ -856,6 +863,7 @@ async fn dispatch_outputs(
     signing_key: &SigningKey,
     vfs_ns: &std::sync::Arc<hyprstream_vfs::Namespace>,
     vfs_subject: &hyprstream_rpc::Subject,
+    tcl_mount_rx: &std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>,
     outputs: Vec<CompositorOutput>,
 ) -> bool {
     for output in outputs {
@@ -868,7 +876,7 @@ async fn dispatch_outputs(
                 let feed_back = handle_rpc(
                     compositor, client, model_client, worker_client, model_status_tx,
                     active_apps, next_local_id, storage_key, signing_key,
-                    &vfs_ns, &vfs_subject, req,
+                    &vfs_ns, &vfs_subject, tcl_mount_rx, req,
                 ).await;
                 for input in feed_back {
                     let follow = compositor.handle(input);
@@ -916,6 +924,7 @@ async fn handle_rpc(
     signing_key: &SigningKey,
     vfs_ns: &std::sync::Arc<hyprstream_vfs::Namespace>,
     vfs_subject: &hyprstream_rpc::Subject,
+    tcl_mount_rx: &std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>,
     req: RpcRequest,
 ) -> Vec<CompositorInput> {
     let session_id = compositor.chrome.session_id;
@@ -1116,6 +1125,7 @@ async fn handle_rpc(
                     )
                     .with_gen_config(gen_config)
                     .with_vfs(vfs_ns.clone(), vfs_subject.clone())
+                    .with_tcl_mount_rx(tcl_mount_rx.clone())
                 }
                 Err(e) => {
                     compositor.chrome.push_toast(
@@ -1129,6 +1139,7 @@ async fn handle_rpc(
                     ChatApp::new(model_ref.clone(), cols, rows, spawner)
                         .with_gen_config(gen_config)
                         .with_vfs(vfs_ns.clone(), vfs_subject.clone())
+                    .with_tcl_mount_rx(tcl_mount_rx.clone())
                 }
             };
             // Detect tool call format from the model reference name.

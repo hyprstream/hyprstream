@@ -318,6 +318,9 @@ pub struct ChatApp {
     vfs_subject: hyprstream_vfs::Subject,
     /// Tcl shell for / command evaluation. !Send/!Sync (molt Value uses Rc).
     tcl_shell: Option<hyprstream_tcl::TclShell>,
+    /// Receiver for TclMount commands (polled in tick()). Shared across tabs.
+    #[cfg(not(target_os = "wasi"))]
+    tcl_mount_rx: Option<std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>>,
 }
 
 impl ChatApp {
@@ -360,6 +363,8 @@ impl ChatApp {
             vfs: None,
             vfs_subject: hyprstream_vfs::Subject::anonymous(),
             tcl_shell: None,
+            #[cfg(not(target_os = "wasi"))]
+            tcl_mount_rx: None,
         }
     }
 
@@ -390,6 +395,8 @@ impl ChatApp {
             vfs: None,
             vfs_subject: hyprstream_vfs::Subject::anonymous(),
             tcl_shell: None,
+            #[cfg(not(target_os = "wasi"))]
+            tcl_mount_rx: None,
         }
     }
 
@@ -466,6 +473,8 @@ impl ChatApp {
             vfs: None,
             vfs_subject: hyprstream_vfs::Subject::anonymous(),
             tcl_shell: None,
+            #[cfg(not(target_os = "wasi"))]
+            tcl_mount_rx: None,
         }
     }
 
@@ -494,6 +503,17 @@ impl ChatApp {
         ));
         self.vfs = Some(ns);
         self.vfs_subject = subject;
+        self
+    }
+
+    /// Attach the receiver end of a `/lang/tcl` mount channel.
+    ///
+    /// The corresponding [`hyprstream_tcl::TclMount`] must be mounted in the
+    /// namespace at `/lang/tcl` before this is called. The ChatApp drains this
+    /// channel in `tick()`, forwarding commands to the Tcl interpreter.
+    #[cfg(not(target_os = "wasi"))]
+    pub fn with_tcl_mount_rx(mut self, rx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>) -> Self {
+        self.tcl_mount_rx = Some(rx);
         self
     }
 
@@ -1316,6 +1336,17 @@ impl TerminalApp for ChatApp {
         }
 
         let mut redraw = false;
+
+        // Process pending TclMount requests from /lang/tcl VFS mount.
+        if let Some(ref rx_arc) = self.tcl_mount_rx {
+            if let Some(ref mut shell) = self.tcl_shell {
+                if let Ok(rx) = rx_arc.try_lock() {
+                    while let Ok(cmd) = rx.try_recv() {
+                        shell.process_command(cmd);
+                    }
+                }
+            }
+        }
 
         // Advance spinner while tool calls are in flight.
         if self.pending_tool_calls > 0 {
