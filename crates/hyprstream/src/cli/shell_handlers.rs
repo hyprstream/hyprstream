@@ -429,6 +429,23 @@ pub async fn handle_shell_tui(
             let _ = ns_mut.mount("/bin",
                 std::sync::Arc::new(bin_tree),
             );
+
+            // Discover .tcl tool scripts and bind them into /bin/ (After = fallback).
+            let tools_dir = std::env::var("XDG_CONFIG_HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| {
+                    dirs::home_dir().unwrap_or_default().join(".config")
+                })
+                .join("hyprstream/tools");
+            let tools = discover_tools(&tools_dir);
+            if !tools.is_empty() {
+                let tools_tree = SyntheticTree::new(SyntheticNode::Dir { children: tools });
+                let _ = ns_mut.bind_mount("/bin",
+                    std::sync::Arc::new(tools_tree),
+                    hyprstream_vfs::BindFlag::After,
+                );
+            }
+
             let _ = ns_mut.mount("/env",
                 std::sync::Arc::new(env_tree),
             );
@@ -1891,4 +1908,58 @@ fn unpack_color(packed: u32) -> ratatui::style::Color {
             _  => Color::Reset,
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tool discovery from .tcl files
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Scan a directory for `.tcl` scripts and return SyntheticNode entries.
+///
+/// Each `.tcl` file becomes a CtlFile whose handler evaluates the script
+/// contents with the written data available as `$args`. The file stem
+/// (without `.tcl` extension) is used as the tool name.
+///
+/// Returns a HashMap suitable for constructing a `SyntheticNode::Dir`.
+/// Returns an empty map if the directory doesn't exist or is unreadable.
+fn discover_tools(dir: &std::path::Path) -> HashMap<String, crate::services::fs::SyntheticNode> {
+    use crate::services::fs::SyntheticNode;
+
+    let mut tools = HashMap::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return tools,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("tcl") {
+            continue;
+        }
+        let name = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(n) => n.to_owned(),
+            None => continue,
+        };
+        // Reject names with path separators or dots (safety).
+        if name.contains('/') || name.contains("..") || name.is_empty() {
+            continue;
+        }
+
+        let script_path = path.clone();
+        tools.insert(name, SyntheticNode::CtlFile {
+            handler: Box::new(move |data, _subject| {
+                let script = std::fs::read_to_string(&script_path)
+                    .map_err(|e| format!("failed to read tool script: {e}"))?;
+                let args = String::from_utf8_lossy(data);
+                // Wrap the script: set $args before executing, capture the result.
+                let wrapped = format!("set args {{{}}}\n{}", args.trim(), script);
+                // Return the wrapped script for evaluation by the caller's TclShell.
+                // The ctl response is the script to eval — the /bin/ fallback in
+                // TclShell.try_cmd_resolve() will pass this through eval.
+                Ok(wrapped.into_bytes())
+            }),
+        });
+    }
+
+    tools
 }

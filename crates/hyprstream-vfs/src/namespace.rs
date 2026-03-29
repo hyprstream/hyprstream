@@ -52,7 +52,7 @@ pub type MountTarget = Arc<dyn Mount>;
 
 struct MountEntry {
     prefix: String,
-    target: MountTarget,
+    targets: Vec<MountTarget>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -76,15 +76,42 @@ impl Namespace {
         Self { mounts: Vec::new() }
     }
 
-    /// Mount a target at a path prefix.
+    /// Mount a target at a path prefix (replaces any existing mount).
     ///
-    /// Reserved prefixes (`/config`, `/private`, etc.) are allowed (all mounts are local now).
+    /// This is shorthand for `bind_mount(prefix, target, BindFlag::Replace)`.
     pub fn mount(&mut self, prefix: &str, target: MountTarget) -> Result<(), NamespaceError> {
+        self.bind_mount(prefix, target, BindFlag::Replace)
+    }
+
+    /// Mount a target at a path prefix with union semantics.
+    ///
+    /// - `Replace`: removes any existing mount at this prefix.
+    /// - `Before`: prepends the target — its entries appear first in readdir,
+    ///   and walk tries it before existing mounts at the same prefix.
+    /// - `After`: appends the target — existing mounts are tried first.
+    pub fn bind_mount(&mut self, prefix: &str, target: MountTarget, flag: BindFlag) -> Result<(), NamespaceError> {
         let prefix = normalize_prefix(prefix);
 
-        // Replace existing mount at this prefix (BindFlag::Replace semantics).
-        self.mounts.retain(|m| m.prefix != prefix);
-        self.mounts.push(MountEntry { prefix, target });
+        match flag {
+            BindFlag::Replace => {
+                self.mounts.retain(|m| m.prefix != prefix);
+                self.mounts.push(MountEntry { prefix, targets: vec![target] });
+            }
+            BindFlag::Before => {
+                if let Some(entry) = self.mounts.iter_mut().find(|m| m.prefix == prefix) {
+                    entry.targets.insert(0, target);
+                } else {
+                    self.mounts.push(MountEntry { prefix, targets: vec![target] });
+                }
+            }
+            BindFlag::After => {
+                if let Some(entry) = self.mounts.iter_mut().find(|m| m.prefix == prefix) {
+                    entry.targets.push(target);
+                } else {
+                    self.mounts.push(MountEntry { prefix, targets: vec![target] });
+                }
+            }
+        }
         // Sort by prefix length descending for longest-prefix match.
         self.mounts.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
         Ok(())
@@ -104,7 +131,7 @@ impl Namespace {
         Namespace {
             mounts: self.mounts.iter().map(|m| MountEntry {
                 prefix: m.prefix.clone(),
-                target: Arc::clone(&m.target),
+                targets: m.targets.iter().map(Arc::clone).collect(),
             }).collect(),
         }
     }
@@ -119,35 +146,61 @@ impl Namespace {
     /// Read the entire contents of a file. Walk + open + read-all + clunk.
     ///
     /// Loops reads until an empty Vec is returned, up to 16MB cap.
+    /// With union mounts, tries each target in bind order until one succeeds.
     pub fn cat(&self, path: &str, caller: &Subject) -> Result<Vec<u8>, NamespaceError> {
-        let (mount, remainder) = self.resolve(path)?;
+        let (targets, remainder) = self.resolve(path)?;
         let components: Vec<&str> = split_path(&remainder);
-        let mut fid = mount.walk(&components, caller)?;
-        mount.open(&mut fid, 0, caller)?; // OREAD
-        let mut data = Vec::new();
-        loop {
-            let chunk = mount.read(&fid, data.len() as u64, 64 * 1024, caller)?;
-            if chunk.is_empty() {
-                break;
-            }
-            data.extend_from_slice(&chunk);
-            if data.len() >= MAX_READ_SIZE {
-                break;
+        let mut last_err = None;
+        for mount in targets {
+            match (|| -> Result<Vec<u8>, MountError> {
+                let mut fid = mount.walk(&components, caller)?;
+                if let Err(e) = mount.open(&mut fid, 0, caller) {
+                    mount.clunk(fid, caller);
+                    return Err(e);
+                }
+                let mut data = Vec::new();
+                loop {
+                    match mount.read(&fid, data.len() as u64, 64 * 1024, caller) {
+                        Ok(chunk) if chunk.is_empty() => break,
+                        Ok(chunk) => {
+                            data.extend_from_slice(&chunk);
+                            if data.len() >= MAX_READ_SIZE { break; }
+                        }
+                        Err(e) => { mount.clunk(fid, caller); return Err(e); }
+                    }
+                }
+                mount.clunk(fid, caller);
+                Ok(data)
+            })() {
+                Ok(data) => return Ok(data),
+                Err(e) => { last_err = Some(e); }
             }
         }
-        mount.clunk(fid, caller);
-        Ok(data)
+        Err(NamespaceError::Mount(last_err.unwrap_or_else(|| MountError::NotFound(path.to_owned()))))
     }
 
     /// Write data to a file. Walk + open(write) + write + clunk.
+    /// With union mounts, tries each target in bind order until one succeeds.
     pub fn echo(&self, path: &str, data: &[u8], caller: &Subject) -> Result<(), NamespaceError> {
-        let (mount, remainder) = self.resolve(path)?;
+        let (targets, remainder) = self.resolve(path)?;
         let components: Vec<&str> = split_path(&remainder);
-        let mut fid = mount.walk(&components, caller)?;
-        mount.open(&mut fid, 1, caller)?; // OWRITE
-        mount.write(&fid, 0, data, caller)?;
-        mount.clunk(fid, caller);
-        Ok(())
+        let mut last_err = None;
+        for mount in targets {
+            match (|| -> Result<(), MountError> {
+                let mut fid = mount.walk(&components, caller)?;
+                if let Err(e) = mount.open(&mut fid, 1, caller) {
+                    mount.clunk(fid, caller);
+                    return Err(e);
+                }
+                mount.write(&fid, 0, data, caller)?;
+                mount.clunk(fid, caller);
+                Ok(())
+            })() {
+                Ok(()) => return Ok(()),
+                Err(e) => { last_err = Some(e); }
+            }
+        }
+        Err(NamespaceError::Mount(last_err.unwrap_or_else(|| MountError::NotFound(path.to_owned()))))
     }
 
     /// Write to a ctl file and read the response. Walk + open(RDWR) + write + read + clunk.
@@ -155,53 +208,92 @@ impl Namespace {
     /// This is the Plan9 ctl pattern: write a command, read the response, all on
     /// the same fid so the response buffer is available after the write.
     /// Loops reads until an empty Vec is returned, up to 16MB cap.
+    /// With union mounts, tries each target in bind order until one succeeds.
     pub fn ctl(&self, path: &str, data: &[u8], caller: &Subject) -> Result<Vec<u8>, NamespaceError> {
-        let (mount, remainder) = self.resolve(path)?;
+        let (targets, remainder) = self.resolve(path)?;
         let components: Vec<&str> = split_path(&remainder);
-        let mut fid = mount.walk(&components, caller)?;
-        mount.open(&mut fid, 2, caller)?; // ORDWR
-        mount.write(&fid, 0, data, caller)?;
-        let mut resp = Vec::new();
-        loop {
-            let chunk = mount.read(&fid, resp.len() as u64, 64 * 1024, caller)?;
-            if chunk.is_empty() {
-                break;
-            }
-            resp.extend_from_slice(&chunk);
-            if resp.len() >= MAX_READ_SIZE {
-                break;
+        let mut last_err = None;
+        for mount in targets {
+            match (|| -> Result<Vec<u8>, MountError> {
+                let mut fid = mount.walk(&components, caller)?;
+                if let Err(e) = mount.open(&mut fid, 2, caller) {
+                    mount.clunk(fid, caller);
+                    return Err(e);
+                }
+                if let Err(e) = mount.write(&fid, 0, data, caller) {
+                    mount.clunk(fid, caller);
+                    return Err(e);
+                }
+                let mut resp = Vec::new();
+                loop {
+                    match mount.read(&fid, resp.len() as u64, 64 * 1024, caller) {
+                        Ok(chunk) if chunk.is_empty() => break,
+                        Ok(chunk) => {
+                            resp.extend_from_slice(&chunk);
+                            if resp.len() >= MAX_READ_SIZE { break; }
+                        }
+                        Err(e) => { mount.clunk(fid, caller); return Err(e); }
+                    }
+                }
+                mount.clunk(fid, caller);
+                Ok(resp)
+            })() {
+                Ok(resp) => return Ok(resp),
+                Err(e) => { last_err = Some(e); }
             }
         }
-        mount.clunk(fid, caller);
-        Ok(resp)
+        Err(NamespaceError::Mount(last_err.unwrap_or_else(|| MountError::NotFound(path.to_owned()))))
     }
 
     /// List directory entries. Walk + open(read) + readdir + clunk.
+    ///
+    /// With union mounts, merges readdir results from all targets at the prefix,
+    /// deduplicating by name (first occurrence wins, preserving bind order).
     pub fn ls(&self, path: &str, caller: &Subject) -> Result<Vec<DirEntry>, NamespaceError> {
         // Special case: ls "/" shows all mount prefixes as directories.
         if path == "/" || path.is_empty() {
             return Ok(self.root_dir_entries());
         }
 
-        let (mount, remainder) = self.resolve(path)?;
+        let (targets, remainder) = self.resolve(path)?;
         let components: Vec<&str> = split_path(&remainder);
-        let mut fid = mount.walk(&components, caller)?;
-        mount.open(&mut fid, 0, caller)?;
-        let entries = mount.readdir(&fid, caller)?;
-        mount.clunk(fid, caller);
-        Ok(entries)
+        let mut seen = std::collections::HashSet::new();
+        let mut merged = Vec::new();
+        let mut any_ok = false;
+        for mount in targets {
+            if let Ok(mut fid) = mount.walk(&components, caller) {
+                if mount.open(&mut fid, 0, caller).is_ok() {
+                    if let Ok(entries) = mount.readdir(&fid, caller) {
+                        any_ok = true;
+                        for entry in entries {
+                            if seen.insert(entry.name.clone()) {
+                                merged.push(entry);
+                            }
+                        }
+                    }
+                }
+                mount.clunk(fid, caller);
+            }
+        }
+        if any_ok {
+            Ok(merged)
+        } else {
+            Err(NamespaceError::Mount(MountError::NotFound(path.to_owned())))
+        }
     }
 
     // ── Internal ────────────────────────────────────────────────────────────
 
-    /// Resolve a path to (MountTarget, remainder after prefix).
-    fn resolve(&self, path: &str) -> Result<(&MountTarget, String), NamespaceError> {
+    /// Resolve a path to (list of MountTargets, remainder after prefix).
+    ///
+    /// Returns targets in bind order (Before targets first, After targets last).
+    fn resolve(&self, path: &str) -> Result<(&[MountTarget], String), NamespaceError> {
         let path = normalize_path(path);
 
         for entry in &self.mounts {
             if path == entry.prefix || path.starts_with(&format!("{}/", entry.prefix)) {
                 let remainder = path[entry.prefix.len()..].to_owned();
-                return Ok((&entry.target, remainder));
+                return Ok((&entry.targets, remainder));
             }
         }
 
@@ -493,5 +585,115 @@ mod tests {
         // /config/../srv/model/status should normalize to /srv/model/status
         let data = ns.cat("/config/../srv/model/status", &test_subject()).unwrap();
         assert_eq!(data, b"ok");
+    }
+
+    // ── Bind / union directory tests ──────────────────────────────────────
+
+    #[test]
+    fn bind_before_walk_tries_new_mount_first() {
+        let mut ns = Namespace::new();
+        // Original mount has "status" = "original"
+        let orig: MountTarget = Arc::new(MemMount::new(vec![("status", b"original")]));
+        ns.mount("/bin", orig).unwrap();
+
+        // Bind Before: new mount has "status" = "override"
+        let overlay: MountTarget = Arc::new(MemMount::new(vec![("status", b"override")]));
+        ns.bind_mount("/bin", overlay, BindFlag::Before).unwrap();
+
+        let data = ns.cat("/bin/status", &test_subject()).unwrap();
+        assert_eq!(data, b"override");
+    }
+
+    #[test]
+    fn bind_after_walk_tries_existing_first() {
+        let mut ns = Namespace::new();
+        let orig: MountTarget = Arc::new(MemMount::new(vec![("status", b"original")]));
+        ns.mount("/bin", orig).unwrap();
+
+        // Bind After: new mount also has "status", but original should win.
+        let extra: MountTarget = Arc::new(MemMount::new(vec![("status", b"extra")]));
+        ns.bind_mount("/bin", extra, BindFlag::After).unwrap();
+
+        let data = ns.cat("/bin/status", &test_subject()).unwrap();
+        assert_eq!(data, b"original");
+    }
+
+    #[test]
+    fn bind_after_fallback_to_new_mount() {
+        let mut ns = Namespace::new();
+        // Original has only "cat"
+        let orig: MountTarget = Arc::new(MemMount::new(vec![("cat", b"cat-impl")]));
+        ns.mount("/bin", orig).unwrap();
+
+        // Bind After: new mount has "mytool" (not in original)
+        let extra: MountTarget = Arc::new(MemMount::new(vec![("mytool", b"mytool-impl")]));
+        ns.bind_mount("/bin", extra, BindFlag::After).unwrap();
+
+        // cat resolves from original
+        let data = ns.cat("/bin/cat", &test_subject()).unwrap();
+        assert_eq!(data, b"cat-impl");
+
+        // mytool falls through to the After mount
+        let data = ns.cat("/bin/mytool", &test_subject()).unwrap();
+        assert_eq!(data, b"mytool-impl");
+    }
+
+    #[test]
+    fn bind_before_fallback_to_existing() {
+        let mut ns = Namespace::new();
+        let orig: MountTarget = Arc::new(MemMount::new(vec![("cat", b"cat-impl")]));
+        ns.mount("/bin", orig).unwrap();
+
+        // Bind Before: new mount has "newtool" only
+        let overlay: MountTarget = Arc::new(MemMount::new(vec![("newtool", b"newtool-impl")]));
+        ns.bind_mount("/bin", overlay, BindFlag::Before).unwrap();
+
+        // "cat" falls through to existing mount
+        let data = ns.cat("/bin/cat", &test_subject()).unwrap();
+        assert_eq!(data, b"cat-impl");
+
+        // "newtool" found in Before mount
+        let data = ns.cat("/bin/newtool", &test_subject()).unwrap();
+        assert_eq!(data, b"newtool-impl");
+    }
+
+    #[test]
+    fn union_readdir_merges_entries() {
+        let mut ns = Namespace::new();
+        let mount_a: MountTarget = Arc::new(MemMount::new(vec![("cat", b""), ("ls", b"")]));
+        ns.mount("/bin", mount_a).unwrap();
+
+        let mount_b: MountTarget = Arc::new(MemMount::new(vec![("mytool", b""), ("cat", b"")]));
+        ns.bind_mount("/bin", mount_b, BindFlag::After).unwrap();
+
+        let entries = ns.ls("/bin", &test_subject()).unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+
+        // Should have "cat", "ls", and "mytool" — "cat" should not be duplicated.
+        assert!(names.contains(&"cat"));
+        assert!(names.contains(&"ls"));
+        assert!(names.contains(&"mytool"));
+        assert_eq!(names.iter().filter(|&&n| n == "cat").count(), 1);
+    }
+
+    #[test]
+    fn bind_replace_still_works() {
+        let mut ns = Namespace::new();
+        let orig: MountTarget = Arc::new(MemMount::new(vec![("status", b"original")]));
+        ns.mount("/bin", orig).unwrap();
+
+        // Add an After mount
+        let extra: MountTarget = Arc::new(MemMount::new(vec![("extra", b"x")]));
+        ns.bind_mount("/bin", extra, BindFlag::After).unwrap();
+
+        // Replace should clear all targets at /bin
+        let replacement: MountTarget = Arc::new(MemMount::new(vec![("status", b"replaced")]));
+        ns.mount("/bin", replacement).unwrap();
+
+        let data = ns.cat("/bin/status", &test_subject()).unwrap();
+        assert_eq!(data, b"replaced");
+
+        // "extra" should be gone (replaced)
+        assert!(ns.cat("/bin/extra", &test_subject()).is_err());
     }
 }
