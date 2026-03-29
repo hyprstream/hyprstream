@@ -36,8 +36,9 @@ pub enum SyntheticNode {
     /// Read-only file whose content is generated on read.
     ReadFile(Box<dyn Fn() -> Vec<u8> + Send + Sync>),
     /// Control file: write input, read response. Mutations go here (Plan9 ctl pattern).
+    /// The handler receives the caller's `Subject` so it can enforce per-caller authorization.
     CtlFile {
-        handler: Box<dyn Fn(&[u8]) -> Result<Vec<u8>, String> + Send + Sync>,
+        handler: Box<dyn Fn(&[u8], &hyprstream_rpc::Subject) -> Result<Vec<u8>, String> + Send + Sync>,
     },
 }
 
@@ -419,7 +420,7 @@ impl SyntheticTree {
     ///
     /// For ctl files, the handler closure is invoked and the response is buffered
     /// for subsequent reads. Response buffer is capped at MAX_RESPONSE_BUF.
-    pub fn write(&self, fid: u32, _offset: u64, data: &[u8], owner: &str) -> Result<u32, String> {
+    pub fn write(&self, fid: u32, _offset: u64, data: &[u8], owner: &str, subject: &hyprstream_rpc::Subject) -> Result<u32, String> {
         let entry = self.fid_table.get_verified(fid, owner)?;
         match &entry.state {
             FidState::Opened { resolved, mode, response_buf, .. } => {
@@ -433,7 +434,7 @@ impl SyntheticTree {
                 };
                 match node {
                     Some(SyntheticNode::CtlFile { handler }) => {
-                        let result = handler(data)?;
+                        let result = handler(data, subject)?;
                         let written = data.len() as u32;
                         let mut buf = response_buf.lock();
                         // Clear old response on new write (Plan9 convention: each write is a new command).
@@ -603,7 +604,7 @@ impl hyprstream_vfs::Mount for SyntheticTree {
 
     fn write(&self, fid: &hyprstream_vfs::Fid, offset: u64, data: &[u8], caller: &hyprstream_rpc::Subject) -> Result<u32, hyprstream_vfs::MountError> {
         let fid_u32 = *fid.downcast_ref::<u32>().ok_or_else(|| hyprstream_vfs::MountError::InvalidArgument("invalid fid type".into()))?;
-        self.write(fid_u32, offset, data, &caller.to_string()).map_err(|e| hyprstream_vfs::MountError::Io(e))
+        self.write(fid_u32, offset, data, &caller.to_string(), caller).map_err(|e| hyprstream_vfs::MountError::Io(e))
     }
 
     fn readdir(&self, fid: &hyprstream_vfs::Fid, caller: &hyprstream_rpc::Subject) -> Result<Vec<hyprstream_vfs::DirEntry>, hyprstream_vfs::MountError> {
@@ -647,7 +648,7 @@ mod tests {
             Box::new(|| b"loaded\n".to_vec()),
         ));
         children.insert("ctl".to_owned(), SyntheticNode::CtlFile {
-            handler: Box::new(|data| {
+            handler: Box::new(|data, _subject| {
                 let cmd = String::from_utf8_lossy(data);
                 Ok(format!("ok: {}", cmd.trim()).into_bytes())
             }),
@@ -686,7 +687,7 @@ mod tests {
         let tree = make_tree();
         let (fid, _) = tree.walk(&["test-model".into(), "ctl".into()], "alice", None).unwrap();
         tree.open(fid, OWRITE, "alice").unwrap();
-        let written = tree.write(fid, 0, b"load", "alice").unwrap();
+        let written = tree.write(fid, 0, b"load", "alice", &hyprstream_rpc::Subject::new("alice")).unwrap();
         assert_eq!(written, 4);
         // Read the response.
         let resp = tree.read(fid, 0, 1024, "alice").unwrap();
@@ -817,7 +818,7 @@ mod tests {
                     Box::new(|| b"{\"temperature\": 0.7}\n".to_vec()),
                 ));
                 children.insert("ctl".to_owned(), SyntheticNode::CtlFile {
-                    handler: Box::new(|data| {
+                    handler: Box::new(|data, _subject| {
                         let cmd = String::from_utf8_lossy(data);
                         Ok(format!("ctl: {}\n", cmd.trim()).into_bytes())
                     }),

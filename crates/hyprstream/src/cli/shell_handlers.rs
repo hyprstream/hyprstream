@@ -323,7 +323,7 @@ pub async fn handle_shell_tui(
             let w = weak.clone();
             let s = subj.clone();
             children.insert("cat".to_owned(), SyntheticNode::CtlFile {
-                handler: Box::new(move |data| {
+                handler: Box::new(move |data, _subject| {
                     let ns = w.upgrade().ok_or("namespace dropped")?;
                     let input = std::str::from_utf8(data).map_err(|e| e.to_string())?;
                     let mut out = Vec::new();
@@ -340,7 +340,7 @@ pub async fn handle_shell_tui(
             let w = weak.clone();
             let s = subj.clone();
             children.insert("ls".to_owned(), SyntheticNode::CtlFile {
-                handler: Box::new(move |data| {
+                handler: Box::new(move |data, _subject| {
                     let ns = w.upgrade().ok_or("namespace dropped")?;
                     let input = std::str::from_utf8(data).map_err(|e| e.to_string())?;
                     let path = input.trim();
@@ -357,7 +357,7 @@ pub async fn handle_shell_tui(
             let w = weak.clone();
             let s = subj.clone();
             children.insert("help".to_owned(), SyntheticNode::CtlFile {
-                handler: Box::new(move |_data| {
+                handler: Box::new(move |_data, _subject| {
                     let mut out = String::from("VFS commands:\n");
                     out.push_str("  cat <path>           read file contents\n");
                     out.push_str("  ls [path]            list directory\n");
@@ -382,7 +382,7 @@ pub async fn handle_shell_tui(
             // /bin/mount — read-only, lists mount prefixes.
             let w = weak.clone();
             children.insert("mount".to_owned(), SyntheticNode::CtlFile {
-                handler: Box::new(move |_data| {
+                handler: Box::new(move |_data, _subject| {
                     let ns = w.upgrade().ok_or("namespace dropped")?;
                     Ok(ns.mount_prefixes().join("\n").into_bytes())
                 }),

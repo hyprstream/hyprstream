@@ -1118,7 +1118,7 @@ impl ModelService {
                     Box::new(move || defaults_json.clone()),
                 ));
                 children.insert("ctl".to_owned(), SyntheticNode::CtlFile {
-                    handler: Box::new(|data| {
+                    handler: Box::new(|data, _subject| {
                         let cmd = String::from_utf8_lossy(data).trim().to_owned();
                         Ok(format!("ctl: {cmd}\n").into_bytes())
                     }),
@@ -1170,8 +1170,9 @@ impl FsHandler for ModelService {
         _model_ref: &str, data: &NpWrite,
     ) -> Result<RWrite> {
         let tree = self.fs_tree();
-        let owner = ctx.subject().to_string();
-        let count = tree.write(data.fid, data.offset, &data.data, &owner)
+        let subject = ctx.subject();
+        let owner = subject.to_string();
+        let count = tree.write(data.fid, data.offset, &data.data, &owner, &subject)
             .map_err(|e| anyhow::anyhow!(e))?;
         Ok(RWrite { count })
     }
