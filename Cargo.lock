@@ -6204,6 +6204,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyprstream-sandbox"
+version = "0.1.0"
+dependencies = [
+ "hyprstream-tcl",
+ "hyprstream-vfs",
+]
+
+[[package]]
 name = "hyprstream-service"
 version = "0.1.0"
 dependencies = [
