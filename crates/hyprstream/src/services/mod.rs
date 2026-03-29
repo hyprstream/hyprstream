@@ -88,6 +88,7 @@ pub mod oai;
 pub mod policy;
 pub mod registry;
 pub mod fs;
+pub mod remote_mount;
 pub mod rpc_types;
 pub mod stream;
 pub mod worker;

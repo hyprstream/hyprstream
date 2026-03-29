@@ -299,12 +299,15 @@ pub async fn handle_shell_tui(
 
         let mut ns = hyprstream_vfs::Namespace::new();
 
-        // Mount an empty model tree — services register dynamically later.
-        let model_tree = SyntheticTree::new(SyntheticNode::Dir {
-            children: std::collections::HashMap::new(),
-        });
+        // Mount the model service's 9P filesystem via RPC proxy.
+        // RemoteModelMount translates sync Mount trait calls to async ModelClient
+        // RPC requests, so `/srv/model/{model_ref}/status` etc. are served by the
+        // model service's SyntheticTree on the other end of the ZMQ socket.
+        let remote_model_mount = crate::services::remote_mount::RemoteModelMount::new(
+            model_client.clone(),
+        );
         let _ = ns.mount("/srv/model",
-            std::sync::Arc::new(model_tree),
+            std::sync::Arc::new(remote_model_mount),
         );
 
         // Wrap in Arc, then build /bin/ with Weak captures to avoid circular ref.
