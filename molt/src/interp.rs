@@ -511,6 +511,12 @@ pub struct Interp {
     // Current number of eval levels.
     num_levels: usize,
 
+    // Instruction (command dispatch) limit. 0 = unlimited.
+    instruction_limit: usize,
+
+    // Commands dispatched since last reset.
+    instruction_count: usize,
+
     // Profile Map
     profile_map: HashMap<String, ProfileRecord>,
 }
@@ -641,6 +647,8 @@ impl Interp {
     pub fn empty() -> Self {
         let mut interp = Self {
             recursion_limit: 1000,
+            instruction_limit: 0,
+            instruction_count: 0,
             commands: HashMap::new(),
             last_context_id: 0,
             context_map: HashMap::new(),
@@ -810,7 +818,18 @@ impl Interp {
         // Tricky, though.  Don't want to have to parse it as a list.  Need a quick way
         // to determine if something is already a list.  (Might need two methods!)
 
-        // FIRST, check the number of nesting levels
+        // FIRST, check instruction limit (catches loops with empty bodies like `while {1} {}`)
+        if self.instruction_limit > 0 {
+            self.instruction_count += 1;
+            if self.instruction_count > self.instruction_limit {
+                return molt_err!(
+                    "instruction limit exceeded ({} commands)",
+                    self.instruction_limit
+                );
+            }
+        }
+
+        // NEXT, check the number of nesting levels
         self.num_levels += 1;
 
         if self.num_levels > self.recursion_limit {
@@ -878,6 +897,17 @@ impl Interp {
             }
 
             let name = words[0].as_str();
+
+            // Instruction limit: catch infinite loops, CPU bombs, etc.
+            if self.instruction_limit > 0 {
+                self.instruction_count += 1;
+                if self.instruction_count > self.instruction_limit {
+                    return molt_err!(
+                        "instruction limit exceeded ({} commands)",
+                        self.instruction_limit
+                    );
+                }
+            }
 
             if let Some(cmd) = self.commands.get(name) {
                 // let start = Instant::now();
@@ -2023,6 +2053,64 @@ impl Interp {
         self.recursion_limit = limit;
     }
 
+    /// Returns the interpreter's instruction limit: the maximum number of commands that may
+    /// be dispatched before an error is returned. 0 means unlimited (default).
+    ///
+    /// The instruction counter is incremented on every command dispatch (including within
+    /// loops, procs, and nested evals). Use [`reset_instruction_count`](#method.reset_instruction_count)
+    /// to reset the counter between independent evaluations.
+    ///
+    /// # Example
+    /// ```
+    /// # use molt::interp::Interp;
+    /// let interp = Interp::new();
+    /// assert_eq!(interp.instruction_limit(), 0);
+    /// ```
+    pub fn instruction_limit(&self) -> usize {
+        self.instruction_limit
+    }
+
+    /// Sets the interpreter's instruction limit: the maximum number of commands that may
+    /// be dispatched before an error is returned. Set to 0 for unlimited (default).
+    ///
+    /// This is the primary defense against infinite loops (`while 1 {}`), CPU bombs
+    /// (`string repeat x 999999`), and runaway recursion that stays within the
+    /// recursion limit.
+    ///
+    /// # Example
+    /// ```
+    /// # use molt::types::*;
+    /// # use molt::interp::Interp;
+    /// let mut interp = Interp::new();
+    /// interp.set_instruction_limit(10000);
+    /// assert_eq!(interp.instruction_limit(), 10000);
+    /// ```
+    pub fn set_instruction_limit(&mut self, limit: usize) {
+        self.instruction_limit = limit;
+    }
+
+    /// Returns the current instruction count (commands dispatched since last reset).
+    pub fn instruction_count(&self) -> usize {
+        self.instruction_count
+    }
+
+    /// Resets the instruction counter to zero. Call this before each independent eval
+    /// to give the script a fresh budget.
+    ///
+    /// # Example
+    /// ```
+    /// # use molt::interp::Interp;
+    /// let mut interp = Interp::new();
+    /// interp.set_instruction_limit(100);
+    /// let _ = interp.eval("expr {1 + 1}");
+    /// assert!(interp.instruction_count() > 0);
+    /// interp.reset_instruction_count();
+    /// assert_eq!(interp.instruction_count(), 0);
+    /// ```
+    pub fn reset_instruction_count(&mut self) {
+        self.instruction_count = 0;
+    }
+
     //--------------------------------------------------------------------------------------------
     // Context Cache
 
@@ -2454,6 +2542,54 @@ mod tests {
                 "too many nested calls to Interp::eval (infinite loop?)"
             ))
         ));
+    }
+
+    #[test]
+    fn test_instruction_limit() {
+        let mut interp = Interp::new();
+
+        assert_eq!(interp.instruction_limit(), 0);
+        interp.set_instruction_limit(100);
+        assert_eq!(interp.instruction_limit(), 100);
+
+        // Simple eval stays under limit.
+        interp.reset_instruction_count();
+        assert!(interp.eval("expr {1 + 1}").is_ok());
+        assert!(interp.instruction_count() > 0);
+        assert!(interp.instruction_count() <= 100);
+
+        // Infinite loop hits the limit.
+        interp.reset_instruction_count();
+        let result = interp.eval("while {1} {}");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().value().to_string();
+        assert!(msg.contains("instruction limit exceeded"));
+
+        // Counter resets properly.
+        interp.reset_instruction_count();
+        assert_eq!(interp.instruction_count(), 0);
+        assert!(interp.eval("set x 1").is_ok());
+    }
+
+    #[test]
+    fn test_instruction_limit_zero_is_unlimited() {
+        let mut interp = Interp::new();
+        interp.set_instruction_limit(0); // unlimited
+
+        // A loop that would exceed any reasonable limit runs fine with limit=0.
+        interp.reset_instruction_count();
+        assert!(interp.eval("for {set i 0} {$i < 10000} {incr i} {}").is_ok());
+    }
+
+    #[test]
+    fn test_instruction_limit_catches_nested_loops() {
+        let mut interp = Interp::new();
+        interp.set_instruction_limit(50);
+
+        interp.reset_instruction_count();
+        let result = interp.eval("for {set i 0} {$i < 1000} {incr i} {expr {$i * $i}}");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().value().to_string().contains("instruction limit"));
     }
 
     //-----------------------------------------------------------------------

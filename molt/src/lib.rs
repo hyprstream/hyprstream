@@ -1,3 +1,7 @@
+// Upstream molt code — suppress clippy lints that predate our fork.
+// Our additions (instruction_limit) follow current Rust style.
+#![allow(clippy::all, dead_code, unused_imports)]
+
 //! # Molt Client Library
 //!
 //! This module defines the API for Molt clients.
