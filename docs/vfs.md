@@ -102,6 +102,88 @@ List all mount points, or check if a specific prefix is mounted.
 
 List VFS builtins and any commands found in `/bin/`.
 
+## Bind mounts and union directories
+
+The namespace supports Plan 9-style `bind` in addition to `mount`.  While
+`mount` attaches a `Mount` implementation at a prefix, `bind` overlays one
+namespace path onto another, creating union directories.
+
+```rust
+ns.bind_mount("/tools", "/bin", BindFlag::Before)?;
+```
+
+`BindFlag` controls union order:
+
+| Flag | Behavior |
+|------|----------|
+| `BindFlag::Before` | New entries appear first in readdir / shadow existing names |
+| `BindFlag::After` | New entries appear after existing ones (fallback) |
+| `BindFlag::Replace` | Completely replaces the target |
+
+When `ls` is called on a union directory, entries from all bound mounts are
+merged.  Duplicate names are resolved by union order (first match wins for
+`cat`/`ctl`; all entries shown for `ls`).
+
+**Tool overlay example**: user-defined `.tcl` tool scripts discovered from
+`~/.config/hyprstream/tools/` are mounted at `/tools/`, then bound before
+`/bin/` so they can extend (or override) built-in commands:
+
+```
+/bind -b /tools /bin
+/ls /bin
+load
+my-custom-tool
+cat
+ls
+...
+```
+
+## `/lang/tcl/` mount
+
+The Tcl interpreter state is exposed as a read-only mount at `/lang/tcl/`,
+allowing introspection of the running shell:
+
+```
+/lang/tcl/
+  eval           Write a Tcl script, read result (ctl semantics)
+  vars/          One file per variable — cat to read current value
+  procs/         One file per user-defined proc — cat to read body
+```
+
+Examples:
+
+```
+/cat /lang/tcl/vars/temperature
+0.7
+
+/ls /lang/tcl/procs
+my-helper
+format-output
+
+/ctl /lang/tcl/eval {expr {2 + 2}}
+4
+```
+
+This is a novel extension of the Plan 9 namespace model: language runtimes
+are mounts at `/lang/{name}/`.  Tcl is first; other runtimes (sh, python)
+could follow the same pattern.
+
+## Tool discovery
+
+Tcl scripts placed in `~/.config/hyprstream/tools/` are automatically
+discovered and mounted into `/bin/` at startup.  Each `.tcl` file becomes
+a command whose name is the filename without the extension:
+
+```
+~/.config/hyprstream/tools/
+  summarize.tcl    -> /bin/summarize
+  translate.tcl    -> /bin/translate
+```
+
+The discovery scan runs once at shell construction.  Scripts are evaluated
+in the sandboxed interpreter — they have no direct host I/O, only VFS
+access.
+
 ## `/bin/` duality
 
 Builtins (`cat`, `ls`, `echo`, `ctl`, `help`, `mount`) are registered directly
@@ -143,10 +225,28 @@ These commands are removed at construction time:
 | `time` | User-controlled iteration count — CPU bomb |
 | `parse`, `pdump`, `pclear` | Debug internals |
 
+### Sandbox trust levels
+
+The `hyprstream-sandbox` crate provides trust-level-aware sandboxing for
+Tcl evaluation.  The `TrustLevel` enum controls what the interpreter is
+allowed to do:
+
+| Level | Instruction limit | Namespace access | Use case |
+|-------|-------------------|------------------|----------|
+| `Human` | 1,000,000 | Full | Interactive TUI user |
+| `Agent` | 100,000 | No `/private/`, no `/config/` writes | LLM tool use |
+| `Federation` | 10,000 | `/srv/` read-only, no `/env/` | Remote peer eval |
+| `Untrusted` | 1,000 | `/bin/` only (no `/srv/`, `/env/`, `/config/`, `/private/`) | Unverified input |
+
+Trust level is set at `TclShell` construction and propagated through the
+`Subject` to every `Mount` call.  Mounts enforce namespace restrictions —
+a `Federation`-level caller receives `MountError::PermissionDenied` when
+attempting to write `/config/`.
+
 ### Limits
 
-- **Instruction limit**: 100,000 per eval (prevents infinite loops).
-  Configurable via `TclShell::set_instruction_limit()`.
+- **Instruction limit**: per trust level (see table above), prevents infinite
+  loops.  Configurable via `TclShell::set_instruction_limit()`.
 - **Recursion limit**: 100 (molt default override).
 
 ### Path sanitization
@@ -223,3 +323,50 @@ The namespace abstracts transport.
 A federated peer's namespace is mounted at `/net/peer-a/srv/...`.
 Tcl scripts that reference those paths cause transparent cross-node
 RPC — the same commands work regardless of where the service lives.
+
+## FUSE/virtio-fs adapter (`hyprstream-vfsd`)
+
+The `hyprstream-vfsd` crate exposes the VFS namespace as a real Linux
+filesystem via FUSE (and optionally virtio-fs for VM guests).  This is
+Linux-only.
+
+Architecture:
+
+- **`VfsFuse`** wraps any `Mount` implementation and translates FUSE
+  operations (lookup, read, write, readdir, etc.) into `Mount` trait calls.
+- An **inode table** maps FUSE inode numbers to VFS fids, handling the
+  translation between the kernel's inode-based model and the 9P fid-based
+  model.
+- **`DaxMount`** provides DAX (direct access) mapping for model weight files,
+  allowing the kernel to memory-map `.safetensors` directly without copying
+  through the FUSE buffer.  This is critical for large model weights where
+  read throughput matters.
+
+Usage:
+
+```bash
+hyprstream vfsd --mountpoint /mnt/hyprstream
+ls /mnt/hyprstream/srv/model/qwen3:main/
+```
+
+When running inside a VM, `hyprstream-vfsd` can serve as a virtio-fs
+backend, allowing the guest kernel to mount the hyprstream namespace
+natively.
+
+## 9P2000.L wire protocol (`hyprstream-9p`)
+
+The `hyprstream-9p` crate implements the 9P2000.L wire protocol, enabling
+federation export of the VFS namespace to remote peers.
+
+- **`NinePServer`** wraps any `Mount` implementation and speaks the 9P2000.L
+  protocol over a TCP or Unix socket.  Remote clients (including other
+  hyprstream instances or standard 9P clients like `9pfuse`) can attach
+  and traverse the namespace.
+- A custom **wire codec** handles 9P message framing (4-byte length prefix,
+  message type, tag multiplexing).
+- **Session management** tracks per-client attach state, fid mappings, and
+  authentication via the `Subject` identity system.
+
+This is the mechanism behind `/net/{peer}/` mounts: when a peer connects,
+its exported namespace is attached via 9P and mounted at the appropriate
+prefix in the local namespace.
