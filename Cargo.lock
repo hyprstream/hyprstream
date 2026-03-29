@@ -8170,9 +8170,7 @@ dependencies = [
 
 [[package]]
 name = "molt"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6ff0d27c6261b74d65ab819de1b163d29917d9f95cf995e5845b6c953e516bc"
+version = "0.3.2"
 dependencies = [
  "indexmap 1.9.3",
 ]

@@ -68,6 +68,7 @@ impl TclShell {
             }
         }
         interp.set_recursion_limit(100);
+        interp.set_instruction_limit(100_000);
 
         let ctx = ShellContext { ns, subject };
         let ctx_id = interp.save_context(ctx);
@@ -80,6 +81,7 @@ impl TclShell {
     /// On "invalid command name" errors, tries `/bin/{name}` resolution
     /// (Plan9 PATH model) before returning the error.
     pub fn eval(&mut self, script: &str) -> Result<String, String> {
+        self.interp.reset_instruction_count();
         match self.interp.eval(script) {
             Ok(val) => Ok(val.to_string()),
             Err(exception) => {
@@ -98,6 +100,12 @@ impl TclShell {
     /// Check if a command name is registered in the interpreter.
     pub fn has_command(&self, name: &str) -> bool {
         self.interp.has_command(name)
+    }
+
+    /// Override the instruction limit (default: 100,000).
+    /// Set to 0 for unlimited (not recommended for untrusted input).
+    pub fn set_instruction_limit(&mut self, limit: usize) {
+        self.interp.set_instruction_limit(limit);
     }
 
     /// Try resolving an unknown command via `/bin/{name}` (Plan9 PATH model).
@@ -493,5 +501,18 @@ mod tests {
         assert_eq!(shell.eval("set x hello; string length $x").unwrap(), "5");
         assert_eq!(shell.eval("if {1} {set y yes}").unwrap(), "yes");
         assert_eq!(shell.eval("list a b c").unwrap(), "a b c");
+    }
+
+    #[test]
+    fn instruction_limit_catches_infinite_loop() {
+        let mut shell = make_shell();
+        // Lower the limit so the test completes quickly.
+        shell.set_instruction_limit(500);
+        let result = shell.eval("while {1} {}");
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("instruction limit"),
+            "error should mention instruction limit"
+        );
     }
 }

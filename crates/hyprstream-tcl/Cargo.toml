@@ -6,5 +6,5 @@ license = "MIT"
 description = "Tcl (molt) shell for hyprstream VFS namespace"
 
 [dependencies]
-molt = "0.3"
+molt = { path = "../../../../../../molt/.worktrees/hyprstream/molt" }
 hyprstream-vfs = { path = "../hyprstream-vfs" }
