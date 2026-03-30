@@ -45,6 +45,10 @@ pub enum TclCommand {
         name: String,
         resp: mpsc::SyncSender<Option<String>>,
     },
+    /// Set the instruction limit on the interpreter.
+    SetInstructionLimit {
+        limit: usize,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -352,6 +356,9 @@ mod tests {
                             _ => None,
                         };
                         let _ = resp.send(body);
+                    }
+                    TclCommand::SetInstructionLimit { .. } => {
+                        // No-op in fake interpreter.
                     }
                 }
             }

@@ -13,6 +13,7 @@
 //! per ChatApp or shell session.
 
 mod builtins;
+pub mod executor;
 pub mod mount;
 
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use hyprstream_vfs::{Namespace, Subject};
 use molt::types::*;
 use molt::Interp;
 
+pub use executor::TclExecutor;
 pub use mount::{create_mount_channel, TclCommand, TclMount};
 
 /// Context stored in the molt interpreter via `save_context()`.
@@ -150,6 +152,9 @@ impl TclShell {
             TclCommand::GetProc { name, resp } => {
                 let body = self.interp.proc_body(&name).ok().map(|v| v.to_string());
                 let _ = resp.send(body);
+            }
+            TclCommand::SetInstructionLimit { limit } => {
+                self.interp.set_instruction_limit(limit);
             }
         }
     }
