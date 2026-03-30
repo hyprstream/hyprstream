@@ -225,28 +225,18 @@ These commands are removed at construction time:
 | `time` | User-controlled iteration count — CPU bomb |
 | `parse`, `pdump`, `pclear` | Debug internals |
 
-### Sandbox trust levels
+### Sandbox
 
-The `hyprstream-sandbox` crate provides trust-level-aware sandboxing for
-Tcl evaluation.  The `TrustLevel` enum controls what the interpreter is
-allowed to do:
-
-| Level | Instruction limit | Namespace access | Use case |
-|-------|-------------------|------------------|----------|
-| `Human` | 100,000 | Full | Interactive TUI user |
-| `Agent` | 10,000 | No `/private/`, no `/env/` | LLM tool use |
-| `Federation` | 1,000 | Also no `/config/`, no `/net/` | Remote peer eval |
-| `Untrusted` | 500 | Allowlist: `/srv/` and `/bin/` only | Unverified input |
-
-Trust level is set at `TclShell` construction and propagated through the
-`Subject` to every `Mount` call.  Mounts enforce namespace restrictions —
-a `Federation`-level caller receives `MountError::PermissionDenied` when
-attempting to write `/config/`.
+The `hyprstream-sandbox` crate provides `SandboxedShell` — a Tcl shell with
+an independently constructed namespace and resource limits. The sandbox does
+NOT make authorization decisions. The policy engine (Subject + Casbin) builds
+the namespace with only the mounts the subject is authorized to access.
+Least privilege: empty namespace by default, policy grants access.
 
 ### Limits
 
-- **Instruction limit**: per trust level (see table above), prevents infinite
-  loops.  Configurable via `TclShell::set_instruction_limit()`.
+- **Instruction limit**: configurable via `TclShell::set_instruction_limit()`,
+  prevents infinite loops and CPU bombs.
 - **Recursion limit**: 100 (molt default override).
 
 ### Path sanitization
