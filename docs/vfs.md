@@ -233,10 +233,10 @@ allowed to do:
 
 | Level | Instruction limit | Namespace access | Use case |
 |-------|-------------------|------------------|----------|
-| `Human` | 1,000,000 | Full | Interactive TUI user |
-| `Agent` | 100,000 | No `/private/`, no `/config/` writes | LLM tool use |
-| `Federation` | 10,000 | `/srv/` read-only, no `/env/` | Remote peer eval |
-| `Untrusted` | 1,000 | `/bin/` only (no `/srv/`, `/env/`, `/config/`, `/private/`) | Unverified input |
+| `Human` | 100,000 | Full | Interactive TUI user |
+| `Agent` | 10,000 | No `/private/`, no `/env/` | LLM tool use |
+| `Federation` | 1,000 | Also no `/config/`, no `/net/` | Remote peer eval |
+| `Untrusted` | 500 | Allowlist: `/srv/` and `/bin/` only | Unverified input |
 
 Trust level is set at `TclShell` construction and propagated through the
 `Subject` to every `Mount` call.  Mounts enforce namespace restrictions —
@@ -268,29 +268,39 @@ The `Mount` trait (`hyprstream_vfs::Mount`) is the universal abstraction for
 all VFS backends.  It mirrors 9P2000 operations:
 
 ```rust
+#[async_trait]
 pub trait Mount: Send + Sync {
-    fn walk(&self, components: &[&str], caller: &Subject) -> Result<Fid, MountError>;
-    fn open(&self, fid: &mut Fid, mode: u8, caller: &Subject) -> Result<(), MountError>;
-    fn read(&self, fid: &Fid, offset: u64, count: u32, caller: &Subject) -> Result<Vec<u8>, MountError>;
-    fn write(&self, fid: &Fid, offset: u64, data: &[u8], caller: &Subject) -> Result<u32, MountError>;
-    fn readdir(&self, fid: &Fid, caller: &Subject) -> Result<Vec<DirEntry>, MountError>;
-    fn stat(&self, fid: &Fid, caller: &Subject) -> Result<Stat, MountError>;
-    fn clunk(&self, fid: Fid, caller: &Subject);
+    async fn walk(&self, components: &[&str], caller: &Subject) -> Result<Fid, MountError>;
+    async fn open(&self, fid: &mut Fid, mode: u8, caller: &Subject) -> Result<(), MountError>;
+    async fn read(&self, fid: &Fid, offset: u64, count: u32, caller: &Subject) -> Result<Vec<u8>, MountError>;
+    async fn write(&self, fid: &Fid, offset: u64, data: &[u8], caller: &Subject) -> Result<u32, MountError>;
+    async fn readdir(&self, fid: &Fid, caller: &Subject) -> Result<Vec<DirEntry>, MountError>;
+    async fn stat(&self, fid: &Fid, caller: &Subject) -> Result<Stat, MountError>;
+    async fn clunk(&self, fid: Fid, caller: &Subject);
 }
 ```
+
+All methods are async. In-process implementations (SyntheticTree) resolve
+instantly. Remote implementations (RemoteMount) `.await` RPC calls directly.
+Sync consumers (Tcl builtins, FUSE callbacks) use `handle.block_on()`.
 
 The `Namespace` provides convenience methods that compose these primitives:
 `cat` (walk+open+read_all+clunk), `echo` (walk+open+write+clunk),
 `ctl` (walk+open(RDWR)+write+read+clunk), `ls` (walk+open+readdir+clunk).
 
-### RemoteModelMount
+### RemoteMount\<C: FsClient\>
 
-`RemoteModelMount` bridges the `Mount` trait to the `ModelClient` RPC.
-It translates synchronous `Mount` calls into async ZMQ requests via a
-dedicated single-threaded tokio runtime.  Local fid numbers are tracked
-in a `DashMap` and mapped to remote fids returned by the model service's
-`FsHandler`.  This allows `/srv/model` to proxy 9P operations to the
-server-side `SyntheticTree` transparently.
+`RemoteMount<C>` is a generic async `Mount` impl that bridges any service's
+`FsClient` to the VFS. The `FsClient` trait (in `hyprstream-rpc`) defines
+the common 9P-shaped async interface (`fs_walk`, `fs_open`, `fs_read`, etc.).
+
+For the model service, `ModelFsAdapter` implements `FsClient` by delegating
+to the generated `ModelClient` RPC. The first walk component selects the
+model reference scope. `RemoteModelMount` is a type alias for
+`RemoteMount<ModelFsAdapter>`.
+
+Any service with an `fs` scope is auto-mountable:
+`RemoteMount::new(service_client.fs(scope))`.
 
 ## Tcl as compound protocol
 
