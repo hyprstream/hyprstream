@@ -13,10 +13,10 @@
 //!
 //! ## Timeout / graceful degradation
 //!
-//! A dedicated single-threaded tokio runtime (`self.rt`) drives the async
-//! client. If the model service is unreachable, `block_on` will hang until
-//! the ZMQ socket timeout fires (set on the underlying socket). Callers
-//! see `MountError::Io("service unreachable: ...")`.
+//! All Mount methods are async and `.await` the RPC client directly — no
+//! dedicated runtime or `block_on`. If the model service is unreachable,
+//! the ZMQ socket timeout fires and the caller sees
+//! `MountError::Io("service unreachable: ...")`.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
