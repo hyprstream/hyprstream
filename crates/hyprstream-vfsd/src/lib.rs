@@ -22,10 +22,14 @@
 #[cfg(target_os = "linux")]
 mod dax;
 #[cfg(target_os = "linux")]
+mod daemon;
+#[cfg(target_os = "linux")]
 mod fuse_fs;
 #[cfg(target_os = "linux")]
 mod inode_table;
 
+#[cfg(target_os = "linux")]
+pub use daemon::VfsDaemon;
 #[cfg(target_os = "linux")]
 pub use dax::DaxMount;
 #[cfg(target_os = "linux")]

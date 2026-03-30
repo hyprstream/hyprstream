@@ -18,6 +18,9 @@ tracing = { workspace = true }
 [dev-dependencies]
 hyprstream-vfs = { path = "../hyprstream-vfs" }
 hyprstream-rpc = { path = "../hyprstream-rpc" }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+async-trait = { workspace = true }
 
 [lints]
 workspace = true

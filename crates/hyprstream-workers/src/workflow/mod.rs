@@ -20,6 +20,7 @@
 
 mod service;
 mod client;
+pub mod namespace;
 mod parser;
 mod triggers;
 mod subscription;
