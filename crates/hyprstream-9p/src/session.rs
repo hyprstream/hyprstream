@@ -68,17 +68,17 @@ impl Session {
     }
 
     /// Process a T-message and produce the corresponding R-message.
-    pub fn handle(&mut self, msg: Tmessage) -> Rmessage {
+    pub async fn handle(&mut self, msg: Tmessage) -> Rmessage {
         match msg {
             Tmessage::Version(v) => self.handle_version(v),
-            Tmessage::Attach(a) => self.handle_attach(a),
-            Tmessage::Walk(w) => self.handle_walk(w),
-            Tmessage::Lopen(o) => self.handle_lopen(o),
-            Tmessage::Read(r) => self.handle_read(r),
-            Tmessage::Write(w) => self.handle_write(w),
-            Tmessage::Clunk(c) => self.handle_clunk(c),
-            Tmessage::Readdir(r) => self.handle_readdir(r),
-            Tmessage::GetAttr(g) => self.handle_getattr(g),
+            Tmessage::Attach(a) => self.handle_attach(a).await,
+            Tmessage::Walk(w) => self.handle_walk(w).await,
+            Tmessage::Lopen(o) => self.handle_lopen(o).await,
+            Tmessage::Read(r) => self.handle_read(r).await,
+            Tmessage::Write(w) => self.handle_write(w).await,
+            Tmessage::Clunk(c) => self.handle_clunk(c).await,
+            Tmessage::Readdir(r) => self.handle_readdir(r).await,
+            Tmessage::GetAttr(g) => self.handle_getattr(g).await,
             Tmessage::Flush(_) => Rmessage::Flush,
             Tmessage::Statfs(_) => self.handle_statfs(),
             Tmessage::Auth(_) => error_msg(errno::EOPNOTSUPP),
@@ -101,8 +101,8 @@ impl Session {
         })
     }
 
-    fn handle_attach(&mut self, a: Tattach) -> Rmessage {
-        match self.mount.walk(&[], &self.caller) {
+    async fn handle_attach(&mut self, a: Tattach) -> Rmessage {
+        match self.mount.walk(&[], &self.caller).await {
             Ok(fid) => {
                 self.fids.insert(a.fid, fid);
                 Rmessage::Attach(Rattach {
@@ -120,14 +120,14 @@ impl Session {
         }
     }
 
-    fn handle_walk(&mut self, w: Twalk) -> Rmessage {
+    async fn handle_walk(&mut self, w: Twalk) -> Rmessage {
         if !self.fids.contains_key(&w.fid) {
             return error_msg(errno::EBADF);
         }
 
         let components: Vec<&str> = w.wnames.iter().map(String::as_str).collect();
 
-        match self.mount.walk(&components, &self.caller) {
+        match self.mount.walk(&components, &self.caller).await {
             Ok(fid) => {
                 let wqids: Vec<Qid> = (0..w.wnames.len())
                     .map(|i| Qid {
@@ -148,14 +148,14 @@ impl Session {
         }
     }
 
-    fn handle_lopen(&mut self, o: Tlopen) -> Rmessage {
+    async fn handle_lopen(&mut self, o: Tlopen) -> Rmessage {
         let Some(fid) = self.fids.get_mut(&o.fid) else {
             return error_msg(errno::EBADF);
         };
 
         let mode = flags_to_mode(o.flags);
 
-        match self.mount.open(fid, mode, &self.caller) {
+        match self.mount.open(fid, mode, &self.caller).await {
             Ok(()) => Rmessage::Lopen(Rlopen {
                 qid: Qid {
                     ty: QTFILE,
@@ -168,7 +168,7 @@ impl Session {
         }
     }
 
-    fn handle_read(&self, r: Tread) -> Rmessage {
+    async fn handle_read(&self, r: Tread) -> Rmessage {
         let Some(fid) = self.fids.get(&r.fid) else {
             return error_msg(errno::EBADF);
         };
@@ -176,36 +176,36 @@ impl Session {
         let max_count = self.msize.saturating_sub(11);
         let count = r.count.min(max_count);
 
-        match self.mount.read(fid, r.offset, count, &self.caller) {
+        match self.mount.read(fid, r.offset, count, &self.caller).await {
             Ok(data) => Rmessage::Read(Rread { data }),
             Err(e) => mount_error_to_rmsg(&e),
         }
     }
 
-    fn handle_write(&self, w: Twrite) -> Rmessage {
+    async fn handle_write(&self, w: Twrite) -> Rmessage {
         let Some(fid) = self.fids.get(&w.fid) else {
             return error_msg(errno::EBADF);
         };
 
-        match self.mount.write(fid, w.offset, &w.data, &self.caller) {
+        match self.mount.write(fid, w.offset, &w.data, &self.caller).await {
             Ok(count) => Rmessage::Write(Rwrite { count }),
             Err(e) => mount_error_to_rmsg(&e),
         }
     }
 
-    fn handle_clunk(&mut self, c: Tclunk) -> Rmessage {
+    async fn handle_clunk(&mut self, c: Tclunk) -> Rmessage {
         if let Some(fid) = self.fids.remove(&c.fid) {
-            self.mount.clunk(fid, &self.caller);
+            self.mount.clunk(fid, &self.caller).await;
         }
         Rmessage::Clunk
     }
 
-    fn handle_readdir(&self, r: Treaddir) -> Rmessage {
+    async fn handle_readdir(&self, r: Treaddir) -> Rmessage {
         let Some(fid) = self.fids.get(&r.fid) else {
             return error_msg(errno::EBADF);
         };
 
-        match self.mount.readdir(fid, &self.caller) {
+        match self.mount.readdir(fid, &self.caller).await {
             Ok(entries) => {
                 let data = encode_dirents(&entries, r.offset, r.count);
                 Rmessage::Readdir(Rreaddir { data })
@@ -214,12 +214,12 @@ impl Session {
         }
     }
 
-    fn handle_getattr(&self, g: Tgetattr) -> Rmessage {
+    async fn handle_getattr(&self, g: Tgetattr) -> Rmessage {
         let Some(fid) = self.fids.get(&g.fid) else {
             return error_msg(errno::EBADF);
         };
 
-        match self.mount.stat(fid, &self.caller) {
+        match self.mount.stat(fid, &self.caller).await {
             Ok(stat) => Rmessage::GetAttr(stat_to_rgetattr(&stat)),
             Err(e) => mount_error_to_rmsg(&e),
         }
@@ -340,6 +340,7 @@ fn stat_to_rgetattr(stat: &Stat) -> Rgetattr {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use hyprstream_vfs::{Fid as VfsFid, Mount, MountError, Stat as VfsStat};
     use std::collections::HashMap as StdHashMap;
 
@@ -351,17 +352,18 @@ mod tests {
         path: String,
     }
 
+    #[async_trait]
     impl Mount for TestMount {
-        fn walk(&self, components: &[&str], _caller: &Subject) -> Result<VfsFid, MountError> {
+        async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<VfsFid, MountError> {
             let path = components.join("/");
             Ok(VfsFid::new(TestFid { path }))
         }
 
-        fn open(&self, _fid: &mut VfsFid, _mode: u8, _caller: &Subject) -> Result<(), MountError> {
+        async fn open(&self, _fid: &mut VfsFid, _mode: u8, _caller: &Subject) -> Result<(), MountError> {
             Ok(())
         }
 
-        fn read(&self, fid: &VfsFid, offset: u64, _count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
+        async fn read(&self, fid: &VfsFid, offset: u64, _count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
             let inner = fid.downcast_ref::<TestFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             match self.files.get(&inner.path) {
                 Some(data) => {
@@ -376,11 +378,11 @@ mod tests {
             }
         }
 
-        fn write(&self, _fid: &VfsFid, _offset: u64, data: &[u8], _caller: &Subject) -> Result<u32, MountError> {
+        async fn write(&self, _fid: &VfsFid, _offset: u64, data: &[u8], _caller: &Subject) -> Result<u32, MountError> {
             Ok(data.len() as u32)
         }
 
-        fn readdir(&self, fid: &VfsFid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
+        async fn readdir(&self, fid: &VfsFid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
             let inner = fid.downcast_ref::<TestFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             let prefix = if inner.path.is_empty() { String::new() } else { format!("{}/", inner.path) };
             let mut entries = Vec::new();
@@ -394,13 +396,13 @@ mod tests {
             Ok(entries)
         }
 
-        fn stat(&self, fid: &VfsFid, _caller: &Subject) -> Result<VfsStat, MountError> {
+        async fn stat(&self, fid: &VfsFid, _caller: &Subject) -> Result<VfsStat, MountError> {
             let inner = fid.downcast_ref::<TestFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             let size = self.files.get(&inner.path).map_or(0, |d| d.len() as u64);
             Ok(VfsStat { qtype: 0, size, name: inner.path.clone(), mtime: 0 })
         }
 
-        fn clunk(&self, _fid: VfsFid, _caller: &Subject) {}
+        async fn clunk(&self, _fid: VfsFid, _caller: &Subject) {}
     }
 
     fn test_mount() -> Arc<dyn Mount> {
@@ -410,13 +412,13 @@ mod tests {
         Arc::new(TestMount { files })
     }
 
-    #[test]
-    fn version_negotiation() {
+    #[tokio::test]
+    async fn version_negotiation() {
         let mut session = Session::new(test_mount(), Subject::new("test"));
         let resp = session.handle(Tmessage::Version(Tversion {
             msize: 65536,
             version: "9P2000.L".into(),
-        }));
+        })).await;
         match resp {
             Rmessage::Version(v) => {
                 assert_eq!(v.version, "9P2000.L");
@@ -426,15 +428,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn attach_walk_read_clunk() {
+    #[tokio::test]
+    async fn attach_walk_read_clunk() {
         let mut session = Session::new(test_mount(), Subject::new("test"));
 
         // Version
         session.handle(Tmessage::Version(Tversion {
             msize: 8192,
             version: "9P2000.L".into(),
-        }));
+        })).await;
 
         // Attach root fid=0
         let resp = session.handle(Tmessage::Attach(Tattach {
@@ -443,7 +445,7 @@ mod tests {
             uname: "nobody".into(),
             aname: String::new(),
             n_uname: u32::MAX,
-        }));
+        })).await;
         assert!(matches!(resp, Rmessage::Attach(_)));
 
         // Walk to "status", newfid=1
@@ -451,48 +453,48 @@ mod tests {
             fid: 0,
             newfid: 1,
             wnames: vec!["status".into()],
-        }));
+        })).await;
         assert!(matches!(resp, Rmessage::Walk(_)));
 
         // Open fid=1
-        let resp = session.handle(Tmessage::Lopen(Tlopen { fid: 1, flags: 0 }));
+        let resp = session.handle(Tmessage::Lopen(Tlopen { fid: 1, flags: 0 })).await;
         assert!(matches!(resp, Rmessage::Lopen(_)));
 
         // Read
-        let resp = session.handle(Tmessage::Read(Tread { fid: 1, offset: 0, count: 4096 }));
+        let resp = session.handle(Tmessage::Read(Tread { fid: 1, offset: 0, count: 4096 })).await;
         match resp {
             Rmessage::Read(r) => assert_eq!(r.data, b"loaded\n"),
             other => panic!("expected Rread, got {:?}", other),
         }
 
         // Clunk
-        assert!(matches!(session.handle(Tmessage::Clunk(Tclunk { fid: 1 })), Rmessage::Clunk));
+        assert!(matches!(session.handle(Tmessage::Clunk(Tclunk { fid: 1 })).await, Rmessage::Clunk));
     }
 
-    #[test]
-    fn read_nonexistent_returns_enoent() {
+    #[tokio::test]
+    async fn read_nonexistent_returns_enoent() {
         let mut session = Session::new(test_mount(), Subject::new("test"));
-        session.handle(Tmessage::Version(Tversion { msize: 8192, version: "9P2000.L".into() }));
+        session.handle(Tmessage::Version(Tversion { msize: 8192, version: "9P2000.L".into() })).await;
         session.handle(Tmessage::Attach(Tattach {
             fid: 0, afid: u32::MAX, uname: "nobody".into(), aname: String::new(), n_uname: u32::MAX,
-        }));
-        session.handle(Tmessage::Walk(Twalk { fid: 0, newfid: 1, wnames: vec!["nonexistent".into()] }));
-        session.handle(Tmessage::Lopen(Tlopen { fid: 1, flags: 0 }));
+        })).await;
+        session.handle(Tmessage::Walk(Twalk { fid: 0, newfid: 1, wnames: vec!["nonexistent".into()] })).await;
+        session.handle(Tmessage::Lopen(Tlopen { fid: 1, flags: 0 })).await;
 
-        let resp = session.handle(Tmessage::Read(Tread { fid: 1, offset: 0, count: 4096 }));
+        let resp = session.handle(Tmessage::Read(Tread { fid: 1, offset: 0, count: 4096 })).await;
         match resp {
             Rmessage::Lerror(e) => assert_eq!(e.ecode, errno::ENOENT),
             other => panic!("expected Lerror(ENOENT), got {:?}", other),
         }
     }
 
-    #[test]
-    fn auth_returns_eopnotsupp() {
+    #[tokio::test]
+    async fn auth_returns_eopnotsupp() {
         let mut session = Session::new(test_mount(), Subject::new("test"));
-        session.handle(Tmessage::Version(Tversion { msize: 8192, version: "9P2000.L".into() }));
+        session.handle(Tmessage::Version(Tversion { msize: 8192, version: "9P2000.L".into() })).await;
         let resp = session.handle(Tmessage::Auth(Tauth {
             afid: 0, uname: "nobody".into(), aname: String::new(), n_uname: u32::MAX,
-        }));
+        })).await;
         assert!(matches!(resp, Rmessage::Lerror(_)));
     }
 }

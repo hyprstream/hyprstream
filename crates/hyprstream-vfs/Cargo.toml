@@ -9,5 +9,9 @@ description = "Plan9-inspired VFS namespace multiplexer for hyprstream"
 # RPC types (Subject for caller identity)
 hyprstream-rpc = { path = "../hyprstream-rpc" }
 
+# Async trait support
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
 # Error handling
 anyhow = { workspace = true }

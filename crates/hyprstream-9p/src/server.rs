@@ -109,7 +109,7 @@ async fn handle_connection(
             };
 
             let tag = tframe.tag;
-            let rmsg = session.handle(tframe.msg);
+            let rmsg = session.handle(tframe.msg).await;
 
             let rframe = Rframe { tag, msg: rmsg };
             let out = rframe.encode()?;
@@ -124,18 +124,20 @@ async fn handle_connection(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use hyprstream_vfs::{DirEntry, Fid as VfsFid, MountError, Stat as VfsStat};
 
     struct SimpleMnt;
 
+    #[async_trait]
     impl Mount for SimpleMnt {
-        fn walk(&self, components: &[&str], _caller: &Subject) -> Result<VfsFid, MountError> {
+        async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<VfsFid, MountError> {
             Ok(VfsFid::new(components.join("/")))
         }
-        fn open(&self, _fid: &mut VfsFid, _mode: u8, _caller: &Subject) -> Result<(), MountError> {
+        async fn open(&self, _fid: &mut VfsFid, _mode: u8, _caller: &Subject) -> Result<(), MountError> {
             Ok(())
         }
-        fn read(&self, fid: &VfsFid, _offset: u64, _count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
+        async fn read(&self, fid: &VfsFid, _offset: u64, _count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
             let path = fid.downcast_ref::<String>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             if path == "hello" {
                 Ok(b"world".to_vec())
@@ -143,16 +145,16 @@ mod tests {
                 Err(MountError::NotFound(path.clone()))
             }
         }
-        fn write(&self, _fid: &VfsFid, _offset: u64, data: &[u8], _caller: &Subject) -> Result<u32, MountError> {
+        async fn write(&self, _fid: &VfsFid, _offset: u64, data: &[u8], _caller: &Subject) -> Result<u32, MountError> {
             Ok(data.len() as u32)
         }
-        fn readdir(&self, _fid: &VfsFid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
+        async fn readdir(&self, _fid: &VfsFid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
             Ok(vec![DirEntry { name: "hello".into(), is_dir: false, size: 5, stat: None }])
         }
-        fn stat(&self, _fid: &VfsFid, _caller: &Subject) -> Result<VfsStat, MountError> {
+        async fn stat(&self, _fid: &VfsFid, _caller: &Subject) -> Result<VfsStat, MountError> {
             Ok(VfsStat { qtype: 0, size: 5, name: "hello".into(), mtime: 0 })
         }
-        fn clunk(&self, _fid: VfsFid, _caller: &Subject) {}
+        async fn clunk(&self, _fid: VfsFid, _caller: &Subject) {}
     }
 
     #[test]

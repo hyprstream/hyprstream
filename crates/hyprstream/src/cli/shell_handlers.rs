@@ -317,12 +317,14 @@ pub async fn handle_shell_tui(
         let weak = std::sync::Arc::downgrade(&ns);
         let subj = vfs_subject.clone();
 
+        let rt_handle = tokio::runtime::Handle::current();
         let bin_tree = {
             let mut children = std::collections::HashMap::new();
 
             // /bin/cat — write path(s), read file contents.
             let w = weak.clone();
             let s = subj.clone();
+            let h = rt_handle.clone();
             children.insert("cat".to_owned(), SyntheticNode::CtlFile {
                 handler: Box::new(move |data, _subject| {
                     let ns = w.upgrade().ok_or("namespace dropped")?;
@@ -330,7 +332,7 @@ pub async fn handle_shell_tui(
                     let mut out = Vec::new();
                     for path in input.split_whitespace() {
                         out.extend_from_slice(
-                            &ns.cat(path, &s).map_err(|e| e.to_string())?,
+                            &h.block_on(ns.cat(path, &s)).map_err(|e| e.to_string())?,
                         );
                     }
                     Ok(out)
@@ -340,13 +342,14 @@ pub async fn handle_shell_tui(
             // /bin/ls — write path, read directory listing.
             let w = weak.clone();
             let s = subj.clone();
+            let h = rt_handle.clone();
             children.insert("ls".to_owned(), SyntheticNode::CtlFile {
                 handler: Box::new(move |data, _subject| {
                     let ns = w.upgrade().ok_or("namespace dropped")?;
                     let input = std::str::from_utf8(data).map_err(|e| e.to_string())?;
                     let path = input.trim();
                     let path = if path.is_empty() { "/" } else { path };
-                    let entries = ns.ls(path, &s).map_err(|e| e.to_string())?;
+                    let entries = h.block_on(ns.ls(path, &s)).map_err(|e| e.to_string())?;
                     let listing: Vec<String> = entries.iter().map(|e| {
                         if e.is_dir { format!("{}/", e.name) } else { e.name.clone() }
                     }).collect();
@@ -357,6 +360,7 @@ pub async fn handle_shell_tui(
             // /bin/help — read-only, lists available commands.
             let w = weak.clone();
             let s = subj.clone();
+            let h = rt_handle.clone();
             children.insert("help".to_owned(), SyntheticNode::CtlFile {
                 handler: Box::new(move |_data, _subject| {
                     let mut out = String::from("VFS commands:\n");
@@ -367,7 +371,7 @@ pub async fn handle_shell_tui(
                     out.push_str("  mount [prefix]       list mount points\n");
                     out.push_str("  help                 this message\n");
                     if let Some(ns) = w.upgrade() {
-                        if let Ok(entries) = ns.ls("/bin", &s) {
+                        if let Ok(entries) = h.block_on(ns.ls("/bin", &s)) {
                             if !entries.is_empty() {
                                 out.push_str("\nCommands (/bin/):\n");
                                 for entry in &entries {
@@ -1141,7 +1145,7 @@ async fn handle_rpc(
                         session_uuid, load_hook, save_hook,
                     )
                     .with_gen_config(gen_config)
-                    .with_vfs(vfs_ns.clone(), vfs_subject.clone())
+                    .with_vfs(vfs_ns.clone(), vfs_subject.clone(), tokio::runtime::Handle::current())
                     .with_tcl_mount_rx(tcl_mount_rx.clone())
                 }
                 Err(e) => {
@@ -1155,7 +1159,7 @@ async fn handle_rpc(
                     );
                     ChatApp::new(model_ref.clone(), cols, rows, spawner)
                         .with_gen_config(gen_config)
-                        .with_vfs(vfs_ns.clone(), vfs_subject.clone())
+                        .with_vfs(vfs_ns.clone(), vfs_subject.clone(), tokio::runtime::Handle::current())
                     .with_tcl_mount_rx(tcl_mount_rx.clone())
                 }
             };

@@ -10,6 +10,7 @@ fuse-backend-rs = { version = "0.12", features = ["virtiofs"] }
 hyprstream-vfs = { path = "../hyprstream-vfs" }
 hyprstream-rpc = { path = "../hyprstream-rpc" }
 libc = { workspace = true }
+tokio = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }

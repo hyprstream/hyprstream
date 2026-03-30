@@ -8,3 +8,5 @@ description = "Tcl (molt) shell for hyprstream VFS namespace"
 [dependencies]
 molt = { path = "../../../../../../molt/.worktrees/hyprstream/molt" }
 hyprstream-vfs = { path = "../hyprstream-vfs" }
+async-trait = { workspace = true }
+tokio = { workspace = true }

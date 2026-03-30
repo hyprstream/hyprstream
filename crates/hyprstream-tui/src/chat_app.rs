@@ -496,10 +496,13 @@ impl ChatApp {
     }
 
     /// Attach a VFS namespace for `/path` command routing.
-    pub fn with_vfs(mut self, ns: std::sync::Arc<hyprstream_vfs::Namespace>, subject: hyprstream_vfs::Subject) -> Self {
+    ///
+    /// The `rt` handle is used by the Tcl shell to `block_on()` async VFS operations.
+    pub fn with_vfs(mut self, ns: std::sync::Arc<hyprstream_vfs::Namespace>, subject: hyprstream_vfs::Subject, rt: tokio::runtime::Handle) -> Self {
         self.tcl_shell = Some(hyprstream_tcl::TclShell::new(
             std::sync::Arc::clone(&ns),
             subject.clone(),
+            rt,
         ));
         self.vfs = Some(ns);
         self.vfs_subject = subject;

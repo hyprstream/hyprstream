@@ -1,5 +1,6 @@
 //! Mount trait — in-process 9P operations without network transport.
 
+use async_trait::async_trait;
 use hyprstream_rpc::Subject;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -106,25 +107,26 @@ pub struct Stat {
 /// Used for `/config/`, `/private/`, `/bin/`, `/env/`, and any other
 /// client-local namespace entries. Every method receives the verified
 /// `Subject` of the caller for per-tenant fid isolation and policy checks.
+#[async_trait]
 pub trait Mount: Send + Sync {
     /// Walk path components, returning an opaque fid.
-    fn walk(&self, components: &[&str], caller: &Subject) -> Result<Fid, MountError>;
+    async fn walk(&self, components: &[&str], caller: &Subject) -> Result<Fid, MountError>;
 
     /// Open a walked fid for I/O. `mode`: OREAD=0, OWRITE=1, ORDWR=2.
-    fn open(&self, fid: &mut Fid, mode: u8, caller: &Subject) -> Result<(), MountError>;
+    async fn open(&self, fid: &mut Fid, mode: u8, caller: &Subject) -> Result<(), MountError>;
 
     /// Read bytes from an open fid at offset.
-    fn read(&self, fid: &Fid, offset: u64, count: u32, caller: &Subject) -> Result<Vec<u8>, MountError>;
+    async fn read(&self, fid: &Fid, offset: u64, count: u32, caller: &Subject) -> Result<Vec<u8>, MountError>;
 
     /// Write bytes to an open fid at offset. Returns bytes written.
-    fn write(&self, fid: &Fid, offset: u64, data: &[u8], caller: &Subject) -> Result<u32, MountError>;
+    async fn write(&self, fid: &Fid, offset: u64, data: &[u8], caller: &Subject) -> Result<u32, MountError>;
 
     /// Read directory entries from an open directory fid.
-    fn readdir(&self, fid: &Fid, caller: &Subject) -> Result<Vec<DirEntry>, MountError>;
+    async fn readdir(&self, fid: &Fid, caller: &Subject) -> Result<Vec<DirEntry>, MountError>;
 
     /// Get file metadata.
-    fn stat(&self, fid: &Fid, caller: &Subject) -> Result<Stat, MountError>;
+    async fn stat(&self, fid: &Fid, caller: &Subject) -> Result<Stat, MountError>;
 
     /// Release a fid.
-    fn clunk(&self, fid: Fid, caller: &Subject);
+    async fn clunk(&self, fid: Fid, caller: &Subject);
 }

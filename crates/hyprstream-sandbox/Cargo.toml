@@ -8,4 +8,6 @@ description = "Trust-level-aware sandbox for untrusted Tcl execution"
 [dependencies]
 hyprstream-vfs = { path = "../hyprstream-vfs" }
 hyprstream-tcl = { path = "../hyprstream-tcl" }
+async-trait = { workspace = true }
+tokio = { workspace = true }
 # wasmtime = "29"  # Future: WASM-based isolation for full untrusted execution

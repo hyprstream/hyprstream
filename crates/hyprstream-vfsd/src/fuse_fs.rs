@@ -44,16 +44,22 @@ pub struct VfsFuse<M: Mount> {
     next_handle: AtomicU64,
     /// Open handle table: handle_id -> HandleData.
     handles: dashmap::DashMap<u64, HandleData>,
+    /// Tokio runtime handle for blocking on async Mount calls from sync FUSE callbacks.
+    rt: tokio::runtime::Handle,
 }
 
 impl<M: Mount> VfsFuse<M> {
     /// Create a new FUSE adapter wrapping the given VFS mount.
-    pub fn new(mount: M) -> Self {
+    ///
+    /// Requires a tokio runtime handle because FUSE callbacks are synchronous
+    /// but the Mount trait is async. Each callback uses `block_on()`.
+    pub fn new(mount: M, rt: tokio::runtime::Handle) -> Self {
         Self {
             mount,
             inodes: InodeTable::new(),
             next_handle: AtomicU64::new(1),
             handles: dashmap::DashMap::new(),
+            rt,
         }
     }
 
@@ -88,17 +94,15 @@ impl<M: Mount> VfsFuse<M> {
     ) -> io::Result<(bool, u64)> {
         let refs: Vec<&str> = components.iter().map(String::as_str).collect();
         let caller = Self::caller();
-        let fid = self
-            .mount
-            .walk(&refs, &caller)
+        let fid = self.rt
+            .block_on(self.mount.walk(&refs, &caller))
             .map_err(mount_err_to_io)?;
-        let stat = self
-            .mount
-            .stat(&fid, &caller)
+        let stat = self.rt
+            .block_on(self.mount.stat(&fid, &caller))
             .map_err(mount_err_to_io)?;
         let is_dir = stat.qtype & 0x80 != 0; // QTDIR
         let size = stat.size;
-        self.mount.clunk(fid, &caller);
+        self.rt.block_on(self.mount.clunk(fid, &caller));
         Ok((is_dir, size))
     }
 }
@@ -180,15 +184,13 @@ impl<M: Mount + 'static> FileSystem for VfsFuse<M> {
             // Walk to get current size.
             let refs: Vec<&str> = path.iter().map(String::as_str).collect();
             let caller = Self::caller();
-            let fid = self
-                .mount
-                .walk(&refs, &caller)
+            let fid = self.rt
+                .block_on(self.mount.walk(&refs, &caller))
                 .map_err(mount_err_to_io)?;
-            let stat = self
-                .mount
-                .stat(&fid, &caller)
+            let stat = self.rt
+                .block_on(self.mount.stat(&fid, &caller))
                 .map_err(mount_err_to_io)?;
-            self.mount.clunk(fid, &caller);
+            self.rt.block_on(self.mount.clunk(fid, &caller));
             Self::file_stat(inode, stat.size)
         };
 
@@ -210,9 +212,8 @@ impl<M: Mount + 'static> FileSystem for VfsFuse<M> {
         let refs: Vec<&str> = path.iter().map(String::as_str).collect();
         let caller = Self::caller();
 
-        let mut fid = self
-            .mount
-            .walk(&refs, &caller)
+        let mut fid = self.rt
+            .block_on(self.mount.walk(&refs, &caller))
             .map_err(mount_err_to_io)?;
 
         // Map POSIX open flags to 9P mode.
@@ -222,8 +223,8 @@ impl<M: Mount + 'static> FileSystem for VfsFuse<M> {
             OREAD
         };
 
-        self.mount
-            .open(&mut fid, mode, &caller)
+        self.rt
+            .block_on(self.mount.open(&mut fid, mode, &caller))
             .map_err(mount_err_to_io)?;
 
         let handle_id = self.next_handle.fetch_add(1, Ordering::Relaxed);
@@ -260,9 +261,8 @@ impl<M: Mount + 'static> FileSystem for VfsFuse<M> {
 
         let fid = entry.fid.read();
         let caller = Self::caller();
-        let data = self
-            .mount
-            .read(&fid, offset, size, &caller)
+        let data = self.rt
+            .block_on(self.mount.read(&fid, offset, size, &caller))
             .map_err(mount_err_to_io)?;
 
         let len = data.len();
@@ -293,9 +293,8 @@ impl<M: Mount + 'static> FileSystem for VfsFuse<M> {
 
         let fid = entry.fid.read();
         let caller = Self::caller();
-        let written = self
-            .mount
-            .write(&fid, offset, &buf, &caller)
+        let written = self.rt
+            .block_on(self.mount.write(&fid, offset, &buf, &caller))
             .map_err(mount_err_to_io)?;
 
         Ok(written as usize)
@@ -314,7 +313,7 @@ impl<M: Mount + 'static> FileSystem for VfsFuse<M> {
         if let Some((_, data)) = self.handles.remove(&handle) {
             let caller = Self::caller();
             let fid = data.fid.into_inner();
-            self.mount.clunk(fid, &caller);
+            self.rt.block_on(self.mount.clunk(fid, &caller));
         }
         Ok(())
     }
@@ -333,13 +332,12 @@ impl<M: Mount + 'static> FileSystem for VfsFuse<M> {
         let refs: Vec<&str> = path.iter().map(String::as_str).collect();
         let caller = Self::caller();
 
-        let mut fid = self
-            .mount
-            .walk(&refs, &caller)
+        let mut fid = self.rt
+            .block_on(self.mount.walk(&refs, &caller))
             .map_err(mount_err_to_io)?;
 
-        self.mount
-            .open(&mut fid, OREAD, &caller)
+        self.rt
+            .block_on(self.mount.open(&mut fid, OREAD, &caller))
             .map_err(mount_err_to_io)?;
 
         let handle_id = self.next_handle.fetch_add(1, Ordering::Relaxed);
@@ -373,9 +371,8 @@ impl<M: Mount + 'static> FileSystem for VfsFuse<M> {
 
         let fid = entry.fid.read();
         let caller = Self::caller();
-        let entries = self
-            .mount
-            .readdir(&fid, &caller)
+        let entries = self.rt
+            .block_on(self.mount.readdir(&fid, &caller))
             .map_err(mount_err_to_io)?;
 
         // Get parent path for building child paths.
@@ -430,7 +427,7 @@ impl<M: Mount + 'static> FileSystem for VfsFuse<M> {
         if let Some((_, data)) = self.handles.remove(&handle) {
             let caller = Self::caller();
             let fid = data.fid.into_inner();
-            self.mount.clunk(fid, &caller);
+            self.rt.block_on(self.mount.clunk(fid, &caller));
         }
         Ok(())
     }

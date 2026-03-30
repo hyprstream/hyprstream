@@ -30,7 +30,7 @@ fn cmd_cat(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResult
     let ctx = interp.context::<ShellContext>(ctx_id);
 
     for path in &paths {
-        match ctx.ns.cat(path, &ctx.subject) {
+        match ctx.rt.block_on(ctx.ns.cat(path, &ctx.subject)) {
             Ok(data) => {
                 output.push_str(&String::from_utf8_lossy(&data));
             }
@@ -51,7 +51,7 @@ fn cmd_ls(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResult 
     };
 
     let ctx = interp.context::<ShellContext>(ctx_id);
-    match ctx.ns.ls(&path, &ctx.subject) {
+    match ctx.rt.block_on(ctx.ns.ls(&path, &ctx.subject)) {
         Ok(entries) => {
             let lines: Vec<String> = entries
                 .iter()
@@ -77,7 +77,7 @@ fn cmd_echo(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResul
     let data = argv[2].to_string();
     let ctx = interp.context::<ShellContext>(ctx_id);
 
-    match ctx.ns.echo(&path, data.as_bytes(), &ctx.subject) {
+    match ctx.rt.block_on(ctx.ns.echo(&path, data.as_bytes(), &ctx.subject)) {
         Ok(()) => molt_ok!(),
         Err(e) => molt_err!("{}: {}", path, e),
     }
@@ -92,7 +92,7 @@ fn cmd_ctl(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResult
     let cmd_str = cmd_parts.join(" ");
 
     let ctx = interp.context::<ShellContext>(ctx_id);
-    match ctx.ns.ctl(&path, cmd_str.as_bytes(), &ctx.subject) {
+    match ctx.rt.block_on(ctx.ns.ctl(&path, cmd_str.as_bytes(), &ctx.subject)) {
         Ok(resp) => {
             let text = String::from_utf8_lossy(&resp);
             molt_ok!(text.into_owned())
@@ -115,7 +115,7 @@ fn cmd_help(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResul
     out.push_str("  help                 this message\n");
 
     let ctx = interp.context::<ShellContext>(ctx_id);
-    if let Ok(entries) = ctx.ns.ls("/bin", &ctx.subject) {
+    if let Ok(entries) = ctx.rt.block_on(ctx.ns.ls("/bin", &ctx.subject)) {
         if !entries.is_empty() {
             out.push_str("\nCommands (/bin/):\n");
             for entry in &entries {

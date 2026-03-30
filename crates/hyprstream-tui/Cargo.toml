@@ -24,6 +24,7 @@ serde_json = "1"
 waxterm = { path = "../waxterm", features = ["avt"] }
 capnp = { workspace = true }
 anyhow = { version = "1" }
+tokio = { workspace = true }
 aes-gcm = "0.10"
 parking_lot = "0.12"
 rand = "0.8"

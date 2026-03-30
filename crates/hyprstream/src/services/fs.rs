@@ -582,38 +582,39 @@ fn encode_dir_entries(entries: &[DirEntry], max_bytes: u32) -> Vec<u8> {
 // Mount implementation — bridges SyntheticTree to the VFS crate
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[async_trait::async_trait]
 impl hyprstream_vfs::Mount for SyntheticTree {
-    fn walk(&self, components: &[&str], caller: &hyprstream_rpc::Subject) -> Result<hyprstream_vfs::Fid, hyprstream_vfs::MountError> {
+    async fn walk(&self, components: &[&str], caller: &hyprstream_rpc::Subject) -> Result<hyprstream_vfs::Fid, hyprstream_vfs::MountError> {
         let wnames: Vec<String> = components.iter().map(|s| (*s).to_owned()).collect();
         let owner = caller.to_string();
         let (fid, _qid) = self.walk(&wnames, &owner, None).map_err(|e| hyprstream_vfs::MountError::NotFound(e))?;
         Ok(hyprstream_vfs::Fid::new(fid))
     }
 
-    fn open(&self, fid: &mut hyprstream_vfs::Fid, mode: u8, caller: &hyprstream_rpc::Subject) -> Result<(), hyprstream_vfs::MountError> {
+    async fn open(&self, fid: &mut hyprstream_vfs::Fid, mode: u8, caller: &hyprstream_rpc::Subject) -> Result<(), hyprstream_vfs::MountError> {
         let fid_u32 = *fid.downcast_ref::<u32>().ok_or_else(|| hyprstream_vfs::MountError::InvalidArgument("invalid fid type".into()))?;
         let owner = caller.to_string();
         self.open(fid_u32, mode, &owner).map_err(|e| hyprstream_vfs::MountError::Io(e))?;
         Ok(())
     }
 
-    fn read(&self, fid: &hyprstream_vfs::Fid, offset: u64, count: u32, caller: &hyprstream_rpc::Subject) -> Result<Vec<u8>, hyprstream_vfs::MountError> {
+    async fn read(&self, fid: &hyprstream_vfs::Fid, offset: u64, count: u32, caller: &hyprstream_rpc::Subject) -> Result<Vec<u8>, hyprstream_vfs::MountError> {
         let fid_u32 = *fid.downcast_ref::<u32>().ok_or_else(|| hyprstream_vfs::MountError::InvalidArgument("invalid fid type".into()))?;
         self.read(fid_u32, offset, count, &caller.to_string()).map_err(|e| hyprstream_vfs::MountError::Io(e))
     }
 
-    fn write(&self, fid: &hyprstream_vfs::Fid, offset: u64, data: &[u8], caller: &hyprstream_rpc::Subject) -> Result<u32, hyprstream_vfs::MountError> {
+    async fn write(&self, fid: &hyprstream_vfs::Fid, offset: u64, data: &[u8], caller: &hyprstream_rpc::Subject) -> Result<u32, hyprstream_vfs::MountError> {
         let fid_u32 = *fid.downcast_ref::<u32>().ok_or_else(|| hyprstream_vfs::MountError::InvalidArgument("invalid fid type".into()))?;
         self.write(fid_u32, offset, data, &caller.to_string(), caller).map_err(|e| hyprstream_vfs::MountError::Io(e))
     }
 
-    fn readdir(&self, fid: &hyprstream_vfs::Fid, caller: &hyprstream_rpc::Subject) -> Result<Vec<hyprstream_vfs::DirEntry>, hyprstream_vfs::MountError> {
+    async fn readdir(&self, fid: &hyprstream_vfs::Fid, caller: &hyprstream_rpc::Subject) -> Result<Vec<hyprstream_vfs::DirEntry>, hyprstream_vfs::MountError> {
         let fid_u32 = *fid.downcast_ref::<u32>().ok_or_else(|| hyprstream_vfs::MountError::InvalidArgument("invalid fid type".into()))?;
         let entries = self.readdir_entries(fid_u32, &caller.to_string()).map_err(|e| hyprstream_vfs::MountError::Io(e))?;
         Ok(entries)
     }
 
-    fn stat(&self, fid: &hyprstream_vfs::Fid, caller: &hyprstream_rpc::Subject) -> Result<hyprstream_vfs::Stat, hyprstream_vfs::MountError> {
+    async fn stat(&self, fid: &hyprstream_vfs::Fid, caller: &hyprstream_rpc::Subject) -> Result<hyprstream_vfs::Stat, hyprstream_vfs::MountError> {
         let fid_u32 = *fid.downcast_ref::<u32>().ok_or_else(|| hyprstream_vfs::MountError::InvalidArgument("invalid fid type".into()))?;
         let (qid, name) = self.stat(fid_u32, &caller.to_string()).map_err(|e| hyprstream_vfs::MountError::Io(e))?;
         Ok(hyprstream_vfs::Stat {
@@ -624,7 +625,7 @@ impl hyprstream_vfs::Mount for SyntheticTree {
         })
     }
 
-    fn clunk(&self, fid: hyprstream_vfs::Fid, caller: &hyprstream_rpc::Subject) {
+    async fn clunk(&self, fid: hyprstream_vfs::Fid, caller: &hyprstream_rpc::Subject) {
         if let Some(fid_u32) = fid.downcast_ref::<u32>() {
             self.clunk(*fid_u32, &caller.to_string());
         }
@@ -753,8 +754,8 @@ mod tests {
 
     // ── VFS integration tests ───────────────────────────────────────────────
 
-    #[test]
-    fn vfs_cat_reads_synthetic_file() {
+    #[tokio::test]
+    async fn vfs_cat_reads_synthetic_file() {
         use hyprstream_vfs::{Namespace, Subject};
         use std::sync::Arc;
 
@@ -763,12 +764,12 @@ mod tests {
         ns.mount("/srv/model", Arc::new(tree)).unwrap();
 
         let caller = Subject::new("alice");
-        let data = ns.cat("/srv/model/test-model/status", &caller).unwrap();
+        let data = ns.cat("/srv/model/test-model/status", &caller).await.unwrap();
         assert_eq!(data, b"loaded\n");
     }
 
-    #[test]
-    fn vfs_ctl_writes_and_reads_response() {
+    #[tokio::test]
+    async fn vfs_ctl_writes_and_reads_response() {
         use hyprstream_vfs::{Namespace, Subject};
         use std::sync::Arc;
 
@@ -779,12 +780,12 @@ mod tests {
         let caller = Subject::new("alice");
 
         // ctl: write command + read response in one fid lifecycle.
-        let resp = ns.ctl("/srv/model/test-model/ctl", b"load", &caller).unwrap();
+        let resp = ns.ctl("/srv/model/test-model/ctl", b"load", &caller).await.unwrap();
         assert_eq!(resp, b"ok: load");
     }
 
-    #[test]
-    fn vfs_ls_lists_directory() {
+    #[tokio::test]
+    async fn vfs_ls_lists_directory() {
         use hyprstream_vfs::{Namespace, Subject};
         use std::sync::Arc;
 
@@ -793,14 +794,14 @@ mod tests {
         ns.mount("/srv/model", Arc::new(tree)).unwrap();
 
         let caller = Subject::new("alice");
-        let entries = ns.ls("/srv/model/test-model", &caller).unwrap();
+        let entries = ns.ls("/srv/model/test-model", &caller).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"status"));
         assert!(names.contains(&"ctl"));
     }
 
-    #[test]
-    fn vfs_dynamic_dir_with_namespace() {
+    #[tokio::test]
+    async fn vfs_dynamic_dir_with_namespace() {
         use hyprstream_vfs::{Namespace, Subject};
         use std::sync::Arc;
 
@@ -833,20 +834,20 @@ mod tests {
         let caller = Subject::new("alice");
 
         // Read model status through the VFS.
-        let status = ns.cat("/srv/model/qwen3:main/status", &caller).unwrap();
+        let status = ns.cat("/srv/model/qwen3:main/status", &caller).await.unwrap();
         assert_eq!(status, b"loaded\n");
 
         // Read model defaults.
-        let defaults = ns.cat("/srv/model/qwen3:main/defaults", &caller).unwrap();
+        let defaults = ns.cat("/srv/model/qwen3:main/defaults", &caller).await.unwrap();
         assert!(defaults.starts_with(b"{\"temperature\""));
 
         // Write to ctl and read response (single fid lifecycle).
-        let resp = ns.ctl("/srv/model/qwen3:main/ctl", b"load", &caller).unwrap();
+        let resp = ns.ctl("/srv/model/qwen3:main/ctl", b"load", &caller).await.unwrap();
         assert_eq!(resp, b"ctl: load\n");
     }
 
-    #[test]
-    fn vfs_tenant_isolation() {
+    #[tokio::test]
+    async fn vfs_tenant_isolation() {
         use hyprstream_vfs::{Namespace, Subject};
         use std::sync::Arc;
 
@@ -858,14 +859,14 @@ mod tests {
         let bob = Subject::new("bob");
 
         // Both tenants can read (cat does walk+open+read+clunk atomically).
-        let data_a = ns.cat("/srv/model/test-model/status", &alice).unwrap();
-        let data_b = ns.cat("/srv/model/test-model/status", &bob).unwrap();
+        let data_a = ns.cat("/srv/model/test-model/status", &alice).await.unwrap();
+        let data_b = ns.cat("/srv/model/test-model/status", &bob).await.unwrap();
         assert_eq!(data_a, data_b);
         assert_eq!(data_a, b"loaded\n");
     }
 
-    #[test]
-    fn vfs_namespace_fork_isolation() {
+    #[tokio::test]
+    async fn vfs_namespace_fork_isolation() {
         use hyprstream_vfs::{Namespace, Subject};
         use std::sync::Arc;
 
@@ -883,11 +884,11 @@ mod tests {
         sandbox.unmount("/srv/worker");
 
         // Parent can access both.
-        assert!(ns.cat("/srv/model/test-model/status", &caller).is_ok());
-        assert!(ns.ls("/srv/worker", &caller).is_ok());
+        assert!(ns.cat("/srv/model/test-model/status", &caller).await.is_ok());
+        assert!(ns.ls("/srv/worker", &caller).await.is_ok());
 
         // Child can access model but not worker.
-        assert!(sandbox.cat("/srv/model/test-model/status", &caller).is_ok());
-        assert!(sandbox.ls("/srv/worker", &caller).is_err());
+        assert!(sandbox.cat("/srv/model/test-model/status", &caller).await.is_ok());
+        assert!(sandbox.ls("/srv/worker", &caller).await.is_err());
     }
 }

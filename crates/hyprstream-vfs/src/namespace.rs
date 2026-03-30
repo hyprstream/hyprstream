@@ -147,31 +147,32 @@ impl Namespace {
     ///
     /// Loops reads until an empty Vec is returned, up to 16MB cap.
     /// With union mounts, tries each target in bind order until one succeeds.
-    pub fn cat(&self, path: &str, caller: &Subject) -> Result<Vec<u8>, NamespaceError> {
+    pub async fn cat(&self, path: &str, caller: &Subject) -> Result<Vec<u8>, NamespaceError> {
         let (targets, remainder) = self.resolve(path)?;
         let components: Vec<&str> = split_path(&remainder);
         let mut last_err = None;
         for mount in targets {
-            match (|| -> Result<Vec<u8>, MountError> {
-                let mut fid = mount.walk(&components, caller)?;
-                if let Err(e) = mount.open(&mut fid, 0, caller) {
-                    mount.clunk(fid, caller);
+            let result: Result<Vec<u8>, MountError> = async {
+                let mut fid = mount.walk(&components, caller).await?;
+                if let Err(e) = mount.open(&mut fid, 0, caller).await {
+                    mount.clunk(fid, caller).await;
                     return Err(e);
                 }
                 let mut data = Vec::new();
                 loop {
-                    match mount.read(&fid, data.len() as u64, 64 * 1024, caller) {
+                    match mount.read(&fid, data.len() as u64, 64 * 1024, caller).await {
                         Ok(chunk) if chunk.is_empty() => break,
                         Ok(chunk) => {
                             data.extend_from_slice(&chunk);
                             if data.len() >= MAX_READ_SIZE { break; }
                         }
-                        Err(e) => { mount.clunk(fid, caller); return Err(e); }
+                        Err(e) => { mount.clunk(fid, caller).await; return Err(e); }
                     }
                 }
-                mount.clunk(fid, caller);
+                mount.clunk(fid, caller).await;
                 Ok(data)
-            })() {
+            }.await;
+            match result {
                 Ok(data) => return Ok(data),
                 Err(e) => { last_err = Some(e); }
             }
@@ -181,21 +182,22 @@ impl Namespace {
 
     /// Write data to a file. Walk + open(write) + write + clunk.
     /// With union mounts, tries each target in bind order until one succeeds.
-    pub fn echo(&self, path: &str, data: &[u8], caller: &Subject) -> Result<(), NamespaceError> {
+    pub async fn echo(&self, path: &str, data: &[u8], caller: &Subject) -> Result<(), NamespaceError> {
         let (targets, remainder) = self.resolve(path)?;
         let components: Vec<&str> = split_path(&remainder);
         let mut last_err = None;
         for mount in targets {
-            match (|| -> Result<(), MountError> {
-                let mut fid = mount.walk(&components, caller)?;
-                if let Err(e) = mount.open(&mut fid, 1, caller) {
-                    mount.clunk(fid, caller);
+            let result: Result<(), MountError> = async {
+                let mut fid = mount.walk(&components, caller).await?;
+                if let Err(e) = mount.open(&mut fid, 1, caller).await {
+                    mount.clunk(fid, caller).await;
                     return Err(e);
                 }
-                mount.write(&fid, 0, data, caller)?;
-                mount.clunk(fid, caller);
+                mount.write(&fid, 0, data, caller).await?;
+                mount.clunk(fid, caller).await;
                 Ok(())
-            })() {
+            }.await;
+            match result {
                 Ok(()) => return Ok(()),
                 Err(e) => { last_err = Some(e); }
             }
@@ -209,35 +211,36 @@ impl Namespace {
     /// the same fid so the response buffer is available after the write.
     /// Loops reads until an empty Vec is returned, up to 16MB cap.
     /// With union mounts, tries each target in bind order until one succeeds.
-    pub fn ctl(&self, path: &str, data: &[u8], caller: &Subject) -> Result<Vec<u8>, NamespaceError> {
+    pub async fn ctl(&self, path: &str, data: &[u8], caller: &Subject) -> Result<Vec<u8>, NamespaceError> {
         let (targets, remainder) = self.resolve(path)?;
         let components: Vec<&str> = split_path(&remainder);
         let mut last_err = None;
         for mount in targets {
-            match (|| -> Result<Vec<u8>, MountError> {
-                let mut fid = mount.walk(&components, caller)?;
-                if let Err(e) = mount.open(&mut fid, 2, caller) {
-                    mount.clunk(fid, caller);
+            let result: Result<Vec<u8>, MountError> = async {
+                let mut fid = mount.walk(&components, caller).await?;
+                if let Err(e) = mount.open(&mut fid, 2, caller).await {
+                    mount.clunk(fid, caller).await;
                     return Err(e);
                 }
-                if let Err(e) = mount.write(&fid, 0, data, caller) {
-                    mount.clunk(fid, caller);
+                if let Err(e) = mount.write(&fid, 0, data, caller).await {
+                    mount.clunk(fid, caller).await;
                     return Err(e);
                 }
                 let mut resp = Vec::new();
                 loop {
-                    match mount.read(&fid, resp.len() as u64, 64 * 1024, caller) {
+                    match mount.read(&fid, resp.len() as u64, 64 * 1024, caller).await {
                         Ok(chunk) if chunk.is_empty() => break,
                         Ok(chunk) => {
                             resp.extend_from_slice(&chunk);
                             if resp.len() >= MAX_READ_SIZE { break; }
                         }
-                        Err(e) => { mount.clunk(fid, caller); return Err(e); }
+                        Err(e) => { mount.clunk(fid, caller).await; return Err(e); }
                     }
                 }
-                mount.clunk(fid, caller);
+                mount.clunk(fid, caller).await;
                 Ok(resp)
-            })() {
+            }.await;
+            match result {
                 Ok(resp) => return Ok(resp),
                 Err(e) => { last_err = Some(e); }
             }
@@ -249,7 +252,7 @@ impl Namespace {
     ///
     /// With union mounts, merges readdir results from all targets at the prefix,
     /// deduplicating by name (first occurrence wins, preserving bind order).
-    pub fn ls(&self, path: &str, caller: &Subject) -> Result<Vec<DirEntry>, NamespaceError> {
+    pub async fn ls(&self, path: &str, caller: &Subject) -> Result<Vec<DirEntry>, NamespaceError> {
         // Special case: ls "/" shows all mount prefixes as directories.
         if path == "/" || path.is_empty() {
             return Ok(self.root_dir_entries());
@@ -261,9 +264,9 @@ impl Namespace {
         let mut merged = Vec::new();
         let mut any_ok = false;
         for mount in targets {
-            if let Ok(mut fid) = mount.walk(&components, caller) {
-                if mount.open(&mut fid, 0, caller).is_ok() {
-                    if let Ok(entries) = mount.readdir(&fid, caller) {
+            if let Ok(mut fid) = mount.walk(&components, caller).await {
+                if mount.open(&mut fid, 0, caller).await.is_ok() {
+                    if let Ok(entries) = mount.readdir(&fid, caller).await {
                         any_ok = true;
                         for entry in entries {
                             if seen.insert(entry.name.clone()) {
@@ -272,7 +275,7 @@ impl Namespace {
                         }
                     }
                 }
-                mount.clunk(fid, caller);
+                mount.clunk(fid, caller).await;
             }
         }
         if any_ok {
@@ -370,6 +373,7 @@ fn split_path(path: &str) -> Vec<&str> {
 mod tests {
     use super::*;
     use crate::mount::{Fid, Stat, MountError};
+    use async_trait::async_trait;
     use std::collections::HashMap;
 
     /// Simple in-memory Mount for testing.
@@ -390,19 +394,20 @@ mod tests {
         is_open: bool,
     }
 
+    #[async_trait]
     impl Mount for MemMount {
-        fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
+        async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
             let path = components.join("/");
             Ok(Fid::new(MemFid { path, is_open: false }))
         }
 
-        fn open(&self, fid: &mut Fid, _mode: u8, _caller: &Subject) -> Result<(), MountError> {
+        async fn open(&self, fid: &mut Fid, _mode: u8, _caller: &Subject) -> Result<(), MountError> {
             let inner = fid.downcast_mut::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             inner.is_open = true;
             Ok(())
         }
 
-        fn read(&self, fid: &Fid, offset: u64, _count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
+        async fn read(&self, fid: &Fid, offset: u64, _count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
             let inner = fid.downcast_ref::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             match self.files.get(&inner.path) {
                 Some(data) => {
@@ -417,11 +422,11 @@ mod tests {
             }
         }
 
-        fn write(&self, _fid: &Fid, _offset: u64, data: &[u8], _caller: &Subject) -> Result<u32, MountError> {
+        async fn write(&self, _fid: &Fid, _offset: u64, data: &[u8], _caller: &Subject) -> Result<u32, MountError> {
             Ok(data.len() as u32)
         }
 
-        fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
+        async fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
             let inner = fid.downcast_ref::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             let prefix = if inner.path.is_empty() { String::new() } else { format!("{}/", inner.path) };
             let mut entries = Vec::new();
@@ -435,48 +440,48 @@ mod tests {
             Ok(entries)
         }
 
-        fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
+        async fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
             let inner = fid.downcast_ref::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             Ok(Stat { qtype: 0, size: 0, name: inner.path.clone(), mtime: 0 })
         }
 
-        fn clunk(&self, _fid: Fid, _caller: &Subject) {}
+        async fn clunk(&self, _fid: Fid, _caller: &Subject) {}
     }
 
     fn test_subject() -> Subject { Subject::new("test") }
 
-    #[test]
-    fn mount_and_cat() {
+    #[tokio::test]
+    async fn mount_and_cat() {
         let mut ns = Namespace::new();
         let mount: MountTarget = Arc::new(MemMount::new(vec![("temperature", b"0.7\n")]));
         ns.mount("/config", mount).unwrap();
 
-        let data = ns.cat("/config/temperature", &test_subject()).unwrap();
+        let data = ns.cat("/config/temperature", &test_subject()).await.unwrap();
         assert_eq!(data, b"0.7\n");
     }
 
-    #[test]
-    fn mount_and_ls_root() {
+    #[tokio::test]
+    async fn mount_and_ls_root() {
         let mut ns = Namespace::new();
         ns.mount("/srv/model", Arc::new(MemMount::new(vec![])) as MountTarget).unwrap();
         ns.mount("/srv/mcp", Arc::new(MemMount::new(vec![])) as MountTarget).unwrap();
         ns.mount("/config", Arc::new(MemMount::new(vec![])) as MountTarget).unwrap();
 
-        let entries = ns.ls("/", &test_subject()).unwrap();
+        let entries = ns.ls("/", &test_subject()).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"srv"));
         assert!(names.contains(&"config"));
     }
 
-    #[test]
-    fn longest_prefix_match() {
+    #[tokio::test]
+    async fn longest_prefix_match() {
         let mut ns = Namespace::new();
         let srv: MountTarget = Arc::new(MemMount::new(vec![("status", b"ok")]));
         let nested: MountTarget = Arc::new(MemMount::new(vec![("status", b"loaded")]));
         ns.mount("/srv", srv).unwrap();
         ns.mount("/srv/model", nested).unwrap();
 
-        let data = ns.cat("/srv/model/status", &test_subject()).unwrap();
+        let data = ns.cat("/srv/model/status", &test_subject()).await.unwrap();
         assert_eq!(data, b"loaded");
     }
 
@@ -487,8 +492,8 @@ mod tests {
         assert!(ns.mount("/config", mount).is_ok());
     }
 
-    #[test]
-    fn fork_and_unmount() {
+    #[tokio::test]
+    async fn fork_and_unmount() {
         let mut ns = Namespace::new();
         ns.mount("/srv/model", Arc::new(MemMount::new(vec![("status", b"loaded")])) as MountTarget).unwrap();
         ns.mount("/srv/worker", Arc::new(MemMount::new(vec![])) as MountTarget).unwrap();
@@ -500,30 +505,30 @@ mod tests {
         assert_eq!(child.mount_prefixes().len(), 1);
         assert_eq!(child.mount_prefixes()[0], "/srv/model");
 
-        let data = child.cat("/srv/model/status", &test_subject()).unwrap();
+        let data = child.cat("/srv/model/status", &test_subject()).await.unwrap();
         assert_eq!(data, b"loaded");
     }
 
-    #[test]
-    fn not_found() {
+    #[tokio::test]
+    async fn not_found() {
         let ns = Namespace::new();
-        assert!(matches!(ns.cat("/nonexistent/file", &test_subject()), Err(NamespaceError::Mount(MountError::NotFound(_)))));
+        assert!(matches!(ns.cat("/nonexistent/file", &test_subject()).await, Err(NamespaceError::Mount(MountError::NotFound(_)))));
     }
 
-    #[test]
-    fn echo_writes() {
+    #[tokio::test]
+    async fn echo_writes() {
         let mut ns = Namespace::new();
         let mount: MountTarget = Arc::new(MemMount::new(vec![("ctl", b"")]));
         ns.mount("/cmd", mount).unwrap();
 
-        assert!(ns.echo("/cmd/ctl", b"load qwen3:main", &test_subject()).is_ok());
+        assert!(ns.echo("/cmd/ctl", b"load qwen3:main", &test_subject()).await.is_ok());
     }
 
     // ── New tests ──────────────────────────────────────────────────────────
 
     /// Read loop must handle files larger than 64KB.
-    #[test]
-    fn read_loop_large_file() {
+    #[tokio::test]
+    async fn read_loop_large_file() {
         // Create a file > 64KB.
         let big_data = vec![0x42u8; 100 * 1024]; // 100 KB
         let mut ns = Namespace::new();
@@ -531,27 +536,28 @@ mod tests {
         struct ChunkedMount { data: Vec<u8> }
         struct ChunkedFid { offset_limit: bool }
 
+        #[async_trait]
         impl Mount for ChunkedMount {
-            fn walk(&self, _c: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
+            async fn walk(&self, _c: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
                 Ok(Fid::new(ChunkedFid { offset_limit: false }))
             }
-            fn open(&self, _fid: &mut Fid, _mode: u8, _caller: &Subject) -> Result<(), MountError> { Ok(()) }
-            fn read(&self, _fid: &Fid, offset: u64, count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
+            async fn open(&self, _fid: &mut Fid, _mode: u8, _caller: &Subject) -> Result<(), MountError> { Ok(()) }
+            async fn read(&self, _fid: &Fid, offset: u64, count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
                 let start = offset as usize;
                 if start >= self.data.len() { return Ok(vec![]); }
                 let end = std::cmp::min(start + count as usize, self.data.len());
                 Ok(self.data[start..end].to_vec())
             }
-            fn write(&self, _fid: &Fid, _o: u64, d: &[u8], _c: &Subject) -> Result<u32, MountError> { Ok(d.len() as u32) }
-            fn readdir(&self, _fid: &Fid, _c: &Subject) -> Result<Vec<DirEntry>, MountError> { Ok(vec![]) }
-            fn stat(&self, _fid: &Fid, _c: &Subject) -> Result<crate::mount::Stat, MountError> {
+            async fn write(&self, _fid: &Fid, _o: u64, d: &[u8], _c: &Subject) -> Result<u32, MountError> { Ok(d.len() as u32) }
+            async fn readdir(&self, _fid: &Fid, _c: &Subject) -> Result<Vec<DirEntry>, MountError> { Ok(vec![]) }
+            async fn stat(&self, _fid: &Fid, _c: &Subject) -> Result<crate::mount::Stat, MountError> {
                 Ok(crate::mount::Stat { qtype: 0, size: 0, name: String::new(), mtime: 0 })
             }
-            fn clunk(&self, _fid: Fid, _c: &Subject) {}
+            async fn clunk(&self, _fid: Fid, _c: &Subject) {}
         }
 
         ns.mount("/big", Arc::new(ChunkedMount { data: big_data.clone() }) as MountTarget).unwrap();
-        let result = ns.cat("/big/file", &test_subject()).unwrap();
+        let result = ns.cat("/big/file", &test_subject()).await.unwrap();
         assert_eq!(result.len(), 100 * 1024);
         assert_eq!(result, big_data);
     }
@@ -577,20 +583,20 @@ mod tests {
     }
 
     /// Normalize path resolves before prefix matching in resolve().
-    #[test]
-    fn resolve_with_dotdot_path() {
+    #[tokio::test]
+    async fn resolve_with_dotdot_path() {
         let mut ns = Namespace::new();
         ns.mount("/srv/model", Arc::new(MemMount::new(vec![("status", b"ok")])) as MountTarget).unwrap();
 
         // /config/../srv/model/status should normalize to /srv/model/status
-        let data = ns.cat("/config/../srv/model/status", &test_subject()).unwrap();
+        let data = ns.cat("/config/../srv/model/status", &test_subject()).await.unwrap();
         assert_eq!(data, b"ok");
     }
 
     // ── Bind / union directory tests ──────────────────────────────────────
 
-    #[test]
-    fn bind_before_walk_tries_new_mount_first() {
+    #[tokio::test]
+    async fn bind_before_walk_tries_new_mount_first() {
         let mut ns = Namespace::new();
         // Original mount has "status" = "original"
         let orig: MountTarget = Arc::new(MemMount::new(vec![("status", b"original")]));
@@ -600,12 +606,12 @@ mod tests {
         let overlay: MountTarget = Arc::new(MemMount::new(vec![("status", b"override")]));
         ns.bind_mount("/bin", overlay, BindFlag::Before).unwrap();
 
-        let data = ns.cat("/bin/status", &test_subject()).unwrap();
+        let data = ns.cat("/bin/status", &test_subject()).await.unwrap();
         assert_eq!(data, b"override");
     }
 
-    #[test]
-    fn bind_after_walk_tries_existing_first() {
+    #[tokio::test]
+    async fn bind_after_walk_tries_existing_first() {
         let mut ns = Namespace::new();
         let orig: MountTarget = Arc::new(MemMount::new(vec![("status", b"original")]));
         ns.mount("/bin", orig).unwrap();
@@ -614,12 +620,12 @@ mod tests {
         let extra: MountTarget = Arc::new(MemMount::new(vec![("status", b"extra")]));
         ns.bind_mount("/bin", extra, BindFlag::After).unwrap();
 
-        let data = ns.cat("/bin/status", &test_subject()).unwrap();
+        let data = ns.cat("/bin/status", &test_subject()).await.unwrap();
         assert_eq!(data, b"original");
     }
 
-    #[test]
-    fn bind_after_fallback_to_new_mount() {
+    #[tokio::test]
+    async fn bind_after_fallback_to_new_mount() {
         let mut ns = Namespace::new();
         // Original has only "cat"
         let orig: MountTarget = Arc::new(MemMount::new(vec![("cat", b"cat-impl")]));
@@ -630,16 +636,16 @@ mod tests {
         ns.bind_mount("/bin", extra, BindFlag::After).unwrap();
 
         // cat resolves from original
-        let data = ns.cat("/bin/cat", &test_subject()).unwrap();
+        let data = ns.cat("/bin/cat", &test_subject()).await.unwrap();
         assert_eq!(data, b"cat-impl");
 
         // mytool falls through to the After mount
-        let data = ns.cat("/bin/mytool", &test_subject()).unwrap();
+        let data = ns.cat("/bin/mytool", &test_subject()).await.unwrap();
         assert_eq!(data, b"mytool-impl");
     }
 
-    #[test]
-    fn bind_before_fallback_to_existing() {
+    #[tokio::test]
+    async fn bind_before_fallback_to_existing() {
         let mut ns = Namespace::new();
         let orig: MountTarget = Arc::new(MemMount::new(vec![("cat", b"cat-impl")]));
         ns.mount("/bin", orig).unwrap();
@@ -649,16 +655,16 @@ mod tests {
         ns.bind_mount("/bin", overlay, BindFlag::Before).unwrap();
 
         // "cat" falls through to existing mount
-        let data = ns.cat("/bin/cat", &test_subject()).unwrap();
+        let data = ns.cat("/bin/cat", &test_subject()).await.unwrap();
         assert_eq!(data, b"cat-impl");
 
         // "newtool" found in Before mount
-        let data = ns.cat("/bin/newtool", &test_subject()).unwrap();
+        let data = ns.cat("/bin/newtool", &test_subject()).await.unwrap();
         assert_eq!(data, b"newtool-impl");
     }
 
-    #[test]
-    fn union_readdir_merges_entries() {
+    #[tokio::test]
+    async fn union_readdir_merges_entries() {
         let mut ns = Namespace::new();
         let mount_a: MountTarget = Arc::new(MemMount::new(vec![("cat", b""), ("ls", b"")]));
         ns.mount("/bin", mount_a).unwrap();
@@ -666,7 +672,7 @@ mod tests {
         let mount_b: MountTarget = Arc::new(MemMount::new(vec![("mytool", b""), ("cat", b"")]));
         ns.bind_mount("/bin", mount_b, BindFlag::After).unwrap();
 
-        let entries = ns.ls("/bin", &test_subject()).unwrap();
+        let entries = ns.ls("/bin", &test_subject()).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
 
         // Should have "cat", "ls", and "mytool" — "cat" should not be duplicated.
@@ -676,8 +682,8 @@ mod tests {
         assert_eq!(names.iter().filter(|&&n| n == "cat").count(), 1);
     }
 
-    #[test]
-    fn bind_replace_still_works() {
+    #[tokio::test]
+    async fn bind_replace_still_works() {
         let mut ns = Namespace::new();
         let orig: MountTarget = Arc::new(MemMount::new(vec![("status", b"original")]));
         ns.mount("/bin", orig).unwrap();
@@ -690,10 +696,10 @@ mod tests {
         let replacement: MountTarget = Arc::new(MemMount::new(vec![("status", b"replaced")]));
         ns.mount("/bin", replacement).unwrap();
 
-        let data = ns.cat("/bin/status", &test_subject()).unwrap();
+        let data = ns.cat("/bin/status", &test_subject()).await.unwrap();
         assert_eq!(data, b"replaced");
 
         // "extra" should be gone (replaced)
-        assert!(ns.cat("/bin/extra", &test_subject()).is_err());
+        assert!(ns.cat("/bin/extra", &test_subject()).await.is_err());
     }
 }

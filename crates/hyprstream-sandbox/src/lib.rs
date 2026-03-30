@@ -116,11 +116,13 @@ impl SandboxedShell {
     /// The fork is immediate and cheap (Arc clones of mount targets).
     /// Sensitive paths are removed from the forked namespace based on
     /// the trust level. The original namespace is not modified.
-    pub fn new(ns: &Namespace, subject: Subject, trust_level: TrustLevel) -> Self {
+    ///
+    /// The `rt` handle is used by the Tcl shell to `block_on()` async VFS operations.
+    pub fn new(ns: &Namespace, subject: Subject, trust_level: TrustLevel, rt: tokio::runtime::Handle) -> Self {
         let mut forked = ns.fork();
         Self::apply_restrictions(&mut forked, trust_level);
 
-        let mut shell = TclShell::new(Arc::new(forked), subject);
+        let mut shell = TclShell::new(Arc::new(forked), subject, rt);
         shell.set_instruction_limit(trust_level.instruction_limit());
 
         Self { shell, trust_level }
@@ -183,6 +185,7 @@ impl SandboxedShell {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
     use std::collections::HashMap;
 
@@ -206,8 +209,9 @@ mod tests {
         path: String,
     }
 
+    #[async_trait]
     impl Mount for MemMount {
-        fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
+        async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
             let path = components.join("/");
             let exists = self.files.contains_key(&path)
                 || self.files.keys().any(|k| k.starts_with(&format!("{path}/")));
@@ -217,11 +221,11 @@ mod tests {
             Ok(Fid::new(MemFid { path }))
         }
 
-        fn open(&self, _fid: &mut Fid, _mode: u8, _caller: &Subject) -> Result<(), MountError> {
+        async fn open(&self, _fid: &mut Fid, _mode: u8, _caller: &Subject) -> Result<(), MountError> {
             Ok(())
         }
 
-        fn read(
+        async fn read(
             &self,
             fid: &Fid,
             offset: u64,
@@ -243,7 +247,7 @@ mod tests {
             }
         }
 
-        fn write(
+        async fn write(
             &self,
             _fid: &Fid,
             _offset: u64,
@@ -253,7 +257,7 @@ mod tests {
             Ok(data.len() as u32)
         }
 
-        fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
+        async fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
             let inner = fid
                 .downcast_ref::<MemFid>()
                 .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
@@ -285,7 +289,7 @@ mod tests {
             Ok(entries)
         }
 
-        fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
+        async fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
             let inner = fid
                 .downcast_ref::<MemFid>()
                 .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
@@ -297,11 +301,19 @@ mod tests {
             })
         }
 
-        fn clunk(&self, _fid: Fid, _caller: &Subject) {}
+        async fn clunk(&self, _fid: Fid, _caller: &Subject) {}
     }
 
     fn test_subject() -> Subject {
         Subject::new("test-agent")
+    }
+
+    fn test_handle() -> tokio::runtime::Handle {
+        // Create and leak a runtime for the test handle.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+        std::mem::forget(rt);
+        handle
     }
 
     /// Build a namespace with mounts at several prefixes for testing restrictions.
@@ -345,7 +357,7 @@ mod tests {
     #[test]
     fn human_sees_all_mounts() {
         let ns = make_namespace();
-        let mut sandbox = SandboxedShell::new(&ns, test_subject(), TrustLevel::Human);
+        let mut sandbox = SandboxedShell::new(&ns, test_subject(), TrustLevel::Human, test_handle());
         // Human can access everything.
         assert_eq!(sandbox.eval("cat /config/temperature").unwrap(), "0.7");
         assert_eq!(sandbox.eval("cat /private/key").unwrap(), "secret");
@@ -361,7 +373,7 @@ mod tests {
     #[test]
     fn agent_cannot_see_private_or_env() {
         let ns = make_namespace();
-        let mut sandbox = SandboxedShell::new(&ns, test_subject(), TrustLevel::Agent);
+        let mut sandbox = SandboxedShell::new(&ns, test_subject(), TrustLevel::Agent, test_handle());
         // /private/ and /env/ should be unmounted.
         assert!(sandbox.eval("cat /private/key").is_err());
         assert!(sandbox.eval("cat /env/HOME").is_err());
@@ -373,7 +385,7 @@ mod tests {
     #[test]
     fn agent_instruction_limit_enforced() {
         let ns = make_namespace();
-        let mut sandbox = SandboxedShell::new(&ns, test_subject(), TrustLevel::Agent);
+        let mut sandbox = SandboxedShell::new(&ns, test_subject(), TrustLevel::Agent, test_handle());
         let result = sandbox.eval("while {1} {}");
         assert!(result.is_err());
         assert!(
@@ -387,7 +399,7 @@ mod tests {
     #[test]
     fn federation_minimal_access() {
         let ns = make_namespace();
-        let mut sandbox = SandboxedShell::new(&ns, test_subject(), TrustLevel::Federation);
+        let mut sandbox = SandboxedShell::new(&ns, test_subject(), TrustLevel::Federation, test_handle());
         // Only /srv/ and /bin/ should be accessible (plus no /config/, /net/).
         assert!(sandbox.eval("cat /private/key").is_err());
         assert!(sandbox.eval("cat /env/HOME").is_err());
@@ -398,7 +410,7 @@ mod tests {
     #[test]
     fn federation_tight_instruction_limit() {
         let ns = make_namespace();
-        let mut sandbox = SandboxedShell::new(&ns, test_subject(), TrustLevel::Federation);
+        let mut sandbox = SandboxedShell::new(&ns, test_subject(), TrustLevel::Federation, test_handle());
         // 1000 instructions should still allow simple expressions.
         assert_eq!(sandbox.eval("expr {2 + 3}").unwrap(), "5");
         // But loops will hit the limit fast.
@@ -411,7 +423,7 @@ mod tests {
     #[test]
     fn untrusted_allowlist_only() {
         let ns = make_namespace();
-        let mut sandbox = SandboxedShell::new(&ns, test_subject(), TrustLevel::Untrusted);
+        let mut sandbox = SandboxedShell::new(&ns, test_subject(), TrustLevel::Untrusted, test_handle());
         // Only /srv/ and /bin/ should survive.
         assert!(sandbox.eval("cat /private/key").is_err());
         assert!(sandbox.eval("cat /env/HOME").is_err());
@@ -424,7 +436,7 @@ mod tests {
     #[test]
     fn untrusted_very_tight_limit() {
         let ns = make_namespace();
-        let mut sandbox = SandboxedShell::new(&ns, test_subject(), TrustLevel::Untrusted);
+        let mut sandbox = SandboxedShell::new(&ns, test_subject(), TrustLevel::Untrusted, test_handle());
         // 500 instructions: simple expr works, loop fails.
         assert_eq!(sandbox.eval("expr {1 + 1}").unwrap(), "2");
         assert!(sandbox.eval("while {1} {}").is_err());
@@ -438,7 +450,7 @@ mod tests {
         let original_prefixes = ns.mount_prefixes().len();
 
         // Create a restrictive sandbox.
-        let _sandbox = SandboxedShell::new(&ns, test_subject(), TrustLevel::Untrusted);
+        let _sandbox = SandboxedShell::new(&ns, test_subject(), TrustLevel::Untrusted, test_handle());
 
         // Parent namespace should be unmodified.
         assert_eq!(ns.mount_prefixes().len(), original_prefixes);
@@ -449,7 +461,7 @@ mod tests {
     #[test]
     fn set_instruction_limit_clamped() {
         let ns = make_namespace();
-        let mut sandbox = SandboxedShell::new(&ns, test_subject(), TrustLevel::Agent);
+        let mut sandbox = SandboxedShell::new(&ns, test_subject(), TrustLevel::Agent, test_handle());
         // Trying to set higher than trust level's max: clamped.
         sandbox.set_instruction_limit(1_000_000);
         // Should still hit agent limit (10K), not 1M.
@@ -460,7 +472,7 @@ mod tests {
     #[test]
     fn set_instruction_limit_lower_works() {
         let ns = make_namespace();
-        let mut sandbox = SandboxedShell::new(&ns, test_subject(), TrustLevel::Human);
+        let mut sandbox = SandboxedShell::new(&ns, test_subject(), TrustLevel::Human, test_handle());
         // Set lower than default: should be respected.
         sandbox.set_instruction_limit(100);
         let result = sandbox.eval("set i 0; while {$i < 1000} { incr i }");
@@ -470,7 +482,7 @@ mod tests {
     #[test]
     fn set_instruction_limit_zero_restores_default() {
         let ns = make_namespace();
-        let mut sandbox = SandboxedShell::new(&ns, test_subject(), TrustLevel::Human);
+        let mut sandbox = SandboxedShell::new(&ns, test_subject(), TrustLevel::Human, test_handle());
         sandbox.set_instruction_limit(10);
         // Zero restores default.
         sandbox.set_instruction_limit(0);
@@ -484,7 +496,7 @@ mod tests {
     #[test]
     fn dangerous_commands_removed_in_sandbox() {
         let ns = make_namespace();
-        let mut sandbox = SandboxedShell::new(&ns, test_subject(), TrustLevel::Human);
+        let mut sandbox = SandboxedShell::new(&ns, test_subject(), TrustLevel::Human, test_handle());
         assert!(sandbox.eval("source /etc/passwd").is_err());
         assert!(sandbox.eval("exit").is_err());
         assert!(sandbox.eval("puts hello").is_err());
@@ -495,7 +507,7 @@ mod tests {
     #[test]
     fn standard_tcl_in_sandbox() {
         let ns = make_namespace();
-        let mut sandbox = SandboxedShell::new(&ns, test_subject(), TrustLevel::Agent);
+        let mut sandbox = SandboxedShell::new(&ns, test_subject(), TrustLevel::Agent, test_handle());
         assert_eq!(sandbox.eval("expr {2 + 3}").unwrap(), "5");
         assert_eq!(
             sandbox.eval("set x hello; string length $x").unwrap(),

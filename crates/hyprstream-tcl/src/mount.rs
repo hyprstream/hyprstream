@@ -13,6 +13,7 @@
 
 use std::sync::mpsc;
 
+use async_trait::async_trait;
 use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat, Subject};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -106,8 +107,9 @@ impl TclMount {
     }
 }
 
+#[async_trait]
 impl Mount for TclMount {
-    fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
+    async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
         let kind = match components {
             [] => TclFidKind::Root,
             ["eval"] => TclFidKind::Eval,
@@ -125,11 +127,11 @@ impl Mount for TclMount {
         }))
     }
 
-    fn open(&self, _fid: &mut Fid, _mode: u8, _caller: &Subject) -> Result<(), MountError> {
+    async fn open(&self, _fid: &mut Fid, _mode: u8, _caller: &Subject) -> Result<(), MountError> {
         Ok(())
     }
 
-    fn read(
+    async fn read(
         &self,
         fid: &Fid,
         offset: u64,
@@ -178,7 +180,7 @@ impl Mount for TclMount {
         Ok(data[start..].to_vec())
     }
 
-    fn write(
+    async fn write(
         &self,
         fid: &Fid,
         _offset: u64,
@@ -213,7 +215,7 @@ impl Mount for TclMount {
         }
     }
 
-    fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
+    async fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
         let inner = fid
             .downcast_ref::<TclFid>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
@@ -269,7 +271,7 @@ impl Mount for TclMount {
         }
     }
 
-    fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
+    async fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
         let inner = fid
             .downcast_ref::<TclFid>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
@@ -291,7 +293,7 @@ impl Mount for TclMount {
         })
     }
 
-    fn clunk(&self, _fid: Fid, _caller: &Subject) {}
+    async fn clunk(&self, _fid: Fid, _caller: &Subject) {}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -356,178 +358,178 @@ mod tests {
         })
     }
 
-    #[test]
-    fn walk_root() {
+    #[tokio::test]
+    async fn walk_root() {
         let (tx, rx) = create_mount_channel();
         let _h = spawn_fake_interp(rx);
         let mount = TclMount::new(tx);
         let subject = Subject::anonymous();
 
-        let fid = mount.walk(&[], &subject).unwrap();
+        let fid = mount.walk(&[], &subject).await.unwrap();
         let inner = fid.downcast_ref::<TclFid>().unwrap();
         assert!(matches!(inner.kind, TclFidKind::Root));
     }
 
-    #[test]
-    fn walk_eval() {
+    #[tokio::test]
+    async fn walk_eval() {
         let (tx, rx) = create_mount_channel();
         let _h = spawn_fake_interp(rx);
         let mount = TclMount::new(tx);
         let subject = Subject::anonymous();
 
-        let fid = mount.walk(&["eval"], &subject).unwrap();
+        let fid = mount.walk(&["eval"], &subject).await.unwrap();
         let inner = fid.downcast_ref::<TclFid>().unwrap();
         assert!(matches!(inner.kind, TclFidKind::Eval));
     }
 
-    #[test]
-    fn walk_not_found() {
+    #[tokio::test]
+    async fn walk_not_found() {
         let (tx, rx) = create_mount_channel();
         let _h = spawn_fake_interp(rx);
         let mount = TclMount::new(tx);
         let subject = Subject::anonymous();
 
-        let result = mount.walk(&["nonexistent"], &subject);
+        let result = mount.walk(&["nonexistent"], &subject).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn eval_write_then_read() {
+    #[tokio::test]
+    async fn eval_write_then_read() {
         let (tx, rx) = create_mount_channel();
         let _h = spawn_fake_interp(rx);
         let mount = TclMount::new(tx);
         let subject = Subject::anonymous();
 
-        let mut fid = mount.walk(&["eval"], &subject).unwrap();
-        mount.open(&mut fid, 2, &subject).unwrap();
+        let mut fid = mount.walk(&["eval"], &subject).await.unwrap();
+        mount.open(&mut fid, 2, &subject).await.unwrap();
 
         // Write a script.
-        let written = mount.write(&fid, 0, b"expr {2+3}", &subject).unwrap();
+        let written = mount.write(&fid, 0, b"expr {2+3}", &subject).await.unwrap();
         assert_eq!(written, 10);
 
         // Read back the result.
-        let data = mount.read(&fid, 0, 4096, &subject).unwrap();
+        let data = mount.read(&fid, 0, 4096, &subject).await.unwrap();
         assert_eq!(String::from_utf8(data).unwrap(), "result: expr {2+3}");
     }
 
-    #[test]
-    fn eval_error() {
+    #[tokio::test]
+    async fn eval_error() {
         let (tx, rx) = create_mount_channel();
         let _h = spawn_fake_interp(rx);
         let mount = TclMount::new(tx);
         let subject = Subject::anonymous();
 
-        let mut fid = mount.walk(&["eval"], &subject).unwrap();
-        mount.open(&mut fid, 2, &subject).unwrap();
-        mount.write(&fid, 0, b"error", &subject).unwrap();
+        let mut fid = mount.walk(&["eval"], &subject).await.unwrap();
+        mount.open(&mut fid, 2, &subject).await.unwrap();
+        mount.write(&fid, 0, b"error", &subject).await.unwrap();
 
-        let data = mount.read(&fid, 0, 4096, &subject).unwrap();
+        let data = mount.read(&fid, 0, 4096, &subject).await.unwrap();
         assert_eq!(String::from_utf8(data).unwrap(), "error: test error");
     }
 
-    #[test]
-    fn readdir_root() {
+    #[tokio::test]
+    async fn readdir_root() {
         let (tx, rx) = create_mount_channel();
         let _h = spawn_fake_interp(rx);
         let mount = TclMount::new(tx);
         let subject = Subject::anonymous();
 
-        let fid = mount.walk(&[], &subject).unwrap();
-        let entries = mount.readdir(&fid, &subject).unwrap();
+        let fid = mount.walk(&[], &subject).await.unwrap();
+        let entries = mount.readdir(&fid, &subject).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"eval"));
         assert!(names.contains(&"vars"));
         assert!(names.contains(&"procs"));
     }
 
-    #[test]
-    fn readdir_vars() {
+    #[tokio::test]
+    async fn readdir_vars() {
         let (tx, rx) = create_mount_channel();
         let _h = spawn_fake_interp(rx);
         let mount = TclMount::new(tx);
         let subject = Subject::anonymous();
 
-        let fid = mount.walk(&["vars"], &subject).unwrap();
-        let entries = mount.readdir(&fid, &subject).unwrap();
+        let fid = mount.walk(&["vars"], &subject).await.unwrap();
+        let entries = mount.readdir(&fid, &subject).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"x"));
         assert!(names.contains(&"y"));
     }
 
-    #[test]
-    fn read_var() {
+    #[tokio::test]
+    async fn read_var() {
         let (tx, rx) = create_mount_channel();
         let _h = spawn_fake_interp(rx);
         let mount = TclMount::new(tx);
         let subject = Subject::anonymous();
 
-        let mut fid = mount.walk(&["vars", "x"], &subject).unwrap();
-        mount.open(&mut fid, 0, &subject).unwrap();
-        let data = mount.read(&fid, 0, 4096, &subject).unwrap();
+        let mut fid = mount.walk(&["vars", "x"], &subject).await.unwrap();
+        mount.open(&mut fid, 0, &subject).await.unwrap();
+        let data = mount.read(&fid, 0, 4096, &subject).await.unwrap();
         assert_eq!(String::from_utf8(data).unwrap(), "42");
     }
 
-    #[test]
-    fn read_var_not_found() {
+    #[tokio::test]
+    async fn read_var_not_found() {
         let (tx, rx) = create_mount_channel();
         let _h = spawn_fake_interp(rx);
         let mount = TclMount::new(tx);
         let subject = Subject::anonymous();
 
-        let mut fid = mount.walk(&["vars", "z"], &subject).unwrap();
-        mount.open(&mut fid, 0, &subject).unwrap();
-        let result = mount.read(&fid, 0, 4096, &subject);
+        let mut fid = mount.walk(&["vars", "z"], &subject).await.unwrap();
+        mount.open(&mut fid, 0, &subject).await.unwrap();
+        let result = mount.read(&fid, 0, 4096, &subject).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn readdir_procs() {
+    #[tokio::test]
+    async fn readdir_procs() {
         let (tx, rx) = create_mount_channel();
         let _h = spawn_fake_interp(rx);
         let mount = TclMount::new(tx);
         let subject = Subject::anonymous();
 
-        let fid = mount.walk(&["procs"], &subject).unwrap();
-        let entries = mount.readdir(&fid, &subject).unwrap();
+        let fid = mount.walk(&["procs"], &subject).await.unwrap();
+        let entries = mount.readdir(&fid, &subject).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "myproc");
     }
 
-    #[test]
-    fn read_proc() {
+    #[tokio::test]
+    async fn read_proc() {
         let (tx, rx) = create_mount_channel();
         let _h = spawn_fake_interp(rx);
         let mount = TclMount::new(tx);
         let subject = Subject::anonymous();
 
-        let mut fid = mount.walk(&["procs", "myproc"], &subject).unwrap();
-        mount.open(&mut fid, 0, &subject).unwrap();
-        let data = mount.read(&fid, 0, 4096, &subject).unwrap();
+        let mut fid = mount.walk(&["procs", "myproc"], &subject).await.unwrap();
+        mount.open(&mut fid, 0, &subject).await.unwrap();
+        let data = mount.read(&fid, 0, 4096, &subject).await.unwrap();
         assert_eq!(String::from_utf8(data).unwrap(), "puts hello");
     }
 
-    #[test]
-    fn stat_directory() {
+    #[tokio::test]
+    async fn stat_directory() {
         let (tx, rx) = create_mount_channel();
         let _h = spawn_fake_interp(rx);
         let mount = TclMount::new(tx);
         let subject = Subject::anonymous();
 
-        let fid = mount.walk(&["vars"], &subject).unwrap();
-        let st = mount.stat(&fid, &subject).unwrap();
+        let fid = mount.walk(&["vars"], &subject).await.unwrap();
+        let st = mount.stat(&fid, &subject).await.unwrap();
         assert_eq!(st.qtype, 0x80); // QTDIR
         assert_eq!(st.name, "vars");
     }
 
-    #[test]
-    fn stat_file() {
+    #[tokio::test]
+    async fn stat_file() {
         let (tx, rx) = create_mount_channel();
         let _h = spawn_fake_interp(rx);
         let mount = TclMount::new(tx);
         let subject = Subject::anonymous();
 
-        let fid = mount.walk(&["eval"], &subject).unwrap();
-        let st = mount.stat(&fid, &subject).unwrap();
+        let fid = mount.walk(&["eval"], &subject).await.unwrap();
+        let st = mount.stat(&fid, &subject).await.unwrap();
         assert_eq!(st.qtype, 0);
         assert_eq!(st.name, "eval");
     }

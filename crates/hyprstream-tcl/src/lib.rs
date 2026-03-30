@@ -27,6 +27,7 @@ pub use mount::{create_mount_channel, TclCommand, TclMount};
 pub(crate) struct ShellContext {
     pub ns: Arc<Namespace>,
     pub subject: Subject,
+    pub rt: tokio::runtime::Handle,
 }
 
 /// A Tcl shell backed by the hyprstream VFS namespace.
@@ -51,7 +52,10 @@ impl TclShell {
     ///
     /// Dangerous commands are removed and the recursion limit is lowered.
     /// All host I/O goes through the VFS — this is a guest interpreter.
-    pub fn new(ns: Arc<Namespace>, subject: Subject) -> Self {
+    ///
+    /// The `rt` handle is used to `block_on()` async VFS operations from sync
+    /// Tcl builtins.
+    pub fn new(ns: Arc<Namespace>, subject: Subject, rt: tokio::runtime::Handle) -> Self {
         let mut interp = Interp::new();
 
         // Remove dangerous commands — all host I/O goes through VFS.
@@ -73,7 +77,7 @@ impl TclShell {
         interp.set_recursion_limit(100);
         interp.set_instruction_limit(100_000);
 
-        let ctx = ShellContext { ns, subject };
+        let ctx = ShellContext { ns, subject, rt };
         let ctx_id = interp.save_context(ctx);
         builtins::register_all(&mut interp, ctx_id);
         Self { interp, ctx_id }
@@ -166,7 +170,7 @@ impl TclShell {
             .strip_prefix(cmd_name)
             .unwrap_or("")
             .trim();
-        match ctx.ns.ctl(&cmd_path, args.as_bytes(), &ctx.subject) {
+        match ctx.rt.block_on(ctx.ns.ctl(&cmd_path, args.as_bytes(), &ctx.subject)) {
             Ok(resp) => Ok(String::from_utf8_lossy(&resp).into_owned()),
             Err(_) => Err(format!("invalid command name \"{cmd_name}\"")),
         }
@@ -193,6 +197,7 @@ fn extract_unknown_command(msg: &str) -> Option<String> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
     use std::collections::HashMap;
 
@@ -217,8 +222,9 @@ mod tests {
         write_buf: Vec<u8>,
     }
 
+    #[async_trait]
     impl Mount for MemMount {
-        fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
+        async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
             let path = components.join("/");
             // Check file exists (or is a prefix of existing files for dirs).
             let exists = self.files.contains_key(&path)
@@ -232,11 +238,11 @@ mod tests {
             }))
         }
 
-        fn open(&self, _fid: &mut Fid, _mode: u8, _caller: &Subject) -> Result<(), MountError> {
+        async fn open(&self, _fid: &mut Fid, _mode: u8, _caller: &Subject) -> Result<(), MountError> {
             Ok(())
         }
 
-        fn read(
+        async fn read(
             &self,
             fid: &Fid,
             offset: u64,
@@ -262,7 +268,7 @@ mod tests {
             }
         }
 
-        fn write(
+        async fn write(
             &self,
             fid: &Fid,
             _offset: u64,
@@ -277,7 +283,7 @@ mod tests {
             Ok(data.len() as u32)
         }
 
-        fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
+        async fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
             let inner = fid.downcast_ref::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             let prefix = if inner.path.is_empty() {
                 String::new()
@@ -307,7 +313,7 @@ mod tests {
             Ok(entries)
         }
 
-        fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
+        async fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
             let inner = fid.downcast_ref::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             Ok(Stat {
                 qtype: 0,
@@ -317,7 +323,7 @@ mod tests {
             })
         }
 
-        fn clunk(&self, _fid: Fid, _caller: &Subject) {}
+        async fn clunk(&self, _fid: Fid, _caller: &Subject) {}
     }
 
     fn test_subject() -> Subject {
@@ -325,6 +331,12 @@ mod tests {
     }
 
     fn make_shell() -> TclShell {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+        // Leak the runtime so the handle stays valid for the test duration.
+        // Tests are short-lived so this is fine.
+        std::mem::forget(rt);
+
         let mut ns = Namespace::new();
         let mount = Arc::new(MemMount::new(vec![
             ("temperature", b"0.7"),
@@ -340,7 +352,7 @@ mod tests {
         let bin_mount = Arc::new(MemMount::new(vec![("load", b"")]));
         ns.mount("/bin", bin_mount).unwrap();
 
-        TclShell::new(Arc::new(ns), test_subject())
+        TclShell::new(Arc::new(ns), test_subject(), handle)
     }
 
     #[test]

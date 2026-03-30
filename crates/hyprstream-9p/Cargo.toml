@@ -12,6 +12,9 @@ hyprstream-vfs = { path = "../hyprstream-vfs" }
 # RPC types (Subject for caller identity)
 hyprstream-rpc = { path = "../hyprstream-rpc" }
 
+# Async trait support
+async-trait = { workspace = true }
+
 # Error handling
 anyhow = { workspace = true }
 thiserror = { workspace = true }

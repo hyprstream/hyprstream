@@ -5926,6 +5926,7 @@ dependencies = [
  "hyprstream-rpc-build",
  "hyprstream-rpc-derive",
  "hyprstream-service",
+ "hyprstream-tcl",
  "hyprstream-tui",
  "hyprstream-vfs",
  "hyprstream-workers",
@@ -6007,6 +6008,7 @@ name = "hyprstream-9p"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "hyprstream-rpc",
  "hyprstream-vfs",
  "thiserror 1.0.69",
@@ -6220,8 +6222,10 @@ dependencies = [
 name = "hyprstream-sandbox"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "hyprstream-tcl",
  "hyprstream-vfs",
+ "tokio",
 ]
 
 [[package]]
@@ -6255,8 +6259,10 @@ dependencies = [
 name = "hyprstream-tcl"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "hyprstream-vfs",
  "molt",
+ "tokio",
 ]
 
 [[package]]
@@ -6282,6 +6288,7 @@ dependencies = [
  "ratatui-textarea",
  "serde",
  "serde_json",
+ "tokio",
  "tui-logger",
  "uuid 1.18.1",
  "waxterm",
@@ -6293,7 +6300,9 @@ name = "hyprstream-vfs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "hyprstream-rpc",
+ "tokio",
 ]
 
 [[package]]
@@ -6306,6 +6315,7 @@ dependencies = [
  "hyprstream-vfs",
  "libc",
  "parking_lot 0.12.4",
+ "tokio",
  "tracing",
 ]
 
