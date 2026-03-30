@@ -13,5 +13,8 @@ hyprstream-rpc = { path = "../hyprstream-rpc" }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 
+# Concurrent fid table for RemoteMount
+dashmap = { workspace = true }
+
 # Error handling
 anyhow = { workspace = true }

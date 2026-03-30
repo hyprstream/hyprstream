@@ -18,7 +18,9 @@
 
 mod mount;
 mod namespace;
+mod remote_mount;
 
 pub use hyprstream_rpc::Subject;
 pub use mount::{DirEntry, Fid, Mount, MountError, Stat, OREAD, OWRITE, ORDWR, OTRUNC, ORCLOSE};
 pub use namespace::{BindFlag, MountTarget, Namespace, NamespaceError};
+pub use remote_mount::RemoteMount;

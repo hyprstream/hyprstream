@@ -101,6 +101,7 @@ pub mod capnp;
 pub mod crypto;
 pub mod envelope;
 pub mod error;
+pub mod fs_client;
 pub mod platform;
 pub mod zmtp_framing;
 
@@ -140,6 +141,7 @@ pub mod wasm_api;
 // ============================================================================
 
 pub use capnp::{serialize_message, FromCapnp, ToCapnp};
+pub use fs_client::{FsClient, FsOpenResult, FsStatResult, FsWalkResult};
 pub use crypto::{
     generate_signing_keypair, signing_key_from_bytes, verifying_key_from_bytes, ChainedStreamHmac,
     DefaultKeyExchange, HmacKey, KeyExchange, SharedSecret, SigningKey, VerifyingKey,

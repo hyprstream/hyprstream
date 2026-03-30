@@ -301,12 +301,14 @@ pub async fn handle_shell_tui(
         let mut ns = hyprstream_vfs::Namespace::new();
 
         // Mount the model service's 9P filesystem via RPC proxy.
-        // RemoteModelMount translates sync Mount trait calls to async ModelClient
-        // RPC requests, so `/srv/model/{model_ref}/status` etc. are served by the
-        // model service's SyntheticTree on the other end of the ZMQ socket.
-        let remote_model_mount = crate::services::remote_mount::RemoteModelMount::new(
+        // ModelFsAdapter implements FsClient for the generated ModelClient,
+        // and RemoteMount<ModelFsAdapter> provides the generic Mount impl.
+        // `/srv/model/{model_ref}/status` etc. are served by the model
+        // service's SyntheticTree on the other end of the ZMQ socket.
+        let model_fs_adapter = crate::services::remote_mount::ModelFsAdapter::new_unscoped(
             model_client.clone(),
         );
+        let remote_model_mount = hyprstream_vfs::RemoteMount::new(model_fs_adapter);
         let _ = ns.mount("/srv/model",
             std::sync::Arc::new(remote_model_mount),
         );
