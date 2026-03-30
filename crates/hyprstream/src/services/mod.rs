@@ -91,6 +91,7 @@ pub mod fs;
 pub mod remote_mount;
 pub mod rpc_types;
 pub mod stream;
+pub mod tcl;
 pub mod worker;
 
 pub use core::{
@@ -140,3 +141,4 @@ pub use notification::{NotificationPublisher, NotificationService};
 pub use generated::notification_client::NotificationClient;
 pub use mcp_service::{McpConfig, McpService};
 pub use metrics::MetricsService;
+pub use tcl::TclService;
