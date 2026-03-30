@@ -19,7 +19,6 @@ members = [
     "crates/hyprstream-tui",
     "crates/hyprstream-vfs",
     "crates/hyprstream-tcl",
-    "crates/hyprstream-sandbox",
     "crates/hyprstream-vfsd",
     "crates/hyprstream-9p",
 ]

@@ -225,13 +225,12 @@ These commands are removed at construction time:
 | `time` | User-controlled iteration count — CPU bomb |
 | `parse`, `pdump`, `pclear` | Debug internals |
 
-### Sandbox
+### Sandboxing
 
-The `hyprstream-sandbox` crate provides `SandboxedShell` — a Tcl shell with
-an independently constructed namespace and resource limits. The sandbox does
-NOT make authorization decisions. The policy engine (Subject + Casbin) builds
-the namespace with only the mounts the subject is authorized to access.
-Least privilege: empty namespace by default, policy grants access.
+`TclShell` is sandboxed by construction: the policy engine (Subject + Casbin)
+builds the namespace with only the mounts the subject is authorized to access.
+Least privilege — empty namespace by default, policy grants access. Resource
+controls (instruction limit, recursion limit) prevent denial of service.
 
 ### Limits
 

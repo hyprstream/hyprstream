@@ -6219,16 +6219,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hyprstream-sandbox"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "hyprstream-tcl",
- "hyprstream-vfs",
- "tokio",
-]
-
-[[package]]
 name = "hyprstream-service"
 version = "0.1.0"
 dependencies = [
