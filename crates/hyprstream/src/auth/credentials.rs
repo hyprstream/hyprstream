@@ -504,14 +504,14 @@ mod tests {
     #[cfg(unix)]
     fn test_signing_key_readonly_dir_fails() {
         use std::os::unix::fs::PermissionsExt;
-        // Use a 0o555 parent (not writable) with a non-existent child as secrets_dir.
-        // TempDir::drop only needs write permission on /tmp, not on the dir itself,
-        // so cleanup succeeds even if we panic between chmod and assert.
+        // 0o500 = r-x------ (owner read+traverse, no write, no group/other access).
+        // Mirrors a systemd credentials directory.  TempDir::drop uses rmdir which
+        // only needs write on the *parent* dir, so cleanup succeeds without restoring.
         let parent = TempDir::new().unwrap();
-        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
         let secrets_dir = parent.path().join("secrets");
+        std::fs::create_dir(&secrets_dir).unwrap();
+        std::fs::set_permissions(&secrets_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
         let result = load_or_generate_node_signing_key(&secrets_dir);
-        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(result.is_err());
     }
 
@@ -654,10 +654,10 @@ mod tests {
     fn test_user_signing_key_readonly_dir_fails() {
         use std::os::unix::fs::PermissionsExt;
         let parent = TempDir::new().unwrap();
-        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
         let secrets_dir = parent.path().join("secrets");
+        std::fs::create_dir(&secrets_dir).unwrap();
+        std::fs::set_permissions(&secrets_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
         let result = load_or_generate_user_signing_key(&secrets_dir);
-        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(result.is_err());
     }
 
@@ -680,10 +680,10 @@ mod tests {
     fn test_tls_materials_readonly_no_key_fails() {
         use std::os::unix::fs::PermissionsExt;
         let parent = TempDir::new().unwrap();
-        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
         let secrets_dir = parent.path().join("secrets");
+        std::fs::create_dir(&secrets_dir).unwrap();
+        std::fs::set_permissions(&secrets_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
         let result = load_or_generate_tls_materials(&secrets_dir, "localhost", 365);
-        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(result.is_err(), "expected error for unwritable dir");
     }
 
@@ -734,11 +734,11 @@ mod tests {
     fn test_credential_store_key_readonly_no_store_fails() {
         use std::os::unix::fs::PermissionsExt;
         let parent = TempDir::new().unwrap();
-        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
         let secrets_dir = parent.path().join("secrets");
+        std::fs::create_dir(&secrets_dir).unwrap();
+        std::fs::set_permissions(&secrets_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
         let store_path = secrets_dir.join("users.toml.age");
         let result = load_or_generate_credential_store_key(&secrets_dir, &store_path);
-        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(result.is_err());
     }
 }
