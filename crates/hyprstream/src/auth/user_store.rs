@@ -2,9 +2,8 @@
 //!
 //! `UserStore` is the trait. `LocalKeyStore` is the implementation
 //! backed by an age-encrypted TOML file, with the decryption key
-//! in the OS keyring.
+//! persisted in the secrets directory.
 
-use age::secrecy::ExposeSecret;
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::VerifyingKey;
@@ -42,11 +41,8 @@ pub struct LocalKeyStore {
 }
 
 impl LocalKeyStore {
-    const KEYRING_SERVICE: &'static str = "hyprstream";
-    const KEYRING_KEY_NAME: &'static str = "credential-store-key";
-
     /// Load (or initialize) the credential store.
-    /// Creates the file and keyring entry if they don't exist.
+    /// Creates the file if it doesn't exist.
     pub fn load(credentials_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(credentials_dir)?;
         let path = credentials_dir.join("users.toml.age");
@@ -62,20 +58,20 @@ impl LocalKeyStore {
         Ok(Self { path, data, identity })
     }
 
-    /// Load the age identity from the OS keyring, or generate a new one on first run.
+    /// Load the age identity from the configured secrets directory, or generate on first run.
     ///
     /// `store_path` is the path of the `users.toml.age` file. When it already exists
-    /// on disk, a missing keyring entry is a hard error — generating a new key would
-    /// produce a "NoMatchingKeys" decryption failure.
+    /// on disk, a missing key is a hard error — generating a new key would produce a
+    /// "NoMatchingKeys" decryption failure.
     ///
     /// Recovery: set `HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY=<age-secret-key-...>`
     /// in the environment to inject the original key, or delete the credential store
     /// file to start fresh.
     fn load_or_generate_identity(store_path: &Path) -> Result<age::x25519::Identity> {
-        let store_file_exists = store_path.exists();
-        // Check for test bypass via config before touching the OS keyring.
+        // Check for test bypass via config before touching the filesystem.
         // Set HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY=<age-secret-key-...> to inject a key.
-        if let Ok(cfg) = crate::config::HyprConfig::load() {
+        let cfg = crate::config::HyprConfig::load();
+        if let Ok(ref cfg) = cfg {
             if let Some(ref age_key) = cfg.oauth.credential_store_key {
                 return age_key
                     .trim()
@@ -84,40 +80,16 @@ impl LocalKeyStore {
             }
         }
 
-        let entry = keyring::Entry::new(Self::KEYRING_SERVICE, Self::KEYRING_KEY_NAME)
-            .context("Failed to access keyring for credential store key")?;
+        let secrets_dir = cfg
+            .map(|c| c.secrets.resolve_dir(c.config_dir()))
+            .unwrap_or_else(|_| {
+                dirs::config_dir()
+                    .unwrap_or_else(|| PathBuf::from("/etc/hyprstream"))
+                    .join("hyprstream")
+                    .join("credentials")
+            });
 
-        match entry.get_secret() {
-            Ok(bytes) => {
-                let s = String::from_utf8(bytes)?;
-                s.parse::<age::x25519::Identity>()
-                    .map_err(|e| anyhow!("Failed to parse credential store key: {:?}", e))
-            }
-            Err(keyring::Error::NoEntry) if store_file_exists => {
-                // The encrypted store exists but the decryption key is gone from the keyring.
-                // Generating a new key would produce "NoMatchingKeys" — fail with a clear message.
-                Err(anyhow!(
-                    "Credential store key not found in OS keyring.\n\
-                     The store file exists at {:?} but cannot be decrypted.\n\
-                     Recovery options:\n\
-                     - Set HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY=<age-secret-key-...> \
-                       if you have a backup of the original key.\n\
-                     - Delete that file to start fresh (existing users will be lost).",
-                    store_path
-                ))
-            }
-            Err(keyring::Error::NoEntry) => {
-                // First run — no store file, safe to generate a new key.
-                let identity = age::x25519::Identity::generate();
-                let secret_str = identity.to_string();
-                entry
-                    .set_secret(secret_str.expose_secret().as_bytes())
-                    .context("Failed to store credential store key in keyring")?;
-                tracing::info!("Generated new credential store key (in OS keyring)");
-                Ok(identity)
-            }
-            Err(e) => Err(anyhow!("Keyring error loading credential store key: {}", e)),
-        }
+        crate::auth::credentials::load_or_generate_credential_store_key(&secrets_dir, store_path)
     }
 
     fn decrypt_and_parse(path: &Path, identity: &age::x25519::Identity) -> Result<UsersFile> {

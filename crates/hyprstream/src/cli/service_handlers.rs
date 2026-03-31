@@ -63,6 +63,17 @@ pub async fn handle_service_install(
     if hyprstream_rpc::has_systemd() {
         let manager = hyprstream_service::detect_service_manager().await?;
 
+        // Encrypt secrets into the systemd user credstore before generating units.
+        // This must happen before manager.install() so that install() can see the
+        // .cred files when deciding whether to emit ImportCredential= directives.
+        #[cfg(feature = "systemd")]
+        {
+            let secrets_dir = crate::config::HyprConfig::load()
+                .map(|c| c.secrets.resolve_dir(c.config_dir()))
+                .ok();
+            hyprstream_service::encrypt_credentials_if_available(secrets_dir.as_deref());
+        }
+
         // If --start, stop all target services first so they pick up changes
         if start {
             println!("  Stopping services...");

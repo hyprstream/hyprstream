@@ -25,7 +25,29 @@ WantedBy=sockets.target
     )
 }
 
-/// Generate a systemd service unit for a service
+/// Secrets managed by systemd credentials (via `ImportCredential=`).
+///
+/// These are the five secrets that `hyprstream service install` encrypts into
+/// `~/.config/credstore.encrypted/` using `systemd-creds encrypt`.  When the
+/// service starts, systemd decrypts them into `$CREDENTIALS_DIRECTORY` and the
+/// unit sets `HYPRSTREAM__SECRETS__PATH=%d` so hyprstream reads from there.
+pub const SYSTEMD_CREDENTIAL_NAMES: &[&str] = &[
+    "signing-key",
+    "credential-store-key",
+    "user-signing-key",
+    "tls-key",
+    "tls-cert",
+    "quic-key",
+    "quic-cert",
+];
+
+/// Generate a systemd service unit for a service.
+///
+/// When `use_systemd_creds` is `true`, the unit includes:
+/// - `ImportCredential=<name>` for each of the five managed secrets
+/// - `Environment=HYPRSTREAM__SECRETS__PATH=%d` to point hyprstream at the
+///   systemd credentials directory (non-swappable ramfs, access-restricted)
+/// - `PrivateMounts=yes` per systemd security recommendation for credential users
 ///
 /// The service manages its own socket binding (via ZMQ) and notifies systemd
 /// when ready via sd_notify.
@@ -41,7 +63,7 @@ WantedBy=sockets.target
 /// 1. Installed binary at `~/.local/bin/hyprstream` (stable, survives updates)
 /// 2. `$APPIMAGE` path (when running from AppImage)
 /// 3. `current_exe()` fallback
-pub fn service_unit(service: &str) -> Result<String> {
+pub fn service_unit(service: &str, use_systemd_creds: bool) -> Result<String> {
     // Prefer installed binary for systemd units (stable location)
     let exec = paths::installed_executable_path()
         .map(Ok)
@@ -91,19 +113,34 @@ pub fn service_unit(service: &str) -> Result<String> {
         format!("\n{env_directives}")
     };
 
+    // Build systemd credentials section (only when systemd-creds are available).
+    let creds_section = if use_systemd_creds {
+        let import_lines: String = SYSTEMD_CREDENTIAL_NAMES
+            .iter()
+            .map(|name| format!("ImportCredential={name}\n"))
+            .collect();
+        format!(
+            "\n{}Environment=HYPRSTREAM__SECRETS__PATH=%d\nPrivateMounts=yes",
+            import_lines
+        )
+    } else {
+        String::new()
+    };
+
     Ok(format!(
         r#"[Unit]
 Description=Hyprstream {service} Service
 
 [Service]
 Type=notify
-ExecStart={exec} service start {service} --foreground{env_section}
+ExecStart={exec} service start {service} --foreground{env_section}{creds_section}
 Restart=on-failure
 
 [Install]
 WantedBy=default.target
 "#,
         exec = exec.display(),
-        env_section = env_section
+        env_section = env_section,
+        creds_section = creds_section,
     ))
 }

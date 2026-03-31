@@ -134,6 +134,42 @@ pub struct HyprConfig {
     /// unavailable. Never set this in production config files.
     #[serde(default, skip_serializing)]
     pub signing_key: Option<String>,
+
+    /// Persistent secrets storage configuration.
+    ///
+    /// Controls where signing keys, TLS materials, and credential store keys are
+    /// read from and written to. On systemd, overridden at runtime by
+    /// `HYPRSTREAM__SECRETS__PATH=%d` in the service unit (pointing to the
+    /// systemd credentials directory).
+    #[serde(default)]
+    pub secrets: SecretsConfig,
+}
+
+/// Persistent secrets storage configuration.
+///
+/// Determines the directory used for reading and writing persistent secret key
+/// material: signing keys, TLS certificates/keys, and the age credential store key.
+///
+/// On systemd, the generated service unit sets
+/// `Environment=HYPRSTREAM__SECRETS__PATH=%d` so that at runtime `path` resolves
+/// to the systemd credentials directory (non-swappable ramfs, access-restricted).
+///
+/// On non-systemd systems the default (`<config_dir>/credentials`) is used.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SecretsConfig {
+    /// Override the directory from which secret files are read (and written on
+    /// first run).  `None` → resolved at runtime to `<config_dir>/credentials`.
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+}
+
+impl SecretsConfig {
+    /// Resolve the secrets directory.
+    ///
+    /// Returns `path` if set, otherwise `<config_dir>/credentials`.
+    pub fn resolve_dir(&self, config_dir: &Path) -> PathBuf {
+        self.path.clone().unwrap_or_else(|| config_dir.join("credentials"))
+    }
 }
 
 /// TLS configuration for HTTP services (OAI, OAuth, MCP).
@@ -273,19 +309,33 @@ impl QuicConfig {
 
     /// Generate or load TLS materials, returning (cert_der, key_der).
     ///
-    /// For self-signed certs, generates an ECDSA P-256 certificate with ≤14 day validity,
-    /// as required by WebTransport `serverCertificateHashes` (W3C spec).
+    /// For self-signed certs, loads persisted ECDSA P-256 materials from the secrets
+    /// directory (generating on first run) with ≤14 day validity, as required by
+    /// WebTransport `serverCertificateHashes` (W3C spec).
+    ///
+    /// QUIC uses a separate cert (`quic-cert`) from the HTTP cert (`tls-cert`) because
+    /// WebTransport requires ≤14-day validity while HTTP allows 365 days.
     pub fn load_tls_materials(&self) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
         if self.use_self_signed() {
-            // Generate self-signed cert with ≤14 day validity for WebTransport compat
-            let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
-            let mut params = rcgen::CertificateParams::new(vec![self.server_name.clone()])?;
-            params.not_before = time::OffsetDateTime::now_utc();
-            params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(14);
-            let cert = params.self_signed(&key_pair)?;
-            let cert_der = cert.der().to_vec();
-            let key_der = key_pair.serialize_der();
-            Ok((cert_der, key_der))
+            let cfg = crate::config::HyprConfig::load();
+            let secrets_dir = cfg.as_ref()
+                .map(|c| c.secrets.resolve_dir(c.config_dir()))
+                .unwrap_or_else(|_| {
+                    dirs::config_dir()
+                        .unwrap_or_else(|| PathBuf::from("/etc/hyprstream"))
+                        .join("hyprstream")
+                        .join("credentials")
+                });
+            // Use quic-specific secret names so QUIC and HTTP certs have different
+            // validity windows without stomping each other's files.
+            let materials = crate::auth::credentials::load_or_generate_tls_materials_named(
+                &secrets_dir,
+                &self.server_name,
+                14,
+                "quic-key",
+                "quic-cert",
+            )?;
+            Ok((materials.cert_der, (*materials.key_der).clone()))
         } else {
             // Load from files
             let cert_pem = std::fs::read(&self.cert_path)
@@ -1235,6 +1285,7 @@ impl HyprConfigBuilder {
             tui: self.tui,
             metrics: self.metrics,
             signing_key: None,
+            secrets: Default::default(),
         }
     }
 

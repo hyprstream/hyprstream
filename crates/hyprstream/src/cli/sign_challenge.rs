@@ -22,7 +22,6 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use ed25519_dalek::Signer;
 
-use crate::cli::policy_handlers::{KEYRING_SERVICE, KEYRING_USER_KEY_NAME};
 
 /// Handle `hyprstream sign-challenge [USER_CODE] [--nonce N] [--code-challenge CC]`
 pub async fn handle_sign_challenge(
@@ -158,12 +157,13 @@ fn handle_auth_code_flow(
     Ok(())
 }
 
-/// Load the user's Ed25519 signing key from the OS keyring.
+/// Load the user's Ed25519 signing key from the configured secrets directory.
 /// Returns (signing_key, username).
 fn load_user_signing_key() -> Result<(ed25519_dalek::SigningKey, String)> {
-    // Check for test bypass via config before touching the OS keyring.
+    // Check for test bypass via config before touching the filesystem.
     // Set HYPRSTREAM__OAUTH__USER_SIGNING_KEY=<hex32> to inject a pre-generated key.
-    if let Ok(cfg) = crate::config::HyprConfig::load() {
+    let cfg = crate::config::HyprConfig::load();
+    if let Ok(ref cfg) = cfg {
         if let Some(ref hex_key) = cfg.oauth.user_signing_key {
             let bytes = hex::decode(hex_key)
                 .map_err(|e| anyhow::anyhow!("HYPRSTREAM__OAUTH__USER_SIGNING_KEY: invalid hex: {e}"))?;
@@ -176,31 +176,20 @@ fn load_user_signing_key() -> Result<(ed25519_dalek::SigningKey, String)> {
         }
     }
 
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER_KEY_NAME).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to access OS keyring for user identity: {e}.\n\
+    let secrets_dir = cfg
+        .map(|c| c.secrets.resolve_dir(c.config_dir()))
+        .unwrap_or_else(|_| {
+            dirs::config_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("/etc/hyprstream"))
+                .join("hyprstream")
+                .join("credentials")
+        });
+
+    let (sk, _vk) = crate::auth::credentials::load_or_generate_user_signing_key(&secrets_dir)
+        .map_err(|e| anyhow::anyhow!(
+            "Could not load user signing key: {e}\n\
              Run 'hyprstream wizard' to set up your identity first."
-        )
-    })?;
-
-    let bytes = entry.get_secret().map_err(|e| match e {
-        keyring::Error::NoEntry => anyhow::anyhow!(
-            "No user identity key found in OS keyring.\n\
-             Run 'hyprstream wizard' to set up your identity first."
-        ),
-        e => anyhow::anyhow!("OS keyring error: {e}"),
-    })?;
-
-    if bytes.len() != 32 {
-        anyhow::bail!(
-            "User identity key in keyring has wrong size ({} bytes, expected 32).\n\
-             Run 'hyprstream wizard' to regenerate your identity.",
-            bytes.len()
-        );
-    }
-
-    let arr: [u8; 32] = bytes.try_into().map_err(|_| anyhow::anyhow!("unreachable"))?;
-    let sk = ed25519_dalek::SigningKey::from_bytes(&arr);
+        ))?;
 
     let username = hyprstream_rpc::envelope::RequestIdentity::anonymous()
         .user()
