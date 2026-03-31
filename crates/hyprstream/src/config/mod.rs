@@ -18,6 +18,7 @@ use crate::storage::paths::StoragePaths;
 use config::{Config, ConfigError, Environment, File};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use zeroize::Zeroizing;
 
 /// Unified configuration for the Hyprstream system
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,6 +171,18 @@ impl SecretsConfig {
     pub fn resolve_dir(&self, config_dir: &Path) -> PathBuf {
         self.path.clone().unwrap_or_else(|| config_dir.join("credentials"))
     }
+
+    /// Return the default secrets directory when no config is available.
+    ///
+    /// Routes through `StoragePaths` so `XDG_CONFIG_HOME` is respected
+    /// consistently with every other directory in the application.
+    /// Falls back to `/etc/hyprstream/credentials` if XDG resolution fails.
+    pub fn default_dir() -> PathBuf {
+        StoragePaths::new()
+            .and_then(|p| p.config_dir())
+            .map(|d| d.join("credentials"))
+            .unwrap_or_else(|_| PathBuf::from("/etc/hyprstream/credentials"))
+    }
 }
 
 /// TLS configuration for HTTP services (OAI, OAuth, MCP).
@@ -303,11 +316,30 @@ impl QuicConfig {
     }
 
     /// Check if self-signed certificate should be generated.
+    ///
+    /// Warns when only one of cert_path/key_path is set (misconfiguration).
     pub fn use_self_signed(&self) -> bool {
-        self.cert_path.is_empty() || self.key_path.is_empty()
+        match (self.cert_path.is_empty(), self.key_path.is_empty()) {
+            (true, true) => true,
+            (false, false) => false,
+            (false, true) => {
+                tracing::warn!(
+                    "quic.cert_path is set but quic.key_path is missing — generating self-signed cert"
+                );
+                true
+            }
+            (true, false) => {
+                tracing::warn!(
+                    "quic.key_path is set but quic.cert_path is missing — generating self-signed cert"
+                );
+                true
+            }
+        }
     }
 
-    /// Generate or load TLS materials, returning (cert_der, key_der).
+    /// Generate or load TLS materials, returning `(cert_der, key_der)`.
+    ///
+    /// `key_der` is wrapped in `Zeroizing` to ensure it is zeroed on drop.
     ///
     /// For self-signed certs, loads persisted ECDSA P-256 materials from the secrets
     /// directory (generating on first run) with ≤14 day validity, as required by
@@ -315,17 +347,9 @@ impl QuicConfig {
     ///
     /// QUIC uses a separate cert (`quic-cert`) from the HTTP cert (`tls-cert`) because
     /// WebTransport requires ≤14-day validity while HTTP allows 365 days.
-    pub fn load_tls_materials(&self) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    pub fn load_tls_materials(&self) -> anyhow::Result<(Vec<u8>, Zeroizing<Vec<u8>>)> {
         if self.use_self_signed() {
-            let cfg = crate::config::HyprConfig::load();
-            let secrets_dir = cfg.as_ref()
-                .map(|c| c.secrets.resolve_dir(c.config_dir()))
-                .unwrap_or_else(|_| {
-                    dirs::config_dir()
-                        .unwrap_or_else(|| PathBuf::from("/etc/hyprstream"))
-                        .join("hyprstream")
-                        .join("credentials")
-                });
+            let secrets_dir = HyprConfig::resolve_secrets_dir();
             // Use quic-specific secret names so QUIC and HTTP certs have different
             // validity windows without stomping each other's files.
             let materials = crate::auth::credentials::load_or_generate_tls_materials_named(
@@ -335,7 +359,7 @@ impl QuicConfig {
                 "quic-key",
                 "quic-cert",
             )?;
-            Ok((materials.cert_der, (*materials.key_der).clone()))
+            Ok((materials.cert_der, materials.key_der))
         } else {
             // Load from files
             let cert_pem = std::fs::read(&self.cert_path)
@@ -350,11 +374,13 @@ impl QuicConfig {
                 .map_err(|e| anyhow::anyhow!("invalid certificate PEM: {}", e))?
                 .to_vec();
 
-            let key_der = rustls_pemfile::private_key(&mut &key_pem[..])
-                .map_err(|e| anyhow::anyhow!("invalid key PEM: {}", e))?
-                .ok_or_else(|| anyhow::anyhow!("no private key found in {}", self.key_path))?
-                .secret_der()
-                .to_vec();
+            let key_der = Zeroizing::new(
+                rustls_pemfile::private_key(&mut &key_pem[..])
+                    .map_err(|e| anyhow::anyhow!("invalid key PEM: {}", e))?
+                    .ok_or_else(|| anyhow::anyhow!("no private key found in {}", self.key_path))?
+                    .secret_der()
+                    .to_vec(),
+            );
 
             Ok((cert_der, key_der))
         }
@@ -1440,6 +1466,75 @@ impl HyprConfig {
 
         tracing::info!("✅ Configuration saved to: {}", config_path.display());
         Ok(())
+    }
+
+    // ── Secrets / key bypass helpers ────────────────────────────────────────
+
+    /// Resolve the secrets directory from config, or the platform XDG default.
+    ///
+    /// Prefer calling this over inlining the fallback logic everywhere.
+    pub fn resolve_secrets_dir() -> PathBuf {
+        match Self::load() {
+            Ok(cfg) => cfg.secrets.resolve_dir(cfg.config_dir()),
+            Err(_) => SecretsConfig::default_dir(),
+        }
+    }
+
+    /// Check for the `HYPRSTREAM__SIGNING_KEY` test bypass.
+    ///
+    /// Returns `Ok(Some(key))` when the bypass is set and valid,
+    /// `Ok(None)` when not configured, `Err` when malformed.
+    pub fn node_signing_key_bypass() -> anyhow::Result<Option<ed25519_dalek::SigningKey>> {
+        if let Ok(cfg) = Self::load() {
+            if let Some(ref hex_key) = cfg.signing_key {
+                let bytes = hex::decode(hex_key)
+                    .map_err(|e| anyhow::anyhow!("HYPRSTREAM__SIGNING_KEY: invalid hex: {e}"))?;
+                let arr: [u8; 32] = bytes
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("HYPRSTREAM__SIGNING_KEY: expected 32 bytes"))?;
+                tracing::info!("Using node signing key from config (test bypass)");
+                return Ok(Some(ed25519_dalek::SigningKey::from_bytes(&arr)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Check for the `HYPRSTREAM__OAUTH__USER_SIGNING_KEY` test bypass.
+    ///
+    /// Returns `Ok(Some((sk, vk)))` when the bypass is set and valid,
+    /// `Ok(None)` when not configured, `Err` when malformed.
+    pub fn user_signing_key_bypass(
+    ) -> anyhow::Result<Option<(ed25519_dalek::SigningKey, ed25519_dalek::VerifyingKey)>> {
+        if let Ok(cfg) = Self::load() {
+            if let Some(ref hex_key) = cfg.oauth.user_signing_key {
+                let bytes = hex::decode(hex_key)
+                    .map_err(|e| anyhow::anyhow!("HYPRSTREAM__OAUTH__USER_SIGNING_KEY: invalid hex: {e}"))?;
+                let arr: [u8; 32] = bytes
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("HYPRSTREAM__OAUTH__USER_SIGNING_KEY: expected 32 bytes"))?;
+                let sk = ed25519_dalek::SigningKey::from_bytes(&arr);
+                tracing::info!("Using user signing key from config (test bypass)");
+                return Ok(Some((sk.clone(), sk.verifying_key())));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Check for the `HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY` test bypass.
+    ///
+    /// Returns `Ok(Some(identity))` when the bypass is set and valid,
+    /// `Ok(None)` when not configured, `Err` when malformed.
+    pub fn credential_store_key_bypass() -> anyhow::Result<Option<age::x25519::Identity>> {
+        if let Ok(cfg) = Self::load() {
+            if let Some(ref age_key) = cfg.oauth.credential_store_key {
+                let identity = age_key
+                    .trim()
+                    .parse::<age::x25519::Identity>()
+                    .map_err(|e| anyhow::anyhow!("HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY: invalid age identity: {e}"))?;
+                return Ok(Some(identity));
+            }
+        }
+        Ok(None)
     }
 
     /// Create a default configuration for a specific model path

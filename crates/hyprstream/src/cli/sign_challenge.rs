@@ -160,40 +160,18 @@ fn handle_auth_code_flow(
 /// Load the user's Ed25519 signing key from the configured secrets directory.
 /// Returns (signing_key, username).
 fn load_user_signing_key() -> Result<(ed25519_dalek::SigningKey, String)> {
-    // Check for test bypass via config before touching the filesystem.
-    // Set HYPRSTREAM__OAUTH__USER_SIGNING_KEY=<hex32> to inject a pre-generated key.
-    let cfg = crate::config::HyprConfig::load();
-    if let Ok(ref cfg) = cfg {
-        if let Some(ref hex_key) = cfg.oauth.user_signing_key {
-            let bytes = hex::decode(hex_key)
-                .map_err(|e| anyhow::anyhow!("HYPRSTREAM__OAUTH__USER_SIGNING_KEY: invalid hex: {e}"))?;
-            let arr: [u8; 32] = bytes
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("HYPRSTREAM__OAUTH__USER_SIGNING_KEY: expected 32 bytes"))?;
-            let sk = ed25519_dalek::SigningKey::from_bytes(&arr);
-            let username = hyprstream_rpc::envelope::RequestIdentity::anonymous().user().to_owned();
-            return Ok((sk, username));
-        }
+    let username = hyprstream_rpc::envelope::RequestIdentity::anonymous().user().to_owned();
+
+    if let Some((sk, _vk)) = crate::config::HyprConfig::user_signing_key_bypass()? {
+        return Ok((sk, username));
     }
 
-    let secrets_dir = cfg
-        .map(|c| c.secrets.resolve_dir(c.config_dir()))
-        .unwrap_or_else(|_| {
-            dirs::config_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("/etc/hyprstream"))
-                .join("hyprstream")
-                .join("credentials")
-        });
-
+    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
     let (sk, _vk) = crate::auth::credentials::load_or_generate_user_signing_key(&secrets_dir)
         .map_err(|e| anyhow::anyhow!(
             "Could not load user signing key: {e}\n\
              Run 'hyprstream wizard' to set up your identity first."
         ))?;
-
-    let username = hyprstream_rpc::envelope::RequestIdentity::anonymous()
-        .user()
-        .to_owned();
 
     Ok((sk, username))
 }

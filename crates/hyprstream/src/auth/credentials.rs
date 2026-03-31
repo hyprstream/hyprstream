@@ -39,47 +39,43 @@ pub fn read_secret(dir: &std::path::Path, name: &str) -> Result<Option<Vec<u8>>>
 ///
 /// Creates `dir` with mode 0700 if it does not exist.  The resulting file has
 /// mode 0600.  Returns an error if the directory is not writable.
+///
+/// Uses `NamedTempFile` so the temporary file is automatically removed on any
+/// failure path — no stale `.{name}.tmp` files are left on disk.
 pub fn write_secret(dir: &std::path::Path, name: &str, value: &[u8]) -> Result<()> {
+    use std::io::Write as _;
     ensure_secrets_dir(dir)?;
     let path = dir.join(name);
 
-    // Write to a tempfile in the same directory, then rename for atomicity.
-    let tmp_path = dir.join(format!(".{name}.tmp"));
-    std::fs::write(&tmp_path, value)
-        .with_context(|| format!("failed to write temp secret '{}'", tmp_path.display()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .with_context(|| format!("failed to create temp file in '{}'", dir.display()))?;
+
+    tmp.write_all(value)
+        .with_context(|| format!("failed to write secret in '{}'", dir.display()))?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to chmod secret '{}'", tmp_path.display()))?;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to chmod secret in '{}'", dir.display()))?;
     }
 
-    std::fs::rename(&tmp_path, &path)
-        .with_context(|| format!("failed to rename secret to '{}'", path.display()))?;
+    tmp.persist(&path)
+        .with_context(|| format!("failed to persist secret to '{}'", path.display()))?;
 
     tracing::debug!("wrote secret '{}'", path.display());
     Ok(())
 }
 
 /// Returns `true` if `dir` exists and is writable (or can be created).
+///
+/// Uses `tempfile::tempfile_in` so no named probe file is left on disk,
+/// even if the process is killed during the check.
 pub fn is_writable(dir: &std::path::Path) -> bool {
     if !dir.exists() {
-        // Check whether the parent is writable instead.
-        return dir
-            .parent()
-            .map(is_writable)
-            .unwrap_or(false);
+        return dir.parent().map(is_writable).unwrap_or(false);
     }
-    // Probe by attempting to create (and immediately remove) a tempfile.
-    let probe = dir.join(".hyprstream-write-probe");
-    match std::fs::write(&probe, b"") {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-            true
-        }
-        Err(_) => false,
-    }
+    tempfile::tempfile_in(dir).is_ok()
 }
 
 /// Ensure the secrets directory exists with mode 0700.
@@ -114,14 +110,16 @@ fn missing_in_readonly(secrets_dir: &std::path::Path, name: &str) -> anyhow::Err
 
 // ─── High-level key loaders ─────────────────────────────────────────────────
 
-/// Load or generate the Ed25519 node signing key.
+/// Load or generate the Ed25519 **node** signing key (the root-of-trust key
+/// that identifies this Hyprstream instance).
 ///
-/// Callers **must** check the `config.signing_key` bypass before calling this.
+/// Callers **must** check `HyprConfig::node_signing_key_bypass()` before
+/// calling this. This function is pure file I/O with no config awareness.
 ///
 /// 1. Read `secrets_dir/signing-key` → return if present.
 /// 2. If writable: generate new key, write, return.
 /// 3. If read-only and missing: hard error.
-pub fn load_or_generate_signing_key(secrets_dir: &std::path::Path) -> Result<SigningKey> {
+pub fn load_or_generate_node_signing_key(secrets_dir: &std::path::Path) -> Result<SigningKey> {
     const NAME: &str = "signing-key";
 
     if let Some(bytes) = read_secret(secrets_dir, NAME)? {
@@ -146,6 +144,12 @@ pub fn load_or_generate_signing_key(secrets_dir: &std::path::Path) -> Result<Sig
     Ok(key)
 }
 
+/// Deprecated alias for [`load_or_generate_node_signing_key`].
+#[deprecated(since = "0.4.1", note = "renamed to load_or_generate_node_signing_key")]
+pub fn load_or_generate_signing_key(secrets_dir: &std::path::Path) -> Result<SigningKey> {
+    load_or_generate_node_signing_key(secrets_dir)
+}
+
 /// Load or generate the age credential-store key.
 ///
 /// Callers **must** check the `config.oauth.credential_store_key` bypass before
@@ -166,7 +170,7 @@ pub fn load_or_generate_credential_store_key(
         return s
             .trim()
             .parse::<age::x25519::Identity>()
-            .map_err(|e| anyhow!("failed to parse credential-store-key: {:?}", e));
+            .map_err(|e| anyhow!("failed to parse credential-store-key: {}", e));
     }
 
     let store_exists = store_file_path.exists();
@@ -352,6 +356,14 @@ pub fn load_or_generate_tls_materials_named(
 /// Check whether the persisted cert needs renewal.
 ///
 /// Returns `true` if the cert file's mtime is older than `(max_validity_days - 1)` days.
+///
+/// # Note on mtime-as-proxy
+///
+/// We use the cert file's mtime as a proxy for its `notBefore` date to avoid
+/// parsing DER. This is a heuristic: over-renewing is safe (one extra I/O on
+/// startup), while under-renewing could cause expired-cert errors in clients.
+/// Clock skew (mtime in the future) is handled conservatively — we trigger
+/// renewal rather than silently skipping it.
 fn cert_renewal_needed(secrets_dir: &std::path::Path, cert_name: &str, max_validity_days: u32) -> bool {
     let cert_path = secrets_dir.join(cert_name);
     let renewal_threshold = std::time::Duration::from_secs(
@@ -360,7 +372,13 @@ fn cert_renewal_needed(secrets_dir: &std::path::Path, cert_name: &str, max_valid
     match std::fs::metadata(&cert_path).and_then(|m| m.modified()) {
         Ok(mtime) => match mtime.elapsed() {
             Ok(age) => age >= renewal_threshold,
-            Err(_) => false,
+            Err(_) => {
+                tracing::warn!(
+                    "cert '{}': mtime is in the future (clock skew?); triggering renewal",
+                    cert_path.display()
+                );
+                true
+            }
         },
         Err(_) => true,
     }
@@ -417,6 +435,25 @@ mod tests {
     }
 
     #[test]
+    fn test_is_writable_leaves_no_probe_file() {
+        let dir = TempDir::new().unwrap();
+        assert!(is_writable(dir.path()));
+        let count = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(count, 0, "is_writable should not leave any files behind");
+    }
+
+    #[test]
+    fn test_write_secret_no_tmp_remnant() {
+        let dir = TempDir::new().unwrap();
+        write_secret(dir.path(), "mykey", b"value").unwrap();
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["mykey"], "only the final file should exist");
+    }
+
+    #[test]
     fn test_read_write_roundtrip() {
         let dir = TempDir::new().unwrap();
         let data = b"hello world";
@@ -446,7 +483,7 @@ mod tests {
     #[test]
     fn test_generate_on_first_run_writes_file() {
         let dir = TempDir::new().unwrap();
-        let key = load_or_generate_signing_key(dir.path()).unwrap();
+        let key = load_or_generate_node_signing_key(dir.path()).unwrap();
         assert_eq!(key.to_bytes().len(), 32);
         // File should now exist
         let raw = read_secret(dir.path(), "signing-key").unwrap().unwrap();
@@ -459,15 +496,19 @@ mod tests {
         // Write a known key
         let known = SigningKey::generate(&mut rand::rngs::OsRng);
         write_secret(dir.path(), "signing-key", &known.to_bytes()).unwrap();
-        let loaded = load_or_generate_signing_key(dir.path()).unwrap();
+        let loaded = load_or_generate_node_signing_key(dir.path()).unwrap();
         assert_eq!(loaded.to_bytes(), known.to_bytes());
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_signing_key_readonly_dir_fails() {
-        // Use a path that doesn't exist and whose parent is the root (unwritable).
-        let dir = std::path::PathBuf::from("/proc/hyprstream-test-readonly");
-        let result = load_or_generate_signing_key(&dir);
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = load_or_generate_node_signing_key(dir.path());
+        // Restore so TempDir::drop can clean up
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(result.is_err());
     }
 
@@ -575,7 +616,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         // Write 16 bytes instead of 32 — should produce a clear error.
         write_secret(dir.path(), "signing-key", &[0u8; 16]).unwrap();
-        let result = load_or_generate_signing_key(dir.path());
+        let result = load_or_generate_node_signing_key(dir.path());
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("32 bytes"),
@@ -606,9 +647,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_user_signing_key_readonly_dir_fails() {
-        let dir = std::path::PathBuf::from("/proc/hyprstream-test-readonly-user");
-        let result = load_or_generate_user_signing_key(&dir);
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = load_or_generate_user_signing_key(dir.path());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(result.is_err());
     }
 
@@ -627,19 +672,16 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_tls_materials_readonly_no_key_fails() {
-        // A non-existent path under /proc is not writable.
-        let dir = std::path::PathBuf::from("/proc/hyprstream-test-readonly-tls");
-        match load_or_generate_tls_materials(&dir, "localhost", 365) {
-            Ok(_) => panic!("expected error for read-only dir with no key"),
-            Err(e) => {
-                let msg = e.to_string();
-                assert!(
-                    msg.contains("not writable") || msg.contains("Re-run"),
-                    "unexpected error: {msg}"
-                );
-            }
-        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = load_or_generate_tls_materials(dir.path(), "localhost", 365);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        // The error may come from a read failure ("Permission denied") or from our
+        // explicit "not writable" / "Re-run" message — both are correct rejections.
+        assert!(result.is_err(), "expected error for unreadable/unwritable dir");
     }
 
     // ── cert_renewal_needed: mtime-based logic ───────────────────────────────
@@ -685,10 +727,14 @@ mod tests {
     // ── Credential store key: readonly + no store ────────────────────────────
 
     #[test]
+    #[cfg(unix)]
     fn test_credential_store_key_readonly_no_store_fails() {
-        let dir = std::path::PathBuf::from("/proc/hyprstream-test-readonly-credstore");
-        let store_path = dir.join("users.toml.age");
-        let result = load_or_generate_credential_store_key(&dir, &store_path);
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let store_path = dir.path().join("users.toml.age");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = load_or_generate_credential_store_key(dir.path(), &store_path);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(result.is_err());
     }
 }

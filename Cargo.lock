@@ -6225,6 +6225,7 @@ dependencies = [
  "uuid 1.18.1",
  "which 7.0.3",
  "zbus_systemd",
+ "zeroize",
  "zmq",
  "zmq-sys",
 ]

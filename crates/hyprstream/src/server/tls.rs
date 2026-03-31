@@ -27,30 +27,24 @@ pub struct TlsMaterials {
 }
 
 /// Shared self-signed TLS materials (generated once, reused across all services).
-static SHARED_TLS: OnceLock<TlsMaterials> = OnceLock::new();
+///
+/// Stored behind an `Arc` so callers share the same allocation rather than
+/// cloning key bytes on every call.
+static SHARED_TLS: OnceLock<Arc<TlsMaterials>> = OnceLock::new();
 
 /// Get or initialize the shared TLS materials.
 ///
-/// - If already initialized, returns a clone.
+/// - If already initialized, returns a clone of the `Arc` (no key bytes copied).
 /// - If both `cert_path`/`key_path` are set in config, loads from PEM files.
 /// - Otherwise, loads persisted materials from `secrets.path` (generating on first run).
 ///   The key is stable across restarts; certs are renewed when approaching expiry.
-pub fn get_or_init_tls_materials(config: &TlsConfig) -> anyhow::Result<TlsMaterials> {
+pub fn get_or_init_tls_materials(config: &TlsConfig) -> anyhow::Result<Arc<TlsMaterials>> {
     if let Some(existing) = SHARED_TLS.get() {
-        return Ok(existing.clone());
+        return Ok(Arc::clone(existing));
     }
 
     let materials = if config.use_self_signed() {
-        // Load or generate from the configured secrets directory.
-        let cfg = crate::config::HyprConfig::load();
-        let secrets_dir = cfg.as_ref()
-            .map(|c| c.secrets.resolve_dir(c.config_dir()))
-            .unwrap_or_else(|_| {
-                dirs::config_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("/etc/hyprstream"))
-                    .join("hyprstream")
-                    .join("credentials")
-            });
+        let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
         let server_name = &config.server_name;
         info!(
             "Loading/generating TLS materials (365-day validity) from '{}'",
@@ -86,8 +80,8 @@ pub fn get_or_init_tls_materials(config: &TlsConfig) -> anyhow::Result<TlsMateri
         TlsMaterials { cert_der, key_der }
     };
 
-    // If another thread beat us, use theirs
-    Ok(SHARED_TLS.get_or_init(|| materials).clone())
+    // If another thread beat us, use theirs (Arc::clone, no key bytes copied)
+    Ok(Arc::clone(SHARED_TLS.get_or_init(|| Arc::new(materials))))
 }
 
 /// Resolve the rustls configuration for a service.
@@ -128,7 +122,7 @@ pub async fn resolve_rustls_config(
     // Shared materials (self-signed or from global [tls] config)
     let materials = get_or_init_tls_materials(tls_config)?;
     let rustls_config = axum_server::tls_rustls::RustlsConfig::from_der(
-        vec![materials.cert_der],
+        vec![materials.cert_der.clone()],
         (*materials.key_der).clone(),
     )
     .await

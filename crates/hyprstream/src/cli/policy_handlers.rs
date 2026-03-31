@@ -24,7 +24,6 @@ use hyprstream_rpc::prelude::*;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
-use tracing::info;
 
 /// Create a PolicyClient for RPC calls.
 fn create_policy_client(signing_key: &SigningKey) -> PolicyClient {
@@ -395,38 +394,19 @@ pub async fn handle_token_create(
 /// Load or generate the Ed25519 node signing key from the configured secrets
 /// directory.
 ///
-/// The `_keys_dir` parameter is retained for API compatibility but unused; the
-/// actual path is resolved from `config.secrets`.
+/// The `_keys_dir` parameter is retained for API compatibility but ignored; the
+/// actual path is always resolved via `HyprConfig::resolve_secrets_dir()`.
 ///
 /// Resolution order:
 /// 1. `HYPRSTREAM__SIGNING_KEY` / `config.signing_key` test bypass.
 /// 2. File at `<secrets_dir>/signing-key`.
 /// 3. Generate new key, write to file (writable dir only).
 pub async fn load_or_generate_signing_key(_keys_dir: &Path) -> Result<SigningKey> {
-    // Check for test bypass via config before touching the filesystem.
-    // Set HYPRSTREAM__SIGNING_KEY=<hex32> to inject a pre-generated key.
-    let cfg = crate::config::HyprConfig::load();
-    if let Ok(ref cfg) = cfg {
-        if let Some(ref hex_key) = cfg.signing_key {
-            let bytes = hex::decode(hex_key)
-                .map_err(|e| anyhow::anyhow!("HYPRSTREAM__SIGNING_KEY: invalid hex: {e}"))?;
-            let arr: [u8; 32] = bytes.try_into()
-                .map_err(|_| anyhow::anyhow!("HYPRSTREAM__SIGNING_KEY: expected 32 bytes"))?;
-            tracing::info!("Using node signing key from config (test bypass)");
-            return Ok(SigningKey::from_bytes(&arr));
-        }
+    if let Some(sk) = crate::config::HyprConfig::node_signing_key_bypass()? {
+        return Ok(sk);
     }
-
-    let secrets_dir = cfg
-        .map(|c| c.secrets.resolve_dir(c.config_dir()))
-        .unwrap_or_else(|_| {
-            dirs::config_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("/etc/hyprstream"))
-                .join("hyprstream")
-                .join("credentials")
-        });
-
-    crate::auth::credentials::load_or_generate_signing_key(&secrets_dir)
+    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
+    crate::auth::credentials::load_or_generate_node_signing_key(&secrets_dir)
 }
 
 /// Mint a JWT locally with proper iss/aud claims.
@@ -459,38 +439,24 @@ pub(crate) fn mint_local_token(
     (token, exp)
 }
 
-/// Ensure the local user has an Ed25519 identity keypair.
+/// Ensure the local user has an Ed25519 signing keypair.
 ///
 /// Loads from `<secrets_dir>/user-signing-key`, generating on first run.
 /// This key is per-OS-user (not per-hyprstream-user). The wizard only
 /// registers it for the local admin. Other users generate their own keys.
-pub(crate) fn ensure_user_identity() -> Result<(SigningKey, ed25519_dalek::VerifyingKey)> {
-    // Check for test bypass via config before touching the filesystem.
-    // Set HYPRSTREAM__OAUTH__USER_SIGNING_KEY=<hex32> to inject a pre-generated key.
-    let cfg = crate::config::HyprConfig::load();
-    if let Ok(ref cfg) = cfg {
-        if let Some(ref hex_key) = cfg.oauth.user_signing_key {
-            let bytes = hex::decode(hex_key)
-                .map_err(|e| anyhow::anyhow!("HYPRSTREAM__OAUTH__USER_SIGNING_KEY: invalid hex: {e}"))?;
-            let arr: [u8; 32] = bytes
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("HYPRSTREAM__OAUTH__USER_SIGNING_KEY: expected 32 bytes"))?;
-            let sk = SigningKey::from_bytes(&arr);
-            info!("Using user signing key from config (test bypass)");
-            return Ok((sk.clone(), sk.verifying_key()));
-        }
+pub(crate) fn ensure_user_signing_key() -> Result<(SigningKey, ed25519_dalek::VerifyingKey)> {
+    if let Some(pair) = crate::config::HyprConfig::user_signing_key_bypass()? {
+        return Ok(pair);
     }
-
-    let secrets_dir = cfg
-        .map(|c| c.secrets.resolve_dir(c.config_dir()))
-        .unwrap_or_else(|_| {
-            dirs::config_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("/etc/hyprstream"))
-                .join("hyprstream")
-                .join("credentials")
-        });
-
+    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
     crate::auth::credentials::load_or_generate_user_signing_key(&secrets_dir)
+}
+
+/// Deprecated alias kept for call-site compatibility during transition.
+#[deprecated(since = "0.4.1", note = "renamed to ensure_user_signing_key")]
+#[allow(dead_code)]
+pub(crate) fn ensure_user_identity() -> Result<(SigningKey, ed25519_dalek::VerifyingKey)> {
+    ensure_user_signing_key()
 }
 
 /// Parse duration string like "30d", "90d", "1y", "never"

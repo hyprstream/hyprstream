@@ -68,27 +68,10 @@ impl LocalKeyStore {
     /// in the environment to inject the original key, or delete the credential store
     /// file to start fresh.
     fn load_or_generate_identity(store_path: &Path) -> Result<age::x25519::Identity> {
-        // Check for test bypass via config before touching the filesystem.
-        // Set HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY=<age-secret-key-...> to inject a key.
-        let cfg = crate::config::HyprConfig::load();
-        if let Ok(ref cfg) = cfg {
-            if let Some(ref age_key) = cfg.oauth.credential_store_key {
-                return age_key
-                    .trim()
-                    .parse::<age::x25519::Identity>()
-                    .map_err(|e| anyhow!("HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY: invalid age identity: {:?}", e));
-            }
+        if let Some(identity) = crate::config::HyprConfig::credential_store_key_bypass()? {
+            return Ok(identity);
         }
-
-        let secrets_dir = cfg
-            .map(|c| c.secrets.resolve_dir(c.config_dir()))
-            .unwrap_or_else(|_| {
-                dirs::config_dir()
-                    .unwrap_or_else(|| PathBuf::from("/etc/hyprstream"))
-                    .join("hyprstream")
-                    .join("credentials")
-            });
-
+        let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
         crate::auth::credentials::load_or_generate_credential_store_key(&secrets_dir, store_path)
     }
 
