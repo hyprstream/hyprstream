@@ -138,7 +138,10 @@ pub fn load_or_generate_node_signing_key(secrets_dir: &std::path::Path) -> Resul
     }
 
     let key = SigningKey::generate(&mut rand::rngs::OsRng);
-    write_secret(secrets_dir, NAME, &key.to_bytes())?;
+    let mut raw = key.to_bytes();
+    let result = write_secret(secrets_dir, NAME, &raw);
+    raw.zeroize();
+    result?;
     tracing::info!(
         "Generated new Ed25519 signing key → '{}/{}'",
         secrets_dir.display(),
@@ -257,7 +260,10 @@ pub fn load_or_generate_user_signing_key(
     }
 
     let sk = SigningKey::generate(&mut rand::rngs::OsRng);
-    write_secret(secrets_dir, NAME, &sk.to_bytes())?;
+    let mut raw = sk.to_bytes();
+    let result = write_secret(secrets_dir, NAME, &raw);
+    raw.zeroize();
+    result?;
     let vk = sk.verifying_key();
     tracing::info!(
         "Generated new user signing key → '{}/{}'",
