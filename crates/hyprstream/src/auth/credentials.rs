@@ -401,6 +401,21 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    // ── Helpers ──────────────────────────────────────────────────────────────
+
+    /// Back-date a file's mtime by `days` days using nix utimes.
+    #[cfg(unix)]
+    fn backdate_mtime(path: &std::path::Path, days: i64) {
+        use nix::sys::time::TimeVal;
+        let past_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - days * 86_400;
+        let tv = TimeVal::new(past_secs, 0);
+        nix::sys::stat::utimes(path, &tv, &tv).unwrap();
+    }
+
     #[test]
     fn test_read_write_roundtrip() {
         let dir = TempDir::new().unwrap();
@@ -520,5 +535,160 @@ mod tests {
         let h2 = Sha256::digest(&m2.cert_der);
         // Hashes differ because cert timestamps differ
         assert_ne!(h1, h2);
+    }
+
+    // ── Directory mode 0700 ──────────────────────────────────────────────────
+
+    #[test]
+    #[cfg(unix)]
+    fn test_ensure_dir_mode_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = TempDir::new().unwrap();
+        let secrets_dir = parent.path().join("new-secrets");
+        // Dir does not exist yet; write_secret should create it with mode 0700.
+        write_secret(&secrets_dir, "k", b"v").unwrap();
+        let meta = std::fs::metadata(&secrets_dir).unwrap();
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o700,
+            "secrets dir should be 0700, got {:o}",
+            meta.permissions().mode() & 0o777
+        );
+    }
+
+    // ── Binary data roundtrip ────────────────────────────────────────────────
+
+    #[test]
+    fn test_read_write_binary_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        // Include null bytes and high-bit bytes to verify binary fidelity.
+        let data: Vec<u8> = (0u8..=255).collect();
+        write_secret(dir.path(), "binary-key", &data).unwrap();
+        let loaded = read_secret(dir.path(), "binary-key").unwrap().unwrap();
+        assert_eq!(loaded, data);
+    }
+
+    // ── Invalid signing key length ───────────────────────────────────────────
+
+    #[test]
+    fn test_load_signing_key_wrong_length_errors() {
+        let dir = TempDir::new().unwrap();
+        // Write 16 bytes instead of 32 — should produce a clear error.
+        write_secret(dir.path(), "signing-key", &[0u8; 16]).unwrap();
+        let result = load_or_generate_signing_key(dir.path());
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("32 bytes"),
+            "error should mention expected 32-byte length"
+        );
+    }
+
+    #[test]
+    fn test_load_user_signing_key_wrong_length_errors() {
+        let dir = TempDir::new().unwrap();
+        write_secret(dir.path(), "user-signing-key", &[0u8; 64]).unwrap();
+        let result = load_or_generate_user_signing_key(dir.path());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("32 bytes"));
+    }
+
+    // ── User signing key: generate + readonly paths ──────────────────────────
+
+    #[test]
+    fn test_user_signing_key_generates_on_first_run() {
+        let dir = TempDir::new().unwrap();
+        let (sk, vk) = load_or_generate_user_signing_key(dir.path()).unwrap();
+        assert_eq!(sk.to_bytes().len(), 32);
+        assert_eq!(vk.as_bytes().len(), 32);
+        // Key file should now exist.
+        let raw = read_secret(dir.path(), "user-signing-key").unwrap().unwrap();
+        assert_eq!(raw, sk.to_bytes().as_slice());
+    }
+
+    #[test]
+    fn test_user_signing_key_readonly_dir_fails() {
+        let dir = std::path::PathBuf::from("/proc/hyprstream-test-readonly-user");
+        let result = load_or_generate_user_signing_key(&dir);
+        assert!(result.is_err());
+    }
+
+    // ── TLS: initial key+cert generation (the (None, _) branch) ────────────
+
+    #[test]
+    fn test_tls_materials_initial_generation() {
+        let dir = TempDir::new().unwrap();
+        // No pre-existing key or cert.
+        let m = load_or_generate_tls_materials(dir.path(), "localhost", 365).unwrap();
+        assert!(!m.cert_der.is_empty(), "cert_der should be non-empty");
+        assert!(!m.key_der.is_empty(), "key_der should be non-empty");
+        // Both files should have been written.
+        assert!(dir.path().join("tls-key").exists(), "tls-key file should exist");
+        assert!(dir.path().join("tls-cert").exists(), "tls-cert file should exist");
+    }
+
+    #[test]
+    fn test_tls_materials_readonly_no_key_fails() {
+        // A non-existent path under /proc is not writable.
+        let dir = std::path::PathBuf::from("/proc/hyprstream-test-readonly-tls");
+        match load_or_generate_tls_materials(&dir, "localhost", 365) {
+            Ok(_) => panic!("expected error for read-only dir with no key"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("not writable") || msg.contains("Re-run"),
+                    "unexpected error: {msg}"
+                );
+            }
+        }
+    }
+
+    // ── cert_renewal_needed: mtime-based logic ───────────────────────────────
+
+    #[test]
+    #[cfg(unix)]
+    fn test_cert_renewal_not_needed_for_fresh_cert() {
+        let dir = TempDir::new().unwrap();
+        write_secret(dir.path(), "tls-cert", b"fake-cert-data").unwrap();
+        // A freshly created file should not need renewal under a 365-day window.
+        assert!(!cert_renewal_needed(dir.path(), "tls-cert", 365));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_cert_renewal_needed_for_old_cert() {
+        let dir = TempDir::new().unwrap();
+        write_secret(dir.path(), "tls-cert", b"fake-cert-data").unwrap();
+        let cert_path = dir.path().join("tls-cert");
+        // Backdate the cert file mtime by 365 days.
+        backdate_mtime(&cert_path, 365);
+        // Now renewal should be triggered (elapsed >= 364 days = threshold for 365d validity).
+        assert!(cert_renewal_needed(dir.path(), "tls-cert", 365));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_cert_renewal_triggers_regen_with_same_key() {
+        use sha2::{Digest, Sha256};
+        let dir = TempDir::new().unwrap();
+        let m1 = load_or_generate_tls_materials(dir.path(), "localhost", 365).unwrap();
+        // Backdate the cert file to trigger mtime-based renewal.
+        backdate_mtime(&dir.path().join("tls-cert"), 365);
+        let m2 = load_or_generate_tls_materials(dir.path(), "localhost", 365).unwrap();
+        // Key bytes must be unchanged (stable key = stable cert hash lineage).
+        assert_eq!(*m1.key_der, *m2.key_der, "key must be reused on cert renewal");
+        // Cert is a different DER (different timestamps).
+        let h1 = Sha256::digest(&m1.cert_der);
+        let h2 = Sha256::digest(&m2.cert_der);
+        assert_ne!(h1, h2, "renewed cert should have different DER due to new timestamps");
+    }
+
+    // ── Credential store key: readonly + no store ────────────────────────────
+
+    #[test]
+    fn test_credential_store_key_readonly_no_store_fails() {
+        let dir = std::path::PathBuf::from("/proc/hyprstream-test-readonly-credstore");
+        let store_path = dir.join("users.toml.age");
+        let result = load_or_generate_credential_store_key(&dir, &store_path);
+        assert!(result.is_err());
     }
 }
