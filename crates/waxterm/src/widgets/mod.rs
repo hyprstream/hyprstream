@@ -6,12 +6,16 @@
 
 mod confirm;
 mod multi_select;
+pub mod numeric_field;
 mod select_list;
+pub mod settings_form;
 mod text_input;
 
 pub use confirm::ConfirmDialog;
 pub use multi_select::MultiSelectList;
+pub use numeric_field::NumericField;
 pub use select_list::SelectList;
+pub use settings_form::SettingsForm;
 pub use text_input::TextInput;
 
 /// Result of a widget's key handling.

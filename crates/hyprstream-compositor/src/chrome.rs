@@ -151,13 +151,32 @@ pub struct ContainerEntry {
     pub mem_mb: Option<u64>,
 }
 
-/// A model repo entry.
-#[derive(Clone)]
+/// Generation parameter defaults from the model's generation_config.json,
+/// served via the model status RPC. All fields are Option — None means
+/// "model has no opinion, use server default."
+/// Adjusting a None field via the settings UI promotes it to Some.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct GenerationDefaults {
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<usize>,
+    pub max_tokens: Option<usize>,
+    pub context_window: Option<usize>,
+}
+
+impl GenerationDefaults {
+    /// Number of user-adjustable fields in the pre-chat settings modal.
+    /// Must match the fields array in render.rs and the match arms in apply_gen_field_delta.
+    pub const NUM_FIELDS: usize = 5;
+}
+
+#[derive(Clone, Debug)]
 pub struct ModelEntry {
     pub model_ref: String,
     pub path: PathBuf,
     pub loaded: bool,
     pub loading: bool,
+    pub gen_defaults: GenerationDefaults,
 }
 
 impl std::fmt::Display for ModelEntry {
@@ -194,11 +213,21 @@ pub struct PaneSummary {
 // ShellMode
 // ============================================================================
 
+/// What kind of conversation picker entry this is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConversationKind {
+    /// Create a new private (client-owned, encrypted) conversation.
+    NewPrivate,
+    /// Create a new server-side conversation.
+    NewServer,
+    /// Resume an existing conversation by UUID.
+    Resume { uuid: String },
+}
+
 /// Entry in the conversation picker.
 #[derive(Clone, Debug)]
 pub struct ConversationPickerEntry {
-    /// UUID as string (avoids uuid dependency in compositor).
-    pub uuid: String,
+    pub kind: ConversationKind,
     pub label: String,
     pub last_active: u64,
 }
@@ -238,15 +267,80 @@ pub enum ShellMode {
         image_sel: usize,
         input_mode: Option<InputDialog>,
     },
+    /// Pre-chat generation settings before starting a new conversation.
+    PreChatSettings(Box<PreChatSettingsState>),
+}
+
+/// State for the pre-chat settings modal.
+pub struct PreChatSettingsState {
+    pub model_ref: String,
+    pub defaults: GenerationDefaults,
+    pub form: waxterm::widgets::SettingsForm,
+    pub chat_type: PreChatType,
+}
+
+/// Build a SettingsForm from GenerationDefaults.
+pub fn build_settings_form(defaults: &GenerationDefaults) -> waxterm::widgets::SettingsForm {
+    use waxterm::widgets::NumericField;
+    waxterm::widgets::SettingsForm::new(vec![
+        NumericField::new("Max Tokens").integer().range(64.0, 32768.0).step(64.0)
+            .value(defaults.max_tokens.map(|v| v as f64)).none_label("default"),
+        NumericField::new("Temperature").float(2).range(0.0, 2.0).step(0.05)
+            .value(defaults.temperature.map(|v| v as f64)).none_label("default"),
+        NumericField::new("Top-P").float(2).range(0.05, 1.0).step(0.05)
+            .value(defaults.top_p.map(|v| v as f64)).none_label("default"),
+        NumericField::new("Top-K").integer().range(1.0, 200.0).step(1.0)
+            .value(defaults.top_k.map(|v| v as f64)).none_label("off"),
+        NumericField::new("Context Window").integer().range(512.0, 131072.0).step(512.0)
+            .value(defaults.context_window.map(|v| v as f64)).none_label("model default"),
+    ])
+}
+
+/// Extract GenerationDefaults from a SettingsForm's current values.
+pub fn form_to_generation_defaults(form: &waxterm::widgets::SettingsForm) -> GenerationDefaults {
+    let vals = form.values();
+    GenerationDefaults {
+        max_tokens: vals.first().copied().flatten().map(|v| v as usize),
+        temperature: vals.get(1).copied().flatten().map(|v| v as f32),
+        top_p: vals.get(2).copied().flatten().map(|v| v as f32),
+        top_k: vals.get(3).copied().flatten().map(|v| v as usize),
+        context_window: vals.get(4).copied().flatten().map(|v| v as usize),
+    }
+}
+
+/// Whether the new conversation is private or server-side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreChatType {
+    Private,
+    Server,
 }
 
 /// Menu items: (label, chord hint shown in popup).
+#[cfg(feature = "experimental")]
 pub const MENU_ITEMS: &[(&str, &str)] = &[
     ("New",        "N"),
     ("Close",      "Q"),
     ("Cycle",      "Tab"),
     ("Models",     "M"),
+    ("Log",        "L"),
+    ("Workers",    "W"),
+    ("Services",   "V"),
     ("Settings",   "S"),
+    ("Fullscreen", "F"),
+    ("Disconnect", "D"),
+];
+
+/// Menu items: (label, chord hint shown in popup).
+#[cfg(not(feature = "experimental"))]
+pub const MENU_ITEMS: &[(&str, &str)] = &[
+    ("New",        "N"),
+    ("Close",      "Q"),
+    ("Cycle",      "Tab"),
+    ("Models",     "M"),
+    ("Log",        "L"),
+    ("Workers",    "W"),
+    ("Settings",   "S"),
+    ("Fullscreen", "F"),
     ("Disconnect", "D"),
 ];
 
@@ -271,6 +365,7 @@ pub enum RpcRequest {
         cols: u16,
         rows: u16,
         pane_id: u32,
+        gen_defaults: Option<GenerationDefaults>,
     },
     /// Client-local private chat — no server round-trip required.
     /// If `resume_uuid` is Some, resumes an existing conversation.
@@ -279,6 +374,7 @@ pub enum RpcRequest {
         cols: u16,
         rows: u16,
         resume_uuid: Option<String>,
+        gen_defaults: Option<GenerationDefaults>,
     },
     /// Delete a private conversation (UUID as string).
     DeleteConversation {
@@ -354,6 +450,8 @@ pub struct ShellChrome {
     pub worker_pool_summary: String,
     /// Image list for the Images tab.
     pub image_list: Vec<ImageEntry>,
+    /// Model ref waiting for load to complete before opening conversation picker.
+    pub pending_picker_model: Option<String>,
 }
 
 impl ShellChrome {
@@ -394,11 +492,13 @@ impl ShellChrome {
             worker_list: Vec::new(),
             worker_pool_summary: String::new(),
             image_list: Vec::new(),
+            pending_picker_model: None,
         }
     }
 
     /// Update model loaded status (called from background polling results).
-    pub fn update_model_status(&mut self, model_ref: &str, loaded: bool) {
+    /// Returns a follow-up RPC if a conversation picker was pending for this model.
+    pub fn update_model_status(&mut self, model_ref: &str, loaded: bool) -> Option<RpcRequest> {
         let mut was_loading = false;
         for entry in self.model_list.items_mut() {
             if entry.model_ref == model_ref {
@@ -410,6 +510,24 @@ impl ShellChrome {
         if was_loading && loaded {
             self.push_toast(format!("Loaded {model_ref}"), ToastLevel::Info);
         }
+        // Check if a conversation picker was waiting for this model.
+        if let Some(ref pending) = self.pending_picker_model {
+            if pending == model_ref {
+                if loaded {
+                    // Only auto-open picker if user is still in a relevant context.
+                    if matches!(self.mode, ShellMode::ModelList | ShellMode::Normal) {
+                        let mr = pending.clone();
+                        self.pending_picker_model = None;
+                        return Some(RpcRequest::ListConversations { model_ref: mr });
+                    }
+                    // User navigated to another modal — leave pending for later.
+                } else {
+                    // Load failed — clear pending.
+                    self.pending_picker_model = None;
+                }
+            }
+        }
+        None
     }
 
     /// Update window list (called when TuiService reports window changes).
@@ -534,6 +652,7 @@ impl ShellChrome {
                     }
                     self.handle_worker_manager(key, sandbox_sel, container_sel, show_containers, tab, image_sel)
                 }
+            ShellMode::PreChatSettings(_) => self.handle_pre_chat_settings(key),
         }
     }
 
@@ -541,40 +660,6 @@ impl ShellChrome {
 
     fn handle_normal(&mut self, key: KeyPress) -> Vec<ChromeOutput> {
         match key {
-            KeyPress::F(12) => vec![ChromeOutput::Rpc(RpcRequest::Quit)],
-            KeyPress::F(9) => {
-                self.console_scroll = self.console_log.len().saturating_sub(1);
-                self.mode = ShellMode::Console;
-                vec![ChromeOutput::Redraw]
-            }
-            KeyPress::F(10) => {
-                self.mode = ShellMode::ModelList;
-                vec![ChromeOutput::Redraw]
-            }
-            KeyPress::F(11) => {
-                self.saved_style = self.bg.style;
-                let idx = ALL_STYLES.iter().position(|s| *s == self.bg.style).unwrap_or(0);
-                self.settings_list = SelectList::new("Background", ALL_STYLES.to_vec())
-                    .with_selected(idx);
-                self.preview_bg.style = self.bg.style;
-                self.mode = ShellMode::Settings;
-                vec![ChromeOutput::Redraw]
-            }
-            KeyPress::F(7) => {
-                let sid = self.session_id;
-                vec![ChromeOutput::Rpc(RpcRequest::CreateWindow { session_id: sid })]
-            }
-            KeyPress::F(8) => {
-                if let Some(win) = self.windows.get(self.active_win) {
-                    let sid = self.session_id;
-                    let wid = win.id;
-                    return vec![ChromeOutput::Rpc(RpcRequest::CloseWindow {
-                        session_id: sid,
-                        window_id: wid,
-                    })];
-                }
-                vec![]
-            }
             KeyPress::CtrlSpace => {
                 self.mode = ShellMode::StartMenu { selected: 0 };
                 vec![ChromeOutput::Redraw]
@@ -587,18 +672,6 @@ impl ShellChrome {
             KeyPress::Char(0x02) => {
                 // Ctrl-B — handled at event loop level; chrome does nothing.
                 vec![]
-            }
-            #[cfg(feature = "experimental")]
-            KeyPress::F(5) => {
-                self.mode = ShellMode::ServiceManager { selected: 0 };
-                vec![ChromeOutput::Redraw]
-            }
-            KeyPress::F(6) => {
-                self.mode = ShellMode::WorkerManager {
-                    sandbox_sel: 0, container_sel: 0, show_containers: false,
-                    tab: WorkerTab::Sandboxes, image_sel: 0, input_mode: None,
-                };
-                vec![ChromeOutput::Redraw]
             }
             key => {
                 let bytes = keypress_to_bytes(key);
@@ -621,7 +694,7 @@ impl ShellChrome {
     // ── ModelList mode ───────────────────────────────────────────────────────
 
     fn handle_model_list(&mut self, key: KeyPress) -> Vec<ChromeOutput> {
-        // l — submit load request
+        // l — submit load request (power-user preload, no pending picker)
         if matches!(key, KeyPress::Char(b'l' | b'L')) {
             if let Some(model) = self.model_list.selected_item().cloned() {
                 let model_ref = model.model_ref.clone();
@@ -641,41 +714,12 @@ impl ShellChrome {
                 return vec![ChromeOutput::Rpc(RpcRequest::UnloadModel { model_ref })];
             }
         }
-        // c (lowercase) — private chat (client-owned, encrypted history)
-        if matches!(key, KeyPress::Char(b'c')) {
-            if let Some(model) = self.model_list.selected_item().cloned() {
-                let model_ref = model.model_ref.clone();
-                self.mode = ShellMode::Normal;
-                return vec![ChromeOutput::Rpc(RpcRequest::ListConversations {
-                    model_ref,
-                })];
-            }
-        }
-        // C (shift) / Enter — server-side chat
-        let is_server_chat = matches!(key, KeyPress::Enter | KeyPress::Char(b'C'));
-        if is_server_chat {
-            if let Some(model) = self.model_list.selected_item().cloned() {
-                let sid  = self.session_id;
-                let cols = self.cols;
-                let rows = self.pane_rows;
-                let mref = model.model_ref.clone();
-                self.mode = ShellMode::Normal;
-                // SpawnServerChat handler creates its own window; no separate CreateWindow.
-                return vec![ChromeOutput::Rpc(RpcRequest::SpawnServerChat {
-                    session_id: sid,
-                    model_ref: mref,
-                    cols, rows,
-                    pane_id: 0,
-                })];
-            }
-        }
         // T — terminal in model worktree
         if matches!(key, KeyPress::Char(b't' | b'T')) {
             if let Some(model) = self.model_list.selected_item().cloned() {
                 let cwd = model.path.to_string_lossy().into_owned();
                 let sid = self.session_id;
                 self.mode = ShellMode::Normal;
-                // SpawnShell handler creates its own window when pane_id == 0.
                 return vec![ChromeOutput::Rpc(RpcRequest::SpawnShell {
                     session_id: sid,
                     pane_id: 0,
@@ -686,29 +730,44 @@ impl ShellChrome {
 
         match self.model_list.handle_key(&key) {
             WidgetResult::Cancelled => {
+                self.pending_picker_model = None;
                 self.mode = ShellMode::Normal;
                 vec![ChromeOutput::Redraw]
             }
             WidgetResult::Confirmed(model) => {
-                let sid  = self.session_id;
-                let cols = self.cols;
-                let rows = self.pane_rows;
-                let mref = model.model_ref.clone();
-                self.mode = ShellMode::Normal;
-                // SpawnServerChat handler creates its own window; no separate CreateWindow.
-                vec![ChromeOutput::Rpc(RpcRequest::SpawnServerChat {
-                    session_id: sid,
-                    model_ref: mref,
-                    cols, rows,
-                    pane_id: 0,
-                })]
+                self.enter_chat_for_model(&model)
             }
             WidgetResult::Pending => {
-                if matches!(key, KeyPress::F(10)) {
-                    self.mode = ShellMode::Normal;
-                }
                 vec![ChromeOutput::Redraw]
             }
+        }
+    }
+
+    /// Unified Enter handler: auto-load if needed, then open conversation picker.
+    fn enter_chat_for_model(&mut self, model: &ModelEntry) -> Vec<ChromeOutput> {
+        let model_ref = model.model_ref.clone();
+        if model.loaded {
+            // Model ready — open conversation picker immediately.
+            self.mode = ShellMode::Normal;
+            vec![ChromeOutput::Rpc(RpcRequest::ListConversations { model_ref })]
+        } else if model.loading {
+            // Already loading — stash pending picker, stay in ModelList.
+            self.pending_picker_model = Some(model_ref.clone());
+            self.push_toast(
+                format!("Waiting for {model_ref} to load\u{2026}"),
+                ToastLevel::Info,
+            );
+            vec![ChromeOutput::Redraw]
+        } else {
+            // Not loaded — auto-load and stash pending picker.
+            self.pending_picker_model = Some(model_ref.clone());
+            self.push_toast(format!("Loading {model_ref}\u{2026}"), ToastLevel::Info);
+            for entry in self.model_list.items_mut() {
+                if entry.model_ref == model_ref {
+                    entry.loading = true;
+                }
+            }
+            vec![ChromeOutput::Rpc(RpcRequest::LoadModel { model_ref })]
         }
     }
 
@@ -717,12 +776,26 @@ impl ShellChrome {
     fn handle_start_menu(&mut self, key: KeyPress, selected: usize) -> Vec<ChromeOutput> {
         let n = MENU_ITEMS.len();
         let chord: Option<usize> = match key {
-            KeyPress::Char(b'n' | b'N') => Some(0),
-            KeyPress::Char(b'q' | b'Q') => Some(1),
-            KeyPress::Tab               => Some(2),
-            KeyPress::Char(b'm' | b'M') => Some(3),
-            KeyPress::Char(b's' | b'S') => Some(4),
-            KeyPress::Char(b'd' | b'D') => Some(5),
+            KeyPress::Char(b'n' | b'N') => Some(0),  // New
+            KeyPress::Char(b'q' | b'Q') => Some(1),  // Close
+            KeyPress::Tab               => Some(2),   // Cycle
+            KeyPress::Char(b'm' | b'M') => Some(3),  // Models
+            KeyPress::Char(b'l' | b'L') => Some(4),  // Log
+            KeyPress::Char(b'w' | b'W') => Some(5),  // Workers
+            #[cfg(feature = "experimental")]
+            KeyPress::Char(b'v' | b'V') => Some(6),  // Services
+            KeyPress::Char(b's' | b'S') => {
+                #[cfg(feature = "experimental")]     { Some(7) }
+                #[cfg(not(feature = "experimental"))] { Some(6) }
+            }
+            KeyPress::Char(b'f' | b'F') => {
+                #[cfg(feature = "experimental")]     { Some(8) }
+                #[cfg(not(feature = "experimental"))] { Some(7) }
+            }
+            KeyPress::Char(b'd' | b'D') => {
+                #[cfg(feature = "experimental")]     { Some(9) }
+                #[cfg(not(feature = "experimental"))] { Some(8) }
+            }
             _ => None,
         };
         if let Some(idx) = chord {
@@ -750,8 +823,25 @@ impl ShellChrome {
         vec![ChromeOutput::Redraw]
     }
 
-    fn execute_menu_action(&mut self, idx: usize) -> Vec<ChromeOutput> {
+    pub(crate) fn execute_menu_action(&mut self, idx: usize) -> Vec<ChromeOutput> {
         let sid = self.session_id;
+
+        // Indices for items that shift when "Services" is present (experimental).
+        #[cfg(feature = "experimental")]
+        const SERVICES_IDX: usize = 6;
+        #[cfg(feature = "experimental")]
+        const SETTINGS_IDX: usize = 7;
+        #[cfg(not(feature = "experimental"))]
+        const SETTINGS_IDX: usize = 6;
+        #[cfg(feature = "experimental")]
+        const FULLSCREEN_IDX: usize = 8;
+        #[cfg(not(feature = "experimental"))]
+        const FULLSCREEN_IDX: usize = 7;
+        #[cfg(feature = "experimental")]
+        const DISCONNECT_IDX: usize = 9;
+        #[cfg(not(feature = "experimental"))]
+        const DISCONNECT_IDX: usize = 8;
+
         match idx {
             0 => vec![ChromeOutput::Rpc(RpcRequest::CreateWindow { session_id: sid })],
             1 => {
@@ -783,6 +873,25 @@ impl ShellChrome {
                 vec![ChromeOutput::Redraw]
             }
             4 => {
+                // Log (console)
+                self.console_scroll = self.console_log.len().saturating_sub(1);
+                self.mode = ShellMode::Console;
+                vec![ChromeOutput::Redraw]
+            }
+            5 => {
+                // Workers
+                self.mode = ShellMode::WorkerManager {
+                    sandbox_sel: 0, container_sel: 0, show_containers: false,
+                    tab: WorkerTab::Sandboxes, image_sel: 0, input_mode: None,
+                };
+                vec![ChromeOutput::Redraw]
+            }
+            #[cfg(feature = "experimental")]
+            SERVICES_IDX => {
+                self.mode = ShellMode::ServiceManager { selected: 0 };
+                vec![ChromeOutput::Redraw]
+            }
+            SETTINGS_IDX => {
                 self.saved_style = self.bg.style;
                 let i = ALL_STYLES.iter().position(|s| *s == self.bg.style).unwrap_or(0);
                 self.settings_list = SelectList::new("Background", ALL_STYLES.to_vec())
@@ -791,7 +900,11 @@ impl ShellChrome {
                 self.mode = ShellMode::Settings;
                 vec![ChromeOutput::Redraw]
             }
-            5 => vec![ChromeOutput::Rpc(RpcRequest::Quit)],
+            FULLSCREEN_IDX => {
+                self.mode = ShellMode::Fullscreen;
+                vec![ChromeOutput::Redraw]
+            }
+            DISCONNECT_IDX => vec![ChromeOutput::Rpc(RpcRequest::Quit)],
             _ => vec![],
         }
     }
@@ -811,7 +924,7 @@ impl ShellChrome {
                 }
                 vec![ChromeOutput::Redraw]
             }
-            KeyPress::Escape | KeyPress::F(9) => {
+            KeyPress::Escape => {
                 self.mode = ShellMode::Normal;
                 vec![ChromeOutput::Redraw]
             }
@@ -852,13 +965,20 @@ impl ShellChrome {
         model_ref: String,
         conversations: Vec<ConversationPickerEntry>,
     ) {
-        let mut items = vec![ConversationPickerEntry {
-            uuid: "new".to_owned(),
-            label: "[New conversation]".to_owned(),
-            last_active: u64::MAX, // sort first
-        }];
+        let mut items = vec![
+            ConversationPickerEntry {
+                kind: ConversationKind::NewPrivate,
+                label: "\u{1f512} New conversation \u{2014} private".to_owned(),
+                last_active: u64::MAX, // sort first
+            },
+            ConversationPickerEntry {
+                kind: ConversationKind::NewServer,
+                label: "\u{1f310} New conversation \u{2014} server".to_owned(),
+                last_active: u64::MAX - 1, // sort second
+            },
+        ];
         items.extend(conversations);
-        let list = SelectList::new(format!("{} — Conversations", model_ref), items);
+        let list = SelectList::new(format!("{} \u{2014} Conversations", model_ref), items);
         self.mode = ShellMode::ConversationPicker { model_ref, list };
     }
 
@@ -870,12 +990,33 @@ impl ShellChrome {
             _ => return vec![],
         };
 
-        // 'd' — delete selected conversation (stays in picker)
+        // 's' — open pre-chat settings (only on new-conversation entries)
+        if matches!(key, KeyPress::Char(b's' | b'S')) {
+            if let Some(entry) = list.selected_item() {
+                let chat_type = match entry.kind {
+                    ConversationKind::NewPrivate => Some(PreChatType::Private),
+                    ConversationKind::NewServer  => Some(PreChatType::Server),
+                    ConversationKind::Resume { .. } => None,
+                };
+                if let Some(chat_type) = chat_type {
+                    let defaults = self.gen_defaults_for(&model_ref);
+                    let form = build_settings_form(&defaults);
+                    self.mode = ShellMode::PreChatSettings(Box::new(PreChatSettingsState {
+                        model_ref: model_ref.clone(),
+                        defaults,
+                        form,
+                        chat_type,
+                    }));
+                    return vec![ChromeOutput::Redraw];
+                }
+            }
+        }
+
+        // 'd' — delete selected conversation (only on resume entries)
         if matches!(key, KeyPress::Char(b'd' | b'D')) {
             let idx = list.selected_index();
             if let Some(entry) = list.selected_item().cloned() {
-                if entry.uuid != "new" {
-                    let uuid = entry.uuid.clone();
+                if let ConversationKind::Resume { uuid } = entry.kind {
                     let mr = model_ref.clone();
                     list.items_mut().remove(idx);
                     list.clamp_selected();
@@ -894,21 +1035,92 @@ impl ShellChrome {
                 vec![ChromeOutput::Redraw]
             }
             WidgetResult::Confirmed(entry) => {
-                let resume = if entry.uuid == "new" { None } else { Some(entry.uuid) };
                 let cols = self.cols;
                 let rows = self.pane_rows;
                 self.mode = ShellMode::Normal;
-                vec![ChromeOutput::Rpc(RpcRequest::LocalPrivateChat {
-                    model_ref,
-                    cols,
-                    rows,
-                    resume_uuid: resume,
-                })]
+                match entry.kind {
+                    ConversationKind::NewServer => {
+                        let gen_defs = self.gen_defaults_for(&model_ref);
+                        vec![ChromeOutput::Rpc(RpcRequest::SpawnServerChat {
+                            session_id: self.session_id,
+                            model_ref, cols, rows, pane_id: 0,
+                            gen_defaults: Some(gen_defs),
+                        })]
+                    }
+                    ConversationKind::NewPrivate => {
+                        let gen_defs = self.gen_defaults_for(&model_ref);
+                        vec![ChromeOutput::Rpc(RpcRequest::LocalPrivateChat {
+                            model_ref, cols, rows, resume_uuid: None,
+                            gen_defaults: Some(gen_defs),
+                        })]
+                    }
+                    ConversationKind::Resume { uuid } => {
+                        vec![ChromeOutput::Rpc(RpcRequest::LocalPrivateChat {
+                            model_ref, cols, rows, resume_uuid: Some(uuid),
+                            gen_defaults: None,
+                        })]
+                    }
+                }
             }
             WidgetResult::Pending => {
                 if matches!(key, KeyPress::Escape) {
                     self.mode = ShellMode::Normal;
                 }
+                vec![ChromeOutput::Redraw]
+            }
+        }
+    }
+
+    /// Look up generation defaults for a model from the model list.
+    fn gen_defaults_for(&self, model_ref: &str) -> GenerationDefaults {
+        self.model_list.items().iter()
+            .find(|e| e.model_ref == model_ref)
+            .map(|e| e.gen_defaults.clone())
+            .unwrap_or_default()
+    }
+
+    // ── PreChatSettings mode ───────────────────────────────────────────────
+
+    /// Handle key input in the pre-chat generation settings modal.
+    /// Delegates to the SettingsForm widget for field navigation and editing.
+    /// Escape (when not editing a field) re-emits ListConversations to rebuild the picker.
+    fn handle_pre_chat_settings(&mut self, key: KeyPress) -> Vec<ChromeOutput> {
+        let state = match &mut self.mode {
+            ShellMode::PreChatSettings(s) => s,
+            _ => return vec![],
+        };
+
+        match state.form.handle_key(&key) {
+            waxterm::widgets::WidgetResult::Confirmed(()) => {
+                let cols = self.cols;
+                let rows = self.pane_rows;
+                let mr = state.model_ref.clone();
+                let gen_defs = form_to_generation_defaults(&state.form);
+                let chat_type = state.chat_type;
+                self.mode = ShellMode::Normal;
+                match chat_type {
+                    PreChatType::Server => {
+                        vec![ChromeOutput::Rpc(RpcRequest::SpawnServerChat {
+                            session_id: self.session_id,
+                            model_ref: mr, cols, rows, pane_id: 0,
+                            gen_defaults: Some(gen_defs),
+                        })]
+                    }
+                    PreChatType::Private => {
+                        vec![ChromeOutput::Rpc(RpcRequest::LocalPrivateChat {
+                            model_ref: mr, cols, rows,
+                            resume_uuid: None,
+                            gen_defaults: Some(gen_defs),
+                        })]
+                    }
+                }
+            }
+            waxterm::widgets::WidgetResult::Cancelled => {
+                let mr = state.model_ref.clone();
+                self.mode = ShellMode::Normal;
+                vec![ChromeOutput::Rpc(RpcRequest::ListConversations { model_ref: mr })]
+            }
+            waxterm::widgets::WidgetResult::Pending => {
                 vec![ChromeOutput::Redraw]
             }
         }
@@ -959,7 +1171,7 @@ impl ShellChrome {
             KeyPress::Char(b'i') => {
                 vec![ChromeOutput::Rpc(RpcRequest::ServiceInstall)]
             }
-            KeyPress::Escape | KeyPress::F(5) => {
+            KeyPress::Escape => {
                 self.mode = ShellMode::Normal;
                 vec![ChromeOutput::Redraw]
             }
@@ -1045,7 +1257,7 @@ impl ShellChrome {
                     }
                     vec![]
                 }
-                KeyPress::Escape | KeyPress::F(6) => {
+                KeyPress::Escape => {
                     self.mode = ShellMode::Normal;
                     vec![ChromeOutput::Redraw]
                 }
@@ -1205,7 +1417,7 @@ impl ShellChrome {
                 }
                 vec![]
             }
-            KeyPress::Escape | KeyPress::F(6) => {
+            KeyPress::Escape => {
                 self.mode = ShellMode::Normal;
                 vec![ChromeOutput::Redraw]
             }
@@ -1411,7 +1623,8 @@ pub fn keypress_to_bytes(key: KeyPress) -> Vec<u8> {
         KeyPress::F(10) => b"\x1b[21~".to_vec(),
         KeyPress::F(11) => b"\x1b[23~".to_vec(),
         KeyPress::F(12) => b"\x1b[24~".to_vec(),
-        KeyPress::F(_) | KeyPress::CtrlSpace => vec![],
+        KeyPress::F(_) | KeyPress::CtrlSpace
+        | KeyPress::ScrollUp | KeyPress::ScrollDown => vec![],
     }
 }
 
@@ -1469,9 +1682,10 @@ mod tests {
 
     #[cfg(feature = "experimental")]
     #[test]
-    fn f5_opens_service_manager() {
+    fn start_menu_v_opens_service_manager() {
         let mut chrome = make_chrome();
-        let out = chrome.handle_key(KeyPress::F(5));
+        chrome.mode = ShellMode::StartMenu { selected: 0 };
+        let out = chrome.handle_key(KeyPress::Char(b'v'));
         assert!(matches!(chrome.mode, ShellMode::ServiceManager { selected: 0 }));
         assert!(out.iter().any(|o| matches!(o, ChromeOutput::Redraw)));
     }
@@ -1484,15 +1698,6 @@ mod tests {
         let out = chrome.handle_key(KeyPress::Escape);
         assert!(matches!(chrome.mode, ShellMode::Normal));
         assert!(out.iter().any(|o| matches!(o, ChromeOutput::Redraw)));
-    }
-
-    #[cfg(feature = "experimental")]
-    #[test]
-    fn service_manager_f5_toggles_off() {
-        let mut chrome = make_chrome();
-        chrome.mode = ShellMode::ServiceManager { selected: 1 };
-        chrome.handle_key(KeyPress::F(5));
-        assert!(matches!(chrome.mode, ShellMode::Normal));
     }
 
     #[cfg(feature = "experimental")]
@@ -1644,12 +1849,13 @@ mod tests {
         assert_eq!(chrome.service_list.len(), 1);
     }
 
-    // ── F6 Worker Manager ───────────────────────────────────────────────────
+    // ── Worker Manager (via Ctrl-Space → W) ─────────────────────────────────
 
     #[test]
-    fn f6_opens_worker_manager() {
+    fn start_menu_w_opens_worker_manager() {
         let mut chrome = make_chrome();
-        let out = chrome.handle_key(KeyPress::F(6));
+        chrome.mode = ShellMode::StartMenu { selected: 0 };
+        let out = chrome.handle_key(KeyPress::Char(b'w'));
         assert!(matches!(chrome.mode, ShellMode::WorkerManager { sandbox_sel: 0, container_sel: 0, show_containers: false, tab: WorkerTab::Sandboxes, image_sel: 0, input_mode: None }));
         assert!(out.iter().any(|o| matches!(o, ChromeOutput::Redraw)));
     }
@@ -1659,14 +1865,6 @@ mod tests {
         let mut chrome = make_chrome();
         chrome.mode = ShellMode::WorkerManager { sandbox_sel: 0, container_sel: 0, show_containers: false, tab: WorkerTab::Sandboxes, image_sel: 0, input_mode: None };
         chrome.handle_key(KeyPress::Escape);
-        assert!(matches!(chrome.mode, ShellMode::Normal));
-    }
-
-    #[test]
-    fn worker_manager_f6_toggles_off() {
-        let mut chrome = make_chrome();
-        chrome.mode = ShellMode::WorkerManager { sandbox_sel: 1, container_sel: 0, show_containers: false, tab: WorkerTab::Sandboxes, image_sel: 0, input_mode: None };
-        chrome.handle_key(KeyPress::F(6));
         assert!(matches!(chrome.mode, ShellMode::Normal));
     }
 
@@ -1799,5 +1997,157 @@ mod tests {
         } else {
             panic!("mode should still be WorkerManager");
         }
+    }
+
+    // ── Start menu chord tests ───────────────────────────────────────────────
+
+    #[test]
+    fn start_menu_l_opens_console() {
+        let mut chrome = make_chrome();
+        chrome.mode = ShellMode::StartMenu { selected: 0 };
+        let out = chrome.handle_key(KeyPress::Char(b'l'));
+        assert!(matches!(chrome.mode, ShellMode::Console));
+        assert!(out.iter().any(|o| matches!(o, ChromeOutput::Redraw)));
+    }
+
+    #[test]
+    fn start_menu_f_enters_fullscreen() {
+        let mut chrome = make_chrome();
+        chrome.mode = ShellMode::StartMenu { selected: 0 };
+        let out = chrome.handle_key(KeyPress::Char(b'f'));
+        assert!(matches!(chrome.mode, ShellMode::Fullscreen));
+        assert!(out.iter().any(|o| matches!(o, ChromeOutput::Redraw)));
+    }
+
+    #[test]
+    fn f_keys_pass_through_in_normal() {
+        let mut chrome = make_chrome();
+        // F9 should pass through to the active pane as escape sequence bytes.
+        let out = chrome.handle_key(KeyPress::F(9));
+        assert!(
+            out.iter().any(|o| matches!(o,
+                ChromeOutput::Rpc(RpcRequest::SendInput { data, .. })
+                    if *data == b"\x1b[20~"
+            )),
+            "F9 should produce SendInput with VT escape sequence"
+        );
+    }
+
+    // ── Unified chat flow tests ──────────────────────────────────────────────
+
+    fn make_chrome_with_models() -> ShellChrome {
+        let models = vec![
+            ModelEntry { model_ref: "loaded:main".into(), path: "/tmp".into(), loaded: true, loading: false, gen_defaults: GenerationDefaults::default() },
+            ModelEntry { model_ref: "unloaded:main".into(), path: "/tmp".into(), loaded: false, loading: false, gen_defaults: GenerationDefaults::default() },
+            ModelEntry { model_ref: "loading:main".into(), path: "/tmp".into(), loaded: false, loading: true, gen_defaults: GenerationDefaults::default() },
+        ];
+        ShellChrome::new(120, 40, 1, 1, vec![], models)
+    }
+
+    #[test]
+    fn model_list_enter_loaded_emits_list_conversations() {
+        let mut chrome = make_chrome_with_models();
+        chrome.mode = ShellMode::ModelList;
+        // Select the first model (loaded:main) and press Enter.
+        let out = chrome.handle_key(KeyPress::Enter);
+        assert!(matches!(chrome.mode, ShellMode::Normal));
+        assert!(out.iter().any(|o| matches!(o,
+            ChromeOutput::Rpc(RpcRequest::ListConversations { ref model_ref })
+                if model_ref == "loaded:main"
+        )));
+        assert!(chrome.pending_picker_model.is_none());
+    }
+
+    #[test]
+    fn model_list_enter_unloaded_emits_load_and_stashes_pending() {
+        let mut chrome = make_chrome_with_models();
+        chrome.mode = ShellMode::ModelList;
+        // Navigate to unloaded:main (index 1).
+        chrome.handle_key(KeyPress::ArrowDown);
+        let out = chrome.handle_key(KeyPress::Enter);
+        // Should emit LoadModel, not ListConversations.
+        assert!(out.iter().any(|o| matches!(o,
+            ChromeOutput::Rpc(RpcRequest::LoadModel { ref model_ref })
+                if model_ref == "unloaded:main"
+        )));
+        assert_eq!(chrome.pending_picker_model.as_deref(), Some("unloaded:main"));
+    }
+
+    #[test]
+    fn model_list_enter_loading_stashes_pending_no_rpc() {
+        let mut chrome = make_chrome_with_models();
+        chrome.mode = ShellMode::ModelList;
+        // Navigate to loading:main (index 2).
+        chrome.handle_key(KeyPress::ArrowDown);
+        chrome.handle_key(KeyPress::ArrowDown);
+        let out = chrome.handle_key(KeyPress::Enter);
+        // Should only redraw, no RPC.
+        assert!(!out.iter().any(|o| matches!(o, ChromeOutput::Rpc(..))));
+        assert_eq!(chrome.pending_picker_model.as_deref(), Some("loading:main"));
+    }
+
+    #[test]
+    fn update_model_status_opens_picker_when_pending() {
+        let mut chrome = make_chrome_with_models();
+        chrome.pending_picker_model = Some("unloaded:main".into());
+        let follow_up = chrome.update_model_status("unloaded:main", true);
+        assert!(matches!(follow_up, Some(RpcRequest::ListConversations { ref model_ref }) if model_ref == "unloaded:main"));
+        assert!(chrome.pending_picker_model.is_none());
+    }
+
+    #[test]
+    fn update_model_status_clears_pending_on_timeout() {
+        let mut chrome = make_chrome_with_models();
+        chrome.pending_picker_model = Some("unloaded:main".into());
+        let follow_up = chrome.update_model_status("unloaded:main", false);
+        assert!(follow_up.is_none());
+        assert!(chrome.pending_picker_model.is_none());
+    }
+
+    #[test]
+    fn model_list_escape_clears_pending() {
+        let mut chrome = make_chrome_with_models();
+        chrome.mode = ShellMode::ModelList;
+        chrome.pending_picker_model = Some("unloaded:main".into());
+        chrome.handle_key(KeyPress::Escape);
+        assert!(matches!(chrome.mode, ShellMode::Normal));
+        assert!(chrome.pending_picker_model.is_none());
+    }
+
+    #[test]
+    fn conversation_picker_new_server_emits_spawn_server_chat() {
+        let mut chrome = make_chrome_with_models();
+        chrome.open_conversation_picker("loaded:main".into(), vec![]);
+        // Select "New conversation — server" (index 1) and confirm.
+        chrome.handle_key(KeyPress::ArrowDown);
+        let out = chrome.handle_key(KeyPress::Enter);
+        assert!(matches!(chrome.mode, ShellMode::Normal));
+        assert!(out.iter().any(|o| matches!(o,
+            ChromeOutput::Rpc(RpcRequest::SpawnServerChat { ref model_ref, .. })
+                if model_ref == "loaded:main"
+        )));
+    }
+
+    #[test]
+    fn conversation_picker_new_private_emits_local_private_chat() {
+        let mut chrome = make_chrome_with_models();
+        chrome.open_conversation_picker("loaded:main".into(), vec![]);
+        // First item is "New conversation — private" (index 0), press Enter.
+        let out = chrome.handle_key(KeyPress::Enter);
+        assert!(matches!(chrome.mode, ShellMode::Normal));
+        assert!(out.iter().any(|o| matches!(o,
+            ChromeOutput::Rpc(RpcRequest::LocalPrivateChat { ref model_ref, resume_uuid: None, .. })
+                if model_ref == "loaded:main"
+        )));
+    }
+
+    #[test]
+    fn conversation_picker_cannot_delete_sentinels() {
+        let mut chrome = make_chrome_with_models();
+        chrome.open_conversation_picker("loaded:main".into(), vec![]);
+        // Try to delete first entry (sentinel).
+        let out = chrome.handle_key(KeyPress::Char(b'd'));
+        // Should NOT emit DeleteConversation.
+        assert!(!out.iter().any(|o| matches!(o, ChromeOutput::Rpc(RpcRequest::DeleteConversation { .. }))));
     }
 }

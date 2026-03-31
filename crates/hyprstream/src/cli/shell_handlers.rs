@@ -22,9 +22,17 @@ use waxterm::input::InputParser;
 use zeroize::Zeroizing;
 
 use hyprstream_compositor::{
-    Compositor, CompositorInput, CompositorOutput, ConversationPickerEntry, ModelEntry,
-    PaneSummary, RpcRequest, ToastLevel, WindowSummary,
+    Compositor, CompositorInput, CompositorOutput, ConversationKind,
+    ConversationPickerEntry, GenerationDefaults, ModelEntry, PaneSummary, RpcRequest,
+    ToastLevel, WindowSummary,
 };
+
+/// Status update from the model polling background task.
+struct ModelStatusUpdate {
+    model_ref: String,
+    loaded: bool,
+    gen_defaults: GenerationDefaults,
+}
 use hyprstream_compositor::layout::{CellUpdate, CursorState, FrameContent, FrameUpdate, ScrollUpdate};
 use hyprstream_tui::chat_app::{ChatApp, LoadHook, SaveHook};
 use hyprstream_tui::console_app::ConsoleApp;
@@ -123,7 +131,7 @@ pub async fn handle_shell_tui(
 
     let client = create_tui_client(signing_key);
     let (cols, rows) = terminal_size();
-    let pane_rows = rows.saturating_sub(5); // status(1) + top border(1) + bottom border(1) + strip(1) + fkeys(1)
+    let pane_rows = rows.saturating_sub(4); // status(1) + top border(1) + bottom border(1) + strip(1)
     let pane_cols = cols.saturating_sub(2); // left + right border
 
     // Connect to session 0 using Capnp display mode so the frame stream
@@ -135,13 +143,6 @@ pub async fn handle_shell_tui(
 
     let session_id = result.session_id;
     let viewer_id  = result.viewer_id;
-
-    // Auto-spawn shell in the first pane if there is one.
-    if let Some(win) = result.windows.first() {
-        if let Some(pane) = win.panes.first() {
-            let _ = spawn_shell_rpc(&client, session_id, pane.id, "").await;
-        }
-    }
 
     // Build initial window list.
     let windows: Vec<WindowSummary> = result
@@ -169,7 +170,7 @@ pub async fn handle_shell_tui(
         hyprstream_workers::runtime::WorkerClient::new(signing_key.clone(), RequestIdentity::anonymous())
     };
     let (model_status_tx, mut model_status_rx) =
-        tokio::sync::mpsc::channel::<(String, bool)>(32);
+        tokio::sync::mpsc::channel::<ModelStatusUpdate>(32);
 
     // Terminal resize channel — SIGWINCH handler → main event loop.
     let (resize_tx, mut resize_rx) = tokio::sync::mpsc::channel::<(u16, u16)>(4);
@@ -196,6 +197,7 @@ pub async fn handle_shell_tui(
     sub_socket.connect(&sub_endpoint)?;
     sub_socket.set_subscribe(topic.as_bytes())?;
     sub_socket.set_linger(0)?;
+    sub_socket.set_rcvtimeo(1000)?; // 1s timeout so recv unblocks periodically for shutdown
 
     let _recv_handle = tokio::task::spawn_blocking(move || {
         let mut verifier = StreamVerifier::new(mac_key, topic);
@@ -203,6 +205,11 @@ pub async fn handle_shell_tui(
             let mut frames: Vec<Vec<u8>> = Vec::with_capacity(3);
             match sub_socket.recv_bytes(0) {
                 Ok(f) => frames.push(f),
+                Err(zmq::Error::EAGAIN) => {
+                    // Timeout — check if the receiver is still alive.
+                    if frame_tx.is_closed() { return; }
+                    continue;
+                }
                 Err(_) => break,
             }
             while sub_socket.get_rcvmore().unwrap_or(false) {
@@ -279,6 +286,181 @@ pub async fn handle_shell_tui(
     // Derive storage key for private chat sessions.
     let storage_key = derive_storage_key(signing_key);
 
+    // Derive VFS subject from the signing key's public key — real identity, not anonymous.
+    let vfs_subject = {
+        let vk = signing_key.verifying_key();
+        let pubkey_hex = hex::encode(vk.as_bytes());
+        hyprstream_rpc::Subject::new(pubkey_hex)
+    };
+
+    // Build VFS namespace for `/path` routing in ChatApps.
+    #[allow(clippy::type_complexity)]
+    let (vfs_ns, tcl_mount_rx): (std::sync::Arc<hyprstream_vfs::Namespace>, std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>) = {
+        use crate::services::fs::{SyntheticNode, SyntheticTree};
+
+        let mut ns = hyprstream_vfs::Namespace::new();
+
+        // Mount the model service's 9P filesystem via RPC proxy.
+        // ModelFsAdapter implements FsClient for the generated ModelClient,
+        // and RemoteMount<ModelFsAdapter> provides the generic Mount impl.
+        // `/srv/model/{model_ref}/status` etc. are served by the model
+        // service's SyntheticTree on the other end of the ZMQ socket.
+        let model_fs_adapter = crate::services::remote_mount::ModelFsAdapter::new_unscoped(
+            model_client.clone(),
+        );
+        let remote_model_mount = hyprstream_vfs::RemoteMount::new(model_fs_adapter);
+        let _ = ns.mount("/srv/model",
+            std::sync::Arc::new(remote_model_mount),
+        );
+
+        // Wrap in Arc, then build /bin/ with Weak captures to avoid circular ref.
+        // Weak doesn't block Arc::get_mut, so we can still mount after.
+        let mut ns = std::sync::Arc::new(ns);
+        let weak = std::sync::Arc::downgrade(&ns);
+        let subj = vfs_subject.clone();
+
+        let rt_handle = tokio::runtime::Handle::current();
+        let bin_tree = {
+            let mut children = std::collections::HashMap::new();
+
+            // /bin/cat — write path(s), read file contents.
+            let w = weak.clone();
+            let s = subj.clone();
+            let h = rt_handle.clone();
+            children.insert("cat".to_owned(), SyntheticNode::CtlFile {
+                handler: Box::new(move |data, _subject| {
+                    let ns = w.upgrade().ok_or("namespace dropped")?;
+                    let input = std::str::from_utf8(data).map_err(|e| e.to_string())?;
+                    let mut out = Vec::new();
+                    for path in input.split_whitespace() {
+                        out.extend_from_slice(
+                            &h.block_on(ns.cat(path, &s)).map_err(|e| e.to_string())?,
+                        );
+                    }
+                    Ok(out)
+                }),
+            });
+
+            // /bin/ls — write path, read directory listing.
+            let w = weak.clone();
+            let s = subj.clone();
+            let h = rt_handle.clone();
+            children.insert("ls".to_owned(), SyntheticNode::CtlFile {
+                handler: Box::new(move |data, _subject| {
+                    let ns = w.upgrade().ok_or("namespace dropped")?;
+                    let input = std::str::from_utf8(data).map_err(|e| e.to_string())?;
+                    let path = input.trim();
+                    let path = if path.is_empty() { "/" } else { path };
+                    let entries = h.block_on(ns.ls(path, &s)).map_err(|e| e.to_string())?;
+                    let listing: Vec<String> = entries.iter().map(|e| {
+                        if e.is_dir { format!("{}/", e.name) } else { e.name.clone() }
+                    }).collect();
+                    Ok(listing.join("\n").into_bytes())
+                }),
+            });
+
+            // /bin/help — read-only, lists available commands.
+            let w = weak.clone();
+            let s = subj.clone();
+            let h = rt_handle.clone();
+            children.insert("help".to_owned(), SyntheticNode::CtlFile {
+                handler: Box::new(move |_data, _subject| {
+                    let mut out = String::from("VFS commands:\n");
+                    out.push_str("  cat <path>           read file contents\n");
+                    out.push_str("  ls [path]            list directory\n");
+                    out.push_str("  echo <path> <data>   write to file\n");
+                    out.push_str("  ctl <path> <cmd>     control file (write+read)\n");
+                    out.push_str("  mount [prefix]       list mount points\n");
+                    out.push_str("  help                 this message\n");
+                    if let Some(ns) = w.upgrade() {
+                        if let Ok(entries) = h.block_on(ns.ls("/bin", &s)) {
+                            if !entries.is_empty() {
+                                out.push_str("\nCommands (/bin/):\n");
+                                for entry in &entries {
+                                    out.push_str(&format!("  {}\n", entry.name));
+                                }
+                            }
+                        }
+                    }
+                    Ok(out.into_bytes())
+                }),
+            });
+
+            // /bin/mount — read-only, lists mount prefixes.
+            let w = weak.clone();
+            children.insert("mount".to_owned(), SyntheticNode::CtlFile {
+                handler: Box::new(move |_data, _subject| {
+                    let ns = w.upgrade().ok_or("namespace dropped")?;
+                    Ok(ns.mount_prefixes().join("\n").into_bytes())
+                }),
+            });
+
+            SyntheticTree::new(SyntheticNode::Dir { children })
+        };
+
+        // /env/ — session variables as files (Plan9 per-process /env/).
+        let env_store: std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<String, String>>> =
+            std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
+
+        let env_tree = {
+            let store_list = env_store.clone();
+            let store_resolve = env_store.clone();
+
+            SyntheticTree::new(SyntheticNode::DynamicDir {
+                list: Box::new(move || {
+                    store_list.read().keys().map(|k| hyprstream_vfs::DirEntry {
+                        name: k.clone(),
+                        is_dir: false,
+                        size: 0,
+                        stat: None,
+                    }).collect()
+                }),
+                resolve: Box::new(move |name| {
+                    let store = store_resolve.clone();
+                    let key = name.to_owned();
+                    Some(SyntheticNode::ReadFile(Box::new(move || {
+                        store.read().get(&key).cloned().unwrap_or_default().into_bytes()
+                    })))
+                }),
+            })
+        };
+
+        // Create /lang/tcl mount channel — the TclMount exposes interpreter state
+        // as files. The receiver is polled by ChatApp::tick().
+        let (tcl_mount_tx, tcl_mount_rx) = hyprstream_tcl::create_mount_channel();
+        let tcl_mount = std::sync::Arc::new(hyprstream_tcl::TclMount::new(tcl_mount_tx));
+
+        // Mount /bin/, /env/, /lang/tcl — Arc::get_mut works because only Weak refs exist (no strong clones).
+        if let Some(ns_mut) = std::sync::Arc::get_mut(&mut ns) {
+            let _ = ns_mut.mount("/bin",
+                std::sync::Arc::new(bin_tree),
+            );
+
+            // Discover .tcl tool scripts and bind them into /bin/ (After = fallback).
+            let tools_dir = std::env::var("XDG_CONFIG_HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| {
+                    dirs::home_dir().unwrap_or_default().join(".config")
+                })
+                .join("hyprstream/tools");
+            let tools = discover_tools(&tools_dir);
+            if !tools.is_empty() {
+                let tools_tree = SyntheticTree::new(SyntheticNode::Dir { children: tools });
+                let _ = ns_mut.bind_mount("/bin",
+                    std::sync::Arc::new(tools_tree),
+                    hyprstream_vfs::BindFlag::After,
+                );
+            }
+
+            let _ = ns_mut.mount("/env",
+                std::sync::Arc::new(env_tree),
+            );
+            let _ = ns_mut.mount("/lang/tcl", tcl_mount);
+        }
+
+        (ns, std::sync::Arc::new(std::sync::Mutex::new(tcl_mount_rx)))
+    };
+
     // Console overlay for log viewing (F9 / Ctrl-L).
     let mut console_app = ConsoleApp::new();
 
@@ -308,9 +490,9 @@ pub async fn handle_shell_tui(
         loop {
             sigwinch.recv().await;
             let (c, r) = terminal_size();
-            // Send pane dimensions to server (full rows minus 5 chrome rows, cols minus 2 borders),
+            // Send pane dimensions to server (full rows minus 4 chrome rows, cols minus 2 borders),
             // matching the initial connect() call which sends pane dimensions not terminal dimensions.
-            let _ = resize_rpc(&resize_client, c.saturating_sub(2), r.saturating_sub(5)).await;
+            let _ = resize_rpc(&resize_client, c.saturating_sub(2), r.saturating_sub(4)).await;
             // Compositor needs full terminal rows to recalculate layout.
             let _ = resize_tx_sigwinch.try_send((c, r));
         }
@@ -341,7 +523,8 @@ pub async fn handle_shell_tui(
                 if dispatch_outputs(
                     &mut compositor, &client, &model_client, &worker_client,
                     &model_status_tx, &mut terminal, &mut console_app,
-                    &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
+                    &mut active_apps, &mut next_local_id, &storage_key, signing_key,
+                    &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
                 ).await { break; }
             }
 
@@ -356,11 +539,37 @@ pub async fn handle_shell_tui(
                 }
                 if should_exit { break; }
 
-                // SGR mouse — window strip tab click.
+                // SGR mouse click handling.
                 if let Some((col, row)) = parse_sgr_mouse_click(&raw) {
-                    let win_strip_row = rows.saturating_sub(2);
+                    // Close button on windows/modals — handled by compositor.
+                    let close_outputs = compositor.handle(CompositorInput::MouseClick { col, row });
+                    if !close_outputs.is_empty() {
+                        if dispatch_outputs(
+                            &mut compositor, &client, &model_client, &worker_client,
+                            &model_status_tx, &mut terminal, &mut console_app,
+                            &mut active_apps, &mut next_local_id, &storage_key, signing_key,
+                            &vfs_ns, &vfs_subject, &tcl_mount_rx, close_outputs,
+                        ).await { break; }
+                        continue;
+                    }
+
+                    // Window strip: [Ctrl-Space] label + tab clicks.
+                    let win_strip_row = rows.saturating_sub(1);
                     if row == win_strip_row {
-                        if let Some(idx) = tab_index_at_col(&compositor.chrome.windows, col) {
+                        const STRIP_LABEL_W: u16 = 14;
+                        if col < STRIP_LABEL_W {
+                            // Click on [Ctrl-Space] label — open start menu.
+                            let outs = compositor.chrome.handle_key(waxterm::input::KeyPress::CtrlSpace);
+                            let mut should_redraw = false;
+                            for co in outs {
+                                if let hyprstream_compositor::ChromeOutput::Redraw = co {
+                                    should_redraw = true;
+                                }
+                            }
+                            if should_redraw {
+                                composite_draw(&mut terminal, &compositor, &mut console_app);
+                            }
+                        } else if let Some(idx) = tab_index_at_col(&compositor.chrome.windows, col - STRIP_LABEL_W) {
                             compositor.chrome.active_win = idx;
                             if let Some(w) = compositor.chrome.windows.get(idx) {
                                 let wid = w.id;
@@ -370,11 +579,13 @@ pub async fn handle_shell_tui(
                         }
                         continue;
                     }
+
+                    // Pass-through clicks in the pane area to the terminal.
                     let (pane_top, pane_rows) =
                         if matches!(compositor.chrome.mode, hyprstream_compositor::ShellMode::Fullscreen) {
                             (0u16, rows)
                         } else {
-                            (2u16, rows.saturating_sub(5))
+                            (2u16, rows.saturating_sub(4))
                         };
                     if row < pane_top || row >= pane_top + pane_rows {
                         continue;
@@ -387,7 +598,8 @@ pub async fn handle_shell_tui(
                     if dispatch_outputs(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
-                        &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
+                        &mut active_apps, &mut next_local_id, &storage_key, signing_key,
+                        &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
                     ).await {
                         should_exit = true;
                         break;
@@ -402,7 +614,8 @@ pub async fn handle_shell_tui(
                     if dispatch_outputs(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
-                        &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
+                        &mut active_apps, &mut next_local_id, &storage_key, signing_key,
+                        &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
                     ).await { break; }
                 }
             }
@@ -447,7 +660,8 @@ pub async fn handle_shell_tui(
                         if dispatch_outputs(
                             &mut compositor, &client, &model_client, &worker_client,
                             &model_status_tx, &mut terminal, &mut console_app,
-                            &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
+                            &mut active_apps, &mut next_local_id, &storage_key, signing_key,
+                            &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
                         ).await { break; }
                     }
                     // Poll images
@@ -468,7 +682,8 @@ pub async fn handle_shell_tui(
                         if dispatch_outputs(
                             &mut compositor, &client, &model_client, &worker_client,
                             &model_status_tx, &mut terminal, &mut console_app,
-                            &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
+                            &mut active_apps, &mut next_local_id, &storage_key, signing_key,
+                            &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
                         ).await { break; }
                     }
                 }
@@ -522,22 +737,7 @@ pub async fn handle_shell_tui(
                         max_context: reload_max_context,
                         kv_quant: None,
                     }).await;
-                    let poll_client = model_client.clone();
-                    let poll_mr = model_ref.clone();
-                    let tx = model_status_tx.clone();
-                    tokio::spawn(async move {
-                        for _ in 0..60u32 {
-                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                            match poll_client.status(&crate::services::generated::model_client::StatusRequest { model_ref: poll_mr.clone() }).await {
-                                Ok(entries) if entries.iter().any(|e| e.status == "loaded") => {
-                                    let _ = tx.send((poll_mr, true)).await;
-                                    return;
-                                }
-                                _ => {}
-                            }
-                        }
-                        let _ = tx.send((poll_mr, false)).await;
-                    });
+                    spawn_model_load_poll(model_client.clone(), model_ref.clone(), model_status_tx.clone());
                 }
                 // Feed dirty frames into compositor.
                 for (pane_id, ansi) in dirty_frames {
@@ -545,7 +745,8 @@ pub async fn handle_shell_tui(
                     if dispatch_outputs(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
-                        &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
+                        &mut active_apps, &mut next_local_id, &storage_key, signing_key,
+                        &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
                     ).await { should_exit = true; break; }
                 }
                 // Remove quitting apps.
@@ -569,19 +770,37 @@ pub async fn handle_shell_tui(
                     dispatch_outputs(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
-                        &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
+                        &mut active_apps, &mut next_local_id, &storage_key, signing_key,
+                        &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
                     ).await;
                 }
                 if should_exit { break; }
             }
 
-            Some((model_ref, loaded)) = model_status_rx.recv() => {
-                compositor.chrome.update_model_status(&model_ref, loaded);
+            Some(update) = model_status_rx.recv() => {
+                let ModelStatusUpdate { model_ref, loaded, gen_defaults } = update;
+                // Update gen_defaults on the model entry.
+                for entry in compositor.chrome.model_list.items_mut() {
+                    if entry.model_ref == model_ref {
+                        entry.gen_defaults = gen_defaults.clone();
+                    }
+                }
+                let follow_up = compositor.chrome.update_model_status(&model_ref, loaded);
                 if !loaded {
                     compositor.chrome.push_toast(
                         format!("Model load timed out: {model_ref}"),
                         ToastLevel::Error,
                     );
+                }
+                // Dispatch follow-up RPC (e.g., ListConversations when pending picker resolves).
+                if let Some(rpc_req) = follow_up {
+                    dispatch_outputs(
+                        &mut compositor, &client, &model_client, &worker_client,
+                        &model_status_tx, &mut terminal, &mut console_app,
+                        &mut active_apps, &mut next_local_id, &storage_key, signing_key,
+                        &vfs_ns, &vfs_subject, &tcl_mount_rx,
+                        vec![CompositorOutput::Rpc(rpc_req)],
+                    ).await;
                 }
                 composite_draw(&mut terminal, &compositor, &mut console_app);
             }
@@ -595,7 +814,8 @@ pub async fn handle_shell_tui(
                 if dispatch_outputs(
                     &mut compositor, &client, &model_client, &worker_client,
                     &model_status_tx, &mut terminal, &mut console_app,
-                    &mut active_apps, &mut next_local_id, &storage_key, signing_key, outputs,
+                    &mut active_apps, &mut next_local_id, &storage_key, signing_key,
+                    &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
                 ).await { break; }
                 composite_draw(&mut terminal, &compositor, &mut console_app);
             }
@@ -603,6 +823,9 @@ pub async fn handle_shell_tui(
             else => break,
         }
     }
+
+    // Abort background tasks that would otherwise block shutdown.
+    _sigwinch_handle.abort();
 
     // Disable mouse tracking.
     {
@@ -654,13 +877,16 @@ async fn dispatch_outputs(
     client: &TuiClient,
     model_client: &crate::services::generated::model_client::ModelClient,
     worker_client: &hyprstream_workers::runtime::WorkerClient,
-    model_status_tx: &tokio::sync::mpsc::Sender<(String, bool)>,
+    model_status_tx: &tokio::sync::mpsc::Sender<ModelStatusUpdate>,
     terminal: &mut ratatui::Terminal<AnsiBackend<AnsiWriter>>,
     console_app: &mut ConsoleApp,
     active_apps: &mut HashMap<u32, ActiveApp>,
     next_local_id: &mut u32,
     storage_key: &StorageKey,
     signing_key: &SigningKey,
+    vfs_ns: &std::sync::Arc<hyprstream_vfs::Namespace>,
+    vfs_subject: &hyprstream_rpc::Subject,
+    tcl_mount_rx: &std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>,
     outputs: Vec<CompositorOutput>,
 ) -> bool {
     for output in outputs {
@@ -672,7 +898,8 @@ async fn dispatch_outputs(
             CompositorOutput::Rpc(req) => {
                 let feed_back = handle_rpc(
                     compositor, client, model_client, worker_client, model_status_tx,
-                    active_apps, next_local_id, storage_key, signing_key, req,
+                    active_apps, next_local_id, storage_key, signing_key,
+                    &vfs_ns, &vfs_subject, tcl_mount_rx, req,
                 ).await;
                 for input in feed_back {
                     let follow = compositor.handle(input);
@@ -713,11 +940,14 @@ async fn handle_rpc(
     client: &TuiClient,
     model_client: &crate::services::generated::model_client::ModelClient,
     worker_client: &hyprstream_workers::runtime::WorkerClient,
-    model_status_tx: &tokio::sync::mpsc::Sender<(String, bool)>,
+    model_status_tx: &tokio::sync::mpsc::Sender<ModelStatusUpdate>,
     active_apps: &mut HashMap<u32, ActiveApp>,
     next_local_id: &mut u32,
     storage_key: &StorageKey,
     signing_key: &SigningKey,
+    vfs_ns: &std::sync::Arc<hyprstream_vfs::Namespace>,
+    vfs_subject: &hyprstream_rpc::Subject,
+    tcl_mount_rx: &std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>,
     req: RpcRequest,
 ) -> Vec<CompositorInput> {
     let session_id = compositor.chrome.session_id;
@@ -743,7 +973,7 @@ async fn handle_rpc(
         }
 
         RpcRequest::CloseWindow { window_id, .. } => {
-            // Collect pane IDs before the RPC removes the window from TuiState.
+            // Collect pane IDs before removing the window.
             let pane_ids: Vec<u32> = compositor.chrome.windows
                 .iter()
                 .find(|w| w.id == window_id)
@@ -752,6 +982,18 @@ async fn handle_rpc(
             // Clean up client-owned ChatApps for any private panes in this window.
             for id in &pane_ids {
                 active_apps.remove(id);
+                compositor.chrome.private_panes.remove(id);
+            }
+            // Remove the window from chrome immediately so the tab disappears
+            // and the background animation resumes without waiting for server confirmation.
+            if let Some(win_idx) = compositor.chrome.windows.iter().position(|w| w.id == window_id) {
+                compositor.chrome.windows.remove(win_idx);
+                if compositor.chrome.windows.is_empty() {
+                    compositor.chrome.active_win = 0;
+                } else {
+                    compositor.chrome.active_win =
+                        compositor.chrome.active_win.min(compositor.chrome.windows.len() - 1);
+                }
             }
             let _ = close_window_rpc(client, window_id).await;
             // Remove each pane's VT buffer from the client-side LayoutTree.
@@ -814,23 +1056,7 @@ async fn handle_rpc(
                 max_context: None,
                 kv_quant: None,
             }).await;
-            // Spawn background polling task.
-            let poll_client = model_client.clone();
-            let poll_mr    = model_ref.clone();
-            let tx         = model_status_tx.clone();
-            tokio::spawn(async move {
-                for _ in 0..60u32 {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    match poll_client.status(&crate::services::generated::model_client::StatusRequest { model_ref: poll_mr.clone() }).await {
-                        Ok(entries) if entries.iter().any(|e| e.status == "loaded") => {
-                            let _ = tx.send((poll_mr, true)).await;
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-                let _ = tx.send((poll_mr, false)).await;
-            });
+            spawn_model_load_poll(model_client.clone(), model_ref, model_status_tx.clone());
             vec![]
         }
 
@@ -842,7 +1068,7 @@ async fn handle_rpc(
             vec![]
         }
 
-        RpcRequest::LocalPrivateChat { model_ref, cols, rows, resume_uuid } => {
+        RpcRequest::LocalPrivateChat { model_ref, cols, rows, resume_uuid, gen_defaults } => {
             // Allocate a local pane ID in the high-bit range to avoid
             // collision with server-allocated IDs (which start at 1).
             let pane_id = *next_local_id;
@@ -858,9 +1084,21 @@ async fn handle_rpc(
                 crate::tui::zmq_transport::make_tool_caller(signing_key);
 
             // Shared gen_config Arc — passed to both the spawner and the ChatApp.
-            let gen_config = std::sync::Arc::new(parking_lot::RwLock::new(
-                hyprstream_tui::chat_app::ChatGenConfig::default(),
-            ));
+            // Use model-specific defaults from RPC if available, otherwise fall back.
+            let chat_gen_cfg = match gen_defaults {
+                Some(gd) => {
+                    let d = hyprstream_tui::chat_app::ChatGenConfig::default();
+                    hyprstream_tui::chat_app::ChatGenConfig {
+                        max_tokens: gd.max_tokens.unwrap_or(d.max_tokens),
+                        temperature: gd.temperature.unwrap_or(d.temperature),
+                        top_p: gd.top_p.unwrap_or(d.top_p),
+                        top_k: gd.top_k.or(d.top_k),
+                        context_window: gd.context_window,
+                    }
+                }
+                None => hyprstream_tui::chat_app::ChatGenConfig::default(),
+            };
+            let gen_config = std::sync::Arc::new(parking_lot::RwLock::new(chat_gen_cfg));
 
             let storage_dir = private_store_dir();
             let app = match FsBackend::new(storage_dir) {
@@ -902,13 +1140,15 @@ async fn handle_rpc(
                     });
                     let spawner = crate::tui::zmq_transport::make_chat_spawner(
                         signing_key, &model_ref, Some(openai_tools.clone()),
-                        std::sync::Arc::clone(&gen_config),
+                        gen_config.clone(),
                     );
                     ChatApp::new_private(
                         model_ref.clone(), cols, rows, spawner,
                         session_uuid, load_hook, save_hook,
                     )
                     .with_gen_config(gen_config)
+                    .with_vfs(vfs_ns.clone(), vfs_subject.clone(), tokio::runtime::Handle::current())
+                    .with_tcl_mount_rx(tcl_mount_rx.clone())
                 }
                 Err(e) => {
                     compositor.chrome.push_toast(
@@ -917,10 +1157,12 @@ async fn handle_rpc(
                     );
                     let spawner = crate::tui::zmq_transport::make_chat_spawner(
                         signing_key, &model_ref, Some(openai_tools.clone()),
-                        std::sync::Arc::clone(&gen_config),
+                        gen_config.clone(),
                     );
                     ChatApp::new(model_ref.clone(), cols, rows, spawner)
                         .with_gen_config(gen_config)
+                        .with_vfs(vfs_ns.clone(), vfs_subject.clone(), tokio::runtime::Handle::current())
+                    .with_tcl_mount_rx(tcl_mount_rx.clone())
                 }
             };
             // Detect tool call format from the model reference name.
@@ -987,7 +1229,7 @@ async fn handle_rpc(
                     store.list_conversations(&model_ref)
                         .into_iter()
                         .map(|meta| ConversationPickerEntry {
-                            uuid: meta.uuid.to_string(),
+                            kind: ConversationKind::Resume { uuid: meta.uuid.to_string() },
                             label: meta.label.unwrap_or_else(|| format!("Chat: {}", meta.model_ref)),
                             last_active: meta.last_active,
                         })
@@ -1367,9 +1609,13 @@ async fn fetch_models(
         tokio::time::timeout(status_timeout, model_client_for_status.status(&all_status_req)),
     );
 
-    let status_map: std::collections::HashMap<String, bool> = match status_result {
+    let status_map: std::collections::HashMap<String, (bool, GenerationDefaults)> = match status_result {
         Ok(Ok(entries)) => entries.into_iter()
-            .map(|e| (e.model_ref, e.status == "loaded"))
+            .map(|e| {
+                let loaded = e.status == "loaded";
+                let gd = wire_gen_defaults_to_compositor(&e.generation_defaults);
+                (e.model_ref, (loaded, gd))
+            })
             .collect(),
         _ => std::collections::HashMap::new(),
     };
@@ -1385,12 +1631,15 @@ async fn fetch_models(
                     let branch = if wt.branch_name.is_empty() { "main".to_owned() } else { wt.branch_name };
                     let model_ref = format!("{}:{}", name, branch);
                     let path = rmd.join(&name).join("worktrees").join(&branch);
-                    ModelEntry { model_ref, path, loaded: false, loading: false }
+                    ModelEntry { model_ref, path, loaded: false, loading: false, gen_defaults: Default::default() }
                 })
                 .collect::<Vec<_>>()
             })
             .map(|mut entry| {
-                entry.loaded = *status_map.get(&entry.model_ref).unwrap_or(&false);
+                if let Some((loaded, gd)) = status_map.get(&entry.model_ref) {
+                    entry.loaded = *loaded;
+                    entry.gen_defaults = gd.clone();
+                }
                 entry
             })
             .collect(),
@@ -1481,6 +1730,58 @@ fn tab_index_at_col(windows: &[WindowSummary], col: u16) -> Option<usize> {
 }
 
 
+
+/// Convert the wire GenerationDefaults (7 fields) to the compositor's
+/// GenerationDefaults (5 fields).
+///
+/// Intentionally dropped from the wire type:
+///   - `repeat_penalty`: not exposed in the pre-chat settings modal
+///   - `stop_tokens`: handled at the engine layer, not user-configurable
+///   - `do_sample`: inferred from temperature > 0
+///
+/// `context_window` is set to `None` because it is a load-time parameter
+/// configured via `LoadModelRequest.maxContext`, not a generation default.
+fn wire_gen_defaults_to_compositor(
+    wire: &crate::services::generated::model_client::GenerationDefaults,
+) -> GenerationDefaults {
+    GenerationDefaults {
+        temperature: wire.temperature,
+        top_p: wire.top_p,
+        top_k: wire.top_k.map(|v| v as usize),
+        max_tokens: wire.max_tokens.map(|v| v as usize),
+        context_window: None,
+    }
+}
+
+/// Spawn a background task that polls model status every 2s until loaded (or timeout).
+/// Sends a `ModelStatusUpdate` through `tx` when the model loads or after 120s timeout.
+fn spawn_model_load_poll(
+    poll_client: crate::services::generated::model_client::ModelClient,
+    model_ref: String,
+    tx: tokio::sync::mpsc::Sender<ModelStatusUpdate>,
+) {
+    tokio::spawn(async move {
+        for _ in 0..60u32 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            if let Ok(entries) = poll_client.status(
+                &crate::services::generated::model_client::StatusRequest {
+                    model_ref: model_ref.clone(),
+                },
+            ).await {
+                if let Some(entry) = entries.iter().find(|e| e.status == "loaded") {
+                    let gd = wire_gen_defaults_to_compositor(&entry.generation_defaults);
+                    let _ = tx.send(ModelStatusUpdate {
+                        model_ref, loaded: true, gen_defaults: gd,
+                    }).await;
+                    return;
+                }
+            }
+        }
+        let _ = tx.send(ModelStatusUpdate {
+            model_ref, loaded: false, gen_defaults: GenerationDefaults::default(),
+        }).await;
+    });
+}
 
 /// Derive a 32-byte AES-256 storage key from the Ed25519 signing key seed.
 ///
@@ -1613,4 +1914,58 @@ fn unpack_color(packed: u32) -> ratatui::style::Color {
             _  => Color::Reset,
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tool discovery from .tcl files
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Scan a directory for `.tcl` scripts and return SyntheticNode entries.
+///
+/// Each `.tcl` file becomes a CtlFile whose handler evaluates the script
+/// contents with the written data available as `$args`. The file stem
+/// (without `.tcl` extension) is used as the tool name.
+///
+/// Returns a HashMap suitable for constructing a `SyntheticNode::Dir`.
+/// Returns an empty map if the directory doesn't exist or is unreadable.
+fn discover_tools(dir: &std::path::Path) -> HashMap<String, crate::services::fs::SyntheticNode> {
+    use crate::services::fs::SyntheticNode;
+
+    let mut tools = HashMap::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return tools,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("tcl") {
+            continue;
+        }
+        let name = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(n) => n.to_owned(),
+            None => continue,
+        };
+        // Reject names with path separators or dots (safety).
+        if name.contains('/') || name.contains("..") || name.is_empty() {
+            continue;
+        }
+
+        let script_path = path.clone();
+        tools.insert(name, SyntheticNode::CtlFile {
+            handler: Box::new(move |data, _subject| {
+                let script = std::fs::read_to_string(&script_path)
+                    .map_err(|e| format!("failed to read tool script: {e}"))?;
+                let args = String::from_utf8_lossy(data);
+                // Wrap the script: set $args before executing, capture the result.
+                let wrapped = format!("set args {{{}}}\n{}", args.trim(), script);
+                // Return the wrapped script for evaluation by the caller's TclShell.
+                // The ctl response is the script to eval — the /bin/ fallback in
+                // TclShell.try_cmd_resolve() will pass this through eval.
+                Ok(wrapped.into_bytes())
+            }),
+        });
+    }
+
+    tools
 }

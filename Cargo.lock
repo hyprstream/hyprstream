@@ -3596,7 +3596,7 @@ dependencies = [
  "thiserror 1.0.69",
  "vfio-bindings 0.3.1",
  "vfio-ioctls",
- "virtio-queue",
+ "virtio-queue 0.7.1",
  "vm-memory 0.10.0",
  "vmm-sys-util 0.11.2",
 ]
@@ -3673,8 +3673,8 @@ dependencies = [
  "threadpool",
  "timerfd",
  "vhost",
- "virtio-bindings",
- "virtio-queue",
+ "virtio-bindings 0.1.0",
+ "virtio-queue 0.7.1",
  "vm-memory 0.10.0",
  "vmm-sys-util 0.11.2",
 ]
@@ -4066,7 +4066,7 @@ dependencies = [
  "tracing",
  "vfio-bindings 0.3.1",
  "vfio-ioctls",
- "virtio-queue",
+ "virtio-queue 0.7.1",
  "vm-memory 0.10.0",
  "vmm-sys-util 0.11.2",
 ]
@@ -4801,7 +4801,7 @@ dependencies = [
  "log",
  "mio 0.8.11",
  "nix 0.24.3",
- "virtio-queue",
+ "virtio-queue 0.7.1",
  "vm-memory 0.10.0",
  "vmm-sys-util 0.11.2",
 ]
@@ -4822,6 +4822,7 @@ dependencies = [
  "mio 0.8.11",
  "nix 0.24.3",
  "radix_trie",
+ "virtio-queue 0.12.0",
  "vm-memory 0.14.1",
  "vmm-sys-util 0.12.1",
 ]
@@ -5925,7 +5926,9 @@ dependencies = [
  "hyprstream-rpc-build",
  "hyprstream-rpc-derive",
  "hyprstream-service",
+ "hyprstream-tcl",
  "hyprstream-tui",
+ "hyprstream-vfs",
  "hyprstream-workers",
  "image",
  "indicatif",
@@ -5998,6 +6001,19 @@ dependencies = [
  "xdg",
  "zeroize",
  "zmq",
+]
+
+[[package]]
+name = "hyprstream-9p"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "hyprstream-rpc",
+ "hyprstream-vfs",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -6230,6 +6246,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyprstream-tcl"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hyprstream-vfs",
+ "molt",
+ "tokio",
+]
+
+[[package]]
 name = "hyprstream-tui"
 version = "0.1.0"
 dependencies = [
@@ -6242,6 +6268,8 @@ dependencies = [
  "dirs-next",
  "edtui",
  "hyprstream-compositor",
+ "hyprstream-tcl",
+ "hyprstream-vfs",
  "landlock",
  "libc",
  "parking_lot 0.12.4",
@@ -6250,10 +6278,38 @@ dependencies = [
  "ratatui-textarea",
  "serde",
  "serde_json",
+ "tokio",
  "tui-logger",
  "uuid 1.18.1",
  "waxterm",
  "zeroize",
+]
+
+[[package]]
+name = "hyprstream-vfs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "dashmap",
+ "hyprstream-rpc",
+ "tokio",
+]
+
+[[package]]
+name = "hyprstream-vfsd"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "dashmap",
+ "fuse-backend-rs 0.12.1",
+ "hyprstream-rpc",
+ "hyprstream-vfs",
+ "libc",
+ "parking_lot 0.12.4",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -6277,6 +6333,7 @@ dependencies = [
  "hyprstream-rpc-build",
  "hyprstream-rpc-derive",
  "hyprstream-service",
+ "hyprstream-vfs",
  "kata-sys-util",
  "kata-types",
  "nix 0.27.1",
@@ -8147,6 +8204,13 @@ dependencies = [
  "smallvec",
  "tagptr",
  "uuid 1.18.1",
+]
+
+[[package]]
+name = "molt"
+version = "0.3.2"
+dependencies = [
+ "indexmap 1.9.3",
 ]
 
 [[package]]
@@ -14635,15 +14699,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ff512178285488516ed85f15b5d0113a7cdb89e9e8a760b269ae4f02b84bd6b"
 
 [[package]]
+name = "virtio-bindings"
+version = "0.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "091f1f09cfbf2a78563b562e7a949465cce1aef63b6065645188d995162f8868"
+
+[[package]]
 name = "virtio-queue"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ba81e2bcc21c0d2fc5e6683e79367e26ad219197423a498df801d79d5ba77bd"
 dependencies = [
  "log",
- "virtio-bindings",
+ "virtio-bindings 0.1.0",
  "vm-memory 0.10.0",
  "vmm-sys-util 0.11.2",
+]
+
+[[package]]
+name = "virtio-queue"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07d8406e7250c934462de585d8f2d2781c31819bca1fbb7c5e964ca6bbaabfe8"
+dependencies = [
+ "log",
+ "virtio-bindings 0.2.7",
+ "vm-memory 0.14.1",
+ "vmm-sys-util 0.12.1",
 ]
 
 [[package]]

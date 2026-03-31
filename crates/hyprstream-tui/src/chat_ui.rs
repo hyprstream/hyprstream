@@ -391,12 +391,12 @@ fn draw_fkey_bar(frame: &mut Frame, area: Rect, app: &ChatApp) {
     } else {
         let keys: &[(&str, &str)] = &[
             ("Enter", "Send"),
+            ("/path", "VFS"),
             ("Ctrl-J", "Newline"),
             ("\u{2191}\u{2193}", "Scroll"),
             ("Ctrl-E", "Editor"),
             ("Ctrl-O", "Thinking"),
-            ("s", "Settings"),
-            ("Esc\u{00d7}2", "Close"),
+            ("Ctrl-Space q", "Close"),
         ];
         let mut spans = Vec::new();
         spans.push(Span::raw("  "));

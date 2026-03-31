@@ -1,0 +1,12 @@
+[package]
+name = "hyprstream-tcl"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT"
+description = "Tcl (molt) shell for hyprstream VFS namespace"
+
+[dependencies]
+molt = { path = "../../../../../../molt/.worktrees/hyprstream/molt" }
+hyprstream-vfs = { path = "../hyprstream-vfs" }
+async-trait = { workspace = true }
+tokio = { workspace = true }

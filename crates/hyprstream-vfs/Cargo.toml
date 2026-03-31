@@ -1,0 +1,20 @@
+[package]
+name = "hyprstream-vfs"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Plan9-inspired VFS namespace multiplexer for hyprstream"
+
+[dependencies]
+# RPC types (Subject for caller identity)
+hyprstream-rpc = { path = "../hyprstream-rpc" }
+
+# Async trait support
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+# Concurrent fid table for RemoteMount
+dashmap = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }

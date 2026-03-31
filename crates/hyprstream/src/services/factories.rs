@@ -900,3 +900,37 @@ fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
 
     Ok(ctx.into_spawnable_quic(metrics_service, mc.quic_port))
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Tcl Service Factory
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Factory for TclService (Tcl interpreter over ZMQ RPC)
+///
+/// Accepts raw UTF-8 eval requests and returns results. Uses a dedicated
+/// OS thread for the `!Send` molt interpreter via `TclExecutor`.
+///
+/// No Cap'n Proto schema yet — requests and responses are raw UTF-8.
+/// A proper `tcl.capnp` schema with `generate_rpc_service!` will be
+/// added when the 9P/fs scope is wired in.
+#[service_factory("tcl")]
+fn create_tcl_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+    info!("Creating TclService");
+
+    use crate::services::TclService;
+
+    // Create an empty VFS namespace for the executor.
+    // The daemon wires mounts (e.g. /srv/model, /config) before starting services;
+    // for now the namespace starts empty — builtins that touch VFS will get
+    // "not found" until mounts are attached.
+    let ns = Arc::new(hyprstream_vfs::Namespace::new());
+
+    let tcl_service = TclService::new(
+        ns,
+        global_context(),
+        ctx.transport("tcl", SocketKind::Rep),
+        ctx.signing_key().clone(),
+    );
+
+    Ok(ctx.into_spawnable(tcl_service))
+}

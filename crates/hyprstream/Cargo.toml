@@ -53,6 +53,7 @@ hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }  # RPC code genera
 hyprstream-flight = { path = "../hyprstream-flight" }  # Flight SQL server and client
 hyprstream-metrics = { path = "../hyprstream-metrics" }  # Metrics storage (for RegistryClient trait)
 hyprstream-workers = { path = "../hyprstream-workers" }  # Worker runtime (Kata containers)
+hyprstream-vfs = { path = "../hyprstream-vfs" }  # VFS namespace (Mount trait)
 inventory.workspace = true  # Service factory registration
 gittorrent = { workspace = true, optional = true }  # P2P transport
 clap.workspace = true
@@ -137,6 +138,7 @@ reflink-copy = "0.1"  # COW file copying (reflink when available)
 hyprstream-containedfs.workspace = true  # Path-contained filesystem operations
 age = { version = "0.11.2", features = ["armor"] }
 hyprstream-tui = { path = "../hyprstream-tui" }  # Setup wizard TUI (WizardBackend trait + WizardApp)
+hyprstream-tcl = { path = "../hyprstream-tcl" }  # Tcl shell for VFS namespace
 hyprstream-compositor = { path = "../hyprstream-compositor" }  # Pure TUI compositor (chrome state machine)
 waxterm = { path = "../waxterm", features = ["avt"] }  # Terminal abstraction for TUI rendering
 avt = "0.17"  # VTE for ShellClient pane rendering

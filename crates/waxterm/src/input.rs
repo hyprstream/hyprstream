@@ -14,6 +14,10 @@ pub enum KeyPress {
     CtrlSpace,
     /// Function keys F1–F12.
     F(u8),
+    /// Mouse scroll wheel up.
+    ScrollUp,
+    /// Mouse scroll wheel down.
+    ScrollDown,
 }
 
 /// Custom OSC handler: receives bytes after `ESC ]`, returns `(command, bytes_consumed)`.
@@ -123,12 +127,33 @@ impl<C: From<KeyPress>> InputParser<C> {
                                         }
                                     }
                                     // SGR mouse: ESC [ < btn;col;row M/m
+                                    // btn 64 = scroll up, btn 65 = scroll down (press only, M terminator)
                                     b'<' => {
                                         let start = i + 3;
                                         let end = data[start..]
                                             .iter()
                                             .position(|&b| b == b'M' || b == b'm');
-                                        i = end.map(|p| start + p + 1).unwrap_or(start);
+                                        if let Some(end_off) = end {
+                                            let term = data[start + end_off];
+                                            let params = &data[start..start + end_off];
+                                            // Parse btn from first param (before first ';')
+                                            if term == b'M' {
+                                                if let Some(semi) = params.iter().position(|&b| b == b';') {
+                                                    if let Ok(btn_str) = std::str::from_utf8(&params[..semi]) {
+                                                        if let Ok(btn) = btn_str.parse::<u32>() {
+                                                            if btn == 64 {
+                                                                cmds.push(C::from(KeyPress::ScrollUp));
+                                                            } else if btn == 65 {
+                                                                cmds.push(C::from(KeyPress::ScrollDown));
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            i = start + end_off + 1;
+                                        } else {
+                                            i = start; // incomplete
+                                        }
                                     }
                                     // X10 mouse: ESC [ M btn cx cy (3 fixed bytes)
                                     b'M' => {

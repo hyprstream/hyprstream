@@ -11,6 +11,7 @@ description = "Isolated workload execution using Kata Containers with CRI-aligne
 hyprstream-rpc = { path = "../hyprstream-rpc" }
 hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }
 hyprstream-service = { path = "../hyprstream-service" }
+hyprstream-vfs = { path = "../hyprstream-vfs" }
 
 # Async runtime
 tokio = { workspace = true }
