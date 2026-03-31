@@ -19,7 +19,7 @@
 use age::secrecy::ExposeSecret;
 use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::server::tls::TlsMaterials;
 
@@ -122,12 +122,15 @@ fn missing_in_readonly(secrets_dir: &std::path::Path, name: &str) -> anyhow::Err
 pub fn load_or_generate_node_signing_key(secrets_dir: &std::path::Path) -> Result<SigningKey> {
     const NAME: &str = "signing-key";
 
-    if let Some(bytes) = read_secret(secrets_dir, NAME)? {
-        let arr: [u8; 32] = bytes
+    if let Some(mut bytes) = read_secret(secrets_dir, NAME)? {
+        let mut arr: [u8; 32] = bytes.as_slice()
             .try_into()
             .map_err(|_| anyhow!("secret '{}' must be 32 bytes (Ed25519 seed)", NAME))?;
+        let sk = SigningKey::from_bytes(&arr);
+        bytes.zeroize();
+        arr.zeroize();
         tracing::info!("Loaded Ed25519 signing key from '{}'", secrets_dir.display());
-        return Ok(SigningKey::from_bytes(&arr));
+        return Ok(sk);
     }
 
     if !is_writable(secrets_dir) {
@@ -209,11 +212,13 @@ pub fn load_or_generate_credential_store_key(
     // First run — no store file, safe to generate a new key.
     let identity = age::x25519::Identity::generate();
     let secret_str = identity.to_string();
-    write_secret(
+    let result = write_secret(
         secrets_dir,
         NAME,
         secret_str.expose_secret().as_bytes(),
-    )?;
+    );
+    drop(secret_str); // SecretString zeroizes on drop
+    result?;
     tracing::info!(
         "Generated new age credential-store key → '{}/{}'",
         secrets_dir.display(),
@@ -235,13 +240,16 @@ pub fn load_or_generate_user_signing_key(
 ) -> Result<(SigningKey, VerifyingKey)> {
     const NAME: &str = "user-signing-key";
 
-    if let Some(bytes) = read_secret(secrets_dir, NAME)? {
-        let arr: [u8; 32] = bytes
+    if let Some(mut bytes) = read_secret(secrets_dir, NAME)? {
+        let mut arr: [u8; 32] = bytes.as_slice()
             .try_into()
             .map_err(|_| anyhow!("secret '{}' must be 32 bytes (Ed25519 seed)", NAME))?;
         let sk = SigningKey::from_bytes(&arr);
+        bytes.zeroize();
+        arr.zeroize();
+        let vk = sk.verifying_key();
         tracing::info!("Loaded user signing key from '{}'", secrets_dir.display());
-        return Ok((sk.clone(), sk.verifying_key()));
+        return Ok((sk, vk));
     }
 
     if !is_writable(secrets_dir) {
@@ -250,12 +258,13 @@ pub fn load_or_generate_user_signing_key(
 
     let sk = SigningKey::generate(&mut rand::rngs::OsRng);
     write_secret(secrets_dir, NAME, &sk.to_bytes())?;
+    let vk = sk.verifying_key();
     tracing::info!(
         "Generated new user signing key → '{}/{}'",
         secrets_dir.display(),
         NAME
     );
-    Ok((sk.clone(), sk.verifying_key()))
+    Ok((sk, vk))
 }
 
 /// Load or generate TLS materials using the default secret names (`tls-key`, `tls-cert`).

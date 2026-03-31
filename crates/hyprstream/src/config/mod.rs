@@ -18,7 +18,7 @@ use crate::storage::paths::StoragePaths;
 use config::{Config, ConfigError, Environment, File};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Unified configuration for the Hyprstream system
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1487,13 +1487,16 @@ impl HyprConfig {
     pub fn node_signing_key_bypass() -> anyhow::Result<Option<ed25519_dalek::SigningKey>> {
         if let Ok(cfg) = Self::load() {
             if let Some(ref hex_key) = cfg.signing_key {
-                let bytes = hex::decode(hex_key)
+                let mut bytes = hex::decode(hex_key)
                     .map_err(|e| anyhow::anyhow!("HYPRSTREAM__SIGNING_KEY: invalid hex: {e}"))?;
-                let arr: [u8; 32] = bytes
+                let mut arr: [u8; 32] = bytes.as_slice()
                     .try_into()
                     .map_err(|_| anyhow::anyhow!("HYPRSTREAM__SIGNING_KEY: expected 32 bytes"))?;
+                let sk = ed25519_dalek::SigningKey::from_bytes(&arr);
+                bytes.zeroize();
+                arr.zeroize();
                 tracing::info!("Using node signing key from config (test bypass)");
-                return Ok(Some(ed25519_dalek::SigningKey::from_bytes(&arr)));
+                return Ok(Some(sk));
             }
         }
         Ok(None)
@@ -1507,14 +1510,17 @@ impl HyprConfig {
     ) -> anyhow::Result<Option<(ed25519_dalek::SigningKey, ed25519_dalek::VerifyingKey)>> {
         if let Ok(cfg) = Self::load() {
             if let Some(ref hex_key) = cfg.oauth.user_signing_key {
-                let bytes = hex::decode(hex_key)
+                let mut bytes = hex::decode(hex_key)
                     .map_err(|e| anyhow::anyhow!("HYPRSTREAM__OAUTH__USER_SIGNING_KEY: invalid hex: {e}"))?;
-                let arr: [u8; 32] = bytes
+                let mut arr: [u8; 32] = bytes.as_slice()
                     .try_into()
                     .map_err(|_| anyhow::anyhow!("HYPRSTREAM__OAUTH__USER_SIGNING_KEY: expected 32 bytes"))?;
                 let sk = ed25519_dalek::SigningKey::from_bytes(&arr);
+                bytes.zeroize();
+                arr.zeroize();
+                let vk = sk.verifying_key();
                 tracing::info!("Using user signing key from config (test bypass)");
-                return Ok(Some((sk.clone(), sk.verifying_key())));
+                return Ok(Some((sk, vk)));
             }
         }
         Ok(None)
