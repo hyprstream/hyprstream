@@ -57,6 +57,18 @@ struct PolicyRequest {
 
     # Set a model branch as public or private
     setBranchVisibility @13 :SetBranchVisibility $mcpScope(manage) $mcpDescription("Set a model branch as public or private");
+
+    # Register an event prefix for publishing
+    registerEventPrefix @14 :RegisterEventPrefix $mcpScope(manage) $mcpDescription("Register an event prefix for publishing");
+
+    # Subscribe to an event prefix
+    subscribeEventPrefix @15 :SubscribeEventPrefix $mcpScope(manage) $mcpDescription("Subscribe to an event prefix");
+
+    # Get pending subscribers for a prefix
+    getPendingSubscribers @16 :GetPendingSubscribers $mcpScope(query) $mcpDescription("Get pending subscribers for a prefix");
+
+    # Deposit wrapped keys for subscribers
+    depositWrappedKeys @17 :DepositWrappedKeys $mcpScope(manage) $mcpDescription("Deposit wrapped keys for subscribers");
   }
 }
 
@@ -171,6 +183,18 @@ struct PolicyResponse {
 
     # Commit SHA from setBranchVisibility
     setBranchVisibilityResult @14 :Text;
+
+    # Event prefix registration result
+    registerEventPrefixResult @15 :Void;
+
+    # Event prefix subscription result (returns access info)
+    subscribeEventPrefixResult @16 :EventPrefixAccess;
+
+    # Pending subscribers result
+    getPendingSubscribersResult @17 :PendingSubscribers;
+
+    # Wrapped keys deposit result
+    depositWrappedKeysResult @18 :Void;
   }
 }
 
@@ -241,4 +265,46 @@ struct SetBranchVisibility {
   modelName  @0 :Text;
   branchName @1 :Text;
   public     @2 :Bool;
+}
+
+# Register an event prefix for publishing
+struct RegisterEventPrefix {
+  prefix @0 :Text;
+  publisherEphemeralPubkey @1 :Data;
+  schema @2 :Text;
+}
+
+# Subscribe to an event prefix
+struct SubscribeEventPrefix {
+  prefix @0 :Text;
+  subscriberEphemeralPubkey @1 :Data;
+}
+
+# Get pending subscribers for a prefix
+struct GetPendingSubscribers {
+  prefix @0 :Text;
+}
+
+# Deposit wrapped keys for pending subscribers
+struct DepositWrappedKeys {
+  prefix @0 :Text;
+  entries @1 :List(WrappedKeyDeposit);
+}
+
+# A single wrapped key deposit for a subscriber
+struct WrappedKeyDeposit {
+  subPubkeyHash @0 :Data;
+  wrappedBlob @1 :Data;
+}
+
+# Access info returned after subscribing to an event prefix
+struct EventPrefixAccess {
+  publisherEphemeralPubkey @0 :Data;
+  wrappedGroupKey @1 :Data;
+  schema @2 :Text;
+}
+
+# List of pending subscriber public keys
+struct PendingSubscribers {
+  pubkeys @0 :List(Data);
 }

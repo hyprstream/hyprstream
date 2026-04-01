@@ -15,43 +15,43 @@
 mod builtins;
 pub mod mount;
 
-use std::sync::Arc;
-
-use hyprstream_vfs::{Namespace, Subject};
+use hyprstream_vfs::proxy::{VfsOp, VfsRequest};
+use hyprstream_vfs::Subject;
 use molt::types::*;
 use molt::Interp;
 
 pub use mount::{create_mount_channel, TclCommand, TclMount};
 
 /// Context stored in the molt interpreter via `save_context()`.
+///
+/// All VFS operations go through the channel proxy — no direct Namespace access.
 pub(crate) struct ShellContext {
-    pub ns: Arc<Namespace>,
     pub subject: Subject,
+    pub vfs_tx: tokio::sync::mpsc::Sender<VfsRequest>,
 }
 
 /// A Tcl shell backed by the hyprstream VFS namespace.
 ///
 /// Contains a molt `Interp` which is `!Send` (uses `Rc` internally).
-/// We implement `Send` because `TclShell` is constructed and then moved
-/// to a single owner thread (ChatApp) where it stays for its lifetime.
-/// It is never accessed from multiple threads concurrently.
+/// Must be constructed and used on the same thread — use `spawn_blocking`
+/// to run on a dedicated thread, passing only `Send` arguments (subject, vfs_tx).
 pub struct TclShell {
     interp: Interp,
     ctx_id: ContextID,
 }
 
-// SAFETY: TclShell is constructed, moved once into ChatApp (which runs on a
-// single thread), and never shared. The inner `Rc`s in molt::Value are only
-// accessed from that thread. This is the same pattern as tch-rs tensors in
-// the inference service (Thread spawner mode for !Send types).
-unsafe impl Send for TclShell {}
-
 impl TclShell {
-    /// Create a new Tcl shell bound to the given VFS namespace and caller identity.
+    /// Create a new Tcl shell bound to the given caller identity and VFS proxy.
+    ///
+    /// The `vfs_tx` sender is used by builtins and `/bin/` resolution for all
+    /// async VFS operations (cat, ls, echo, ctl, mount) via the channel proxy.
+    ///
+    /// **Must be called on the thread where the shell will be used** (e.g., inside
+    /// `spawn_blocking`). TclShell is `!Send` due to molt's `Rc`-based `Value`.
     ///
     /// Dangerous commands are removed and the recursion limit is lowered.
     /// All host I/O goes through the VFS — this is a guest interpreter.
-    pub fn new(ns: Arc<Namespace>, subject: Subject) -> Self {
+    pub fn new(subject: Subject, vfs_tx: tokio::sync::mpsc::Sender<VfsRequest>) -> Self {
         let mut interp = Interp::new();
 
         // Remove dangerous commands — all host I/O goes through VFS.
@@ -62,9 +62,10 @@ impl TclShell {
         // global: scope manipulation unnecessary in VFS shell
         // time: runs a command N times (user-controlled N, CPU bomb)
         // parse/pdump/pclear: debug internals, not for users
+        // apply/eval/subst/uplevel: evaluate arbitrary code, enabling injection via field output
         for cmd in &[
             "source", "exit", "puts", "rename", "global", "time",
-            "parse", "pdump", "pclear",
+            "parse", "pdump", "pclear", "apply", "eval", "subst", "uplevel",
         ] {
             if interp.has_command(cmd) {
                 interp.remove_command(cmd);
@@ -73,7 +74,7 @@ impl TclShell {
         interp.set_recursion_limit(100);
         interp.set_instruction_limit(100_000);
 
-        let ctx = ShellContext { ns, subject };
+        let ctx = ShellContext { subject, vfs_tx };
         let ctx_id = interp.save_context(ctx);
         builtins::register_all(&mut interp, ctx_id);
         Self { interp, ctx_id }
@@ -103,6 +104,16 @@ impl TclShell {
     /// Check if a command name is registered in the interpreter.
     pub fn has_command(&self, name: &str) -> bool {
         self.interp.has_command(name)
+    }
+
+    /// Set an env array variable safely, bypassing the Tcl evaluator.
+    ///
+    /// Uses `Interp::set_element` to avoid Tcl injection from values
+    /// containing unbalanced braces or bracket expressions.
+    pub fn set_env(&mut self, key: &str, value: &str) -> Result<(), String> {
+        self.interp
+            .set_element("env", key, molt::types::Value::from(value))
+            .map_err(|e| e.value().to_string())
     }
 
     /// Override the instruction limit (default: 100,000).
@@ -153,22 +164,46 @@ impl TclShell {
     /// Try resolving an unknown command via `/bin/{name}` (Plan9 PATH model).
     ///
     /// Extracts everything after the command name as the argument payload,
-    /// then does a ctl (write+read) on `/bin/{name}`.
+    /// then does a ctl (write+read) on `/bin/{name}` via the channel proxy.
     fn try_cmd_resolve(&mut self, cmd_name: &str, script: &str) -> Result<String, String> {
         // Sanitize: reject path traversal in command names.
         if cmd_name.contains('/') || cmd_name.contains("..") {
             return Err(format!("invalid command name \"{cmd_name}\""));
         }
-        let ctx = self.interp.context::<ShellContext>(self.ctx_id);
         let cmd_path = format!("/bin/{cmd_name}");
-        let args = script
+        let raw_args = script
             .trim()
             .strip_prefix(cmd_name)
             .unwrap_or("")
             .trim();
-        match ctx.ns.ctl(&cmd_path, args.as_bytes(), &ctx.subject) {
-            Ok(resp) => Ok(String::from_utf8_lossy(&resp).into_owned()),
-            Err(_) => Err(format!("invalid command name \"{cmd_name}\"")),
+
+        // Evaluate args through the Tcl evaluator to resolve variable and
+        // command substitutions (e.g., `[cat /config/token]` → actual value).
+        // Without this, raw bracket expressions reach ctl file handlers.
+        let evaluated_args = if raw_args.is_empty() {
+            String::new()
+        } else {
+            match self.interp.eval(&format!("list {raw_args}")) {
+                Ok(val) => val.to_string(),
+                Err(e) => return Err(e.value().to_string()),
+            }
+        };
+
+        let ctx = self.interp.context::<ShellContext>(self.ctx_id);
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+        let req = VfsRequest {
+            op: VfsOp::Ctl {
+                path: cmd_path,
+                cmd: evaluated_args.into_bytes(),
+            },
+            reply: reply_tx,
+        };
+        if ctx.vfs_tx.blocking_send(req).is_err() {
+            return Err(format!("invalid command name \"{cmd_name}\""));
+        }
+        match reply_rx.recv() {
+            Ok(Ok(resp)) => Ok(String::from_utf8_lossy(&resp).into_owned()),
+            _ => Err(format!("invalid command name \"{cmd_name}\"")),
         }
     }
 }
@@ -193,8 +228,11 @@ fn extract_unknown_command(msg: &str) -> Option<String> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
+    use async_trait::async_trait;
+    use hyprstream_vfs::proxy::spawn_vfs_proxy;
+    use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Namespace, Stat};
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     /// Minimal in-memory mount for testing.
     struct MemMount {
@@ -214,11 +252,12 @@ mod tests {
 
     struct MemFid {
         path: String,
-        write_buf: Vec<u8>,
+        write_buf: std::sync::Mutex<Vec<u8>>,
     }
 
+    #[async_trait]
     impl Mount for MemMount {
-        fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
+        async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
             let path = components.join("/");
             // Check file exists (or is a prefix of existing files for dirs).
             let exists = self.files.contains_key(&path)
@@ -228,15 +267,15 @@ mod tests {
             }
             Ok(Fid::new(MemFid {
                 path,
-                write_buf: Vec::new(),
+                write_buf: std::sync::Mutex::new(Vec::new()),
             }))
         }
 
-        fn open(&self, _fid: &mut Fid, _mode: u8, _caller: &Subject) -> Result<(), MountError> {
+        async fn open(&self, _fid: &mut Fid, _mode: u8, _caller: &Subject) -> Result<(), MountError> {
             Ok(())
         }
 
-        fn read(
+        async fn read(
             &self,
             fid: &Fid,
             offset: u64,
@@ -245,13 +284,15 @@ mod tests {
         ) -> Result<Vec<u8>, MountError> {
             let inner = fid.downcast_ref::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             // If there's a write buffer (ctl pattern), return that then clear via offset.
-            if !inner.write_buf.is_empty() {
+            let wb = inner.write_buf.lock().unwrap();
+            if !wb.is_empty() {
                 let start = offset as usize;
-                if start >= inner.write_buf.len() {
+                if start >= wb.len() {
                     return Ok(vec![]);
                 }
-                return Ok(inner.write_buf[start..].to_vec());
+                return Ok(wb[start..].to_vec());
             }
+            drop(wb);
             match self.files.get(&inner.path) {
                 Some(data) => {
                     let start = offset as usize;
@@ -262,7 +303,7 @@ mod tests {
             }
         }
 
-        fn write(
+        async fn write(
             &self,
             fid: &Fid,
             _offset: u64,
@@ -271,13 +312,11 @@ mod tests {
         ) -> Result<u32, MountError> {
             // For ctl files: store the "response" as the uppercased write data.
             let inner = fid.downcast_ref::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
-            // SAFETY: MemFid write_buf mutation — test-only, single-threaded.
-            let fid_ptr = inner as *const MemFid as *mut MemFid;
-            unsafe { (*fid_ptr).write_buf = format!("ok: {}", String::from_utf8_lossy(data)).into_bytes() };
+            *inner.write_buf.lock().unwrap() = format!("ok: {}", String::from_utf8_lossy(data)).into_bytes();
             Ok(data.len() as u32)
         }
 
-        fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
+        async fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
             let inner = fid.downcast_ref::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             let prefix = if inner.path.is_empty() {
                 String::new()
@@ -307,7 +346,7 @@ mod tests {
             Ok(entries)
         }
 
-        fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
+        async fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
             let inner = fid.downcast_ref::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             Ok(Stat {
                 qtype: 0,
@@ -317,14 +356,14 @@ mod tests {
             })
         }
 
-        fn clunk(&self, _fid: Fid, _caller: &Subject) {}
+        async fn clunk(&self, _fid: Fid, _caller: &Subject) {}
     }
 
     fn test_subject() -> Subject {
         Subject::new("test")
     }
 
-    fn make_shell() -> TclShell {
+    fn make_namespace() -> Arc<Namespace> {
         let mut ns = Namespace::new();
         let mount = Arc::new(MemMount::new(vec![
             ("temperature", b"0.7"),
@@ -333,74 +372,79 @@ mod tests {
         ns.mount("/config", mount).unwrap();
 
         let model_mount = Arc::new(MemMount::new(vec![("status", b"loaded")]));
-        ns.mount("/srv/model", model_mount)
-            .unwrap();
+        ns.mount("/srv/model", model_mount).unwrap();
 
         // /bin/ mount with a ctl file (Plan9 PATH model).
         let bin_mount = Arc::new(MemMount::new(vec![("load", b"")]));
         ns.mount("/bin", bin_mount).unwrap();
 
-        TclShell::new(Arc::new(ns), test_subject())
+        Arc::new(ns)
     }
 
-    #[test]
-    fn eval_cat() {
-        let mut shell = make_shell();
-        let result = shell.eval("cat /config/temperature").unwrap();
+    /// Helper: spawn proxy and construct shell on blocking thread, run closure.
+    async fn with_shell<F, R>(f: F) -> R
+    where
+        F: FnOnce(&mut TclShell) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let ns = make_namespace();
+        let vfs_tx = spawn_vfs_proxy(Arc::clone(&ns), test_subject());
+        tokio::task::spawn_blocking(move || {
+            let mut shell = TclShell::new(test_subject(), vfs_tx);
+            f(&mut shell)
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eval_cat() {
+        let result = with_shell(|s| s.eval("cat /config/temperature")).await.unwrap();
         assert_eq!(result, "0.7");
     }
 
-    #[test]
-    fn eval_cat_multi() {
-        let mut shell = make_shell();
-        let result = shell.eval("cat /config/temperature /config/status").unwrap();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eval_cat_multi() {
+        let result = with_shell(|s| s.eval("cat /config/temperature /config/status")).await.unwrap();
         assert_eq!(result, "0.7loaded");
     }
 
-    #[test]
-    fn eval_cat_not_found() {
-        let mut shell = make_shell();
-        let result = shell.eval("cat /config/nonexistent");
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eval_cat_not_found() {
+        let result = with_shell(|s| s.eval("cat /config/nonexistent")).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn eval_ls() {
-        let mut shell = make_shell();
-        let result = shell.eval("ls /config").unwrap();
-        // Order may vary; check both entries are present.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eval_ls() {
+        let result = with_shell(|s| s.eval("ls /config")).await.unwrap();
         assert!(result.contains("temperature"));
         assert!(result.contains("status"));
     }
 
-    #[test]
-    fn eval_ls_root() {
-        let mut shell = make_shell();
-        let result = shell.eval("ls").unwrap();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eval_ls_root() {
+        let result = with_shell(|s| s.eval("ls")).await.unwrap();
         assert!(result.contains("srv"));
         assert!(result.contains("config"));
         assert!(result.contains("bin"));
     }
 
-    #[test]
-    fn eval_echo() {
-        let mut shell = make_shell();
-        // Echo just writes — shouldn't error.
-        let result = shell.eval("echo /bin/load qwen3:main");
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eval_echo() {
+        let result = with_shell(|s| s.eval("echo /bin/load qwen3:main")).await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn eval_ctl() {
-        let mut shell = make_shell();
-        let result = shell.eval("ctl /bin/load qwen3:main").unwrap();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eval_ctl() {
+        let result = with_shell(|s| s.eval("ctl /bin/load qwen3:main")).await.unwrap();
         assert_eq!(result, "ok: qwen3:main");
     }
 
-    #[test]
-    fn eval_help() {
-        let mut shell = make_shell();
-        let result = shell.eval("help").unwrap();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eval_help() {
+        let result = with_shell(|s| s.eval("help")).await.unwrap();
         assert!(result.contains("cat"));
         assert!(result.contains("ls"));
         assert!(result.contains("ctl"));
@@ -409,70 +453,75 @@ mod tests {
         assert!(result.contains("help"));
     }
 
-    #[test]
-    fn eval_mount() {
-        let mut shell = make_shell();
-        let result = shell.eval("mount").unwrap();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eval_mount() {
+        let result = with_shell(|s| s.eval("mount")).await.unwrap();
         assert!(result.contains("/config"));
         assert!(result.contains("/srv/model"));
         assert!(result.contains("/bin"));
     }
 
-    #[test]
-    fn eval_mount_specific() {
-        let mut shell = make_shell();
-        let result = shell.eval("mount /config").unwrap();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eval_mount_specific() {
+        let result = with_shell(|s| s.eval("mount /config")).await.unwrap();
         assert_eq!(result, "mounted: /config");
     }
 
-    #[test]
-    fn eval_mount_not_found() {
-        let mut shell = make_shell();
-        let result = shell.eval("mount /nonexistent");
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eval_mount_not_found() {
+        let result = with_shell(|s| s.eval("mount /nonexistent")).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn eval_tcl_builtins() {
-        let mut shell = make_shell();
-        // Use standard Tcl: set a variable from cat output, use string length.
-        let result = shell
-            .eval("set x [cat /config/temperature]; string length $x")
-            .unwrap();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eval_tcl_builtins() {
+        let result = with_shell(|s| {
+            s.eval("set x [cat /config/temperature]; string length $x")
+        }).await.unwrap();
         assert_eq!(result, "3"); // "0.7" is 3 chars
     }
 
-    #[test]
-    fn eval_tcl_expr() {
-        let mut shell = make_shell();
-        let result = shell.eval("expr {2 + 3}").unwrap();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eval_tcl_expr() {
+        let result = with_shell(|s| s.eval("expr {2 + 3}")).await.unwrap();
         assert_eq!(result, "5");
     }
 
-    #[test]
-    fn unknown_resolves_cmd() {
-        let mut shell = make_shell();
-        // "load" is not a registered command, but /bin/load exists.
-        let result = shell.eval("load qwen3:main").unwrap();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_resolves_cmd() {
+        let result = with_shell(|s| s.eval("load qwen3:main")).await.unwrap();
         assert_eq!(result, "ok: qwen3:main");
     }
 
-    #[test]
-    fn unknown_fails_cleanly() {
-        let mut shell = make_shell();
-        let result = shell.eval("nonexistent_command arg1 arg2");
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_fails_cleanly() {
+        let result = with_shell(|s| s.eval("nonexistent_command arg1 arg2")).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid command name"));
     }
 
-    #[test]
-    fn has_command_builtin() {
-        let shell = make_shell();
-        assert!(shell.has_command("cat"));
-        assert!(shell.has_command("ls"));
-        assert!(shell.has_command("help"));
-        assert!(shell.has_command("expr")); // standard Tcl
-        assert!(!shell.has_command("nonexistent"));
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn has_command_builtin() {
+        let ns = make_namespace();
+        let vfs_tx = spawn_vfs_proxy(Arc::clone(&ns), test_subject());
+        // has_command is sync-only, construct and check on blocking thread
+        let result = tokio::task::spawn_blocking(move || {
+            let shell = TclShell::new(test_subject(), vfs_tx);
+            (
+                shell.has_command("cat"),
+                shell.has_command("ls"),
+                shell.has_command("help"),
+                shell.has_command("expr"),
+                shell.has_command("nonexistent"),
+            )
+        })
+        .await
+        .unwrap();
+        assert!(result.0); // cat
+        assert!(result.1); // ls
+        assert!(result.2); // help
+        assert!(result.3); // expr
+        assert!(!result.4); // nonexistent
     }
 
     #[test]
@@ -490,71 +539,137 @@ mod tests {
 
     // ── Hardening tests ──────────────────────────────────────────────────────
 
-    #[test]
-    fn source_command_removed() {
-        let mut shell = make_shell();
-        let result = shell.eval("source /etc/passwd");
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn source_command_removed() {
+        let result = with_shell(|s| s.eval("source /etc/passwd")).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid command name"));
     }
 
-    #[test]
-    fn exit_command_removed() {
-        let mut shell = make_shell();
-        let result = shell.eval("exit");
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exit_command_removed() {
+        let result = with_shell(|s| s.eval("exit")).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid command name"));
     }
 
-    #[test]
-    fn puts_command_removed() {
-        let mut shell = make_shell();
-        let result = shell.eval("puts hello");
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn puts_command_removed() {
+        let result = with_shell(|s| s.eval("puts hello")).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn rename_command_removed() {
-        let mut shell = make_shell();
-        let result = shell.eval("rename cat {}");
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rename_command_removed() {
+        let result = with_shell(|s| s.eval("rename cat {}")).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn time_command_removed() {
-        let mut shell = make_shell();
-        let result = shell.eval("time {expr 1} 999999");
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_command_removed() {
+        let result = with_shell(|s| s.eval("time {expr 1} 999999")).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn cmd_name_path_traversal_rejected() {
-        let mut shell = make_shell();
-        // A command name with path separators should not resolve.
-        let result = shell.eval("../srv/model/ctl something");
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cmd_name_path_traversal_rejected() {
+        let result = with_shell(|s| s.eval("../srv/model/ctl something")).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn safe_commands_still_work() {
-        let mut shell = make_shell();
-        // Core Tcl still available.
-        assert_eq!(shell.eval("expr {2 + 3}").unwrap(), "5");
-        assert_eq!(shell.eval("set x hello; string length $x").unwrap(), "5");
-        assert_eq!(shell.eval("if {1} {set y yes}").unwrap(), "yes");
-        assert_eq!(shell.eval("list a b c").unwrap(), "a b c");
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn safe_commands_still_work() {
+        let results = with_shell(|s| {
+            vec![
+                s.eval("expr {2 + 3}"),
+                s.eval("set x hello; string length $x"),
+                s.eval("if {1} {set y yes}"),
+                s.eval("list a b c"),
+            ]
+        }).await;
+        assert_eq!(results[0].as_ref().unwrap(), "5");
+        assert_eq!(results[1].as_ref().unwrap(), "5");
+        assert_eq!(results[2].as_ref().unwrap(), "yes");
+        assert_eq!(results[3].as_ref().unwrap(), "a b c");
     }
 
-    #[test]
-    fn instruction_limit_catches_infinite_loop() {
-        let mut shell = make_shell();
-        // Lower the limit so the test completes quickly.
-        shell.set_instruction_limit(500);
-        let result = shell.eval("while {1} {}");
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn instruction_limit_catches_infinite_loop() {
+        let ns = make_namespace();
+        let vfs_tx = spawn_vfs_proxy(Arc::clone(&ns), test_subject());
+        let result = tokio::task::spawn_blocking(move || {
+            let mut shell = TclShell::new(test_subject(), vfs_tx);
+            shell.set_instruction_limit(500);
+            shell.eval("while {1} {}")
+        })
+        .await
+        .unwrap();
         assert!(result.is_err());
         assert!(
             result.unwrap_err().contains("instruction limit"),
             "error should mention instruction limit"
         );
+    }
+
+    // ── field builtin tests ─────────────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn field_extract_string() {
+        // Double-brace: outer {} = Tcl quoting, inner {} = JSON object
+        let result = with_shell(|s| {
+            s.eval(r#"field {{"name":"alice","age":30}} name"#)
+        }).await.unwrap();
+        assert_eq!(result, "alice");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn field_extract_number() {
+        let result = with_shell(|s| {
+            s.eval(r#"field {{"name":"alice","age":30}} age"#)
+        }).await.unwrap();
+        assert_eq!(result, "30");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn field_extract_nested() {
+        let result = with_shell(|s| {
+            s.eval(r#"field {{"data":{"x":1}}} data"#)
+        }).await.unwrap();
+        assert_eq!(result, r#"{"x":1}"#);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn field_not_found() {
+        let result = with_shell(|s| {
+            s.eval(r#"field {{"name":"alice"}} missing"#)
+        }).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("field 'missing' not found"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn field_invalid_json() {
+        let result = with_shell(|s| {
+            s.eval(r#"field {not json} name"#)
+        }).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid JSON"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn field_bracket_string_no_subst() {
+        // SECURITY: Verify bracket-containing string values don't trigger Tcl substitution
+        // Double-brace to pass JSON through Tcl quoting
+        let result = with_shell(|s| {
+            s.eval(r#"field {{"cmd":"[exec rm -rf /]"}} cmd"#)
+        }).await.unwrap();
+        // Should return the literal string, not execute it
+        assert_eq!(result, "[exec rm -rf /]");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn field_in_help() {
+        let result = with_shell(|s| s.eval("help")).await.unwrap();
+        assert!(result.contains("field"));
     }
 }

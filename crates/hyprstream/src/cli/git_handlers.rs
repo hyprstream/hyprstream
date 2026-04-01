@@ -825,6 +825,9 @@ async fn clone_with_streaming(
                 }
                 return Err(anyhow::anyhow!("Clone stream error: {}", message));
             }
+            Some(StreamPayload::Tagged { .. }) => {
+                // Tagged payloads not expected in clone streams; skip
+            }
             None => {
                 // Stream ended without completion
                 if !quiet {
@@ -1335,6 +1338,9 @@ pub async fn handle_infer(
                     warn!("Stream error: {}", message);
                     bail!("Inference stream error: {}", message);
                 }
+                Some(StreamPayload::Tagged { .. }) => {
+                    // Tagged payloads not expected here; skip
+                }
                 None => {
                     // Stream ended
                     break;
@@ -1379,6 +1385,7 @@ pub async fn handle_infer(
                     StreamPayload::Error(msg) => {
                         bail!("Generation error: {msg}");
                     }
+                    StreamPayload::Tagged { .. } => {}
                 },
                 None => {
                     bail!("Stream ended without completion");

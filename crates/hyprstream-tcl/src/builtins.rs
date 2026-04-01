@@ -2,11 +2,17 @@
 //!
 //! Each command is a `CommandFunc` registered via `add_context_command`.
 //! VFS state is accessed via `interp.context::<ShellContext>(ctx_id)`.
+//!
+//! All VFS operations go through the channel proxy pattern: each builtin
+//! creates a `std::sync::mpsc::sync_channel(1)` for the reply, sends a
+//! `VfsRequest` via `blocking_send`, and blocks on `reply_rx.recv()`.
 
 use molt::molt_err;
 use molt::molt_ok;
 use molt::types::*;
 use molt::Interp;
+
+use hyprstream_vfs::proxy::{VfsOp, VfsRequest};
 
 use crate::ShellContext;
 
@@ -16,6 +22,7 @@ pub fn register_all(interp: &mut Interp, ctx_id: ContextID) {
     interp.add_context_command("ls", cmd_ls, ctx_id);
     interp.add_context_command("echo", cmd_echo, ctx_id);
     interp.add_context_command("ctl", cmd_ctl, ctx_id);
+    interp.add_context_command("field", cmd_field, ctx_id);
     interp.add_context_command("help", cmd_help, ctx_id);
     interp.add_context_command("mount", cmd_mount, ctx_id);
 }
@@ -25,16 +32,24 @@ fn cmd_cat(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResult
     molt::check_args(1, argv, 2, 0, "path ?path ...?")?;
 
     let mut output = String::new();
-    // Collect paths first, then borrow context — avoids holding &mut Interp across iterations.
     let paths: Vec<String> = argv[1..].iter().map(|v| v.to_string()).collect();
     let ctx = interp.context::<ShellContext>(ctx_id);
 
     for path in &paths {
-        match ctx.ns.cat(path, &ctx.subject) {
-            Ok(data) => {
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+        let req = VfsRequest {
+            op: VfsOp::Cat { path: path.clone() },
+            reply: reply_tx,
+        };
+        if ctx.vfs_tx.blocking_send(req).is_err() {
+            return molt_err!("VFS proxy gone");
+        }
+        match reply_rx.recv() {
+            Ok(Ok(data)) => {
                 output.push_str(&String::from_utf8_lossy(&data));
             }
-            Err(e) => return molt_err!("{}: {}", path, e),
+            Ok(Err(e)) => return molt_err!("{}: {}", path, e),
+            Err(_) => return molt_err!("{}: VFS proxy did not respond", path),
         }
     }
     molt_ok!(output)
@@ -51,21 +66,21 @@ fn cmd_ls(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResult 
     };
 
     let ctx = interp.context::<ShellContext>(ctx_id);
-    match ctx.ns.ls(&path, &ctx.subject) {
-        Ok(entries) => {
-            let lines: Vec<String> = entries
-                .iter()
-                .map(|e| {
-                    if e.is_dir {
-                        format!("{}/", e.name)
-                    } else {
-                        e.name.clone()
-                    }
-                })
-                .collect();
-            molt_ok!(lines.join("\n"))
+    let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+    let req = VfsRequest {
+        op: VfsOp::Ls { path: path.clone() },
+        reply: reply_tx,
+    };
+    if ctx.vfs_tx.blocking_send(req).is_err() {
+        return molt_err!("VFS proxy gone");
+    }
+    match reply_rx.recv() {
+        Ok(Ok(data)) => {
+            let text = String::from_utf8_lossy(&data);
+            molt_ok!(text.into_owned())
         }
-        Err(e) => molt_err!("{}: {}", path, e),
+        Ok(Err(e)) => molt_err!("{}: {}", path, e),
+        Err(_) => molt_err!("{}: VFS proxy did not respond", path),
     }
 }
 
@@ -76,10 +91,21 @@ fn cmd_echo(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResul
     let path = argv[1].to_string();
     let data = argv[2].to_string();
     let ctx = interp.context::<ShellContext>(ctx_id);
-
-    match ctx.ns.echo(&path, data.as_bytes(), &ctx.subject) {
-        Ok(()) => molt_ok!(),
-        Err(e) => molt_err!("{}: {}", path, e),
+    let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+    let req = VfsRequest {
+        op: VfsOp::Echo {
+            path: path.clone(),
+            data: data.into_bytes(),
+        },
+        reply: reply_tx,
+    };
+    if ctx.vfs_tx.blocking_send(req).is_err() {
+        return molt_err!("VFS proxy gone");
+    }
+    match reply_rx.recv() {
+        Ok(Ok(_)) => molt_ok!(),
+        Ok(Err(e)) => molt_err!("{}: {}", path, e),
+        Err(_) => molt_err!("{}: VFS proxy did not respond", path),
     }
 }
 
@@ -92,12 +118,50 @@ fn cmd_ctl(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResult
     let cmd_str = cmd_parts.join(" ");
 
     let ctx = interp.context::<ShellContext>(ctx_id);
-    match ctx.ns.ctl(&path, cmd_str.as_bytes(), &ctx.subject) {
-        Ok(resp) => {
+    let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+    let req = VfsRequest {
+        op: VfsOp::Ctl {
+            path: path.clone(),
+            cmd: cmd_str.into_bytes(),
+        },
+        reply: reply_tx,
+    };
+    if ctx.vfs_tx.blocking_send(req).is_err() {
+        return molt_err!("VFS proxy gone");
+    }
+    match reply_rx.recv() {
+        Ok(Ok(resp)) => {
             let text = String::from_utf8_lossy(&resp);
             molt_ok!(text.into_owned())
         }
-        Err(e) => molt_err!("{}: {}", path, e),
+        Ok(Err(e)) => molt_err!("{}: {}", path, e),
+        Err(_) => molt_err!("{}: VFS proxy did not respond", path),
+    }
+}
+
+/// `field value fieldName` — extract a field from a JSON string.
+///
+/// Returns the string value for string fields, or the JSON representation
+/// for non-string fields (numbers, objects, arrays, booleans, null).
+///
+/// SECURITY: String values are returned unescaped. If the result is used
+/// with `eval` or `subst`, bracket contents trigger Tcl command substitution.
+/// The attenuated TclShell does not register `eval` or `subst`, so this is
+/// safe in normal operation. If those commands are available, callers must
+/// quote with `[list $result]` before substitution.
+fn cmd_field(_interp: &mut Interp, _ctx_id: ContextID, argv: &[Value]) -> MoltResult {
+    molt::check_args(1, argv, 3, 3, "value fieldName")?;
+
+    let json_str = argv[1].to_string();
+    let field = argv[2].to_string();
+    let parsed: serde_json::Value = match serde_json::from_str(&json_str) {
+        Ok(v) => v,
+        Err(e) => return molt_err!("invalid JSON: {}", e),
+    };
+    match parsed.get(&field) {
+        Some(serde_json::Value::String(s)) => molt_ok!(s.as_str()),
+        Some(v) => molt_ok!(v.to_string()),
+        None => molt_err!("field '{}' not found", field),
     }
 }
 
@@ -111,15 +175,28 @@ fn cmd_help(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResul
     out.push_str("  ls [path]            list directory\n");
     out.push_str("  echo <path> <data>   write to file\n");
     out.push_str("  ctl <path> <cmd>     control file (write+read)\n");
+    out.push_str("  field <json> <name>  extract JSON field\n");
     out.push_str("  mount [prefix]       list mount points\n");
     out.push_str("  help                 this message\n");
 
     let ctx = interp.context::<ShellContext>(ctx_id);
-    if let Ok(entries) = ctx.ns.ls("/bin", &ctx.subject) {
-        if !entries.is_empty() {
-            out.push_str("\nCommands (/bin/):\n");
-            for entry in &entries {
-                out.push_str(&format!("  {}\n", entry.name));
+    let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+    let req = VfsRequest {
+        op: VfsOp::Ls {
+            path: "/bin".to_owned(),
+        },
+        reply: reply_tx,
+    };
+    if ctx.vfs_tx.blocking_send(req).is_ok() {
+        if let Ok(Ok(data)) = reply_rx.recv() {
+            let text = String::from_utf8_lossy(&data);
+            if !text.is_empty() {
+                out.push_str("\nCommands (/bin/):\n");
+                for name in text.split('\n') {
+                    if !name.is_empty() {
+                        out.push_str(&format!("  {}\n", name.trim_end_matches('/')));
+                    }
+                }
             }
         }
     }
@@ -132,10 +209,23 @@ fn cmd_mount(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResu
     molt::check_args(1, argv, 1, 2, "?prefix?")?;
 
     let ctx = interp.context::<ShellContext>(ctx_id);
-    let prefixes = ctx.ns.mount_prefixes();
+    let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+    let req = VfsRequest {
+        op: VfsOp::MountPrefixes,
+        reply: reply_tx,
+    };
+    if ctx.vfs_tx.blocking_send(req).is_err() {
+        return molt_err!("VFS proxy gone");
+    }
+    let prefixes_str = match reply_rx.recv() {
+        Ok(Ok(data)) => String::from_utf8_lossy(&data).into_owned(),
+        Ok(Err(e)) => return molt_err!("mount: {}", e),
+        Err(_) => return molt_err!("mount: VFS proxy did not respond"),
+    };
+    let prefixes: Vec<&str> = prefixes_str.lines().collect();
 
     if argv.len() == 1 {
-        molt_ok!(prefixes.join("\n"))
+        molt_ok!(prefixes_str)
     } else {
         let prefix = argv[1].to_string();
         if prefixes.iter().any(|p| *p == prefix) {

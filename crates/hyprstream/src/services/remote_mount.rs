@@ -20,6 +20,7 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use async_trait::async_trait;
 use dashmap::DashMap;
 use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
 use hyprstream_rpc::Subject;
@@ -105,8 +106,9 @@ impl RemoteModelMount {
     }
 }
 
+#[async_trait]
 impl Mount for RemoteModelMount {
-    fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
+    async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
         // First component is the model_ref (e.g., "qwen3:main"), rest is path within model tree.
         if components.is_empty() {
             return Err(MountError::InvalidArgument("empty path".into()));
@@ -141,7 +143,7 @@ impl Mount for RemoteModelMount {
         Ok(Fid::new(RemoteFidKey(local_fid)))
     }
 
-    fn open(&self, fid: &mut Fid, mode: u8, _caller: &Subject) -> Result<(), MountError> {
+    async fn open(&self, fid: &mut Fid, mode: u8, _caller: &Subject) -> Result<(), MountError> {
         let key = fid.downcast_ref::<RemoteFidKey>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid type".into()))?;
         let local_id = key.0;
@@ -161,7 +163,7 @@ impl Mount for RemoteModelMount {
         Ok(())
     }
 
-    fn read(&self, fid: &Fid, offset: u64, count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
+    async fn read(&self, fid: &Fid, offset: u64, count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
         let key = fid.downcast_ref::<RemoteFidKey>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid type".into()))?;
         let local_id = key.0;
@@ -180,7 +182,7 @@ impl Mount for RemoteModelMount {
         Ok(result.data)
     }
 
-    fn write(&self, fid: &Fid, offset: u64, data: &[u8], _caller: &Subject) -> Result<u32, MountError> {
+    async fn write(&self, fid: &Fid, offset: u64, data: &[u8], _caller: &Subject) -> Result<u32, MountError> {
         let key = fid.downcast_ref::<RemoteFidKey>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid type".into()))?;
         let local_id = key.0;
@@ -199,7 +201,7 @@ impl Mount for RemoteModelMount {
         Ok(result.count)
     }
 
-    fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
+    async fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
         // 9P doesn't have a dedicated readdir — we read the directory fid and parse
         // the stat entries from the raw bytes. However, the model service's SyntheticTree
         // encodes directory listings in its read() response as newline-separated entries.
@@ -234,7 +236,7 @@ impl Mount for RemoteModelMount {
         Ok(entries)
     }
 
-    fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
+    async fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
         let key = fid.downcast_ref::<RemoteFidKey>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid type".into()))?;
         let local_id = key.0;
@@ -260,7 +262,7 @@ impl Mount for RemoteModelMount {
         })
     }
 
-    fn clunk(&self, fid: Fid, _caller: &Subject) {
+    async fn clunk(&self, fid: Fid, _caller: &Subject) {
         let Some(key) = fid.downcast_ref::<RemoteFidKey>() else { return };
         let local_id = key.0;
 

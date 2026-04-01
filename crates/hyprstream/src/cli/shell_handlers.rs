@@ -295,7 +295,7 @@ pub async fn handle_shell_tui(
 
     // Build VFS namespace for `/path` routing in ChatApps.
     #[allow(clippy::type_complexity)]
-    let (vfs_ns, tcl_mount_rx): (std::sync::Arc<hyprstream_vfs::Namespace>, std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>) = {
+    let (vfs_ns, tcl_mount_rx): (std::sync::Arc<hyprstream_vfs::Namespace>, std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>) = {
         use crate::services::fs::{SyntheticNode, SyntheticTree};
 
         let mut ns = hyprstream_vfs::Namespace::new();
@@ -327,10 +327,11 @@ pub async fn handle_shell_tui(
                 handler: Box::new(move |data, _subject| {
                     let ns = w.upgrade().ok_or("namespace dropped")?;
                     let input = std::str::from_utf8(data).map_err(|e| e.to_string())?;
+                    let handle = tokio::runtime::Handle::current();
                     let mut out = Vec::new();
                     for path in input.split_whitespace() {
                         out.extend_from_slice(
-                            &ns.cat(path, &s).map_err(|e| e.to_string())?,
+                            &tokio::task::block_in_place(|| handle.block_on(ns.cat(path, &s))).map_err(|e| e.to_string())?,
                         );
                     }
                     Ok(out)
@@ -346,7 +347,8 @@ pub async fn handle_shell_tui(
                     let input = std::str::from_utf8(data).map_err(|e| e.to_string())?;
                     let path = input.trim();
                     let path = if path.is_empty() { "/" } else { path };
-                    let entries = ns.ls(path, &s).map_err(|e| e.to_string())?;
+                    let handle = tokio::runtime::Handle::current();
+                    let entries = tokio::task::block_in_place(|| handle.block_on(ns.ls(path, &s))).map_err(|e| e.to_string())?;
                     let listing: Vec<String> = entries.iter().map(|e| {
                         if e.is_dir { format!("{}/", e.name) } else { e.name.clone() }
                     }).collect();
@@ -367,7 +369,8 @@ pub async fn handle_shell_tui(
                     out.push_str("  mount [prefix]       list mount points\n");
                     out.push_str("  help                 this message\n");
                     if let Some(ns) = w.upgrade() {
-                        if let Ok(entries) = ns.ls("/bin", &s) {
+                        let handle = tokio::runtime::Handle::current();
+                        if let Ok(entries) = tokio::task::block_in_place(|| handle.block_on(ns.ls("/bin", &s))) {
                             if !entries.is_empty() {
                                 out.push_str("\nCommands (/bin/):\n");
                                 for entry in &entries {
@@ -452,7 +455,7 @@ pub async fn handle_shell_tui(
             let _ = ns_mut.mount("/lang/tcl", tcl_mount);
         }
 
-        (ns, std::sync::Arc::new(std::sync::Mutex::new(tcl_mount_rx)))
+        (ns, std::sync::Arc::new(tokio::sync::Mutex::new(tcl_mount_rx)))
     };
 
     // Console overlay for log viewing (F9 / Ctrl-L).
@@ -880,7 +883,7 @@ async fn dispatch_outputs(
     signing_key: &SigningKey,
     vfs_ns: &std::sync::Arc<hyprstream_vfs::Namespace>,
     vfs_subject: &hyprstream_rpc::Subject,
-    tcl_mount_rx: &std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>,
+    tcl_mount_rx: &std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>,
     outputs: Vec<CompositorOutput>,
 ) -> bool {
     for output in outputs {
@@ -941,7 +944,7 @@ async fn handle_rpc(
     signing_key: &SigningKey,
     vfs_ns: &std::sync::Arc<hyprstream_vfs::Namespace>,
     vfs_subject: &hyprstream_rpc::Subject,
-    tcl_mount_rx: &std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>,
+    tcl_mount_rx: &std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>,
     req: RpcRequest,
 ) -> Vec<CompositorInput> {
     let session_id = compositor.chrome.session_id;

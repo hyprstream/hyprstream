@@ -57,9 +57,12 @@
 
 pub mod endpoints;
 mod publisher;
+pub mod secure_publisher;
+pub mod secure_subscriber;
 mod service;
 pub mod sockopt;
 mod subscriber;
+pub mod token_manager;
 mod types;
 
 pub use publisher::EventPublisher;
@@ -85,6 +88,11 @@ pub use types::{
     serialize_container_started, serialize_container_stopped,
     serialize_sandbox_started, serialize_sandbox_stopped,
 };
+
+// Secure event transport (Phase 7)
+pub use secure_publisher::{SecureEventPublisher, EncryptedEvent, RekeyPolicy, RotationResult};
+pub use secure_subscriber::SecureEventSubscriber;
+pub use token_manager::EventTokenManager;
 
 // Inproc endpoint constants (for backward compatibility)
 pub use endpoints::{PUB as EVENTS_PUB, SUB as EVENTS_SUB};

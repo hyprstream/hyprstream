@@ -24,12 +24,16 @@ mod parser;
 mod triggers;
 mod subscription;
 mod runner;
+pub mod adapter;
+pub mod gh_adapter;
 
 pub use service::WorkflowService;
 pub use parser::{Workflow, Job, Step};
 pub use triggers::{EventTrigger, EventHandler, HandlerResult};
 pub use subscription::WorkflowSubscription;
 pub use runner::WorkflowRunner;
+pub use adapter::SubscriberAdapter;
+pub use gh_adapter::GitHubActionsAdapter;
 
 // Re-export generated wire-format types for external consumers
 pub use client::{

@@ -130,6 +130,10 @@ async fn collect_stream_to_result(
                 StreamPayload::Error(msg) => {
                     anyhow::bail!("Generation error: {msg}");
                 }
+                StreamPayload::Tagged { .. } => {
+                    // encrypted event payload, skip
+                    continue;
+                }
             },
             Some(Err(e)) => {
                 anyhow::bail!("Stream error: {e}");

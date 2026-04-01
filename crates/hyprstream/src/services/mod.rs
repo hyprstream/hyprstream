@@ -91,6 +91,7 @@ pub mod fs;
 pub mod remote_mount;
 pub mod rpc_types;
 pub mod stream;
+pub mod typed;
 pub mod worker;
 
 pub use core::{

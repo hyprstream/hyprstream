@@ -4,12 +4,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use anyhow::Result as AnyhowResult;
 use async_trait::async_trait;
 use hyprstream_rpc::prelude::SigningKey;
 use hyprstream_rpc::service::{AuthorizeFn, EnvelopeContext, ZmqService};
 use hyprstream_rpc::transport::TransportConfig;
+
+use hyprstream_vfs::Namespace;
 
 use crate::error::Result;
 use crate::events::{EventSubscriber, ReceivedEvent};
@@ -22,6 +25,7 @@ use crate::generated::workflow_client::{
     DispatchRequest, SubscribeRequest,
 };
 
+use super::runner::WorkflowRunner;
 use super::subscription::WorkflowSubscription;
 use super::triggers::{EventHandler, EventTrigger, HandlerResult};
 use super::{RunId, WorkflowId, Workflow};
@@ -80,8 +84,8 @@ pub struct WorkflowService {
     /// Registered workflows
     workflows: RwLock<HashMap<WorkflowId, WorkflowDef>>,
 
-    /// Active runs
-    runs: RwLock<HashMap<RunId, WorkflowRun>>,
+    /// Active runs (Arc for sharing with spawned execution tasks)
+    runs: Arc<RwLock<HashMap<RunId, WorkflowRun>>>,
 
     /// Per-repo workflow subscriptions (O(1) lookup)
     repo_workflows: RwLock<HashMap<String, Vec<WorkflowSubscription>>>,
@@ -103,6 +107,9 @@ pub struct WorkflowService {
 
     /// Optional authorization callback (injected by parent crate)
     authorize_fn: Option<AuthorizeFn>,
+
+    /// Workflow execution engine
+    runner: Option<WorkflowRunner>,
 }
 
 impl WorkflowService {
@@ -120,7 +127,7 @@ impl WorkflowService {
     ) -> Self {
         Self {
             workflows: RwLock::new(HashMap::new()),
-            runs: RwLock::new(HashMap::new()),
+            runs: Arc::new(RwLock::new(HashMap::new())),
             repo_workflows: RwLock::new(HashMap::new()),
             context,
             handlers: RwLock::new(Vec::new()),
@@ -128,7 +135,16 @@ impl WorkflowService {
             transport,
             signing_key,
             authorize_fn: None,
+            runner: None,
         }
+    }
+
+    /// Set the VFS namespace for workflow execution.
+    ///
+    /// This creates a WorkflowRunner that resolves actions through `/bin/`
+    /// and evaluates scripts via TclShell.
+    pub fn set_namespace(&mut self, ns: Arc<Namespace>) {
+        self.runner = Some(WorkflowRunner::new(ns));
     }
 
     /// Set the authorization callback for policy checks.
@@ -221,7 +237,8 @@ impl WorkflowService {
                             trigger_event = %topic,
                             "Dispatching workflow from event"
                         );
-                        if let Err(e) = self.dispatch(&workflow_id, inputs).await {
+                        let event_subject = hyprstream_vfs::Subject::new("workflow-event-dispatch");
+                        if let Err(e) = self.dispatch(&workflow_id, inputs, &event_subject).await {
                             tracing::error!(
                                 workflow_id = %workflow_id,
                                 error = %e,
@@ -287,16 +304,33 @@ impl WorkflowService {
             .collect())
     }
 
-    /// Dispatch a workflow manually
+    /// Dispatch a workflow manually.
+    ///
+    /// `subject` is the execution identity (who the workflow runs as).
+    /// Rejects user-supplied inputs with `_`-prefixed keys (reserved for provenance).
+    ///
+    /// If a WorkflowRunner is configured (via `set_namespace`), the workflow
+    /// is executed asynchronously in a spawned task that updates run status.
+    /// Otherwise, the run is created in Queued state with no execution.
     pub(crate) async fn dispatch(
         &self,
         workflow_id: &WorkflowId,
         inputs: HashMap<String, String>,
+        subject: &hyprstream_vfs::Subject,
     ) -> Result<RunId> {
+        // Reject reserved _-prefixed keys in user inputs (provenance injection prevention).
+        if let Some(bad_key) = inputs.keys().find(|k| k.starts_with('_')) {
+            return Err(crate::error::WorkerError::WorkflowParseError(
+                format!("input keys starting with '_' are reserved: {bad_key}"),
+            ));
+        }
+
         let workflows = self.workflows.read().await;
-        let _workflow = workflows
+        let workflow_def = workflows
             .get(workflow_id)
             .ok_or_else(|| crate::error::WorkerError::WorkflowNotFound(workflow_id.clone()))?;
+        let workflow = workflow_def.workflow.clone();
+        drop(workflows);
 
         let run_id = uuid::Uuid::new_v4().to_string();
 
@@ -311,14 +345,49 @@ impl WorkflowService {
 
         let mut runs = self.runs.write().await;
         runs.insert(run_id.clone(), run);
+        drop(runs);
 
-        // TODO: Start workflow execution
         tracing::info!(
             workflow_id = %workflow_id,
             run_id = %run_id,
             inputs = ?inputs,
             "Dispatched workflow"
         );
+
+        // If runner is configured, spawn execution task.
+        if let Some(ref runner) = self.runner {
+            let runner = runner.clone();
+            let subject = subject.clone();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let run_id_clone = run_id.clone();
+            let runs = self.runs.clone();
+            tokio::spawn(async move {
+                // Update status to Running.
+                if let Some(run) = runs.write().await.get_mut(&run_id_clone) {
+                    run.status = WireRunStatus::InProgress;
+                    run.started_at = Some(chrono::Utc::now());
+                }
+                let result = runner.run(&workflow, inputs, &subject, cancel).await;
+                // Update final status.
+                if let Some(run) = runs.write().await.get_mut(&run_id_clone) {
+                    match &result {
+                        Ok(wr) => {
+                            run.status = if wr.success {
+                                WireRunStatus::Success
+                            } else {
+                                WireRunStatus::Failure
+                            };
+                            tracing::info!(run_id = %run_id_clone, success = wr.success, "Workflow completed");
+                        }
+                        Err(e) => {
+                            run.status = WireRunStatus::Failure;
+                            tracing::error!(run_id = %run_id_clone, error = %e, "Workflow failed");
+                        }
+                    }
+                    run.completed_at = Some(chrono::Utc::now());
+                }
+            });
+        }
 
         Ok(run_id)
     }
@@ -363,6 +432,26 @@ impl WorkflowService {
         tracing::info!(repo_id = %repo_id, "Rescanned repository");
         Ok(())
     }
+
+    /// Start a subscriber adapter. Returns a CancellationToken to stop it.
+    ///
+    /// The adapter runs in a background task that receives events and
+    /// dispatches workflows. Cancel the returned token to stop the adapter.
+    pub async fn start_adapter(
+        self: &Arc<Self>,
+        adapter: Box<dyn super::adapter::SubscriberAdapter>,
+    ) -> CancellationToken {
+        let cancel = CancellationToken::new();
+        let service = Arc::clone(self);
+        let child = cancel.child_token();
+        let name = adapter.name().to_owned();
+        tokio::spawn(async move {
+            if let Err(e) = adapter.run(service, child).await {
+                tracing::error!(adapter = %name, error = %e, "adapter failed");
+            }
+        });
+        cancel
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -389,6 +478,9 @@ fn to_run_data(run: &WorkflowRun) -> WorkflowRunWire {
     }
 }
 
+// ?Send required: capnp Reader types are !Send, and the generated dispatch_workflow
+// macro holds readers across await points. This means WorkflowService cannot use the
+// Spawnable blanket impl and must be run on a LocalSet or single-threaded runtime.
 #[async_trait::async_trait(?Send)]
 impl WorkflowHandler for WorkflowService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> AnyhowResult<()> {
@@ -460,14 +552,15 @@ impl WorkflowHandler for WorkflowService {
 
     async fn handle_dispatch(
         &self,
-        _ctx: &EnvelopeContext,
+        ctx: &EnvelopeContext,
         _request_id: u64,
         request: &DispatchRequest,
     ) -> AnyhowResult<WorkflowResponseVariant> {
         let inputs_map: HashMap<String, String> = request.inputs.iter()
             .map(|kv| (kv.key.clone(), kv.value.clone()))
             .collect();
-        let run_id = self.dispatch(&request.workflow_id.clone(), inputs_map).await?;
+        let subject = hyprstream_vfs::Subject::new(ctx.subject().to_string());
+        let run_id = self.dispatch(&request.workflow_id.clone(), inputs_map, &subject).await?;
         Ok(WorkflowResponseVariant::DispatchResult(run_id))
     }
 
