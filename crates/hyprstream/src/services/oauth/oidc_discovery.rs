@@ -104,6 +104,21 @@ impl OidcDiscoveryCache {
             ));
         }
 
+        // Enforce HTTPS on derived URLs (SSRF protection)
+        if !allow_http {
+            for (name, url) in [
+                ("token_endpoint", &metadata.token_endpoint),
+                ("jwks_uri", &metadata.jwks_uri),
+            ] {
+                if !url.starts_with("https://") {
+                    return Err(anyhow!(
+                        "OIDC discovery {} must be HTTPS: {} (set allow_http=true for dev)",
+                        name, url
+                    ));
+                }
+            }
+        }
+
         // Cache
         {
             let mut cache = self.cache.write().await;

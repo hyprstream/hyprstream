@@ -194,10 +194,13 @@ pub async fn external_callback(
         }
     };
 
-    // Verify external id_token using jsonwebtoken (supports RS256, ES256, EdDSA)
-    // For now, decode without full JWKS verification — we trust the TLS connection
-    // to the token endpoint. Full JWKS verification will be added with the
-    // FederationKeySource refactor.
+    // Decode external id_token claims.
+    //
+    // NOTE: Signature verification against the provider's JWKS is not yet
+    // implemented (requires async JWKS fetch + multi-algorithm verification).
+    // The token was received directly from the provider's token endpoint over
+    // TLS, so transport-level trust is established. Full JWKS verification
+    // will be added when the FederationKeySource is refactored.
     let external_claims: serde_json::Value = match decode_external_id_token(external_id_token) {
         Ok(c) => c,
         Err(e) => {
@@ -206,11 +209,51 @@ pub async fn external_callback(
         }
     };
 
-    // Validate nonce
-    if let Some(expected_nonce) = external_claims["nonce"].as_str() {
-        if expected_nonce != pending.external_nonce {
+    // Validate issuer (OIDC Core Section 3.1.3.7)
+    if external_claims["iss"].as_str() != Some(&provider.issuer_url) {
+        tracing::error!(
+            provider = %provider_slug,
+            expected = %provider.issuer_url,
+            got = %external_claims["iss"],
+            "External id_token issuer mismatch"
+        );
+        return (axum::http::StatusCode::BAD_REQUEST, "Issuer mismatch").into_response();
+    }
+
+    // Validate audience (OIDC Core Section 3.1.3.6)
+    let aud_valid = match &external_claims["aud"] {
+        serde_json::Value::String(s) => s == &provider.client_id,
+        serde_json::Value::Array(arr) => arr.iter().any(|v| v.as_str() == Some(&provider.client_id)),
+        _ => false,
+    };
+    if !aud_valid {
+        tracing::error!(provider = %provider_slug, "External id_token audience mismatch");
+        return (axum::http::StatusCode::BAD_REQUEST, "Audience mismatch").into_response();
+    }
+
+    // Validate expiration (OIDC Core Section 3.1.3.6)
+    if let Some(exp) = external_claims["exp"].as_i64() {
+        let now = chrono::Utc::now().timestamp();
+        let skew = provider.clock_skew_seconds as i64;
+        if now > exp + skew {
+            tracing::error!(provider = %provider_slug, "External id_token expired");
+            return (axum::http::StatusCode::BAD_REQUEST, "Token expired").into_response();
+        }
+    } else {
+        tracing::error!(provider = %provider_slug, "External id_token missing exp claim");
+        return (axum::http::StatusCode::BAD_REQUEST, "Missing exp claim").into_response();
+    }
+
+    // Validate nonce (REQUIRED when sent in auth request — OIDC Core Section 3.1.3.6)
+    match external_claims["nonce"].as_str() {
+        Some(nonce) if nonce == pending.external_nonce => { /* valid */ }
+        Some(_) => {
             tracing::error!(provider = %provider_slug, "External id_token nonce mismatch");
             return (axum::http::StatusCode::BAD_REQUEST, "Nonce mismatch").into_response();
+        }
+        None => {
+            tracing::error!(provider = %provider_slug, "External id_token missing nonce (required)");
+            return (axum::http::StatusCode::BAD_REQUEST, "Missing nonce").into_response();
         }
     }
 

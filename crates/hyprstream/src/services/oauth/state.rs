@@ -251,6 +251,13 @@ impl OAuthState {
                     let mut tokens = state.refresh_tokens.write().await;
                     tokens.retain(|_, entry| !entry.is_expired());
                 }
+
+                // Sweep expired external auth flows
+                {
+                    let now = Instant::now();
+                    let mut auths = state.pending_external_auths.write().await;
+                    auths.retain(|_, auth| auth.expires_at > now);
+                }
             }
         });
     }
