@@ -150,7 +150,7 @@ async fn exchange_authorization_code(
     tracing::info!(client_id = %params.client_id, username = %pending.username, "PKCE verified, issuing token");
     // Use the authenticated username as JWT sub (set during Ed25519 challenge-response on consent page).
     let sub = pending.username.clone();
-    issue_token_with_refresh(&state, &params.client_id, pending.scopes, pending.resource, &sub, pending.oidc_nonce).await
+    issue_token_with_refresh(&state, &params.client_id, pending.scopes, pending.resource, &sub, pending.oidc_nonce, true).await
 }
 
 /// Handle refresh_token grant type (OAuth 2.1 with rotation).
@@ -198,7 +198,7 @@ async fn exchange_refresh_token(
 
     // Issue new access token + rotated refresh token with the stored scopes/resource and original subject.
     // No id_token on refresh per OIDC Core Section 12.2.
-    issue_token_with_refresh(&state, &entry.client_id, entry.scopes, entry.resource, &entry.username, None).await
+    issue_token_with_refresh(&state, &entry.client_id, entry.scopes, entry.resource, &entry.username, None, false).await
 }
 
 /// Handle urn:ietf:params:oauth:grant-type:device_code grant type (RFC 8628 Section 3.4).
@@ -284,8 +284,8 @@ async fn exchange_device_code(
             let mut user_code_map = state.device_code_by_user_code.write().await;
             user_code_map.remove(&user_code);
             drop(user_code_map);
-            // Device flow: no OIDC nonce (device codes don't carry authorize params).
-            issue_token_with_refresh(&state, &client_id, scopes, resource, &approved_by, None).await
+            // Device flow: no OIDC nonce and not initial OIDC auth.
+            issue_token_with_refresh(&state, &client_id, scopes, resource, &approved_by, None, false).await
         }
     }
 }
@@ -304,6 +304,9 @@ fn generate_refresh_token() -> String {
 /// - authorization_code flow: pass `pending.username` (the Ed25519-authenticated user from the consent page)
 /// - refresh_token flow: pass the original sub from the RefreshTokenEntry
 /// - device_code flow: pass the approving user's username (from challenge-response)
+///
+/// `initial_auth`: true for authorization_code exchange (may issue id_token),
+/// false for refresh_token and device_code (never issues id_token per OIDC Core § 12.2).
 async fn issue_token_with_refresh(
     state: &OAuthState,
     client_id: &str,
@@ -311,6 +314,7 @@ async fn issue_token_with_refresh(
     resource: Option<String>,
     sub: &str,
     oidc_nonce: Option<String>,
+    initial_auth: bool,
 ) -> Response {
     let scope_str = scopes.join(" ");
 
@@ -343,8 +347,10 @@ async fn issue_token_with_refresh(
                 });
             }
 
-            // Build OIDC id_token when scope includes "openid" and signing key is available.
-            let id_token = if scopes.iter().any(|s| s == "openid") && state.signing_key.is_some() {
+            // Build OIDC id_token when: scope includes "openid", signing key is available,
+            // and this is an initial authorization (not refresh/device per OIDC Core § 12.2).
+            let has_openid = scopes.iter().any(|s| s == "openid");
+            let id_token = if has_openid && initial_auth && state.signing_key.is_some() {
                 let id_exp = now + 300; // 5-minute id_token lifetime
                 let mut id_claims = hyprstream_rpc::auth::IdTokenClaims::new(
                     state.issuer_url.clone(),
