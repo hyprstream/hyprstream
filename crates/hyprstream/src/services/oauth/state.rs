@@ -171,6 +171,8 @@ pub struct OAuthState {
     pub pending_external_auths: RwLock<HashMap<String, PendingExternalAuth>>,
     /// OIDC discovery cache for external providers.
     pub oidc_discovery: super::oidc_discovery::SharedDiscoveryCache,
+    /// Server-side session store for browser login flow.
+    pub sessions: super::session::SessionStore,
 }
 
 impl OAuthState {
@@ -197,6 +199,7 @@ impl OAuthState {
             authority_hints: config.authority_hints.clone(),
             pending_external_auths: RwLock::new(HashMap::new()),
             oidc_discovery: std::sync::Arc::new(super::oidc_discovery::OidcDiscoveryCache::default()),
+            sessions: super::session::SessionStore::default(),
         }
     }
 
@@ -258,6 +261,9 @@ impl OAuthState {
                     let mut auths = state.pending_external_auths.write().await;
                     auths.retain(|_, auth| auth.expires_at > now);
                 }
+
+                // Sweep expired sessions
+                state.sessions.sweep().await;
             }
         });
     }
