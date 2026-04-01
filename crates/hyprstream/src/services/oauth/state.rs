@@ -33,6 +33,8 @@ pub struct PendingAuthCode {
     pub scopes: Vec<String>,
     /// RFC 8707 resource indicator (the audience for the token)
     pub resource: Option<String>,
+    /// OIDC nonce — echoed into the id_token when scope includes "openid".
+    pub oidc_nonce: Option<String>,
     pub created_at: Instant,
     pub expires_at: Instant,
     /// Authenticated username from Ed25519 challenge-response on the consent page.
