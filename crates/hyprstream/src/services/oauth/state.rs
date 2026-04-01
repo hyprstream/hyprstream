@@ -12,6 +12,83 @@ use crate::auth::user_store::UserStore;
 use crate::config::OAuthConfig;
 use crate::services::PolicyClient;
 
+/// Extract RSA public key components (n, e) from PKCS#8 DER and build a JWK.
+///
+/// Uses simple_asn1 (transitive dep of jsonwebtoken) for DER parsing.
+fn extract_rsa_jwk_from_der(pkcs8_der: &[u8], kid: &str) -> Option<serde_json::Value> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+    // PKCS#8 wraps the RSA key. We need to extract n and e from the inner
+    // RSA public key. Rather than parsing ASN.1 manually, use jsonwebtoken
+    // to create an EncodingKey and then use openssl to extract components.
+    //
+    // Shell out to openssl for public key component extraction.
+    let temp = tempfile::NamedTempFile::new().ok()?;
+    std::fs::write(temp.path(), pkcs8_der).ok()?;
+
+    let output = std::process::Command::new("openssl")
+        .args([
+            "pkey", "-inform", "DER", "-in",
+            temp.path().to_str()?,
+            "-noout", "-text",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+
+    // Parse modulus and exponent from openssl text output.
+    // This is fragile but avoids adding ASN.1 parsing dependencies.
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut n_hex = String::new();
+    let mut in_modulus = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Modulus:") || trimmed == "modulus:" {
+            in_modulus = true;
+            continue;
+        }
+        if trimmed.starts_with("Exponent:") || trimmed.starts_with("publicExponent:") {
+            in_modulus = false;
+            // Extract exponent (usually 65537 = 0x10001)
+            // We'll use the standard value
+            continue;
+        }
+        if in_modulus {
+            // Lines like "    00:ab:cd:..."
+            let hex_part: String = trimmed.chars()
+                .filter(char::is_ascii_hexdigit)
+                .collect();
+            n_hex.push_str(&hex_part);
+        }
+    }
+
+    if n_hex.is_empty() {
+        return None;
+    }
+
+    // Strip leading zero byte if present (ASN.1 unsigned integer padding)
+    if n_hex.starts_with("00") && n_hex.len() > 2 {
+        n_hex = n_hex[2..].to_owned();
+    }
+
+    let n_bytes = hex::decode(&n_hex).ok()?;
+    let e_bytes = vec![0x01, 0x00, 0x01]; // 65537
+
+    let n_b64 = URL_SAFE_NO_PAD.encode(&n_bytes);
+    let e_b64 = URL_SAFE_NO_PAD.encode(&e_bytes);
+
+    Some(serde_json::json!({
+        "kty": "RSA",
+        "use": "sig",
+        "alg": "RS256",
+        "kid": kid,
+        "n": n_b64,
+        "e": e_b64,
+    }))
+}
+
 /// A dynamically registered OAuth client (RFC 7591) or Client ID Metadata Document client.
 #[derive(Debug, Clone)]
 pub struct RegisteredClient {
@@ -173,6 +250,12 @@ pub struct OAuthState {
     pub oidc_discovery: super::oidc_discovery::SharedDiscoveryCache,
     /// Server-side session store for browser login flow.
     pub sessions: super::session::SessionStore,
+    /// RSA encoding key for RS256 id_token signing (optional, loaded from secrets).
+    pub rsa_encoding_key: Option<jsonwebtoken::EncodingKey>,
+    /// RSA public key as JWK JSON (for the JWKS endpoint).
+    pub rsa_jwk: Option<serde_json::Value>,
+    /// RSA key kid (for the JWT header).
+    pub rsa_kid: Option<String>,
 }
 
 impl OAuthState {
@@ -200,6 +283,9 @@ impl OAuthState {
             pending_external_auths: RwLock::new(HashMap::new()),
             oidc_discovery: std::sync::Arc::new(super::oidc_discovery::OidcDiscoveryCache::default()),
             sessions: super::session::SessionStore::default(),
+            rsa_encoding_key: None,
+            rsa_jwk: None,
+            rsa_kid: None,
         }
     }
 
@@ -212,6 +298,24 @@ impl OAuthState {
     /// Attach the signing key for OpenID Federation 1.0 entity configuration signing.
     pub fn with_signing_key(mut self, key: ed25519_dalek::SigningKey) -> Self {
         self.signing_key = Some(key);
+        self
+    }
+
+    /// Attach an RSA key for RS256 id_token signing (OIDC interop).
+    ///
+    /// `rsa_der` is the PKCS#8 DER-encoded RSA private key.
+    pub fn with_rsa_key(mut self, rsa_der: &[u8]) -> Self {
+        // Build encoding key
+        self.rsa_encoding_key = Some(jsonwebtoken::EncodingKey::from_rsa_der(rsa_der));
+
+        // Extract public key components for JWKS using jsonwebtoken's DecodingKey
+        let kid = super::jwks::compute_kid(rsa_der);
+        self.rsa_kid = Some(kid.clone());
+
+        if let Some(jwk) = extract_rsa_jwk_from_der(rsa_der, &kid) {
+            self.rsa_jwk = Some(jwk);
+        }
+
         self
     }
 

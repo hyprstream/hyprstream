@@ -50,7 +50,7 @@ pub async fn openid_configuration(
     obj.insert("userinfo_endpoint".into(),
         serde_json::Value::String(format!("{}/oauth/userinfo", issuer)));
     obj.insert("id_token_signing_alg_values_supported".into(),
-        serde_json::json!(["EdDSA"]));
+        serde_json::json!(["EdDSA", "RS256"]));
     obj.insert("subject_types_supported".into(),
         serde_json::json!(["public"]));
     obj.insert("claims_supported".into(),

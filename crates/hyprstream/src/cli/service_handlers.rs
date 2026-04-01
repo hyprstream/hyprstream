@@ -579,6 +579,18 @@ pub(crate) async fn run_repair_checks(
         }
     }
 
+    // 4c. RSA key for RS256 JWT signing (OIDC interop)
+    {
+        let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
+        match crate::auth::credentials::load_or_generate_rsa_key(&secrets_dir) {
+            Ok(_) => print_check("RSA key", CheckStatus::Ok, "RS256 (2048-bit)"),
+            Err(e) => {
+                // Non-fatal: EdDSA still works, RS256 is for interop
+                print_check("RSA key", CheckStatus::Warn, &format!("{e}"));
+            }
+        }
+    }
+
     // 5. Git config (warning only, don't modify)
     {
         let label = "Git identity";

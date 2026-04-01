@@ -28,9 +28,11 @@ WantedBy=sockets.target
 /// Node-level credentials — every service on this node needs these.
 ///
 /// These are infrastructure secrets that define the node's identity:
-/// signing key (root of trust), TLS materials (HTTP/QUIC transport).
+/// signing key (root of trust), TLS materials (HTTP/QUIC transport),
+/// RSA key (RS256 JWT signing for OIDC interop).
 pub const NODE_CREDENTIAL_NAMES: &[&str] = &[
     "signing-key",
+    "rsa-key",
     "tls-key",
     "tls-cert",
     "quic-key",
@@ -52,6 +54,7 @@ pub const OAUTH_CREDENTIAL_NAMES: &[&str] = &[
 /// from the secrets directory into the systemd credstore.
 pub const ALL_CREDENTIAL_NAMES: &[&str] = &[
     "signing-key",
+    "rsa-key",
     "credential-store-key",
     "user-signing-key",
     "tls-key",

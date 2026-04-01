@@ -273,6 +273,49 @@ pub fn load_or_generate_user_signing_key(
     Ok((sk, vk))
 }
 
+/// Load or generate an RSA 2048 keypair for RS256 JWT signing.
+///
+/// Stored as PKCS#8 DER in `secrets_dir/rsa-key`. If the file doesn't exist
+/// and the directory is writable, a new keypair is generated using `openssl`.
+///
+/// Returns the DER-encoded PKCS#8 private key bytes (suitable for
+/// `jsonwebtoken::EncodingKey::from_rsa_der`).
+pub fn load_or_generate_rsa_key(secrets_dir: &std::path::Path) -> Result<Vec<u8>> {
+    const NAME: &str = "rsa-key";
+
+    if let Some(bytes) = read_secret(secrets_dir, NAME)? {
+        tracing::info!("Loaded RSA key from '{}'", secrets_dir.display());
+        return Ok(bytes);
+    }
+
+    if !is_writable(secrets_dir) {
+        return Err(missing_in_readonly(secrets_dir, NAME));
+    }
+
+    // Generate RSA 2048 keypair via openssl (avoids adding rsa crate dependency).
+    // Output is PKCS#8 DER, compatible with jsonwebtoken::EncodingKey::from_rsa_der.
+    let output = std::process::Command::new("openssl")
+        .args(["genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-outform", "DER"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .context("Failed to run openssl for RSA key generation")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("openssl RSA key generation failed: {stderr}"));
+    }
+
+    let der_bytes = output.stdout;
+    if der_bytes.len() < 100 {
+        return Err(anyhow!("openssl produced unexpectedly small RSA key ({} bytes)", der_bytes.len()));
+    }
+
+    write_secret(secrets_dir, NAME, &der_bytes)?;
+    tracing::info!("Generated new RSA 2048 key → '{}/{}'", secrets_dir.display(), NAME);
+    Ok(der_bytes)
+}
+
 /// Load or generate TLS materials using the default secret names (`tls-key`, `tls-cert`).
 ///
 /// See [`load_or_generate_tls_materials_named`] for details.

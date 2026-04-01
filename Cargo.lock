@@ -5932,6 +5932,7 @@ dependencies = [
  "inquire",
  "inventory",
  "json-threat-protection",
+ "jsonwebtoken",
  "keyring",
  "libc",
  "listenfd",
