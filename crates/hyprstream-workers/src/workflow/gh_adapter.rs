@@ -122,9 +122,10 @@ impl GitHubActionsAdapter {
                 )))
             }
             // WorkflowDispatch is triggered via RPC, not events.
-            EventTrigger::WorkflowDispatch { .. } => None,
             // Training/Metrics triggers need specialized handlers.
-            EventTrigger::TrainingProgress { .. } | EventTrigger::MetricsBreach { .. } => None,
+            EventTrigger::WorkflowDispatch { .. }
+            | EventTrigger::TrainingProgress { .. }
+            | EventTrigger::MetricsBreach { .. } => None,
         }
     }
 

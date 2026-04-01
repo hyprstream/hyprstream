@@ -347,7 +347,7 @@ impl SecureEventPublisher {
         state.key_state.pending = Some(PendingRekey {
             new_key: new_group_key,
             effective_at,
-            new_ephemeral_secret: new_ephemeral_secret,
+            new_ephemeral_secret,
             new_ephemeral_pubkey,
         });
 
@@ -372,14 +372,6 @@ impl SecureEventPublisher {
     /// Get the signing verifying key.
     pub fn verifying_key(&self) -> [u8; 32] {
         self.signing_key.verifying_key().to_bytes()
-    }
-}
-
-/// Select the active group key (pending if past effective_at, else current).
-fn active_group_key(key_state: &GroupKeyState) -> &[u8; 32] {
-    match &key_state.pending {
-        Some(p) if Instant::now() >= p.effective_at => &p.new_key,
-        _ => &key_state.current,
     }
 }
 

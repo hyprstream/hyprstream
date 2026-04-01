@@ -156,7 +156,7 @@ impl SecureEventSubscriber {
         self.prefixes
             .write()
             .await
-            .insert(prefix.to_string(), state);
+            .insert(prefix.to_owned(), state);
         Ok(pubkey_out)
     }
 
@@ -216,7 +216,7 @@ impl SecureEventSubscriber {
             }
         }
 
-        Err("decryption failed: no matching key".to_string())
+        Err("decryption failed: no matching key".to_owned())
     }
 
     /// Handle a rekey: trial-decrypt the wrapped key entries and send the
@@ -261,21 +261,29 @@ impl SecureEventSubscriber {
         // Trial-decrypt each wrapped blob to find ours (O(N) per rekey, infrequent)
         for wrapped_blob in wrapped_blobs {
             if let Ok(new_key) = unwrap_group_key(&wrap_key, wrapped_blob, &sub_hash, prefix) {
+                // Update stored publisher pubkey for future rekeys
+                {
+                    let mut prefixes = self.prefixes.write().await;
+                    if let Some(state) = prefixes.get_mut(prefix) {
+                        state.publisher_pubkey = *new_publisher_pubkey;
+                    }
+                }
+
                 // Send rekey event through channel
                 self.rekey_tx
                     .send(RekeyEvent {
-                        prefix: prefix.to_string(),
+                        prefix: prefix.to_owned(),
                         new_key,
                         effective_at,
                     })
                     .await
-                    .map_err(|_| "rekey channel closed".to_string())?;
+                    .map_err(|_| "rekey channel closed".to_owned())?;
 
                 return Ok(());
             }
         }
 
-        Err("no wrapped entry found for our key".to_string())
+        Err("no wrapped entry found for our key".to_owned())
     }
 
     /// Promote a pending key to current, demoting current to previous

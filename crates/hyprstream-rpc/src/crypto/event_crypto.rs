@@ -61,7 +61,7 @@ fn aes_gcm_encrypt(
     };
     cipher
         .encrypt(Nonce::from_slice(nonce), payload)
-        .map_err(|_| "AES-GCM encrypt failed".to_string())
+        .map_err(|_| "AES-GCM encrypt failed".to_owned())
 }
 
 /// Decrypt with AES-256-GCM. Returns plaintext.
@@ -78,7 +78,7 @@ fn aes_gcm_decrypt(
     };
     cipher
         .decrypt(Nonce::from_slice(nonce), payload)
-        .map_err(|_| "AES-GCM decrypt failed".to_string())
+        .map_err(|_| "AES-GCM decrypt failed".to_owned())
 }
 
 /// Generate a random 12-byte AES-GCM nonce from OsRng.
@@ -182,7 +182,7 @@ pub fn unwrap_group_key(
     prefix: &str,
 ) -> Result<Zeroizing<[u8; 32]>, String> {
     if wrapped_blob.len() < 12 {
-        return Err("wrapped blob too short".to_string());
+        return Err("wrapped blob too short".to_owned());
     }
 
     let nonce: [u8; 12] = wrapped_blob[..12]
@@ -266,7 +266,7 @@ pub fn encrypt_event(
 
     // AES-GCM output is ciphertext || 16-byte tag
     if aead_output.len() < 16 {
-        return Err("AEAD output too short".to_string());
+        return Err("AEAD output too short".to_owned());
     }
     let split = aead_output.len() - 16;
     let ciphertext = aead_output[..split].to_vec();

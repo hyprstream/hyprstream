@@ -896,7 +896,7 @@ async fn dispatch_outputs(
                 let feed_back = handle_rpc(
                     compositor, client, model_client, worker_client, model_status_tx,
                     active_apps, next_local_id, storage_key, signing_key,
-                    &vfs_ns, &vfs_subject, tcl_mount_rx, req,
+                    vfs_ns, vfs_subject, tcl_mount_rx, req,
                 ).await;
                 for input in feed_back {
                     let follow = compositor.handle(input);

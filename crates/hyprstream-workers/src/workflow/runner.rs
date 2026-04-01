@@ -143,7 +143,11 @@ impl WorkflowRunner {
             let mut join_set = JoinSet::new();
 
             for job_name in wave {
-                let job = workflow.jobs.get(&job_name).cloned().unwrap();
+                // Job names come from topological_sort which iterates jobs.keys(),
+                // so this lookup cannot fail. Continue defensively to satisfy clippy.
+                let Some(job) = workflow.jobs.get(&job_name).cloned() else {
+                    continue;
+                };
                 let ns = Arc::clone(&self.ns);
                 let sem = Arc::clone(&self.script_semaphore);
                 let subject = subject.clone();
@@ -306,7 +310,7 @@ async fn run_job(
             if let Some(ref action) = step.uses {
                 // Action step — runs on async runtime.
                 let result =
-                    run_action_step(action, &step.with, &*ns_for_actions, &subject_for_actions)
+                    run_action_step(action, &step.with, &ns_for_actions, &subject_for_actions)
                         .await;
                 match result {
                     Ok(output) => {
@@ -396,7 +400,7 @@ async fn run_job(
                 .unwrap_or_else(|| format!("step-{}", i));
 
             if let Some(ref action) = step.uses {
-                let result = run_action_step(action, &step.with, &*ns, subject).await;
+                let result = run_action_step(action, &step.with, &ns, subject).await;
                 match result {
                     Ok(output) => {
                         step_results.push(StepRunResult {
@@ -530,7 +534,7 @@ fn validate_env_var_name(name: &str) -> RunnerResult<()> {
 /// Returns a Vec of waves, where each wave is a Vec of job names that
 /// can execute concurrently. Jobs in wave N+1 depend on jobs in wave N or earlier.
 fn topological_sort(jobs: &HashMap<String, Job>) -> RunnerResult<Vec<Vec<String>>> {
-    let job_names: HashSet<&str> = jobs.keys().map(|s| s.as_str()).collect();
+    let job_names: HashSet<&str> = jobs.keys().map(String::as_str).collect();
 
     // Validate all dependencies exist.
     for (name, job) in jobs {
@@ -584,7 +588,9 @@ fn topological_sort(jobs: &HashMap<String, Job>) -> RunnerResult<Vec<Vec<String>
             processed += 1;
 
             for &dependent in dependents.get(name).unwrap_or(&Vec::new()) {
-                let deg = in_degree.get_mut(dependent).unwrap();
+                let Some(deg) = in_degree.get_mut(dependent) else {
+                    continue;
+                };
                 *deg -= 1;
                 if *deg == 0 {
                     next_queue.push_back(dependent);

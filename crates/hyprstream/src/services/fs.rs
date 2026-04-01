@@ -451,7 +451,7 @@ impl SyntheticTree {
                 if offset > 0 { return Ok(vec![]); }
                 Ok(encode_dir_entries(&list(), count))
             }
-            Some(SyntheticNode::CtlFile { .. }) => Ok(vec![]),
+            Some(SyntheticNode::CtlFile { .. }) | Some(SyntheticNode::AsyncCtlFile { .. }) => Ok(vec![]),
             Some(SyntheticNode::WatchFile(sender)) => {
                 // Borrow the latest value from the watch channel — instant, no await.
                 // NOTE: For Dynamic nodes this runs under a DashMap guard. That's acceptable
@@ -465,9 +465,6 @@ impl SyntheticTree {
             }
             // OneshotFile requires async — cannot be read on the sync path.
             Some(SyntheticNode::OneshotFile(_)) => Err("OneshotFile requires async read (use Mount trait)".to_owned()),
-            // AsyncCtlFile responses are buffer-driven (written by async write path).
-            // If we reach here, the response buffer was empty — return EOF.
-            Some(SyntheticNode::AsyncCtlFile { .. }) => Ok(vec![]),
             None => Err("path not found in tree".to_owned()),
         }
     }
@@ -680,14 +677,14 @@ impl hyprstream_vfs::Mount for SyntheticTree {
     async fn walk(&self, components: &[&str], caller: &hyprstream_rpc::Subject) -> Result<hyprstream_vfs::Fid, hyprstream_vfs::MountError> {
         let wnames: Vec<String> = components.iter().map(|s| (*s).to_owned()).collect();
         let owner = caller.to_string();
-        let (fid, _qid) = self.walk(&wnames, &owner, None).map_err(|e| hyprstream_vfs::MountError::NotFound(e))?;
+        let (fid, _qid) = self.walk(&wnames, &owner, None).map_err(hyprstream_vfs::MountError::NotFound)?;
         Ok(hyprstream_vfs::Fid::new(fid))
     }
 
     async fn open(&self, fid: &mut hyprstream_vfs::Fid, mode: u8, caller: &hyprstream_rpc::Subject) -> Result<(), hyprstream_vfs::MountError> {
         let fid_u32 = *fid.downcast_ref::<u32>().ok_or_else(|| hyprstream_vfs::MountError::InvalidArgument("invalid fid type".into()))?;
         let owner = caller.to_string();
-        self.open(fid_u32, mode, &owner).map_err(|e| hyprstream_vfs::MountError::Io(e))?;
+        self.open(fid_u32, mode, &owner).map_err(hyprstream_vfs::MountError::Io)?;
         Ok(())
     }
 
@@ -709,7 +706,7 @@ impl hyprstream_vfs::Mount for SyntheticTree {
                     let state = Arc::clone(state);
                     drop(entry); // Drop DashMap guard before await.
                     let data = state.read().await
-                        .map_err(|e| hyprstream_vfs::MountError::Io(e))?;
+                        .map_err(hyprstream_vfs::MountError::Io)?;
                     let start = std::cmp::min(offset as usize, data.len());
                     let end = std::cmp::min(start + count as usize, data.len());
                     return Ok(data[start..end].to_vec());
@@ -718,7 +715,7 @@ impl hyprstream_vfs::Mount for SyntheticTree {
         }
 
         // Non-async path (ReadFile, WatchFile, Dir, CtlFile response buffer, etc.)
-        self.read(fid_u32, offset, count, &owner).map_err(|e| hyprstream_vfs::MountError::Io(e))
+        self.read(fid_u32, offset, count, &owner).map_err(hyprstream_vfs::MountError::Io)
     }
 
     async fn write(&self, fid: &hyprstream_vfs::Fid, offset: u64, data: &[u8], caller: &hyprstream_rpc::Subject) -> Result<u32, hyprstream_vfs::MountError> {
@@ -743,7 +740,7 @@ impl hyprstream_vfs::Mount for SyntheticTree {
                     let written = data.len() as u32;
                     drop(entry); // Release DashMap guard before await.
                     let result = fut.await
-                        .map_err(|e| hyprstream_vfs::MountError::Io(e))?;
+                        .map_err(hyprstream_vfs::MountError::Io)?;
                     // Re-acquire guard to write response buffer. If the fid was
                     // clunked during the await, the handler already ran (side-effect
                     // committed) but nobody will read the response — return Ok(written)
@@ -762,18 +759,18 @@ impl hyprstream_vfs::Mount for SyntheticTree {
         }
 
         // Non-async path (sync CtlFile, etc.)
-        self.write(fid_u32, offset, data, &owner, caller).map_err(|e| hyprstream_vfs::MountError::Io(e))
+        self.write(fid_u32, offset, data, &owner, caller).map_err(hyprstream_vfs::MountError::Io)
     }
 
     async fn readdir(&self, fid: &hyprstream_vfs::Fid, caller: &hyprstream_rpc::Subject) -> Result<Vec<hyprstream_vfs::DirEntry>, hyprstream_vfs::MountError> {
         let fid_u32 = *fid.downcast_ref::<u32>().ok_or_else(|| hyprstream_vfs::MountError::InvalidArgument("invalid fid type".into()))?;
-        let entries = self.readdir_entries(fid_u32, &caller.to_string()).map_err(|e| hyprstream_vfs::MountError::Io(e))?;
+        let entries = self.readdir_entries(fid_u32, &caller.to_string()).map_err(hyprstream_vfs::MountError::Io)?;
         Ok(entries)
     }
 
     async fn stat(&self, fid: &hyprstream_vfs::Fid, caller: &hyprstream_rpc::Subject) -> Result<hyprstream_vfs::Stat, hyprstream_vfs::MountError> {
         let fid_u32 = *fid.downcast_ref::<u32>().ok_or_else(|| hyprstream_vfs::MountError::InvalidArgument("invalid fid type".into()))?;
-        let (qid, name) = self.stat(fid_u32, &caller.to_string()).map_err(|e| hyprstream_vfs::MountError::Io(e))?;
+        let (qid, name) = self.stat(fid_u32, &caller.to_string()).map_err(hyprstream_vfs::MountError::Io)?;
         Ok(hyprstream_vfs::Stat {
             qtype: qid.qtype,
             size: 0,

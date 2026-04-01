@@ -66,6 +66,7 @@ pub struct RemoteModelMount {
 
 impl RemoteModelMount {
     /// Create a new remote mount wrapping the given model client.
+    #[allow(clippy::expect_used)] // Runtime creation is infallible in practice
     pub fn new(client: ModelClient) -> Self {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -115,7 +116,7 @@ impl Mount for RemoteModelMount {
         }
 
         let model_ref = components[0];
-        let wnames: Vec<String> = components[1..].iter().map(|s| s.to_string()).collect();
+        let wnames: Vec<String> = components[1..].iter().map(std::string::ToString::to_string).collect();
 
         let local_fid = self.alloc_fid();
         let remote_newfid = local_fid; // Use same numbering for simplicity.
@@ -134,7 +135,7 @@ impl Mount for RemoteModelMount {
 
         let state = RemoteFidState {
             remote_fid: remote_newfid,
-            model_ref: model_ref.to_string(),
+            model_ref: model_ref.to_owned(),
             qtype,
             opened: false,
         };

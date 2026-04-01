@@ -26,7 +26,7 @@ pub use mount::{create_mount_channel, TclCommand, TclMount};
 ///
 /// All VFS operations go through the channel proxy — no direct Namespace access.
 pub(crate) struct ShellContext {
-    pub subject: Subject,
+    pub _subject: Subject,
     pub vfs_tx: tokio::sync::mpsc::Sender<VfsRequest>,
 }
 
@@ -74,7 +74,7 @@ impl TclShell {
         interp.set_recursion_limit(100);
         interp.set_instruction_limit(100_000);
 
-        let ctx = ShellContext { subject, vfs_tx };
+        let ctx = ShellContext { _subject: subject, vfs_tx };
         let ctx_id = interp.save_context(ctx);
         builtins::register_all(&mut interp, ctx_id);
         Self { interp, ctx_id }
