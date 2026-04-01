@@ -538,6 +538,30 @@ pub(crate) async fn run_repair_checks(
         }
     }
 
+    // 4b. TLS materials (HTTP + QUIC) — generate into secrets dir so they are
+    //     available for systemd-creds encryption in phase 6.
+    {
+        let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
+        // HTTP TLS (365-day self-signed)
+        match crate::auth::credentials::load_or_generate_tls_materials(&secrets_dir, "localhost", 365) {
+            Ok(_) => print_check("TLS key+cert", CheckStatus::Ok, "HTTP (365d)"),
+            Err(e) => {
+                print_check("TLS key+cert", CheckStatus::Fail, &format!("{e}"));
+                all_passed = false;
+            }
+        }
+        // QUIC TLS (14-day per WebTransport spec)
+        match crate::auth::credentials::load_or_generate_tls_materials_named(
+            &secrets_dir, "localhost", 14, "quic-key", "quic-cert",
+        ) {
+            Ok(_) => print_check("QUIC key+cert", CheckStatus::Ok, "WebTransport (14d)"),
+            Err(e) => {
+                print_check("QUIC key+cert", CheckStatus::Fail, &format!("{e}"));
+                all_passed = false;
+            }
+        }
+    }
+
     // 5. Git config (warning only, don't modify)
     {
         let label = "Git identity";
