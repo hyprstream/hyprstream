@@ -1771,53 +1771,58 @@ fn main() -> Result<()> {
                                 let manager = InprocManager::new();
                                 let mut handles = Vec::new();
 
-                                for svc_name in &service_names {
-                                    let factory = get_factory(svc_name).ok_or_else(|| {
-                                        let available: Vec<_> =
-                                            hyprstream_service::list_factories()
-                                                .map(|f| f.name)
-                                                .collect();
-                                        anyhow::anyhow!(
-                                            "Unknown service: '{}'. Available services: {}",
-                                            svc_name,
-                                            available.join(", ")
-                                        )
-                                    })?;
+                                // Compute dependency-aware startup stages.
+                                let stages = hyprstream_service::startup_stages(&service_names);
 
-                                    info!(
-                                        "Starting {} service in standalone mode (IPC: {})",
-                                        svc_name, ipc
-                                    );
+                                for stage in &stages {
+                                    for svc_name in stage {
+                                        let factory = get_factory(svc_name).ok_or_else(|| {
+                                            let available: Vec<_> =
+                                                hyprstream_service::list_factories()
+                                                    .map(|f| f.name)
+                                                    .collect();
+                                            anyhow::anyhow!(
+                                                "Unknown service: '{}'. Available services: {}",
+                                                svc_name,
+                                                available.join(", ")
+                                            )
+                                        })?;
 
-                                    let spawnable = (factory.factory)(&ctx).context(format!(
-                                        "Failed to create {} service",
-                                        svc_name
-                                    ))?;
-                                    let handle = manager.spawn(spawnable).await.context(
-                                        format!("Failed to start {} service", svc_name),
-                                    )?;
-                                    handles.push((svc_name.clone(), handle));
+                                        info!(
+                                            "Starting {} service in standalone mode (IPC: {})",
+                                            svc_name, ipc
+                                        );
+
+                                        let spawnable = (factory.factory)(&ctx).context(format!(
+                                            "Failed to create {} service",
+                                            svc_name
+                                        ))?;
+                                        let handle = manager.spawn(spawnable).await.context(
+                                            format!("Failed to start {} service", svc_name),
+                                        )?;
+                                        handles.push((svc_name.clone(), handle));
+                                    }
+
+                                    // Publish ready events for this stage before starting the next.
+                                    for svc_name in stage {
+                                        if let Ok(mut publisher) =
+                                            hyprstream_workers::EventPublisher::new(
+                                                &global_context(),
+                                                "system",
+                                            )
+                                        {
+                                            let _ = publisher
+                                                .publish_raw(
+                                                    &format!("system.{}.ready", svc_name),
+                                                    b"",
+                                                )
+                                                .await;
+                                        }
+                                    }
                                 }
 
                                 if handles.is_empty() {
                                     return Err(anyhow::anyhow!("No services to start"));
-                                }
-
-                                // Publish ready events for all services
-                                for (svc_name, _) in &handles {
-                                    if let Ok(mut publisher) =
-                                        hyprstream_workers::EventPublisher::new(
-                                            &global_context(),
-                                            "system",
-                                        )
-                                    {
-                                        let _ = publisher
-                                            .publish_raw(
-                                                &format!("system.{}.ready", svc_name),
-                                                b"",
-                                            )
-                                            .await;
-                                    }
                                 }
 
                                 let svc_names: Vec<_> = handles.iter().map(|(n, _)| n.as_str()).collect();

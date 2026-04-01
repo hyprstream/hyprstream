@@ -199,24 +199,41 @@ pub async fn handle_service_start(
             }
         }
     } else {
-        // Standalone mode: spawn processes in background
+        // Standalone mode: spawn processes in dependency order
         println!("Starting services (standalone)...\n");
 
         let spawner = hyprstream_service::ProcessSpawner::standalone();
         let exe = hyprstream_rpc::paths::executable_path()?;
+        let stages = hyprstream_service::startup_stages(&target_services);
 
-        for service in &target_services {
-            print!("  \u{25CB} {}... ", service);
+        for stage in &stages {
+            for service in stage {
+                print!("  \u{25CB} {}... ", service);
 
-            let config = hyprstream_service::ProcessConfig::new(service, &exe)
-                .args(["service", "start", service, "--foreground", "--ipc"]);
+                let config = hyprstream_service::ProcessConfig::new(service, &exe)
+                    .args(["service", "start", service, "--foreground", "--ipc"]);
 
-            match spawner.spawn(config).await {
-                Ok(process) => {
-                    info!("Spawned {} service: {:?}", service, process.kind);
-                    println!("\u{2713}");
+                match spawner.spawn(config).await {
+                    Ok(process) => {
+                        info!("Spawned {} service: {:?}", service, process.kind);
+                        println!("\u{2713}");
+                    }
+                    Err(e) => println!("\u{2717} {}", e),
                 }
-                Err(e) => println!("\u{2717} {}", e),
+            }
+
+            // Wait for this stage's services to be ready before starting the next.
+            // Probe for IPC socket existence as the readiness signal.
+            let runtime_dir = hyprstream_rpc::paths::runtime_dir();
+            for service in stage {
+                let sock = runtime_dir.join(format!("{service}.sock"));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !sock.exists() && std::time::Instant::now() < deadline {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                if !sock.exists() {
+                    tracing::warn!("Timeout waiting for {service} socket; continuing");
+                }
             }
         }
     }

@@ -41,3 +41,5 @@ pub use service::manager::SystemdManager;
 pub use service::manager::systemd::encrypt_credentials_if_available;
 
 pub use service::metadata::{MethodMeta, ParamMeta, SchemaMetadataFn, ScopedSchemaMetadataFn, ScopedClientTreeNode};
+
+pub use service::ordering::startup_stages;

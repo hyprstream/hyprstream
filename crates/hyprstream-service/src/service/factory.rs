@@ -351,6 +351,15 @@ impl ServiceFactory {
     ) -> Self {
         Self { name, factory, schema: Some(schema), metadata: Some(metadata), depends_on: &[] }
     }
+
+    /// Set service dependencies (chained builder).
+    ///
+    /// Services listed in `depends_on` must be started before this one.
+    /// Used by the `#[service_factory("name", depends_on = ["policy"])]` macro.
+    pub const fn with_depends_on(mut self, deps: &'static [&'static str]) -> Self {
+        self.depends_on = deps;
+        self
+    }
 }
 
 // Collect all registered factories

@@ -76,7 +76,12 @@ impl ServiceManager for SystemdManager {
         // so by the time we generate the unit the .cred files should be present.
         let use_creds = credstore_has_credentials();
 
-        let service_content = units::service_unit(service, use_creds)?;
+        // Look up the factory to get depends_on for this service.
+        let depends_on = crate::service::factory::get_factory(service)
+            .map(|f| f.depends_on)
+            .unwrap_or(&[]);
+
+        let service_content = units::service_unit(service, use_creds, depends_on)?;
         let service_path = units_dir.join(Self::service_unit(service));
 
         // Write service unit if changed (idempotent)
@@ -165,7 +170,7 @@ fn credstore_has_credentials() -> bool {
     if !credstore.exists() {
         return false;
     }
-    units::SYSTEMD_CREDENTIAL_NAMES
+    units::ALL_CREDENTIAL_NAMES
         .iter()
         .any(|name| credstore.join(name).exists())
 }
@@ -270,7 +275,7 @@ pub fn encrypt_credentials_if_available(secrets_dir: Option<&std::path::Path>) -
     }
 
     let mut encrypted_count = 0usize;
-    for name in units::SYSTEMD_CREDENTIAL_NAMES {
+    for name in units::ALL_CREDENTIAL_NAMES {
         let secret_path = dir.join(name);
         if !secret_path.exists() {
             debug!("Skipping credential '{}' (not yet generated)", name);

@@ -25,13 +25,32 @@ WantedBy=sockets.target
     )
 }
 
-/// Secrets managed by systemd credentials (via `ImportCredential=`).
+/// Node-level credentials — every service on this node needs these.
 ///
-/// These are the five secrets that `hyprstream service install` encrypts into
-/// `~/.config/credstore.encrypted/` using `systemd-creds encrypt`.  When the
-/// service starts, systemd decrypts them into `$CREDENTIALS_DIRECTORY` and the
-/// unit sets `HYPRSTREAM__SECRETS__PATH=%d` so hyprstream reads from there.
-pub const SYSTEMD_CREDENTIAL_NAMES: &[&str] = &[
+/// These are infrastructure secrets that define the node's identity:
+/// signing key (root of trust), TLS materials (HTTP/QUIC transport).
+pub const NODE_CREDENTIAL_NAMES: &[&str] = &[
+    "signing-key",
+    "tls-key",
+    "tls-cert",
+    "quic-key",
+    "quic-cert",
+];
+
+/// Application-level credentials — only the oauth service needs these.
+///
+/// The credential-store key encrypts the user database (users.toml.age).
+/// The user-signing key is used for Ed25519 challenge-response auth.
+pub const OAUTH_CREDENTIAL_NAMES: &[&str] = &[
+    "credential-store-key",
+    "user-signing-key",
+];
+
+/// All managed credential names (node + application).
+///
+/// Used by `encrypt_credentials_if_available` to encrypt all secrets
+/// from the secrets directory into the systemd credstore.
+pub const ALL_CREDENTIAL_NAMES: &[&str] = &[
     "signing-key",
     "credential-store-key",
     "user-signing-key",
@@ -43,27 +62,23 @@ pub const SYSTEMD_CREDENTIAL_NAMES: &[&str] = &[
 
 /// Generate a systemd service unit for a service.
 ///
-/// When `use_systemd_creds` is `true`, the unit includes:
-/// - `ImportCredential=<name>` for each of the five managed secrets
-/// - `Environment=HYPRSTREAM__SECRETS__PATH=%d` to point hyprstream at the
-///   systemd credentials directory (non-swappable ramfs, access-restricted)
-/// - `PrivateMounts=yes` per systemd security recommendation for credential users
+/// # Arguments
 ///
-/// The service manages its own socket binding (via ZMQ) and notifies systemd
-/// when ready via sd_notify.
+/// * `service` — service name (e.g., "policy", "oauth")
+/// * `use_systemd_creds` — whether to emit `ImportCredential=` directives
+/// * `depends_on` — service names that must start before this one
 ///
-/// Environment variables (LD_LIBRARY_PATH, LIBTORCH) are captured from
-/// the process environment and forwarded to the service unit, **unless** the
-/// target executable is an AppImage. AppImages bundle their own libtorch and
-/// set up library paths via `AppRun` at launch time — hardcoding the mount path
-/// from the installer process would produce a stale `/tmp/.mount_hyprst*/` path
-/// that no longer exists when the service starts later.
+/// # Credential scoping
 ///
-/// Executable path priority for systemd units:
-/// 1. Installed binary at `~/.local/bin/hyprstream` (stable, survives updates)
-/// 2. `$APPIMAGE` path (when running from AppImage)
-/// 3. `current_exe()` fallback
-pub fn service_unit(service: &str, use_systemd_creds: bool) -> Result<String> {
+/// All services receive node-level credentials (signing key, TLS/QUIC
+/// materials). Only the `oauth` service additionally receives application-
+/// level secrets (credential-store key, user-signing key).
+///
+/// # Startup ordering
+///
+/// When `depends_on` is non-empty, the unit includes `After=` and
+/// `Requires=` directives so systemd enforces the dependency graph.
+pub fn service_unit(service: &str, use_systemd_creds: bool, depends_on: &[&str]) -> Result<String> {
     // Prefer installed binary for systemd units (stable location)
     let exec = paths::installed_executable_path()
         .map(Ok)
@@ -114,17 +129,28 @@ pub fn service_unit(service: &str, use_systemd_creds: bool) -> Result<String> {
     };
 
     // Build systemd credentials section — only import credentials that
-    // actually exist in the credstore (TLS/QUIC keys may not have been
-    // generated at install time).
+    // actually exist in the credstore.
     let creds_section = if use_systemd_creds {
         let credstore = dirs::config_dir()
             .map(|d| d.join("credstore.encrypted"))
             .unwrap_or_default();
-        let import_lines: String = SYSTEMD_CREDENTIAL_NAMES
+
+        // Node-level credentials for all services; add application-level
+        // credentials for oauth only.
+        let names: Vec<&&str> = if service == "oauth" {
+            NODE_CREDENTIAL_NAMES.iter()
+                .chain(OAUTH_CREDENTIAL_NAMES.iter())
+                .collect()
+        } else {
+            NODE_CREDENTIAL_NAMES.iter().collect()
+        };
+
+        let import_lines: String = names
             .iter()
             .filter(|name| credstore.join(name).exists())
             .map(|name| format!("ImportCredential={name}\n"))
             .collect();
+
         if import_lines.is_empty() {
             String::new()
         } else {
@@ -141,20 +167,40 @@ pub fn service_unit(service: &str, use_systemd_creds: bool) -> Result<String> {
         String::new()
     };
 
+    // Build dependency directives for [Unit] section.
+    let dep_section = if depends_on.is_empty() {
+        String::new()
+    } else {
+        let units: Vec<String> = depends_on
+            .iter()
+            .map(|dep| format!("hyprstream-{dep}.service"))
+            .collect();
+        let unit_list = units.join(" ");
+        format!("\nAfter={unit_list}\nRequires={unit_list}")
+    };
+
+    // Security hardening directives.
+    let hardening = format!(
+        "\nLimitCORE=0\nProtectProc=invisible\nProcSubset=pid{}",
+        if is_appimage { "" } else { "\nPrivateTmp=yes" }
+    );
+
     Ok(format!(
         r#"[Unit]
-Description=Hyprstream {service} Service
+Description=Hyprstream {service} Service{dep_section}
 
 [Service]
 Type=notify
-ExecStart={exec} service start {service} --foreground{env_section}{creds_section}
+ExecStart={exec} service start {service} --foreground{env_section}{creds_section}{hardening}
 Restart=on-failure
 
 [Install]
 WantedBy=default.target
 "#,
         exec = exec.display(),
+        dep_section = dep_section,
         env_section = env_section,
         creds_section = creds_section,
+        hardening = hardening,
     ))
 }
