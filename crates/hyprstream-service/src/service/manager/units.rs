@@ -113,16 +113,30 @@ pub fn service_unit(service: &str, use_systemd_creds: bool) -> Result<String> {
         format!("\n{env_directives}")
     };
 
-    // Build systemd credentials section (only when systemd-creds are available).
+    // Build systemd credentials section — only import credentials that
+    // actually exist in the credstore (TLS/QUIC keys may not have been
+    // generated at install time).
     let creds_section = if use_systemd_creds {
+        let credstore = dirs::config_dir()
+            .map(|d| d.join("credstore.encrypted"))
+            .unwrap_or_default();
         let import_lines: String = SYSTEMD_CREDENTIAL_NAMES
             .iter()
+            .filter(|name| credstore.join(name).exists())
             .map(|name| format!("ImportCredential={name}\n"))
             .collect();
-        format!(
-            "\n{}Environment=HYPRSTREAM__SECRETS__PATH=%d\nPrivateMounts=yes",
-            import_lines
-        )
+        if import_lines.is_empty() {
+            String::new()
+        } else {
+            // PrivateMounts=yes is recommended for credential users, but it
+            // creates a private mount namespace that prevents AppImage FUSE
+            // mounts.  Only enable it for non-AppImage executables.
+            let private_mounts = if is_appimage { "" } else { "\nPrivateMounts=yes" };
+            format!(
+                "\n{}Environment=HYPRSTREAM__SECRETS__PATH=%d{private_mounts}",
+                import_lines
+            )
+        }
     } else {
         String::new()
     };
