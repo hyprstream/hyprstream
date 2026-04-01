@@ -33,8 +33,10 @@ pub mod federation_entity;
 pub mod jwks;
 pub mod metadata;
 pub mod registration;
+pub mod revocation;
 pub mod state;
 pub mod token;
+pub mod userinfo;
 
 use std::sync::Arc;
 
@@ -81,6 +83,15 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             get(device::verify_get).post(device::verify_post),
         )
         .route("/oauth/device/nonce", get(device::device_nonce))
+        .route(
+            "/oauth/userinfo",
+            get(userinfo::userinfo).post(userinfo::userinfo),
+        )
+        .route("/oauth/revoke", post(revocation::revoke_token))
+        .route(
+            "/.well-known/openid-configuration",
+            get(metadata::openid_configuration),
+        )
         .route(
             "/.well-known/openid-federation",
             get(federation_entity::entity_configuration),
