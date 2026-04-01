@@ -178,12 +178,14 @@ fn build_cli() -> ClapCommand {
                 Arg::new("nonce")
                     .long("nonce")
                     .required(false)
+                    .allow_hyphen_values(true)
                     .help("Nonce from the browser authorization challenge form"),
             )
             .arg(
                 Arg::new("code_challenge")
                     .long("code-challenge")
                     .required(false)
+                    .allow_hyphen_values(true)
                     .help("PKCE code_challenge from the browser authorization URL"),
             )
             .arg(
