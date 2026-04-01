@@ -649,6 +649,80 @@ pub struct TrustedIssuerConfig {
 
 fn default_jwks_cache_ttl() -> u64 { 300 }
 
+/// Configuration for an external OIDC provider (login delegation).
+///
+/// Hyprstream acts as an OIDC Relying Party to this provider. Users authenticate
+/// with the provider; hyprstream validates the external id_token and issues its
+/// own JWT with scopes from the policy engine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OidcProviderConfig {
+    /// OIDC issuer URL (must support `/.well-known/openid-configuration`).
+    pub issuer_url: String,
+    /// Client ID registered with the external provider.
+    pub client_id: String,
+    /// Client secret (optional — omit for public client with PKCE).
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    /// Scopes to request from the provider.
+    #[serde(default = "default_oidc_scopes")]
+    pub scopes: Vec<String>,
+    /// Display name for the login UI (e.g., "Corporate SSO").
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Allow plain HTTP for discovery (dev only).
+    #[serde(default)]
+    pub allow_http: bool,
+    /// User identity mapping strategy.
+    #[serde(default)]
+    pub user_mapping: UserMappingStrategy,
+    /// User provisioning mode.
+    #[serde(default)]
+    pub provisioning: ProvisioningMode,
+    /// Allowed email domains (when provisioning = allowlist).
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+    /// Default hyprstream scopes for auto-provisioned users.
+    #[serde(default)]
+    pub default_scopes: Vec<String>,
+    /// Clock skew tolerance for JWT validation (seconds).
+    #[serde(default = "default_clock_skew")]
+    pub clock_skew_seconds: u64,
+}
+
+fn default_oidc_scopes() -> Vec<String> {
+    vec!["openid".into(), "profile".into(), "email".into()]
+}
+fn default_clock_skew() -> u64 { 60 }
+
+/// How to map an external OIDC identity to a local hyprstream subject.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum UserMappingStrategy {
+    /// `provider_slug:external_sub` (e.g., `keycloak:12345`). Default.
+    #[default]
+    Namespaced,
+    /// Use the `email` claim (requires `email_verified=true`).
+    Email,
+    /// Use a specific claim value.
+    Claim {
+        /// The claim name to use as the local subject.
+        name: String,
+    },
+}
+
+/// Whether to auto-create users on first external login.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ProvisioningMode {
+    /// Reject unknown users (admin must pre-create).
+    #[default]
+    Deny,
+    /// Auto-provision on first login.
+    Auto,
+    /// Auto-provision only for matching `allowed_domains`.
+    Allowlist,
+}
+
 /// OAuth 2.1 authorization server configuration
 ///
 /// Provides OAuth 2.1 (draft-ietf-oauth-v2-1-13) authorization for MCP and OAI services.
@@ -710,6 +784,15 @@ pub struct OAuthConfig {
     #[serde(default)]
     pub authority_hints: Vec<String>,
 
+    /// External OIDC providers for login delegation (IdP-agnostic).
+    ///
+    /// Users authenticate with the external provider; hyprstream validates the
+    /// external id_token and issues its own JWT with scopes from the policy engine.
+    /// Separate from `trusted_issuers` which is for hyprstream federation (direct
+    /// JWT acceptance between nodes).
+    #[serde(default)]
+    pub oidc_providers: std::collections::HashMap<String, OidcProviderConfig>,
+
     /// age x25519 identity string for the credential store (bypasses OS keyring lookup).
     ///
     /// **TEST USE ONLY.** Set via `HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY` env var.
@@ -747,6 +830,7 @@ impl Default for OAuthConfig {
             cors: default_oauth_cors(),
             trusted_issuers: std::collections::HashMap::new(),
             authority_hints: Vec::new(),
+            oidc_providers: std::collections::HashMap::new(),
             credential_store_key: None,
             user_signing_key: None,
         }

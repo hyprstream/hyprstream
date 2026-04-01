@@ -32,10 +32,13 @@ pub mod device;
 pub mod federation_entity;
 pub mod jwks;
 pub mod metadata;
+pub mod oidc_callback;
+pub mod oidc_discovery;
 pub mod registration;
 pub mod revocation;
 pub mod state;
 pub mod token;
+pub mod user_mapping;
 pub mod userinfo;
 
 use std::sync::Arc;
@@ -88,6 +91,14 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             get(userinfo::userinfo).post(userinfo::userinfo),
         )
         .route("/oauth/revoke", post(revocation::revoke_token))
+        .route(
+            "/oauth/external/authorize/:provider",
+            get(oidc_callback::external_authorize),
+        )
+        .route(
+            "/oauth/callback/:provider",
+            get(oidc_callback::external_callback),
+        )
         .route(
             "/.well-known/openid-configuration",
             get(metadata::openid_configuration),

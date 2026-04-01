@@ -48,6 +48,30 @@ impl PendingAuthCode {
     }
 }
 
+/// Pending external OIDC authentication flow.
+///
+/// Stores the original hyprstream authorize request so it can be resumed
+/// after the user authenticates with the external provider.
+#[derive(Debug, Clone)]
+pub struct PendingExternalAuth {
+    pub provider_slug: String,
+    pub external_state: String,
+    pub external_nonce: String,
+    pub pkce_verifier: String,
+    pub client_secret: Option<String>,
+    pub token_endpoint: String,
+    // Original hyprstream authorize request
+    pub original_client_id: String,
+    pub original_redirect_uri: String,
+    pub original_code_challenge: String,
+    pub original_scopes: String,
+    pub original_state: Option<String>,
+    pub original_resource: Option<String>,
+    pub original_oidc_nonce: Option<String>,
+    pub created_at: Instant,
+    pub expires_at: Instant,
+}
+
 /// Status of a pending device authorization code (RFC 8628).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeviceCodeStatus {
@@ -143,6 +167,10 @@ pub struct OAuthState {
     /// OpenID Federation 1.0 Trust Anchor URLs.
     /// Included as `authority_hints` in the entity configuration JWT.
     pub authority_hints: Vec<String>,
+    /// Pending external OIDC authentication flows (keyed by external state).
+    pub pending_external_auths: RwLock<HashMap<String, PendingExternalAuth>>,
+    /// OIDC discovery cache for external providers.
+    pub oidc_discovery: super::oidc_discovery::SharedDiscoveryCache,
 }
 
 impl OAuthState {
@@ -167,6 +195,8 @@ impl OAuthState {
             user_store: None,
             signing_key: None,
             authority_hints: config.authority_hints.clone(),
+            pending_external_auths: RwLock::new(HashMap::new()),
+            oidc_discovery: std::sync::Arc::new(super::oidc_discovery::OidcDiscoveryCache::default()),
         }
     }
 
