@@ -15,7 +15,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use hyprstream_tcl::TclShell;
-use hyprstream_vfs::proxy::spawn_vfs_proxy;
+// VFS proxy no longer needed — TclShell awaits namespace operations directly.
 use hyprstream_vfs::{Namespace, Subject};
 
 use super::parser::{Job, Step, Workflow};
@@ -252,26 +252,16 @@ async fn run_job(
 
         let forked = Arc::new(forked);
 
-        // Spawn VFS proxy BEFORE spawn_blocking (needs tokio runtime).
-        let vfs_tx = spawn_vfs_proxy(Arc::clone(&forked), subject.clone());
-
         // Collect steps to process on the blocking thread.
         let steps: Vec<Step> = job.steps.clone();
         let subject_clone = subject.clone();
         let ns_for_actions = Arc::clone(&ns);
         let subject_for_actions = subject.clone();
 
-        // For jobs with mixed action + script steps, we process action steps
-        // on the async runtime and script steps on spawn_blocking.
-        // Since steps are sequential, we interleave.
         // Spawn a single blocking thread with one TclShell for the job.
         // Script steps are sent to it via channel; action steps run on async runtime.
-        // This reuses the interpreter across sequential steps (Tcl state carries over).
-        //
-        // Channel types: tokio::sync::mpsc for the dispatch channel (async send,
-        // blocking_recv on spawn_blocking side). tokio::sync::oneshot for replies
-        // (blocking send on spawn_blocking, async recv on the runtime). This avoids
-        // blocking tokio worker threads with std::sync::mpsc::recv().
+        // The thread runs a current-thread tokio runtime + LocalSet so TclShell
+        // (which is !Send due to Rc in molt Value) can .await VFS operations directly.
         let (script_tx, mut script_rx) = tokio::sync::mpsc::channel::<(
             String,                                                          // script
             HashMap<String, String>,                                         // step env
@@ -279,19 +269,25 @@ async fn run_job(
         )>(1);
 
         let shell_handle = {
-            let vfs_tx = vfs_tx.clone();
+            let ns = Arc::clone(&forked);
             let subject_clone = subject_clone.clone();
+            #[allow(clippy::expect_used)] // Runtime creation failure is unrecoverable
             tokio::task::spawn_blocking(move || {
-                let mut shell = TclShell::new(subject_clone, vfs_tx);
-                while let Some((script, step_env, reply)) = script_rx.blocking_recv() {
-                    // Set step-level env vars via the interpreter API (not eval)
-                    // to prevent Tcl injection from brace-unbalancing in values.
-                    for (k, v) in &step_env {
-                        let _ = shell.set_env(k, v);
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("tcl runner runtime");
+                let local = tokio::task::LocalSet::new();
+                local.block_on(&rt, async {
+                    let mut shell = TclShell::new(subject_clone, ns);
+                    while let Some((script, step_env, reply)) = script_rx.recv().await {
+                        for (k, v) in &step_env {
+                            let _ = shell.set_env(k, v);
+                        }
+                        let result = shell.eval(&script).await;
+                        let _ = reply.send(result);
                     }
-                    let result = shell.eval(&script);
-                    let _ = reply.send(result);
-                }
+                });
             })
         };
 

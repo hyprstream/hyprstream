@@ -129,6 +129,7 @@ build_binary() {
     export LIBTORCH="$libtorch_dir"
     export LD_LIBRARY_PATH="$libtorch_dir/lib:${LD_LIBRARY_PATH:-}"
     export LIBTORCH_BYPASS_VERSION_CHECK=1
+    export OPENSSL_NO_VENDOR=1
 
     (cd "$PROJECT_ROOT" && cargo build --release --features otel)
 
