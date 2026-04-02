@@ -5,7 +5,7 @@
 //!
 //! All VFS operations go through the channel proxy pattern: each builtin
 //! creates a `std::sync::mpsc::sync_channel(1)` for the reply, sends a
-//! `VfsRequest` via `blocking_send`, and blocks on `reply_rx.recv()`.
+//! `VfsRequest` via `send_vfs_request`, and blocks on `reply_rx.recv()`.
 
 use molt::molt_err;
 use molt::molt_ok;
@@ -15,6 +15,18 @@ use molt::Interp;
 use hyprstream_vfs::proxy::{VfsOp, VfsRequest};
 
 use crate::ShellContext;
+
+/// Send a VFS request, handling both tokio-runtime and plain-thread contexts.
+///
+/// `blocking_send()` panics when called from within a tokio runtime (e.g. the
+/// CLI shell's LocalSet). `try_send()` works in any context as long as the
+/// channel has capacity (buffer=64, and we send one-at-a-time with sync reply).
+fn send_vfs_request(
+    tx: &tokio::sync::mpsc::Sender<VfsRequest>,
+    req: VfsRequest,
+) -> Result<(), ()> {
+    tx.try_send(req).map_err(|_| ())
+}
 
 /// Register all VFS builtins on the interpreter.
 pub fn register_all(interp: &mut Interp, ctx_id: ContextID) {
@@ -41,7 +53,7 @@ fn cmd_cat(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResult
             op: VfsOp::Cat { path: path.clone() },
             reply: reply_tx,
         };
-        if ctx.vfs_tx.blocking_send(req).is_err() {
+        if send_vfs_request(&ctx.vfs_tx, req).is_err() {
             return molt_err!("VFS proxy gone");
         }
         match reply_rx.recv() {
@@ -71,7 +83,7 @@ fn cmd_ls(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResult 
         op: VfsOp::Ls { path: path.clone() },
         reply: reply_tx,
     };
-    if ctx.vfs_tx.blocking_send(req).is_err() {
+    if send_vfs_request(&ctx.vfs_tx, req).is_err() {
         return molt_err!("VFS proxy gone");
     }
     match reply_rx.recv() {
@@ -99,7 +111,7 @@ fn cmd_echo(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResul
         },
         reply: reply_tx,
     };
-    if ctx.vfs_tx.blocking_send(req).is_err() {
+    if send_vfs_request(&ctx.vfs_tx, req).is_err() {
         return molt_err!("VFS proxy gone");
     }
     match reply_rx.recv() {
@@ -126,7 +138,7 @@ fn cmd_ctl(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResult
         },
         reply: reply_tx,
     };
-    if ctx.vfs_tx.blocking_send(req).is_err() {
+    if send_vfs_request(&ctx.vfs_tx, req).is_err() {
         return molt_err!("VFS proxy gone");
     }
     match reply_rx.recv() {
@@ -187,7 +199,7 @@ fn cmd_help(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResul
         },
         reply: reply_tx,
     };
-    if ctx.vfs_tx.blocking_send(req).is_ok() {
+    if send_vfs_request(&ctx.vfs_tx, req).is_ok() {
         if let Ok(Ok(data)) = reply_rx.recv() {
             let text = String::from_utf8_lossy(&data);
             if !text.is_empty() {
@@ -214,7 +226,7 @@ fn cmd_mount(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResu
         op: VfsOp::MountPrefixes,
         reply: reply_tx,
     };
-    if ctx.vfs_tx.blocking_send(req).is_err() {
+    if send_vfs_request(&ctx.vfs_tx, req).is_err() {
         return molt_err!("VFS proxy gone");
     }
     let prefixes_str = match reply_rx.recv() {

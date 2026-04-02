@@ -403,6 +403,15 @@ pub async fn handle_shell_tui(
         (ns, std::sync::Arc::new(tokio::sync::Mutex::new(tcl_mount_rx)))
     };
 
+    // Spawn VFS proxy on a dedicated OS thread with its own tokio runtime.
+    // The CLI shell's ChatApps run directly in the LocalSet event loop (not
+    // via spawn_app_process), so the proxy must NOT share the same runtime —
+    // otherwise reply_rx.recv() blocks the runtime and deadlocks the proxy.
+    let vfs_proxy_tx = crate::tui::vfs::spawn_dedicated_vfs_proxy(
+        vfs_ns.clone(),
+        vfs_subject.clone(),
+    );
+
     // Console overlay for log viewing (F9 / Ctrl-L).
     let mut console_app = ConsoleApp::new();
 
@@ -466,7 +475,7 @@ pub async fn handle_shell_tui(
                     &mut compositor, &client, &model_client, &worker_client,
                     &model_status_tx, &mut terminal, &mut console_app,
                     &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                    &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
+                    &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
                 ).await { break; }
             }
 
@@ -490,7 +499,7 @@ pub async fn handle_shell_tui(
                             &mut compositor, &client, &model_client, &worker_client,
                             &model_status_tx, &mut terminal, &mut console_app,
                             &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                            &vfs_ns, &vfs_subject, &tcl_mount_rx, close_outputs,
+                            &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, close_outputs,
                         ).await { break; }
                         continue;
                     }
@@ -541,7 +550,7 @@ pub async fn handle_shell_tui(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                        &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
+                        &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
                     ).await {
                         should_exit = true;
                         break;
@@ -557,7 +566,7 @@ pub async fn handle_shell_tui(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                        &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
+                        &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
                     ).await { break; }
                 }
             }
@@ -603,7 +612,7 @@ pub async fn handle_shell_tui(
                             &mut compositor, &client, &model_client, &worker_client,
                             &model_status_tx, &mut terminal, &mut console_app,
                             &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                            &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
+                            &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
                         ).await { break; }
                     }
                     // Poll images
@@ -625,7 +634,7 @@ pub async fn handle_shell_tui(
                             &mut compositor, &client, &model_client, &worker_client,
                             &model_status_tx, &mut terminal, &mut console_app,
                             &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                            &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
+                            &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
                         ).await { break; }
                     }
                 }
@@ -688,7 +697,7 @@ pub async fn handle_shell_tui(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                        &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
+                        &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
                     ).await { should_exit = true; break; }
                 }
                 // Remove quitting apps.
@@ -713,7 +722,7 @@ pub async fn handle_shell_tui(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                        &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
+                        &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
                     ).await;
                 }
                 if should_exit { break; }
@@ -740,7 +749,7 @@ pub async fn handle_shell_tui(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                        &vfs_ns, &vfs_subject, &tcl_mount_rx,
+                        &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx,
                         vec![CompositorOutput::Rpc(rpc_req)],
                     ).await;
                 }
@@ -757,7 +766,7 @@ pub async fn handle_shell_tui(
                     &mut compositor, &client, &model_client, &worker_client,
                     &model_status_tx, &mut terminal, &mut console_app,
                     &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                    &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
+                    &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
                 ).await { break; }
                 composite_draw(&mut terminal, &compositor, &mut console_app);
             }
@@ -828,6 +837,7 @@ async fn dispatch_outputs(
     signing_key: &SigningKey,
     vfs_ns: &std::sync::Arc<hyprstream_vfs::Namespace>,
     vfs_subject: &hyprstream_rpc::Subject,
+    vfs_proxy_tx: &tokio::sync::mpsc::Sender<hyprstream_vfs::proxy::VfsRequest>,
     tcl_mount_rx: &std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>,
     outputs: Vec<CompositorOutput>,
 ) -> bool {
@@ -841,7 +851,7 @@ async fn dispatch_outputs(
                 let feed_back = handle_rpc(
                     compositor, client, model_client, worker_client, model_status_tx,
                     active_apps, next_local_id, storage_key, signing_key,
-                    vfs_ns, vfs_subject, tcl_mount_rx, req,
+                    vfs_ns, vfs_subject, vfs_proxy_tx, tcl_mount_rx, req,
                 ).await;
                 for input in feed_back {
                     let follow = compositor.handle(input);
@@ -889,6 +899,7 @@ async fn handle_rpc(
     signing_key: &SigningKey,
     vfs_ns: &std::sync::Arc<hyprstream_vfs::Namespace>,
     vfs_subject: &hyprstream_rpc::Subject,
+    vfs_proxy_tx: &tokio::sync::mpsc::Sender<hyprstream_vfs::proxy::VfsRequest>,
     tcl_mount_rx: &std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>,
     req: RpcRequest,
 ) -> Vec<CompositorInput> {
@@ -1089,7 +1100,7 @@ async fn handle_rpc(
                         session_uuid, load_hook, save_hook,
                     )
                     .with_gen_config(gen_config)
-                    .with_vfs(vfs_ns.clone(), vfs_subject.clone())
+                    .with_vfs_proxy(vfs_ns.clone(), vfs_subject.clone(), vfs_proxy_tx.clone())
                     .with_tcl_mount_rx(tcl_mount_rx.clone())
                 }
                 Err(e) => {
@@ -1103,7 +1114,7 @@ async fn handle_rpc(
                     );
                     ChatApp::new(model_ref.clone(), cols, rows, spawner)
                         .with_gen_config(gen_config)
-                        .with_vfs(vfs_ns.clone(), vfs_subject.clone())
+                        .with_vfs_proxy(vfs_ns.clone(), vfs_subject.clone(), vfs_proxy_tx.clone())
                     .with_tcl_mount_rx(tcl_mount_rx.clone())
                 }
             };
