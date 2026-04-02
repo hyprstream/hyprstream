@@ -198,7 +198,7 @@ impl TclShell {
             },
             reply: reply_tx,
         };
-        if ctx.vfs_tx.blocking_send(req).is_err() {
+        if builtins::send_vfs_request(&ctx.vfs_tx, req).is_err() {
             return Err(format!("invalid command name \"{cmd_name}\""));
         }
         match reply_rx.recv() {

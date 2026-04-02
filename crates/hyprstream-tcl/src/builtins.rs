@@ -21,7 +21,7 @@ use crate::ShellContext;
 /// `blocking_send()` panics when called from within a tokio runtime (e.g. the
 /// CLI shell's LocalSet). `try_send()` works in any context as long as the
 /// channel has capacity (buffer=64, and we send one-at-a-time with sync reply).
-fn send_vfs_request(
+pub(crate) fn send_vfs_request(
     tx: &tokio::sync::mpsc::Sender<VfsRequest>,
     req: VfsRequest,
 ) -> Result<(), ()> {
