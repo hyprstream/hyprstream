@@ -327,8 +327,9 @@ pub async fn handle_shell_tui(
                 let mut out = String::from("VFS commands:\n");
                 out.push_str("  cat <path>           read file contents\n");
                 out.push_str("  ls [path]            list directory\n");
-                out.push_str("  echo <path> <data>   write to file\n");
+                out.push_str("  write <path> <data>  write to file\n");
                 out.push_str("  ctl <path> <cmd>     control file (write+read)\n");
+                out.push_str("  json parse <str>     convert JSON to Tcl dict\n");
                 out.push_str("  mount [prefix]       list mount points\n");
                 out.push_str("  help                 this message\n");
                 out.into_bytes()
@@ -336,8 +337,8 @@ pub async fn handle_shell_tui(
             children.insert("mount".to_owned(), SyntheticNode::ReadFile(Box::new(|| {
                 b"usage: mount".to_vec()
             })));
-            children.insert("echo".to_owned(), SyntheticNode::ReadFile(Box::new(|| {
-                b"usage: echo <path> <data>".to_vec()
+            children.insert("write".to_owned(), SyntheticNode::ReadFile(Box::new(|| {
+                b"usage: write <path> <data>".to_vec()
             })));
 
             SyntheticTree::new(SyntheticNode::Dir { children })
@@ -1905,19 +1906,12 @@ pub(crate) fn discover_tools(dir: &std::path::Path) -> HashMap<String, crate::se
         }
 
         let script_path = path.clone();
-        tools.insert(name, SyntheticNode::CtlFile {
-            handler: Box::new(move |data, _subject| {
-                let script = std::fs::read_to_string(&script_path)
-                    .map_err(|e| format!("failed to read tool script: {e}"))?;
-                let args = String::from_utf8_lossy(data);
-                // Wrap the script: set $args before executing, capture the result.
-                let wrapped = format!("set args {{{}}}\n{}", args.trim(), script);
-                // Return the wrapped script for evaluation by the caller's TclShell.
-                // The ctl response is the script to eval — the /bin/ fallback in
-                // TclShell.try_cmd_resolve() will pass this through eval.
-                Ok(wrapped.into_bytes())
-            }),
-        });
+        tools.insert(name, SyntheticNode::ReadFile(Box::new(move || {
+            // Read script from disk at access time so edits take effect immediately.
+            std::fs::read_to_string(&script_path)
+                .unwrap_or_else(|e| format!("# error reading tool script: {e}"))
+                .into_bytes()
+        })));
     }
 
     tools

@@ -134,8 +134,9 @@ pub fn build_chat_vfs_namespace(
             let mut out = String::from("VFS commands:\n");
             out.push_str("  cat <path>           read file contents\n");
             out.push_str("  ls [path]            list directory\n");
-            out.push_str("  echo <path> <data>   write to file\n");
+            out.push_str("  write <path> <data>  write to file\n");
             out.push_str("  ctl <path> <cmd>     control file (write+read)\n");
+            out.push_str("  json parse <str>     convert JSON to Tcl dict\n");
             out.push_str("  mount [prefix]       list mount points\n");
             out.push_str("  help                 this message\n");
             out.into_bytes()
@@ -143,8 +144,8 @@ pub fn build_chat_vfs_namespace(
         children.insert("mount".to_owned(), SyntheticNode::ReadFile(Box::new(|| {
             b"usage: mount".to_vec()
         })));
-        children.insert("echo".to_owned(), SyntheticNode::ReadFile(Box::new(|| {
-            b"usage: echo <path> <data>".to_vec()
+        children.insert("write".to_owned(), SyntheticNode::ReadFile(Box::new(|| {
+            b"usage: write <path> <data>".to_vec()
         })));
 
         SyntheticTree::new(SyntheticNode::Dir { children })

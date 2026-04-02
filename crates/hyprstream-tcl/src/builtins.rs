@@ -32,9 +32,9 @@ pub(crate) fn send_vfs_request(
 pub fn register_all(interp: &mut Interp, ctx_id: ContextID) {
     interp.add_context_command("cat", cmd_cat, ctx_id);
     interp.add_context_command("ls", cmd_ls, ctx_id);
-    interp.add_context_command("echo", cmd_echo, ctx_id);
+    interp.add_context_command("write", cmd_write, ctx_id);
     interp.add_context_command("ctl", cmd_ctl, ctx_id);
-    interp.add_context_command("field", cmd_field, ctx_id);
+    interp.add_context_command("json", cmd_json, ctx_id);
     interp.add_context_command("help", cmd_help, ctx_id);
     interp.add_context_command("mount", cmd_mount, ctx_id);
 }
@@ -96,8 +96,8 @@ fn cmd_ls(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResult 
     }
 }
 
-/// `echo path data` — write data to a VFS file.
-fn cmd_echo(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResult {
+/// `write path data` — write data to a VFS file.
+fn cmd_write(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResult {
     molt::check_args(1, argv, 3, 3, "path data")?;
 
     let path = argv[1].to_string();
@@ -151,29 +151,73 @@ fn cmd_ctl(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResult
     }
 }
 
-/// `field value fieldName` — extract a field from a JSON string.
+/// `json parse value` — convert a JSON string to a Tcl dict.
 ///
-/// Returns the string value for string fields, or the JSON representation
-/// for non-string fields (numbers, objects, arrays, booleans, null).
+/// Returns a Tcl dict representation of the JSON object. Nested objects
+/// become nested dicts. Arrays become Tcl lists. Use standard `dict get`
+/// to extract fields:
+///
+/// ```tcl
+///     set d [json parse $response]
+///     dict get $d fieldName
+/// ```
 ///
 /// SECURITY: String values are returned unescaped. If the result is used
 /// with `eval` or `subst`, bracket contents trigger Tcl command substitution.
 /// The attenuated TclShell does not register `eval` or `subst`, so this is
-/// safe in normal operation. If those commands are available, callers must
-/// quote with `[list $result]` before substitution.
-fn cmd_field(_interp: &mut Interp, _ctx_id: ContextID, argv: &[Value]) -> MoltResult {
-    molt::check_args(1, argv, 3, 3, "value fieldName")?;
+/// safe in normal operation.
+fn cmd_json(_interp: &mut Interp, _ctx_id: ContextID, argv: &[Value]) -> MoltResult {
+    molt::check_args(1, argv, 3, 3, "parse value")?;
 
-    let json_str = argv[1].to_string();
-    let field = argv[2].to_string();
+    let subcmd = argv[1].to_string();
+    if subcmd != "parse" {
+        return molt_err!("unknown subcommand \"{}\": must be parse", subcmd);
+    }
+
+    let json_str = argv[2].to_string();
     let parsed: serde_json::Value = match serde_json::from_str(&json_str) {
         Ok(v) => v,
         Err(e) => return molt_err!("invalid JSON: {}", e),
     };
-    match parsed.get(&field) {
-        Some(serde_json::Value::String(s)) => molt_ok!(s.as_str()),
-        Some(v) => molt_ok!(v.to_string()),
-        None => molt_err!("field '{}' not found", field),
+    molt_ok!(json_to_tcl(&parsed))
+}
+
+/// Convert a serde_json::Value to a Tcl string representation.
+///
+/// Objects → Tcl dicts (key value key value ...)
+/// Arrays  → Tcl lists (value value ...)
+/// Strings → raw string value
+/// Numbers/bools/null → string representation
+fn json_to_tcl(val: &serde_json::Value) -> String {
+    match val {
+        serde_json::Value::Object(map) => {
+            let mut parts = Vec::with_capacity(map.len() * 2);
+            for (k, v) in map {
+                parts.push(tcl_list_escape(k));
+                parts.push(tcl_list_escape(&json_to_tcl(v)));
+            }
+            parts.join(" ")
+        }
+        serde_json::Value::Array(arr) => {
+            let items: Vec<String> = arr.iter().map(|v| tcl_list_escape(&json_to_tcl(v))).collect();
+            items.join(" ")
+        }
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => (if *b { "1" } else { "0" }).to_owned(),
+        serde_json::Value::Null => String::new(),
+    }
+}
+
+/// Escape a string for safe inclusion in a Tcl list.
+///
+/// If the string contains spaces, braces, backslashes, or is empty,
+/// wrap it in braces. Otherwise return as-is.
+fn tcl_list_escape(s: &str) -> String {
+    if s.is_empty() || s.contains(|c: char| c.is_whitespace() || c == '{' || c == '}' || c == '\\' || c == '"') {
+        format!("{{{}}}", s)
+    } else {
+        s.to_owned()
     }
 }
 
@@ -185,9 +229,9 @@ fn cmd_help(interp: &mut Interp, ctx_id: ContextID, argv: &[Value]) -> MoltResul
     out.push_str("VFS commands:\n");
     out.push_str("  cat <path>           read file contents\n");
     out.push_str("  ls [path]            list directory\n");
-    out.push_str("  echo <path> <data>   write to file\n");
+    out.push_str("  write <path> <data>  write to file\n");
     out.push_str("  ctl <path> <cmd>     control file (write+read)\n");
-    out.push_str("  field <json> <name>  extract JSON field\n");
+    out.push_str("  json parse <str>     convert JSON to Tcl dict\n");
     out.push_str("  mount [prefix]       list mount points\n");
     out.push_str("  help                 this message\n");
 

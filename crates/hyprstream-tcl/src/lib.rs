@@ -163,8 +163,9 @@ impl TclShell {
 
     /// Try resolving an unknown command via `/bin/{name}` (Plan9 PATH model).
     ///
-    /// Extracts everything after the command name as the argument payload,
-    /// then does a ctl (write+read) on `/bin/{name}` via the channel proxy.
+    /// Two-phase resolution:
+    /// 1. Try ctl (write+read) — for Rust-backed service actions
+    /// 2. If ctl fails, try cat — for `.tcl` script files, then eval with args
     fn try_cmd_resolve(&mut self, cmd_name: &str, script: &str) -> Result<String, String> {
         // Sanitize: reject path traversal in command names.
         if cmd_name.contains('/') || cmd_name.contains("..") {
@@ -189,20 +190,45 @@ impl TclShell {
             }
         };
 
+        // Phase 1: Try ctl (service actions — CtlFile nodes).
         let ctx = self.interp.context::<ShellContext>(self.ctx_id);
         let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
         let req = VfsRequest {
             op: VfsOp::Ctl {
-                path: cmd_path,
-                cmd: evaluated_args.into_bytes(),
+                path: cmd_path.clone(),
+                cmd: evaluated_args.clone().into_bytes(),
             },
+            reply: reply_tx,
+        };
+        if builtins::send_vfs_request(&ctx.vfs_tx, req).is_ok() {
+            match reply_rx.recv() {
+                Ok(Ok(resp)) => return Ok(String::from_utf8_lossy(&resp).into_owned()),
+                Ok(Err(_)) => {} // ctl failed — fall through to cat
+                Err(_) => {}
+            }
+        }
+
+        // Phase 2: Try cat (script files — ReadFile nodes).
+        // Read the script, prepend `set argv {args}`, and eval it.
+        let ctx = self.interp.context::<ShellContext>(self.ctx_id);
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+        let req = VfsRequest {
+            op: VfsOp::Cat { path: cmd_path },
             reply: reply_tx,
         };
         if builtins::send_vfs_request(&ctx.vfs_tx, req).is_err() {
             return Err(format!("invalid command name \"{cmd_name}\""));
         }
         match reply_rx.recv() {
-            Ok(Ok(resp)) => Ok(String::from_utf8_lossy(&resp).into_owned()),
+            Ok(Ok(script_bytes)) => {
+                let tool_script = String::from_utf8_lossy(&script_bytes);
+                // Wrap: set argv before executing so the script can access args.
+                let wrapped = format!("set argv {{{evaluated_args}}}\n{tool_script}");
+                match self.interp.eval(&wrapped) {
+                    Ok(val) => Ok(val.to_string()),
+                    Err(e) => Err(e.value().to_string()),
+                }
+            }
             _ => Err(format!("invalid command name \"{cmd_name}\"")),
         }
     }
@@ -431,8 +457,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn eval_echo() {
-        let result = with_shell(|s| s.eval("echo /bin/load qwen3:main")).await;
+    async fn eval_write() {
+        let result = with_shell(|s| s.eval("write /bin/load qwen3:main")).await;
         assert!(result.is_ok());
     }
 
@@ -448,7 +474,7 @@ mod tests {
         assert!(result.contains("cat"));
         assert!(result.contains("ls"));
         assert!(result.contains("ctl"));
-        assert!(result.contains("echo"));
+        assert!(result.contains("write"));
         assert!(result.contains("mount"));
         assert!(result.contains("help"));
     }
@@ -611,66 +637,73 @@ mod tests {
         );
     }
 
-    // ── field builtin tests ─────────────────────────────────────────────────
+    // ── json builtin tests ──────────────────────────────────────────────────
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn field_extract_string() {
-        // Double-brace: outer {} = Tcl quoting, inner {} = JSON object
+    async fn json_parse_object() {
+        // json parse returns a Tcl dict; use dict get to extract fields
         let result = with_shell(|s| {
-            s.eval(r#"field {{"name":"alice","age":30}} name"#)
+            s.eval(r#"dict get [json parse {{"name":"alice","age":30}}] name"#)
         }).await.unwrap();
         assert_eq!(result, "alice");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn field_extract_number() {
+    async fn json_parse_number() {
         let result = with_shell(|s| {
-            s.eval(r#"field {{"name":"alice","age":30}} age"#)
+            s.eval(r#"dict get [json parse {{"name":"alice","age":30}}] age"#)
         }).await.unwrap();
         assert_eq!(result, "30");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn field_extract_nested() {
+    async fn json_parse_nested() {
+        // Nested objects become nested dicts
         let result = with_shell(|s| {
-            s.eval(r#"field {{"data":{"x":1}}} data"#)
+            s.eval(r#"dict get [dict get [json parse {{"data":{"x":1}}}] data] x"#)
         }).await.unwrap();
-        assert_eq!(result, r#"{"x":1}"#);
+        assert_eq!(result, "1");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn field_not_found() {
+    async fn json_parse_invalid() {
         let result = with_shell(|s| {
-            s.eval(r#"field {{"name":"alice"}} missing"#)
-        }).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("field 'missing' not found"));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn field_invalid_json() {
-        let result = with_shell(|s| {
-            s.eval(r#"field {not json} name"#)
+            s.eval(r#"json parse {not json}"#)
         }).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid JSON"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn field_bracket_string_no_subst() {
-        // SECURITY: Verify bracket-containing string values don't trigger Tcl substitution
-        // Double-brace to pass JSON through Tcl quoting
+    async fn json_parse_array() {
+        // Arrays become Tcl lists
         let result = with_shell(|s| {
-            s.eval(r#"field {{"cmd":"[exec rm -rf /]"}} cmd"#)
+            s.eval(r#"lindex [json parse {[1, 2, 3]}] 1"#)
         }).await.unwrap();
-        // Should return the literal string, not execute it
-        assert_eq!(result, "[exec rm -rf /]");
+        assert_eq!(result, "2");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn field_in_help() {
+    async fn json_parse_bool_null() {
+        let result = with_shell(|s| {
+            s.eval(r#"dict get [json parse {{"flag":true,"empty":null}}] flag"#)
+        }).await.unwrap();
+        assert_eq!(result, "1");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn json_unknown_subcommand() {
+        let result = with_shell(|s| {
+            s.eval(r#"json encode {something}"#)
+        }).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown subcommand"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn json_in_help() {
         let result = with_shell(|s| s.eval("help")).await.unwrap();
-        assert!(result.contains("field"));
+        assert!(result.contains("json"));
     }
 
     // ── Runtime safety tests ────────────────────────────────────────────────
