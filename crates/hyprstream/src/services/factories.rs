@@ -763,12 +763,16 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 
     let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::anonymous());
 
+    // Build VFS namespace for ChatApps spawned via TUI RPC.
+    let (vfs_ns, vfs_subject) = crate::tui::vfs::build_chat_vfs_namespace(ctx.signing_key());
+
     let mut tui_service = TuiService::new(
         state,
         global_context(),
         ctx.transport("tui", SocketKind::Rep),
         ctx.signing_key().clone(),
-    ).with_policy_client(policy_client);
+    ).with_policy_client(policy_client)
+     .with_vfs(vfs_ns, vfs_subject);
 
     if let Some(issuer) = ctx.oauth_issuer_url() {
         tui_service = tui_service.with_local_issuer_url(issuer.to_owned());

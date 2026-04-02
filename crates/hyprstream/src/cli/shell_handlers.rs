@@ -311,89 +311,56 @@ pub async fn handle_shell_tui(
             std::sync::Arc::new(remote_model_mount),
         );
 
-        // Wrap in Arc, then build /bin/ with Weak captures to avoid circular ref.
-        // Weak doesn't block Arc::get_mut, so we can still mount after.
-        let mut ns = std::sync::Arc::new(ns);
-        let weak = std::sync::Arc::downgrade(&ns);
-        let subj = vfs_subject.clone();
-
+        // /bin/ — static directory entries for listing purposes.
+        // Actual command execution goes through TclShell builtins via VFS proxy,
+        // not through these nodes. These exist so `ls /bin` shows available commands.
         let bin_tree = {
             let mut children = std::collections::HashMap::new();
 
-            // /bin/cat — write path(s), read file contents.
-            let w = weak.clone();
-            let s = subj.clone();
-            children.insert("cat".to_owned(), SyntheticNode::CtlFile {
-                handler: Box::new(move |data, _subject| {
-                    let ns = w.upgrade().ok_or("namespace dropped")?;
-                    let input = std::str::from_utf8(data).map_err(|e| e.to_string())?;
-                    let handle = tokio::runtime::Handle::current();
-                    let mut out = Vec::new();
-                    for path in input.split_whitespace() {
-                        out.extend_from_slice(
-                            &tokio::task::block_in_place(|| handle.block_on(ns.cat(path, &s))).map_err(|e| e.to_string())?,
-                        );
-                    }
-                    Ok(out)
-                }),
-            });
-
-            // /bin/ls — write path, read directory listing.
-            let w = weak.clone();
-            let s = subj.clone();
-            children.insert("ls".to_owned(), SyntheticNode::CtlFile {
-                handler: Box::new(move |data, _subject| {
-                    let ns = w.upgrade().ok_or("namespace dropped")?;
-                    let input = std::str::from_utf8(data).map_err(|e| e.to_string())?;
-                    let path = input.trim();
-                    let path = if path.is_empty() { "/" } else { path };
-                    let handle = tokio::runtime::Handle::current();
-                    let entries = tokio::task::block_in_place(|| handle.block_on(ns.ls(path, &s))).map_err(|e| e.to_string())?;
-                    let listing: Vec<String> = entries.iter().map(|e| {
-                        if e.is_dir { format!("{}/", e.name) } else { e.name.clone() }
-                    }).collect();
-                    Ok(listing.join("\n").into_bytes())
-                }),
-            });
-
-            // /bin/help — read-only, lists available commands.
-            let w = weak.clone();
-            let s = subj.clone();
-            children.insert("help".to_owned(), SyntheticNode::CtlFile {
-                handler: Box::new(move |_data, _subject| {
-                    let mut out = String::from("VFS commands:\n");
-                    out.push_str("  cat <path>           read file contents\n");
-                    out.push_str("  ls [path]            list directory\n");
-                    out.push_str("  echo <path> <data>   write to file\n");
-                    out.push_str("  ctl <path> <cmd>     control file (write+read)\n");
-                    out.push_str("  mount [prefix]       list mount points\n");
-                    out.push_str("  help                 this message\n");
-                    if let Some(ns) = w.upgrade() {
-                        let handle = tokio::runtime::Handle::current();
-                        if let Ok(entries) = tokio::task::block_in_place(|| handle.block_on(ns.ls("/bin", &s))) {
-                            if !entries.is_empty() {
-                                out.push_str("\nCommands (/bin/):\n");
-                                for entry in &entries {
-                                    out.push_str(&format!("  {}\n", entry.name));
-                                }
-                            }
-                        }
-                    }
-                    Ok(out.into_bytes())
-                }),
-            });
-
-            // /bin/mount — read-only, lists mount prefixes.
-            let w = weak.clone();
-            children.insert("mount".to_owned(), SyntheticNode::CtlFile {
-                handler: Box::new(move |_data, _subject| {
-                    let ns = w.upgrade().ok_or("namespace dropped")?;
-                    Ok(ns.mount_prefixes().join("\n").into_bytes())
-                }),
-            });
+            children.insert("cat".to_owned(), SyntheticNode::ReadFile(Box::new(|| {
+                b"usage: cat <path> [path ...]".to_vec()
+            })));
+            children.insert("ls".to_owned(), SyntheticNode::ReadFile(Box::new(|| {
+                b"usage: ls [path]".to_vec()
+            })));
+            children.insert("help".to_owned(), SyntheticNode::ReadFile(Box::new(|| {
+                let mut out = String::from("VFS commands:\n");
+                out.push_str("  cat <path>           read file contents\n");
+                out.push_str("  ls [path]            list directory\n");
+                out.push_str("  echo <path> <data>   write to file\n");
+                out.push_str("  ctl <path> <cmd>     control file (write+read)\n");
+                out.push_str("  mount [prefix]       list mount points\n");
+                out.push_str("  help                 this message\n");
+                out.into_bytes()
+            })));
+            children.insert("mount".to_owned(), SyntheticNode::ReadFile(Box::new(|| {
+                b"usage: mount".to_vec()
+            })));
+            children.insert("echo".to_owned(), SyntheticNode::ReadFile(Box::new(|| {
+                b"usage: echo <path> <data>".to_vec()
+            })));
 
             SyntheticTree::new(SyntheticNode::Dir { children })
         };
+        let _ = ns.mount("/bin",
+            std::sync::Arc::new(bin_tree),
+        );
+
+        // Discover .tcl tool scripts and bind them into /bin/ (After = fallback).
+        let tools_dir = std::env::var("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                dirs::home_dir().unwrap_or_default().join(".config")
+            })
+            .join("hyprstream/tools");
+        let tools = discover_tools(&tools_dir);
+        if !tools.is_empty() {
+            let tools_tree = SyntheticTree::new(SyntheticNode::Dir { children: tools });
+            let _ = ns.bind_mount("/bin",
+                std::sync::Arc::new(tools_tree),
+                hyprstream_vfs::BindFlag::After,
+            );
+        }
 
         // /env/ — session variables as files (Plan9 per-process /env/).
         let env_store: std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<String, String>>> =
@@ -421,39 +388,17 @@ pub async fn handle_shell_tui(
                 }),
             })
         };
+        let _ = ns.mount("/env",
+            std::sync::Arc::new(env_tree),
+        );
 
         // Create /lang/tcl mount channel — the TclMount exposes interpreter state
         // as files. The receiver is polled by ChatApp::tick().
         let (tcl_mount_tx, tcl_mount_rx) = hyprstream_tcl::create_mount_channel();
         let tcl_mount = std::sync::Arc::new(hyprstream_tcl::TclMount::new(tcl_mount_tx));
+        let _ = ns.mount("/lang/tcl", tcl_mount);
 
-        // Mount /bin/, /env/, /lang/tcl — Arc::get_mut works because only Weak refs exist (no strong clones).
-        if let Some(ns_mut) = std::sync::Arc::get_mut(&mut ns) {
-            let _ = ns_mut.mount("/bin",
-                std::sync::Arc::new(bin_tree),
-            );
-
-            // Discover .tcl tool scripts and bind them into /bin/ (After = fallback).
-            let tools_dir = std::env::var("XDG_CONFIG_HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| {
-                    dirs::home_dir().unwrap_or_default().join(".config")
-                })
-                .join("hyprstream/tools");
-            let tools = discover_tools(&tools_dir);
-            if !tools.is_empty() {
-                let tools_tree = SyntheticTree::new(SyntheticNode::Dir { children: tools });
-                let _ = ns_mut.bind_mount("/bin",
-                    std::sync::Arc::new(tools_tree),
-                    hyprstream_vfs::BindFlag::After,
-                );
-            }
-
-            let _ = ns_mut.mount("/env",
-                std::sync::Arc::new(env_tree),
-            );
-            let _ = ns_mut.mount("/lang/tcl", tcl_mount);
-        }
+        let ns = std::sync::Arc::new(ns);
 
         (ns, std::sync::Arc::new(tokio::sync::Mutex::new(tcl_mount_rx)))
     };
@@ -1925,7 +1870,7 @@ fn unpack_color(packed: u32) -> ratatui::style::Color {
 ///
 /// Returns a HashMap suitable for constructing a `SyntheticNode::Dir`.
 /// Returns an empty map if the directory doesn't exist or is unreadable.
-fn discover_tools(dir: &std::path::Path) -> HashMap<String, crate::services::fs::SyntheticNode> {
+pub(crate) fn discover_tools(dir: &std::path::Path) -> HashMap<String, crate::services::fs::SyntheticNode> {
     use crate::services::fs::SyntheticNode;
 
     let mut tools = HashMap::new();

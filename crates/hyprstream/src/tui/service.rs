@@ -153,6 +153,13 @@ pub struct TuiService {
     local_issuer_url: Option<String>,
     /// Federation key source for verifying externally-issued JWTs.
     federation_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>>,
+    /// Shared VFS namespace for ChatApps spawned via RPC.
+    vfs_ns: Option<std::sync::Arc<hyprstream_vfs::Namespace>>,
+    /// VFS subject identity for ChatApps spawned via RPC.
+    vfs_subject: Option<hyprstream_rpc::Subject>,
+    /// Lazily-spawned VFS proxy sender (shared across all ChatApps).
+    /// Initialized on first ChatApp spawn within the service's async context.
+    vfs_proxy_tx: std::sync::OnceLock<tokio::sync::mpsc::Sender<hyprstream_vfs::proxy::VfsRequest>>,
 }
 
 impl TuiService {
@@ -175,6 +182,9 @@ impl TuiService {
             expected_audience: None,
             local_issuer_url: None,
             federation_key_source: None,
+            vfs_ns: None,
+            vfs_subject: None,
+            vfs_proxy_tx: std::sync::OnceLock::new(),
         }
     }
 
@@ -203,6 +213,34 @@ impl TuiService {
     ) -> Self {
         self.federation_key_source = Some(src);
         self
+    }
+
+    /// Attach a VFS namespace so ChatApps spawned via RPC have VFS access.
+    ///
+    /// The VFS proxy task is spawned lazily on the first ChatApp spawn,
+    /// on the service's own tokio runtime (inside the LocalSet).
+    pub fn with_vfs(
+        mut self,
+        ns: std::sync::Arc<hyprstream_vfs::Namespace>,
+        subject: hyprstream_rpc::Subject,
+    ) -> Self {
+        self.vfs_ns = Some(ns);
+        self.vfs_subject = Some(subject);
+        self
+    }
+
+    /// Get the VFS proxy sender, spawning a dedicated proxy thread on first call.
+    fn vfs_proxy(&self) -> Option<&tokio::sync::mpsc::Sender<hyprstream_vfs::proxy::VfsRequest>> {
+        let (ns, subject) = match (&self.vfs_ns, &self.vfs_subject) {
+            (Some(ns), Some(subject)) => (ns, subject),
+            _ => return None,
+        };
+        Some(self.vfs_proxy_tx.get_or_init(|| {
+            super::vfs::spawn_dedicated_vfs_proxy(
+                std::sync::Arc::clone(ns),
+                subject.clone(),
+            )
+        }))
     }
 
     /// Check authorization via PolicyClient.
@@ -1040,6 +1078,16 @@ impl TuiService {
                 .unwrap_or(hyprstream_tui::chat_app::ToolCallFormat::Qwen3Xml),
         )
         .with_server_spawned();
+
+        // Wire VFS namespace if available, using the shared proxy sender.
+        let app = if let (Some(vfs_ns), Some(vfs_subject), Some(vfs_tx)) =
+            (&self.vfs_ns, &self.vfs_subject, self.vfs_proxy())
+        {
+            app.with_vfs_proxy(vfs_ns.clone(), vfs_subject.clone(), vfs_tx.clone())
+        } else {
+            app
+        };
+
         let config = waxterm::app::TerminalConfig::new().cols(cols).rows(rows);
         let process = super::process::spawn_app_process(app, config);
 

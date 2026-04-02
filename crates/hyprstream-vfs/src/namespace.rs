@@ -258,30 +258,60 @@ impl Namespace {
             return Ok(self.root_dir_entries());
         }
 
-        let (targets, remainder) = self.resolve(path)?;
-        let components: Vec<&str> = split_path(&remainder);
-        let mut seen = std::collections::HashSet::new();
-        let mut merged = Vec::new();
-        let mut any_ok = false;
-        for mount in targets {
-            if let Ok(mut fid) = mount.walk(&components, caller).await {
-                if mount.open(&mut fid, 0, caller).await.is_ok() {
-                    if let Ok(entries) = mount.readdir(&fid, caller).await {
-                        any_ok = true;
-                        for entry in entries {
-                            if seen.insert(entry.name.clone()) {
-                                merged.push(entry);
+        match self.resolve(path) {
+            Ok((targets, remainder)) => {
+                let components: Vec<&str> = split_path(&remainder);
+                let mut seen = std::collections::HashSet::new();
+                let mut merged = Vec::new();
+                let mut any_ok = false;
+                for mount in targets {
+                    if let Ok(mut fid) = mount.walk(&components, caller).await {
+                        if mount.open(&mut fid, 0, caller).await.is_ok() {
+                            if let Ok(entries) = mount.readdir(&fid, caller).await {
+                                any_ok = true;
+                                for entry in entries {
+                                    if seen.insert(entry.name.clone()) {
+                                        merged.push(entry);
+                                    }
+                                }
                             }
+                        }
+                        mount.clunk(fid, caller).await;
+                    }
+                }
+                if any_ok {
+                    Ok(merged)
+                } else {
+                    Err(NamespaceError::Mount(MountError::NotFound(path.to_owned())))
+                }
+            }
+            Err(_) => {
+                // Path doesn't match any mount prefix directly. Check if it's an
+                // intermediate directory — i.e., some mount's prefix starts with
+                // "{path}/". Synthesize directory entries from sub-mount components.
+                let normalized = normalize_path(path);
+                let prefix_with_slash = format!("{}/", normalized);
+                let mut seen = std::collections::HashSet::new();
+                let mut entries = Vec::new();
+                for m in &self.mounts {
+                    if let Some(rest) = m.prefix.strip_prefix(&prefix_with_slash[..]) {
+                        let next = rest.split('/').next().unwrap_or("");
+                        if !next.is_empty() && seen.insert(next.to_owned()) {
+                            entries.push(DirEntry {
+                                name: next.to_owned(),
+                                is_dir: true,
+                                size: 0,
+                                stat: None,
+                            });
                         }
                     }
                 }
-                mount.clunk(fid, caller).await;
+                if entries.is_empty() {
+                    Err(NamespaceError::Mount(MountError::NotFound(path.to_owned())))
+                } else {
+                    Ok(entries)
+                }
             }
-        }
-        if any_ok {
-            Ok(merged)
-        } else {
-            Err(NamespaceError::Mount(MountError::NotFound(path.to_owned())))
         }
     }
 

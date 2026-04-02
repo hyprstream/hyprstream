@@ -548,6 +548,23 @@ impl ChatApp {
         self
     }
 
+    /// Attach VFS using a pre-spawned proxy sender.
+    ///
+    /// Use this when the VFS proxy was already spawned on a specific runtime
+    /// (e.g. in server-spawned ChatApps where the handler's runtime differs
+    /// from the ChatApp's OS thread).
+    pub fn with_vfs_proxy(
+        mut self,
+        ns: std::sync::Arc<hyprstream_vfs::Namespace>,
+        subject: hyprstream_vfs::Subject,
+        vfs_tx: tokio::sync::mpsc::Sender<hyprstream_vfs::proxy::VfsRequest>,
+    ) -> Self {
+        self.tcl_shell_init = Some((subject.clone(), vfs_tx));
+        self.vfs = Some(ns);
+        self.vfs_subject = subject;
+        self
+    }
+
     /// Attach the receiver end of a `/lang/tcl` mount channel.
     ///
     /// The corresponding [`hyprstream_tcl::TclMount`] must be mounted in the
