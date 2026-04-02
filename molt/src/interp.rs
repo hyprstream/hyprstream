@@ -523,8 +523,11 @@ pub struct Interp {
 
 /// A command defined in the interpreter.
 enum Command {
-    /// A binary command implemented as a Rust CommandFunc.
+    /// A binary command implemented as a synchronous Rust CommandFunc.
     Native(CommandFunc, ContextID),
+
+    /// A binary command implemented as an async Rust function (returns BoxFuture).
+    AsyncNative(AsyncCommandFunc, ContextID),
 
     /// A Molt procedure
     Proc(Procedure),
@@ -532,9 +535,15 @@ enum Command {
 
 impl Command {
     /// Execute the command according to its kind.
-    fn execute(&self, interp: &mut Interp, argv: &[Value]) -> MoltResult {
+    /// Returns a BoxFuture — sync commands are wrapped in `ready()`.
+    fn execute<'a>(&'a self, interp: &'a mut Interp, argv: &'a [Value]) -> BoxFuture<'a, MoltResult> {
         match self {
-            Command::Native(func, context_id) => func(interp, *context_id, argv),
+            Command::Native(func, context_id) => {
+                Box::pin(std::future::ready(func(interp, *context_id, argv)))
+            }
+            Command::AsyncNative(func, context_id) => {
+                func(interp, *context_id, argv)
+            }
             Command::Proc(proc) => proc.execute(interp, argv),
         }
     }
@@ -542,7 +551,7 @@ impl Command {
     /// Returns a value naming the command type.
     fn cmdtype(&self) -> Value {
         match self {
-            Command::Native(_, _) => Value::from("native"),
+            Command::Native(_, _) | Command::AsyncNative(_, _) => Value::from("native"),
             Command::Proc(_) => Value::from("proc"),
         }
     }
@@ -550,7 +559,7 @@ impl Command {
     /// Gets the command's context, or NULL_CONTEXT if none.
     fn context_id(&self) -> ContextID {
         match self {
-            Command::Native(_, context_id) => *context_id,
+            Command::Native(_, context_id) | Command::AsyncNative(_, context_id) => *context_id,
             _ => NULL_CONTEXT,
         }
     }
@@ -692,15 +701,15 @@ impl Interp {
         interp.add_command("array", commands::cmd_array);
         interp.add_command("assert_eq", commands::cmd_assert_eq);
         interp.add_command("break", commands::cmd_break);
-        interp.add_command("catch", commands::cmd_catch);
+        interp.add_async_command("catch", commands::cmd_catch);
         interp.add_command("continue", commands::cmd_continue);
         interp.add_command("dict", commands::cmd_dict);
         interp.add_command("error", commands::cmd_error);
-        interp.add_command("expr", commands::cmd_expr);
-        interp.add_command("for", commands::cmd_for);
-        interp.add_command("foreach", commands::cmd_foreach);
+        interp.add_async_command("expr", commands::cmd_expr);
+        interp.add_async_command("for", commands::cmd_for);
+        interp.add_async_command("foreach", commands::cmd_foreach);
         interp.add_command("global", commands::cmd_global);
-        interp.add_command("if", commands::cmd_if);
+        interp.add_async_command("if", commands::cmd_if);
         interp.add_command("incr", commands::cmd_incr);
         interp.add_command("info", commands::cmd_info);
         interp.add_command("join", commands::cmd_join);
@@ -715,13 +724,13 @@ impl Interp {
         interp.add_command("set", commands::cmd_set);
         interp.add_command("string", commands::cmd_string);
         interp.add_command("throw", commands::cmd_throw);
-        interp.add_command("time", commands::cmd_time);
+        interp.add_async_command("time", commands::cmd_time);
         interp.add_command("unset", commands::cmd_unset);
-        interp.add_command("while", commands::cmd_while);
+        interp.add_async_command("while", commands::cmd_while);
 
         // TODO: Requires file access.  Ultimately, might go in an extension crate if
         // the necessary operations aren't available in core::.
-        interp.add_command("source", commands::cmd_source);
+        interp.add_async_command("source", commands::cmd_source);
 
         // TODO: Useful for entire programs written in Molt; but not necessarily wanted in
         // extension scripts.
@@ -795,9 +804,9 @@ impl Interp {
     /// }
     /// ```
 
-    pub fn eval(&mut self, script: &str) -> MoltResult {
+    pub async fn eval(&mut self, script: &str) -> MoltResult {
         let value = Value::from(script);
-        self.eval_value(&value)
+        self.eval_value(&value).await
     }
 
     /// Evaluates the string value of a [`Value`] as a script.  Returns the `Value`
@@ -812,12 +821,7 @@ impl Interp {
     /// times.
     ///
     /// [`Value`]: ../value/index.html
-    pub fn eval_value(&mut self, value: &Value) -> MoltResult {
-        // TODO: Could probably do better, here.  If the value is already a list, for
-        // example, can maybe evaluate it as a command without using as_script().
-        // Tricky, though.  Don't want to have to parse it as a list.  Need a quick way
-        // to determine if something is already a list.  (Might need two methods!)
-
+    pub async fn eval_value(&mut self, value: &Value) -> MoltResult {
         // FIRST, check instruction limit (catches loops with empty bodies like `while {1} {}`)
         if self.instruction_limit > 0 {
             self.instruction_count += 1;
@@ -838,7 +842,7 @@ impl Interp {
         }
 
         // NEXT, evaluate the script and translate the result to Ok or Error
-        let mut result = self.eval_script(&*value.as_script()?);
+        let mut result = self.eval_script(&*value.as_script()?).await;
 
         // NEXT, decrement the number of nesting levels.
         self.num_levels -= 1;
@@ -886,11 +890,11 @@ impl Interp {
 
     /// Evaluates a parsed Script, producing a normal MoltResult.
     /// Also used by expr.rs.
-    pub(crate) fn eval_script(&mut self, script: &Script) -> MoltResult {
+    pub(crate) async fn eval_script(&mut self, script: &Script) -> MoltResult {
         let mut result_value = Value::empty();
 
         for word_vec in script.commands() {
-            let words = self.eval_word_vec(word_vec.words())?;
+            let words = self.eval_word_vec(word_vec.words()).await?;
 
             if words.is_empty() {
                 break;
@@ -910,25 +914,14 @@ impl Interp {
             }
 
             if let Some(cmd) = self.commands.get(name) {
-                // let start = Instant::now();
                 let cmd = Rc::clone(cmd);
-                let result = cmd.execute(self, words.as_slice());
-                // self.profile_save(&format!("cmd.execute({})", name), start);
+                let result = cmd.execute(self, words.as_slice()).await;
 
                 if let Ok(v) = result {
                     result_value = v;
                 } else if let Err(mut exception) = result {
-                    // TODO: I think this needs to be done up above.
-                    // // Handle the return -code, -level protocol
-                    // if exception.code() == ResultCode::Return {
-                    //     exception.decrement_level();
-                    // }
-
                     match exception.code() {
-                        // ResultCode::Okay => result_value = exception.value(),
                         ResultCode::Error => {
-                            // FIRST, new error, an error from within a proc, or an error from
-                            // within some other body (ignored).
                             if exception.is_new_error() {
                                 exception.add_error_info("    while executing");
                             } else if cmd.is_proc() {
@@ -941,9 +934,6 @@ impl Interp {
                                 return Err(exception);
                             }
 
-                            // TODO: Add command.  In standard TCL, this is the text of the command
-                            // before interpolation; at present, we don't have that info in a
-                            // convenient form.  For now, just convert the final words to a string.
                             exception.add_error_info(&format!("\"{}\"", &list_to_string(&words)));
                             return Err(exception);
                         }
@@ -962,17 +952,17 @@ impl Interp {
 
     /// Evaluates a WordVec, producing a list of Values.  The expansion operator is handled
     /// as a special case.
-    fn eval_word_vec(&mut self, words: &[Word]) -> Result<MoltList, Exception> {
+    async fn eval_word_vec(&mut self, words: &[Word]) -> Result<MoltList, Exception> {
         let mut list: MoltList = Vec::new();
 
         for word in words {
             if let Word::Expand(word_to_expand) = word {
-                let value = self.eval_word(word_to_expand)?;
+                let value = self.eval_word(word_to_expand).await?;
                 for val in &*value.as_list()? {
                     list.push(val.clone());
                 }
             } else {
-                list.push(self.eval_word(word)?);
+                list.push(self.eval_word(word).await?);
             }
         }
 
@@ -980,23 +970,28 @@ impl Interp {
     }
 
     /// Evaluates a single word, producing a value.  This is also used by expr.rs.
-    pub(crate) fn eval_word(&mut self, word: &Word) -> MoltResult {
-        match word {
-            Word::Value(val) => Ok(val.clone()),
-            Word::VarRef(name) => self.scalar(name),
-            Word::ArrayRef(name, index_word) => {
-                let index = self.eval_word(index_word)?;
-                self.element(name, index.as_str())
+    ///
+    /// Returns `BoxFuture` (rather than being `async fn`) to break the
+    /// recursive-future-size cycle: eval_word → eval_script → eval_word.
+    pub(crate) fn eval_word<'a>(&'a mut self, word: &'a Word) -> BoxFuture<'a, MoltResult> {
+        Box::pin(async move {
+            match word {
+                Word::Value(val) => Ok(val.clone()),
+                Word::VarRef(name) => self.scalar(name),
+                Word::ArrayRef(name, index_word) => {
+                    let index = self.eval_word(index_word).await?;
+                    self.element(name, index.as_str())
+                }
+                Word::Script(script) => self.eval_script(script).await,
+                Word::Tokens(tokens) => {
+                    let tlist = self.eval_word_vec(tokens).await?;
+                    let string: String = tlist.iter().map(|i| i.as_str()).collect();
+                    Ok(Value::from(string))
+                }
+                Word::Expand(_) => panic!("recursive Expand!"),
+                Word::String(str) => Ok(Value::from(str)),
             }
-            Word::Script(script) => self.eval_script(script),
-            Word::Tokens(tokens) => {
-                let tlist = self.eval_word_vec(tokens)?;
-                let string: String = tlist.iter().map(|i| i.as_str()).collect();
-                Ok(Value::from(string))
-            }
-            Word::Expand(_) => panic!("recursive Expand!"),
-            Word::String(str) => Ok(Value::from(str)),
-        }
+        })
     }
 
     /// Returns the `return` option dictionary for the given result as a dictionary value.
@@ -1083,9 +1078,9 @@ impl Interp {
     /// # Ok("dummy".to_string())
     /// # }
     /// ```
-    pub fn expr(&mut self, expr: &Value) -> MoltResult {
+    pub async fn expr(&mut self, expr: &Value) -> MoltResult {
         // Evaluate the expression and set the errorInfo/errorCode.
-        let result = expr::expr(self, expr);
+        let result = expr::expr(self, expr).await;
 
         if let Err(exception) = &result {
             self.set_global_error_data(exception.error_data())?;
@@ -1112,8 +1107,8 @@ impl Interp {
     /// # Ok("dummy".to_string())
     /// # }
     /// ```
-    pub fn expr_bool(&mut self, expr: &Value) -> Result<bool, Exception> {
-        self.expr(expr)?.as_bool()
+    pub async fn expr_bool(&mut self, expr: &Value) -> Result<bool, Exception> {
+        self.expr(expr).await?.as_bool()
     }
 
     /// Evaluates a [Molt expression](https://wduquette.github.io/molt/ref/expr.html)
@@ -1135,8 +1130,8 @@ impl Interp {
     /// # Ok("dummy".to_string())
     /// # }
     /// ```
-    pub fn expr_int(&mut self, expr: &Value) -> Result<MoltInt, Exception> {
-        self.expr(expr)?.as_int()
+    pub async fn expr_int(&mut self, expr: &Value) -> Result<MoltInt, Exception> {
+        self.expr(expr).await?.as_int()
     }
 
     /// Evaluates a [Molt expression](https://wduquette.github.io/molt/ref/expr.html)
@@ -1158,8 +1153,8 @@ impl Interp {
     /// # Ok("dummy".to_string())
     /// # }
     /// ```
-    pub fn expr_float(&mut self, expr: &Value) -> Result<MoltFloat, Exception> {
-        self.expr(expr)?.as_float()
+    pub async fn expr_float(&mut self, expr: &Value) -> Result<MoltFloat, Exception> {
+        self.expr(expr).await?.as_float()
     }
 
     //--------------------------------------------------------------------------------------------
@@ -1487,6 +1482,17 @@ impl Interp {
     /// # molt_ok!()
     /// # }
     /// ```
+    /// Adds a trace on the named variable. The trace callback fires on the specified
+    /// operations (read, write, unset).
+    pub fn trace_variable(&mut self, name: &str, flags: crate::scope::TraceFlags, func: crate::scope::TraceFunc) {
+        self.scopes.add_trace(name, flags, func);
+    }
+
+    /// Removes all traces on the named variable.
+    pub fn untrace_variable(&mut self, name: &str) {
+        self.scopes.remove_traces(name);
+    }
+
     pub fn unset_var(&mut self, name: &Value) {
         let var_name = name.as_var_name();
 
@@ -1774,6 +1780,31 @@ impl Interp {
             .insert(name.into(), Rc::new(Command::Native(func, context_id)));
     }
 
+    /// Adds an async binary command with no related context to the interpreter.
+    /// Use this for commands that need `.await` (e.g., VFS builtins, control-flow
+    /// commands that evaluate sub-scripts).
+    pub fn add_async_command(&mut self, name: &str, func: AsyncCommandFunc) {
+        self.add_async_context_command(name, func, NULL_CONTEXT);
+    }
+
+    /// Adds an async binary command with related context data to the interpreter.
+    pub fn add_async_context_command(
+        &mut self,
+        name: &str,
+        func: AsyncCommandFunc,
+        context_id: ContextID,
+    ) {
+        if context_id != NULL_CONTEXT {
+            self.context_map
+                .get_mut(&context_id)
+                .expect("unknown context ID")
+                .increment();
+        }
+
+        self.commands
+            .insert(name.into(), Rc::new(Command::AsyncNative(func, context_id)));
+    }
+
     /// Adds a procedure to the interpreter.
     ///
     /// This is how to add a Molt `proc` to the interpreter.  The arguments are the same
@@ -1847,6 +1878,9 @@ impl Interp {
     /// assert!(!interp.has_command("set"));
     /// ```
     pub fn remove_command(&mut self, name: &str) {
+        if !self.commands.contains_key(name) {
+            return; // Silently ignore removal of non-existent commands
+        }
         // FIRST, get the command's context ID, if any.
         let context_id = self
             .commands
@@ -2274,80 +2308,68 @@ struct Procedure {
 }
 
 impl Procedure {
-    fn execute(&self, interp: &mut Interp, argv: &[Value]) -> MoltResult {
-        // FIRST, push the proc's local scope onto the stack.
-        interp.push_scope();
+    /// Returns `BoxFuture` to break the recursive-future-size cycle:
+    /// Procedure::execute → eval_value → eval_script → cmd.execute → Procedure::execute.
+    fn execute<'a>(&'a self, interp: &'a mut Interp, argv: &'a [Value]) -> BoxFuture<'a, MoltResult> {
+        Box::pin(async move {
+            // FIRST, push the proc's local scope onto the stack.
+            interp.push_scope();
 
-        // NEXT, process the proc's argument list.
-        let mut argi = 1; // Skip the proc's name
+            // NEXT, process the proc's argument list.
+            let mut argi = 1; // Skip the proc's name
 
-        for (speci, spec) in self.parms.iter().enumerate() {
-            // FIRST, get the parameter as a vector.  It should be a list of
-            // one or two elements.
-            let vec = &*spec.as_list()?; // Should never fail
-            assert!(vec.len() == 1 || vec.len() == 2);
+            for (speci, spec) in self.parms.iter().enumerate() {
+                let vec = &*spec.as_list()?; // Should never fail
+                assert!(vec.len() == 1 || vec.len() == 2);
 
-            // NEXT, if this is the args parameter, give the remaining args,
-            // if any.  Note that "args" has special meaning only if it's the
-            // final arg spec in the list.
-            if vec[0].as_str() == "args" && speci == self.parms.len() - 1 {
-                interp.set_scalar("args", Value::from(&argv[argi..]))?;
+                if vec[0].as_str() == "args" && speci == self.parms.len() - 1 {
+                    interp.set_scalar("args", Value::from(&argv[argi..]))?;
+                    argi = argv.len();
+                    break;
+                }
 
-                // We've processed all of the args
-                argi = argv.len();
-                break;
+                if argi < argv.len() {
+                    interp.set_scalar(vec[0].as_str(), argv[argi].clone())?;
+                    argi += 1;
+                    continue;
+                }
+
+                if vec.len() == 2 {
+                    interp.set_scalar(vec[0].as_str(), vec[1].clone())?;
+                } else {
+                    interp.pop_scope();
+                    return self.wrong_num_args(&argv[0]);
+                }
             }
 
-            // NEXT, do we have a matching argument?
-            if argi < argv.len() {
-                // Pair them up
-                interp.set_scalar(vec[0].as_str(), argv[argi].clone())?;
-                argi += 1;
-                continue;
-            }
-
-            // NEXT, do we have a default value?
-            if vec.len() == 2 {
-                interp.set_scalar(vec[0].as_str(), vec[1].clone())?;
-            } else {
-                // We don't; we're missing a required argument.
+            if argi != argv.len() {
+                interp.pop_scope();
                 return self.wrong_num_args(&argv[0]);
             }
-        }
 
-        // NEXT, do we have any arguments left over?
+            // NEXT, evaluate the proc's body, getting the result.
+            let result = interp.eval_value(&self.body).await;
 
-        if argi != argv.len() {
-            return self.wrong_num_args(&argv[0]);
-        }
+            // NEXT, pop the scope off of the stack; we're done with it.
+            interp.pop_scope();
 
-        // NEXT, evaluate the proc's body, getting the result.
-        let result = interp.eval_value(&self.body);
+            if let Err(mut exception) = result {
+                if exception.code() == ResultCode::Return {
+                    exception.decrement_level();
+                }
 
-        // NEXT, pop the scope off of the stack; we're done with it.
-        interp.pop_scope();
-
-        if let Err(mut exception) = result {
-            // FIRST, handle the return -code, -level protocol
-            if exception.code() == ResultCode::Return {
-                exception.decrement_level();
+                return match exception.code() {
+                    ResultCode::Okay => Ok(exception.value()),
+                    ResultCode::Error => Err(exception),
+                    ResultCode::Return => Err(exception), // -level > 0
+                    ResultCode::Break => molt_err!("invoked \"break\" outside of a loop"),
+                    ResultCode::Continue => molt_err!("invoked \"continue\" outside of a loop"),
+                    ResultCode::Other(_) => molt_err!("unexpected result code."),
+                };
             }
 
-            return match exception.code() {
-                ResultCode::Okay => Ok(exception.value()),
-                ResultCode::Error => Err(exception),
-                ResultCode::Return => Err(exception), // -level > 0
-                ResultCode::Break => molt_err!("invoked \"break\" outside of a loop"),
-                ResultCode::Continue => molt_err!("invoked \"continue\" outside of a loop"),
-                // TODO: Better error message
-                ResultCode::Other(_) => molt_err!("unexpected result code."),
-            };
-        }
-
-        // NEXT, return the computed result.
-        // Note: no need for special handling for return, break, continue;
-        // interp.eval() returns only Ok or a real error.
-        result
+            result
+        })
     }
 
     // Outputs the wrong # args message for the proc.  The name is passed in
@@ -2385,49 +2407,52 @@ impl Procedure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::task::LocalSet;
+
+    /// Helper: run an async test on a single-threaded runtime (molt is !Send).
+    fn molt_block_on<F: std::future::Future<Output = ()>>(f: F) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        LocalSet::new().block_on(&rt, f);
+    }
 
     #[test]
     fn test_empty() {
         let interp = Interp::empty();
-        // Interpreter is empty
         assert!(interp.command_names().is_empty());
     }
 
     #[test]
     fn test_new() {
         let interp = Interp::new();
-
-        // Interpreter is not empty
         assert!(!interp.command_names().is_empty());
-
-        // Note: in theory, we should test here that the normal set of commands is present.
-        // In fact, that should be tested by the `molt test` suite.
     }
 
     #[test]
     fn test_eval() {
-        let mut interp = Interp::new();
+        molt_block_on(async {
+            let mut interp = Interp::new();
 
-        assert_eq!(interp.eval("set a 1"), Ok(Value::from("1")));
-        assert!(ex_match(
-            &interp.eval("error 2"),
-            Exception::molt_err(Value::from("2"))
-        ));
-        assert_eq!(interp.eval("return 3"), Ok(Value::from("3")));
-        assert!(ex_match(
-            &interp.eval("break"),
-            Exception::molt_err(Value::from("invoked \"break\" outside of a loop"))
-        ));
-        assert!(ex_match(
-            &interp.eval("continue"),
-            Exception::molt_err(Value::from("invoked \"continue\" outside of a loop"))
-        ));
+            assert_eq!(interp.eval("set a 1").await, Ok(Value::from("1")));
+            assert!(ex_match(
+                &interp.eval("error 2").await,
+                Exception::molt_err(Value::from("2"))
+            ));
+            assert_eq!(interp.eval("return 3").await, Ok(Value::from("3")));
+            assert!(ex_match(
+                &interp.eval("break").await,
+                Exception::molt_err(Value::from("invoked \"break\" outside of a loop"))
+            ));
+            assert!(ex_match(
+                &interp.eval("continue").await,
+                Exception::molt_err(Value::from("invoked \"continue\" outside of a loop"))
+            ));
+        });
     }
 
-    // Shows that the result is matches the given exception.  Ignores the exception's
-    // ErrorData, if any.
     fn ex_match(r: &MoltResult, expected: Exception) -> bool {
-        // FIRST, if the results are of different types, there's no match.
         if let Err(e) = r {
             e.code() == expected.code() && e.value() == expected.value()
         } else {
@@ -2437,28 +2462,30 @@ mod tests {
 
     #[test]
     fn test_eval_value() {
-        let mut interp = Interp::new();
+        molt_block_on(async {
+            let mut interp = Interp::new();
 
-        assert_eq!(
-            interp.eval_value(&Value::from("set a 1")),
-            Ok(Value::from("1"))
-        );
-        assert!(ex_match(
-            &interp.eval_value(&Value::from("error 2")),
-            Exception::molt_err(Value::from("2"))
-        ));
-        assert_eq!(
-            interp.eval_value(&Value::from("return 3")),
-            Ok(Value::from("3"))
-        );
-        assert!(ex_match(
-            &interp.eval_value(&Value::from("break")),
-            Exception::molt_err(Value::from("invoked \"break\" outside of a loop"))
-        ));
-        assert!(ex_match(
-            &interp.eval_value(&Value::from("continue")),
-            Exception::molt_err(Value::from("invoked \"continue\" outside of a loop"))
-        ));
+            assert_eq!(
+                interp.eval_value(&Value::from("set a 1")).await,
+                Ok(Value::from("1"))
+            );
+            assert!(ex_match(
+                &interp.eval_value(&Value::from("error 2")).await,
+                Exception::molt_err(Value::from("2"))
+            ));
+            assert_eq!(
+                interp.eval_value(&Value::from("return 3")).await,
+                Ok(Value::from("3"))
+            );
+            assert!(ex_match(
+                &interp.eval_value(&Value::from("break")).await,
+                Exception::molt_err(Value::from("invoked \"break\" outside of a loop"))
+            ));
+            assert!(ex_match(
+                &interp.eval_value(&Value::from("continue")).await,
+                Exception::molt_err(Value::from("invoked \"continue\" outside of a loop"))
+            ));
+        });
     }
 
     #[test]
@@ -2475,121 +2502,134 @@ mod tests {
 
     #[test]
     fn test_expr() {
-        let mut interp = Interp::new();
-        assert_eq!(interp.expr(&Value::from("1 + 2")), Ok(Value::from(3)));
-        assert_eq!(
-            interp.expr(&Value::from("a + b")),
-            Err(Exception::molt_err(Value::from(
-                "unknown math function \"a\""
-            )))
-        );
+        molt_block_on(async {
+            let mut interp = Interp::new();
+            assert_eq!(interp.expr(&Value::from("1 + 2")).await, Ok(Value::from(3)));
+            assert_eq!(
+                interp.expr(&Value::from("a + b")).await,
+                Err(Exception::molt_err(Value::from(
+                    "unknown math function \"a\""
+                )))
+            );
+        });
     }
 
     #[test]
     fn test_expr_bool() {
-        let mut interp = Interp::new();
-        assert_eq!(interp.expr_bool(&Value::from("1")), Ok(true));
-        assert_eq!(interp.expr_bool(&Value::from("0")), Ok(false));
-        assert_eq!(
-            interp.expr_bool(&Value::from("a")),
-            Err(Exception::molt_err(Value::from(
-                "unknown math function \"a\""
-            )))
-        );
+        molt_block_on(async {
+            let mut interp = Interp::new();
+            assert_eq!(interp.expr_bool(&Value::from("1")).await, Ok(true));
+            assert_eq!(interp.expr_bool(&Value::from("0")).await, Ok(false));
+            assert_eq!(
+                interp.expr_bool(&Value::from("a")).await,
+                Err(Exception::molt_err(Value::from(
+                    "unknown math function \"a\""
+                )))
+            );
+        });
     }
 
     #[test]
     fn test_expr_int() {
-        let mut interp = Interp::new();
-        assert_eq!(interp.expr_int(&Value::from("1 + 2")), Ok(3));
-        assert_eq!(
-            interp.expr_int(&Value::from("a")),
-            Err(Exception::molt_err(Value::from(
-                "unknown math function \"a\""
-            )))
-        );
+        molt_block_on(async {
+            let mut interp = Interp::new();
+            assert_eq!(interp.expr_int(&Value::from("1 + 2")).await, Ok(3));
+            assert_eq!(
+                interp.expr_int(&Value::from("a")).await,
+                Err(Exception::molt_err(Value::from(
+                    "unknown math function \"a\""
+                )))
+            );
+        });
     }
 
     #[test]
     fn test_expr_float() {
-        let mut interp = Interp::new();
-        let val = interp
-            .expr_float(&Value::from("1.1 + 2.2"))
-            .expect("floating point value");
+        molt_block_on(async {
+            let mut interp = Interp::new();
+            let val = interp
+                .expr_float(&Value::from("1.1 + 2.2"))
+                .await
+                .expect("floating point value");
 
-        assert!((val - 3.3).abs() < 0.001);
+            assert!((val - 3.3).abs() < 0.001);
 
-        assert_eq!(
-            interp.expr_float(&Value::from("a")),
-            Err(Exception::molt_err(Value::from(
-                "unknown math function \"a\""
-            )))
-        );
+            assert_eq!(
+                interp.expr_float(&Value::from("a")).await,
+                Err(Exception::molt_err(Value::from(
+                    "unknown math function \"a\""
+                )))
+            );
+        });
     }
 
     #[test]
     fn test_recursion_limit() {
-        let mut interp = Interp::new();
+        molt_block_on(async {
+            let mut interp = Interp::new();
 
-        assert_eq!(interp.recursion_limit(), 1000);
-        interp.set_recursion_limit(100);
-        assert_eq!(interp.recursion_limit(), 100);
+            assert_eq!(interp.recursion_limit(), 1000);
+            interp.set_recursion_limit(100);
+            assert_eq!(interp.recursion_limit(), 100);
 
-        assert!(dbg!(interp.eval("proc myproc {} { myproc }")).is_ok());
-        assert!(ex_match(
-            &interp.eval("myproc"),
-            Exception::molt_err(Value::from(
-                "too many nested calls to Interp::eval (infinite loop?)"
-            ))
-        ));
+            assert!(interp.eval("proc myproc {} { myproc }").await.is_ok());
+            assert!(ex_match(
+                &interp.eval("myproc").await,
+                Exception::molt_err(Value::from(
+                    "too many nested calls to Interp::eval (infinite loop?)"
+                ))
+            ));
+        });
     }
 
     #[test]
     fn test_instruction_limit() {
-        let mut interp = Interp::new();
+        molt_block_on(async {
+            let mut interp = Interp::new();
 
-        assert_eq!(interp.instruction_limit(), 0);
-        interp.set_instruction_limit(100);
-        assert_eq!(interp.instruction_limit(), 100);
+            assert_eq!(interp.instruction_limit(), 0);
+            interp.set_instruction_limit(100);
+            assert_eq!(interp.instruction_limit(), 100);
 
-        // Simple eval stays under limit.
-        interp.reset_instruction_count();
-        assert!(interp.eval("expr {1 + 1}").is_ok());
-        assert!(interp.instruction_count() > 0);
-        assert!(interp.instruction_count() <= 100);
+            interp.reset_instruction_count();
+            assert!(interp.eval("expr {1 + 1}").await.is_ok());
+            assert!(interp.instruction_count() > 0);
+            assert!(interp.instruction_count() <= 100);
 
-        // Infinite loop hits the limit.
-        interp.reset_instruction_count();
-        let result = interp.eval("while {1} {}");
-        assert!(result.is_err());
-        let msg = result.unwrap_err().value().to_string();
-        assert!(msg.contains("instruction limit exceeded"));
+            interp.reset_instruction_count();
+            let result = interp.eval("while {1} {}").await;
+            assert!(result.is_err());
+            let msg = result.unwrap_err().value().to_string();
+            assert!(msg.contains("instruction limit exceeded"));
 
-        // Counter resets properly.
-        interp.reset_instruction_count();
-        assert_eq!(interp.instruction_count(), 0);
-        assert!(interp.eval("set x 1").is_ok());
+            interp.reset_instruction_count();
+            assert_eq!(interp.instruction_count(), 0);
+            assert!(interp.eval("set x 1").await.is_ok());
+        });
     }
 
     #[test]
     fn test_instruction_limit_zero_is_unlimited() {
-        let mut interp = Interp::new();
-        interp.set_instruction_limit(0); // unlimited
+        molt_block_on(async {
+            let mut interp = Interp::new();
+            interp.set_instruction_limit(0);
 
-        // A loop that would exceed any reasonable limit runs fine with limit=0.
-        interp.reset_instruction_count();
-        assert!(interp.eval("for {set i 0} {$i < 10000} {incr i} {}").is_ok());
+            interp.reset_instruction_count();
+            assert!(interp.eval("for {set i 0} {$i < 10000} {incr i} {}").await.is_ok());
+        });
     }
 
     #[test]
     fn test_instruction_limit_catches_nested_loops() {
-        let mut interp = Interp::new();
-        interp.set_instruction_limit(50);
+        molt_block_on(async {
+            let mut interp = Interp::new();
+            interp.set_instruction_limit(50);
 
-        interp.reset_instruction_count();
-        let result = interp.eval("for {set i 0} {$i < 1000} {incr i} {expr {$i * $i}}");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().value().to_string().contains("instruction limit"));
+            interp.reset_instruction_count();
+            let result = interp.eval("for {set i 0} {$i < 1000} {incr i} {expr {$i * $i}}").await;
+            assert!(result.is_err());
+            assert!(result.unwrap_err().value().to_string().contains("instruction limit"));
+        });
     }
 
     //-----------------------------------------------------------------------
@@ -2598,15 +2638,10 @@ mod tests {
     #[test]
     fn context_basic_use() {
         let mut interp = Interp::new();
-
-        // Save a context object.
         let id = interp.save_context(String::from("ABC"));
-
-        // Retrieve it.
         let ctx = interp.context::<String>(id);
         assert_eq!(*ctx, "ABC");
         ctx.push_str("DEF");
-
         let ctx = interp.context::<String>(id);
         assert_eq!(*ctx, "ABCDEF");
     }
@@ -2614,12 +2649,8 @@ mod tests {
     #[test]
     fn context_advanced_use() {
         let mut interp = Interp::new();
-
-        // Save a context object.
         let id = interp.context_id();
         interp.set_context(id, String::from("ABC"));
-
-        // Retrieve it.
         let ctx = interp.context::<String>(id);
         assert_eq!(*ctx, "ABC");
     }
@@ -2628,45 +2659,25 @@ mod tests {
     #[should_panic]
     fn context_unknown() {
         let mut interp = Interp::new();
-
-        // Valid ID Generated, but no context saved.
         let id = interp.context_id();
-
-        // Try to retrieve it.
         let _ctx = interp.context::<String>(id);
-
-        // Should panic!
     }
 
     #[test]
     #[should_panic]
     fn context_wrong_type() {
         let mut interp = Interp::new();
-
-        // Save a context object.
         let id = interp.save_context(String::from("ABC"));
-
-        // Try to retrieve it as something else.
         let _ctx = interp.context::<Vec<String>>(id);
-
-        // Should panic!
     }
 
     #[test]
     #[should_panic]
     fn context_forgotten_1_command() {
         let mut interp = Interp::new();
-
-        // Save a context object.
         let id = interp.save_context(String::from("ABC"));
-
-        // Use it with a command.
         interp.add_context_command("dummy", dummy_cmd, id);
-
-        // Remove the command.
         interp.remove_command("dummy");
-
-        // Try to retrieve it; this should panic.
         let _ctx = interp.context::<String>(id);
     }
 
@@ -2674,20 +2685,12 @@ mod tests {
     #[should_panic(expected = "unknown context ID")]
     fn context_forgotten_2_commands() {
         let mut interp = Interp::new();
-
-        // Save a context object.
         let id = interp.save_context(String::from("ABC"));
-
-        // Use it with a command.
         interp.add_context_command("dummy", dummy_cmd, id);
         interp.add_context_command("dummy2", dummy_cmd, id);
-
-        // Remove the command.
         interp.remove_command("dummy");
         assert_eq!(interp.context::<String>(id), "ABC");
         interp.remove_command("dummy2");
-
-        // Try to retrieve it; this should panic.
         let _ctx = interp.context::<String>(id);
     }
 

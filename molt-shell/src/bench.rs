@@ -55,7 +55,7 @@ use std::path::PathBuf;
 ///     eprintln!("Usage: mybench *filename.tcl");
 /// }
 /// ```
-pub fn benchmark(interp: &mut Interp, args: &[String]) {
+pub async fn benchmark(interp: &mut Interp, args: &[String]) {
     // FIRST, get the script file name
     if args.is_empty() {
         eprintln!("Missing benchmark script.");
@@ -100,7 +100,7 @@ pub fn benchmark(interp: &mut Interp, args: &[String]) {
     interp.add_command("ok", cmd_ok);
 
     // NEXT, load the benchmark Tcl library
-    if let Err(exception) = interp.eval(include_str!("bench.tcl")) {
+    if let Err(exception) = interp.eval(include_str!("bench.tcl")).await {
         panic!(
             "Error in benchmark Tcl library: {}",
             exception.value().as_str()
@@ -114,7 +114,7 @@ pub fn benchmark(interp: &mut Interp, args: &[String]) {
                 let _ = env::set_current_dir(parent);
             }
 
-            match interp.eval(&script) {
+            match interp.eval(&script).await {
                 Ok(_) => (),
                 Err(exception) => {
                     eprintln!("{}", exception.value());

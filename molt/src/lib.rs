@@ -41,7 +41,7 @@ mod tokenizer;
 #[macro_use]
 mod macros;
 mod parser;
-mod scope;
+pub mod scope;
 pub mod test_harness;
 pub mod types;
 mod util;

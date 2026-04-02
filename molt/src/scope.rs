@@ -18,6 +18,47 @@ use crate::value::Value;
 use std::collections::HashMap;
 use std::fmt::Debug;
 
+/// The operation being traced on a variable.
+#[derive(Debug)]
+pub enum TraceOp {
+    /// The variable is being read.
+    Read,
+    /// The variable is being written with the given value.
+    Write(Value),
+    /// The variable is being unset.
+    Unset,
+}
+
+/// A trace callback function. Parameters: variable name, array index (empty if scalar), operation.
+/// For Read: returning Ok(value) overrides the read value.
+/// For Write: returning Ok(value) is ignored (write already happened).
+/// For Unset: returning Ok(value) is ignored.
+/// Returning Err prevents the operation and propagates the error.
+pub type TraceFunc = Box<dyn Fn(&str, &str, &TraceOp) -> Result<Value, Exception>>;
+
+/// Flags indicating which operations to trace.
+#[derive(Clone, Copy)]
+pub struct TraceFlags {
+    pub read: bool,
+    pub write: bool,
+    pub unset: bool,
+}
+
+impl TraceFlags {
+    pub fn all() -> Self {
+        Self { read: true, write: true, unset: true }
+    }
+    pub fn read_write() -> Self {
+        Self { read: true, write: true, unset: false }
+    }
+}
+
+/// A variable trace registration.
+pub(crate) struct VarTrace {
+    pub flags: TraceFlags,
+    pub func: TraceFunc,
+}
+
 /// A variable in a `Scope`.  If the variable is defined in the given `Scope`, it is a
 /// `Scalar` or an `Array`; if it is an alias to a variable in a higher scope (e.g., a global)
 /// then the `Upvar` gives the referenced scope.  The `New` variant is used transiently as
@@ -80,9 +121,16 @@ impl Scope {
 
 /// The scope stack: a stack of variable scopes corresponding to the Molt `proc`
 /// call stack.
-#[derive(Default, Debug)]
 pub(crate) struct ScopeStack {
     stack: Vec<Scope>,
+    /// Variable traces by variable name.
+    traces: HashMap<String, Vec<VarTrace>>,
+}
+
+impl Default for ScopeStack {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ScopeStack {
@@ -92,7 +140,10 @@ impl ScopeStack {
     /// Creates a scope stack containing only scope `0`, the global scope.  This is usually
     /// done once, as part of creating an `Interp`.
     pub fn new() -> Self {
-        let mut ss = Self { stack: Vec::new() };
+        let mut ss = Self {
+            stack: Vec::new(),
+            traces: HashMap::new(),
+        };
 
         ss.stack.push(Scope::new());
 
@@ -101,6 +152,10 @@ impl ScopeStack {
 
     /// Requires the value of the named scalar variable in the current scope.
     pub fn get(&self, name: &str) -> Result<Value, Exception> {
+        // Fire read trace first — it can override the value
+        if let Some(result) = self.fire_read_trace(name, "") {
+            return result;
+        }
         match self.var(self.current(), name) {
             Some(Var::Scalar(value)) => Ok(value.clone()),
             Some(Var::Array(_)) => molt_err!("can't read \"{}\": variable is array", name),
@@ -111,6 +166,10 @@ impl ScopeStack {
 
     /// Requires the value of an array element given its variable name and index.
     pub fn get_elem(&self, name: &str, index: &str) -> Result<Value, Exception> {
+        // Fire read trace — can override value for array elements
+        if let Some(result) = self.fire_read_trace(name, index) {
+            return result;
+        }
         match self.var(self.current(), name) {
             Some(Var::Scalar(_)) => {
                 molt_err!("can't read \"{}({})\": variable isn't array", name, index)
@@ -152,6 +211,7 @@ impl ScopeStack {
     /// if it doesn't already exist.  It's an error if the variable exists but is an array
     /// variable.
     pub fn set(&mut self, name: &str, val: Value) -> Result<(), Exception> {
+        self.fire_write_trace(name, "", &val)?;
         match self.var_mut(self.current(), name) {
             Some(Var::Upvar(_)) => unreachable!(),
             Some(Var::Array(_)) => molt_err!("can't set \"{}\": variable is array", name),
@@ -169,6 +229,7 @@ impl ScopeStack {
     /// and/or the element if they don't already exist. It's an error if the variable exists
     /// but is a scalar variable.
     pub fn set_elem(&mut self, name: &str, index: &str, val: Value) -> Result<(), Exception> {
+        self.fire_write_trace(name, index, &val)?;
         let top = self.current();
 
         match self.var_mut(top, name) {
@@ -212,6 +273,7 @@ impl ScopeStack {
     ///
     /// Note: it's irrelevant whether the variable is a scalar or array; it's going away.
     pub fn unset(&mut self, name: &str) {
+        self.fire_unset_trace(name);
         self.unset_at(self.current(), name, false);
     }
 
@@ -388,6 +450,60 @@ impl ScopeStack {
     /// Only affects array variables.
     pub fn array_unset(&mut self, name: &str) {
         self.unset_at(self.current(), name, true);
+    }
+
+    //--------------------------------------------------------------
+    // Trace API
+
+    /// Adds a trace on the named variable.
+    pub fn add_trace(&mut self, name: &str, flags: TraceFlags, func: TraceFunc) {
+        self.traces
+            .entry(name.into())
+            .or_insert_with(Vec::new)
+            .push(VarTrace { flags, func });
+    }
+
+    /// Removes all traces on the named variable.
+    pub fn remove_traces(&mut self, name: &str) {
+        self.traces.remove(name);
+    }
+
+    /// Fires read traces for the named variable. Returns overridden value if any trace provides one.
+    fn fire_read_trace(&self, name: &str, index: &str) -> Option<Result<Value, Exception>> {
+        if let Some(traces) = self.traces.get(name) {
+            for trace in traces {
+                if trace.flags.read {
+                    match (trace.func)(name, index, &TraceOp::Read) {
+                        Ok(val) => return Some(Ok(val)),
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Fires write traces for the named variable.
+    fn fire_write_trace(&self, name: &str, index: &str, val: &Value) -> Result<(), Exception> {
+        if let Some(traces) = self.traces.get(name) {
+            for trace in traces {
+                if trace.flags.write {
+                    (trace.func)(name, index, &TraceOp::Write(val.clone()))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Fires unset traces for the named variable.
+    fn fire_unset_trace(&self, name: &str) {
+        if let Some(traces) = self.traces.get(name) {
+            for trace in traces {
+                if trace.flags.unset {
+                    let _ = (trace.func)(name, "", &TraceOp::Unset);
+                }
+            }
+        }
     }
 
     //--------------------------------------------------------------

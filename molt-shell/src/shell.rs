@@ -31,12 +31,12 @@ use std::fs;
 /// // NEXT, invoke the REPL.
 /// molt_shell::repl(&mut interp);
 /// ```
-pub fn repl(interp: &mut Interp) {
+pub async fn repl(interp: &mut Interp) {
     let mut rl = Editor::<()>::new();
 
     loop {
         let readline = if let Ok(pscript) = interp.scalar("tcl_prompt1") {
-            match interp.eval(pscript.as_str()) {
+            match interp.eval(pscript.as_str()).await {
                 Ok(prompt) => rl.readline(prompt.as_str()),
                 Err(exception) => {
                     println!("{}", exception.value());
@@ -51,7 +51,7 @@ pub fn repl(interp: &mut Interp) {
             Ok(line) => {
                 let line = line.trim();
                 if !line.is_empty() {
-                    match interp.eval(line) {
+                    match interp.eval(line).await {
                         Ok(value) => {
                             rl.add_history_entry(line);
 
@@ -118,11 +118,11 @@ pub fn repl(interp: &mut Interp) {
 ///     eprintln!("Usage: myshell *filename.tcl");
 /// }
 /// ```
-pub fn script(interp: &mut Interp, args: &[String]) {
+pub async fn script(interp: &mut Interp, args: &[String]) {
     let arg0 = &args[0];
     let argv = &args[1..];
     match fs::read_to_string(&args[0]) {
-        Ok(script) => execute_script(interp, script, arg0, argv),
+        Ok(script) => execute_script(interp, script, arg0, argv).await,
         Err(e) => println!("{}", e),
     }
 }
@@ -139,7 +139,7 @@ pub fn script(interp: &mut Interp, args: &[String]) {
 ///
 /// * The Molt variable `arg0` will be set to the `arg0` value.
 /// * The Molt variable `argv` will be set to the `argv` array as a Molt list.
-fn execute_script(interp: &mut Interp, script: String, arg0: &str, argv: &[String]) {
+async fn execute_script(interp: &mut Interp, script: String, arg0: &str, argv: &[String]) {
     let argv: MoltList = argv.iter().map(Value::from).collect();
     interp
         .set_scalar("arg0", Value::from(arg0))
@@ -148,7 +148,7 @@ fn execute_script(interp: &mut Interp, script: String, arg0: &str, argv: &[Strin
         .set_scalar("argv", Value::from(argv))
         .expect("argv predefined as array!");
 
-    match interp.eval(&script) {
+    match interp.eval(&script).await {
         Ok(_) => (),
         Err(exception) => {
             eprintln!("{}", exception.value());

@@ -10,39 +10,47 @@ fn main() {
 
     // NOTE: commands can be added to the interpreter here.
 
-    // NEXT, if there's at least one then it's a subcommand.
-    if args.len() > 1 {
-        let subcmd: &str = &args[1];
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
 
-        match subcmd {
-            "bench" => {
-                molt_shell::benchmark(&mut interp, &args[2..]);
-            }
-            "shell" => {
-                if args.len() == 2 {
-                    println!("Molt {}", env!("CARGO_PKG_VERSION"));
-                    molt_shell::repl(&mut interp);
-                } else {
-                    molt_shell::script(&mut interp, &args[2..]);
+    local.block_on(&rt, async {
+        // NEXT, if there's at least one then it's a subcommand.
+        if args.len() > 1 {
+            let subcmd: &str = &args[1];
+
+            match subcmd {
+                "bench" => {
+                    molt_shell::benchmark(&mut interp, &args[2..]).await;
+                }
+                "shell" => {
+                    if args.len() == 2 {
+                        println!("Molt {}", env!("CARGO_PKG_VERSION"));
+                        molt_shell::repl(&mut interp).await;
+                    } else {
+                        molt_shell::script(&mut interp, &args[2..]).await;
+                    }
+                }
+                "test" => {
+                    if molt::test_harness(&mut interp, &args[2..]).await.is_ok() {
+                        std::process::exit(0);
+                    } else {
+                        std::process::exit(1);
+                    }
+                }
+                "help" => {
+                    print_help();
+                }
+                _ => {
+                    eprintln!("unknown subcommand: \"{}\"", subcmd);
                 }
             }
-            "test" => {
-                if molt::test_harness(&mut interp, &args[2..]).is_ok() {
-                    std::process::exit(0);
-                } else {
-                    std::process::exit(1);
-                }
-            }
-            "help" => {
-                print_help();
-            }
-            _ => {
-                eprintln!("unknown subcommand: \"{}\"", subcmd);
-            }
+        } else {
+            print_help();
         }
-    } else {
-        print_help();
-    }
+    });
 }
 
 fn print_help() {

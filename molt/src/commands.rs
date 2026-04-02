@@ -144,33 +144,35 @@ pub fn cmd_break(_interp: &mut Interp, _: ContextID, argv: &[Value]) -> MoltResu
 /// Executes a script, returning the result code.  If the resultVarName is given, the result
 /// of executing the script is returned in it.  The result code is returned as an integer,
 /// 0=Ok, 1=Error, 2=Return, 3=Break, 4=Continue.
-pub fn cmd_catch(interp: &mut Interp, _: ContextID, argv: &[Value]) -> MoltResult {
-    check_args(1, argv, 2, 4, "script ?resultVarName? ?optionsVarName?")?;
+pub fn cmd_catch<'a>(interp: &'a mut Interp, _: ContextID, argv: &'a [Value]) -> BoxFuture<'a, MoltResult> {
+    Box::pin(async move {
+        check_args(1, argv, 2, 4, "script ?resultVarName? ?optionsVarName?")?;
 
-    // If the script called `return x`, should get Return, -level 1, -code Okay here
-    let result = interp.eval_value(&argv[1]);
+        // If the script called `return x`, should get Return, -level 1, -code Okay here
+        let result = interp.eval_value(&argv[1]).await;
 
-    let (code, value) = match &result {
-        Ok(val) => (0, val.clone()),
-        Err(exception) => match exception.code() {
-            ResultCode::Okay => unreachable!(), // Should not be reachable here.
-            ResultCode::Error => (1, exception.value()),
-            ResultCode::Return => (2, exception.value()),
-            ResultCode::Break => (3, exception.value()),
-            ResultCode::Continue => (4, exception.value()),
-            ResultCode::Other(_) => unimplemented!(), // TODO: Not in use yet
-        },
-    };
+        let (code, value) = match &result {
+            Ok(val) => (0, val.clone()),
+            Err(exception) => match exception.code() {
+                ResultCode::Okay => unreachable!(), // Should not be reachable here.
+                ResultCode::Error => (1, exception.value()),
+                ResultCode::Return => (2, exception.value()),
+                ResultCode::Break => (3, exception.value()),
+                ResultCode::Continue => (4, exception.value()),
+                ResultCode::Other(_) => unimplemented!(), // TODO: Not in use yet
+            },
+        };
 
-    if argv.len() >= 3 {
-        interp.set_var(&argv[2], value)?;
-    }
+        if argv.len() >= 3 {
+            interp.set_var(&argv[2], value)?;
+        }
 
-    if argv.len() == 4 {
-        interp.set_var(&argv[3], interp.return_options(&result))?;
-    }
+        if argv.len() == 4 {
+            interp.set_var(&argv[3], interp.return_options(&result))?;
+        }
 
-    Ok(Value::from(code))
+        Ok(Value::from(code))
+    })
 }
 
 /// # continue
@@ -372,53 +374,57 @@ pub fn cmd_exit(_interp: &mut Interp, _: ContextID, argv: &[Value]) -> MoltResul
 ///
 /// See the Molt Book.
 
-pub fn cmd_expr(interp: &mut Interp, _: ContextID, argv: &[Value]) -> MoltResult {
-    check_args(1, argv, 2, 2, "expr")?;
+pub fn cmd_expr<'a>(interp: &'a mut Interp, _: ContextID, argv: &'a [Value]) -> BoxFuture<'a, MoltResult> {
+    Box::pin(async move {
+        check_args(1, argv, 2, 2, "expr")?;
 
-    interp.expr(&argv[1])
+        interp.expr(&argv[1]).await
+    })
 }
 
 /// # for *start* *test* *next* *command*
 ///
 /// A standard "for" loop.  start, next, and command are scripts; test is an expression
 ///
-pub fn cmd_for(interp: &mut Interp, _: ContextID, argv: &[Value]) -> MoltResult {
-    check_args(1, argv, 5, 5, "start test next command")?;
+pub fn cmd_for<'a>(interp: &'a mut Interp, _: ContextID, argv: &'a [Value]) -> BoxFuture<'a, MoltResult> {
+    Box::pin(async move {
+        check_args(1, argv, 5, 5, "start test next command")?;
 
-    let start = &argv[1];
-    let test = &argv[2];
-    let next = &argv[3];
-    let command = &argv[4];
+        let start = &argv[1];
+        let test = &argv[2];
+        let next = &argv[3];
+        let command = &argv[4];
 
-    // Start
-    interp.eval_value(start)?;
+        // Start
+        interp.eval_value(start).await?;
 
-    while interp.expr_bool(test)? {
-        let result = interp.eval_value(command);
+        while interp.expr_bool(test).await? {
+            let result = interp.eval_value(command).await;
 
-        if let Err(exception) = result {
-            match exception.code() {
-                ResultCode::Break => break,
-                ResultCode::Continue => (),
-                _ => return Err(exception),
-            }
-        }
-
-        // Execute next script.  Break is allowed, but continue is not.
-        let result = interp.eval_value(next);
-
-        if let Err(exception) = result {
-            match exception.code() {
-                ResultCode::Break => break,
-                ResultCode::Continue => {
-                    return molt_err!("invoked \"continue\" outside of a loop");
+            if let Err(exception) = result {
+                match exception.code() {
+                    ResultCode::Break => break,
+                    ResultCode::Continue => (),
+                    _ => return Err(exception),
                 }
-                _ => return Err(exception),
+            }
+
+            // Execute next script.  Break is allowed, but continue is not.
+            let result = interp.eval_value(next).await;
+
+            if let Err(exception) = result {
+                match exception.code() {
+                    ResultCode::Break => break,
+                    ResultCode::Continue => {
+                        return molt_err!("invoked \"continue\" outside of a loop");
+                    }
+                    _ => return Err(exception),
+                }
             }
         }
-    }
 
-    molt_ok!()
+        molt_ok!()
+    })
 }
 
 /// # foreach *varList* *list* *body*
@@ -431,37 +437,39 @@ pub fn cmd_for(interp: &mut Interp, _: ContextID, argv: &[Value]) -> MoltResult 
 /// ## TCL Liens
 ///
 /// * In Standard TCL, `foreach` can loop over several lists at the same time.
-pub fn cmd_foreach(interp: &mut Interp, _: ContextID, argv: &[Value]) -> MoltResult {
-    check_args(1, argv, 4, 4, "varList list body")?;
+pub fn cmd_foreach<'a>(interp: &'a mut Interp, _: ContextID, argv: &'a [Value]) -> BoxFuture<'a, MoltResult> {
+    Box::pin(async move {
+        check_args(1, argv, 4, 4, "varList list body")?;
 
-    let var_list = &*argv[1].as_list()?;
-    let list = &*argv[2].as_list()?;
-    let body = &argv[3];
+        let var_list = &*argv[1].as_list()?;
+        let list = &*argv[2].as_list()?;
+        let body = &argv[3];
 
-    let mut i = 0;
+        let mut i = 0;
 
-    while i < list.len() {
-        for var in var_list {
-            if i < list.len() {
-                interp.set_var(&var, list[i].clone())?;
-                i += 1;
-            } else {
-                interp.set_var(&var, Value::empty())?;
+        while i < list.len() {
+            for var in var_list {
+                if i < list.len() {
+                    interp.set_var(&var, list[i].clone())?;
+                    i += 1;
+                } else {
+                    interp.set_var(&var, Value::empty())?;
+                }
+            }
+
+            let result = interp.eval_value(body).await;
+
+            if let Err(exception) = result {
+                match exception.code() {
+                    ResultCode::Break => break,
+                    ResultCode::Continue => (),
+                    _ => return Err(exception),
+                }
             }
         }
 
-        let result = interp.eval_value(body);
-
-        if let Err(exception) = result {
-            match exception.code() {
-                ResultCode::Break => break,
-                ResultCode::Continue => (),
-                _ => return Err(exception),
-            }
-        }
-    }
-
-    molt_ok!()
+        molt_ok!()
+    })
 }
 
 /// # global ?*varName* ...?
@@ -499,89 +507,91 @@ enum IfWants {
 ///
 /// * Because we don't yet have an expression parser, the *expr* arguments are evaluated as
 ///   scripts that must return a boolean value.
-pub fn cmd_if(interp: &mut Interp, _: ContextID, argv: &[Value]) -> MoltResult {
-    let mut argi = 1;
-    let mut wants = IfWants::Expr;
+pub fn cmd_if<'a>(interp: &'a mut Interp, _: ContextID, argv: &'a [Value]) -> BoxFuture<'a, MoltResult> {
+    Box::pin(async move {
+        let mut argi = 1;
+        let mut wants = IfWants::Expr;
 
-    while argi < argv.len() {
-        match wants {
-            IfWants::Expr => {
-                wants = if interp.expr_bool(&argv[argi])? {
-                    IfWants::ThenBody
-                } else {
-                    IfWants::SkipThenClause
-                };
-            }
-            IfWants::ThenBody => {
-                if argv[argi].as_str() == "then" {
-                    argi += 1;
+        while argi < argv.len() {
+            match wants {
+                IfWants::Expr => {
+                    wants = if interp.expr_bool(&argv[argi]).await? {
+                        IfWants::ThenBody
+                    } else {
+                        IfWants::SkipThenClause
+                    };
                 }
+                IfWants::ThenBody => {
+                    if argv[argi].as_str() == "then" {
+                        argi += 1;
+                    }
 
-                if argi < argv.len() {
-                    return interp.eval_value(&argv[argi]);
-                } else {
-                    break;
-                }
-            }
-            IfWants::SkipThenClause => {
-                if argv[argi].as_str() == "then" {
-                    argi += 1;
-                }
-
-                if argi < argv.len() {
-                    argi += 1;
-                    wants = IfWants::ElseClause;
-                }
-                continue;
-            }
-            IfWants::ElseClause => {
-                if argv[argi].as_str() == "elseif" {
-                    wants = IfWants::Expr;
-                } else {
-                    wants = IfWants::ElseBody;
-                    continue;
-                }
-            }
-            IfWants::ElseBody => {
-                if argv[argi].as_str() == "else" {
-                    argi += 1;
-
-                    // If "else" appears, then the else body is required.
-                    if argi == argv.len() {
-                        return molt_err!(
-                            "wrong # args: no script following after \"{}\" argument",
-                            argv[argi - 1]
-                        );
+                    if argi < argv.len() {
+                        return interp.eval_value(&argv[argi]).await;
+                    } else {
+                        break;
                     }
                 }
+                IfWants::SkipThenClause => {
+                    if argv[argi].as_str() == "then" {
+                        argi += 1;
+                    }
 
-                if argi < argv.len() {
-                    return interp.eval_value(&argv[argi]);
-                } else {
-                    break;
+                    if argi < argv.len() {
+                        argi += 1;
+                        wants = IfWants::ElseClause;
+                    }
+                    continue;
+                }
+                IfWants::ElseClause => {
+                    if argv[argi].as_str() == "elseif" {
+                        wants = IfWants::Expr;
+                    } else {
+                        wants = IfWants::ElseBody;
+                        continue;
+                    }
+                }
+                IfWants::ElseBody => {
+                    if argv[argi].as_str() == "else" {
+                        argi += 1;
+
+                        // If "else" appears, then the else body is required.
+                        if argi == argv.len() {
+                            return molt_err!(
+                                "wrong # args: no script following after \"{}\" argument",
+                                argv[argi - 1]
+                            );
+                        }
+                    }
+
+                    if argi < argv.len() {
+                        return interp.eval_value(&argv[argi]).await;
+                    } else {
+                        break;
+                    }
                 }
             }
+
+            argi += 1;
         }
 
-        argi += 1;
-    }
-
-    if argi < argv.len() {
-        return molt_err!("wrong # args: extra words after \"else\" clause in \"if\" command");
-    } else if wants == IfWants::Expr {
-        return molt_err!(
-            "wrong # args: no expression after \"{}\" argument",
-            argv[argi - 1]
-        );
-    } else if wants == IfWants::ThenBody || wants == IfWants::SkipThenClause {
-        return molt_err!(
-            "wrong # args: no script following after \"{}\" argument",
-            argv[argi - 1]
-        );
-    } else {
-        // Looking for ElseBody, but there doesn't need to be one.
-        molt_ok!() // temp
-    }
+        if argi < argv.len() {
+            return molt_err!("wrong # args: extra words after \"else\" clause in \"if\" command");
+        } else if wants == IfWants::Expr {
+            return molt_err!(
+                "wrong # args: no expression after \"{}\" argument",
+                argv[argi - 1]
+            );
+        } else if wants == IfWants::ThenBody || wants == IfWants::SkipThenClause {
+            return molt_err!(
+                "wrong # args: no script following after \"{}\" argument",
+                argv[argi - 1]
+            );
+        } else {
+            // Looking for ElseBody, but there doesn't need to be one.
+            molt_ok!() // temp
+        }
+    })
 }
 
 /// # incr *varName* ?*increment* ...?
@@ -984,15 +994,17 @@ pub fn cmd_set(interp: &mut Interp, _: ContextID, argv: &[Value]) -> MoltResult 
 /// # source *filename*
 ///
 /// Sources the file, returning the result.
-pub fn cmd_source(interp: &mut Interp, _: ContextID, argv: &[Value]) -> MoltResult {
-    check_args(1, argv, 2, 2, "filename")?;
+pub fn cmd_source<'a>(interp: &'a mut Interp, _: ContextID, argv: &'a [Value]) -> BoxFuture<'a, MoltResult> {
+    Box::pin(async move {
+        check_args(1, argv, 2, 2, "filename")?;
 
-    let filename = argv[1].as_str();
+        let filename = argv[1].as_str();
 
-    match fs::read_to_string(filename) {
-        Ok(script) => interp.eval(&script),
-        Err(e) => molt_err!("couldn't read file \"{}\": {}", filename, e),
-    }
+        match fs::read_to_string(filename) {
+            Ok(script) => interp.eval(&script).await,
+            Err(e) => molt_err!("couldn't read file \"{}\": {}", filename, e),
+        }
+    })
 }
 
 /// # string *subcommand* ?*arg*...?
@@ -1354,35 +1366,37 @@ pub fn cmd_throw(_interp: &mut Interp, _: ContextID, argv: &[Value]) -> MoltResu
 ///
 /// Executes the command the given number of times, and returns the average
 /// number of microseconds per iteration.  The *count* defaults to 1.
-pub fn cmd_time(interp: &mut Interp, _: ContextID, argv: &[Value]) -> MoltResult {
-    check_args(1, argv, 2, 3, "command ?count?")?;
+pub fn cmd_time<'a>(interp: &'a mut Interp, _: ContextID, argv: &'a [Value]) -> BoxFuture<'a, MoltResult> {
+    Box::pin(async move {
+        check_args(1, argv, 2, 3, "command ?count?")?;
 
-    let command = &argv[1];
+        let command = &argv[1];
 
-    let count = if argv.len() == 3 {
-        argv[2].as_int()?
-    } else {
-        1
-    };
+        let count = if argv.len() == 3 {
+            argv[2].as_int()?
+        } else {
+            1
+        };
 
-    let start = Instant::now();
+        let start = Instant::now();
 
-    for _i in 0..count {
-        let result = interp.eval_value(command);
-        if result.is_err() {
-            return result;
+        for _i in 0..count {
+            let result = interp.eval_value(command).await;
+            if result.is_err() {
+                return result;
+            }
         }
-    }
 
-    let span = start.elapsed();
+        let span = start.elapsed();
 
-    let avg = if count > 0 {
-        span.as_nanos() / (count as u128)
-    } else {
-        0
-    } as MoltInt;
+        let avg = if count > 0 {
+            span.as_nanos() / (count as u128)
+        } else {
+            0
+        } as MoltInt;
 
-    molt_ok!("{} nanoseconds per iteration", avg)
+        molt_ok!("{} nanoseconds per iteration", avg)
+    })
 }
 
 /// # unset ?-nocomplain? *varName*
@@ -1417,20 +1431,22 @@ pub fn cmd_unset(interp: &mut Interp, _: ContextID, argv: &[Value]) -> MoltResul
 ///
 /// A standard "while" loop.  *test* is a boolean expression; *command* is a script to
 /// execute so long as the expression is true.
-pub fn cmd_while(interp: &mut Interp, _: ContextID, argv: &[Value]) -> MoltResult {
-    check_args(1, argv, 3, 3, "test command")?;
+pub fn cmd_while<'a>(interp: &'a mut Interp, _: ContextID, argv: &'a [Value]) -> BoxFuture<'a, MoltResult> {
+    Box::pin(async move {
+        check_args(1, argv, 3, 3, "test command")?;
 
-    while interp.expr_bool(&argv[1])? {
-        let result = interp.eval_value(&argv[2]);
+        while interp.expr_bool(&argv[1]).await? {
+            let result = interp.eval_value(&argv[2]).await;
 
-        if let Err(exception) = result {
-            match exception.code() {
-                ResultCode::Break => break,
-                ResultCode::Continue => (),
-                _ => return Err(exception),
+            if let Err(exception) = result {
+                match exception.code() {
+                    ResultCode::Break => break,
+                    ResultCode::Continue => (),
+                    _ => return Err(exception),
+                }
             }
         }
-    }
 
-    molt_ok!()
+        molt_ok!()
+    })
 }

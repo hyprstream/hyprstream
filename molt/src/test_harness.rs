@@ -24,6 +24,7 @@
 
 use crate::check_args;
 use crate::molt_ok;
+use crate::types::BoxFuture;
 use crate::types::ContextID;
 use crate::Interp;
 use crate::MoltResult;
@@ -66,7 +67,7 @@ use std::path::PathBuf;
 /// }
 /// ```
 
-pub fn test_harness(interp: &mut Interp, args: &[String]) -> Result<(), ()> {
+pub async fn test_harness(interp: &mut Interp, args: &[String]) -> Result<(), ()> {
     // FIRST, announce who we are.
     println!("Molt {} -- Test Harness", env!("CARGO_PKG_VERSION"));
 
@@ -82,7 +83,7 @@ pub fn test_harness(interp: &mut Interp, args: &[String]) -> Result<(), ()> {
     let context_id = interp.save_context(TestContext::new());
 
     // NEXT, install the test commands into the interpreter.
-    interp.add_context_command("test", test_cmd, context_id);
+    interp.add_async_context_command("test", test_cmd, context_id);
 
     // NEXT, execute the script.
     match fs::read_to_string(&args[0]) {
@@ -91,7 +92,7 @@ pub fn test_harness(interp: &mut Interp, args: &[String]) -> Result<(), ()> {
                 let _ = env::set_current_dir(parent);
             }
 
-            if let Err(exception) = interp.eval(&script) {
+            if let Err(exception) = interp.eval(&script).await {
                 if exception.code() == ResultCode::Error {
                     eprintln!("{}", exception.value());
                     return Err(());
@@ -217,21 +218,23 @@ impl TestInfo {
 /// point I'll need something much more robust.
 ///
 /// Note: See the Molt Book for the full syntax.
-fn test_cmd(interp: &mut Interp, context_id: ContextID, argv: &[Value]) -> MoltResult {
-    // FIRST, check the minimum command line.
-    check_args(1, argv, 4, 0, "name description args...")?;
+fn test_cmd<'a>(interp: &'a mut Interp, context_id: ContextID, argv: &'a [Value]) -> BoxFuture<'a, MoltResult> {
+    Box::pin(async move {
+        // FIRST, check the minimum command line.
+        check_args(1, argv, 4, 0, "name description args...")?;
 
-    // NEXT, see which kind of command it is.
-    let arg = argv[3].as_str();
-    if arg.starts_with('-') {
-        fancy_test(interp, context_id, argv)
-    } else {
-        simple_test(interp, context_id, argv)
-    }
+        // NEXT, see which kind of command it is.
+        let arg = argv[3].as_str();
+        if arg.starts_with('-') {
+            fancy_test(interp, context_id, argv).await
+        } else {
+            simple_test(interp, context_id, argv).await
+        }
+    })
 }
 
 // The simple version of the test command.
-fn simple_test(interp: &mut Interp, context_id: ContextID, argv: &[Value]) -> MoltResult {
+async fn simple_test(interp: &mut Interp, context_id: ContextID, argv: &[Value]) -> MoltResult {
     check_args(1, argv, 6, 6, "name description script -ok|-error result")?;
 
     // FIRST, get the test info
@@ -253,12 +256,12 @@ fn simple_test(interp: &mut Interp, context_id: ContextID, argv: &[Value]) -> Mo
     };
 
     // NEXT, run the test.
-    run_test(interp, context_id, &info);
+    run_test(interp, context_id, &info).await;
     molt_ok!()
 }
 
 // The fancier, more flexible version of the test.
-fn fancy_test(interp: &mut Interp, context_id: ContextID, argv: &[Value]) -> MoltResult {
+async fn fancy_test(interp: &mut Interp, context_id: ContextID, argv: &[Value]) -> MoltResult {
     check_args(
         1,
         argv,
@@ -306,19 +309,19 @@ fn fancy_test(interp: &mut Interp, context_id: ContextID, argv: &[Value]) -> Mol
     }
 
     // NEXT, run the test.
-    run_test(interp, context_id, &info);
+    run_test(interp, context_id, &info).await;
     molt_ok!()
 }
 
 // Run the actual test and save the result.
-fn run_test(interp: &mut Interp, context_id: ContextID, info: &TestInfo) {
+async fn run_test(interp: &mut Interp, context_id: ContextID, info: &TestInfo) {
     // FIRST, push a variable scope; -setup, -body, and -cleanup will share it.
     interp.push_scope();
 
     // NEXT, execute the parts of the test.
 
     // Setup
-    if let Err(exception) = interp.eval(&info.setup) {
+    if let Err(exception) = interp.eval(&info.setup).await {
         if exception.code() == ResultCode::Error {
             info.print_helper_error("-setup", exception.value().as_str());
         }
@@ -329,10 +332,10 @@ fn run_test(interp: &mut Interp, context_id: ContextID, info: &TestInfo) {
 
     // Body
     let body = Value::from(&info.body);
-    let result = interp.eval_value(&body);
+    let result = interp.eval_value(&body).await;
 
     // Cleanup
-    if let Err(exception) = interp.eval(&info.cleanup) {
+    if let Err(exception) = interp.eval(&info.cleanup).await {
         if exception.code() == ResultCode::Error {
             info.print_helper_error("-cleanup", exception.value().as_str());
         }

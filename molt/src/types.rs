@@ -29,6 +29,11 @@ use indexmap::IndexMap;
 use std::fmt;
 use std::str::FromStr;
 
+/// A type-erased, pinned, boxed future. Used for async command dispatch.
+/// Deliberately `!Send` — molt uses `Rc`/`RefCell` internally, so all futures
+/// must run on a single-threaded executor (`LocalSet` / `spawn_local`).
+pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>;
+
 // Molt Numeric Types
 
 /// The standard integer type for Molt code.
@@ -723,6 +728,15 @@ pub struct ContextID(pub(crate) u64);
 /// [`interp`]: ../interp/index.html
 /// [`ContextID`]: struct.ContextID.html
 pub type CommandFunc = fn(&mut Interp, ContextID, &[Value]) -> MoltResult;
+
+/// A function used to implement an async binary Molt command — one that needs `.await`
+/// (e.g. VFS builtins, `source`, control-flow commands that eval sub-scripts).
+///
+/// Returns a [`BoxFuture`] so that the interpreter's async eval chain can `.await` it.
+/// Sync commands are wrapped in `std::future::ready()` at the dispatch site, so there is
+/// zero overhead for commands that never suspend.
+pub type AsyncCommandFunc =
+    for<'a> fn(&'a mut Interp, ContextID, &'a [Value]) -> BoxFuture<'a, MoltResult>;
 
 /// A Molt command that has subcommands is called an _ensemble_ command.  In Rust code,
 /// the ensemble is defined as an array of `Subcommand` structs, each one mapping from
