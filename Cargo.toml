@@ -198,6 +198,10 @@ quickcheck = "1.0"
 quickcheck_macros = "1.0"
 criterion = "0.5.1"
 
+[patch."https://github.com/hyprstream/hyprstream-molt.git"]
+molt = { path = "../../../../molt/molt" }
+molt-shell = { path = "../../../../molt/molt-shell" }
+
 # NOTE: [patch.crates-io] section removed
 # tch backend selection is now handled via features in crates/hyprstream/Cargo.toml:
 # - default: tch-cpu (CPU-only)

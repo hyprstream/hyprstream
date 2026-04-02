@@ -15,19 +15,19 @@
 mod builtins;
 pub mod mount;
 
-use hyprstream_vfs::proxy::{VfsOp, VfsRequest};
-use hyprstream_vfs::Subject;
+use hyprstream_vfs::{Namespace, Subject};
 use molt::types::*;
 use molt::Interp;
+use std::sync::Arc;
 
 pub use mount::{create_mount_channel, TclCommand, TclMount};
 
 /// Context stored in the molt interpreter via `save_context()`.
 ///
-/// All VFS operations go through the channel proxy — no direct Namespace access.
+/// VFS operations are called directly via the Namespace — no proxy channel needed.
 pub(crate) struct ShellContext {
-    pub _subject: Subject,
-    pub vfs_tx: tokio::sync::mpsc::Sender<VfsRequest>,
+    pub subject: Subject,
+    pub namespace: Arc<Namespace>,
 }
 
 /// A Tcl shell backed by the hyprstream VFS namespace.
@@ -41,17 +41,16 @@ pub struct TclShell {
 }
 
 impl TclShell {
-    /// Create a new Tcl shell bound to the given caller identity and VFS proxy.
+    /// Create a new Tcl shell bound to the given caller identity and VFS namespace.
     ///
-    /// The `vfs_tx` sender is used by builtins and `/bin/` resolution for all
-    /// async VFS operations (cat, ls, echo, ctl, mount) via the channel proxy.
+    /// Builtins `.await` VFS operations directly on the namespace — no proxy channel.
     ///
-    /// **Must be called on the thread where the shell will be used** (e.g., inside
-    /// `spawn_blocking`). TclShell is `!Send` due to molt's `Rc`-based `Value`.
+    /// TclShell is `!Send` due to molt's `Rc`-based `Value`.
+    /// Must be used within a `LocalSet` or single-threaded executor.
     ///
     /// Dangerous commands are removed and the recursion limit is lowered.
     /// All host I/O goes through the VFS — this is a guest interpreter.
-    pub fn new(subject: Subject, vfs_tx: tokio::sync::mpsc::Sender<VfsRequest>) -> Self {
+    pub fn new(subject: Subject, namespace: Arc<Namespace>) -> Self {
         let mut interp = Interp::new();
 
         // Remove dangerous commands — all host I/O goes through VFS.
@@ -74,7 +73,7 @@ impl TclShell {
         interp.set_recursion_limit(100);
         interp.set_instruction_limit(100_000);
 
-        let ctx = ShellContext { _subject: subject, vfs_tx };
+        let ctx = ShellContext { subject, namespace };
         let ctx_id = interp.save_context(ctx);
         builtins::register_all(&mut interp, ctx_id);
         Self { interp, ctx_id }
@@ -84,15 +83,15 @@ impl TclShell {
     ///
     /// On "invalid command name" errors, tries `/bin/{name}` resolution
     /// (Plan9 PATH model) before returning the error.
-    pub fn eval(&mut self, script: &str) -> Result<String, String> {
+    pub async fn eval(&mut self, script: &str) -> Result<String, String> {
         self.interp.reset_instruction_count();
-        match self.interp.eval(script) {
+        match self.interp.eval(script).await {
             Ok(val) => Ok(val.to_string()),
             Err(exception) => {
                 let msg = exception.value().to_string();
                 // Try /bin/ resolution on command-not-found.
                 if let Some(cmd_name) = extract_unknown_command(&msg) {
-                    if let Ok(result) = self.try_cmd_resolve(&cmd_name, script) {
+                    if let Ok(result) = self.try_cmd_resolve(&cmd_name, script).await {
                         return Ok(result);
                     }
                 }
@@ -127,10 +126,10 @@ impl TclShell {
     /// Called from the owner thread's event loop (e.g., `ChatApp::tick()`).
     /// Each command carries a oneshot response channel; the caller blocks
     /// until we send the reply.
-    pub fn process_command(&mut self, cmd: TclCommand) {
+    pub async fn process_command(&mut self, cmd: TclCommand) {
         match cmd {
             TclCommand::Eval { script, resp } => {
-                let _ = resp.send(self.eval(&script));
+                let _ = resp.send(self.eval(&script).await);
             }
             TclCommand::ListVars { resp } => {
                 let names: Vec<String> = self
@@ -166,7 +165,7 @@ impl TclShell {
     /// Two-phase resolution:
     /// 1. Try ctl (write+read) — for Rust-backed service actions
     /// 2. If ctl fails, try cat — for `.tcl` script files, then eval with args
-    fn try_cmd_resolve(&mut self, cmd_name: &str, script: &str) -> Result<String, String> {
+    async fn try_cmd_resolve(&mut self, cmd_name: &str, script: &str) -> Result<String, String> {
         // Sanitize: reject path traversal in command names.
         if cmd_name.contains('/') || cmd_name.contains("..") {
             return Err(format!("invalid command name \"{cmd_name}\""));
@@ -184,52 +183,35 @@ impl TclShell {
         let evaluated_args = if raw_args.is_empty() {
             String::new()
         } else {
-            match self.interp.eval(&format!("list {raw_args}")) {
+            match self.interp.eval(&format!("list {raw_args}")).await {
                 Ok(val) => val.to_string(),
                 Err(e) => return Err(e.value().to_string()),
             }
         };
 
-        // Phase 1: Try ctl (service actions — CtlFile nodes).
+        // Get namespace and subject for direct VFS access.
         let ctx = self.interp.context::<ShellContext>(self.ctx_id);
-        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
-        let req = VfsRequest {
-            op: VfsOp::Ctl {
-                path: cmd_path.clone(),
-                cmd: evaluated_args.clone().into_bytes(),
-            },
-            reply: reply_tx,
-        };
-        if builtins::send_vfs_request(&ctx.vfs_tx, req).is_ok() {
-            match reply_rx.recv() {
-                Ok(Ok(resp)) => return Ok(String::from_utf8_lossy(&resp).into_owned()),
-                Ok(Err(_)) => {} // ctl failed — fall through to cat
-                Err(_) => {}
-            }
+        let namespace = Arc::clone(&ctx.namespace);
+        let subject = ctx.subject.clone();
+
+        // Phase 1: Try ctl (service actions — CtlFile nodes).
+        if let Ok(resp) = namespace.ctl(&cmd_path, evaluated_args.as_bytes(), &subject).await {
+            return Ok(String::from_utf8_lossy(&resp).into_owned());
         }
 
         // Phase 2: Try cat (script files — ReadFile nodes).
         // Read the script, prepend `set argv {args}`, and eval it.
-        let ctx = self.interp.context::<ShellContext>(self.ctx_id);
-        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
-        let req = VfsRequest {
-            op: VfsOp::Cat { path: cmd_path },
-            reply: reply_tx,
-        };
-        if builtins::send_vfs_request(&ctx.vfs_tx, req).is_err() {
-            return Err(format!("invalid command name \"{cmd_name}\""));
-        }
-        match reply_rx.recv() {
-            Ok(Ok(script_bytes)) => {
+        match namespace.cat(&cmd_path, &subject).await {
+            Ok(script_bytes) => {
                 let tool_script = String::from_utf8_lossy(&script_bytes);
                 // Wrap: set argv before executing so the script can access args.
                 let wrapped = format!("set argv {{{evaluated_args}}}\n{tool_script}");
-                match self.interp.eval(&wrapped) {
+                match self.interp.eval(&wrapped).await {
                     Ok(val) => Ok(val.to_string()),
                     Err(e) => Err(e.value().to_string()),
                 }
             }
-            _ => Err(format!("invalid command name \"{cmd_name}\"")),
+            Err(_) => Err(format!("invalid command name \"{cmd_name}\"")),
         }
     }
 }
@@ -255,10 +237,8 @@ fn extract_unknown_command(msg: &str) -> Option<String> {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use hyprstream_vfs::proxy::spawn_vfs_proxy;
     use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Namespace, Stat};
     use std::collections::HashMap;
-    use std::sync::Arc;
 
     /// Minimal in-memory mount for testing.
     struct MemMount {
@@ -285,7 +265,6 @@ mod tests {
     impl Mount for MemMount {
         async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
             let path = components.join("/");
-            // Check file exists (or is a prefix of existing files for dirs).
             let exists = self.files.contains_key(&path)
                 || self.files.keys().any(|k| k.starts_with(&format!("{path}/")));
             if !exists && !path.is_empty() {
@@ -309,7 +288,6 @@ mod tests {
             _caller: &Subject,
         ) -> Result<Vec<u8>, MountError> {
             let inner = fid.downcast_ref::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
-            // If there's a write buffer (ctl pattern), return that then clear via offset.
             let wb = inner.write_buf.lock().unwrap();
             if !wb.is_empty() {
                 let start = offset as usize;
@@ -336,7 +314,6 @@ mod tests {
             data: &[u8],
             _caller: &Subject,
         ) -> Result<u32, MountError> {
-            // For ctl files: store the "response" as the uppercased write data.
             let inner = fid.downcast_ref::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             *inner.write_buf.lock().unwrap() = format!("ok: {}", String::from_utf8_lossy(data)).into_bytes();
             Ok(data.len() as u32)
@@ -400,77 +377,113 @@ mod tests {
         let model_mount = Arc::new(MemMount::new(vec![("status", b"loaded")]));
         ns.mount("/srv/model", model_mount).unwrap();
 
-        // /bin/ mount with a ctl file (Plan9 PATH model).
         let bin_mount = Arc::new(MemMount::new(vec![("load", b"")]));
         ns.mount("/bin", bin_mount).unwrap();
 
         Arc::new(ns)
     }
 
-    /// Helper: spawn proxy and construct shell on blocking thread, run closure.
-    async fn with_shell<F, R>(f: F) -> R
+    /// Helper: construct shell and run async closure within a LocalSet.
+    async fn with_shell<F, Fut, R>(f: F) -> R
     where
-        F: FnOnce(&mut TclShell) -> R + Send + 'static,
-        R: Send + 'static,
+        F: FnOnce(TclShell) -> Fut,
+        Fut: std::future::Future<Output = R>,
     {
         let ns = make_namespace();
-        let vfs_tx = spawn_vfs_proxy(Arc::clone(&ns), test_subject());
-        tokio::task::spawn_blocking(move || {
-            let mut shell = TclShell::new(test_subject(), vfs_tx);
-            f(&mut shell)
-        })
-        .await
-        .unwrap()
+        let mut shell = TclShell::new(test_subject(), ns);
+        f(shell).await
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    // Note: TclShell is !Send, so we use current_thread + LocalSet for all tests.
+
+    #[tokio::test(flavor = "current_thread")]
     async fn eval_cat() {
-        let result = with_shell(|s| s.eval("cat /config/temperature")).await.unwrap();
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut shell = TclShell::new(test_subject(), ns);
+            shell.eval("cat /config/temperature").await
+        }).await.unwrap();
         assert_eq!(result, "0.7");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn eval_cat_multi() {
-        let result = with_shell(|s| s.eval("cat /config/temperature /config/status")).await.unwrap();
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut shell = TclShell::new(test_subject(), ns);
+            shell.eval("cat /config/temperature /config/status").await
+        }).await.unwrap();
         assert_eq!(result, "0.7loaded");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn eval_cat_not_found() {
-        let result = with_shell(|s| s.eval("cat /config/nonexistent")).await;
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut shell = TclShell::new(test_subject(), ns);
+            shell.eval("cat /config/nonexistent").await
+        }).await;
         assert!(result.is_err());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn eval_ls() {
-        let result = with_shell(|s| s.eval("ls /config")).await.unwrap();
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut shell = TclShell::new(test_subject(), ns);
+            shell.eval("ls /config").await
+        }).await.unwrap();
         assert!(result.contains("temperature"));
         assert!(result.contains("status"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn eval_ls_root() {
-        let result = with_shell(|s| s.eval("ls")).await.unwrap();
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut shell = TclShell::new(test_subject(), ns);
+            shell.eval("ls").await
+        }).await.unwrap();
         assert!(result.contains("srv"));
         assert!(result.contains("config"));
         assert!(result.contains("bin"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn eval_write() {
-        let result = with_shell(|s| s.eval("write /bin/load qwen3:main")).await;
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut shell = TclShell::new(test_subject(), ns);
+            shell.eval("write /bin/load qwen3:main").await
+        }).await;
         assert!(result.is_ok());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn eval_ctl() {
-        let result = with_shell(|s| s.eval("ctl /bin/load qwen3:main")).await.unwrap();
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut shell = TclShell::new(test_subject(), ns);
+            shell.eval("ctl /bin/load qwen3:main").await
+        }).await.unwrap();
         assert_eq!(result, "ok: qwen3:main");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn eval_help() {
-        let result = with_shell(|s| s.eval("help")).await.unwrap();
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut shell = TclShell::new(test_subject(), ns);
+            shell.eval("help").await
+        }).await.unwrap();
         assert!(result.contains("cat"));
         assert!(result.contains("ls"));
         assert!(result.contains("ctl"));
@@ -479,75 +492,95 @@ mod tests {
         assert!(result.contains("help"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn eval_mount() {
-        let result = with_shell(|s| s.eval("mount")).await.unwrap();
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut shell = TclShell::new(test_subject(), ns);
+            shell.eval("mount").await
+        }).await.unwrap();
         assert!(result.contains("/config"));
         assert!(result.contains("/srv/model"));
         assert!(result.contains("/bin"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn eval_mount_specific() {
-        let result = with_shell(|s| s.eval("mount /config")).await.unwrap();
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut shell = TclShell::new(test_subject(), ns);
+            shell.eval("mount /config").await
+        }).await.unwrap();
         assert_eq!(result, "mounted: /config");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn eval_mount_not_found() {
-        let result = with_shell(|s| s.eval("mount /nonexistent")).await;
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut shell = TclShell::new(test_subject(), ns);
+            shell.eval("mount /nonexistent").await
+        }).await;
         assert!(result.is_err());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn eval_tcl_builtins() {
-        let result = with_shell(|s| {
-            s.eval("set x [cat /config/temperature]; string length $x")
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut shell = TclShell::new(test_subject(), ns);
+            shell.eval("set x [cat /config/temperature]; string length $x").await
         }).await.unwrap();
-        assert_eq!(result, "3"); // "0.7" is 3 chars
+        assert_eq!(result, "3");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn eval_tcl_expr() {
-        let result = with_shell(|s| s.eval("expr {2 + 3}")).await.unwrap();
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut shell = TclShell::new(test_subject(), ns);
+            shell.eval("expr {2 + 3}").await
+        }).await.unwrap();
         assert_eq!(result, "5");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn unknown_resolves_cmd() {
-        let result = with_shell(|s| s.eval("load qwen3:main")).await.unwrap();
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut shell = TclShell::new(test_subject(), ns);
+            shell.eval("load qwen3:main").await
+        }).await.unwrap();
         assert_eq!(result, "ok: qwen3:main");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn unknown_fails_cleanly() {
-        let result = with_shell(|s| s.eval("nonexistent_command arg1 arg2")).await;
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut shell = TclShell::new(test_subject(), ns);
+            shell.eval("nonexistent_command arg1 arg2").await
+        }).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid command name"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn has_command_builtin() {
+    #[test]
+    fn has_command_builtin() {
         let ns = make_namespace();
-        let vfs_tx = spawn_vfs_proxy(Arc::clone(&ns), test_subject());
-        // has_command is sync-only, construct and check on blocking thread
-        let result = tokio::task::spawn_blocking(move || {
-            let shell = TclShell::new(test_subject(), vfs_tx);
-            (
-                shell.has_command("cat"),
-                shell.has_command("ls"),
-                shell.has_command("help"),
-                shell.has_command("expr"),
-                shell.has_command("nonexistent"),
-            )
-        })
-        .await
-        .unwrap();
-        assert!(result.0); // cat
-        assert!(result.1); // ls
-        assert!(result.2); // help
-        assert!(result.3); // expr
-        assert!(!result.4); // nonexistent
+        let shell = TclShell::new(test_subject(), ns);
+        assert!(shell.has_command("cat"));
+        assert!(shell.has_command("ls"));
+        assert!(shell.has_command("help"));
+        assert!(shell.has_command("expr"));
+        assert!(!shell.has_command("nonexistent"));
     }
 
     #[test]
@@ -565,52 +598,85 @@ mod tests {
 
     // ── Hardening tests ──────────────────────────────────────────────────────
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn source_command_removed() {
-        let result = with_shell(|s| s.eval("source /etc/passwd")).await;
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut shell = TclShell::new(test_subject(), ns);
+            shell.eval("source /etc/passwd").await
+        }).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid command name"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn exit_command_removed() {
-        let result = with_shell(|s| s.eval("exit")).await;
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut shell = TclShell::new(test_subject(), ns);
+            shell.eval("exit").await
+        }).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid command name"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn puts_command_removed() {
-        let result = with_shell(|s| s.eval("puts hello")).await;
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut shell = TclShell::new(test_subject(), ns);
+            shell.eval("puts hello").await
+        }).await;
         assert!(result.is_err());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn rename_command_removed() {
-        let result = with_shell(|s| s.eval("rename cat {}")).await;
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut shell = TclShell::new(test_subject(), ns);
+            shell.eval("rename cat {}").await
+        }).await;
         assert!(result.is_err());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn time_command_removed() {
-        let result = with_shell(|s| s.eval("time {expr 1} 999999")).await;
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut shell = TclShell::new(test_subject(), ns);
+            shell.eval("time {expr 1} 999999").await
+        }).await;
         assert!(result.is_err());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn cmd_name_path_traversal_rejected() {
-        let result = with_shell(|s| s.eval("../srv/model/ctl something")).await;
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut shell = TclShell::new(test_subject(), ns);
+            shell.eval("../srv/model/ctl something").await
+        }).await;
         assert!(result.is_err());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn safe_commands_still_work() {
-        let results = with_shell(|s| {
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let results = local.run_until(async {
+            let mut s = TclShell::new(test_subject(), ns);
             vec![
-                s.eval("expr {2 + 3}"),
-                s.eval("set x hello; string length $x"),
-                s.eval("if {1} {set y yes}"),
-                s.eval("list a b c"),
+                s.eval("expr {2 + 3}").await,
+                s.eval("set x hello; string length $x").await,
+                s.eval("if {1} {set y yes}").await,
+                s.eval("list a b c").await,
             ]
         }).await;
         assert_eq!(results[0].as_ref().unwrap(), "5");
@@ -619,17 +685,15 @@ mod tests {
         assert_eq!(results[3].as_ref().unwrap(), "a b c");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn instruction_limit_catches_infinite_loop() {
         let ns = make_namespace();
-        let vfs_tx = spawn_vfs_proxy(Arc::clone(&ns), test_subject());
-        let result = tokio::task::spawn_blocking(move || {
-            let mut shell = TclShell::new(test_subject(), vfs_tx);
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut shell = TclShell::new(test_subject(), ns);
             shell.set_instruction_limit(500);
-            shell.eval("while {1} {}")
-        })
-        .await
-        .unwrap();
+            shell.eval("while {1} {}").await
+        }).await;
         assert!(result.is_err());
         assert!(
             result.unwrap_err().contains("instruction limit"),
@@ -639,220 +703,93 @@ mod tests {
 
     // ── json builtin tests ──────────────────────────────────────────────────
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn json_parse_object() {
-        // json parse returns a Tcl dict; use dict get to extract fields
-        let result = with_shell(|s| {
-            s.eval(r#"dict get [json parse {{"name":"alice","age":30}}] name"#)
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut s = TclShell::new(test_subject(), ns);
+            s.eval(r#"dict get [json parse {{"name":"alice","age":30}}] name"#).await
         }).await.unwrap();
         assert_eq!(result, "alice");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn json_parse_number() {
-        let result = with_shell(|s| {
-            s.eval(r#"dict get [json parse {{"name":"alice","age":30}}] age"#)
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut s = TclShell::new(test_subject(), ns);
+            s.eval(r#"dict get [json parse {{"name":"alice","age":30}}] age"#).await
         }).await.unwrap();
         assert_eq!(result, "30");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn json_parse_nested() {
-        // Nested objects become nested dicts
-        let result = with_shell(|s| {
-            s.eval(r#"dict get [dict get [json parse {{"data":{"x":1}}}] data] x"#)
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut s = TclShell::new(test_subject(), ns);
+            s.eval(r#"dict get [dict get [json parse {{"data":{"x":1}}}] data] x"#).await
         }).await.unwrap();
         assert_eq!(result, "1");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn json_parse_invalid() {
-        let result = with_shell(|s| {
-            s.eval(r#"json parse {not json}"#)
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut s = TclShell::new(test_subject(), ns);
+            s.eval(r#"json parse {not json}"#).await
         }).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid JSON"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn json_parse_array() {
-        // Arrays become Tcl lists
-        let result = with_shell(|s| {
-            s.eval(r#"lindex [json parse {[1, 2, 3]}] 1"#)
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut s = TclShell::new(test_subject(), ns);
+            s.eval(r#"lindex [json parse {[1, 2, 3]}] 1"#).await
         }).await.unwrap();
         assert_eq!(result, "2");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn json_parse_bool_null() {
-        let result = with_shell(|s| {
-            s.eval(r#"dict get [json parse {{"flag":true,"empty":null}}] flag"#)
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut s = TclShell::new(test_subject(), ns);
+            s.eval(r#"dict get [json parse {{"flag":true,"empty":null}}] flag"#).await
         }).await.unwrap();
         assert_eq!(result, "1");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn json_unknown_subcommand() {
-        let result = with_shell(|s| {
-            s.eval(r#"json encode {something}"#)
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut s = TclShell::new(test_subject(), ns);
+            s.eval(r#"json encode {something}"#).await
         }).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("unknown subcommand"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn json_in_help() {
-        let result = with_shell(|s| s.eval("help")).await.unwrap();
+        let ns = make_namespace();
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(async {
+            let mut s = TclShell::new(test_subject(), ns);
+            s.eval("help").await
+        }).await.unwrap();
         assert!(result.contains("json"));
-    }
-
-    // ── Runtime safety tests ────────────────────────────────────────────────
-    //
-    // These tests verify that VFS builtins work when the TclShell runs inside
-    // a tokio runtime context (not on spawn_blocking). This catches:
-    // - blocking_send() panics (would crash the process)
-    // - Deadlocks from proxy sharing the same single-threaded runtime
-    //
-    // The pattern reproduces the CLI shell's architecture where ChatApp runs
-    // directly in the LocalSet event loop.
-
-    /// Helper: spawn a dedicated VFS proxy on its own OS thread (like
-    /// `spawn_dedicated_vfs_proxy`), then construct and run the shell
-    /// directly on the test's async task — NOT on `spawn_blocking`.
-    ///
-    /// This simulates the CLI shell path where ChatApp.handle_vfs_command()
-    /// runs inside the tokio runtime.
-    fn spawn_test_proxy(
-        ns: Arc<Namespace>,
-        subject: Subject,
-    ) -> tokio::sync::mpsc::Sender<VfsRequest> {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<VfsRequest>(64);
-        std::thread::Builder::new()
-            .name("test-vfs-proxy".into())
-            .spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap();
-                rt.block_on(async move {
-                    use hyprstream_vfs::proxy::VfsOp;
-                    while let Some(req) = rx.recv().await {
-                        let result = match req.op {
-                            VfsOp::Cat { ref path } => ns
-                                .cat(path, &subject)
-                                .await
-                                .map_err(|e| e.to_string()),
-                            VfsOp::Ls { ref path } => ns
-                                .ls(path, &subject)
-                                .await
-                                .map(|entries| {
-                                    entries.iter()
-                                        .map(|e| if e.is_dir { format!("{}/", e.name) } else { e.name.clone() })
-                                        .collect::<Vec<_>>()
-                                        .join("\n")
-                                        .into_bytes()
-                                })
-                                .map_err(|e| e.to_string()),
-                            VfsOp::Echo { ref path, ref data } => ns
-                                .echo(path, data, &subject)
-                                .await
-                                .map(|_| Vec::new())
-                                .map_err(|e| e.to_string()),
-                            VfsOp::Ctl { ref path, ref cmd } => ns
-                                .ctl(path, cmd, &subject)
-                                .await
-                                .map_err(|e| e.to_string()),
-                            VfsOp::MountPrefixes => {
-                                Ok(ns.mount_prefixes().join("\n").into_bytes())
-                            }
-                        };
-                        let _ = req.reply.send(result);
-                    }
-                });
-            })
-            .unwrap();
-        tx
-    }
-
-    /// VFS builtins must not panic when called from within a tokio runtime.
-    ///
-    /// This test constructs the TclShell directly on the async task (simulating
-    /// the CLI shell path where ChatApp runs in the LocalSet). The VFS proxy
-    /// runs on a dedicated thread to avoid deadlock.
-    ///
-    /// Before the try_send fix, this test would panic with:
-    /// "Cannot block the current thread from within a runtime"
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn builtins_safe_inside_tokio_runtime() {
-        let ns = make_namespace();
-        let vfs_tx = spawn_test_proxy(Arc::clone(&ns), test_subject());
-
-        // Construct shell directly on the async task — NOT on spawn_blocking.
-        // TclShell is !Send so we can't move it across awaits, but we can
-        // construct and use it synchronously within a single async block.
-        let vfs_tx_clone = vfs_tx.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            // Enter a tokio runtime context to simulate the CLI shell environment.
-            // The _guard ensures Handle::current() returns Ok inside the closure.
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            let _guard = rt.enter();
-
-            let mut shell = TclShell::new(test_subject(), vfs_tx_clone);
-
-            // These would all panic with blocking_send if called inside a runtime.
-            let ls = shell.eval("ls /config").unwrap();
-            let cat = shell.eval("cat /config/temperature").unwrap();
-            let help = shell.eval("help").unwrap();
-            let mount = shell.eval("mount").unwrap();
-
-            (ls, cat, help, mount)
-        })
-        .await
-        .unwrap();
-
-        assert!(result.0.contains("temperature"));
-        assert_eq!(result.1, "0.7");
-        assert!(result.2.contains("cat"));
-        assert!(result.3.contains("/config"));
-    }
-
-    /// VFS builtins must work on a current_thread runtime with a dedicated proxy.
-    ///
-    /// This exactly replicates the CLI shell architecture:
-    /// - current_thread runtime with LocalSet
-    /// - VFS proxy on a separate OS thread
-    /// - TclShell eval called from within the LocalSet
-    ///
-    /// Before the fix, this would deadlock because spawn_vfs_proxy ran the
-    /// proxy on the same current_thread runtime, and reply_rx.recv() blocked
-    /// the runtime thread.
-    #[test]
-    fn builtins_safe_on_current_thread_runtime() {
-        let ns = make_namespace();
-        let vfs_tx = spawn_test_proxy(Arc::clone(&ns), test_subject());
-
-        // Run on a current_thread runtime — matching the CLI shell's architecture.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        let result = rt.block_on(async {
-            // The LocalSet is how the CLI shell drives its event loop.
-            let local = tokio::task::LocalSet::new();
-            local.run_until(async {
-                // Construct TclShell inside the LocalSet (like handle_vfs_command).
-                let mut shell = TclShell::new(test_subject(), vfs_tx);
-                let ls = shell.eval("ls /config").unwrap();
-                let cat = shell.eval("cat /config/temperature").unwrap();
-                (ls, cat)
-            }).await
-        });
-
-        assert!(result.0.contains("temperature"));
-        assert_eq!(result.1, "0.7");
     }
 }

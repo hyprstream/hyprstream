@@ -8185,7 +8185,6 @@ dependencies = [
 [[package]]
 name = "molt"
 version = "0.3.2"
-source = "git+https://github.com/hyprstream/hyprstream-molt.git?branch=hyprstream#a2d99ac72b4222b20d8d7a028792eb80b1cab432"
 dependencies = [
  "indexmap 1.9.3",
 ]
@@ -16429,3 +16428,7 @@ dependencies = [
  "quote",
  "syn 2.0.111",
 ]
+
+[[patch.unused]]
+name = "molt-shell"
+version = "0.3.2"
