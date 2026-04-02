@@ -438,6 +438,7 @@ fn hash_prefix_bytes(data: &[u8]) -> [u8; 32] {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use hyprstream_rpc::crypto::event_crypto::{decrypt_event_full, unwrap_group_key};

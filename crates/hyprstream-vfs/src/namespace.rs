@@ -564,12 +564,12 @@ mod tests {
         let mut ns = Namespace::new();
 
         struct ChunkedMount { data: Vec<u8> }
-        struct ChunkedFid { offset_limit: bool }
+        struct ChunkedFid { _offset_limit: bool }
 
         #[async_trait]
         impl Mount for ChunkedMount {
             async fn walk(&self, _c: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
-                Ok(Fid::new(ChunkedFid { offset_limit: false }))
+                Ok(Fid::new(ChunkedFid { _offset_limit: false }))
             }
             async fn open(&self, _fid: &mut Fid, _mode: u8, _caller: &Subject) -> Result<(), MountError> { Ok(()) }
             async fn read(&self, _fid: &Fid, offset: u64, count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {

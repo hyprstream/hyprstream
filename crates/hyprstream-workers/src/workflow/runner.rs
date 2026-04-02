@@ -743,7 +743,7 @@ impl hyprstream_vfs::Mount for EnvMount {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::disallowed_types)]
 mod tests {
     use super::*;
     use async_trait::async_trait;

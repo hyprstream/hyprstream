@@ -391,7 +391,7 @@ mod tests {
         {
             let mut prefixes = subscriber.prefixes.write().await;
             prefixes.insert(
-                prefix.to_string(),
+                prefix.to_owned(),
                 PrefixState {
                     ephemeral_secret: Zeroizing::new(sub_secret_bytes),
                     ephemeral_pubkey: sub_pubkey_bytes,
@@ -427,7 +427,7 @@ mod tests {
         {
             let mut prefixes = subscriber.prefixes.write().await;
             prefixes.insert(
-                prefix.to_string(),
+                prefix.to_owned(),
                 PrefixState {
                     ephemeral_secret: Zeroizing::new(sub_secret.scalar().to_bytes()),
                     ephemeral_pubkey: sub_public.to_bytes(),
@@ -466,7 +466,7 @@ mod tests {
         {
             let mut prefixes = subscriber.prefixes.write().await;
             prefixes.insert(
-                prefix.to_string(),
+                prefix.to_owned(),
                 PrefixState {
                     ephemeral_secret: Zeroizing::new(sub_secret.scalar().to_bytes()),
                     ephemeral_pubkey: sub_public.to_bytes(),
@@ -518,7 +518,7 @@ mod tests {
         {
             let mut prefixes = subscriber.prefixes.write().await;
             prefixes.insert(
-                prefix.to_string(),
+                prefix.to_owned(),
                 PrefixState {
                     ephemeral_secret: Zeroizing::new(sub_secret.scalar().to_bytes()),
                     ephemeral_pubkey: sub_public.to_bytes(),

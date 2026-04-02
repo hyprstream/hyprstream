@@ -233,7 +233,7 @@ fn extract_unknown_command(msg: &str) -> Option<String> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::disallowed_types)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
@@ -381,17 +381,6 @@ mod tests {
         ns.mount("/bin", bin_mount).unwrap();
 
         Arc::new(ns)
-    }
-
-    /// Helper: construct shell and run async closure within a LocalSet.
-    async fn with_shell<F, Fut, R>(f: F) -> R
-    where
-        F: FnOnce(TclShell) -> Fut,
-        Fut: std::future::Future<Output = R>,
-    {
-        let ns = make_namespace();
-        let mut shell = TclShell::new(test_subject(), ns);
-        f(shell).await
     }
 
     // Note: TclShell is !Send, so we use current_thread + LocalSet for all tests.
