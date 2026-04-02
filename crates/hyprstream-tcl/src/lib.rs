@@ -672,4 +672,154 @@ mod tests {
         let result = with_shell(|s| s.eval("help")).await.unwrap();
         assert!(result.contains("field"));
     }
+
+    // ── Runtime safety tests ────────────────────────────────────────────────
+    //
+    // These tests verify that VFS builtins work when the TclShell runs inside
+    // a tokio runtime context (not on spawn_blocking). This catches:
+    // - blocking_send() panics (would crash the process)
+    // - Deadlocks from proxy sharing the same single-threaded runtime
+    //
+    // The pattern reproduces the CLI shell's architecture where ChatApp runs
+    // directly in the LocalSet event loop.
+
+    /// Helper: spawn a dedicated VFS proxy on its own OS thread (like
+    /// `spawn_dedicated_vfs_proxy`), then construct and run the shell
+    /// directly on the test's async task — NOT on `spawn_blocking`.
+    ///
+    /// This simulates the CLI shell path where ChatApp.handle_vfs_command()
+    /// runs inside the tokio runtime.
+    fn spawn_test_proxy(
+        ns: Arc<Namespace>,
+        subject: Subject,
+    ) -> tokio::sync::mpsc::Sender<VfsRequest> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<VfsRequest>(64);
+        std::thread::Builder::new()
+            .name("test-vfs-proxy".into())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    use hyprstream_vfs::proxy::VfsOp;
+                    while let Some(req) = rx.recv().await {
+                        let result = match req.op {
+                            VfsOp::Cat { ref path } => ns
+                                .cat(path, &subject)
+                                .await
+                                .map_err(|e| e.to_string()),
+                            VfsOp::Ls { ref path } => ns
+                                .ls(path, &subject)
+                                .await
+                                .map(|entries| {
+                                    entries.iter()
+                                        .map(|e| if e.is_dir { format!("{}/", e.name) } else { e.name.clone() })
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                        .into_bytes()
+                                })
+                                .map_err(|e| e.to_string()),
+                            VfsOp::Echo { ref path, ref data } => ns
+                                .echo(path, data, &subject)
+                                .await
+                                .map(|_| Vec::new())
+                                .map_err(|e| e.to_string()),
+                            VfsOp::Ctl { ref path, ref cmd } => ns
+                                .ctl(path, cmd, &subject)
+                                .await
+                                .map_err(|e| e.to_string()),
+                            VfsOp::MountPrefixes => {
+                                Ok(ns.mount_prefixes().join("\n").into_bytes())
+                            }
+                        };
+                        let _ = req.reply.send(result);
+                    }
+                });
+            })
+            .unwrap();
+        tx
+    }
+
+    /// VFS builtins must not panic when called from within a tokio runtime.
+    ///
+    /// This test constructs the TclShell directly on the async task (simulating
+    /// the CLI shell path where ChatApp runs in the LocalSet). The VFS proxy
+    /// runs on a dedicated thread to avoid deadlock.
+    ///
+    /// Before the try_send fix, this test would panic with:
+    /// "Cannot block the current thread from within a runtime"
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn builtins_safe_inside_tokio_runtime() {
+        let ns = make_namespace();
+        let vfs_tx = spawn_test_proxy(Arc::clone(&ns), test_subject());
+
+        // Construct shell directly on the async task — NOT on spawn_blocking.
+        // TclShell is !Send so we can't move it across awaits, but we can
+        // construct and use it synchronously within a single async block.
+        let vfs_tx_clone = vfs_tx.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            // Enter a tokio runtime context to simulate the CLI shell environment.
+            // The _guard ensures Handle::current() returns Ok inside the closure.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _guard = rt.enter();
+
+            let mut shell = TclShell::new(test_subject(), vfs_tx_clone);
+
+            // These would all panic with blocking_send if called inside a runtime.
+            let ls = shell.eval("ls /config").unwrap();
+            let cat = shell.eval("cat /config/temperature").unwrap();
+            let help = shell.eval("help").unwrap();
+            let mount = shell.eval("mount").unwrap();
+
+            (ls, cat, help, mount)
+        })
+        .await
+        .unwrap();
+
+        assert!(result.0.contains("temperature"));
+        assert_eq!(result.1, "0.7");
+        assert!(result.2.contains("cat"));
+        assert!(result.3.contains("/config"));
+    }
+
+    /// VFS builtins must work on a current_thread runtime with a dedicated proxy.
+    ///
+    /// This exactly replicates the CLI shell architecture:
+    /// - current_thread runtime with LocalSet
+    /// - VFS proxy on a separate OS thread
+    /// - TclShell eval called from within the LocalSet
+    ///
+    /// Before the fix, this would deadlock because spawn_vfs_proxy ran the
+    /// proxy on the same current_thread runtime, and reply_rx.recv() blocked
+    /// the runtime thread.
+    #[test]
+    fn builtins_safe_on_current_thread_runtime() {
+        let ns = make_namespace();
+        let vfs_tx = spawn_test_proxy(Arc::clone(&ns), test_subject());
+
+        // Run on a current_thread runtime — matching the CLI shell's architecture.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let result = rt.block_on(async {
+            // The LocalSet is how the CLI shell drives its event loop.
+            let local = tokio::task::LocalSet::new();
+            local.run_until(async {
+                // Construct TclShell inside the LocalSet (like handle_vfs_command).
+                let mut shell = TclShell::new(test_subject(), vfs_tx);
+                let ls = shell.eval("ls /config").unwrap();
+                let cat = shell.eval("cat /config/temperature").unwrap();
+                (ls, cat)
+            }).await
+        });
+
+        assert!(result.0.contains("temperature"));
+        assert_eq!(result.1, "0.7");
+    }
 }

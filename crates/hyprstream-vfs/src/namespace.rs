@@ -732,4 +732,56 @@ mod tests {
         // "extra" should be gone (replaced)
         assert!(ns.cat("/bin/extra", &test_subject()).await.is_err());
     }
+
+    // ── Intermediate directory synthesis ─────────────────────────────────────
+
+    /// `ls /srv` should synthesize directory entries when mounts exist at
+    /// `/srv/model` but not at `/srv` itself.
+    ///
+    /// This catches the bug where intermediate paths between root and mount
+    /// points returned "not found".
+    #[tokio::test]
+    async fn ls_intermediate_directory() {
+        let mut ns = Namespace::new();
+        let mount = Arc::new(MemMount::new(vec![("status", b"ok")]));
+        ns.mount("/srv/model", mount).unwrap();
+        let lang_mount = Arc::new(MemMount::new(vec![("interp", b"tcl")]));
+        ns.mount("/lang/tcl", lang_mount).unwrap();
+
+        // /srv is not a mount point but /srv/model is — ls should synthesize.
+        let entries = ns.ls("/srv", &test_subject()).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "model");
+        assert!(entries[0].is_dir);
+
+        // /lang is not a mount point but /lang/tcl is — same pattern.
+        let entries = ns.ls("/lang", &test_subject()).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "tcl");
+        assert!(entries[0].is_dir);
+
+        // /nonexistent has no mounts beneath it — still errors.
+        assert!(ns.ls("/nonexistent", &test_subject()).await.is_err());
+    }
+
+    /// Multiple mounts under the same intermediate prefix synthesize correctly.
+    #[tokio::test]
+    async fn ls_intermediate_multiple_children() {
+        let mut ns = Namespace::new();
+        ns.mount("/a/b", Arc::new(MemMount::new(vec![("x", b"")]))).unwrap();
+        ns.mount("/a/c", Arc::new(MemMount::new(vec![("y", b"")]))).unwrap();
+        ns.mount("/a/d/e", Arc::new(MemMount::new(vec![("z", b"")]))).unwrap();
+
+        let entries = ns.ls("/a", &test_subject()).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"b"));
+        assert!(names.contains(&"c"));
+        assert!(names.contains(&"d"));
+        assert_eq!(entries.len(), 3);
+
+        // Deeper intermediate: /a/d should show "e"
+        let entries = ns.ls("/a/d", &test_subject()).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "e");
+    }
 }
