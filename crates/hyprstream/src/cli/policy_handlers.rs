@@ -24,7 +24,6 @@ use hyprstream_rpc::prelude::*;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
-use tracing::info;
 
 /// Create a PolicyClient for RPC calls.
 fn create_policy_client(signing_key: &SigningKey) -> PolicyClient {
@@ -392,94 +391,22 @@ pub async fn handle_token_create(
 }
 
 
-/// Load or generate the Ed25519 signing key using the OS keyring exclusively.
+/// Load or generate the Ed25519 node signing key from the configured secrets
+/// directory.
 ///
-/// Supported platforms:
-/// - Linux: kernel keyutils (`linux-native` feature)
-/// - macOS / iOS: Keychain (`apple-native` feature)
-/// - Windows: Credential Manager (`windows-native` feature)
-/// - FreeBSD / OpenBSD: DBus Secret Service (`sync-secret-service` + `crypto-rust` features)
+/// The `_keys_dir` parameter is retained for API compatibility but ignored; the
+/// actual path is always resolved via `HyprConfig::resolve_secrets_dir()`.
 ///
-/// For platforms without a supported keyring daemon, supply a client-provided
-/// credential store via [`keyring::set_default_credential_builder`] before
-/// calling this function.
-///
-/// The `_keys_dir` parameter is retained for API compatibility but unused;
-/// keys are stored exclusively in the OS keyring.
+/// Resolution order:
+/// 1. `HYPRSTREAM__SIGNING_KEY` / `config.signing_key` test bypass.
+/// 2. File at `<secrets_dir>/signing-key`.
+/// 3. Generate new key, write to file (writable dir only).
 pub async fn load_or_generate_signing_key(_keys_dir: &Path) -> Result<SigningKey> {
-    // Check for test bypass via config before touching the OS keyring.
-    // Set HYPRSTREAM__SIGNING_KEY=<hex32> to inject a pre-generated key.
-    if let Ok(cfg) = crate::config::HyprConfig::load() {
-        if let Some(ref hex_key) = cfg.signing_key {
-            let bytes = hex::decode(hex_key)
-                .map_err(|e| anyhow::anyhow!("HYPRSTREAM__SIGNING_KEY: invalid hex: {e}"))?;
-            let arr: [u8; 32] = bytes.try_into()
-                .map_err(|_| anyhow::anyhow!("HYPRSTREAM__SIGNING_KEY: expected 32 bytes"))?;
-            tracing::info!("Using node signing key from config (test bypass)");
-            return Ok(SigningKey::from_bytes(&arr));
-        }
+    if let Some(sk) = crate::config::HyprConfig::node_signing_key_bypass()? {
+        return Ok(sk);
     }
-
-    const SERVICE: &str = "hyprstream";
-    const KEY_NAME: &str = "signing-key";
-
-    let entry = keyring::Entry::new(SERVICE, KEY_NAME).or_else(|_| {
-        // On Linux, the session keyring may be revoked (common in systemd user
-        // sessions after the original login session ends). Try to join/create
-        // a new session keyring and retry.
-        #[cfg(target_os = "linux")]
-        {
-            tracing::debug!("session keyring unavailable, creating new session");
-            // KEYCTL_JOIN_SESSION_KEYRING = 1, NULL name = create anonymous session
-            let rc = unsafe { libc::syscall(libc::SYS_keyctl, 1i32, std::ptr::null::<u8>()) };
-            if rc >= 0 {
-                return keyring::Entry::new(SERVICE, KEY_NAME);
-            }
-        }
-        keyring::Entry::new(SERVICE, KEY_NAME)
-    }).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to access OS keyring (service={SERVICE}, key={KEY_NAME}): {e}.\n\
-             On Linux, ensure kernel keyutils is available.\n\
-             On FreeBSD/OpenBSD, ensure a Secret Service daemon (e.g. gnome-keyring \
-             or kwallet) is running, or supply a custom credential store via \
-             keyring::set_default_credential_builder()."
-        )
-    })?;
-
-    match entry.get_secret() {
-        Ok(bytes) if bytes.len() == 32 => {
-            let arr: [u8; 32] = bytes.try_into().map_err(|_| anyhow::anyhow!("unreachable: length already checked"))?;
-            info!("Loaded Ed25519 signing key from OS keyring");
-            return Ok(SigningKey::from_bytes(&arr));
-        }
-        Ok(_) => {
-            tracing::warn!("Keyring entry for signing key has wrong size; regenerating");
-        }
-        Err(keyring::Error::NoEntry) => {
-            // No key stored yet; generate a new one below
-        }
-        Err(e) => {
-            anyhow::bail!(
-                "OS keyring error while loading signing key: {e}.\n\
-                 Ensure the keyring daemon is accessible. On BSD without a \
-                 Secret Service daemon, supply a custom credential store via \
-                 keyring::set_default_credential_builder()."
-            );
-        }
-    }
-
-    // Generate new key and persist it in the keyring
-    let key = SigningKey::generate(&mut rand::rngs::OsRng);
-    entry.set_secret(&key.to_bytes()).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to store signing key in OS keyring: {e}.\n\
-             Ensure the keyring daemon is accessible, or supply a custom \
-             credential store via keyring::set_default_credential_builder()."
-        )
-    })?;
-    info!("Generated and stored new Ed25519 signing key in OS keyring");
-    Ok(key)
+    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
+    crate::auth::credentials::load_or_generate_node_signing_key(&secrets_dir)
 }
 
 /// Mint a JWT locally with proper iss/aud claims.
@@ -512,80 +439,24 @@ pub(crate) fn mint_local_token(
     (token, exp)
 }
 
-/// Keyring service name used for all hyprstream keyring entries.
-pub(crate) const KEYRING_SERVICE: &str = "hyprstream";
-/// Keyring key name for the user's Ed25519 signing key (for OAuth device flow challenges).
-// The `user-signing-key` is separate from the node `signing-key`:
-// - `signing-key`: server identity — signs JWTs and RPC envelopes
-// - `user-signing-key`: client identity — signs OAuth device flow challenges
-pub(crate) const KEYRING_USER_KEY_NAME: &str = "user-signing-key";
-
-/// Ensure the local user has an Ed25519 identity keypair.
+/// Ensure the local user has an Ed25519 signing keypair.
 ///
-/// If a keypair already exists in the OS keyring, returns the existing
-/// verifying key. Otherwise generates a new keypair, stores the private
-/// key in the keyring, and returns the public key for UserStore registration.
-///
+/// Loads from `<secrets_dir>/user-signing-key`, generating on first run.
 /// This key is per-OS-user (not per-hyprstream-user). The wizard only
 /// registers it for the local admin. Other users generate their own keys.
+pub(crate) fn ensure_user_signing_key() -> Result<(SigningKey, ed25519_dalek::VerifyingKey)> {
+    if let Some(pair) = crate::config::HyprConfig::user_signing_key_bypass()? {
+        return Ok(pair);
+    }
+    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
+    crate::auth::credentials::load_or_generate_user_signing_key(&secrets_dir)
+}
+
+/// Deprecated alias kept for call-site compatibility during transition.
+#[deprecated(since = "0.4.1", note = "renamed to ensure_user_signing_key")]
+#[allow(dead_code)]
 pub(crate) fn ensure_user_identity() -> Result<(SigningKey, ed25519_dalek::VerifyingKey)> {
-    // Check for test bypass via config before touching the OS keyring.
-    // Set HYPRSTREAM__OAUTH__USER_SIGNING_KEY=<hex32> to inject a pre-generated key.
-    if let Ok(cfg) = crate::config::HyprConfig::load() {
-        if let Some(ref hex_key) = cfg.oauth.user_signing_key {
-            let bytes = hex::decode(hex_key)
-                .map_err(|e| anyhow::anyhow!("HYPRSTREAM__OAUTH__USER_SIGNING_KEY: invalid hex: {e}"))?;
-            let arr: [u8; 32] = bytes
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("HYPRSTREAM__OAUTH__USER_SIGNING_KEY: expected 32 bytes"))?;
-            let sk = SigningKey::from_bytes(&arr);
-            info!("Using user signing key from config (test bypass)");
-            return Ok((sk.clone(), sk.verifying_key()));
-        }
-    }
-
-    const SERVICE: &str = KEYRING_SERVICE;
-    const KEY_NAME: &str = KEYRING_USER_KEY_NAME;
-
-    let entry = keyring::Entry::new(SERVICE, KEY_NAME).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to access OS keyring for user identity (service={SERVICE}, key={KEY_NAME}): {e}.\n\
-             On Linux, ensure kernel keyutils is available.\n\
-             On FreeBSD/OpenBSD, ensure a Secret Service daemon is running."
-        )
-    })?;
-
-    match entry.get_secret() {
-        Ok(bytes) if bytes.len() == 32 => {
-            let arr: [u8; 32] = bytes.try_into()
-                .map_err(|_| anyhow::anyhow!("unreachable: length already checked"))?;
-            let sk = SigningKey::from_bytes(&arr);
-            info!("Loaded user identity key from OS keyring");
-            Ok((sk.clone(), sk.verifying_key()))
-        }
-        Ok(bad) => {
-            anyhow::bail!(
-                "Keyring entry '{KEY_NAME}' has wrong size ({} bytes, expected 32).\n\
-                 This indicates corruption. Remove it manually and re-run:\n\
-                 - Linux:   keyctl purge user hyprstream:{KEY_NAME}\n\
-                 - macOS:   security delete-generic-password -s hyprstream -a {KEY_NAME}\n\
-                 - Windows: cmdkey /delete:hyprstream:{KEY_NAME}",
-                bad.len()
-            );
-        }
-        Err(keyring::Error::NoEntry) => {
-            let sk = SigningKey::generate(&mut rand::rngs::OsRng);
-            entry.set_secret(&sk.to_bytes()).map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to store user identity key in OS keyring: {e}.\n\
-                     Ensure the keyring daemon is accessible."
-                )
-            })?;
-            info!("Generated and stored new user identity key in OS keyring");
-            Ok((sk.clone(), sk.verifying_key()))
-        }
-        Err(e) => anyhow::bail!("OS keyring error while loading user identity key: {e}"),
-    }
+    ensure_user_signing_key()
 }
 
 /// Parse duration string like "30d", "90d", "1y", "never"

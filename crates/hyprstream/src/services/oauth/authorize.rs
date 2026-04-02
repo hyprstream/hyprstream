@@ -45,6 +45,9 @@ pub struct AuthorizeParams {
     /// RFC 8707 resource indicator
     #[serde(default)]
     pub resource: Option<String>,
+    /// OIDC nonce — echoed into id_token (OpenID Connect Core 1.0, Section 3.1.2.1)
+    #[serde(default)]
+    pub nonce: Option<String>,
 }
 
 /// Consent form submission (Ed25519 challenge-response)
@@ -64,6 +67,9 @@ pub struct ConsentForm {
     pub username: String,
     /// Base64-encoded Ed25519 signature
     pub signature: String,
+    /// OIDC nonce (passed through from authorize request, stored in auth code)
+    #[serde(default)]
+    pub oidc_nonce: Option<String>,
 }
 
 /// GET /oauth/authorize — validate params and render Ed25519 challenge form
@@ -177,6 +183,7 @@ pub async fn authorize_get(
         params.state.as_deref().unwrap_or(""),
         params.resource.as_deref().unwrap_or(""),
         &nonce,
+        params.nonce.as_deref().unwrap_or(""),
         None,
     );
 
@@ -221,6 +228,7 @@ pub async fn authorize_post(
             form.state.as_deref().unwrap_or(""),
             form.resource.as_deref().unwrap_or(""),
             &fresh_nonce,
+            form.oidc_nonce.as_deref().unwrap_or(""),
             Some("Authorization request expired. Please try again."),
         );
         return Html(html).into_response();
@@ -274,6 +282,7 @@ pub async fn authorize_post(
             form.state.as_deref().unwrap_or(""),
             form.resource.as_deref().unwrap_or(""),
             &fresh_nonce,
+            form.oidc_nonce.as_deref().unwrap_or(""),
             Some(e.message()),
         );
         return Html(html).into_response();
@@ -293,6 +302,7 @@ pub async fn authorize_post(
         redirect_uri: form.redirect_uri.clone(),
         code_challenge: form.code_challenge.clone(),
         scopes,
+        oidc_nonce: form.oidc_nonce.clone(),
         resource,
         created_at: Instant::now(),
         expires_at: Instant::now() + Duration::from_secs(60),
@@ -425,6 +435,7 @@ fn render_challenge_page(
     state: &str,
     resource: &str,
     nonce: &str,
+    oidc_nonce: &str,
     error: Option<&str>,
 ) -> String {
     let error_html = match error {
@@ -485,6 +496,7 @@ fn render_challenge_page(
     <input type="hidden" name="state" value="{state_val}">
     <input type="hidden" name="resource" value="{resource_val}">
     <input type="hidden" name="nonce" value="{nonce_val}">
+    <input type="hidden" name="oidc_nonce" value="{oidc_nonce_val}">
     <label>Username:
       <input type="text" name="username" required autocomplete="username" autofocus/>
     </label>
@@ -513,5 +525,6 @@ fn render_challenge_page(
         state_val = html_escape(state),
         resource_val = html_escape(resource),
         nonce_val = html_escape(nonce),
+        oidc_nonce_val = html_escape(oidc_nonce),
     )
 }

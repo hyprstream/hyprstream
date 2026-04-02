@@ -14,7 +14,7 @@ use inquire::{Confirm, Select, Text};
 use crate::auth::policy_templates::{get_templates, PolicyTemplate};
 use crate::auth::{write_policy_file, LocalKeyStore, PolicyManager, UserStore};
 use crate::cli::policy_handlers::{
-    ensure_user_identity, load_or_generate_signing_key, mint_local_token, parse_duration,
+    ensure_user_signing_key, load_or_generate_signing_key, mint_local_token, parse_duration,
 };
 use crate::cli::service_handlers::{
     build_version, format_size, handle_service_install, handle_service_start,
@@ -489,7 +489,7 @@ async fn phase_users(state: &mut WizardState, non_interactive: bool) -> Result<(
     if non_interactive {
         if registered_users.is_empty() {
             // Register identity FIRST — UserStore is authoritative
-            let (_sk, vk) = ensure_user_identity()?;
+            let (_sk, vk) = ensure_user_signing_key()?;
             user_store.register(&local_user, vk)
                 .context("Failed to register identity")?;
 
@@ -542,7 +542,7 @@ async fn phase_users(state: &mut WizardState, non_interactive: bool) -> Result<(
         // Register local identity BEFORE adding any Casbin policies (Step 3)
         if username == local_user {
             if user_store.get_pubkey(&username)?.is_none() {
-                let (_sk, vk) = ensure_user_identity()?;
+                let (_sk, vk) = ensure_user_signing_key()?;
                 user_store.register(&username, vk)?;
                 print_check(&username, CheckStatus::Ok, "identity registered (OAuth ready)");
             } else {

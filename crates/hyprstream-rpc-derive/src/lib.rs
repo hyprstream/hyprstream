@@ -1110,6 +1110,13 @@ pub fn service_factory(attr: TokenStream, item: TokenStream) -> TokenStream {
     let func_name = &func.sig.ident;
     let name = &args.name;
 
+    let deps = &args.depends_on;
+    let depends_on_chain = if deps.is_empty() {
+        quote! {}
+    } else {
+        quote! { .with_depends_on(&[#(#deps),*]) }
+    };
+
     let expanded = match (&args.schema, &args.metadata) {
         (Some(schema_path), Some(metadata_path)) => {
             quote! {
@@ -1121,7 +1128,7 @@ pub fn service_factory(attr: TokenStream, item: TokenStream) -> TokenStream {
                         #func_name,
                         include_bytes!(#schema_path),
                         #metadata_path
-                    )
+                    )#depends_on_chain
                 }
             }
         }
@@ -1134,7 +1141,7 @@ pub fn service_factory(attr: TokenStream, item: TokenStream) -> TokenStream {
                         #name,
                         #func_name,
                         include_bytes!(#schema_path)
-                    )
+                    )#depends_on_chain
                 }
             }
         }
@@ -1146,7 +1153,7 @@ pub fn service_factory(attr: TokenStream, item: TokenStream) -> TokenStream {
                     hyprstream_service::ServiceFactory::new(
                         #name,
                         #func_name
-                    )
+                    )#depends_on_chain
                 }
             }
         }
@@ -1161,10 +1168,12 @@ pub fn service_factory(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// - `#[service_factory("name")]` — no schema
 /// - `#[service_factory("name", schema = "path/to/schema.capnp")]` — with schema
 /// - `#[service_factory("name", schema = "...", metadata = path::to::schema_metadata)]` — with metadata
+/// - `#[service_factory("name", depends_on = ["policy", "registry"])]` — with dependencies
 struct ServiceFactoryArgs {
     name: syn::LitStr,
     schema: Option<syn::LitStr>,
     metadata: Option<syn::Path>,
+    depends_on: Vec<syn::LitStr>,
 }
 
 impl syn::parse::Parse for ServiceFactoryArgs {
@@ -1172,6 +1181,7 @@ impl syn::parse::Parse for ServiceFactoryArgs {
         let name: syn::LitStr = input.parse()?;
         let mut schema = None;
         let mut metadata = None;
+        let mut depends_on = Vec::new();
 
         while input.peek(syn::Token![,]) {
             input.parse::<syn::Token![,]>()?;
@@ -1187,13 +1197,19 @@ impl syn::parse::Parse for ServiceFactoryArgs {
                 "metadata" => {
                     metadata = Some(input.parse::<syn::Path>()?);
                 }
+                "depends_on" => {
+                    let content;
+                    syn::bracketed!(content in input);
+                    let deps = content.parse_terminated(|input: syn::parse::ParseStream<'_>| input.parse::<syn::LitStr>(), syn::Token![,])?;
+                    depends_on = deps.into_iter().collect();
+                }
                 other => {
                     return Err(syn::Error::new(ident.span(), format!("unknown attribute: {other}")));
                 }
             }
         }
 
-        Ok(ServiceFactoryArgs { name, schema, metadata })
+        Ok(ServiceFactoryArgs { name, schema, metadata, depends_on })
     }
 }
 

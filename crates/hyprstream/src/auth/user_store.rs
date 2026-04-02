@@ -2,9 +2,8 @@
 //!
 //! `UserStore` is the trait. `LocalKeyStore` is the implementation
 //! backed by an age-encrypted TOML file, with the decryption key
-//! in the OS keyring.
+//! persisted in the secrets directory.
 
-use age::secrecy::ExposeSecret;
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::VerifyingKey;
@@ -13,22 +12,70 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+/// User profile data (OIDC standard claims).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UserProfile {
+    /// Stable subject identifier (UUID). Generated at registration, never changes.
+    #[serde(default)]
+    pub sub: Option<String>,
+    /// Display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Email address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// Whether the email is verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email_verified: Option<bool>,
+}
+
 /// Abstraction over user credential stores.
 pub trait UserStore: Send + Sync {
     /// Look up a user's Ed25519 public key by username.
     fn get_pubkey(&self, username: &str) -> Result<Option<VerifyingKey>>;
+    /// Get a user's profile (OIDC claims).
+    fn get_profile(&self, username: &str) -> Result<Option<UserProfile>>;
     /// Register a user with their Ed25519 public key.
     fn register(&mut self, username: &str, pubkey: VerifyingKey) -> Result<()>;
+    /// Update a user's profile.
+    fn set_profile(&mut self, username: &str, profile: UserProfile) -> Result<()>;
     /// Remove a user.
     fn remove(&mut self, username: &str) -> Result<bool>;
     /// List all registered usernames.
     fn list_users(&self) -> Vec<String>;
 }
 
+/// Per-user entry in the TOML file (rich format).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UserEntry {
+    /// Base64-standard-encoded 32-byte Ed25519 public key.
+    pubkey: String,
+    /// Stable subject UUID.
+    #[serde(default)]
+    sub: Option<String>,
+    /// Display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    /// Email address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+    /// Whether the email is verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    email_verified: Option<bool>,
+}
+
+/// Serialized users file.
+///
+/// Supports two formats for backward compatibility:
+/// - Old: `users: HashMap<String, String>` (username → base64 pubkey)
+/// - New: `users: HashMap<String, UserEntry>` (username → structured entry)
+///
+/// On load, old format is auto-detected and migrated. UUID subs are generated
+/// for entries that don't have one.
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct UsersFile {
-    /// username -> base64-standard-encoded 32-byte Ed25519 public key
-    users: HashMap<String, String>,
+    /// username -> user entry (rich format)
+    users: HashMap<String, UserEntry>,
 }
 
 /// Credential store backed by an age-encrypted TOML file.
@@ -42,11 +89,8 @@ pub struct LocalKeyStore {
 }
 
 impl LocalKeyStore {
-    const KEYRING_SERVICE: &'static str = "hyprstream";
-    const KEYRING_KEY_NAME: &'static str = "credential-store-key";
-
     /// Load (or initialize) the credential store.
-    /// Creates the file and keyring entry if they don't exist.
+    /// Creates the file if it doesn't exist.
     pub fn load(credentials_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(credentials_dir)?;
         let path = credentials_dir.join("users.toml.age");
@@ -62,62 +106,21 @@ impl LocalKeyStore {
         Ok(Self { path, data, identity })
     }
 
-    /// Load the age identity from the OS keyring, or generate a new one on first run.
+    /// Load the age identity from the configured secrets directory, or generate on first run.
     ///
     /// `store_path` is the path of the `users.toml.age` file. When it already exists
-    /// on disk, a missing keyring entry is a hard error — generating a new key would
-    /// produce a "NoMatchingKeys" decryption failure.
+    /// on disk, a missing key is a hard error — generating a new key would produce a
+    /// "NoMatchingKeys" decryption failure.
     ///
     /// Recovery: set `HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY=<age-secret-key-...>`
     /// in the environment to inject the original key, or delete the credential store
     /// file to start fresh.
     fn load_or_generate_identity(store_path: &Path) -> Result<age::x25519::Identity> {
-        let store_file_exists = store_path.exists();
-        // Check for test bypass via config before touching the OS keyring.
-        // Set HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY=<age-secret-key-...> to inject a key.
-        if let Ok(cfg) = crate::config::HyprConfig::load() {
-            if let Some(ref age_key) = cfg.oauth.credential_store_key {
-                return age_key
-                    .trim()
-                    .parse::<age::x25519::Identity>()
-                    .map_err(|e| anyhow!("HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY: invalid age identity: {:?}", e));
-            }
+        if let Some(identity) = crate::config::HyprConfig::credential_store_key_bypass()? {
+            return Ok(identity);
         }
-
-        let entry = keyring::Entry::new(Self::KEYRING_SERVICE, Self::KEYRING_KEY_NAME)
-            .context("Failed to access keyring for credential store key")?;
-
-        match entry.get_secret() {
-            Ok(bytes) => {
-                let s = String::from_utf8(bytes)?;
-                s.parse::<age::x25519::Identity>()
-                    .map_err(|e| anyhow!("Failed to parse credential store key: {:?}", e))
-            }
-            Err(keyring::Error::NoEntry) if store_file_exists => {
-                // The encrypted store exists but the decryption key is gone from the keyring.
-                // Generating a new key would produce "NoMatchingKeys" — fail with a clear message.
-                Err(anyhow!(
-                    "Credential store key not found in OS keyring.\n\
-                     The store file exists at {:?} but cannot be decrypted.\n\
-                     Recovery options:\n\
-                     - Set HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY=<age-secret-key-...> \
-                       if you have a backup of the original key.\n\
-                     - Delete that file to start fresh (existing users will be lost).",
-                    store_path
-                ))
-            }
-            Err(keyring::Error::NoEntry) => {
-                // First run — no store file, safe to generate a new key.
-                let identity = age::x25519::Identity::generate();
-                let secret_str = identity.to_string();
-                entry
-                    .set_secret(secret_str.expose_secret().as_bytes())
-                    .context("Failed to store credential store key in keyring")?;
-                tracing::info!("Generated new credential store key (in OS keyring)");
-                Ok(identity)
-            }
-            Err(e) => Err(anyhow!("Keyring error loading credential store key: {}", e)),
-        }
+        let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
+        crate::auth::credentials::load_or_generate_credential_store_key(&secrets_dir, store_path)
     }
 
     fn decrypt_and_parse(path: &Path, identity: &age::x25519::Identity) -> Result<UsersFile> {
@@ -129,7 +132,31 @@ impl LocalKeyStore {
             .decrypt(std::iter::once(identity as &dyn age::Identity))
             .map_err(|e| anyhow!("Decryption failed: {:?}", e))?;
         reader.read_to_end(&mut plaintext)?;
-        toml::from_str(std::str::from_utf8(&plaintext)?).context("Failed to parse users.toml")
+        let text = std::str::from_utf8(&plaintext)?;
+
+        // Try new format first (structured UserEntry), fall back to old format
+        // (plain string pubkey) for backward compatibility.
+        if let Ok(file) = toml::from_str::<UsersFile>(text) {
+            return Ok(file);
+        }
+
+        // Old format: users is HashMap<String, String> where value is base64 pubkey.
+        #[derive(Deserialize)]
+        struct OldUsersFile {
+            users: HashMap<String, String>,
+        }
+        let old: OldUsersFile = toml::from_str(text).context("Failed to parse users.toml")?;
+        let users = old.users.into_iter().map(|(username, pubkey)| {
+            let entry = UserEntry {
+                pubkey,
+                sub: Some(uuid::Uuid::new_v4().to_string()),
+                name: None,
+                email: None,
+                email_verified: None,
+            };
+            (username, entry)
+        }).collect();
+        Ok(UsersFile { users })
     }
 
     fn encrypt_and_write(&self) -> Result<()> {
@@ -156,13 +183,25 @@ impl UserStore for LocalKeyStore {
     fn get_pubkey(&self, username: &str) -> Result<Option<VerifyingKey>> {
         match self.data.users.get(username) {
             None => Ok(None),
-            Some(b64) => {
-                let raw = STANDARD.decode(b64)?;
+            Some(entry) => {
+                let raw = STANDARD.decode(&entry.pubkey)?;
                 let bytes: [u8; 32] = raw
                     .try_into()
                     .map_err(|_| anyhow!("Stored pubkey for {} is not 32 bytes", username))?;
                 Ok(Some(VerifyingKey::from_bytes(&bytes)?))
             }
+        }
+    }
+
+    fn get_profile(&self, username: &str) -> Result<Option<UserProfile>> {
+        match self.data.users.get(username) {
+            None => Ok(None),
+            Some(entry) => Ok(Some(UserProfile {
+                sub: entry.sub.clone(),
+                name: entry.name.clone(),
+                email: entry.email.clone(),
+                email_verified: entry.email_verified,
+            })),
         }
     }
 
@@ -177,7 +216,32 @@ impl UserStore for LocalKeyStore {
                 username
             );
         }
-        self.data.users.insert(username.to_owned(), b64);
+        let entry = UserEntry {
+            pubkey: b64,
+            sub: Some(uuid::Uuid::new_v4().to_string()),
+            name: None,
+            email: None,
+            email_verified: None,
+        };
+        self.data.users.insert(username.to_owned(), entry);
+        self.encrypt_and_write()
+    }
+
+    fn set_profile(&mut self, username: &str, profile: UserProfile) -> Result<()> {
+        let entry = self.data.users.get_mut(username)
+            .ok_or_else(|| anyhow!("User '{}' not found", username))?;
+        if let Some(sub) = profile.sub {
+            entry.sub = Some(sub);
+        }
+        if profile.name.is_some() {
+            entry.name = profile.name;
+        }
+        if profile.email.is_some() {
+            entry.email = profile.email;
+        }
+        if profile.email_verified.is_some() {
+            entry.email_verified = profile.email_verified;
+        }
         self.encrypt_and_write()
     }
 
@@ -249,16 +313,18 @@ mod tests {
         // Re-load from disk using the same identity
         let loaded_data =
             LocalKeyStore::decrypt_and_parse(&dir.path().join("users.toml.age"), &identity)?;
-        let b64 = loaded_data
+        let entry = loaded_data
             .users
             .get("carol")
             .ok_or_else(|| anyhow!("carol not found in loaded data"))?;
-        let raw = STANDARD.decode(b64)?;
+        let raw = STANDARD.decode(&entry.pubkey)?;
         let bytes: [u8; 32] = raw
             .try_into()
             .map_err(|_| anyhow!("wrong key length after roundtrip"))?;
         let loaded_key = VerifyingKey::from_bytes(&bytes)?;
         assert_eq!(loaded_key.as_bytes(), pubkey.as_bytes());
+        // Verify UUID sub was generated
+        assert!(entry.sub.is_some(), "sub should be generated on register");
         Ok(())
     }
 

@@ -181,7 +181,7 @@ whoami = "1.5"  # OS username detection
 
 # Cryptography (for signed envelopes, DH key exchange, stream HMAC)
 base64 = "0.22"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 curve25519-dalek = { version = "4", features = ["rand_core"] }  # Ristretto255 DH for stream authentication
 hkdf = "0.12"
 hmac = "0.12"
@@ -189,6 +189,7 @@ zeroize = { version = "1", features = ["derive"] }
 subtle = "2"
 aes-gcm = "0.10"  # AES-256-GCM for notification broadcast encryption
 p256 = { version = "0.13", features = ["ecdh"] }  # FIPS mode alternative (P-256 ECDH)
+jsonwebtoken = "9"  # RS256/ES256 JWT verification for external OIDC providers
 
 # Dev dependencies
 proptest = "1.0"

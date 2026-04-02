@@ -63,6 +63,17 @@ pub async fn handle_service_install(
     if hyprstream_rpc::has_systemd() {
         let manager = hyprstream_service::detect_service_manager().await?;
 
+        // Encrypt secrets into the systemd user credstore before generating units.
+        // This must happen before manager.install() so that install() can see the
+        // .cred files when deciding whether to emit ImportCredential= directives.
+        #[cfg(feature = "systemd")]
+        {
+            let secrets_dir = crate::config::HyprConfig::load()
+                .map(|c| c.secrets.resolve_dir(c.config_dir()))
+                .ok();
+            hyprstream_service::encrypt_credentials_if_available(secrets_dir.as_deref());
+        }
+
         // If --start, stop all target services first so they pick up changes
         if start {
             println!("  Stopping services...");
@@ -188,24 +199,41 @@ pub async fn handle_service_start(
             }
         }
     } else {
-        // Standalone mode: spawn processes in background
+        // Standalone mode: spawn processes in dependency order
         println!("Starting services (standalone)...\n");
 
         let spawner = hyprstream_service::ProcessSpawner::standalone();
         let exe = hyprstream_rpc::paths::executable_path()?;
+        let stages = hyprstream_service::startup_stages(&target_services);
 
-        for service in &target_services {
-            print!("  \u{25CB} {}... ", service);
+        for stage in &stages {
+            for service in stage {
+                print!("  \u{25CB} {}... ", service);
 
-            let config = hyprstream_service::ProcessConfig::new(service, &exe)
-                .args(["service", "start", service, "--foreground", "--ipc"]);
+                let config = hyprstream_service::ProcessConfig::new(service, &exe)
+                    .args(["service", "start", service, "--foreground", "--ipc"]);
 
-            match spawner.spawn(config).await {
-                Ok(process) => {
-                    info!("Spawned {} service: {:?}", service, process.kind);
-                    println!("\u{2713}");
+                match spawner.spawn(config).await {
+                    Ok(process) => {
+                        info!("Spawned {} service: {:?}", service, process.kind);
+                        println!("\u{2713}");
+                    }
+                    Err(e) => println!("\u{2717} {}", e),
                 }
-                Err(e) => println!("\u{2717} {}", e),
+            }
+
+            // Wait for this stage's services to be ready before starting the next.
+            // Probe for IPC socket existence as the readiness signal.
+            let runtime_dir = hyprstream_rpc::paths::runtime_dir();
+            for service in stage {
+                let sock = runtime_dir.join(format!("{service}.sock"));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !sock.exists() && std::time::Instant::now() < deadline {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                if !sock.exists() {
+                    tracing::warn!("Timeout waiting for {service} socket; continuing");
+                }
             }
         }
     }
@@ -523,6 +551,42 @@ pub(crate) async fn run_repair_checks(
                     print_check(label, CheckStatus::Fail, &format!("failed to generate: {e}"));
                     all_passed = false;
                 }
+            }
+        }
+    }
+
+    // 4b. TLS materials (HTTP + QUIC) — generate into secrets dir so they are
+    //     available for systemd-creds encryption in phase 6.
+    {
+        let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
+        // HTTP TLS (365-day self-signed)
+        match crate::auth::credentials::load_or_generate_tls_materials(&secrets_dir, "localhost", 365) {
+            Ok(_) => print_check("TLS key+cert", CheckStatus::Ok, "HTTP (365d)"),
+            Err(e) => {
+                print_check("TLS key+cert", CheckStatus::Fail, &format!("{e}"));
+                all_passed = false;
+            }
+        }
+        // QUIC TLS (14-day per WebTransport spec)
+        match crate::auth::credentials::load_or_generate_tls_materials_named(
+            &secrets_dir, "localhost", 14, "quic-key", "quic-cert",
+        ) {
+            Ok(_) => print_check("QUIC key+cert", CheckStatus::Ok, "WebTransport (14d)"),
+            Err(e) => {
+                print_check("QUIC key+cert", CheckStatus::Fail, &format!("{e}"));
+                all_passed = false;
+            }
+        }
+    }
+
+    // 4c. RSA key for RS256 JWT signing (OIDC interop)
+    {
+        let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
+        match crate::auth::credentials::load_or_generate_rsa_key(&secrets_dir) {
+            Ok(_) => print_check("RSA key", CheckStatus::Ok, "RS256 (2048-bit)"),
+            Err(e) => {
+                // Non-fatal: EdDSA still works, RS256 is for interop
+                print_check("RSA key", CheckStatus::Warn, &format!("{e}"));
             }
         }
     }

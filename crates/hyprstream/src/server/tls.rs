@@ -27,29 +27,30 @@ pub struct TlsMaterials {
 }
 
 /// Shared self-signed TLS materials (generated once, reused across all services).
-static SHARED_TLS: OnceLock<TlsMaterials> = OnceLock::new();
+///
+/// Stored behind an `Arc` so callers share the same allocation rather than
+/// cloning key bytes on every call.
+static SHARED_TLS: OnceLock<Arc<TlsMaterials>> = OnceLock::new();
 
 /// Get or initialize the shared TLS materials.
 ///
-/// - If already initialized, returns a clone.
-/// - If `use_self_signed()`, generates an ECDSA P-256 cert with 365-day validity.
-/// - Otherwise, loads PEM from `cert_path`/`key_path`.
-pub fn get_or_init_tls_materials(config: &TlsConfig) -> anyhow::Result<TlsMaterials> {
+/// - If already initialized, returns a clone of the `Arc` (no key bytes copied).
+/// - If both `cert_path`/`key_path` are set in config, loads from PEM files.
+/// - Otherwise, loads persisted materials from `secrets.path` (generating on first run).
+///   The key is stable across restarts; certs are renewed when approaching expiry.
+pub fn get_or_init_tls_materials(config: &TlsConfig) -> anyhow::Result<Arc<TlsMaterials>> {
     if let Some(existing) = SHARED_TLS.get() {
-        return Ok(existing.clone());
+        return Ok(Arc::clone(existing));
     }
 
     let materials = if config.use_self_signed() {
-        info!("Generating self-signed TLS certificate (365-day validity) for HTTP services");
-        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
-        let mut params = rcgen::CertificateParams::new(vec![config.server_name.clone()])?;
-        params.not_before = time::OffsetDateTime::now_utc();
-        params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(365);
-        let cert = params.self_signed(&key_pair)?;
-        TlsMaterials {
-            cert_der: cert.der().to_vec(),
-            key_der: Zeroizing::new(key_pair.serialize_der()),
-        }
+        let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
+        let server_name = &config.server_name;
+        info!(
+            "Loading/generating TLS materials (365-day validity) from '{}'",
+            secrets_dir.display()
+        );
+        crate::auth::credentials::load_or_generate_tls_materials(&secrets_dir, server_name, 365)?
     } else {
         // Both paths guaranteed Some when use_self_signed() returns false
         let cert_path = config.cert_path.as_ref()
@@ -79,8 +80,8 @@ pub fn get_or_init_tls_materials(config: &TlsConfig) -> anyhow::Result<TlsMateri
         TlsMaterials { cert_der, key_der }
     };
 
-    // If another thread beat us, use theirs
-    Ok(SHARED_TLS.get_or_init(|| materials).clone())
+    // If another thread beat us, use theirs (Arc::clone, no key bytes copied)
+    Ok(Arc::clone(SHARED_TLS.get_or_init(|| Arc::new(materials))))
 }
 
 /// Resolve the rustls configuration for a service.
@@ -121,7 +122,7 @@ pub async fn resolve_rustls_config(
     // Shared materials (self-signed or from global [tls] config)
     let materials = get_or_init_tls_materials(tls_config)?;
     let rustls_config = axum_server::tls_rustls::RustlsConfig::from_der(
-        vec![materials.cert_der],
+        vec![materials.cert_der.clone()],
         (*materials.key_der).clone(),
     )
     .await
