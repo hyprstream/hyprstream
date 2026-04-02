@@ -37,4 +37,9 @@ pub use service::manager::{detect as detect_service_manager, ServiceManager, Sta
 #[cfg(feature = "systemd")]
 pub use service::manager::SystemdManager;
 
+#[cfg(feature = "systemd")]
+pub use service::manager::systemd::encrypt_credentials_if_available;
+
 pub use service::metadata::{MethodMeta, ParamMeta, SchemaMetadataFn, ScopedSchemaMetadataFn, ScopedClientTreeNode};
+
+pub use service::ordering::startup_stages;

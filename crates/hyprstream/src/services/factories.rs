@@ -163,7 +163,7 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Factory for RegistryService (git2db model registry)
-#[service_factory("registry", schema = "../../schema/registry.capnp", metadata = crate::services::generated::registry_client::schema_metadata)]
+#[service_factory("registry", schema = "../../schema/registry.capnp", metadata = crate::services::generated::registry_client::schema_metadata, depends_on = ["policy"])]
 fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating RegistryService");
 
@@ -226,7 +226,7 @@ fn create_streams_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Factory for ModelService (model lifecycle management)
-#[service_factory("model", schema = "../../schema/model.capnp", metadata = crate::services::generated::model_client::schema_metadata)]
+#[service_factory("model", schema = "../../schema/model.capnp", metadata = crate::services::generated::model_client::schema_metadata, depends_on = ["policy", "registry"])]
 fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating ModelService");
 
@@ -270,7 +270,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
 ///
 /// Note: This service requires worker configuration. If not configured,
 /// the factory will use sensible defaults.
-#[service_factory("worker")]
+#[service_factory("worker", depends_on = ["policy"])]
 fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating WorkerService");
 
@@ -359,7 +359,7 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 ///
 /// This service provides the HTTP API for inference requests.
 /// It communicates with ModelService and PolicyService via ZMQ.
-#[service_factory("oai")]
+#[service_factory("oai", depends_on = ["policy", "model", "registry"])]
 fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating OAIService");
 
@@ -418,7 +418,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 ///
 /// This service provides Flight SQL protocol for dataset queries.
 /// It optionally uses RegistryClient for dataset lookup.
-#[service_factory("flight")]
+#[service_factory("flight", depends_on = ["registry"])]
 fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating FlightService");
 
@@ -459,7 +459,7 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 ///
 /// This service provides OAuth 2.1 authorization for MCP and OAI services.
 /// It delegates token issuance to PolicyService over ZMQ.
-#[service_factory("oauth")]
+#[service_factory("oauth", depends_on = ["policy"])]
 fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating OAuthService");
 
@@ -494,7 +494,7 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
 /// - HTTP/SSE (for external MCP clients)
 ///
 /// Note: The HTTP/SSE server is spawned as a background task in the factory.
-#[service_factory("mcp", schema = "../../schema/mcp.capnp", metadata = crate::services::generated::mcp_client::schema_metadata)]
+#[service_factory("mcp", schema = "../../schema/mcp.capnp", metadata = crate::services::generated::mcp_client::schema_metadata, depends_on = ["policy"])]
 fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating McpService");
 
@@ -746,7 +746,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 ///
 /// This service provides a terminal multiplexer with session persistence,
 /// multi-pane layouts, and remote access via ZMQ RPC and WebTransport.
-#[service_factory("tui", schema = "../../schema/tui.capnp")]
+#[service_factory("tui", schema = "../../schema/tui.capnp", depends_on = ["policy"])]
 fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating TuiService");
 
@@ -793,7 +793,7 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 ///
 /// This service exposes the EndpointRegistry so remote clients can discover
 /// registered services, their endpoints, socket kinds, and schemas.
-#[service_factory("discovery", schema = "../../../hyprstream-discovery/schema/discovery.capnp", metadata = hyprstream_discovery::generated::discovery_client::schema_metadata)]
+#[service_factory("discovery", schema = "../../../hyprstream-discovery/schema/discovery.capnp", metadata = hyprstream_discovery::generated::discovery_client::schema_metadata, depends_on = ["policy"])]
 fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating DiscoveryService");
 
@@ -824,7 +824,7 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Factory for NotificationService (blind relay with broadcast encryption)
-#[service_factory("notification", schema = "../../schema/notification.capnp", metadata = crate::services::generated::notification_client::schema_metadata)]
+#[service_factory("notification", schema = "../../schema/notification.capnp", metadata = crate::services::generated::notification_client::schema_metadata, depends_on = ["policy"])]
 fn create_notification_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating NotificationService");
 
@@ -851,7 +851,7 @@ fn create_notification_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn S
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Factory for MetricsService (DuckDB-backed time-series ingest + DataFusion query)
-#[service_factory("metrics", schema = "../../schema/metrics.capnp", metadata = crate::services::generated::metrics_client::schema_metadata)]
+#[service_factory("metrics", schema = "../../schema/metrics.capnp", metadata = crate::services::generated::metrics_client::schema_metadata, depends_on = ["policy"])]
 fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating MetricsService");
 

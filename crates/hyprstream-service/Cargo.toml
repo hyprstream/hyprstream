@@ -43,6 +43,9 @@ zmq-sys = { workspace = true }
 # Ed25519 (for factory::ServiceContext)
 ed25519-dalek = { workspace = true }
 
+# Key material zeroization
+zeroize = { workspace = true }
+
 # Compile-time service registration
 inventory = { workspace = true }
 
