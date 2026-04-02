@@ -23,7 +23,7 @@ use crate::services::fs::{SyntheticNode, SyntheticTree};
 /// Note: Actual VFS command execution goes through TclShell builtins via the
 /// VFS proxy channel, not through /bin/ ctl files. The /bin/ entries exist
 /// for directory listing so `ls /bin` shows available commands.
-
+///
 /// Spawn a VFS proxy on a **dedicated thread** with its own tokio runtime.
 ///
 /// The TUI service's `RequestLoop` runs on a `current_thread` runtime inside
@@ -36,6 +36,7 @@ pub fn spawn_dedicated_vfs_proxy(
     subject: Subject,
 ) -> tokio::sync::mpsc::Sender<hyprstream_vfs::proxy::VfsRequest> {
     let (tx, rx) = tokio::sync::mpsc::channel::<hyprstream_vfs::proxy::VfsRequest>(64);
+    #[allow(clippy::expect_used)] // Thread/runtime creation failure is unrecoverable
     std::thread::Builder::new()
         .name("vfs-proxy".into())
         .spawn(move || {
