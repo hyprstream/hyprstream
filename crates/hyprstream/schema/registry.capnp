@@ -5,6 +5,25 @@ using import "/annotations.capnp".mcpScope;
 using import "/annotations.capnp".mcpDescription;
 using import "/streaming.capnp".StreamInfo;
 
+# 9P types — shared across all services with fs scope.
+using import "/nine.capnp".Qid;
+using import "/nine.capnp".NpStat;
+using import "/nine.capnp".NpWalk;
+using import "/nine.capnp".NpOpen;
+using import "/nine.capnp".NpCreate;
+using import "/nine.capnp".NpRead;
+using import "/nine.capnp".NpWrite;
+using import "/nine.capnp".NpClunk;
+using import "/nine.capnp".NpRemove;
+using import "/nine.capnp".NpStatReq;
+using import "/nine.capnp".NpWstat;
+using import "/nine.capnp".NpFlush;
+using import "/nine.capnp".RWalk;
+using import "/nine.capnp".ROpen;
+using import "/nine.capnp".RRead;
+using import "/nine.capnp".RWrite;
+using import "/nine.capnp".RStat;
+
 # Cap'n Proto schema for registry service
 #
 # The registry service manages git repositories (models).
@@ -164,27 +183,6 @@ struct RepositoryResponse {
   }
 }
 
-# --- 9P2000-inspired types ---
-# Qid uniquely identifies a file version (inode + ctime).
-struct Qid {
-  qtype @0 :UInt8;      # QTDIR=0x80 QTAPPEND=0x40 QTEXCL=0x20 QTFILE=0x00
-  version @1 :UInt32;   # st_ctime (seconds)
-  path @2 :UInt64;      # st_ino (unique file id)
-}
-
-# File metadata (9P stat structure).
-struct NpStat {
-  qid @0 :Qid;
-  mode @1 :UInt32;
-  atime @2 :UInt32;
-  mtime @3 :UInt32;
-  length @4 :UInt64;
-  name @5 :Text;
-  uid @6 :Text;
-  gid @7 :Text;
-  muid @8 :Text;
-}
-
 # --- WorktreeRequest: 9P2000-inspired worktree filesystem protocol ---
 # 10 operations replacing 19 POSIX ops. Read is always offset+count,
 # bounded by iounit — no unbounded readFile convenience method.
@@ -253,43 +251,7 @@ struct WorktreeRequest {
   }
 }
 
-# 9P Request structs
-
-struct NpWalk {
-  fid @0 :UInt32;          # source fid (0 = root, auto-attached per worktree)
-  newfid @1 :UInt32;       # fid to assign to walked path
-  wnames @2 :List(Text);   # path components (empty = clone fid)
-}
-
-struct NpOpen {
-  fid @0 :UInt32;
-  mode @1 :UInt8;          # OREAD=0 OWRITE=1 ORDWR=2; OTRUNC=0x10 ORCLOSE=0x40
-}
-
-struct NpCreate {
-  fid @0 :UInt32;          # must be a walked directory fid
-  name @1 :Text;           # name of file/dir to create
-  perm @2 :UInt32;         # DMDIR=0x80000000 for dirs, otherwise file mode
-  mode @3 :UInt8;          # open mode for the new file (same as NpOpen.mode)
-}
-
-struct NpRead {
-  fid @0 :UInt32;
-  offset @1 :UInt64;
-  count @2 :UInt32;        # server clamps to iounit
-}
-
-struct NpWrite {
-  fid @0 :UInt32;
-  offset @1 :UInt64;
-  data @2 :Data;           # server rejects if > iounit
-}
-
-struct NpClunk   { fid @0 :UInt32; }
-struct NpRemove  { fid @0 :UInt32; }
-struct NpStatReq { fid @0 :UInt32; }
-struct NpWstat   { fid @0 :UInt32; stat @1 :NpStat; }
-struct NpFlush   { oldtag @0 :UInt64; }
+# 9P request/response structs imported from nine.capnp above.
 
 # --- WorktreeResponse: 9P2000-inspired responses ---
 
@@ -334,13 +296,7 @@ struct WorktreeResponse {
   }
 }
 
-# 9P Response structs
-
-struct RWalk  { qid @0 :Qid; }
-struct ROpen  { qid @0 :Qid; iounit @1 :UInt32; }
-struct RRead  { data @0 :Data; }
-struct RWrite { count @0 :UInt32; }
-struct RStat  { stat @0 :NpStat; }
+# 9P response structs imported from nine.capnp above.
 
 # Clone Request
 

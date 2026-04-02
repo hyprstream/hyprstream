@@ -25,6 +25,7 @@ pub mod wt_viewer;
 pub mod backend;
 pub mod vte_parser;
 pub mod shell_client;
+pub mod vfs;
 pub mod zmq_transport;
 
 pub use state::{

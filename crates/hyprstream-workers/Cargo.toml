@@ -11,6 +11,8 @@ description = "Isolated workload execution using Kata Containers with CRI-aligne
 hyprstream-rpc = { path = "../hyprstream-rpc" }
 hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }
 hyprstream-service = { path = "../hyprstream-service" }
+hyprstream-vfs = { path = "../hyprstream-vfs" }
+hyprstream-tcl = { path = "../hyprstream-tcl" }
 
 # Async runtime
 tokio = { workspace = true }
@@ -73,6 +75,13 @@ reqwest = { version = "0.11", default-features = false, features = ["json", "rus
 sha2 = "0.10"
 hex = "0.4"
 base64 = "0.21"
+
+# Crypto (for secure event publisher)
+ed25519-dalek = { workspace = true }
+curve25519-dalek = { workspace = true }
+blake3 = { workspace = true }
+rand = { workspace = true }
+zeroize = { workspace = true }
 
 # Kata Containers runtime-rs (hypervisor abstraction)
 kata-hypervisor = { git = "https://github.com/kata-containers/kata-containers", tag = "3.25.0", package = "hypervisor", features = ["cloud-hypervisor"] }

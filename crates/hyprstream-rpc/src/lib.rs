@@ -58,6 +58,14 @@ pub mod events_capnp {
     include!(concat!(env!("OUT_DIR"), "/events_capnp.rs"));
 }
 
+pub mod nine_capnp {
+    #![allow(dead_code, unused_imports)]
+    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
+    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    include!(concat!(env!("OUT_DIR"), "/nine_capnp.rs"));
+}
+
 pub mod streaming_capnp {
     #![allow(dead_code, unused_imports)]
     #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]

@@ -5925,7 +5925,9 @@ dependencies = [
  "hyprstream-rpc-build",
  "hyprstream-rpc-derive",
  "hyprstream-service",
+ "hyprstream-tcl",
  "hyprstream-tui",
+ "hyprstream-vfs",
  "hyprstream-workers",
  "image",
  "indicatif",
@@ -6232,6 +6234,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyprstream-tcl"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hyprstream-vfs",
+ "molt",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "hyprstream-tui"
 version = "0.1.0"
 dependencies = [
@@ -6244,6 +6257,8 @@ dependencies = [
  "dirs-next",
  "edtui",
  "hyprstream-compositor",
+ "hyprstream-tcl",
+ "hyprstream-vfs",
  "landlock",
  "libc",
  "parking_lot 0.12.4",
@@ -6252,10 +6267,21 @@ dependencies = [
  "ratatui-textarea",
  "serde",
  "serde_json",
+ "tokio",
  "tui-logger",
  "uuid 1.18.1",
  "waxterm",
  "zeroize",
+]
+
+[[package]]
+name = "hyprstream-vfs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "hyprstream-rpc",
+ "tokio",
 ]
 
 [[package]]
@@ -6265,11 +6291,14 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.21.7",
+ "blake3",
  "capnp",
  "capnpc",
  "ch-config",
  "chrono",
+ "curve25519-dalek",
  "dashmap",
+ "ed25519-dalek",
  "fuse-backend-rs 0.12.1",
  "futures",
  "glob",
@@ -6279,6 +6308,8 @@ dependencies = [
  "hyprstream-rpc-build",
  "hyprstream-rpc-derive",
  "hyprstream-service",
+ "hyprstream-tcl",
+ "hyprstream-vfs",
  "kata-sys-util",
  "kata-types",
  "nix 0.27.1",
@@ -6286,6 +6317,7 @@ dependencies = [
  "nydus-service",
  "nydus-storage 0.7.1",
  "parking_lot 0.12.4",
+ "rand 0.8.5",
  "reqwest 0.11.27",
  "serde",
  "serde_json",
@@ -6302,6 +6334,7 @@ dependencies = [
  "walkdir",
  "which 7.0.3",
  "zbus 4.4.0",
+ "zeroize",
  "zmq",
  "zmq-sys",
 ]
@@ -8149,6 +8182,14 @@ dependencies = [
  "smallvec",
  "tagptr",
  "uuid 1.18.1",
+]
+
+[[package]]
+name = "molt"
+version = "0.3.2"
+source = "git+https://github.com/hyprstream/hyprstream-molt.git?branch=hyprstream#b0a69687f36c2c005750b907d50aa4cd08704c2c"
+dependencies = [
+ "indexmap 1.9.3",
 ]
 
 [[package]]

@@ -591,6 +591,10 @@ pub async fn handle_worker_terminal(
                         eprintln!("\n--- Stream error: {message} ---");
                         break;
                     }
+                    Ok(StreamPayload::Tagged { .. }) => {
+                        // encrypted event payload, skip
+                        continue;
+                    }
                     Err(e) => {
                         tracing::warn!("Stream receive error: {}", e);
                         break;

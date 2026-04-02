@@ -48,3 +48,57 @@ struct EventEnvelope {
   # Links related events across services (e.g., workflow run ID)
   correlationId @5 :Data;
 }
+
+# Event registration for secure pub/sub prefix management
+struct EventRegistration {
+  topicPrefix @0 :Text;
+  schema @1 :Text;
+  publishScope @2 :Text;
+  subscribeScope @3 :Text;
+}
+
+# V2 envelope with publisher authentication (E2E signed)
+struct EventEnvelopeV2 {
+  topic @0 :Text;
+  payload @1 :Data;
+  publisherSignature @2 :Data;
+  timestamp @3 :Int64;
+  publisherPubkey @4 :Data;
+}
+
+# Announcement that group key is rotating
+struct RekeyAnnouncement {
+  prefix @0 :Text;
+  effectiveAt @1 :Int64;
+  wrappedKeys @2 :List(WrappedKey);
+  versionId @3 :UInt64;
+  publisherEphemeralPubkey @4 :Data;
+}
+
+# A wrapped symmetric key for a single subscriber
+struct WrappedKey {
+  routingTag @0 :Data;
+  wrapped @1 :Data;
+}
+
+# Control-plane announcement union
+struct Announcement {
+  union {
+    prefixAvailable @0 :PrefixAvailableAnnouncement;
+    rekey @1 :RekeyAnnouncement;
+    prefixOffline @2 :PrefixOfflineAnnouncement;
+  }
+}
+
+# A prefix is available for subscription
+struct PrefixAvailableAnnouncement {
+  prefix @0 :Text;
+  publisherEphemeralPubkey @1 :Data;
+  schema @2 :Text;
+}
+
+# A prefix is going offline
+struct PrefixOfflineAnnouncement {
+  prefix @0 :Text;
+  reason @1 :Text;
+}

@@ -84,7 +84,16 @@ struct StreamPayload {
     complete @1 :Data;            # App-specific completion metadata (serialized)
     error @2 :StreamError;        # Error during streaming
     heartbeat @3 :Void;           # Keep-alive (no data)
+    tagged @4 :TaggedPayload;     # Encrypted tagged payload with key commitment
   }
+}
+
+# Tagged payload with authenticated encryption metadata
+struct TaggedPayload {
+  tag @0 :Data;
+  payload @1 :Data;
+  nonce @2 :Data;
+  keyCommitment @3 :Data;
 }
 
 # =============================================================================

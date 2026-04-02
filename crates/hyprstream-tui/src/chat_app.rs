@@ -225,6 +225,47 @@ pub enum ChatMode {
 // ChatApp
 // ============================================================================
 
+/// Create a no-op waker for polling futures that don't need wake notifications.
+///
+/// Safe for TclShell/VFS futures which are purely computational (no IO reactor,
+/// no timers) — they always make progress on each poll without needing external
+/// wake-ups.
+fn noop_waker() -> std::task::Waker {
+    fn noop(_: *const ()) {}
+    fn clone(p: *const ()) -> std::task::RawWaker {
+        std::task::RawWaker::new(p, &VTABLE)
+    }
+    static VTABLE: std::task::RawWakerVTable =
+        std::task::RawWakerVTable::new(clone, noop, noop, noop);
+    // SAFETY: The vtable functions are valid no-ops. The data pointer is never dereferenced.
+    unsafe { std::task::Waker::from_raw(std::task::RawWaker::new(std::ptr::null(), &VTABLE)) }
+}
+
+/// Wrapper that asserts `Send` for a `!Send` value.
+///
+/// **Not thread-local storage** — this is a Send bypass for values that are
+/// constructed and accessed on a single thread but must transit a thread boundary
+/// wrapped in `Option<AssertSend<T>>` where the Option is `None` during the move.
+///
+/// SAFETY: This is used exclusively for `TclShell` which uses `Rc` internally
+/// (making it `!Send`). The wrapper is safe because:
+/// - The value is always wrapped in `Option` that is `None` during cross-thread moves
+/// - It is only populated via `ensure_tcl_shell()` on the app thread
+/// - It is only accessed from that same thread thereafter
+/// - `UnsafeCell` ensures `AssertSend<T>` is `!Sync` (cannot be shared across threads)
+struct AssertSend<T>(std::cell::UnsafeCell<T>);
+
+// SAFETY: See struct-level documentation.
+unsafe impl<T> Send for AssertSend<T> {}
+
+impl<T> std::ops::Deref for AssertSend<T> {
+    type Target = T;
+    fn deref(&self) -> &T { unsafe { &*self.0.get() } }
+}
+impl<T> std::ops::DerefMut for AssertSend<T> {
+    fn deref_mut(&mut self) -> &mut T { unsafe { &mut *self.0.get() } }
+}
+
 /// Double-Esc close window: two Esc presses within this interval close the app.
 #[cfg(not(target_os = "wasi"))]
 const DOUBLE_ESC_MS: u128 = 1500;
@@ -309,6 +350,27 @@ pub struct ChatApp {
     pub pending_tool_calls: usize,
     /// Spinner frame index — incremented each tick while tool calls are in flight.
     pub spinner_tick: u32,
+
+    // ── VFS namespace for / command routing ──────────────────────────────────
+
+    /// VFS namespace for / path commands. None on WASM.
+    vfs: Option<std::sync::Arc<hyprstream_vfs::Namespace>>,
+    /// Caller identity for VFS operations.
+    vfs_subject: hyprstream_vfs::Subject,
+    /// Tcl shell for / command evaluation. Created lazily on first use because
+    /// TclShell is !Send (molt Value uses Rc) and ChatApp is moved across threads
+    /// in spawn_app_process. The init data (vfs_tx + subject) IS Send.
+    ///
+    /// SAFETY: TclShell is wrapped in `AssertSend` (unsafe Send impl) because:
+    /// 1. It is always `None` when ChatApp crosses a thread boundary
+    /// 2. It is only constructed inside `ensure_tcl_shell()` on the app thread
+    /// 3. It is only accessed from that same thread thereafter
+    tcl_shell: Option<AssertSend<hyprstream_tcl::TclShell>>,
+    /// Deferred init data for tcl_shell (Send-safe). Consumed on first access.
+    tcl_shell_init: Option<(hyprstream_vfs::Subject, std::sync::Arc<hyprstream_vfs::Namespace>)>,
+    /// Receiver for TclMount commands (polled in tick()). Shared across tabs.
+    #[cfg(not(target_os = "wasi"))]
+    tcl_mount_rx: Option<std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>>,
 }
 
 impl ChatApp {
@@ -348,6 +410,12 @@ impl ChatApp {
             tool_call_buf: String::new(),
             pending_tool_calls: 0,
             spinner_tick: 0,
+            vfs: None,
+            vfs_subject: hyprstream_vfs::Subject::anonymous(),
+            tcl_shell: None,
+            tcl_shell_init: None,
+            #[cfg(not(target_os = "wasi"))]
+            tcl_mount_rx: None,
         }
     }
 
@@ -375,6 +443,12 @@ impl ChatApp {
             in_tool_call: false,
             tool_call_buf: String::new(),
             spinner_tick: 0,
+            vfs: None,
+            vfs_subject: hyprstream_vfs::Subject::anonymous(),
+            tcl_shell: None,
+            tcl_shell_init: None,
+            #[cfg(not(target_os = "wasi"))]
+            tcl_mount_rx: None,
         }
     }
 
@@ -448,6 +522,12 @@ impl ChatApp {
             tool_call_buf: String::new(),
             pending_tool_calls: 0,
             spinner_tick: 0,
+            vfs: None,
+            vfs_subject: hyprstream_vfs::Subject::anonymous(),
+            tcl_shell: None,
+            tcl_shell_init: None,
+            #[cfg(not(target_os = "wasi"))]
+            tcl_mount_rx: None,
         }
     }
 
@@ -465,6 +545,46 @@ impl ChatApp {
     #[cfg(not(target_os = "wasi"))]
     pub fn with_server_spawned(mut self) -> Self {
         self.is_server_spawned = true;
+        self
+    }
+
+    /// Attach a VFS namespace for `/path` command routing.
+    ///
+    /// The TclShell is created lazily on first use (inside the app thread)
+    /// because it is `!Send` and ChatApp must cross a thread boundary in
+    /// `spawn_app_process`.
+    pub fn with_vfs(mut self, ns: std::sync::Arc<hyprstream_vfs::Namespace>, subject: hyprstream_vfs::Subject) -> Self {
+        self.tcl_shell_init = Some((subject.clone(), std::sync::Arc::clone(&ns)));
+        self.vfs = Some(ns);
+        self.vfs_subject = subject;
+        self
+    }
+
+    /// Attach VFS namespace for `/path` command routing (compat shim).
+    ///
+    /// The `_vfs_tx` parameter is ignored — TclShell now awaits namespace
+    /// operations directly. This method exists for call-site compatibility;
+    /// prefer `with_vfs` for new code.
+    pub fn with_vfs_proxy(
+        mut self,
+        ns: std::sync::Arc<hyprstream_vfs::Namespace>,
+        subject: hyprstream_vfs::Subject,
+        _vfs_tx: tokio::sync::mpsc::Sender<hyprstream_vfs::proxy::VfsRequest>,
+    ) -> Self {
+        self.tcl_shell_init = Some((subject.clone(), std::sync::Arc::clone(&ns)));
+        self.vfs = Some(ns);
+        self.vfs_subject = subject;
+        self
+    }
+
+    /// Attach the receiver end of a `/lang/tcl` mount channel.
+    ///
+    /// The corresponding [`hyprstream_tcl::TclMount`] must be mounted in the
+    /// namespace at `/lang/tcl` before this is called. The ChatApp drains this
+    /// channel in `tick()`, forwarding commands to the Tcl interpreter.
+    #[cfg(not(target_os = "wasi"))]
+    pub fn with_tcl_mount_rx(mut self, rx: std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>) -> Self {
+        self.tcl_mount_rx = Some(rx);
         self
     }
 
@@ -688,6 +808,92 @@ impl ChatApp {
         }
 
         detected
+    }
+
+    // ── VFS helpers ──────────────────────────────────────────────────────────
+
+    /// Display a system-level message in the chat history (VFS output, errors).
+    fn push_system_message(&mut self, msg: &str) {
+        self.history.push(ChatHistoryEntry {
+            role: ChatRole::Assistant,
+            content: msg.to_owned(),
+            thinking: String::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        });
+        self.scroll_offset = 0;
+    }
+
+    /// Lazily initialize the TclShell. Must be called from the app thread
+    /// (after the ChatApp has been moved into spawn_app_process).
+    fn ensure_tcl_shell(&mut self) {
+        if self.tcl_shell.is_none() {
+            if let Some((subject, namespace)) = self.tcl_shell_init.take() {
+                self.tcl_shell = Some(AssertSend(std::cell::UnsafeCell::new(
+                    hyprstream_tcl::TclShell::new(subject, namespace),
+                )));
+            }
+        }
+    }
+
+    /// Poll a `!Send` future to completion on the current thread.
+    ///
+    /// Works in both contexts: inside an existing tokio runtime (shell_handlers
+    /// compositor loop) and on a bare OS thread (spawn_app_process). Uses a
+    /// noop-waker poll loop — safe because TclShell/VFS futures are pure async
+    /// (no IO reactor, no timers — just trait method dispatch).
+    fn poll_local<F: std::future::Future>(fut: F) -> F::Output {
+        let mut fut = std::pin::pin!(fut);
+        let waker = noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        loop {
+            match fut.as_mut().poll(&mut cx) {
+                std::task::Poll::Ready(val) => return val,
+                std::task::Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    /// Handle a `/`-prefixed command by evaluating it as Tcl against the VFS.
+    ///
+    /// Bare paths (e.g. `/srv/model/status`) are treated as `cat /srv/model/status`.
+    /// Commands (e.g. `/ls /srv/model`) are evaluated directly.
+    fn handle_vfs_command(&mut self, input: &str) {
+        self.ensure_tcl_shell();
+        let Some(shell) = &mut self.tcl_shell else {
+            self.push_system_message("VFS not available");
+            return;
+        };
+
+        // Show the command in history.
+        self.history.push(ChatHistoryEntry {
+            role: ChatRole::User,
+            content: input.to_owned(),
+            thinking: String::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        });
+
+        // Strip leading '/' and decide: bare path vs command.
+        let stripped = input.trim_start_matches('/');
+        let script = if !stripped.contains(' ') && stripped.contains('/') {
+            // Bare path like /srv/model/status → cat it.
+            format!("cat {input}")
+        } else {
+            // Command like /ls /srv or /help → eval as-is.
+            stripped.to_owned()
+        };
+
+        let result = Self::poll_local(shell.eval(&script));
+        match result {
+            Ok(output) if !output.is_empty() => {
+                self.push_system_message(&output);
+            }
+            Ok(_) => {} // Empty output — nothing to display.
+            Err(e) => {
+                self.push_system_message(&format!("error: {e}"));
+            }
+        }
     }
 
     // ── Submit helpers ────────────────────────────────────────────────────────
@@ -998,29 +1204,12 @@ impl TerminalApp for ChatApp {
             // ── Input mode ──────────────────────────────────────────────────
             ChatMode::Input => match key {
                 KeyPress::Escape => {
-                    if let Some(prev) = self.last_esc {
-                        if prev.elapsed().as_millis() < DOUBLE_ESC_MS {
-                            self.quit = true;
-                            return true;
-                        }
-                    }
-                    self.last_esc = Some(Instant::now());
-                    self.status = Some("Press Esc again to close".to_owned());
-                    true
-                }
-                KeyPress::F(10) => {
-                    self.quit = true;
-                    true
+                    // No-op. Use Ctrl+Space → Q to close via compositor menu.
+                    false
                 }
                 KeyPress::Char(0x05) => {
                     self.editor_text = self.textarea.lines().join("\n");
                     self.mode = ChatMode::Editor;
-                    true
-                }
-                // 's' opens settings modal when textarea is empty.
-                KeyPress::Char(b's') if self.textarea.lines().iter().all(|l| l.is_empty()) => {
-                    self.settings_draft = self.gen_config.read().clone();
-                    self.mode = ChatMode::Settings { selected_field: 0 };
                     true
                 }
                 KeyPress::Enter => {
@@ -1031,7 +1220,21 @@ impl TerminalApp for ChatApp {
                     }
                     self.textarea = Self::make_textarea();
                     self.last_esc = None;
-                    self.submit_message(user_content);
+
+                    // VFS path routing: /path → cat from namespace.
+                    if user_content.starts_with('/') && !user_content.starts_with("//") {
+                        self.handle_vfs_command(&user_content);
+                        return true;
+                    }
+
+                    // Escape: // → / (send to model with leading slash).
+                    let content = if let Some(stripped) = user_content.strip_prefix("//") {
+                        format!("/{stripped}")
+                    } else {
+                        user_content
+                    };
+
+                    self.submit_message(content);
                     true
                 }
                 KeyPress::Backspace => {
@@ -1057,12 +1260,16 @@ impl TerminalApp for ChatApp {
                     self.textarea.move_cursor(ratatui_textarea::CursorMove::Forward);
                     true
                 }
-                KeyPress::ArrowUp => {
-                    self.scroll_offset = self.scroll_offset.saturating_add(1);
+                KeyPress::ArrowUp | KeyPress::ScrollUp => {
+                    self.scroll_offset = self.scroll_offset.saturating_add(
+                        if matches!(key, KeyPress::ScrollUp) { 3 } else { 1 },
+                    );
                     true
                 }
-                KeyPress::ArrowDown => {
-                    self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                KeyPress::ArrowDown | KeyPress::ScrollDown => {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(
+                        if matches!(key, KeyPress::ScrollDown) { 3 } else { 1 },
+                    );
                     true
                 }
                 _ => false,
@@ -1116,12 +1323,16 @@ impl TerminalApp for ChatApp {
                     self.textarea.move_cursor(ratatui_textarea::CursorMove::Forward);
                     true
                 }
-                KeyPress::ArrowUp => {
-                    self.scroll_offset = self.scroll_offset.saturating_add(1);
+                KeyPress::ArrowUp | KeyPress::ScrollUp => {
+                    self.scroll_offset = self.scroll_offset.saturating_add(
+                        if matches!(key, KeyPress::ScrollUp) { 3 } else { 1 },
+                    );
                     true
                 }
-                KeyPress::ArrowDown => {
-                    self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                KeyPress::ArrowDown | KeyPress::ScrollDown => {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(
+                        if matches!(key, KeyPress::ScrollDown) { 3 } else { 1 },
+                    );
                     true
                 }
                 _ => false,
@@ -1228,6 +1439,20 @@ impl TerminalApp for ChatApp {
         }
 
         let mut redraw = false;
+
+        // Process pending TclMount requests from /lang/tcl VFS mount.
+        if self.tcl_mount_rx.is_some() {
+            self.ensure_tcl_shell();
+            if let (Some(ref rx_arc), Some(ref mut shell)) =
+                (&self.tcl_mount_rx, &mut self.tcl_shell)
+            {
+                if let Ok(mut rx) = rx_arc.try_lock() {
+                    while let Ok(cmd) = rx.try_recv() {
+                        Self::poll_local(shell.process_command(cmd));
+                    }
+                }
+            }
+        }
 
         // Advance spinner while tool calls are in flight.
         if self.pending_tool_calls > 0 {

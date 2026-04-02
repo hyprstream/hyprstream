@@ -17,6 +17,8 @@ members = [
     "crates/waxterm",
     "crates/hyprstream-compositor",
     "crates/hyprstream-tui",
+    "crates/hyprstream-vfs",
+    "crates/hyprstream-tcl",
 ]
 # bitsandbytes-sys is standalone - only built when bnb feature is enabled
 exclude = ["crates/bitsandbytes-sys"]
@@ -196,6 +198,7 @@ proptest = "1.0"
 quickcheck = "1.0"
 quickcheck_macros = "1.0"
 criterion = "0.5.1"
+
 
 # NOTE: [patch.crates-io] section removed
 # tch backend selection is now handled via features in crates/hyprstream/Cargo.toml:

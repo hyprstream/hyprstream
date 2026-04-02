@@ -46,6 +46,8 @@ cargo test --workspace --release
 | `hyprstream-rpc-build` | CGR → JSON metadata extraction for macros |
 | `hyprstream-workers` | Kata-based worker isolation |
 | `hyprstream-containedfs` | Contained filesystem ops |
+| `hyprstream-vfs` | Plan 9-inspired VFS namespace multiplexer |
+| `hyprstream-tcl` | Tcl (molt) shell for VFS namespace |
 | `bitsandbytes-sys` | bitsandbytes FFI bindings |
 
 ## Key Source Layout (`crates/hyprstream/src/`)

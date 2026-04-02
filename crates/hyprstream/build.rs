@@ -65,7 +65,7 @@ fn compile_capnp_schemas() {
     let schemas = ["events", "inference", "registry", "policy", "model", "mcp", "notification", "tui", "compositor_ipc", "metrics"];
 
     // Schemas from hyprstream-rpc/schema/ (need TS codegen but live in the RPC crate)
-    let rpc_schemas = ["streaming"];
+    let rpc_schemas = ["streaming", "nine"];
 
     // Compile hyprstream schemas
     hyprstream_rpc_build::compile_schemas(schema_dir, out_path, import_paths, &schemas);

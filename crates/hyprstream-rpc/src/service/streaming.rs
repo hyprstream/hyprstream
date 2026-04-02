@@ -746,8 +746,11 @@ fn parse_stream_register(payload: &[u8]) -> Option<(String, i64)> {
     Some((topic, exp))
 }
 
-/// Parse a StreamResume message
-fn parse_stream_resume(msg: &[u8]) -> Option<(String, [u8; 32])> {
+/// Parse a StreamResume message.
+///
+/// Wire MACs are 16-byte truncated HMAC-SHA256 (matching `PendingMessage.mac`
+/// and `StreamBlock` MAC format).
+fn parse_stream_resume(msg: &[u8]) -> Option<(String, [u8; 16])> {
     use capnp::serialize;
 
     let reader = serialize::read_message(
@@ -759,10 +762,10 @@ fn parse_stream_resume(msg: &[u8]) -> Option<(String, [u8; 32])> {
     let topic = resume.get_topic().ok()?.to_str().ok()?.to_owned();
     let hmac_data = resume.get_resume_from_hmac().ok()?;
 
-    if hmac_data.len() != 32 {
+    if hmac_data.len() != 16 {
         return None;
     }
-    let mut hmac = [0u8; 32];
+    let mut hmac = [0u8; 16];
     hmac.copy_from_slice(hmac_data);
 
     Some((topic, hmac))
