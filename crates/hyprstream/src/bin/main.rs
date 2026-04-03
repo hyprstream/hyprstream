@@ -1742,17 +1742,17 @@ fn main() -> Result<()> {
 
                                 if quic_cfg.enabled {
                                     let qc = quic_cfg;
-                                    let (cert_der, key_der) = qc.load_tls_materials()
+                                    let (cert_chain, key_der) = qc.load_tls_materials()
                                         .context("Failed to load QUIC TLS materials")?;
 
-                                    // Print cert hash if requested
+                                    // Print cert hash if requested (hash of leaf cert)
                                     if print_cert_hash {
-                                        let hash = hyprstream_rpc::transport::zmtp_quic::cert_hash(&cert_der);
+                                        let hash = hyprstream_rpc::transport::zmtp_quic::cert_hash(&cert_chain[0]);
                                         println!("QUIC/WebTransport cert hash: {}", hash);
                                     }
 
                                     let shared = hyprstream_service::QuicSharedConfig {
-                                        cert_der,
+                                        cert_chain,
                                         key_der,
                                         base_ip: qc.socket_addr()?.ip(),
                                         server_name: qc.server_name.clone(),

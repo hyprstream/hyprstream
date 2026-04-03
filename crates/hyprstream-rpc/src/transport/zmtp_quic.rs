@@ -1358,16 +1358,18 @@ impl WebTransportServer {
     /// * `key_der` - DER-encoded private key
     pub fn bind(
         addr: SocketAddr,
-        cert_der: Vec<u8>,
+        cert_chain: Vec<Vec<u8>>,
         key_der: Vec<u8>,
     ) -> Result<Self> {
-        let tls = webtransport_tls_config(cert_der.clone(), key_der)?;
+        let tls = webtransport_tls_config(cert_chain.clone(), key_der)?;
         let quic_cfg = quinn::ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(tls)
                 .map_err(|e| anyhow!("QUIC server config failed: {}", e))?
         ));
         let endpoint = quinn::Endpoint::server(quic_cfg, addr)?;
 
+        // Store leaf cert for cert-hash endpoint
+        let cert_der = cert_chain.into_iter().next().unwrap_or_default();
         Ok(Self { endpoint, protected_resource_json: None, cert_der })
     }
 
@@ -1450,6 +1452,7 @@ impl WebTransportServer {
         let h3_conn = h3_quinn::Connection::new(quinn_conn);
         let mut h3_server: H3QuinnConnection = h3::server::builder()
             .enable_webtransport(true)
+            .max_webtransport_sessions(64)
             .enable_datagram(true)
             .enable_extended_connect(true)
             .build(h3_conn)
@@ -1794,17 +1797,22 @@ pub fn ensure_crypto_provider() {
 }
 
 /// Build TLS config for HTTP/3 + WebTransport (ALPN: h3).
+///
+/// Accepts a certificate chain (leaf first, then intermediates/CA).
+/// For self-signed certs, the chain is just `vec![leaf]`.
+/// For CA-signed certs (e.g. mkcert), include leaf + CA cert.
 fn webtransport_tls_config(
-    cert_der: Vec<u8>,
+    cert_chain: Vec<Vec<u8>>,
     key_der: Vec<u8>,
 ) -> Result<rustls::ServerConfig> {
     ensure_crypto_provider();
     let key = rustls::pki_types::PrivateKeyDer::from(
         rustls::pki_types::PrivatePkcs8KeyDer::from(key_der)
     );
+    let certs = cert_chain.into_iter().map(Into::into).collect();
     let mut cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(vec![cert_der.into()], key)?;
+        .with_single_cert(certs, key)?;
     cfg.alpn_protocols = vec![b"h3".to_vec()];
     Ok(cfg)
 }

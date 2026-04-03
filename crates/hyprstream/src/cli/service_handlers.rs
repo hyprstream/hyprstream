@@ -1067,10 +1067,10 @@ fn remove_if_exists(path: &Path) -> Result<()> {
 /// the base64-encoded SHA-256 hash, suitable for use in the browser's
 /// `serverCertificateHashes` WebTransport option.
 pub fn handle_print_cert_hash(quic_config: &crate::config::QuicConfig) -> Result<()> {
-    let (cert_der, _key_der) = quic_config.load_tls_materials()
+    let (cert_chain, _key_der) = quic_config.load_tls_materials()
         .context("Failed to load/generate QUIC TLS certificate")?;
 
-    let hash = hyprstream_rpc::transport::zmtp_quic::cert_hash(&cert_der);
+    let hash = hyprstream_rpc::transport::zmtp_quic::cert_hash(&cert_chain[0]);
     println!("{}", hash);
     Ok(())
 }

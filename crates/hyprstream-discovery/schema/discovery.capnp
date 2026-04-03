@@ -43,6 +43,9 @@ struct DiscoveryRequest {
 
     # Removed: listStreams
     listStreams @8 :Void;
+
+    # Announce a service endpoint (used by services after QUIC binding)
+    announce @9 :ServiceAnnouncement $mcpScope(write) $mcpDescription("Announce a service endpoint for discovery");
   }
 }
 
@@ -80,6 +83,9 @@ struct DiscoveryResponse {
 
     # Removed: listStreamsResult
     listStreamsResult @9 :Void;
+
+    # Acknowledge endpoint announcement
+    announceResult @10 :Void;
   }
 }
 
@@ -142,3 +148,12 @@ struct AuthMetadataList {
   services @0 :List(AuthMetadata);
 }
 
+# Service endpoint announcement (sent by services after QUIC binding)
+struct ServiceAnnouncement {
+  # Service name (e.g. "registry", "policy", "model")
+  serviceName @0 :Text;
+  # Socket kind (e.g. "quic", "rep")
+  socketKind @1 :Text;
+  # Endpoint string (e.g. "quic://localhost:0.0.0.0:4433")
+  endpoint @2 :Text;
+}

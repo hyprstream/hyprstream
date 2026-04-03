@@ -6215,6 +6215,7 @@ dependencies = [
  "dirs 5.0.1",
  "ed25519-dalek",
  "futures",
+ "hyprstream-discovery",
  "hyprstream-rpc",
  "inventory",
  "nix 0.27.1",

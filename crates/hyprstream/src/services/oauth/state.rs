@@ -10,7 +10,7 @@ use tokio::sync::RwLock;
 
 use crate::auth::user_store::UserStore;
 use crate::config::OAuthConfig;
-use crate::services::PolicyClient;
+use crate::services::{DiscoveryClient, PolicyClient};
 
 /// Extract RSA public key components (n, e) from PKCS#8 DER and build a JWK.
 ///
@@ -223,6 +223,8 @@ pub struct OAuthState {
     pub refresh_tokens: RwLock<HashMap<String, RefreshTokenEntry>>,
     /// PolicyClient for JWT token issuance via ZMQ
     pub policy_client: PolicyClient,
+    /// DiscoveryClient for resolving service QUIC endpoints via ZMQ
+    pub discovery_client: DiscoveryClient,
     /// Issuer URL (e.g., "http://localhost:6791")
     pub issuer_url: String,
     /// Default scopes for new clients
@@ -259,7 +261,7 @@ pub struct OAuthState {
 }
 
 impl OAuthState {
-    pub fn new(config: &OAuthConfig, policy_client: PolicyClient, verifying_key_bytes: [u8; 32]) -> Self {
+    pub fn new(config: &OAuthConfig, policy_client: PolicyClient, discovery_client: DiscoveryClient, verifying_key_bytes: [u8; 32]) -> Self {
         Self {
             clients: RwLock::new(HashMap::new()),
             pending_codes: RwLock::new(HashMap::new()),
@@ -268,6 +270,7 @@ impl OAuthState {
             device_code_by_user_code: RwLock::new(HashMap::new()),
             refresh_tokens: RwLock::new(HashMap::new()),
             policy_client,
+            discovery_client,
             issuer_url: config.issuer_url(),
             default_scopes: config.default_scopes.clone(),
             token_ttl: config.token_ttl_seconds,

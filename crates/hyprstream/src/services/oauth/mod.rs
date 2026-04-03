@@ -141,10 +141,42 @@ async fn handle_logout(
 }
 
 /// RFC 9728 Protected Resource Metadata for the OAuth server itself.
-async fn oauth_self_protected_resource_metadata() -> axum::Json<ProtectedResourceMetadata> {
+///
+/// Returns the DiscoveryService QUIC endpoint as the `resource` URL so that
+/// browsers can bootstrap a WebTransport connection via DiscoveryService,
+/// then resolve all other service endpoints from there.
+///
+/// Queries the DiscoveryService via ZMQ IPC to get its QUIC endpoint address,
+/// since each service runs in a separate process and the in-process registry
+/// only contains endpoints registered by that process.
+async fn oauth_self_protected_resource_metadata(
+    State(state): State<Arc<OAuthState>>,
+) -> axum::Json<ProtectedResourceMetadata> {
     let config = crate::config::HyprConfig::load().unwrap_or_default();
     let issuer_url = config.oauth.issuer_url();
-    let mut meta = protected_resource_metadata(&issuer_url, &issuer_url);
+
+    // Query the DiscoveryService (via ZMQ IPC) for its own QUIC endpoint.
+    let discovery_url = match state.discovery_client.get_endpoints("discovery").await {
+        Ok(service_endpoints) => service_endpoints
+            .endpoints
+            .iter()
+            .find(|ep| ep.socket_kind == "quic")
+            .and_then(|ep| {
+                // Parse "quic://server_name:bind_ip:port" into "https://server_name:port"
+                let stripped = ep.endpoint.strip_prefix("quic://")?;
+                let parts: Vec<&str> = stripped.splitn(3, ':').collect();
+                if parts.len() >= 3 {
+                    Some(format!("https://{}:{}", parts[0], parts[2]))
+                } else {
+                    None
+                }
+            }),
+        Err(_) => None,
+    };
+
+    let resource = discovery_url.unwrap_or_else(|| issuer_url.clone());
+
+    let mut meta = protected_resource_metadata(&resource, &issuer_url);
     meta.resource_name = Some("HyprStream OAuth 2.1 Authorization Server".to_owned());
     meta.scopes_supported = Some(vec![
         "openid".into(),
@@ -152,6 +184,12 @@ async fn oauth_self_protected_resource_metadata() -> axum::Json<ProtectedResourc
         "write:*:*".into(),
         "infer:model:*".into(),
     ]);
+
+    // Include the QUIC TLS cert hash so browsers can pin the self-signed certificate.
+    if let Ok((cert_chain, _)) = config.quic.load_tls_materials() {
+        meta.x_cert_hash = Some(hyprstream_rpc::transport::zmtp_quic::cert_hash(&cert_chain[0]));
+    }
+
     axum::Json(meta)
 }
 
@@ -237,10 +275,14 @@ impl Spawnable for OAuthService {
 
             let scheme = if rustls_config.is_some() { "https" } else { "http" };
 
-            // Create PolicyClient HERE, inside the OAuth runtime, so that ZMQ
+            // Create RPC clients HERE, inside the OAuth runtime, so that ZMQ
             // async I/O (TMQ) registers socket FDs with THIS runtime's epoll.
-            // Creating it in the factory (main runtime) would cause hangs.
+            // Creating them in the factory (main runtime) would cause hangs.
             let policy_client = PolicyClient::new(
+                self.signing_key.clone(),
+                hyprstream_rpc::RequestIdentity::anonymous(),
+            );
+            let discovery_client = crate::services::DiscoveryClient::new(
                 self.signing_key.clone(),
                 hyprstream_rpc::RequestIdentity::anonymous(),
             );
@@ -275,6 +317,7 @@ impl Spawnable for OAuthService {
             let mut oauth_state = OAuthState::new(
                 &self.config,
                 policy_client,
+                discovery_client,
                 self.verifying_key.to_bytes(),
             );
             if let Some(store) = user_store {
@@ -319,6 +362,9 @@ pub struct ProtectedResourceMetadata {
     pub resource_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_documentation: Option<String>,
+    /// Base64 SHA-256 hash of the TLS certificate for WebTransport cert pinning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_cert_hash: Option<String>,
 }
 
 /// Create a Protected Resource Metadata response (RFC 9728).
@@ -332,6 +378,7 @@ pub fn protected_resource_metadata(resource_url: &str, oauth_issuer_url: &str) -
         scopes_supported: None,
         resource_name: None,
         resource_documentation: None,
+        x_cert_hash: None,
     }
 }
 

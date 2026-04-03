@@ -347,7 +347,13 @@ impl QuicConfig {
     ///
     /// QUIC uses a separate cert (`quic-cert`) from the HTTP cert (`tls-cert`) because
     /// WebTransport requires ≤14-day validity while HTTP allows 365 days.
-    pub fn load_tls_materials(&self) -> anyhow::Result<(Vec<u8>, Zeroizing<Vec<u8>>)> {
+    /// Load TLS materials for QUIC/WebTransport.
+    ///
+    /// Returns a certificate **chain** (leaf first, then intermediates/CA) and the
+    /// private key. When loading from PEM files, all certificates in the file are
+    /// included — this allows CA-signed certs (e.g. mkcert) to work by bundling
+    /// the leaf + CA cert in a single PEM file.
+    pub fn load_tls_materials(&self) -> anyhow::Result<(Vec<Vec<u8>>, Zeroizing<Vec<u8>>)> {
         if self.use_self_signed() {
             let secrets_dir = HyprConfig::resolve_secrets_dir();
             // Use quic-specific secret names so QUIC and HTTP certs have different
@@ -359,7 +365,8 @@ impl QuicConfig {
                 "quic-key",
                 "quic-cert",
             )?;
-            Ok((materials.cert_der, materials.key_der))
+            // Self-signed: chain is just the leaf cert
+            Ok((vec![materials.cert_der], materials.key_der))
         } else {
             // Load from files
             let cert_pem = std::fs::read(&self.cert_path)
@@ -367,12 +374,16 @@ impl QuicConfig {
             let key_pem = std::fs::read(&self.key_path)
                 .map_err(|e| anyhow::anyhow!("failed to read key_path '{}': {}", self.key_path, e))?;
 
-            // Parse PEM to DER
-            let cert_der = rustls_pemfile::certs(&mut &cert_pem[..])
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("no certificate found in {}", self.cert_path))?
+            // Parse ALL certs from PEM (leaf + intermediates + CA)
+            let cert_chain: Vec<Vec<u8>> = rustls_pemfile::certs(&mut &cert_pem[..])
+                .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| anyhow::anyhow!("invalid certificate PEM: {}", e))?
-                .to_vec();
+                .into_iter()
+                .map(|c| c.to_vec())
+                .collect();
+            if cert_chain.is_empty() {
+                return Err(anyhow::anyhow!("no certificate found in {}", self.cert_path));
+            }
 
             let key_der = Zeroizing::new(
                 rustls_pemfile::private_key(&mut &key_pem[..])
@@ -382,7 +393,7 @@ impl QuicConfig {
                     .to_vec(),
             );
 
-            Ok((cert_der, key_der))
+            Ok((cert_chain, key_der))
         }
     }
 
@@ -396,7 +407,7 @@ impl QuicConfig {
         oauth_issuer_url: Option<&str>,
     ) -> anyhow::Result<hyprstream_rpc::service::QuicLoopConfig> {
         let addr = self.socket_addr()?;
-        let (cert_der, key_der) = self.load_tls_materials()?;
+        let (cert_chain, key_der) = self.load_tls_materials()?;
         let meta_json = oauth_issuer_url.map(|issuer| {
             let meta = crate::services::oauth::protected_resource_metadata(
                 &format!("https://{}/{}", self.server_name, service_name),
@@ -405,11 +416,12 @@ impl QuicConfig {
             serde_json::to_vec(&meta).unwrap_or_default()
         });
         Ok(hyprstream_rpc::service::QuicLoopConfig {
-            cert_der,
+            cert_chain,
             key_der,
             bind_addr: addr,
             server_name: self.server_name.clone(),
             protected_resource_json: meta_json,
+            on_quic_bound: None,
         })
     }
 }

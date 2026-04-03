@@ -536,10 +536,9 @@ pub struct RequestLoop {
 }
 
 /// QUIC server configuration for `RequestLoop`.
-#[derive(Clone)]
 pub struct QuicLoopConfig {
-    /// DER-encoded certificate
-    pub cert_der: Vec<u8>,
+    /// DER-encoded certificate chain (leaf first, then intermediates/CA)
+    pub cert_chain: Vec<Vec<u8>>,
     /// DER-encoded private key — zeroed on drop.
     pub key_der: Zeroizing<Vec<u8>>,
     /// Address to bind the WebTransport server
@@ -548,6 +547,9 @@ pub struct QuicLoopConfig {
     pub server_name: String,
     /// Pre-serialized RFC 9728 JSON for HTTP/3 `.well-known/oauth-protected-resource`
     pub protected_resource_json: Option<Vec<u8>>,
+    /// Callback invoked after QUIC binding succeeds, with (service_name, actual_addr, server_name).
+    /// Used to announce endpoints to the DiscoveryService.
+    pub on_quic_bound: Option<Box<dyn FnOnce(String, std::net::SocketAddr, String) + Send>>,
 }
 
 impl RequestLoop {
@@ -632,7 +634,7 @@ impl RequestLoop {
         server_pubkey: VerifyingKey,
         signing_key: SigningKey,
         nonce_cache: Arc<InMemoryNonceCache>,
-        quic_config: Option<QuicLoopConfig>,
+        mut quic_config: Option<QuicLoopConfig>,
         shutdown: Arc<Notify>,
         ready_tx: Option<tokio::sync::oneshot::Sender<Result<()>>>,
     ) -> Result<()> {
@@ -680,10 +682,10 @@ impl RequestLoop {
         };
 
         // Optionally create WebTransport server
-        let wt_server = if let Some(ref qc) = quic_config {
+        let wt_server = if let Some(ref mut qc) = quic_config {
             match crate::transport::zmtp_quic::WebTransportServer::bind(
                 qc.bind_addr,
-                qc.cert_der.clone(),
+                qc.cert_chain.clone(),
                 (*qc.key_der).clone(),
             ) {
                 Ok(mut wts) => {
@@ -691,7 +693,8 @@ impl RequestLoop {
                         wts = wts.with_protected_resource_metadata(meta.clone());
                     }
                     let actual_addr = wts.local_addr().unwrap_or(qc.bind_addr);
-                    let cert_hash = crate::transport::zmtp_quic::cert_hash(&qc.cert_der);
+                    // Cert hash is computed from the leaf cert (first in chain)
+                    let cert_hash = crate::transport::zmtp_quic::cert_hash(&qc.cert_chain[0]);
                     info!(
                         "{} QUIC/WebTransport bound to {} (cert hash: {})",
                         service.name(),
@@ -706,6 +709,10 @@ impl RequestLoop {
                             crate::transport::TransportConfig::quic(actual_addr, &qc.server_name),
                             None,
                         );
+                    }
+                    // Announce to DiscoveryService (cross-process)
+                    if let Some(cb) = qc.on_quic_bound.take() {
+                        cb(service.name().to_owned(), actual_addr, qc.server_name.clone());
                     }
                     Some(wts)
                 }

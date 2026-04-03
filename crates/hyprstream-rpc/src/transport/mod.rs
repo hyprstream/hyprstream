@@ -298,6 +298,18 @@ impl TransportConfig {
         self.zmq_endpoint()
     }
 
+    /// Get the WebTransport URL for QUIC endpoints.
+    ///
+    /// Returns `https://{server_name}:{port}` for QUIC endpoints, `None` otherwise.
+    pub fn quic_webtransport_url(&self) -> Option<String> {
+        match &self.endpoint {
+            EndpointType::Quic { addr, server_name } => {
+                Some(format!("https://{}:{}", server_name, addr.port()))
+            }
+            _ => None,
+        }
+    }
+
     /// Apply CurveZMQ configuration to a socket (client or server).
     ///
     /// This method configures CurveZMQ encryption and authentication on the given socket.

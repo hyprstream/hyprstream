@@ -41,8 +41,8 @@ use hyprstream_rpc::transport::TransportConfig;
 /// Each service gets its own port via `for_service()`.
 #[derive(Clone)]
 pub struct QuicSharedConfig {
-    /// DER-encoded TLS certificate
-    pub cert_der: Vec<u8>,
+    /// DER-encoded TLS certificate chain (leaf first, then intermediates/CA)
+    pub cert_chain: Vec<Vec<u8>>,
     /// DER-encoded TLS private key — zeroed on drop.
     pub key_der: Zeroizing<Vec<u8>>,
     /// Base IP address for binding (e.g., 0.0.0.0)
@@ -67,12 +67,58 @@ impl QuicSharedConfig {
             }).to_string().into_bytes()
         });
         hyprstream_rpc::service::QuicLoopConfig {
-            cert_der: self.cert_der.clone(),
+            cert_chain: self.cert_chain.clone(),
             key_der: Zeroizing::new((*self.key_der).clone()),
             bind_addr,
             server_name: self.server_name.clone(),
             protected_resource_json: metadata,
+            on_quic_bound: None,
         }
+    }
+
+    /// Build a per-service `QuicLoopConfig` with an announce callback.
+    ///
+    /// After binding, the callback announces the QUIC endpoint to the DiscoveryService.
+    pub fn for_service_with_announce(
+        &self,
+        service_name: &str,
+        port: u16,
+        signing_key: hyprstream_rpc::prelude::SigningKey,
+    ) -> hyprstream_rpc::service::QuicLoopConfig {
+        let mut config = self.for_service(service_name, port);
+        let _server_name = self.server_name.clone();
+        config.on_quic_bound = Some(Box::new(move |svc_name, addr, sn| {
+            let endpoint = format!("quic://{}:{}:{}", sn, addr.ip(), addr.port());
+            let sk = signing_key;
+            // Spawn async announce in a new thread since we may not be in a tokio context
+            std::thread::spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        tracing::warn!("Failed to create announce runtime: {}", e);
+                        return;
+                    }
+                };
+                rt.block_on(async {
+                    let client = hyprstream_discovery::DiscoveryClient::new(
+                        sk,
+                        hyprstream_rpc::RequestIdentity::anonymous(),
+                    );
+                    match client.announce(&hyprstream_discovery::ServiceAnnouncement {
+                        service_name: svc_name,
+                        socket_kind: "quic".to_owned(),
+                        endpoint,
+                    }).await {
+                        Ok(_) => tracing::info!("Announced QUIC endpoint to DiscoveryService"),
+                        Err(e) => tracing::warn!("Failed to announce QUIC endpoint: {}", e),
+                    }
+                });
+            });
+        }));
+        config
     }
 }
 
@@ -261,9 +307,18 @@ impl ServiceContext {
     ) -> Box<dyn Spawnable> {
         let quic = match &self.quic_shared {
             Some(shared) => {
-                // Default to ephemeral (0) when no explicit port is configured
                 let port = quic_port.unwrap_or(0);
-                Some(shared.for_service(service.name(), port))
+                // Use announce callback for all services except discovery itself
+                // (discovery can't announce to itself)
+                if service.name() == "discovery" {
+                    Some(shared.for_service(service.name(), port))
+                } else {
+                    Some(shared.for_service_with_announce(
+                        service.name(),
+                        port,
+                        self.signing_key().clone(),
+                    ))
+                }
             }
             None => None,
         };

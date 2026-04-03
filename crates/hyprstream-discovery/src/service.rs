@@ -13,14 +13,16 @@ use hyprstream_rpc::SigningKey;
 use crate::generated::discovery_client::{
     DiscoveryHandler, DiscoveryResponseVariant,
     ErrorInfo, ServiceList, ServiceSummary, ServiceEndpoints, EndpointInfo,
-    PingInfo, AuthMetadata, AuthMetadataList,
+    PingInfo, AuthMetadata, AuthMetadataList, ServiceAnnouncement,
     dispatch_discovery, serialize_response,
 };
 
 use anyhow::Result;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::trace;
+use parking_lot::RwLock;
+use tracing::{trace, info};
 
 // ============================================================================
 // AuthorizationProvider trait (D5)
@@ -58,6 +60,9 @@ pub struct DiscoveryService {
     expected_audience: Option<String>,
     /// Authorization provider (None = no authorization)
     auth_provider: Option<Box<dyn AuthorizationProvider>>,
+    /// Endpoints announced by other services (cross-process).
+    /// Maps service_name → Vec<(socket_kind, endpoint)>.
+    announced_endpoints: RwLock<HashMap<String, Vec<(String, String)>>>,
     // Infrastructure (for Spawnable)
     context: Arc<zmq::Context>,
     transport: TransportConfig,
@@ -76,6 +81,7 @@ impl DiscoveryService {
             oauth_issuer_url: None,
             expected_audience: None,
             auth_provider: None,
+            announced_endpoints: RwLock::new(HashMap::new()),
             context,
             transport,
         }
@@ -181,9 +187,10 @@ impl DiscoveryHandler for DiscoveryService {
     ) -> Result<DiscoveryResponseVariant> {
         trace!("Discovery: listing services");
 
+        // Process-local registry
         let reg = self.reg()?;
         let service_names = reg.list_services();
-        let summaries: Vec<ServiceSummary> = service_names
+        let mut summaries: Vec<ServiceSummary> = service_names
             .iter()
             .filter_map(|name| {
                 reg.service_entry(name).map(|entry| {
@@ -203,6 +210,30 @@ impl DiscoveryHandler for DiscoveryService {
             .collect();
         drop(reg);
 
+        // Merge announced endpoints from other processes
+        let announced = self.announced_endpoints.read();
+        let local_names: Vec<String> = summaries.iter().map(|s| s.name.clone()).collect();
+        for (name, endpoints) in announced.iter() {
+            if local_names.iter().any(|n| n == name) {
+                // Service exists locally — add announced socket kinds
+                if let Some(summary) = summaries.iter_mut().find(|s| s.name == *name) {
+                    for (kind, _) in endpoints {
+                        if !summary.socket_kinds.contains(kind) {
+                            summary.socket_kinds.push(kind.clone());
+                        }
+                    }
+                }
+            } else {
+                // Service only known from announcements
+                summaries.push(ServiceSummary {
+                    name: name.clone(),
+                    description: String::new(),
+                    socket_kinds: endpoints.iter().map(|(k, _)| k.clone()).collect(),
+                    has_schema: false,
+                });
+            }
+        }
+
         Ok(DiscoveryResponseVariant::ListServicesResult(ServiceList {
             services: summaries,
         }))
@@ -217,28 +248,46 @@ impl DiscoveryHandler for DiscoveryService {
         let service_name = data;
         trace!("Discovery: getting endpoints for '{}'", service_name);
 
+        // Process-local registry
         let reg = self.reg()?;
         let endpoints_map = reg.service_endpoints(service_name);
         drop(reg);
 
-        match endpoints_map {
-            Some(map) => {
-                let endpoints: Vec<EndpointInfo> = map
-                    .iter()
-                    .map(|(kind, transport)| EndpointInfo {
-                        socket_kind: socket_kind_to_string(*kind).to_owned(),
-                        endpoint: transport.to_zmq_string(),
-                    })
-                    .collect();
-                Ok(DiscoveryResponseVariant::GetEndpointsResult(
-                    ServiceEndpoints { endpoints },
-                ))
+        let mut endpoints: Vec<EndpointInfo> = match endpoints_map {
+            Some(map) => map
+                .iter()
+                .map(|(kind, transport)| EndpointInfo {
+                    socket_kind: socket_kind_to_string(*kind).to_owned(),
+                    endpoint: transport.to_zmq_string(),
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+
+        // Merge announced endpoints from other processes
+        let announced = self.announced_endpoints.read();
+        if let Some(announced_eps) = announced.get(service_name) {
+            for (kind, ep) in announced_eps {
+                // Don't duplicate if already present from local registry
+                if !endpoints.iter().any(|e| e.socket_kind == *kind) {
+                    endpoints.push(EndpointInfo {
+                        socket_kind: kind.clone(),
+                        endpoint: ep.clone(),
+                    });
+                }
             }
-            None => Ok(DiscoveryResponseVariant::Error(ErrorInfo {
+        }
+
+        if endpoints.is_empty() {
+            Ok(DiscoveryResponseVariant::Error(ErrorInfo {
                 message: format!("Service '{}' not found", service_name),
                 code: "NOT_FOUND".to_owned(),
                 details: String::new(),
-            })),
+            }))
+        } else {
+            Ok(DiscoveryResponseVariant::GetEndpointsResult(
+                ServiceEndpoints { endpoints },
+            ))
         }
     }
 
@@ -364,6 +413,33 @@ impl DiscoveryHandler for DiscoveryService {
             code: "REMOVED".to_owned(),
             details: String::new(),
         }))
+    }
+
+    async fn handle_announce(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &ServiceAnnouncement,
+    ) -> Result<DiscoveryResponseVariant> {
+        info!(
+            "Discovery: service '{}' announced {} endpoint: {} (from {})",
+            data.service_name, data.socket_kind, data.endpoint, ctx.subject()
+        );
+
+        let svc_name = data.service_name.clone();
+        let sock_kind = data.socket_kind.clone();
+        let endpoint = data.endpoint.clone();
+
+        let mut endpoints = self.announced_endpoints.write();
+        let entry = endpoints.entry(svc_name).or_default();
+        // Replace existing endpoint for the same socket kind, or add new
+        if let Some(existing) = entry.iter_mut().find(|(k, _)| *k == sock_kind) {
+            existing.1 = endpoint;
+        } else {
+            entry.push((sock_kind, endpoint));
+        }
+
+        Ok(DiscoveryResponseVariant::AnnounceResult)
     }
 }
 
