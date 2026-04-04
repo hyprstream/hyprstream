@@ -845,19 +845,26 @@ impl ServerHandler for McpService {
 #[async_trait::async_trait(?Send)]
 impl McpHandler for McpService {
     async fn authorize(&self, ctx: &crate::services::EnvelopeContext, resource: &str, operation: &str) -> anyhow::Result<()> {
-        // All callers are authorized via Casbin: system (node key) gets full access,
-        // external callers via JWT-derived subjects.
         let subject = ctx.subject().to_string();
-        let allowed = self.policy_client.check(&PolicyCheck { subject: subject.clone(), domain: "*".to_owned(), resource: resource.to_owned(), operation: operation.to_owned() })
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!("MCP policy check failed for {}: {}", subject, e);
-                false
-            });
-        if allowed {
-            Ok(())
-        } else {
-            anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource)
+        let result = self.policy_client.check(&PolicyCheck {
+            subject: subject.clone(),
+            domain: "*".to_owned(),
+            resource: resource.to_owned(),
+            operation: operation.to_owned(),
+        }).await;
+        match result {
+            Ok(allowed) => {
+                if allowed {
+                    Ok(())
+                } else {
+                    tracing::info!("MCP policy denied: sub={} obj={} act={}", subject, resource, operation);
+                    anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource)
+                }
+            }
+            Err(e) => {
+                tracing::warn!("MCP policy check RPC error: sub={} obj={} act={} err={}", subject, resource, operation, e);
+                anyhow::bail!("Unauthorized: {} cannot {} on {} (policy check error: {})", subject, operation, resource, e)
+            }
         }
     }
 
