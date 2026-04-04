@@ -525,7 +525,7 @@ fn emit_scoped_response_parse(
             for nv in &nc.inner_response_variants {
                 let nv_field = nrs.fields.iter().find(|f| f.name == nv.name && f.discriminant_value != 0xFFFF);
                 let nv_disc = nv_field.map(|f| f.discriminant_value).unwrap_or(0);
-                let nv_data = emit_inner_variant_read(nv_field, &nv.type_name, schema);
+                let nv_data = emit_inner_variant_read_from("_nested", nv_field, &nv.type_name, schema, 0);
                 out.push_str(&format!(
                     "            case {nv_disc}: // {}\n",
                     nv.name
@@ -568,7 +568,7 @@ fn emit_scoped_response_parse(
                     for nnv in &nnc.inner_response_variants {
                         let nnv_field = nns.fields.iter().find(|f| f.name == nnv.name && f.discriminant_value != 0xFFFF);
                         let nnv_disc = nnv_field.map(|f| f.discriminant_value).unwrap_or(0);
-                        let nnv_data = emit_inner_variant_read(nnv_field, &nnv.type_name, schema);
+                        let nnv_data = emit_inner_variant_read_from("_deep", nnv_field, &nnv.type_name, schema, 0);
                         out.push_str(&format!(
                             "                case {nnv_disc}: // {}\n",
                             nnv.name
