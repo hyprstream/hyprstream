@@ -155,12 +155,17 @@ export class CapnpArena {
     if (this.allocOffset + needed <= this.capacity) return;
     const newCap = Math.max(this.capacity * 2, this.allocOffset + needed + 256);
     if (this._wasmPtr !== 0) {
-      // WASM-backed: alloc new WASM buffer, copy, dealloc old
+      // WASM-backed: alloc new buffer, copy from old, dealloc old.
+      // wasm.alloc() may trigger memory.grow(), detaching all existing views.
+      // Re-read old data from wasm.memory.buffer using the old pointer.
       const wasm = getHyprstreamWasm();
+      const oldPtr = this._wasmPtr;
+      const oldLen = this.allocOffset;
       const newPtr = wasm.alloc(newCap);
+      const oldData = new Uint8Array(wasm.memory.buffer, oldPtr, oldLen);
       const newRaw = new Uint8Array(wasm.memory.buffer, newPtr, newCap);
-      newRaw.set(this.raw.subarray(0, this.allocOffset));
-      wasm.dealloc(this._wasmPtr, this._wasmCapacity);
+      newRaw.set(oldData);
+      wasm.dealloc(oldPtr, this._wasmCapacity);
       this._wasmPtr = newPtr;
       this._wasmCapacity = newCap;
       this.raw = newRaw;
