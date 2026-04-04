@@ -3,7 +3,6 @@
 //! This service wraps git2db and provides a ZMQ REQ/REP interface for
 //! repository operations. It uses Cap'n Proto for serialization.
 
-use crate::auth::Operation;
 use crate::services::PolicyClient;
 use crate::services::types::{MAX_FDS_GLOBAL, MAX_FDS_PER_CLIENT};
 use hyprstream_containedfs::{ContainedFs, FsError, FsHandle};
@@ -558,16 +557,7 @@ impl RegistryService {
         }
     }
 
-    /// Check if a request is authorized (returns bool for generated handler methods).
-    async fn is_authorized(&self, ctx: &EnvelopeContext, resource: &str, operation: Operation) -> bool {
-        let subject = ctx.subject();
-        self.policy_client.check(&PolicyCheck { subject: subject.to_string(), domain: "*".to_owned(), resource: resource.to_owned(), operation: operation.as_str().to_owned() })
-            .await
-            .unwrap_or_else(|e| {
-                warn!("Policy check failed for {} on {}: {} - denying access", subject, resource, e);
-                false
-            })
-    }
+
 
     /// Parse a RepoId from string
     fn parse_repo_id(id_str: &str) -> Result<RepoId> {
@@ -1369,11 +1359,22 @@ fn reg_error(msg: &str) -> RegistryResponseVariant {
 #[async_trait::async_trait(?Send)]
 impl RegistryHandler for RegistryService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
-        let op = operation.parse::<Operation>()?;
-        if self.is_authorized(ctx, resource, op).await {
+        // Pass the operation string as-is to the policy check rather than
+        // round-tripping through Operation enum (which maps "query" → "query.status").
+        let subject = ctx.subject();
+        let allowed = self.policy_client.check(&PolicyCheck {
+            subject: subject.to_string(),
+            domain: "*".to_owned(),
+            resource: resource.to_owned(),
+            operation: operation.to_owned(),
+        }).await.unwrap_or_else(|e| {
+            warn!("Policy check RPC error: sub={} obj={} act={} err={} - denying access", subject, resource, operation, e);
+            false
+        });
+        if allowed {
             Ok(())
         } else {
-            anyhow::bail!("Unauthorized: {} cannot {} on {}", ctx.subject(), operation, resource)
+            anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource)
         }
     }
 
