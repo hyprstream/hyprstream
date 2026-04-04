@@ -1560,7 +1560,7 @@ impl WebTransportServer {
                         if let Err(e) = Self::handle_wt_stream(
                             stream, service, server_pubkey, signing_key, nonce_cache,
                         ).await {
-                            debug!("WebTransport stream error: {}", e);
+                            warn!("WebTransport stream error: {}", e);
                         }
                     });
                 }
