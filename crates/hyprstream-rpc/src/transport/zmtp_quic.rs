@@ -1741,13 +1741,27 @@ impl WebTransportServer {
                     }
                 };
 
-                // Drain remaining frames (MAC etc)
+                // Read MAC frame if present (frame 3 of multipart)
+                let mac = if sub_socket.get_rcvmore().unwrap_or(false) {
+                    sub_socket.recv_bytes(0).ok()
+                } else {
+                    None
+                };
+
+                // Drain any remaining frames
                 while sub_socket.get_rcvmore().unwrap_or(false) {
                     let _ = sub_socket.recv_bytes(0);
                 }
 
+                // Concatenate capnp block + MAC for the WebTransport client
+                // Wire format: [capnp_bytes][mac_bytes] (client splits at len - 32)
+                let mut payload = capnp_block;
+                if let Some(mac_bytes) = mac {
+                    payload.extend_from_slice(&mac_bytes);
+                }
+
                 // Send to async side; if channel full or closed, stop
-                if block_tx.blocking_send(capnp_block).is_err() {
+                if block_tx.blocking_send(payload).is_err() {
                     break;
                 }
             }
