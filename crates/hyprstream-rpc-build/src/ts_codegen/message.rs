@@ -821,7 +821,7 @@ export class CapnpReader {
     return new StructReader(this.raw, this.buf, targetOffset, dataWords, ptrWords);
   }
 
-  /** Read a List(Text) pointer. */
+  /** Read a List(Text) pointer (supports both pointer-list and composite encodings). */
   getTextList(ptrIndex: number): string[] {
     const ptrOffset = this.rootPtrOffset + ptrIndex * WORD_SIZE;
     const lo = this.buf.getUint32(ptrOffset, true);
@@ -836,9 +836,27 @@ export class CapnpReader {
     const elementSize = hi & 7;
     const targetOffset = ptrOffset + WORD_SIZE + offsetWords * WORD_SIZE;
 
-    if (elementSize !== 7) return []; // not composite
+    if (elementSize === 6) {
+      // Pointer list: each element is a pointer to a text blob
+      const elementCount = hi >>> 3;
+      const results: string[] = [];
+      for (let i = 0; i < elementCount; i++) {
+        const elemOffset = targetOffset + i * WORD_SIZE;
+        const elemLo = this.buf.getUint32(elemOffset, true);
+        const elemHi = this.buf.getUint32(elemOffset + 4, true);
+        if (elemLo === 0 && elemHi === 0) { results.push(''); continue; }
+        const elemOffsetWords = (elemLo >> 2) | 0;
+        const byteCount = elemHi >>> 3;
+        const textOffset = elemOffset + WORD_SIZE + elemOffsetWords * WORD_SIZE;
+        const strLen = byteCount > 0 ? byteCount - 1 : 0;
+        results.push(decoder.decode(this.raw.subarray(textOffset, textOffset + strLen)));
+      }
+      return results;
+    }
 
-    // Read tag word
+    if (elementSize !== 7) return []; // unsupported element size
+
+    // Composite list: tag word + elements
     const tagLo = this.buf.getUint32(targetOffset, true);
     const elementCount = (tagLo >> 2) | 0;
 
@@ -1054,7 +1072,26 @@ export class StructReader {
     const elementSize = hi & 7;
     const targetOffset = ptrOffset + WORD_SIZE + offsetWords * WORD_SIZE;
 
+    if (elementSize === 6) {
+      // Pointer list: each element is a pointer to a text blob
+      const elementCount = hi >>> 3;
+      const results: string[] = [];
+      for (let i = 0; i < elementCount; i++) {
+        const elemOffset = targetOffset + i * WORD_SIZE;
+        const elemLo = this.buf.getUint32(elemOffset, true);
+        const elemHi = this.buf.getUint32(elemOffset + 4, true);
+        if (elemLo === 0 && elemHi === 0) { results.push(''); continue; }
+        const elemOffsetWords = (elemLo >> 2) | 0;
+        const byteCount = elemHi >>> 3;
+        const textOffset = elemOffset + WORD_SIZE + elemOffsetWords * WORD_SIZE;
+        const strLen = byteCount > 0 ? byteCount - 1 : 0;
+        results.push(decoder.decode(this.raw.subarray(textOffset, textOffset + strLen)));
+      }
+      return results;
+    }
+
     if (elementSize !== 7) return [];
+
     const tagLo = this.buf.getUint32(targetOffset, true);
     const elementCount = (tagLo >> 2) | 0;
 
