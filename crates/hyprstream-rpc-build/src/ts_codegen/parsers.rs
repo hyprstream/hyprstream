@@ -478,33 +478,128 @@ fn emit_scoped_response_parse(
         ));
     }
 
-    // Also handle nested scoped response variants
+    // Handle nested scoped response variants by recursively parsing
     for nc in &sc.nested_clients {
         let nested_resp_name = format!("{}Result", nc.factory_name);
-        let nested_resp = sc
-            .inner_response_variants
-            .iter()
-            .find(|v| v.name == nested_resp_name);
 
-        // If this was already handled above, skip
-        // (nested client variants are filtered from inner_response_variants in CGR reader)
-        // They won't appear in the loop above, so we handle them here.
-        if nested_resp.is_some() {
-            // Already emitted in the inner_response_variants loop
+        // Skip if already handled in inner_response_variants loop
+        if sc.inner_response_variants.iter().any(|v| v.name == nested_resp_name) {
             continue;
         }
 
-        // Check if there's a matching field in the inner response struct
+        // Find the matching discriminant field
         let nested_field = irs
             .fields
             .iter()
             .find(|f| f.name == nested_resp_name && f.discriminant_value != 0xFFFF);
 
-        if let Some(nf) = nested_field {
+        let Some(nf) = nested_field else { continue };
+
+        // Find the nested response struct to know its layout
+        let nested_resp_struct = schema.structs.iter().find(|s| s.name == nf.type_name);
+
+        out.push_str(&format!(
+            "        case {}: // {} (nested scope)\n",
+            nf.discriminant_value, nested_resp_name
+        ));
+
+        if let Some(nrs) = nested_resp_struct {
+            // Read the nested struct and recursively parse its union
             out.push_str(&format!(
-                "        case {}: // {} (nested scope)\n",
-                nf.discriminant_value, nested_resp_name
+                "        {{\n          const _nested = _inner.getStruct({}, {}, {});\n",
+                nf.slot_offset, nrs.data_words, nrs.pointer_words
             ));
+            out.push_str(&format!(
+                "          if (!_nested) return {{ {fields_str}{comma}variant: '{variant_name}', data: {{ variant: '{}', data: null }} }};\n",
+                nested_resp_name
+            ));
+
+            // Read nested discriminant and switch
+            let nested_disc_byte_off = nrs.discriminant_offset * 2;
+            out.push_str(&format!(
+                "          const _nestedDisc = _nested.getUint16({nested_disc_byte_off});\n"
+            ));
+            out.push_str("          switch (_nestedDisc) {\n");
+
+            // Emit each variant of the nested response
+            for nv in &nc.inner_response_variants {
+                let nv_field = nrs.fields.iter().find(|f| f.name == nv.name && f.discriminant_value != 0xFFFF);
+                let nv_disc = nv_field.map(|f| f.discriminant_value).unwrap_or(0);
+                let nv_data = emit_inner_variant_read(nv_field, &nv.type_name, schema);
+                out.push_str(&format!(
+                    "            case {nv_disc}: // {}\n",
+                    nv.name
+                ));
+                out.push_str(&format!(
+                    "              return {{ {fields_str}{comma}variant: '{variant_name}', data: {{ variant: '{}', data: {{ variant: '{}', data: {nv_data} }} }} }};\n",
+                    nested_resp_name, nv.name
+                ));
+            }
+
+            // Handle nested-nested clients (e.g., worktree → ctl)
+            for nnc in &nc.nested_clients {
+                let nn_resp_name = format!("{}Result", nnc.factory_name);
+                if nc.inner_response_variants.iter().any(|v| v.name == nn_resp_name) {
+                    continue;
+                }
+                let nn_field = nrs.fields.iter().find(|f| f.name == nn_resp_name && f.discriminant_value != 0xFFFF);
+                let Some(nnf) = nn_field else { continue };
+                let nn_struct = schema.structs.iter().find(|s| s.name == nnf.type_name);
+
+                out.push_str(&format!(
+                    "            case {}: // {} (nested scope)\n",
+                    nnf.discriminant_value, nn_resp_name
+                ));
+
+                if let Some(nns) = nn_struct {
+                    out.push_str(&format!(
+                        "            {{\n              const _deep = _nested.getStruct({}, {}, {});\n",
+                        nnf.slot_offset, nns.data_words, nns.pointer_words
+                    ));
+                    out.push_str(&format!(
+                        "              if (!_deep) return {{ {fields_str}{comma}variant: '{variant_name}', data: {{ variant: '{}', data: {{ variant: '{}', data: null }} }} }};\n",
+                        nested_resp_name, nn_resp_name
+                    ));
+                    let nn_disc_off = nns.discriminant_offset * 2;
+                    out.push_str(&format!(
+                        "              const _deepDisc = _deep.getUint16({nn_disc_off});\n"
+                    ));
+                    out.push_str("              switch (_deepDisc) {\n");
+                    for nnv in &nnc.inner_response_variants {
+                        let nnv_field = nns.fields.iter().find(|f| f.name == nnv.name && f.discriminant_value != 0xFFFF);
+                        let nnv_disc = nnv_field.map(|f| f.discriminant_value).unwrap_or(0);
+                        let nnv_data = emit_inner_variant_read(nnv_field, &nnv.type_name, schema);
+                        out.push_str(&format!(
+                            "                case {nnv_disc}: // {}\n",
+                            nnv.name
+                        ));
+                        out.push_str(&format!(
+                            "                  return {{ {fields_str}{comma}variant: '{variant_name}', data: {{ variant: '{}', data: {{ variant: '{}', data: {{ variant: '{}', data: {nnv_data} }} }} }} }};\n",
+                            nested_resp_name, nn_resp_name, nnv.name
+                        ));
+                    }
+                    out.push_str(&format!(
+                        "                default:\n                  return {{ {fields_str}{comma}variant: '{variant_name}', data: {{ variant: '{}', data: {{ variant: '{}', data: {{ variant: 'unknown', data: null }} }} }} }};\n",
+                        nested_resp_name, nn_resp_name
+                    ));
+                    out.push_str("              }\n");
+                    out.push_str("            }\n");
+                } else {
+                    out.push_str(&format!(
+                        "              return {{ {fields_str}{comma}variant: '{variant_name}', data: {{ variant: '{}', data: {{ variant: '{}', data: null }} }} }};\n",
+                        nested_resp_name, nn_resp_name
+                    ));
+                }
+            }
+
+            out.push_str(&format!(
+                "            default:\n              return {{ {fields_str}{comma}variant: '{variant_name}', data: {{ variant: '{}', data: {{ variant: 'unknown', data: null }} }} }};\n",
+                nested_resp_name
+            ));
+            out.push_str("          }\n");
+            out.push_str("        }\n");
+        } else {
+            // Can't find nested struct — fall back to null
             out.push_str(&format!(
                 "          return {{ {fields_str}{comma}variant: '{variant_name}', data: {{ variant: '{}', data: null }} }};\n",
                 nested_resp_name
