@@ -1640,7 +1640,13 @@ impl WebTransportServer {
                     }
                 }
                 Err(e) => {
-                    debug!("WebTransport RPC error: {}", e);
+                    warn!("WebTransport RPC error: {}", e);
+                    // Send a minimal error response so the client doesn't hang
+                    let error_msg = format!("RPC error: {}", e);
+                    let error_bytes = error_msg.as_bytes();
+                    let _ = send.write_all(&(error_bytes.len() as u32).to_be_bytes()).await;
+                    let _ = send.write_all(error_bytes).await;
+                    let _ = send.shutdown().await;
                 }
             }
         } else {
