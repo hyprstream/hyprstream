@@ -6039,6 +6039,7 @@ dependencies = [
  "hyprstream-rpc",
  "hyprstream-rpc-build",
  "hyprstream-rpc-derive",
+ "parking_lot 0.12.4",
  "serde",
  "serde_json",
  "tracing",
