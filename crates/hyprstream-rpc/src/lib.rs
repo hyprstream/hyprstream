@@ -134,6 +134,8 @@ pub mod socket;
 
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_api;
+#[cfg(target_arch = "wasm32")]
+pub mod web_transport;
 
 // ============================================================================
 // Re-exports available on ALL targets
