@@ -70,7 +70,8 @@ pub fn generate_client(out: &mut String, service_name: &str, schema: &ParsedSche
              \x20   requestId: bigint;\n\
              \x20   ephemeralPrivkey: Uint8Array;\n\
              \x20   ephemeralPubkey: Uint8Array;\n\
-             \x20 }>;\n"
+             \x20 }>;\n\
+             \x20 subscribe(topic: string): Promise<ReadableStream<Uint8Array>>;\n"
         );
     }
     out.push_str(
@@ -438,7 +439,7 @@ fn generate_streaming_body(out: &mut String, pascal: &str, chain_depth: usize) {
         // Top-level streaming method: parsed.data is StreamInfo directly
         out.push_str(
             "    const streamInfo = parsed.data as StreamInfo;\n\
-             \x20   return createStreamSubscription(streamInfo, blocks, ephemeralPrivkey, ephemeralPubkey, requestId);\n",
+             \x20   return createStreamSubscription(streamInfo, blocks, ephemeralPrivkey, ephemeralPubkey, requestId, this.transport);\n",
         );
     } else {
         // Scoped streaming method: unwrap through scope chain to get StreamInfo
@@ -455,7 +456,7 @@ fn generate_streaming_body(out: &mut String, pascal: &str, chain_depth: usize) {
                 emit_error_throw(out, &inner_var);
                 out.push_str(&format!(
                     "    const streamInfo = {inner_var}.data as StreamInfo;\n\
-                     \x20   return createStreamSubscription(streamInfo, blocks, ephemeralPrivkey, ephemeralPubkey, requestId);\n"
+                     \x20   return createStreamSubscription(streamInfo, blocks, ephemeralPrivkey, ephemeralPubkey, requestId, this.transport);\n"
                 ));
             }
         }
