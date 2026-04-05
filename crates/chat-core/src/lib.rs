@@ -9,6 +9,9 @@
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "wasm")]
+use wasm_bindgen::prelude::*;
+
 // ─── Tool Call Format ────────────────────────────────────────────────
 
 /// Model-specific tool call syntax.
@@ -478,6 +481,112 @@ pub fn parse_xml_param_tool_call(buf: &str) -> Option<(String, String)> {
 
     let arguments = serde_json::to_string(&serde_json::Value::Object(args)).ok()?;
     Some((name, arguments))
+}
+
+// ─── WASM-Bindgen API ────────────────────────────────────────────────
+
+/// WASM-accessible wrapper around ChatState.
+/// All communication is via JSON strings to avoid wasm-bindgen complex type issues.
+#[cfg(feature = "wasm")]
+#[wasm_bindgen]
+pub struct WasmChatState {
+    inner: ChatState,
+}
+
+#[cfg(feature = "wasm")]
+#[wasm_bindgen]
+impl WasmChatState {
+    /// Create a new chat state with the given tool call format.
+    /// format: "qwen3", "qwen3_5", "llama", "mistral", or "" for none.
+    #[wasm_bindgen(constructor)]
+    pub fn new(format: &str) -> Self {
+        let fmt = ToolCallFormat::from_architecture(format);
+        Self { inner: ChatState::new(fmt) }
+    }
+
+    /// Set tool descriptions as a JSON object: {"uuid": "description", ...}
+    #[wasm_bindgen(js_name = setToolDescriptions)]
+    pub fn set_tool_descriptions(&mut self, json: &str) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json) {
+            if let Some(obj) = v.as_object() {
+                for (k, v) in obj {
+                    if let Some(s) = v.as_str() {
+                        self.inner.tool_descriptions.insert(k.clone(), s.to_owned());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Process a command (JSON string). Returns a JSON array of events.
+    /// Command format: {"type": "userMessage", "text": "..."} etc.
+    /// Events format: [{"type": "content", "text": "..."}, ...]
+    #[wasm_bindgen(js_name = handleCommand)]
+    pub fn handle_command(&mut self, json: &str) -> String {
+        let cmd = match json_to_command(json) {
+            Ok(c) => c,
+            Err(e) => return serde_json::json!([{"type": "error", "message": e}]).to_string(),
+        };
+        let events = self.inner.handle_command(cmd);
+        let json_events: Vec<serde_json::Value> = events.iter().map(event_to_json_value).collect();
+        serde_json::to_string(&json_events).unwrap_or_else(|_| "[]".to_owned())
+    }
+
+    /// Check if the state machine needs inference re-invocation.
+    #[wasm_bindgen(js_name = needsReinvoke)]
+    pub fn needs_reinvoke(&self) -> bool {
+        self.inner.needs_reinvoke()
+    }
+
+    /// Get the current history as JSON.
+    #[wasm_bindgen(js_name = getHistory)]
+    pub fn get_history(&self) -> String {
+        serde_json::to_string(&self.inner.history).unwrap_or_else(|_| "[]".to_owned())
+    }
+
+    /// Get the number of pending tool calls.
+    #[wasm_bindgen(js_name = pendingToolCalls)]
+    pub fn pending_tool_calls(&self) -> usize {
+        self.inner.pending_tool_calls
+    }
+}
+
+#[cfg(feature = "wasm")]
+fn json_to_command(json: &str) -> Result<ChatCommand, String> {
+    let v: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    let cmd_type = v["type"].as_str().ok_or("missing type field")?;
+    match cmd_type {
+        "userMessage" => Ok(ChatCommand::UserMessage(
+            v["text"].as_str().ok_or("missing text")?.to_owned(),
+        )),
+        "inferenceToken" => Ok(ChatCommand::InferenceToken(
+            v["token"].as_str().ok_or("missing token")?.to_owned(),
+        )),
+        "inferenceComplete" => Ok(ChatCommand::InferenceComplete),
+        "inferenceError" => Ok(ChatCommand::InferenceError(
+            v["message"].as_str().unwrap_or("unknown error").to_owned(),
+        )),
+        "toolCallResult" => Ok(ChatCommand::ToolCallResult {
+            id: v["id"].as_str().ok_or("missing id")?.to_owned(),
+            result: v["result"].as_str().ok_or("missing result")?.to_owned(),
+        }),
+        "cancel" => Ok(ChatCommand::Cancel),
+        other => Err(format!("unknown command type: {other}")),
+    }
+}
+
+#[cfg(feature = "wasm")]
+fn event_to_json_value(event: &ChatEvent) -> serde_json::Value {
+    match event {
+        ChatEvent::Content(text) => serde_json::json!({"type": "content", "text": text}),
+        ChatEvent::Thinking(text) => serde_json::json!({"type": "thinking", "text": text}),
+        ChatEvent::ToolCallDetected { id, uuid, description, arguments } => {
+            serde_json::json!({"type": "toolCallDetected", "id": id, "uuid": uuid,
+                "description": description, "arguments": arguments})
+        }
+        ChatEvent::Complete => serde_json::json!({"type": "complete"}),
+        ChatEvent::Error(msg) => serde_json::json!({"type": "error", "message": msg}),
+    }
 }
 
 #[cfg(test)]
