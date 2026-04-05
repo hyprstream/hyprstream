@@ -163,6 +163,8 @@ pub struct ChatState {
 
     // Agentic loop state
     pub pending_tool_calls: usize,
+    tool_call_counter: usize,
+    awaiting_reinvoke: bool,
 }
 
 impl ChatState {
@@ -175,6 +177,8 @@ impl ChatState {
             in_tool_call: false,
             tool_call_buf: String::new(),
             pending_tool_calls: 0,
+            tool_call_counter: 0,
+            awaiting_reinvoke: false,
         }
     }
 
@@ -202,9 +206,34 @@ impl ChatState {
                 self.tool_call_buf.clear();
                 Vec::new() // Caller should trigger inference
             }
-            ChatCommand::InferenceToken(token) => self.ingest_token(&token),
+            ChatCommand::InferenceToken(token) => {
+                self.awaiting_reinvoke = false;
+                self.ingest_token(&token)
+            }
             ChatCommand::InferenceComplete => {
                 let mut events = Vec::new();
+
+                // Flush buffered tool call for formats without closing tags (Llama/Mistral)
+                if self.in_tool_call && !self.tool_call_buf.is_empty() {
+                    self.in_tool_call = false;
+                    let buf = std::mem::take(&mut self.tool_call_buf);
+                    if let Some((uuid, arguments)) = parse_tool_call_buf(&buf) {
+                        let description = self.tool_descriptions
+                            .get(&uuid).cloned().unwrap_or_else(|| uuid.clone());
+                        self.tool_call_counter += 1;
+                        let id = format!("tc-{}", self.tool_call_counter);
+                        if let Some(last) = self.history.last_mut() {
+                            last.tool_calls.push(ToolCallRecord {
+                                id: id.clone(), uuid: uuid.clone(),
+                                description: description.clone(),
+                                arguments: arguments.clone(), result: None,
+                            });
+                        }
+                        self.pending_tool_calls += 1;
+                        events.push(ChatEvent::ToolCallDetected { id, uuid, description, arguments });
+                    }
+                }
+
                 if self.pending_tool_calls == 0 {
                     events.push(ChatEvent::Complete);
                 }
@@ -233,8 +262,9 @@ impl ChatState {
 
                 self.pending_tool_calls = self.pending_tool_calls.saturating_sub(1);
 
-                // If all tool calls resolved, signal for re-invocation
+                // If all tool calls resolved, set up for re-invocation
                 if self.pending_tool_calls == 0 {
+                    self.awaiting_reinvoke = true;
                     // Add new empty assistant entry for the next generation
                     self.history.push(ChatHistoryEntry {
                         role: ChatRole::Assistant,
@@ -268,7 +298,6 @@ impl ChatState {
         let mut events: Vec<ChatEvent> = Vec::new();
         let markers = self.tool_call_format.markers();
 
-        let history_len = self.history.len();
         let last = match self.history.last_mut() {
             Some(e) => e,
             None => return events,
@@ -306,7 +335,8 @@ impl ChatState {
                             .get(&uuid)
                             .cloned()
                             .unwrap_or_else(|| uuid.clone());
-                        let id = format!("tc-{}", history_len);
+                        self.tool_call_counter += 1;
+                        let id = format!("tc-{}", self.tool_call_counter);
                         last.tool_calls.push(ToolCallRecord {
                             id: id.clone(),
                             uuid: uuid.clone(),
@@ -369,11 +399,10 @@ impl ChatState {
 
     /// Whether the state machine needs inference to be re-invoked
     /// (e.g. after all tool results have been received).
+    /// Whether the state machine needs inference to be re-invoked
+    /// (after all tool results received and a new empty assistant entry is ready).
     pub fn needs_reinvoke(&self) -> bool {
-        self.pending_tool_calls == 0
-            && self.history.last().map(|e| e.role == ChatRole::Assistant && e.content.is_empty()).unwrap_or(false)
-            && self.history.len() >= 3 // user + assistant + tool + new assistant
-            && self.history.iter().rev().nth(1).map(|e| e.role == ChatRole::Tool).unwrap_or(false)
+        self.awaiting_reinvoke
     }
 }
 
