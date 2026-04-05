@@ -429,6 +429,8 @@ async fn chat_completions(
             add_generation_prompt: true,
             tools_json: Some(tools_str.clone()).filter(|s| !s.is_empty()),
             max_tokens: request.max_tokens.map(|v| v as u32),
+            enable_thinking: None,
+            template_vars_json: None,
         })
         .await
     {
@@ -639,6 +641,8 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                 add_generation_prompt: true,
                 tools_json: Some(tools_str.clone()).filter(|s| !s.is_empty()),
                 max_tokens: request.max_tokens.map(|v| v as u32),
+                enable_thinking: None,
+                template_vars_json: None,
             })
             .await
         {
@@ -964,6 +968,8 @@ async fn completions(
             add_generation_prompt: true,
             tools_json: None,
             max_tokens: request.max_tokens.map(|v| v as u32),
+            enable_thinking: None,
+            template_vars_json: None,
         })
         .await
     {

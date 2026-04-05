@@ -1279,6 +1279,8 @@ pub async fn handle_infer(
         add_generation_prompt: true,
         tools_json: Some(String::new()),
         max_tokens: None,
+        enable_thinking: None,
+        template_vars_json: None,
     }).await {
         Ok(prompt_str) => crate::config::TemplatedPrompt::new(prompt_str),
         Err(e) => {

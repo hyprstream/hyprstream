@@ -1100,10 +1100,12 @@ impl InferenceService {
         messages: Vec<crate::runtime::template_engine::ChatMessage>,
         add_generation_prompt: bool,
         tools: Option<&serde_json::Value>,
+        enable_thinking: Option<bool>,
+        template_vars_json: Option<&str>,
     ) -> Result<String> {
         self.engine
             .read()
-            .apply_chat_template(&messages, add_generation_prompt, tools)
+            .apply_chat_template_with_vars(&messages, add_generation_prompt, tools, enable_thinking, template_vars_json)
     }
 
     /// Truncate messages to fit within the context budget.
@@ -2218,6 +2220,8 @@ impl InferenceHandler for InferenceService {
 
         let result = InferenceService::handle_apply_chat_template(
             self, chat_messages, data.add_generation_prompt, tools.as_ref(),
+            data.enable_thinking,
+            data.template_vars_json.as_deref(),
         ).await?;
         Ok(InferenceResponseVariant::ApplyChatTemplateResult(result))
     }

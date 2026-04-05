@@ -128,6 +128,8 @@ pub fn make_chat_spawner(
                             add_generation_prompt: true,
                             tools_json: Some(tools_json.clone()).filter(|s| !s.is_empty()),
                             max_tokens: Some(gen_cfg.max_tokens as u32),
+                            enable_thinking: None,
+                            template_vars_json: None,
                         }),
                 ).await;
                 let prompt = match template_result {

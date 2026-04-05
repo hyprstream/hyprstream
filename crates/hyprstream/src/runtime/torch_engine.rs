@@ -1252,12 +1252,22 @@ impl RuntimeEngine for TorchEngine {
         add_generation_prompt: bool,
         tools: Option<&serde_json::Value>,
     ) -> Result<String> {
+        self.apply_chat_template_with_vars(messages, add_generation_prompt, tools, None, None)
+    }
+
+    fn apply_chat_template_with_vars(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+        tools: Option<&serde_json::Value>,
+        enable_thinking: Option<bool>,
+        template_vars_json: Option<&str>,
+    ) -> Result<String> {
         // Use our template engine if available
         let template_guard = self.template_engine.lock();
 
         if let Some(ref engine) = *template_guard {
-            // Use the template engine
-            engine.apply_chat_template(messages, Some(add_generation_prompt), tools)
+            engine.apply_chat_template_with_vars(messages, Some(add_generation_prompt), tools, enable_thinking, template_vars_json)
         } else {
             // Fallback to simple formatting
             let mut formatted = String::new();

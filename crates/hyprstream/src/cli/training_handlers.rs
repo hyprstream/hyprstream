@@ -399,7 +399,7 @@ pub async fn handle_training_infer(
     // Apply chat template
     let messages = vec![ChatMessage { role: "user".into(), content: prompt.into(), tool_calls: vec![], tool_call_id: String::new() }];
 
-    let formatted_prompt = match client.apply_chat_template(&ChatTemplateRequest { messages: messages.clone(), add_generation_prompt: true, tools_json: Some(String::new()), max_tokens: None }).await {
+    let formatted_prompt = match client.apply_chat_template(&ChatTemplateRequest { messages: messages.clone(), add_generation_prompt: true, tools_json: Some(String::new()), max_tokens: None, enable_thinking: None, template_vars_json: None }).await {
         Ok(formatted) => formatted,
         Err(e) => {
             warn!("Could not apply chat template: {}. Using raw prompt.", e);
