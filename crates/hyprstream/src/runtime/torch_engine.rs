@@ -606,23 +606,26 @@ impl TorchEngine {
                         } else if let Some(ml) = json["max_length"].as_u64() {
                             self.generation_config.max_tokens = ml as usize;
                         }
-                        info!("Loaded generation_config.json: temperature={}, top_p={}, top_k={:?}, repeat_penalty={}",
-                            self.generation_config.temperature, self.generation_config.top_p,
-                            self.generation_config.top_k, self.generation_config.repeat_penalty);
                     }
                 }
                 Err(e) => warn!("Failed to read generation_config.json: {}", e),
             }
-        } else if config.model_type.contains("qwen3") {
-            // Qwen3/3.5 recommended defaults (non-thinking mode) when no
-            // generation_config.json is present:
-            //   temperature=0.7, top_p=0.8, top_k=20, presence_penalty=1.5
+        }
+
+        if !gen_config_path.exists() && config.model_type.contains("qwen3_5") {
+            // Qwen3.5 recommended defaults (non-thinking mode) when no
+            // generation_config.json is present. Qwen3 models ship their own
+            // generation_config.json so this only applies to Qwen3.5.
             self.generation_config.temperature = 0.7;
             self.generation_config.top_p = 0.8;
             self.generation_config.top_k = Some(20);
             self.generation_config.repeat_penalty = 1.5;
-            info!("Applied Qwen3 recommended defaults: temperature=0.7, top_p=0.8, top_k=20, repeat_penalty=1.5");
         }
+
+        info!("Generation config: temperature={}, top_p={}, top_k={:?}, repeat_penalty={} (model_type={})",
+            self.generation_config.temperature, self.generation_config.top_p,
+            self.generation_config.top_k, self.generation_config.repeat_penalty,
+            config.model_type);
 
         Ok(())
     }
