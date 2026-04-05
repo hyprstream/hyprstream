@@ -9,6 +9,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod capnp;
+
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
@@ -532,6 +534,16 @@ impl WasmChatState {
         serde_json::to_string(&json_events).unwrap_or_else(|_| "[]".to_owned())
     }
 
+    /// Fast path: ingest a token and return Cap'n Proto encoded events.
+    /// Returns a length-prefixed event list: [u32 count] [u32 len] [capnp bytes] ...
+    /// No JSON serialization — binary only.
+    #[wasm_bindgen(js_name = ingestTokenBytes)]
+    pub fn ingest_token_bytes(&mut self, token: &str) -> Vec<u8> {
+        let events = self.inner.ingest_token(token);
+        let capnp_events: Vec<Vec<u8>> = events.iter().map(event_to_capnp).collect();
+        capnp::encode_event_list(&capnp_events)
+    }
+
     /// Check if the state machine needs inference re-invocation.
     #[wasm_bindgen(js_name = needsReinvoke)]
     pub fn needs_reinvoke(&self) -> bool {
@@ -572,6 +584,19 @@ fn json_to_command(json: &str) -> Result<ChatCommand, String> {
         }),
         "cancel" => Ok(ChatCommand::Cancel),
         other => Err(format!("unknown command type: {other}")),
+    }
+}
+
+#[cfg(feature = "wasm")]
+fn event_to_capnp(event: &ChatEvent) -> Vec<u8> {
+    match event {
+        ChatEvent::Content(text) => capnp::build_text_event(0, text),
+        ChatEvent::Thinking(text) => capnp::build_text_event(1, text),
+        ChatEvent::ToolCallDetected { id, uuid, description, arguments } => {
+            capnp::build_tool_call_detected(id, uuid, description, arguments)
+        }
+        ChatEvent::Complete => capnp::build_complete(),
+        ChatEvent::Error(msg) => capnp::build_text_event(4, msg),
     }
 }
 
