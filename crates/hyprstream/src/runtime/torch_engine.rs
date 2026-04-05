@@ -582,6 +582,48 @@ impl TorchEngine {
         info!("✅ Model weights loaded in {:.2}s", factory_time.as_secs_f64());
 
         self.persistent_model = Some(Arc::new(Mutex::new(model)));
+
+        // Load generation_config.json if present (model-specific sampling defaults)
+        let gen_config_path = model_path.join("generation_config.json");
+        if gen_config_path.exists() {
+            match std::fs::read_to_string(&gen_config_path) {
+                Ok(contents) => {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
+                        if let Some(t) = json["temperature"].as_f64() {
+                            self.generation_config.temperature = t as f32;
+                        }
+                        if let Some(p) = json["top_p"].as_f64() {
+                            self.generation_config.top_p = p as f32;
+                        }
+                        if let Some(k) = json["top_k"].as_u64() {
+                            self.generation_config.top_k = Some(k as usize);
+                        }
+                        if let Some(rp) = json["repetition_penalty"].as_f64() {
+                            self.generation_config.repeat_penalty = rp as f32;
+                        }
+                        if let Some(mt) = json["max_new_tokens"].as_u64() {
+                            self.generation_config.max_tokens = mt as usize;
+                        } else if let Some(ml) = json["max_length"].as_u64() {
+                            self.generation_config.max_tokens = ml as usize;
+                        }
+                        info!("Loaded generation_config.json: temperature={}, top_p={}, top_k={:?}, repeat_penalty={}",
+                            self.generation_config.temperature, self.generation_config.top_p,
+                            self.generation_config.top_k, self.generation_config.repeat_penalty);
+                    }
+                }
+                Err(e) => warn!("Failed to read generation_config.json: {}", e),
+            }
+        } else if config.model_type.contains("qwen3") {
+            // Qwen3/3.5 recommended defaults (non-thinking mode) when no
+            // generation_config.json is present:
+            //   temperature=0.7, top_p=0.8, top_k=20, presence_penalty=1.5
+            self.generation_config.temperature = 0.7;
+            self.generation_config.top_p = 0.8;
+            self.generation_config.top_k = Some(20);
+            self.generation_config.repeat_penalty = 1.5;
+            info!("Applied Qwen3 recommended defaults: temperature=0.7, top_p=0.8, top_k=20, repeat_penalty=1.5");
+        }
+
         Ok(())
     }
 
@@ -2144,12 +2186,15 @@ impl<'a> TextStream<'a> {
             exempt
         };
 
-        // PERF: Pre-create sampling params to avoid struct allocation per token
+        // PERF: Pre-create sampling params to avoid struct allocation per token.
+        // Fall back to model's generation_config defaults (from generation_config.json
+        // or engine defaults) when the request doesn't specify a value.
+        let gc = &engine.generation_config;
         let sampling_params = SamplingParams {
-            temperature: request.temperature.unwrap_or(0.7),
-            top_p: request.top_p.unwrap_or(0.95),
-            top_k: request.top_k.map(|v| v as usize),
-            repeat_penalty: request.repeat_penalty.unwrap_or(1.0),
+            temperature: request.temperature.unwrap_or(gc.temperature),
+            top_p: request.top_p.unwrap_or(gc.top_p),
+            top_k: request.top_k.map(|v| v as usize).or(gc.top_k),
+            repeat_penalty: request.repeat_penalty.unwrap_or(gc.repeat_penalty),
         };
 
         // PERF: Cache vocab_size to avoid lock acquisition per token
