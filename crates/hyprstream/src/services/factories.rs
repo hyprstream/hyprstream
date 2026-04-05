@@ -88,7 +88,7 @@ fn create_event_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Factory for PolicyService (Casbin policy management)
-#[service_factory("policy", schema = "../../schema/policy.capnp", metadata = crate::services::generated::policy_client::schema_metadata)]
+#[service_factory("policy", schema = "../../../hyprstream-rpc-std/schema/policy.capnp", metadata = crate::services::generated::policy_client::schema_metadata)]
 fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating PolicyService");
 
@@ -163,7 +163,7 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Factory for RegistryService (git2db model registry)
-#[service_factory("registry", schema = "../../schema/registry.capnp", metadata = crate::services::generated::registry_client::schema_metadata, depends_on = ["policy", "discovery"])]
+#[service_factory("registry", schema = "../../../hyprstream-rpc-std/schema/registry.capnp", metadata = crate::services::generated::registry_client::schema_metadata, depends_on = ["policy", "discovery"])]
 fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating RegistryService");
 
@@ -226,7 +226,7 @@ fn create_streams_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Factory for ModelService (model lifecycle management)
-#[service_factory("model", schema = "../../schema/model.capnp", metadata = crate::services::generated::model_client::schema_metadata, depends_on = ["policy", "registry", "discovery"])]
+#[service_factory("model", schema = "../../../hyprstream-rpc-std/schema/model.capnp", metadata = crate::services::generated::model_client::schema_metadata, depends_on = ["policy", "registry", "discovery"])]
 fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating ModelService");
 
@@ -494,7 +494,7 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
 /// - HTTP/SSE (for external MCP clients)
 ///
 /// Note: The HTTP/SSE server is spawned as a background task in the factory.
-#[service_factory("mcp", schema = "../../schema/mcp.capnp", metadata = crate::services::generated::mcp_client::schema_metadata, depends_on = ["policy", "discovery"])]
+#[service_factory("mcp", schema = "../../../hyprstream-rpc-std/schema/mcp.capnp", metadata = crate::services::generated::mcp_client::schema_metadata, depends_on = ["policy", "discovery"])]
 fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating McpService");
 
@@ -824,7 +824,7 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Factory for NotificationService (blind relay with broadcast encryption)
-#[service_factory("notification", schema = "../../schema/notification.capnp", metadata = crate::services::generated::notification_client::schema_metadata, depends_on = ["policy", "discovery"])]
+#[service_factory("notification", schema = "../../../hyprstream-rpc-std/schema/notification.capnp", metadata = crate::services::generated::notification_client::schema_metadata, depends_on = ["policy", "discovery"])]
 fn create_notification_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating NotificationService");
 
@@ -851,7 +851,7 @@ fn create_notification_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn S
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Factory for MetricsService (DuckDB-backed time-series ingest + DataFusion query)
-#[service_factory("metrics", schema = "../../schema/metrics.capnp", metadata = crate::services::generated::metrics_client::schema_metadata, depends_on = ["policy", "discovery"])]
+#[service_factory("metrics", schema = "../../../hyprstream-rpc-std/schema/metrics.capnp", metadata = crate::services::generated::metrics_client::schema_metadata, depends_on = ["policy", "discovery"])]
 fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating MetricsService");
 

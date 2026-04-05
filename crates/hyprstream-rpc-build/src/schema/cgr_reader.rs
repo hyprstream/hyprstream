@@ -41,7 +41,24 @@ pub fn parse_from_cgr(name: &str) -> Result<ParsedSchema, String> {
     let out_dir = std::env::var("OUT_DIR")
         .map_err(|_| "OUT_DIR not set — CGR files require build.rs to run first".to_owned())?;
     let cgr_path = Path::new(&out_dir).join(format!("{name}.cgr"));
-    parse_from_cgr_path(&cgr_path, name)
+
+    if cgr_path.exists() {
+        return parse_from_cgr_path(&cgr_path, name);
+    }
+
+    // Fall back to dependency crate OUT_DIRs.
+    // Cargo exposes DEP_<CRATE>_<KEY> from dependency build scripts.
+    // hyprstream-rpc-std exports its OUT_DIR via `cargo:out_dir=...`
+    for env_key in ["DEP_HYPRSTREAM_RPC_STD_OUT_DIR", "DEP_HYPRSTREAM_RPC_OUT_DIR"] {
+        if let Ok(dep_out_dir) = std::env::var(env_key) {
+            let dep_cgr = Path::new(&dep_out_dir).join(format!("{name}.cgr"));
+            if dep_cgr.exists() {
+                return parse_from_cgr_path(&dep_cgr, name);
+            }
+        }
+    }
+
+    parse_from_cgr_path(&cgr_path, name) // will produce the original error
 }
 
 // ---------------------------------------------------------------------------

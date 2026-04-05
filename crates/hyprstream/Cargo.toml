@@ -47,6 +47,7 @@ serde_yaml.workspace = true
 git2.workspace = true  # Still needed by git2db internally
 git2db = { path = "../git2db", features = ["overlayfs"] }  # High-level git library with overlayfs
 hyprstream-rpc = { path = "../hyprstream-rpc" }  # RPC infrastructure (Cap'n Proto + ZMQ)
+hyprstream-rpc-std = { path = "../hyprstream-rpc-std" }  # Standard service schemas + clients
 hyprstream-discovery = { path = "../hyprstream-discovery" }  # Service discovery
 hyprstream-service = { path = "../hyprstream-service" }  # Service orchestration
 hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }  # RPC code generation proc macros

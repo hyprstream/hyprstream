@@ -1864,6 +1864,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "chat-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5924,6 +5933,7 @@ dependencies = [
  "hyprstream-rpc",
  "hyprstream-rpc-build",
  "hyprstream-rpc-derive",
+ "hyprstream-rpc-std",
  "hyprstream-service",
  "hyprstream-tcl",
  "hyprstream-tui",
@@ -6162,6 +6172,7 @@ dependencies = [
  "rcgen",
  "rustls 0.23.31",
  "serde",
+ "serde-wasm-bindgen",
  "serde_json",
  "sha2 0.10.9",
  "subtle",
@@ -6174,6 +6185,8 @@ dependencies = [
  "tracing",
  "uuid 1.18.1",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "web-time",
  "webpki-roots 0.26.11",
  "whoami",
@@ -6204,6 +6217,23 @@ dependencies = [
  "serde",
  "serde_json",
  "syn 2.0.111",
+]
+
+[[package]]
+name = "hyprstream-rpc-std"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "capnp",
+ "capnpc",
+ "hyprstream-rpc",
+ "hyprstream-rpc-build",
+ "hyprstream-rpc-derive",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
 ]
 
 [[package]]
@@ -12508,6 +12538,17 @@ dependencies = [
  "serde",
  "serde_core",
  "typeid",
+]
+
+[[package]]
+name = "serde-wasm-bindgen"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8302e169f0eddcc139c70f139d19d6467353af16f9fce27e8c30158036a1e16b"
+dependencies = [
+ "js-sys",
+ "serde",
+ "wasm-bindgen",
 ]
 
 [[package]]
