@@ -20,6 +20,7 @@ members = [
     "crates/hyprstream-vfs",
     "crates/hyprstream-tcl",
     "crates/chat-core",
+    "crates/hyprstream-client",
 ]
 # bitsandbytes-sys is standalone - only built when bnb feature is enabled
 exclude = ["crates/bitsandbytes-sys"]

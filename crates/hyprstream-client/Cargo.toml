@@ -1,0 +1,23 @@
+[package]
+name = "hyprstream-client"
+version = "0.1.0"
+edition = "2021"
+description = "Hyprstream RPC client — compiles to native and wasm32"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+hyprstream-rpc = { path = "../hyprstream-rpc" }
+hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+serde-wasm-bindgen = "0.6"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
