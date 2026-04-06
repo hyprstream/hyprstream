@@ -1,13 +1,12 @@
-//! VFS Mount implementations backed by WASM RpcSession.
+//! Generic VFS Mount driven by codegen — no per-service manual wrappers.
 //!
-//! Each mount translates filesystem operations (walk, read, readdir) into
-//! RPC calls via the existing WASM client methods. Uses the same ZMTP/QUIC
-//! transport as all other browser RPC.
+//! `ServiceMount` uses the proc-macro-generated `dispatch()`, `schema_metadata()`,
+//! and `render_doc()` functions to serve any service through the VFS. All
+//! serialization, method routing, and documentation are codegen-driven.
 //!
 //! Mount points:
-//!   /srv/registry  → RegistryMount (list repos, repo details, branches, worktrees)
-//!   /srv/model     → ModelMount (status, load/unload)
-//!   /srv/policy    → PolicyMount (check, list scopes)
+//!   /srv/{service}     → ServiceMount (ctl for mutations, cat for queries)
+//!   /srv/{service}/doc → DocMount (man pages from schema annotations)
 
 #![cfg(target_arch = "wasm32")]
 
@@ -16,7 +15,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
 use hyprstream_rpc::Subject;
-use wasm_bindgen::prelude::*;
 
 use crate::wasm_exports::RpcSession;
 
@@ -24,8 +22,6 @@ use crate::wasm_exports::RpcSession;
 // Send+Sync wrapper for RpcSession on wasm32
 // ============================================================================
 
-/// Wrapper that makes RpcSession usable in Send+Sync contexts.
-/// Safe on wasm32 because everything is single-threaded.
 struct SessionHandle(Arc<RpcSession>);
 
 // SAFETY: wasm32 is single-threaded — no actual cross-thread sharing occurs.
@@ -45,19 +41,16 @@ impl Clone for SessionHandle {
 }
 
 // ============================================================================
-// Fid state — tracks walked path for deferred RPC calls
+// Fid state
 // ============================================================================
 
 #[derive(Clone, Debug)]
 struct VfsFidState {
-    /// Full path components from walk
     path: Vec<String>,
-    /// Whether this fid has been opened
     opened: bool,
 }
 
 /// Apply offset+count slicing to a read result (9P semantics).
-/// Returns empty vec when offset is past end (signals EOF to the read loop).
 fn slice_read(data: Vec<u8>, offset: u64, count: u32) -> Vec<u8> {
     let start = (offset as usize).min(data.len());
     let end = (start + count as usize).min(data.len());
@@ -65,232 +58,76 @@ fn slice_read(data: Vec<u8>, offset: u64, count: u32) -> Vec<u8> {
 }
 
 // ============================================================================
-// RegistryMount — /srv/registry
+// CtlResponseCache — stores write→read response for ctl pattern
 // ============================================================================
 
-/// Mount for the registry service.
-///
-/// Path layout:
-///   /srv/registry/              → readdir: list repos by name
-///   /srv/registry/{name}        → read: repo JSON (id, url, tracking_ref, worktrees)
-///   /srv/registry/{name}/branches → readdir: branch names
-///   /srv/registry/{name}/worktrees → readdir: worktree info
-///   /srv/registry/{name}/remotes  → readdir: remote info
-///   /srv/registry/{name}/status   → read: repo status JSON
-pub struct RegistryMount {
-    session: SessionHandle,
+struct CtlResponseCache(std::cell::RefCell<Option<Vec<u8>>>);
+
+// SAFETY: wasm32 is single-threaded.
+unsafe impl Send for CtlResponseCache {}
+unsafe impl Sync for CtlResponseCache {}
+
+impl CtlResponseCache {
+    fn new() -> Self {
+        Self(std::cell::RefCell::new(None))
+    }
+    fn take(&self) -> Option<Vec<u8>> {
+        self.0.borrow_mut().take()
+    }
+    fn set(&self, data: Vec<u8>) {
+        *self.0.borrow_mut() = Some(data);
+    }
 }
 
-impl RegistryMount {
-    pub fn new(session: Arc<RpcSession>) -> Self {
-        Self { session: SessionHandle(session) }
+/// Atomic-like counter for request IDs, Send+Sync on wasm32.
+struct IdCounter(std::cell::Cell<u64>);
+unsafe impl Send for IdCounter {}
+unsafe impl Sync for IdCounter {}
+impl IdCounter {
+    fn new() -> Self { Self(std::cell::Cell::new(1)) }
+    fn next(&self) -> u64 {
+        let id = self.0.get();
+        self.0.set(id + 1);
+        id
     }
+}
 
-    async fn list_repos(&self) -> Result<Vec<serde_json::Value>, MountError> {
-        let result = self.session.session().registry_list().await
-            .map_err(|e| MountError::Io(format!("{e:?}")))?;
-        let parsed: serde_json::Value = serde_wasm_bindgen::from_value(result)
-            .map_err(|e| MountError::Io(e.to_string()))?;
+// ============================================================================
+// GenericServiceMount — codegen-driven mount for any service
+// ============================================================================
 
-        // unwrap ListResult variant
-        if let Some(list) = parsed.get("ListResult") {
-            if let Some(arr) = list.as_array() {
-                return Ok(arr.clone());
-            }
+/// Trait for service-specific dispatch. Implemented via macro from generated code.
+#[async_trait(?Send)]
+trait ServiceDispatch: Send + Sync {
+    async fn dispatch(&self, method: &str, args_json: &str, session: &RpcSession) -> Result<String, String>;
+    fn metadata(&self) -> (&'static str, &'static [hyprstream_rpc::metadata::MethodMeta]);
+}
+
+/// Generic VFS mount driven by a ServiceDispatch implementation.
+pub struct GenericServiceMount {
+    session: SessionHandle,
+    service: Box<dyn ServiceDispatch>,
+    next_id: IdCounter,
+    ctl_response: CtlResponseCache,
+}
+
+impl GenericServiceMount {
+    pub fn new(session: Arc<RpcSession>, service: Box<dyn ServiceDispatch>) -> Self {
+        Self {
+            session: SessionHandle(session),
+            service,
+            next_id: IdCounter::new(),
+            ctl_response: CtlResponseCache::new(),
         }
-        Ok(Vec::new())
     }
 
-    fn find_repo_id<'a>(repos: &'a [serde_json::Value], name: &str) -> Option<&'a str> {
-        repos.iter()
-            .find(|r| r.get("name").and_then(|n| n.as_str()) == Some(name))
-            .and_then(|r| r.get("id").and_then(|id| id.as_str()))
+    fn next_id(&self) -> u64 {
+        self.next_id.next()
     }
 }
 
 #[async_trait(?Send)]
-impl Mount for RegistryMount {
-    async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
-        // Validate path exists (lazily — actual RPC on read)
-        Ok(Fid::new(VfsFidState {
-            path: components.iter().map(|s| s.to_string()).collect(),
-            opened: false,
-        }))
-    }
-
-    async fn open(&self, fid: &mut Fid, _mode: u8, _caller: &Subject) -> Result<(), MountError> {
-        if let Some(state) = fid.downcast_mut::<VfsFidState>() {
-            state.opened = true;
-        }
-        Ok(())
-    }
-
-    async fn read(&self, fid: &Fid, offset: u64, count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
-        let state = fid.downcast_ref::<VfsFidState>()
-            .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
-
-        let data = match state.path.len() {
-            0 => return Err(MountError::IsDirectory("registry root is a directory".into())),
-            1 => {
-                // /srv/registry/{name} → get repo details
-                let repos = self.list_repos().await?;
-                let name = &state.path[0];
-                let repo = repos.iter()
-                    .find(|r| r.get("name").and_then(|n| n.as_str()) == Some(name))
-                    .ok_or_else(|| MountError::NotFound(name.clone()))?;
-                serde_json::to_string_pretty(repo).unwrap_or_default().into_bytes()
-            }
-            2 => {
-                // /srv/registry/{name}/{sub} → read sub-resource
-                let repos = self.list_repos().await?;
-                let name = &state.path[0];
-                let sub = &state.path[1];
-                let repo_id = Self::find_repo_id(&repos, name)
-                    .ok_or_else(|| MountError::NotFound(name.clone()))?;
-
-                match sub.as_str() {
-                    "status" => {
-                        let result = self.session.session().registry_repo_status(repo_id).await
-                            .map_err(|e| MountError::Io(format!("{e:?}")))?;
-                        let parsed: serde_json::Value = serde_wasm_bindgen::from_value(result)
-                            .map_err(|e| MountError::Io(e.to_string()))?;
-                        serde_json::to_string_pretty(&parsed).unwrap_or_default().into_bytes()
-                    }
-                    _ => return Err(MountError::NotFound(format!("{name}/{sub}"))),
-                }
-            }
-            _ => return Err(MountError::NotFound(state.path.join("/"))),
-        };
-        Ok(slice_read(data, offset, count))
-    }
-
-    async fn write(&self, _fid: &Fid, _offset: u64, _data: &[u8], _caller: &Subject) -> Result<u32, MountError> {
-        Err(MountError::NotSupported("registry is read-only".into()))
-    }
-
-    async fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
-        let state = fid.downcast_ref::<VfsFidState>()
-            .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
-
-        match state.path.len() {
-            0 => {
-                // /srv/registry/ → list repos
-                let repos = self.list_repos().await?;
-                Ok(repos.iter().filter_map(|r| {
-                    let name = r.get("name")?.as_str()?.to_string();
-                    Some(DirEntry { name, is_dir: true, size: 0, stat: None })
-                }).collect())
-            }
-            1 => {
-                // /srv/registry/{name}/ → sub-resources
-                Ok(vec![
-                    DirEntry { name: "branches".into(), is_dir: true, size: 0, stat: None },
-                    DirEntry { name: "worktrees".into(), is_dir: true, size: 0, stat: None },
-                    DirEntry { name: "remotes".into(), is_dir: true, size: 0, stat: None },
-                    DirEntry { name: "status".into(), is_dir: false, size: 0, stat: None },
-                ])
-            }
-            2 => {
-                let repos = self.list_repos().await?;
-                let name = &state.path[0];
-                let sub = &state.path[1];
-                let repo_id = Self::find_repo_id(&repos, name)
-                    .ok_or_else(|| MountError::NotFound(name.clone()))?;
-
-                match sub.as_str() {
-                    "branches" => {
-                        let result = self.session.session().registry_repo_list_branches(repo_id).await
-                            .map_err(|e| MountError::Io(format!("{e:?}")))?;
-                        let parsed: serde_json::Value = serde_wasm_bindgen::from_value(result)
-                            .map_err(|e| MountError::Io(e.to_string()))?;
-                        // RepoResult → ListBranches → [string]
-                        let branches = parsed.get("RepoResult")
-                            .and_then(|r| r.get("ListBranches"))
-                            .and_then(|b| b.as_array())
-                            .cloned()
-                            .unwrap_or_default();
-                        Ok(branches.iter().filter_map(|b| {
-                            let name = b.as_str()?.to_string();
-                            Some(DirEntry { name, is_dir: false, size: 0, stat: None })
-                        }).collect())
-                    }
-                    "worktrees" => {
-                        let result = self.session.session().registry_repo_list_worktrees(repo_id).await
-                            .map_err(|e| MountError::Io(format!("{e:?}")))?;
-                        let parsed: serde_json::Value = serde_wasm_bindgen::from_value(result)
-                            .map_err(|e| MountError::Io(e.to_string()))?;
-                        let wts = parsed.get("RepoResult")
-                            .and_then(|r| r.get("ListWorktrees"))
-                            .and_then(|w| w.as_array())
-                            .cloned()
-                            .unwrap_or_default();
-                        Ok(wts.iter().filter_map(|wt| {
-                            let name = wt.get("branchName")?.as_str()?.to_string();
-                            Some(DirEntry { name, is_dir: true, size: 0, stat: None })
-                        }).collect())
-                    }
-                    "remotes" => {
-                        let result = self.session.session().registry_repo_list_remotes(repo_id).await
-                            .map_err(|e| MountError::Io(format!("{e:?}")))?;
-                        let parsed: serde_json::Value = serde_wasm_bindgen::from_value(result)
-                            .map_err(|e| MountError::Io(e.to_string()))?;
-                        let remotes = parsed.get("RepoResult")
-                            .and_then(|r| r.get("ListRemotes"))
-                            .and_then(|r| r.as_array())
-                            .cloned()
-                            .unwrap_or_default();
-                        Ok(remotes.iter().filter_map(|rm| {
-                            let name = rm.get("name")?.as_str()?.to_string();
-                            Some(DirEntry { name, is_dir: false, size: 0, stat: None })
-                        }).collect())
-                    }
-                    _ => Err(MountError::NotFound(format!("{name}/{sub}"))),
-                }
-            }
-            _ => Err(MountError::NotFound(state.path.join("/"))),
-        }
-    }
-
-    async fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
-        let state = fid.downcast_ref::<VfsFidState>()
-            .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
-        let name = state.path.last().map(|s| s.as_str()).unwrap_or("registry");
-        let is_dir = state.path.len() != 2 || state.path[1] != "status";
-        Ok(Stat {
-            qtype: if is_dir { 0x80 } else { 0 },
-            size: 0,
-            name: name.to_string(),
-            mtime: 0,
-        })
-    }
-
-    async fn clunk(&self, _fid: Fid, _caller: &Subject) {
-        // No-op — fid state is self-contained
-    }
-}
-
-// ============================================================================
-// ModelMount — /srv/model
-// ============================================================================
-
-/// Mount for the model service.
-///
-/// Path layout:
-///   /srv/model/           → readdir: list loaded models
-///   /srv/model/status     → read: all model status JSON
-///   /srv/model/health     → read: health check JSON
-pub struct ModelMount {
-    session: SessionHandle,
-}
-
-impl ModelMount {
-    pub fn new(session: Arc<RpcSession>) -> Self {
-        Self { session: SessionHandle(session) }
-    }
-}
-
-#[async_trait(?Send)]
-impl Mount for ModelMount {
+impl Mount for GenericServiceMount {
     async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
         Ok(Fid::new(VfsFidState {
             path: components.iter().map(|s| s.to_string()).collect(),
@@ -306,32 +143,56 @@ impl Mount for ModelMount {
     }
 
     async fn read(&self, fid: &Fid, offset: u64, count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
+        // Check for ctl response first (from previous write)
+        if let Some(resp) = self.ctl_response.take() {
+            return Ok(slice_read(resp, offset, count));
+        }
+
         let state = fid.downcast_ref::<VfsFidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
 
-        let data = match state.path.first().map(|s| s.as_str()) {
-            Some("status") => {
-                let result = self.session.session().model_status(JsValue::from_str("{}")).await
-                    .map_err(|e| MountError::Io(format!("{e:?}")))?;
-                let parsed: serde_json::Value = serde_wasm_bindgen::from_value(result)
-                    .map_err(|e| MountError::Io(e.to_string()))?;
-                serde_json::to_string_pretty(&parsed).unwrap_or_default().into_bytes()
-            }
-            Some("health") => {
-                let result = self.session.session().model_health_check().await
-                    .map_err(|e| MountError::Io(format!("{e:?}")))?;
-                let parsed: serde_json::Value = serde_wasm_bindgen::from_value(result)
-                    .map_err(|e| MountError::Io(e.to_string()))?;
-                serde_json::to_string_pretty(&parsed).unwrap_or_default().into_bytes()
-            }
-            None => return Err(MountError::IsDirectory("model root is a directory".into())),
-            Some(p) => return Err(MountError::NotFound(p.into())),
-        };
-        Ok(slice_read(data, offset, count))
+        if state.path.is_empty() {
+            return Err(MountError::IsDirectory("service root is a directory".into()));
+        }
+
+        // cat /srv/{service}/{method} → dispatch query method with empty args
+        let method = &state.path[0];
+        let data = self.service.dispatch(method, "{}", self.session.session()).await
+            .map_err(|e| MountError::Io(e))?;
+        Ok(slice_read(data.into_bytes(), offset, count))
     }
 
-    async fn write(&self, _fid: &Fid, _offset: u64, _data: &[u8], _caller: &Subject) -> Result<u32, MountError> {
-        Err(MountError::NotSupported("use ctl for model operations".into()))
+    async fn write(&self, fid: &Fid, _offset: u64, data: &[u8], _caller: &Subject) -> Result<u32, MountError> {
+        let state = fid.downcast_ref::<VfsFidState>()
+            .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+
+        // ctl pattern: data = "command {json_args}" or path contains command
+        let data_str = std::str::from_utf8(data).unwrap_or("").trim();
+
+        let (cmd, args_str) = if let Some(brace) = data_str.find('{') {
+            let cmd_part = data_str[..brace].trim();
+            let args_part = &data_str[brace..];
+            if cmd_part.is_empty() {
+                (state.path.first().map(|s| s.as_str()).unwrap_or(""), args_part)
+            } else {
+                (cmd_part, args_part)
+            }
+        } else {
+            // No JSON — might be a simple command name
+            let cmd = if data_str.is_empty() {
+                state.path.first().map(|s| s.as_str()).unwrap_or("")
+            } else {
+                data_str
+            };
+            (cmd, "{}")
+        };
+
+        let result = self.service.dispatch(cmd, args_str, self.session.session()).await
+            .map_err(|e| MountError::Io(e))?;
+        let resp = result.into_bytes();
+        let len = resp.len() as u32;
+        self.ctl_response.set(resp);
+        Ok(len)
     }
 
     async fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
@@ -339,10 +200,18 @@ impl Mount for ModelMount {
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
 
         if state.path.is_empty() {
-            Ok(vec![
-                DirEntry { name: "status".into(), is_dir: false, size: 0, stat: None },
-                DirEntry { name: "health".into(), is_dir: false, size: 0, stat: None },
-            ])
+            // Root: list methods from metadata
+            let (_, methods) = self.service.metadata();
+            Ok(methods
+                .iter()
+                .filter(|m| !m.hidden)
+                .map(|m| DirEntry {
+                    name: m.name.to_owned(),
+                    is_dir: m.is_scoped,
+                    size: 0,
+                    stat: None,
+                })
+                .collect())
         } else {
             Err(MountError::NotDirectory(state.path.join("/")))
         }
@@ -351,7 +220,8 @@ impl Mount for ModelMount {
     async fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
         let state = fid.downcast_ref::<VfsFidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
-        let name = state.path.last().map(|s| s.as_str()).unwrap_or("model");
+        let (svc_name, _) = self.service.metadata();
+        let name = state.path.last().map(|s| s.as_str()).unwrap_or(svc_name);
         Ok(Stat {
             qtype: if state.path.is_empty() { 0x80 } else { 0 },
             size: 0,
@@ -367,10 +237,6 @@ impl Mount for ModelMount {
 // DocMount — serves man pages from compiled schema metadata
 // ============================================================================
 
-/// Mount for serving service documentation generated at compile time.
-///
-/// Uses the `render_doc()` function from the proc macro codegen.
-/// Mounted at `/srv/{service}/doc` for each service.
 pub struct DocMount {
     render: fn(&[&str]) -> Option<String>,
     metadata: fn() -> (&'static str, &'static [hyprstream_rpc::metadata::MethodMeta]),
@@ -409,9 +275,7 @@ impl Mount for DocMount {
         match (self.render)(&path_refs) {
             Some(text) => {
                 let bytes = text.into_bytes();
-                let start = (offset as usize).min(bytes.len());
-                let end = (start + count as usize).min(bytes.len());
-                Ok(bytes[start..end].to_vec())
+                Ok(slice_read(bytes, offset, count))
             }
             None => Err(MountError::NotFound(state.path.join("/"))),
         }
@@ -426,9 +290,9 @@ impl Mount for DocMount {
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
 
         if state.path.is_empty() {
-            // Root: list methods from metadata
             let (_, methods) = (self.metadata)();
-            Ok(methods.iter()
+            Ok(methods
+                .iter()
                 .filter(|m| !m.hidden)
                 .map(|m| DirEntry {
                     name: m.name.to_owned(),
@@ -438,7 +302,6 @@ impl Mount for DocMount {
                 })
                 .collect())
         } else {
-            // Sub-path: not a directory
             Err(MountError::NotDirectory(state.path.join("/")))
         }
     }
@@ -447,9 +310,8 @@ impl Mount for DocMount {
         let state = fid.downcast_ref::<VfsFidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
         let name = state.path.last().map(|s| s.as_str()).unwrap_or("doc");
-        let is_dir = state.path.is_empty();
         Ok(Stat {
-            qtype: if is_dir { 0x80 } else { 0 },
+            qtype: if state.path.is_empty() { 0x80 } else { 0 },
             size: 0,
             name: name.to_string(),
             mtime: 0,
@@ -460,20 +322,57 @@ impl Mount for DocMount {
 }
 
 // ============================================================================
+// Per-service dispatch wrappers — thin adapters calling generated dispatch()
+// ============================================================================
+
+macro_rules! impl_service_dispatch {
+    ($name:ident, $mod:path) => {
+        struct $name;
+
+        #[async_trait(?Send)]
+        impl ServiceDispatch for $name {
+            async fn dispatch(&self, method: &str, args_json: &str, session: &RpcSession) -> Result<String, String> {
+                use $mod as svc;
+                svc::dispatch(method, args_json, 0, |payload: Vec<u8>| async move {
+                    // session.send() handles signing + envelope unwrapping
+                    session.send(&payload).await
+                        .map(|v| v)
+                        .map_err(|e| format!("{e:?}"))
+                }).await
+            }
+
+            fn metadata(&self) -> (&'static str, &'static [hyprstream_rpc::metadata::MethodMeta]) {
+                use $mod as svc;
+                svc::schema_metadata()
+            }
+        }
+    };
+}
+
+impl_service_dispatch!(RegistryDispatch, crate::registry_client);
+impl_service_dispatch!(ModelDispatch, crate::model_client);
+impl_service_dispatch!(PolicyDispatch, crate::policy_client);
+impl_service_dispatch!(McpDispatch, crate::mcp_client);
+impl_service_dispatch!(InferenceDispatch, crate::inference_client);
+
+// ============================================================================
 // Builder — construct a Namespace with all service mounts
 // ============================================================================
 
-/// Build a VFS namespace with mounts backed by RpcSession.
+/// Build a VFS namespace with codegen-driven service mounts.
 pub fn build_browser_namespace(
     registry_session: Arc<RpcSession>,
     model_session: Arc<RpcSession>,
 ) -> hyprstream_vfs::Namespace {
     let mut ns = hyprstream_vfs::Namespace::new();
 
-    ns.mount("/srv/registry", Arc::new(RegistryMount::new(registry_session)))
-        .expect("mount /srv/registry");
-    ns.mount("/srv/model", Arc::new(ModelMount::new(model_session)))
-        .expect("mount /srv/model");
+    // Service mounts — all use GenericServiceMount with generated dispatch
+    ns.mount("/srv/registry", Arc::new(GenericServiceMount::new(
+        Arc::clone(&registry_session), Box::new(RegistryDispatch),
+    ))).expect("mount /srv/registry");
+    ns.mount("/srv/model", Arc::new(GenericServiceMount::new(
+        Arc::clone(&model_session), Box::new(ModelDispatch),
+    ))).expect("mount /srv/model");
 
     // Documentation mounts — generated at compile time from schema annotations
     ns.mount("/srv/registry/doc", Arc::new(DocMount::new(

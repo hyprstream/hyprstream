@@ -715,7 +715,7 @@ impl RpcSession {
     }
 
     /// Sign payload, send via WebTransport REQ/REP, unwrap ResponseEnvelope.
-    async fn send(&self, payload: &[u8]) -> Result<Vec<u8>, JsError> {
+    pub async fn send(&self, payload: &[u8]) -> Result<Vec<u8>, JsError> {
         let request_id = self.next_id();
         let signed = self.sign(payload, request_id, &[])?;
         let response_bytes = self.client
@@ -987,7 +987,7 @@ pub fn parse_stream_block(capnp_data: &[u8]) -> Result<JsValue, JsError> {
 ///
 /// This extracts the `payload` field so the caller can parse it as a
 /// service-specific response message.
-fn unwrap_response_envelope(bytes: &[u8]) -> Result<Vec<u8>, JsError> {
+pub fn unwrap_response_envelope(bytes: &[u8]) -> Result<Vec<u8>, JsError> {
     let reader = capnp::serialize::read_message(
         &mut std::io::Cursor::new(bytes),
         capnp::message::ReaderOptions::new(),

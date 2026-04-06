@@ -2,6 +2,7 @@
 
 pub mod client;
 pub mod data;
+pub mod dispatch;
 pub mod handler;
 pub mod metadata;
 pub mod scoped;
@@ -50,6 +51,9 @@ pub fn generate_client_only(service_name: &str, schema: &ParsedSchema, types_cra
     // Uses client-only variant (no JSON dispatcher which requires ZmqClient types)
     let metadata_code = metadata::generate_metadata_client_only(service_name, &resolved, types_crate);
 
+    // Transport-agnostic dispatch function — routes method calls by name
+    let portable_dispatch = dispatch::generate_portable_dispatch(service_name, &resolved, types_crate);
+
     quote::quote! {
         #data_structs
         #response_enum
@@ -60,6 +64,7 @@ pub fn generate_client_only(service_name: &str, schema: &ParsedSchema, types_cra
 
         #scoped_response_types
         #metadata_code
+        #portable_dispatch
     }
 }
 
