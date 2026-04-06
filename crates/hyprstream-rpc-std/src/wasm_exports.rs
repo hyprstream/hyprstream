@@ -848,29 +848,25 @@ pub struct VfsShell {
 
 #[wasm_bindgen]
 impl VfsShell {
-    /// Create a new VFS shell with service mounts.
+    /// Create a new VFS shell by connecting to services.
+    ///
+    /// Creates its own RpcSessions for the registry and model services.
     #[wasm_bindgen(constructor)]
-    pub fn create(
-        registry_session: &RpcSession,
-        model_session: &RpcSession,
+    pub async fn connect(
+        registry_url: &str,
+        model_url: &str,
+        cert_hash: Option<String>,
+        key_seed: &[u8],
     ) -> Result<VfsShell, JsError> {
-        // Build namespace with mounts backed by the provided sessions
-        // SAFETY: wasm32 is single-threaded — Arc<RpcSession> is safe to share
-        let reg_arc = unsafe {
-            Arc::from_raw(registry_session as *const RpcSession)
-        };
-        let model_arc = unsafe {
-            Arc::from_raw(model_session as *const RpcSession)
-        };
+        // Create dedicated sessions for the VFS mounts
+        let reg_session = RpcSession::connect(registry_url, cert_hash.clone(), key_seed).await?;
+        let model_session = RpcSession::connect(model_url, cert_hash, key_seed).await?;
 
-        // Prevent Arc from dropping the sessions (they're owned by JS)
-        let reg_arc2 = Arc::clone(&reg_arc);
-        let model_arc2 = Arc::clone(&model_arc);
-        std::mem::forget(reg_arc);
-        std::mem::forget(model_arc);
+        let reg_arc = Arc::new(reg_session);
+        let model_arc = Arc::new(model_session);
 
-        let ns = crate::vfs_mount::build_browser_namespace(reg_arc2, model_arc2);
-        let ns = std::sync::Arc::new(ns);
+        let ns = crate::vfs_mount::build_browser_namespace(reg_arc, model_arc);
+        let ns = Arc::new(ns);
         let subject = hyprstream_rpc::Subject::anonymous();
 
         let shell = hyprstream_tcl::TclShell::new(subject, ns);
