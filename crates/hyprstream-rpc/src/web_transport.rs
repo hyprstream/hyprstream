@@ -140,9 +140,29 @@ impl WtClient {
 }
 
 /// Subscription stream yielding ZMTP multipart messages.
+#[wasm_bindgen::prelude::wasm_bindgen]
 pub struct SubStream {
     reader: web_sys::ReadableStreamDefaultReader,
     buffer: Vec<u8>,
+}
+
+#[wasm_bindgen::prelude::wasm_bindgen]
+impl SubStream {
+    /// Read next block as JS arrays. Returns null on stream end.
+    /// Each block is an array of Uint8Array frames (topic already stripped).
+    pub async fn next_block(&mut self) -> Result<JsValue, JsValue> {
+        match self.next().await {
+            Ok(Some(frames)) => {
+                let arr = js_sys::Array::new();
+                for frame in &frames {
+                    arr.push(&js_sys::Uint8Array::from(&frame[..]).into());
+                }
+                Ok(arr.into())
+            }
+            Ok(None) => Ok(JsValue::NULL),
+            Err(e) => Err(JsValue::from_str(&e.to_string())),
+        }
+    }
 }
 
 impl SubStream {

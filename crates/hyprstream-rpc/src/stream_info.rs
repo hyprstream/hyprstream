@@ -8,6 +8,7 @@
 /// Defined once here; service codegen modules emit `pub type StreamInfo =
 /// hyprstream_rpc::StreamInfo;` instead of generating duplicates.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StreamInfo {
     pub stream_id: String,
     pub endpoint: String,
