@@ -148,6 +148,13 @@ pub struct SubStream {
 
 #[wasm_bindgen::prelude::wasm_bindgen]
 impl SubStream {
+    /// Zero internal buffers and release the reader. Call on stream completion.
+    pub fn dispose(&mut self) {
+        self.buffer.fill(0);
+        self.buffer.clear();
+        // Reader is released when SubStream is dropped
+    }
+
     /// Read next block as JS arrays. Returns null on stream end.
     /// Each block is an array of Uint8Array frames (topic already stripped).
     pub async fn next_block(&mut self) -> Result<JsValue, JsValue> {

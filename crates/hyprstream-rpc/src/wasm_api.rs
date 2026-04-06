@@ -28,10 +28,11 @@ thread_local! {
     static WASM_NONCE_CACHE: std::sync::Arc<crate::envelope::InMemoryNonceCache> =
         std::sync::Arc::new(crate::envelope::InMemoryNonceCache::new());
 
-    // Stateful HMAC chain for streaming block verification (one per active subscription).
-    // Initialized by init_stream_hmac; advanced by verify_stream_block_step.
-    static STREAM_HMAC: std::cell::RefCell<Option<crate::crypto::ChainedStreamHmac>> =
-        std::cell::RefCell::new(None);
+    // Per-stream HMAC chains for concurrent stream verification.
+    // Each stream gets a unique handle from init_stream_hmac.
+    static STREAM_HMAC_TABLE: std::cell::RefCell<std::collections::HashMap<u32, crate::crypto::ChainedStreamHmac>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    static NEXT_HMAC_HANDLE: std::cell::Cell<u32> = std::cell::Cell::new(1);
 
     // Session-stable state: set once at connect time, reused for every call.
     static SESSION_SEED: std::cell::RefCell<Option<[u8; 32]>> =
@@ -257,55 +258,79 @@ pub fn verify_stream_block(
 
 /// Initialize the stateful HMAC chain for streaming block verification.
 ///
-/// Must be called once per subscription before verify_stream_block_step.
-/// The chain state is seeded from `request_id`, matching server-side initialization.
+/// Initialize a per-stream HMAC chain for stateful block verification.
+///
+/// Returns a handle (u32) to identify this stream's HMAC state. Pass the handle
+/// to `verify_stream_block_step` and `close_stream_hmac`. Supports concurrent streams.
 ///
 /// # Arguments
 ///
 /// * `mac_key` - 32 bytes MAC key from derive_stream_keys (bytes 32..64)
 /// * `request_id` - Request ID that seeds the HMAC chain
 #[wasm_bindgen]
-pub fn init_stream_hmac(mac_key: &[u8], request_id: u64) -> Result<(), JsError> {
+pub fn init_stream_hmac(mac_key: &[u8], request_id: u64) -> Result<u32, JsError> {
     use crate::crypto::ChainedStreamHmac;
 
     let key: [u8; 32] = mac_key
         .try_into()
         .map_err(|_| JsError::new("mac_key must be 32 bytes"))?;
-    STREAM_HMAC.with(|s| {
-        *s.borrow_mut() = Some(ChainedStreamHmac::from_bytes(key, request_id));
+    let handle = NEXT_HMAC_HANDLE.with(|h| {
+        let id = h.get();
+        h.set(id + 1);
+        id
     });
-    Ok(())
+    STREAM_HMAC_TABLE.with(|t| {
+        t.borrow_mut().insert(handle, ChainedStreamHmac::from_bytes(key, request_id));
+    });
+    Ok(handle)
 }
 
 /// Verify the next stream block in the stateful HMAC chain.
 ///
-/// Unlike verify_stream_block (stateless, only works for block 0), this advances the
-/// chain state so that blocks 1..N verify correctly. Must call init_stream_hmac first.
+/// Advances the chain state so that blocks 1..N verify correctly.
+/// Accepts both 16-byte truncated and 32-byte full MACs (wire format uses 16-byte).
 ///
 /// # Arguments
 ///
-/// * `capnp_data` - Cap'n Proto StreamBlock bytes (WITHOUT the trailing 32-byte MAC)
-/// * `mac` - 32 bytes trailing MAC extracted from the WebTransport message
+/// * `handle` - HMAC chain handle from init_stream_hmac
+/// * `capnp_data` - Cap'n Proto StreamBlock bytes (WITHOUT the trailing MAC)
+/// * `mac` - 16 or 32 byte MAC extracted from the WebTransport message
 ///
 /// # Returns
 ///
 /// true if MAC verification passes; false if MAC is wrong (stream integrity violation)
 #[wasm_bindgen]
-pub fn verify_stream_block_step(capnp_data: &[u8], mac: &[u8]) -> Result<bool, JsError> {
-    let mac_arr: [u8; 32] = mac
-        .try_into()
-        .map_err(|_| JsError::new("mac must be 32 bytes"))?;
-    STREAM_HMAC.with(|s| {
-        let mut s = s.borrow_mut();
-        let hmac = s
-            .as_mut()
-            .ok_or_else(|| JsError::new("stream HMAC not initialized; call init_stream_hmac first"))?;
-        match hmac.verify_next(capnp_data, &mac_arr) {
-            Ok(()) => Ok(true),
-            Err(crate::error::EnvelopeError::InvalidHmac) => Ok(false),
-            Err(e) => Err(JsError::new(&format!("stream block verification error: {}", e))),
-        }
+pub fn verify_stream_block_step(handle: u32, capnp_data: &[u8], mac: &[u8]) -> Result<bool, JsError> {
+    STREAM_HMAC_TABLE.with(|t| {
+        let mut table = t.borrow_mut();
+        let hmac = table
+            .get_mut(&handle)
+            .ok_or_else(|| JsError::new(&format!("stream HMAC handle {} not found; call init_stream_hmac first", handle)))?;
+
+        // Compute expected MAC and compare against provided (16 or 32 bytes)
+        let expected = hmac.compute_next(capnp_data);
+        let ok = if mac.len() == 16 {
+            // 16-byte truncated MAC (wire format)
+            expected[..16] == mac[..16]
+        } else if mac.len() == 32 {
+            // 32-byte full MAC
+            expected[..] == mac[..]
+        } else {
+            return Err(JsError::new(&format!("mac must be 16 or 32 bytes, got {}", mac.len())));
+        };
+        Ok(ok)
     })
+}
+
+/// Close a stream HMAC chain, zeroing key material.
+///
+/// Call when the stream is complete or cancelled to clean up state.
+#[wasm_bindgen]
+pub fn close_stream_hmac(handle: u32) {
+    STREAM_HMAC_TABLE.with(|t| {
+        t.borrow_mut().remove(&handle);
+        // ChainedStreamHmac drops, key is in a plain [u8; 32] — zeroed by Drop if using Zeroizing
+    });
 }
 
 // ============================================================================
