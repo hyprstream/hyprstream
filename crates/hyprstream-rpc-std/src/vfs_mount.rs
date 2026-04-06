@@ -117,15 +117,21 @@ pub struct GenericServiceMount {
     service: Box<dyn ServiceDispatch>,
     next_id: IdCounter,
     ctl_response: CtlResponseCache,
+    stream_registry: std::sync::Arc<crate::stream_mount::StreamRegistry>,
 }
 
 impl GenericServiceMount {
-    pub fn new(session: Arc<RpcSession>, service: Box<dyn ServiceDispatch>) -> Self {
+    pub fn new(
+        session: Arc<RpcSession>,
+        service: Box<dyn ServiceDispatch>,
+        stream_registry: std::sync::Arc<crate::stream_mount::StreamRegistry>,
+    ) -> Self {
         Self {
             session: SessionHandle(session),
             service,
             next_id: IdCounter::new(),
             ctl_response: CtlResponseCache::new(),
+            stream_registry,
         }
     }
 
@@ -224,10 +230,47 @@ impl Mount for GenericServiceMount {
         let resp = match dispatch_result {
             ServiceDispatchResult::Response(json) => json.into_bytes(),
             ServiceDispatchResult::Stream(stream_json) => {
-                // Streaming response — JSON of parsed StreamInfo
-                // The caller (Tcl stream builtin) uses the topic to read from /stream/{topic}/data
-                // TODO: auto-register SubStream in StreamRegistry for transparent /stream/ mount
-                stream_json.into_bytes()
+                // Streaming response — set up SUB subscription and register in StreamRegistry
+                let info: hyprstream_rpc::stream_info::StreamInfo = serde_json::from_str(&stream_json)
+                    .map_err(|e| MountError::Io(format!("parse StreamInfo: {e}")))?;
+
+                // ECDH key exchange
+                let keypair = hyprstream_rpc::wasm_api::generate_ephemeral_keypair()
+                    .map_err(|e| MountError::Io(format!("generate keypair: {e:?}")))?;
+                let shared_secret = hyprstream_rpc::wasm_api::ecdh_ristretto(&keypair[..32], &info.server_pubkey)
+                    .map_err(|e| MountError::Io(format!("ECDH: {e:?}")))?;
+
+                // Derive stream keys: [topic(32) | mac_key(32) | ctrl_topic(32) | ctrl_mac_key(32)]
+                let key_bytes = hyprstream_rpc::wasm_api::derive_stream_keys(&shared_secret, &keypair[32..64], &info.server_pubkey)
+                    .map_err(|e| MountError::Io(format!("derive keys: {e:?}")))?;
+                let topic_bytes = &key_bytes[..32];
+                let mac_key = &key_bytes[32..64];
+                let topic_hex: String = topic_bytes.iter().map(|b| format!("{b:02x}")).collect();
+
+                // Subscribe to SUB endpoint
+                let sub_stream = self.session.session().subscribe_at_endpoint(&info.endpoint, topic_bytes).await
+                    .map_err(|e| MountError::Io(format!("subscribe: {e:?}")))?;
+
+                // Init per-stream HMAC chain
+                let hmac_handle = hyprstream_rpc::wasm_api::init_stream_hmac(mac_key, 0)
+                    .map_err(|e| MountError::Io(format!("init HMAC: {e:?}")))?;
+
+                // Register in StreamRegistry
+                self.stream_registry.register(topic_hex.clone(), crate::stream_mount::StreamEntry {
+                    sub_stream,
+                    hmac_handle,
+                    owner: _caller.name().unwrap_or("anonymous").to_owned(),
+                    bytes_received: 0,
+                    blocks_received: 0,
+                    complete: false,
+                });
+
+                // Return JSON with topic so caller knows where to read from /stream/{topic}/data
+                let result = serde_json::json!({
+                    "streamId": info.stream_id,
+                    "topic": topic_hex,
+                });
+                serde_json::to_string(&result).unwrap_or_default().into_bytes()
             }
         };
         let len = resp.len() as u32;
@@ -412,10 +455,10 @@ pub fn build_browser_namespace(
 
     // Service mounts — all use GenericServiceMount with generated dispatch
     ns.mount("/srv/registry", Arc::new(GenericServiceMount::new(
-        Arc::clone(&registry_session), Box::new(RegistryDispatch),
+        Arc::clone(&registry_session), Box::new(RegistryDispatch), Arc::clone(&stream_registry),
     ))).expect("mount /srv/registry");
     ns.mount("/srv/model", Arc::new(GenericServiceMount::new(
-        Arc::clone(&model_session), Box::new(ModelDispatch),
+        Arc::clone(&model_session), Box::new(ModelDispatch), Arc::clone(&stream_registry),
     ))).expect("mount /srv/model");
 
     // Documentation mounts — generated at compile time from schema annotations

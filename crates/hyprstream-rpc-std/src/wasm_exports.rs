@@ -714,6 +714,18 @@ impl RpcSession {
         Ok(bytes)
     }
 
+    /// Subscribe to a SUB stream on a separate endpoint.
+    ///
+    /// Connects a new WebTransport session to the given endpoint and subscribes
+    /// to the specified topic. Use for streaming methods where the SUB endpoint
+    /// differs from the REQ/REP service endpoint.
+    pub async fn subscribe_at_endpoint(&self, endpoint: &str, topic: &[u8]) -> Result<hyprstream_rpc::web_transport::SubStream, JsError> {
+        let sub_client = hyprstream_rpc::web_transport::WtClient::connect(endpoint, None).await
+            .map_err(|e| JsError::new(&format!("connect SUB: {e}")))?;
+        sub_client.subscribe(topic).await
+            .map_err(|e| JsError::new(&format!("subscribe: {e}")))
+    }
+
     /// Sign payload, send via WebTransport REQ/REP, unwrap ResponseEnvelope.
     pub async fn send(&self, payload: &[u8]) -> Result<Vec<u8>, JsError> {
         let request_id = self.next_id();
