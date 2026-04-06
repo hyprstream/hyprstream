@@ -100,8 +100,12 @@ impl IdCounter {
 pub enum ServiceDispatchResult {
     /// Normal JSON response string.
     Response(String),
-    /// Streaming — JSON string of parsed StreamInfo for SUB setup.
-    Stream(String),
+    /// Streaming — JSON string of parsed StreamInfo + ephemeral keypair for ECDH.
+    Stream {
+        json: String,
+        /// 64 bytes: [secret(32) | pubkey(32)]
+        ephemeral_keypair: Vec<u8>,
+    },
 }
 
 /// Trait for service-specific dispatch. Implemented via macro from generated code.
@@ -109,6 +113,14 @@ pub enum ServiceDispatchResult {
 trait ServiceDispatch: Send + Sync {
     async fn dispatch(&self, method: &str, args_json: &str, session: &RpcSession) -> Result<ServiceDispatchResult, String>;
     fn metadata(&self) -> (&'static str, &'static [hyprstream_rpc::metadata::MethodMeta]);
+}
+
+/// Send function that uses call_streaming with ephemeral pubkey for streaming methods.
+async fn send_streaming(session: &RpcSession, payload: Vec<u8>, ephemeral_pubkey: &[u8]) -> Result<Vec<u8>, String> {
+    let response = session.call_streaming(&payload, ephemeral_pubkey).await
+        .map_err(|e| format!("{e:?}"))?;
+    crate::wasm_exports::unwrap_response_envelope(&response)
+        .map_err(|e| format!("envelope: {e:?}"))
 }
 
 /// Generic VFS mount driven by a ServiceDispatch implementation.
@@ -178,7 +190,7 @@ impl Mount for GenericServiceMount {
             ServiceDispatchResult::Response(json) => {
                 Ok(slice_read(json.into_bytes(), offset, count))
             }
-            ServiceDispatchResult::Stream(_) => {
+            ServiceDispatchResult::Stream { .. } => {
                 Err(MountError::NotSupported("use ctl to start streams, then read from /stream/{topic}/data".into()))
             }
         }
@@ -229,9 +241,8 @@ impl Mount for GenericServiceMount {
 
         let resp = match dispatch_result {
             ServiceDispatchResult::Response(json) => json.into_bytes(),
-            ServiceDispatchResult::Stream(stream_json) => {
+            ServiceDispatchResult::Stream { json: stream_json, ephemeral_keypair } => {
                 // Streaming response — set up SUB subscription and register in StreamRegistry
-                // JSON may be wrapped in a variant name: {"GenerateStream":{...}} or plain {...}
                 let parsed: serde_json::Value = serde_json::from_str(&stream_json)
                     .map_err(|e| MountError::Io(format!("parse stream response: {e}")))?;
                 // Unwrap single-key variant wrapper if present
@@ -247,14 +258,12 @@ impl Mount for GenericServiceMount {
                 let info: hyprstream_rpc::stream_info::StreamInfo = serde_json::from_value(inner)
                     .map_err(|e| MountError::Io(format!("parse StreamInfo: {e}")))?;
 
-                // ECDH key exchange
-                let keypair = hyprstream_rpc::wasm_api::generate_ephemeral_keypair()
-                    .map_err(|e| MountError::Io(format!("generate keypair: {e:?}")))?;
-                let shared_secret = hyprstream_rpc::wasm_api::ecdh_ristretto(&keypair[..32], &info.server_pubkey)
+                // ECDH key exchange using the ephemeral keypair from the dispatch
+                let shared_secret = hyprstream_rpc::wasm_api::ecdh_ristretto(&ephemeral_keypair[..32], &info.server_pubkey)
                     .map_err(|e| MountError::Io(format!("ECDH: {e:?}")))?;
 
                 // Derive stream keys: [topic(32) | mac_key(32) | ctrl_topic(32) | ctrl_mac_key(32)]
-                let key_bytes = hyprstream_rpc::wasm_api::derive_stream_keys(&shared_secret, &keypair[32..64], &info.server_pubkey)
+                let key_bytes = hyprstream_rpc::wasm_api::derive_stream_keys(&shared_secret, &ephemeral_keypair[32..64], &info.server_pubkey)
                     .map_err(|e| MountError::Io(format!("derive keys: {e:?}")))?;
                 let topic_bytes = &key_bytes[..32];
                 let mac_key = &key_bytes[32..64];
@@ -432,14 +441,29 @@ macro_rules! impl_service_dispatch {
         impl ServiceDispatch for $name {
             async fn dispatch(&self, method: &str, args_json: &str, session: &RpcSession) -> Result<ServiceDispatchResult, String> {
                 use $mod as svc;
+
+                // Generate ephemeral keypair upfront — used by streaming methods,
+                // ignored by non-streaming (the send closure decides which transport to use).
+                let keypair = hyprstream_rpc::wasm_api::generate_ephemeral_keypair()
+                    .map_err(|e| format!("keypair: {e:?}"))?;
+                let ephemeral_pubkey = keypair[32..64].to_vec();
+
                 let result = svc::dispatch(method, args_json, 0, |payload: Vec<u8>| async move {
-                    session.send(&payload).await
-                        .map_err(|e| format!("{e:?}"))
+                    // Use call_streaming which injects ephemeral_pubkey into the
+                    // RequestEnvelope. For non-streaming methods, the server ignores
+                    // the pubkey — it only matters for streaming handshakes.
+                    let response = session.call_streaming(&payload, &ephemeral_pubkey).await
+                        .map_err(|e| format!("{e:?}"))?;
+                    crate::wasm_exports::unwrap_response_envelope(&response)
+                        .map_err(|e| format!("envelope: {e:?}"))
                 }).await?;
-                // Convert generated DispatchResult to our ServiceDispatchResult
+
                 Ok(match result {
                     svc::DispatchResult::Response(json) => ServiceDispatchResult::Response(json),
-                    svc::DispatchResult::Stream(bytes) => ServiceDispatchResult::Stream(bytes),
+                    svc::DispatchResult::Stream(json) => ServiceDispatchResult::Stream {
+                        json,
+                        ephemeral_keypair: keypair,
+                    },
                 })
             }
 
