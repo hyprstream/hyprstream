@@ -1,0 +1,20 @@
+# Dioxus.toml — dx serve config for hyprstream hot-patching
+#
+# Dev workflow:
+#   OPENSSL_NO_VENDOR=1 LIBTORCH_USE_PYTORCH=1 LIBTORCH_BYPASS_VERSION_CHECK=1 \
+#     dx serve --hotpatch --server --package hyprstream --bin hyprstream --open false \
+#     --args "service start --foreground"
+#
+# This starts hyprstream in foreground mode with hot-patching enabled.
+# Change any .rs file → ~130ms patch → running services updated.
+
+[application]
+out_dir = "target/dx"
+asset_dir = "public"
+
+[web.watcher]
+watch_path = ["crates"]
+
+[bundle]
+identifier = "ai.cyberdione.hyprstream"
+publisher = "Cyberdione"
