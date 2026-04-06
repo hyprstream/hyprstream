@@ -875,8 +875,8 @@ impl VfsShell {
         let model_arc = Arc::new(model_session);
         web_sys::console::log_1(&"[VfsShell] Building namespace...".into());
 
-        // Step 4: Build VFS namespace
-        let ns = crate::vfs_mount::build_browser_namespace(reg_arc, model_arc);
+        // Step 4: Build VFS namespace (includes /stream/ mount)
+        let (ns, _stream_registry) = crate::vfs_mount::build_browser_namespace(reg_arc, model_arc);
         let ns = Arc::new(ns);
         web_sys::console::log_1(&"[VfsShell] Namespace built".into());
 

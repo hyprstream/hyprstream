@@ -168,7 +168,8 @@ impl Mount for GenericServiceMount {
         let state = fid.downcast_ref::<VfsFidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
 
-        // ctl pattern: data = "command {json_args}" or "command '{json_args}'"
+        // ctl pattern: data = "command {json_args}" or "command json_args"
+        // Tcl brace quoting strips outer {} so we may receive bare JSON fields.
         let data_str = std::str::from_utf8(data).unwrap_or("").trim();
 
         // Strip shell quotes from around JSON if present
@@ -176,23 +177,32 @@ impl Mount for GenericServiceMount {
             .trim_end_matches('\'')
             .trim_end_matches('"');
 
-        let (cmd, args_str) = if let Some(brace) = stripped.find('{') {
+        let (cmd, args_owned);
+        if let Some(brace) = stripped.find('{') {
             let cmd_part = stripped[..brace].trim().trim_end_matches('\'').trim_end_matches('"').trim();
             let args_part = &stripped[brace..];
-            if cmd_part.is_empty() {
-                (state.path.first().map(|s| s.as_str()).unwrap_or(""), args_part)
+            cmd = if cmd_part.is_empty() {
+                state.path.first().map(|s| s.as_str()).unwrap_or("")
             } else {
-                (cmd_part, args_part)
-            }
+                cmd_part
+            };
+            args_owned = args_part.to_owned();
+        } else if stripped.contains(':') && stripped.contains('"') {
+            // Looks like stripped JSON (Tcl brace quoting removed outer {})
+            // Split on first whitespace to find command, rest is bare JSON
+            let (c, rest) = stripped.split_once(char::is_whitespace).unwrap_or((stripped, ""));
+            cmd = c.trim();
+            // Re-wrap bare JSON fields with braces
+            args_owned = format!("{{{}}}", rest.trim());
         } else {
-            // No JSON — might be a simple command name
-            let cmd = if stripped.is_empty() {
+            cmd = if stripped.is_empty() {
                 state.path.first().map(|s| s.as_str()).unwrap_or("")
             } else {
                 stripped
             };
-            (cmd, "{}")
+            args_owned = "{}".to_owned();
         };
+        let args_str = args_owned.as_str();
 
         let result = self.service.dispatch(cmd, args_str, self.session.session()).await
             .map_err(|e| MountError::Io(e))?;
@@ -370,7 +380,8 @@ impl_service_dispatch!(InferenceDispatch, crate::inference_client);
 pub fn build_browser_namespace(
     registry_session: Arc<RpcSession>,
     model_session: Arc<RpcSession>,
-) -> hyprstream_vfs::Namespace {
+) -> (hyprstream_vfs::Namespace, Arc<crate::stream_mount::StreamRegistry>) {
+    let stream_registry = Arc::new(crate::stream_mount::StreamRegistry::new());
     let mut ns = hyprstream_vfs::Namespace::new();
 
     // Service mounts — all use GenericServiceMount with generated dispatch
@@ -403,5 +414,10 @@ pub fn build_browser_namespace(
         crate::mcp_client::schema_metadata,
     ))).expect("mount /srv/mcp/doc");
 
-    ns
+    // Stream mount — named pipes for active streaming data
+    ns.mount("/stream", Arc::new(crate::stream_mount::StreamMount::new(
+        Arc::clone(&stream_registry),
+    ))).expect("mount /stream");
+
+    (ns, stream_registry)
 }
