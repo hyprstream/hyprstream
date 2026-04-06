@@ -15,6 +15,7 @@
 #![cfg(target_arch = "wasm32")]
 
 use std::cell::{Cell, RefCell};
+use std::sync::Arc;
 
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsError;
@@ -823,6 +824,71 @@ where
         setup(req.reborrow());
     })
     .map_err(|e| JsError::new(&e.to_string()))
+}
+
+// ============================================================================
+// VFS Shell — Tcl + Namespace backed by RpcSession mounts
+// ============================================================================
+
+/// Browser-side VFS shell with Tcl interpreter.
+///
+/// Provides a single `eval` entry point for executing shell commands
+/// against the VFS namespace. All I/O goes through RpcSession → ZMTP/QUIC.
+///
+/// Usage from JS:
+/// ```js
+/// const shell = await VfsShell.create(registrySession, modelSession);
+/// const output = await shell.eval("ls /srv/registry");
+/// const output2 = await shell.eval("cat /srv/registry/qwen3-4b");
+/// ```
+#[wasm_bindgen]
+pub struct VfsShell {
+    shell: std::cell::RefCell<hyprstream_tcl::TclShell>,
+}
+
+#[wasm_bindgen]
+impl VfsShell {
+    /// Create a new VFS shell with service mounts.
+    #[wasm_bindgen(constructor)]
+    pub fn create(
+        registry_session: &RpcSession,
+        model_session: &RpcSession,
+    ) -> Result<VfsShell, JsError> {
+        // Build namespace with mounts backed by the provided sessions
+        // SAFETY: wasm32 is single-threaded — Arc<RpcSession> is safe to share
+        let reg_arc = unsafe {
+            Arc::from_raw(registry_session as *const RpcSession)
+        };
+        let model_arc = unsafe {
+            Arc::from_raw(model_session as *const RpcSession)
+        };
+
+        // Prevent Arc from dropping the sessions (they're owned by JS)
+        let reg_arc2 = Arc::clone(&reg_arc);
+        let model_arc2 = Arc::clone(&model_arc);
+        std::mem::forget(reg_arc);
+        std::mem::forget(model_arc);
+
+        let ns = crate::vfs_mount::build_browser_namespace(reg_arc2, model_arc2);
+        let ns = std::sync::Arc::new(ns);
+        let subject = hyprstream_rpc::Subject::anonymous();
+
+        let shell = hyprstream_tcl::TclShell::new(subject, ns);
+
+        Ok(VfsShell {
+            shell: std::cell::RefCell::new(shell),
+        })
+    }
+
+    /// Evaluate a Tcl script against the VFS namespace.
+    ///
+    /// Returns the script output as a string.
+    /// All VFS operations go through RpcSession → ZMTP/QUIC → server.
+    pub async fn eval(&self, script: &str) -> Result<String, JsError> {
+        let mut shell = self.shell.borrow_mut();
+        shell.eval(script).await
+            .map_err(|e| JsError::new(&e))
+    }
 }
 
 // ============================================================================

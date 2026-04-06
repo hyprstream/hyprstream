@@ -107,7 +107,9 @@ pub struct Stat {
 /// Used for `/config/`, `/private/`, `/bin/`, `/env/`, and any other
 /// client-local namespace entries. Every method receives the verified
 /// `Subject` of the caller for per-tenant fid isolation and policy checks.
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", allow(clippy::non_send_fields_in_send_ty))]
 pub trait Mount: Send + Sync {
     /// Walk path components, returning an opaque fid.
     async fn walk(&self, components: &[&str], caller: &Subject) -> Result<Fid, MountError>;

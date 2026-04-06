@@ -18,6 +18,7 @@
 
 mod mount;
 mod namespace;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod proxy;
 
 pub use hyprstream_rpc::Subject;

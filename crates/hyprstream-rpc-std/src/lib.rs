@@ -148,4 +148,6 @@ pub mod metrics_client {
 // ============================================================================
 
 #[cfg(target_arch = "wasm32")]
+pub mod vfs_mount;
+#[cfg(target_arch = "wasm32")]
 pub mod wasm_exports;
