@@ -152,7 +152,9 @@ impl Mount for GenericServiceMount {
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
 
         if state.path.is_empty() {
-            return Err(MountError::IsDirectory("service root is a directory".into()));
+            // After ctl write→read, second read returns empty (EOF)
+            // For plain cat on root, this is also correct (it's a directory)
+            return Ok(Vec::new());
         }
 
         // cat /srv/{service}/{method} → dispatch query method with empty args
@@ -166,12 +168,17 @@ impl Mount for GenericServiceMount {
         let state = fid.downcast_ref::<VfsFidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
 
-        // ctl pattern: data = "command {json_args}" or path contains command
+        // ctl pattern: data = "command {json_args}" or "command '{json_args}'"
         let data_str = std::str::from_utf8(data).unwrap_or("").trim();
 
-        let (cmd, args_str) = if let Some(brace) = data_str.find('{') {
-            let cmd_part = data_str[..brace].trim();
-            let args_part = &data_str[brace..];
+        // Strip shell quotes from around JSON if present
+        let stripped = data_str
+            .trim_end_matches('\'')
+            .trim_end_matches('"');
+
+        let (cmd, args_str) = if let Some(brace) = stripped.find('{') {
+            let cmd_part = stripped[..brace].trim().trim_end_matches('\'').trim_end_matches('"').trim();
+            let args_part = &stripped[brace..];
             if cmd_part.is_empty() {
                 (state.path.first().map(|s| s.as_str()).unwrap_or(""), args_part)
             } else {
@@ -179,10 +186,10 @@ impl Mount for GenericServiceMount {
             }
         } else {
             // No JSON — might be a simple command name
-            let cmd = if data_str.is_empty() {
+            let cmd = if stripped.is_empty() {
                 state.path.first().map(|s| s.as_str()).unwrap_or("")
             } else {
-                data_str
+                stripped
             };
             (cmd, "{}")
         };
