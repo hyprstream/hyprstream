@@ -96,10 +96,18 @@ impl IdCounter {
 // GenericServiceMount — codegen-driven mount for any service
 // ============================================================================
 
+/// Result from service dispatch — normal response or stream setup.
+pub enum ServiceDispatchResult {
+    /// Normal JSON response string.
+    Response(String),
+    /// Streaming — JSON string of parsed StreamInfo for SUB setup.
+    Stream(String),
+}
+
 /// Trait for service-specific dispatch. Implemented via macro from generated code.
 #[async_trait(?Send)]
 trait ServiceDispatch: Send + Sync {
-    async fn dispatch(&self, method: &str, args_json: &str, session: &RpcSession) -> Result<String, String>;
+    async fn dispatch(&self, method: &str, args_json: &str, session: &RpcSession) -> Result<ServiceDispatchResult, String>;
     fn metadata(&self) -> (&'static str, &'static [hyprstream_rpc::metadata::MethodMeta]);
 }
 
@@ -159,9 +167,15 @@ impl Mount for GenericServiceMount {
 
         // cat /srv/{service}/{method} → dispatch query method with empty args
         let method = &state.path[0];
-        let data = self.service.dispatch(method, "{}", self.session.session()).await
-            .map_err(|e| MountError::Io(e))?;
-        Ok(slice_read(data.into_bytes(), offset, count))
+        match self.service.dispatch(method, "{}", self.session.session()).await
+            .map_err(|e| MountError::Io(e))? {
+            ServiceDispatchResult::Response(json) => {
+                Ok(slice_read(json.into_bytes(), offset, count))
+            }
+            ServiceDispatchResult::Stream(_) => {
+                Err(MountError::NotSupported("use ctl to start streams, then read from /stream/{topic}/data".into()))
+            }
+        }
     }
 
     async fn write(&self, fid: &Fid, _offset: u64, data: &[u8], _caller: &Subject) -> Result<u32, MountError> {
@@ -204,9 +218,18 @@ impl Mount for GenericServiceMount {
         };
         let args_str = args_owned.as_str();
 
-        let result = self.service.dispatch(cmd, args_str, self.session.session()).await
+        let dispatch_result = self.service.dispatch(cmd, args_str, self.session.session()).await
             .map_err(|e| MountError::Io(e))?;
-        let resp = result.into_bytes();
+
+        let resp = match dispatch_result {
+            ServiceDispatchResult::Response(json) => json.into_bytes(),
+            ServiceDispatchResult::Stream(stream_json) => {
+                // Streaming response — JSON of parsed StreamInfo
+                // The caller (Tcl stream builtin) uses the topic to read from /stream/{topic}/data
+                // TODO: auto-register SubStream in StreamRegistry for transparent /stream/ mount
+                stream_json.into_bytes()
+            }
+        };
         let len = resp.len() as u32;
         self.ctl_response.set(resp);
         Ok(len)
@@ -348,14 +371,17 @@ macro_rules! impl_service_dispatch {
 
         #[async_trait(?Send)]
         impl ServiceDispatch for $name {
-            async fn dispatch(&self, method: &str, args_json: &str, session: &RpcSession) -> Result<String, String> {
+            async fn dispatch(&self, method: &str, args_json: &str, session: &RpcSession) -> Result<ServiceDispatchResult, String> {
                 use $mod as svc;
-                svc::dispatch(method, args_json, 0, |payload: Vec<u8>| async move {
-                    // session.send() handles signing + envelope unwrapping
+                let result = svc::dispatch(method, args_json, 0, |payload: Vec<u8>| async move {
                     session.send(&payload).await
-                        .map(|v| v)
                         .map_err(|e| format!("{e:?}"))
-                }).await
+                }).await?;
+                // Convert generated DispatchResult to our ServiceDispatchResult
+                Ok(match result {
+                    svc::DispatchResult::Response(json) => ServiceDispatchResult::Response(json),
+                    svc::DispatchResult::Stream(bytes) => ServiceDispatchResult::Stream(bytes),
+                })
             }
 
             fn metadata(&self) -> (&'static str, &'static [hyprstream_rpc::metadata::MethodMeta]) {
