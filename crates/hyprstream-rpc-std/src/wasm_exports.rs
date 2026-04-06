@@ -119,17 +119,12 @@ impl RpcSession {
             .map_err(|e| JsError::new(&e.to_string()))
     }
 
-    /// Open a SUB stream. Returns raw subscription bytes for the topic.
-    pub async fn subscribe_raw(&self, topic: &[u8]) -> Result<Vec<u8>, JsError> {
-        let mut sub = self.client
+    /// Open a SUB stream. Returns a SubStream that yields blocks via next_block().
+    pub async fn subscribe_stream(&self, topic: &[u8]) -> Result<hyprstream_rpc::web_transport::SubStream, JsError> {
+        self.client
             .subscribe(topic)
             .await
-            .map_err(|e| JsError::new(&e.to_string()))?;
-        // Return first message from subscription
-        match sub.next().await.map_err(|e| JsError::new(&e.to_string()))? {
-            Some(frames) if !frames.is_empty() => Ok(frames[0].clone()),
-            _ => Err(JsError::new("subscription returned no data")),
-        }
+            .map_err(|e| JsError::new(&e.to_string()))
     }
 
     // ========================================================================
@@ -514,8 +509,8 @@ impl RpcSession {
             hyprstream_rpc::ToCapnp::write_to(&req, &mut inner);
         })?;
         let response = self.send(&payload).await?;
-        // Response is ModelResponseVariant::InferResult which contains InferResponseVariant::ApplyChatTemplate(String)
-        let parsed = crate::model_client::ModelResponseVariant::parse_response(&response)
+        // Use scoped response parser — handles nested ModelResponse → InferResponse union
+        let parsed = crate::model_client::InferClientResponseVariant::parse_scoped_response(&response)
             .map_err(|e| JsError::new(&e.to_string()))?;
         serde_wasm_bindgen::to_value(&parsed).map_err(|e| JsError::new(&e.to_string()))
     }
@@ -540,7 +535,8 @@ impl RpcSession {
             .await
             .map_err(|e| JsError::new(&e.to_string()))?;
         let inner = unwrap_response_envelope(&response_bytes)?;
-        let parsed = crate::model_client::ModelResponseVariant::parse_response(&inner)
+        // Use scoped response parser — handles nested ModelResponse → InferResponse union
+        let parsed = crate::model_client::InferClientResponseVariant::parse_scoped_response(&inner)
             .map_err(|e| JsError::new(&e.to_string()))?;
         serde_wasm_bindgen::to_value(&parsed).map_err(|e| JsError::new(&e.to_string()))
     }

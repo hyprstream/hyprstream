@@ -43,6 +43,9 @@ pub fn generate_client_only(service_name: &str, schema: &ParsedSchema, types_cra
         types_crate,
     );
 
+    // Scoped response enums + parsers (e.g., InferClientResponseVariant with parse_scoped_response)
+    let scoped_response_types = scoped::generate_scoped_response_types(service_name, &resolved, types_crate);
+
     quote::quote! {
         #data_structs
         #response_enum
@@ -50,6 +53,8 @@ pub fn generate_client_only(service_name: &str, schema: &ParsedSchema, types_cra
         impl #response_type {
             #parse_response
         }
+
+        #scoped_response_types
     }
 }
 

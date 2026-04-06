@@ -33,6 +33,129 @@ pub fn generate_scoped_clients(service_name: &str, resolved: &ResolvedSchema, ty
     tokens
 }
 
+/// Generate only the response enums and parse functions for scoped clients.
+/// No client structs, no transport deps — compiles on all targets including wasm32.
+pub fn generate_scoped_response_types(service_name: &str, resolved: &ResolvedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
+    let mut tokens = TokenStream::new();
+    let pascal = to_pascal_case(service_name);
+    let capnp_mod_ident = format_ident!("{}_capnp", service_name);
+    let capnp_mod: TokenStream = match types_crate {
+        Some(tc) => quote! { #tc::#capnp_mod_ident },
+        None => quote! { crate::#capnp_mod_ident },
+    };
+
+    for sc in &resolved.raw.scoped_clients {
+        walk_scoped_response_types(&mut tokens, &pascal, &capnp_mod, sc, &[], resolved, types_crate);
+    }
+
+    tokens
+}
+
+fn walk_scoped_response_types(
+    tokens: &mut TokenStream,
+    pascal: &str,
+    capnp_mod: &TokenStream,
+    sc: &ScopedClient,
+    ancestors: &[&ScopedClient],
+    resolved: &ResolvedSchema,
+    types_crate: Option<&syn::Path>,
+) {
+    tokens.extend(generate_scoped_response_only(pascal, capnp_mod, sc, ancestors, resolved, types_crate));
+    let mut next_ancestors: Vec<&ScopedClient> = ancestors.to_vec();
+    next_ancestors.push(sc);
+    for nested in &sc.nested_clients {
+        walk_scoped_response_types(tokens, pascal, capnp_mod, nested, &next_ancestors, resolved, types_crate);
+    }
+}
+
+/// Generate response enum + parse_scoped_response for one scoped client level.
+fn generate_scoped_response_only(
+    pascal: &str,
+    capnp_mod: &TokenStream,
+    sc: &ScopedClient,
+    ancestors: &[&ScopedClient],
+    resolved: &ResolvedSchema,
+    types_crate: Option<&syn::Path>,
+) -> TokenStream {
+    let _client_name = format_ident!("{}Client", to_pascal_case(&sc.client_name));
+    let response_type = format_ident!("{}ResponseVariant", to_pascal_case(&sc.client_name));
+
+    let response_enum = generate_response_enum_from_variants(
+        &response_type.to_string(),
+        &sc.inner_response_variants,
+        resolved,
+        types_crate,
+    );
+
+    // Build parse_scoped_response
+    let outer_resp_type = format_ident!("{}", to_snake_case(&format!("{pascal}Response")));
+    let full_chain: Vec<&ScopedClient> = ancestors.iter().copied().chain(std::iter::once(sc)).collect();
+
+    let mut levels = Vec::new();
+    for (i, level_sc) in full_chain.iter().enumerate() {
+        let resp_module = if i == 0 {
+            format_ident!("{}", to_snake_case(&format!("{pascal}Response")))
+        } else {
+            format_ident!("{}", full_chain[i - 1].capnp_inner_response)
+        };
+        let variant = format_ident!("{}", to_pascal_case(&format!("{}Result", level_sc.factory_name)));
+        let which_alias = format_ident!("__W{}", i);
+        levels.push(UnwrapLevel { resp_module, variant, which_alias });
+    }
+
+    let inner_which = format_ident!("__WInner");
+    let inner_match_arms: Vec<TokenStream> = sc.inner_response_variants.iter().map(|v| {
+        generate_parse_match_arm(&response_type, capnp_mod, v, resolved, &inner_which, types_crate)
+    }).collect();
+
+    let inner_resp_mod = format_ident!("{}", sc.capnp_inner_response);
+    let mut body = quote! {
+        use #capnp_mod::#inner_resp_mod::Which as __WInner;
+        match resp.which()? {
+            #(#inner_match_arms)*
+            #[allow(unreachable_patterns)]
+            _ => Err(anyhow::anyhow!("unexpected inner response variant")),
+        }
+    };
+
+    for level in levels.iter().rev() {
+        let which_alias = &level.which_alias;
+        let variant = &level.variant;
+        let resp_module = &level.resp_module;
+        body = quote! {
+            use #capnp_mod::#resp_module::Which as #which_alias;
+            match resp.which()? {
+                #which_alias::#variant(resp) => {
+                    let resp = resp?;
+                    #body
+                }
+                #which_alias::Error(err) => {
+                    let err = err?;
+                    let msg = err.get_message()?.to_str()?.to_string();
+                    Err(anyhow::anyhow!(msg))
+                }
+                _ => Err(anyhow::anyhow!("unexpected response variant")),
+            }
+        };
+    }
+
+    quote! {
+        #response_enum
+
+        impl #response_type {
+            /// Parse a scoped response from raw bytes.
+            pub fn parse_scoped_response(bytes: &[u8]) -> anyhow::Result<#response_type> {
+                let reader = capnp::serialize::read_message(
+                    &mut std::io::Cursor::new(bytes),
+                    capnp::message::ReaderOptions::new(),
+                )?;
+                let resp = reader.get_root::<#capnp_mod::#outer_resp_type::Reader>()?;
+                #body
+            }
+        }
+    }
+}
+
 /// Recursively walk the scoped client tree, generating each client with its ancestors.
 fn walk_scoped(
     tokens: &mut TokenStream,
