@@ -231,7 +231,20 @@ impl Mount for GenericServiceMount {
             ServiceDispatchResult::Response(json) => json.into_bytes(),
             ServiceDispatchResult::Stream(stream_json) => {
                 // Streaming response — set up SUB subscription and register in StreamRegistry
-                let info: hyprstream_rpc::stream_info::StreamInfo = serde_json::from_str(&stream_json)
+                // JSON may be wrapped in a variant name: {"GenerateStream":{...}} or plain {...}
+                let parsed: serde_json::Value = serde_json::from_str(&stream_json)
+                    .map_err(|e| MountError::Io(format!("parse stream response: {e}")))?;
+                // Unwrap single-key variant wrapper if present
+                let inner = if let Some(obj) = parsed.as_object() {
+                    if obj.len() == 1 {
+                        obj.values().next().unwrap().clone()
+                    } else {
+                        parsed.clone()
+                    }
+                } else {
+                    parsed.clone()
+                };
+                let info: hyprstream_rpc::stream_info::StreamInfo = serde_json::from_value(inner)
                     .map_err(|e| MountError::Io(format!("parse StreamInfo: {e}")))?;
 
                 // ECDH key exchange
@@ -247,8 +260,11 @@ impl Mount for GenericServiceMount {
                 let mac_key = &key_bytes[32..64];
                 let topic_hex: String = topic_bytes.iter().map(|b| format!("{b:02x}")).collect();
 
-                // Subscribe to SUB endpoint
-                let sub_stream = self.session.session().subscribe_at_endpoint(&info.endpoint, topic_bytes).await
+                // Subscribe on the existing WebTransport connection (same QUIC session)
+                // Browser clients don't connect to the IPC endpoint from StreamInfo —
+                // they subscribe on the service's QUIC connection which multiplexes SUB.
+                let topic_hex_bytes = topic_hex.as_bytes();
+                let sub_stream = self.session.session().subscribe_stream(topic_hex_bytes).await
                     .map_err(|e| MountError::Io(format!("subscribe: {e:?}")))?;
 
                 // Init per-stream HMAC chain
@@ -257,7 +273,7 @@ impl Mount for GenericServiceMount {
 
                 // Register in StreamRegistry
                 self.stream_registry.register(topic_hex.clone(), crate::stream_mount::StreamEntry {
-                    sub_stream,
+                    sub_stream: Some(sub_stream),
                     hmac_handle,
                     owner: _caller.name().unwrap_or("anonymous").to_owned(),
                     bytes_received: 0,

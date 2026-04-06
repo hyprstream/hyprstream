@@ -44,8 +44,8 @@ impl<T> SyncRefCell<T> {
 
 /// Metadata and state for an active stream.
 pub struct StreamEntry {
-    /// The SubStream providing data blocks
-    pub sub_stream: hyprstream_rpc::web_transport::SubStream,
+    /// The SubStream providing data blocks (Option for temporary extraction during await)
+    pub sub_stream: Option<hyprstream_rpc::web_transport::SubStream>,
     /// HMAC chain handle for verification (from init_stream_hmac)
     pub hmac_handle: u32,
     /// Owner identity (for access control)
@@ -189,24 +189,50 @@ impl Mount for StreamMount {
                 Err(MountError::IsDirectory("stream topic dir".into()))
             }
             StreamFidState::Data { topic } => {
-                let mut streams = self.registry.streams.borrow_mut();
-                let entry = streams
-                    .get_mut(topic.as_str())
-                    .ok_or_else(|| MountError::NotFound(topic.clone()))?;
+                // Check completion and get HMAC handle WITHOUT holding borrow across await
+                let (complete, hmac_handle) = {
+                    let streams = self.registry.streams.borrow();
+                    let entry = streams
+                        .get(topic.as_str())
+                        .ok_or_else(|| MountError::NotFound(topic.clone()))?;
+                    (entry.complete, entry.hmac_handle)
+                };
 
-                if entry.complete {
+                if complete {
                     return Ok(vec![]); // EOF
                 }
 
-                // Read next block from SubStream (blocks until data arrives)
-                match entry.sub_stream.next_block().await {
+                // Take SubStream out temporarily (avoids holding RefCell borrow across await)
+                let mut sub_stream = {
+                    let mut streams = self.registry.streams.borrow_mut();
+                    let entry = streams
+                        .get_mut(topic.as_str())
+                        .ok_or_else(|| MountError::NotFound(topic.clone()))?;
+                    entry.sub_stream.take()
+                        .ok_or_else(|| MountError::Io("stream read in progress".into()))?
+                };
+
+                // Read next block (await without holding borrow)
+                let result = sub_stream.next_block().await;
+
+                // Put SubStream back
+                {
+                    let mut streams = self.registry.streams.borrow_mut();
+                    if let Some(entry) = streams.get_mut(topic.as_str()) {
+                        entry.sub_stream = Some(sub_stream);
+                    }
+                }
+
+                match result {
                     Ok(js_val) => {
                         if js_val.is_null() {
-                            entry.complete = true;
+                            let mut streams = self.registry.streams.borrow_mut();
+                            if let Some(entry) = streams.get_mut(topic.as_str()) {
+                                entry.complete = true;
+                            }
                             return Ok(vec![]); // EOF
                         }
-                        // js_val is an Array of Uint8Array frames
-                        // Frame 0 = capnp StreamBlock, Frame 1 = MAC (if present)
+
                         let arr = js_sys::Array::from(&js_val);
                         if arr.length() == 0 {
                             return Ok(vec![]);
@@ -222,13 +248,12 @@ impl Mount for StreamMount {
                             let mut mac = vec![0u8; mac_frame.length() as usize];
                             mac_frame.copy_to(&mut mac);
 
-                            // Verify using per-stream HMAC handle
                             match hyprstream_rpc::wasm_api::verify_stream_block_step(
-                                entry.hmac_handle,
+                                hmac_handle,
                                 &capnp_data,
                                 &mac,
                             ) {
-                                Ok(true) => {} // Valid
+                                Ok(true) => {}
                                 Ok(false) => {
                                     return Err(MountError::Io(
                                         "stream block HMAC verification failed".into(),
@@ -240,10 +265,17 @@ impl Mount for StreamMount {
                             }
                         }
 
-                        // Parse StreamBlock and extract data payload
                         let data = parse_stream_block_data(&capnp_data);
-                        entry.bytes_received += data.len() as u64;
-                        entry.blocks_received += 1;
+
+                        // Update metrics
+                        {
+                            let mut streams = self.registry.streams.borrow_mut();
+                            if let Some(entry) = streams.get_mut(topic.as_str()) {
+                                entry.bytes_received += data.len() as u64;
+                                entry.blocks_received += 1;
+                            }
+                        }
+
                         Ok(data)
                     }
                     Err(e) => Err(MountError::Io(format!("stream read: {:?}", e))),
@@ -289,7 +321,9 @@ impl Mount for StreamMount {
                 match cmd {
                     "cancel" => {
                         if let Some(mut entry) = self.registry.remove(topic) {
-                            entry.sub_stream.dispose();
+                            if let Some(ref mut ss) = entry.sub_stream {
+                                ss.dispose();
+                            }
                             hyprstream_rpc::wasm_api::close_stream_hmac(entry.hmac_handle);
                         }
                         Ok(cmd.len() as u32)
@@ -370,7 +404,9 @@ impl Mount for StreamMount {
                     drop(streams);
                     // Stream finished and reader clunked — clean up
                     if let Some(mut entry) = self.registry.remove(topic) {
-                        entry.sub_stream.dispose();
+                        if let Some(ref mut ss) = entry.sub_stream {
+                            ss.dispose();
+                        }
                         hyprstream_rpc::wasm_api::close_stream_hmac(entry.hmac_handle);
                     }
                 }

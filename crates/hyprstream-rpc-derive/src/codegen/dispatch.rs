@@ -46,9 +46,15 @@ pub fn generate_portable_dispatch(
         .map(|sc| sc.factory_name.as_str())
         .collect();
 
-    // Identify which methods are streaming
-    let is_streaming = |v: &UnionVariant, resp_variants: &[UnionVariant]| -> bool {
-        let result_name = format!("{}Result", v.name);
+    // Identify which methods are streaming.
+    // Top-level: response variant is "{name}Result" with type StreamInfo
+    // Scoped: response variant matches request name directly (no "Result" suffix)
+    let is_streaming = |v: &UnionVariant, resp_variants: &[UnionVariant], is_scoped: bool| -> bool {
+        let result_name = if is_scoped {
+            v.name.clone()
+        } else {
+            format!("{}Result", v.name)
+        };
         resp_variants.iter().any(|r| r.name == result_name && r.type_name == "StreamInfo")
     };
 
@@ -59,7 +65,7 @@ pub fn generate_portable_dispatch(
         .iter()
         .filter(|v| !scoped_names.contains(&v.name.as_str()))
         .filter(|v| !v.cli_hidden)
-        .filter(|v| !is_streaming(v, &resolved.raw.response_variants))
+        .filter(|v| !is_streaming(v, &resolved.raw.response_variants, false))
         .map(|v| generate_dispatch_arm(v, resolved, &capnp_mod, &req_type, &response_type))
         .collect();
 
@@ -70,7 +76,7 @@ pub fn generate_portable_dispatch(
         .iter()
         .filter(|v| !scoped_names.contains(&v.name.as_str()))
         .filter(|v| !v.cli_hidden)
-        .filter(|v| is_streaming(v, &resolved.raw.response_variants))
+        .filter(|v| is_streaming(v, &resolved.raw.response_variants, false))
         .map(|v| generate_streaming_dispatch_arm(v, resolved, &capnp_mod, &req_type, &response_type))
         .collect();
 
@@ -115,7 +121,7 @@ pub fn generate_portable_dispatch(
 
             sc.inner_request_variants.iter()
                 .filter(|v| !v.cli_hidden)
-                .filter(|v| !is_streaming(v, &sc.inner_response_variants))
+                .filter(|v| !is_streaming(v, &sc.inner_response_variants, true))
                 .map(|v| {
                     let method_snake = to_snake_case(&v.name);
                     let full_name = format!("{}.{}", scope_snake, method_snake);
@@ -234,7 +240,7 @@ pub fn generate_portable_dispatch(
 
             sc.inner_request_variants.iter()
                 .filter(|v| !v.cli_hidden)
-                .filter(|v| is_streaming(v, &sc.inner_response_variants))
+                .filter(|v| is_streaming(v, &sc.inner_response_variants, true))
                 .map(|v| {
                     let method_snake = to_snake_case(&v.name);
                     let full_name = format!("{}.{}", scope_snake, method_snake);
