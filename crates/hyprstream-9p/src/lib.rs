@@ -17,3 +17,7 @@
 
 pub mod msg;
 pub mod client;
+#[cfg(target_arch = "wasm32")]
+pub mod dma;
+#[cfg(target_arch = "wasm32")]
+pub mod wanix_mount;
