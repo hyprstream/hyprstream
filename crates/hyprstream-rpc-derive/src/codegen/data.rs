@@ -71,7 +71,7 @@ pub fn generate_data_structs(
                 // Types originating from RPC infrastructure schemas (e.g. streaming.capnp)
                 // alias to the canonical type in hyprstream_rpc instead of generating duplicates.
                 const RPC_CRATE_MODULES: &[(&str, &str)] = &[
-                    ("streaming", "hyprstream_rpc::streaming"),
+                    ("streaming", "hyprstream_rpc::stream_info"),
                     ("common", "hyprstream_rpc::common_types"),
                 ];
                 if origin != service_name {
@@ -185,6 +185,7 @@ fn generate_data_struct(
     quote! {
         #[doc = #doc]
         #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
         pub struct #data_name {
             #(#fields,)*
         }

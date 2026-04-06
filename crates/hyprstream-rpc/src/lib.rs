@@ -102,6 +102,8 @@ pub mod crypto;
 pub mod envelope;
 pub mod error;
 pub mod platform;
+pub mod rpc_client;
+pub mod stream_info;
 pub mod zmtp_framing;
 
 // ============================================================================
@@ -142,6 +144,8 @@ pub mod web_transport;
 // ============================================================================
 
 pub use capnp::{serialize_message, FromCapnp, ToCapnp};
+pub use rpc_client::RpcClient;
+pub use stream_info::StreamInfo;
 pub use crypto::{
     generate_signing_keypair, signing_key_from_bytes, verifying_key_from_bytes, ChainedStreamHmac,
     DefaultKeyExchange, HmacKey, KeyExchange, SharedSecret, SigningKey, VerifyingKey,

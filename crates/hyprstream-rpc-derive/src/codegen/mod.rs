@@ -9,6 +9,50 @@ pub mod scoped;
 use crate::resolve::ResolvedSchema;
 use crate::schema::types::ParsedSchema;
 
+/// Generate client-only code from a parsed schema.
+///
+/// Emits data structs, response enum, client struct, scoped clients, and metadata.
+/// Does NOT emit server-side handler traits, ZMQ service code, or native-only deps.
+/// Compiles to all targets including wasm32.
+pub fn generate_client_only(service_name: &str, schema: &ParsedSchema, types_crate: Option<&syn::Path>) -> proc_macro2::TokenStream {
+    let resolved = ResolvedSchema::from(schema);
+    let is_data_only = resolved.raw.request_variants.is_empty();
+
+    let data_structs = data::generate_data_structs(&resolved, service_name, types_crate);
+
+    if is_data_only {
+        return quote::quote! { #data_structs };
+    }
+
+    let pascal = crate::util::to_pascal_case(service_name);
+    let response_type = quote::format_ident!("{}ResponseVariant", pascal);
+    let capnp_mod_ident = quote::format_ident!("{}_capnp", service_name);
+    let capnp_mod: proc_macro2::TokenStream = match types_crate {
+        Some(tc) => quote::quote! { #tc::#capnp_mod_ident },
+        None => quote::quote! { crate::#capnp_mod_ident },
+    };
+    let resp_type = quote::format_ident!("{}", crate::util::to_snake_case(&format!("{pascal}Response")));
+
+    let response_enum = client::generate_response_enum(service_name, &resolved, types_crate);
+    let parse_response = client::generate_parse_response_fn(
+        &response_type,
+        &capnp_mod,
+        &resp_type,
+        &resolved.raw.response_variants,
+        &resolved,
+        types_crate,
+    );
+
+    quote::quote! {
+        #data_structs
+        #response_enum
+
+        impl #response_type {
+            #parse_response
+        }
+    }
+}
+
 /// Generate all service code from a parsed schema.
 ///
 /// When `types_crate` is `Some`, generates client-only code (no handler/dispatch)

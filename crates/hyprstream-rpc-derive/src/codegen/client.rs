@@ -760,10 +760,119 @@ pub fn generate_client(service_name: &str, resolved: &ResolvedSchema, types_crat
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Portable Client (transport-agnostic, works on native + wasm32)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Generate a transport-agnostic client struct using `RpcClient` trait.
+///
+/// Unlike `generate_client()` which hardcodes `ZmqClientBase`, this emits a
+/// client that works with any `RpcClient` implementation (ZMQ, WebTransport, etc.).
+/// Used by `generate_rpc_client!` for the client-only crate.
+/// TODO: Wire into generate_client_only() once scoped client codegen supports portable mode.
+#[allow(dead_code)]
+pub fn generate_portable_client(service_name: &str, resolved: &ResolvedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
+    let pascal = to_pascal_case(service_name);
+    let client_name = format_ident!("{}Client", pascal);
+    let response_type = format_ident!("{}ResponseVariant", pascal);
+    let capnp_mod_ident = format_ident!("{}_capnp", service_name);
+    let capnp_mod: TokenStream = match types_crate {
+        Some(tc) => quote! { #tc::#capnp_mod_ident },
+        None => quote! { crate::#capnp_mod_ident },
+    };
+    let req_type = format_ident!("{}", to_snake_case(&format!("{pascal}Request")));
+    let doc = format!("Auto-generated client for the {pascal} service (transport-agnostic).");
+
+    let scoped_variant_names: Vec<&str> = resolved.raw
+        .scoped_clients
+        .iter()
+        .map(|sc| sc.factory_name.as_str())
+        .collect();
+
+    // Request methods (skip scoped variants — those get factory methods)
+    let request_methods: Vec<TokenStream> = resolved.raw
+        .request_variants
+        .iter()
+        .filter(|v| !scoped_variant_names.contains(&v.name.as_str()))
+        .map(|v| {
+            generate_request_method_inner(
+                &capnp_mod,
+                &req_type,
+                &response_type,
+                v,
+                resolved,
+                None,
+                Some(&resolved.raw.response_variants),
+                false,
+                types_crate,
+                true, // portable
+            )
+        })
+        .collect();
+
+    // parse_response method
+    let resp_type = format_ident!("{}", to_snake_case(&format!("{pascal}Response")));
+    let parse_response = generate_parse_response_fn(
+        &response_type,
+        &capnp_mod,
+        &resp_type,
+        &resolved.raw.response_variants,
+        resolved,
+        types_crate,
+    );
+
+    // Factory methods for scoped clients
+    let factory_methods: Vec<TokenStream> = resolved.raw
+        .scoped_clients
+        .iter()
+        .map(generate_scoped_factory_method)
+        .collect();
+
+    quote! {
+        #[doc = #doc]
+        #[derive(Clone)]
+        pub struct #client_name {
+            client: Arc<dyn hyprstream_rpc::RpcClient>,
+        }
+
+        impl #client_name {
+            /// Create a new client from any RpcClient implementation.
+            pub fn new(client: Arc<dyn hyprstream_rpc::RpcClient>) -> Self {
+                Self { client }
+            }
+
+            /// Get the next request ID.
+            pub fn next_id(&self) -> u64 {
+                self.client.next_id()
+            }
+
+            /// Send a raw request and return the raw response bytes.
+            pub async fn call(&self, payload: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+                self.client.call(payload).await
+            }
+
+            /// Send a streaming request with ephemeral DH pubkey.
+            pub async fn call_streaming(&self, payload: Vec<u8>, ephemeral_pubkey: [u8; 32]) -> anyhow::Result<Vec<u8>> {
+                self.client.call_streaming(payload, ephemeral_pubkey).await
+            }
+
+            #(#request_methods)*
+
+            #parse_response
+
+            #(#factory_methods)*
+        }
+    }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Request Method Generation
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Generate a single request method. Used for both top-level and scoped clients.
+///
+/// When `portable` is true, streaming methods use `self.call_streaming(payload, ephemeral_pubkey)`
+/// instead of `CallOptions`. This enables the generated code to work without native-only ZMQ types.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_request_method(
     capnp_mod: &TokenStream,
@@ -775,6 +884,23 @@ pub fn generate_request_method(
     response_variants: Option<&[UnionVariant]>,
     is_scoped: bool,
     types_crate: Option<&syn::Path>,
+) -> TokenStream {
+    generate_request_method_inner(capnp_mod, req_type, response_type, variant, resolved, scope, response_variants, is_scoped, types_crate, false)
+}
+
+/// Inner implementation with portable flag.
+#[allow(clippy::too_many_arguments)]
+fn generate_request_method_inner(
+    capnp_mod: &TokenStream,
+    req_type: &syn::Ident,
+    response_type: &syn::Ident,
+    variant: &UnionVariant,
+    resolved: &ResolvedSchema,
+    scope: Option<&ScopedMethodContext>,
+    response_variants: Option<&[UnionVariant]>,
+    is_scoped: bool,
+    types_crate: Option<&syn::Path>,
+    portable: bool,
 ) -> TokenStream {
     let method_name = format_ident!("{}", to_snake_case(&variant.name));
     let doc = format!("{} ({} variant)", to_snake_case(&variant.name), variant.type_name);
@@ -843,13 +969,22 @@ pub fn generate_request_method(
     };
 
     let (extra_param, call_expr) = if is_streaming {
-        (
-            quote! { , ephemeral_pubkey: [u8; 32] },
-            quote! {
-                let opts = CallOptions::default().ephemeral_pubkey(ephemeral_pubkey);
-                let response = self.call_with_options(payload, opts).await?;
-            },
-        )
+        if portable {
+            (
+                quote! { , ephemeral_pubkey: [u8; 32] },
+                quote! {
+                    let response = self.call_streaming(payload, ephemeral_pubkey).await?;
+                },
+            )
+        } else {
+            (
+                quote! { , ephemeral_pubkey: [u8; 32] },
+                quote! {
+                    let opts = CallOptions::default().ephemeral_pubkey(ephemeral_pubkey);
+                    let response = self.call_with_options(payload, opts).await?;
+                },
+            )
+        }
     } else {
         (
             TokenStream::new(),

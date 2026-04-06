@@ -1367,3 +1367,108 @@ pub fn generate_rpc_service(input: TokenStream) -> TokenStream {
 
     codegen::generate_service(&name, &parsed, types_crate, args.scope_handlers).into()
 }
+
+/// Generate client-only code from a Cap'n Proto service schema.
+///
+/// Like `generate_rpc_service!` but emits only data structs, response enums,
+/// and metadata — no server handler traits, no ZMQ deps, no async runtime.
+/// Compiles to all targets including wasm32.
+///
+/// # Usage
+///
+/// ```ignore
+/// pub mod model_client {
+///     hyprstream_rpc_derive::generate_rpc_client!("model");
+/// }
+/// ```
+#[proc_macro]
+pub fn generate_rpc_client(input: TokenStream) -> TokenStream {
+    let args: RpcServiceArgs = match syn::parse(input) {
+        Ok(a) => a,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let service_name = &args.name;
+    let name = service_name.value();
+    let types_crate = args.types_crate.as_ref();
+
+    let parsed = match schema::parse_from_cgr(&name) {
+        Ok(p) => p,
+        Err(_cgr_err) => {
+            let manifest_dir = match std::env::var("CARGO_MANIFEST_DIR") {
+                Ok(d) => d,
+                Err(_) => {
+                    return syn::Error::new(service_name.span(), "CARGO_MANIFEST_DIR not set")
+                        .to_compile_error()
+                        .into()
+                }
+            };
+
+            let schema_dir = match std::fs::canonicalize(format!("{manifest_dir}/schema")) {
+                Ok(d) => d,
+                Err(e) => {
+                    return syn::Error::new(
+                        service_name.span(),
+                        format!("Cannot resolve schema directory: {e}"),
+                    )
+                    .to_compile_error()
+                    .into()
+                }
+            };
+            let schema_path = match std::fs::canonicalize(schema_dir.join(format!("{name}.capnp"))) {
+                Ok(p) if p.starts_with(&schema_dir) => p,
+                Ok(p) => {
+                    return syn::Error::new(
+                        service_name.span(),
+                        format!("Schema path escapes build environment: {}", p.display()),
+                    )
+                    .to_compile_error()
+                    .into()
+                }
+                Err(e) => {
+                    return syn::Error::new(
+                        service_name.span(),
+                        format!("Cannot resolve schema '{name}.capnp': {e}"),
+                    )
+                    .to_compile_error()
+                    .into()
+                }
+            };
+            let schema_text = match std::fs::read_to_string(&schema_path) {
+                Ok(t) => t,
+                Err(e) => {
+                    return syn::Error::new(
+                        service_name.span(),
+                        format!("Cannot read {}: {e}", schema_path.display()),
+                    )
+                    .to_compile_error()
+                    .into()
+                }
+            };
+
+            let mut parsed = match schema::parse_capnp_schema(&schema_text, &name) {
+                Some(p) => p,
+                None => {
+                    return syn::Error::new(
+                        service_name.span(),
+                        format!("Failed to parse schema for '{name}'"),
+                    )
+                    .to_compile_error()
+                    .into()
+                }
+            };
+
+            if let Ok(out_dir) = std::env::var("OUT_DIR") {
+                let metadata_path = std::path::Path::new(&out_dir).join(format!("{name}_metadata.json"));
+                if let Ok(metadata_text) = std::fs::read_to_string(&metadata_path) {
+                    if let Err(e) = schema::merge_annotations_from_metadata(&mut parsed, &metadata_text) {
+                        let _ = e;
+                    }
+                }
+            }
+
+            parsed
+        }
+    };
+
+    codegen::generate_client_only(&name, &parsed, types_crate).into()
+}

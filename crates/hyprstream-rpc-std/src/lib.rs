@@ -89,71 +89,63 @@ pub mod chat_core_capnp {
 }
 
 // ============================================================================
-// Generated service clients (from proc macro)
-// These include server-side handler traits + ZMQ transport code that
-// requires native deps. Gate to non-wasm32 for now.
-// TODO: proc macro flag for client-only generation (no server handler code)
+// Generated client types (from proc macro)
+// Client-only: data structs, response enums, metadata. No server handlers.
+// Compiles to all targets including wasm32.
 // ============================================================================
 
-#[cfg(not(target_arch = "wasm32"))]
 pub mod inference_client {
     #![allow(dead_code, unused_imports, unused_variables)]
     #![allow(clippy::all)]
     extern crate self as hyprstream_rpc_std;
-    hyprstream_rpc_derive::generate_rpc_service!("inference");
+    hyprstream_rpc_derive::generate_rpc_client!("inference");
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 pub mod model_client {
     #![allow(dead_code, unused_imports, unused_variables)]
     #![allow(clippy::all)]
     extern crate self as hyprstream_rpc_std;
-    hyprstream_rpc_derive::generate_rpc_service!("model");
+    hyprstream_rpc_derive::generate_rpc_client!("model");
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 pub mod registry_client {
     #![allow(dead_code, unused_imports, unused_variables)]
     #![allow(clippy::all)]
     extern crate self as hyprstream_rpc_std;
-    hyprstream_rpc_derive::generate_rpc_service!("registry");
+    hyprstream_rpc_derive::generate_rpc_client!("registry");
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 pub mod policy_client {
     #![allow(dead_code, unused_imports, unused_variables)]
     #![allow(clippy::all)]
     extern crate self as hyprstream_rpc_std;
-    hyprstream_rpc_derive::generate_rpc_service!("policy");
+    hyprstream_rpc_derive::generate_rpc_client!("policy");
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 pub mod mcp_client {
     #![allow(dead_code, unused_imports, unused_variables)]
     #![allow(clippy::all)]
     extern crate self as hyprstream_rpc_std;
-    hyprstream_rpc_derive::generate_rpc_service!("mcp");
+    hyprstream_rpc_derive::generate_rpc_client!("mcp");
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 pub mod notification_client {
     #![allow(dead_code, unused_imports, unused_variables)]
     #![allow(clippy::all)]
     extern crate self as hyprstream_rpc_std;
-    hyprstream_rpc_derive::generate_rpc_service!("notification");
+    hyprstream_rpc_derive::generate_rpc_client!("notification");
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 pub mod metrics_client {
     #![allow(dead_code, unused_imports, unused_variables)]
     #![allow(clippy::all)]
     extern crate self as hyprstream_rpc_std;
-    hyprstream_rpc_derive::generate_rpc_service!("metrics");
+    hyprstream_rpc_derive::generate_rpc_client!("metrics");
 }
 
 // ============================================================================
-// WASM exports (browser only) — TODO after clients work
+// WASM exports (browser only)
 // ============================================================================
 
-// #[cfg(target_arch = "wasm32")]
-// pub mod wasm_exports;
+#[cfg(target_arch = "wasm32")]
+pub mod wasm_exports;
