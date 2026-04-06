@@ -3,6 +3,7 @@
 using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".mcpScope;
 using import "/annotations.capnp".mcpDescription;
+using import "/annotations.capnp".docExample;
 using import "/streaming.capnp".StreamInfo;
 
 # 9P types — shared across all services with fs scope.
@@ -41,19 +42,27 @@ struct RegistryRequest {
   # Request payload (union of request types)
   union {
     # List all models available in the registry
-    list @1 :Void $mcpScope(query);
+    list @1 :Void $mcpScope(query)
+        $mcpDescription("List all repositories registered in the local registry.")
+        $docExample("ls /srv/registry");
     # Get repository information by ID
     get @2 :Text $mcpScope(query);
     # Get repository information by name
-    getByName @3 :Text $mcpScope(query);
+    getByName @3 :Text $mcpScope(query)
+        $mcpDescription("Get repository information by its display name.")
+        $docExample("cat /srv/registry/my-model");
     # Clone a model repository from a URL
-    clone @4 :CloneRequest $mcpScope(write);
+    clone @4 :CloneRequest $mcpScope(write)
+        $mcpDescription("Clone a model repository from a URL into the local registry.")
+        $docExample("ctl /srv/registry clone '{\"url\": \"https://huggingface.co/org/model\"}'");
     # Register an existing local repository
     register @5 :RegisterRequest $mcpScope(write);
     # Remove a repository from the registry
     remove @6 :Text $mcpScope(manage);
     # Check registry service health
-    healthCheck @7 :Void $mcpScope(query);
+    healthCheck @7 :Void $mcpScope(query)
+        $mcpDescription("Check if the registry service is healthy and responding.")
+        $docExample("cat /srv/registry/health");
     # Clone a model repository from a URL (streaming progress)
     cloneStream @8 :CloneRequest $mcpScope(write) $mcpDescription("Clone a model repository from a URL (streaming progress)");
 

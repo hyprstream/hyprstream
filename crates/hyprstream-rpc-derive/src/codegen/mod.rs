@@ -46,6 +46,10 @@ pub fn generate_client_only(service_name: &str, schema: &ParsedSchema, types_cra
     // Scoped response enums + parsers (e.g., InferClientResponseVariant with parse_scoped_response)
     let scoped_response_types = scoped::generate_scoped_response_types(service_name, &resolved, types_crate);
 
+    // Schema metadata + render_doc() — needed for client-side documentation via VFS
+    // Uses client-only variant (no JSON dispatcher which requires ZmqClient types)
+    let metadata_code = metadata::generate_metadata_client_only(service_name, &resolved, types_crate);
+
     quote::quote! {
         #data_structs
         #response_enum
@@ -55,6 +59,7 @@ pub fn generate_client_only(service_name: &str, schema: &ParsedSchema, types_cra
         }
 
         #scoped_response_types
+        #metadata_code
     }
 }
 

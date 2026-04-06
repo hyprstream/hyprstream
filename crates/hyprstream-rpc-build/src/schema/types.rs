@@ -31,6 +31,8 @@ pub struct UnionVariant {
     pub scope: String,
     /// Whether this method is hidden from CLI (internal-only).
     pub cli_hidden: bool,
+    /// VFS usage example from `$docExample` annotation. Empty = no example.
+    pub doc_example: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -14,6 +14,7 @@ mod zmq;
 pub mod streaming;
 pub mod spawnable;
 pub mod metadata;
+pub mod doc;
 
 pub use traits::{RpcHandler, RpcRequest, RpcService};
 #[allow(deprecated)]
@@ -21,6 +22,7 @@ pub use zmq::{AuthorizeFn, CallOptions, Continuation, EnvelopeContext, QuicLoopC
 pub use streaming::StreamService;
 pub use spawnable::Spawnable;
 pub use metadata::{MethodMeta, ParamMeta, SchemaMetadataFn, ScopedSchemaMetadataFn, ScopedClientTreeNode};
+pub use doc::DocFs;
 
 /// Trait for generated service clients that can be constructed from a base `ZmqClient`.
 ///

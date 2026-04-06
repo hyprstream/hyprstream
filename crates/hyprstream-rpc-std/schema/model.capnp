@@ -4,6 +4,7 @@ using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".paramDescription;
 using import "/annotations.capnp".mcpScope;
+using import "/annotations.capnp".docExample;
 using import "/annotations.capnp".optional;
 using import "/annotations.capnp".serdeRename;
 using import "/streaming.capnp".StreamInfo;
@@ -51,8 +52,10 @@ struct ModelRequest {
   union {
     load @1 :LoadModelRequest $mcpDescription("Load a model into memory for inference") $mcpScope(write);
     unload @2 :UnloadModelRequest $mcpDescription("Unload a model from memory to free resources") $mcpScope(write);
-    status @3 :StatusRequest $mcpDescription("Get status of all loaded/loading models (empty modelRef) or a specific model") $mcpScope(query);
-    healthCheck @4 :Void $mcpDescription("Check model service health and status") $mcpScope(query);
+    status @3 :StatusRequest $mcpDescription("Get status of all loaded/loading models (empty modelRef) or a specific model") $mcpScope(query)
+        $docExample("cat /srv/model/status");
+    healthCheck @4 :Void $mcpDescription("Check model service health and status") $mcpScope(query)
+        $docExample("cat /srv/model/health");
 
     # Scoped interfaces (require modelRef)
     ttt @5 :TttRequest;         # Test-time training operations

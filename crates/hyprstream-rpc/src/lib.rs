@@ -107,6 +107,16 @@ pub mod stream_info;
 pub mod zmtp_framing;
 
 // ============================================================================
+// Cross-platform modules (available on all targets including wasm32)
+// ============================================================================
+
+/// Schema introspection metadata types — used by proc macro codegen on all targets.
+pub mod metadata {
+    pub use crate::_metadata::*;
+}
+mod _metadata;
+
+// ============================================================================
 // Native-only modules (not compiled for wasm32)
 // ============================================================================
 

@@ -903,7 +903,12 @@ fn generate_request_method_inner(
     portable: bool,
 ) -> TokenStream {
     let method_name = format_ident!("{}", to_snake_case(&variant.name));
-    let doc = format!("{} ({} variant)", to_snake_case(&variant.name), variant.type_name);
+    let doc = if variant.description.is_empty() {
+        format!("{} ({} variant)", to_snake_case(&variant.name), variant.type_name)
+    } else {
+        let scope_info = if variant.scope.is_empty() { String::new() } else { format!("\n\nScope: {}", variant.scope) };
+        format!("{}{}", variant.description, scope_info)
+    };
 
     // For scoped methods, walk the ScopedMethodContext chain and shadow `req`
     let (outer_req_setup, parse_call) = if let Some(sc) = scope {

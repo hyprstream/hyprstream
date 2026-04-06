@@ -41,6 +41,10 @@ annotation cliHidden(field) :Void;
 # Usage: serverPubkey @2 :Data $fixedSize(32);
 annotation fixedSize(field) :UInt32;
 
+# VFS usage example for man pages. Complete usage scenario, not a field value hint.
+# Usage: $docExample("ctl /srv/registry clone '{\"url\": \"...\"}'")
+annotation docExample(field) :Text;
+
 # Mark a field as optional in MCP tool schemas.
 # Optional fields use type-appropriate defaults when absent (0 for numbers, "" for text, [] for lists).
 annotation optional(field) :Void;

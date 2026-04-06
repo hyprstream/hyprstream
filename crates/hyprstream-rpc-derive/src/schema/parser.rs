@@ -474,6 +474,9 @@ pub fn parse_variant_line(line: &str) -> Option<UnionVariant> {
         return None;
     }
 
+    // Extract $docExample before stripping annotations
+    let doc_example = extract_text_annotation(line, "docExample");
+
     // Strip out Cap'n Proto annotations (e.g., $mcpDescription("..."))
     if let Some(dollar_pos) = line.find('$') {
         line = line[..dollar_pos].trim();
@@ -487,7 +490,19 @@ pub fn parse_variant_line(line: &str) -> Option<UnionVariant> {
     let _ordinal: u32 = ordinal_str.parse().ok()?;
     let type_name = line[colon_pos + 1..].trim().to_owned();
 
-    Some(UnionVariant { name, type_name, description: String::new(), scope: String::new(), cli_hidden: false })
+    Some(UnionVariant { name, type_name, description: String::new(), scope: String::new(), cli_hidden: false, doc_example })
+}
+
+/// Extract the value of a text annotation like `$docExample("...")` from a line.
+fn extract_text_annotation(line: &str, name: &str) -> String {
+    let marker = format!("${}(\"", name);
+    if let Some(start) = line.find(&marker) {
+        let rest = &line[start + marker.len()..];
+        if let Some(end) = rest.find("\")") {
+            return rest[..end].to_owned();
+        }
+    }
+    String::new()
 }
 
 /// Collect all struct names that need Data structs generated.
@@ -649,6 +664,7 @@ pub fn merge_annotations_from_metadata(
     let mut param_desc_map: HashMap<(String, String), String> = HashMap::new();
     let mut fixed_size_map: HashMap<(String, String), u32> = HashMap::new();
     let mut optional_set: HashSet<(String, String)> = HashSet::new();
+    let mut doc_example_map: HashMap<(String, String), String> = HashMap::new();
 
     for struct_meta in &metadata.structs {
         let struct_name = struct_meta.name.split(':').next_back().unwrap_or(&struct_meta.name).to_owned();
@@ -692,6 +708,7 @@ pub fn merge_annotations_from_metadata(
                     "mcpDescription" => { desc_map.insert(key, value_str); }
                     "paramDescription" => { param_desc_map.insert(key, value_str); }
                     "mcpScope" => { scope_map.insert(key, value_str); }
+                    "docExample" => { doc_example_map.insert(key, value_str); }
                     "" => {
                         // Legacy: no name field — treat as description (backwards compat)
                         if !value_str.is_empty() {
@@ -712,6 +729,9 @@ pub fn merge_annotations_from_metadata(
         }
         if let Some(scope) = scope_map.get(&key) {
             variant.scope = scope.clone();
+        }
+        if let Some(example) = doc_example_map.get(&key) {
+            variant.doc_example = example.clone();
         }
     };
 

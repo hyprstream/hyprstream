@@ -56,6 +56,14 @@ struct VfsFidState {
     opened: bool,
 }
 
+/// Apply offset+count slicing to a read result (9P semantics).
+/// Returns empty vec when offset is past end (signals EOF to the read loop).
+fn slice_read(data: Vec<u8>, offset: u64, count: u32) -> Vec<u8> {
+    let start = (offset as usize).min(data.len());
+    let end = (start + count as usize).min(data.len());
+    data[start..end].to_vec()
+}
+
 // ============================================================================
 // RegistryMount — /srv/registry
 // ============================================================================
@@ -117,12 +125,12 @@ impl Mount for RegistryMount {
         Ok(())
     }
 
-    async fn read(&self, fid: &Fid, _offset: u64, _count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
+    async fn read(&self, fid: &Fid, offset: u64, count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
         let state = fid.downcast_ref::<VfsFidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
 
-        match state.path.len() {
-            0 => Err(MountError::IsDirectory("registry root is a directory".into())),
+        let data = match state.path.len() {
+            0 => return Err(MountError::IsDirectory("registry root is a directory".into())),
             1 => {
                 // /srv/registry/{name} → get repo details
                 let repos = self.list_repos().await?;
@@ -130,7 +138,7 @@ impl Mount for RegistryMount {
                 let repo = repos.iter()
                     .find(|r| r.get("name").and_then(|n| n.as_str()) == Some(name))
                     .ok_or_else(|| MountError::NotFound(name.clone()))?;
-                Ok(serde_json::to_string_pretty(repo).unwrap_or_default().into_bytes())
+                serde_json::to_string_pretty(repo).unwrap_or_default().into_bytes()
             }
             2 => {
                 // /srv/registry/{name}/{sub} → read sub-resource
@@ -146,13 +154,14 @@ impl Mount for RegistryMount {
                             .map_err(|e| MountError::Io(format!("{e:?}")))?;
                         let parsed: serde_json::Value = serde_wasm_bindgen::from_value(result)
                             .map_err(|e| MountError::Io(e.to_string()))?;
-                        Ok(serde_json::to_string_pretty(&parsed).unwrap_or_default().into_bytes())
+                        serde_json::to_string_pretty(&parsed).unwrap_or_default().into_bytes()
                     }
-                    _ => Err(MountError::NotFound(format!("{name}/{sub}"))),
+                    _ => return Err(MountError::NotFound(format!("{name}/{sub}"))),
                 }
             }
-            _ => Err(MountError::NotFound(state.path.join("/"))),
-        }
+            _ => return Err(MountError::NotFound(state.path.join("/"))),
+        };
+        Ok(slice_read(data, offset, count))
     }
 
     async fn write(&self, _fid: &Fid, _offset: u64, _data: &[u8], _caller: &Subject) -> Result<u32, MountError> {
@@ -296,28 +305,29 @@ impl Mount for ModelMount {
         Ok(())
     }
 
-    async fn read(&self, fid: &Fid, _offset: u64, _count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
+    async fn read(&self, fid: &Fid, offset: u64, count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
         let state = fid.downcast_ref::<VfsFidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
 
-        match state.path.first().map(|s| s.as_str()) {
+        let data = match state.path.first().map(|s| s.as_str()) {
             Some("status") => {
                 let result = self.session.session().model_status(JsValue::from_str("{}")).await
                     .map_err(|e| MountError::Io(format!("{e:?}")))?;
                 let parsed: serde_json::Value = serde_wasm_bindgen::from_value(result)
                     .map_err(|e| MountError::Io(e.to_string()))?;
-                Ok(serde_json::to_string_pretty(&parsed).unwrap_or_default().into_bytes())
+                serde_json::to_string_pretty(&parsed).unwrap_or_default().into_bytes()
             }
             Some("health") => {
                 let result = self.session.session().model_health_check().await
                     .map_err(|e| MountError::Io(format!("{e:?}")))?;
                 let parsed: serde_json::Value = serde_wasm_bindgen::from_value(result)
                     .map_err(|e| MountError::Io(e.to_string()))?;
-                Ok(serde_json::to_string_pretty(&parsed).unwrap_or_default().into_bytes())
+                serde_json::to_string_pretty(&parsed).unwrap_or_default().into_bytes()
             }
-            None => Err(MountError::IsDirectory("model root is a directory".into())),
-            Some(p) => Err(MountError::NotFound(p.into())),
-        }
+            None => return Err(MountError::IsDirectory("model root is a directory".into())),
+            Some(p) => return Err(MountError::NotFound(p.into())),
+        };
+        Ok(slice_read(data, offset, count))
     }
 
     async fn write(&self, _fid: &Fid, _offset: u64, _data: &[u8], _caller: &Subject) -> Result<u32, MountError> {
@@ -354,6 +364,102 @@ impl Mount for ModelMount {
 }
 
 // ============================================================================
+// DocMount — serves man pages from compiled schema metadata
+// ============================================================================
+
+/// Mount for serving service documentation generated at compile time.
+///
+/// Uses the `render_doc()` function from the proc macro codegen.
+/// Mounted at `/srv/{service}/doc` for each service.
+pub struct DocMount {
+    render: fn(&[&str]) -> Option<String>,
+    metadata: fn() -> (&'static str, &'static [hyprstream_rpc::metadata::MethodMeta]),
+}
+
+impl DocMount {
+    pub fn new(
+        render: fn(&[&str]) -> Option<String>,
+        metadata: fn() -> (&'static str, &'static [hyprstream_rpc::metadata::MethodMeta]),
+    ) -> Self {
+        Self { render, metadata }
+    }
+}
+
+#[async_trait(?Send)]
+impl Mount for DocMount {
+    async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
+        Ok(Fid::new(VfsFidState {
+            path: components.iter().map(|s| s.to_string()).collect(),
+            opened: false,
+        }))
+    }
+
+    async fn open(&self, fid: &mut Fid, _mode: u8, _caller: &Subject) -> Result<(), MountError> {
+        if let Some(state) = fid.downcast_mut::<VfsFidState>() {
+            state.opened = true;
+        }
+        Ok(())
+    }
+
+    async fn read(&self, fid: &Fid, offset: u64, count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
+        let state = fid.downcast_ref::<VfsFidState>()
+            .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+
+        let path_refs: Vec<&str> = state.path.iter().map(|s| s.as_str()).collect();
+        match (self.render)(&path_refs) {
+            Some(text) => {
+                let bytes = text.into_bytes();
+                let start = (offset as usize).min(bytes.len());
+                let end = (start + count as usize).min(bytes.len());
+                Ok(bytes[start..end].to_vec())
+            }
+            None => Err(MountError::NotFound(state.path.join("/"))),
+        }
+    }
+
+    async fn write(&self, _fid: &Fid, _offset: u64, _data: &[u8], _caller: &Subject) -> Result<u32, MountError> {
+        Err(MountError::NotSupported("docs are read-only".into()))
+    }
+
+    async fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
+        let state = fid.downcast_ref::<VfsFidState>()
+            .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+
+        if state.path.is_empty() {
+            // Root: list methods from metadata
+            let (_, methods) = (self.metadata)();
+            Ok(methods.iter()
+                .filter(|m| !m.hidden)
+                .map(|m| DirEntry {
+                    name: m.name.to_owned(),
+                    is_dir: m.is_scoped,
+                    size: 0,
+                    stat: None,
+                })
+                .collect())
+        } else {
+            // Sub-path: not a directory
+            Err(MountError::NotDirectory(state.path.join("/")))
+        }
+    }
+
+    async fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
+        let state = fid.downcast_ref::<VfsFidState>()
+            .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+        let name = state.path.last().map(|s| s.as_str()).unwrap_or("doc");
+        let is_dir = state.path.is_empty();
+        Ok(Stat {
+            qtype: if is_dir { 0x80 } else { 0 },
+            size: 0,
+            name: name.to_string(),
+            mtime: 0,
+        })
+    }
+
+    async fn clunk(&self, _fid: Fid, _caller: &Subject) {}
+}
+
+// ============================================================================
 // Builder — construct a Namespace with all service mounts
 // ============================================================================
 
@@ -368,6 +474,28 @@ pub fn build_browser_namespace(
         .expect("mount /srv/registry");
     ns.mount("/srv/model", Arc::new(ModelMount::new(model_session)))
         .expect("mount /srv/model");
+
+    // Documentation mounts — generated at compile time from schema annotations
+    ns.mount("/srv/registry/doc", Arc::new(DocMount::new(
+        crate::registry_client::render_doc,
+        crate::registry_client::schema_metadata,
+    ))).expect("mount /srv/registry/doc");
+    ns.mount("/srv/model/doc", Arc::new(DocMount::new(
+        crate::model_client::render_doc,
+        crate::model_client::schema_metadata,
+    ))).expect("mount /srv/model/doc");
+    ns.mount("/srv/inference/doc", Arc::new(DocMount::new(
+        crate::inference_client::render_doc,
+        crate::inference_client::schema_metadata,
+    ))).expect("mount /srv/inference/doc");
+    ns.mount("/srv/policy/doc", Arc::new(DocMount::new(
+        crate::policy_client::render_doc,
+        crate::policy_client::schema_metadata,
+    ))).expect("mount /srv/policy/doc");
+    ns.mount("/srv/mcp/doc", Arc::new(DocMount::new(
+        crate::mcp_client::render_doc,
+        crate::mcp_client::schema_metadata,
+    ))).expect("mount /srv/mcp/doc");
 
     ns
 }

@@ -19,6 +19,7 @@ pub fn register_all(interp: &mut Interp, ctx_id: ContextID) {
     interp.add_async_context_command("ctl", cmd_ctl, ctx_id);
     interp.add_context_command("json", cmd_json, ctx_id);
     interp.add_async_context_command("help", cmd_help, ctx_id);
+    interp.add_async_context_command("man", cmd_man, ctx_id);
     interp.add_async_context_command("mount", cmd_mount, ctx_id);
 }
 
@@ -180,6 +181,7 @@ fn cmd_help<'a>(interp: &'a mut Interp, ctx_id: ContextID, argv: &'a [Value]) ->
         out.push_str("  ctl <path> <cmd>     control file (write+read)\n");
         out.push_str("  json parse <str>     convert JSON to Tcl dict\n");
         out.push_str("  mount [prefix]       list mount points\n");
+        out.push_str("  man [svc] [method]   service documentation\n");
         out.push_str("  help                 this message\n");
 
         let ctx = interp.context::<ShellContext>(ctx_id);
@@ -199,6 +201,66 @@ fn cmd_help<'a>(interp: &'a mut Interp, ctx_id: ContextID, argv: &'a [Value]) ->
         }
 
         molt_ok!(out)
+    })
+}
+
+/// `man [service [method ...]]` — display service documentation.
+///
+/// Reads from `/srv/{service}/doc/{method}` in the VFS namespace.
+/// Without arguments, lists all available services.
+fn cmd_man<'a>(interp: &'a mut Interp, ctx_id: ContextID, argv: &'a [Value]) -> BoxFuture<'a, MoltResult> {
+    Box::pin(async move {
+        molt::check_args(1, argv, 1, 0, "?service? ?method ...?")?;
+
+        let ctx = interp.context::<ShellContext>(ctx_id);
+        let namespace = Arc::clone(&ctx.namespace);
+        let subject = ctx.subject.clone();
+
+        if argv.len() == 1 {
+            // No args: list available services under /srv
+            match namespace.ls("/srv", &subject).await {
+                Ok(entries) => {
+                    let mut out = String::from("Available services:\n");
+                    for e in &entries {
+                        let name = e.name.trim_end_matches('/');
+                        if !name.is_empty() {
+                            out.push_str(&format!("  {}\n", name));
+                        }
+                    }
+                    out.push_str("\nUsage: man <service> [method]");
+                    molt_ok!(out)
+                }
+                Err(e) => molt_err!("cannot list services: {}", e),
+            }
+        } else {
+            // Build doc path: /srv/{service}/doc/{method...}
+            let service = argv[1].to_string();
+            let mut path = format!("/srv/{}/doc", service);
+            for arg in &argv[2..] {
+                path.push('/');
+                path.push_str(&arg.to_string());
+            }
+
+            match namespace.cat(&path, &subject).await {
+                Ok(data) => molt_ok!(String::from_utf8_lossy(&data).into_owned()),
+                Err(_) => {
+                    // Fallback: try listing if it's a directory
+                    match namespace.ls(&path, &subject).await {
+                        Ok(entries) => {
+                            let mut out = format!("{}:\n", path);
+                            for e in &entries {
+                                let name = e.name.trim_end_matches('/');
+                                if !name.is_empty() {
+                                    out.push_str(&format!("  {}\n", name));
+                                }
+                            }
+                            molt_ok!(out)
+                        }
+                        Err(e) => molt_err!("{}: {}", path, e),
+                    }
+                }
+            }
+        }
     })
 }
 

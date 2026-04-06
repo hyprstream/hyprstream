@@ -121,6 +121,7 @@ fn parse_cgr(
     let fixed_size_id = find_annotation_id(&nodes, &node_map, "fixedSize");
     let optional_id = find_annotation_id(&nodes, &node_map, "optional");
     let serde_rename_id = find_annotation_id(&nodes, &node_map, "serdeRename");
+    let doc_example_id = find_annotation_id(&nodes, &node_map, "docExample");
 
     let pascal = to_pascal_case(service_name);
     let request_name = format!("{pascal}Request");
@@ -153,11 +154,11 @@ fn parse_cgr(
 
             let rv = extract_union_variants(
                 request_node, &nodes, &node_map,
-                mcp_desc_id, param_desc_id, mcp_scope_id, cli_hidden_id,
+                mcp_desc_id, param_desc_id, mcp_scope_id, cli_hidden_id, doc_example_id,
             )?;
             let rs = extract_union_variants(
                 response_node, &nodes, &node_map,
-                mcp_desc_id, param_desc_id, mcp_scope_id, cli_hidden_id,
+                mcp_desc_id, param_desc_id, mcp_scope_id, cli_hidden_id, doc_example_id,
             )?;
 
             if rv.is_empty() || rs.is_empty() {
@@ -185,6 +186,7 @@ fn parse_cgr(
             param_desc_id,
             mcp_scope_id,
             cli_hidden_id,
+            doc_example_id,
         )?;
 
         // Recursively detect nested scoped clients (3rd level)
@@ -198,6 +200,7 @@ fn parse_cgr(
                 param_desc_id,
                 mcp_scope_id,
                 cli_hidden_id,
+                doc_example_id,
             )?;
         }
         sc
@@ -462,6 +465,7 @@ fn extract_union_variants(
     _param_desc_id: Option<u64>,
     mcp_scope_id: Option<u64>,
     cli_hidden_id: Option<u64>,
+    doc_example_id: Option<u64>,
 ) -> Result<Vec<UnionVariant>, String> {
     let struct_reader = match struct_node.which() {
         Ok(capnp::schema_capnp::node::Struct(s)) => s,
@@ -512,6 +516,10 @@ fn extract_union_variants(
             field.get_annotations().map_err(|e| format!("{e}"))?,
             cli_hidden_id,
         );
+        let doc_example = extract_annotation_text(
+            field.get_annotations().map_err(|e| format!("{e}"))?,
+            doc_example_id,
+        );
 
         variants.push(UnionVariant {
             name,
@@ -519,6 +527,7 @@ fn extract_union_variants(
             description,
             scope,
             cli_hidden,
+            doc_example,
         });
     }
 
@@ -911,6 +920,7 @@ fn build_scoped_client_for_variant(
     param_desc_id: Option<u64>,
     mcp_scope_id: Option<u64>,
     cli_hidden_id: Option<u64>,
+    doc_example_id: Option<u64>,
     require_scope_fields: bool,
 ) -> Result<Option<ScopedClient>, String> {
     if is_primitive_capnp_type(&req_variant.type_name) {
@@ -943,7 +953,7 @@ fn build_scoped_client_for_variant(
     };
     let inner_node = nodes.get(node_map[&inner_node_id].index);
     let inner_req_variants = extract_union_variants(
-        inner_node, nodes, node_map, mcp_desc_id, param_desc_id, mcp_scope_id, cli_hidden_id,
+        inner_node, nodes, node_map, mcp_desc_id, param_desc_id, mcp_scope_id, cli_hidden_id, doc_example_id,
     )?;
 
     let resp_node_id = match find_struct_node_id(node_map, &resp_variant.type_name) {
@@ -952,7 +962,7 @@ fn build_scoped_client_for_variant(
     };
     let resp_node = nodes.get(node_map[&resp_node_id].index);
     let inner_resp_variants = extract_union_variants(
-        resp_node, nodes, node_map, mcp_desc_id, param_desc_id, mcp_scope_id, cli_hidden_id,
+        resp_node, nodes, node_map, mcp_desc_id, param_desc_id, mcp_scope_id, cli_hidden_id, doc_example_id,
     )?;
 
     if inner_req_variants.is_empty() || inner_resp_variants.is_empty() {
@@ -994,6 +1004,7 @@ fn detect_scoped_clients(
     param_desc_id: Option<u64>,
     mcp_scope_id: Option<u64>,
     cli_hidden_id: Option<u64>,
+    doc_example_id: Option<u64>,
 ) -> Result<Vec<ScopedClient>, String> {
     let mut scoped = Vec::new();
 
@@ -1008,6 +1019,7 @@ fn detect_scoped_clients(
             param_desc_id,
             mcp_scope_id,
             cli_hidden_id,
+            doc_example_id,
             false, // top-level: don't require non-empty scope fields
         )? {
             scoped.push(sc);
@@ -1028,6 +1040,7 @@ fn detect_nested_scoped_clients_cgr(
     param_desc_id: Option<u64>,
     mcp_scope_id: Option<u64>,
     cli_hidden_id: Option<u64>,
+    doc_example_id: Option<u64>,
 ) -> Result<(), String> {
     let mut nested = Vec::new();
     let mut nested_factory_names = Vec::new();
@@ -1043,6 +1056,7 @@ fn detect_nested_scoped_clients_cgr(
             param_desc_id,
             mcp_scope_id,
             cli_hidden_id,
+            doc_example_id,
             true, // nested: require at least one non-union scope field
         )? {
             nested_factory_names.push(req_variant.name.clone());
@@ -1074,6 +1088,7 @@ fn detect_nested_scoped_clients_cgr(
             param_desc_id,
             mcp_scope_id,
             cli_hidden_id,
+            doc_example_id,
         )?;
     }
 
