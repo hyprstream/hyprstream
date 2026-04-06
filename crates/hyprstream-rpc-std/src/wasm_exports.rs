@@ -851,25 +851,40 @@ impl VfsShell {
     /// Create a new VFS shell by connecting to services.
     ///
     /// Creates its own RpcSessions for the registry and model services.
-    #[wasm_bindgen(constructor)]
     pub async fn connect(
         registry_url: &str,
         model_url: &str,
         cert_hash: Option<String>,
         key_seed: &[u8],
     ) -> Result<VfsShell, JsError> {
-        // Create dedicated sessions for the VFS mounts
-        let reg_session = RpcSession::connect(registry_url, cert_hash.clone(), key_seed).await?;
-        let model_session = RpcSession::connect(model_url, cert_hash, key_seed).await?;
+        #[cfg(target_arch = "wasm32")]
+        console_error_panic_hook::set_once();
 
+        // Step 1: Connect to registry
+        web_sys::console::log_1(&"[VfsShell] Connecting to registry...".into());
+        let reg_session = RpcSession::connect(registry_url, cert_hash.clone(), key_seed).await?;
+        web_sys::console::log_1(&"[VfsShell] Registry connected".into());
+
+        // Step 2: Connect to model
+        web_sys::console::log_1(&"[VfsShell] Connecting to model...".into());
+        let model_session = RpcSession::connect(model_url, cert_hash, key_seed).await?;
+        web_sys::console::log_1(&"[VfsShell] Model connected".into());
+
+        // Step 3: Wrap in Arc (SAFETY: wasm32 is single-threaded)
         let reg_arc = Arc::new(reg_session);
         let model_arc = Arc::new(model_session);
+        web_sys::console::log_1(&"[VfsShell] Building namespace...".into());
 
+        // Step 4: Build VFS namespace
         let ns = crate::vfs_mount::build_browser_namespace(reg_arc, model_arc);
         let ns = Arc::new(ns);
-        let subject = hyprstream_rpc::Subject::anonymous();
+        web_sys::console::log_1(&"[VfsShell] Namespace built".into());
 
+        // Step 5: Create Tcl shell
+        let subject = hyprstream_rpc::Subject::anonymous();
+        web_sys::console::log_1(&"[VfsShell] Creating TclShell...".into());
         let shell = hyprstream_tcl::TclShell::new(subject, ns);
+        web_sys::console::log_1(&"[VfsShell] TclShell created".into());
 
         Ok(VfsShell {
             shell: std::cell::RefCell::new(shell),
