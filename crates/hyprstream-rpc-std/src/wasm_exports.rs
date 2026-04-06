@@ -826,6 +826,77 @@ where
 }
 
 // ============================================================================
+// StreamBlock parsing
+// ============================================================================
+
+/// Parse a Cap'n Proto StreamBlock and return the token data.
+///
+/// Returns a JS array: `[{ type: "data"|"complete"|"error"|"heartbeat", data: Uint8Array }]`
+#[wasm_bindgen]
+#[allow(clippy::unnecessary_wraps)]
+pub fn parse_stream_block(capnp_data: &[u8]) -> Result<JsValue, JsError> {
+    let reader = capnp::serialize::read_message(
+        &mut std::io::Cursor::new(capnp_data),
+        capnp::message::ReaderOptions::new(),
+    )
+    .map_err(|e| JsError::new(&format!("failed to parse StreamBlock: {}", e)))?;
+
+    let block = reader
+        .get_root::<hyprstream_rpc::streaming_capnp::stream_block::Reader>()
+        .map_err(|e| JsError::new(&format!("failed to read StreamBlock root: {}", e)))?;
+
+    let payloads = block
+        .get_payloads()
+        .map_err(|e| JsError::new(&format!("failed to get payloads: {}", e)))?;
+
+    let result = js_sys::Array::new();
+
+    for i in 0..payloads.len() {
+        let payload = payloads.get(i);
+        let obj = js_sys::Object::new();
+
+        match payload.which() {
+            Ok(hyprstream_rpc::streaming_capnp::stream_payload::Which::Data(data)) => {
+                let data = data.map_err(|e| JsError::new(&format!("payload data error: {}", e)))?;
+                js_sys::Reflect::set(&obj, &"type".into(), &"data".into())
+                    .map_err(|_| JsError::new("reflect set failed"))?;
+                js_sys::Reflect::set(&obj, &"data".into(), &js_sys::Uint8Array::from(data).into())
+                    .map_err(|_| JsError::new("reflect set failed"))?;
+            }
+            Ok(hyprstream_rpc::streaming_capnp::stream_payload::Which::Complete(data)) => {
+                let data = data.map_err(|e| JsError::new(&format!("complete data error: {}", e)))?;
+                js_sys::Reflect::set(&obj, &"type".into(), &"complete".into())
+                    .map_err(|_| JsError::new("reflect set failed"))?;
+                js_sys::Reflect::set(&obj, &"data".into(), &js_sys::Uint8Array::from(data).into())
+                    .map_err(|_| JsError::new("reflect set failed"))?;
+            }
+            Ok(hyprstream_rpc::streaming_capnp::stream_payload::Which::Heartbeat(())) => {
+                js_sys::Reflect::set(&obj, &"type".into(), &"heartbeat".into())
+                    .map_err(|_| JsError::new("reflect set failed"))?;
+            }
+            Ok(hyprstream_rpc::streaming_capnp::stream_payload::Which::Error(err)) => {
+                let err = err.map_err(|e| JsError::new(&format!("error payload: {}", e)))?;
+                let msg = err.get_message()
+                    .map(|m| m.to_str().unwrap_or("unknown error").to_string())
+                    .unwrap_or_default();
+                js_sys::Reflect::set(&obj, &"type".into(), &"error".into())
+                    .map_err(|_| JsError::new("reflect set failed"))?;
+                js_sys::Reflect::set(&obj, &"data".into(), &msg.into())
+                    .map_err(|_| JsError::new("reflect set failed"))?;
+            }
+            _ => {
+                js_sys::Reflect::set(&obj, &"type".into(), &"unknown".into())
+                    .map_err(|_| JsError::new("reflect set failed"))?;
+            }
+        }
+
+        result.push(&obj);
+    }
+
+    Ok(result.into())
+}
+
+// ============================================================================
 // Response envelope unwrapping
 // ============================================================================
 

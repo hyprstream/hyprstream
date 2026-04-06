@@ -25,6 +25,7 @@ subsecond = { workspace = true }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 serde-wasm-bindgen = "0.6"
+js-sys = "0.3"
 
 [build-dependencies]
 capnpc = { workspace = true }
