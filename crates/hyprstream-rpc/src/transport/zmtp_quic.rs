@@ -524,13 +524,14 @@ impl QuicRep {
         let raw_bytes = &request.parts[0];
 
         // Process through envelope pipeline (FixedSigner: QUIC peers pre-share keys)
-        let (response_bytes, continuation) = process_request(
+        // subsecond::call wraps dispatch for hot-patching during dev
+        let (response_bytes, continuation) = subsecond::call(|| process_request(
             raw_bytes,
             &*service,
             EnvelopeVerification::FixedSigner(&server_pubkey),
             &signing_key,
             &nonce_cache,
-        ).await?;
+        )).await?;
 
         // Send response
         let response = Multipart {
@@ -1668,13 +1669,13 @@ impl WebTransportServer {
                 ensure!(!request.parts.is_empty(), "Empty RPC request");
                 let raw_bytes = &request.parts[0];
 
-                match process_request(
+                match subsecond::call(|| process_request(
                     raw_bytes,
                     &*service,
                     EnvelopeVerification::AnySigner,
                     &signing_key,
                     &nonce_cache,
-                ).await {
+                )).await {
                     Ok((response_bytes, continuation)) => {
                         zmtp.send_multipart(&[Bytes::from(response_bytes)]).await?;
                         zmtp.stream.send.shutdown().await

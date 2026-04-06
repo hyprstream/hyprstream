@@ -33,9 +33,7 @@ impl WtClient {
             let js_bytes = js_sys::Uint8Array::from(&hash_bytes[..]);
             js_hash.set_value(&js_bytes.buffer());
 
-            let hashes = js_sys::Array::new();
-            hashes.push(&js_hash);
-            opts.set_server_certificate_hashes(&hashes);
+            opts.set_server_certificate_hashes(&[js_hash]);
         }
 
         let wt = web_sys::WebTransport::new_with_options(url, &opts)

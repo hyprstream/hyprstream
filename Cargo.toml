@@ -195,6 +195,9 @@ aes-gcm = "0.10"  # AES-256-GCM for notification broadcast encryption
 p256 = { version = "0.13", features = ["ecdh"] }  # FIPS mode alternative (P-256 ECDH)
 jsonwebtoken = "9"  # RS256/ES256 JWT verification for external OIDC providers
 
+# Hot-reloading (dev only — zero overhead in release builds)
+subsecond = "0.7"
+
 # Dev dependencies
 proptest = "1.0"
 quickcheck = "1.0"

@@ -824,13 +824,14 @@ impl RequestLoop {
                     }
 
                     // Process through shared envelope pipeline (FixedSigner: ZMQ peers pre-share keys)
-                    let (response_bytes, continuation) = match crate::transport::zmtp_quic::process_request(
+                    // subsecond::call wraps the dispatch so handler code can be hot-patched during dev.
+                    let (response_bytes, continuation) = match subsecond::call(|| crate::transport::zmtp_quic::process_request(
                         &request,
                         &*service,
                         crate::transport::zmtp_quic::EnvelopeVerification::FixedSigner(&server_pubkey),
                         &signing_key,
                         &nonce_cache,
-                    ).await {
+                    )).await {
                         Ok(result) => result,
                         Err(e) => {
                             error!("{} request processing error: {}", service.name(), e);
