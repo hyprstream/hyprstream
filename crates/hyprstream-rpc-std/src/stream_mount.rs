@@ -402,24 +402,12 @@ impl Mount for StreamMount {
         })
     }
 
-    async fn clunk(&self, fid: Fid, _caller: &Subject) {
-        // If clunking a Data fid, mark stream for potential cleanup
-        // (don't remove immediately — other fids may still reference it)
-        if let Some(StreamFidState::Data { topic }) = fid.downcast_ref::<StreamFidState>() {
-            let streams = self.registry.streams.borrow();
-            if let Some(entry) = streams.get(topic.as_str()) {
-                if entry.complete {
-                    drop(streams);
-                    // Stream finished and reader clunked — clean up
-                    if let Some(mut entry) = self.registry.remove(topic) {
-                        if let Some(ref mut ss) = entry.sub_stream {
-                            ss.dispose();
-                        }
-                        hyprstream_rpc::wasm_api::close_stream_hmac(entry.hmac_handle);
-                    }
-                }
-            }
-        }
+    async fn clunk(&self, _fid: Fid, _caller: &Subject) {
+        // Don't auto-remove on clunk — namespace.read_one() walks/opens/reads/clunks
+        // for every block, so cleaning up here would remove the entry between
+        // sequential reads. The Tcl loop sees EOF when read returns empty,
+        // and explicit cleanup happens via `cancel` ctl write or stream completion
+        // detection in a future enhancement.
     }
 }
 
