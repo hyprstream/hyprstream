@@ -180,6 +180,33 @@ impl Namespace {
         Err(NamespaceError::Mount(last_err.unwrap_or_else(|| MountError::NotFound(path.to_owned()))))
     }
 
+    /// Read a single block from a file (for streams). Walk + open + read(once) + clunk.
+    ///
+    /// Unlike `cat()` which loops to EOF, this returns after one read call.
+    /// For streams, this returns the next available block. Empty bytes = EOF.
+    pub async fn read_one(&self, path: &str, caller: &Subject) -> Result<Vec<u8>, NamespaceError> {
+        let (targets, remainder) = self.resolve(path)?;
+        let components: Vec<&str> = split_path(&remainder);
+        let mut last_err = None;
+        for mount in targets {
+            let result: Result<Vec<u8>, MountError> = async {
+                let mut fid = mount.walk(&components, caller).await?;
+                if let Err(e) = mount.open(&mut fid, 0, caller).await {
+                    mount.clunk(fid, caller).await;
+                    return Err(e);
+                }
+                let chunk = mount.read(&fid, 0, 64 * 1024, caller).await;
+                mount.clunk(fid, caller).await;
+                chunk
+            }.await;
+            match result {
+                Ok(data) => return Ok(data),
+                Err(e) => { last_err = Some(e); }
+            }
+        }
+        Err(NamespaceError::Mount(last_err.unwrap_or_else(|| MountError::NotFound(path.to_owned()))))
+    }
+
     /// Write data to a file. Walk + open(write) + write + clunk.
     /// With union mounts, tries each target in bind order until one succeeds.
     pub async fn echo(&self, path: &str, data: &[u8], caller: &Subject) -> Result<(), NamespaceError> {

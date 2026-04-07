@@ -311,8 +311,10 @@ fn cmd_stream<'a>(interp: &'a mut Interp, ctx_id: ContextID, argv: &'a [Value]) 
             let var_val = Value::from(var_name.as_str());
             let mut total_output = String::new();
 
+            // Read one block at a time, evaluating body between reads.
+            // Each read_one() yields to the event loop, allowing other JS work.
             loop {
-                match namespace.cat(&data_path, &subject).await {
+                match namespace.read_one(&data_path, &subject).await {
                     Ok(data) if data.is_empty() => break, // EOF
                     Ok(data) => {
                         let chunk = String::from_utf8_lossy(&data);
