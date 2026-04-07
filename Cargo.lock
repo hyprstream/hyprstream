@@ -1589,7 +1589,16 @@ version = "0.20.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "053b81915c2ce1629b8fb964f578b18cb39b23ef9d5b24120d0dfc959569a1d9"
 dependencies = [
- "embedded-io",
+ "embedded-io 0.6.1",
+]
+
+[[package]]
+name = "capnp"
+version = "0.24.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3fe67a3f89b693d2163cf3d94129125463ac5913e1c4322f2db905aa631d3c67"
+dependencies = [
+ "embedded-io 0.7.1",
 ]
 
 [[package]]
@@ -1598,7 +1607,7 @@ version = "0.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b70b0d44372d42654e3efac38c1643c7b0f9d3a9e9b72b635f942ff3f17e891"
 dependencies = [
- "capnp",
+ "capnp 0.20.6",
  "futures-channel",
  "futures-util",
 ]
@@ -1609,7 +1618,7 @@ version = "0.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa3d5f01e69ed11656d2c7c47bf34327ea9bfb5c85c7de787fcd7b6c5e45b61"
 dependencies = [
- "capnp",
+ "capnp 0.20.6",
 ]
 
 [[package]]
@@ -4231,6 +4240,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
+name = "embedded-io"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9eb1aa714776b75c7e67e1da744b81a129b3ff919c8712b5e1b32252c1f07cc7"
+
+[[package]]
 name = "encode_unicode"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5892,7 +5907,7 @@ dependencies = [
  "bitsandbytes-sys",
  "blake3",
  "bytes",
- "capnp",
+ "capnp 0.24.1",
  "capnp-futures",
  "capnpc",
  "casbin",
@@ -6033,7 +6048,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "capnp",
+ "capnp 0.24.1",
  "capnpc",
  "ed25519-dalek",
  "hyprstream-rpc",
@@ -6132,7 +6147,7 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "bytes",
- "capnp",
+ "capnp 0.24.1",
  "capnpc",
  "chrono",
  "curve25519-dalek",
@@ -6185,7 +6200,7 @@ dependencies = [
 name = "hyprstream-rpc-build"
 version = "0.1.0"
 dependencies = [
- "capnp",
+ "capnp 0.24.1",
  "capnpc",
  "clap",
  "serde",
@@ -6196,7 +6211,7 @@ dependencies = [
 name = "hyprstream-rpc-derive"
 version = "0.1.0"
 dependencies = [
- "capnp",
+ "capnp 0.24.1",
  "hyprstream-rpc-build",
  "proc-macro2",
  "quote",
@@ -6251,7 +6266,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "avt",
- "capnp",
+ "capnp 0.24.1",
  "capnpc",
  "crossterm 0.29.0",
  "dirs-next",
@@ -6292,7 +6307,7 @@ dependencies = [
  "async-trait",
  "base64 0.21.7",
  "blake3",
- "capnp",
+ "capnp 0.24.1",
  "capnpc",
  "ch-config",
  "chrono",
