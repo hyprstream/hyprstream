@@ -191,7 +191,7 @@ zeroize = { version = "1", features = ["derive"] }
 subtle = "2"
 aes-gcm = "0.10"  # AES-256-GCM for notification broadcast encryption
 p256 = { version = "0.13", features = ["ecdh"] }  # FIPS mode alternative (P-256 ECDH)
-jsonwebtoken = "9"  # RS256/ES256 JWT verification for external OIDC providers
+jsonwebtoken = "10"  # RS256/ES256 JWT verification for external OIDC providers
 
 # Dev dependencies
 proptest = "1.0"
