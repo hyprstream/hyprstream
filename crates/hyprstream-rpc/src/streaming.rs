@@ -207,54 +207,9 @@ pub enum StreamPayload {
 /// HMAC chain state for StreamBlock with 16-byte truncated MACs.
 ///
 /// MAC chain:
-/// - Block 0: HMAC(key, topic || capnp)[..16]
-/// - Block N: HMAC(key, prev_mac || capnp)[..16]
-#[derive(Clone)]
-pub struct StreamHmacState {
-    key: [u8; 32],
-    prev_mac: Option<[u8; 16]>,
-    topic: String,
-}
-
-impl StreamHmacState {
-    /// Create new HMAC chain state.
-    pub fn new(key: [u8; 32], topic: String) -> Self {
-        Self {
-            key,
-            prev_mac: None,
-            topic,
-        }
-    }
-
-    /// Compute 16-byte truncated MAC for next block.
-    pub fn compute_next(&mut self, capnp_data: &[u8]) -> [u8; 16] {
-        // Build input: (prev_mac or topic) || capnp_data
-        let mut input = Vec::with_capacity(64 + capnp_data.len());
-        match &self.prev_mac {
-            None => input.extend_from_slice(self.topic.as_bytes()),
-            Some(prev) => input.extend_from_slice(prev),
-        }
-        input.extend_from_slice(capnp_data);
-
-        // Compute 16-byte truncated MAC using backend
-        let truncated = keyed_mac_truncated(&self.key, &input);
-        self.prev_mac = Some(truncated);
-        truncated
-    }
-
-    /// Get the topic.
-    pub fn topic(&self) -> &str {
-        &self.topic
-    }
-
-    /// Get previous MAC bytes (for prevMac field in StreamBlock).
-    pub fn prev_mac_bytes(&self) -> &[u8] {
-        match &self.prev_mac {
-            Some(mac) => mac,
-            None => &self.topic.as_bytes()[..16.min(self.topic.len())],
-        }
-    }
-}
+// StreamHmacState was moved to crypto::hmac for cross-platform availability.
+// Re-exported here for backward compatibility.
+pub use crate::crypto::StreamHmacState;
 
 // ============================================================================
 // Stream Frames
@@ -1999,7 +1954,7 @@ mod tests {
         // MACs should be different
         assert_ne!(mac1, mac2);
 
-        // Chain state should update
-        assert_eq!(state.prev_mac, Some(mac2));
+        // Chain state should advance to mac2
+        assert_eq!(state.prev_mac_bytes(), &mac2[..]);
     }
 }

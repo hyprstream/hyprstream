@@ -157,8 +157,8 @@ pub use capnp::{serialize_message, FromCapnp, ToCapnp};
 pub use rpc_client::RpcClient;
 pub use stream_info::StreamInfo;
 pub use crypto::{
-    generate_signing_keypair, signing_key_from_bytes, verifying_key_from_bytes, ChainedStreamHmac,
-    DefaultKeyExchange, HmacKey, KeyExchange, SharedSecret, SigningKey, VerifyingKey,
+    generate_signing_keypair, signing_key_from_bytes, verifying_key_from_bytes,
+    DefaultKeyExchange, KeyExchange, SharedSecret, SigningKey, StreamHmacState, VerifyingKey,
 };
 
 #[cfg(not(feature = "fips"))]
@@ -213,8 +213,7 @@ pub mod prelude {
         serialize_message, FromCapnp, ToCapnp,
         // Crypto
         generate_signing_keypair, signing_key_from_bytes, verifying_key_from_bytes,
-        ChainedStreamHmac, DefaultKeyExchange, HmacKey, KeyExchange, SharedSecret,
-        SigningKey, VerifyingKey,
+        DefaultKeyExchange, KeyExchange, SharedSecret, SigningKey, StreamHmacState, VerifyingKey,
         // Envelope
         unwrap_envelope, unwrap_and_verify, InMemoryNonceCache, NonceCache, RequestEnvelope,
         RequestIdentity, ResponseEnvelope, SignedEnvelope, Subject,

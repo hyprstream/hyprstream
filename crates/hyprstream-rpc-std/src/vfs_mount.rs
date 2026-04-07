@@ -276,8 +276,8 @@ impl Mount for GenericServiceMount {
                 let sub_stream = self.session.session().subscribe_stream(topic_hex_bytes).await
                     .map_err(|e| MountError::Io(format!("subscribe: {e:?}")))?;
 
-                // Init per-stream HMAC chain
-                let hmac_handle = hyprstream_rpc::wasm_api::init_stream_hmac(mac_key, 0)
+                // Init per-stream HMAC chain — uses topic as initial chain state to match server
+                let hmac_handle = hyprstream_rpc::wasm_api::init_stream_hmac(mac_key, &topic_hex)
                     .map_err(|e| MountError::Io(format!("init HMAC: {e:?}")))?;
 
                 // Register in StreamRegistry

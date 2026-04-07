@@ -34,7 +34,7 @@ pub mod notification;
 pub mod signing;
 
 pub use backend::{derive_key, keyed_mac, keyed_mac_truncated};
-pub use hmac::{ChainedStreamHmac, HmacKey};
+pub use hmac::StreamHmacState;
 pub use key_exchange::{
     derive_notification_keys, derive_stream_keys, DefaultKeyExchange, KeyExchange,
     NotificationKeys, SharedSecret, StreamKeys,

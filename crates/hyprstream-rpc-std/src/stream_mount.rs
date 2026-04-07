@@ -173,10 +173,11 @@ impl Mount for StreamMount {
     async fn read(
         &self,
         fid: &Fid,
-        _offset: u64,
-        _count: u32,
+        offset: u64,
+        count: u32,
         caller: &Subject,
     ) -> Result<Vec<u8>, MountError> {
+        let _ = (offset, count); // Used only for Info reads; stream data ignores offset
         let state = fid
             .downcast_ref::<StreamFidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
@@ -255,29 +256,31 @@ impl Mount for StreamMount {
                             ) {
                                 Ok(true) => {} // Valid
                                 Ok(false) => {
-                                    // TODO: fix HMAC chain seed (request_id mismatch)
-                                    // For now, log and continue — data integrity is
-                                    // still protected by the QUIC transport layer
-                                    web_sys::console::warn_1(
-                                        &"[StreamMount] HMAC verification failed (request_id mismatch)".into(),
-                                    );
+                                    return Err(MountError::Io(
+                                        "stream block HMAC verification failed".into(),
+                                    ));
                                 }
-                                Err(_) => {} // HMAC not initialized — skip
+                                Err(e) => {
+                                    return Err(MountError::Io(format!("HMAC error: {:?}", e)));
+                                }
                             }
                         }
 
-                        let data = parse_stream_block_data(&capnp_data);
+                        let parsed = parse_stream_block(&capnp_data);
 
-                        // Update metrics
+                        // Update metrics + completion flag
                         {
                             let mut streams = self.registry.streams.borrow_mut();
                             if let Some(entry) = streams.get_mut(topic.as_str()) {
-                                entry.bytes_received += data.len() as u64;
+                                entry.bytes_received += parsed.data.len() as u64;
                                 entry.blocks_received += 1;
+                                if parsed.complete {
+                                    entry.complete = true;
+                                }
                             }
                         }
 
-                        Ok(data)
+                        Ok(parsed.data)
                     }
                     Err(e) => Err(MountError::Io(format!("stream read: {:?}", e))),
                 }
@@ -294,9 +297,13 @@ impl Mount for StreamMount {
                     "blocksReceived": entry.blocks_received,
                     "complete": entry.complete,
                 });
-                Ok(serde_json::to_string_pretty(&info)
+                let bytes = serde_json::to_string_pretty(&info)
                     .unwrap_or_default()
-                    .into_bytes())
+                    .into_bytes();
+                // Apply 9P offset+count slicing to prevent read-loop duplication
+                let start = (offset as usize).min(bytes.len());
+                let end = (start + count as usize).min(bytes.len());
+                Ok(bytes[start..end].to_vec())
             }
             StreamFidState::Ctl { .. } => {
                 // Ctl is write-only
@@ -420,45 +427,56 @@ impl Mount for StreamMount {
 // StreamBlock parsing
 // ============================================================================
 
-/// Parse raw Cap'n Proto StreamBlock bytes and extract concatenated data payload.
-fn parse_stream_block_data(capnp_bytes: &[u8]) -> Vec<u8> {
-    // Try parsing as Cap'n Proto StreamBlock
+/// Result of parsing a Cap'n Proto StreamBlock.
+struct ParsedBlock {
+    /// Coalesced data bytes from `Data` and `Complete` payload variants.
+    data: Vec<u8>,
+    /// True if a `Complete` or `Error` payload was found in this block.
+    complete: bool,
+}
+
+/// Parse raw Cap'n Proto StreamBlock bytes, extracting data and detecting completion.
+fn parse_stream_block(capnp_bytes: &[u8]) -> ParsedBlock {
     let reader = match capnp::serialize::read_message(
         &mut std::io::Cursor::new(capnp_bytes),
         capnp::message::ReaderOptions::new(),
     ) {
         Ok(r) => r,
-        Err(_) => return capnp_bytes.to_vec(), // Fallback: return raw bytes
+        Err(_) => return ParsedBlock { data: capnp_bytes.to_vec(), complete: false },
     };
 
     let block = match reader
         .get_root::<hyprstream_rpc::streaming_capnp::stream_block::Reader>()
     {
         Ok(b) => b,
-        Err(_) => return capnp_bytes.to_vec(),
+        Err(_) => return ParsedBlock { data: capnp_bytes.to_vec(), complete: false },
     };
 
-    // Coalesce all data segments into a single buffer
-    let mut result = Vec::new();
+    let mut data = Vec::new();
+    let mut complete = false;
+
     if let Ok(payloads) = block.get_payloads() {
         for i in 0..payloads.len() {
             let payload = payloads.get(i);
             if let Ok(which) = payload.which() {
                 use hyprstream_rpc::streaming_capnp::stream_payload::Which;
                 match which {
-                    Which::Data(Ok(data)) => result.extend_from_slice(data),
-                    Which::Complete(Ok(data)) => result.extend_from_slice(data),
-                    Which::Error(_) | Which::Heartbeat(()) | Which::Tagged(_) => {}
+                    Which::Data(Ok(d)) => data.extend_from_slice(d),
+                    Which::Complete(Ok(d)) => {
+                        // Complete may include final metadata bytes
+                        data.extend_from_slice(d);
+                        complete = true;
+                    }
+                    Which::Error(_) => {
+                        // Error terminates the stream
+                        complete = true;
+                    }
+                    Which::Heartbeat(()) | Which::Tagged(_) => {}
                     _ => {}
                 }
             }
         }
     }
 
-    if result.is_empty() {
-        // No payloads — return raw bytes as fallback
-        capnp_bytes.to_vec()
-    } else {
-        result
-    }
+    ParsedBlock { data, complete }
 }
