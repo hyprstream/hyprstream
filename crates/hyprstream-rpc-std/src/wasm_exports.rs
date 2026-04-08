@@ -17,44 +17,74 @@
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
+use js_sys::{Function, Uint8Array};
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsError;
+use wasm_bindgen::{JsCast, JsError, JsValue};
+use wasm_bindgen_futures::JsFuture;
 
 use hyprstream_rpc::web_transport::WtClient;
 
-// Re-export low-level WASM API (signing, crypto, ZMTP framing) from hyprstream-rpc
+// Re-export low-level WASM API (crypto primitives, ZMTP framing) from hyprstream-rpc.
+// Note: the seed-based signing exports (set_session_key, sign_envelope_from_ptr,
+// generate_signing_keypair, etc.) have been removed — RpcSession now takes an
+// external signing callback instead of holding key material.
 pub use hyprstream_rpc::wasm_api::*;
 
-/// Browser RPC session — wraps WebTransport + signing state.
+/// Browser RPC session — wraps WebTransport + an external signing callback.
 ///
 /// One session per server connection. All service methods are available
 /// as async methods that return serde-serialized JsValues.
+///
+/// # Signing model
+///
+/// RpcSession does not hold any Ed25519 key material. When an envelope needs
+/// to be signed, it calls an externally-supplied JS function (`sign_fn`) with
+/// the canonical bytes-to-sign and awaits the returned Promise for the
+/// signature. This lets consumers keep signing keys in an isolated context —
+/// e.g. an [aegis-vault](https://github.com/cyberdione/aegis-vault) identity
+/// handle, a cross-origin iframe, a Wanix worker process, or a hardware token.
+///
+/// The callback signature (in TypeScript) is:
+///
+/// ```ts
+/// async (canonicalBytes: Uint8Array) => Uint8Array  // 64-byte Ed25519 signature
+/// ```
+///
+/// The `signer_pubkey` is supplied separately at `connect()` time and is
+/// embedded in every `SignedEnvelope` this session produces. Consumers must
+/// ensure the pubkey matches the signing key held by `sign_fn`.
 #[wasm_bindgen]
 pub struct RpcSession {
     client: WtClient,
-    seed: [u8; 32],
+    signer_pubkey: [u8; 32],
+    sign_fn: Function,
     claims: RefCell<Option<hyprstream_rpc::auth::Claims>>,
     next_id: Cell<u64>,
 }
 
 #[wasm_bindgen]
 impl RpcSession {
-    /// Connect to a hyprstream WebTransport endpoint.
+    /// Connect to a hyprstream WebTransport endpoint with an external signer.
     ///
     /// - `url`: WebTransport URL (e.g., `https://host:port/wt`)
     /// - `cert_hash`: Optional base64-encoded SHA-256 certificate hash for pinning
-    /// - `key_seed`: 32-byte Ed25519 signing key seed
+    /// - `signer_pubkey`: 32-byte Ed25519 public key that will appear in every
+    ///   signed envelope this session produces
+    /// - `sign_fn`: JavaScript async function `(canonicalBytes: Uint8Array) => Promise<Uint8Array>`
+    ///   that signs canonical envelope bytes and resolves to a 64-byte Ed25519
+    ///   signature. Called once per outgoing request.
     #[wasm_bindgen(constructor)]
     pub async fn connect(
         url: &str,
         cert_hash: Option<String>,
-        key_seed: &[u8],
+        signer_pubkey: &[u8],
+        sign_fn: Function,
     ) -> Result<RpcSession, JsError> {
-        if key_seed.len() != 32 {
-            return Err(JsError::new("key_seed must be 32 bytes"));
+        if signer_pubkey.len() != 32 {
+            return Err(JsError::new("signer_pubkey must be 32 bytes"));
         }
-        let mut seed = [0u8; 32];
-        seed.copy_from_slice(key_seed);
+        let mut pubkey = [0u8; 32];
+        pubkey.copy_from_slice(signer_pubkey);
 
         let client = WtClient::connect(url, cert_hash.as_deref())
             .await
@@ -62,7 +92,8 @@ impl RpcSession {
 
         Ok(RpcSession {
             client,
-            seed,
+            signer_pubkey: pubkey,
+            sign_fn,
             claims: RefCell::new(None),
             next_id: Cell::new(1),
         })
@@ -99,7 +130,7 @@ impl RpcSession {
     /// Send a raw signed RPC request. Returns response payload bytes.
     pub async fn call(&self, payload: &[u8]) -> Result<Vec<u8>, JsError> {
         let request_id = self.next_id();
-        let signed = self.sign(payload, request_id, &[])?;
+        let signed = self.sign(payload, request_id, &[]).await?;
         self.client
             .request(&signed)
             .await
@@ -113,7 +144,7 @@ impl RpcSession {
         ephemeral_pubkey: &[u8],
     ) -> Result<Vec<u8>, JsError> {
         let request_id = self.next_id();
-        let signed = self.sign(payload, request_id, ephemeral_pubkey)?;
+        let signed = self.sign(payload, request_id, ephemeral_pubkey).await?;
         self.client
             .request(&signed)
             .await
@@ -530,7 +561,7 @@ impl RpcSession {
             let mut inner = builder.init_generate_stream();
             hyprstream_rpc::ToCapnp::write_to(&req, &mut inner);
         })?;
-        let signed = self.sign(&payload, request_id, ephemeral_pubkey)?;
+        let signed = self.sign(&payload, request_id, ephemeral_pubkey).await?;
         let response_bytes = self.client
             .request(&signed)
             .await
@@ -603,7 +634,7 @@ impl RpcSession {
         })
         .map_err(|e| JsError::new(&e.to_string()))?;
 
-        let signed = self.sign(&payload, request_id, ephemeral_pubkey)?;
+        let signed = self.sign(&payload, request_id, ephemeral_pubkey).await?;
         let response = self.client
             .request(&signed)
             .await
@@ -660,17 +691,22 @@ impl RpcSession {
 
 impl RpcSession {
     /// Sign a payload into a SignedEnvelope.
-    fn sign(
+    /// Sign a payload into a SignedEnvelope using the external sign callback.
+    ///
+    /// Builds the RequestEnvelope struct, serializes it to canonical Cap'n Proto
+    /// bytes, passes those bytes to the JS `sign_fn` callback, awaits the
+    /// resulting signature, and assembles the final SignedEnvelope. The seed
+    /// for the signing key never exists in this crate — the callback owns it
+    /// (typically in an aegis-vault wasm module, a cross-origin iframe, a Wanix
+    /// worker, or similar).
+    async fn sign(
         &self,
         payload: &[u8],
         request_id: u64,
         ephemeral_pubkey: &[u8],
     ) -> Result<Vec<u8>, JsError> {
-        use hyprstream_rpc::crypto::signing::signing_key_from_bytes;
         use hyprstream_rpc::envelope::{RequestEnvelope, RequestIdentity, SignedEnvelope};
         use hyprstream_rpc::ToCapnp;
-
-        let signing_key = signing_key_from_bytes(&self.seed);
 
         let ephemeral = if ephemeral_pubkey.is_empty() {
             None
@@ -682,25 +718,67 @@ impl RpcSession {
             return Err(JsError::new("ephemeral_pubkey must be empty or 32 bytes"));
         };
 
-        let claims_ref = self.claims.borrow();
-        let identity = match claims_ref.as_ref() {
-            Some(c) => RequestIdentity::api_token(&c.sub, "jwt"),
-            None => RequestIdentity::Anonymous,
+        // Snapshot claims into an owned struct and drop the borrow before we
+        // await the signing callback (await points cannot hold RefCell borrows).
+        let identity_and_claims = {
+            let claims_ref = self.claims.borrow();
+            let identity = match claims_ref.as_ref() {
+                Some(c) => RequestIdentity::api_token(&c.sub, "jwt"),
+                None => RequestIdentity::Anonymous,
+            };
+            (identity, claims_ref.clone())
         };
 
-        let mut envelope = RequestEnvelope {
+        let envelope = RequestEnvelope {
             request_id,
-            identity,
+            identity: identity_and_claims.0,
             timestamp: hyprstream_rpc::envelope::current_timestamp(),
             nonce: hyprstream_rpc::envelope::generate_nonce(),
             ephemeral_pubkey: ephemeral,
             payload: payload.to_vec(),
-            claims: None,
+            claims: identity_and_claims.1,
         };
-        envelope.claims = claims_ref.clone();
-        drop(claims_ref);
 
-        let signed = SignedEnvelope::new_signed(envelope, &signing_key);
+        // Compute the canonical bytes the signer must sign.
+        let canonical_bytes = envelope.to_bytes();
+
+        // Call the JS signer and await the returned Promise.
+        let canonical_js = Uint8Array::from(canonical_bytes.as_slice());
+        let promise_jsvalue = self
+            .sign_fn
+            .call1(&JsValue::NULL, &canonical_js)
+            .map_err(|e| {
+                JsError::new(&format!("sign callback threw: {:?}", e))
+            })?;
+        let promise: js_sys::Promise = promise_jsvalue
+            .dyn_into()
+            .map_err(|_| JsError::new("sign callback must return a Promise<Uint8Array>"))?;
+        let signature_jsvalue = JsFuture::from(promise)
+            .await
+            .map_err(|e| JsError::new(&format!("sign callback rejected: {:?}", e)))?;
+        let signature_js: Uint8Array = signature_jsvalue
+            .dyn_into()
+            .map_err(|_| JsError::new("sign callback must resolve to a Uint8Array"))?;
+        let signature_vec = signature_js.to_vec();
+        if signature_vec.len() != 64 {
+            return Err(JsError::new(&format!(
+                "signature must be 64 bytes, got {}",
+                signature_vec.len()
+            )));
+        }
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(&signature_vec);
+
+        // Assemble the SignedEnvelope directly — NOT via new_signed (which would
+        // re-sign with a local key we don't have). The envelope struct holds the
+        // same fields that were just serialized for signing, so Cap'n Proto's
+        // canonical form guarantees the nested serialization inside SignedEnvelope
+        // will match what the callback signed over.
+        let signed = SignedEnvelope {
+            envelope,
+            signature,
+            signer_pubkey: self.signer_pubkey,
+        };
 
         let mut message = capnp::message::Builder::new_default();
         let mut builder =
@@ -729,7 +807,7 @@ impl RpcSession {
     /// Sign payload, send via WebTransport REQ/REP, unwrap ResponseEnvelope.
     pub async fn send(&self, payload: &[u8]) -> Result<Vec<u8>, JsError> {
         let request_id = self.next_id();
-        let signed = self.sign(payload, request_id, &[])?;
+        let signed = self.sign(payload, request_id, &[]).await?;
         let response_bytes = self.client
             .request(&signed)
             .await
@@ -862,24 +940,40 @@ pub struct VfsShell {
 impl VfsShell {
     /// Create a new VFS shell by connecting to services.
     ///
-    /// Creates its own RpcSessions for the registry and model services.
+    /// Creates its own RpcSessions for the registry and model services. Both
+    /// sessions share the same `signer_pubkey` and `sign_fn` — the shell uses
+    /// one identity for all of its RPCs.
+    ///
+    /// - `signer_pubkey`: 32-byte Ed25519 public key for every envelope this
+    ///   shell produces
+    /// - `sign_fn`: async JS callback `(canonicalBytes: Uint8Array) => Promise<Uint8Array>`
+    ///   returning a 64-byte Ed25519 signature. Called once per outgoing RPC.
     pub async fn connect(
         registry_url: &str,
         model_url: &str,
         cert_hash: Option<String>,
-        key_seed: &[u8],
+        signer_pubkey: &[u8],
+        sign_fn: Function,
     ) -> Result<VfsShell, JsError> {
         #[cfg(target_arch = "wasm32")]
         console_error_panic_hook::set_once();
 
-        // Step 1: Connect to registry
+        // Step 1: Connect to registry (clone the callback — Function is a
+        // JsValue wrapper, cloning just bumps the JS object refcount).
         web_sys::console::log_1(&"[VfsShell] Connecting to registry...".into());
-        let reg_session = RpcSession::connect(registry_url, cert_hash.clone(), key_seed).await?;
+        let reg_session = RpcSession::connect(
+            registry_url,
+            cert_hash.clone(),
+            signer_pubkey,
+            sign_fn.clone(),
+        )
+        .await?;
         web_sys::console::log_1(&"[VfsShell] Registry connected".into());
 
         // Step 2: Connect to model
         web_sys::console::log_1(&"[VfsShell] Connecting to model...".into());
-        let model_session = RpcSession::connect(model_url, cert_hash, key_seed).await?;
+        let model_session =
+            RpcSession::connect(model_url, cert_hash, signer_pubkey, sign_fn).await?;
         web_sys::console::log_1(&"[VfsShell] Model connected".into());
 
         // Step 3: Wrap in Arc (SAFETY: wasm32 is single-threaded)
