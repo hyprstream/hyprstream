@@ -704,7 +704,7 @@ mod tests {
             .await
             .expect("spawn policy service");
 
-        let policy_client = PolicyClient::with_endpoint(
+        let policy_client = PolicyClient::for_endpoint(
             &format!("inproc://{policy_tag}"),
             signing_key.clone(),
             RequestIdentity::anonymous(),
@@ -743,7 +743,7 @@ mod tests {
             .await
             .expect("spawn metrics service");
 
-        let client = MetricsClient::with_endpoint(
+        let client = MetricsClient::for_endpoint(
             &format!("inproc://{svc_tag}"),
             signing_key,
             RequestIdentity::anonymous(),

@@ -15,30 +15,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
 use hyprstream_rpc::Subject;
-
-use crate::wasm_exports::RpcSession;
+use hyprstream_rpc::rpc_client::RpcClient;
 
 // ============================================================================
-// Send+Sync wrapper for RpcSession on wasm32
+// RpcClient is already Send + Sync — no wrapper needed.
 // ============================================================================
-
-struct SessionHandle(Arc<RpcSession>);
-
-// SAFETY: wasm32 is single-threaded — no actual cross-thread sharing occurs.
-unsafe impl Send for SessionHandle {}
-unsafe impl Sync for SessionHandle {}
-
-impl SessionHandle {
-    fn session(&self) -> &RpcSession {
-        &self.0
-    }
-}
-
-impl Clone for SessionHandle {
-    fn clone(&self) -> Self {
-        Self(Arc::clone(&self.0))
-    }
-}
 
 // ============================================================================
 // Fid state
@@ -111,21 +92,13 @@ pub enum ServiceDispatchResult {
 /// Trait for service-specific dispatch. Implemented via macro from generated code.
 #[async_trait(?Send)]
 trait ServiceDispatch: Send + Sync {
-    async fn dispatch(&self, method: &str, args_json: &str, session: &RpcSession) -> Result<ServiceDispatchResult, String>;
+    async fn dispatch(&self, method: &str, args_json: &str, client: &dyn RpcClient) -> Result<ServiceDispatchResult, String>;
     fn metadata(&self) -> (&'static str, &'static [hyprstream_rpc::metadata::MethodMeta]);
-}
-
-/// Send function that uses call_streaming with ephemeral pubkey for streaming methods.
-async fn send_streaming(session: &RpcSession, payload: Vec<u8>, ephemeral_pubkey: &[u8]) -> Result<Vec<u8>, String> {
-    let response = session.call_streaming(&payload, ephemeral_pubkey).await
-        .map_err(|e| format!("{e:?}"))?;
-    crate::wasm_exports::unwrap_response_envelope(&response)
-        .map_err(|e| format!("envelope: {e:?}"))
 }
 
 /// Generic VFS mount driven by a ServiceDispatch implementation.
 pub struct GenericServiceMount {
-    session: SessionHandle,
+    client: Arc<dyn RpcClient>,
     service: Box<dyn ServiceDispatch>,
     next_id: IdCounter,
     ctl_response: CtlResponseCache,
@@ -134,12 +107,12 @@ pub struct GenericServiceMount {
 
 impl GenericServiceMount {
     pub fn new(
-        session: Arc<RpcSession>,
+        client: Arc<dyn RpcClient>,
         service: Box<dyn ServiceDispatch>,
         stream_registry: std::sync::Arc<crate::stream_mount::StreamRegistry>,
     ) -> Self {
         Self {
-            session: SessionHandle(session),
+            client,
             service,
             next_id: IdCounter::new(),
             ctl_response: CtlResponseCache::new(),
@@ -185,7 +158,7 @@ impl Mount for GenericServiceMount {
 
         // cat /srv/{service}/{method} → dispatch query method with empty args
         let method = &state.path[0];
-        match self.service.dispatch(method, "{}", self.session.session()).await
+        match self.service.dispatch(method, "{}", self.client.as_ref()).await
             .map_err(|e| MountError::Io(e))? {
             ServiceDispatchResult::Response(json) => {
                 Ok(slice_read(json.into_bytes(), offset, count))
@@ -236,16 +209,23 @@ impl Mount for GenericServiceMount {
         };
         let args_str = args_owned.as_str();
 
-        let dispatch_result = self.service.dispatch(cmd, args_str, self.session.session()).await
+        let dispatch_result = self.service.dispatch(cmd, args_str, self.client.as_ref()).await
             .map_err(|e| MountError::Io(e))?;
 
         let resp = match dispatch_result {
             ServiceDispatchResult::Response(json) => json.into_bytes(),
             ServiceDispatchResult::Stream { json: stream_json, ephemeral_keypair } => {
-                // Streaming response — set up SUB subscription and register in StreamRegistry
+                // Streaming response — use open_stream() to set up verified subscription
                 let parsed: serde_json::Value = serde_json::from_str(&stream_json)
                     .map_err(|e| MountError::Io(format!("parse stream response: {e}")))?;
-                // Unwrap single-key variant wrapper if present
+
+                // The dispatch already sent the streaming request and got StreamInfo back.
+                // Now we need to open a stream handle. But open_stream() does the full
+                // flow (send + ECDH + subscribe). Since dispatch already sent the request,
+                // we need to do the ECDH + subscribe part manually using the StreamInfo.
+                //
+                // TODO: Refactor dispatch to return raw payload bytes so open_stream()
+                // can handle the full flow. For now, use StreamHandle::open() directly.
                 let inner = if let Some(obj) = parsed.as_object() {
                     if obj.len() == 1 {
                         obj.values().next().unwrap().clone()
@@ -258,42 +238,30 @@ impl Mount for GenericServiceMount {
                 let info: hyprstream_rpc::stream_info::StreamInfo = serde_json::from_value(inner)
                     .map_err(|e| MountError::Io(format!("parse StreamInfo: {e}")))?;
 
-                // ECDH key exchange using the ephemeral keypair from the dispatch
-                let shared_secret = hyprstream_rpc::wasm_api::ecdh_ristretto(&ephemeral_keypair[..32], &info.server_pubkey)
-                    .map_err(|e| MountError::Io(format!("ECDH: {e:?}")))?;
+                let client_secret = &ephemeral_keypair[..32];
+                let client_pubkey = &ephemeral_keypair[32..64];
+                let mut secret_32 = [0u8; 32];
+                let mut pubkey_32 = [0u8; 32];
+                secret_32.copy_from_slice(client_secret);
+                pubkey_32.copy_from_slice(client_pubkey);
 
-                // Derive stream keys: [topic(32) | mac_key(32) | ctrl_topic(32) | ctrl_mac_key(32)]
-                let key_bytes = hyprstream_rpc::wasm_api::derive_stream_keys(&shared_secret, &ephemeral_keypair[32..64], &info.server_pubkey)
-                    .map_err(|e| MountError::Io(format!("derive keys: {e:?}")))?;
-                let topic_bytes = &key_bytes[..32];
-                let mac_key = &key_bytes[32..64];
-                let topic_hex: String = topic_bytes.iter().map(|b| format!("{b:02x}")).collect();
+                // Open verified stream handle via RpcClient
+                let handle = self.client.open_stream_from_info(info.clone(), secret_32, pubkey_32)
+                    .await
+                    .map_err(|e| MountError::Io(format!("open stream: {e}")))?;
 
-                // Subscribe on the existing WebTransport connection (same QUIC session)
-                // Browser clients don't connect to the IPC endpoint from StreamInfo —
-                // they subscribe on the service's QUIC connection which multiplexes SUB.
-                let topic_hex_bytes = topic_hex.as_bytes();
-                let sub_stream = self.session.session().subscribe_stream(topic_hex_bytes).await
-                    .map_err(|e| MountError::Io(format!("subscribe: {e:?}")))?;
+                let topic = handle.stream_id().to_owned();
 
-                // Init per-stream HMAC chain — uses topic as initial chain state to match server
-                let hmac_handle = hyprstream_rpc::wasm_api::init_stream_hmac(mac_key, &topic_hex)
-                    .map_err(|e| MountError::Io(format!("init HMAC: {e:?}")))?;
-
-                // Register in StreamRegistry
-                self.stream_registry.register(topic_hex.clone(), crate::stream_mount::StreamEntry {
-                    sub_stream: Some(sub_stream),
-                    hmac_handle,
+                self.stream_registry.register(topic.clone(), crate::stream_mount::StreamEntry {
+                    handle: Some(handle),
                     owner: _caller.name().unwrap_or("anonymous").to_owned(),
                     bytes_received: 0,
                     blocks_received: 0,
-                    complete: false,
                 });
 
-                // Return JSON with topic so caller knows where to read from /stream/{topic}/data
                 let result = serde_json::json!({
                     "streamId": info.stream_id,
-                    "topic": topic_hex,
+                    "topic": topic,
                 });
                 serde_json::to_string(&result).unwrap_or_default().into_bytes()
             }
@@ -439,7 +407,7 @@ macro_rules! impl_service_dispatch {
 
         #[async_trait(?Send)]
         impl ServiceDispatch for $name {
-            async fn dispatch(&self, method: &str, args_json: &str, session: &RpcSession) -> Result<ServiceDispatchResult, String> {
+            async fn dispatch(&self, method: &str, args_json: &str, client: &dyn RpcClient) -> Result<ServiceDispatchResult, String> {
                 use $mod as svc;
 
                 // Generate ephemeral keypair upfront — used by streaming methods,
@@ -452,10 +420,12 @@ macro_rules! impl_service_dispatch {
                     // Use call_streaming which injects ephemeral_pubkey into the
                     // RequestEnvelope. For non-streaming methods, the server ignores
                     // the pubkey — it only matters for streaming handshakes.
-                    let response = session.call_streaming(&payload, &ephemeral_pubkey).await
-                        .map_err(|e| format!("{e:?}"))?;
-                    crate::wasm_exports::unwrap_response_envelope(&response)
-                        .map_err(|e| format!("envelope: {e:?}"))
+                    client.call_streaming(payload, {
+                        let mut epk = [0u8; 32];
+                        epk.copy_from_slice(&ephemeral_pubkey);
+                        epk
+                    }).await
+                        .map_err(|e| format!("{e:?}"))
                 }).await?;
 
                 Ok(match result {
@@ -487,18 +457,18 @@ impl_service_dispatch!(InferenceDispatch, crate::inference_client);
 
 /// Build a VFS namespace with codegen-driven service mounts.
 pub fn build_browser_namespace(
-    registry_session: Arc<RpcSession>,
-    model_session: Arc<RpcSession>,
+    registry_client: Arc<dyn RpcClient>,
+    model_client: Arc<dyn RpcClient>,
 ) -> (hyprstream_vfs::Namespace, Arc<crate::stream_mount::StreamRegistry>) {
     let stream_registry = Arc::new(crate::stream_mount::StreamRegistry::new());
     let mut ns = hyprstream_vfs::Namespace::new();
 
     // Service mounts — all use GenericServiceMount with generated dispatch
     ns.mount("/srv/registry", Arc::new(GenericServiceMount::new(
-        Arc::clone(&registry_session), Box::new(RegistryDispatch), Arc::clone(&stream_registry),
+        Arc::clone(&registry_client), Box::new(RegistryDispatch), Arc::clone(&stream_registry),
     ))).expect("mount /srv/registry");
     ns.mount("/srv/model", Arc::new(GenericServiceMount::new(
-        Arc::clone(&model_session), Box::new(ModelDispatch), Arc::clone(&stream_registry),
+        Arc::clone(&model_client), Box::new(ModelDispatch), Arc::clone(&stream_registry),
     ))).expect("mount /srv/model");
 
     // Documentation mounts — generated at compile time from schema annotations

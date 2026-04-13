@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 
-pub use traits::{AsyncTransport, Transport};
+pub use crate::transport_traits::{PublishSink, Signer, Transport};
 
 /// Socket bind mode for transport configuration.
 ///

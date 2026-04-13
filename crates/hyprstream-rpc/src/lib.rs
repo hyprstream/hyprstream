@@ -117,6 +117,10 @@ pub mod metadata {
 mod _metadata;
 
 // ============================================================================
+// Transport traits (available on ALL targets)
+pub mod transport_traits;
+pub mod stream_consumer;
+
 // Native-only modules (not compiled for wasm32)
 // ============================================================================
 
@@ -154,7 +158,13 @@ pub mod web_transport;
 // ============================================================================
 
 pub use capnp::{serialize_message, FromCapnp, ToCapnp};
-pub use rpc_client::RpcClient;
+pub use rpc_client::{RpcClient, RpcClientImpl};
+pub use transport_traits::{PublishSink, Signer, Transport};
+pub mod identity;
+pub mod node_identity;
+pub mod signer;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod zmq_connection;
 pub use stream_info::StreamInfo;
 pub use crypto::{
     generate_signing_keypair, signing_key_from_bytes, verifying_key_from_bytes,
@@ -190,7 +200,7 @@ pub use resolver::Resolver;
 pub use registry::SocketKind;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use service::{Continuation, EnvelopeContext, RequestLoop, Spawnable, ServiceHandle, ZmqClient, ZmqService};
+pub use service::{Continuation, EnvelopeContext, RequestLoop, Spawnable, ServiceHandle, ZmqService};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use streaming::{
@@ -200,7 +210,7 @@ pub use streaming::{
 };
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use zmq_context::{global_context, create_service_client_base};
+pub use zmq_context::global_context;
 
 // ============================================================================
 // Prelude (native only — too many native-only types)
@@ -221,7 +231,7 @@ pub mod prelude {
         // Error
         EnvelopeError, EnvelopeResult, Result, RpcError,
         // Service (transport)
-        EnvelopeContext, RequestLoop, ServiceHandle, ZmqClient, ZmqService,
+        EnvelopeContext, RequestLoop, ServiceHandle, ZmqService,
         // Streaming
         StreamContext, StreamPublisher,
     };
@@ -230,7 +240,7 @@ pub mod prelude {
     pub use crate::{generate_ephemeral_keypair, ristretto_dh, RistrettoPublic, RistrettoSecret};
 
     // ZMQ context
-    pub use crate::zmq_context::{global_context, create_service_client_base};
+    pub use crate::zmq_context::global_context;
 
     // Registry (with renamed imports for convenience)
     pub use crate::registry::{
@@ -239,7 +249,7 @@ pub mod prelude {
     };
 
     // Transport
-    pub use crate::transport::{AsyncTransport, Transport, TransportConfig};
+    pub use crate::transport::TransportConfig;
 }
 
 // ============================================================================

@@ -20,7 +20,8 @@ use std::pin::Pin;
 /// `unsafe impl Send + Sync` on it because wasm32 is single-threaded.
 /// The `Send + Sync` bounds on this trait are required so that `RpcClient<S, T>`
 /// can be used with `Arc` and `tokio::spawn` on native.
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait Signer: Send + Sync {
     /// Ed25519 public key (32 bytes).
     fn pubkey(&self) -> [u8; 32];
@@ -42,14 +43,20 @@ pub trait Signer: Send + Sync {
 ///
 /// `Sub` must implement `futures::Stream` yielding frames as `Vec<Vec<u8>>`,
 /// matching the ZMTP multipart format `[topic, capnp_data, mac]`.
-#[async_trait]
+///
+/// Uses cfg-gated async_trait: Send on native, ?Send on wasm32.
+/// The trait types themselves are `Send + Sync` (via unsafe impl on wasm32),
+/// so `Arc<RpcClient<S, T>>` can be shared across threads on native.
+/// Individual call futures are awaited in place, not spawned.
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait Transport: Send + Sync {
     /// Subscriber type for data streams (server→client).
     /// Must yield ZMTP multipart frames as `Vec<Vec<u8>>`.
     type Sub: Stream<Item = Result<Vec<Vec<u8>>>> + Unpin + Send;
 
     /// Publisher type for control channel (client→server).
-    type Pub: Send;
+    type Pub: PublishSink + Send;
 
     /// Send a request and receive a response (REQ/REP pattern).
     ///
@@ -69,7 +76,8 @@ pub trait Transport: Send + Sync {
 ///
 /// Abstracted because native uses sync `zmq::Socket::send` with `DONTWAIT`,
 /// while WASM uses async WebTransport writes.
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait PublishSink: Send {
     /// Send ZMTP multipart frames (e.g., `[ctrl_topic, capnp, mac]`).
     async fn send_frames(&self, frames: &[&[u8]]) -> Result<()>;

@@ -32,7 +32,6 @@ use hyprstream_rpc::envelope::RequestIdentity;
 use hyprstream_rpc::registry::{global as global_registry, SocketKind};
 use crate::service::metadata::SchemaMetadataFn;
 use crate::service::spawner::Spawnable;
-use hyprstream_rpc::service::ZmqClient;
 use hyprstream_rpc::transport::TransportConfig;
 
 /// Shared QUIC/WebTransport configuration for all services.
@@ -103,7 +102,7 @@ impl QuicSharedConfig {
                     }
                 };
                 rt.block_on(async {
-                    let client = hyprstream_discovery::DiscoveryClient::new(
+                    let client = hyprstream_discovery::DiscoveryClient::for_service(
                         sk,
                         hyprstream_rpc::RequestIdentity::anonymous(),
                     );
@@ -268,27 +267,23 @@ impl ServiceContext {
         }
     }
 
-    /// Create a generic ZMQ client for any named service (runtime resolution).
-    ///
-    /// Uses the REP endpoint from the registry. For compile-time-safe clients,
-    /// use `typed_client::<T>()` instead.
-    pub fn client(&self, service: &str) -> ZmqClient {
-        let endpoint = self.endpoint(service, SocketKind::Rep).to_zmq_string();
-        ZmqClient::new(
-            &endpoint,
-            self.zmq_context.clone(),
-            self.signing_key.clone(),
-            self.verifying_key,
-            RequestIdentity::anonymous(),
-        )
-    }
-
     /// Create a typed client for a compile-time-known service.
     ///
-    /// The service type must implement `ServiceClient`, which provides
-    /// the service name and construction from a `ZmqClient`.
-    pub fn typed_client<T: ServiceClient>(&self) -> T {
-        T::from_zmq(self.client(T::SERVICE_NAME))
+    /// Uses `RpcClient<LocalSigner, ZmqConnection>` via the generated `connect_to()` constructor.
+    pub fn rpc_client(&self, service: &str) -> std::sync::Arc<dyn hyprstream_rpc::RpcClient> {
+        let endpoint = self.endpoint(service, SocketKind::Rep).to_zmq_string();
+        let signer = hyprstream_rpc::signer::LocalSigner::new(
+            self.signing_key.clone(),
+            RequestIdentity::anonymous(),
+        );
+        let transport = hyprstream_rpc::zmq_connection::ZmqConnection::new(
+            &endpoint,
+            self.zmq_context.clone(),
+        );
+        let rpc = hyprstream_rpc::rpc_client::RpcClientImpl::new(
+            signer, transport, self.verifying_key,
+        );
+        std::sync::Arc::new(rpc)
     }
 
     /// Wrap a ZmqService for spawning with a per-service QUIC port.
@@ -342,8 +337,7 @@ impl ServiceContext {
     }
 }
 
-// Re-export ServiceClient from hyprstream-rpc (canonical location)
-pub use hyprstream_rpc::service::ServiceClient;
+// ServiceClient trait removed — generated clients use Arc<dyn RpcClient> directly.
 
 /// Factory function signature for creating services.
 ///

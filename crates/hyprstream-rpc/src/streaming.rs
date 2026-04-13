@@ -182,23 +182,8 @@ pub enum StreamPayloadData {
 
 /// Output payload from StreamVerifier (what gets parsed).
 ///
-/// Stream identity comes from the DH-derived topic, not from payload fields.
-#[derive(Clone, Debug)]
-pub enum StreamPayload {
-    /// Generic binary data (tokens, I/O, etc.)
-    Data(Vec<u8>),
-    /// Error during streaming
-    Error(String),
-    /// Completion with app-specific metadata
-    Complete(Vec<u8>),
-    /// Encrypted tagged payload with key commitment
-    Tagged {
-        tag: Vec<u8>,
-        payload: Vec<u8>,
-        nonce: Vec<u8>,
-        key_commitment: Vec<u8>,
-    },
-}
+/// Re-exported from `stream_consumer` for backwards compatibility.
+pub use crate::stream_consumer::StreamPayload;
 
 // ============================================================================
 // HMAC Chain State
@@ -1416,8 +1401,8 @@ pub struct StreamChannel {
     push_socket: OnceCell<Arc<tokio::sync::Mutex<tmq::push::Push>>>,
     /// Channel to send subscription requests to the ctrl listener task
     ctrl_sub_tx: OnceCell<tokio::sync::mpsc::Sender<Vec<u8>>>,
-    /// Active cancel tokens keyed by ctrl_topic
-    cancel_tokens: Arc<DashMap<String, CancellationToken>>,
+    /// Active cancel tokens keyed by ctrl_topic, with ctrl_mac_key for verification
+    cancel_tokens: Arc<DashMap<String, (CancellationToken, [u8; 32])>>,
 }
 
 impl StreamChannel {
@@ -1484,7 +1469,7 @@ impl StreamChannel {
             .map_err(|_| anyhow::anyhow!("ctrl listener closed"))?;
         self.cancel_tokens.insert(
             stream_ctx.ctrl_topic().to_owned(),
-            stream_ctx.cancel_token().clone(),
+            (stream_ctx.cancel_token().clone(), *stream_ctx.ctrl_mac_key()),
         );
 
         // 4. Spawn JWT expiry timeout as universal backstop
@@ -1622,15 +1607,28 @@ impl StreamChannel {
                         };
 
                         // Wire format: [ctrl_topic, capnp, mac]
-                        if multipart.is_empty() {
+                        if multipart.len() < 3 {
+                            tracing::warn!("ctrl message missing frames (got {})", multipart.len());
                             continue;
                         }
                         let topic = String::from_utf8_lossy(&multipart[0]);
+                        let capnp_data = &multipart[1];
+                        let mac_bytes = &multipart[2];
 
-                        // Fire the cancel token if we have one for this topic
-                        if let Some((_, token)) = tokens.remove(topic.as_ref()) {
-                            tracing::debug!(ctrl_topic = %topic, "control cancel received");
-                            token.cancel();
+                        // Look up the token + mac_key for this topic
+                        if let Some(entry) = tokens.get(topic.as_ref()) {
+                            let (ref token, ref ctrl_mac_key) = *entry;
+
+                            // Verify MAC before acting on the control message
+                            let expected_mac = keyed_mac_truncated(ctrl_mac_key, capnp_data);
+                            if subtle::ConstantTimeEq::ct_eq(&mac_bytes[..], &expected_mac[..]).into() {
+                                tracing::debug!(ctrl_topic = %topic, "control cancel received (MAC verified)");
+                                token.cancel();
+                                drop(entry);
+                                tokens.remove(topic.as_ref());
+                            } else {
+                                tracing::warn!(ctrl_topic = %topic, "control message MAC verification failed — ignoring");
+                            }
                         }
                     }
                 }

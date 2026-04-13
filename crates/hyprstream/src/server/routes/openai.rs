@@ -472,9 +472,9 @@ async fn chat_completions(
 
     // Call inference via collect-stream (per-request ZMQ client preserves caller identity for TTT delta routing)
     let identity = identity_from_user(&user);
-    let model_client = ModelClient::new((*state.signing_key).clone(), identity);
+    let model_client = ModelClient::for_service((*state.signing_key).clone(), identity);
     let claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
-    let result = collect_stream_to_result(&model_client.with_claims(claims), &request.model, &gen_request).await;
+    let result = collect_stream_to_result(&model_client.with_jwt(claims.token.unwrap_or_default()), &request.model, &gen_request).await;
 
     info!("Generation completed - success: {}", result.is_ok());
 
@@ -674,9 +674,9 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
 
         // Start ZMQ stream with per-request client (preserves caller identity for TTT delta routing)
         let identity = identity_from_user(&user);
-        let model_client = ModelClient::new((*state.signing_key).clone(), identity);
+        let model_client = ModelClient::for_service((*state.signing_key).clone(), identity);
         let claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
-        let client = model_client.with_claims(claims);
+        let client = model_client.with_jwt(claims.token.unwrap_or_default());
         use crate::services::generated::model_client::InferRpc;
         let mut stream_handle = match InferRpc::generate_stream(&client.infer(&model_name), &gen_request).await {
             Ok(h) => h,
@@ -1000,9 +1000,9 @@ async fn completions(
 
     // Call inference via collect-stream (per-request ZMQ client preserves caller identity for TTT delta routing)
     let identity = identity_from_user(&user);
-    let model_client = ModelClient::new((*state.signing_key).clone(), identity);
+    let model_client = ModelClient::for_service((*state.signing_key).clone(), identity);
     let claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
-    let result = collect_stream_to_result(&model_client.with_claims(claims), &request.model, &gen_request).await;
+    let result = collect_stream_to_result(&model_client.with_jwt(claims.token.unwrap_or_default()), &request.model, &gen_request).await;
 
     // Metrics automatically decremented by MetricsGuard on drop
 

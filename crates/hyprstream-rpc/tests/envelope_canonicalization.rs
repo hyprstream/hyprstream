@@ -13,6 +13,7 @@ fn test_envelope_serialization_deterministic() {
         nonce: [42u8; 16],
         timestamp: 1234567890,
         claims: None,
+        jwt_token: None,
     };
 
     let envelope2 = envelope1.clone();
@@ -45,6 +46,7 @@ fn test_envelope_signature_verification_stable() {
         nonce: [99u8; 16],
         timestamp: 9876543210,
         claims: None,
+        jwt_token: None,
     };
 
     // Sign envelope
@@ -101,6 +103,7 @@ fn test_envelope_canonical_form() {
         nonce: [0u8; 16],
         timestamp: 1111111111,
         claims: None,
+        jwt_token: None,
     };
 
     let bytes = envelope.to_bytes();
@@ -135,6 +138,7 @@ fn test_envelope_with_claims_deterministic() {
         nonce: [123u8; 16],
         timestamp: 5555555555,
         claims: None,
+        jwt_token: None,
     };
 
     // Multiple serializations must produce identical bytes
@@ -156,6 +160,7 @@ fn test_envelope_different_data_different_bytes() {
         nonce: [1u8; 16],
         timestamp: 1000000000,
         claims: None,
+        jwt_token: None,
     };
 
     let envelope2 = RequestEnvelope {
@@ -166,6 +171,7 @@ fn test_envelope_different_data_different_bytes() {
         nonce: [2u8; 16],
         timestamp: 2000000000,
         claims: None,
+        jwt_token: None,
     };
 
     let bytes1 = envelope1.to_bytes();

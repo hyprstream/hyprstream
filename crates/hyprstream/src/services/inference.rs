@@ -2731,7 +2731,7 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
 
             // Create PolicyClient HERE, inside the service thread's runtime,
             // so ZMQ sockets are registered with the correct reactor.
-            let policy_client = PolicyClient::new(
+            let policy_client = PolicyClient::for_service(
                 self.policy_signing_key,
                 hyprstream_rpc::envelope::RequestIdentity::anonymous(),
             );

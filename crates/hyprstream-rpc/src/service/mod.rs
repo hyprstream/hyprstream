@@ -18,20 +18,8 @@ pub mod doc;
 
 pub use traits::{RpcHandler, RpcRequest, RpcService};
 #[allow(deprecated)]
-pub use zmq::{AuthorizeFn, CallOptions, Continuation, EnvelopeContext, QuicLoopConfig, ServiceHandle, RequestLoop, UnifiedRequestLoop, ZmqClient, ZmqService};
+pub use zmq::{AuthorizeFn, Continuation, EnvelopeContext, QuicLoopConfig, ServiceHandle, RequestLoop, UnifiedRequestLoop, ZmqService};
 pub use streaming::StreamService;
 pub use spawnable::Spawnable;
 pub use metadata::{MethodMeta, ParamMeta, SchemaMetadataFn, ScopedSchemaMetadataFn, ScopedClientTreeNode};
 pub use doc::DocFs;
-
-/// Trait for generated service clients that can be constructed from a base `ZmqClient`.
-///
-/// Implement this trait to enable `ServiceContext::typed_client::<T>()`.
-/// Generated clients implement this automatically via `generate_rpc_service!`.
-pub trait ServiceClient: Sized {
-    /// The service name as registered in the endpoint registry.
-    const SERVICE_NAME: &'static str;
-
-    /// Construct this client from a base `ZmqClient`.
-    fn from_zmq(client: ZmqClient) -> Self;
-}

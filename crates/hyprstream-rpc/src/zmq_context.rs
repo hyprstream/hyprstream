@@ -35,18 +35,3 @@ static ZMQ_CONTEXT: Lazy<Arc<zmq::Context>> = Lazy::new(|| {
 pub fn global_context() -> Arc<zmq::Context> {
     Arc::clone(&ZMQ_CONTEXT)
 }
-
-/// Create a service client using the global ZMQ context.
-///
-/// Derives the server verifying key from the signing key (self-signed scenario).
-/// For non-self-signed cases, use `ZmqClient::new` directly.
-pub fn create_service_client_base(
-    endpoint: &str,
-    signing_key: crate::SigningKey,
-    identity: crate::RequestIdentity,
-) -> crate::service::ZmqClient {
-    let server_verifying_key = signing_key.verifying_key();
-    crate::service::ZmqClient::new(
-        endpoint, global_context(), signing_key, server_verifying_key, identity,
-    )
-}

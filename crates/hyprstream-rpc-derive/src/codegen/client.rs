@@ -73,7 +73,8 @@ fn generate_scope_trait_recursive(sc: &ScopedClient, resolved: &ResolvedSchema, 
 
     tokens.extend(quote! {
         #[doc = #doc]
-        #[async_trait::async_trait]
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
         pub trait #trait_ident: Send + Sync {
             #(#nested_assoc_types)*
             #(#nested_factory_methods)*
@@ -121,7 +122,8 @@ fn generate_top_level_trait(service_name: &str, resolved: &ResolvedSchema, types
 
     quote! {
         #[doc = #doc]
-        #[async_trait::async_trait]
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
         pub trait #trait_name: Send + Sync {
             #(#assoc_types)*
             #(#factory_methods)*
@@ -312,7 +314,8 @@ pub fn generate_trait_impls(service_name: &str, resolved: &ResolvedSchema, types
         .collect();
 
     tokens.extend(quote! {
-        #[async_trait::async_trait]
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
         impl #trait_ident for #client_ident {
             #(#assoc_bindings)*
             #(#factory_impls)*
@@ -362,7 +365,8 @@ fn generate_scope_trait_impl_recursive(sc: &ScopedClient, resolved: &ResolvedSch
         .collect();
 
     tokens.extend(quote! {
-        #[async_trait::async_trait]
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
         impl #trait_ident for #client_ident {
             #(#nested_assoc)*
             #(#nested_factory_impls)*
@@ -480,10 +484,7 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
             pub const SERVICE_NAME: &'static str = #service_name_lit;
 
             /// Create a new client by looking up the service endpoint from the global registry.
-            ///
-            /// If the registry is not yet initialized (D9), falls back to the default
-            /// inproc endpoint. Use `with_endpoint()` or `from_resolver()` for explicit control.
-            pub fn new(
+            pub fn for_service(
                 signing_key: hyprstream_rpc::crypto::SigningKey,
                 identity: hyprstream_rpc::envelope::RequestIdentity,
             ) -> Self {
@@ -493,18 +494,25 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
                         concat!("hyprstream/", #service_name_lit)
                     ))
                     .to_zmq_string();
-                Self::with_endpoint(&endpoint, signing_key, identity)
+                Self::for_endpoint(&endpoint, signing_key, identity)
             }
 
             /// Create a new client connected to a specific endpoint.
-            pub fn with_endpoint(
+            pub fn for_endpoint(
                 endpoint: &str,
                 signing_key: hyprstream_rpc::crypto::SigningKey,
                 identity: hyprstream_rpc::envelope::RequestIdentity,
             ) -> Self {
-                Self::from_zmq(
-                    hyprstream_rpc::zmq_context::create_service_client_base(endpoint, signing_key, identity)
-                )
+                let server_verifying_key = signing_key.verifying_key();
+                let signer = hyprstream_rpc::signer::LocalSigner::new(signing_key, identity);
+                let transport = hyprstream_rpc::zmq_connection::ZmqConnection::new(
+                    endpoint,
+                    hyprstream_rpc::zmq_context::global_context(),
+                );
+                let rpc = hyprstream_rpc::rpc_client::RpcClientImpl::new(
+                    signer, transport, server_verifying_key,
+                );
+                Self::new(std::sync::Arc::new(rpc) as std::sync::Arc<dyn hyprstream_rpc::RpcClient>)
             }
 
             /// Create a new client by resolving the service endpoint via a `Resolver`.
@@ -517,7 +525,7 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
                     .resolve(Self::SERVICE_NAME, hyprstream_rpc::registry::SocketKind::Rep)
                     .await?
                     .to_zmq_string();
-                Ok(Self::with_endpoint(&endpoint, signing_key, identity))
+                Ok(Self::for_endpoint(&endpoint, signing_key, identity))
             }
         }
     }
@@ -648,13 +656,13 @@ pub fn generate_client(service_name: &str, resolved: &ResolvedSchema, types_crat
         .map(|sc| sc.factory_name.as_str())
         .collect();
 
-    // Request methods (skip scoped variants)
+    // Request methods (portable — uses self.client.call(), not CallOptions)
     let request_methods: Vec<TokenStream> = resolved.raw
         .request_variants
         .iter()
         .filter(|v| !scoped_variant_names.contains(&v.name.as_str()))
         .map(|v| {
-            generate_request_method(
+            generate_request_method_inner(
                 &capnp_mod,
                 &req_type,
                 &response_type,
@@ -682,167 +690,31 @@ pub fn generate_client(service_name: &str, resolved: &ResolvedSchema, types_crat
     let factory_methods: Vec<TokenStream> = resolved.raw
         .scoped_clients
         .iter()
-        .map(generate_scoped_factory_method)
-        .collect();
-
-    // ServiceClient impl
-    let service_name_lit = service_name;
-
-    quote! {
-        #[doc = #doc]
-        #[derive(Clone)]
-        pub struct #client_name {
-            client: Arc<ZmqClientBase>,
-            claims: Option<std::sync::Arc<hyprstream_rpc::auth::Claims>>,
-        }
-
-        impl ServiceClient for #client_name {
-            const SERVICE_NAME: &'static str = #service_name_lit;
-
-            fn from_zmq(client: ZmqClientBase) -> Self {
-                Self { client: Arc::new(client), claims: None }
-            }
-        }
-
-        impl #client_name {
-            /// Get the next request ID.
-            pub fn next_id(&self) -> u64 {
-                self.client.next_id()
-            }
-
-            /// Attach claims for e2e verification. All subsequent calls include these claims.
-            pub fn with_claims(mut self, claims: hyprstream_rpc::auth::Claims) -> Self {
-                self.claims = Some(std::sync::Arc::new(claims));
-                self
-            }
-
-            /// Send a raw request and return the raw response bytes.
-            pub async fn call(&self, payload: Vec<u8>) -> anyhow::Result<Vec<u8>> {
-                let opts = match &self.claims {
-                    Some(c) => CallOptions::default().claims((**c).clone()),
-                    None => CallOptions::default(),
-                };
-                self.client.call(payload, opts).await
-            }
-
-            /// Send a raw request with custom options and return the raw response bytes.
-            pub async fn call_with_options(&self, payload: Vec<u8>, mut opts: CallOptions) -> anyhow::Result<Vec<u8>> {
-                if opts.claims.is_none() {
-                    if let Some(ref c) = self.claims {
-                        opts = opts.claims((**c).clone());
-                    }
-                }
-                self.client.call(payload, opts).await
-            }
-
-            /// Get the endpoint this client is connected to.
-            pub fn endpoint(&self) -> &str {
-                self.client.endpoint()
-            }
-
-            /// Get the signing key used by this client.
-            pub fn signing_key(&self) -> &hyprstream_rpc::crypto::SigningKey {
-                self.client.signing_key()
-            }
-
-            /// Get the request identity used by this client.
-            pub fn identity(&self) -> &hyprstream_rpc::envelope::RequestIdentity {
-                self.client.identity()
-            }
-
-            #(#request_methods)*
-
-            #parse_response
-
-            #(#factory_methods)*
-        }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Portable Client (transport-agnostic, works on native + wasm32)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Generate a transport-agnostic client struct using `RpcClient` trait.
-///
-/// Unlike `generate_client()` which hardcodes `ZmqClientBase`, this emits a
-/// client that works with any `RpcClient` implementation (ZMQ, WebTransport, etc.).
-/// Used by `generate_rpc_client!` for the client-only crate.
-/// TODO: Wire into generate_client_only() once scoped client codegen supports portable mode.
-#[allow(dead_code)]
-pub fn generate_portable_client(service_name: &str, resolved: &ResolvedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
-    let pascal = to_pascal_case(service_name);
-    let client_name = format_ident!("{}Client", pascal);
-    let response_type = format_ident!("{}ResponseVariant", pascal);
-    let capnp_mod_ident = format_ident!("{}_capnp", service_name);
-    let capnp_mod: TokenStream = match types_crate {
-        Some(tc) => quote! { #tc::#capnp_mod_ident },
-        None => quote! { crate::#capnp_mod_ident },
-    };
-    let req_type = format_ident!("{}", to_snake_case(&format!("{pascal}Request")));
-    let doc = format!("Auto-generated client for the {pascal} service (transport-agnostic).");
-
-    let scoped_variant_names: Vec<&str> = resolved.raw
-        .scoped_clients
-        .iter()
-        .map(|sc| sc.factory_name.as_str())
-        .collect();
-
-    // Request methods (skip scoped variants — those get factory methods)
-    let request_methods: Vec<TokenStream> = resolved.raw
-        .request_variants
-        .iter()
-        .filter(|v| !scoped_variant_names.contains(&v.name.as_str()))
-        .map(|v| {
-            generate_request_method_inner(
-                &capnp_mod,
-                &req_type,
-                &response_type,
-                v,
-                resolved,
-                None,
-                Some(&resolved.raw.response_variants),
-                false,
-                types_crate,
-                true, // portable
-            )
-        })
-        .collect();
-
-    // parse_response method
-    let resp_type = format_ident!("{}", to_snake_case(&format!("{pascal}Response")));
-    let parse_response = generate_parse_response_fn(
-        &response_type,
-        &capnp_mod,
-        &resp_type,
-        &resolved.raw.response_variants,
-        resolved,
-        types_crate,
-    );
-
-    // Factory methods for scoped clients
-    let factory_methods: Vec<TokenStream> = resolved.raw
-        .scoped_clients
-        .iter()
-        .map(generate_scoped_factory_method)
+        .map(generate_portable_scoped_factory_method)
         .collect();
 
     quote! {
         #[doc = #doc]
         #[derive(Clone)]
         pub struct #client_name {
-            client: Arc<dyn hyprstream_rpc::RpcClient>,
+            client: std::sync::Arc<dyn hyprstream_rpc::RpcClient>,
         }
 
         impl #client_name {
-            /// Create a new client from any RpcClient implementation.
-            pub fn new(client: Arc<dyn hyprstream_rpc::RpcClient>) -> Self {
+            /// Create from any RpcClient implementation.
+            pub fn new(client: std::sync::Arc<dyn hyprstream_rpc::RpcClient>) -> Self {
                 Self { client }
             }
 
             /// Get the next request ID.
             pub fn next_id(&self) -> u64 {
                 self.client.next_id()
+            }
+
+            /// Set the opaque JWT token for authenticated requests.
+            pub fn with_jwt(&self, token: String) -> &Self {
+                self.client.set_jwt(Some(token));
+                self
             }
 
             /// Send a raw request and return the raw response bytes.
@@ -864,17 +736,13 @@ pub fn generate_portable_client(service_name: &str, resolved: &ResolvedSchema, t
     }
 }
 
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Request Method Generation
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Generate a single request method. Used for both top-level and scoped clients.
-///
-/// When `portable` is true, streaming methods use `self.call_streaming(payload, ephemeral_pubkey)`
-/// instead of `CallOptions`. This enables the generated code to work without native-only ZMQ types.
+/// Generate a portable request method (no CallOptions, no ZMQ deps).
 #[allow(clippy::too_many_arguments)]
-pub fn generate_request_method(
+pub fn generate_portable_request_method(
     capnp_mod: &TokenStream,
     req_type: &syn::Ident,
     response_type: &syn::Ident,
@@ -885,10 +753,10 @@ pub fn generate_request_method(
     is_scoped: bool,
     types_crate: Option<&syn::Path>,
 ) -> TokenStream {
-    generate_request_method_inner(capnp_mod, req_type, response_type, variant, resolved, scope, response_variants, is_scoped, types_crate, false)
+    generate_request_method_inner(capnp_mod, req_type, response_type, variant, resolved, scope, response_variants, is_scoped, types_crate)
 }
 
-/// Inner implementation with portable flag.
+/// Inner request method generation (transport-agnostic).
 #[allow(clippy::too_many_arguments)]
 fn generate_request_method_inner(
     capnp_mod: &TokenStream,
@@ -900,7 +768,6 @@ fn generate_request_method_inner(
     response_variants: Option<&[UnionVariant]>,
     is_scoped: bool,
     types_crate: Option<&syn::Path>,
-    portable: bool,
 ) -> TokenStream {
     let method_name = format_ident!("{}", to_snake_case(&variant.name));
     let doc = if variant.description.is_empty() {
@@ -965,33 +832,34 @@ fn generate_request_method_inner(
         .map(|v| is_rpc_stream_info(&v.type_name, resolved))
         .unwrap_or(false);
 
-    let (return_type, response_handling) = if let Some(ref info) = typed_info {
-        let ret = &info.return_type;
-        let match_body = &info.match_body;
-        (quote! { #ret }, quote! { #match_body })
-    } else {
-        (quote! { #response_type }, quote! { #parse_call })
-    };
-
-    let (extra_param, call_expr) = if is_streaming {
-        if portable {
-            (
-                quote! { , ephemeral_pubkey: [u8; 32] },
-                quote! {
-                    let response = self.call_streaming(payload, ephemeral_pubkey).await?;
-                },
-            )
+    // For streaming methods, use call_streaming with ephemeral pubkey
+    let (return_type, response_handling, extra_param, call_expr) = if is_streaming {
+        let (rt, rh) = if let Some(ref info) = typed_info {
+            let ret = &info.return_type;
+            let match_body = &info.match_body;
+            (quote! { #ret }, quote! { #match_body })
         } else {
-            (
-                quote! { , ephemeral_pubkey: [u8; 32] },
-                quote! {
-                    let opts = CallOptions::default().ephemeral_pubkey(ephemeral_pubkey);
-                    let response = self.call_with_options(payload, opts).await?;
-                },
-            )
-        }
-    } else {
+            (quote! { #response_type }, quote! { #parse_call })
+        };
         (
+            rt,
+            rh,
+            quote! { , ephemeral_pubkey: [u8; 32] },
+            quote! {
+                let response = self.call_streaming(payload, ephemeral_pubkey).await?;
+            },
+        )
+    } else {
+        let (rt, rh) = if let Some(ref info) = typed_info {
+            let ret = &info.return_type;
+            let match_body = &info.match_body;
+            (quote! { #ret }, quote! { #match_body })
+        } else {
+            (quote! { #response_type }, quote! { #parse_call })
+        };
+        (
+            rt,
+            rh,
             TokenStream::new(),
             quote! { let response = self.call(payload).await?; },
         )
@@ -1474,7 +1342,9 @@ fn generate_list_parse_arm(
 // Scoped Factory Method
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn generate_scoped_factory_method(sc: &ScopedClient) -> TokenStream {
+
+/// Generate a scoped factory method for portable clients (no jwt_token field).
+fn generate_portable_scoped_factory_method(sc: &ScopedClient) -> TokenStream {
     let method_name = format_ident!("{}", to_snake_case(&sc.factory_name));
     let client_name_ident = format_ident!("{}", sc.client_name);
     let doc = format!("Create a scoped {} client.", sc.factory_name);
@@ -1497,8 +1367,7 @@ fn generate_scoped_factory_method(sc: &ScopedClient) -> TokenStream {
         #[doc = #doc]
         pub fn #method_name(&self #(, #params)*) -> #client_name_ident {
             #client_name_ident {
-                client: Arc::clone(&self.client),
-                claims: self.claims.clone(),
+                client: std::sync::Arc::clone(&self.client),
                 #(#field_inits,)*
             }
         }

@@ -51,7 +51,8 @@ struct RequestEnvelope {
   ephemeralPubkey @3 :Data $fixedSize(32) $optional;  # Ristretto255/P-256 public key for stream HMAC
   nonce @4 :Data $fixedSize(16);   # 16 random bytes for replay protection
   timestamp @5 :Int64;             # Unix millis, for expiration check
-  claims @6 :Claims $optional;     # User authorization claims (protected by envelope signature)
+  claims @6 :Claims $optional;     # DEPRECATED: use jwtToken instead. Kept for wire compat.
+  jwtToken @7 :Text $optional;     # Opaque JWT token string. Server decodes and verifies.
 }
 
 # Signed wrapper - signature covers serialized RequestEnvelope bytes

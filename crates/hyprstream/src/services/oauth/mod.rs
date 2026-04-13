@@ -278,11 +278,11 @@ impl Spawnable for OAuthService {
             // Create RPC clients HERE, inside the OAuth runtime, so that ZMQ
             // async I/O (TMQ) registers socket FDs with THIS runtime's epoll.
             // Creating them in the factory (main runtime) would cause hangs.
-            let policy_client = PolicyClient::new(
+            let policy_client = PolicyClient::for_service(
                 self.signing_key.clone(),
                 hyprstream_rpc::RequestIdentity::anonymous(),
             );
-            let discovery_client = crate::services::DiscoveryClient::new(
+            let discovery_client = crate::services::DiscoveryClient::for_service(
                 self.signing_key.clone(),
                 hyprstream_rpc::RequestIdentity::anonymous(),
             );

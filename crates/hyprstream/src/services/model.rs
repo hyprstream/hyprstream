@@ -194,7 +194,7 @@ impl ModelService {
         };
         let cache_size = NonZeroUsize::new(config.max_models).unwrap_or(DEFAULT_CACHE_SIZE);
 
-        let notif_client = NotificationClient::new(signing_key.clone(), RequestIdentity::anonymous());
+        let notif_client = NotificationClient::for_service(signing_key.clone(), RequestIdentity::anonymous());
         let notification_publisher = NotificationPublisher::new(notif_client, signing_key.clone());
 
         Self { inner: Arc::new(ModelServiceInner {
@@ -272,7 +272,7 @@ impl ModelService {
         };
         let cache_size = NonZeroUsize::new(config.max_models).unwrap_or(DEFAULT_CACHE_SIZE);
 
-        let notif_client = NotificationClient::new(signing_key.clone(), RequestIdentity::anonymous());
+        let notif_client = NotificationClient::for_service(signing_key.clone(), RequestIdentity::anonymous());
         let notification_publisher = NotificationPublisher::new(notif_client, signing_key.clone());
 
         Self { inner: Arc::new(ModelServiceInner {
@@ -407,7 +407,7 @@ impl ModelService {
             .map_err(|e| anyhow!("Failed to spawn inference service: {}", e))?;
 
         // Create client for this service
-        let client = InferenceClient::with_endpoint(
+        let client = InferenceClient::for_endpoint(
             &endpoint,
             self.signing_key.clone(),
             RequestIdentity::anonymous(),
@@ -609,10 +609,10 @@ impl ModelService {
             .ok_or_else(|| anyhow!("Model {} not found after loading", model_ref_str))?;
         model.last_used = Instant::now();
         let client = model.client.clone();
-        match ctx.claims() {
-            Some(claims) => Ok(client.with_claims(claims.clone())),
-            None => Ok(client),
+        if let Some(token) = ctx.jwt_token() {
+            client.with_jwt(token.to_owned());
         }
+        Ok(client)
     }
 
     /// Load a LoRA adapter from a file

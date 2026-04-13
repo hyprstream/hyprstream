@@ -474,7 +474,12 @@ pub struct RequestEnvelope {
     pub timestamp: i64,
 
     /// User authorization claims (protected by envelope signature).
+    /// DEPRECATED: use jwt_token instead. Kept for wire compat deserialization only.
     pub claims: Option<Claims>,
+
+    /// Opaque JWT token string. Server decodes and verifies.
+    /// Client treats this as opaque — no decoding, no trust in individual fields.
+    pub jwt_token: Option<String>,
 }
 
 impl RequestEnvelope {
@@ -488,6 +493,7 @@ impl RequestEnvelope {
             nonce: generate_nonce(),
             timestamp: current_timestamp(),
             claims: None,
+            jwt_token: None,
         }
     }
 
@@ -498,8 +504,15 @@ impl RequestEnvelope {
     }
 
     /// Set user authorization claims.
+    /// DEPRECATED: use with_jwt_token instead.
     pub fn with_claims(mut self, claims: Claims) -> Self {
         self.claims = Some(claims);
+        self
+    }
+
+    /// Set opaque JWT token. Server decodes and verifies.
+    pub fn with_jwt_token(mut self, token: String) -> Self {
+        self.jwt_token = Some(token);
         self
     }
 
@@ -955,8 +968,14 @@ impl ToCapnp for RequestEnvelope {
         }
         builder.set_nonce(&self.nonce);
         builder.set_timestamp(self.timestamp);
+        // DEPRECATED: claims @6 — no longer written by clients.
+        // Server-side code that re-serializes envelopes may still write claims
+        // for backwards compat with older peers, but new envelopes use jwt_token.
         if let Some(ref claims) = self.claims {
             claims.write_to(&mut builder.reborrow().init_claims());
+        }
+        if let Some(ref token) = self.jwt_token {
+            builder.set_jwt_token(token);
         }
     }
 }
@@ -1002,6 +1021,15 @@ impl FromCapnp for RequestEnvelope {
             }
         };
 
+        let jwt_token = {
+            if reader.has_jwt_token() {
+                let t = reader.get_jwt_token()?.to_str()?;
+                if t.is_empty() { None } else { Some(t.to_owned()) }
+            } else {
+                None
+            }
+        };
+
         Ok(Self {
             request_id: reader.get_request_id(),
             identity: RequestIdentity::read_from(reader.get_identity()?)?,
@@ -1010,6 +1038,7 @@ impl FromCapnp for RequestEnvelope {
             nonce,
             timestamp: reader.get_timestamp(),
             claims,
+            jwt_token,
         })
     }
 }

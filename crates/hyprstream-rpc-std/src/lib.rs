@@ -153,3 +153,5 @@ pub mod vfs_mount;
 pub mod stream_mount;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_exports;
+#[cfg(target_arch = "wasm32")]
+pub mod wasm_rpc_client;

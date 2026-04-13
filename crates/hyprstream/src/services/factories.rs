@@ -170,7 +170,7 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     let config = load_config();
 
     // Create policy client for authorization checks
-    let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::anonymous());
+    let policy_client = PolicyClient::for_service(ctx.signing_key().clone(), RequestIdentity::anonymous());
 
     // Create registry service with infrastructure (blocking since we're in sync context)
     let mut registry_service = tokio::task::block_in_place(|| {
@@ -235,10 +235,10 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     let config = load_config();
 
     // Create policy client for authorization checks
-    let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::anonymous());
+    let policy_client = PolicyClient::for_service(ctx.signing_key().clone(), RequestIdentity::anonymous());
 
     // Create registry client
-    let registry_client: RegistryClient = RegistryClient::new(
+    let registry_client: RegistryClient = RegistryClient::for_service(
         ctx.signing_key().clone(),
         RequestIdentity::anonymous(),
     );
@@ -335,7 +335,7 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     )?;
 
     // Wire up policy-backed authorization
-    let policy_client = crate::services::PolicyClient::new(
+    let policy_client = crate::services::PolicyClient::for_service(
         ctx.signing_key().clone(),
         hyprstream_rpc::RequestIdentity::anonymous(),
     );
@@ -371,11 +371,11 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let config = load_config();
 
     // Create ZMQ clients for Model and Policy services
-    let model_client = ModelClient::new(ctx.signing_key().clone(), RequestIdentity::anonymous());
-    let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::anonymous());
+    let model_client = ModelClient::for_service(ctx.signing_key().clone(), RequestIdentity::anonymous());
+    let policy_client = PolicyClient::for_service(ctx.signing_key().clone(), RequestIdentity::anonymous());
 
     // Create registry client
-    let registry_client: RegistryClient = RegistryClient::new(
+    let registry_client: RegistryClient = RegistryClient::for_service(
         ctx.signing_key().clone(),
         RequestIdentity::anonymous(),
     );
@@ -431,7 +431,7 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     // RegistryClient already implements hyprstream_metrics::RegistryClient
     let registry_client: Option<Arc<dyn hyprstream_metrics::RegistryClient>> =
         if config.flight.default_dataset.is_some() {
-            let zmq_client: RegistryClient = RegistryClient::new(
+            let zmq_client: RegistryClient = RegistryClient::for_service(
                 ctx.signing_key().clone(),
                 RequestIdentity::anonymous(),
             );
@@ -761,7 +761,7 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         tui_config.scrollback_lines,
     )));
 
-    let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::anonymous());
+    let policy_client = PolicyClient::for_service(ctx.signing_key().clone(), RequestIdentity::anonymous());
 
     // Build VFS namespace for ChatApps spawned via TUI RPC.
     let (vfs_ns, vfs_subject) = crate::tui::vfs::build_chat_vfs_namespace(ctx.signing_key());
@@ -800,7 +800,7 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
     let config = load_config();
 
     // Create policy-based authorization provider
-    let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::anonymous());
+    let policy_client = PolicyClient::for_service(ctx.signing_key().clone(), RequestIdentity::anonymous());
     let auth_provider = crate::services::discovery::PolicyAuthProvider::new(policy_client);
 
     let mut discovery_service = DiscoveryService::new(
@@ -828,7 +828,7 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
 fn create_notification_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating NotificationService");
 
-    let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::anonymous());
+    let policy_client = PolicyClient::for_service(ctx.signing_key().clone(), RequestIdentity::anonymous());
 
     let mut notification_service = crate::services::NotificationService::new(
         Arc::new(ctx.signing_key().clone()),
@@ -885,7 +885,7 @@ fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
         .map_err(|e| anyhow::anyhow!("metrics service init: {e}"))?,
     );
 
-    let policy_client = PolicyClient::new(ctx.signing_key().clone(), RequestIdentity::anonymous());
+    let policy_client = PolicyClient::for_service(ctx.signing_key().clone(), RequestIdentity::anonymous());
 
     let mut metrics_service = MetricsService::new(
         orchestrator,

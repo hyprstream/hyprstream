@@ -74,7 +74,7 @@ fn generate_service_file(service_name: &str, schema: &ParsedSchema) -> String {
     // Conditional streaming import (only for service schemas with streaming methods)
     if is_service && client::has_streaming_methods(schema) {
         out.push_str(
-            "import { type StreamSubscription, createStreamSubscription } from '../stream-client';\n"
+            "import { type StreamHandle } from '../../wasm/hyprstream-rpc-std/hyprstream_rpc_std';\n"
         );
     }
     out.push('\n');

@@ -112,6 +112,8 @@ struct EndpointInfo {
   socketKind @0 :Text;
   # Endpoint string (e.g. "inproc://hyprstream/policy")
   endpoint @1 :Text;
+  # Ed25519 public key of the service (32 bytes, for response verification)
+  pubkey @2 :Data;
 }
 
 # Endpoints for a specific service

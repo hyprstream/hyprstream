@@ -95,7 +95,7 @@ pub mod typed;
 pub mod worker;
 
 pub use core::{
-    CallOptions, Continuation, EnvelopeContext, ZmqClient, ZmqService,
+    Continuation, EnvelopeContext, ZmqService,
 };
 
 // Generated client types — the public API

@@ -452,7 +452,7 @@ fn handle_quick_command(
             || async move {
                 let keys_dir = ctx.models_dir().join(".registry").join("keys");
                 let signing_key = load_or_generate_signing_key(&keys_dir).await?;
-                let model_client = hyprstream_core::services::generated::model_client::ModelClient::new(
+                let model_client = hyprstream_core::services::generated::model_client::ModelClient::for_service(
                     signing_key,
                     RequestIdentity::anonymous(),
                 );
@@ -1050,7 +1050,7 @@ fn handle_quick_command(
                         )?;
 
                         // Wire up policy-backed authorization
-                        let worker_policy_client = PolicyClient::new(
+                        let worker_policy_client = PolicyClient::for_service(
                             signing_key.clone(),
                             RequestIdentity::anonymous(),
                         );
@@ -1071,7 +1071,7 @@ fn handle_quick_command(
 
                     use hyprstream_workers::runtime::WorkerClient;
                     let worker_client =
-                        WorkerClient::new(signing_key, RequestIdentity::anonymous());
+                        WorkerClient::for_service(signing_key, RequestIdentity::anonymous());
 
                     match action {
                         WorkerAction::List {
@@ -1499,7 +1499,7 @@ fn main() -> Result<()> {
                             signing_key.clone(),
                         );
                         // Wire up policy-backed authorization
-                        let wf_policy_client = PolicyClient::new(
+                        let wf_policy_client = PolicyClient::for_service(
                             signing_key.clone(),
                             RequestIdentity::anonymous(),
                         );
@@ -1517,7 +1517,7 @@ fn main() -> Result<()> {
                         None
                     };
 
-                let client = hyprstream_core::services::RegistryClient::new(
+                let client = hyprstream_core::services::RegistryClient::for_service(
                     signing_key.clone(),
                     RequestIdentity::anonymous(),
                 );
@@ -1539,7 +1539,7 @@ fn main() -> Result<()> {
                 let signing_key = load_or_generate_signing_key(&keys_dir).await?;
                 let verifying_key = signing_key.verifying_key();
 
-                let client = hyprstream_core::services::RegistryClient::new(
+                let client = hyprstream_core::services::RegistryClient::for_service(
                     signing_key.clone(),
                     RequestIdentity::anonymous(),
                 );
@@ -1657,7 +1657,7 @@ fn main() -> Result<()> {
                                     let keys_dir = data_dir.join("keys");
                                     let signing_key =
                                         load_or_generate_signing_key(&keys_dir).await?;
-                                    let policy_client = PolicyClient::new(
+                                    let policy_client = PolicyClient::for_service(
                                         signing_key.clone(),
                                         hyprstream_rpc::RequestIdentity::anonymous(),
                                     );

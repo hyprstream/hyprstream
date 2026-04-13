@@ -5,7 +5,8 @@
 //! `/stream/{topic}/ctl`  — write control commands (cancel)
 //!
 //! Follows Plan 9 `/net/tcp/{n}/data` pattern. Streams are created by
-//! dispatching streaming RPC methods and registered in the StreamRegistry.
+//! dispatching streaming RPC methods via `RpcClient::open_stream()` and
+//! registered in the StreamRegistry.
 
 #![cfg(target_arch = "wasm32")]
 
@@ -14,8 +15,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
 use hyprstream_rpc::Subject;
-
-use crate::wasm_exports::RpcSession;
+use hyprstream_rpc::stream_consumer::{StreamHandle, StreamPayload};
 
 // ============================================================================
 // Send+Sync wrappers for wasm32
@@ -44,18 +44,14 @@ impl<T> SyncRefCell<T> {
 
 /// Metadata and state for an active stream.
 pub struct StreamEntry {
-    /// The SubStream providing data blocks (Option for temporary extraction during await)
-    pub sub_stream: Option<hyprstream_rpc::web_transport::SubStream>,
-    /// HMAC chain handle for verification (from init_stream_hmac)
-    pub hmac_handle: u32,
+    /// Verified stream handle — does HMAC verification internally.
+    pub handle: Option<Box<dyn StreamHandle>>,
     /// Owner identity (for access control)
     pub owner: String,
     /// Bytes received so far
     pub bytes_received: u64,
     /// Blocks received so far
     pub blocks_received: u64,
-    /// Whether the stream has completed
-    pub complete: bool,
 }
 
 /// Registry of active streams, keyed by topic.
@@ -125,8 +121,8 @@ enum StreamFidState {
 /// VFS mount for streaming data pipes.
 ///
 /// Streams appear as directories under `/stream/{topic}/` with `data`, `info`,
-/// and `ctl` pseudo-files. Reading from `data` blocks until the next StreamBlock
-/// arrives via the SUB channel.
+/// and `ctl` pseudo-files. Reading from `data` blocks until the next verified
+/// payload arrives via the StreamHandle.
 pub struct StreamMount {
     registry: std::sync::Arc<StreamRegistry>,
 }
@@ -175,9 +171,8 @@ impl Mount for StreamMount {
         fid: &Fid,
         offset: u64,
         count: u32,
-        caller: &Subject,
+        _caller: &Subject,
     ) -> Result<Vec<u8>, MountError> {
-        let _ = (offset, count); // Used only for Info reads; stream data ignores offset
         let state = fid
             .downcast_ref::<StreamFidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
@@ -190,99 +185,70 @@ impl Mount for StreamMount {
                 Err(MountError::IsDirectory("stream topic dir".into()))
             }
             StreamFidState::Data { topic } => {
-                // Check completion and get HMAC handle WITHOUT holding borrow across await
-                let (complete, hmac_handle) = {
+                // Check completion WITHOUT holding borrow across await
+                let is_completed = {
                     let streams = self.registry.streams.borrow();
                     let entry = streams
                         .get(topic.as_str())
                         .ok_or_else(|| MountError::NotFound(topic.clone()))?;
-                    (entry.complete, entry.hmac_handle)
+                    entry.handle.as_ref().map(|h| h.is_completed()).unwrap_or(true)
                 };
 
-                if complete {
+                if is_completed {
                     return Ok(vec![]); // EOF
                 }
 
-                // Take SubStream out temporarily (avoids holding RefCell borrow across await)
-                let mut sub_stream = {
+                // Take handle out temporarily (avoids holding RefCell borrow across await)
+                let mut handle = {
                     let mut streams = self.registry.streams.borrow_mut();
                     let entry = streams
                         .get_mut(topic.as_str())
                         .ok_or_else(|| MountError::NotFound(topic.clone()))?;
-                    entry.sub_stream.take()
+                    entry.handle.take()
                         .ok_or_else(|| MountError::Io("stream read in progress".into()))?
                 };
 
-                // Read next block (await without holding borrow)
-                let result = sub_stream.next_block().await;
+                // Read next verified payload (await without holding borrow)
+                let result = handle.next_payload().await;
 
-                // Put SubStream back
+                // Put handle back
+                let is_completed = handle.is_completed();
                 {
                     let mut streams = self.registry.streams.borrow_mut();
                     if let Some(entry) = streams.get_mut(topic.as_str()) {
-                        entry.sub_stream = Some(sub_stream);
+                        entry.handle = Some(handle);
                     }
                 }
 
                 match result {
-                    Ok(js_val) => {
-                        if js_val.is_null() {
-                            let mut streams = self.registry.streams.borrow_mut();
-                            if let Some(entry) = streams.get_mut(topic.as_str()) {
-                                entry.complete = true;
-                            }
-                            return Ok(vec![]); // EOF
+                    Ok(Some(StreamPayload::Data(data))) => {
+                        let mut streams = self.registry.streams.borrow_mut();
+                        if let Some(entry) = streams.get_mut(topic.as_str()) {
+                            entry.bytes_received += data.len() as u64;
+                            entry.blocks_received += 1;
                         }
-
-                        let arr = js_sys::Array::from(&js_val);
-                        if arr.length() == 0 {
-                            return Ok(vec![]);
-                        }
-
-                        let capnp_frame = js_sys::Uint8Array::from(arr.get(0));
-                        let mut capnp_data = vec![0u8; capnp_frame.length() as usize];
-                        capnp_frame.copy_to(&mut capnp_data);
-
-                        // HMAC verification if MAC frame present
-                        if arr.length() >= 2 {
-                            let mac_frame = js_sys::Uint8Array::from(arr.get(1));
-                            let mut mac = vec![0u8; mac_frame.length() as usize];
-                            mac_frame.copy_to(&mut mac);
-
-                            match hyprstream_rpc::wasm_api::verify_stream_block_step(
-                                hmac_handle,
-                                &capnp_data,
-                                &mac,
-                            ) {
-                                Ok(true) => {} // Valid
-                                Ok(false) => {
-                                    return Err(MountError::Io(
-                                        "stream block HMAC verification failed".into(),
-                                    ));
-                                }
-                                Err(e) => {
-                                    return Err(MountError::Io(format!("HMAC error: {:?}", e)));
-                                }
-                            }
-                        }
-
-                        let parsed = parse_stream_block(&capnp_data);
-
-                        // Update metrics + completion flag
-                        {
-                            let mut streams = self.registry.streams.borrow_mut();
-                            if let Some(entry) = streams.get_mut(topic.as_str()) {
-                                entry.bytes_received += parsed.data.len() as u64;
-                                entry.blocks_received += 1;
-                                if parsed.complete {
-                                    entry.complete = true;
-                                }
-                            }
-                        }
-
-                        Ok(parsed.data)
+                        Ok(data)
                     }
-                    Err(e) => Err(MountError::Io(format!("stream read: {:?}", e))),
+                    Ok(Some(StreamPayload::Complete(meta))) => {
+                        let mut streams = self.registry.streams.borrow_mut();
+                        if let Some(entry) = streams.get_mut(topic.as_str()) {
+                            entry.blocks_received += 1;
+                        }
+                        Ok(meta)
+                    }
+                    Ok(Some(StreamPayload::Error(msg))) => {
+                        Err(MountError::Io(format!("stream error: {msg}")))
+                    }
+                    Ok(Some(StreamPayload::Tagged { payload, .. })) => {
+                        let mut streams = self.registry.streams.borrow_mut();
+                        if let Some(entry) = streams.get_mut(topic.as_str()) {
+                            entry.bytes_received += payload.len() as u64;
+                            entry.blocks_received += 1;
+                        }
+                        Ok(payload)
+                    }
+                    Ok(None) => Ok(vec![]), // EOF
+                    Err(e) => Err(MountError::Io(format!("stream read: {e}"))),
                 }
             }
             StreamFidState::Info { topic } => {
@@ -291,16 +257,16 @@ impl Mount for StreamMount {
                     .get(topic.as_str())
                     .ok_or_else(|| MountError::NotFound(topic.clone()))?;
 
+                let complete = entry.handle.as_ref().map(|h| h.is_completed()).unwrap_or(true);
                 let info = serde_json::json!({
                     "topic": topic,
                     "bytesReceived": entry.bytes_received,
                     "blocksReceived": entry.blocks_received,
-                    "complete": entry.complete,
+                    "complete": complete,
                 });
                 let bytes = serde_json::to_string_pretty(&info)
                     .unwrap_or_default()
                     .into_bytes();
-                // Apply 9P offset+count slicing to prevent read-loop duplication
                 let start = (offset as usize).min(bytes.len());
                 let end = (start + count as usize).min(bytes.len());
                 Ok(bytes[start..end].to_vec())
@@ -328,11 +294,10 @@ impl Mount for StreamMount {
                 let cmd = std::str::from_utf8(data).unwrap_or("").trim();
                 match cmd {
                     "cancel" => {
-                        if let Some(mut entry) = self.registry.remove(topic) {
-                            if let Some(ref mut ss) = entry.sub_stream {
-                                ss.dispose();
+                        if let Some(entry) = self.registry.remove(topic) {
+                            if let Some(handle) = entry.handle {
+                                let _ = handle.cancel().await;
                             }
-                            hyprstream_rpc::wasm_api::close_stream_hmac(entry.hmac_handle);
                         }
                         Ok(cmd.len() as u32)
                     }
@@ -346,20 +311,14 @@ impl Mount for StreamMount {
         }
     }
 
-    async fn readdir(
-        &self,
-        fid: &Fid,
-        caller: &Subject,
-    ) -> Result<Vec<DirEntry>, MountError> {
+    async fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
         let state = fid
             .downcast_ref::<StreamFidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
 
         match state {
             StreamFidState::Root => {
-                // List active stream topics (filtered by caller for multi-tenant)
-                let owner = caller.name().unwrap_or("anonymous");
-                let topics = self.registry.list_topics(Some(owner));
+                let topics = self.registry.list_topics(None);
                 Ok(topics
                     .into_iter()
                     .map(|name| DirEntry {
@@ -370,13 +329,26 @@ impl Mount for StreamMount {
                     })
                     .collect())
             }
-            StreamFidState::TopicDir { .. } => {
-                Ok(vec![
-                    DirEntry { name: "data".into(), is_dir: false, size: 0, stat: None },
-                    DirEntry { name: "info".into(), is_dir: false, size: 0, stat: None },
-                    DirEntry { name: "ctl".into(), is_dir: false, size: 0, stat: None },
-                ])
-            }
+            StreamFidState::TopicDir { .. } => Ok(vec![
+                DirEntry {
+                    name: "data".into(),
+                    is_dir: false,
+                    size: 0,
+                    stat: None,
+                },
+                DirEntry {
+                    name: "info".into(),
+                    is_dir: false,
+                    size: 0,
+                    stat: None,
+                },
+                DirEntry {
+                    name: "ctl".into(),
+                    is_dir: false,
+                    size: 0,
+                    stat: None,
+                },
+            ]),
             _ => Err(MountError::NotDirectory("not a directory".into())),
         }
     }
@@ -385,86 +357,20 @@ impl Mount for StreamMount {
         let state = fid
             .downcast_ref::<StreamFidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
-
-        let (name, is_dir) = match state {
-            StreamFidState::Root => ("stream", true),
-            StreamFidState::TopicDir { topic } => (topic.as_str(), true),
-            StreamFidState::Data { .. } => ("data", false),
-            StreamFidState::Info { .. } => ("info", false),
-            StreamFidState::Ctl { .. } => ("ctl", false),
+        let (qtype, name) = match state {
+            StreamFidState::Root => (0x80, "stream"),
+            StreamFidState::TopicDir { topic } => (0x80, topic.as_str()),
+            StreamFidState::Data { .. } => (0, "data"),
+            StreamFidState::Info { .. } => (0, "info"),
+            StreamFidState::Ctl { .. } => (0, "ctl"),
         };
-
         Ok(Stat {
-            qtype: if is_dir { 0x80 } else { 0 },
+            qtype,
             size: 0,
             name: name.to_string(),
             mtime: 0,
         })
     }
 
-    async fn clunk(&self, _fid: Fid, _caller: &Subject) {
-        // Don't auto-remove on clunk — namespace.read_one() walks/opens/reads/clunks
-        // for every block, so cleaning up here would remove the entry between
-        // sequential reads. The Tcl loop sees EOF when read returns empty,
-        // and explicit cleanup happens via `cancel` ctl write or stream completion
-        // detection in a future enhancement.
-    }
-}
-
-// ============================================================================
-// StreamBlock parsing
-// ============================================================================
-
-/// Result of parsing a Cap'n Proto StreamBlock.
-struct ParsedBlock {
-    /// Coalesced data bytes from `Data` and `Complete` payload variants.
-    data: Vec<u8>,
-    /// True if a `Complete` or `Error` payload was found in this block.
-    complete: bool,
-}
-
-/// Parse raw Cap'n Proto StreamBlock bytes, extracting data and detecting completion.
-fn parse_stream_block(capnp_bytes: &[u8]) -> ParsedBlock {
-    let reader = match capnp::serialize::read_message(
-        &mut std::io::Cursor::new(capnp_bytes),
-        capnp::message::ReaderOptions::new(),
-    ) {
-        Ok(r) => r,
-        Err(_) => return ParsedBlock { data: capnp_bytes.to_vec(), complete: false },
-    };
-
-    let block = match reader
-        .get_root::<hyprstream_rpc::streaming_capnp::stream_block::Reader>()
-    {
-        Ok(b) => b,
-        Err(_) => return ParsedBlock { data: capnp_bytes.to_vec(), complete: false },
-    };
-
-    let mut data = Vec::new();
-    let mut complete = false;
-
-    if let Ok(payloads) = block.get_payloads() {
-        for i in 0..payloads.len() {
-            let payload = payloads.get(i);
-            if let Ok(which) = payload.which() {
-                use hyprstream_rpc::streaming_capnp::stream_payload::Which;
-                match which {
-                    Which::Data(Ok(d)) => data.extend_from_slice(d),
-                    Which::Complete(Ok(d)) => {
-                        // Complete may include final metadata bytes
-                        data.extend_from_slice(d);
-                        complete = true;
-                    }
-                    Which::Error(_) => {
-                        // Error terminates the stream
-                        complete = true;
-                    }
-                    Which::Heartbeat(()) | Which::Tagged(_) => {}
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    ParsedBlock { data, complete }
+    async fn clunk(&self, _fid: Fid, _caller: &Subject) {}
 }

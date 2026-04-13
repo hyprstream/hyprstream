@@ -832,12 +832,12 @@ impl TuiService {
                 .endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep)
                 .to_zmq_string();
             let registry_client: crate::services::RegistryClient =
-                crate::services::RegistryClient::with_endpoint(
+                crate::services::RegistryClient::for_endpoint(
                     &registry_endpoint,
                     self.signing_key.clone(),
                     RequestIdentity::anonymous(),
                 );
-            let model_client_for_status = crate::services::generated::model_client::ModelClient::new(
+            let model_client_for_status = crate::services::generated::model_client::ModelClient::for_service(
                 self.signing_key.clone(),
                 RequestIdentity::anonymous(),
             );
@@ -886,7 +886,7 @@ impl TuiService {
                 let h   = handle_load.clone();
                 // Submit load — returns "accepted" immediately (Continuation pattern).
                 h.block_on(async {
-                    let client = crate::services::generated::model_client::ModelClient::new(
+                    let client = crate::services::generated::model_client::ModelClient::for_service(
                         sk.clone(), RequestIdentity::anonymous(),
                     );
                     let _ = client.load(&crate::services::generated::model_client::LoadModelRequest {
@@ -903,7 +903,7 @@ impl TuiService {
                     for _ in 0..60u32 {   // max ~2 minutes (60 × 2 s)
                         std::thread::sleep(std::time::Duration::from_secs(2));
                         let loaded = h_poll.block_on(async {
-                            let client = crate::services::generated::model_client::ModelClient::new(
+                            let client = crate::services::generated::model_client::ModelClient::for_service(
                                 sk_poll.clone(), RequestIdentity::anonymous(),
                             );
                             client.status(&crate::services::generated::model_client::StatusRequest { model_ref: mr_poll.clone() }).await
@@ -925,7 +925,7 @@ impl TuiService {
             let sk = sk_unload.clone();
             let mr = model_ref.to_owned();
             handle_unload.block_on(async move {
-                let client = crate::services::generated::model_client::ModelClient::new(sk, RequestIdentity::anonymous());
+                let client = crate::services::generated::model_client::ModelClient::for_service(sk, RequestIdentity::anonymous());
                 client.unload(&crate::services::generated::model_client::UnloadModelRequest { model_ref: mr.clone() }).await.is_ok()
             })
         });

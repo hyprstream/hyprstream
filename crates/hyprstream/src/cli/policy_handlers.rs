@@ -27,7 +27,7 @@ use std::process::Command;
 
 /// Create a PolicyClient for RPC calls.
 fn create_policy_client(signing_key: &SigningKey) -> PolicyClient {
-    PolicyClient::new(signing_key.clone(), RequestIdentity::anonymous())
+    PolicyClient::for_service(signing_key.clone(), RequestIdentity::anonymous())
 }
 
 /// Handle `policy show` - Display the running policy via RPC

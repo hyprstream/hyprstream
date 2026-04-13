@@ -818,7 +818,12 @@ fn emit_option_setter(
         let some_field = opt_struct.fields.iter().find(|f| f.name == "some");
         if let Some(sf) = some_field {
             let some_byte_off = super::data_byte_offset(sf);
-            out.push_str(&format!("{indent}  _opt.{method}({some_byte_off}, {value_expr});\n"));
+            if inner_type_name == "Bool" {
+                let bit = super::bool_bit_index(sf);
+                out.push_str(&format!("{indent}  _opt.setBool({some_byte_off}, {bit}, {value_expr});\n"));
+            } else {
+                out.push_str(&format!("{indent}  _opt.{method}({some_byte_off}, {value_expr});\n"));
+            }
         }
     }
     // else: unsupported inner type (nested struct, etc.) — leave as-is with discriminant set

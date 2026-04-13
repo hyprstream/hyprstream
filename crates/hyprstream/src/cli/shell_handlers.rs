@@ -162,12 +162,12 @@ pub async fn handle_shell_tui(
     // Model load-status channel (background polling → event loop).
     let model_client = {
         use hyprstream_rpc::envelope::RequestIdentity;
-        crate::services::generated::model_client::ModelClient::new(signing_key.clone(), RequestIdentity::anonymous())
+        crate::services::generated::model_client::ModelClient::for_service(signing_key.clone(), RequestIdentity::anonymous())
     };
     // Worker client for sandbox/container/image management.
     let worker_client = {
         use hyprstream_rpc::envelope::RequestIdentity;
-        hyprstream_workers::runtime::WorkerClient::new(signing_key.clone(), RequestIdentity::anonymous())
+        hyprstream_workers::runtime::WorkerClient::for_service(signing_key.clone(), RequestIdentity::anonymous())
     };
     let (model_status_tx, mut model_status_rx) =
         tokio::sync::mpsc::channel::<ModelStatusUpdate>(32);
@@ -1545,12 +1545,12 @@ async fn fetch_models(
     let registry_endpoint = hyprstream_rpc::registry::global()
         .endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep)
         .to_zmq_string();
-    let registry: crate::services::RegistryClient = crate::services::RegistryClient::with_endpoint(
+    let registry: crate::services::RegistryClient = crate::services::RegistryClient::for_endpoint(
         &registry_endpoint,
         signing_key.clone(),
         RequestIdentity::anonymous(),
     );
-    let model_client_for_status = crate::services::generated::model_client::ModelClient::new(
+    let model_client_for_status = crate::services::generated::model_client::ModelClient::for_service(
         signing_key.clone(),
         RequestIdentity::anonymous(),
     );

@@ -367,21 +367,21 @@ async fn dispatch_top_level(
 
     match service {
         "registry" => {
-            let client: RegistryClient = RegistryClient::new(
+            let client: RegistryClient = RegistryClient::for_service(
                 signing_key, identity,
             );
             client.call_method(method, args).await
         }
         "model" => {
-            let client = ModelClient::new(signing_key, identity);
+            let client = ModelClient::for_service(signing_key, identity);
             client.call_method(method, args).await
         }
         "inference" => {
-            let client = InferenceClient::new(signing_key, identity);
+            let client = InferenceClient::for_service(signing_key, identity);
             client.call_method(method, args).await
         }
         "policy" => {
-            let client = PolicyClient::new(signing_key, identity);
+            let client = PolicyClient::for_service(signing_key, identity);
             client.call_method(method, args).await
         }
         "worker" => {
@@ -406,17 +406,17 @@ async fn dispatch_scoped_dynamic(
 
     match service {
         "registry" => {
-            let client: RegistryClient = RegistryClient::new(
+            let client: RegistryClient = RegistryClient::for_service(
                 signing_key, identity,
             );
             client.call_scoped_method(scope_chain, method, args).await
         }
         "model" => {
-            let client = ModelClient::new(signing_key, identity);
+            let client = ModelClient::for_service(signing_key, identity);
             client.call_scoped_method(scope_chain, method, args).await
         }
         "worker" => {
-            let client = WorkerClient::new(signing_key, identity);
+            let client = WorkerClient::for_service(signing_key, identity);
             client.call_scoped_method(scope_chain, method, args).await
         }
         _ => bail!("Service '{}' has no scoped methods", service),

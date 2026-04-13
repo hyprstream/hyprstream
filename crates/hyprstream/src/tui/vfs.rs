@@ -112,7 +112,7 @@ pub fn build_chat_vfs_namespace(
     let mut ns = Namespace::new();
 
     // Mount /srv/model via RemoteModelMount.
-    let model_client = crate::services::generated::model_client::ModelClient::new(
+    let model_client = crate::services::generated::model_client::ModelClient::for_service(
         signing_key.clone(),
         RequestIdentity::anonymous(),
     );

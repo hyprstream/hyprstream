@@ -22,7 +22,7 @@ curve25519-dalek = { workspace = true }  # Ristretto255 DH for stream authentica
 sha2 = { workspace = true }              # Always needed for Ed25519 (Sha512)
 blake3 = { workspace = true }            # Default: fast KDF and MAC
 aes-gcm = { workspace = true }          # AES-256-GCM for notification broadcast encryption
-hkdf = { workspace = true, optional = true }   # FIPS mode only
+hkdf = { workspace = true }                    # HKDF-SHA256 for identity derivation + FIPS
 hmac = { workspace = true, optional = true }   # FIPS mode only
 zeroize = { workspace = true }
 subtle = { workspace = true }
@@ -40,6 +40,9 @@ serde_json = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
 chrono = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+parking_lot = { workspace = true }
 
 # WASM cross-platform support
 web-time = "1.1"    # Drop-in replacement for std::time (auto-detects wasm32)
@@ -77,14 +80,11 @@ http = { workspace = true }
 # Async runtime
 tokio = { workspace = true, features = ["io-util", "net"] }
 tokio-util = { workspace = true }
-async-trait = { workspace = true }
-futures = { workspace = true }
 bytes = { workspace = true }
 
 # Utilities
 tracing = { workspace = true }
 whoami = { workspace = true }
-parking_lot = { workspace = true }
 once_cell = { workspace = true }
 inventory = "0.3"
 
@@ -98,7 +98,7 @@ systemd = { version = "0.10", optional = true }
 
 [features]
 default = []
-fips = ["p256", "hkdf", "hmac"]  # FIPS mode uses P-256 + HKDF-SHA256 + HMAC-SHA256
+fips = ["p256", "hmac"]  # FIPS mode uses P-256 + HMAC-SHA256 (hkdf is always enabled)
 systemd = ["dep:systemd"]
 
 [build-dependencies]

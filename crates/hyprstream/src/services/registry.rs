@@ -2801,7 +2801,7 @@ mod tests {
         let _policy_handle = manager.spawn(Box::new(policy_service)).await.expect("test: start policy service");
 
         // Create policy client for RegistryService
-        let policy_client: PolicyClient = PolicyClient::with_endpoint(
+        let policy_client: PolicyClient = PolicyClient::for_endpoint(
             "inproc://test-policy-health",
             signing_key.clone(),
             RequestIdentity::anonymous(),
@@ -2819,7 +2819,7 @@ mod tests {
         let mut handle = manager.spawn(Box::new(registry_service)).await.expect("test: start registry service");
 
         // Create signed client with matching key and local identity
-        let client: RegistryClient = RegistryClient::with_endpoint(
+        let client: RegistryClient = RegistryClient::for_endpoint(
             "inproc://test-registry-health",
             signing_key,
             RequestIdentity::anonymous(),

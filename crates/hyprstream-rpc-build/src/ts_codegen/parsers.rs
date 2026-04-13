@@ -1077,6 +1077,9 @@ fn emit_option_read_expr(
             // Enum types are stored as UInt16 — generate array lookup + cast
             if let Some(ed) = schema.enums.iter().find(|e| e.name == inner_type_name) {
                 super::emit_enum_getter_expr("_optR", some_byte_off, inner_type_name, ed)
+            } else if inner_type_name == "Bool" {
+                let bit = super::bool_bit_index(sf);
+                format!("_optR.getBool({some_byte_off}, {bit})")
             } else {
                 let getter = super::getter_method(inner_type_name);
                 format!("_optR.{getter}({some_byte_off})")

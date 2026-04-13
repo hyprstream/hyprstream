@@ -54,6 +54,12 @@ pub fn generate_client_only(service_name: &str, schema: &ParsedSchema, types_cra
     // Transport-agnostic dispatch function — routes method calls by name
     let portable_dispatch = dispatch::generate_portable_dispatch(service_name, &resolved, types_crate);
 
+    // Client struct (cfg-gated: concrete on native, dyn on wasm)
+    let client_struct = client::generate_client(service_name, &resolved, types_crate);
+
+    // Scoped client structs (same cfg-gated pattern)
+    let scoped_clients = scoped::generate_portable_scoped_clients(service_name, &resolved, types_crate);
+
     quote::quote! {
         #data_structs
         #response_enum
@@ -63,6 +69,8 @@ pub fn generate_client_only(service_name: &str, schema: &ParsedSchema, types_cra
         }
 
         #scoped_response_types
+        #client_struct
+        #scoped_clients
         #metadata_code
         #portable_dispatch
     }
@@ -89,7 +97,8 @@ pub fn generate_service(service_name: &str, schema: &ParsedSchema, types_crate: 
 
     let response_enum = client::generate_response_enum(service_name, &resolved, types_crate);
     let client_struct = client::generate_client(service_name, &resolved, types_crate);
-    let scoped_clients = scoped::generate_scoped_clients(service_name, &resolved, types_crate);
+    let scoped_clients = scoped::generate_portable_scoped_clients(service_name, &resolved, types_crate);
+    let scoped_response_types = scoped::generate_scoped_response_types(service_name, &resolved, types_crate);
     let service_traits = client::generate_service_traits(service_name, &resolved, types_crate);
     let trait_impls = client::generate_trait_impls(service_name, &resolved, types_crate);
     let constructors = client::generate_constructors(service_name);
@@ -102,15 +111,11 @@ pub fn generate_service(service_name: &str, schema: &ParsedSchema, types_crate: 
     };
 
     quote::quote! {
-        use std::sync::Arc;
-        use hyprstream_rpc::service::ZmqClient as ZmqClientBase;
-        use hyprstream_rpc::service::ServiceClient;
-        use hyprstream_rpc::service::CallOptions;
-
         #data_structs
         #response_enum
         #client_struct
         #scoped_clients
+        #scoped_response_types
         #service_traits
         #trait_impls
         #constructors

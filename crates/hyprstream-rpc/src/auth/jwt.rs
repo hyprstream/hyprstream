@@ -200,11 +200,11 @@ fn decode_inner(token: &str, verifying_key: &VerifyingKey, expected_aud: Option<
     Ok(claims)
 }
 
-/// Decode a JWT without verifying the signature (for introspection)
+/// Decode a JWT without verifying the signature.
 ///
-/// WARNING: Only use this for debugging or when signature has already been verified.
-/// Restricted to test and debug builds to prevent misuse in production.
-#[cfg(test)]
+/// Used by `verify_claims()` to peek at the issuer field before selecting
+/// the appropriate verification key (local vs federated). The token is
+/// always fully verified after issuer routing.
 pub fn decode_unverified(token: &str) -> Result<Claims, JwtError> {
     // Split into parts
     let parts: Vec<&str> = token.split('.').collect();

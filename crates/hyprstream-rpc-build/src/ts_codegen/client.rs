@@ -50,28 +50,24 @@ fn has_streaming_in_scoped(sc: &ScopedClient) -> bool {
             .any(has_streaming_in_scoped)
 }
 
-/// Generate the transport interface, main client class, and scoped client classes.
+/// Generate the main client class and scoped client classes.
+///
+/// Clients take a `WasmRpcClient` (from wasm-bindgen) and call `client.call(bytes)`
+/// with Cap'n Proto request bytes. Responses are parsed by generated parsers.
 pub fn generate_client(out: &mut String, service_name: &str, schema: &ParsedSchema) {
     let pascal = to_pascal_case(service_name);
 
     let has_streaming = has_streaming_methods(schema);
 
-    // Transport interface
-    out.push_str(&format!(
-        "/** Transport interface for {pascal} RPC calls. */\n\
-         export interface {pascal}Transport {{\n\
+    // Import WasmRpcClient type from wasm-bindgen output
+    out.push_str(
+        "/** RPC client interface (matches RpcClient from wasm-bindgen). */\n\
+         export interface RpcTransport {\n\
          \x20 call(bytes: Uint8Array): Promise<Uint8Array>;\n"
-    ));
+    );
     if has_streaming {
         out.push_str(
-            "  callStreaming(bytes: Uint8Array): Promise<{\n\
-             \x20   response: Uint8Array;\n\
-             \x20   blocks: ReadableStream<Uint8Array>;\n\
-             \x20   requestId: bigint;\n\
-             \x20   ephemeralPrivkey: Uint8Array;\n\
-             \x20   ephemeralPubkey: Uint8Array;\n\
-             \x20 }>;\n\
-             \x20 subscribe(topic: string): Promise<ReadableStream<Uint8Array>>;\n"
+            "  openStream(bytes: Uint8Array): Promise<StreamHandle>;\n"
         );
     }
     out.push_str(
@@ -82,7 +78,7 @@ pub fn generate_client(out: &mut String, service_name: &str, schema: &ParsedSche
     // Main client class
     out.push_str(&format!(
         "export class {pascal}Client {{\n\
-         \x20 constructor(private readonly transport: {pascal}Transport) {{}}\n\n"
+         \x20 constructor(private readonly client: RpcTransport) {{}}\n\n"
     ));
 
     // Filter out scoped variants (they become factory methods)
@@ -115,7 +111,7 @@ pub fn generate_client(out: &mut String, service_name: &str, schema: &ParsedSche
         let resp_type_name = resp_variant.map(|v| v.type_name.as_str()).unwrap_or("unknown");
         let is_streaming = resp_type_name == "StreamInfo";
         let return_type = if is_streaming {
-            "StreamSubscription".into()
+            "StreamHandle".into()
         } else {
             capnp_to_ts_type(resp_type_name)
         };
@@ -139,11 +135,11 @@ pub fn generate_client(out: &mut String, service_name: &str, schema: &ParsedSche
         let builder_name = format!("build{pascal}Request_{}", variant.name);
         if is_void {
             out.push_str(&format!(
-                "    const bytes = {builder_name}(this.transport.nextId());\n"
+                "    const bytes = {builder_name}(this.client.nextId());\n"
             ));
         } else {
             out.push_str(&format!(
-                "    const bytes = {builder_name}(this.transport.nextId(), p);\n"
+                "    const bytes = {builder_name}(this.client.nextId(), p);\n"
             ));
         }
 
@@ -152,7 +148,7 @@ pub fn generate_client(out: &mut String, service_name: &str, schema: &ParsedSche
             generate_streaming_body(out, &pascal, 0);
         } else {
             // Call transport and parse response
-            out.push_str("    const resp = await this.transport.call(bytes);\n");
+            out.push_str("    const resp = await this.client.call(bytes);\n");
             out.push_str(&format!(
                 "    const parsed = parse{pascal}Response(resp);\n"
             ));
@@ -193,7 +189,7 @@ pub fn generate_client(out: &mut String, service_name: &str, schema: &ParsedSche
             sc.client_name
         ));
         out.push_str(&format!(
-            "    return new {}(this.transport, {});\n",
+            "    return new {}(this.client, {});\n",
             sc.client_name,
             args.join(", ")
         ));
@@ -249,9 +245,9 @@ fn generate_scoped_client(
         .collect();
 
     out.push_str(&format!("export class {} {{\n", sc.client_name));
-    out.push_str(&format!(
-        "  constructor(\n    private readonly transport: {pascal}Transport,\n"
-    ));
+    out.push_str(
+        "  constructor(\n    private readonly client: RpcTransport,\n"
+    );
     for p in &scope_params {
         out.push_str(&format!("    {p},\n"));
     }
@@ -291,7 +287,7 @@ fn generate_scoped_client(
         let resp_type_name = resp_variant.map(|v| v.type_name.as_str()).unwrap_or("unknown");
         let is_streaming = resp_type_name == "StreamInfo";
         let return_type = if is_streaming {
-            "StreamSubscription".into()
+            "StreamHandle".into()
         } else {
             capnp_to_ts_type(resp_type_name)
         };
@@ -315,7 +311,7 @@ fn generate_scoped_client(
         let builder_name = format!("build{pascal}Request{name_chain}_{}", variant.name);
 
         // Builder args: transport.nextId() + all scope fields + optional payload
-        let mut builder_args = vec!["this.transport.nextId()".to_owned()];
+        let mut builder_args = vec!["this.client.nextId()".to_owned()];
         for f in &all_scope_fields {
             builder_args.push(format!("this.{}", to_camel_case(&f.name)));
         }
@@ -333,7 +329,7 @@ fn generate_scoped_client(
             generate_streaming_body(out, &pascal, chain_depth);
         } else {
             // Call transport and parse outer response
-            out.push_str("    const resp = await this.transport.call(bytes);\n");
+            out.push_str("    const resp = await this.client.call(bytes);\n");
             out.push_str(&format!(
                 "    const parsed = parse{pascal}Response(resp);\n"
             ));
@@ -401,7 +397,7 @@ fn generate_scoped_client(
             nc.client_name
         ));
         out.push_str(&format!(
-            "    return new {}(this.transport, {});\n",
+            "    return new {}(this.client, {});\n",
             nc.client_name,
             all_args.join(", ")
         ));
@@ -422,43 +418,10 @@ fn generate_scoped_client(
 ///
 /// `chain_depth` is 0 for top-level methods (no scoped unwrapping needed),
 /// or N for scoped methods where N ancestor+scope layers must be unwrapped.
-fn generate_streaming_body(out: &mut String, pascal: &str, chain_depth: usize) {
-    // Use callStreaming to get response + block stream + ephemeral keys
+fn generate_streaming_body(out: &mut String, _pascal: &str, _chain_depth: usize) {
+    // All crypto (ECDH, key derivation, HMAC verification) happens in Rust.
+    // JS just gets a StreamHandle back.
     out.push_str(
-        "    const { response, blocks, requestId, ephemeralPrivkey, ephemeralPubkey } = \
-         await this.transport.callStreaming(bytes);\n",
+        "    return await this.client.openStream(bytes);\n",
     );
-    out.push_str(&format!(
-        "    const parsed = parse{pascal}Response(response);\n"
-    ));
-
-    // Error handling at outer level
-    emit_error_throw(out, "parsed");
-
-    if chain_depth == 0 {
-        // Top-level streaming method: parsed.data is StreamInfo directly
-        out.push_str(
-            "    const streamInfo = parsed.data as StreamInfo;\n\
-             \x20   return createStreamSubscription(streamInfo, blocks, ephemeralPrivkey, ephemeralPubkey, requestId, this.transport);\n",
-        );
-    } else {
-        // Scoped streaming method: unwrap through scope chain to get StreamInfo
-        let mut current_var = "parsed.data".to_owned();
-        for depth in 0..chain_depth {
-            let inner_var = format!("_r{depth}");
-            out.push_str(&format!(
-                "    const {inner_var} = {current_var} as {{ variant: string; data: unknown }};\n"
-            ));
-
-            if depth < chain_depth - 1 {
-                current_var = format!("{inner_var}.data");
-            } else {
-                emit_error_throw(out, &inner_var);
-                out.push_str(&format!(
-                    "    const streamInfo = {inner_var}.data as StreamInfo;\n\
-                     \x20   return createStreamSubscription(streamInfo, blocks, ephemeralPrivkey, ephemeralPubkey, requestId, this.transport);\n"
-                ));
-            }
-        }
-    }
 }

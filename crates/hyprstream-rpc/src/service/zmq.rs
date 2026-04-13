@@ -15,7 +15,6 @@ use crate::transport::TransportConfig;
 use anyhow::{anyhow, Result};
 use zeroize::Zeroizing;
 use async_trait::async_trait;
-use chrono::Utc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -74,9 +73,13 @@ pub struct EnvelopeContext {
     /// Ephemeral public key for stream HMAC derivation (if streaming)
     pub ephemeral_pubkey: Option<[u8; 32]>,
 
-    /// User claims from envelope (protected by envelope signature)
-    /// Already verified by envelope signature verification
+    /// User claims decoded from jwt_token (or legacy claims field).
+    /// Populated by `verify_claims()` after JWT signature verification.
     claims: Option<crate::auth::Claims>,
+
+    /// Raw JWT token from the envelope. Server decodes and verifies this.
+    /// Preferred over the legacy `claims` field when present.
+    jwt_token: Option<String>,
 
     /// Authorization subject derived from the verified Ed25519 signer key.
     ///
@@ -112,6 +115,7 @@ impl EnvelopeContext {
             identity: envelope.identity().clone(),
             ephemeral_pubkey: envelope.ephemeral_pubkey().copied(),
             claims: envelope.envelope.claims.clone(),
+            jwt_token: envelope.envelope.jwt_token.clone(),
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
             signer_pubkey: envelope.signer_pubkey,
@@ -129,6 +133,7 @@ impl EnvelopeContext {
             identity: envelope.identity().clone(),
             ephemeral_pubkey: envelope.ephemeral_pubkey().copied(),
             claims: envelope.envelope.claims.clone(),
+            jwt_token: envelope.envelope.jwt_token.clone(),
             key_derived_subject: Subject::new("system"),
             jwt_subject: None,
             signer_pubkey: envelope.signer_pubkey,
@@ -150,6 +155,7 @@ impl EnvelopeContext {
             identity: envelope.identity().clone(),
             ephemeral_pubkey: envelope.ephemeral_pubkey().copied(),
             claims: envelope.envelope.claims.clone(),
+            jwt_token: envelope.envelope.jwt_token.clone(),
             key_derived_subject,
             jwt_subject: None,
             signer_pubkey: envelope.signer_pubkey,
@@ -171,6 +177,7 @@ impl EnvelopeContext {
             identity: RequestIdentity::Anonymous,
             ephemeral_pubkey: None,
             claims: None,
+            jwt_token: None,
             key_derived_subject: Subject::new("system"),
             jwt_subject: None,
             signer_pubkey: [0u8; 32],
@@ -212,11 +219,14 @@ impl EnvelopeContext {
         self.identity.is_authenticated()
     }
 
-    /// Get user claims (if present in envelope)
-    ///
-    /// Claims are already verified by the envelope signature.
+    /// Get user claims (if present, after verify_claims has run).
     pub fn claims(&self) -> Option<&crate::auth::Claims> {
         self.claims.as_ref()
+    }
+
+    /// Get the raw JWT token from the envelope (if present).
+    pub fn jwt_token(&self) -> Option<&str> {
+        self.jwt_token.as_deref()
     }
 
     /// Check if request has user context
@@ -354,110 +364,80 @@ pub trait ZmqService: 'static {
     /// which correctly distinguishes local tokens (bare `sub`) from federated
     /// ones (`iss:sub` format) using this service's `local_issuer_url()`.
     /// Async because federated key resolution may require an HTTP JWKS fetch.
+    ///
+    /// Prefers `jwt_token` (opaque token string) over legacy `claims` field.
+    /// When `jwt_token` is present, the server decodes and verifies it directly.
+    /// The legacy `claims` path is kept for backwards compat with older clients.
     async fn verify_claims(&self, ctx: &mut EnvelopeContext) -> anyhow::Result<()> {
-        if let Some(claims) = ctx.claims() {
-            let local_url = self.local_issuer_url();
-            let local_issuers: &[&str] = match local_url {
-                Some(ref u) => std::slice::from_ref(u),
-                None => &[],
-            };
+        // Prefer jwt_token (new path) over legacy claims
+        let token = ctx.jwt_token.clone()
+            .or_else(|| ctx.claims().and_then(|c| c.token.clone()));
 
-            if claims.is_local_to(local_issuers) {
-                // --- Local token path ---
-                match claims.verify_token(&self.verifying_key(), self.expected_audience()) {
-                    Ok(Some(verified)) => {
-                        if verified.sub != claims.sub {
-                            tracing::warn!(
-                                "Claims sub mismatch: envelope={} jwt={}",
-                                claims.sub,
-                                verified.sub
-                            );
-                            anyhow::bail!("Claims subject mismatch");
-                        }
-                        if verified.iss != claims.iss {
-                            tracing::warn!(
-                                "Claims iss mismatch: envelope={} jwt={}",
-                                claims.iss,
-                                verified.iss
-                            );
-                            anyhow::bail!("Claims issuer mismatch");
-                        }
-                    }
-                    Ok(None) => {
-                        // No JWT token — subject is derived from the signer key via
-                        // KeyRegistry (FixedSigner callers → "system"). No bypass needed.
-                    }
-                    Err(e) => {
-                        tracing::warn!("E2E JWT verification failed: {}", e);
-                        anyhow::bail!("JWT verification failed");
-                    }
-                }
-            } else {
-                // --- Federated token path ---
-                let resolver = self.federation_key_source().ok_or_else(|| {
-                    tracing::warn!(
-                        "Federated JWT rejected: no FederationKeySource configured \
-                         (iss={})",
-                        claims.iss
-                    );
-                    anyhow::anyhow!("Federated JWT rejected: federation not configured")
+        let Some(token) = token else {
+            // No JWT at all — subject stays as key-derived (system or anonymous)
+            return Ok(());
+        };
+
+        // Decode the JWT to get claims for issuer routing
+        let unverified = crate::auth::decode_unverified(&token)
+            .map_err(|e| anyhow::anyhow!("JWT decode failed: {}", e))?;
+
+        let local_url = self.local_issuer_url();
+        let local_issuers: &[&str] = match local_url {
+            Some(ref u) => std::slice::from_ref(u),
+            None => &[],
+        };
+
+        if unverified.is_local_to(local_issuers) {
+            // --- Local token path ---
+            let verified = crate::auth::decode(&token, &self.verifying_key(), self.expected_audience())
+                .map_err(|e| {
+                    tracing::warn!("Local JWT verification failed: {}", e);
+                    anyhow::anyhow!("JWT verification failed")
                 })?;
 
-                if !resolver.is_trusted(&claims.iss) {
-                    tracing::warn!(
-                        "Federated JWT from untrusted issuer rejected (iss={})",
-                        claims.iss
-                    );
-                    anyhow::bail!("Federated JWT issuer not trusted");
-                }
-
-                let fed_key = resolver.get_key(&claims.iss).await.map_err(|e| {
-                    tracing::warn!(
-                        "Federation key resolution failed for iss={}: {}",
-                        claims.iss,
-                        e
-                    );
-                    anyhow::anyhow!("Federation key resolution failed")
-                })?;
-
-                let token = claims.token.as_deref().ok_or_else(|| {
-                    tracing::warn!(
-                        "Federated JWT (iss={}) missing raw token field",
-                        claims.iss
-                    );
-                    anyhow::anyhow!("Federated JWT missing token")
-                })?;
-
-                let verified = crate::auth::decode_with_key(token, &fed_key, self.expected_audience())
-                    .map_err(|e| {
-                        anyhow::anyhow!("Federated JWT signature invalid: {}", e)
-                    })?;
-
-                if verified.sub != claims.sub {
-                    tracing::warn!(
-                        "Federated claims sub mismatch: envelope={} jwt={}",
-                        claims.sub,
-                        verified.sub
-                    );
-                    anyhow::bail!("Federated claims subject mismatch");
-                }
-                if verified.iss != claims.iss {
-                    tracing::warn!(
-                        "Federated claims iss mismatch: envelope={} jwt={}",
-                        claims.iss,
-                        verified.iss
-                    );
-                    anyhow::bail!("Federated claims issuer mismatch");
-                }
-            }
-
-            // Derive the authorization subject via Claims::subject(), which
-            // produces bare "sub" for local tokens and "iss:sub" for federated ones.
-            let s = claims.subject(local_issuers);
+            // Store verified claims on context for downstream use
+            let s = verified.subject(local_issuers);
             if !s.is_anonymous() {
                 ctx.jwt_subject = Some(s);
             }
+            ctx.claims = Some(verified);
+        } else {
+            // --- Federated token path ---
+            let resolver = self.federation_key_source().ok_or_else(|| {
+                tracing::warn!(
+                    "Federated JWT rejected: no FederationKeySource configured (iss={})",
+                    unverified.iss
+                );
+                anyhow::anyhow!("Federated JWT rejected: federation not configured")
+            })?;
+
+            if !resolver.is_trusted(&unverified.iss) {
+                tracing::warn!(
+                    "Federated JWT from untrusted issuer rejected (iss={})",
+                    unverified.iss
+                );
+                anyhow::bail!("Federated JWT issuer not trusted");
+            }
+
+            let fed_key = resolver.get_key(&unverified.iss).await.map_err(|e| {
+                tracing::warn!(
+                    "Federation key resolution failed for iss={}: {}",
+                    unverified.iss, e
+                );
+                anyhow::anyhow!("Federation key resolution failed")
+            })?;
+
+            let verified = crate::auth::decode_with_key(&token, &fed_key, self.expected_audience())
+                .map_err(|e| anyhow::anyhow!("Federated JWT signature invalid: {}", e))?;
+
+            let s = verified.subject(local_issuers);
+            if !s.is_anonymous() {
+                ctx.jwt_subject = Some(s);
+            }
+            ctx.claims = Some(verified);
         }
+
         Ok(())
     }
 
@@ -1027,8 +1007,8 @@ pub struct CallOptions {
     pub timeout_ms: Option<i32>,
     /// Requested lifetime for this request
     pub requested_lifetime_ms: Option<i32>,
-    /// User authorization claims (for authenticated calls)
-    pub claims: Option<crate::auth::Claims>,
+    /// Opaque JWT token string. Server decodes and verifies.
+    pub jwt_token: Option<String>,
     /// Ephemeral Ristretto255 public key for stream HMAC key derivation
     pub ephemeral_pubkey: Option<[u8; 32]>,
 }
@@ -1046,9 +1026,9 @@ impl CallOptions {
         self
     }
 
-    /// Set user authorization claims.
-    pub fn claims(mut self, claims: crate::auth::Claims) -> Self {
-        self.claims = Some(claims);
+    /// Set opaque JWT token. Server decodes and verifies.
+    pub fn jwt_token(mut self, token: String) -> Self {
+        self.jwt_token = Some(token);
         self
     }
 
@@ -1058,10 +1038,12 @@ impl CallOptions {
         self
     }
 
-    /// Create options from EnvelopeContext (preserves user claims).
+    /// Create options from EnvelopeContext (for server-side request forwarding).
     pub fn from_context(ctx: &EnvelopeContext) -> Self {
+        // Extract the raw JWT token from verified claims if available
+        let jwt_token = ctx.claims().and_then(|c| c.token.clone());
         Self {
-            claims: ctx.claims().cloned(),
+            jwt_token,
             ..Default::default()
         }
     }
@@ -1072,21 +1054,15 @@ impl CallOptions {
 /// Returns the smaller of:
 /// - Explicit timeout parameter (if provided)
 /// - Requested lifetime (if provided)
-/// - JWT remaining time (with 1s safety buffer)
 /// - Default timeout (30 seconds)
 ///
-/// This ensures:
-/// - We don't wait past JWT expiration (security)
-/// - We respect service-specific timeout requirements (practicality)
-/// - We respect user-requested lifetime (quality of service)
-/// - We don't have excessively long timeouts (practicality)
+/// Note: JWT expiry capping was removed because the client now treats the JWT
+/// as opaque (no decoding). The server enforces JWT expiry on its side.
 fn calculate_timeout(
     explicit_timeout: Option<i32>,
     requested_lifetime_ms: Option<i32>,
-    claims: Option<&crate::auth::Claims>,
 ) -> i32 {
     const DEFAULT_TIMEOUT_MS: i32 = 30000; // 30 seconds
-    const SAFETY_BUFFER_MS: i64 = 1000; // 1 second buffer
 
     // Start with explicit timeout or default
     let mut timeout = explicit_timeout.unwrap_or(DEFAULT_TIMEOUT_MS);
@@ -1094,21 +1070,6 @@ fn calculate_timeout(
     // Apply requested lifetime constraint (if provided)
     if let Some(lifetime) = requested_lifetime_ms {
         timeout = timeout.min(lifetime);
-    }
-
-    // Apply Claims expiration constraint (if provided)
-    if let Some(claims) = claims {
-        let now = Utc::now().timestamp();
-        let remaining_ms = (claims.exp - now) * 1000 - SAFETY_BUFFER_MS;
-
-        if remaining_ms > 0 {
-            // Cap at i32::MAX for ZMQ timeout (about 24 days, more than enough)
-            let remaining_i32 = i32::try_from(remaining_ms).unwrap_or(i32::MAX);
-            timeout = timeout.min(remaining_i32);
-        } else {
-            warn!("Claims have expired or will expire immediately, using minimal timeout");
-            return 100; // 100ms minimal timeout
-        }
     }
 
     timeout
@@ -1281,7 +1242,7 @@ impl ZmqClient {
     /// ```
     pub async fn call(&self, payload: Vec<u8>, opts: CallOptions) -> Result<Vec<u8>> {
         let signed = self.sign_request(payload, &opts)?;
-        let timeout = calculate_timeout(opts.timeout_ms, opts.requested_lifetime_ms, opts.claims.as_ref());
+        let timeout = calculate_timeout(opts.timeout_ms, opts.requested_lifetime_ms);
 
         trace!(
             "ZmqClient sending {} bytes to {} (timeout: {}ms)",
@@ -1352,9 +1313,9 @@ impl ZmqClient {
 
         let mut envelope = RequestEnvelope::new(self.identity.clone(), payload);
 
-        // Apply optional claims
-        if let Some(ref claims) = opts.claims {
-            envelope = envelope.with_claims(claims.clone());
+        // Apply opaque JWT token
+        if let Some(ref token) = opts.jwt_token {
+            envelope = envelope.with_jwt_token(token.clone());
         }
 
         // Apply optional ephemeral pubkey for E2E streaming

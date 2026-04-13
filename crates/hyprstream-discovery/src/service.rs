@@ -253,12 +253,15 @@ impl DiscoveryHandler for DiscoveryService {
         let endpoints_map = reg.service_endpoints(service_name);
         drop(reg);
 
+        let pubkey = self.signing_key.verifying_key().to_bytes().to_vec();
+
         let mut endpoints: Vec<EndpointInfo> = match endpoints_map {
             Some(map) => map
                 .iter()
                 .map(|(kind, transport)| EndpointInfo {
                     socket_kind: socket_kind_to_string(*kind).to_owned(),
                     endpoint: transport.to_zmq_string(),
+                    pubkey: pubkey.clone(),
                 })
                 .collect(),
             None => Vec::new(),
@@ -273,6 +276,7 @@ impl DiscoveryHandler for DiscoveryService {
                     endpoints.push(EndpointInfo {
                         socket_kind: kind.clone(),
                         endpoint: ep.clone(),
+                        pubkey: pubkey.clone(),
                     });
                 }
             }
