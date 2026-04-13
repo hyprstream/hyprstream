@@ -527,6 +527,41 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
                     .to_zmq_string();
                 Ok(Self::for_endpoint(&endpoint, signing_key, identity))
             }
+
+            /// Create a client from an `IdentityProvider` with automatic endpoint resolution.
+            pub async fn from_provider(
+                provider: &dyn hyprstream_rpc::identity::IdentityProvider,
+                identity: hyprstream_rpc::envelope::RequestIdentity,
+            ) -> anyhow::Result<Self> {
+                let endpoint = hyprstream_rpc::registry::try_global()
+                    .map(|r| r.endpoint(#service_name_lit, hyprstream_rpc::registry::SocketKind::Rep))
+                    .unwrap_or_else(|| hyprstream_rpc::transport::TransportConfig::inproc(
+                        concat!("hyprstream/", #service_name_lit)
+                    ))
+                    .to_zmq_string();
+                Self::from_provider_at(&endpoint, provider, identity).await
+            }
+
+            /// Create a client from an `IdentityProvider` at a specific endpoint.
+            pub async fn from_provider_at(
+                endpoint: &str,
+                provider: &dyn hyprstream_rpc::identity::IdentityProvider,
+                identity: hyprstream_rpc::envelope::RequestIdentity,
+            ) -> anyhow::Result<Self> {
+                let handle = provider.identity_open(concat!("hyprstream-", #service_name_lit, "-v1")).await?;
+                let pubkey = handle.pubkey();
+                let server_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(&pubkey)
+                    .map_err(|e| anyhow::anyhow!("invalid derived pubkey: {}", e))?;
+                let signer = hyprstream_rpc::signer::IdentitySigner::new(handle, identity);
+                let transport = hyprstream_rpc::zmq_connection::ZmqConnection::new(
+                    endpoint,
+                    hyprstream_rpc::zmq_context::global_context(),
+                );
+                let rpc = hyprstream_rpc::rpc_client::RpcClientImpl::new(
+                    signer, transport, server_vk,
+                );
+                Ok(Self::new(std::sync::Arc::new(rpc) as std::sync::Arc<dyn hyprstream_rpc::RpcClient>))
+            }
         }
     }
 }

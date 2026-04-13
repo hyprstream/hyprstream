@@ -1,6 +1,7 @@
 //! Signer implementations for Ed25519 envelope signing.
 //!
 //! - `LocalSigner`: Native — owns the `SigningKey`, signs synchronously.
+//! - `IdentitySigner`: Wraps a `SigningIdentity` from an `IdentityProvider`.
 //! - `JsSigner`: WASM — delegates to a JS callback (aegis-vault), awaits the result.
 
 use anyhow::Result;
@@ -8,6 +9,7 @@ use async_trait::async_trait;
 
 use crate::crypto::SigningKey;
 use crate::envelope::RequestIdentity;
+use crate::identity::SigningIdentity;
 use crate::transport_traits::Signer;
 
 /// Native signer that owns an Ed25519 signing key.
@@ -43,6 +45,37 @@ impl Signer for LocalSigner {
     async fn sign(&self, canonical_bytes: &[u8]) -> Result<[u8; 64]> {
         use ed25519_dalek::Signer as _;
         Ok(self.signing_key.sign(canonical_bytes).to_bytes())
+    }
+}
+
+/// Signer backed by an `IdentityProvider`-derived `SigningIdentity`.
+///
+/// Bridges the `IdentityProvider` abstraction to the `Signer` trait
+/// used by `RpcClientImpl`. Created via `IdentityProvider::identity_open()`.
+pub struct IdentitySigner {
+    identity_handle: Box<dyn SigningIdentity>,
+    request_identity: RequestIdentity,
+}
+
+impl IdentitySigner {
+    pub fn new(identity_handle: Box<dyn SigningIdentity>, request_identity: RequestIdentity) -> Self {
+        Self { identity_handle, request_identity }
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+impl Signer for IdentitySigner {
+    fn pubkey(&self) -> [u8; 32] {
+        self.identity_handle.pubkey()
+    }
+
+    fn identity(&self) -> RequestIdentity {
+        self.request_identity.clone()
+    }
+
+    async fn sign(&self, canonical_bytes: &[u8]) -> Result<[u8; 64]> {
+        self.identity_handle.sign(canonical_bytes).await
     }
 }
 

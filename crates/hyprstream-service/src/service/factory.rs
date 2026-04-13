@@ -135,6 +135,9 @@ pub struct ServiceContext {
     /// Server's verifying key (for envelope/JWT verification)
     verifying_key: VerifyingKey,
 
+    /// Identity provider for purpose-keyed signing
+    identity_provider: Arc<hyprstream_rpc::node_identity::NodeIdentityProvider>,
+
     /// Whether running in IPC mode (vs inproc)
     ipc: bool,
 
@@ -162,10 +165,14 @@ impl ServiceContext {
         ipc: bool,
         models_dir: std::path::PathBuf,
     ) -> Self {
+        let identity_provider = Arc::new(
+            hyprstream_rpc::node_identity::NodeIdentityProvider::new(&signing_key)
+        );
         Self {
             zmq_context,
             signing_key,
             verifying_key,
+            identity_provider,
             ipc,
             models_dir,
             quic_shared: None,
@@ -232,6 +239,11 @@ impl ServiceContext {
     /// Get the verifying key.
     pub fn verifying_key(&self) -> VerifyingKey {
         self.verifying_key
+    }
+
+    /// Get the identity provider for purpose-keyed signing.
+    pub fn identity_provider(&self) -> &Arc<hyprstream_rpc::node_identity::NodeIdentityProvider> {
+        &self.identity_provider
     }
 
     /// Check if running in IPC mode.
