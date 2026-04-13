@@ -358,7 +358,7 @@ impl QuicConfig {
             let secrets_dir = HyprConfig::resolve_secrets_dir();
             // Use quic-specific secret names so QUIC and HTTP certs have different
             // validity windows without stomping each other's files.
-            let materials = crate::auth::credentials::load_or_generate_tls_materials_named(
+            let materials = crate::auth::identity_store::load_or_generate_tls_materials_named(
                 &secrets_dir,
                 &self.server_name,
                 14,

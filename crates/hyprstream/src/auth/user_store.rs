@@ -120,7 +120,7 @@ impl LocalKeyStore {
             return Ok(identity);
         }
         let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
-        crate::auth::credentials::load_or_generate_credential_store_key(&secrets_dir, store_path)
+        crate::auth::identity_store::load_or_generate_credential_store_key(&secrets_dir, store_path)
     }
 
     fn decrypt_and_parse(path: &Path, identity: &age::x25519::Identity) -> Result<UsersFile> {

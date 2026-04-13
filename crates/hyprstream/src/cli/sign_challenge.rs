@@ -167,7 +167,7 @@ fn load_user_signing_key() -> Result<(ed25519_dalek::SigningKey, String)> {
     }
 
     let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
-    let (sk, _vk) = crate::auth::credentials::load_or_generate_user_signing_key(&secrets_dir)
+    let (sk, _vk) = crate::auth::identity_store::load_or_generate_user_signing_key(&secrets_dir)
         .map_err(|e| anyhow::anyhow!(
             "Could not load user signing key: {e}\n\
              Run 'hyprstream wizard' to set up your identity first."

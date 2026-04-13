@@ -406,7 +406,7 @@ pub async fn load_or_generate_signing_key(_keys_dir: &Path) -> Result<SigningKey
         return Ok(sk);
     }
     let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
-    crate::auth::credentials::load_or_generate_node_signing_key(&secrets_dir)
+    crate::auth::identity_store::load_or_generate_node_signing_key(&secrets_dir)
 }
 
 /// Mint a JWT locally with proper iss/aud claims.
@@ -449,7 +449,7 @@ pub(crate) fn ensure_user_signing_key() -> Result<(SigningKey, ed25519_dalek::Ve
         return Ok(pair);
     }
     let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
-    crate::auth::credentials::load_or_generate_user_signing_key(&secrets_dir)
+    crate::auth::identity_store::load_or_generate_user_signing_key(&secrets_dir)
 }
 
 /// Deprecated alias kept for call-site compatibility during transition.

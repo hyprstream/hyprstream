@@ -560,7 +560,7 @@ pub(crate) async fn run_repair_checks(
     {
         let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
         // HTTP TLS (365-day self-signed)
-        match crate::auth::credentials::load_or_generate_tls_materials(&secrets_dir, "localhost", 365) {
+        match crate::auth::identity_store::load_or_generate_tls_materials(&secrets_dir, "localhost", 365) {
             Ok(_) => print_check("TLS key+cert", CheckStatus::Ok, "HTTP (365d)"),
             Err(e) => {
                 print_check("TLS key+cert", CheckStatus::Fail, &format!("{e}"));
@@ -568,7 +568,7 @@ pub(crate) async fn run_repair_checks(
             }
         }
         // QUIC TLS (14-day per WebTransport spec)
-        match crate::auth::credentials::load_or_generate_tls_materials_named(
+        match crate::auth::identity_store::load_or_generate_tls_materials_named(
             &secrets_dir, "localhost", 14, "quic-key", "quic-cert",
         ) {
             Ok(_) => print_check("QUIC key+cert", CheckStatus::Ok, "WebTransport (14d)"),
@@ -582,7 +582,7 @@ pub(crate) async fn run_repair_checks(
     // 4c. RSA key for RS256 JWT signing (OIDC interop)
     {
         let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
-        match crate::auth::credentials::load_or_generate_rsa_key(&secrets_dir) {
+        match crate::auth::identity_store::load_or_generate_rsa_key(&secrets_dir) {
             Ok(_) => print_check("RSA key", CheckStatus::Ok, "RS256 (2048-bit)"),
             Err(e) => {
                 // Non-fatal: EdDSA still works, RS256 is for interop

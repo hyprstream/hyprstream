@@ -50,7 +50,7 @@ pub fn get_or_init_tls_materials(config: &TlsConfig) -> anyhow::Result<Arc<TlsMa
             "Loading/generating TLS materials (365-day validity) from '{}'",
             secrets_dir.display()
         );
-        crate::auth::credentials::load_or_generate_tls_materials(&secrets_dir, server_name, 365)?
+        crate::auth::identity_store::load_or_generate_tls_materials(&secrets_dir, server_name, 365)?
     } else {
         // Both paths guaranteed Some when use_self_signed() returns false
         let cert_path = config.cert_path.as_ref()

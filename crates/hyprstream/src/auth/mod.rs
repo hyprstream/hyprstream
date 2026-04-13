@@ -5,7 +5,7 @@
 //!
 //! Also provides JWT token authentication with Ed25519 signatures.
 
-pub mod credentials;
+pub mod identity_store;
 pub mod federation;
 pub mod jwt;
 mod policy_manager;
