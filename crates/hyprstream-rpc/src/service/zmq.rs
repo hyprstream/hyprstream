@@ -319,6 +319,15 @@ pub trait ZmqService: 'static {
         self.signing_key().verifying_key()
     }
 
+    /// Ed25519 verifying key for JWT token verification.
+    ///
+    /// Defaults to the purpose-derived key `HKDF(root, "hyprstream-jwt-v1")`.
+    /// Override if JWTs are signed with a different key.
+    fn jwt_verifying_key(&self) -> VerifyingKey {
+        crate::node_identity::derive_purpose_key(&self.signing_key(), "hyprstream-jwt-v1")
+            .verifying_key()
+    }
+
     /// Expected audience (resource URL) for JWT validation.
     ///
     /// When `Some`, `verify_claims()` rejects tokens whose `aud` claim doesn't match.
@@ -390,7 +399,7 @@ pub trait ZmqService: 'static {
 
         if unverified.is_local_to(local_issuers) {
             // --- Local token path ---
-            let verified = crate::auth::decode(&token, &self.verifying_key(), self.expected_audience())
+            let verified = crate::auth::decode(&token, &self.jwt_verifying_key(), self.expected_audience())
                 .map_err(|e| {
                     tracing::warn!("Local JWT verification failed: {}", e);
                     anyhow::anyhow!("JWT verification failed")

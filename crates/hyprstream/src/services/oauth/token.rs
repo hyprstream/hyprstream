@@ -382,7 +382,8 @@ async fn issue_token_with_refresh(
 
                 // SAFETY: signing_key.is_some() checked in the outer condition.
                 let Some(ref sk) = state.signing_key else { unreachable!() };
-                let id_token_jwt = hyprstream_rpc::auth::jwt::encode_id_token(&id_claims, sk);
+                let jwt_key = hyprstream_rpc::node_identity::derive_purpose_key(sk, "hyprstream-jwt-v1");
+                let id_token_jwt = hyprstream_rpc::auth::jwt::encode_id_token(&id_claims, &jwt_key);
                 Some(id_token_jwt)
             } else {
                 None

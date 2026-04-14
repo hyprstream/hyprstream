@@ -435,7 +435,8 @@ pub(crate) fn mint_local_token(
         .with_issuer(issuer)
         .with_audience(Some(audience));
 
-    let token = jwt::encode(&claims, signing_key);
+    let jwt_key = hyprstream_rpc::node_identity::derive_purpose_key(signing_key, "hyprstream-jwt-v1");
+    let token = jwt::encode(&claims, &jwt_key);
     (token, exp)
 }
 

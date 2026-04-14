@@ -20,6 +20,20 @@ use parking_lot::RwLock;
 use crate::identity::{IdentityProvider, SigningIdentity};
 use crate::Subject;
 
+/// Derive a purpose-keyed Ed25519 signing key from a root key.
+///
+/// Standalone function for use in sync contexts (e.g., JWT signing)
+/// where the full async `IdentityProvider` isn't needed.
+pub fn derive_purpose_key(root_key: &SigningKey, purpose: &str) -> SigningKey {
+    let hk = Hkdf::<Sha256>::new(None, &root_key.to_bytes());
+    let mut okm = [0u8; 32];
+    hk.expand(purpose.as_bytes(), &mut okm)
+        .expect("HKDF-SHA256 expand to 32 bytes cannot fail");
+    let key = SigningKey::from_bytes(&okm);
+    okm.fill(0);
+    key
+}
+
 /// A purpose-derived Ed25519 signing identity.
 struct DerivedIdentity {
     signing_key: SigningKey,

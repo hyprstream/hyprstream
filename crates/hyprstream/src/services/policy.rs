@@ -51,6 +51,8 @@ pub struct PolicyService {
     // Business logic
     policy_manager: Arc<PolicyManager>,
     signing_key: Arc<SigningKey>,
+    /// Purpose-derived key for JWT token signing (isolated from envelope signing)
+    jwt_signing_key: SigningKey,
     token_config: crate::config::TokenConfig,
     /// Supported scopes computed once at construction from ServiceFactory inventory
     supported_scopes: Vec<String>,
@@ -84,9 +86,11 @@ impl PolicyService {
         transport: TransportConfig,
     ) -> Self {
         let registry_repo_id = RepoId::from_uuid(git2db::registry::registry_self_uuid());
+        let jwt_signing_key = hyprstream_rpc::node_identity::derive_purpose_key(&signing_key, "hyprstream-jwt-v1");
         Self {
             policy_manager,
             signing_key,
+            jwt_signing_key,
             token_config,
             supported_scopes: compute_supported_scopes(),
             git2db,
@@ -306,7 +310,7 @@ impl PolicyHandler for PolicyService {
         ).with_issuer(issuer)
          .with_audience(audience);
 
-        let token = crate::auth::jwt::encode(&claims, &self.signing_key);
+        let token = crate::auth::jwt::encode(&claims, &self.jwt_signing_key);
 
         Ok(PolicyResponseVariant::IssueTokenResult(TokenInfo {
             token,
