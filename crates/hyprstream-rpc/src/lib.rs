@@ -162,6 +162,7 @@ pub use rpc_client::{RpcClient, RpcClientImpl};
 pub use transport_traits::{PublishSink, Signer, Transport};
 pub mod identity;
 pub mod node_identity;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod federated_identity;
 pub mod signer;
 #[cfg(not(target_arch = "wasm32"))]
