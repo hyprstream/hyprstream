@@ -313,12 +313,15 @@ impl Spawnable for OAuthService {
                 }
             };
 
-            // Create shared state
+            // Create shared state — JWKS serves the purpose-derived JWT verifying key
+            let jwt_verifying_key = hyprstream_rpc::node_identity::derive_purpose_key(
+                &self.signing_key, "hyprstream-jwt-v1"
+            ).verifying_key().to_bytes();
             let mut oauth_state = OAuthState::new(
                 &self.config,
                 policy_client,
                 discovery_client,
-                self.verifying_key.to_bytes(),
+                jwt_verifying_key,
             );
             if let Some(store) = user_store {
                 oauth_state = oauth_state.with_user_store(store);

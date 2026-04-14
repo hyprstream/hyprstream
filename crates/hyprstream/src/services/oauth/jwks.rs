@@ -12,7 +12,7 @@ use super::state::OAuthState;
 pub fn compute_kid(key_bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(key_bytes);
-    hex::encode(&hash[..4])
+    hex::encode(&hash[..8])
 }
 
 /// GET /oauth/jwks
