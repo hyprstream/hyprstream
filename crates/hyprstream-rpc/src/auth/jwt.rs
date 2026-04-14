@@ -80,7 +80,7 @@ pub fn encode_id_token(claims: &super::IdTokenClaims, signing_key: &SigningKey) 
     use sha2::{Sha256, Digest};
     let kid = {
         let hash = Sha256::digest(signing_key.verifying_key().as_bytes());
-        hex::encode(&hash[..4])
+        hex::encode(&hash[..8])
     };
     let header = serde_json::json!({
         "alg": "EdDSA",
