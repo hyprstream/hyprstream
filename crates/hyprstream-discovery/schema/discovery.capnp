@@ -114,6 +114,16 @@ struct EndpointInfo {
   endpoint @1 :Text;
   # Ed25519 public key of the service (32 bytes, for response verification)
   pubkey @2 :Data;
+  # Self-signed proof: Sign(ed25519_root, pubkey || timestamp || expiry)
+  selfProof @3 :Data;
+  # Unix timestamp (seconds) when proof was created
+  proofTimestamp @4 :Int64;
+  # Unix timestamp (seconds) when proof expires (0 = no expiry)
+  proofExpiry @5 :Int64;
+  # TLS endorsement: Sign(tls_key, ed25519_pubkey || domain) — optional
+  tlsEndorsement @6 :Data;
+  # Domain the TLS cert covers — optional, present when tlsEndorsement is set
+  tlsDomain @7 :Text;
 }
 
 # Endpoints for a specific service

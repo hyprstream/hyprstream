@@ -255,6 +255,19 @@ impl DiscoveryHandler for DiscoveryService {
 
         let pubkey = self.signing_key.verifying_key().to_bytes().to_vec();
 
+        // Self-signed proof: Sign(ed25519_root, pubkey || timestamp || expiry)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let expiry = now + 86400; // 24h
+        let mut proof_data = Vec::with_capacity(32 + 8 + 8);
+        proof_data.extend_from_slice(&pubkey);
+        proof_data.extend_from_slice(&now.to_le_bytes());
+        proof_data.extend_from_slice(&expiry.to_le_bytes());
+        use ed25519_dalek::Signer as _;
+        let self_proof = self.signing_key.sign(&proof_data).to_bytes().to_vec();
+
         let mut endpoints: Vec<EndpointInfo> = match endpoints_map {
             Some(map) => map
                 .iter()
@@ -262,6 +275,11 @@ impl DiscoveryHandler for DiscoveryService {
                     socket_kind: socket_kind_to_string(*kind).to_owned(),
                     endpoint: transport.to_zmq_string(),
                     pubkey: pubkey.clone(),
+                    self_proof: self_proof.clone(),
+                    proof_timestamp: now,
+                    proof_expiry: expiry,
+                    tls_endorsement: Vec::new(),
+                    tls_domain: String::new(),
                 })
                 .collect(),
             None => Vec::new(),
@@ -277,6 +295,11 @@ impl DiscoveryHandler for DiscoveryService {
                         socket_kind: kind.clone(),
                         endpoint: ep.clone(),
                         pubkey: pubkey.clone(),
+                        self_proof: self_proof.clone(),
+                        proof_timestamp: now,
+                        proof_expiry: expiry,
+                        tls_endorsement: Vec::new(),
+                        tls_domain: String::new(),
                     });
                 }
             }
