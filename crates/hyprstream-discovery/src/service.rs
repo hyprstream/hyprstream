@@ -63,6 +63,11 @@ pub struct DiscoveryService {
     /// Endpoints announced by other services (cross-process).
     /// Maps service_name → Vec<(socket_kind, endpoint)>.
     announced_endpoints: RwLock<HashMap<String, Vec<(String, String)>>>,
+    /// Pre-computed TLS endorsement: Sign(tls_key, ed25519_pubkey || domain).
+    /// Empty when TLS endorsement is not available (e.g. self-signed certs).
+    tls_endorsement: Vec<u8>,
+    /// Domain the TLS endorsement covers (empty when no endorsement).
+    tls_domain: String,
     // Infrastructure (for Spawnable)
     context: Arc<zmq::Context>,
     transport: TransportConfig,
@@ -82,9 +87,22 @@ impl DiscoveryService {
             expected_audience: None,
             auth_provider: None,
             announced_endpoints: RwLock::new(HashMap::new()),
+            tls_endorsement: Vec::new(),
+            tls_domain: String::new(),
             context,
             transport,
         }
+    }
+
+    /// Set the pre-computed TLS endorsement and domain.
+    ///
+    /// The endorsement is `Sign(tls_private_key, "TLS_ENDORSEMENT_V1" || ed25519_pubkey || domain)`,
+    /// computed once at startup by the service factory where TLS key materials are available.
+    /// Discovery never touches the TLS private key directly.
+    pub fn with_tls_endorsement(mut self, endorsement: Vec<u8>, domain: String) -> Self {
+        self.tls_endorsement = endorsement;
+        self.tls_domain = domain;
+        self
     }
 
     /// Set the OAuth issuer URL for RFC 9728 auth metadata responses.
@@ -278,8 +296,8 @@ impl DiscoveryHandler for DiscoveryService {
                     self_proof: self_proof.clone(),
                     proof_timestamp: now,
                     proof_expiry: expiry,
-                    tls_endorsement: Vec::new(),
-                    tls_domain: String::new(),
+                    tls_endorsement: self.tls_endorsement.clone(),
+                    tls_domain: self.tls_domain.clone(),
                 })
                 .collect(),
             None => Vec::new(),
@@ -298,8 +316,8 @@ impl DiscoveryHandler for DiscoveryService {
                         self_proof: self_proof.clone(),
                         proof_timestamp: now,
                         proof_expiry: expiry,
-                        tls_endorsement: Vec::new(),
-                        tls_domain: String::new(),
+                        tls_endorsement: self.tls_endorsement.clone(),
+                        tls_domain: self.tls_domain.clone(),
                     });
                 }
             }

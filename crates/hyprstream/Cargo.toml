@@ -166,6 +166,7 @@ keyring = { version = "3", features = ["linux-native"] }  # OS keyring — Linux
 curve25519-dalek.workspace = true        # Ristretto255 DH for stream authentication
 hkdf.workspace = true                    # HKDF key derivation
 subtle.workspace = true                  # Constant-time operations
+ring = "0.17"                            # TLS endorsement signing (key-type-agnostic)
 
 # HTTP API dependencies
 axum.workspace = true

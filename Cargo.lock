@@ -5980,6 +5980,7 @@ dependencies = [
  "reflink-copy",
  "regex",
  "reqwest 0.11.27",
+ "ring",
  "rlimit 0.10.2",
  "rmcp",
  "rtrb",
