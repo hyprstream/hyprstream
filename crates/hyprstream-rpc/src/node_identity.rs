@@ -20,12 +20,16 @@ use parking_lot::RwLock;
 use crate::identity::{IdentityProvider, SigningIdentity};
 use crate::Subject;
 
+/// Domain-separated HKDF salt for node identity derivation.
+/// Prevents cross-protocol confusion if the same seed material is used elsewhere.
+const NODE_IDENTITY_SALT: &[u8] = b"hyprstream-node-identity-hkdf-v1";
+
 /// Derive a purpose-keyed Ed25519 signing key from a root key.
 ///
 /// Standalone function for use in sync contexts (e.g., JWT signing)
 /// where the full async `IdentityProvider` isn't needed.
 pub fn derive_purpose_key(root_key: &SigningKey, purpose: &str) -> SigningKey {
-    let hk = Hkdf::<Sha256>::new(None, &root_key.to_bytes());
+    let hk = Hkdf::<Sha256>::new(Some(NODE_IDENTITY_SALT), &root_key.to_bytes());
     let mut okm = [0u8; 32];
     hk.expand(purpose.as_bytes(), &mut okm)
         .expect("HKDF-SHA256 expand to 32 bytes cannot fail");
@@ -85,7 +89,7 @@ impl NodeIdentityProvider {
         if purpose.len() > 255 {
             anyhow::bail!("purpose must be at most 255 bytes");
         }
-        let hk = Hkdf::<Sha256>::new(None, &self.root_seed);
+        let hk = Hkdf::<Sha256>::new(Some(NODE_IDENTITY_SALT), &self.root_seed);
         let mut okm = [0u8; 32];
         hk.expand(purpose.as_bytes(), &mut okm)
             .expect("HKDF-SHA256 expand to 32 bytes cannot fail");
@@ -211,5 +215,24 @@ mod tests {
         let provider = NodeIdentityProvider::new(&root);
         let long = "x".repeat(256);
         assert!(provider.identity_open(&long).await.is_err());
+    }
+
+    #[test]
+    fn salt_produces_different_keys_than_none() {
+        let root = SigningKey::generate(&mut rand::rngs::OsRng);
+        // With salt (current implementation)
+        let salted = derive_purpose_key(&root, "test-purpose");
+        // Without salt (old implementation)
+        let hk = Hkdf::<Sha256>::new(None, &root.to_bytes());
+        let mut unsalted_okm = [0u8; 32];
+        hk.expand(b"test-purpose", &mut unsalted_okm).unwrap();
+        let unsalted = SigningKey::from_bytes(&unsalted_okm);
+        unsalted_okm.fill(0);
+
+        assert_ne!(
+            salted.verifying_key().to_bytes(),
+            unsalted.verifying_key().to_bytes(),
+            "Salted and unsalted HKDF must produce different keys"
+        );
     }
 }
