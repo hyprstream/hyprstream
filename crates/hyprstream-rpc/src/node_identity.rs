@@ -30,16 +30,19 @@ const NODE_IDENTITY_SALT: &[u8] = b"hyprstream-node-identity-hkdf-v1";
 /// Standalone function for use in sync contexts (e.g., JWT signing)
 /// where the full async `IdentityProvider` isn't needed.
 pub fn derive_purpose_key(root_key: &SigningKey, purpose: &str) -> SigningKey {
+    assert!(!purpose.is_empty(), "purpose must be non-empty");
+    assert!(purpose.len() <= 255, "purpose must be at most 255 bytes");
     let hk = Hkdf::<Sha256>::new(Some(NODE_IDENTITY_SALT), &root_key.to_bytes());
     let mut okm = [0u8; 32];
     hk.expand(purpose.as_bytes(), &mut okm)
         .expect("HKDF-SHA256 expand to 32 bytes cannot fail");
     let key = SigningKey::from_bytes(&okm);
-    okm.fill(0);
+    okm.zeroize();
     key
 }
 
 /// A purpose-derived Ed25519 signing identity.
+/// Inner SigningKey is zeroized on drop via ed25519-dalek's `zeroize` feature.
 struct DerivedIdentity {
     signing_key: SigningKey,
     pubkey: [u8; 32],
@@ -101,7 +104,7 @@ impl NodeIdentityProvider {
         hk.expand(purpose.as_bytes(), &mut okm)
             .expect("HKDF-SHA256 expand to 32 bytes cannot fail");
         let key = SigningKey::from_bytes(&okm);
-        okm.fill(0);
+        okm.zeroize();
         Ok(key)
     }
 
