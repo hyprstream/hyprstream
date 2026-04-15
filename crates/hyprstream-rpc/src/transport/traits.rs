@@ -7,7 +7,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::Stream;
-use std::pin::Pin;
 
 /// Signing abstraction for Ed25519 envelope signatures.
 ///

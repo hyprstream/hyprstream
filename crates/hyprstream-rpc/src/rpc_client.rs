@@ -17,11 +17,11 @@ use async_trait::async_trait;
 
 use crate::crypto::VerifyingKey;
 use crate::envelope::{
-    self, RequestEnvelope, RequestIdentity, SignedEnvelope,
+    self, RequestEnvelope, SignedEnvelope,
 };
 use crate::transport_traits::{Signer, Transport};
 use crate::capnp::{FromCapnp, ToCapnp};
-use crate::stream_consumer::{StreamHandle, StreamHandleImpl, StreamPayload};
+use crate::stream_consumer::{StreamHandle, StreamHandleImpl};
 
 /// Unified RPC client. Evolved from ZmqClient — same envelope, timeout,
 /// and resilience logic, parameterized over transport and signing.
@@ -142,7 +142,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
     /// that yields verified payloads.
     #[cfg(not(feature = "fips"))]
     pub async fn open_stream(&self, payload: Vec<u8>) -> Result<StreamHandleImpl<T>> {
-        use crate::crypto::{generate_ephemeral_keypair, RistrettoPublic};
+        use crate::crypto::generate_ephemeral_keypair;
 
         let (secret, public) = generate_ephemeral_keypair();
         let pub_bytes = public.to_bytes();

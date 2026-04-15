@@ -11,7 +11,7 @@ use std::task::{Context, Poll};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use futures::Stream;
-use tmq::{AsZmqSocket, FromZmqSocket, Multipart, RequestSender, SocketExt};
+use tmq::{AsZmqSocket, FromZmqSocket, Multipart, RequestSender};
 use tracing::{debug, trace, warn};
 
 use crate::transport_traits::{PublishSink, Transport};
