@@ -16,6 +16,7 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use std::collections::HashSet;
 use parking_lot::RwLock;
+use zeroize::Zeroize;
 
 use crate::identity::{IdentityProvider, SigningIdentity};
 use crate::Subject;
@@ -66,6 +67,12 @@ pub struct NodeIdentityProvider {
     node_pubkey: [u8; 32],
     /// All pubkeys derived from this node's root — recognized as "system".
     known_pubkeys: RwLock<HashSet<[u8; 32]>>,
+}
+
+impl Drop for NodeIdentityProvider {
+    fn drop(&mut self) {
+        self.root_seed.zeroize();
+    }
 }
 
 impl NodeIdentityProvider {

@@ -54,6 +54,8 @@ pub struct DiscoveryService {
     started_at: Instant,
     /// Ed25519 signing key for envelope signing
     signing_key: Arc<SigningKey>,
+    /// Purpose-derived key for self-proof signing (not the root key)
+    proof_signing_key: SigningKey,
     /// OAuth issuer URL for RFC 9728 metadata (None = not configured)
     oauth_issuer_url: Option<String>,
     /// Expected audience for JWT validation (resource URL)
@@ -80,9 +82,14 @@ impl DiscoveryService {
         context: Arc<zmq::Context>,
         transport: TransportConfig,
     ) -> Self {
+        let proof_signing_key = hyprstream_rpc::node_identity::derive_purpose_key(
+            &signing_key,
+            "discovery-self-proof-v1",
+        );
         Self {
             started_at: Instant::now(),
             signing_key,
+            proof_signing_key,
             oauth_issuer_url: None,
             expected_audience: None,
             auth_provider: None,
@@ -271,9 +278,9 @@ impl DiscoveryHandler for DiscoveryService {
         let endpoints_map = reg.service_endpoints(service_name);
         drop(reg);
 
-        let pubkey = self.signing_key.verifying_key().to_bytes().to_vec();
+        let pubkey = self.proof_signing_key.verifying_key().to_bytes().to_vec();
 
-        // Self-signed proof: Sign(ed25519_root, pubkey || timestamp || expiry)
+        // Self-signed proof: Sign(purpose_derived_key, pubkey || timestamp || expiry)
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -284,7 +291,7 @@ impl DiscoveryHandler for DiscoveryService {
         proof_data.extend_from_slice(&now.to_le_bytes());
         proof_data.extend_from_slice(&expiry.to_le_bytes());
         use ed25519_dalek::Signer as _;
-        let self_proof = self.signing_key.sign(&proof_data).to_bytes().to_vec();
+        let self_proof = self.proof_signing_key.sign(&proof_data).to_bytes().to_vec();
 
         let mut endpoints: Vec<EndpointInfo> = match endpoints_map {
             Some(map) => map
