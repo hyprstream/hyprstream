@@ -1471,7 +1471,8 @@ fn main() -> Result<()> {
                     models_dir.clone(),
                 )
                 .with_oauth_issuer(config.oauth.issuer_url())
-                .with_federation_key_source(fed_src);
+                .with_federation_key_source(fed_src)
+                .generate_independent_service_keys(&config.services.startup);
 
                 let manager = InprocManager::new();
                 let mut handles = Vec::new();
@@ -1776,6 +1777,9 @@ fn main() -> Result<()> {
                                 } else {
                                     vec![name.clone()]
                                 };
+
+                                // Generate independent per-service keys + JWTs in memory
+                                ctx = ctx.generate_independent_service_keys(&service_names);
 
                                 let manager = InprocManager::new();
                                 let mut handles = Vec::new();
