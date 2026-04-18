@@ -10,6 +10,7 @@
 using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".mcpScope;
 using import "/annotations.capnp".mcpDescription;
+using import "/annotations.capnp".optional;
 
 # Unified discovery request with union discriminator
 struct DiscoveryRequest {
@@ -107,23 +108,19 @@ struct ServiceList {
 }
 
 # Endpoint information
+# FLAG-DAY: field numbers renumbered in integration-1 (self-proof fields removed).
+# All services and clients must be upgraded together.
 struct EndpointInfo {
   # Socket kind as lowercase text (e.g. "rep", "router")
   socketKind @0 :Text;
   # Endpoint string (e.g. "inproc://hyprstream/policy")
   endpoint @1 :Text;
-  # Ed25519 public key of the service (32 bytes, for response verification)
-  pubkey @2 :Data;
-  # Self-signed proof: Sign(ed25519_root, pubkey || timestamp || expiry)
-  selfProof @3 :Data;
-  # Unix timestamp (seconds) when proof was created
-  proofTimestamp @4 :Int64;
-  # Unix timestamp (seconds) when proof expires (0 = no expiry)
-  proofExpiry @5 :Int64;
+  # Service identity JWT (carries sub, pub, exp — replaces self-proof fields)
+  serviceJwt @2 :Text;
   # TLS endorsement: Sign(tls_key, ed25519_pubkey || domain) — optional
-  tlsEndorsement @6 :Data;
+  tlsEndorsement @3 :Data;
   # Domain the TLS cert covers — optional, present when tlsEndorsement is set
-  tlsDomain @7 :Text;
+  tlsDomain @4 :Text;
 }
 
 # Endpoints for a specific service
@@ -168,4 +165,6 @@ struct ServiceAnnouncement {
   socketKind @1 :Text;
   # Endpoint string (e.g. "quic://localhost:0.0.0.0:4433")
   endpoint @2 :Text;
+  # Service JWT attesting to the service's pubkey and identity
+  serviceJwt @3 :Text $optional;
 }

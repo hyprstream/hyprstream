@@ -47,6 +47,13 @@ pub struct Claims {
     /// RFC 8707 audience claim for resource indicator binding.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aud: Option<String>,
+    /// Ed25519 public key (base64url-encoded) for service identity tokens.
+    ///
+    /// Present only in service JWTs (where `sub` starts with `"service:"`).
+    /// Binds the service's Ed25519 signing key to the JWT, allowing callers
+    /// to verify that envelope signatures match the JWT-attested identity.
+    #[serde(rename = "pub", skip_serializing_if = "Option::is_none")]
+    pub pub_key: Option<String>,
     /// Original JWT token for end-to-end verification.
     /// When present, downstream services MUST verify this token
     /// independently rather than trusting the envelope claims alone.
@@ -69,6 +76,7 @@ impl std::fmt::Debug for Claims {
             .field("exp", &self.exp)
             .field("iat", &self.iat)
             .field("aud", &self.aud)
+            .field("pub", &self.pub_key)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
             .finish()
     }
@@ -90,6 +98,9 @@ impl ToCapnp for Claims {
         }
         if !self.iss.is_empty() {
             builder.set_iss(&self.iss);
+        }
+        if let Some(ref pub_key) = self.pub_key {
+            builder.set_pub_key(pub_key);
         }
         // Write empty scopes list for wire compatibility
         builder.reborrow().init_scopes(0);
@@ -116,12 +127,18 @@ impl FromCapnp for Claims {
             .map(std::borrow::ToOwned::to_owned)
             .unwrap_or_default();
 
+        let pub_key = reader.get_pub_key().ok()
+            .and_then(|s| s.to_str().ok())
+            .map(std::borrow::ToOwned::to_owned)
+            .filter(|s| !s.is_empty());
+
         Ok(Self {
             iss,
             sub: reader.get_sub()?.to_str()?.to_owned(),
             exp: reader.get_exp(),
             iat: reader.get_iat(),
             aud,
+            pub_key,
             token,
         })
     }
@@ -136,6 +153,7 @@ impl Claims {
             exp,
             iat,
             aud: None,
+            pub_key: None,
             token: None,
         }
     }
@@ -156,6 +174,12 @@ impl Claims {
     /// Attach original JWT token for e2e verification by downstream services.
     pub fn with_token(mut self, token: String) -> Self {
         self.token = Some(token);
+        self
+    }
+
+    /// Set the Ed25519 public key (base64url-encoded) for service identity tokens.
+    pub fn with_pub_key(mut self, pubkey: String) -> Self {
+        self.pub_key = Some(pubkey);
         self
     }
 

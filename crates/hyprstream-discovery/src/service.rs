@@ -48,14 +48,26 @@ pub trait AuthorizationProvider: Send + Sync {
 // DiscoveryService
 // ============================================================================
 
+/// Endpoint data stored per announced entry.
+struct AnnouncedEndpoint {
+    /// Socket kind (e.g. "quic", "rep")
+    socket_kind: String,
+    /// Endpoint string (e.g. "quic://localhost:0.0.0.0:4433")
+    endpoint: String,
+    /// Service JWT attesting to the service's identity and pubkey
+    service_jwt: String,
+    /// Last heartbeat timestamp (Instant)
+    last_heartbeat: Instant,
+}
+
 /// Discovery service that exposes EndpointRegistry over ZMQ RPC.
 pub struct DiscoveryService {
     /// Timestamp when the service was created
     started_at: Instant,
     /// Ed25519 signing key for envelope signing
     signing_key: Arc<SigningKey>,
-    /// Purpose-derived key for self-proof signing (not the root key)
-    proof_signing_key: SigningKey,
+    /// JWT verifying key for service JWT verification (derived from root via HKDF)
+    jwt_verifying_key: hyprstream_rpc::prelude::VerifyingKey,
     /// OAuth issuer URL for RFC 9728 metadata (None = not configured)
     oauth_issuer_url: Option<String>,
     /// Expected audience for JWT validation (resource URL)
@@ -63,8 +75,8 @@ pub struct DiscoveryService {
     /// Authorization provider (None = no authorization)
     auth_provider: Option<Box<dyn AuthorizationProvider>>,
     /// Endpoints announced by other services (cross-process).
-    /// Maps service_name → Vec<(socket_kind, endpoint)>.
-    announced_endpoints: RwLock<HashMap<String, Vec<(String, String)>>>,
+    /// Maps service_name → Vec<AnnouncedEndpoint>.
+    announced_endpoints: RwLock<HashMap<String, Vec<AnnouncedEndpoint>>>,
     /// Pre-computed TLS endorsement: Sign(tls_key, ed25519_pubkey || domain).
     /// Empty when TLS endorsement is not available (e.g. self-signed certs).
     tls_endorsement: Vec<u8>,
@@ -77,19 +89,20 @@ pub struct DiscoveryService {
 
 impl DiscoveryService {
     /// Create a new discovery service with infrastructure.
+    ///
+    /// `signing_key` is used for envelope signing (should be the per-service key
+    /// derived via HKDF). `jwt_verifying_key` is the root-derived JWT verifying
+    /// key for verifying service JWTs (derived from root via HKDF "hyprstream-jwt-v1").
     pub fn new(
         signing_key: Arc<SigningKey>,
+        jwt_verifying_key: hyprstream_rpc::prelude::VerifyingKey,
         context: Arc<zmq::Context>,
         transport: TransportConfig,
     ) -> Self {
-        let proof_signing_key = hyprstream_rpc::node_identity::derive_purpose_key(
-            &signing_key,
-            "discovery-self-proof-v1",
-        );
         Self {
             started_at: Instant::now(),
             signing_key,
-            proof_signing_key,
+            jwt_verifying_key,
             oauth_issuer_url: None,
             expected_audience: None,
             auth_provider: None,
@@ -242,9 +255,9 @@ impl DiscoveryHandler for DiscoveryService {
             if local_names.iter().any(|n| n == name) {
                 // Service exists locally — add announced socket kinds
                 if let Some(summary) = summaries.iter_mut().find(|s| s.name == *name) {
-                    for (kind, _) in endpoints {
-                        if !summary.socket_kinds.contains(kind) {
-                            summary.socket_kinds.push(kind.clone());
+                    for ep in endpoints {
+                        if !summary.socket_kinds.contains(&ep.socket_kind) {
+                            summary.socket_kinds.push(ep.socket_kind.clone());
                         }
                     }
                 }
@@ -253,7 +266,7 @@ impl DiscoveryHandler for DiscoveryService {
                 summaries.push(ServiceSummary {
                     name: name.clone(),
                     description: String::new(),
-                    socket_kinds: endpoints.iter().map(|(k, _)| k.clone()).collect(),
+                    socket_kinds: endpoints.iter().map(|e| e.socket_kind.clone()).collect(),
                     has_schema: false,
                 });
             }
@@ -278,31 +291,14 @@ impl DiscoveryHandler for DiscoveryService {
         let endpoints_map = reg.service_endpoints(service_name);
         drop(reg);
 
-        let pubkey = self.proof_signing_key.verifying_key().to_bytes().to_vec();
-
-        // Self-signed proof: Sign(purpose_derived_key, pubkey || timestamp || expiry)
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        let expiry = now + 86400; // 24h
-        let mut proof_data = Vec::with_capacity(32 + 8 + 8);
-        proof_data.extend_from_slice(&pubkey);
-        proof_data.extend_from_slice(&now.to_le_bytes());
-        proof_data.extend_from_slice(&expiry.to_le_bytes());
-        use ed25519_dalek::Signer as _;
-        let self_proof = self.proof_signing_key.sign(&proof_data).to_bytes().to_vec();
-
+        // Build from local registry (no self-proof — discovery's own JWT not stored locally)
         let mut endpoints: Vec<EndpointInfo> = match endpoints_map {
             Some(map) => map
                 .iter()
                 .map(|(kind, transport)| EndpointInfo {
                     socket_kind: socket_kind_to_string(*kind).to_owned(),
                     endpoint: transport.to_zmq_string(),
-                    pubkey: pubkey.clone(),
-                    self_proof: self_proof.clone(),
-                    proof_timestamp: now,
-                    proof_expiry: expiry,
+                    service_jwt: String::new(),
                     tls_endorsement: self.tls_endorsement.clone(),
                     tls_domain: self.tls_domain.clone(),
                 })
@@ -310,19 +306,16 @@ impl DiscoveryHandler for DiscoveryService {
             None => Vec::new(),
         };
 
-        // Merge announced endpoints from other processes
+        // Merge announced endpoints from other processes (carry service JWT)
         let announced = self.announced_endpoints.read();
         if let Some(announced_eps) = announced.get(service_name) {
-            for (kind, ep) in announced_eps {
+            for ep in announced_eps {
                 // Don't duplicate if already present from local registry
-                if !endpoints.iter().any(|e| e.socket_kind == *kind) {
+                if !endpoints.iter().any(|e| e.socket_kind == ep.socket_kind) {
                     endpoints.push(EndpointInfo {
-                        socket_kind: kind.clone(),
-                        endpoint: ep.clone(),
-                        pubkey: pubkey.clone(),
-                        self_proof: self_proof.clone(),
-                        proof_timestamp: now,
-                        proof_expiry: expiry,
+                        socket_kind: ep.socket_kind.clone(),
+                        endpoint: ep.endpoint.clone(),
+                        service_jwt: ep.service_jwt.clone(),
                         tls_endorsement: self.tls_endorsement.clone(),
                         tls_domain: self.tls_domain.clone(),
                     });
@@ -481,14 +474,44 @@ impl DiscoveryHandler for DiscoveryService {
         let svc_name = data.service_name.clone();
         let sock_kind = data.socket_kind.clone();
         let endpoint = data.endpoint.clone();
+        let service_jwt = data.service_jwt.clone().unwrap_or_default();
+
+        // R3: Verify service JWT signature + subject matches serviceName.
+        // Full JWT verification (not decode_unverified) to prevent forged identities.
+        if !service_jwt.is_empty() {
+            let verified = hyprstream_rpc::auth::jwt::decode(
+                &service_jwt,
+                &self.jwt_verifying_key,
+                self.expected_audience.as_deref(),
+            ).map_err(|e| {
+                tracing::warn!("Service JWT verification failed in announce: {}", e);
+                anyhow::anyhow!("Invalid service JWT in announce: {}", e)
+            })?;
+            // Check that sub matches "service:{serviceName}"
+            let expected_sub = format!("service:{}", svc_name);
+            if verified.sub != expected_sub {
+                anyhow::bail!(
+                    "Service JWT subject mismatch: expected '{}', got '{}'",
+                    expected_sub,
+                    verified.sub
+                );
+            }
+        }
 
         let mut endpoints = self.announced_endpoints.write();
         let entry = endpoints.entry(svc_name).or_default();
         // Replace existing endpoint for the same socket kind, or add new
-        if let Some(existing) = entry.iter_mut().find(|(k, _)| *k == sock_kind) {
-            existing.1 = endpoint;
+        if let Some(existing) = entry.iter_mut().find(|e| e.socket_kind == sock_kind) {
+            existing.endpoint = endpoint;
+            existing.service_jwt = service_jwt;
+            existing.last_heartbeat = Instant::now();
         } else {
-            entry.push((sock_kind, endpoint));
+            entry.push(AnnouncedEndpoint {
+                socket_kind: sock_kind,
+                endpoint,
+                service_jwt,
+                last_heartbeat: Instant::now(),
+            });
         }
 
         Ok(DiscoveryResponseVariant::AnnounceResult)
