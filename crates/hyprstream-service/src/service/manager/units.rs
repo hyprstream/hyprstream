@@ -27,16 +27,27 @@ WantedBy=sockets.target
 
 /// Node-level credentials — every service on this node needs these.
 ///
-/// These are infrastructure secrets that define the node's identity:
-/// signing key (root of trust), TLS materials (HTTP/QUIC transport),
-/// RSA key (RS256 JWT signing for OIDC interop).
+/// These are infrastructure secrets shared across services:
+/// RSA key (RS256 JWT signing for OIDC interop), TLS materials (HTTP/QUIC transport).
+/// Per-service signing keys are stored in per-service subdirectories.
 pub const NODE_CREDENTIAL_NAMES: &[&str] = &[
-    "signing-key",
     "rsa-key",
     "tls-key",
     "tls-cert",
     "quic-key",
     "quic-cert",
+    "ca-pubkey",
+    "bootstrap-pubkeys",
+];
+
+/// Per-service credentials — each service gets its own subdirectory.
+///
+/// Stored under `credentials/{service_name}/`:
+/// - `signing-key` — service's own independent Ed25519 private key
+/// - `service-jwt` — CA-signed JWT certificate binding name → pubkey
+pub const SERVICE_CREDENTIAL_NAMES: &[&str] = &[
+    "signing-key",
+    "service-jwt",
 ];
 
 /// Application-level credentials — only the oauth service needs these.
@@ -48,7 +59,14 @@ pub const OAUTH_CREDENTIAL_NAMES: &[&str] = &[
     "user-signing-key",
 ];
 
-/// All managed credential names (node + application).
+/// Policy-service-only credentials.
+///
+/// The CA private key is only available to PolicyService (the CA).
+pub const POLICY_CREDENTIAL_NAMES: &[&str] = &[
+    "ca-key",
+];
+
+/// All managed credential names (node + service + application).
 ///
 /// Used by `encrypt_credentials_if_available` to encrypt all secrets
 /// from the secrets directory into the systemd credstore.
@@ -61,6 +79,10 @@ pub const ALL_CREDENTIAL_NAMES: &[&str] = &[
     "tls-cert",
     "quic-key",
     "quic-cert",
+    "ca-key",
+    "ca-pubkey",
+    "bootstrap-pubkeys",
+    "service-jwt",
 ];
 
 /// Generate a systemd service unit for a service.
@@ -138,19 +160,25 @@ pub fn service_unit(service: &str, use_systemd_creds: bool, depends_on: &[&str])
             .map(|d| d.join("credstore.encrypted"))
             .unwrap_or_default();
 
-        // Node-level credentials for all services; add application-level
-        // credentials for oauth only.
-        let names: Vec<&&str> = if service == "oauth" {
-            NODE_CREDENTIAL_NAMES.iter()
-                .chain(OAUTH_CREDENTIAL_NAMES.iter())
-                .collect()
-        } else {
-            NODE_CREDENTIAL_NAMES.iter().collect()
-        };
+        // Node-level credentials for all services; add per-service credentials
+        // from the service's subdirectory; add application-level credentials
+        // for oauth; add CA private key for policy.
+        let mut names: Vec<&'static str> = NODE_CREDENTIAL_NAMES.to_vec();
+        names.extend(SERVICE_CREDENTIAL_NAMES.iter().copied());
+        if service == "oauth" {
+            names.extend(OAUTH_CREDENTIAL_NAMES.iter().copied());
+        }
+        if service == "policy" {
+            names.extend(POLICY_CREDENTIAL_NAMES.iter().copied());
+        }
 
         let import_lines: String = names
             .iter()
-            .filter(|name| credstore.join(name).exists())
+            .filter(|name| {
+                // Check both flat credstore and per-service subdirectory
+                credstore.join(name).exists()
+                    || credstore.join(service).join(name).exists()
+            })
             .map(|name| format!("ImportCredential={name}\n"))
             .collect();
 

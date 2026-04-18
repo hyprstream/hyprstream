@@ -275,10 +275,88 @@ pub fn encrypt_credentials_if_available(secrets_dir: Option<&std::path::Path>) -
     }
 
     let mut encrypted_count = 0usize;
-    for name in units::ALL_CREDENTIAL_NAMES {
+
+    // Encrypt node-level credentials (flat: ca-pubkey, bootstrap-pubkeys, rsa-key, TLS)
+    for name in units::NODE_CREDENTIAL_NAMES {
         let secret_path = dir.join(name);
         if !secret_path.exists() {
-            debug!("Skipping credential '{}' (not yet generated)", name);
+            debug!("Skipping node credential '{}' (not yet generated)", name);
+            continue;
+        }
+        let plaintext = match std::fs::read(&secret_path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("Could not read secret '{}': {e}", secret_path.display());
+                continue;
+            }
+        };
+        match systemd_creds_encrypt(name, &plaintext, &credstore) {
+            Ok(()) => encrypted_count += 1,
+            Err(e) => tracing::warn!("Failed to encrypt credential '{name}': {e}"),
+        }
+    }
+
+    // Discover service subdirectories and encrypt their credentials
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let service_name = match entry.file_name().to_str() {
+                Some(n) => n.to_owned(),
+                None => continue,
+            };
+            let svc_credstore = credstore.join(&service_name);
+            if let Err(e) = std::fs::create_dir_all(&svc_credstore) {
+                tracing::warn!("Could not create per-service credstore '{}': {e}", svc_credstore.display());
+                continue;
+            }
+            for name in units::SERVICE_CREDENTIAL_NAMES {
+                let secret_path = path.join(name);
+                if !secret_path.exists() {
+                    continue;
+                }
+                let plaintext = match std::fs::read(&secret_path) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!("Could not read secret '{}': {e}", secret_path.display());
+                        continue;
+                    }
+                };
+                match systemd_creds_encrypt(name, &plaintext, &svc_credstore) {
+                    Ok(()) => encrypted_count += 1,
+                    Err(e) => tracing::warn!(
+                        "Failed to encrypt credential '{name}' for service '{service_name}': {e}"
+                    ),
+                }
+            }
+        }
+    }
+
+    // Encrypt application-level credentials (oauth)
+    for name in units::OAUTH_CREDENTIAL_NAMES {
+        let secret_path = dir.join(name);
+        if !secret_path.exists() {
+            continue;
+        }
+        let plaintext = match std::fs::read(&secret_path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("Could not read secret '{}': {e}", secret_path.display());
+                continue;
+            }
+        };
+        match systemd_creds_encrypt(name, &plaintext, &credstore) {
+            Ok(()) => encrypted_count += 1,
+            Err(e) => tracing::warn!("Failed to encrypt credential '{name}': {e}"),
+        }
+    }
+
+    // Encrypt policy-only credentials (ca-key)
+    for name in units::POLICY_CREDENTIAL_NAMES {
+        let secret_path = dir.join(name);
+        if !secret_path.exists() {
             continue;
         }
         let plaintext = match std::fs::read(&secret_path) {
