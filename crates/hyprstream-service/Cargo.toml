@@ -47,6 +47,12 @@ ed25519-dalek = { workspace = true }
 # Base64 encoding for x_root_pubkey in RFC 9728 metadata
 base64 = { workspace = true }
 
+# Time for JWT expiry calculation
+chrono = { workspace = true }
+
+# Random key generation
+rand = { workspace = true }
+
 # Key material zeroization
 zeroize = { workspace = true }
 

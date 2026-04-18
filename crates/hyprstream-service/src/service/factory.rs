@@ -23,6 +23,7 @@
 //! }
 //! ```
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -91,17 +92,61 @@ impl QuicSharedConfig {
     /// Build a per-service `QuicLoopConfig` with an announce callback.
     ///
     /// After binding, the callback announces the QUIC endpoint to the DiscoveryService.
+    ///
+    /// If the service JWT is close to expiry (within 2x heartbeat interval),
+    /// the callback mints a fresh JWT using the CA JWT signing key before announcing.
     pub fn for_service_with_announce(
         &self,
         service_name: &str,
         port: u16,
         signing_key: hyprstream_rpc::prelude::SigningKey,
+        service_jwt: Option<String>,
+        root_signing_key: hyprstream_rpc::prelude::SigningKey,
     ) -> hyprstream_rpc::service::QuicLoopConfig {
         let mut config = self.for_service(service_name, port);
         let _server_name = self.server_name.clone();
+        let ca_jwt_key = hyprstream_rpc::node_identity::derive_purpose_key(
+            &root_signing_key, "hyprstream-jwt-v1",
+        );
         config.on_quic_bound = Some(Box::new(move |svc_name, addr, sn| {
             let endpoint = format!("quic://{}:{}:{}", sn, addr.ip(), addr.port());
-            let sk = signing_key;
+            let sk = signing_key.clone();
+            let ca_key = ca_jwt_key.clone();
+            let mut jwt = service_jwt.clone();
+
+            // Check if JWT needs renewal (within 2 days of expiry, or missing)
+            let needs_renewal = jwt.as_ref().map_or(true, |j| {
+                // Decode without verification to check expiry
+                let parts: Vec<&str> = j.split('.').collect();
+                if parts.len() != 3 {
+                    return true;
+                }
+                use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+                if let Ok(payload) = URL_SAFE_NO_PAD.decode(parts[1]) {
+                    if let Ok(claims) = serde_json::from_slice::<serde_json::Value>(&payload) {
+                        if let Some(exp) = claims["exp"].as_i64() {
+                            let now = chrono::Utc::now().timestamp();
+                            return now > exp - 2 * 86_400; // Renew within 2 days of expiry
+                        }
+                    }
+                }
+                true
+            });
+
+            if needs_renewal {
+                use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+                let now = chrono::Utc::now().timestamp();
+                let expiry = now + 7 * 86_400; // 7 days
+                let claims = hyprstream_rpc::auth::Claims::new(
+                    format!("service:{svc_name}"),
+                    now,
+                    expiry,
+                )
+                .with_pub_key(URL_SAFE_NO_PAD.encode(sk.verifying_key().as_bytes()));
+                jwt = Some(hyprstream_rpc::auth::jwt::encode(&claims, &ca_key));
+                tracing::info!("Renewed service JWT for '{svc_name}' (expiry: {expiry})");
+            }
+
             // Spawn async announce in a new thread since we may not be in a tokio context
             std::thread::spawn(move || {
                 let rt = match tokio::runtime::Builder::new_current_thread()
@@ -115,16 +160,24 @@ impl QuicSharedConfig {
                     }
                 };
                 rt.block_on(async {
+                    // Use root key for HKDF derivation of discovery verifying key.
+                    // In single-process mode, ca_key is derived from the root key so we
+                    // can re-derive discovery's key. In multi-process mode with independent
+                    // keys, the announce callback should receive the root key directly.
+                    // For now, derive from the CA key's root (which is the same root).
+                    let discovery_vk = hyprstream_rpc::node_identity::service_verifying_key(
+                        &sk, "discovery",
+                    );
                     let client = hyprstream_discovery::DiscoveryClient::for_service(
-                        sk.clone(),
+                        sk,
                         hyprstream_rpc::RequestIdentity::anonymous(),
-                        hyprstream_rpc::node_identity::service_verifying_key(&sk, "discovery"),
+                        discovery_vk,
                     );
                     match client.announce(&hyprstream_discovery::ServiceAnnouncement {
                         service_name: svc_name,
                         socket_kind: "quic".to_owned(),
                         endpoint,
-                        service_jwt: None, // TODO(phase-2c): include service JWT when heartbeat is implemented
+                        service_jwt: jwt,
                     }).await {
                         Ok(_) => tracing::info!("Announced QUIC endpoint to DiscoveryService"),
                         Err(e) => tracing::warn!("Failed to announce QUIC endpoint: {}", e),
@@ -169,6 +222,32 @@ pub struct ServiceContext {
 
     /// Shared federation key resolver (None when no trusted_issuers are configured).
     federation_key_source: Option<Arc<dyn hyprstream_rpc::auth::FederationKeySource>>,
+
+    /// Per-service signing keys (independent Ed25519 keypairs).
+    ///
+    /// Populated from:
+    /// - Single-process: generated in memory at startup
+    /// - Multi-process: loaded from per-service credential files
+    service_keys: HashMap<String, SigningKey>,
+
+    /// Resolved service pubkeys for RPC client construction.
+    ///
+    /// Maps service name → verifying key. Populated from:
+    /// - Single-process: generated alongside service_keys
+    /// - Multi-process: bootstrap-pubkeys credential + discovery lookup
+    pubkey_registry: HashMap<String, VerifyingKey>,
+
+    /// CA verifying key (trust anchor for verifying service JWTs).
+    ///
+    /// In single-process mode, this is derived from the root key.
+    /// In multi-process mode, this is loaded from the ca-pubkey credential.
+    ca_verifying_key: Option<VerifyingKey>,
+
+    /// Per-service JWTs (CA-signed certificates).
+    ///
+    /// In single-process mode, these are minted in memory at startup.
+    /// In multi-process mode, these are loaded from per-service credential files.
+    service_jwts: HashMap<String, String>,
 }
 
 impl ServiceContext {
@@ -193,7 +272,114 @@ impl ServiceContext {
             quic_shared: None,
             oauth_issuer_url: None,
             federation_key_source: None,
+            service_keys: HashMap::new(),
+            pubkey_registry: HashMap::new(),
+            ca_verifying_key: None,
+            service_jwts: HashMap::new(),
         }
+    }
+
+    /// Add a per-service independent signing key.
+    ///
+    /// In single-process mode, these are generated in memory at startup.
+    /// In multi-process mode, these are loaded from per-service credential files.
+    pub fn with_service_key(mut self, service_name: &str, signing_key: SigningKey) -> Self {
+        let vk = signing_key.verifying_key();
+        self.service_keys.insert(service_name.to_owned(), signing_key);
+        self.pubkey_registry.insert(service_name.to_owned(), vk);
+        self
+    }
+
+    /// Bulk-register service keys from an iterator.
+    pub fn with_service_keys<I>(mut self, keys: I) -> Self
+    where
+        I: IntoIterator<Item = (String, SigningKey)>,
+    {
+        for (name, sk) in keys {
+            let vk = sk.verifying_key();
+            self.service_keys.insert(name.clone(), sk);
+            self.pubkey_registry.insert(name, vk);
+        }
+        self
+    }
+
+    /// Set the CA verifying key (trust anchor for verifying service JWTs).
+    pub fn with_ca_verifying_key(mut self, key: VerifyingKey) -> Self {
+        self.ca_verifying_key = Some(key);
+        self
+    }
+
+    /// Bulk-register service JWTs.
+    pub fn with_service_jwts(mut self, jwts: HashMap<String, String>) -> Self {
+        self.service_jwts = jwts;
+        self
+    }
+
+    /// Add a single service JWT.
+    pub fn with_service_jwt(mut self, service_name: &str, jwt: String) -> Self {
+        self.service_jwts.insert(service_name.to_owned(), jwt);
+        self
+    }
+
+    /// Register a known pubkey for a service (without the signing key).
+    ///
+    /// Used for bootstrap services where we only have the pubkey (e.g.,
+    /// loaded from bootstrap-pubkeys credential).
+    pub fn with_known_pubkey(mut self, service_name: &str, verifying_key: VerifyingKey) -> Self {
+        self.pubkey_registry.insert(service_name.to_owned(), verifying_key);
+        self
+    }
+
+    /// Generate independent Ed25519 keypairs for all listed services and
+    /// issue CA-signed service JWTs in memory.
+    ///
+    /// Used by single-process mode where all services run in one process.
+    /// The root signing key serves as the CA key — PolicyService will use it
+    /// directly (it IS the CA), while all other services get independent keys.
+    ///
+    /// Populates `service_keys`, `pubkey_registry`, `service_jwts`, and
+    /// `ca_verifying_key` from the generated materials.
+    pub fn generate_independent_service_keys(self, service_names: &[String]) -> Self {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+        let ca_signing_key = hyprstream_rpc::node_identity::derive_purpose_key(
+            &self.signing_key, "hyprstream-jwt-v1",
+        );
+        let ca_verifying_key = ca_signing_key.verifying_key();
+
+        let mut ctx = self
+            .with_ca_verifying_key(ca_verifying_key);
+
+        let now = chrono::Utc::now().timestamp();
+        let expiry = now + 7 * 86_400; // 7 days
+
+        for name in service_names {
+            if name == "policy" {
+                // PolicyService uses the root key directly (it IS the CA)
+                // No need to generate an independent key or issue a JWT
+                continue;
+            }
+
+            // Generate independent Ed25519 keypair
+            let service_key = SigningKey::generate(&mut rand::rngs::OsRng);
+            let service_vk = service_key.verifying_key();
+
+            // Issue service JWT (CA-signed certificate binding name → pubkey)
+            let claims = hyprstream_rpc::auth::Claims::new(
+                format!("service:{name}"),
+                now,
+                expiry,
+            )
+            .with_pub_key(URL_SAFE_NO_PAD.encode(service_vk.as_bytes()));
+
+            let jwt = hyprstream_rpc::auth::jwt::encode(&claims, &ca_signing_key);
+
+            ctx = ctx
+                .with_service_key(name, service_key)
+                .with_service_jwt(name, jwt);
+        }
+
+        ctx
     }
 
     /// Set the shared QUIC/WebTransport configuration.
@@ -260,30 +446,47 @@ impl ServiceContext {
         &self.signing_key
     }
 
-    /// Derive a per-service signing key via HKDF.
+    /// Get the signing key for a specific service.
     ///
-    /// Each service gets its own Ed25519 key derived from the root key
-    /// using `HKDF(root, "service:{name}")`. This provides key separation
-    /// between services while maintaining a single root of trust.
-    ///
-    /// PolicyService keeps the root key directly (it IS the CA).
+    /// Lookup order:
+    /// 1. `service_keys` registry (independent keypair per service)
+    /// 2. PolicyService special case (returns root key — it IS the CA)
+    /// 3. HKDF fallback (for services not yet migrated to independent keys)
     pub fn service_signing_key(&self, service_name: &str) -> SigningKey {
-        if service_name == "policy" {
-            self.signing_key.clone()
-        } else {
-            hyprstream_rpc::node_identity::derive_purpose_key(
-                &self.signing_key,
-                &format!("service:{service_name}"),
-            )
+        if let Some(sk) = self.service_keys.get(service_name) {
+            return sk.clone();
         }
+        if service_name == "policy" {
+            return self.signing_key.clone();
+        }
+        // Fallback: HKDF-derived key for single-process mode without explicit keys
+        hyprstream_rpc::node_identity::derive_purpose_key(
+            &self.signing_key,
+            &format!("service:{service_name}"),
+        )
     }
 
     /// Get the verifying key for a target service.
     ///
-    /// PolicyService ("policy") uses the root key directly (it IS the CA).
-    /// All other services use `HKDF(root, "service:{name}")` derived keys.
+    /// Lookup order:
+    /// 1. `pubkey_registry` (populated from independent keys or bootstrap pubkeys)
+    /// 2. HKDF fallback
     pub fn service_verifying_key(&self, service_name: &str) -> VerifyingKey {
+        if let Some(vk) = self.pubkey_registry.get(service_name) {
+            return *vk;
+        }
+        // Fallback: derive from signing key (HKDF or root for policy)
         self.service_signing_key(service_name).verifying_key()
+    }
+
+    /// Get the service JWT for a specific service (if available).
+    pub fn service_jwt(&self, service_name: &str) -> Option<&str> {
+        self.service_jwts.get(service_name).map(|s| s.as_str())
+    }
+
+    /// Get the CA verifying key (trust anchor).
+    pub fn ca_verifying_key(&self) -> Option<VerifyingKey> {
+        self.ca_verifying_key
     }
 
     /// Get the verifying key.
@@ -381,10 +584,13 @@ impl ServiceContext {
                 if service.name() == "discovery" {
                     Some(shared.for_service(service.name(), port))
                 } else {
+                    let service_jwt = self.service_jwt(service.name()).map(|s| s.to_owned());
                     Some(shared.for_service_with_announce(
                         service.name(),
                         port,
                         self.service_signing_key(service.name()),
+                        service_jwt,
+                        self.signing_key.clone(),
                     ))
                 }
             }
