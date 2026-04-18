@@ -7,6 +7,7 @@
 
 pub mod identity_store;
 pub mod federation;
+pub mod id_token_verify;
 pub mod jwt;
 mod policy_manager;
 pub mod policy_migration;

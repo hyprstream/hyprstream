@@ -6276,6 +6276,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "dashmap",
  "dirs 5.0.1",
  "ed25519-dalek",
