@@ -15,12 +15,12 @@ use crate::transport::TransportConfig;
 use anyhow::{anyhow, Result};
 use zeroize::Zeroizing;
 use async_trait::async_trait;
-use std::sync::atomic::{AtomicU64, Ordering};
+// AtomicU64 and Ordering removed — were unused
 use std::rc::Rc;
 use std::sync::Arc;
-use tmq::{FromZmqSocket, Multipart, RequestSender};
+use tmq::{FromZmqSocket, Multipart};
 use tokio::sync::Notify;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 
 /// Authorization callback for policy checks.
 ///
@@ -447,6 +447,50 @@ pub trait ZmqService: 'static {
             ctx.claims = Some(verified);
         }
 
+        // R2: Bind JWT `pub` claim to envelope `signerPubkey` for service tokens.
+        // For service-to-service calls, the JWT's `pub` claim (Ed25519 pubkey, base64url)
+        // must match the envelope's `signerPubkey`. This prevents a valid service JWT
+        // holder from signing envelopes with a different key and being attributed
+        // the service identity.
+        // Only applies when both conditions are met: sub starts with "service:" AND pub_key is present.
+        if let Some(ref claims) = ctx.claims {
+            if claims.sub.starts_with("service:") {
+                if let Some(ref pub_key_b64) = claims.pub_key {
+                    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+                    match URL_SAFE_NO_PAD.decode(pub_key_b64) {
+                        Ok(pub_key_bytes) => {
+                            // C2: Reject malformed pubkey — must be exactly 32 bytes for Ed25519
+                            if pub_key_bytes.len() != 32 {
+                                tracing::warn!(
+                                    "Service JWT pubkey has invalid length: {} bytes (expected 32)",
+                                    pub_key_bytes.len()
+                                );
+                                anyhow::bail!(
+                                    "Service JWT pubkey has invalid length: {} bytes",
+                                    pub_key_bytes.len()
+                                );
+                            }
+                            let mut expected = [0u8; 32];
+                            expected.copy_from_slice(&pub_key_bytes);
+                            // M2: Constant-time comparison to prevent timing side-channel
+                            use subtle::ConstantTimeEq as _;
+                            if expected.ct_ne(&ctx.signer_pubkey).into() {
+                                tracing::warn!(
+                                    "Service JWT pubkey mismatch: sub={}",
+                                    claims.sub
+                                );
+                                anyhow::bail!("Service JWT pubkey does not match envelope signer");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Invalid base64 in service JWT pub claim: {}", e);
+                            anyhow::bail!("Invalid service JWT pubkey encoding");
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -812,12 +856,15 @@ impl RequestLoop {
                         continue;
                     }
 
-                    // Process through shared envelope pipeline (FixedSigner: ZMQ peers pre-share keys)
+                    // Process through shared envelope pipeline.
+                    // AnySigner: per-service keys mean each caller signs with its own key,
+                    // not a shared root key. The envelope signature is still verified —
+                    // JWT claims + Casbin handle authorization.
                     // subsecond::call wraps the dispatch so handler code can be hot-patched during dev.
                     let (response_bytes, continuation) = match subsecond::call(|| crate::transport::zmtp_quic::process_request(
                         &request,
                         &*service,
-                        crate::transport::zmtp_quic::EnvelopeVerification::FixedSigner(&server_pubkey),
+                        crate::transport::zmtp_quic::EnvelopeVerification::AnySigner,
                         &signing_key,
                         &nonce_cache,
                     )).await {

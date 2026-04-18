@@ -19,6 +19,7 @@ use futures::Stream;
 /// `unsafe impl Send + Sync` on it because wasm32 is single-threaded.
 /// The `Send + Sync` bounds on this trait are required so that `RpcClient<S, T>`
 /// can be used with `Arc` and `tokio::spawn` on native.
+#[allow(dead_code)]
 #[async_trait]
 pub trait Signer: Send + Sync {
     /// Ed25519 public key (32 bytes).
@@ -41,6 +42,7 @@ pub trait Signer: Send + Sync {
 ///
 /// `Sub` must implement `futures::Stream` yielding frames as `Vec<Vec<u8>>`,
 /// matching the ZMTP multipart format `[topic, capnp_data, mac]`.
+#[allow(dead_code)]
 #[async_trait]
 pub trait Transport: Send + Sync {
     /// Subscriber type for data streams (server→client).
@@ -68,6 +70,7 @@ pub trait Transport: Send + Sync {
 ///
 /// Abstracted because native uses sync `zmq::Socket::send` with `DONTWAIT`,
 /// while WASM uses async WebTransport writes.
+#[allow(dead_code)]
 #[async_trait]
 pub trait PublishSink: Send {
     /// Send ZMTP multipart frames (e.g., `[ctrl_topic, capnp, mac]`).

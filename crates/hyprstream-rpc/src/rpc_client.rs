@@ -268,6 +268,6 @@ impl<S: Signer, T: Transport + 'static> RpcClient for RpcClientImpl<S, T> {
     }
 
     fn set_jwt(&self, token: Option<String>) {
-        RpcClientImpl::set_jwt(self, token)
+        RpcClientImpl::set_jwt(self, token);
     }
 }

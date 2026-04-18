@@ -503,7 +503,7 @@ impl QuicRep {
         send: quinn::SendStream,
         recv: quinn::RecvStream,
         service: Rc<S>,
-        server_pubkey: ed25519_dalek::VerifyingKey,
+        _server_pubkey: ed25519_dalek::VerifyingKey,
         signing_key: ed25519_dalek::SigningKey,
         nonce_cache: Arc<crate::envelope::InMemoryNonceCache>,
     ) -> Result<()>
@@ -523,12 +523,16 @@ impl QuicRep {
 
         let raw_bytes = &request.parts[0];
 
-        // Process through envelope pipeline (FixedSigner: QUIC peers pre-share keys)
+        // Process through envelope pipeline.
+        // AnySigner: per-service keys mean each client signs with its own key,
+        // not a shared root key. The envelope signature is still verified — we
+        // just don't pin it to the server's own key. JWT claims + Casbin handle
+        // authorization.
         // subsecond::call wraps dispatch for hot-patching during dev
         let (response_bytes, continuation) = subsecond::call(|| process_request(
             raw_bytes,
             &*service,
-            EnvelopeVerification::FixedSigner(&server_pubkey),
+            EnvelopeVerification::AnySigner,
             &signing_key,
             &nonce_cache,
         )).await?;
@@ -1823,26 +1827,21 @@ impl WebTransportServer {
         let _ = push_socket.set_linger(0);
 
         // Read loop: ZMTP multipart from WebTransport → ZMQ PUSH
-        loop {
-            match zmtp.recv_multipart().await {
-                Ok(msg) => {
-                    if msg.parts.is_empty() {
-                        continue;
-                    }
-                    // Forward all frames via ZMQ PUSH
-                    for (i, frame) in msg.parts.iter().enumerate() {
-                        let flags = if i < msg.parts.len() - 1 {
-                            zmq::SNDMORE | zmq::DONTWAIT
-                        } else {
-                            zmq::DONTWAIT
-                        };
-                        if let Err(e) = push_socket.send(frame.as_ref(), flags) {
-                            warn!(topic = %topic, "PUSH send failed: {}", e);
-                            break;
-                        }
-                    }
+        while let Ok(msg) = zmtp.recv_multipart().await {
+            if msg.parts.is_empty() {
+                continue;
+            }
+            // Forward all frames via ZMQ PUSH
+            for (i, frame) in msg.parts.iter().enumerate() {
+                let flags = if i < msg.parts.len() - 1 {
+                    zmq::SNDMORE | zmq::DONTWAIT
+                } else {
+                    zmq::DONTWAIT
+                };
+                if let Err(e) = push_socket.send(frame.as_ref(), flags) {
+                    warn!(topic = %topic, "PUSH send failed: {}", e);
+                    break;
                 }
-                Err(_) => break, // stream closed
             }
         }
 

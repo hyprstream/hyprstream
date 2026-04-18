@@ -77,6 +77,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::unwrap_used)]
     #[tokio::test]
     async fn federated_provider_signs_locally() {
         let root = SigningKey::generate(&mut rand::rngs::OsRng);
@@ -92,6 +93,7 @@ mod tests {
         assert!(vk.verify(b"hello", &signature).is_ok());
     }
 
+    #[allow(clippy::unwrap_used)]
     #[test]
     fn federated_resolve_local_key() {
         let root = SigningKey::generate(&mut rand::rngs::OsRng);

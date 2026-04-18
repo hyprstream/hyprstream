@@ -484,9 +484,14 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
             pub const SERVICE_NAME: &'static str = #service_name_lit;
 
             /// Create a new client by looking up the service endpoint from the global registry.
+            ///
+            /// `server_verifying_key` is the Ed25519 verifying key of the target service,
+            /// used to verify response envelope signatures. This must be the target service's
+            /// actual pubkey (obtained via service JWT / discovery), NOT the caller's key.
             pub fn for_service(
                 signing_key: hyprstream_rpc::crypto::SigningKey,
                 identity: hyprstream_rpc::envelope::RequestIdentity,
+                server_verifying_key: hyprstream_rpc::crypto::VerifyingKey,
             ) -> Self {
                 let endpoint = hyprstream_rpc::registry::try_global()
                     .map(|r| r.endpoint(#service_name_lit, hyprstream_rpc::registry::SocketKind::Rep))
@@ -494,16 +499,19 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
                         concat!("hyprstream/", #service_name_lit)
                     ))
                     .to_zmq_string();
-                Self::for_endpoint(&endpoint, signing_key, identity)
+                Self::for_endpoint(&endpoint, signing_key, identity, server_verifying_key)
             }
 
             /// Create a new client connected to a specific endpoint.
+            ///
+            /// `server_verifying_key` is the target service's Ed25519 verifying key,
+            /// used to verify response signatures.
             pub fn for_endpoint(
                 endpoint: &str,
                 signing_key: hyprstream_rpc::crypto::SigningKey,
                 identity: hyprstream_rpc::envelope::RequestIdentity,
+                server_verifying_key: hyprstream_rpc::crypto::VerifyingKey,
             ) -> Self {
-                let server_verifying_key = signing_key.verifying_key();
                 let signer = hyprstream_rpc::signer::LocalSigner::new(signing_key, identity);
                 let transport = hyprstream_rpc::zmq_connection::ZmqConnection::new(
                     endpoint,
@@ -520,12 +528,13 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
                 resolver: &dyn hyprstream_rpc::Resolver,
                 signing_key: hyprstream_rpc::crypto::SigningKey,
                 identity: hyprstream_rpc::envelope::RequestIdentity,
+                server_verifying_key: hyprstream_rpc::crypto::VerifyingKey,
             ) -> anyhow::Result<Self> {
                 let endpoint = resolver
                     .resolve(Self::SERVICE_NAME, hyprstream_rpc::registry::SocketKind::Rep)
                     .await?
                     .to_zmq_string();
-                Ok(Self::for_endpoint(&endpoint, signing_key, identity))
+                Ok(Self::for_endpoint(&endpoint, signing_key, identity, server_verifying_key))
             }
 
             /// Create a client from an `IdentityProvider` with automatic endpoint resolution.

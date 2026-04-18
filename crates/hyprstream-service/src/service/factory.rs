@@ -50,6 +50,9 @@ pub struct QuicSharedConfig {
     pub server_name: String,
     /// OAuth issuer URL for RFC 9728 protected resource metadata
     pub oauth_issuer_url: Option<String>,
+    /// JWT verifying key (derived from root via HKDF "hyprstream-jwt-v1").
+    /// Published as `x_root_pubkey` in RFC 9728 metadata for client-side trust pinning.
+    pub jwt_verifying_key: Option<ed25519_dalek::VerifyingKey>,
 }
 
 impl QuicSharedConfig {
@@ -59,11 +62,21 @@ impl QuicSharedConfig {
     pub fn for_service(&self, service_name: &str, port: u16) -> hyprstream_rpc::service::QuicLoopConfig {
         let bind_addr = std::net::SocketAddr::new(self.base_ip, port);
         let metadata = self.oauth_issuer_url.as_ref().map(|issuer| {
-            serde_json::json!({
+            let mut meta = serde_json::json!({
                 "resource": format!("https://{}/{}", self.server_name, service_name),
                 "authorization_servers": [issuer],
                 "bearer_methods_supported": ["header"],
-            }).to_string().into_bytes()
+            });
+            // Publish root pubkey for client-side trust pinning (TOFU)
+            if let Some(ref vk) = self.jwt_verifying_key {
+                use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+                #[allow(clippy::unwrap_used)] // meta is always a JSON object
+                meta.as_object_mut().unwrap().insert(
+                    "x_root_pubkey".to_owned(),
+                    serde_json::Value::String(URL_SAFE_NO_PAD.encode(vk.to_bytes())),
+                );
+            }
+            meta.to_string().into_bytes()
         });
         hyprstream_rpc::service::QuicLoopConfig {
             cert_chain: self.cert_chain.clone(),
@@ -103,13 +116,15 @@ impl QuicSharedConfig {
                 };
                 rt.block_on(async {
                     let client = hyprstream_discovery::DiscoveryClient::for_service(
-                        sk,
+                        sk.clone(),
                         hyprstream_rpc::RequestIdentity::anonymous(),
+                        hyprstream_rpc::node_identity::service_verifying_key(&sk, "discovery"),
                     );
                     match client.announce(&hyprstream_discovery::ServiceAnnouncement {
                         service_name: svc_name,
                         socket_kind: "quic".to_owned(),
                         endpoint,
+                        service_jwt: None, // TODO(phase-2c): include service JWT when heartbeat is implemented
                     }).await {
                         Ok(_) => tracing::info!("Announced QUIC endpoint to DiscoveryService"),
                         Err(e) => tracing::warn!("Failed to announce QUIC endpoint: {}", e),
@@ -231,14 +246,60 @@ impl ServiceContext {
         self.zmq_context.clone()
     }
 
-    /// Get the signing key.
+    /// Get the root signing key.
+    ///
+    /// **Only PolicyService (the CA) should call this.** All other services must
+    /// use `service_signing_key("name")` for per-service key derivation. The root
+    /// key is needed by PolicyService to issue service JWTs and by node-level
+    /// operations (main.rs) for QuicSharedConfig construction.
+    ///
+    /// If you're writing a factory function and the service name is not "policy",
+    /// use `service_signing_key(service_name)` instead.
+    #[inline]
     pub fn signing_key(&self) -> &SigningKey {
         &self.signing_key
+    }
+
+    /// Derive a per-service signing key via HKDF.
+    ///
+    /// Each service gets its own Ed25519 key derived from the root key
+    /// using `HKDF(root, "service:{name}")`. This provides key separation
+    /// between services while maintaining a single root of trust.
+    ///
+    /// PolicyService keeps the root key directly (it IS the CA).
+    pub fn service_signing_key(&self, service_name: &str) -> SigningKey {
+        if service_name == "policy" {
+            self.signing_key.clone()
+        } else {
+            hyprstream_rpc::node_identity::derive_purpose_key(
+                &self.signing_key,
+                &format!("service:{service_name}"),
+            )
+        }
+    }
+
+    /// Get the verifying key for a target service.
+    ///
+    /// PolicyService ("policy") uses the root key directly (it IS the CA).
+    /// All other services use `HKDF(root, "service:{name}")` derived keys.
+    pub fn service_verifying_key(&self, service_name: &str) -> VerifyingKey {
+        self.service_signing_key(service_name).verifying_key()
     }
 
     /// Get the verifying key.
     pub fn verifying_key(&self) -> VerifyingKey {
         self.verifying_key
+    }
+
+    /// Get the JWT verifying key (derived from root via HKDF "hyprstream-jwt-v1").
+    ///
+    /// This is the key that verifies all service JWTs. Published as `x_root_pubkey`
+    /// in RFC 9728 metadata. Services use this to verify service JWTs from peers.
+    pub fn jwt_verifying_key(&self) -> VerifyingKey {
+        hyprstream_rpc::node_identity::derive_purpose_key(
+            &self.signing_key,
+            "hyprstream-jwt-v1",
+        ).verifying_key()
     }
 
     /// Get the identity provider for purpose-keyed signing.
@@ -323,7 +384,7 @@ impl ServiceContext {
                     Some(shared.for_service_with_announce(
                         service.name(),
                         port,
-                        self.signing_key().clone(),
+                        self.service_signing_key(service.name()),
                     ))
                 }
             }

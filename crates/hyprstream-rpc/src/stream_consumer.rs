@@ -291,6 +291,7 @@ impl<T: Transport> StreamHandleImpl<T> {
 }
 
 /// Build a StreamControl::Cancel capnp message.
+#[allow(clippy::expect_used)]
 fn build_stream_control_cancel() -> Vec<u8> {
     let mut builder = capnp::message::Builder::new_default();
     {

@@ -29,6 +29,7 @@ const NODE_IDENTITY_SALT: &[u8] = b"hyprstream-node-identity-hkdf-v1";
 ///
 /// Standalone function for use in sync contexts (e.g., JWT signing)
 /// where the full async `IdentityProvider` isn't needed.
+#[allow(clippy::expect_used)] // HKDF-SHA256 expand to 32 bytes cannot fail
 pub fn derive_purpose_key(root_key: &SigningKey, purpose: &str) -> SigningKey {
     assert!(!purpose.is_empty(), "purpose must be non-empty");
     assert!(purpose.len() <= 255, "purpose must be at most 255 bytes");
@@ -39,6 +40,18 @@ pub fn derive_purpose_key(root_key: &SigningKey, purpose: &str) -> SigningKey {
     let key = SigningKey::from_bytes(&okm);
     okm.zeroize();
     key
+}
+
+/// Get the verifying key for a target service.
+///
+/// PolicyService ("policy") uses the root key directly (it IS the CA).
+/// All other services use `HKDF(root, "service:{name}")` derived keys.
+pub fn service_verifying_key(root_key: &SigningKey, service_name: &str) -> ed25519_dalek::VerifyingKey {
+    if service_name == "policy" {
+        root_key.verifying_key()
+    } else {
+        derive_purpose_key(root_key, &format!("service:{service_name}")).verifying_key()
+    }
 }
 
 /// A purpose-derived Ed25519 signing identity.
@@ -67,6 +80,7 @@ impl SigningIdentity for DerivedIdentity {
 /// so `resolve()` can map them back to the node's "system" subject.
 pub struct NodeIdentityProvider {
     root_seed: [u8; 32],
+    #[allow(dead_code)]
     node_pubkey: [u8; 32],
     /// All pubkeys derived from this node's root — recognized as "system".
     known_pubkeys: RwLock<HashSet<[u8; 32]>>,
@@ -101,6 +115,7 @@ impl NodeIdentityProvider {
         }
         let hk = Hkdf::<Sha256>::new(Some(NODE_IDENTITY_SALT), &self.root_seed);
         let mut okm = [0u8; 32];
+        #[allow(clippy::expect_used)] // HKDF-SHA256 expand to 32 bytes cannot fail
         hk.expand(purpose.as_bytes(), &mut okm)
             .expect("HKDF-SHA256 expand to 32 bytes cannot fail");
         let key = SigningKey::from_bytes(&okm);
@@ -150,6 +165,7 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
 
+    #[allow(clippy::unwrap_used)]
     #[tokio::test]
     async fn same_purpose_same_key() {
         let root = SigningKey::generate(&mut rand::rngs::OsRng);
@@ -160,6 +176,7 @@ mod tests {
         assert_eq!(id1.pubkey(), id2.pubkey());
     }
 
+    #[allow(clippy::unwrap_used)]
     #[tokio::test]
     async fn different_purpose_different_key() {
         let root = SigningKey::generate(&mut rand::rngs::OsRng);
@@ -170,6 +187,7 @@ mod tests {
         assert_ne!(id1.pubkey(), id2.pubkey());
     }
 
+    #[allow(clippy::unwrap_used)]
     #[tokio::test]
     async fn sign_and_verify() {
         let root = SigningKey::generate(&mut rand::rngs::OsRng);
@@ -185,6 +203,7 @@ mod tests {
         assert!(vk.verify(msg, &signature).is_ok());
     }
 
+    #[allow(clippy::unwrap_used)]
     #[test]
     fn resolve_node_key() {
         let root = SigningKey::generate(&mut rand::rngs::OsRng);
@@ -195,6 +214,7 @@ mod tests {
         assert_eq!(provider.resolve(&[0u8; 32]).name(), None);
     }
 
+    #[allow(clippy::unwrap_used)]
     #[tokio::test]
     async fn resolve_derived_key() {
         let root = SigningKey::generate(&mut rand::rngs::OsRng);
@@ -212,6 +232,7 @@ mod tests {
         assert_eq!(provider.resolve(&[0u8; 32]).name(), None);
     }
 
+    #[allow(clippy::unwrap_used)]
     #[tokio::test]
     async fn empty_purpose_rejected() {
         let root = SigningKey::generate(&mut rand::rngs::OsRng);
@@ -219,6 +240,7 @@ mod tests {
         assert!(provider.identity_open("").await.is_err());
     }
 
+    #[allow(clippy::unwrap_used)]
     #[tokio::test]
     async fn long_purpose_rejected() {
         let root = SigningKey::generate(&mut rand::rngs::OsRng);
@@ -227,6 +249,7 @@ mod tests {
         assert!(provider.identity_open(&long).await.is_err());
     }
 
+    #[allow(clippy::unwrap_used)]
     #[test]
     fn salt_produces_different_keys_than_none() {
         let root = SigningKey::generate(&mut rand::rngs::OsRng);
