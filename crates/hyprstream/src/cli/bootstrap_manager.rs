@@ -15,6 +15,7 @@ use ed25519_dalek::SigningKey;
 
 use hyprstream_tui::wizard::backend::*;
 
+use crate::auth::identity_store;
 use crate::auth::policy_templates::{get_template, get_templates};
 use crate::auth::{LocalKeyStore, PolicyManager, UserStore, write_policy_file};
 use crate::cli::gpu_detect;
@@ -613,10 +614,84 @@ async fn do_bootstrap(
             .context("Failed to create default policy files")?;
     }
 
-    // ── 4. Signing key ──────────────────────────────────────────────────────
+    // ── 4. Signing key (becomes the CA key for PolicyService) ────────────
     let _ = tx.send(BootstrapPoll::InProgress("Loading signing key...".to_owned()));
-    load_or_generate_signing_key(keys_dir).await?;
-    steps.push("Signing key OK".to_owned());
+    let root_key = load_or_generate_signing_key(keys_dir).await?;
+
+    // ── 4b. Per-service independent keys + CA credentials ────────────────
+    let _ = tx.send(BootstrapPoll::InProgress("Generating service keys...".to_owned()));
+    {
+        let credentials_dir = crate::config::HyprConfig::load()
+            .map(|c| c.config_dir().join("credentials"))
+            .unwrap_or_else(|_| {
+                dirs::config_dir()
+                    .unwrap_or_else(|| models_dir.to_path_buf())
+                    .join("hyprstream")
+                    .join("credentials")
+            });
+
+        // Write CA signing key (the root key becomes the CA key)
+        identity_store::write_ca_signing_key(&credentials_dir, &root_key)?;
+
+        // Write CA verifying key (public, distributed to all services)
+        identity_store::write_ca_verifying_key(&credentials_dir, &root_key.verifying_key())?;
+
+        // CA JWT signing key (purpose-derived for JWT signature separation)
+        let ca_jwt_key = hyprstream_rpc::node_identity::derive_purpose_key(
+            &root_key, "hyprstream-jwt-v1",
+        );
+
+        // Generate independent keypairs for each registered service
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use hyprstream_service::list_factories;
+
+        let mut bootstrap_pubkeys = std::collections::HashMap::new();
+        let now = chrono::Utc::now().timestamp();
+        let expiry = now + 7 * 86_400; // 7 days
+
+        for factory in list_factories() {
+            let service_name = factory.name;
+
+            if service_name == "policy" {
+                // PolicyService uses the root/CA key directly — no independent key needed.
+                // Add its pubkey to bootstrap map.
+                bootstrap_pubkeys.insert(
+                    service_name.to_owned(),
+                    root_key.verifying_key(),
+                );
+                continue;
+            }
+
+            // Generate independent Ed25519 keypair
+            let service_key = identity_store::load_or_generate_service_signing_key(
+                &credentials_dir, service_name,
+            )?;
+            let service_vk = service_key.verifying_key();
+
+            // Issue service JWT (CA-signed certificate binding name → pubkey)
+            let claims = hyprstream_rpc::auth::Claims::new(
+                format!("service:{service_name}"),
+                now,
+                expiry,
+            )
+            .with_pub_key(URL_SAFE_NO_PAD.encode(service_vk.as_bytes()));
+
+            let jwt = hyprstream_rpc::auth::jwt::encode(&claims, &ca_jwt_key);
+            identity_store::write_service_jwt(&credentials_dir, service_name, &jwt)?;
+
+            // Add to bootstrap pubkeys (policy + discovery are critical)
+            bootstrap_pubkeys.insert(service_name.to_owned(), service_vk);
+        }
+
+        // Write bootstrap pubkeys for all services
+        identity_store::write_bootstrap_pubkeys(&credentials_dir, &bootstrap_pubkeys)?;
+
+        tracing::info!(
+            "Generated {} independent service keypairs + JWTs",
+            bootstrap_pubkeys.len(),
+        );
+    }
+    steps.push("Service keys OK".to_owned());
 
     // ── 5. Done ─────────────────────────────────────────────────────────────
     let _ = tx.send(BootstrapPoll::InProgress("Validating environment...".to_owned()));
