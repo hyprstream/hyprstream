@@ -18,6 +18,7 @@
 
 use age::secrecy::ExposeSecret;
 use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -109,6 +110,180 @@ fn missing_in_readonly(secrets_dir: &std::path::Path, name: &str) -> anyhow::Err
 }
 
 // ─── High-level key loaders ─────────────────────────────────────────────────
+
+// ─── Per-service key management ──────────────────────────────────────────────
+
+/// Per-service credential directory layout:
+///
+/// ```text
+/// credentials/
+///   ca-key            # CA private key (policy service only)
+///   ca-pubkey         # CA verifying key (public, all services)
+///   {service}/
+///     signing-key     # service's own Ed25519 private key
+///     service-jwt     # CA-signed JWT certificate
+///   bootstrap-pubkeys # JSON: { "policy": "base64...", "discovery": "base64..." }
+/// ```
+
+/// Load or generate an independent Ed25519 signing key for a specific service.
+///
+/// Each service gets its own randomly-generated keypair stored in
+/// `credentials/{service_name}/signing-key`. This is NOT derived from the root
+/// key — it's an independent key that the CA (PolicyService) certifies via a
+/// service JWT.
+///
+/// # Arguments
+///
+/// * `credentials_dir` — Base credentials directory (e.g., `~/.config/hyprstream/credentials`)
+/// * `service_name` — Service name (e.g., "model", "discovery")
+pub fn load_or_generate_service_signing_key(
+    credentials_dir: &std::path::Path,
+    service_name: &str,
+) -> Result<SigningKey> {
+    let service_dir = credentials_dir.join(service_name);
+    const NAME: &str = "signing-key";
+
+    if let Some(mut bytes) = read_secret(&service_dir, NAME)? {
+        let mut arr: [u8; 32] = bytes.as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("service '{service_name}' signing-key must be 32 bytes (Ed25519 seed)"))?;
+        let sk = SigningKey::from_bytes(&arr);
+        bytes.zeroize();
+        arr.zeroize();
+        tracing::info!("Loaded Ed25519 signing key for service '{service_name}'");
+        return Ok(sk);
+    }
+
+    if !is_writable(&service_dir) && !is_writable(credentials_dir) {
+        return Err(missing_in_readonly(&service_dir, NAME));
+    }
+
+    let key = SigningKey::generate(&mut rand::rngs::OsRng);
+    let mut raw = key.to_bytes();
+    let result = write_secret(&service_dir, NAME, &raw);
+    raw.zeroize();
+    result?;
+    tracing::info!("Generated new Ed25519 signing key for service '{service_name}'");
+    Ok(key)
+}
+
+/// Load the CA signing key (PolicyService only).
+///
+/// The CA key is the PolicyService's own signing key — it signs service JWTs
+/// that bind service names to their Ed25519 pubkeys.
+pub fn load_ca_signing_key(credentials_dir: &std::path::Path) -> Result<SigningKey> {
+    const NAME: &str = "ca-key";
+    if let Some(mut bytes) = read_secret(credentials_dir, NAME)? {
+        let mut arr: [u8; 32] = bytes.as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("ca-key must be 32 bytes (Ed25519 seed)"))?;
+        let sk = SigningKey::from_bytes(&arr);
+        bytes.zeroize();
+        arr.zeroize();
+        tracing::info!("Loaded CA signing key");
+        return Ok(sk);
+    }
+    Err(missing_in_readonly(credentials_dir, NAME))
+}
+
+/// Write the CA signing key to the credentials directory.
+///
+/// Used during wizard bootstrap to persist the generated CA key.
+pub fn write_ca_signing_key(credentials_dir: &std::path::Path, key: &SigningKey) -> Result<()> {
+    write_secret(credentials_dir, "ca-key", &key.to_bytes())
+}
+
+/// Load the CA verifying key (public, distributed to all services).
+///
+/// This is the trust anchor for verifying service JWTs.
+pub fn load_ca_verifying_key(credentials_dir: &std::path::Path) -> Result<VerifyingKey> {
+    const NAME: &str = "ca-pubkey";
+    if let Some(bytes) = read_secret(credentials_dir, NAME)? {
+        let arr: [u8; 32] = bytes.as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("ca-pubkey must be 32 bytes (Ed25519 pubkey)"))?;
+        VerifyingKey::from_bytes(&arr)
+            .map_err(|e| anyhow!("invalid ca-pubkey: {e}"))
+    } else {
+        Err(missing_in_readonly(credentials_dir, NAME))
+    }
+}
+
+/// Write the CA verifying key to the credentials directory.
+pub fn write_ca_verifying_key(credentials_dir: &std::path::Path, key: &VerifyingKey) -> Result<()> {
+    write_secret(credentials_dir, "ca-pubkey", key.as_bytes())
+}
+
+/// Load a service JWT (CA-signed certificate binding service name → pubkey).
+pub fn load_service_jwt(credentials_dir: &std::path::Path, service_name: &str) -> Result<Option<String>> {
+    let service_dir = credentials_dir.join(service_name);
+    match read_secret(&service_dir, "service-jwt") {
+        Ok(Some(bytes)) => {
+            let jwt = String::from_utf8(bytes)
+                .context("service-jwt is not valid UTF-8")?;
+            Ok(Some(jwt))
+        }
+        Ok(None) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Write a service JWT to the service's credential directory.
+pub fn write_service_jwt(
+    credentials_dir: &std::path::Path,
+    service_name: &str,
+    jwt: &str,
+) -> Result<()> {
+    let service_dir = credentials_dir.join(service_name);
+    write_secret(&service_dir, "service-jwt", jwt.as_bytes())
+}
+
+/// Bootstrap pubkeys — the pubkeys of services needed before discovery is available.
+///
+/// Contains the pubkeys of PolicyService and DiscoveryService, which must be
+/// known to all services so they can verify RPC responses from these bootstrap
+/// services without querying discovery (chicken-and-egg).
+pub fn load_bootstrap_pubkeys(
+    credentials_dir: &std::path::Path,
+) -> Result<std::collections::HashMap<String, VerifyingKey>> {
+    const NAME: &str = "bootstrap-pubkeys";
+    match read_secret(credentials_dir, NAME) {
+        Ok(Some(bytes)) => {
+            let json: std::collections::HashMap<String, String> = serde_json::from_slice(&bytes)
+                .context("bootstrap-pubkeys is not valid JSON")?;
+            let mut map = std::collections::HashMap::new();
+            for (name, b64) in json {
+                let pubkey_bytes: Vec<u8> = URL_SAFE_NO_PAD.decode(b64)
+                    .with_context(|| format!("invalid base64 in bootstrap-pubkeys for '{name}'"))?;
+                let arr: [u8; 32] = pubkey_bytes.try_into()
+                    .map_err(|_| anyhow!("bootstrap-pubkey for '{name}' must be 32 bytes"))?;
+                let vk = VerifyingKey::from_bytes(&arr)
+                    .map_err(|e| anyhow!("invalid bootstrap-pubkey for '{name}': {e}"))?;
+                map.insert(name, vk);
+            }
+            Ok(map)
+        }
+        Ok(None) => Ok(std::collections::HashMap::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Write bootstrap pubkeys to the credentials directory.
+pub fn write_bootstrap_pubkeys(
+    credentials_dir: &std::path::Path,
+    pubkeys: &std::collections::HashMap<String, VerifyingKey>,
+) -> Result<()> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let json: std::collections::HashMap<String, String> = pubkeys
+        .iter()
+        .map(|(name, vk)| (name.clone(), URL_SAFE_NO_PAD.encode(vk.as_bytes())))
+        .collect();
+    let data = serde_json::to_vec(&json)
+        .context("failed to serialize bootstrap-pubkeys")?;
+    write_secret(credentials_dir, "bootstrap-pubkeys", &data)
+}
+
+// ─── Node-level key loaders ──────────────────────────────────────────────────
 
 /// Load or generate the Ed25519 **node** signing key (the root-of-trust key
 /// that identifies this Hyprstream instance).
