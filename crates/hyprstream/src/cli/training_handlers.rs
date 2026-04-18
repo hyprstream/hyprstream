@@ -394,7 +394,11 @@ pub async fn handle_training_infer(
         .map_err(|e| anyhow::anyhow!("Failed to spawn inference service: {}", e))?;
 
     // Create client for service communication
-    let client = InferenceClient::for_service(signing_key, RequestIdentity::anonymous());
+    let client = InferenceClient::for_service(
+        signing_key.clone(),
+        RequestIdentity::anonymous(),
+        hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "inference"),
+    );
 
     // Apply chat template
     let messages = vec![ChatMessage { role: "user".into(), content: prompt.into(), tool_calls: vec![], tool_call_id: String::new() }];
@@ -685,7 +689,11 @@ pub async fn handle_training_batch(
     let mut service_handle = spawner.spawn(service_config).await
         .map_err(|e| anyhow::anyhow!("Failed to spawn inference service: {}", e))?;
 
-    let client = InferenceClient::for_service(signing_key, RequestIdentity::anonymous());
+    let client = InferenceClient::for_service(
+        signing_key.clone(),
+        RequestIdentity::anonymous(),
+        hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "inference"),
+    );
 
     // Get adapter info for checkpoint saves
     let adapter_manager = AdapterManager::new(&model_path);

@@ -452,9 +452,11 @@ fn handle_quick_command(
             || async move {
                 let keys_dir = ctx.models_dir().join(".registry").join("keys");
                 let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+                let model_server_vk = hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "model");
                 let model_client = hyprstream_core::services::generated::model_client::ModelClient::for_service(
                     signing_key,
                     RequestIdentity::anonymous(),
+                    model_server_vk,
                 );
                 let filters = parse_filters(&filter)?;
                 let status_filter = parse_status_filter(&status)?;
@@ -1053,6 +1055,7 @@ fn handle_quick_command(
                         let worker_policy_client = PolicyClient::for_service(
                             signing_key.clone(),
                             RequestIdentity::anonymous(),
+                            hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "policy"),
                         );
                         worker_service.set_authorize_fn(
                             hyprstream_core::services::build_authorize_fn(worker_policy_client),
@@ -1070,8 +1073,9 @@ fn handle_quick_command(
                     };
 
                     use hyprstream_workers::runtime::WorkerClient;
+                    let worker_server_vk = hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "worker");
                     let worker_client =
-                        WorkerClient::for_service(signing_key, RequestIdentity::anonymous());
+                        WorkerClient::for_service(signing_key, RequestIdentity::anonymous(), worker_server_vk);
 
                     match action {
                         WorkerAction::List {
@@ -1502,6 +1506,7 @@ fn main() -> Result<()> {
                         let wf_policy_client = PolicyClient::for_service(
                             signing_key.clone(),
                             RequestIdentity::anonymous(),
+                            hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "policy"),
                         );
                         wf_svc.set_authorize_fn(
                             hyprstream_core::services::build_authorize_fn(wf_policy_client),
@@ -1520,6 +1525,7 @@ fn main() -> Result<()> {
                 let client = hyprstream_core::services::RegistryClient::for_service(
                     signing_key.clone(),
                     RequestIdentity::anonymous(),
+                    hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "registry"),
                 );
 
                 Ok::<_, anyhow::Error>((
@@ -1542,6 +1548,7 @@ fn main() -> Result<()> {
                 let client = hyprstream_core::services::RegistryClient::for_service(
                     signing_key.clone(),
                     RequestIdentity::anonymous(),
+                    hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "registry"),
                 );
 
                 Ok::<_, anyhow::Error>((client, Vec::new(), None, signing_key, verifying_key))
@@ -1660,6 +1667,7 @@ fn main() -> Result<()> {
                                     let policy_client = PolicyClient::for_service(
                                         signing_key.clone(),
                                         hyprstream_rpc::RequestIdentity::anonymous(),
+                                        hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "policy"),
                                     );
 
                                     let runtime_config =
@@ -1757,6 +1765,7 @@ fn main() -> Result<()> {
                                         base_ip: qc.socket_addr()?.ip(),
                                         server_name: qc.server_name.clone(),
                                         oauth_issuer_url: Some(config.oauth.issuer_url()),
+                                        jwt_verifying_key: Some(ctx.jwt_verifying_key()),
                                     };
                                     ctx = ctx.with_quic(shared);
                                 }

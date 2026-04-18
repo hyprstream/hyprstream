@@ -162,12 +162,22 @@ pub async fn handle_shell_tui(
     // Model load-status channel (background polling → event loop).
     let model_client = {
         use hyprstream_rpc::envelope::RequestIdentity;
-        crate::services::generated::model_client::ModelClient::for_service(signing_key.clone(), RequestIdentity::anonymous())
+        use hyprstream_rpc::node_identity::service_verifying_key;
+        crate::services::generated::model_client::ModelClient::for_service(
+            signing_key.clone(),
+            RequestIdentity::anonymous(),
+            service_verifying_key(&signing_key, "model"),
+        )
     };
     // Worker client for sandbox/container/image management.
     let worker_client = {
         use hyprstream_rpc::envelope::RequestIdentity;
-        hyprstream_workers::runtime::WorkerClient::for_service(signing_key.clone(), RequestIdentity::anonymous())
+        use hyprstream_rpc::node_identity::service_verifying_key;
+        hyprstream_workers::runtime::WorkerClient::for_service(
+            signing_key.clone(),
+            RequestIdentity::anonymous(),
+            service_verifying_key(&signing_key, "worker"),
+        )
     };
     let (model_status_tx, mut model_status_rx) =
         tokio::sync::mpsc::channel::<ModelStatusUpdate>(32);
@@ -1549,10 +1559,12 @@ async fn fetch_models(
         &registry_endpoint,
         signing_key.clone(),
         RequestIdentity::anonymous(),
+        hyprstream_rpc::node_identity::service_verifying_key(signing_key, "registry"),
     );
     let model_client_for_status = crate::services::generated::model_client::ModelClient::for_service(
         signing_key.clone(),
         RequestIdentity::anonymous(),
+        hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "model"),
     );
     let registry_models_dir = models_dir.to_path_buf();
     let status_timeout = std::time::Duration::from_millis(500);

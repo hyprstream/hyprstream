@@ -246,27 +246,34 @@ impl PolicyHandler for PolicyService {
     ) -> Result<PolicyResponseVariant> {
         trace!("Issuing JWT token");
 
+        let is_service_token = data.subject.as_ref().map_or(false, |s| s.starts_with("service:"));
+
         // Determine subject: explicit subject (if provided and authorized) or envelope identity.
         // JWT sub must contain a bare username (e.g. "randy", "birdetta") — the identity
         // system adds the namespace prefix ("token:randy") when the JWT is decoded.
+        // For service tokens: sub = "service:{name}", e.g. "service:model".
         let subject = if let Some(ref subj) = data.subject.as_ref().filter(|s| !s.is_empty()) {
             // Explicit subject requires `manage` permission on `policy:issue-token`
+            // Service tokens from in-process callers (system subject) are auto-allowed.
             let caller = ctx.subject().to_string();
-            let allowed = self.policy_manager.check_with_domain(
-                &caller,
-                "*",
-                "policy:issue-token",
-                Operation::Manage.as_str(),
-            ).await;
-            if !allowed {
-                return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                    message: format!(
-                        "Subject '{}' is not authorized to issue tokens on behalf of '{}'",
-                        caller, subj
-                    ),
-                    code: "UNAUTHORIZED_SUBJECT".to_owned(),
-                    details: "Requires 'manage' permission on 'policy:issue-token'".to_owned(),
-                }));
+            let is_system = caller == "system";
+            if !is_system {
+                let allowed = self.policy_manager.check_with_domain(
+                    &caller,
+                    "*",
+                    "policy:issue-token",
+                    Operation::Manage.as_str(),
+                ).await;
+                if !allowed {
+                    return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                        message: format!(
+                            "Subject '{}' is not authorized to issue tokens on behalf of '{}'",
+                            caller, subj
+                        ),
+                        code: "UNAUTHORIZED_SUBJECT".to_owned(),
+                        details: "Requires 'manage' permission on 'policy:issue-token'".to_owned(),
+                    }));
+                }
             }
             (*subj).clone()
         } else {
@@ -274,8 +281,13 @@ impl PolicyHandler for PolicyService {
             ctx.user().to_owned()
         };
 
-        // Validate TTL
-        let requested_ttl = data.ttl.filter(|&t| t != 0).unwrap_or(self.token_config.default_ttl_seconds);
+        // Validate TTL — service tokens get a longer default (7 days)
+        let default_ttl = if is_service_token {
+            data.ttl.filter(|&t| t != 0).unwrap_or(604800) // 7 days for service tokens
+        } else {
+            data.ttl.filter(|&t| t != 0).unwrap_or(self.token_config.default_ttl_seconds)
+        };
+        let requested_ttl = default_ttl;
 
         const MIN_TTL_SECONDS: u32 = 60;
         if requested_ttl < MIN_TTL_SECONDS {
@@ -300,15 +312,33 @@ impl PolicyHandler for PolicyService {
         let audience = data.audience.as_ref().filter(|s| !s.is_empty()).cloned()
             .or_else(|| self.default_audience.clone());
 
+        // Service tokens: derive the Ed25519 pubkey from the root key.
+        // The CA (PolicyService) is authoritative — the pubkey is not caller-provided.
+        let service_pub_key = if is_service_token {
+            let svc_name = &subject["service:".len()..];
+            let svc_signing_key = hyprstream_rpc::node_identity::derive_purpose_key(
+                &self.signing_key,
+                &format!("service:{svc_name}"),
+            );
+            use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+            Some(URL_SAFE_NO_PAD.encode(svc_signing_key.verifying_key().to_bytes()))
+        } else {
+            None
+        };
+
         // Populate iss with the OAuth issuer URL so federation peers can fetch JWKS.
         // default_audience is the OAuth issuer URL (set via with_default_audience).
         let issuer = self.default_audience.clone().unwrap_or_default();
-        let claims = hyprstream_rpc::auth::Claims::new(
+        let mut claims = hyprstream_rpc::auth::Claims::new(
             subject,
             now,
             now + requested_ttl as i64,
         ).with_issuer(issuer)
          .with_audience(audience);
+
+        if let Some(pub_key) = service_pub_key {
+            claims = claims.with_pub_key(pub_key);
+        }
 
         let token = crate::auth::jwt::encode(&claims, &self.jwt_signing_key);
 

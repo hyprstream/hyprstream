@@ -281,10 +281,12 @@ impl Spawnable for OAuthService {
             let policy_client = PolicyClient::for_service(
                 self.signing_key.clone(),
                 hyprstream_rpc::RequestIdentity::anonymous(),
+                hyprstream_rpc::node_identity::service_verifying_key(&self.signing_key, "policy"),
             );
             let discovery_client = crate::services::DiscoveryClient::for_service(
                 self.signing_key.clone(),
                 hyprstream_rpc::RequestIdentity::anonymous(),
+                hyprstream_rpc::node_identity::service_verifying_key(&self.signing_key, "discovery"),
             );
 
             // Attempt to load the user credential store for Ed25519 device verification.

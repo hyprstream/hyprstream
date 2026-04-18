@@ -194,7 +194,11 @@ impl ModelService {
         };
         let cache_size = NonZeroUsize::new(config.max_models).unwrap_or(DEFAULT_CACHE_SIZE);
 
-        let notif_client = NotificationClient::for_service(signing_key.clone(), RequestIdentity::anonymous());
+        let notif_client = NotificationClient::for_service(
+            signing_key.clone(),
+            RequestIdentity::anonymous(),
+            hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "notification"),
+        );
         let notification_publisher = NotificationPublisher::new(notif_client, signing_key.clone());
 
         Self { inner: Arc::new(ModelServiceInner {
@@ -272,7 +276,11 @@ impl ModelService {
         };
         let cache_size = NonZeroUsize::new(config.max_models).unwrap_or(DEFAULT_CACHE_SIZE);
 
-        let notif_client = NotificationClient::for_service(signing_key.clone(), RequestIdentity::anonymous());
+        let notif_client = NotificationClient::for_service(
+            signing_key.clone(),
+            RequestIdentity::anonymous(),
+            hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "notification"),
+        );
         let notification_publisher = NotificationPublisher::new(notif_client, signing_key.clone());
 
         Self { inner: Arc::new(ModelServiceInner {
@@ -411,6 +419,7 @@ impl ModelService {
             &endpoint,
             self.signing_key.clone(),
             RequestIdentity::anonymous(),
+            hyprstream_rpc::node_identity::service_verifying_key(&self.signing_key, "inference"),
         );
 
         // Load TTT config from model's config.json (if TTT is enabled)

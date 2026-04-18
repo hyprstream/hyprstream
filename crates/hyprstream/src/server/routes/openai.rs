@@ -472,7 +472,8 @@ async fn chat_completions(
 
     // Call inference via collect-stream (per-request ZMQ client preserves caller identity for TTT delta routing)
     let identity = identity_from_user(&user);
-    let model_client = ModelClient::for_service((*state.signing_key).clone(), identity);
+    let model_server_vk = hyprstream_rpc::node_identity::service_verifying_key(&state.signing_key, "model");
+    let model_client = ModelClient::for_service((*state.signing_key).clone(), identity, model_server_vk);
     let claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
     let result = collect_stream_to_result(&model_client.with_jwt(claims.token.unwrap_or_default()), &request.model, &gen_request).await;
 
@@ -674,7 +675,8 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
 
         // Start ZMQ stream with per-request client (preserves caller identity for TTT delta routing)
         let identity = identity_from_user(&user);
-        let model_client = ModelClient::for_service((*state.signing_key).clone(), identity);
+        let model_server_vk = hyprstream_rpc::node_identity::service_verifying_key(&state.signing_key, "model");
+        let model_client = ModelClient::for_service((*state.signing_key).clone(), identity, model_server_vk);
         let claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
         let client = model_client.with_jwt(claims.token.unwrap_or_default());
         use crate::services::generated::model_client::InferRpc;
@@ -1000,7 +1002,8 @@ async fn completions(
 
     // Call inference via collect-stream (per-request ZMQ client preserves caller identity for TTT delta routing)
     let identity = identity_from_user(&user);
-    let model_client = ModelClient::for_service((*state.signing_key).clone(), identity);
+    let model_server_vk = hyprstream_rpc::node_identity::service_verifying_key(&state.signing_key, "model");
+    let model_client = ModelClient::for_service((*state.signing_key).clone(), identity, model_server_vk);
     let claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
     let result = collect_stream_to_result(&model_client.with_jwt(claims.token.unwrap_or_default()), &request.model, &gen_request).await;
 

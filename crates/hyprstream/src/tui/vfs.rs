@@ -115,6 +115,7 @@ pub fn build_chat_vfs_namespace(
     let model_client = crate::services::generated::model_client::ModelClient::for_service(
         signing_key.clone(),
         RequestIdentity::anonymous(),
+        hyprstream_rpc::node_identity::service_verifying_key(signing_key, "model"),
     );
     let remote_model_mount = crate::services::remote_mount::RemoteModelMount::new(model_client);
     let _ = ns.mount("/srv/model", Arc::new(remote_model_mount));

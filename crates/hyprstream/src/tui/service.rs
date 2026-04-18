@@ -836,10 +836,12 @@ impl TuiService {
                     &registry_endpoint,
                     self.signing_key.clone(),
                     RequestIdentity::anonymous(),
+                    hyprstream_rpc::node_identity::service_verifying_key(&self.signing_key, "registry"),
                 );
             let model_client_for_status = crate::services::generated::model_client::ModelClient::for_service(
                 self.signing_key.clone(),
                 RequestIdentity::anonymous(),
+                hyprstream_rpc::node_identity::service_verifying_key(&self.signing_key, "model"),
             );
             let status_timeout = std::time::Duration::from_millis(500);
             let all_status_req = crate::services::generated::model_client::StatusRequest { model_ref: String::new() };
@@ -888,6 +890,7 @@ impl TuiService {
                 h.block_on(async {
                     let client = crate::services::generated::model_client::ModelClient::for_service(
                         sk.clone(), RequestIdentity::anonymous(),
+                        hyprstream_rpc::node_identity::service_verifying_key(&sk, "model"),
                     );
                     let _ = client.load(&crate::services::generated::model_client::LoadModelRequest {
                         model_ref: mr.clone(),
@@ -905,6 +908,7 @@ impl TuiService {
                         let loaded = h_poll.block_on(async {
                             let client = crate::services::generated::model_client::ModelClient::for_service(
                                 sk_poll.clone(), RequestIdentity::anonymous(),
+                                hyprstream_rpc::node_identity::service_verifying_key(&sk_poll, "model"),
                             );
                             client.status(&crate::services::generated::model_client::StatusRequest { model_ref: mr_poll.clone() }).await
                                 .is_ok_and(|es| es.iter().any(|e| e.status == "loaded"))
@@ -925,7 +929,10 @@ impl TuiService {
             let sk = sk_unload.clone();
             let mr = model_ref.to_owned();
             handle_unload.block_on(async move {
-                let client = crate::services::generated::model_client::ModelClient::for_service(sk, RequestIdentity::anonymous());
+                let client = crate::services::generated::model_client::ModelClient::for_service(
+                    sk.clone(), RequestIdentity::anonymous(),
+                    hyprstream_rpc::node_identity::service_verifying_key(&sk, "model"),
+                );
                 client.unload(&crate::services::generated::model_client::UnloadModelRequest { model_ref: mr.clone() }).await.is_ok()
             })
         });

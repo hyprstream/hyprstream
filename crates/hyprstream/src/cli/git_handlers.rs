@@ -1264,7 +1264,11 @@ pub async fn handle_infer(
     let _ = ModelRef::parse(model_ref_str)?;
 
     // ModelService is already running (started by main.rs in inproc mode, or by systemd in ipc-systemd mode).
-    let model_client = ModelClient::for_service(signing_key.clone(), RequestIdentity::anonymous());
+    let model_client = ModelClient::for_service(
+        signing_key.clone(),
+        RequestIdentity::anonymous(),
+        hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "model"),
+    );
 
     // Apply chat template to the prompt via ModelService
     let messages = vec![ChatMessage {
@@ -1434,6 +1438,7 @@ pub async fn handle_load(
         let notif_client = crate::services::NotificationClient::for_service(
             signing_key.clone(),
             RequestIdentity::anonymous(),
+            hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "notification"),
         );
 
         let sub_resp = notif_client.subscribe(&SubscribeRequest {
@@ -1469,7 +1474,11 @@ pub async fn handle_load(
     // (Continuation pattern), so this completes in milliseconds.
     // fire-and-forget via tokio::spawn caused the task to never run: the CLI runtime
     // drops before the spawned task executes.
-    let model_client = ModelClient::for_service(signing_key.clone(), RequestIdentity::anonymous());
+    let model_client = ModelClient::for_service(
+        signing_key.clone(),
+        RequestIdentity::anonymous(),
+        hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "model"),
+    );
     let model_ref_owned = model_ref_str.to_owned();
     match model_client.load(&LoadModelRequest {
         model_ref: model_ref_owned.clone(),
@@ -1724,9 +1733,11 @@ async fn handle_notify_subscribe(
     let (sub_secret, sub_pubkey) = generate_ephemeral_keypair();
     let sub_pub_bytes = sub_pubkey.to_bytes();
 
+    let notif_server_vk = hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "notification");
     let notif_client = crate::services::NotificationClient::for_service(
         signing_key,
         RequestIdentity::anonymous(),
+        notif_server_vk,
     );
 
     // Subscribe with maximum TTL for long-running listeners
@@ -1863,7 +1874,8 @@ pub async fn handle_unload(
     // Validate model reference format
     let _ = ModelRef::parse(model_ref_str)?;
 
-    let model_client = ModelClient::for_service(signing_key, RequestIdentity::anonymous());
+    let model_server_vk = hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "model");
+    let model_client = ModelClient::for_service(signing_key, RequestIdentity::anonymous(), model_server_vk);
 
     model_client.unload(&UnloadModelRequest { model_ref: model_ref_str.to_owned() }).await?;
 

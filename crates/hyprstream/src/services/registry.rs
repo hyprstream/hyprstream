@@ -2805,6 +2805,7 @@ mod tests {
             "inproc://test-policy-health",
             signing_key.clone(),
             RequestIdentity::anonymous(),
+            hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "policy"),
         );
 
         // Start the registry service with policy client
@@ -2821,8 +2822,9 @@ mod tests {
         // Create signed client with matching key and local identity
         let client: RegistryClient = RegistryClient::for_endpoint(
             "inproc://test-registry-health",
-            signing_key,
+            signing_key.clone(),
             RequestIdentity::anonymous(),
+            hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "registry"),
         );
         // health_check returns () on success
         let result = client.health_check().await;

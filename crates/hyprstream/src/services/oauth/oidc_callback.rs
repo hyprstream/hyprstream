@@ -194,18 +194,33 @@ pub async fn external_callback(
         }
     };
 
-    // Decode external id_token claims.
+    // Verify external id_token signature against the provider's JWKS.
     //
-    // NOTE: Signature verification against the provider's JWKS is not yet
-    // implemented (requires async JWKS fetch + multi-algorithm verification).
-    // The token was received directly from the provider's token endpoint over
-    // TLS, so transport-level trust is established. Full JWKS verification
-    // will be added when the FederationKeySource is refactored.
-    let external_claims: serde_json::Value = match decode_external_id_token(external_id_token) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(provider = %provider_slug, error = %e, "Failed to decode external id_token");
-            return (axum::http::StatusCode::BAD_GATEWAY, "Invalid external id_token").into_response();
+    // Fetches the JWKS from the provider's discovery endpoint, selects the
+    // appropriate key (by kid or algorithm), and verifies the JWT signature.
+    // Supports RS256, ES256, and EdDSA algorithms.
+    let external_claims: serde_json::Value = {
+        // Get JWKS URI from OIDC discovery
+        let metadata = match state.oidc_discovery.get_metadata(&provider.issuer_url, provider.allow_http).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!(provider = %provider_slug, error = %e, "OIDC discovery for JWKS failed");
+                return (axum::http::StatusCode::BAD_GATEWAY, "OIDC discovery for JWKS verification failed").into_response();
+            }
+        };
+
+        match crate::auth::id_token_verify::verify_id_token(
+            external_id_token,
+            &metadata.jwks_uri,
+            &provider.issuer_url,
+            &provider.client_id,
+            &state.http_client,
+        ).await {
+            Ok(verified) => verified.claims,
+            Err(e) => {
+                tracing::error!(provider = %provider_slug, error = %e, "External id_token JWKS verification failed");
+                return (axum::http::StatusCode::BAD_GATEWAY, "External id_token verification failed").into_response();
+            }
         }
     };
 
@@ -327,23 +342,4 @@ pub async fn external_callback(
     }
 
     Redirect::temporary(&redirect_url).into_response()
-}
-
-/// Decode an external id_token without full JWKS verification.
-///
-/// Uses jsonwebtoken's dangerous_insecure_decode to extract claims.
-/// The token was received directly from the provider's token endpoint over TLS,
-/// so transport-level trust is established. Full JWKS verification will be
-/// added when the FederationKeySource is refactored for multi-algorithm support.
-fn decode_external_id_token(token: &str) -> anyhow::Result<serde_json::Value> {
-    // Split token to get the payload
-    let parts: Vec<&str> = token.splitn(3, '.').collect();
-    if parts.len() != 3 {
-        return Err(anyhow::anyhow!("Invalid JWT format"));
-    }
-    let payload_bytes = URL_SAFE_NO_PAD.decode(parts[1])
-        .map_err(|e| anyhow::anyhow!("Invalid base64 in id_token payload: {e}"))?;
-    let claims: serde_json::Value = serde_json::from_slice(&payload_bytes)
-        .map_err(|e| anyhow::anyhow!("Invalid JSON in id_token payload: {e}"))?;
-    Ok(claims)
 }

@@ -340,13 +340,15 @@ fn register_scoped_tools_recursive(
 
                             let stream_info_json = match service.as_str() {
                                 "registry" => {
+                                    let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&ctx.signing_key, "registry");
                                     let client: RegistryClient = RegistryClient::for_service(
-                                        ctx.signing_key, ctx.identity.clone(),
+                                        ctx.signing_key, ctx.identity.clone(), server_vk,
                                     );
                                     client.call_scoped_streaming_method(&scope_refs, &method, &ctx.args, client_pubkey_bytes).await?
                                 }
                                 "model" => {
-                                    let client = ModelClient::for_service(ctx.signing_key, ctx.identity.clone());
+                                    let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&ctx.signing_key, "model");
+                                    let client = ModelClient::for_service(ctx.signing_key, ctx.identity.clone(), server_vk);
                                     client.call_scoped_streaming_method(&scope_refs, &method, &ctx.args, client_pubkey_bytes).await?
                                 }
                                 _ => anyhow::bail!("No scoped streaming dispatch for service: {service}"),
@@ -423,13 +425,15 @@ async fn dispatch_scoped_call(
 ) -> anyhow::Result<ToolResult> {
     let result = match service {
         "registry" => {
+            let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&ctx.signing_key, "registry");
             let client: RegistryClient = RegistryClient::for_service(
-                ctx.signing_key.clone(), ctx.identity.clone(),
+                ctx.signing_key.clone(), ctx.identity.clone(), server_vk,
             );
             client.call_scoped_method(scopes, method, &ctx.args).await?
         }
         "model" => {
-            let client = ModelClient::for_service(ctx.signing_key.clone(), ctx.identity.clone());
+            let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&ctx.signing_key, "model");
+            let client = ModelClient::for_service(ctx.signing_key.clone(), ctx.identity.clone(), server_vk);
             client.call_scoped_method(scopes, method, &ctx.args).await?
         }
         _ => anyhow::bail!("No scoped dispatch for service: {service}"),
@@ -489,13 +493,15 @@ fn register_streaming_tool(
 
                 let stream_info_json = match service.as_str() {
                     "registry" => {
+                        let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&ctx.signing_key, "registry");
                         let client: RegistryClient = RegistryClient::for_service(
-                            ctx.signing_key, ctx.identity.clone(),
+                            ctx.signing_key, ctx.identity.clone(), server_vk,
                         );
                         client.call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?
                     }
                     "model" => {
-                        let client = ModelClient::for_service(ctx.signing_key, ctx.identity.clone());
+                        let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&ctx.signing_key, "model");
+                        let client = ModelClient::for_service(ctx.signing_key, ctx.identity.clone(), server_vk);
                         client.call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?
                     }
                     _ => anyhow::bail!("No streaming support for service: {}", service),
@@ -578,17 +584,20 @@ async fn dispatch_schema_call(service: &str, method: &str, ctx: &ToolCallContext
 
     match service {
         "model" => {
-            let client = ModelClient::for_service(signing_key, identity);
+            let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "model");
+            let client = ModelClient::for_service(signing_key, identity, server_vk);
             client.call_method(method, &ctx.args).await
         }
         "registry" => {
+            let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "registry");
             let client: RegistryClient = RegistryClient::for_service(
-                signing_key, identity,
+                signing_key, identity, server_vk,
             );
             client.call_method(method, &ctx.args).await
         }
         "policy" => {
-            let client = PolicyClient::for_service(signing_key, identity);
+            let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "policy");
+            let client = PolicyClient::for_service(signing_key, identity, server_vk);
             client.call_method(method, &ctx.args).await
         }
         _ => anyhow::bail!("Unknown service: {service}"),
@@ -636,7 +645,11 @@ impl McpService {
             tool_reg.by_uuid.len(),
         );
 
-        let policy_client = PolicyClient::for_service(config.signing_key.clone(), RequestIdentity::anonymous());
+        let policy_client = PolicyClient::for_service(
+            config.signing_key.clone(),
+            RequestIdentity::anonymous(),
+            hyprstream_rpc::node_identity::service_verifying_key(&config.signing_key, "policy"),
+        );
 
         Ok(Self {
             registry: Arc::new(tool_reg),
@@ -875,7 +888,11 @@ impl McpHandler for McpService {
     ) -> anyhow::Result<McpResponseVariant> {
         let loaded_model_count = {
             // Status check uses local identity (internal health check, no user context)
-            let client = ModelClient::for_service(self.signing_key.clone(), RequestIdentity::anonymous());
+            let client = ModelClient::for_service(
+                self.signing_key.clone(),
+                RequestIdentity::anonymous(),
+                hyprstream_rpc::node_identity::service_verifying_key(&self.signing_key, "model"),
+            );
             client.status(&crate::services::generated::model_client::StatusRequest { model_ref: String::new() }).await
                 .map(|models| models.len() as u32)
                 .unwrap_or(0)

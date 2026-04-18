@@ -367,21 +367,25 @@ async fn dispatch_top_level(
 
     match service {
         "registry" => {
+            let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "registry");
             let client: RegistryClient = RegistryClient::for_service(
-                signing_key, identity,
+                signing_key, identity, server_vk,
             );
             client.call_method(method, args).await
         }
         "model" => {
-            let client = ModelClient::for_service(signing_key, identity);
+            let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "model");
+            let client = ModelClient::for_service(signing_key, identity, server_vk);
             client.call_method(method, args).await
         }
         "inference" => {
-            let client = InferenceClient::for_service(signing_key, identity);
+            let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "inference");
+            let client = InferenceClient::for_service(signing_key, identity, server_vk);
             client.call_method(method, args).await
         }
         "policy" => {
-            let client = PolicyClient::for_service(signing_key, identity);
+            let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "policy");
+            let client = PolicyClient::for_service(signing_key, identity, server_vk);
             client.call_method(method, args).await
         }
         "worker" => {
@@ -406,17 +410,20 @@ async fn dispatch_scoped_dynamic(
 
     match service {
         "registry" => {
+            let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "registry");
             let client: RegistryClient = RegistryClient::for_service(
-                signing_key, identity,
+                signing_key, identity, server_vk,
             );
             client.call_scoped_method(scope_chain, method, args).await
         }
         "model" => {
-            let client = ModelClient::for_service(signing_key, identity);
+            let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "model");
+            let client = ModelClient::for_service(signing_key, identity, server_vk);
             client.call_scoped_method(scope_chain, method, args).await
         }
         "worker" => {
-            let client = WorkerClient::for_service(signing_key, identity);
+            let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "worker");
+            let client = WorkerClient::for_service(signing_key, identity, server_vk);
             client.call_scoped_method(scope_chain, method, args).await
         }
         _ => bail!("Service '{}' has no scoped methods", service),

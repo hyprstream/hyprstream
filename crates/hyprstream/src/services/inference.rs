@@ -2732,8 +2732,9 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
             // Create PolicyClient HERE, inside the service thread's runtime,
             // so ZMQ sockets are registered with the correct reactor.
             let policy_client = PolicyClient::for_service(
-                self.policy_signing_key,
+                self.policy_signing_key.clone(),
                 hyprstream_rpc::envelope::RequestIdentity::anonymous(),
+                hyprstream_rpc::node_identity::service_verifying_key(&self.policy_signing_key, "policy"),
             );
 
             // GPU initialization happens HERE, on the service thread

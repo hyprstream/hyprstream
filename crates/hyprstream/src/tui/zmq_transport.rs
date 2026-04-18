@@ -28,6 +28,7 @@ pub fn make_chat_spawner(
     use crate::services::generated::inference_client::{ChatMessage, ToolCall, ToolCallFunction};
     use crate::runtime::GenerationRequest;
     use crate::services::generated::model_client::ModelClient;
+    use hyprstream_rpc::node_identity::service_verifying_key;
     use hyprstream_tui::chat_app::{ChatEvent, ChatHistoryEntry, ChatRole};
 
     let sk = signing_key.clone();
@@ -61,7 +62,7 @@ pub fn make_chat_spawner(
 
             rt.block_on(async move {
                 let model_client =
-                    ModelClient::for_service(sk_inner.clone(), RequestIdentity::anonymous());
+                    ModelClient::for_service(sk_inner.clone(), RequestIdentity::anonymous(), service_verifying_key(&sk_inner, "model"));
 
                 // Map ChatHistoryEntry → ChatMessage, handling all roles.
                 // Skip the trailing empty assistant placeholder — it's only a
@@ -227,6 +228,7 @@ pub fn make_tool_caller(
     use hyprstream_tui::chat_app::ChatEvent;
 
     let sk = signing_key.clone();
+    use hyprstream_rpc::node_identity::service_verifying_key;
 
     // ── Eagerly fetch tool list ───────────────────────────────────────────────
     // Spawned on a dedicated OS thread so `block_on` is safe regardless of
@@ -235,13 +237,14 @@ pub fn make_tool_caller(
     let (descriptions, openai_tools): (HashMap<String, String>, Vec<serde_json::Value>) =
         std::thread::spawn(move || {
             let endpoint = registry().endpoint("mcp", SocketKind::Rep).to_zmq_string();
+            let mcp_vk = service_verifying_key(&sk_fetch, "mcp");
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .ok()?;
             rt.block_on(async move {
                 let gen: GenMcpClient =
-                    GenMcpClient::for_endpoint(&endpoint, sk_fetch, RequestIdentity::anonymous());
+                    GenMcpClient::for_endpoint(&endpoint, sk_fetch, RequestIdentity::anonymous(), mcp_vk);
                 let tool_list = gen.list_tools().await.ok()?;
                 let mut descs = HashMap::new();
                 let mut tools = Vec::new();
@@ -283,7 +286,8 @@ pub fn make_tool_caller(
                         Err(e) => return format!("error: {e}"),
                     };
                     rt.block_on(async move {
-                        match GenMcpClient::for_endpoint(&endpoint, sk_c, RequestIdentity::anonymous())
+                        let mcp_vk = service_verifying_key(&sk_c, "mcp");
+                        match GenMcpClient::for_endpoint(&endpoint, sk_c, RequestIdentity::anonymous(), mcp_vk)
                             .call_tool(&crate::services::generated::mcp_client::CallTool {
                                 tool_name: uuid_c,
                                 arguments,

@@ -708,6 +708,7 @@ mod tests {
             &format!("inproc://{policy_tag}"),
             signing_key.clone(),
             RequestIdentity::anonymous(),
+            hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "policy"),
         );
 
         // In-memory DuckDB backend + metrics table creation.
@@ -745,8 +746,9 @@ mod tests {
 
         let client = MetricsClient::for_endpoint(
             &format!("inproc://{svc_tag}"),
-            signing_key,
+            signing_key.clone(),
             RequestIdentity::anonymous(),
+            hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "metrics"),
         );
 
         (client, manager)

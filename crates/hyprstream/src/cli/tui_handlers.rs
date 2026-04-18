@@ -26,9 +26,12 @@ use crate::services::generated::tui_client::{TuiClient, ConnectRequest, DisplayM
 /// with the given signing key and local identity.
 pub fn create_tui_client(signing_key: &SigningKey) -> TuiClient {
     use hyprstream_rpc::registry::{global as registry, SocketKind};
+    use hyprstream_rpc::node_identity::service_verifying_key;
 
     let endpoint = registry().endpoint("tui", SocketKind::Rep).to_zmq_string();
-    TuiClient::for_endpoint(&endpoint, signing_key.clone(), RequestIdentity::anonymous())
+    let sk = signing_key.clone();
+    let server_vk = service_verifying_key(&sk, "tui");
+    TuiClient::for_endpoint(&endpoint, sk, RequestIdentity::anonymous(), server_vk)
 }
 
 /// Attach to an existing TUI session.
