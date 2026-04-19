@@ -2022,11 +2022,7 @@ where
     // AnySigner: external callers (WebTransport) use their own key → Anonymous until JWT.
     let (mut ctx, payload) = match match verification {
         EnvelopeVerification::FixedSigner(pubkey) =>
-            if let Some(registry) = service.key_registry() {
-                crate::envelope::unwrap_envelope_with_registry(raw_bytes, pubkey, nonce_cache, &*registry)
-            } else {
-                crate::envelope::unwrap_envelope_as_system(raw_bytes, pubkey, nonce_cache)
-            },
+            crate::envelope::unwrap_envelope_as_system(raw_bytes, pubkey, nonce_cache),
         EnvelopeVerification::AnySigner =>
             crate::envelope::unwrap_envelope_any_signer(raw_bytes, nonce_cache),
     } {

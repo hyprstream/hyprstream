@@ -83,9 +83,8 @@ pub struct EnvelopeContext {
 
     /// Authorization subject derived from the verified Ed25519 signer key.
     ///
-    /// Set by `from_verified_as_system()` (FixedSigner path) or
-    /// `from_verified_with_registry()` (custom registry). `Anonymous` when
-    /// neither has been applied (e.g., AnySigner/WebTransport callers).
+    /// Set by `from_verified_as_system()` (FixedSigner path).
+    /// `Anonymous` when AnySigner/WebTransport callers (identity from JWT/trust store).
     key_derived_subject: Subject,
 
     /// Authorization subject resolved from a verified JWT token.
@@ -104,8 +103,7 @@ impl EnvelopeContext {
     /// Create context from a verified SignedEnvelope (AnySigner path).
     ///
     /// `key_derived_subject` is `Anonymous`. Use `from_verified_as_system()` for
-    /// FixedSigner/inproc callers or `from_verified_with_registry()` for custom
-    /// key mappings.
+    /// FixedSigner/inproc callers.
     ///
     /// `pub(crate)` — external callers should use the named constructors above
     /// to make the trust level explicit.
@@ -135,28 +133,6 @@ impl EnvelopeContext {
             claims: envelope.envelope.claims.clone(),
             jwt_token: envelope.envelope.jwt_token.clone(),
             key_derived_subject: Subject::new("system"),
-            jwt_subject: None,
-            signer_pubkey: envelope.signer_pubkey,
-        }
-    }
-
-    /// Create context using a `KeyRegistry` to resolve the signer's subject.
-    ///
-    /// The registry maps the verified `signer_pubkey` to an authorization subject.
-    /// This is the general form; `from_verified_as_system` is a convenience wrapper
-    /// for single-key deployments.
-    pub fn from_verified_with_registry(
-        envelope: &SignedEnvelope,
-        registry: &dyn crate::envelope::KeyRegistry,
-    ) -> Self {
-        let key_derived_subject = registry.resolve(&envelope.signer_pubkey);
-        Self {
-            request_id: envelope.request_id(),
-            identity: envelope.identity().clone(),
-            ephemeral_pubkey: envelope.ephemeral_pubkey().copied(),
-            claims: envelope.envelope.claims.clone(),
-            jwt_token: envelope.envelope.jwt_token.clone(),
-            key_derived_subject,
             jwt_subject: None,
             signer_pubkey: envelope.signer_pubkey,
         }
@@ -354,15 +330,6 @@ pub trait ZmqService: 'static {
     fn federation_key_source(
         &self,
     ) -> Option<std::sync::Arc<dyn crate::auth::FederationKeySource>> {
-        None
-    }
-
-    /// Key registry for resolving verified signer public keys to subjects.
-    ///
-    /// Return `None` (default) to use the automatic `FixedSigner → system`
-    /// resolution in `process_request`. Override to provide custom key→subject
-    /// mappings (e.g., for multi-key or peer-trust scenarios).
-    fn key_registry(&self) -> Option<std::sync::Arc<dyn crate::envelope::KeyRegistry>> {
         None
     }
 

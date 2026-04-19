@@ -25,12 +25,16 @@ use dashmap::DashMap;
 use ed25519_dalek::VerifyingKey;
 use std::collections::HashSet;
 use std::sync::Arc;
+use tracing;
 
 /// An attestation binding a key to authorization scopes.
 #[derive(Clone, Debug)]
 pub struct Attestation {
     /// Authorization scopes this key is valid for (e.g., "model", "policy").
     pub scopes: HashSet<String>,
+    /// Explicit subject identity (e.g., "alice", "https://node-b:alice").
+    /// `None` for service keys (derived as "service:{scope}").
+    pub subject: Option<String>,
     /// CA-signed JWT attesting this key.
     pub jwt: Option<String>,
     /// Unix timestamp when this attestation expires.
@@ -58,15 +62,42 @@ impl TrustStore {
     ///
     /// If the key already exists, the attestation is replaced if the new one
     /// expires later. Otherwise the existing entry is kept (prevents downgrade).
+    /// Logs a warning on equal-expiry discard.
     pub fn insert(&self, key: VerifyingKey, attestation: Attestation) {
+        let subject_debug = attestation.subject.as_deref().unwrap_or("<scope-derived>").to_owned();
+        let scopes_debug: Vec<String> = attestation.scopes.iter().cloned().collect();
+        let expires_debug = attestation.expires_at;
         self.inner
             .entry(key)
             .and_modify(|existing| {
                 if attestation.expires_at > existing.expires_at {
+                    tracing::info!(
+                        key = ?key.to_bytes()[..4],
+                        subject = %subject_debug,
+                        scopes = ?scopes_debug,
+                        expires_at = expires_debug,
+                        "Trust store: updating attestation (later expiry)"
+                    );
                     *existing = attestation.clone();
+                } else if attestation.expires_at == existing.expires_at {
+                    tracing::warn!(
+                        key = ?key.to_bytes()[..4],
+                        new_subject = %subject_debug,
+                        existing_subject = ?existing.subject,
+                        "Trust store: equal-expiry attestation discarded (first-writer wins)"
+                    );
                 }
             })
-            .or_insert(attestation);
+            .or_insert_with(|| {
+                tracing::info!(
+                    key = ?key.to_bytes()[..4],
+                    subject = %subject_debug,
+                    scopes = ?scopes_debug,
+                    expires_at = expires_debug,
+                    "Trust store: new attestation inserted"
+                );
+                attestation
+            });
     }
 
     /// Check if a key is authorized for the given scope.
@@ -129,6 +160,24 @@ impl TrustStore {
         self.keys_for_scope(scope).into_iter().next()
     }
 
+    /// Resolve a signer key to an authorization subject.
+    ///
+    /// For user keys: returns `attestation.subject` (e.g., "alice").
+    /// For service keys: returns `"service:{first_scope}"` (e.g., "service:model").
+    /// Returns `None` if the key is not in the trust store or is expired.
+    pub fn resolve_subject(&self, signer_pubkey: &[u8; 32]) -> Option<hyprstream_rpc::envelope::Subject> {
+        let vk = VerifyingKey::from_bytes(signer_pubkey).ok()?;
+        let att = self.get(&vk)?;
+        // User keys: explicit subject
+        if let Some(ref subject) = att.subject {
+            return Some(hyprstream_rpc::envelope::Subject::new(subject.clone()));
+        }
+        // Service keys: derive from scope
+        att.scopes.iter().next().map(|scope| {
+            hyprstream_rpc::envelope::Subject::new(format!("service:{scope}"))
+        })
+    }
+
     /// Remove all entries whose attestation was issued by a revoked root key.
     ///
     /// Not yet implemented — needs attestation chain tracking.
@@ -180,6 +229,7 @@ mod tests {
     fn make_attestation(scopes: &[&str], expires_at: i64) -> Attestation {
         Attestation {
             scopes: scopes.iter().map(std::string::ToString::to_string).collect(),
+            subject: None,
             jwt: None,
             expires_at,
         }

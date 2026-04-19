@@ -1255,6 +1255,7 @@ fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
                 *vk,
                 hyprstream_service::Attestation {
                     scopes: std::iter::once(name.clone()).collect(),
+                    subject: None,
                     jwt: None,
                     expires_at: 0,
                 },
@@ -1263,10 +1264,6 @@ fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
     }
     trust.resolve_one(service_name)
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Main entry point
-// ─────────────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
     // ROCm allocator and BLAS optimizations — must be set before any tch/libtorch init.
@@ -1827,6 +1824,7 @@ fn main() -> Result<()> {
                                             ca_vk,
                                             hyprstream_service::Attestation {
                                                 scopes: std::iter::once("policy".to_owned()).collect(),
+                                                subject: None,
                                                 jwt: None,
                                                 expires_at: 0,
                                             },
@@ -1836,11 +1834,11 @@ fn main() -> Result<()> {
                                     // Load bootstrap pubkeys (all service pubkeys) into trust store
                                     if let Ok(pubkeys) = hyprstream_core::auth::identity_store::load_bootstrap_pubkeys(&secrets_dir) {
                                         for (svc_name, vk) in &pubkeys {
-                                            ctx = ctx.with_known_pubkey(svc_name, *vk);
                                             hyprstream_service::global_trust_store().insert(
                                                 *vk,
                                                 hyprstream_service::Attestation {
                                                     scopes: std::iter::once(svc_name.clone()).collect(),
+                                                    subject: None,
                                                     jwt: None,
                                                     expires_at: 0,
                                                 },

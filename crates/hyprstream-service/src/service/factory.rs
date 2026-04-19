@@ -222,30 +222,11 @@ pub struct ServiceContext {
     /// - Multi-process: loaded from per-service credential files
     service_keys: HashMap<String, SigningKey>,
 
-    /// Resolved service pubkeys for RPC client construction.
-    ///
-    /// Maps service name → verifying key. Populated from:
-    /// - Single-process: generated alongside service_keys
-    /// - Multi-process: bootstrap-pubkeys credential + discovery lookup
-    pubkey_registry: HashMap<String, VerifyingKey>,
-
     /// CA verifying key (trust anchor for verifying service JWTs).
     ///
     /// In single-process mode, this is derived from the root key.
     /// In multi-process mode, this is loaded from the ca-pubkey credential.
     ca_verifying_key: Option<VerifyingKey>,
-
-    /// Per-service JWTs (CA-signed certificates).
-    ///
-    /// In single-process mode, these are minted in memory at startup.
-    /// In multi-process mode, these are loaded from per-service credential files.
-    service_jwts: HashMap<String, String>,
-
-    /// Key registry for resolving signer pubkeys to authorization subjects.
-    ///
-    /// Maps each service's Ed25519 pubkey to `Subject::new("service:{name}")`.
-    /// Used by ZMQ RequestLoop for envelope verification.
-    key_registry: Arc<dyn hyprstream_rpc::envelope::KeyRegistry>,
 }
 
 impl ServiceContext {
@@ -271,10 +252,7 @@ impl ServiceContext {
             oauth_issuer_url: None,
             federation_key_source: None,
             service_keys: HashMap::new(),
-            pubkey_registry: HashMap::new(),
             ca_verifying_key: None,
-            service_jwts: HashMap::new(),
-            key_registry: Arc::new(hyprstream_rpc::envelope::ServiceKeyRegistry::new()),
         }
     }
 
@@ -283,10 +261,7 @@ impl ServiceContext {
     /// In single-process mode, these are generated in memory at startup.
     /// In multi-process mode, these are loaded from per-service credential files.
     pub fn with_service_key(mut self, service_name: &str, signing_key: SigningKey) -> Self {
-        let vk = signing_key.verifying_key();
         self.service_keys.insert(service_name.to_owned(), signing_key);
-        self.pubkey_registry.insert(service_name.to_owned(), vk);
-        self.rebuild_key_registry();
         self
     }
 
@@ -296,9 +271,7 @@ impl ServiceContext {
         I: IntoIterator<Item = (String, SigningKey)>,
     {
         for (name, sk) in keys {
-            let vk = sk.verifying_key();
-            self.service_keys.insert(name.clone(), sk);
-            self.pubkey_registry.insert(name, vk);
+            self.service_keys.insert(name, sk);
         }
         self
     }
@@ -320,52 +293,7 @@ impl ServiceContext {
             hyprstream_rpc::node_identity::NodeIdentityProvider::new(&new_key)
         );
         self.signing_key = new_key;
-        // Rebuild key registry with updated pubkeys
-        let mut registry = hyprstream_rpc::envelope::ServiceKeyRegistry::new();
-        for (name, vk) in &self.pubkey_registry {
-            registry.register(name, *vk);
-        }
-        self.key_registry = Arc::new(registry);
         self
-    }
-
-    /// Bulk-register service JWTs.
-    pub fn with_service_jwts(mut self, jwts: HashMap<String, String>) -> Self {
-        self.service_jwts = jwts;
-        self
-    }
-
-    /// Add a single service JWT.
-    pub fn with_service_jwt(mut self, service_name: &str, jwt: String) -> Self {
-        self.service_jwts.insert(service_name.to_owned(), jwt);
-        self
-    }
-
-    /// Register a known pubkey for a service (without the signing key).
-    ///
-    /// Used for bootstrap services where we only have the pubkey (e.g.,
-    /// loaded from bootstrap-pubkeys credential).
-    pub fn with_known_pubkey(mut self, service_name: &str, verifying_key: VerifyingKey) -> Self {
-        self.pubkey_registry.insert(service_name.to_owned(), verifying_key);
-        self.rebuild_key_registry();
-        self
-    }
-
-    /// Rebuild the ServiceKeyRegistry from the current pubkey_registry.
-    ///
-    /// Called automatically by `with_service_key` and `with_known_pubkey`.
-    /// Each service's pubkey is mapped to `Subject::new("service:{name}")`.
-    fn rebuild_key_registry(&mut self) {
-        let mut registry = hyprstream_rpc::envelope::ServiceKeyRegistry::new();
-        for (name, vk) in &self.pubkey_registry {
-            registry.register(name, *vk);
-        }
-        self.key_registry = Arc::new(registry);
-    }
-
-    /// Get the key registry for ZMQ envelope verification.
-    pub fn key_registry(&self) -> Arc<dyn hyprstream_rpc::envelope::KeyRegistry> {
-        self.key_registry.clone()
     }
 
     /// Generate independent Ed25519 keypairs for all listed services and
@@ -375,8 +303,8 @@ impl ServiceContext {
     /// The root signing key serves as the CA key — PolicyService will use it
     /// directly (it IS the CA), while all other services get independent keys.
     ///
-    /// Populates `service_keys`, `pubkey_registry`, `service_jwts`, and
-    /// `ca_verifying_key` from the generated materials.
+    /// Populates `service_keys`, `ca_verifying_key`, and the global trust store
+    /// from the generated materials.
     pub fn generate_independent_service_keys(self, service_names: &[String]) -> Self {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
@@ -406,12 +334,12 @@ impl ServiceContext {
                 // Register its signing key in the registry
                 // so service_signing_key("policy") works.
                 ctx = ctx
-                    .with_service_key(name, root_signing_key.clone())
-                    .with_known_pubkey(name, root_verifying_key);
+                    .with_service_key(name, root_signing_key.clone());
 
                 // PolicyService key never expires — it IS the trust anchor.
                 trust.insert(root_verifying_key, crate::service::trust_store::Attestation {
                     scopes: std::iter::once("policy".to_owned()).collect(),
+                    subject: None,
                     jwt: None,
                     expires_at: 0,
                 });
@@ -433,12 +361,12 @@ impl ServiceContext {
             let jwt = hyprstream_rpc::auth::jwt::encode(&claims, &ca_signing_key);
 
             ctx = ctx
-                .with_service_key(name, service_key)
-                .with_service_jwt(name, jwt.clone());
+                .with_service_key(name, service_key);
 
             // Register this service's key in the trust store.
             trust.insert(service_vk, crate::service::trust_store::Attestation {
                 scopes: std::iter::once(name.clone()).collect(),
+                subject: None,
                 jwt: Some(jwt),
                 expires_at: expiry,
             });
@@ -531,11 +459,6 @@ impl ServiceContext {
              Ensure generate_independent_service_keys() was called (inproc) or \
              the service's signing-key credential was loaded (IPC mode)."
         );
-    }
-
-    /// Get the service JWT for a specific service (if available).
-    pub fn service_jwt(&self, service_name: &str) -> Option<&str> {
-        self.service_jwts.get(service_name).map(std::string::String::as_str)
     }
 
     /// Get the CA verifying key (trust anchor).
@@ -642,9 +565,11 @@ impl ServiceContext {
                 if service.name() == "discovery" {
                     Some(shared.for_service(service.name(), port))
                 } else {
-                    let service_jwt = self.service_jwt(service.name()).map(str::to_owned);
-                    let policy_vk = crate::service::trust_store::global_trust_store()
-                        .resolve_one("policy")
+                    // Read JWT from trust store attestation
+                    let trust = crate::service::trust_store::global_trust_store();
+                    let service_jwt = trust.resolve_one(service.name())
+                        .and_then(|vk| trust.get(&vk).and_then(|att| att.jwt.clone()));
+                    let policy_vk = trust.resolve_one("policy")
                         .unwrap_or_else(|| panic!("trust store has no policy key"));
                     let discovery_vk = crate::service::trust_store::global_trust_store()
                         .resolve_one("discovery")

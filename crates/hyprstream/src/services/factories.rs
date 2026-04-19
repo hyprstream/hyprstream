@@ -68,7 +68,7 @@ fn get_or_init_git2db(models_dir: &std::path::Path) -> anyhow::Result<Arc<RwLock
 /// Called by each non-policy factory so that peer services can resolve
 /// our pubkey via `resolveServiceKey` RPC.  No-op for PolicyService itself.
 fn register_service_key(
-    ctx: &ServiceContext,
+    _ctx: &ServiceContext,
     service_name: &str,
     signing_key: &SigningKey,
 ) -> anyhow::Result<()> {
@@ -77,11 +77,14 @@ fn register_service_key(
         return Ok(());
     }
 
-    let jwt = ctx.service_jwt(service_name)
-        .ok_or_else(|| anyhow::anyhow!(
-            "No service JWT for '{service_name}'. \
-             Ensure generate_independent_service_keys() was called."
-        ))?;
+    let jwt = {
+        let trust = hyprstream_service::global_trust_store();
+        let vk = trust.resolve_one(service_name)
+            .ok_or_else(|| anyhow::anyhow!("trust store has no key for '{service_name}'"))?;
+        trust.get(&vk)
+            .and_then(|att| att.jwt.clone())
+            .ok_or_else(|| anyhow::anyhow!("trust store has no JWT for '{service_name}'"))?
+    };
 
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")

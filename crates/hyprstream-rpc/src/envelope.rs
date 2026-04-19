@@ -332,51 +332,6 @@ impl From<&Claims> for Subject {
 /// The signer public key is taken from the *verified* `SignedEnvelope.signer_pubkey`
 /// field — i.e., from after Ed25519 signature verification passes. It is not
 /// caller-asserted payload data.
-pub trait KeyRegistry: Send + Sync {
-    /// Resolve a verified signer public key to an authorization subject.
-    fn resolve(&self, signer_pubkey: &[u8; 32]) -> Subject;
-}
-
-/// Multi-key registry mapping service Ed25519 pubkeys to service subjects.
-///
-/// Each registered service key maps to `Subject::new("service:{name}")`.
-/// Unregistered keys resolve to `Subject::anonymous()`.
-///
-/// In inproc mode, all generated independent service keys are registered.
-/// In IPC mode, keys are loaded from bootstrap-pubkeys credential.
-pub struct ServiceKeyRegistry {
-    /// Ed25519 pubkey bytes → service name
-    service_pubkeys: std::collections::HashMap<[u8; 32], String>,
-}
-
-impl Default for ServiceKeyRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ServiceKeyRegistry {
-    pub fn new() -> Self {
-        Self {
-            service_pubkeys: std::collections::HashMap::new(),
-        }
-    }
-
-    /// Register a service's verifying key.
-    pub fn register(&mut self, service_name: &str, verifying_key: VerifyingKey) {
-        self.service_pubkeys.insert(verifying_key.to_bytes(), service_name.to_owned());
-    }
-}
-
-impl KeyRegistry for ServiceKeyRegistry {
-    fn resolve(&self, signer_pubkey: &[u8; 32]) -> Subject {
-        if let Some(name) = self.service_pubkeys.get(signer_pubkey) {
-            Subject::new(format!("service:{name}"))
-        } else {
-            Subject::anonymous()
-        }
-    }
-}
 
 // Cap'n Proto implementation for Subject (simple text field)
 impl ToCapnp for Subject {
@@ -1325,23 +1280,6 @@ pub fn unwrap_envelope_as_system(
 ) -> Result<(crate::service::EnvelopeContext, Vec<u8>)> {
     let (signed, payload) = unwrap_and_verify(request, server_pubkey, nonce_cache)?;
     let ctx = crate::service::EnvelopeContext::from_verified_as_system(&signed);
-    Ok((ctx, payload))
-}
-
-/// Unwrap and verify, resolving the subject via a `KeyRegistry`.
-///
-/// More flexible variant that allows custom key→subject mappings. Use this
-/// when a service needs to distinguish multiple trusted keys (e.g., federated
-/// peer nodes each mapping to their own system subject).
-#[cfg(not(target_arch = "wasm32"))]
-pub fn unwrap_envelope_with_registry(
-    request: &[u8],
-    server_pubkey: &VerifyingKey,
-    nonce_cache: &dyn NonceCache,
-    registry: &dyn KeyRegistry,
-) -> Result<(crate::service::EnvelopeContext, Vec<u8>)> {
-    let (signed, payload) = unwrap_and_verify(request, server_pubkey, nonce_cache)?;
-    let ctx = crate::service::EnvelopeContext::from_verified_with_registry(&signed, registry);
     Ok((ctx, payload))
 }
 
