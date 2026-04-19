@@ -35,6 +35,7 @@ use tracing::info;
 use crate::auth::PolicyManager;
 use crate::config::{HyprConfig, TokenConfig};
 use crate::services::{DiscoveryService, McpService, McpConfig, PolicyService, PolicyClient, RegistryService, RegistryClient};
+use crate::services::generated::policy_client::RegisterServiceKey;
 use crate::zmq::global_context;
 
 /// Load HyprConfig, falling back to default on error.
@@ -60,6 +61,47 @@ fn get_or_init_git2db(models_dir: &std::path::Path) -> anyhow::Result<Arc<RwLock
     let shared = Arc::new(RwLock::new(registry));
     // If another thread beat us, that's fine — use theirs
     Ok(Arc::clone(SHARED_GIT2DB.get_or_init(|| shared)))
+}
+
+/// Register this service's verifying key with the PolicyService CA.
+///
+/// Called by each non-policy factory so that peer services can resolve
+/// our pubkey via `resolveServiceKey` RPC.  No-op for PolicyService itself.
+fn register_service_key(
+    ctx: &ServiceContext,
+    service_name: &str,
+    signing_key: &SigningKey,
+) -> anyhow::Result<()> {
+    // PolicyService doesn't register — it IS the CA.
+    if service_name == "policy" {
+        return Ok(());
+    }
+
+    let jwt = ctx.service_jwt(service_name)
+        .ok_or_else(|| anyhow::anyhow!(
+            "No service JWT for '{service_name}'. \
+             Ensure generate_independent_service_keys() was called."
+        ))?;
+
+    let policy_client = PolicyClient::for_service(
+        signing_key.clone(),
+        RequestIdentity::anonymous(),
+        ctx.service_verifying_key("policy"),
+    );
+
+    let request = RegisterServiceKey {
+        service_name: service_name.to_owned(),
+        verifying_key: signing_key.verifying_key().as_bytes().to_vec(),
+        service_jwt: jwt.to_owned(),
+    };
+
+    tokio::task::block_in_place(|| {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(policy_client.register_service_key(&request))
+    }).map_err(|e| anyhow::anyhow!("registerServiceKey RPC failed for '{service_name}': {e}"))?;
+
+    info!(service = service_name, "Registered verifying key with PolicyService");
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -107,19 +149,14 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
                 // These rules are in DEFAULT_POLICY_CSV for new installs; existing
                 // deployments need them added once.
                 let rules = pm.get_policy().await;
-                let has_system = rules.iter().any(|r| r.first().map(|s| s == "system").unwrap_or(false));
                 let has_anon_tui = rules.iter().any(|r| {
                     r.len() >= 3 && r[0] == "anonymous" && r[2] == "tui:*"
                 });
-                if !has_system {
-                    let _ = pm.add_policy_with_domain("system", "*", "*", "*", "allow").await;
-                    tracing::info!("policy migration: added 'system' full-access grant");
-                }
                 if !has_anon_tui {
                     let _ = pm.add_policy_with_domain("anonymous", "*", "tui:*", "*", "allow").await;
                     tracing::info!("policy migration: added 'anonymous' TUI access grant");
                 }
-                if !has_system || !has_anon_tui {
+                if !has_anon_tui {
                     let _ = pm.save().await;
                 }
                 Ok::<_, anyhow::Error>(pm)
@@ -169,6 +206,9 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
 
     let config = load_config();
     let sk = ctx.service_signing_key("registry");
+
+    // Register this service's verifying key with PolicyService
+    register_service_key(ctx, "registry", &sk)?;
 
     // Create policy client for authorization checks
     let policy_client = PolicyClient::for_service(sk.clone(), RequestIdentity::anonymous(), ctx.service_verifying_key("policy"));
@@ -236,6 +276,9 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     let config = load_config();
     let sk = ctx.service_signing_key("model");
 
+    // Register this service's verifying key with PolicyService
+    register_service_key(ctx, "model", &sk)?;
+
     // Create policy client for authorization checks
     let policy_client = PolicyClient::for_service(sk.clone(), RequestIdentity::anonymous(), ctx.service_verifying_key("policy"));
 
@@ -246,14 +289,17 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
         ctx.service_verifying_key("registry"),
     );
 
-    let mut model_service = ModelService::new(
-        ModelServiceConfig::default(),
-        sk.clone(),
-        policy_client,
-        registry_client,
-        global_context(),
-        ctx.transport("model", SocketKind::Rep),
-    );
+    let mut model_service = tokio::task::block_in_place(|| {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(ModelService::new(
+            ModelServiceConfig::default(),
+            sk.clone(),
+            policy_client,
+            registry_client,
+            global_context(),
+            ctx.transport("model", SocketKind::Rep),
+        ))
+    })?;
     if let Some(issuer) = ctx.oauth_issuer_url() {
         model_service = model_service.with_expected_audience(issuer.to_owned());
         model_service = model_service.with_local_issuer_url(issuer.to_owned());
@@ -329,6 +375,9 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 
     let sk = ctx.service_signing_key("worker");
 
+    // Register this service's verifying key with PolicyService
+    register_service_key(ctx, "worker", &sk)?;
+
     // Service includes infrastructure - directly Spawnable via blanket impl
     let mut worker_service = WorkerService::new(
         pool_config,
@@ -376,6 +425,9 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     // Load full config for OAI settings
     let config = load_config();
     let sk = ctx.service_signing_key("oai");
+
+    // Register this service's verifying key with PolicyService
+    register_service_key(ctx, "oai", &sk)?;
 
     // Create ZMQ clients for Model and Policy services
     let model_client = ModelClient::for_service(sk.clone(), RequestIdentity::anonymous(), ctx.service_verifying_key("model"));
@@ -434,13 +486,17 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 
     // Load full config for Flight settings
     let config = load_config();
+    let sk = ctx.service_signing_key("flight");
+
+    // Register this service's verifying key with PolicyService
+    register_service_key(ctx, "flight", &sk)?;
 
     // Create registry client for dataset lookup (if default_dataset is configured)
     // RegistryClient already implements hyprstream_metrics::RegistryClient
     let registry_client: Option<Arc<dyn hyprstream_metrics::RegistryClient>> =
         if config.flight.default_dataset.is_some() {
             let zmq_client: RegistryClient = RegistryClient::for_service(
-                ctx.service_signing_key("flight"),
+                sk.clone(),
                 RequestIdentity::anonymous(),
                 ctx.service_verifying_key("registry"),
             );
@@ -475,6 +531,10 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     use crate::services::OAuthService;
 
     let config = load_config();
+    let sk = ctx.service_signing_key("oauth");
+
+    // Register this service's verifying key with PolicyService
+    register_service_key(ctx, "oauth", &sk)?;
 
     // Pass signing key instead of a pre-created PolicyClient.
     // OAuthService runs in its own tokio runtime (separate thread), so the
@@ -482,7 +542,7 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     let oauth_service = OAuthService::new(
         config.oauth.clone(),
         config.tls.clone(),
-        ctx.service_signing_key("oauth"),
+        sk,
         global_context(),
         ctx.transport("oauth", SocketKind::Rep),
         ctx.verifying_key(),
@@ -513,12 +573,18 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     // Create McpConfig for the service
     let oauth_issuer = ctx.oauth_issuer_url().map(str::to_owned);
     let federation_key_source = ctx.federation_key_source();
+    let sk = ctx.service_signing_key("mcp");
+
+    // Register this service's verifying key with PolicyService
+    register_service_key(ctx, "mcp", &sk)?;
+
     let mcp_config = McpConfig {
         verifying_key: ctx.verifying_key(),
         zmq_context: global_context(),
-        signing_key: ctx.service_signing_key("mcp"),
+        signing_key: sk,
         transport: ctx.transport("mcp", SocketKind::Rep),
         ctx: None, // ServiceContext not yet available as Arc — handlers use signing_key directly
+        policy_verifying_key: ctx.service_verifying_key("policy"),
         expected_audience: Some(config.mcp.resource_url()),
         local_issuer_url: oauth_issuer.clone(),
         federation_key_source: federation_key_source.clone(),
@@ -765,6 +831,9 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let tui_config = &config.tui;
     let sk = ctx.service_signing_key("tui");
 
+    // Register this service's verifying key with PolicyService
+    register_service_key(ctx, "tui", &sk)?;
+
     let state = Arc::new(RwLock::new(TuiState::new(
         80,
         24,
@@ -774,7 +843,7 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let policy_client = PolicyClient::for_service(sk.clone(), RequestIdentity::anonymous(), ctx.service_verifying_key("policy"));
 
     // Build VFS namespace for ChatApps spawned via TUI RPC.
-    let (vfs_ns, vfs_subject) = crate::tui::vfs::build_chat_vfs_namespace(&sk);
+    let (vfs_ns, vfs_subject) = crate::tui::vfs::build_chat_vfs_namespace(&sk)?;
 
     let mut tui_service = TuiService::new(
         state,
@@ -809,6 +878,9 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
 
     let config = load_config();
     let sk = ctx.service_signing_key("discovery");
+
+    // Register this service's verifying key with PolicyService
+    register_service_key(ctx, "discovery", &sk)?;
 
     // Create policy-based authorization provider
     let policy_client = PolicyClient::for_service(sk.clone(), RequestIdentity::anonymous(), ctx.service_verifying_key("policy"));
@@ -861,6 +933,10 @@ fn create_notification_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn S
     info!("Creating NotificationService");
 
     let sk = ctx.service_signing_key("notification");
+
+    // Register this service's verifying key with PolicyService
+    register_service_key(ctx, "notification", &sk)?;
+
     let policy_client = PolicyClient::for_service(sk.clone(), RequestIdentity::anonymous(), ctx.service_verifying_key("policy"));
 
     let mut notification_service = crate::services::NotificationService::new(
@@ -919,6 +995,10 @@ fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
     );
 
     let sk = ctx.service_signing_key("metrics");
+
+    // Register this service's verifying key with PolicyService
+    register_service_key(ctx, "metrics", &sk)?;
+
     let policy_client = PolicyClient::for_service(sk.clone(), RequestIdentity::anonymous(), ctx.service_verifying_key("policy"));
 
     let mut metrics_service = MetricsService::new(
@@ -1002,6 +1082,7 @@ fn compute_tls_endorsement(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -1010,7 +1091,7 @@ mod tests {
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         let pkcs8 = key_pair.serialize_der();
         let pub_der = key_pair.public_key_der();
-        (pkcs8, pub_der.to_vec())
+        (pkcs8, pub_der.clone())
     }
 
     fn build_endorsement_message(ed25519_pubkey: &[u8; 32], domain: &str) -> Vec<u8> {

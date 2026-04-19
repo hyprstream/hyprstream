@@ -16,6 +16,7 @@ use crate::services::generated::policy_client::{
     AddGrouping, RemoveGrouping, SetBranchVisibility,
     RegisterEventPrefix, SubscribeEventPrefix, GetPendingSubscribers, DepositWrappedKeys,
     EventPrefixAccess, PendingSubscribers,
+    ResolveServiceKey, RegisterServiceKey, ServiceKeyResponse,
     dispatch_policy, serialize_response,
 };
 use anyhow::{anyhow, Result};
@@ -73,6 +74,9 @@ pub struct PolicyService {
     /// Event prefix state for secure event transport (Phase 7).
     /// PolicyService is a blind relay — stores opaque wrapped blobs, never plaintext keys.
     event_prefixes: RwLock<HashMap<String, EventPrefixState>>,
+    /// Service pubkeys registered via registerServiceKey RPC.
+    /// Maps service name → Ed25519 verifying key. Populated at runtime by each service.
+    service_pubkeys: RwLock<HashMap<String, (VerifyingKey, Option<String>)>>,
 }
 
 impl PolicyService {
@@ -101,6 +105,7 @@ impl PolicyService {
             context,
             transport,
             event_prefixes: RwLock::new(HashMap::new()),
+            service_pubkeys: RwLock::new(HashMap::new()),
         }
     }
 
@@ -246,34 +251,31 @@ impl PolicyHandler for PolicyService {
     ) -> Result<PolicyResponseVariant> {
         trace!("Issuing JWT token");
 
-        let is_service_token = data.subject.as_ref().map_or(false, |s| s.starts_with("service:"));
+        let is_service_token = data.subject.as_ref().is_some_and(|s| s.starts_with("service:"));
 
         // Determine subject: explicit subject (if provided and authorized) or envelope identity.
         // JWT sub must contain a bare username (e.g. "randy", "birdetta") — the identity
         // system adds the namespace prefix ("token:randy") when the JWT is decoded.
         // For service tokens: sub = "service:{name}", e.g. "service:model".
         let subject = if let Some(ref subj) = data.subject.as_ref().filter(|s| !s.is_empty()) {
-            // Explicit subject requires `manage` permission on `policy:issue-token`
-            // Service tokens from in-process callers (system subject) are auto-allowed.
+            // Explicit subject requires `manage` permission on `policy:issue-token`.
+            // All callers go through Casbin — no identity-based bypasses.
             let caller = ctx.subject().to_string();
-            let is_system = caller == "system";
-            if !is_system {
-                let allowed = self.policy_manager.check_with_domain(
-                    &caller,
-                    "*",
-                    "policy:issue-token",
-                    Operation::Manage.as_str(),
-                ).await;
-                if !allowed {
-                    return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                        message: format!(
-                            "Subject '{}' is not authorized to issue tokens on behalf of '{}'",
-                            caller, subj
-                        ),
-                        code: "UNAUTHORIZED_SUBJECT".to_owned(),
-                        details: "Requires 'manage' permission on 'policy:issue-token'".to_owned(),
-                    }));
-                }
+            let allowed = self.policy_manager.check_with_domain(
+                &caller,
+                "*",
+                "policy:issue-token",
+                Operation::Manage.as_str(),
+            ).await;
+            if !allowed {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: format!(
+                        "Subject '{}' is not authorized to issue tokens on behalf of '{}'",
+                        caller, subj
+                    ),
+                    code: "UNAUTHORIZED_SUBJECT".to_owned(),
+                    details: "Requires 'manage' permission on 'policy:issue-token'".to_owned(),
+                }));
             }
             (*subj).clone()
         } else {
@@ -433,8 +435,15 @@ impl PolicyHandler for PolicyService {
             }
         };
 
-        // Get the expanded rules
-        let new_content = template.expanded_rules();
+        // Get the expanded rules — prepend service base rules so templates
+        // never wipe out inter-service permissions
+        let template_content = template.expanded_rules();
+        let new_content = format!(
+            "{}\n# User-facing rules from '{}' template:\n{}",
+            crate::auth::policy_templates::SERVICE_BASE_RULES,
+            data.name,
+            template_content,
+        );
 
         // Read existing content for rollback on validation failure
         let policy_path = self.policy_manager.policy_csv_path();
@@ -848,25 +857,28 @@ impl PolicyHandler for PolicyService {
             }));
         }
 
-        // Elevated roles require system identity (node key / inproc caller)
+        // Elevated roles can only be assigned by policy service.
         const ELEVATED_ROLES: &[&str] = &["ttt.privileged", "operator"];
-        if ELEVATED_ROLES.contains(&data.role.as_str()) && ctx.subject() != Subject::new("system") {
+        let caller_subject = ctx.subject().to_string();
+        if ELEVATED_ROLES.contains(&data.role.as_str())
+            && caller_subject != "service:policy"
+        {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: format!(
-                    "Role '{}' is an elevated role and can only be assigned by the system",
+                    "Role '{}' is an elevated role and can only be assigned by policy service",
                     data.role
                 ),
                 code: "UNAUTHORIZED".to_owned(),
-                details: "Elevated roles require system identity (node signing key)".to_owned(),
+                details: "Elevated roles require service:policy identity".to_owned(),
             }));
         }
 
-        // Non-system callers cannot assign roles to themselves
-        if ctx.subject() != Subject::new("system") && data.user == caller {
+        // Callers cannot assign roles to themselves
+        if data.user == caller {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: "Cannot assign roles to yourself".to_owned(),
                 code: "SELF_ASSIGNMENT".to_owned(),
-                details: "Non-system callers may not assign roles to themselves".to_owned(),
+                details: "Callers may not assign roles to themselves".to_owned(),
             }));
         }
 
@@ -1210,6 +1222,78 @@ impl PolicyHandler for PolicyService {
             "Deposited wrapped keys"
         );
         Ok(PolicyResponseVariant::DepositWrappedKeysResult)
+    }
+
+    async fn handle_resolve_service_key(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &ResolveServiceKey,
+    ) -> Result<PolicyResponseVariant> {
+        let pubkeys = self.service_pubkeys.read().await;
+        match pubkeys.get(&data.service_name) {
+            Some((vk, jwt)) => {
+                debug!("Resolved service key for '{}'", data.service_name);
+                Ok(PolicyResponseVariant::ResolveServiceKeyResult(
+                    ServiceKeyResponse {
+                        verifying_key: vk.to_bytes().to_vec(),
+                        service_jwt: jwt.clone(),
+                    }
+                ))
+            }
+            None => Err(anyhow!("No verifying key registered for service '{}'", data.service_name)),
+        }
+    }
+
+    async fn handle_register_service_key(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &RegisterServiceKey,
+    ) -> Result<PolicyResponseVariant> {
+        let caller = ctx.subject().to_string();
+
+        // Verify the caller is who they claim to be.
+        // The service JWT must be signed by the CA (our jwt_signing_key) and
+        // its subject must match "service:{serviceName}".
+        let claims = hyprstream_rpc::auth::jwt::decode_with_key(
+            &data.service_jwt,
+            &self.jwt_signing_key.verifying_key(),
+            None,
+        ).map_err(|e| anyhow!("Invalid service JWT: {e}"))?;
+
+        let expected_sub = format!("service:{}", data.service_name);
+        if claims.sub != expected_sub {
+            anyhow::bail!(
+                "JWT subject '{}' does not match service name '{}'",
+                claims.sub, data.service_name
+            );
+        }
+
+        // Verify the provided verifying key matches the JWT's pub_key claim.
+        let vk_bytes: [u8; 32] = data.verifying_key.as_slice().try_into()
+            .map_err(|_| anyhow!("verifying_key must be 32 bytes"))?;
+        let vk = VerifyingKey::from_bytes(&vk_bytes)
+            .map_err(|e| anyhow!("Invalid Ed25519 verifying key: {e}"))?;
+
+        if let Some(ref pub_key_b64) = claims.pub_key {
+            use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+            let decoded = URL_SAFE_NO_PAD.decode(pub_key_b64)
+                .map_err(|_| anyhow!("Invalid base64 in JWT pub_key claim"))?;
+            if decoded != vk_bytes {
+                anyhow::bail!("JWT pub_key does not match provided verifying key");
+            }
+        }
+
+        // Store the pubkey
+        {
+            let mut pubkeys = self.service_pubkeys.write().await;
+            pubkeys.insert(data.service_name.clone(), (vk, Some(data.service_jwt.clone())));
+        }
+
+        info!(service = %data.service_name, caller = %caller, "Registered service verifying key");
+
+        Ok(PolicyResponseVariant::RegisterServiceKeyResult)
     }
 }
 

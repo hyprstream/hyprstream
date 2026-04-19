@@ -708,7 +708,7 @@ mod tests {
             &format!("inproc://{policy_tag}"),
             signing_key.clone(),
             RequestIdentity::anonymous(),
-            hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "policy"),
+            signing_key.verifying_key(),
         );
 
         // In-memory DuckDB backend + metrics table creation.
@@ -748,7 +748,7 @@ mod tests {
             &format!("inproc://{svc_tag}"),
             signing_key.clone(),
             RequestIdentity::anonymous(),
-            hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "metrics"),
+            signing_key.verifying_key(),
         );
 
         (client, manager)

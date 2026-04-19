@@ -826,6 +826,35 @@ impl TuiService {
         };
 
         let registry_models_dir = std::path::PathBuf::from(registry_dir);
+
+        // Resolve peer service keys via PolicyClient (inproc policy service).
+        let policy_vk = self.signing_key.verifying_key();
+        let policy_client = PolicyClient::for_service(
+            self.signing_key.clone(),
+            hyprstream_rpc::envelope::RequestIdentity::anonymous(),
+            policy_vk,
+        );
+
+        let registry_key_resp = policy_client.resolve_service_key(
+            &crate::services::generated::policy_client::ResolveServiceKey {
+                service_name: "registry".to_owned(),
+            },
+        ).await.map_err(|e| anyhow::anyhow!("Failed to resolve registry key: {e}"))?;
+        let registry_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+            registry_key_resp.verifying_key.as_slice().try_into()
+                .map_err(|_| anyhow::anyhow!("Invalid registry key length"))?,
+        ).map_err(|e| anyhow::anyhow!("Invalid registry key: {e}"))?;
+
+        let model_key_resp = policy_client.resolve_service_key(
+            &crate::services::generated::policy_client::ResolveServiceKey {
+                service_name: "model".to_owned(),
+            },
+        ).await.map_err(|e| anyhow::anyhow!("Failed to resolve model key: {e}"))?;
+        let model_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+            model_key_resp.verifying_key.as_slice().try_into()
+                .map_err(|_| anyhow::anyhow!("Invalid model key length"))?,
+        ).map_err(|e| anyhow::anyhow!("Invalid model key: {e}"))?;
+
         let models = {
             use hyprstream_rpc::envelope::RequestIdentity;
             let registry_endpoint = hyprstream_rpc::registry::global()
@@ -836,12 +865,12 @@ impl TuiService {
                     &registry_endpoint,
                     self.signing_key.clone(),
                     RequestIdentity::anonymous(),
-                    hyprstream_rpc::node_identity::service_verifying_key(&self.signing_key, "registry"),
+                    registry_vk,
                 );
             let model_client_for_status = crate::services::generated::model_client::ModelClient::for_service(
                 self.signing_key.clone(),
                 RequestIdentity::anonymous(),
-                hyprstream_rpc::node_identity::service_verifying_key(&self.signing_key, "model"),
+                model_vk,
             );
             let status_timeout = std::time::Duration::from_millis(500);
             let all_status_req = crate::services::generated::model_client::StatusRequest { model_ref: String::new() };
@@ -880,17 +909,19 @@ impl TuiService {
         let handle = tokio::runtime::Handle::current();
         let sk_load = self.signing_key.clone();
         let handle_load = handle.clone();
+        let model_vk_load = model_vk;
         let load_fn: Box<dyn Fn(&str, hyprstream_tui::shell_app::ModelStatusSender) + Send> =
             Box::new(move |model_ref: &str, tx: hyprstream_tui::shell_app::ModelStatusSender| {
                 use hyprstream_rpc::envelope::RequestIdentity;
                 let sk  = sk_load.clone();
                 let mr  = model_ref.to_owned();
                 let h   = handle_load.clone();
+                let vk  = model_vk_load;
                 // Submit load — returns "accepted" immediately (Continuation pattern).
                 h.block_on(async {
                     let client = crate::services::generated::model_client::ModelClient::for_service(
                         sk.clone(), RequestIdentity::anonymous(),
-                        hyprstream_rpc::node_identity::service_verifying_key(&sk, "model"),
+                        vk,
                     );
                     let _ = client.load(&crate::services::generated::model_client::LoadModelRequest {
                         model_ref: mr.clone(),
@@ -902,13 +933,14 @@ impl TuiService {
                 let sk_poll = sk.clone();
                 let mr_poll = mr.clone();
                 let h_poll  = h.clone();
+                let vk_poll = vk;
                 std::thread::spawn(move || {
                     for _ in 0..60u32 {   // max ~2 minutes (60 × 2 s)
                         std::thread::sleep(std::time::Duration::from_secs(2));
                         let loaded = h_poll.block_on(async {
                             let client = crate::services::generated::model_client::ModelClient::for_service(
                                 sk_poll.clone(), RequestIdentity::anonymous(),
-                                hyprstream_rpc::node_identity::service_verifying_key(&sk_poll, "model"),
+                                vk_poll,
                             );
                             client.status(&crate::services::generated::model_client::StatusRequest { model_ref: mr_poll.clone() }).await
                                 .is_ok_and(|es| es.iter().any(|e| e.status == "loaded"))
@@ -924,6 +956,7 @@ impl TuiService {
             });
         let sk_unload = self.signing_key.clone();
         let handle_unload = handle.clone();
+        let model_vk_unload = model_vk;
         let unload_fn: Box<dyn Fn(&str) -> bool + Send> = Box::new(move |model_ref: &str| {
             use hyprstream_rpc::envelope::RequestIdentity;
             let sk = sk_unload.clone();
@@ -931,7 +964,7 @@ impl TuiService {
             handle_unload.block_on(async move {
                 let client = crate::services::generated::model_client::ModelClient::for_service(
                     sk.clone(), RequestIdentity::anonymous(),
-                    hyprstream_rpc::node_identity::service_verifying_key(&sk, "model"),
+                    model_vk_unload,
                 );
                 client.unload(&crate::services::generated::model_client::UnloadModelRequest { model_ref: mr.clone() }).await.is_ok()
             })

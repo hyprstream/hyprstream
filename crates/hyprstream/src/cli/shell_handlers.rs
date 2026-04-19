@@ -17,6 +17,7 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
+use hyprstream_rpc::envelope::RequestIdentity;
 use waxterm::backend::AnsiBackend;
 use waxterm::input::InputParser;
 use zeroize::Zeroizing;
@@ -160,23 +161,44 @@ pub async fn handle_shell_tui(
     let models = fetch_models(signing_key, models_dir).await;
 
     // Model load-status channel (background polling → event loop).
+    // Resolve model + worker keys via PolicyClient.
+    let policy_vk = signing_key.verifying_key();
+    let policy_client = crate::services::PolicyClient::for_service(
+        signing_key.clone(),
+        RequestIdentity::anonymous(),
+        policy_vk,
+    );
+    let model_vk_resp = policy_client.resolve_service_key(
+        &crate::services::generated::policy_client::ResolveServiceKey {
+            service_name: "model".to_owned(),
+        },
+    ).await.context("Failed to resolve model service key")?;
+    let model_server_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+        model_vk_resp.verifying_key.as_slice().try_into()
+            .context("Invalid model key length")?,
+    ).context("Invalid model key")?;
+    let worker_vk_resp = policy_client.resolve_service_key(
+        &crate::services::generated::policy_client::ResolveServiceKey {
+            service_name: "worker".to_owned(),
+        },
+    ).await.context("Failed to resolve worker service key")?;
+    let worker_server_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+        worker_vk_resp.verifying_key.as_slice().try_into()
+            .context("Invalid worker key length")?,
+    ).context("Invalid worker key")?;
     let model_client = {
-        use hyprstream_rpc::envelope::RequestIdentity;
-        use hyprstream_rpc::node_identity::service_verifying_key;
         crate::services::generated::model_client::ModelClient::for_service(
             signing_key.clone(),
             RequestIdentity::anonymous(),
-            service_verifying_key(&signing_key, "model"),
+            model_server_vk,
         )
     };
     // Worker client for sandbox/container/image management.
     let worker_client = {
-        use hyprstream_rpc::envelope::RequestIdentity;
-        use hyprstream_rpc::node_identity::service_verifying_key;
         hyprstream_workers::runtime::WorkerClient::for_service(
             signing_key.clone(),
             RequestIdentity::anonymous(),
-            service_verifying_key(&signing_key, "worker"),
+            worker_server_vk,
         )
     };
     let (model_status_tx, mut model_status_rx) =
@@ -1552,6 +1574,43 @@ async fn fetch_models(
     models_dir: &std::path::Path,
 ) -> Vec<ModelEntry> {
     use hyprstream_rpc::envelope::RequestIdentity;
+
+    // Resolve registry + model keys via PolicyClient
+    let policy_vk = signing_key.verifying_key();
+    let policy_client = crate::services::PolicyClient::for_service(
+        signing_key.clone(), RequestIdentity::anonymous(), policy_vk,
+    );
+    let registry_server_vk = match policy_client.resolve_service_key(
+        &crate::services::generated::policy_client::ResolveServiceKey {
+            service_name: "registry".to_owned(),
+        },
+    ).await {
+        Ok(resp) => match <[u8; 32]>::try_from(resp.verifying_key.as_slice()) {
+            Ok(bytes) => hyprstream_rpc::crypto::VerifyingKey::from_bytes(&bytes)
+                .unwrap_or_else(|_| signing_key.verifying_key()),
+            Err(_) => signing_key.verifying_key(),
+        },
+        Err(e) => {
+            tracing::warn!("Failed to resolve registry key: {e}");
+            signing_key.verifying_key()
+        }
+    };
+    let model_server_vk = match policy_client.resolve_service_key(
+        &crate::services::generated::policy_client::ResolveServiceKey {
+            service_name: "model".to_owned(),
+        },
+    ).await {
+        Ok(resp) => match <[u8; 32]>::try_from(resp.verifying_key.as_slice()) {
+            Ok(bytes) => hyprstream_rpc::crypto::VerifyingKey::from_bytes(&bytes)
+                .unwrap_or_else(|_| signing_key.verifying_key()),
+            Err(_) => signing_key.verifying_key(),
+        },
+        Err(e) => {
+            tracing::warn!("Failed to resolve model key: {e}");
+            signing_key.verifying_key()
+        }
+    };
+
     let registry_endpoint = hyprstream_rpc::registry::global()
         .endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep)
         .to_zmq_string();
@@ -1559,12 +1618,12 @@ async fn fetch_models(
         &registry_endpoint,
         signing_key.clone(),
         RequestIdentity::anonymous(),
-        hyprstream_rpc::node_identity::service_verifying_key(signing_key, "registry"),
+        registry_server_vk,
     );
     let model_client_for_status = crate::services::generated::model_client::ModelClient::for_service(
         signing_key.clone(),
         RequestIdentity::anonymous(),
-        hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "model"),
+        model_server_vk,
     );
     let registry_models_dir = models_dir.to_path_buf();
     let status_timeout = std::time::Duration::from_millis(500);

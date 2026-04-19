@@ -356,6 +356,29 @@ pub async fn handle_schema_command(
     Ok(())
 }
 
+/// Resolve a service verifying key via PolicyService.
+///
+/// Creates a PolicyClient using the root key (inproc mode) and resolves the
+/// given service name to its verifying key.
+async fn resolve_key_via_policy(
+    signing_key: &SigningKey,
+    service_name: &str,
+) -> Result<hyprstream_rpc::crypto::VerifyingKey> {
+    let policy_vk = signing_key.verifying_key();
+    let policy_client = PolicyClient::for_service(
+        signing_key.clone(), RequestIdentity::anonymous(), policy_vk,
+    );
+    let resp = policy_client.resolve_service_key(
+        &crate::services::generated::policy_client::ResolveServiceKey {
+            service_name: service_name.to_owned(),
+        },
+    ).await.map_err(|e| anyhow::anyhow!("Failed to resolve key for '{}': {e}", service_name))?;
+    hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+        resp.verifying_key.as_slice().try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid key length for '{}'", service_name))?,
+    ).map_err(|e| anyhow::anyhow!("Invalid key for '{}': {e}", service_name))
+}
+
 /// Dispatch a top-level (non-scoped) method call.
 async fn dispatch_top_level(
     service: &str,
@@ -367,24 +390,25 @@ async fn dispatch_top_level(
 
     match service {
         "registry" => {
-            let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "registry");
+            let server_vk = resolve_key_via_policy(&signing_key, "registry").await?;
             let client: RegistryClient = RegistryClient::for_service(
                 signing_key, identity, server_vk,
             );
             client.call_method(method, args).await
         }
         "model" => {
-            let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "model");
+            let server_vk = resolve_key_via_policy(&signing_key, "model").await?;
             let client = ModelClient::for_service(signing_key, identity, server_vk);
             client.call_method(method, args).await
         }
         "inference" => {
-            let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "inference");
+            let server_vk = resolve_key_via_policy(&signing_key, "inference").await?;
             let client = InferenceClient::for_service(signing_key, identity, server_vk);
             client.call_method(method, args).await
         }
         "policy" => {
-            let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "policy");
+            // Bootstrap: PolicyService uses the root key
+            let server_vk = signing_key.verifying_key();
             let client = PolicyClient::for_service(signing_key, identity, server_vk);
             client.call_method(method, args).await
         }
@@ -410,19 +434,19 @@ async fn dispatch_scoped_dynamic(
 
     match service {
         "registry" => {
-            let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "registry");
+            let server_vk = resolve_key_via_policy(&signing_key, "registry").await?;
             let client: RegistryClient = RegistryClient::for_service(
                 signing_key, identity, server_vk,
             );
             client.call_scoped_method(scope_chain, method, args).await
         }
         "model" => {
-            let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "model");
+            let server_vk = resolve_key_via_policy(&signing_key, "model").await?;
             let client = ModelClient::for_service(signing_key, identity, server_vk);
             client.call_scoped_method(scope_chain, method, args).await
         }
         "worker" => {
-            let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "worker");
+            let server_vk = resolve_key_via_policy(&signing_key, "worker").await?;
             let client = WorkerClient::for_service(signing_key, identity, server_vk);
             client.call_scoped_method(scope_chain, method, args).await
         }

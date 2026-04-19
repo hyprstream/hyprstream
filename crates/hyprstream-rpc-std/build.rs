@@ -3,6 +3,8 @@
 //! Compiles service Cap'n Proto schemas. Imports shared types from
 //! hyprstream-rpc/schema/ (common, streaming, annotations, optional).
 
+#![allow(clippy::expect_used)]
+
 use std::env;
 use std::path::Path;
 

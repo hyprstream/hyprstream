@@ -28,8 +28,9 @@ WantedBy=sockets.target
 /// Node-level credentials — every service on this node needs these.
 ///
 /// These are infrastructure secrets shared across services:
-/// RSA key (RS256 JWT signing for OIDC interop), TLS materials (HTTP/QUIC transport).
-/// Per-service signing keys are stored in per-service subdirectories.
+/// signing-key (CA key, also used by PolicyService), RSA key, TLS materials.
+/// Per-service signing keys are stored in per-service subdirectories and loaded
+/// via SetLoadCredential.
 pub const NODE_CREDENTIAL_NAMES: &[&str] = &[
     "rsa-key",
     "tls-key",
@@ -44,7 +45,12 @@ pub const NODE_CREDENTIAL_NAMES: &[&str] = &[
 ///
 /// Stored under `credentials/{service_name}/`:
 /// - `signing-key` — service's own independent Ed25519 private key
+///   (loaded via SetLoadCredential from per-service credstore subdirectory)
 /// - `service-jwt` — CA-signed JWT certificate binding name → pubkey
+///
+/// Note: `signing-key` is also in NODE_CREDENTIAL_NAMES (flat credstore) as
+/// the CA key for PolicyService. Non-policy services use SetLoadCredential
+/// to override with their independent per-service key.
 pub const SERVICE_CREDENTIAL_NAMES: &[&str] = &[
     "signing-key",
     "service-jwt",
@@ -172,17 +178,45 @@ pub fn service_unit(service: &str, use_systemd_creds: bool, depends_on: &[&str])
             names.extend(POLICY_CREDENTIAL_NAMES.iter().copied());
         }
 
-        let import_lines: String = names
-            .iter()
-            .filter(|name| {
-                // Check both flat credstore and per-service subdirectory
-                credstore.join(name).exists()
-                    || credstore.join(service).join(name).exists()
-            })
-            .map(|name| format!("ImportCredential={name}\n"))
-            .collect();
+        // Plaintext credential directory (wizard-written files):
+        //   ~/.config/hyprstream/credentials/{service}/signing-key
+        let plain_creds = dirs::config_dir()
+            .map(|d| d.join("hyprstream").join("credentials"))
+            .unwrap_or_default();
 
-        if import_lines.is_empty() {
+        let mut import_lines = String::new();
+
+        for name in &names {
+            // Per-service credentials (signing-key, service-jwt): each service
+            // has its own independent Ed25519 key stored in a subdirectory.
+            //
+            // ImportCredential requires the credstore file name to match the
+            // runtime name, but per-service creds are encrypted with prefixed
+            // names (e.g. model-signing-key).  Use LoadCredential to load from
+            // the plaintext file directly, making it available as the unprefixed
+            // name the runtime expects.
+            //
+            // Policy is special: its "signing-key" IS the CA key, stored flat
+            // in the encrypted credstore, so ImportCredential works for it.
+            if SERVICE_CREDENTIAL_NAMES.contains(name) && service != "policy" {
+                let plain_path = plain_creds.join(service).join(name);
+                if plain_path.exists() {
+                    import_lines.push_str(&format!(
+                        "LoadCredential={name}:{}\n",
+                        plain_path.display()
+                    ));
+                    continue;
+                }
+                // Fall through: no per-service plaintext file, try encrypted credstore
+            }
+            if credstore.join(name).exists() {
+                import_lines.push_str(&format!("ImportCredential={name}\n"));
+            }
+        }
+
+        let all_cred_lines = import_lines;
+
+        if all_cred_lines.is_empty() {
             String::new()
         } else {
             // PrivateMounts=yes is recommended for credential users, but it
@@ -191,7 +225,7 @@ pub fn service_unit(service: &str, use_systemd_creds: bool, depends_on: &[&str])
             let private_mounts = if is_appimage { "" } else { "\nPrivateMounts=yes" };
             format!(
                 "\n{}Environment=HYPRSTREAM__SECRETS__PATH=%d{private_mounts}",
-                import_lines
+                all_cred_lines
             )
         }
     } else {

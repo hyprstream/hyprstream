@@ -472,10 +472,32 @@ async fn chat_completions(
 
     // Call inference via collect-stream (per-request ZMQ client preserves caller identity for TTT delta routing)
     let identity = identity_from_user(&user);
-    let model_server_vk = hyprstream_rpc::node_identity::service_verifying_key(&state.signing_key, "model");
+    let model_server_vk = match state.policy_client.resolve_service_key(
+        &crate::services::generated::policy_client::ResolveServiceKey {
+            service_name: "model".to_owned(),
+        },
+    ).await {
+        Ok(resp) => match <[u8; 32]>::try_from(resp.verifying_key.as_slice()) {
+            Ok(bytes) => match hyprstream_rpc::crypto::VerifyingKey::from_bytes(&bytes) {
+                Ok(vk) => vk,
+                Err(_) => {
+                    tracing::error!("Invalid Ed25519 key from PolicyService");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "Key resolution failed").into_response();
+                }
+            }
+            Err(_) => {
+                tracing::error!("Invalid key length from PolicyService");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Key resolution failed").into_response();
+            }
+        }
+        Err(e) => {
+            tracing::error!("Failed to resolve model key: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Key resolution failed").into_response();
+        }
+    };
     let model_client = ModelClient::for_service((*state.signing_key).clone(), identity, model_server_vk);
     let claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
-    let result = collect_stream_to_result(&model_client.with_jwt(claims.token.unwrap_or_default()), &request.model, &gen_request).await;
+    let result = collect_stream_to_result(model_client.with_jwt(claims.token.unwrap_or_default()), &request.model, &gen_request).await;
 
     info!("Generation completed - success: {}", result.is_ok());
 
@@ -675,7 +697,32 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
 
         // Start ZMQ stream with per-request client (preserves caller identity for TTT delta routing)
         let identity = identity_from_user(&user);
-        let model_server_vk = hyprstream_rpc::node_identity::service_verifying_key(&state.signing_key, "model");
+        let model_server_vk = match state.policy_client.resolve_service_key(
+            &crate::services::generated::policy_client::ResolveServiceKey {
+                service_name: "model".to_owned(),
+            },
+        ).await {
+            Ok(resp) => {
+                let bytes: [u8; 32] = match resp.verifying_key.as_slice().try_into() {
+                    Ok(b) => b,
+                    Err(_) => {
+                        tracing::error!("Invalid key length from PolicyService");
+                        return;
+                    }
+                };
+                match hyprstream_rpc::crypto::VerifyingKey::from_bytes(&bytes) {
+                    Ok(vk) => vk,
+                    Err(e) => {
+                        tracing::error!("Invalid Ed25519 key from PolicyService: {e}");
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to resolve model key: {e}");
+                return;
+            }
+        };
         let model_client = ModelClient::for_service((*state.signing_key).clone(), identity, model_server_vk);
         let claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
         let client = model_client.with_jwt(claims.token.unwrap_or_default());
@@ -1002,10 +1049,32 @@ async fn completions(
 
     // Call inference via collect-stream (per-request ZMQ client preserves caller identity for TTT delta routing)
     let identity = identity_from_user(&user);
-    let model_server_vk = hyprstream_rpc::node_identity::service_verifying_key(&state.signing_key, "model");
+    let model_server_vk = match state.policy_client.resolve_service_key(
+        &crate::services::generated::policy_client::ResolveServiceKey {
+            service_name: "model".to_owned(),
+        },
+    ).await {
+        Ok(resp) => match <[u8; 32]>::try_from(resp.verifying_key.as_slice()) {
+            Ok(bytes) => match hyprstream_rpc::crypto::VerifyingKey::from_bytes(&bytes) {
+                Ok(vk) => vk,
+                Err(_) => {
+                    tracing::error!("Invalid Ed25519 key from PolicyService");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "Key resolution failed").into_response();
+                }
+            }
+            Err(_) => {
+                tracing::error!("Invalid key length from PolicyService");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Key resolution failed").into_response();
+            }
+        }
+        Err(e) => {
+            tracing::error!("Failed to resolve model key: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Key resolution failed").into_response();
+        }
+    };
     let model_client = ModelClient::for_service((*state.signing_key).clone(), identity, model_server_vk);
     let claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
-    let result = collect_stream_to_result(&model_client.with_jwt(claims.token.unwrap_or_default()), &request.model, &gen_request).await;
+    let result = collect_stream_to_result(model_client.with_jwt(claims.token.unwrap_or_default()), &request.model, &gen_request).await;
 
     // Metrics automatically decremented by MetricsGuard on drop
 

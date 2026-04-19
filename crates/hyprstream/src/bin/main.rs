@@ -452,7 +452,8 @@ fn handle_quick_command(
             || async move {
                 let keys_dir = ctx.models_dir().join(".registry").join("keys");
                 let signing_key = load_or_generate_signing_key(&keys_dir).await?;
-                let model_server_vk = hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "model");
+                let model_server_vk = resolve_service_vk("model")
+                    .ok_or_else(|| anyhow::anyhow!("Cannot resolve model service pubkey. Run 'hyprstream wizard -y' to generate bootstrap credentials."))?;
                 let model_client = hyprstream_core::services::generated::model_client::ModelClient::for_service(
                     signing_key,
                     RequestIdentity::anonymous(),
@@ -1055,7 +1056,8 @@ fn handle_quick_command(
                         let worker_policy_client = PolicyClient::for_service(
                             signing_key.clone(),
                             RequestIdentity::anonymous(),
-                            hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "policy"),
+                            resolve_service_vk("policy")
+                                .ok_or_else(|| anyhow::anyhow!("Cannot resolve policy pubkey. Run wizard."))?,
                         );
                         worker_service.set_authorize_fn(
                             hyprstream_core::services::build_authorize_fn(worker_policy_client),
@@ -1073,7 +1075,8 @@ fn handle_quick_command(
                     };
 
                     use hyprstream_workers::runtime::WorkerClient;
-                    let worker_server_vk = hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "worker");
+                    let worker_server_vk = resolve_service_vk("worker")
+                        .ok_or_else(|| anyhow::anyhow!("Cannot resolve worker pubkey. Run wizard."))?;
                     let worker_client =
                         WorkerClient::for_service(signing_key, RequestIdentity::anonymous(), worker_server_vk);
 
@@ -1225,6 +1228,25 @@ fn handle_quick_command(
             },
         ),
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CLI pubkey resolution helper
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Resolve a service's verifying key from bootstrap-pubkeys credential.
+///
+/// Resolve a service's verifying key from bootstrap-pubkeys credential.
+///
+/// Used by CLI command handlers that don't have a ServiceContext but need
+/// to verify responses from a target service.
+///
+/// Returns `None` if bootstrap-pubkeys is not available (wizard not run).
+fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
+    let secrets_dir = HyprConfig::resolve_secrets_dir();
+    hyprstream_core::auth::identity_store::load_bootstrap_pubkeys(&secrets_dir)
+        .ok()
+        .and_then(|pubkeys| pubkeys.get(service_name).copied())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1507,7 +1529,7 @@ fn main() -> Result<()> {
                         let wf_policy_client = PolicyClient::for_service(
                             signing_key.clone(),
                             RequestIdentity::anonymous(),
-                            hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "policy"),
+                            ctx.service_verifying_key("policy"),
                         );
                         wf_svc.set_authorize_fn(
                             hyprstream_core::services::build_authorize_fn(wf_policy_client),
@@ -1526,7 +1548,7 @@ fn main() -> Result<()> {
                 let client = hyprstream_core::services::RegistryClient::for_service(
                     signing_key.clone(),
                     RequestIdentity::anonymous(),
-                    hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "registry"),
+                    ctx.service_verifying_key("registry"),
                 );
 
                 Ok::<_, anyhow::Error>((
@@ -1546,10 +1568,16 @@ fn main() -> Result<()> {
                 let signing_key = load_or_generate_signing_key(&keys_dir).await?;
                 let verifying_key = signing_key.verifying_key();
 
+                // Resolve the registry service's verifying key from bootstrap pubkeys.
+                // CLI mode doesn't have a ServiceContext, so we look up the target
+                // pubkey directly from the credential store.
+                let registry_vk = resolve_service_vk("registry")
+                    .ok_or_else(|| anyhow::anyhow!("Cannot resolve registry pubkey. Run wizard."))?;
+
                 let client = hyprstream_core::services::RegistryClient::for_service(
                     signing_key.clone(),
                     RequestIdentity::anonymous(),
-                    hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "registry"),
+                    registry_vk,
                 );
 
                 Ok::<_, anyhow::Error>((client, Vec::new(), None, signing_key, verifying_key))
@@ -1668,7 +1696,8 @@ fn main() -> Result<()> {
                                     let policy_client = PolicyClient::for_service(
                                         signing_key.clone(),
                                         hyprstream_rpc::RequestIdentity::anonymous(),
-                                        hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "policy"),
+                                        resolve_service_vk("policy")
+                                            .ok_or_else(|| anyhow::anyhow!("Cannot resolve policy pubkey. Run wizard."))?,
                                     );
 
                                     let runtime_config =
@@ -1778,8 +1807,54 @@ fn main() -> Result<()> {
                                     vec![name.clone()]
                                 };
 
-                                // Generate independent per-service keys + JWTs in memory
-                                ctx = ctx.generate_independent_service_keys(&service_names);
+                                if execution_mode.uses_ipc() {
+                                    // Multi-process mode: each service gets its own independent key.
+                                    let secrets_dir = std::path::PathBuf::from(
+                                        std::env::var("HYPRSTREAM__SECRETS__PATH")
+                                            .unwrap_or_else(|_| {
+                                                dirs::config_dir()
+                                                    .map(|d| d.join("hyprstream").join("credentials"))
+                                                    .unwrap_or_default()
+                                                    .to_str()
+                                                    .unwrap_or("")
+                                                    .to_owned()
+                                            }),
+                                    );
+
+                                    // Load CA verifying key (trust anchor)
+                                    if let Ok(ca_vk) = hyprstream_core::auth::identity_store::load_ca_verifying_key(&secrets_dir) {
+                                        ctx = ctx.with_ca_verifying_key(ca_vk);
+                                    }
+
+                                    // Load bootstrap pubkeys (all service pubkeys)
+                                    if let Ok(pubkeys) = hyprstream_core::auth::identity_store::load_bootstrap_pubkeys(&secrets_dir) {
+                                        for (svc_name, vk) in &pubkeys {
+                                            ctx = ctx.with_known_pubkey(svc_name, *vk);
+                                        }
+                                    }
+
+                                    // C3 fix: systemd uses flat %d/signing-key, standalone uses subdirectory.
+                                    let systemd_mode = std::env::var("HYPRSTREAM__SECRETS__PATH").is_ok();
+                                    let own_key = if systemd_mode {
+                                        hyprstream_core::auth::identity_store::load_or_generate_node_signing_key(&secrets_dir)?
+                                    } else {
+                                        hyprstream_core::auth::identity_store::load_or_generate_service_signing_key(&secrets_dir, &name)?
+                                    };
+
+                                    if name == "policy" {
+                                        // PolicyService: signing_key IS the CA key (already loaded).
+                                        ctx = ctx.with_service_key(&name, own_key);
+                                    } else {
+                                        // Non-policy: swap signing_key to service's own independent key.
+                                        // CA key is no longer accessible via ctx.signing_key().
+                                        ctx = ctx.swap_signing_key(own_key.clone());
+                                        ctx = ctx.with_service_key(&name, own_key);
+                                    }
+                                } else {
+                                    // Single-process mode: generate independent keys in memory.
+                                    // All services share the same process, so in-memory keys work.
+                                    ctx = ctx.generate_independent_service_keys(&service_names);
+                                }
 
                                 let manager = InprocManager::new();
                                 let mut handles = Vec::new();

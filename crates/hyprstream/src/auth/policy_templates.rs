@@ -2,6 +2,58 @@
 //!
 //! Templates provide pre-configured policy rules that can be applied
 //! via CLI or PolicyService RPC.
+//!
+//! Also defines [`SERVICE_BASE_RULES`] — mandatory service-to-service
+//! authorization rules that are always present in every policy.csv.
+
+/// Base service-to-service authorization rules.
+///
+/// These rules MUST be present in every policy.csv — they grant each local
+/// service the permissions it needs to operate. Templates and user-facing
+/// rules are appended ON TOP of these rules, never replacing them.
+///
+/// Applied by:
+/// - `DEFAULT_POLICY_CSV` on first-time init
+/// - `handle_apply_template()` when templates are applied
+/// - `BootstrapManager::apply_template()` during wizard
+pub const SERVICE_BASE_RULES: &str = r#"# Service-to-service base rules (do not remove)
+# PolicyService: CA — issues tokens, manages policy rules, assigns roles
+p, service:policy, *, *, *, allow
+
+# Token self-renewal: any service can request its own token renewal
+p, service:*, *, policy:issue-token, manage, allow
+
+# Services that perform policy authorization checks
+p, service:registry, *, policy:*, check, allow
+p, service:model, *, policy:*, check, allow
+p, service:worker, *, policy:*, check, allow
+p, service:oai, *, policy:*, check, allow
+p, service:tui, *, policy:*, check, allow
+p, service:discovery, *, policy:*, check, allow
+p, service:notification, *, policy:*, check, allow
+p, service:metrics, *, policy:*, check, allow
+p, service:mcp, *, policy:*, *, allow
+
+# Registry access (services that create RegistryClient)
+p, service:model, *, registry:*, *, allow
+p, service:oai, *, registry:*, *, allow
+p, service:flight, *, registry:*, *, allow
+
+# Model/inference access (services that create ModelClient)
+p, service:model, *, model:*, *, allow
+p, service:oai, *, model:*, *, allow
+
+# Discovery: services announce and query endpoints
+p, service:discovery, *, discovery:*, *, allow
+p, service:model, *, discovery:*, *, allow
+p, service:oai, *, discovery:*, *, allow
+p, service:worker, *, discovery:*, *, allow
+
+# Infra services — scoped to their own domain
+p, service:oauth, *, oauth:*, *, allow
+p, service:streams, *, streams:*, *, allow
+p, service:event, *, event:*, *, allow
+"#;
 
 /// Built-in policy template
 pub struct PolicyTemplate {

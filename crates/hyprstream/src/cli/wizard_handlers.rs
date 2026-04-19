@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use inquire::{Confirm, Select, Text};
 
+use crate::auth::identity_store;
 use crate::auth::policy_templates::{get_templates, PolicyTemplate};
 use crate::auth::{write_policy_file, LocalKeyStore, PolicyManager, UserStore};
 use crate::cli::policy_handlers::{
@@ -190,7 +191,57 @@ async fn phase_bootstrap(state: &mut WizardState, _non_interactive: bool) -> Res
 
     // Load the signing key (repair checks ensure it exists)
     let signing_key = load_or_generate_signing_key(&state.keys_dir()).await?;
-    state.signing_key = Some(signing_key);
+    state.signing_key = Some(signing_key.clone());
+
+    // Generate per-service independent keys + CA credentials
+    let credentials_dir = crate::config::HyprConfig::load()
+        .map(|c| c.config_dir().join("credentials"))
+        .unwrap_or_else(|_| {
+            dirs::config_dir()
+                .unwrap_or_else(|| state.models_dir.clone())
+                .join("hyprstream")
+                .join("credentials")
+        });
+
+    // Write CA signing key (the root key becomes the CA key)
+    identity_store::write_ca_signing_key(&credentials_dir, &signing_key)?;
+    // Also write as 'signing-key' so PolicyService can load it via the flat credstore
+    identity_store::write_secret(&credentials_dir, "signing-key", &signing_key.to_bytes())?;
+    // Write CA verifying key (public, distributed to all services)
+    identity_store::write_ca_verifying_key(&credentials_dir, &signing_key.verifying_key())?;
+
+    // CA JWT signing key (purpose-derived for JWT signature separation)
+    let ca_jwt_key = hyprstream_rpc::node_identity::derive_purpose_key(
+        &signing_key, "hyprstream-jwt-v1",
+    );
+
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let mut bootstrap_pubkeys = std::collections::HashMap::new();
+    let now = chrono::Utc::now().timestamp();
+    let expiry = now + 7 * 86_400;
+
+    for factory in hyprstream_service::list_factories() {
+        let service_name = factory.name;
+        if service_name == "policy" {
+            bootstrap_pubkeys.insert(service_name.to_owned(), signing_key.verifying_key());
+            continue;
+        }
+        let service_key = identity_store::load_or_generate_service_signing_key(
+            &credentials_dir, service_name,
+        )?;
+        let service_vk = service_key.verifying_key();
+
+        let claims = hyprstream_rpc::auth::Claims::new(
+            format!("service:{service_name}"), now, expiry,
+        ).with_pub_key(URL_SAFE_NO_PAD.encode(service_vk.as_bytes()));
+        let jwt = hyprstream_rpc::auth::jwt::encode(&claims, &ca_jwt_key);
+        identity_store::write_service_jwt(&credentials_dir, service_name, &jwt)?;
+        bootstrap_pubkeys.insert(service_name.to_owned(), service_vk);
+    }
+    identity_store::write_bootstrap_pubkeys(&credentials_dir, &bootstrap_pubkeys)?;
+
+    print_check("Service keys", CheckStatus::Ok,
+        &format!("{} independent keypairs + JWTs", bootstrap_pubkeys.len()));
 
     println!();
     Ok(())

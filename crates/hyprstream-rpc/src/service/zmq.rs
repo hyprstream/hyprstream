@@ -144,7 +144,7 @@ impl EnvelopeContext {
     ///
     /// The registry maps the verified `signer_pubkey` to an authorization subject.
     /// This is the general form; `from_verified_as_system` is a convenience wrapper
-    /// that uses `NodeKeyRegistry`.
+    /// for single-key deployments.
     pub fn from_verified_with_registry(
         envelope: &SignedEnvelope,
         registry: &dyn crate::envelope::KeyRegistry,
@@ -162,23 +162,23 @@ impl EnvelopeContext {
         }
     }
 
-    /// Create a system-identity context for internal callbacks that bypass the ZMQ envelope pipeline.
+    /// Create a service-identity context for internal callbacks that bypass the ZMQ envelope pipeline.
     ///
     /// Used by services that make inproc self-calls without a real `SignedEnvelope`
-    /// (e.g., `InferenceService` callback mode). Sets `key_derived_subject = "system"`
-    /// so that `subject()` correctly returns the system subject for authorization.
+    /// (e.g., `InferenceService` callback mode). Sets `key_derived_subject = "service:{name}"`
+    /// so that `subject()` returns a proper service identity for authorization.
     ///
-    /// `signer_pubkey` is zeroed because there is no real envelope; the system subject
+    /// `signer_pubkey` is zeroed because there is no real envelope; the service subject
     /// is asserted directly and is trusted because this constructor is only reachable
     /// from internal code paths that never cross a network boundary.
-    pub fn from_callback_system(request_id: u64) -> Self {
+    pub fn from_callback_service(request_id: u64, service_name: &str) -> Self {
         Self {
             request_id,
             identity: RequestIdentity::Anonymous,
             ephemeral_pubkey: None,
             claims: None,
             jwt_token: None,
-            key_derived_subject: Subject::new("system"),
+            key_derived_subject: Subject::new(format!("service:{service_name}")),
             jwt_subject: None,
             signer_pubkey: [0u8; 32],
         }

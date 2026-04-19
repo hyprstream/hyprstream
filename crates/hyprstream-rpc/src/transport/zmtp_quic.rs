@@ -2018,7 +2018,7 @@ where
 
     // 1. Unwrap and verify SignedEnvelope based on verification mode.
     //
-    // FixedSigner: all callers sign with the node key → key_derived_subject = "system".
+    // FixedSigner: callers sign with a known service key → key_derived_subject = "service:{name}".
     // AnySigner: external callers (WebTransport) use their own key → Anonymous until JWT.
     let (mut ctx, payload) = match match verification {
         EnvelopeVerification::FixedSigner(pubkey) =>

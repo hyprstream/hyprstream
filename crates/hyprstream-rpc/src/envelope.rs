@@ -337,28 +337,41 @@ pub trait KeyRegistry: Send + Sync {
     fn resolve(&self, signer_pubkey: &[u8; 32]) -> Subject;
 }
 
-/// Single-key registry mapping the local node's signing key to `Subject::new("system")`.
+/// Multi-key registry mapping service Ed25519 pubkeys to service subjects.
 ///
-/// Create one per service using the node's `VerifyingKey`. All inproc/IPC callers
-/// that sign with this key resolve to `"system"`, which Casbin grants full
-/// permissions. All other signer keys resolve to `Subject::anonymous()`.
-pub struct NodeKeyRegistry {
-    node_pubkey: [u8; 32],
+/// Each registered service key maps to `Subject::new("service:{name}")`.
+/// Unregistered keys resolve to `Subject::anonymous()`.
+///
+/// In inproc mode, all generated independent service keys are registered.
+/// In IPC mode, keys are loaded from bootstrap-pubkeys credential.
+pub struct ServiceKeyRegistry {
+    /// Ed25519 pubkey bytes → service name
+    service_pubkeys: std::collections::HashMap<[u8; 32], String>,
 }
 
-impl NodeKeyRegistry {
-    /// Create a registry from the node's Ed25519 verifying key.
-    pub fn new(key: &VerifyingKey) -> Self {
-        Self {
-            node_pubkey: key.to_bytes(),
-        }
+impl Default for ServiceKeyRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-impl KeyRegistry for NodeKeyRegistry {
+impl ServiceKeyRegistry {
+    pub fn new() -> Self {
+        Self {
+            service_pubkeys: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Register a service's verifying key.
+    pub fn register(&mut self, service_name: &str, verifying_key: VerifyingKey) {
+        self.service_pubkeys.insert(verifying_key.to_bytes(), service_name.to_owned());
+    }
+}
+
+impl KeyRegistry for ServiceKeyRegistry {
     fn resolve(&self, signer_pubkey: &[u8; 32]) -> Subject {
-        if signer_pubkey == &self.node_pubkey {
-            Subject::new("system")
+        if let Some(name) = self.service_pubkeys.get(signer_pubkey) {
+            Subject::new(format!("service:{name}"))
         } else {
             Subject::anonymous()
         }

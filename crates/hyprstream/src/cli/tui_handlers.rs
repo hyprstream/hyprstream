@@ -10,7 +10,7 @@
 //! where codegen covers the method, and raw Cap'n Proto for UInt32 variants
 //! (list_windows, disconnect, etc.) that codegen doesn't generate client methods for.
 // CLI handlers intentionally print to stdout/stderr for user interaction
-#![allow(clippy::print_stdout, clippy::print_stderr)]
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::expect_used)]
 
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
@@ -23,14 +23,40 @@ use crate::services::generated::tui_client::{TuiClient, ConnectRequest, DisplayM
 /// Create a TuiClient for RPC calls.
 ///
 /// Resolves the TUI service endpoint from the registry and creates a client
-/// with the given signing key and local identity.
+/// with the given signing key and local identity. Uses PolicyClient to resolve
+/// the TUI service's verifying key at runtime.
 pub fn create_tui_client(signing_key: &SigningKey) -> TuiClient {
     use hyprstream_rpc::registry::{global as registry, SocketKind};
-    use hyprstream_rpc::node_identity::service_verifying_key;
 
     let endpoint = registry().endpoint("tui", SocketKind::Rep).to_zmq_string();
     let sk = signing_key.clone();
-    let server_vk = service_verifying_key(&sk, "tui");
+
+    // Bootstrap: PolicyService uses the root key in inproc mode
+    let policy_vk = signing_key.verifying_key();
+    let policy_client = crate::services::PolicyClient::for_service(
+        sk.clone(), RequestIdentity::anonymous(), policy_vk,
+    );
+    let server_vk = {
+        let resp = tokio::task::block_in_place(|| {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(policy_client.resolve_service_key(
+                &crate::services::generated::policy_client::ResolveServiceKey {
+                    service_name: "tui".to_owned(),
+                },
+            ))
+        });
+        match resp {
+            Ok(r) => match <[u8; 32]>::try_from(r.verifying_key.as_slice()) {
+                Ok(bytes) => match hyprstream_rpc::crypto::VerifyingKey::from_bytes(&bytes) {
+                    Ok(vk) => vk,
+                    Err(_) => panic!("Invalid Ed25519 key from PolicyService"),
+                },
+                Err(_) => panic!("Invalid key length from PolicyService"),
+            },
+            Err(e) => panic!("Failed to resolve TUI service key: {e}"),
+        }
+    };
+
     TuiClient::for_endpoint(&endpoint, sk, RequestIdentity::anonymous(), server_vk)
 }
 

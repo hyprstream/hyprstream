@@ -69,6 +69,12 @@ struct PolicyRequest {
 
     # Deposit wrapped keys for subscribers
     depositWrappedKeys @17 :DepositWrappedKeys $mcpScope(manage) $mcpDescription("Deposit wrapped keys for subscribers");
+
+    # Resolve a service name to its Ed25519 verifying key
+    resolveServiceKey @18 :ResolveServiceKey $mcpScope(query) $mcpDescription("Resolve a service name to its Ed25519 verifying key");
+
+    # Register a service's verifying key with the CA
+    registerServiceKey @19 :RegisterServiceKey $mcpScope(manage) $mcpDescription("Register a service verifying key with the CA");
   }
 }
 
@@ -197,6 +203,12 @@ struct PolicyResponse {
 
     # Wrapped keys deposit result
     depositWrappedKeysResult @18 :Void;
+
+    # Service key resolution result
+    resolveServiceKeyResult @19 :ServiceKeyResponse;
+
+    # Service key registration result
+    registerServiceKeyResult @20 :Void;
   }
 }
 
@@ -309,4 +321,27 @@ struct EventPrefixAccess {
 # List of pending subscriber public keys
 struct PendingSubscribers {
   pubkeys @0 :List(Data);
+}
+
+# Resolve a service name to its Ed25519 verifying key
+struct ResolveServiceKey {
+  serviceName @0 :Text;
+}
+
+# Response containing a service's verifying key and optional CA-signed attestation
+struct ServiceKeyResponse {
+  # Ed25519 verifying key (32 bytes)
+  verifyingKey @0 :Data;
+  # CA-signed JWT attesting this key (optional, for verification)
+  serviceJwt @1 :Text $optional;
+}
+
+# Register a service's verifying key with the CA (PolicyService)
+struct RegisterServiceKey {
+  # Service name (e.g. "model", "registry")
+  serviceName @0 :Text;
+  # Ed25519 verifying key (32 bytes)
+  verifyingKey @1 :Data;
+  # CA-signed JWT proving key ownership (subject must be "service:{serviceName}")
+  serviceJwt @2 :Text;
 }

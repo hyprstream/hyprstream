@@ -31,6 +31,7 @@
 //! g, alice, trainer
 //! ```
 
+use crate::auth::policy_templates::SERVICE_BASE_RULES;
 use crate::auth::Operation;
 use casbin::{CoreApi, DefaultModel, Enforcer, FileAdapter, MemoryAdapter, MgmtApi, RbacApi};
 use std::path::{Path, PathBuf};
@@ -130,41 +131,37 @@ m = (g(r.sub, p.sub) || keyMatch(r.sub, p.sub)) && \
     (p.act == "*" || keyMatch(r.act, p.act))
 "#;
 
-/// Default policy rules: deny-by-default with system grant
+/// Default policy rules: deny-by-default with service grants
 ///
 /// All access is denied until the operator explicitly configures policy via:
 ///   hyprstream quick policy apply-template local    # grant local CLI full access
 ///   hyprstream quick policy apply-template public-inference  # open inference API
 ///
-/// The `system` subject (derived from the node's Ed25519 signing key) is granted
-/// full access. This allows inproc/IPC callers (CLI, services) to function without
-/// requiring explicit policy configuration.
+/// Service-to-service rules are defined in [`policy_templates::SERVICE_BASE_RULES`].
 ///
 /// Policy format: p, subject, domain, resource, action, effect
-const DEFAULT_POLICY_CSV: &str = r#"# Hyprstream Access Control Policy — deny-by-default
-#
-# The 'system' subject (local node key → inproc/IPC callers) has full access.
-p, system, *, *, *, allow
-#
-# The TUI display server is a local-only service; anonymous browser clients
-# (connecting via WebTransport from localhost) may access TUI resources.
-p, anonymous, *, tui:*, *, allow
-#
-# No other access is granted until you apply a policy template:
-#
-#   hyprstream quick policy apply-template local             # local CLI full access
-#   hyprstream quick policy apply-template public-inference  # anonymous inference
-#   hyprstream quick policy apply-template public-read       # anonymous registry browse
-#
-# Or add rules manually:
-#   p, alice, *, *, *, allow                           # Alice full access
-#   p, alice, *, model:*, infer, allow                 # Alice can infer
-#   p, anonymous, *, inference:*, infer, allow         # public inference
-#
-# Role assignments:
-#   g, alice, trainer
-#   p, trainer, *, model:*, train, allow
-"#;
+fn default_policy_csv() -> String {
+    format!(
+        "# Hyprstream Access Control Policy — deny-by-default\n\
+        {}\n\
+        # The TUI display server is a local-only service; anonymous browser clients\n\
+        # (connecting via WebTransport from localhost) may access TUI resources.\n\
+        p, anonymous, *, tui:*, *, allow\n\
+        #\n\
+        # No other access is granted until you apply a policy template:\n\
+        #\n\
+        #   hyprstream quick policy apply-template local             # local CLI full access\n\
+        #   hyprstream quick policy apply-template public-inference  # anonymous inference\n\
+        #   hyprstream quick policy apply-template public-read       # anonymous registry browse\n\
+        #\n\
+        # Or add rules manually:\n\
+        #   p, alice, *, *, *, allow                           # Alice full access\n\
+        #   p, alice, *, model:*, infer, allow                 # Alice can infer\n\
+        #   p, anonymous, *, inference:*, infer, allow         # public inference\n\
+        #\n",
+        SERVICE_BASE_RULES,
+    )
+}
 
 /// Validate policy.csv format before loading
 ///
@@ -267,7 +264,7 @@ impl PolicyManager {
         // Create default policy.csv if not exists
         if !policy_path.exists() {
             info!("Creating default policy.csv (deny-by-default — run `hyprstream quick policy apply-template local` to grant access)");
-            write_policy_file(&policy_path, DEFAULT_POLICY_CSV).await?;
+            write_policy_file(&policy_path, default_policy_csv()).await?;
         }
 
         // Validate policy.csv format before loading

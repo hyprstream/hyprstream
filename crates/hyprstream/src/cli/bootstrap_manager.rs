@@ -321,7 +321,14 @@ impl WizardBackend for BootstrapManager {
 
     fn apply_template(&mut self, name: &str) {
         if let Some(template) = get_template(name) {
-            let content = template.expanded_rules();
+            let template_content = template.expanded_rules();
+            // Prepend service base rules so templates don't wipe inter-service permissions
+            let content = format!(
+                "{}\n# User-facing rules from '{}' template:\n{}",
+                crate::auth::policy_templates::SERVICE_BASE_RULES,
+                name,
+                template_content,
+            );
             let policy_csv = self.policies_dir().join("policy.csv");
             let _ = self.rt.block_on(async {
                 write_policy_file(&policy_csv, content.as_bytes()).await

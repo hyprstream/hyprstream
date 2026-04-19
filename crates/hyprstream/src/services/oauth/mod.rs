@@ -278,15 +278,30 @@ impl Spawnable for OAuthService {
             // Create RPC clients HERE, inside the OAuth runtime, so that ZMQ
             // async I/O (TMQ) registers socket FDs with THIS runtime's epoll.
             // Creating them in the factory (main runtime) would cause hangs.
+
+            // Bootstrap: PolicyClient requires the policy service's verifying key.
+            // Use HKDF for this initial client since we need it to resolve all other keys.
             let policy_client = PolicyClient::for_service(
                 self.signing_key.clone(),
                 hyprstream_rpc::RequestIdentity::anonymous(),
-                hyprstream_rpc::node_identity::service_verifying_key(&self.signing_key, "policy"),
+                // Bootstrap: PolicyService uses the root key
+                self.signing_key.verifying_key(),
             );
+
+            // Resolve discovery service verifying key via PolicyService RPC.
+            let key_resp = policy_client.resolve_service_key(
+                &crate::services::generated::policy_client::ResolveServiceKey {
+                    service_name: "discovery".to_owned(),
+                },
+            ).await.map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("resolve discovery key: {e}")))?;
+            let discovery_vk = ed25519_dalek::VerifyingKey::from_bytes(
+                key_resp.verifying_key.as_slice().try_into()
+                    .map_err(|_| hyprstream_rpc::error::RpcError::SpawnFailed("Invalid verifying key length".to_owned()))?,
+            ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("Invalid Ed25519 key: {e}")))?;
             let discovery_client = crate::services::DiscoveryClient::for_service(
                 self.signing_key.clone(),
                 hyprstream_rpc::RequestIdentity::anonymous(),
-                hyprstream_rpc::node_identity::service_verifying_key(&self.signing_key, "discovery"),
+                discovery_vk,
             );
 
             // Attempt to load the user credential store for Ed25519 device verification.

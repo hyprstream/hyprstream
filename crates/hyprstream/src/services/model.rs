@@ -179,14 +179,14 @@ impl std::ops::Deref for ModelService {
 
 impl ModelService {
     /// Create a new model service with infrastructure
-    pub fn new(
+    pub async fn new(
         config: ModelServiceConfig,
         signing_key: SigningKey,
         policy_client: PolicyClient,
         registry: RegistryClient,
         context: Arc<zmq::Context>,
         transport: TransportConfig,
-    ) -> Self {
+    ) -> Result<Self> {
         // SAFETY: 5 is a valid non-zero value
         const DEFAULT_CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(5) {
             Some(n) => n,
@@ -194,14 +194,23 @@ impl ModelService {
         };
         let cache_size = NonZeroUsize::new(config.max_models).unwrap_or(DEFAULT_CACHE_SIZE);
 
+        let key_resp = policy_client.resolve_service_key(
+            &crate::services::generated::policy_client::ResolveServiceKey {
+                service_name: "notification".to_owned(),
+            },
+        ).await?;
+        let notif_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+            key_resp.verifying_key.as_slice().try_into()
+                .map_err(|_| anyhow!("Invalid verifying key length"))?,
+        ).map_err(|e| anyhow!("Invalid Ed25519 key: {e}"))?;
         let notif_client = NotificationClient::for_service(
             signing_key.clone(),
             RequestIdentity::anonymous(),
-            hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "notification"),
+            notif_vk,
         );
         let notification_publisher = NotificationPublisher::new(notif_client, signing_key.clone());
 
-        Self { inner: Arc::new(ModelServiceInner {
+        Ok(Self { inner: Arc::new(ModelServiceInner {
             loaded_models: RwLock::new(LruCache::new(cache_size)),
             pending_loads: Mutex::new(HashSet::new()),
             config,
@@ -217,7 +226,7 @@ impl ModelService {
             local_issuer_url: None,
             federation_key_source: None,
             fs_tree: std::sync::OnceLock::new(),
-        })}
+        })})
     }
 
     /// Set the expected JWT audience for token validation.
@@ -261,7 +270,7 @@ impl ModelService {
     }
 
     /// Create a model service with callback router for spawned mode
-    pub fn with_callback_router(
+    pub async fn with_callback_router(
         config: ModelServiceConfig,
         signing_key: SigningKey,
         policy_client: PolicyClient,
@@ -269,21 +278,30 @@ impl ModelService {
         callback_router: crate::services::callback::CallbackRouter,
         context: Arc<zmq::Context>,
         transport: TransportConfig,
-    ) -> Self {
+    ) -> Result<Self> {
         const DEFAULT_CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(5) {
             Some(n) => n,
             None => unreachable!(),
         };
         let cache_size = NonZeroUsize::new(config.max_models).unwrap_or(DEFAULT_CACHE_SIZE);
 
+        let key_resp = policy_client.resolve_service_key(
+            &crate::services::generated::policy_client::ResolveServiceKey {
+                service_name: "notification".to_owned(),
+            },
+        ).await?;
+        let notif_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+            key_resp.verifying_key.as_slice().try_into()
+                .map_err(|_| anyhow!("Invalid verifying key length"))?,
+        ).map_err(|e| anyhow!("Invalid Ed25519 key: {e}"))?;
         let notif_client = NotificationClient::for_service(
             signing_key.clone(),
             RequestIdentity::anonymous(),
-            hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "notification"),
+            notif_vk,
         );
         let notification_publisher = NotificationPublisher::new(notif_client, signing_key.clone());
 
-        Self { inner: Arc::new(ModelServiceInner {
+        Ok(Self { inner: Arc::new(ModelServiceInner {
             loaded_models: RwLock::new(LruCache::new(cache_size)),
             pending_loads: Mutex::new(HashSet::new()),
             config,
@@ -299,7 +317,7 @@ impl ModelService {
             local_issuer_url: None,
             federation_key_source: None,
             fs_tree: std::sync::OnceLock::new(),
-        })}
+        })})
     }
 
     /// Derive the deterministic IPC endpoint for a model reference.
@@ -415,11 +433,20 @@ impl ModelService {
             .map_err(|e| anyhow!("Failed to spawn inference service: {}", e))?;
 
         // Create client for this service
+        let key_resp = self.policy_client.resolve_service_key(
+            &crate::services::generated::policy_client::ResolveServiceKey {
+                service_name: "inference".to_owned(),
+            },
+        ).await?;
+        let inference_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+            key_resp.verifying_key.as_slice().try_into()
+                .map_err(|_| anyhow!("Invalid verifying key length"))?,
+        ).map_err(|e| anyhow!("Invalid Ed25519 key: {e}"))?;
         let client = InferenceClient::for_endpoint(
             &endpoint,
             self.signing_key.clone(),
             RequestIdentity::anonymous(),
-            hyprstream_rpc::node_identity::service_verifying_key(&self.signing_key, "inference"),
+            inference_vk,
         );
 
         // Load TTT config from model's config.json (if TTT is enabled)

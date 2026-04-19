@@ -26,11 +26,14 @@ use std::path::Path;
 use std::process::Command;
 
 /// Create a PolicyClient for RPC calls.
+///
+/// Bootstrap: PolicyService key needed to create the PolicyClient for peer key resolution.
 fn create_policy_client(signing_key: &SigningKey) -> PolicyClient {
     PolicyClient::for_service(
         signing_key.clone(),
         RequestIdentity::anonymous(),
-        hyprstream_rpc::node_identity::service_verifying_key(signing_key, "policy"),
+        // Bootstrap: PolicyService uses the root key
+        signing_key.verifying_key(),
     )
 }
 

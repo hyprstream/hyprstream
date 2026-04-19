@@ -76,7 +76,7 @@ pub async fn verify_id_token(
     let matching_key = find_matching_key(keys, kid, &header)?;
 
     // Build a jsonwebtoken::Validation with the correct algorithm
-    let alg = determine_algorithm(&matching_key, &header)?;
+    let alg = determine_algorithm(matching_key, &header)?;
     let mut validation = Validation::new(alg);
     validation.set_issuer(&[expected_issuer]);
     validation.set_audience(&[expected_audience]);
@@ -84,7 +84,7 @@ pub async fn verify_id_token(
     validation.leeway = 60;
 
     // Build the DecodingKey from the JWKS key
-    let decoding_key = build_decoding_key(&matching_key)?;
+    let decoding_key = build_decoding_key(matching_key)?;
 
     // Decode and verify
     let decoded = jsonwebtoken::decode::<Value>(token, &decoding_key, &validation)
@@ -258,6 +258,7 @@ pub fn decode_unverified(token: &str) -> Result<Value> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

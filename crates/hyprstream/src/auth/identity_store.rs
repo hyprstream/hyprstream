@@ -68,6 +68,38 @@ pub fn write_secret(dir: &std::path::Path, name: &str, value: &[u8]) -> Result<(
     Ok(())
 }
 
+/// Write a secret only if the file does not already exist (atomic O_EXCL).
+///
+/// Returns `Ok(true)` if the file was created, `Ok(false)` if it already
+/// existed (another process won the race). This eliminates the TOCTOU race
+/// between checking if a key exists and generating a new one.
+pub fn write_secret_exclusive(dir: &std::path::Path, name: &str, value: &[u8]) -> Result<bool> {
+    use std::io::Write as _;
+    ensure_secrets_dir(dir)?;
+    let path = dir.join(name);
+
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true) // O_EXCL — atomic check-and-create
+        .open(&path)
+    {
+        Ok(mut f) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                    .with_context(|| format!("failed to chmod '{}'", path.display()))?;
+            }
+            f.write_all(value)
+                .with_context(|| format!("failed to write secret to '{}'", path.display()))?;
+            tracing::debug!("exclusively wrote secret '{}'", path.display());
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("failed to create '{}'", path.display())),
+    }
+}
+
 /// Returns `true` if `dir` exists and is writable (or can be created).
 ///
 /// Uses `tempfile::tempfile_in` so no named probe file is left on disk,
@@ -124,7 +156,7 @@ fn missing_in_readonly(secrets_dir: &std::path::Path, name: &str) -> anyhow::Err
 ///     service-jwt     # CA-signed JWT certificate
 ///   bootstrap-pubkeys # JSON: { "policy": "base64...", "discovery": "base64..." }
 /// ```
-
+///
 /// Load or generate an independent Ed25519 signing key for a specific service.
 ///
 /// Each service gets its own randomly-generated keypair stored in
@@ -136,10 +168,36 @@ fn missing_in_readonly(secrets_dir: &std::path::Path, name: &str) -> anyhow::Err
 ///
 /// * `credentials_dir` — Base credentials directory (e.g., `~/.config/hyprstream/credentials`)
 /// * `service_name` — Service name (e.g., "model", "discovery")
+///
+/// Validate a service name for use in filesystem paths.
+///
+/// Rejects names containing path separators, `..`, or characters
+/// outside `[a-z0-9-]`. Prevents directory traversal when service
+/// names are used in path construction.
+pub fn validate_service_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("service name cannot be empty");
+    }
+    if name.len() > 64 {
+        anyhow::bail!("service name too long (max 64 chars): '{name}'");
+    }
+    if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+        anyhow::bail!(
+            "service name '{name}' contains invalid characters; \
+             only lowercase ASCII, digits, and hyphens are allowed"
+        );
+    }
+    if name.starts_with('-') {
+        anyhow::bail!("service name cannot start with a hyphen: '{name}'");
+    }
+    Ok(())
+}
+
 pub fn load_or_generate_service_signing_key(
     credentials_dir: &std::path::Path,
     service_name: &str,
 ) -> Result<SigningKey> {
+    validate_service_name(service_name)?;
     let service_dir = credentials_dir.join(service_name);
     const NAME: &str = "signing-key";
 
@@ -160,11 +218,34 @@ pub fn load_or_generate_service_signing_key(
 
     let key = SigningKey::generate(&mut rand::rngs::OsRng);
     let mut raw = key.to_bytes();
-    let result = write_secret(&service_dir, NAME, &raw);
-    raw.zeroize();
-    result?;
-    tracing::info!("Generated new Ed25519 signing key for service '{service_name}'");
-    Ok(key)
+    match write_secret_exclusive(&service_dir, NAME, &raw) {
+        Ok(true) => {
+            raw.zeroize();
+            tracing::info!("Generated new Ed25519 signing key for service '{service_name}'");
+            Ok(key)
+        }
+        Ok(false) => {
+            // Another process won the race — reload their key
+            raw.zeroize();
+            tracing::info!(
+                "Key for '{service_name}' created by another process — reloading"
+            );
+            // Re-read (not recursive — file now exists)
+            let mut bytes = read_secret(&service_dir, NAME)?
+                .ok_or_else(|| anyhow!("race loser: key file disappeared"))?;
+            let mut arr: [u8; 32] = bytes.as_slice()
+                .try_into()
+                .map_err(|_| anyhow!("service '{service_name}' signing-key must be 32 bytes"))?;
+            let sk = SigningKey::from_bytes(&arr);
+            bytes.zeroize();
+            arr.zeroize();
+            Ok(sk)
+        }
+        Err(e) => {
+            raw.zeroize();
+            Err(e)
+        }
+    }
 }
 
 /// Load the CA signing key (PolicyService only).

@@ -438,11 +438,11 @@ impl InferenceService {
         let req = reader.get_root::<inference_capnp::inference_request::Reader>()?;
         let request_id = req.get_id();
 
-        // Create a system-identity context for the internal callback.
+        // Create a service-identity context for the internal callback.
         // Callback mode is an inproc self-call — it does not go through the ZMQ
         // envelope pipeline, so we construct the context directly with
-        // from_verified_as_system to ensure subject() == "system".
-        let ctx = EnvelopeContext::from_callback_system(request_id);
+        // from_callback_service to authenticate as the model service.
+        let ctx = EnvelopeContext::from_callback_service(request_id, "model");
 
         // Dispatch via generated handler — propagate continuation
         dispatch_inference(self, &ctx, request_data).await
@@ -2729,12 +2729,16 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
             // Create nonce cache (shared between service and RequestLoop)
             let nonce_cache = Arc::new(InMemoryNonceCache::new());
 
-            // Create PolicyClient HERE, inside the service thread's runtime,
+            // Bootstrap: Create PolicyClient HERE, inside the service thread's runtime,
             // so ZMQ sockets are registered with the correct reactor.
+            // HKDF is used for the "policy" key because this IS the bootstrap client —
+            // all other service keys are resolved via policy_client.resolve_service_key()
+            // once this client exists.
             let policy_client = PolicyClient::for_service(
                 self.policy_signing_key.clone(),
                 hyprstream_rpc::envelope::RequestIdentity::anonymous(),
-                hyprstream_rpc::node_identity::service_verifying_key(&self.policy_signing_key, "policy"),
+                // Bootstrap: PolicyService uses the root key
+                self.policy_signing_key.verifying_key(),
             );
 
             // GPU initialization happens HERE, on the service thread

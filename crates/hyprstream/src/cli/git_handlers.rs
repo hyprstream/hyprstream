@@ -1264,10 +1264,25 @@ pub async fn handle_infer(
     let _ = ModelRef::parse(model_ref_str)?;
 
     // ModelService is already running (started by main.rs in inproc mode, or by systemd in ipc-systemd mode).
+    let model_server_vk = {
+        let policy_vk = signing_key.verifying_key();
+        let policy_client = crate::services::PolicyClient::for_service(
+            signing_key.clone(), RequestIdentity::anonymous(), policy_vk,
+        );
+        let resp = policy_client.resolve_service_key(
+            &crate::services::generated::policy_client::ResolveServiceKey {
+                service_name: "model".to_owned(),
+            },
+        ).await.map_err(|e| anyhow::anyhow!("Failed to resolve model key: {e}"))?;
+        hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+            resp.verifying_key.as_slice().try_into()
+                .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
+        ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?
+    };
     let model_client = ModelClient::for_service(
         signing_key.clone(),
         RequestIdentity::anonymous(),
-        hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "model"),
+        model_server_vk,
     );
 
     // Apply chat template to the prompt via ModelService
@@ -1426,6 +1441,12 @@ pub async fn handle_load(
         Some(kv_quant)
     };
 
+    // Resolve service keys via PolicyClient
+    let policy_vk = signing_key.verifying_key();
+    let policy_client = crate::services::PolicyClient::for_service(
+        signing_key.clone(), RequestIdentity::anonymous(), policy_vk,
+    );
+
     // If --wait, subscribe to notifications BEFORE issuing load request
     // (ensures no events are missed between load and subscribe)
     let notification_state = if let Some(timeout_secs) = wait {
@@ -1435,10 +1456,19 @@ pub async fn handle_load(
         let (sub_secret, sub_pubkey) = generate_ephemeral_keypair();
         let sub_pub_bytes = sub_pubkey.to_bytes();
 
+        let notif_key_resp = policy_client.resolve_service_key(
+            &crate::services::generated::policy_client::ResolveServiceKey {
+                service_name: "notification".to_owned(),
+            },
+        ).await.map_err(|e| anyhow::anyhow!("Failed to resolve notification key: {e}"))?;
+        let notif_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+            notif_key_resp.verifying_key.as_slice().try_into()
+                .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
+        ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?;
         let notif_client = crate::services::NotificationClient::for_service(
             signing_key.clone(),
             RequestIdentity::anonymous(),
-            hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "notification"),
+            notif_vk,
         );
 
         let sub_resp = notif_client.subscribe(&SubscribeRequest {
@@ -1474,10 +1504,19 @@ pub async fn handle_load(
     // (Continuation pattern), so this completes in milliseconds.
     // fire-and-forget via tokio::spawn caused the task to never run: the CLI runtime
     // drops before the spawned task executes.
+    let model_key_resp = policy_client.resolve_service_key(
+        &crate::services::generated::policy_client::ResolveServiceKey {
+            service_name: "model".to_owned(),
+        },
+    ).await.map_err(|e| anyhow::anyhow!("Failed to resolve model key: {e}"))?;
+    let model_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+        model_key_resp.verifying_key.as_slice().try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
+    ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?;
     let model_client = ModelClient::for_service(
         signing_key.clone(),
         RequestIdentity::anonymous(),
-        hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "model"),
+        model_vk,
     );
     let model_ref_owned = model_ref_str.to_owned();
     match model_client.load(&LoadModelRequest {
@@ -1733,7 +1772,19 @@ async fn handle_notify_subscribe(
     let (sub_secret, sub_pubkey) = generate_ephemeral_keypair();
     let sub_pub_bytes = sub_pubkey.to_bytes();
 
-    let notif_server_vk = hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "notification");
+    let policy_vk = signing_key.verifying_key();
+    let policy_client = crate::services::PolicyClient::for_service(
+        signing_key.clone(), RequestIdentity::anonymous(), policy_vk,
+    );
+    let notif_key_resp = policy_client.resolve_service_key(
+        &crate::services::generated::policy_client::ResolveServiceKey {
+            service_name: "notification".to_owned(),
+        },
+    ).await.map_err(|e| anyhow::anyhow!("Failed to resolve notification key: {e}"))?;
+    let notif_server_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+        notif_key_resp.verifying_key.as_slice().try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
+    ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?;
     let notif_client = crate::services::NotificationClient::for_service(
         signing_key,
         RequestIdentity::anonymous(),
@@ -1874,7 +1925,21 @@ pub async fn handle_unload(
     // Validate model reference format
     let _ = ModelRef::parse(model_ref_str)?;
 
-    let model_server_vk = hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "model");
+    let model_server_vk = {
+        let policy_vk = signing_key.verifying_key();
+        let policy_client = crate::services::PolicyClient::for_service(
+            signing_key.clone(), RequestIdentity::anonymous(), policy_vk,
+        );
+        let resp = policy_client.resolve_service_key(
+            &crate::services::generated::policy_client::ResolveServiceKey {
+                service_name: "model".to_owned(),
+            },
+        ).await.map_err(|e| anyhow::anyhow!("Failed to resolve model key: {e}"))?;
+        hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+            resp.verifying_key.as_slice().try_into()
+                .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
+        ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?
+    };
     let model_client = ModelClient::for_service(signing_key, RequestIdentity::anonymous(), model_server_vk);
 
     model_client.unload(&UnloadModelRequest { model_ref: model_ref_str.to_owned() }).await?;

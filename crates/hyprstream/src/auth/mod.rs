@@ -18,7 +18,7 @@ pub use federation::FederationKeyResolver;
 pub use jwt::{Claims, JwtError};
 pub use policy_manager::{PolicyManager, PolicyError, write_policy_file};
 pub use policy_migration::migrate_policy_csv;
-pub use policy_templates::{PolicyTemplate, get_template, get_templates};
+pub use policy_templates::{PolicyTemplate, SERVICE_BASE_RULES, get_template, get_templates};
 pub use user_store::{LocalKeyStore, UserStore};
 
 /// Operation types that can be controlled via policies

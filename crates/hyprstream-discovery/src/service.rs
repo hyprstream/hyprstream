@@ -190,13 +190,6 @@ fn socket_kind_to_string(kind: SocketKind) -> &'static str {
 #[async_trait(?Send)]
 impl DiscoveryHandler for DiscoveryService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
-        // System (node key) bypass for read operations only.
-        // Write operations (manage scope) always go through Casbin.
-        if ctx.subject() == hyprstream_rpc::envelope::Subject::new("system")
-            && operation == "query"
-        {
-            return Ok(());
-        }
         // Delegate to authorization provider if available
         if let Some(ref auth) = self.auth_provider {
             let subject = ctx.subject().to_string();
@@ -479,7 +472,7 @@ impl DiscoveryHandler for DiscoveryService {
         // R3: Verify service JWT signature + subject matches serviceName.
         // Full JWT verification (not decode_unverified) to prevent forged identities.
         if !service_jwt.is_empty() {
-            let verified = hyprstream_rpc::auth::jwt::decode(
+            let verified = hyprstream_rpc::auth::jwt::decode_with_key(
                 &service_jwt,
                 &self.jwt_verifying_key,
                 self.expected_audience.as_deref(),

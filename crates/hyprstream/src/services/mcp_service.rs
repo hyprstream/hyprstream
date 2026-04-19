@@ -83,6 +83,9 @@ pub struct McpConfig {
     pub transport: TransportConfig,
     /// Service context for client construction (optional for backward compat)
     pub ctx: Option<Arc<ServiceContext>>,
+    /// PolicyService verifying key — used to create the internal PolicyClient
+    /// for peer key resolution and authorization checks.
+    pub policy_verifying_key: VerifyingKey,
     /// Expected audience (resource URL) for future defense-in-depth
     pub expected_audience: Option<String>,
     /// Local OAuth issuer URL for distinguishing local vs. federated JWTs on ZMQ path.
@@ -112,6 +115,23 @@ pub struct ToolCallContext {
     pub identity: RequestIdentity,
     /// ServiceContext for typed_client() / client() access (optional for backward compat)
     pub ctx: Option<Arc<ServiceContext>>,
+    /// PolicyClient for resolving peer verifying keys
+    pub policy_client: PolicyClient,
+}
+
+impl ToolCallContext {
+    /// Resolve a peer service's verifying key via PolicyService RPC.
+    pub async fn resolve_peer_key(&self, service_name: &str) -> anyhow::Result<VerifyingKey> {
+        let resp = self.policy_client.resolve_service_key(
+            &crate::services::generated::policy_client::ResolveServiceKey {
+                service_name: service_name.to_owned(),
+            },
+        ).await?;
+        let bytes: [u8; 32] = resp.verifying_key.as_slice().try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid verifying key length from PolicyService"))?;
+        VerifyingKey::from_bytes(&bytes)
+            .map_err(|e| anyhow::anyhow!("Invalid Ed25519 key: {e}"))
+    }
 }
 
 type ToolHandler = Arc<dyn Fn(ToolCallContext) -> BoxFuture<'static, anyhow::Result<ToolResult>> + Send + Sync>;
@@ -340,14 +360,14 @@ fn register_scoped_tools_recursive(
 
                             let stream_info_json = match service.as_str() {
                                 "registry" => {
-                                    let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&ctx.signing_key, "registry");
+                                    let server_vk = ctx.resolve_peer_key("registry").await?;
                                     let client: RegistryClient = RegistryClient::for_service(
                                         ctx.signing_key, ctx.identity.clone(), server_vk,
                                     );
                                     client.call_scoped_streaming_method(&scope_refs, &method, &ctx.args, client_pubkey_bytes).await?
                                 }
                                 "model" => {
-                                    let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&ctx.signing_key, "model");
+                                    let server_vk = ctx.resolve_peer_key("model").await?;
                                     let client = ModelClient::for_service(ctx.signing_key, ctx.identity.clone(), server_vk);
                                     client.call_scoped_streaming_method(&scope_refs, &method, &ctx.args, client_pubkey_bytes).await?
                                 }
@@ -425,14 +445,14 @@ async fn dispatch_scoped_call(
 ) -> anyhow::Result<ToolResult> {
     let result = match service {
         "registry" => {
-            let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&ctx.signing_key, "registry");
+            let server_vk = ctx.resolve_peer_key("registry").await?;
             let client: RegistryClient = RegistryClient::for_service(
                 ctx.signing_key.clone(), ctx.identity.clone(), server_vk,
             );
             client.call_scoped_method(scopes, method, &ctx.args).await?
         }
         "model" => {
-            let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&ctx.signing_key, "model");
+            let server_vk = ctx.resolve_peer_key("model").await?;
             let client = ModelClient::for_service(ctx.signing_key.clone(), ctx.identity.clone(), server_vk);
             client.call_scoped_method(scopes, method, &ctx.args).await?
         }
@@ -493,14 +513,14 @@ fn register_streaming_tool(
 
                 let stream_info_json = match service.as_str() {
                     "registry" => {
-                        let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&ctx.signing_key, "registry");
+                        let server_vk = ctx.resolve_peer_key("registry").await?;
                         let client: RegistryClient = RegistryClient::for_service(
                             ctx.signing_key, ctx.identity.clone(), server_vk,
                         );
                         client.call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?
                     }
                     "model" => {
-                        let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&ctx.signing_key, "model");
+                        let server_vk = ctx.resolve_peer_key("model").await?;
                         let client = ModelClient::for_service(ctx.signing_key, ctx.identity.clone(), server_vk);
                         client.call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?
                     }
@@ -584,19 +604,19 @@ async fn dispatch_schema_call(service: &str, method: &str, ctx: &ToolCallContext
 
     match service {
         "model" => {
-            let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "model");
+            let server_vk = ctx.resolve_peer_key("model").await?;
             let client = ModelClient::for_service(signing_key, identity, server_vk);
             client.call_method(method, &ctx.args).await
         }
         "registry" => {
-            let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "registry");
+            let server_vk = ctx.resolve_peer_key("registry").await?;
             let client: RegistryClient = RegistryClient::for_service(
                 signing_key, identity, server_vk,
             );
             client.call_method(method, &ctx.args).await
         }
         "policy" => {
-            let server_vk = hyprstream_rpc::node_identity::service_verifying_key(&signing_key, "policy");
+            let server_vk = ctx.resolve_peer_key("policy").await?;
             let client = PolicyClient::for_service(signing_key, identity, server_vk);
             client.call_method(method, &ctx.args).await
         }
@@ -648,7 +668,7 @@ impl McpService {
         let policy_client = PolicyClient::for_service(
             config.signing_key.clone(),
             RequestIdentity::anonymous(),
-            hyprstream_rpc::node_identity::service_verifying_key(&config.signing_key, "policy"),
+            config.policy_verifying_key,
         );
 
         Ok(Self {
@@ -664,6 +684,19 @@ impl McpService {
             federation_key_source: config.federation_key_source,
             policy_client,
         })
+    }
+
+    /// Resolve a peer service's verifying key via PolicyService RPC.
+    async fn resolve_peer_key(&self, service_name: &str) -> anyhow::Result<VerifyingKey> {
+        let resp = self.policy_client.resolve_service_key(
+            &crate::services::generated::policy_client::ResolveServiceKey {
+                service_name: service_name.to_owned(),
+            },
+        ).await?;
+        let bytes: [u8; 32] = resp.verifying_key.as_slice().try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid verifying key length from PolicyService"))?;
+        VerifyingKey::from_bytes(&bytes)
+            .map_err(|e| anyhow::anyhow!("Invalid Ed25519 key: {e}"))
     }
 
     /// Convert registry to rmcp Tool list
@@ -750,6 +783,7 @@ impl McpService {
             zmq_context: self.context.clone(),
             identity,
             ctx: self.service_ctx.clone(),
+            policy_client: self.policy_client.clone(),
         };
 
         let result = (entry.handler)(ctx).await
@@ -888,10 +922,11 @@ impl McpHandler for McpService {
     ) -> anyhow::Result<McpResponseVariant> {
         let loaded_model_count = {
             // Status check uses local identity (internal health check, no user context)
+            let server_vk = self.resolve_peer_key("model").await?;
             let client = ModelClient::for_service(
                 self.signing_key.clone(),
                 RequestIdentity::anonymous(),
-                hyprstream_rpc::node_identity::service_verifying_key(&self.signing_key, "model"),
+                server_vk,
             );
             client.status(&crate::services::generated::model_client::StatusRequest { model_ref: String::new() }).await
                 .map(|models| models.len() as u32)

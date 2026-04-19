@@ -177,7 +177,7 @@ pub use crypto::{
 pub use crypto::{generate_ephemeral_keypair, ristretto_dh, RistrettoPublic, RistrettoSecret};
 
 pub use envelope::{
-    unwrap_and_verify, InMemoryNonceCache, KeyRegistry, NodeKeyRegistry, NonceCache,
+    unwrap_and_verify, InMemoryNonceCache, KeyRegistry, NonceCache,
     RequestEnvelope, RequestIdentity, ResponseEnvelope, SignedEnvelope, Subject,
     MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
 };

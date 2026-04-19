@@ -42,18 +42,6 @@ pub fn derive_purpose_key(root_key: &SigningKey, purpose: &str) -> SigningKey {
     key
 }
 
-/// Get the verifying key for a target service.
-///
-/// PolicyService ("policy") uses the root key directly (it IS the CA).
-/// All other services use `HKDF(root, "service:{name}")` derived keys.
-pub fn service_verifying_key(root_key: &SigningKey, service_name: &str) -> ed25519_dalek::VerifyingKey {
-    if service_name == "policy" {
-        root_key.verifying_key()
-    } else {
-        derive_purpose_key(root_key, &format!("service:{service_name}")).verifying_key()
-    }
-}
-
 /// A purpose-derived Ed25519 signing identity.
 /// Inner SigningKey is zeroized on drop via ed25519-dalek's `zeroize` feature.
 struct DerivedIdentity {
