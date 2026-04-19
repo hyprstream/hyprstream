@@ -1526,10 +1526,13 @@ fn main() -> Result<()> {
                             signing_key.clone(),
                         );
                         // Wire up policy-backed authorization
+                        let policy_vk = hyprstream_service::global_trust_store()
+                            .resolve_one("policy")
+                            .context("trust store has no policy key")?;
                         let wf_policy_client = PolicyClient::for_service(
                             signing_key.clone(),
                             RequestIdentity::anonymous(),
-                            ctx.service_verifying_key("policy"),
+                            policy_vk,
                         );
                         wf_svc.set_authorize_fn(
                             hyprstream_core::services::build_authorize_fn(wf_policy_client),
@@ -1545,10 +1548,13 @@ fn main() -> Result<()> {
                         None
                     };
 
+                let registry_vk = hyprstream_service::global_trust_store()
+                    .resolve_one("registry")
+                    .context("trust store has no registry key")?;
                 let client = hyprstream_core::services::RegistryClient::for_service(
                     signing_key.clone(),
                     RequestIdentity::anonymous(),
-                    ctx.service_verifying_key("registry"),
+                    registry_vk,
                 );
 
                 Ok::<_, anyhow::Error>((

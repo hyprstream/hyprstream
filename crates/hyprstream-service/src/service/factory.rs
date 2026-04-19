@@ -534,24 +534,6 @@ impl ServiceContext {
         );
     }
 
-    /// Get the verifying key for a target service.
-    ///
-    /// Lookup order:
-    /// 1. `pubkey_registry` (populated from independent keys or bootstrap pubkeys)
-    ///
-    /// Panics if no pubkey is registered. Ensure `generate_independent_service_keys()`
-    /// was called (inproc) or `bootstrap-pubkeys` credential was loaded (IPC mode).
-    pub fn service_verifying_key(&self, service_name: &str) -> VerifyingKey {
-        if let Some(vk) = self.pubkey_registry.get(service_name) {
-            return *vk;
-        }
-        panic!(
-            "service_verifying_key({service_name}): no pubkey registered. \
-             Ensure generate_independent_service_keys() was called (inproc) or \
-             bootstrap-pubkeys credential was loaded (IPC mode)."
-        );
-    }
-
     /// Get the service JWT for a specific service (if available).
     pub fn service_jwt(&self, service_name: &str) -> Option<&str> {
         self.service_jwts.get(service_name).map(std::string::String::as_str)
@@ -662,13 +644,19 @@ impl ServiceContext {
                     Some(shared.for_service(service.name(), port))
                 } else {
                     let service_jwt = self.service_jwt(service.name()).map(str::to_owned);
+                    let policy_vk = crate::service::trust_store::global_trust_store()
+                        .resolve_one("policy")
+                        .unwrap_or_else(|| panic!("trust store has no policy key"));
+                    let discovery_vk = crate::service::trust_store::global_trust_store()
+                        .resolve_one("discovery")
+                        .unwrap_or_else(|| panic!("trust store has no discovery key"));
                     Some(shared.for_service_with_announce(
                         service.name(),
                         port,
                         self.service_signing_key(service.name()),
                         service_jwt,
-                        self.service_verifying_key("policy"),
-                        self.service_verifying_key("discovery"),
+                        policy_vk,
+                        discovery_vk,
                     ))
                 }
             }
