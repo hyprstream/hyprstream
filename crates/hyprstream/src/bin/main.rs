@@ -1778,28 +1778,6 @@ fn main() -> Result<()> {
                                     config.quic.clone()
                                 };
 
-                                if quic_cfg.enabled {
-                                    let qc = quic_cfg;
-                                    let (cert_chain, key_der) = qc.load_tls_materials()
-                                        .context("Failed to load QUIC TLS materials")?;
-
-                                    // Print cert hash if requested (hash of leaf cert)
-                                    if print_cert_hash {
-                                        let hash = hyprstream_rpc::transport::zmtp_quic::cert_hash(&cert_chain[0]);
-                                        println!("QUIC/WebTransport cert hash: {}", hash);
-                                    }
-
-                                    let shared = hyprstream_service::QuicSharedConfig {
-                                        cert_chain,
-                                        key_der,
-                                        base_ip: qc.socket_addr()?.ip(),
-                                        server_name: qc.server_name.clone(),
-                                        oauth_issuer_url: Some(config.oauth.issuer_url()),
-                                        jwt_verifying_key: Some(ctx.jwt_verifying_key()),
-                                    };
-                                    ctx = ctx.with_quic(shared);
-                                }
-
                                 // Determine which services to start
                                 let service_names: Vec<String> = if let Some(ref svc_list) = multi_services {
                                     svc_list.clone()
@@ -1854,6 +1832,29 @@ fn main() -> Result<()> {
                                     // Single-process mode: generate independent keys in memory.
                                     // All services share the same process, so in-memory keys work.
                                     ctx = ctx.generate_independent_service_keys(&service_names);
+                                }
+
+                                // Wire QUIC shared config (must be after key generation so jwt_verifying_key is set)
+                                if quic_cfg.enabled {
+                                    let qc = quic_cfg;
+                                    let (cert_chain, key_der) = qc.load_tls_materials()
+                                        .context("Failed to load QUIC TLS materials")?;
+
+                                    // Print cert hash if requested (hash of leaf cert)
+                                    if print_cert_hash {
+                                        let hash = hyprstream_rpc::transport::zmtp_quic::cert_hash(&cert_chain[0]);
+                                        println!("QUIC/WebTransport cert hash: {}", hash);
+                                    }
+
+                                    let shared = hyprstream_service::QuicSharedConfig {
+                                        cert_chain,
+                                        key_der,
+                                        base_ip: qc.socket_addr()?.ip(),
+                                        server_name: qc.server_name.clone(),
+                                        oauth_issuer_url: Some(config.oauth.issuer_url()),
+                                        jwt_verifying_key: Some(ctx.jwt_verifying_key()),
+                                    };
+                                    ctx = ctx.with_quic(shared);
                                 }
 
                                 let manager = InprocManager::new();
