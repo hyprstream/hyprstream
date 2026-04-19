@@ -403,9 +403,8 @@ impl ServiceContext {
         for name in service_names {
             if name == "policy" {
                 // PolicyService uses the root key directly (it IS the CA).
-                // Register its signing key and verifying key in the registries
-                // so service_signing_key("policy") and service_verifying_key("policy")
-                // work without HKDF fallback.
+                // Register its signing key in the registry
+                // so service_signing_key("policy") works.
                 ctx = ctx
                     .with_service_key(name, root_signing_key.clone())
                     .with_known_pubkey(name, root_verifying_key);

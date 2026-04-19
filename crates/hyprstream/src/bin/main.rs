@@ -1234,19 +1234,34 @@ fn handle_quick_command(
 // CLI pubkey resolution helper
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Resolve a service's verifying key from bootstrap-pubkeys credential.
+/// Resolve a service's verifying key via the global trust store.
 ///
-/// Resolve a service's verifying key from bootstrap-pubkeys credential.
-///
+/// On first call in CLI mode, seeds the trust store from bootstrap-pubkeys.
 /// Used by CLI command handlers that don't have a ServiceContext but need
 /// to verify responses from a target service.
 ///
 /// Returns `None` if bootstrap-pubkeys is not available (wizard not run).
 fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
+    let trust = hyprstream_service::global_trust_store();
+    // Fast path: already populated (service startup seeded it)
+    if let Some(vk) = trust.resolve_one(service_name) {
+        return Some(vk);
+    }
+    // CLI mode: seed from bootstrap-pubkeys on first use
     let secrets_dir = HyprConfig::resolve_secrets_dir();
-    hyprstream_core::auth::identity_store::load_bootstrap_pubkeys(&secrets_dir)
-        .ok()
-        .and_then(|pubkeys| pubkeys.get(service_name).copied())
+    if let Ok(pubkeys) = hyprstream_core::auth::identity_store::load_bootstrap_pubkeys(&secrets_dir) {
+        for (name, vk) in &pubkeys {
+            trust.insert(
+                *vk,
+                hyprstream_service::Attestation {
+                    scopes: std::iter::once(name.clone()).collect(),
+                    jwt: None,
+                    expires_at: 0,
+                },
+            );
+        }
+    }
+    trust.resolve_one(service_name)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

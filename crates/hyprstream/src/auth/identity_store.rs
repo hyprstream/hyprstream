@@ -406,12 +406,6 @@ pub fn load_or_generate_node_signing_key(secrets_dir: &std::path::Path) -> Resul
     Ok(key)
 }
 
-/// Deprecated alias for [`load_or_generate_node_signing_key`].
-#[deprecated(since = "0.4.1", note = "renamed to load_or_generate_node_signing_key")]
-pub fn load_or_generate_signing_key(secrets_dir: &std::path::Path) -> Result<SigningKey> {
-    load_or_generate_node_signing_key(secrets_dir)
-}
-
 /// Load or generate the age credential-store key.
 ///
 /// Callers **must** check the `config.oauth.credential_store_key` bypass before

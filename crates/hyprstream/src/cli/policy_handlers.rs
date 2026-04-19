@@ -460,13 +460,6 @@ pub(crate) fn ensure_user_signing_key() -> Result<(SigningKey, ed25519_dalek::Ve
     crate::auth::identity_store::load_or_generate_user_signing_key(&secrets_dir)
 }
 
-/// Deprecated alias kept for call-site compatibility during transition.
-#[deprecated(since = "0.4.1", note = "renamed to ensure_user_signing_key")]
-#[allow(dead_code)]
-pub(crate) fn ensure_user_identity() -> Result<(SigningKey, ed25519_dalek::VerifyingKey)> {
-    ensure_user_signing_key()
-}
-
 /// Parse duration string like "30d", "90d", "1y", "never"
 pub(crate) fn parse_duration(s: &str) -> Result<Option<Duration>> {
     let s = s.trim().to_lowercase();
