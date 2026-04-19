@@ -1785,7 +1785,7 @@ fn main() -> Result<()> {
                                     vec![name.clone()]
                                 };
 
-                                if execution_mode.uses_ipc() {
+                                if ipc {
                                     // Multi-process mode: each service gets its own independent key.
                                     let secrets_dir = std::path::PathBuf::from(
                                         std::env::var("HYPRSTREAM__SECRETS__PATH")
