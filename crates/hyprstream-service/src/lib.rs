@@ -32,6 +32,8 @@ pub use service::factory::{
     ServiceFactoryFn,
 };
 
+pub use service::trust_store::{TrustStore, Attestation, global_trust_store};
+
 pub use service::manager::{detect as detect_service_manager, ServiceManager, StandaloneManager};
 
 #[cfg(feature = "systemd")]

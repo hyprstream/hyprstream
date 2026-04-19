@@ -827,8 +827,10 @@ impl TuiService {
 
         let registry_models_dir = std::path::PathBuf::from(registry_dir);
 
-        // Resolve peer service keys via PolicyClient (inproc policy service).
-        let policy_vk = self.signing_key.verifying_key();
+        // Resolve peer service keys via PolicyClient.
+        let policy_vk = hyprstream_service::global_trust_store()
+            .resolve_one("policy")
+            .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
         let policy_client = PolicyClient::for_service(
             self.signing_key.clone(),
             hyprstream_rpc::envelope::RequestIdentity::anonymous(),

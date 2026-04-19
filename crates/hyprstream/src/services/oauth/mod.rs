@@ -280,12 +280,19 @@ impl Spawnable for OAuthService {
             // Creating them in the factory (main runtime) would cause hangs.
 
             // Bootstrap: PolicyClient requires the policy service's verifying key.
-            // Use HKDF for this initial client since we need it to resolve all other keys.
+            // The trust store holds PolicyService's key — populated during startup.
+            let policy_vk = match hyprstream_service::global_trust_store().resolve_one("policy") {
+                Some(vk) => vk,
+                None => {
+                    return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                        "trust store has no policy key — startup must populate it".to_owned(),
+                    ));
+                }
+            };
             let policy_client = PolicyClient::for_service(
                 self.signing_key.clone(),
                 hyprstream_rpc::RequestIdentity::anonymous(),
-                // Bootstrap: PolicyService uses the root key
-                self.signing_key.verifying_key(),
+                policy_vk,
             );
 
             // Resolve discovery service verifying key via PolicyService RPC.

@@ -395,6 +395,11 @@ impl ServiceContext {
         let root_signing_key = ctx.signing_key.clone();
         let root_verifying_key = ctx.verifying_key();
 
+        // Populate the global trust store with all service keys.
+        // The trust store is the source of truth for key-centric identity:
+        // keys ARE identity, service names are authorization scopes.
+        let trust = crate::service::trust_store::global_trust_store();
+
         for name in service_names {
             if name == "policy" {
                 // PolicyService uses the root key directly (it IS the CA).
@@ -404,6 +409,13 @@ impl ServiceContext {
                 ctx = ctx
                     .with_service_key(name, root_signing_key.clone())
                     .with_known_pubkey(name, root_verifying_key);
+
+                // PolicyService key never expires — it IS the trust anchor.
+                trust.insert(root_verifying_key, crate::service::trust_store::Attestation {
+                    scopes: std::iter::once("policy".to_owned()).collect(),
+                    jwt: None,
+                    expires_at: 0,
+                });
                 continue;
             }
 
@@ -423,7 +435,14 @@ impl ServiceContext {
 
             ctx = ctx
                 .with_service_key(name, service_key)
-                .with_service_jwt(name, jwt);
+                .with_service_jwt(name, jwt.clone());
+
+            // Register this service's key in the trust store.
+            trust.insert(service_vk, crate::service::trust_store::Attestation {
+                scopes: std::iter::once(name.clone()).collect(),
+                jwt: Some(jwt),
+                expires_at: expiry,
+            });
         }
 
         ctx

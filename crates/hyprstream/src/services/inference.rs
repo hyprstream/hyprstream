@@ -2731,14 +2731,18 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
 
             // Bootstrap: Create PolicyClient HERE, inside the service thread's runtime,
             // so ZMQ sockets are registered with the correct reactor.
-            // HKDF is used for the "policy" key because this IS the bootstrap client —
-            // all other service keys are resolved via policy_client.resolve_service_key()
-            // once this client exists.
+            let policy_vk = match hyprstream_service::global_trust_store().resolve_one("policy") {
+                Some(vk) => vk,
+                None => {
+                    return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                        "trust store has no policy key — startup must populate it".to_owned(),
+                    ));
+                }
+            };
             let policy_client = PolicyClient::for_service(
                 self.policy_signing_key.clone(),
                 hyprstream_rpc::envelope::RequestIdentity::anonymous(),
-                // Bootstrap: PolicyService uses the root key
-                self.policy_signing_key.verifying_key(),
+                policy_vk,
             );
 
             // GPU initialization happens HERE, on the service thread

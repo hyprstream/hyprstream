@@ -112,7 +112,9 @@ pub fn build_chat_vfs_namespace(
     let mut ns = Namespace::new();
 
     // Resolve the model service's verifying key via PolicyClient.
-    let policy_vk = signing_key.verifying_key();
+    let policy_vk = hyprstream_service::global_trust_store()
+        .resolve_one("policy")
+        .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
     let policy_client = crate::services::PolicyClient::for_service(
         signing_key.clone(),
         RequestIdentity::anonymous(),
