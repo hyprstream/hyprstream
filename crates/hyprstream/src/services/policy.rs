@@ -74,9 +74,6 @@ pub struct PolicyService {
     /// Event prefix state for secure event transport (Phase 7).
     /// PolicyService is a blind relay — stores opaque wrapped blobs, never plaintext keys.
     event_prefixes: RwLock<HashMap<String, EventPrefixState>>,
-    /// Service pubkeys registered via registerServiceKey RPC.
-    /// Maps service name → Ed25519 verifying key. Populated at runtime by each service.
-    service_pubkeys: RwLock<HashMap<String, (VerifyingKey, Option<String>)>>,
 }
 
 impl PolicyService {
@@ -105,7 +102,6 @@ impl PolicyService {
             context,
             transport,
             event_prefixes: RwLock::new(HashMap::new()),
-            service_pubkeys: RwLock::new(HashMap::new()),
         }
     }
 
@@ -316,6 +312,7 @@ impl PolicyHandler for PolicyService {
 
         // Service tokens: derive the Ed25519 pubkey from the root key.
         // The CA (PolicyService) is authoritative — the pubkey is not caller-provided.
+        // User tokens: use the caller-provided pubkey (from OAuth Ed25519 challenge-response).
         let service_pub_key = if is_service_token {
             let svc_name = &subject["service:".len()..];
             let svc_signing_key = hyprstream_rpc::node_identity::derive_purpose_key(
@@ -325,7 +322,7 @@ impl PolicyHandler for PolicyService {
             use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
             Some(URL_SAFE_NO_PAD.encode(svc_signing_key.verifying_key().to_bytes()))
         } else {
-            None
+            data.user_pub_key.clone()
         };
 
         // Populate iss with the OAuth issuer URL so federation peers can fetch JWKS.
@@ -1230,19 +1227,18 @@ impl PolicyHandler for PolicyService {
         _request_id: u64,
         data: &ResolveServiceKey,
     ) -> Result<PolicyResponseVariant> {
-        let pubkeys = self.service_pubkeys.read().await;
-        match pubkeys.get(&data.service_name) {
-            Some((vk, jwt)) => {
-                debug!("Resolved service key for '{}'", data.service_name);
-                Ok(PolicyResponseVariant::ResolveServiceKeyResult(
-                    ServiceKeyResponse {
-                        verifying_key: vk.to_bytes().to_vec(),
-                        service_jwt: jwt.clone(),
-                    }
-                ))
+        let trust = hyprstream_service::global_trust_store();
+        let vk = trust.resolve_one(&data.service_name)
+            .ok_or_else(|| anyhow!("No verifying key registered for service '{}'", data.service_name))?;
+        let att = trust.get(&vk)
+            .ok_or_else(|| anyhow!("No attestation for service '{}'", data.service_name))?;
+        debug!("Resolved service key for '{}'", data.service_name);
+        Ok(PolicyResponseVariant::ResolveServiceKeyResult(
+            ServiceKeyResponse {
+                verifying_key: vk.to_bytes().to_vec(),
+                service_jwt: att.jwt.clone(),
             }
-            None => Err(anyhow!("No verifying key registered for service '{}'", data.service_name)),
-        }
+        ))
     }
 
     async fn handle_register_service_key(
@@ -1285,10 +1281,15 @@ impl PolicyHandler for PolicyService {
             }
         }
 
-        // Store the pubkey
+        // Store in trust store (key-centric: the key IS the identity)
         {
-            let mut pubkeys = self.service_pubkeys.write().await;
-            pubkeys.insert(data.service_name.clone(), (vk, Some(data.service_jwt.clone())));
+            let trust = hyprstream_service::global_trust_store();
+            trust.insert(vk, hyprstream_service::Attestation {
+                scopes: std::iter::once(data.service_name.clone()).collect(),
+                subject: None, // service keys derive subject from scope
+                jwt: Some(data.service_jwt.clone()),
+                expires_at: claims.exp,
+            });
         }
 
         info!(service = %data.service_name, caller = %caller, "Registered service verifying key");

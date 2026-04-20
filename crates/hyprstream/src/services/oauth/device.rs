@@ -110,6 +110,7 @@ pub async fn device_authorize(
         last_polled: None,
         nonce,
         approved_by: None,
+        verifying_key: None,
     };
 
     // Store pending device code
@@ -254,17 +255,20 @@ pub async fn verify_post(
     };
 
     // Verify Ed25519 challenge-response using the shared helper
-    if let Err(e) = challenge::verify_ed25519_response(
+    let verifying_key = match challenge::verify_ed25519_response(
         user_store.as_ref(),
         &form.username,
         &challenge_str,
         &form.signature,
     ) {
-        if matches!(e, challenge::ChallengeError::UserStoreError(_)) {
-            tracing::error!(username = %form.username, "UserStore lookup error during device verify");
+        Ok(vk) => vk,
+        Err(e) => {
+            if matches!(e, challenge::ChallengeError::UserStoreError(_)) {
+                tracing::error!(username = %form.username, "UserStore lookup error during device verify");
+            }
+            return verify_err(json_client, &form.user_code, &nonce, e.message());
         }
-        return verify_err(json_client, &form.user_code, &nonce, e.message());
-    }
+    };
 
     // Signature valid — approve the device code and record who approved it
     let result = {
@@ -283,6 +287,7 @@ pub async fn verify_post(
             Some(pending) => {
                 pending.status = DeviceCodeStatus::Approved;
                 pending.approved_by = Some(form.username.clone());
+                pending.verifying_key = Some(verifying_key);
                 Ok(())
             }
             None => Err("Invalid or expired code. Please try again."),

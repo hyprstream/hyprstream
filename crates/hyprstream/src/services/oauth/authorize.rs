@@ -250,43 +250,46 @@ pub async fn authorize_post(
     };
 
     // Verify Ed25519 challenge-response
-    if let Err(e) = challenge::verify_ed25519_response(
+    let verifying_key = match challenge::verify_ed25519_response(
         user_store.as_ref(),
         &form.username,
         &challenge_str,
         &form.signature,
     ) {
-        if matches!(e, challenge::ChallengeError::UserStoreError(_)) {
-            tracing::error!(username = %form.username, "UserStore lookup error during authorize");
+        Ok(vk) => vk,
+        Err(e) => {
+            if matches!(e, challenge::ChallengeError::UserStoreError(_)) {
+                tracing::error!(username = %form.username, "UserStore lookup error during authorize");
+            }
+            // Validate redirect_uri and re-derive client display info from the registry.
+            // Never trust the POST body for display values; return an error page if
+            // the client or redirect_uri is no longer valid.
+            let Some((client_name, redirect_host)) =
+                derive_display_info(&state, &form.client_id, &form.redirect_uri).await
+            else {
+                return Html(render_error_page(
+                    "Invalid Request",
+                    "Unknown client or redirect URI. Please restart the authorization flow.",
+                )).into_response();
+            };
+            // Issue a fresh nonce so re-render shows a signable challenge.
+            let fresh_nonce = issue_nonce(&state).await;
+            let html = render_challenge_page(
+                &client_name,
+                &form.scope,
+                &redirect_host,
+                &form.client_id,
+                &form.redirect_uri,
+                &form.code_challenge,
+                form.state.as_deref().unwrap_or(""),
+                form.resource.as_deref().unwrap_or(""),
+                &fresh_nonce,
+                form.oidc_nonce.as_deref().unwrap_or(""),
+                Some(e.message()),
+            );
+            return Html(html).into_response();
         }
-        // Validate redirect_uri and re-derive client display info from the registry.
-        // Never trust the POST body for display values; return an error page if
-        // the client or redirect_uri is no longer valid.
-        let Some((client_name, redirect_host)) =
-            derive_display_info(&state, &form.client_id, &form.redirect_uri).await
-        else {
-            return Html(render_error_page(
-                "Invalid Request",
-                "Unknown client or redirect URI. Please restart the authorization flow.",
-            )).into_response();
-        };
-        // Issue a fresh nonce so re-render shows a signable challenge.
-        let fresh_nonce = issue_nonce(&state).await;
-        let html = render_challenge_page(
-            &client_name,
-            &form.scope,
-            &redirect_host,
-            &form.client_id,
-            &form.redirect_uri,
-            &form.code_challenge,
-            form.state.as_deref().unwrap_or(""),
-            form.resource.as_deref().unwrap_or(""),
-            &fresh_nonce,
-            form.oidc_nonce.as_deref().unwrap_or(""),
-            Some(e.message()),
-        );
-        return Html(html).into_response();
-    }
+    };
 
     // Signature valid — generate auth code
     let mut code_bytes = [0u8; 32];
@@ -307,6 +310,7 @@ pub async fn authorize_post(
         created_at: Instant::now(),
         expires_at: Instant::now() + Duration::from_secs(60),
         username: form.username.clone(),
+        verifying_key: Some(verifying_key),
     };
 
     state.pending_codes.write().await.insert(code.clone(), pending);

@@ -109,6 +109,11 @@ struct IssueToken {
   # For service tokens: sub = "service:{name}" (e.g. "service:model").
   # The "pub" claim is derived from the root key by the CA — not caller-provided.
   subject @3 :Text $optional;
+
+  # User's Ed25519 verifying key (base64url, 32 bytes) for user tokens.
+  # When present, included in the JWT `pub_key` claim to bind the user's key identity.
+  # Ignored for service tokens (pubkey is CA-derived).
+  userPubKey @4 :Text $optional;
 }
 
 # Apply a built-in policy template

@@ -117,6 +117,9 @@ pub struct PendingAuthCode {
     /// Authenticated username from Ed25519 challenge-response on the consent page.
     /// Used as the JWT `sub` claim for the issued token.
     pub username: String,
+    /// Ed25519 verifying key verified during challenge-response.
+    /// Included in the JWT `pub_key` claim to bind the user's key identity.
+    pub verifying_key: Option<ed25519_dalek::VerifyingKey>,
 }
 
 impl PendingAuthCode {
@@ -180,6 +183,9 @@ pub struct PendingDeviceCode {
     pub nonce: String,
     /// Username of the person who approved this code (set on POST /verify success)
     pub approved_by: Option<String>,
+    /// Ed25519 verifying key verified during device challenge-response.
+    /// Included in the JWT `pub_key` claim to bind the user's key identity.
+    pub verifying_key: Option<ed25519_dalek::VerifyingKey>,
 }
 
 impl PendingDeviceCode {

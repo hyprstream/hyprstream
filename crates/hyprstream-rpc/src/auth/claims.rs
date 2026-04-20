@@ -47,12 +47,13 @@ pub struct Claims {
     /// RFC 8707 audience claim for resource indicator binding.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aud: Option<String>,
-    /// Ed25519 public key (base64url-encoded) for service identity tokens.
+    /// Ed25519 public key (base64url-encoded) binding the signer's key to the JWT subject.
     ///
-    /// Present only in service JWTs (where `sub` starts with `"service:"`).
-    /// Binds the service's Ed25519 signing key to the JWT, allowing callers
-    /// to verify that envelope signatures match the JWT-attested identity.
-    #[serde(rename = "pub", skip_serializing_if = "Option::is_none")]
+    /// Present in both service and user tokens. Binds the Ed25519 signing key to the
+    /// JWT-attested identity, allowing callers to verify envelope signatures match the
+    /// JWT-attested subject. For service tokens, derived by the CA from the root key.
+    /// For user tokens, set during OAuth flow from the verified Ed25519 challenge-response.
+    #[serde(alias = "pub", rename = "pub_key", skip_serializing_if = "Option::is_none")]
     pub pub_key: Option<String>,
     /// Original JWT token for end-to-end verification.
     /// When present, downstream services MUST verify this token
@@ -76,7 +77,7 @@ impl std::fmt::Debug for Claims {
             .field("exp", &self.exp)
             .field("iat", &self.iat)
             .field("aud", &self.aud)
-            .field("pub", &self.pub_key)
+            .field("pub_key", &self.pub_key)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
             .finish()
     }

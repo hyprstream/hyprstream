@@ -52,12 +52,15 @@ impl ChallengeError {
 /// - Auth code flow: `"{username}:{nonce}:{code_challenge}"`
 ///
 /// `sig_b64` is the standard (non-URL-safe) base64-encoded 64-byte signature.
+///
+/// Returns the verified `VerifyingKey` on success — the key confirmed to have
+/// signed the challenge, looked up from the UserStore by username.
 pub(super) fn verify_ed25519_response(
     user_store: &dyn UserStore,
     username: &str,
     challenge: &str,
     sig_b64: &str,
-) -> Result<(), ChallengeError> {
+) -> Result<ed25519_dalek::VerifyingKey, ChallengeError> {
     if username.contains(':') {
         return Err(ChallengeError::InvalidUsername);
     }
@@ -70,14 +73,16 @@ pub(super) fn verify_ed25519_response(
 
     let signature = ed25519_dalek::Signature::from_bytes(&sig_array);
 
-    let pubkey = match user_store.get_pubkey(username) {
+    let verifying_key = match user_store.get_pubkey(username) {
         Ok(Some(pk)) => pk,
         Ok(None) => return Err(ChallengeError::UserNotFound),
         Err(e) => return Err(ChallengeError::UserStoreError(e)),
     };
 
-    pubkey.verify_strict(challenge.as_bytes(), &signature)
-        .map_err(|_| ChallengeError::SignatureInvalid)
+    verifying_key.verify_strict(challenge.as_bytes(), &signature)
+        .map_err(|_| ChallengeError::SignatureInvalid)?;
+
+    Ok(verifying_key)
 }
 
 /// HTML-escape a string for safe embedding in HTML attributes and text.

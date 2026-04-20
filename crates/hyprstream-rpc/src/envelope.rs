@@ -321,18 +321,6 @@ impl From<&Claims> for Subject {
     }
 }
 
-/// Registry mapping Ed25519 signer public keys to authorization subjects.
-///
-/// The primary purpose is mapping the node's own signing key to
-/// `Subject::new("system")`, which Casbin grants broad permissions via
-/// `p, system, *, *, *, allow`. All other keys default to `Subject::anonymous()`.
-///
-/// # Security
-///
-/// The signer public key is taken from the *verified* `SignedEnvelope.signer_pubkey`
-/// field — i.e., from after Ed25519 signature verification passes. It is not
-/// caller-asserted payload data.
-
 // Cap'n Proto implementation for Subject (simple text field)
 impl ToCapnp for Subject {
     type Builder<'a> = common_capnp::subject::Builder<'a>;

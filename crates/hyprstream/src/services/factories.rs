@@ -98,7 +98,7 @@ fn register_service_key(
     let request = RegisterServiceKey {
         service_name: service_name.to_owned(),
         verifying_key: signing_key.verifying_key().as_bytes().to_vec(),
-        service_jwt: jwt.to_owned(),
+        service_jwt: jwt.clone(),
     };
 
     tokio::task::block_in_place(|| {

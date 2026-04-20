@@ -150,7 +150,8 @@ async fn exchange_authorization_code(
     tracing::info!(client_id = %params.client_id, username = %pending.username, "PKCE verified, issuing token");
     // Use the authenticated username as JWT sub (set during Ed25519 challenge-response on consent page).
     let sub = pending.username.clone();
-    issue_token_with_refresh(&state, &params.client_id, pending.scopes, pending.resource, &sub, pending.oidc_nonce, true).await
+    let vk_ref = pending.verifying_key.as_ref();
+    issue_token_with_refresh(&state, &params.client_id, pending.scopes, pending.resource, &sub, pending.oidc_nonce, true, vk_ref).await
 }
 
 /// Handle refresh_token grant type (OAuth 2.1 with rotation).
@@ -198,7 +199,7 @@ async fn exchange_refresh_token(
 
     // Issue new access token + rotated refresh token with the stored scopes/resource and original subject.
     // No id_token on refresh per OIDC Core Section 12.2.
-    issue_token_with_refresh(&state, &entry.client_id, entry.scopes, entry.resource, &entry.username, None, false).await
+    issue_token_with_refresh(&state, &entry.client_id, entry.scopes, entry.resource, &entry.username, None, false, None).await
 }
 
 /// Handle urn:ietf:params:oauth:grant-type:device_code grant type (RFC 8628 Section 3.4).
@@ -279,13 +280,14 @@ async fn exchange_device_code(
                     );
                 }
             };
+            let device_vk = pending.verifying_key;
             device_codes.remove(&device_code);
             drop(device_codes);
             let mut user_code_map = state.device_code_by_user_code.write().await;
             user_code_map.remove(&user_code);
             drop(user_code_map);
             // Device flow: no OIDC nonce and not initial OIDC auth.
-            issue_token_with_refresh(&state, &client_id, scopes, resource, &approved_by, None, false).await
+            issue_token_with_refresh(&state, &client_id, scopes, resource, &approved_by, None, false, device_vk.as_ref()).await
         }
     }
 }
@@ -315,8 +317,14 @@ async fn issue_token_with_refresh(
     sub: &str,
     oidc_nonce: Option<String>,
     initial_auth: bool,
+    user_verifying_key: Option<&ed25519_dalek::VerifyingKey>,
 ) -> Response {
     let scope_str = scopes.join(" ");
+
+    // Encode user's Ed25519 pubkey for the JWT pub_key claim
+    let user_pub_key_b64 = user_verifying_key.map(|vk| {
+        URL_SAFE_NO_PAD.encode(vk.to_bytes())
+    });
 
     let result = state
         .policy_client
@@ -325,6 +333,7 @@ async fn issue_token_with_refresh(
             ttl: Some(state.token_ttl),
             audience: resource.clone(),
             subject: Some(sub.to_owned()),
+            user_pub_key: user_pub_key_b64,
         })
         .await;
 
