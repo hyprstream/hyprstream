@@ -14,7 +14,6 @@
 
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
-use hyprstream_rpc::prelude::*;
 use std::io::Write;
 use tracing::info;
 
@@ -34,7 +33,7 @@ pub fn create_tui_client(signing_key: &SigningKey) -> TuiClient {
     // Bootstrap: PolicyService uses the root key in inproc mode
     let policy_vk = signing_key.verifying_key();
     let policy_client = crate::services::PolicyClient::for_service(
-        sk.clone(), RequestIdentity::anonymous(), policy_vk,
+        sk.clone(), policy_vk, None,
     );
     let server_vk = {
         let resp = tokio::task::block_in_place(|| {
@@ -57,7 +56,7 @@ pub fn create_tui_client(signing_key: &SigningKey) -> TuiClient {
         }
     };
 
-    TuiClient::for_endpoint(&endpoint, sk, RequestIdentity::anonymous(), server_vk)
+    TuiClient::for_endpoint(&endpoint, sk, server_vk, None)
 }
 
 /// Attach to an existing TUI session.

@@ -11,6 +11,7 @@
 //! for object-safe dynamic dispatch.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -23,13 +24,122 @@ use crate::transport_traits::{Signer, Transport};
 use crate::capnp::{FromCapnp, ToCapnp};
 use crate::stream_consumer::{StreamHandle, StreamHandleImpl};
 
+// ============================================================================
+// Per-call options (non-mutating, Send+Sync, owned data)
+// ============================================================================
+
+/// Per-call options for RPC requests.
+///
+/// Used with `call_with_options()` and `RequestBuilder` to pass per-call
+/// authentication context without mutating shared client state.
+/// Safe for concurrent use — each call gets its own owned `CallOptions`.
+///
+/// # Security
+///
+/// - `jwt`: Overrides the client's default JWT for this call.
+///   Used when a service needs to present a specific token.
+/// - `delegated_bearer`: Bearer token relayed on behalf of a user.
+///   Only trusted services (OAI, MCP) may set this. Policy gates which
+///   services can relay bearer tokens. The server resolves the subject
+///   from the bearer token, not the service identity.
+#[derive(Debug, Clone, Default)]
+pub struct CallOptions {
+    /// Override the client's default JWT for this call.
+    pub jwt: Option<String>,
+    /// Bearer token relayed on behalf of a user (delegation).
+    pub delegated_bearer: Option<String>,
+}
+
+impl CallOptions {
+    /// Create empty options (no overrides).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set a per-call JWT override.
+    pub fn jwt(mut self, token: impl Into<String>) -> Self {
+        self.jwt = Some(token.into());
+        self
+    }
+
+    /// Set a delegated bearer token for relay.
+    pub fn delegated_bearer(mut self, token: impl Into<String>) -> Self {
+        self.delegated_bearer = Some(token.into());
+        self
+    }
+}
+
+// ============================================================================
+// Per-call request builder
+// ============================================================================
+
+/// Per-call request builder for custom authentication options.
+///
+/// Created by `client.request()`, captures per-call auth context
+/// without mutating the shared `Arc<dyn RpcClient>`. Safe for
+/// concurrent use with connection pooling.
+///
+/// # Example
+///
+/// ```ignore
+/// let response = model_client.request()
+///     .delegated_bearer(user_bearer_token)
+///     .call(payload)
+///     .await?;
+/// ```
+pub struct RequestBuilder<'a> {
+    client: &'a Arc<dyn RpcClient>,
+    jwt: Option<String>,
+    delegated_bearer: Option<String>,
+}
+
+impl<'a> std::fmt::Debug for RequestBuilder<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequestBuilder")
+            .field("jwt", &self.jwt.as_ref().map(|_| "***"))
+            .field("delegated_bearer", &self.delegated_bearer.as_ref().map(|_| "***"))
+            .finish()
+    }
+}
+
+impl<'a> RequestBuilder<'a> {
+    /// Create a builder wrapping the given client.
+    pub fn new(client: &'a Arc<dyn RpcClient>) -> Self {
+        Self {
+            client,
+            jwt: None,
+            delegated_bearer: None,
+        }
+    }
+
+    /// Set a per-call JWT override.
+    pub fn jwt(mut self, token: impl Into<String>) -> Self {
+        self.jwt = Some(token.into());
+        self
+    }
+
+    /// Set a delegated bearer token for relay.
+    pub fn delegated_bearer(mut self, token: impl Into<String>) -> Self {
+        self.delegated_bearer = Some(token.into());
+        self
+    }
+
+    /// Send a raw request with these options and return the raw response bytes.
+    pub async fn call(self, payload: Vec<u8>) -> Result<Vec<u8>> {
+        self.client.call_with_options(payload, CallOptions {
+            jwt: self.jwt,
+            delegated_bearer: self.delegated_bearer,
+        }).await
+    }
+}
+
 /// Unified RPC client. Evolved from ZmqClient — same envelope, timeout,
 /// and resilience logic, parameterized over transport and signing.
 pub struct RpcClientImpl<S: Signer, T: Transport + 'static> {
     pub signer: S,
     pub transport: T,
     pub server_verifying_key: VerifyingKey,
-    jwt_token: parking_lot::RwLock<Option<String>>,
+    default_jwt: Option<String>,
     request_id: AtomicU64,
 }
 
@@ -40,15 +150,25 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             signer,
             transport,
             server_verifying_key,
-            jwt_token: parking_lot::RwLock::new(None),
+            default_jwt: None,
             request_id: AtomicU64::new(1),
         }
     }
 
+    /// Create a new RPC client with a default JWT token.
+    ///
+    /// The token is stored immutably and used for all calls unless
+    /// overridden by `call_with_options()`.
+    pub fn with_default_jwt(mut self, token: String) -> Self {
+        self.default_jwt = Some(token);
+        self
+    }
+
     /// Send a request and return the verified, unwrapped response payload.
+    /// Uses the client's default JWT.
     pub async fn call(&self, payload: Vec<u8>) -> Result<Vec<u8>> {
         let request_id = self.next_id();
-        let signed_bytes = self.sign_envelope(request_id, payload, None).await?;
+        let signed_bytes = self.sign_envelope(request_id, payload, None, self.default_jwt.clone(), None).await?;
         let timeout = self.calculate_timeout();
         let response_bytes = self.transport.send(signed_bytes, timeout).await?;
         let (_req_id, inner) = envelope::unwrap_response(
@@ -60,6 +180,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
 
     /// Send a streaming request with ephemeral DH pubkey.
     /// Returns the verified, unwrapped response payload (typically StreamInfo).
+    /// Uses the client's default JWT.
     pub async fn call_streaming(
         &self,
         payload: Vec<u8>,
@@ -67,7 +188,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
     ) -> Result<Vec<u8>> {
         let request_id = self.next_id();
         let signed_bytes = self
-            .sign_envelope(request_id, payload, Some(ephemeral_pubkey))
+            .sign_envelope(request_id, payload, Some(ephemeral_pubkey), self.default_jwt.clone(), None)
             .await?;
         let timeout = self.calculate_timeout();
         let response_bytes = self.transport.send(signed_bytes, timeout).await?;
@@ -78,9 +199,50 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         Ok(inner)
     }
 
-    /// Set the opaque JWT token. Server decodes and verifies.
-    pub fn set_jwt(&self, token: Option<String>) {
-        *self.jwt_token.write() = token;
+    /// Send a streaming request with per-call authentication options.
+    ///
+    /// Uses `options.jwt` if provided, otherwise falls back to `default_jwt`.
+    pub async fn call_streaming_with_options(
+        &self,
+        payload: Vec<u8>,
+        ephemeral_pubkey: [u8; 32],
+        options: CallOptions,
+    ) -> Result<Vec<u8>> {
+        let request_id = self.next_id();
+        let jwt = options.jwt.or_else(|| self.default_jwt.clone());
+        let signed_bytes = self
+            .sign_envelope(request_id, payload, Some(ephemeral_pubkey), jwt, options.delegated_bearer)
+            .await?;
+        let timeout = self.calculate_timeout();
+        let response_bytes = self.transport.send(signed_bytes, timeout).await?;
+        let (_req_id, inner) = envelope::unwrap_response(
+            &response_bytes,
+            Some(&self.server_verifying_key),
+        )?;
+        Ok(inner)
+    }
+
+    /// Send a request with per-call authentication options.
+    ///
+    /// Uses `options.jwt` if provided, otherwise falls back to `default_jwt`.
+    /// Includes `options.delegated_bearer` in the envelope for relay.
+    pub async fn call_with_options(
+        &self,
+        payload: Vec<u8>,
+        options: CallOptions,
+    ) -> Result<Vec<u8>> {
+        let request_id = self.next_id();
+        let jwt = options.jwt.or_else(|| self.default_jwt.clone());
+        let signed_bytes = self
+            .sign_envelope(request_id, payload, None, jwt, options.delegated_bearer)
+            .await?;
+        let timeout = self.calculate_timeout();
+        let response_bytes = self.transport.send(signed_bytes, timeout).await?;
+        let (_req_id, inner) = envelope::unwrap_response(
+            &response_bytes,
+            Some(&self.server_verifying_key),
+        )?;
+        Ok(inner)
     }
 
     /// Get the next monotonically increasing request ID.
@@ -94,13 +256,16 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         request_id: u64,
         payload: Vec<u8>,
         ephemeral_pubkey: Option<[u8; 32]>,
+        jwt: Option<String>,
+        delegated_bearer: Option<String>,
     ) -> Result<Vec<u8>> {
-        let jwt_token = self.jwt_token.read().clone();
-
         let mut envelope = RequestEnvelope::new(self.signer.identity(), payload);
         envelope.request_id = request_id;
-        if let Some(token) = jwt_token {
+        if let Some(token) = jwt {
             envelope = envelope.with_jwt_token(token);
+        }
+        if let Some(bearer) = delegated_bearer {
+            envelope = envelope.with_delegated_bearer(bearer);
         }
         if let Some(pubkey) = ephemeral_pubkey {
             envelope = envelope.with_ephemeral_pubkey(pubkey);
@@ -157,6 +322,28 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         let secret_bytes = secret.scalar().to_bytes();
         StreamHandleImpl::open(&self.transport, stream_info, &secret_bytes, &pub_bytes).await
     }
+
+    /// Open a verified streaming subscription with per-call authentication options.
+    ///
+    /// Same as `open_stream` but passes per-call JWT through the streaming
+    /// request envelope. Used by WASM client where JWT is set post-construction.
+    #[cfg(not(feature = "fips"))]
+    pub async fn open_stream_with_options(
+        &self,
+        payload: Vec<u8>,
+        options: CallOptions,
+    ) -> Result<StreamHandleImpl<T>> {
+        use crate::crypto::generate_ephemeral_keypair;
+
+        let (secret, public) = generate_ephemeral_keypair();
+        let pub_bytes = public.to_bytes();
+
+        let response = self.call_streaming_with_options(payload, pub_bytes, options).await?;
+        let stream_info = parse_stream_info(&response)?;
+
+        let secret_bytes = secret.scalar().to_bytes();
+        StreamHandleImpl::open(&self.transport, stream_info, &secret_bytes, &pub_bytes).await
+    }
     /// Open a verified stream from pre-parsed StreamInfo + ephemeral keys.
     ///
     /// Use when the streaming RPC was already sent (e.g., via dispatch) and
@@ -198,6 +385,12 @@ pub trait RpcClient: Send + Sync {
     /// Send a request and return the verified response payload.
     async fn call(&self, payload: Vec<u8>) -> Result<Vec<u8>>;
 
+    /// Send a request with per-call authentication options.
+    ///
+    /// Uses `options.jwt` if provided, otherwise falls back to the client's
+    /// default JWT. Includes `options.delegated_bearer` in the envelope.
+    async fn call_with_options(&self, payload: Vec<u8>, options: CallOptions) -> Result<Vec<u8>>;
+
     /// Send a streaming request with ephemeral DH pubkey.
     async fn call_streaming(&self, payload: Vec<u8>, ephemeral_pubkey: [u8; 32]) -> Result<Vec<u8>>;
 
@@ -214,9 +407,6 @@ pub trait RpcClient: Send + Sync {
 
     /// Get the next request ID.
     fn next_id(&self) -> u64;
-
-    /// Set the JWT token for authenticated requests.
-    fn set_jwt(&self, token: Option<String>);
 }
 
 /// Blanket impl: any `RpcClientImpl<S, T>` satisfies `RpcClient`.
@@ -225,6 +415,10 @@ pub trait RpcClient: Send + Sync {
 impl<S: Signer, T: Transport + 'static> RpcClient for RpcClientImpl<S, T> {
     async fn call(&self, payload: Vec<u8>) -> Result<Vec<u8>> {
         RpcClientImpl::call(self, payload).await
+    }
+
+    async fn call_with_options(&self, payload: Vec<u8>, options: CallOptions) -> Result<Vec<u8>> {
+        RpcClientImpl::call_with_options(self, payload, options).await
     }
 
     async fn call_streaming(&self, payload: Vec<u8>, ephemeral_pubkey: [u8; 32]) -> Result<Vec<u8>> {
@@ -265,9 +459,5 @@ impl<S: Signer, T: Transport + 'static> RpcClient for RpcClientImpl<S, T> {
 
     fn next_id(&self) -> u64 {
         RpcClientImpl::next_id(self)
-    }
-
-    fn set_jwt(&self, token: Option<String>) {
-        RpcClientImpl::set_jwt(self, token);
     }
 }

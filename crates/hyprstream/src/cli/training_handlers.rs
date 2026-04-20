@@ -25,7 +25,7 @@ use crate::services::{InferenceServiceConfig, RegistryClient, WorktreeClient, IN
 use crate::services::generated::inference_client::InferenceClient;
 use crate::storage::ModelRef;
 use crate::zmq::global_context;
-use hyprstream_rpc::{RequestIdentity, SigningKey, VerifyingKey};
+use hyprstream_rpc::{SigningKey, VerifyingKey};
 use hyprstream_service::ServiceSpawner;
 use std::path::PathBuf;
 
@@ -396,7 +396,7 @@ pub async fn handle_training_infer(
     // Create client for service communication — resolve inference key via PolicyService
     let policy_vk = signing_key.verifying_key();
     let policy_client = crate::services::PolicyClient::for_service(
-        signing_key.clone(), RequestIdentity::anonymous(), policy_vk,
+        signing_key.clone(), policy_vk, None,
     );
     let key_resp = policy_client.resolve_service_key(
         &crate::services::generated::policy_client::ResolveServiceKey {
@@ -409,8 +409,8 @@ pub async fn handle_training_infer(
     ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?;
     let client = InferenceClient::for_service(
         signing_key.clone(),
-        RequestIdentity::anonymous(),
         inference_vk,
+        None,
     );
 
     // Apply chat template
@@ -705,7 +705,7 @@ pub async fn handle_training_batch(
     // Resolve inference key via PolicyService
     let policy_vk = signing_key.verifying_key();
     let policy_client = crate::services::PolicyClient::for_service(
-        signing_key.clone(), RequestIdentity::anonymous(), policy_vk,
+        signing_key.clone(), policy_vk, None,
     );
     let key_resp = policy_client.resolve_service_key(
         &crate::services::generated::policy_client::ResolveServiceKey {
@@ -718,8 +718,8 @@ pub async fn handle_training_batch(
     ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?;
     let client = InferenceClient::for_service(
         signing_key.clone(),
-        RequestIdentity::anonymous(),
         inference_vk,
+        None,
     );
 
     // Get adapter info for checkpoint saves

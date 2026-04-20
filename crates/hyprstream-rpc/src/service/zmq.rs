@@ -333,6 +333,27 @@ pub trait ZmqService: 'static {
         None
     }
 
+    /// Resolve a signer key to an authorization subject via the trust store.
+    ///
+    /// Returns `Some(subject)` if the key is cached and not expired.
+    /// Default implementation returns `None` (no trust store available).
+    fn resolve_key_subject(&self, _signer_pubkey: &[u8; 32]) -> Option<crate::envelope::Subject> {
+        None
+    }
+
+    /// Cache a verified key→subject binding in the trust store.
+    ///
+    /// Called after successful JWT verification when the JWT's `pub_key` matches
+    /// the envelope signer. Default implementation is a no-op.
+    fn cache_key_binding(
+        &self,
+        _verifying_key: ed25519_dalek::VerifyingKey,
+        _subject: &str,
+        _jwt: &str,
+        _expires_at: i64,
+    ) {
+    }
+
     /// E2E JWT verification with federation and downgrade attack protection.
     ///
     /// Called by `process_request` after envelope signature verification.
@@ -350,7 +371,12 @@ pub trait ZmqService: 'static {
             .or_else(|| ctx.claims().and_then(|c| c.token.clone()));
 
         let Some(token) = token else {
-            // No JWT at all — subject stays as key-derived (system or anonymous)
+            // No JWT — try trust store lookup for cached key bindings
+            if let Some(subject) = self.resolve_key_subject(&ctx.signer_pubkey) {
+                ctx.key_derived_subject = subject;
+                return Ok(());
+            }
+            // No JWT and no trust store entry — subject stays anonymous
             return Ok(());
         };
 
@@ -414,45 +440,63 @@ pub trait ZmqService: 'static {
             ctx.claims = Some(verified);
         }
 
-        // R2: Bind JWT `pub` claim to envelope `signerPubkey` for service tokens.
-        // For service-to-service calls, the JWT's `pub` claim (Ed25519 pubkey, base64url)
-        // must match the envelope's `signerPubkey`. This prevents a valid service JWT
-        // holder from signing envelopes with a different key and being attributed
-        // the service identity.
-        // Only applies when both conditions are met: sub starts with "service:" AND pub_key is present.
+        // R2: Bind JWT pub_key claim to envelope signer for ALL tokens.
+        // When a JWT carries a pub_key (Ed25519 pubkey, base64url), the envelope's
+        // signer must match. This prevents a valid JWT holder from signing envelopes
+        // with a different key and being attributed the JWT's subject identity.
+        // Applies to both service tokens and user tokens.
         if let Some(ref claims) = ctx.claims {
-            if claims.sub.starts_with("service:") {
-                if let Some(ref pub_key_b64) = claims.pub_key {
-                    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-                    match URL_SAFE_NO_PAD.decode(pub_key_b64) {
-                        Ok(pub_key_bytes) => {
-                            // C2: Reject malformed pubkey — must be exactly 32 bytes for Ed25519
-                            if pub_key_bytes.len() != 32 {
-                                tracing::warn!(
-                                    "Service JWT pubkey has invalid length: {} bytes (expected 32)",
-                                    pub_key_bytes.len()
-                                );
-                                anyhow::bail!(
-                                    "Service JWT pubkey has invalid length: {} bytes",
-                                    pub_key_bytes.len()
-                                );
-                            }
-                            let mut expected = [0u8; 32];
-                            expected.copy_from_slice(&pub_key_bytes);
-                            // M2: Constant-time comparison to prevent timing side-channel
-                            use subtle::ConstantTimeEq as _;
-                            if expected.ct_ne(&ctx.signer_pubkey).into() {
-                                tracing::warn!(
-                                    "Service JWT pubkey mismatch: sub={}",
-                                    claims.sub
-                                );
-                                anyhow::bail!("Service JWT pubkey does not match envelope signer");
-                            }
+            if let Some(ref pub_key_b64) = claims.pub_key {
+                use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+                match URL_SAFE_NO_PAD.decode(pub_key_b64) {
+                    Ok(pub_key_bytes) => {
+                        if pub_key_bytes.len() != 32 {
+                            tracing::warn!(
+                                "JWT pubkey has invalid length: {} bytes (expected 32)",
+                                pub_key_bytes.len()
+                            );
+                            anyhow::bail!(
+                                "JWT pubkey has invalid length: {} bytes",
+                                pub_key_bytes.len()
+                            );
                         }
-                        Err(e) => {
-                            tracing::warn!("Invalid base64 in service JWT pub claim: {}", e);
-                            anyhow::bail!("Invalid service JWT pubkey encoding");
+                        let mut expected = [0u8; 32];
+                        expected.copy_from_slice(&pub_key_bytes);
+                        use subtle::ConstantTimeEq as _;
+                        if expected.ct_ne(&ctx.signer_pubkey).into() {
+                            tracing::warn!(
+                                "JWT pubkey mismatch: sub={}",
+                                claims.sub
+                            );
+                            anyhow::bail!("JWT pubkey does not match envelope signer");
                         }
+
+                        // Cache the (key → subject) binding in the trust store.
+                        // Uses namespaced subject for federated tokens.
+                        let vk = match ed25519_dalek::VerifyingKey::from_bytes(&expected) {
+                            Ok(vk) => vk,
+                            Err(_) => {
+                                tracing::warn!("Invalid Ed25519 verifying key in JWT pub_key");
+                                anyhow::bail!("Invalid Ed25519 verifying key in JWT");
+                            }
+                        };
+                        let subject_str = claims.subject(local_issuers);
+                        if let Some(subject_name) = subject_str.name() {
+                            self.cache_key_binding(
+                                vk,
+                                subject_name,
+                                &token,
+                                claims.exp,
+                            );
+                            tracing::info!(
+                                subject = %subject_name,
+                                "Cached key binding in trust store"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Invalid base64 in JWT pub_key claim: {}", e);
+                        anyhow::bail!("Invalid JWT pubkey encoding");
                     }
                 }
             }

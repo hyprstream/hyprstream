@@ -17,7 +17,7 @@ use hyprstream_tui::wizard::backend::*;
 
 use crate::auth::identity_store;
 use crate::auth::policy_templates::{get_template, get_templates};
-use crate::auth::{LocalKeyStore, PolicyManager, UserStore, write_policy_file};
+use crate::auth::{LocalKeyStore, PolicyManager, UserStore};
 use crate::cli::gpu_detect;
 use crate::cli::policy_handlers::{
     ensure_user_signing_key, load_or_generate_signing_key, mint_local_token, parse_duration,
@@ -321,21 +321,12 @@ impl WizardBackend for BootstrapManager {
 
     fn apply_template(&mut self, name: &str) {
         if let Some(template) = get_template(name) {
-            let template_content = template.expanded_rules();
-            // Prepend service base rules so templates don't wipe inter-service permissions
-            let content = format!(
-                "{}\n# User-facing rules from '{}' template:\n{}",
-                crate::auth::policy_templates::SERVICE_BASE_RULES,
-                name,
-                template_content,
-            );
-            let policy_csv = self.policies_dir().join("policy.csv");
-            let _ = self.rt.block_on(async {
-                write_policy_file(&policy_csv, content.as_bytes()).await
-            });
-            // Reload policy manager
-            self.policy_manager = None;
             self.ensure_policy_manager();
+            if let Some(ref pm) = self.policy_manager {
+                let _ = self.rt.block_on(async {
+                    pm.apply_template(template).await
+                });
+            }
         }
     }
 

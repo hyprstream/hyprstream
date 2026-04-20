@@ -74,7 +74,9 @@ struct PolicyRequest {
     resolveServiceKey @18 :ResolveServiceKey $mcpScope(query) $mcpDescription("Resolve a service name to its Ed25519 verifying key");
 
     # Register a service's verifying key with the CA
-    registerServiceKey @19 :RegisterServiceKey $mcpScope(manage) $mcpDescription("Register a service verifying key with the CA");
+    # Internal CA operation — any caller with a valid CA-signed JWT can register.
+    # No authorization scope required; the JWT itself proves CA attestation.
+    registerServiceKey @19 :RegisterServiceKey $mcpDescription("Register a service verifying key with the CA");
   }
 }
 

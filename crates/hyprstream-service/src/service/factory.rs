@@ -162,8 +162,8 @@ impl QuicSharedConfig {
 
                     let client = hyprstream_discovery::DiscoveryClient::for_service(
                         sk,
-                        hyprstream_rpc::RequestIdentity::anonymous(),
                         discovery_vk,
+                        None,
                     );
                     match client.announce(&hyprstream_discovery::ServiceAnnouncement {
                         service_name: svc_name,
@@ -328,6 +328,19 @@ impl ServiceContext {
         // keys ARE identity, service names are authorization scopes.
         let trust = crate::service::trust_store::global_trust_store();
 
+        // Remove any stale entries for services we're about to regenerate.
+        // This happens when CLI mode loaded bootstrap pubkeys from disk (no JWTs)
+        // before the service start handler generates fresh in-memory keys with JWTs.
+        for name in service_names {
+            if let Some(stale_vk) = trust.resolve_one(name) {
+                let stale = trust.get(&stale_vk);
+                if stale.as_ref().is_some_and(|a| a.jwt.is_none()) {
+                    tracing::debug!(service = name, "Removing stale trust store entry (no JWT)");
+                    trust.remove(&stale_vk);
+                }
+            }
+        }
+
         for name in service_names {
             if name == "policy" {
                 // PolicyService uses the root key directly (it IS the CA).
@@ -350,13 +363,21 @@ impl ServiceContext {
             let service_key = SigningKey::generate(&mut rand::rngs::OsRng);
             let service_vk = service_key.verifying_key();
 
-            // Issue service JWT (CA-signed certificate binding name → pubkey)
-            let claims = hyprstream_rpc::auth::Claims::new(
+            // Issue service JWT (CA-signed certificate binding name → pubkey).
+            // Set iss and aud to match PolicyService's local_issuer_url and
+            // default_audience so it recognizes these CA-signed tokens as local.
+            let oauth_issuer = ctx.oauth_issuer_url().map(str::to_owned);
+            let mut claims = hyprstream_rpc::auth::Claims::new(
                 format!("service:{name}"),
                 now,
                 expiry,
             )
             .with_pub_key(URL_SAFE_NO_PAD.encode(service_vk.as_bytes()));
+            if let Some(ref iss) = oauth_issuer {
+                claims = claims
+                    .with_issuer(iss.clone())
+                    .with_audience(Some(iss.clone()));
+            }
 
             let jwt = hyprstream_rpc::auth::jwt::encode(&claims, &ca_signing_key);
 

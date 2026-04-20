@@ -1172,7 +1172,7 @@ pub async fn apply_policy_template_to_model(
     };
 
     // Check if template rules already exist
-    let rules = template.expanded_rules();
+    let rules = template.to_csv();
     if existing_content.contains(rules.trim()) {
         println!("✓ Policy template '{template_name}' already applied");
         return Ok(());
@@ -1267,7 +1267,7 @@ pub async fn handle_infer(
     let model_server_vk = {
         let policy_vk = signing_key.verifying_key();
         let policy_client = crate::services::PolicyClient::for_service(
-            signing_key.clone(), RequestIdentity::anonymous(), policy_vk,
+            signing_key.clone(), policy_vk, None,
         );
         let resp = policy_client.resolve_service_key(
             &crate::services::generated::policy_client::ResolveServiceKey {
@@ -1281,8 +1281,8 @@ pub async fn handle_infer(
     };
     let model_client = ModelClient::for_service(
         signing_key.clone(),
-        RequestIdentity::anonymous(),
         model_server_vk,
+        None,
     );
 
     // Apply chat template to the prompt via ModelService
@@ -1444,7 +1444,7 @@ pub async fn handle_load(
     // Resolve service keys via PolicyClient
     let policy_vk = signing_key.verifying_key();
     let policy_client = crate::services::PolicyClient::for_service(
-        signing_key.clone(), RequestIdentity::anonymous(), policy_vk,
+        signing_key.clone(), policy_vk, None,
     );
 
     // If --wait, subscribe to notifications BEFORE issuing load request
@@ -1467,8 +1467,8 @@ pub async fn handle_load(
         ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?;
         let notif_client = crate::services::NotificationClient::for_service(
             signing_key.clone(),
-            RequestIdentity::anonymous(),
             notif_vk,
+            None,
         );
 
         let sub_resp = notif_client.subscribe(&SubscribeRequest {
@@ -1515,8 +1515,8 @@ pub async fn handle_load(
     ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?;
     let model_client = ModelClient::for_service(
         signing_key.clone(),
-        RequestIdentity::anonymous(),
         model_vk,
+        None,
     );
     let model_ref_owned = model_ref_str.to_owned();
     match model_client.load(&LoadModelRequest {
@@ -1774,7 +1774,7 @@ async fn handle_notify_subscribe(
 
     let policy_vk = signing_key.verifying_key();
     let policy_client = crate::services::PolicyClient::for_service(
-        signing_key.clone(), RequestIdentity::anonymous(), policy_vk,
+        signing_key.clone(), policy_vk, None,
     );
     let notif_key_resp = policy_client.resolve_service_key(
         &crate::services::generated::policy_client::ResolveServiceKey {
@@ -1787,8 +1787,8 @@ async fn handle_notify_subscribe(
     ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?;
     let notif_client = crate::services::NotificationClient::for_service(
         signing_key,
-        RequestIdentity::anonymous(),
         notif_server_vk,
+        None,
     );
 
     // Subscribe with maximum TTL for long-running listeners
@@ -1928,7 +1928,7 @@ pub async fn handle_unload(
     let model_server_vk = {
         let policy_vk = signing_key.verifying_key();
         let policy_client = crate::services::PolicyClient::for_service(
-            signing_key.clone(), RequestIdentity::anonymous(), policy_vk,
+            signing_key.clone(), policy_vk, None,
         );
         let resp = policy_client.resolve_service_key(
             &crate::services::generated::policy_client::ResolveServiceKey {
@@ -1940,7 +1940,7 @@ pub async fn handle_unload(
                 .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
         ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?
     };
-    let model_client = ModelClient::for_service(signing_key, RequestIdentity::anonymous(), model_server_vk);
+    let model_client = ModelClient::for_service(signing_key, model_server_vk, None);
 
     model_client.unload(&UnloadModelRequest { model_ref: model_ref_str.to_owned() }).await?;
 

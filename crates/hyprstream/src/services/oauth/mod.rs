@@ -291,8 +291,8 @@ impl Spawnable for OAuthService {
             };
             let policy_client = PolicyClient::for_service(
                 self.signing_key.clone(),
-                hyprstream_rpc::RequestIdentity::anonymous(),
                 policy_vk,
+                None,
             );
 
             // Resolve discovery service verifying key via PolicyService RPC.
@@ -307,8 +307,8 @@ impl Spawnable for OAuthService {
             ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("Invalid Ed25519 key: {e}")))?;
             let discovery_client = crate::services::DiscoveryClient::for_service(
                 self.signing_key.clone(),
-                hyprstream_rpc::RequestIdentity::anonymous(),
                 discovery_vk,
+                None,
             );
 
             // Attempt to load the user credential store for Ed25519 device verification.

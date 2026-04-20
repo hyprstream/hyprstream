@@ -22,7 +22,6 @@ pub fn make_chat_spawner(
     available_tools: Option<Vec<serde_json::Value>>,
     gen_config: Arc<RwLock<hyprstream_tui::chat_app::ChatGenConfig>>,
 ) -> hyprstream_tui::chat_app::StreamSpawner {
-    use hyprstream_rpc::envelope::RequestIdentity;
     use hyprstream_rpc::streaming::StreamPayload;
 
     use crate::services::generated::inference_client::{ChatMessage, ToolCall, ToolCallFunction};
@@ -64,8 +63,8 @@ pub fn make_chat_spawner(
                 let policy_vk = sk_inner.verifying_key();
                 let policy_client = crate::services::PolicyClient::for_service(
                     sk_inner.clone(),
-                    RequestIdentity::anonymous(),
                     policy_vk,
+                    None,
                 );
                 let model_key_resp = match policy_client.resolve_service_key(
                     &crate::services::generated::policy_client::ResolveServiceKey {
@@ -92,7 +91,7 @@ pub fn make_chat_spawner(
                     }
                 };
                 let model_client =
-                    ModelClient::for_service(sk_inner.clone(), RequestIdentity::anonymous(), model_vk);
+                    ModelClient::for_service(sk_inner.clone(), model_vk, None);
 
                 // Map ChatHistoryEntry → ChatMessage, handling all roles.
                 // Skip the trailing empty assistant placeholder — it's only a
@@ -252,7 +251,6 @@ pub fn make_chat_spawner(
 pub fn make_tool_caller(
     signing_key: &SigningKey,
 ) -> (hyprstream_tui::chat_app::ToolCaller, HashMap<String, String>, Vec<serde_json::Value>) {
-    use hyprstream_rpc::envelope::RequestIdentity;
     use hyprstream_rpc::registry::{global as registry, SocketKind};
     use crate::services::generated::mcp_client::McpClient as GenMcpClient;
     use hyprstream_tui::chat_app::ChatEvent;
@@ -275,8 +273,8 @@ pub fn make_tool_caller(
                 let policy_vk = sk_fetch.verifying_key();
                 let policy_client = crate::services::PolicyClient::for_service(
                     sk_fetch.clone(),
-                    RequestIdentity::anonymous(),
                     policy_vk,
+                    None,
                 );
                 let mcp_key_resp = policy_client.resolve_service_key(
                     &crate::services::generated::policy_client::ResolveServiceKey {
@@ -287,7 +285,7 @@ pub fn make_tool_caller(
                     mcp_key_resp.verifying_key.as_slice().try_into().ok()?
                 ).ok()?;
                 let gen: GenMcpClient =
-                    GenMcpClient::for_endpoint(&endpoint, sk_fetch, RequestIdentity::anonymous(), mcp_vk);
+                    GenMcpClient::for_endpoint(&endpoint, sk_fetch, mcp_vk, None);
                 let tool_list = gen.list_tools().await.ok()?;
                 let mut descs = HashMap::new();
                 let mut tools = Vec::new();
@@ -333,8 +331,8 @@ pub fn make_tool_caller(
                         let policy_vk = sk_c.verifying_key();
                         let policy_client = crate::services::PolicyClient::for_service(
                             sk_c.clone(),
-                            RequestIdentity::anonymous(),
                             policy_vk,
+                            None,
                         );
                         let mcp_vk = match policy_client.resolve_service_key(
                             &crate::services::generated::policy_client::ResolveServiceKey {
@@ -353,7 +351,7 @@ pub fn make_tool_caller(
                             },
                             Err(e) => return format!("error: failed to resolve MCP key: {e}"),
                         };
-                        match GenMcpClient::for_endpoint(&endpoint, sk_c, RequestIdentity::anonymous(), mcp_vk)
+                        match GenMcpClient::for_endpoint(&endpoint, sk_c, mcp_vk, None)
                             .call_tool(&crate::services::generated::mcp_client::CallTool {
                                 tool_name: uuid_c,
                                 arguments,

@@ -56,7 +56,7 @@ use std::sync::Arc;
 // Unified service manager API
 use hyprstream_service::{get_factory, InprocManager, ServiceContext, ServiceManager};
 use hyprstream_rpc::transport::TransportConfig;
-use hyprstream_rpc::{RequestIdentity, SigningKey, VerifyingKey};
+use hyprstream_rpc::{SigningKey, VerifyingKey};
 // Tracing imports (feature-gated)
 #[cfg(feature = "otel")]
 use opentelemetry::trace::TracerProvider;
@@ -456,8 +456,8 @@ fn handle_quick_command(
                     .ok_or_else(|| anyhow::anyhow!("Cannot resolve model service pubkey. Run 'hyprstream wizard -y' to generate bootstrap credentials."))?;
                 let model_client = hyprstream_core::services::generated::model_client::ModelClient::for_service(
                     signing_key,
-                    RequestIdentity::anonymous(),
                     model_server_vk,
+                    None,
                 );
                 let filters = parse_filters(&filter)?;
                 let status_filter = parse_status_filter(&status)?;
@@ -1055,9 +1055,9 @@ fn handle_quick_command(
                         // Wire up policy-backed authorization
                         let worker_policy_client = PolicyClient::for_service(
                             signing_key.clone(),
-                            RequestIdentity::anonymous(),
                             resolve_service_vk("policy")
                                 .ok_or_else(|| anyhow::anyhow!("Cannot resolve policy pubkey. Run wizard."))?,
+                            None,
                         );
                         worker_service.set_authorize_fn(
                             hyprstream_core::services::build_authorize_fn(worker_policy_client),
@@ -1078,7 +1078,7 @@ fn handle_quick_command(
                     let worker_server_vk = resolve_service_vk("worker")
                         .ok_or_else(|| anyhow::anyhow!("Cannot resolve worker pubkey. Run wizard."))?;
                     let worker_client =
-                        WorkerClient::for_service(signing_key, RequestIdentity::anonymous(), worker_server_vk);
+                        WorkerClient::for_service(signing_key, worker_server_vk, None);
 
                     match action {
                         WorkerAction::List {
@@ -1543,8 +1543,8 @@ fn main() -> Result<()> {
                             .context("trust store has no policy key")?;
                         let wf_policy_client = PolicyClient::for_service(
                             signing_key.clone(),
-                            RequestIdentity::anonymous(),
                             policy_vk,
+                            None,
                         );
                         wf_svc.set_authorize_fn(
                             hyprstream_core::services::build_authorize_fn(wf_policy_client),
@@ -1565,8 +1565,8 @@ fn main() -> Result<()> {
                     .context("trust store has no registry key")?;
                 let client = hyprstream_core::services::RegistryClient::for_service(
                     signing_key.clone(),
-                    RequestIdentity::anonymous(),
                     registry_vk,
+                    None,
                 );
 
                 Ok::<_, anyhow::Error>((
@@ -1594,8 +1594,8 @@ fn main() -> Result<()> {
 
                 let client = hyprstream_core::services::RegistryClient::for_service(
                     signing_key.clone(),
-                    RequestIdentity::anonymous(),
                     registry_vk,
+                    None,
                 );
 
                 Ok::<_, anyhow::Error>((client, Vec::new(), None, signing_key, verifying_key))
@@ -1713,9 +1713,9 @@ fn main() -> Result<()> {
                                         load_or_generate_signing_key(&keys_dir).await?;
                                     let policy_client = PolicyClient::for_service(
                                         signing_key.clone(),
-                                        hyprstream_rpc::RequestIdentity::anonymous(),
                                         resolve_service_vk("policy")
                                             .ok_or_else(|| anyhow::anyhow!("Cannot resolve policy pubkey. Run wizard."))?,
+                                        None,
                                     );
 
                                     let runtime_config =

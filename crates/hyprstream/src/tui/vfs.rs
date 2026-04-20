@@ -101,8 +101,6 @@ async fn vfs_proxy_loop(
 pub fn build_chat_vfs_namespace(
     signing_key: &ed25519_dalek::SigningKey,
 ) -> anyhow::Result<(Arc<Namespace>, Subject)> {
-    use hyprstream_rpc::envelope::RequestIdentity;
-
     let subject = {
         let vk = signing_key.verifying_key();
         let pubkey_hex = hex::encode(vk.as_bytes());
@@ -117,8 +115,8 @@ pub fn build_chat_vfs_namespace(
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
     let policy_client = crate::services::PolicyClient::for_service(
         signing_key.clone(),
-        RequestIdentity::anonymous(),
         policy_vk,
+        None,
     );
     let model_vk_resp = tokio::task::block_in_place(|| {
         let rt = tokio::runtime::Handle::current();
@@ -137,8 +135,8 @@ pub fn build_chat_vfs_namespace(
     // Mount /srv/model via RemoteModelMount.
     let model_client = crate::services::generated::model_client::ModelClient::for_service(
         signing_key.clone(),
-        RequestIdentity::anonymous(),
         model_vk,
+        None,
     );
     let remote_model_mount = crate::services::remote_mount::RemoteModelMount::new(model_client);
     let _ = ns.mount("/srv/model", Arc::new(remote_model_mount));

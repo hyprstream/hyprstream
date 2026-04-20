@@ -9,7 +9,6 @@
 use anyhow::{bail, Result};
 use clap::{Arg, ArgMatches, Command};
 use ed25519_dalek::SigningKey;
-use hyprstream_rpc::RequestIdentity;
 use hyprstream_service::ScopedClientTreeNode;
 use serde_json::Value;
 
@@ -366,7 +365,7 @@ async fn resolve_key_via_policy(
 ) -> Result<hyprstream_rpc::crypto::VerifyingKey> {
     let policy_vk = signing_key.verifying_key();
     let policy_client = PolicyClient::for_service(
-        signing_key.clone(), RequestIdentity::anonymous(), policy_vk,
+        signing_key.clone(), policy_vk, None,
     );
     let resp = policy_client.resolve_service_key(
         &crate::services::generated::policy_client::ResolveServiceKey {
@@ -386,30 +385,28 @@ async fn dispatch_top_level(
     args: &Value,
     signing_key: SigningKey,
 ) -> Result<Value> {
-    let identity = RequestIdentity::anonymous();
-
     match service {
         "registry" => {
             let server_vk = resolve_key_via_policy(&signing_key, "registry").await?;
             let client: RegistryClient = RegistryClient::for_service(
-                signing_key, identity, server_vk,
+                signing_key, server_vk, None,
             );
             client.call_method(method, args).await
         }
         "model" => {
             let server_vk = resolve_key_via_policy(&signing_key, "model").await?;
-            let client = ModelClient::for_service(signing_key, identity, server_vk);
+            let client = ModelClient::for_service(signing_key, server_vk, None);
             client.call_method(method, args).await
         }
         "inference" => {
             let server_vk = resolve_key_via_policy(&signing_key, "inference").await?;
-            let client = InferenceClient::for_service(signing_key, identity, server_vk);
+            let client = InferenceClient::for_service(signing_key, server_vk, None);
             client.call_method(method, args).await
         }
         "policy" => {
             // Bootstrap: PolicyService uses the root key
             let server_vk = signing_key.verifying_key();
-            let client = PolicyClient::for_service(signing_key, identity, server_vk);
+            let client = PolicyClient::for_service(signing_key, server_vk, None);
             client.call_method(method, args).await
         }
         "worker" => {
@@ -430,24 +427,22 @@ async fn dispatch_scoped_dynamic(
     args: &Value,
     signing_key: SigningKey,
 ) -> Result<Value> {
-    let identity = RequestIdentity::anonymous();
-
     match service {
         "registry" => {
             let server_vk = resolve_key_via_policy(&signing_key, "registry").await?;
             let client: RegistryClient = RegistryClient::for_service(
-                signing_key, identity, server_vk,
+                signing_key, server_vk, None,
             );
             client.call_scoped_method(scope_chain, method, args).await
         }
         "model" => {
             let server_vk = resolve_key_via_policy(&signing_key, "model").await?;
-            let client = ModelClient::for_service(signing_key, identity, server_vk);
+            let client = ModelClient::for_service(signing_key, server_vk, None);
             client.call_scoped_method(scope_chain, method, args).await
         }
         "worker" => {
             let server_vk = resolve_key_via_policy(&signing_key, "worker").await?;
-            let client = WorkerClient::for_service(signing_key, identity, server_vk);
+            let client = WorkerClient::for_service(signing_key, server_vk, None);
             client.call_scoped_method(scope_chain, method, args).await
         }
         _ => bail!("Service '{}' has no scoped methods", service),

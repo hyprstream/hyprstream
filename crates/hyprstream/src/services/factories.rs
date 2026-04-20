@@ -43,6 +43,13 @@ fn load_config() -> HyprConfig {
     HyprConfig::load().unwrap_or_default()
 }
 
+/// Get the JWT token for a service from the trust store.
+fn service_token(service_name: &str) -> Option<String> {
+    let trust = hyprstream_service::global_trust_store();
+    let vk = trust.resolve_one(service_name)?;
+    trust.get(&vk).and_then(|att| att.jwt.clone())
+}
+
 /// Shared Git2DB registry instance. Lazily initialized by the first factory
 /// that needs it. Both PolicyService and RegistryService share this instance.
 static SHARED_GIT2DB: std::sync::OnceLock<Arc<RwLock<Git2DB>>> = std::sync::OnceLock::new();
@@ -79,11 +86,20 @@ fn register_service_key(
 
     let jwt = {
         let trust = hyprstream_service::global_trust_store();
-        let vk = trust.resolve_one(service_name)
-            .ok_or_else(|| anyhow::anyhow!("trust store has no key for '{service_name}'"))?;
-        trust.get(&vk)
-            .and_then(|att| att.jwt.clone())
-            .ok_or_else(|| anyhow::anyhow!("trust store has no JWT for '{service_name}'"))?
+        let vk = match trust.resolve_one(service_name) {
+            Some(vk) => vk,
+            None => {
+                tracing::warn!(service = service_name, "trust store has no key — skipping registerServiceKey");
+                return Ok(());
+            }
+        };
+        match trust.get(&vk).and_then(|att| att.jwt.clone()) {
+            Some(jwt) => jwt,
+            None => {
+                tracing::warn!(service = service_name, "trust store has no JWT — skipping registerServiceKey");
+                return Ok(());
+            }
+        }
     };
 
     let policy_vk = hyprstream_service::global_trust_store()
@@ -91,8 +107,8 @@ fn register_service_key(
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
     let policy_client = PolicyClient::for_service(
         signing_key.clone(),
-        RequestIdentity::anonymous(),
         policy_vk,
+        Some(jwt.clone()),
     );
 
     let request = RegisterServiceKey {
@@ -162,8 +178,18 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
                     let _ = pm.add_policy_with_domain("anonymous", "*", "tui:*", "*", "allow").await;
                     tracing::info!("policy migration: added 'anonymous' TUI access grant");
                 }
-                if !has_anon_tui {
+                // Migration: persist service base rules to disk if not already there.
+                // PolicyManager::new() already injected them into memory, but older
+                // policy.csv files won't have them on disk. Save writes the full
+                // enforcer state (including base rules) to disk.
+                let has_service_policy = rules.iter().any(|r| {
+                    r.len() >= 2 && r[0] == "service:policy"
+                });
+                if !has_anon_tui || !has_service_policy {
                     let _ = pm.save().await;
+                    if !has_service_policy {
+                        tracing::info!("policy migration: persisted service-to-service base rules to disk");
+                    }
                 }
                 Ok::<_, anyhow::Error>(pm)
             })
@@ -220,7 +246,7 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = PolicyClient::for_service(sk.clone(), RequestIdentity::anonymous(), policy_vk);
+    let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("registry"));
 
     // Create registry service with infrastructure (blocking since we're in sync context)
     let mut registry_service = tokio::task::block_in_place(|| {
@@ -292,7 +318,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = PolicyClient::for_service(sk.clone(), RequestIdentity::anonymous(), policy_vk);
+    let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("model"));
 
     // Create registry client
     let registry_vk = hyprstream_service::global_trust_store()
@@ -300,8 +326,8 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
         .ok_or_else(|| anyhow::anyhow!("trust store has no registry key"))?;
     let registry_client: RegistryClient = RegistryClient::for_service(
         sk.clone(),
-        RequestIdentity::anonymous(),
         registry_vk,
+        service_token("model"),
     );
 
     let mut model_service = tokio::task::block_in_place(|| {
@@ -409,8 +435,8 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
     let policy_client = crate::services::PolicyClient::for_service(
         sk.clone(),
-        hyprstream_rpc::RequestIdentity::anonymous(),
         policy_vk,
+        service_token("worker"),
     );
     worker_service.set_authorize_fn(super::worker::build_authorize_fn(policy_client));
     if let Some(issuer) = ctx.oauth_issuer_url() {
@@ -451,11 +477,11 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let model_vk = hyprstream_service::global_trust_store()
         .resolve_one("model")
         .ok_or_else(|| anyhow::anyhow!("trust store has no model key"))?;
-    let model_client = ModelClient::for_service(sk.clone(), RequestIdentity::anonymous(), model_vk);
+    let model_client = ModelClient::for_service(sk.clone(), model_vk, service_token("oai"));
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = PolicyClient::for_service(sk.clone(), RequestIdentity::anonymous(), policy_vk);
+    let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("oai"));
 
     // Create registry client
     let registry_vk = hyprstream_service::global_trust_store()
@@ -463,8 +489,8 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         .ok_or_else(|| anyhow::anyhow!("trust store has no registry key"))?;
     let registry_client: RegistryClient = RegistryClient::for_service(
         sk.clone(),
-        RequestIdentity::anonymous(),
         registry_vk,
+        service_token("oai"),
     );
 
     // Create server state (blocking since we're in sync context)
@@ -527,8 +553,8 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
                 .ok_or_else(|| anyhow::anyhow!("trust store has no registry key"))?;
             let zmq_client: RegistryClient = RegistryClient::for_service(
                 sk.clone(),
-                RequestIdentity::anonymous(),
                 registry_vk,
+                service_token("flight"),
             );
             Some(Arc::new(zmq_client))
         } else {
@@ -877,7 +903,7 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = PolicyClient::for_service(sk.clone(), RequestIdentity::anonymous(), policy_vk);
+    let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("tui"));
 
     // Build VFS namespace for ChatApps spawned via TUI RPC.
     let (vfs_ns, vfs_subject) = crate::tui::vfs::build_chat_vfs_namespace(&sk)?;
@@ -923,7 +949,7 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = PolicyClient::for_service(sk.clone(), RequestIdentity::anonymous(), policy_vk);
+    let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("discovery"));
     let auth_provider = crate::services::discovery::PolicyAuthProvider::new(policy_client);
 
     let mut discovery_service = DiscoveryService::new(
@@ -980,7 +1006,7 @@ fn create_notification_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn S
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = PolicyClient::for_service(sk.clone(), RequestIdentity::anonymous(), policy_vk);
+    let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("notification"));
 
     let mut notification_service = crate::services::NotificationService::new(
         Arc::new(sk),
@@ -1045,7 +1071,7 @@ fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = PolicyClient::for_service(sk.clone(), RequestIdentity::anonymous(), policy_vk);
+    let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("metrics"));
 
     let mut metrics_service = MetricsService::new(
         orchestrator,

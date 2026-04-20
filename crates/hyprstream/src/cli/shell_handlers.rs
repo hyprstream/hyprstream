@@ -17,7 +17,6 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
-use hyprstream_rpc::envelope::RequestIdentity;
 use waxterm::backend::AnsiBackend;
 use waxterm::input::InputParser;
 use zeroize::Zeroizing;
@@ -165,8 +164,8 @@ pub async fn handle_shell_tui(
     let policy_vk = signing_key.verifying_key();
     let policy_client = crate::services::PolicyClient::for_service(
         signing_key.clone(),
-        RequestIdentity::anonymous(),
         policy_vk,
+        None,
     );
     let model_vk_resp = policy_client.resolve_service_key(
         &crate::services::generated::policy_client::ResolveServiceKey {
@@ -189,16 +188,16 @@ pub async fn handle_shell_tui(
     let model_client = {
         crate::services::generated::model_client::ModelClient::for_service(
             signing_key.clone(),
-            RequestIdentity::anonymous(),
             model_server_vk,
+            None,
         )
     };
     // Worker client for sandbox/container/image management.
     let worker_client = {
         hyprstream_workers::runtime::WorkerClient::for_service(
             signing_key.clone(),
-            RequestIdentity::anonymous(),
             worker_server_vk,
+            None,
         )
     };
     let (model_status_tx, mut model_status_rx) =
@@ -1573,12 +1572,11 @@ async fn fetch_models(
     signing_key: &SigningKey,
     models_dir: &std::path::Path,
 ) -> Vec<ModelEntry> {
-    use hyprstream_rpc::envelope::RequestIdentity;
 
     // Resolve registry + model keys via PolicyClient
     let policy_vk = signing_key.verifying_key();
     let policy_client = crate::services::PolicyClient::for_service(
-        signing_key.clone(), RequestIdentity::anonymous(), policy_vk,
+        signing_key.clone(), policy_vk, None,
     );
     let registry_server_vk = match policy_client.resolve_service_key(
         &crate::services::generated::policy_client::ResolveServiceKey {
@@ -1617,13 +1615,13 @@ async fn fetch_models(
     let registry: crate::services::RegistryClient = crate::services::RegistryClient::for_endpoint(
         &registry_endpoint,
         signing_key.clone(),
-        RequestIdentity::anonymous(),
         registry_server_vk,
+        None,
     );
     let model_client_for_status = crate::services::generated::model_client::ModelClient::for_service(
         signing_key.clone(),
-        RequestIdentity::anonymous(),
         model_server_vk,
+        None,
     );
     let registry_models_dir = models_dir.to_path_buf();
     let status_timeout = std::time::Duration::from_millis(500);

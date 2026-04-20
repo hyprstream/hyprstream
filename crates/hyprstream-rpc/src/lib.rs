@@ -158,7 +158,7 @@ pub mod web_transport;
 // ============================================================================
 
 pub use capnp::{serialize_message, FromCapnp, ToCapnp};
-pub use rpc_client::{RpcClient, RpcClientImpl};
+pub use rpc_client::{CallOptions, RequestBuilder, RpcClient, RpcClientImpl};
 pub use transport_traits::{PublishSink, Signer, Transport};
 pub mod identity;
 pub mod node_identity;

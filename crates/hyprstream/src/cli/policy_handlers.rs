@@ -20,7 +20,6 @@ use crate::services::generated::policy_client::{
 use anyhow::{Context, Result};
 use chrono::Duration;
 use ed25519_dalek::SigningKey;
-use hyprstream_rpc::prelude::*;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
@@ -31,9 +30,9 @@ use std::process::Command;
 fn create_policy_client(signing_key: &SigningKey) -> PolicyClient {
     PolicyClient::for_service(
         signing_key.clone(),
-        RequestIdentity::anonymous(),
         // Bootstrap: PolicyService uses the root key
         signing_key.verifying_key(),
+        None,
     )
 }
 
@@ -627,14 +626,14 @@ pub async fn handle_policy_apply_template(
             template_name
         ))?;
 
-    let new_content = template.expanded_rules();
+    let rules_csv = template.to_csv();
 
     println!("Applying template: {template_name}");
     println!("Description: {}", template.description);
     println!();
     println!("Rules:");
-    for line in new_content.lines() {
-        if !line.trim().is_empty() && !line.starts_with('#') {
+    for line in rules_csv.lines() {
+        if !line.trim().is_empty() {
             println!("  {line}");
         }
     }

@@ -432,34 +432,14 @@ impl PolicyHandler for PolicyService {
             }
         };
 
-        // Get the expanded rules — prepend service base rules so templates
-        // never wipe out inter-service permissions
-        let template_content = template.expanded_rules();
-        let new_content = format!(
-            "{}\n# User-facing rules from '{}' template:\n{}",
-            crate::auth::policy_templates::SERVICE_BASE_RULES,
-            data.name,
-            template_content,
-        );
-
-        // Read existing content for rollback on validation failure
-        let policy_path = self.policy_manager.policy_csv_path();
-        let existing_content = tokio::fs::read_to_string(&policy_path).await
-            .unwrap_or_default();
-
-        // Write the new policy with restrictive permissions
-        crate::auth::write_policy_file(&policy_path, &new_content).await
-            .map_err(|e| anyhow!("Failed to write policy file: {}", e))?;
-
-        // Validate by reloading
-        if let Err(e) = self.policy_manager.reload().await {
-            // Rollback on validation failure
-            warn!("Template validation failed, rolling back: {}", e);
-            let _ = crate::auth::write_policy_file(&policy_path, &existing_content).await;
-            let _ = self.policy_manager.reload().await;
+        // Apply template rules via the Casbin enforcer.
+        // Base rules are always present (injected at init/reload), so templates
+        // only add their own rules on top. The enforcer's save_policy() persists
+        // everything (base + template) to disk via the FileAdapter.
+        if let Err(e) = self.policy_manager.apply_template(template).await {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                message: format!("Policy validation failed: {}", e),
-                code: "VALIDATION_FAILED".to_owned(),
+                message: format!("Failed to apply template: {}", e),
+                code: "TEMPLATE_APPLY_FAILED".to_owned(),
                 details: String::new(),
             }));
         }
@@ -1337,6 +1317,25 @@ impl ZmqService for PolicyService {
         &self,
     ) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>> {
         self.federation_key_source.clone()
+    }
+
+    fn resolve_key_subject(&self, signer_pubkey: &[u8; 32]) -> Option<hyprstream_rpc::envelope::Subject> {
+        hyprstream_service::global_trust_store().resolve_subject(signer_pubkey)
+    }
+
+    fn cache_key_binding(
+        &self,
+        verifying_key: ed25519_dalek::VerifyingKey,
+        subject: &str,
+        jwt: &str,
+        expires_at: i64,
+    ) {
+        hyprstream_service::global_trust_store().insert(verifying_key, hyprstream_service::Attestation {
+            scopes: std::collections::HashSet::new(),
+            subject: Some(subject.to_owned()),
+            jwt: Some(jwt.to_owned()),
+            expires_at,
+        });
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {

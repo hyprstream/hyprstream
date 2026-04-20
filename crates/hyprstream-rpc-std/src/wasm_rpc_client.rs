@@ -9,12 +9,13 @@
 
 #![cfg(target_arch = "wasm32")]
 
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use wasm_bindgen::prelude::*;
 
 use hyprstream_rpc::crypto::VerifyingKey;
-use hyprstream_rpc::rpc_client::{RpcClientImpl, RpcClient};
+use hyprstream_rpc::rpc_client::{CallOptions, RpcClientImpl, RpcClient};
 use hyprstream_rpc::signer::JsSigner;
 use hyprstream_rpc::stream_consumer::{StreamHandle, StreamHandleImpl, StreamPayload};
 use hyprstream_rpc::web_transport::WtConnection;
@@ -26,9 +27,12 @@ use hyprstream_rpc::web_transport::WtConnection;
 ///
 /// TypeScript consumers use this via generated client classes that call
 /// `client.call(payload)` with Cap'n Proto bytes.
+///
+/// Uses `RefCell` for JWT storage — safe because WASM is single-threaded.
 #[wasm_bindgen(js_name = "RpcClient")]
 pub struct WasmRpcClient {
     inner: RpcClientImpl<JsSigner, WtConnection>,
+    jwt: RefCell<Option<String>>,
 }
 
 #[wasm_bindgen(js_class = "RpcClient")]
@@ -38,7 +42,7 @@ impl WasmRpcClient {
     /// - `url`: WebTransport URL (e.g., `https://host:port/wt`)
     /// - `cert_hash`: Optional base64-encoded SHA-256 certificate hash for pinning
     /// - `signer_pubkey`: 32-byte Ed25519 public key for envelope signing
-    /// - `sign_fn`: JavaScript async function `(canonicalBytes: Uint8Array) => Promise<Uint8Array>`
+    /// - `sign_fn`: JavaScript async function `(canonicalBytes: Uint8Array) -> Promise<Uint8Array>`
     /// - `server_verifying_key`: 32-byte Ed25519 public key for response verification
     #[wasm_bindgen(constructor)]
     pub async fn connect(
@@ -62,22 +66,33 @@ impl WasmRpcClient {
 
         Ok(Self {
             inner: RpcClientImpl::new(signer, transport, server_key),
+            jwt: RefCell::new(None),
         })
     }
 
     /// Set opaque JWT token for authenticated requests. Server decodes and verifies.
+    ///
+    /// Safe for single-threaded WASM — `RefCell` has no concurrent access risk.
     #[wasm_bindgen(js_name = "setJwt")]
     pub fn set_jwt(&self, token: &str) {
-        self.inner.set_jwt(if token.is_empty() {
+        *self.jwt.borrow_mut() = if token.is_empty() {
             None
         } else {
             Some(token.to_string())
-        });
+        };
+    }
+
+    /// Read the current JWT and build per-call options.
+    fn call_options(&self) -> CallOptions {
+        CallOptions {
+            jwt: self.jwt.borrow().clone(),
+            delegated_bearer: None,
+        }
     }
 
     /// Send a signed request and return the verified response payload (Cap'n Proto bytes).
     pub async fn call(&self, payload: &[u8]) -> Result<Vec<u8>, JsError> {
-        self.inner.call(payload.to_vec())
+        self.inner.call_with_options(payload.to_vec(), self.call_options())
             .await
             .map_err(|e| JsError::new(&e.to_string()))
     }
@@ -95,7 +110,7 @@ impl WasmRpcClient {
         }
         epk.copy_from_slice(ephemeral_pubkey);
 
-        self.inner.call_streaming(payload.to_vec(), epk)
+        self.inner.call_streaming_with_options(payload.to_vec(), epk, self.call_options())
             .await
             .map_err(|e| JsError::new(&e.to_string()))
     }
@@ -114,7 +129,7 @@ impl WasmRpcClient {
     /// Open a verified streaming subscription.
     #[wasm_bindgen(js_name = "openStream")]
     pub async fn open_stream(&self, payload: &[u8]) -> Result<WasmStreamHandle, JsError> {
-        let handle = self.inner.open_stream(payload.to_vec())
+        let handle = self.inner.open_stream_with_options(payload.to_vec(), self.call_options())
             .await
             .map_err(|e| JsError::new(&e.to_string()))?;
         Ok(WasmStreamHandle { inner: handle })

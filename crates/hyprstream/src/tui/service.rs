@@ -833,8 +833,8 @@ impl TuiService {
             .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
         let policy_client = PolicyClient::for_service(
             self.signing_key.clone(),
-            hyprstream_rpc::envelope::RequestIdentity::anonymous(),
             policy_vk,
+            None,
         );
 
         let registry_key_resp = policy_client.resolve_service_key(
@@ -858,7 +858,6 @@ impl TuiService {
         ).map_err(|e| anyhow::anyhow!("Invalid model key: {e}"))?;
 
         let models = {
-            use hyprstream_rpc::envelope::RequestIdentity;
             let registry_endpoint = hyprstream_rpc::registry::global()
                 .endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep)
                 .to_zmq_string();
@@ -866,13 +865,13 @@ impl TuiService {
                 crate::services::RegistryClient::for_endpoint(
                     &registry_endpoint,
                     self.signing_key.clone(),
-                    RequestIdentity::anonymous(),
                     registry_vk,
+                    None,
                 );
             let model_client_for_status = crate::services::generated::model_client::ModelClient::for_service(
                 self.signing_key.clone(),
-                RequestIdentity::anonymous(),
                 model_vk,
+                None,
             );
             let status_timeout = std::time::Duration::from_millis(500);
             let all_status_req = crate::services::generated::model_client::StatusRequest { model_ref: String::new() };
@@ -914,7 +913,6 @@ impl TuiService {
         let model_vk_load = model_vk;
         let load_fn: Box<dyn Fn(&str, hyprstream_tui::shell_app::ModelStatusSender) + Send> =
             Box::new(move |model_ref: &str, tx: hyprstream_tui::shell_app::ModelStatusSender| {
-                use hyprstream_rpc::envelope::RequestIdentity;
                 let sk  = sk_load.clone();
                 let mr  = model_ref.to_owned();
                 let h   = handle_load.clone();
@@ -922,8 +920,9 @@ impl TuiService {
                 // Submit load — returns "accepted" immediately (Continuation pattern).
                 h.block_on(async {
                     let client = crate::services::generated::model_client::ModelClient::for_service(
-                        sk.clone(), RequestIdentity::anonymous(),
+                        sk.clone(),
                         vk,
+                        None,
                     );
                     let _ = client.load(&crate::services::generated::model_client::LoadModelRequest {
                         model_ref: mr.clone(),
@@ -941,8 +940,9 @@ impl TuiService {
                         std::thread::sleep(std::time::Duration::from_secs(2));
                         let loaded = h_poll.block_on(async {
                             let client = crate::services::generated::model_client::ModelClient::for_service(
-                                sk_poll.clone(), RequestIdentity::anonymous(),
+                                sk_poll.clone(),
                                 vk_poll,
+                                None,
                             );
                             client.status(&crate::services::generated::model_client::StatusRequest { model_ref: mr_poll.clone() }).await
                                 .is_ok_and(|es| es.iter().any(|e| e.status == "loaded"))
@@ -960,13 +960,13 @@ impl TuiService {
         let handle_unload = handle.clone();
         let model_vk_unload = model_vk;
         let unload_fn: Box<dyn Fn(&str) -> bool + Send> = Box::new(move |model_ref: &str| {
-            use hyprstream_rpc::envelope::RequestIdentity;
             let sk = sk_unload.clone();
             let mr = model_ref.to_owned();
             handle_unload.block_on(async move {
                 let client = crate::services::generated::model_client::ModelClient::for_service(
-                    sk.clone(), RequestIdentity::anonymous(),
+                    sk.clone(),
                     model_vk_unload,
+                    None,
                 );
                 client.unload(&crate::services::generated::model_client::UnloadModelRequest { model_ref: mr.clone() }).await.is_ok()
             })

@@ -2741,8 +2741,8 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
             };
             let policy_client = PolicyClient::for_service(
                 self.policy_signing_key.clone(),
-                hyprstream_rpc::envelope::RequestIdentity::anonymous(),
                 policy_vk,
+                None,
             );
 
             // GPU initialization happens HERE, on the service thread

@@ -659,7 +659,6 @@ mod tests {
     use hyprstream_metrics::query::QueryOrchestrator;
     use hyprstream_metrics::storage::duckdb::DuckDbBackend;
     use hyprstream_rpc::crypto::generate_signing_keypair;
-    use hyprstream_rpc::envelope::RequestIdentity;
     use hyprstream_rpc::transport::TransportConfig;
     use hyprstream_service::{InprocManager, ServiceManager};
 
@@ -707,8 +706,8 @@ mod tests {
         let policy_client = PolicyClient::for_endpoint(
             &format!("inproc://{policy_tag}"),
             signing_key.clone(),
-            RequestIdentity::anonymous(),
             signing_key.verifying_key(),
+            None,
         );
 
         // In-memory DuckDB backend + metrics table creation.
@@ -747,8 +746,8 @@ mod tests {
         let client = MetricsClient::for_endpoint(
             &format!("inproc://{svc_tag}"),
             signing_key.clone(),
-            RequestIdentity::anonymous(),
             signing_key.verifying_key(),
+            None,
         );
 
         (client, manager)

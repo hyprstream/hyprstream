@@ -436,6 +436,13 @@ pub struct RequestEnvelope {
     /// Opaque JWT token string. Server decodes and verifies.
     /// Client treats this as opaque — no decoding, no trust in individual fields.
     pub jwt_token: Option<String>,
+
+    /// Bearer token relayed by a trusted service (e.g., OAI, MCP adapter).
+    /// The service's envelope signature covers this field. The server verifies:
+    /// 1. The service is trusted for bearer relay (policy-gated)
+    /// 2. The bearer token is valid
+    /// 3. The resolved subject comes from the bearer, not the service identity
+    pub delegated_bearer: Option<String>,
 }
 
 impl RequestEnvelope {
@@ -450,6 +457,7 @@ impl RequestEnvelope {
             timestamp: current_timestamp(),
             claims: None,
             jwt_token: None,
+            delegated_bearer: None,
         }
     }
 
@@ -469,6 +477,12 @@ impl RequestEnvelope {
     /// Set opaque JWT token. Server decodes and verifies.
     pub fn with_jwt_token(mut self, token: String) -> Self {
         self.jwt_token = Some(token);
+        self
+    }
+
+    /// Set delegated bearer token for relay by a trusted service.
+    pub fn with_delegated_bearer(mut self, bearer: String) -> Self {
+        self.delegated_bearer = Some(bearer);
         self
     }
 
@@ -933,6 +947,9 @@ impl ToCapnp for RequestEnvelope {
         if let Some(ref token) = self.jwt_token {
             builder.set_jwt_token(token);
         }
+        if let Some(ref bearer) = self.delegated_bearer {
+            builder.set_delegated_bearer(bearer);
+        }
     }
 }
 
@@ -986,6 +1003,15 @@ impl FromCapnp for RequestEnvelope {
             }
         };
 
+        let delegated_bearer = {
+            if reader.has_delegated_bearer() {
+                let t = reader.get_delegated_bearer()?.to_str()?;
+                if t.is_empty() { None } else { Some(t.to_owned()) }
+            } else {
+                None
+            }
+        };
+
         Ok(Self {
             request_id: reader.get_request_id(),
             identity: RequestIdentity::read_from(reader.get_identity()?)?,
@@ -995,6 +1021,7 @@ impl FromCapnp for RequestEnvelope {
             timestamp: reader.get_timestamp(),
             claims,
             jwt_token,
+            delegated_bearer,
         })
     }
 }

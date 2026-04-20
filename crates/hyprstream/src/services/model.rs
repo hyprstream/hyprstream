@@ -39,7 +39,6 @@ use crate::services::generated::inference_client::InferenceClient;
 use crate::services::RegistryClient;
 use crate::services::generated::registry_client::{StageFilesRequest, CommitWithAuthorRequest};
 use crate::services::generated::policy_client::PolicyCheck;
-use hyprstream_rpc::envelope::RequestIdentity;
 use crate::storage::ModelRef;
 use anyhow::{anyhow, Result};
 use hyprstream_rpc::prelude::*;
@@ -205,8 +204,8 @@ impl ModelService {
         ).map_err(|e| anyhow!("Invalid Ed25519 key: {e}"))?;
         let notif_client = NotificationClient::for_service(
             signing_key.clone(),
-            RequestIdentity::anonymous(),
             notif_vk,
+            None,
         );
         let notification_publisher = NotificationPublisher::new(notif_client, signing_key.clone());
 
@@ -296,8 +295,8 @@ impl ModelService {
         ).map_err(|e| anyhow!("Invalid Ed25519 key: {e}"))?;
         let notif_client = NotificationClient::for_service(
             signing_key.clone(),
-            RequestIdentity::anonymous(),
             notif_vk,
+            None,
         );
         let notification_publisher = NotificationPublisher::new(notif_client, signing_key.clone());
 
@@ -445,8 +444,8 @@ impl ModelService {
         let client = InferenceClient::for_endpoint(
             &endpoint,
             self.signing_key.clone(),
-            RequestIdentity::anonymous(),
             inference_vk,
+            None,
         );
 
         // Load TTT config from model's config.json (if TTT is enabled)
@@ -645,9 +644,10 @@ impl ModelService {
             .ok_or_else(|| anyhow!("Model {} not found after loading", model_ref_str))?;
         model.last_used = Instant::now();
         let client = model.client.clone();
-        if let Some(token) = ctx.jwt_token() {
-            client.with_jwt(token.to_owned());
-        }
+        // TODO: Forward user JWT to worker via per-call builder (delegated_bearer or
+        // request().jwt(token).call(payload)) once inference methods support CallOptions.
+        // The previous with_jwt() call was mutating shared state — unsafe with pooling.
+        let _ = ctx.jwt_token();
         Ok(client)
     }
 

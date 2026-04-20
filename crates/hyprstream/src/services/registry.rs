@@ -2804,8 +2804,8 @@ mod tests {
         let policy_client: PolicyClient = PolicyClient::for_endpoint(
             "inproc://test-policy-health",
             signing_key.clone(),
-            RequestIdentity::anonymous(),
             signing_key.verifying_key(),
+            None,
         );
 
         // Start the registry service with policy client
@@ -2823,8 +2823,8 @@ mod tests {
         let client: RegistryClient = RegistryClient::for_endpoint(
             "inproc://test-registry-health",
             signing_key.clone(),
-            RequestIdentity::anonymous(),
             signing_key.verifying_key(),
+            None,
         );
         // health_check returns () on success
         let result = client.health_check().await;

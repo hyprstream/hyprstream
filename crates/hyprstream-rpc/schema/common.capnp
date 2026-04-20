@@ -53,6 +53,7 @@ struct RequestEnvelope {
   timestamp @5 :Int64;             # Unix millis, for expiration check
   claims @6 :Claims $optional;     # DEPRECATED: use jwtToken instead. Kept for wire compat.
   jwtToken @7 :Text $optional;     # Opaque JWT token string. Server decodes and verifies.
+  delegatedBearer @8 :Text $optional;  # Bearer token relayed by a trusted service (e.g., OAI, MCP). Verified at envelope layer.
 }
 
 # Signed wrapper - signature covers serialized RequestEnvelope bytes

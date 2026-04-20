@@ -437,7 +437,7 @@ async fn phase_policy_templates(state: &mut WizardState, non_interactive: bool) 
 }
 
 async fn apply_template(state: &mut WizardState, template: &PolicyTemplate) -> Result<()> {
-    let content = template.expanded_rules();
+    let content = template.to_csv();
     let policy_csv = state.policies_dir().join("policy.csv");
 
     // Save current content for rollback
