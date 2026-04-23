@@ -77,11 +77,8 @@ pub fn generate_builders(out: &mut String, service_name: &str, schema: &ParsedSc
             "function {fn_name}({}): Uint8Array {{\n",
             params.join(", ")
         ));
-        // Estimate slack for pointer targets: 16 words (128 B) per pointer field.
-        // grow() handles overflow automatically via wasm.alloc/dealloc.
-        let extra_words = std::cmp::max(8usize, req_struct.pointer_words as usize * 16);
         out.push_str(&format!(
-            "  const msg = CapnpArena.intoWasm({}, {}, {extra_words});\n",
+            "  const msg = new CapnpArena({}, {});\n",
             req_struct.data_words, req_struct.pointer_words
         ));
 
@@ -210,9 +207,8 @@ fn generate_scoped_builders(
             "function {fn_name}({}): Uint8Array {{\n",
             params.join(", ")
         ));
-        let extra_words = std::cmp::max(8usize, root_struct.pointer_words as usize * 16);
         out.push_str(&format!(
-            "  const msg = CapnpArena.intoWasm({}, {}, {extra_words});\n",
+            "  const msg = new CapnpArena({}, {});\n",
             root_struct.data_words, root_struct.pointer_words
         ));
 
@@ -456,9 +452,8 @@ pub fn generate_struct_builders(out: &mut String, schema: &ParsedSchema) {
                 "export function {fn_name}({}): Uint8Array {{\n",
                 params.join(", ")
             ));
-            let extra_words = std::cmp::max(8usize, sd.pointer_words as usize * 16);
             out.push_str(&format!(
-                "  const msg = CapnpArena.intoWasm({}, {}, {extra_words});\n",
+                "  const msg = new CapnpArena({}, {});\n",
                 sd.data_words, sd.pointer_words
             ));
 
@@ -519,9 +514,8 @@ fn generate_plain_struct_builder(out: &mut String, sd: &StructDef, schema: &Pars
         "export function {fn_name}(p: {}): Uint8Array {{\n",
         sd.name
     ));
-    let extra_words = std::cmp::max(8usize, sd.pointer_words as usize * 16);
     out.push_str(&format!(
-        "  const msg = CapnpArena.intoWasm({}, {}, {extra_words});\n",
+        "  const msg = new CapnpArena({}, {});\n",
         sd.data_words, sd.pointer_words
     ));
 

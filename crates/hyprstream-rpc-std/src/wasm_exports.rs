@@ -74,7 +74,7 @@ impl VfsShell {
         let reg_signer = JsSigner::new(signer_pubkey, sign_fn.clone())
             .map_err(|e| JsError::new(&e.to_string()))?;
         let reg_client: Arc<dyn RpcClient> = Arc::new(
-            RpcClientImpl::new(reg_signer, reg_transport, server_key.clone())
+            RpcClientImpl::new(reg_signer, reg_transport, Some(server_key.clone()))
         );
         web_sys::console::log_1(&"[VfsShell] Registry connected".into());
 
@@ -85,7 +85,7 @@ impl VfsShell {
         let model_signer = JsSigner::new(signer_pubkey, sign_fn)
             .map_err(|e| JsError::new(&e.to_string()))?;
         let model_client: Arc<dyn RpcClient> = Arc::new(
-            RpcClientImpl::new(model_signer, model_transport, server_key)
+            RpcClientImpl::new(model_signer, model_transport, Some(server_key))
         );
         web_sys::console::log_1(&"[VfsShell] Model connected".into());
 

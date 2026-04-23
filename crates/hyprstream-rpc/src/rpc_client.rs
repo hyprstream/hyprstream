@@ -138,14 +138,17 @@ impl<'a> RequestBuilder<'a> {
 pub struct RpcClientImpl<S: Signer, T: Transport + 'static> {
     pub signer: S,
     pub transport: T,
-    pub server_verifying_key: VerifyingKey,
+    pub server_verifying_key: Option<VerifyingKey>,
     default_jwt: Option<String>,
     request_id: AtomicU64,
 }
 
 impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
     /// Create a new RPC client.
-    pub fn new(signer: S, transport: T, server_verifying_key: VerifyingKey) -> Self {
+    ///
+    /// `server_verifying_key`: `None` skips response signature verification
+    /// (TLS cert pinning still protects the connection).
+    pub fn new(signer: S, transport: T, server_verifying_key: Option<VerifyingKey>) -> Self {
         Self {
             signer,
             transport,
@@ -173,7 +176,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         let response_bytes = self.transport.send(signed_bytes, timeout).await?;
         let (_req_id, inner) = envelope::unwrap_response(
             &response_bytes,
-            Some(&self.server_verifying_key),
+            self.server_verifying_key.as_ref(),
         )?;
         Ok(inner)
     }
@@ -194,7 +197,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         let response_bytes = self.transport.send(signed_bytes, timeout).await?;
         let (_req_id, inner) = envelope::unwrap_response(
             &response_bytes,
-            Some(&self.server_verifying_key),
+            self.server_verifying_key.as_ref(),
         )?;
         Ok(inner)
     }
@@ -217,7 +220,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         let response_bytes = self.transport.send(signed_bytes, timeout).await?;
         let (_req_id, inner) = envelope::unwrap_response(
             &response_bytes,
-            Some(&self.server_verifying_key),
+            self.server_verifying_key.as_ref(),
         )?;
         Ok(inner)
     }
@@ -240,7 +243,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         let response_bytes = self.transport.send(signed_bytes, timeout).await?;
         let (_req_id, inner) = envelope::unwrap_response(
             &response_bytes,
-            Some(&self.server_verifying_key),
+            self.server_verifying_key.as_ref(),
         )?;
         Ok(inner)
     }

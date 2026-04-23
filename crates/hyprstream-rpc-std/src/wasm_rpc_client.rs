@@ -1,98 +1,169 @@
-//! RpcClient — wasm-bindgen export of `RpcClient<JsSigner, WtConnection>`.
+//! RpcClient — wasm-bindgen export of `RpcClientImpl<JsSigner, WtConnection>`.
 //!
 //! This is the JS-facing RPC client. Exported as `RpcClient` to JavaScript
 //! (matching the Rust generic name). Internally wraps the concrete
 //! `RpcClient<JsSigner, WtConnection>` parameterization.
 //!
-//! The old `RpcSession` in `wasm_exports.rs` is the legacy equivalent.
-//! Once all consumers migrate, `RpcSession` will be deleted.
+//! The WASM shim mirrors the native Rust API:
+//! - Layered construction: `new WtConnection()` + `new RpcClient(conn, ...)`
+//! - Immutable JWT via `with_default_jwt()` builder (no `set_jwt` mutation)
+//! - Per-call override via `call_with_options()`
+//! - Streaming via `callStreaming()` / `openStream()`
 
 #![cfg(target_arch = "wasm32")]
-
-use std::cell::RefCell;
-use std::sync::Arc;
 
 use wasm_bindgen::prelude::*;
 
 use hyprstream_rpc::crypto::VerifyingKey;
-use hyprstream_rpc::rpc_client::{CallOptions, RpcClientImpl, RpcClient};
+use hyprstream_rpc::rpc_client::{CallOptions, RpcClientImpl};
 use hyprstream_rpc::signer::JsSigner;
 use hyprstream_rpc::stream_consumer::{StreamHandle, StreamHandleImpl, StreamPayload};
 use hyprstream_rpc::web_transport::WtConnection;
 
+// ============================================================================
+// WtConnection — standalone WebTransport connection (Step 1)
+// ============================================================================
+
+/// WebTransport connection exported to JavaScript.
+///
+/// Constructed separately from the RPC client, matching how native code
+/// constructs `ZmqConnection::new(endpoint)` before building a client.
+#[wasm_bindgen(js_name = "WtConnection")]
+pub struct WasmWtConnection {
+    inner: WtConnection,
+}
+
+#[wasm_bindgen(js_class = "WtConnection")]
+impl WasmWtConnection {
+    /// Connect to a hyprstream WebTransport endpoint.
+    ///
+    /// - `url`: WebTransport URL (e.g., `https://host:port/wt`)
+    /// - `cert_hash`: Optional base64-encoded SHA-256 certificate hash for pinning
+    #[wasm_bindgen(constructor)]
+    pub async fn connect(url: &str, cert_hash: Option<String>) -> Result<WasmWtConnection, JsError> {
+        let transport = WtConnection::connect(url, cert_hash.as_deref())
+            .await
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(Self { inner: transport })
+    }
+}
+
+// ============================================================================
+// RpcClient — unified RPC client (Steps 2-3)
+// ============================================================================
+
 /// Unified RPC client exported to JavaScript as `RpcClient`.
 ///
-/// Wraps `RpcClient<JsSigner, WtConnection>` — same envelope construction,
-/// signing, and response verification as the native `RpcClient<LocalSigner, ZmqConnection>`.
+/// Wraps `RpcClientImpl<JsSigner, WtConnection>` — same envelope construction,
+/// signing, and response verification as the native `RpcClientImpl<LocalSigner, ZmqConnection>`.
 ///
 /// TypeScript consumers use this via generated client classes that call
 /// `client.call(payload)` with Cap'n Proto bytes.
 ///
-/// Uses `RefCell` for JWT storage — safe because WASM is single-threaded.
+/// Construction is layered (matches Rust pattern):
+/// ```js
+/// const conn = await new WtConnection(url, certHash);
+/// const client = new RpcClient(conn, signerPubkey, signFn, serverVerifyingKey)
+///     .withDefaultJwt(token);
+/// ```
 #[wasm_bindgen(js_name = "RpcClient")]
 pub struct WasmRpcClient {
     inner: RpcClientImpl<JsSigner, WtConnection>,
-    jwt: RefCell<Option<String>>,
 }
 
 #[wasm_bindgen(js_class = "RpcClient")]
 impl WasmRpcClient {
-    /// Connect to a hyprstream WebTransport endpoint with an external signer.
+    /// Create a new RPC client with a pre-built transport connection.
     ///
-    /// - `url`: WebTransport URL (e.g., `https://host:port/wt`)
-    /// - `cert_hash`: Optional base64-encoded SHA-256 certificate hash for pinning
+    /// - `connection`: A `WtConnection` (constructed separately, consumed by this call)
     /// - `signer_pubkey`: 32-byte Ed25519 public key for envelope signing
     /// - `sign_fn`: JavaScript async function `(canonicalBytes: Uint8Array) -> Promise<Uint8Array>`
-    /// - `server_verifying_key`: 32-byte Ed25519 public key for response verification
+    /// - `server_verifying_key`: Optional 32-byte Ed25519 public key for response verification.
+    ///   Pass `null`/`undefined` to skip response signature verification (TLS still protects the connection).
     #[wasm_bindgen(constructor)]
+    pub fn new(
+        connection: WasmWtConnection,
+        signer_pubkey: &[u8],
+        sign_fn: js_sys::Function,
+        server_verifying_key: Option<Vec<u8>>,
+    ) -> Result<WasmRpcClient, JsError> {
+        let signer = JsSigner::new(signer_pubkey, sign_fn)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+
+        let server_key: Option<VerifyingKey> = match server_verifying_key {
+            Some(bytes) => {
+                let arr: [u8; 32] = bytes.try_into()
+                    .map_err(|_| JsError::new("server_verifying_key must be 32 bytes"))?;
+                Some(VerifyingKey::from_bytes(&arr)
+                    .map_err(|e| JsError::new(&format!("invalid server verifying key: {}", e)))?)
+            }
+            None => None,
+        };
+
+        Ok(Self {
+            inner: RpcClientImpl::new(signer, connection.inner, server_key),
+        })
+    }
+
+    /// Convenience: one-step connect + construct (backward compat).
+    ///
+    /// Equivalent to `new WtConnection(url, certHash)` + `new RpcClient(conn, ...)`.
+    #[wasm_bindgen(js_name = "connect")]
     pub async fn connect(
         url: &str,
         cert_hash: Option<String>,
         signer_pubkey: &[u8],
         sign_fn: js_sys::Function,
-        server_verifying_key: &[u8],
+        server_verifying_key: Option<Vec<u8>>,
     ) -> Result<WasmRpcClient, JsError> {
-        let transport = WtConnection::connect(url, cert_hash.as_deref())
-            .await
-            .map_err(|e| JsError::new(&e.to_string()))?;
-
-        let signer = JsSigner::new(signer_pubkey, sign_fn)
-            .map_err(|e| JsError::new(&e.to_string()))?;
-
-        let server_key = VerifyingKey::from_bytes(
-            server_verifying_key.try_into()
-                .map_err(|_| JsError::new("server_verifying_key must be 32 bytes"))?
-        ).map_err(|e| JsError::new(&format!("invalid server verifying key: {}", e)))?;
-
-        Ok(Self {
-            inner: RpcClientImpl::new(signer, transport, server_key),
-            jwt: RefCell::new(None),
-        })
+        let conn = WasmWtConnection::connect(url, cert_hash).await?;
+        // conn is moved into Self::new()
+        Self::new(conn, signer_pubkey, sign_fn, server_verifying_key)
     }
 
-    /// Set opaque JWT token for authenticated requests. Server decodes and verifies.
+    /// Builder: set the default JWT token for all calls.
     ///
-    /// Safe for single-threaded WASM — `RefCell` has no concurrent access risk.
-    #[wasm_bindgen(js_name = "setJwt")]
-    pub fn set_jwt(&self, token: &str) {
-        *self.jwt.borrow_mut() = if token.is_empty() {
-            None
-        } else {
-            Some(token.to_string())
-        };
-    }
-
-    /// Read the current JWT and build per-call options.
-    fn call_options(&self) -> CallOptions {
-        CallOptions {
-            jwt: self.jwt.borrow().clone(),
-            delegated_bearer: None,
+    /// The token is stored immutably in the underlying `RpcClientImpl`.
+    /// Per-call override is available via `callWithOptions()`.
+    /// Consumes and returns a new client — matches the Rust `with_default_jwt()` pattern.
+    #[wasm_bindgen(js_name = "withDefaultJwt")]
+    pub fn with_default_jwt(self, token: &str) -> WasmRpcClient {
+        WasmRpcClient {
+            inner: self.inner.with_default_jwt(token.to_string()),
         }
     }
 
     /// Send a signed request and return the verified response payload (Cap'n Proto bytes).
+    ///
+    /// Uses the client's default JWT (set via `withDefaultJwt()`).
     pub async fn call(&self, payload: &[u8]) -> Result<Vec<u8>, JsError> {
-        self.inner.call_with_options(payload.to_vec(), self.call_options())
+        self.inner.call(payload.to_vec())
+            .await
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Send a request with per-call authentication options.
+    ///
+    /// - `payload`: Cap'n Proto request bytes
+    /// - `jwt`: Optional per-call JWT override (takes precedence over default)
+    /// - `delegated_bearer`: Optional bearer token to relay on behalf of a user
+    #[wasm_bindgen(js_name = "callWithOptions")]
+    pub async fn call_with_options(
+        &self,
+        payload: &[u8],
+        jwt: Option<String>,
+        delegated_bearer: Option<String>,
+    ) -> Result<Vec<u8>, JsError> {
+        let options = CallOptions::new();
+        let options = match jwt {
+            Some(t) => options.jwt(t),
+            None => options,
+        };
+        let options = match delegated_bearer {
+            Some(b) => options.delegated_bearer(b),
+            None => options,
+        };
+        self.inner.call_with_options(payload.to_vec(), options)
             .await
             .map_err(|e| JsError::new(&e.to_string()))
     }
@@ -110,7 +181,7 @@ impl WasmRpcClient {
         }
         epk.copy_from_slice(ephemeral_pubkey);
 
-        self.inner.call_streaming_with_options(payload.to_vec(), epk, self.call_options())
+        self.inner.call_streaming(payload.to_vec(), epk)
             .await
             .map_err(|e| JsError::new(&e.to_string()))
     }
@@ -129,12 +200,16 @@ impl WasmRpcClient {
     /// Open a verified streaming subscription.
     #[wasm_bindgen(js_name = "openStream")]
     pub async fn open_stream(&self, payload: &[u8]) -> Result<WasmStreamHandle, JsError> {
-        let handle = self.inner.open_stream_with_options(payload.to_vec(), self.call_options())
+        let handle = self.inner.open_stream(payload.to_vec())
             .await
             .map_err(|e| JsError::new(&e.to_string()))?;
         Ok(WasmStreamHandle { inner: handle })
     }
 }
+
+// ============================================================================
+// StreamHandle — verified stream subscription
+// ============================================================================
 
 /// Verified stream handle exported to JavaScript as `StreamHandle`.
 ///
@@ -158,7 +233,6 @@ impl WasmStreamHandle {
                 Ok(js_sys::Uint8Array::from(&data[..]).into())
             }
             Ok(Some(StreamPayload::Complete(meta))) => {
-                // Return completion metadata; caller checks via is_completed()
                 Ok(js_sys::Uint8Array::from(&meta[..]).into())
             }
             Ok(Some(StreamPayload::Error(msg))) => {

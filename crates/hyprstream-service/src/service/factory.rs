@@ -559,7 +559,7 @@ impl ServiceContext {
             self.zmq_context.clone(),
         );
         let rpc = hyprstream_rpc::rpc_client::RpcClientImpl::new(
-            signer, transport, self.verifying_key,
+            signer, transport, Some(self.verifying_key),
         );
         std::sync::Arc::new(rpc)
     }

@@ -15,8 +15,6 @@ pub fn generate_capnp_runtime() -> String {
 // List pointer:   [offset_words:30 | 0b01:2] [element_size:3 | element_count:29]
 // Text/Data:      List(UInt8) with NUL terminator for Text
 
-import { getHyprstreamWasm } from '../../wasm/hyprstream-rpc/HyprstreamWasm';
-
 const WORD_SIZE = 8;
 
 // Module-level singletons — avoid per-call allocation
@@ -24,30 +22,9 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
 /**
- * WeakMap from the Uint8Array returned by CapnpArena.finish() to the arena that
- * produced it.  Used by call() in client.ts to detect WASM-backed payloads and
- * invoke sign_envelope_into without an extra copy.
- */
-const _wasmArenaMap = new WeakMap<Uint8Array, CapnpArena>();
-
-/**
- * Return the CapnpArena that produced `view`, if it was WASM-backed.
- * Used by HyprstreamClient.call() to detect zero-copy payloads.
- */
-export function getArenaForView(view: Uint8Array): CapnpArena | undefined {
-  return _wasmArenaMap.get(view);
-}
-
-/**
  * Single-segment Cap'n Proto message builder / arena.
  *
- * Two construction modes:
- *   new CapnpArena(dataWords, ptrWords)               — JS-heap backed (Phase 1)
- *   CapnpArena.intoWasm(dataWords, ptrWords, extra)   — WASM-memory backed (Phase 2)
- *
- * WASM-backed arenas allow sign_envelope_into to sign the payload in-place
- * (no JS→WASM copy) and return a SharedArrayBuffer view that stays valid
- * across the async WebTransport send.
+ * JS-heap backed — grows on demand via Uint8Array reallocation.
  */
 export class CapnpArena {
   private buf: DataView;
@@ -62,118 +39,36 @@ export class CapnpArena {
   private readonly rootPtrOffset: number;
   private readonly dataWords: number;
   private readonly ptrWords: number;
-  /** Non-zero when backed by WASM linear memory (pointer value from wasm.alloc). */
-  private _wasmPtr: number = 0;
-  /** Original allocation size in bytes (needed for wasm.dealloc). */
-  private _wasmCapacity: number = 0;
 
-  /**
-   * JS-heap constructor.
-   *
-   * @param dataWords  Number of 64-bit words in the root struct data section
-   * @param ptrWords   Number of pointers in the root struct pointer section
-   * @param externalRaw  Optional externally-allocated buffer (WASM-backed path)
-   * @param wasmPtr    WASM linear-memory pointer matching externalRaw (WASM-backed path)
-   */
   constructor(
     dataWords: number,
     ptrWords: number,
-    externalRaw?: Uint8Array,
-    wasmPtr?: number,
   ) {
     this.dataWords = dataWords;
     this.ptrWords = ptrWords;
 
     const structSize = (dataWords + ptrWords) * WORD_SIZE;
-    // Standard Cap'n Proto format:
-    //   Bytes 0-7:   segment table [num_segments-1=0, segment_size_words]
-    //   Bytes 8-15:  root struct pointer (written by finish())
-    //   Bytes 16+:   root struct data section + pointer section
-    const HEADER = 16; // segment table (8B) + root struct pointer slot (8B)
+    const HEADER = 16;
 
-    if (externalRaw !== undefined && wasmPtr !== undefined) {
-      this.raw = externalRaw;
-      this.capacity = externalRaw.byteLength;
-      this._wasmPtr = wasmPtr;
-      this._wasmCapacity = externalRaw.byteLength;
-    } else {
-      this.capacity = HEADER + structSize + 1024;
-      this.raw = new Uint8Array(this.capacity);
-      this._wasmPtr = 0;
-      this._wasmCapacity = 0;
-    }
+    this.capacity = HEADER + structSize + 1024;
+    this.raw = new Uint8Array(this.capacity);
     this.buf = new DataView(this.raw.buffer, this.raw.byteOffset, this.raw.byteLength);
 
-    this.rootDataOffset = HEADER;                            // 16
-    this.rootPtrOffset  = HEADER + dataWords * WORD_SIZE;   // 16 + dw*8
-    this.allocOffset    = HEADER + structSize;               // 16 + (dw+pw)*8
+    this.rootDataOffset = HEADER;
+    this.rootPtrOffset  = HEADER + dataWords * WORD_SIZE;
+    this.allocOffset    = HEADER + structSize;
   }
-
-  /**
-   * Create a WASM-memory-backed arena.
-   *
-   * The arena allocates `(2 + dataWords + ptrWords + extraWords) * 8` bytes from
-   * WASM linear memory (via wasm.alloc).  finish() returns a subarray view into
-   * that SharedArrayBuffer — valid across async WebTransport sends.
-   *
-   * Call releaseWasm() (or let call() in client.ts do it) to free the WASM memory.
-   *
-   * @param dataWords  Root struct data words
-   * @param ptrWords   Root struct pointer words
-   * @param extraWords Slack for pointer targets (Text/Data/Struct allocations).
-   *                   Defaults to 16 (128 B).  grow() handles overflow automatically.
-   */
-  static intoWasm(dataWords: number, ptrWords: number, extraWords: number = 16): CapnpArena {
-    const wasm = getHyprstreamWasm();
-    // 2 header words (segment table + root ptr slot) + struct + extra
-    const totalBytes = (2 + dataWords + ptrWords + extraWords) * WORD_SIZE;
-    const ptr = wasm.alloc(totalBytes);
-    const view = new Uint8Array(wasm.memory.buffer, ptr, totalBytes);
-    return new CapnpArena(dataWords, ptrWords, view, ptr);
-  }
-
-  /** WASM linear-memory pointer, or 0 if JS-heap backed. */
-  backingPtr(): number { return this._wasmPtr; }
 
   /** The raw backing buffer (for diagnostics / direct access). */
   backingBuffer(): Uint8Array { return this.raw; }
-
-  /**
-   * Free the WASM linear-memory backing (if WASM-backed).
-   * Called automatically by HyprstreamClient.call() after the signed envelope
-   * has been handed to the transport.  Safe to call multiple times.
-   */
-  releaseWasm(): void {
-    if (this._wasmPtr !== 0) {
-      getHyprstreamWasm().dealloc(this._wasmPtr, this._wasmCapacity);
-      this._wasmPtr = 0;
-    }
-  }
 
   /** Ensure capacity for `needed` more bytes, growing if necessary. */
   private ensureCapacity(needed: number): void {
     if (this.allocOffset + needed <= this.capacity) return;
     const newCap = Math.max(this.capacity * 2, this.allocOffset + needed + 256);
-    if (this._wasmPtr !== 0) {
-      // WASM-backed: alloc new buffer, copy from old, dealloc old.
-      // wasm.alloc() may trigger memory.grow(), detaching all existing views.
-      // Re-read old data from wasm.memory.buffer using the old pointer.
-      const wasm = getHyprstreamWasm();
-      const oldPtr = this._wasmPtr;
-      const oldLen = this.allocOffset;
-      const newPtr = wasm.alloc(newCap);
-      const oldData = new Uint8Array(wasm.memory.buffer, oldPtr, oldLen);
-      const newRaw = new Uint8Array(wasm.memory.buffer, newPtr, newCap);
-      newRaw.set(oldData);
-      wasm.dealloc(oldPtr, this._wasmCapacity);
-      this._wasmPtr = newPtr;
-      this._wasmCapacity = newCap;
-      this.raw = newRaw;
-    } else {
-      const newBuf = new Uint8Array(newCap);
-      newBuf.set(this.raw);
-      this.raw = newBuf;
-    }
+    const newBuf = new Uint8Array(newCap);
+    newBuf.set(this.raw);
+    this.raw = newBuf;
     this.buf = new DataView(this.raw.buffer, this.raw.byteOffset, this.raw.byteLength);
     this.capacity = newCap;
   }
@@ -439,11 +334,6 @@ export class CapnpArena {
     this.buf.setUint32(4, segmentWords, true);
 
     const view = this.raw.subarray(0, 8 + segmentWords * WORD_SIZE);
-
-    // Register WASM-backed views so client.ts can detect zero-copy payloads.
-    if (this._wasmPtr !== 0) {
-      _wasmArenaMap.set(view, this);
-    }
 
     return view;
   }

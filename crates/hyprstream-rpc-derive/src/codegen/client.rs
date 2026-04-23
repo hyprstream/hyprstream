@@ -525,7 +525,7 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
                     hyprstream_rpc::zmq_context::global_context(),
                 );
                 let rpc = hyprstream_rpc::rpc_client::RpcClientImpl::new(
-                    signer, transport, destination,
+                    signer, transport, Some(destination),
                 );
                 let rpc = match token {
                     Some(t) => rpc.with_default_jwt(t),
@@ -578,7 +578,7 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
                     hyprstream_rpc::zmq_context::global_context(),
                 );
                 let rpc = hyprstream_rpc::rpc_client::RpcClientImpl::new(
-                    signer, transport, server_vk,
+                    signer, transport, Some(server_vk),
                 );
                 Ok(Self::new(std::sync::Arc::new(rpc) as std::sync::Arc<dyn hyprstream_rpc::RpcClient>))
             }

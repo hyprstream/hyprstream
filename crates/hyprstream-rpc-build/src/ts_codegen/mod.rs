@@ -71,10 +71,18 @@ fn generate_service_file(service_name: &str, schema: &ParsedSchema) -> String {
         label = if is_service { "Service" } else { "Schema" }
     ));
 
-    // Conditional streaming import (only for service schemas with streaming methods)
+    // Inline StreamHandle interface (only for service schemas with streaming methods)
     if is_service && client::has_streaming_methods(schema) {
         out.push_str(
-            "import { type StreamHandle } from '../../wasm/hyprstream-rpc-std/hyprstream_rpc_std';\n"
+            "/** Verified stream handle (duck-type compatible with WASM StreamHandle). */\n\
+             export interface StreamHandle {\n\
+             \x20 nextPayload(): Promise<Uint8Array | null>;\n\
+             \x20 cancel(): Promise<void>;\n\
+             \x20 streamId(): string;\n\
+             \x20 isCompleted(): boolean;\n\
+             \x20 free(): void;\n\
+             \x20 [Symbol.dispose](): void;\n\
+             }\n\n"
         );
     }
     out.push('\n');
