@@ -23,6 +23,7 @@ pub use hyprstream_rpc_std::model_capnp;
 pub use hyprstream_rpc_std::mcp_capnp;
 pub use hyprstream_rpc_std::notification_capnp;
 pub use hyprstream_rpc_std::metrics_capnp;
+pub use hyprstream_rpc_std::oauth_capnp;
 
 // TUI-specific Cap'n Proto modules (remain in hyprstream)
 pub mod tui_capnp {

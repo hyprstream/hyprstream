@@ -580,7 +580,7 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 ///
 /// This service provides OAuth 2.1 authorization for MCP and OAI services.
 /// It delegates token issuance to PolicyService over ZMQ.
-#[service_factory("oauth", depends_on = ["policy", "discovery"])]
+#[service_factory("oauth", schema = "../../../hyprstream-rpc-std/schema/oauth.capnp", metadata = crate::services::generated::oauth_client::schema_metadata, depends_on = ["policy", "discovery"])]
 fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating OAuthService");
 

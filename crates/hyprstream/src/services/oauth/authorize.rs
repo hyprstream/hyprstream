@@ -104,7 +104,7 @@ pub async fn authorize_get(
     }
 
     // Require UserStore for identity verification
-    if state.user_store.is_none() {
+    if !state.has_user_store() {
         return Html(render_error_page(
             "Server Not Configured",
             "This server is not configured for local user authentication. \
@@ -239,8 +239,8 @@ pub async fn authorize_post(
     let challenge_str = format!("{}:{}:{}", form.username, form.nonce, form.code_challenge);
 
     // Get user store
-    let user_store = match state.user_store.as_ref() {
-        Some(s) => s,
+    let user_store = match state.user_store_reader().await {
+        Some(guard) => guard,
         None => {
             return Html(render_error_page(
                 "Server Not Configured",

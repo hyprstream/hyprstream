@@ -11,6 +11,7 @@ use tokio::sync::RwLock;
 use crate::auth::user_store::UserStore;
 use crate::config::OAuthConfig;
 use crate::services::{DiscoveryClient, PolicyClient};
+use super::user_service::UserService;
 
 /// Extract RSA public key components (n, e) from PKCS#8 DER and build a JWK.
 ///
@@ -244,8 +245,9 @@ pub struct OAuthState {
     /// Raw Ed25519 verifying key bytes (32 bytes) for the JWKS endpoint.
     pub verifying_key_bytes: [u8; 32],
     /// User credential store for Ed25519 challenge-response device verification.
-    /// `None` when not configured (keyring unavailable or no credentials dir set).
-    pub user_store: Option<Arc<dyn UserStore + Send + Sync>>,
+    /// Now backed by `user_service`. Legacy code uses `user_store_reader()`.
+    /// Kept as Option for backward-compatible `is_none()` checks.
+    pub user_service: Option<Arc<UserService>>,
     /// Ed25519 signing key for signing entity configurations (OpenID Federation 1.0).
     /// `None` when not configured.
     pub signing_key: Option<ed25519_dalek::SigningKey>,
@@ -286,7 +288,7 @@ impl OAuthState {
                 .build()
                 .unwrap_or_default(),
             verifying_key_bytes,
-            user_store: None,
+            user_service: None,
             signing_key: None,
             authority_hints: config.authority_hints.clone(),
             pending_external_auths: RwLock::new(HashMap::new()),
@@ -298,10 +300,33 @@ impl OAuthState {
         }
     }
 
-    /// Attach a user credential store for Ed25519 challenge-response device verification.
-    pub fn with_user_store(mut self, store: Arc<dyn UserStore + Send + Sync>) -> Self {
-        self.user_store = Some(store);
+    /// Attach a user credential store. Creates a `UserService` backed by the store
+    /// for SCIM/RPC access and legacy OAuth handler reads.
+    pub fn with_user_store(mut self, store: Box<dyn UserStore + Send + Sync>) -> Self {
+        self.user_service = Some(Arc::new(UserService::new(store)));
         self
+    }
+
+    /// Attach a pre-built `UserService`. Used when the service is constructed externally
+    /// (e.g., for testing or when the store is shared across services).
+    pub fn with_user_service(mut self, service: Arc<UserService>) -> Self {
+        self.user_service = Some(service);
+        self
+    }
+
+    /// Get read access to the user store via the UserService.
+    /// Returns None if no user store is configured.
+    /// Returns an owned guard so the caller does not borrow from `self`.
+    pub async fn user_store_reader(&self)
+        -> Option<tokio::sync::OwnedRwLockReadGuard<Box<dyn UserStore>>>
+    {
+        let service = self.user_service.as_ref()?;
+        Some(service.store().read_owned().await)
+    }
+
+    /// Backward-compatible check: returns true if a user store is configured.
+    pub fn has_user_store(&self) -> bool {
+        self.user_service.is_some()
     }
 
     /// Attach the signing key for OpenID Federation 1.0 entity configuration signing.

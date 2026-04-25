@@ -56,3 +56,9 @@ pub mod metrics_client {
 
 // worker_client — use hyprstream_workers::generated::worker_client instead.
 // workflow_client — use hyprstream_workers::generated::workflow_client instead.
+
+pub mod oauth_client {
+    #![allow(dead_code, unused_imports, unused_variables)]
+    #![allow(clippy::all)]
+    hyprstream_rpc_derive::generate_rpc_service!("oauth", scope_handlers);
+}

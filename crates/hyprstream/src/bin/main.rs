@@ -2031,7 +2031,7 @@ fn main() -> Result<()> {
         Some(("user", sub_m)) => {
             let cmd = UserCommand::from_arg_matches(sub_m)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let credentials_dir = ctx.models_dir().join(".registry").join("credentials");
+            let credentials_dir = ctx.config_dir().join("credentials");
             match cmd {
                 UserCommand::Register { username, pubkey_base64 } => {
                     handle_user_register(&credentials_dir, &username, &pubkey_base64)?;

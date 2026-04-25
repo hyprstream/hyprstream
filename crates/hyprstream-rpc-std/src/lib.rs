@@ -88,6 +88,13 @@ pub mod chat_core_capnp {
     include!(concat!(env!("OUT_DIR"), "/chat_core_capnp.rs"));
 }
 
+pub mod oauth_capnp {
+    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown)]
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    include!(concat!(env!("OUT_DIR"), "/oauth_capnp.rs"));
+}
+
 // ============================================================================
 // Generated client types (from proc macro)
 // Client-only: data structs, response enums, metadata. No server handlers.
@@ -141,6 +148,13 @@ pub mod metrics_client {
     #![allow(clippy::all)]
     extern crate self as hyprstream_rpc_std;
     hyprstream_rpc_derive::generate_rpc_client!("metrics");
+}
+
+pub mod oauth_client {
+    #![allow(dead_code, unused_imports, unused_variables)]
+    #![allow(clippy::all)]
+    extern crate self as hyprstream_rpc_std;
+    hyprstream_rpc_derive::generate_rpc_client!("oauth");
 }
 
 // ============================================================================

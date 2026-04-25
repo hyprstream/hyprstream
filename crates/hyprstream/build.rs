@@ -77,7 +77,7 @@ fn compile_capnp_schemas() {
     // DEP_HYPRSTREAM_RPC_STD_OUT_DIR is set by hyprstream-rpc-std's build.rs.
     if let Ok(std_out_dir) = env::var("DEP_HYPRSTREAM_RPC_STD_OUT_DIR") {
         let std_schemas = ["inference", "model", "registry", "policy", "mcp",
-                          "metrics", "notification", "service_events", "chat_core"];
+                          "metrics", "notification", "service_events", "chat_core", "oauth"];
         for name in &std_schemas {
             let cgr_src = Path::new(&std_out_dir).join(format!("{name}.cgr"));
             let cgr_dst = out_path.join(format!("{name}.cgr"));

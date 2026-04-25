@@ -68,4 +68,9 @@ impl AppContext {
     pub fn models_dir(&self) -> &std::path::Path {
         self.config.models_dir()
     }
+
+    /// Get the config directory path
+    pub fn config_dir(&self) -> &std::path::Path {
+        self.config.config_dir()
+    }
 }

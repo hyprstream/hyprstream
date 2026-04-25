@@ -19,7 +19,7 @@ pub use jwt::{Claims, JwtError};
 pub use policy_manager::{PolicyManager, PolicyError, write_policy_file};
 pub use policy_migration::migrate_policy_csv;
 pub use policy_templates::{PolicyTemplate, ServicePolicyRule, SERVICE_BASE_POLICIES, get_template, get_templates};
-pub use user_store::{LocalKeyStore, UserStore};
+pub use user_store::{LocalKeyStore, UserFilter, UserProfile, UserStore};
 
 /// Operation types that can be controlled via policies
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

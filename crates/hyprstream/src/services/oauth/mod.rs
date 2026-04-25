@@ -41,13 +41,18 @@ pub mod session;
 pub mod state;
 pub mod token;
 pub mod user_mapping;
+pub mod user_service;
+pub mod scim;
+pub mod scim_types;
 pub mod userinfo;
+pub mod zmq_handler;
 
 use std::sync::Arc;
 
 use anyhow::Result;
 use axum::{extract::State, response::IntoResponse, routing::{get, post}, Router};
 use hyprstream_rpc::registry::SocketKind;
+use hyprstream_rpc::service::{RequestLoop, ZmqService};
 use hyprstream_service::Spawnable;
 use hyprstream_rpc::transport::TransportConfig;
 use tokio::sync::Notify;
@@ -101,6 +106,23 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
         .route(
             "/oauth/callback/:provider",
             get(oidc_callback::external_callback),
+        )
+        // SCIM 2.0 endpoints (RFC 7644)
+        .route(
+            "/scim/v2/Users",
+            get(scim::list_users).post(scim::create_user),
+        )
+        .route(
+            "/scim/v2/Users/:id",
+            get(scim::get_user)
+                .put(scim::replace_user)
+                .delete(scim::delete_user),
+        )
+        .route("/scim/v2/Schemas", get(scim::schemas))
+        .route("/scim/v2/ResourceTypes", get(scim::resource_types))
+        .route(
+            "/scim/v2/ServiceProviderConfig",
+            get(scim::service_provider_config),
         )
         .route(
             "/.well-known/openid-configuration",
@@ -313,7 +335,7 @@ impl Spawnable for OAuthService {
 
             // Attempt to load the user credential store for Ed25519 device verification.
             // Failure is non-fatal; the verify endpoint will report "not configured" instead.
-            let user_store: Option<Arc<dyn crate::auth::user_store::UserStore + Send + Sync>> = {
+            let user_store: Option<Box<dyn crate::auth::user_store::UserStore + Send + Sync>> = {
                 let credentials_dir = crate::config::HyprConfig::load()
                     .map(|c| c.config_dir().join("credentials"))
                     .unwrap_or_else(|_| {
@@ -325,7 +347,7 @@ impl Spawnable for OAuthService {
                 match crate::auth::user_store::LocalKeyStore::load(&credentials_dir) {
                     Ok(store) => {
                         info!("User credential store loaded from {:?}", credentials_dir);
-                        Some(Arc::new(store))
+                        Some(Box::new(store))
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -355,7 +377,7 @@ impl Spawnable for OAuthService {
             state.spawn_code_sweeper();
 
             // Create router with configurable CORS
-            let app = create_app(state, &self.config.cors);
+            let app = create_app(state.clone(), &self.config.cors);
 
             info!(
                 "Authorization server metadata at {scheme}://{addr}/.well-known/oauth-authorization-server",
@@ -367,8 +389,33 @@ impl Spawnable for OAuthService {
 
             let _ = hyprstream_rpc::notify::ready();
 
+            // ZMQ RPC loop for user CRUD (alongside HTTP server)
+            let zmq_transport = self.control_transport.clone();
+            let zmq_context = Arc::clone(&self.context);
+            let zmq_signing_key = self.signing_key.clone();
+            let zmq_state = state.clone();
+            let zmq_loop = tokio::spawn(async move {
+                let handler = zmq_handler::OAuthZmqHandler::new(
+                    zmq_state,
+                    zmq_context,
+                    zmq_transport,
+                    zmq_signing_key,
+                );
+                let zmq_transport = ZmqService::transport(&handler).clone();
+                let zmq_context = Arc::clone(ZmqService::context(&handler));
+                let zmq_signing_key = ZmqService::signing_key(&handler);
+                let loop_ = RequestLoop::new(zmq_transport, zmq_context, zmq_signing_key);
+                if let Err(e) = loop_.run(handler).await {
+                    tracing::error!("OAuth ZMQ loop error: {}", e);
+                }
+            });
+
             // Run HTTP(S) server with graceful shutdown
-            crate::server::tls::serve_app(addr, app, rustls_config, shutdown, "OAuthService").await
+            let _ = crate::server::tls::serve_app(addr, app, rustls_config, shutdown, "OAuthService").await;
+
+            let _ = zmq_loop.await;
+
+            Ok(())
         })
     }
 }

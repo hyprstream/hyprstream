@@ -247,8 +247,8 @@ pub async fn verify_post(
     let challenge_str = format!("{}:{}:{}", form.username, normalized, nonce);
 
     // Look up user credential store
-    let user_store = match state.user_store.as_ref() {
-        Some(s) => s,
+    let user_store = match state.user_store_reader().await {
+        Some(guard) => guard,
         None => {
             return verify_err(json_client, &form.user_code, &nonce, "User credential store not configured on this server.");
         }

@@ -36,6 +36,7 @@ fn main() {
         "notification",
         "service_events",
         "chat_core",
+        "oauth",
     ];
 
     hyprstream_rpc_build::compile_schemas(schema_dir, out_path, import_paths, &schemas);
