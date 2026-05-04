@@ -610,34 +610,19 @@ impl ServiceContext {
                     let trust = crate::service::trust_store::global_trust_store();
                     let service_jwt = trust.resolve_one(service.name())
                         .and_then(|vk| trust.get(&vk).and_then(|att| att.jwt.clone()));
-
-                    // Try to get policy and discovery keys for announce callback.
-                    // If either is missing (e.g., discovery not in startup list),
-                    // fall back to basic QUIC without service announcement.
-                    let policy_vk = trust.resolve_one("policy");
-                    let discovery_vk = trust.resolve_one("discovery");
-
-                    match (policy_vk, discovery_vk) {
-                        (Some(policy_vk), Some(discovery_vk)) => {
-                            Some(shared.for_service_with_announce(
-                                service.name(),
-                                port,
-                                self.service_signing_key(service.name()),
-                                service_jwt,
-                                policy_vk,
-                                discovery_vk,
-                            ))
-                        }
-                        _ => {
-                            // Discovery or policy not available — skip announce callback.
-                            // This happens when running a subset of services.
-                            tracing::debug!(
-                                service = service.name(),
-                                "Skipping QUIC announce: policy or discovery key not in trust store"
-                            );
-                            Some(shared.for_service(service.name(), port))
-                        }
-                    }
+                    let policy_vk = trust.resolve_one("policy")
+                        .unwrap_or_else(|| panic!("trust store has no policy key"));
+                    let discovery_vk = crate::service::trust_store::global_trust_store()
+                        .resolve_one("discovery")
+                        .unwrap_or_else(|| panic!("trust store has no discovery key"));
+                    Some(shared.for_service_with_announce(
+                        service.name(),
+                        port,
+                        self.service_signing_key(service.name()),
+                        service_jwt,
+                        policy_vk,
+                        discovery_vk,
+                    ))
                 }
             }
             None => None,
