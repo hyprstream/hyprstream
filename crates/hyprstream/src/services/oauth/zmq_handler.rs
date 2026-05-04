@@ -65,6 +65,13 @@ impl OAuthZmqHandler {
             email_verified: info.email_verified,
             active: info.active,
             external_id: info.external_id.clone().unwrap_or_default(),
+            pubkeys: info.pubkeys.iter().map(|pk| crate::services::generated::oauth_client::PubkeyEntry {
+                fingerprint: pk.fingerprint.clone(),
+                pubkey_base64: pk.pubkey_base64.clone(),
+                label: pk.label.clone().unwrap_or_default(),
+                created_at: pk.created_at,
+                last_used_at: pk.last_used_at.unwrap_or(0),
+            }).collect(),
         }
     }
 }

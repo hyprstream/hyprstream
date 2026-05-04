@@ -1,10 +1,11 @@
 //! User credential store abstraction.
 //!
-//! `UserStore` is the trait. `LocalKeyStore` is the implementation
-//! backed by an age-encrypted TOML file, with the decryption key
-//! persisted in the secrets directory.
+//! `UserStore` is the trait. `LocalKeyStore` is the legacy implementation
+//! backed by an age-encrypted TOML file. `RocksDbUserStore` is the new
+//! implementation with atomic updates and multi-pubkey support.
 
 use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,21 @@ pub struct UserProfile {
     pub external_id: Option<String>,
 }
 
+/// A pubkey entry associated with a user (like GitHub SSH keys).
+#[derive(Debug, Clone)]
+pub struct PubkeyEntry {
+    /// Base64url SHA-256 fingerprint of the pubkey bytes.
+    pub fingerprint: String,
+    /// The actual Ed25519 public key.
+    pub pubkey: VerifyingKey,
+    /// User-provided label (e.g., "laptop", "work").
+    pub label: Option<String>,
+    /// Unix timestamp when the key was added.
+    pub created_at: i64,
+    /// Unix timestamp when the key was last used for auth, or None if never.
+    pub last_used_at: Option<i64>,
+}
+
 /// Filter parameters for user search (SCIM-aligned).
 #[derive(Debug, Clone, Default)]
 pub struct UserFilter {
@@ -54,23 +70,62 @@ pub struct UserFilter {
 }
 
 /// Abstraction over user credential stores.
+///
+/// Supports profile CRUD and multi-pubkey management (like GitHub SSH keys).
+#[async_trait]
 pub trait UserStore: Send + Sync {
-    /// Look up a user's Ed25519 public key by username.
-    fn get_pubkey(&self, username: &str) -> Result<Option<VerifyingKey>>;
+    // ─── Profile CRUD ────────────────────────────────────────────────────────
+
     /// Get a user's profile (OIDC claims).
-    fn get_profile(&self, username: &str) -> Result<Option<UserProfile>>;
-    /// Register a user with their Ed25519 public key.
-    fn register(&mut self, username: &str, pubkey: VerifyingKey) -> Result<()>;
-    /// Update a user's profile.
-    fn set_profile(&mut self, username: &str, profile: UserProfile) -> Result<()>;
-    /// Remove a user.
-    fn remove(&mut self, username: &str) -> Result<bool>;
+    async fn get_profile(&self, username: &str) -> Result<Option<UserProfile>>;
+
+    /// Register a new user. Returns the generated subject UUID.
+    async fn register(&self, username: &str) -> Result<String>;
+
+    /// Update a user's profile fields (merge semantics).
+    async fn set_profile(&self, username: &str, profile: UserProfile) -> Result<()>;
+
+    /// Remove a user and all their pubkeys.
+    async fn remove(&self, username: &str) -> Result<bool>;
+
     /// List all registered usernames.
-    fn list_users(&self) -> Vec<String>;
+    async fn list_users(&self) -> Vec<String>;
+
     /// Search users with SCIM-aligned filtering, sorting, and pagination.
-    fn search(&self, filter: &UserFilter) -> Vec<(String, UserProfile)>;
+    async fn search(&self, filter: &UserFilter) -> Result<Vec<(String, UserProfile)>>;
+
     /// Set a user's active status.
-    fn set_active(&mut self, username: &str, active: bool) -> Result<()>;
+    async fn set_active(&self, username: &str, active: bool) -> Result<()>;
+
+    // ─── Pubkey Management ───────────────────────────────────────────────────
+
+    /// List all pubkeys for a user.
+    async fn list_pubkeys(&self, username: &str) -> Result<Vec<PubkeyEntry>>;
+
+    /// Add a pubkey to a user. Returns the fingerprint.
+    async fn add_pubkey(
+        &self,
+        username: &str,
+        pubkey: VerifyingKey,
+        label: Option<String>,
+    ) -> Result<String>;
+
+    /// Remove a pubkey by fingerprint.
+    async fn remove_pubkey(&self, username: &str, fingerprint: &str) -> Result<bool>;
+
+    /// Reverse lookup: find username by pubkey fingerprint (for auth).
+    async fn get_pubkey_user(&self, fingerprint: &str) -> Result<Option<String>>;
+
+    /// Update last_used_at timestamp for a pubkey.
+    async fn touch_pubkey(&self, username: &str, fingerprint: &str) -> Result<()>;
+}
+
+/// Compute the fingerprint of a pubkey (base64url SHA-256).
+pub fn pubkey_fingerprint(pubkey: &VerifyingKey) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(pubkey.as_bytes());
+    URL_SAFE_NO_PAD.encode(hash)
 }
 
 /// Per-user entry in the TOML file (rich format).
@@ -114,10 +169,13 @@ struct UsersFile {
 
 /// Credential store backed by an age-encrypted TOML file.
 /// The age decryption key is stored in the OS keyring.
+///
+/// DEPRECATED: Use `RocksDbUserStore` for new code. This implementation
+/// does not support multi-pubkey and uses interior mutability for async compat.
 pub struct LocalKeyStore {
     path: PathBuf,
     /// In-memory state (loaded at startup, written on mutation)
-    data: UsersFile,
+    data: parking_lot::RwLock<UsersFile>,
     /// age identity for decrypting/re-encrypting the file
     identity: age::x25519::Identity,
 }
@@ -137,7 +195,7 @@ impl LocalKeyStore {
             UsersFile::default()
         };
 
-        Ok(Self { path, data, identity })
+        Ok(Self { path, data: parking_lot::RwLock::new(data), identity })
     }
 
     /// Load the age identity from the configured secrets directory, or generate on first run.
@@ -195,9 +253,9 @@ impl LocalKeyStore {
         Ok(UsersFile { users })
     }
 
-    fn encrypt_and_write(&self) -> Result<()> {
+    fn encrypt_and_write(&self, data: &UsersFile) -> Result<()> {
         let plaintext =
-            toml::to_string_pretty(&self.data).context("Failed to serialize users.toml")?;
+            toml::to_string_pretty(data).context("Failed to serialize users.toml")?;
         let recipient = self.identity.to_public();
         let encryptor =
             age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
@@ -213,11 +271,11 @@ impl LocalKeyStore {
         std::fs::write(&self.path, ciphertext)?;
         Ok(())
     }
-}
 
-impl UserStore for LocalKeyStore {
-    fn get_pubkey(&self, username: &str) -> Result<Option<VerifyingKey>> {
-        match self.data.users.get(username) {
+    /// Get a user's single pubkey (legacy method for backward compatibility).
+    pub fn get_pubkey(&self, username: &str) -> Result<Option<VerifyingKey>> {
+        let data = self.data.read();
+        match data.users.get(username) {
             None => Ok(None),
             Some(entry) => {
                 let raw = STANDARD.decode(&entry.pubkey)?;
@@ -228,9 +286,13 @@ impl UserStore for LocalKeyStore {
             }
         }
     }
+}
 
-    fn get_profile(&self, username: &str) -> Result<Option<UserProfile>> {
-        match self.data.users.get(username) {
+#[async_trait]
+impl UserStore for LocalKeyStore {
+    async fn get_profile(&self, username: &str) -> Result<Option<UserProfile>> {
+        let data = self.data.read();
+        match data.users.get(username) {
             None => Ok(None),
             Some(entry) => Ok(Some(UserProfile {
                 sub: entry.sub.clone(),
@@ -243,32 +305,37 @@ impl UserStore for LocalKeyStore {
         }
     }
 
-    fn register(&mut self, username: &str, pubkey: VerifyingKey) -> Result<()> {
+    async fn register(&self, username: &str) -> Result<String> {
         if username.contains(':') {
             anyhow::bail!("Username '{}' must not contain ':'", username);
         }
-        let b64 = STANDARD.encode(pubkey.as_bytes());
-        if self.data.users.contains_key(username) {
-            tracing::warn!(
-                "Overwriting existing public key for user '{}' in credential store",
-                username
-            );
+        let sub = uuid::Uuid::new_v4().to_string();
+        {
+            let mut data = self.data.write();
+            if data.users.contains_key(username) {
+                tracing::warn!(
+                    "Overwriting existing entry for user '{}' in credential store",
+                    username
+                );
+            }
+            let entry = UserEntry {
+                pubkey: String::new(), // No pubkey on register in new API
+                sub: Some(sub.clone()),
+                name: None,
+                email: None,
+                email_verified: None,
+                active: None,
+                external_id: None,
+            };
+            data.users.insert(username.to_owned(), entry);
+            self.encrypt_and_write(&data)?;
         }
-        let entry = UserEntry {
-            pubkey: b64,
-            sub: Some(uuid::Uuid::new_v4().to_string()),
-            name: None,
-            email: None,
-            email_verified: None,
-            active: None,
-            external_id: None,
-        };
-        self.data.users.insert(username.to_owned(), entry);
-        self.encrypt_and_write()
+        Ok(sub)
     }
 
-    fn set_profile(&mut self, username: &str, profile: UserProfile) -> Result<()> {
-        let entry = self.data.users.get_mut(username)
+    async fn set_profile(&self, username: &str, profile: UserProfile) -> Result<()> {
+        let mut data = self.data.write();
+        let entry = data.users.get_mut(username)
             .ok_or_else(|| anyhow!("User '{}' not found", username))?;
         if let Some(sub) = profile.sub {
             entry.sub = Some(sub);
@@ -288,23 +355,25 @@ impl UserStore for LocalKeyStore {
         if profile.external_id.is_some() {
             entry.external_id = profile.external_id;
         }
-        self.encrypt_and_write()
+        self.encrypt_and_write(&data)
     }
 
-    fn remove(&mut self, username: &str) -> Result<bool> {
-        let removed = self.data.users.remove(username).is_some();
+    async fn remove(&self, username: &str) -> Result<bool> {
+        let mut data = self.data.write();
+        let removed = data.users.remove(username).is_some();
         if removed {
-            self.encrypt_and_write()?;
+            self.encrypt_and_write(&data)?;
         }
         Ok(removed)
     }
 
-    fn list_users(&self) -> Vec<String> {
-        self.data.users.keys().cloned().collect()
+    async fn list_users(&self) -> Vec<String> {
+        self.data.read().users.keys().cloned().collect()
     }
 
-    fn search(&self, filter: &UserFilter) -> Vec<(String, UserProfile)> {
-        let mut results: Vec<(String, UserProfile)> = self.data.users.iter()
+    async fn search(&self, filter: &UserFilter) -> Result<Vec<(String, UserProfile)>> {
+        let data = self.data.read();
+        let mut results: Vec<(String, UserProfile)> = data.users.iter()
             .filter_map(|(username, entry)| {
                 let profile = UserProfile {
                     sub: entry.sub.clone(),
@@ -351,14 +420,123 @@ impl UserStore for LocalKeyStore {
         let start = filter.start_index.unwrap_or(1).saturating_sub(1);
         let count = filter.count.unwrap_or(100);
 
-        results.into_iter().skip(start).take(count).collect()
+        Ok(results.into_iter().skip(start).take(count).collect())
     }
 
-    fn set_active(&mut self, username: &str, active: bool) -> Result<()> {
-        let entry = self.data.users.get_mut(username)
+    async fn set_active(&self, username: &str, active: bool) -> Result<()> {
+        let mut data = self.data.write();
+        let entry = data.users.get_mut(username)
             .ok_or_else(|| anyhow!("User '{}' not found", username))?;
         entry.active = Some(active);
-        self.encrypt_and_write()
+        self.encrypt_and_write(&data)
+    }
+
+    // ─── Pubkey Management (limited support for legacy store) ────────────────
+
+    async fn list_pubkeys(&self, username: &str) -> Result<Vec<PubkeyEntry>> {
+        let data = self.data.read();
+        let entry = data.users.get(username)
+            .ok_or_else(|| anyhow!("User '{}' not found", username))?;
+
+        if entry.pubkey.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let raw = STANDARD.decode(&entry.pubkey)?;
+        let bytes: [u8; 32] = raw
+            .try_into()
+            .map_err(|_| anyhow!("Stored pubkey for {} is not 32 bytes", username))?;
+        let pubkey = VerifyingKey::from_bytes(&bytes)?;
+        let fingerprint = pubkey_fingerprint(&pubkey);
+
+        Ok(vec![PubkeyEntry {
+            fingerprint,
+            pubkey,
+            label: Some("legacy".to_owned()),
+            created_at: 0,
+            last_used_at: None,
+        }])
+    }
+
+    async fn add_pubkey(
+        &self,
+        username: &str,
+        pubkey: VerifyingKey,
+        _label: Option<String>,
+    ) -> Result<String> {
+        let mut data = self.data.write();
+        let entry = data.users.get_mut(username)
+            .ok_or_else(|| anyhow!("User '{}' not found", username))?;
+
+        if !entry.pubkey.is_empty() {
+            anyhow::bail!("LocalKeyStore only supports one pubkey per user. Use RocksDbUserStore for multi-pubkey.");
+        }
+
+        let b64 = STANDARD.encode(pubkey.as_bytes());
+        entry.pubkey = b64;
+        self.encrypt_and_write(&data)?;
+
+        Ok(pubkey_fingerprint(&pubkey))
+    }
+
+    async fn remove_pubkey(&self, username: &str, fingerprint: &str) -> Result<bool> {
+        let mut data = self.data.write();
+        let entry = data.users.get_mut(username)
+            .ok_or_else(|| anyhow!("User '{}' not found", username))?;
+
+        if entry.pubkey.is_empty() {
+            return Ok(false);
+        }
+
+        // Verify fingerprint matches
+        let raw = STANDARD.decode(&entry.pubkey)?;
+        let bytes: [u8; 32] = raw
+            .try_into()
+            .map_err(|_| anyhow!("Stored pubkey is not 32 bytes"))?;
+        let pubkey = VerifyingKey::from_bytes(&bytes)?;
+        let stored_fp = pubkey_fingerprint(&pubkey);
+
+        if stored_fp != fingerprint {
+            return Ok(false);
+        }
+
+        entry.pubkey = String::new();
+        self.encrypt_and_write(&data)?;
+        Ok(true)
+    }
+
+    async fn get_pubkey_user(&self, fingerprint: &str) -> Result<Option<String>> {
+        let data = self.data.read();
+        for (username, entry) in &data.users {
+            if entry.pubkey.is_empty() {
+                continue;
+            }
+            let raw = match STANDARD.decode(&entry.pubkey) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let bytes: [u8; 32] = match raw.try_into() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let pubkey = match VerifyingKey::from_bytes(&bytes) {
+                Ok(pk) => pk,
+                Err(_) => continue,
+            };
+            if pubkey_fingerprint(&pubkey) == fingerprint {
+                return Ok(Some(username.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn touch_pubkey(&self, username: &str, _fingerprint: &str) -> Result<()> {
+        // LocalKeyStore doesn't track last_used_at
+        let data = self.data.read();
+        if !data.users.contains_key(username) {
+            anyhow::bail!("User '{}' not found", username);
+        }
+        Ok(())
     }
 }
 
@@ -371,7 +549,7 @@ impl UserStore for LocalKeyStore {
 /// - `active eq true/false` — match on active status
 /// - `userName pr` — presence (non-empty/non-None)
 /// - `active pr` — presence check
-fn matches_filter(
+pub(crate) fn matches_filter(
     expr: &str,
     username: &str,
     sub: &Option<String>,
@@ -432,19 +610,20 @@ mod tests {
     fn make_store_with_identity(dir: &Path, identity: age::x25519::Identity) -> LocalKeyStore {
         LocalKeyStore {
             path: dir.join("users.toml.age"),
-            data: UsersFile::default(),
+            data: parking_lot::RwLock::new(UsersFile::default()),
             identity,
         }
     }
 
-    #[test]
-    fn test_register_and_get_pubkey() -> Result<()> {
+    #[tokio::test]
+    async fn test_register_and_get_pubkey() -> Result<()> {
         let dir = TempDir::new()?;
         let identity = age::x25519::Identity::generate();
-        let mut store = make_store_with_identity(dir.path(), identity);
+        let store = make_store_with_identity(dir.path(), identity);
         let signing_key = SigningKey::generate(&mut rand::thread_rng());
         let pubkey = signing_key.verifying_key();
-        store.register("alice", pubkey)?;
+        store.register("alice").await?;
+        store.add_pubkey("alice", pubkey, None).await?;
         let retrieved = store
             .get_pubkey("alice")?
             .ok_or_else(|| anyhow!("alice not found"))?;
@@ -452,26 +631,26 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_remove_user() -> Result<()> {
+    #[tokio::test]
+    async fn test_remove_user() -> Result<()> {
         let dir = TempDir::new()?;
         let identity = age::x25519::Identity::generate();
-        let mut store = make_store_with_identity(dir.path(), identity);
-        let key = SigningKey::generate(&mut rand::thread_rng()).verifying_key();
-        store.register("bob", key)?;
-        assert!(store.remove("bob")?);
+        let store = make_store_with_identity(dir.path(), identity);
+        store.register("bob").await?;
+        assert!(store.remove("bob").await?);
         assert!(store.get_pubkey("bob")?.is_none());
         Ok(())
     }
 
-    #[test]
-    fn test_encrypt_decrypt_roundtrip() -> Result<()> {
+    #[tokio::test]
+    async fn test_encrypt_decrypt_roundtrip() -> Result<()> {
         let dir = TempDir::new()?;
         let identity = age::x25519::Identity::generate();
-        let mut store = make_store_with_identity(dir.path(), identity.clone());
+        let store = make_store_with_identity(dir.path(), identity.clone());
         let signing_key = SigningKey::generate(&mut rand::thread_rng());
         let pubkey = signing_key.verifying_key();
-        store.register("carol", pubkey)?;
+        store.register("carol").await?;
+        store.add_pubkey("carol", pubkey, None).await?;
 
         // Re-load from disk using the same identity
         let loaded_data =
@@ -491,84 +670,77 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_list_users() -> Result<()> {
+    #[tokio::test]
+    async fn test_list_users() -> Result<()> {
         let dir = TempDir::new()?;
         let identity = age::x25519::Identity::generate();
-        let mut store = make_store_with_identity(dir.path(), identity);
-        let key1 = SigningKey::generate(&mut rand::thread_rng()).verifying_key();
-        let key2 = SigningKey::generate(&mut rand::thread_rng()).verifying_key();
-        store.register("alice", key1)?;
-        store.register("bob", key2)?;
-        let mut users = store.list_users();
+        let store = make_store_with_identity(dir.path(), identity);
+        store.register("alice").await?;
+        store.register("bob").await?;
+        let mut users = store.list_users().await;
         users.sort();
         assert_eq!(users, vec!["alice", "bob"]);
         Ok(())
     }
 
-    #[test]
-    fn test_register_rejects_colon_in_username() -> Result<()> {
+    #[tokio::test]
+    async fn test_register_rejects_colon_in_username() -> Result<()> {
         let dir = TempDir::new()?;
         let identity = age::x25519::Identity::generate();
-        let mut store = make_store_with_identity(dir.path(), identity);
-        let key = SigningKey::generate(&mut rand::thread_rng()).verifying_key();
-        let result = store.register("bad:user", key);
+        let store = make_store_with_identity(dir.path(), identity);
+        let result = store.register("bad:user").await;
         assert!(result.is_err(), "register should reject usernames with ':'");
         let err = result.unwrap_err();
         assert!(err.to_string().contains("must not contain"), "error message should mention colon restriction");
         Ok(())
     }
 
-    #[test]
-    fn test_search_filter_eq() -> Result<()> {
+    #[tokio::test]
+    async fn test_search_filter_eq() -> Result<()> {
         let dir = TempDir::new()?;
         let identity = age::x25519::Identity::generate();
-        let mut store = make_store_with_identity(dir.path(), identity);
-        let key1 = SigningKey::generate(&mut rand::thread_rng()).verifying_key();
-        let key2 = SigningKey::generate(&mut rand::thread_rng()).verifying_key();
-        store.register("alice", key1)?;
-        store.register("bob", key2)?;
+        let store = make_store_with_identity(dir.path(), identity);
+        store.register("alice").await?;
+        store.register("bob").await?;
 
         let results = store.search(&UserFilter {
             filter: Some(r#"userName eq "alice""#.to_owned()),
             ..Default::default()
-        });
+        }).await?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "alice");
         Ok(())
     }
 
-    #[test]
-    fn test_search_filter_pr() -> Result<()> {
+    #[tokio::test]
+    async fn test_search_filter_pr() -> Result<()> {
         let dir = TempDir::new()?;
         let identity = age::x25519::Identity::generate();
-        let mut store = make_store_with_identity(dir.path(), identity);
-        let key = SigningKey::generate(&mut rand::thread_rng()).verifying_key();
-        store.register("alice", key)?;
+        let store = make_store_with_identity(dir.path(), identity);
+        store.register("alice").await?;
 
         let results = store.search(&UserFilter {
             filter: Some("userName pr".to_owned()),
             ..Default::default()
-        });
+        }).await?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "alice");
 
         let results = store.search(&UserFilter {
             filter: Some("active pr".to_owned()),
             ..Default::default()
-        });
+        }).await?;
         assert!(results.is_empty(), "active is None by default, pr should not match");
         Ok(())
     }
 
-    #[test]
-    fn test_search_pagination() -> Result<()> {
+    #[tokio::test]
+    async fn test_search_pagination() -> Result<()> {
         let dir = TempDir::new()?;
         let identity = age::x25519::Identity::generate();
-        let mut store = make_store_with_identity(dir.path(), identity);
+        let store = make_store_with_identity(dir.path(), identity);
         for name in &["alice", "bob", "carol"] {
-            let key = SigningKey::generate(&mut rand::thread_rng()).verifying_key();
-            store.register(name, key)?;
+            store.register(name).await?;
         }
 
         // Page 1: start_index=1, count=2
@@ -576,7 +748,7 @@ mod tests {
             start_index: Some(1),
             count: Some(2),
             ..Default::default()
-        });
+        }).await?;
         assert_eq!(results.len(), 2);
 
         // Page 2: start_index=3, count=2
@@ -584,28 +756,25 @@ mod tests {
             start_index: Some(3),
             count: Some(2),
             ..Default::default()
-        });
+        }).await?;
         assert_eq!(results.len(), 1);
         Ok(())
     }
 
-    #[test]
-    fn test_search_sorting() -> Result<()> {
+    #[tokio::test]
+    async fn test_search_sorting() -> Result<()> {
         let dir = TempDir::new()?;
         let identity = age::x25519::Identity::generate();
-        let mut store = make_store_with_identity(dir.path(), identity);
-        let key1 = SigningKey::generate(&mut rand::thread_rng()).verifying_key();
-        let key2 = SigningKey::generate(&mut rand::thread_rng()).verifying_key();
-        let key3 = SigningKey::generate(&mut rand::thread_rng()).verifying_key();
-        store.register("carol", key1)?;
-        store.register("alice", key2)?;
-        store.register("bob", key3)?;
+        let store = make_store_with_identity(dir.path(), identity);
+        store.register("carol").await?;
+        store.register("alice").await?;
+        store.register("bob").await?;
 
         let results = store.search(&UserFilter {
             sort_by: Some("userName".to_owned()),
             sort_order: Some("ascending".to_owned()),
             ..Default::default()
-        });
+        }).await?;
         assert_eq!(results[0].0, "alice");
         assert_eq!(results[1].0, "bob");
         assert_eq!(results[2].0, "carol");
@@ -614,51 +783,49 @@ mod tests {
             sort_by: Some("userName".to_owned()),
             sort_order: Some("descending".to_owned()),
             ..Default::default()
-        });
+        }).await?;
         assert_eq!(results[0].0, "carol");
         assert_eq!(results[1].0, "bob");
         assert_eq!(results[2].0, "alice");
         Ok(())
     }
 
-    #[test]
-    fn test_set_active() -> Result<()> {
+    #[tokio::test]
+    async fn test_set_active() -> Result<()> {
         let dir = TempDir::new()?;
         let identity = age::x25519::Identity::generate();
-        let mut store = make_store_with_identity(dir.path(), identity);
-        let key = SigningKey::generate(&mut rand::thread_rng()).verifying_key();
-        store.register("alice", key)?;
+        let store = make_store_with_identity(dir.path(), identity);
+        store.register("alice").await?;
 
         // Default: active is None (treated as true)
-        let profile = store.get_profile("alice")?.unwrap();
+        let profile = store.get_profile("alice").await?.unwrap();
         assert!(profile.active.is_none());
 
         // Suspend
-        store.set_active("alice", false)?;
-        let profile = store.get_profile("alice")?.unwrap();
+        store.set_active("alice", false).await?;
+        let profile = store.get_profile("alice").await?.unwrap();
         assert_eq!(profile.active, Some(false));
 
         // Active-only search excludes suspended user
         let results = store.search(&UserFilter {
             active_only: Some(true),
             ..Default::default()
-        });
+        }).await?;
         assert!(results.is_empty());
 
         // Resume
-        store.set_active("alice", true)?;
-        let profile = store.get_profile("alice")?.unwrap();
+        store.set_active("alice", true).await?;
+        let profile = store.get_profile("alice").await?.unwrap();
         assert_eq!(profile.active, Some(true));
         Ok(())
     }
 
-    #[test]
-    fn test_new_fields_roundtrip() -> Result<()> {
+    #[tokio::test]
+    async fn test_new_fields_roundtrip() -> Result<()> {
         let dir = TempDir::new()?;
         let identity = age::x25519::Identity::generate();
-        let mut store = make_store_with_identity(dir.path(), identity.clone());
-        let key = SigningKey::generate(&mut rand::thread_rng()).verifying_key();
-        store.register("alice", key)?;
+        let store = make_store_with_identity(dir.path(), identity.clone());
+        store.register("alice").await?;
 
         // Set profile with new fields
         store.set_profile("alice", UserProfile {
@@ -668,7 +835,7 @@ mod tests {
             email_verified: Some(true),
             active: Some(true),
             external_id: Some("ext-123".to_owned()),
-        })?;
+        }).await?;
 
         // Reload from disk
         let loaded = LocalKeyStore::decrypt_and_parse(

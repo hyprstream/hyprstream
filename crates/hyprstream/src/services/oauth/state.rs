@@ -302,7 +302,7 @@ impl OAuthState {
 
     /// Attach a user credential store. Creates a `UserService` backed by the store
     /// for SCIM/RPC access and legacy OAuth handler reads.
-    pub fn with_user_store(mut self, store: Box<dyn UserStore + Send + Sync>) -> Self {
+    pub fn with_user_store(mut self, store: Arc<dyn UserStore>) -> Self {
         self.user_service = Some(Arc::new(UserService::new(store)));
         self
     }
@@ -316,12 +316,8 @@ impl OAuthState {
 
     /// Get read access to the user store via the UserService.
     /// Returns None if no user store is configured.
-    /// Returns an owned guard so the caller does not borrow from `self`.
-    pub async fn user_store_reader(&self)
-        -> Option<tokio::sync::OwnedRwLockReadGuard<Box<dyn UserStore>>>
-    {
-        let service = self.user_service.as_ref()?;
-        Some(service.store().read_owned().await)
+    pub fn user_store_reader(&self) -> Option<Arc<dyn UserStore>> {
+        self.user_service.as_ref().map(|s| s.store())
     }
 
     /// Backward-compatible check: returns true if a user store is configured.

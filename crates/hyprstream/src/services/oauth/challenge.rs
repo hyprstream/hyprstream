@@ -10,6 +10,7 @@ use base64::Engine;
 use crate::auth::user_store::UserStore;
 
 /// Error types for Ed25519 challenge-response verification.
+#[allow(dead_code)]
 pub(super) enum ChallengeError {
     /// Username contains ':', which would make the challenge string ambiguous.
     InvalidUsername,
@@ -19,9 +20,11 @@ pub(super) enum ChallengeError {
     InvalidSignatureLength,
     /// No UserStore entry for this username.
     UserNotFound,
+    /// User has no pubkeys registered.
+    NoPubkeys,
     /// UserStore returned an error.
     UserStoreError(#[allow(dead_code)] anyhow::Error),
-    /// Signature is syntactically valid but does not verify against the challenge.
+    /// Signature is syntactically valid but does not verify against any registered key.
     SignatureInvalid,
 }
 
@@ -36,6 +39,8 @@ impl ChallengeError {
                 "Invalid signature length (expected 64 bytes / 88 base64 chars).",
             ChallengeError::UserNotFound =>
                 "Unknown user. Please contact your administrator.",
+            ChallengeError::NoPubkeys =>
+                "No public keys registered for this user.",
             ChallengeError::UserStoreError(_) =>
                 "Internal error looking up user credentials.",
             ChallengeError::SignatureInvalid =>
@@ -54,8 +59,8 @@ impl ChallengeError {
 /// `sig_b64` is the standard (non-URL-safe) base64-encoded 64-byte signature.
 ///
 /// Returns the verified `VerifyingKey` on success — the key confirmed to have
-/// signed the challenge, looked up from the UserStore by username.
-pub(super) fn verify_ed25519_response(
+/// signed the challenge. Tries all registered pubkeys for the user until one matches.
+pub(super) async fn verify_ed25519_response(
     user_store: &dyn UserStore,
     username: &str,
     challenge: &str,
@@ -73,16 +78,24 @@ pub(super) fn verify_ed25519_response(
 
     let signature = ed25519_dalek::Signature::from_bytes(&sig_array);
 
-    let verifying_key = match user_store.get_pubkey(username) {
-        Ok(Some(pk)) => pk,
-        Ok(None) => return Err(ChallengeError::UserNotFound),
-        Err(e) => return Err(ChallengeError::UserStoreError(e)),
-    };
+    // Get all pubkeys for the user and try each one
+    let pubkeys = user_store.list_pubkeys(username).await
+        .map_err(ChallengeError::UserStoreError)?;
 
-    verifying_key.verify_strict(challenge.as_bytes(), &signature)
-        .map_err(|_| ChallengeError::SignatureInvalid)?;
+    if pubkeys.is_empty() {
+        return Err(ChallengeError::NoPubkeys);
+    }
 
-    Ok(verifying_key)
+    // Try to verify against each registered pubkey
+    for entry in &pubkeys {
+        if entry.pubkey.verify_strict(challenge.as_bytes(), &signature).is_ok() {
+            // Optionally touch the pubkey to update last_used_at
+            let _ = user_store.touch_pubkey(username, &entry.fingerprint).await;
+            return Ok(entry.pubkey);
+        }
+    }
+
+    Err(ChallengeError::SignatureInvalid)
 }
 
 /// HTML-escape a string for safe embedding in HTML attributes and text.

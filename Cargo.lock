@@ -5983,6 +5983,7 @@ dependencies = [
  "ring",
  "rlimit 0.10.2",
  "rmcp",
+ "rocksdb",
  "rtrb",
  "rustls 0.23.31",
  "rustls-pemfile 2.2.0",
@@ -7737,6 +7738,21 @@ dependencies = [
  "bitflags 2.11.0",
  "libc",
  "redox_syscall 0.5.17",
+]
+
+[[package]]
+name = "librocksdb-sys"
+version = "0.17.3+10.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cef2a00ee60fe526157c9023edab23943fae1ce2ab6f4abb2a807c1746835de9"
+dependencies = [
+ "bindgen",
+ "bzip2-sys",
+ "cc",
+ "libc",
+ "libz-sys",
+ "lz4-sys",
+ "zstd-sys",
 ]
 
 [[package]]
@@ -11735,6 +11751,16 @@ dependencies = [
  "quote",
  "serde_json",
  "syn 2.0.111",
+]
+
+[[package]]
+name = "rocksdb"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26ec73b20525cb235bad420f911473b69f9fe27cc856c5461bccd7e4af037f43"
+dependencies = [
+ "libc",
+ "librocksdb-sys",
 ]
 
 [[package]]

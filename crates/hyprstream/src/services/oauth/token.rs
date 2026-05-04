@@ -372,8 +372,8 @@ async fn issue_token_with_refresh(
                 .with_auth_time(now);
 
                 // Add profile claims based on requested scopes.
-                if let Some(user_store) = state.user_store_reader().await {
-                    if let Ok(Some(profile)) = user_store.get_profile(sub) {
+                if let Some(user_store) = state.user_store_reader() {
+                    if let Ok(Some(profile)) = user_store.get_profile(sub).await {
                         if scopes.iter().any(|s| s == "profile") {
                             id_claims.preferred_username = Some(sub.to_owned());
                             id_claims.name = profile.name;

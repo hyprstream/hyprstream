@@ -72,12 +72,21 @@ struct UpdateUser {
 struct UserInfo {
   username @0 :Text;
   sub @1 :Text;
-  pubkeyBase64 @2 :Text;
+  pubkeyBase64 @2 :Text;  # DEPRECATED: use pubkeys list for new code
   name @3 :Text;
   email @4 :Text;
   emailVerified @5 :Bool;
   active @6 :Bool;
   externalId @7 :Text;
+  pubkeys @8 :List(PubkeyEntry);  # Multiple pubkeys per user
+}
+
+struct PubkeyEntry {
+  fingerprint @0 :Text;   # base64url SHA-256 of pubkey bytes
+  pubkeyBase64 @1 :Text;  # base64url of raw 32-byte Ed25519 pubkey
+  label @2 :Text;         # user-provided label (e.g., "laptop", "work")
+  createdAt @3 :Int64;    # unix timestamp
+  lastUsedAt @4 :Int64;   # unix timestamp, 0 if never used
 }
 
 struct UserListResult {

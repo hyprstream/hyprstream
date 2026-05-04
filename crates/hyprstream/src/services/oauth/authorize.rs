@@ -239,8 +239,8 @@ pub async fn authorize_post(
     let challenge_str = format!("{}:{}:{}", form.username, form.nonce, form.code_challenge);
 
     // Get user store
-    let user_store = match state.user_store_reader().await {
-        Some(guard) => guard,
+    let user_store = match state.user_store_reader() {
+        Some(store) => store,
         None => {
             return Html(render_error_page(
                 "Server Not Configured",
@@ -255,7 +255,7 @@ pub async fn authorize_post(
         &form.username,
         &challenge_str,
         &form.signature,
-    ) {
+    ).await {
         Ok(vk) => vk,
         Err(e) => {
             if matches!(e, challenge::ChallengeError::UserStoreError(_)) {

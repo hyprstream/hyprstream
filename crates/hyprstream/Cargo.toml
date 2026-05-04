@@ -141,6 +141,7 @@ libc = "0.2"  # For system calls in overlay2 driver
 reflink-copy = "0.1"  # COW file copying (reflink when available)
 hyprstream-containedfs.workspace = true  # Path-contained filesystem operations
 age = { version = "0.11.2", features = ["armor"] }
+rocksdb = "0.23"  # User credential store (RocksDbUserStore)
 hyprstream-tui = { path = "../hyprstream-tui" }  # Setup wizard TUI (WizardBackend trait + WizardApp)
 hyprstream-compositor = { path = "../hyprstream-compositor" }  # Pure TUI compositor (chrome state machine)
 waxterm = { path = "../waxterm", features = ["avt"] }  # Terminal abstraction for TUI rendering

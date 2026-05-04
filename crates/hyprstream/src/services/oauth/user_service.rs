@@ -7,9 +7,8 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::VerifyingKey;
-use tokio::sync::RwLock;
 
-use crate::auth::{UserFilter, UserProfile, UserStore};
+use crate::auth::{UserFilter, UserProfile, UserStore, PubkeyEntry};
 
 /// Shared user information type (SCIM-informed).
 #[derive(Debug, Clone)]
@@ -22,6 +21,29 @@ pub struct UserInfo {
     pub email_verified: bool,
     pub active: bool,
     pub external_id: Option<String>,
+    pub pubkeys: Vec<PubkeyInfo>,
+}
+
+/// Pubkey info for API responses.
+#[derive(Debug, Clone)]
+pub struct PubkeyInfo {
+    pub fingerprint: String,
+    pub pubkey_base64: String,
+    pub label: Option<String>,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+}
+
+impl From<&PubkeyEntry> for PubkeyInfo {
+    fn from(entry: &PubkeyEntry) -> Self {
+        Self {
+            fingerprint: entry.fingerprint.clone(),
+            pubkey_base64: STANDARD.encode(entry.pubkey.as_bytes()),
+            label: entry.label.clone(),
+            created_at: entry.created_at,
+            last_used_at: entry.last_used_at,
+        }
+    }
 }
 
 /// Paginated user list result.
@@ -42,14 +64,12 @@ pub struct UserUpdate {
 
 /// Shared user CRUD service used by both SCIM HTTP and ZMQ RPC transports.
 pub struct UserService {
-    store: Arc<RwLock<Box<dyn UserStore>>>,
+    store: Arc<dyn UserStore>,
 }
 
 impl UserService {
-    pub fn new(store: Box<dyn UserStore>) -> Self {
-        Self {
-            store: Arc::new(RwLock::new(store)),
-        }
+    pub fn new(store: Arc<dyn UserStore>) -> Self {
+        Self { store }
     }
 
     /// Register a new user with their Ed25519 public key.
@@ -63,9 +83,11 @@ impl UserService {
         let pubkey = VerifyingKey::from_bytes(&bytes)
             .map_err(|e| anyhow!("Invalid Ed25519 public key: {e}"))?;
 
-        let mut store = self.store.write().await;
-        store.register(username, pubkey)?;
-        drop(store);
+        // Register user first (creates UUID sub)
+        self.store.register(username).await?;
+
+        // Then add the pubkey
+        self.store.add_pubkey(username, pubkey, None).await?;
 
         self.get(username)
             .await?
@@ -74,31 +96,35 @@ impl UserService {
 
     /// Get a user by username.
     pub async fn get(&self, username: &str) -> Result<Option<UserInfo>> {
-        let store = self.store.read().await;
-        let profile = store.get_profile(username)?;
-        let pubkey = store.get_pubkey(username)?;
-        drop(store);
+        let profile = self.store.get_profile(username).await?;
+        let pubkeys = self.store.list_pubkeys(username).await.unwrap_or_default();
 
-        match (profile, pubkey) {
-            (Some(profile), Some(pubkey)) => Ok(Some(UserInfo {
-                username: username.to_owned(),
-                sub: profile.sub.unwrap_or_default(),
-                pubkey_base64: STANDARD.encode(pubkey.as_bytes()),
-                name: profile.name,
-                email: profile.email,
-                email_verified: profile.email_verified.unwrap_or(false),
-                active: profile.active.unwrap_or(true),
-                external_id: profile.external_id,
-            })),
-            _ => Ok(None),
+        match profile {
+            Some(profile) => {
+                // For backward compat, use first pubkey as the primary
+                let primary_pubkey = pubkeys.first()
+                    .map(|pk| STANDARD.encode(pk.pubkey.as_bytes()))
+                    .unwrap_or_default();
+
+                Ok(Some(UserInfo {
+                    username: username.to_owned(),
+                    sub: profile.sub.unwrap_or_default(),
+                    pubkey_base64: primary_pubkey,
+                    name: profile.name,
+                    email: profile.email,
+                    email_verified: profile.email_verified.unwrap_or(false),
+                    active: profile.active.unwrap_or(true),
+                    external_id: profile.external_id,
+                    pubkeys: pubkeys.iter().map(PubkeyInfo::from).collect(),
+                }))
+            }
+            None => Ok(None),
         }
     }
 
     /// List/search users with SCIM-aligned filtering, sorting, and pagination.
     pub async fn list(&self, filter: &UserFilter) -> Result<UserList> {
-        let store = self.store.read().await;
-        let results = store.search(filter);
-        drop(store);
+        let results = self.store.search(filter).await?;
 
         // Total count is before pagination (we need a separate count without pagination).
         // For simplicity, search() already applies pagination, so we re-run without
@@ -108,9 +134,7 @@ impl UserService {
             start_index: None,
             ..filter.clone()
         };
-        let store = self.store.read().await;
-        let total_results = store.search(&total_filter).len();
-        drop(store);
+        let total_results = self.store.search(&total_filter).await?.len();
 
         let users = results
             .into_iter()
@@ -124,6 +148,7 @@ impl UserService {
                     email_verified: profile.email_verified.unwrap_or(false),
                     active: profile.active.unwrap_or(true),
                     external_id: profile.external_id,
+                    pubkeys: vec![], // Omitted in list
                 }
             })
             .collect();
@@ -136,22 +161,19 @@ impl UserService {
 
     /// Update a user's profile fields.
     pub async fn update(&self, username: &str, update: UserUpdate) -> Result<UserInfo> {
-        {
-            let mut store = self.store.write().await;
-            let existing = store
-                .get_profile(username)?
-                .ok_or_else(|| anyhow!("User '{}' not found", username))?;
+        let existing = self.store
+            .get_profile(username).await?
+            .ok_or_else(|| anyhow!("User '{}' not found", username))?;
 
-            let merged = UserProfile {
-                sub: existing.sub,
-                name: update.name.unwrap_or(existing.name),
-                email: update.email.unwrap_or(existing.email),
-                email_verified: Some(update.email_verified.unwrap_or_else(|| existing.email_verified.unwrap_or(false))),
-                active: existing.active,
-                external_id: update.external_id.unwrap_or(existing.external_id),
-            };
-            store.set_profile(username, merged)?;
-        }
+        let merged = UserProfile {
+            sub: existing.sub,
+            name: update.name.unwrap_or(existing.name),
+            email: update.email.unwrap_or(existing.email),
+            email_verified: Some(update.email_verified.unwrap_or_else(|| existing.email_verified.unwrap_or(false))),
+            active: existing.active,
+            external_id: update.external_id.unwrap_or(existing.external_id),
+        };
+        self.store.set_profile(username, merged).await?;
 
         self.get(username)
             .await?
@@ -160,24 +182,21 @@ impl UserService {
 
     /// Suspend a user (set active = false).
     pub async fn suspend(&self, username: &str) -> Result<()> {
-        let mut store = self.store.write().await;
-        store.set_active(username, false)
+        self.store.set_active(username, false).await
     }
 
     /// Resume a suspended user (set active = true).
     pub async fn resume(&self, username: &str) -> Result<()> {
-        let mut store = self.store.write().await;
-        store.set_active(username, true)
+        self.store.set_active(username, true).await
     }
 
     /// Permanently remove a user.
     pub async fn remove(&self, username: &str) -> Result<bool> {
-        let mut store = self.store.write().await;
-        store.remove(username)
+        self.store.remove(username).await
     }
 
     /// Get the underlying store for direct access (e.g., by OAuth handlers).
-    pub fn store(&self) -> Arc<RwLock<Box<dyn UserStore>>> {
+    pub fn store(&self) -> Arc<dyn UserStore> {
         Arc::clone(&self.store)
     }
 }

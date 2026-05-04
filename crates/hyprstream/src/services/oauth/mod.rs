@@ -27,6 +27,7 @@
 //! ```
 
 pub mod authorize;
+pub mod challenge;
 pub mod device;
 pub mod federation_entity;
 pub mod jwks;
@@ -103,10 +104,6 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
         .route("/oauth/revoke", post(revocation::revoke_token))
         .route("/oauth/logout", post(handle_logout))
         .route(
-            "/oauth/login",
-            get(login_page::login_get).post(login_page::login_post),
-        )
-        .route(
             "/oauth/external/authorize/:provider",
             get(oidc_callback::external_authorize),
         )
@@ -180,20 +177,14 @@ async fn handle_logout(
 /// Returns the DiscoveryService QUIC endpoint as the `resource` URL so that
 /// browsers can bootstrap a WebTransport connection via DiscoveryService,
 /// then resolve all other service endpoints from there.
-///
-/// Uses the cached discovery URL (resolved at startup) to avoid RPC calls
-/// in HTTP handlers, which would require LocalSet context.
 async fn oauth_self_protected_resource_metadata(
-    State(state): State<Arc<OAuthState>>,
+    State(_state): State<Arc<OAuthState>>,
 ) -> axum::Json<ProtectedResourceMetadata> {
     let config = crate::config::HyprConfig::load().unwrap_or_default();
     let issuer_url = config.oauth.issuer_url();
 
-    // Use cached discovery URL (resolved at startup with LocalSet context)
-    let resource = state
-        .cached_discovery_url
-        .clone()
-        .unwrap_or_else(|| issuer_url.clone());
+    // Use issuer URL as the resource
+    let resource = issuer_url.clone();
 
     let mut meta = protected_resource_metadata(&resource, &issuer_url);
     meta.resource_name = Some("HyprStream OAuth 2.1 Authorization Server".to_owned());
@@ -342,7 +333,7 @@ impl Spawnable for OAuthService {
 
             // Load the user store (RocksDB for concurrent access).
             // Failure is non-fatal; endpoints will report "not configured" instead.
-            let user_store: Option<Box<dyn crate::auth::user_store::UserStore + Send + Sync>> = {
+            let user_store: Option<Arc<dyn crate::auth::user_store::UserStore>> = {
                 let credentials_dir = crate::config::HyprConfig::load()
                     .map(|c| c.config_dir().join("credentials"))
                     .unwrap_or_else(|_| {
@@ -354,7 +345,7 @@ impl Spawnable for OAuthService {
                 match crate::auth::RocksDbUserStore::open(&credentials_dir) {
                     Ok(store) => {
                         info!("User store (RocksDB) opened at {:?}", credentials_dir);
-                        Some(Box::new(store))
+                        Some(Arc::new(store))
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -381,6 +372,7 @@ impl Spawnable for OAuthService {
 
             // Resolve discovery URL at startup with LocalSet (RPC calls need LocalSet context).
             // Cache it so HTTP handlers don't need to make RPC calls.
+            #[allow(clippy::expect_used)]
             let cached_discovery_url = {
                 let dc = discovery_client;
                 std::thread::spawn(move || {
@@ -412,8 +404,8 @@ impl Spawnable for OAuthService {
                 .ok()
                 .flatten()
             };
-            if let Some(url) = cached_discovery_url {
-                oauth_state = oauth_state.with_cached_discovery_url(url);
+            if let Some(_url) = cached_discovery_url {
+                // Discovery URL caching removed - use issuer URL directly
             }
 
             let state = Arc::new(oauth_state);

@@ -11,7 +11,7 @@ use std::path::Path;
 use crate::auth::{LocalKeyStore, UserStore};
 
 /// Handle `user register <username> <pubkey_base64>`
-pub fn handle_user_register(
+pub async fn handle_user_register(
     credentials_dir: &Path,
     username: &str,
     pubkey_base64: &str,
@@ -25,20 +25,21 @@ pub fn handle_user_register(
     let pubkey =
         VerifyingKey::from_bytes(&bytes).context("Invalid Ed25519 public key")?;
 
-    let mut store =
+    let store =
         LocalKeyStore::load(credentials_dir).context("Failed to open credential store")?;
-    store
-        .register(username, pubkey)
+    store.register(username).await
         .context("Failed to register user")?;
+    store.add_pubkey(username, pubkey, None).await
+        .context("Failed to add pubkey")?;
     println!("Registered user '{username}'");
     Ok(())
 }
 
 /// Handle `user list`
-pub fn handle_user_list(credentials_dir: &Path) -> Result<()> {
+pub async fn handle_user_list(credentials_dir: &Path) -> Result<()> {
     let store =
         LocalKeyStore::load(credentials_dir).context("Failed to open credential store")?;
-    let mut users = store.list_users();
+    let mut users = store.list_users().await;
     if users.is_empty() {
         println!("No users registered.");
     } else {
@@ -51,7 +52,7 @@ pub fn handle_user_list(credentials_dir: &Path) -> Result<()> {
 }
 
 /// Handle `user remove <username> [--force]`
-pub fn handle_user_remove(
+pub async fn handle_user_remove(
     credentials_dir: &Path,
     username: &str,
     force: bool,
@@ -66,9 +67,9 @@ pub fn handle_user_remove(
             return Ok(());
         }
     }
-    let mut store =
+    let store =
         LocalKeyStore::load(credentials_dir).context("Failed to open credential store")?;
-    let removed = store.remove(username)?;
+    let removed = store.remove(username).await?;
     if removed {
         println!("Removed user '{username}'");
     } else {
@@ -78,15 +79,16 @@ pub fn handle_user_remove(
 }
 
 /// Handle `user show <username>`
-pub fn handle_user_show(credentials_dir: &Path, username: &str) -> Result<()> {
+pub async fn handle_user_show(credentials_dir: &Path, username: &str) -> Result<()> {
     let store =
         LocalKeyStore::load(credentials_dir).context("Failed to open credential store")?;
-    match store.get_pubkey(username)? {
-        Some(key) => {
-            println!("{}", STANDARD.encode(key.as_bytes()));
-        }
-        None => {
-            println!("User '{username}' not found");
+    let pubkeys = store.list_pubkeys(username).await?;
+    if pubkeys.is_empty() {
+        println!("User '{username}' has no pubkeys");
+    } else {
+        for pk in &pubkeys {
+            let label = pk.label.as_deref().unwrap_or("(no label)");
+            println!("{} {}", STANDARD.encode(pk.pubkey.as_bytes()), label);
         }
     }
     Ok(())

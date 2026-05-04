@@ -1864,9 +1864,55 @@ fn main() -> Result<()> {
                                         ctx = ctx.with_service_key(&name, own_key);
                                     }
                                 } else {
-                                    // Single-process mode: generate independent keys in memory.
-                                    // All services share the same process, so in-memory keys work.
-                                    ctx = ctx.generate_independent_service_keys(&service_names);
+                                    // Single-process mode: load keys from disk (same as IPC).
+                                    // Wizard must have run to create credentials.
+                                    let secrets_dir = dirs::config_dir()
+                                        .map(|d| d.join("hyprstream").join("credentials"))
+                                        .ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))?;
+
+                                    // Load CA verifying key (trust anchor)
+                                    let ca_vk = hyprstream_core::auth::identity_store::load_ca_verifying_key(&secrets_dir)
+                                        .context("CA key not found — run 'hyprstream wizard' first")?;
+                                    ctx = ctx.with_ca_verifying_key(ca_vk);
+                                    hyprstream_service::global_trust_store().insert(
+                                        ca_vk,
+                                        hyprstream_service::Attestation {
+                                            scopes: std::iter::once("policy".to_owned()).collect(),
+                                            subject: None,
+                                            jwt: None,
+                                            expires_at: 0,
+                                        },
+                                    );
+
+                                    // Load bootstrap pubkeys (all service pubkeys) into trust store
+                                    let pubkeys = hyprstream_core::auth::identity_store::load_bootstrap_pubkeys(&secrets_dir)
+                                        .context("Bootstrap pubkeys not found — run 'hyprstream wizard' first")?;
+                                    if pubkeys.is_empty() {
+                                        anyhow::bail!("Bootstrap pubkeys file is empty — run 'hyprstream wizard' first");
+                                    }
+                                    for (svc_name, vk) in &pubkeys {
+                                        hyprstream_service::global_trust_store().insert(
+                                            *vk,
+                                            hyprstream_service::Attestation {
+                                                scopes: std::iter::once(svc_name.clone()).collect(),
+                                                subject: None,
+                                                jwt: None,
+                                                expires_at: 0,
+                                            },
+                                        );
+                                    }
+                                    tracing::debug!(
+                                        "Loaded {} bootstrap pubkeys from {}",
+                                        pubkeys.len(),
+                                        secrets_dir.display()
+                                    );
+
+                                    // Load signing keys for each service being started
+                                    for svc_name in &service_names {
+                                        let svc_key = hyprstream_core::auth::identity_store::load_or_generate_service_signing_key(&secrets_dir, svc_name)
+                                            .with_context(|| format!("Failed to load signing key for service '{}'", svc_name))?;
+                                        ctx = ctx.with_service_key(svc_name, svc_key);
+                                    }
                                 }
 
                                 // Wire QUIC shared config (must be after key generation so jwt_verifying_key is set)
@@ -2032,20 +2078,28 @@ fn main() -> Result<()> {
             let cmd = UserCommand::from_arg_matches(sub_m)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
             let credentials_dir = ctx.config_dir().join("credentials");
-            match cmd {
-                UserCommand::Register { username, pubkey_base64 } => {
-                    handle_user_register(&credentials_dir, &username, &pubkey_base64)?;
+            // User handlers are async, run them in a minimal runtime
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("Failed to create runtime for user command")?;
+            rt.block_on(async {
+                match cmd {
+                    UserCommand::Register { username, pubkey_base64 } => {
+                        handle_user_register(&credentials_dir, &username, &pubkey_base64).await?;
+                    }
+                    UserCommand::List => {
+                        handle_user_list(&credentials_dir).await?;
+                    }
+                    UserCommand::Remove { username, force } => {
+                        handle_user_remove(&credentials_dir, &username, force).await?;
+                    }
+                    UserCommand::Show { username } => {
+                        handle_user_show(&credentials_dir, &username).await?;
+                    }
                 }
-                UserCommand::List => {
-                    handle_user_list(&credentials_dir)?;
-                }
-                UserCommand::Remove { username, force } => {
-                    handle_user_remove(&credentials_dir, &username, force)?;
-                }
-                UserCommand::Show { username } => {
-                    handle_user_show(&credentials_dir, &username)?;
-                }
-            }
+                Ok::<_, anyhow::Error>(())
+            })?;
         }
 
         // ── TUI display server ──────────────────────────────────────────

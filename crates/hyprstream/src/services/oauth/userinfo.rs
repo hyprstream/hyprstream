@@ -57,8 +57,8 @@ pub async fn userinfo(
         "sub": claims.sub,
     });
 
-    if let Some(user_store) = state.user_store_reader().await {
-        if let Ok(Some(profile)) = user_store.get_profile(&claims.sub) {
+    if let Some(user_store) = state.user_store_reader() {
+        if let Ok(Some(profile)) = user_store.get_profile(&claims.sub).await {
             // Use UUID sub if available
             if let Some(ref uuid_sub) = profile.sub {
                 response["sub"] = serde_json::Value::String(uuid_sub.clone());

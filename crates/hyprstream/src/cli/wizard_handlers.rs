@@ -484,7 +484,7 @@ async fn phase_users(state: &mut WizardState, non_interactive: bool) -> Result<(
         .context("Failed to load PolicyManager")?;
 
     let credentials_dir = state.credentials_dir();
-    let mut user_store = LocalKeyStore::load(&credentials_dir)
+    let user_store = LocalKeyStore::load(&credentials_dir)
         .context("Failed to open credential store")?;
 
     // Separate Casbin subjects into local (bare names) vs federated/OIDC (contain "://")
@@ -502,7 +502,7 @@ async fn phase_users(state: &mut WizardState, non_interactive: bool) -> Result<(
         .collect();
 
     let registered_users: std::collections::BTreeSet<String> =
-        user_store.list_users().into_iter().collect();
+        user_store.list_users().await.into_iter().collect();
 
     // Section 1: Local users (UserStore is authoritative)
     if !registered_users.is_empty() || !local_policy_users.is_empty() {
@@ -541,8 +541,10 @@ async fn phase_users(state: &mut WizardState, non_interactive: bool) -> Result<(
         if registered_users.is_empty() {
             // Register identity FIRST — UserStore is authoritative
             let (_sk, vk) = ensure_user_signing_key()?;
-            user_store.register(&local_user, vk)
+            user_store.register(&local_user).await
                 .context("Failed to register identity")?;
+            user_store.add_pubkey(&local_user, vk, Some("wizard".to_owned())).await
+                .context("Failed to add pubkey")?;
 
             pm.add_policy_with_domain(&local_user, "*", "*", "*", "allow")
                 .await
@@ -592,9 +594,14 @@ async fn phase_users(state: &mut WizardState, non_interactive: bool) -> Result<(
 
         // Register local identity BEFORE adding any Casbin policies (Step 3)
         if username == local_user {
-            if user_store.get_pubkey(&username)?.is_none() {
+            let pubkeys = user_store.list_pubkeys(&username).await.unwrap_or_default();
+            if pubkeys.is_empty() {
                 let (_sk, vk) = ensure_user_signing_key()?;
-                user_store.register(&username, vk)?;
+                // Check if user exists first
+                if user_store.get_profile(&username).await?.is_none() {
+                    user_store.register(&username).await?;
+                }
+                user_store.add_pubkey(&username, vk, Some("wizard".to_owned())).await?;
                 print_check(&username, CheckStatus::Ok, "identity registered (OAuth ready)");
             } else {
                 print_check(&username, CheckStatus::Ok, "identity already registered");

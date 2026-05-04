@@ -324,6 +324,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
         service_token("model"),
     );
 
+    #[allow(clippy::expect_used)]
     let mut model_service = tokio::task::block_in_place(|| {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -620,7 +621,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let config = load_config();
 
     // Create McpConfig for the service
-    let oauth_issuer = ctx.oauth_issuer_url().map(str::to_owned);
+    let _oauth_issuer = ctx.oauth_issuer_url().map(str::to_owned);
     let federation_key_source = ctx.federation_key_source();
     let sk = ctx.service_signing_key("mcp");
 
