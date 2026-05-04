@@ -48,8 +48,7 @@ use hyprstream_core::storage::{GitRef, ModelRef};
 use hyprstream_core::services::{PolicyClient, RegistryClient};
 // Worker service for Kata-based workload execution
 use hyprstream_workers::runtime::WorkerService;
-use hyprstream_workers::workflow::WorkflowService;
-use hyprstream_workers::{ImageConfig, PoolConfig, SpawnedService};
+use hyprstream_workers::{ImageConfig, PoolConfig};
 // ZMQ context for service startup
 use hyprstream_core::zmq::global_context;
 use std::sync::Arc;
@@ -1479,129 +1478,32 @@ fn main() -> Result<()> {
         .context("Failed to create registry runtime")?;
 
     // Start ZMQ-based services and create keypair
-    let (registry_client, mut _service_handles, _workflow_service, signing_key, verifying_key): (
+    let (registry_client, signing_key, verifying_key): (
         RegistryClient,
-        Vec<SpawnedService>,
-        Option<Arc<WorkflowService>>,
         SigningKey,
         VerifyingKey,
-    ) = if execution_mode == ExecutionMode::Inproc {
-        _registry_runtime
-            .block_on(async {
-                let models_dir = config.models_dir();
-                let keys_dir = models_dir.join(".registry").join("keys");
-                let signing_key = load_or_generate_signing_key(&keys_dir).await?;
-                let verifying_key = signing_key.verifying_key();
+    ) = _registry_runtime
+        .block_on(async {
+            let models_dir = config.models_dir();
+            let keys_dir = models_dir.join(".registry").join("keys");
+            let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+            let verifying_key = signing_key.verifying_key();
 
-                let fed_src: Arc<dyn hyprstream_rpc::auth::FederationKeySource> =
-                    Arc::new(hyprstream_core::auth::FederationKeyResolver::new(
-                        &config.oauth.trusted_issuers,
-                    ));
-                let ctx = ServiceContext::new(
-                    global_context(),
-                    signing_key.clone(),
-                    verifying_key,
-                    false,
-                    models_dir.clone(),
-                )
-                .with_oauth_issuer(config.oauth.issuer_url())
-                .with_federation_key_source(fed_src)
-                .generate_independent_service_keys(&config.services.startup);
+            // Resolve the registry service's verifying key from bootstrap pubkeys.
+            // CLI mode doesn't have a ServiceContext, so we look up the target
+            // pubkey directly from the credential store.
+            let registry_vk = resolve_service_vk("registry")
+                .ok_or_else(|| anyhow::anyhow!("Cannot resolve registry pubkey. Run wizard."))?;
 
-                let manager = InprocManager::new();
-                let mut handles = Vec::new();
+            let client = hyprstream_core::services::RegistryClient::for_service(
+                signing_key.clone(),
+                registry_vk,
+                None,
+            );
 
-                for service_name in &config.services.startup {
-                    if service_name == "workflow" {
-                        continue;
-                    }
-
-                    let factory = get_factory(service_name).ok_or_else(|| {
-                        anyhow::anyhow!("Unknown service in startup config: {}", service_name)
-                    })?;
-
-                    info!("Starting {} service via factory", service_name);
-                    let spawnable = (factory.factory)(&ctx)
-                        .context(format!("Failed to create {} service", service_name))?;
-                    let handle = manager
-                        .spawn(spawnable)
-                        .await
-                        .context(format!("Failed to start {} service", service_name))?;
-                    handles.push(handle);
-                }
-
-                let workflow_service =
-                    if config.services.startup.iter().any(|s| s == "workflow") {
-                        let mut wf_svc = WorkflowService::new(
-                            global_context(),
-                            TransportConfig::inproc("hyprstream/workflow"),
-                            signing_key.clone(),
-                        );
-                        // Wire up policy-backed authorization
-                        let policy_vk = hyprstream_service::global_trust_store()
-                            .resolve_one("policy")
-                            .context("trust store has no policy key")?;
-                        let wf_policy_client = PolicyClient::for_service(
-                            signing_key.clone(),
-                            policy_vk,
-                            None,
-                        );
-                        wf_svc.set_authorize_fn(
-                            hyprstream_core::services::build_authorize_fn(wf_policy_client),
-                        );
-                        let ws = Arc::new(wf_svc);
-                        ws.clone()
-                            .start()
-                            .await
-                            .context("Failed to start workflow service")?;
-                        info!("WorkflowService started, subscribed to worker.* events");
-                        Some(ws)
-                    } else {
-                        None
-                    };
-
-                let registry_vk = hyprstream_service::global_trust_store()
-                    .resolve_one("registry")
-                    .context("trust store has no registry key")?;
-                let client = hyprstream_core::services::RegistryClient::for_service(
-                    signing_key.clone(),
-                    registry_vk,
-                    None,
-                );
-
-                Ok::<_, anyhow::Error>((
-                    client,
-                    handles,
-                    workflow_service,
-                    signing_key,
-                    verifying_key,
-                ))
-            })
-            .context("Failed to initialize services")?
-    } else {
-        _registry_runtime
-            .block_on(async {
-                let models_dir = config.models_dir();
-                let keys_dir = models_dir.join(".registry").join("keys");
-                let signing_key = load_or_generate_signing_key(&keys_dir).await?;
-                let verifying_key = signing_key.verifying_key();
-
-                // Resolve the registry service's verifying key from bootstrap pubkeys.
-                // CLI mode doesn't have a ServiceContext, so we look up the target
-                // pubkey directly from the credential store.
-                let registry_vk = resolve_service_vk("registry")
-                    .ok_or_else(|| anyhow::anyhow!("Cannot resolve registry pubkey. Run wizard."))?;
-
-                let client = hyprstream_core::services::RegistryClient::for_service(
-                    signing_key.clone(),
-                    registry_vk,
-                    None,
-                );
-
-                Ok::<_, anyhow::Error>((client, Vec::new(), None, signing_key, verifying_key))
-            })
-            .context("Failed to connect to services")?
-    };
+            Ok::<_, anyhow::Error>((client, signing_key, verifying_key))
+        })
+        .context("Failed to connect to services")?;
 
     // Create application context with shared registry client
     let config_for_service = config.clone();
@@ -2276,15 +2178,6 @@ fn main() -> Result<()> {
             }
         }
     };
-
-    // Gracefully stop services before exiting (only for Inproc mode)
-    _registry_runtime.block_on(async {
-        for mut handle in _service_handles {
-            if let Err(e) = handle.stop().await {
-                tracing::warn!("Failed to stop service: {}", e);
-            }
-        }
-    });
 
     Ok(())
 }

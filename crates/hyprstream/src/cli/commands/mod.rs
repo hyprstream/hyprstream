@@ -50,15 +50,11 @@ impl From<KVQuantArg> for KVQuantType {
 /// Overall execution mode for the hyprstream CLI and services
 ///
 /// This determines how services are spawned and managed:
-/// - **Inproc**: Single process, all services in-process, inproc:// ZMQ transport (mobile/embedded)
 /// - **IpcStandalone**: Multiple processes spawned directly, ipc:// ZMQ transport (default)
 /// - **IpcSystemd**: Multiple systemd services with socket activation, ipc:// ZMQ transport
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExecutionMode {
-    /// In-process mode with all services in a single process (mobile/embedded builds)
-    Inproc,
-
     /// Standalone mode with forked processes (default for desktop/server/containers)
     /// Services spawned via ProcessSpawner with StandaloneBackend
     #[default]
@@ -75,9 +71,6 @@ impl ExecutionMode {
     /// Returns:
     /// - `IpcSystemd` if systemd is available
     /// - `IpcStandalone` otherwise (default for desktop/server/containers)
-    ///
-    /// Note: `Inproc` mode is reserved for special builds (mobile/embedded)
-    /// and must be explicitly requested via CLI flag (future feature).
     pub fn detect() -> Self {
         #[cfg(feature = "systemd")]
         {
@@ -91,17 +84,12 @@ impl ExecutionMode {
 
     /// Get the EndpointMode for this execution mode
     pub fn endpoint_mode(&self) -> hyprstream_rpc::registry::EndpointMode {
-        match self {
-            ExecutionMode::Inproc => hyprstream_rpc::registry::EndpointMode::Inproc,
-            ExecutionMode::IpcStandalone | ExecutionMode::IpcSystemd => {
-                hyprstream_rpc::registry::EndpointMode::Ipc
-            }
-        }
+        hyprstream_rpc::registry::EndpointMode::Ipc
     }
 
     /// Whether this mode uses IPC sockets
     pub fn uses_ipc(&self) -> bool {
-        matches!(self, ExecutionMode::IpcStandalone | ExecutionMode::IpcSystemd)
+        true
     }
 
     /// Whether this mode uses systemd
@@ -113,7 +101,6 @@ impl ExecutionMode {
 impl std::fmt::Display for ExecutionMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ExecutionMode::Inproc => write!(f, "inproc"),
             ExecutionMode::IpcStandalone => write!(f, "ipc-standalone"),
             ExecutionMode::IpcSystemd => write!(f, "ipc-systemd"),
         }
