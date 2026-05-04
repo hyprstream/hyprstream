@@ -295,13 +295,17 @@ pub trait ZmqService: 'static {
         self.signing_key().verifying_key()
     }
 
-    /// Ed25519 verifying key for JWT token verification.
+    /// JWT key source for token verification.
     ///
-    /// Defaults to the purpose-derived key `HKDF(root, "hyprstream-jwt-v1")`.
-    /// Override if JWTs are signed with a different key.
-    fn jwt_verifying_key(&self) -> VerifyingKey {
-        crate::node_identity::derive_purpose_key(&self.signing_key(), "hyprstream-jwt-v1")
-            .verifying_key()
+    /// Returns the key source used to verify JWT signatures. Services must
+    /// provide this to enable JWT verification. Returns `None` by default,
+    /// which means JWT verification is skipped (anonymous access only).
+    ///
+    /// Most services should return a `ClusterKeySource` that trusts the
+    /// cluster's CA key. PolicyService may return a `FederatedKeySource`
+    /// for cross-cluster token exchange.
+    fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn crate::auth::JwtKeySource>> {
+        None
     }
 
     /// Expected audience (resource URL) for JWT validation.
@@ -309,27 +313,6 @@ pub trait ZmqService: 'static {
     /// When `Some`, `verify_claims()` rejects tokens whose `aud` claim doesn't match.
     /// Override this on services that should bind tokens to a specific resource.
     fn expected_audience(&self) -> Option<&str> {
-        None
-    }
-
-    /// Local OAuth issuer URL used to distinguish locally-issued JWTs from
-    /// federated ones. Return `None` to treat all tokens as local.
-    ///
-    /// When `Some(url)`, a JWT whose `iss` matches `url` (or is empty) is
-    /// verified with `self.verifying_key()`. Any other non-empty `iss` falls
-    /// through to `federation_key_source()`.
-    fn local_issuer_url(&self) -> Option<&str> {
-        None
-    }
-
-    /// Federation key resolver for multi-issuer JWT verification on the ZMQ path.
-    ///
-    /// Return `None` (default) to disable federated JWT acceptance. Services that
-    /// accept external / network traffic should return `Some(Arc<dyn FederationKeySource>)`.
-    /// Internal-only services (workers, workflows) keep the default.
-    fn federation_key_source(
-        &self,
-    ) -> Option<std::sync::Arc<dyn crate::auth::FederationKeySource>> {
         None
     }
 
@@ -354,12 +337,12 @@ pub trait ZmqService: 'static {
     ) {
     }
 
-    /// E2E JWT verification with federation and downgrade attack protection.
+    /// E2E JWT verification with unified key source.
     ///
     /// Called by `process_request` after envelope signature verification.
     /// Takes `&mut EnvelopeContext` to store the resolved `jwt_subject` directly,
     /// which correctly distinguishes local tokens (bare `sub`) from federated
-    /// ones (`iss:sub` format) using this service's `local_issuer_url()`.
+    /// ones (`iss:sub` format) using the key source's `local_issuers()`.
     /// Async because federated key resolution may require an HTTP JWKS fetch.
     ///
     /// Prefers `jwt_token` (opaque token string) over legacy `claims` field.
@@ -380,65 +363,55 @@ pub trait ZmqService: 'static {
             return Ok(());
         };
 
+        // Get key source — if not configured, JWT verification is disabled
+        let key_source = match self.jwt_key_source() {
+            Some(ks) => ks,
+            None => {
+                tracing::warn!(
+                    service = self.name(),
+                    "JWT present but jwt_key_source() not configured — rejecting"
+                );
+                anyhow::bail!("JWT verification not configured for this service");
+            }
+        };
+
         // Decode the JWT to get claims for issuer routing
         let unverified = crate::auth::decode_unverified(&token)
             .map_err(|e| anyhow::anyhow!("JWT decode failed: {}", e))?;
 
-        let local_url = self.local_issuer_url();
-        let local_issuers: &[&str] = match local_url {
-            Some(ref u) => std::slice::from_ref(u),
-            None => &[],
-        };
-
-        if unverified.is_local_to(local_issuers) {
-            // --- Local token path ---
-            let verified = crate::auth::decode(&token, &self.jwt_verifying_key(), self.expected_audience())
-                .map_err(|e| {
-                    tracing::warn!("Local JWT verification failed: {}", e);
-                    anyhow::anyhow!("JWT verification failed")
-                })?;
-
-            // Store verified claims on context for downstream use
-            let s = verified.subject(local_issuers);
-            if !s.is_anonymous() {
-                ctx.jwt_subject = Some(s);
-            }
-            ctx.claims = Some(verified);
-        } else {
-            // --- Federated token path ---
-            let resolver = self.federation_key_source().ok_or_else(|| {
-                tracing::warn!(
-                    "Federated JWT rejected: no FederationKeySource configured (iss={})",
-                    unverified.iss
-                );
-                anyhow::anyhow!("Federated JWT rejected: federation not configured")
-            })?;
-
-            if !resolver.is_trusted(&unverified.iss) {
-                tracing::warn!(
-                    "Federated JWT from untrusted issuer rejected (iss={})",
-                    unverified.iss
-                );
-                anyhow::bail!("Federated JWT issuer not trusted");
-            }
-
-            let fed_key = resolver.get_key(&unverified.iss).await.map_err(|e| {
-                tracing::warn!(
-                    "Federation key resolution failed for iss={}: {}",
-                    unverified.iss, e
-                );
-                anyhow::anyhow!("Federation key resolution failed")
-            })?;
-
-            let verified = crate::auth::decode_with_key(&token, &fed_key, self.expected_audience())
-                .map_err(|e| anyhow::anyhow!("Federated JWT signature invalid: {}", e))?;
-
-            let s = verified.subject(local_issuers);
-            if !s.is_anonymous() {
-                ctx.jwt_subject = Some(s);
-            }
-            ctx.claims = Some(verified);
+        // Check if issuer is trusted
+        if !key_source.is_trusted(&unverified.iss) {
+            tracing::warn!(
+                "JWT from untrusted issuer rejected (iss={})",
+                unverified.iss
+            );
+            anyhow::bail!("JWT issuer not trusted: {}", unverified.iss);
         }
+
+        // Get verifying key from key source
+        let verifying_key = key_source.get_key(&unverified.iss).await.map_err(|e| {
+            tracing::warn!(
+                "JWT key resolution failed for iss={}: {}",
+                unverified.iss, e
+            );
+            anyhow::anyhow!("JWT key resolution failed")
+        })?;
+
+        // Verify JWT signature
+        let verified = crate::auth::decode_with_key(&token, &verifying_key, self.expected_audience())
+            .map_err(|e| {
+                tracing::warn!("JWT verification failed: {}", e);
+                anyhow::anyhow!("JWT verification failed")
+            })?;
+
+        // Store verified claims on context for downstream use
+        let local_issuers = key_source.local_issuers();
+        let local_issuers_refs: Vec<&str> = local_issuers.iter().map(String::as_str).collect();
+        let s = verified.subject(&local_issuers_refs);
+        if !s.is_anonymous() {
+            ctx.jwt_subject = Some(s);
+        }
+        ctx.claims = Some(verified.clone());
 
         // R2: Bind JWT pub_key claim to envelope signer for ALL tokens.
         // When a JWT carries a pub_key (Ed25519 pubkey, base64url), the envelope's
@@ -480,7 +453,7 @@ pub trait ZmqService: 'static {
                                 anyhow::bail!("Invalid Ed25519 verifying key in JWT");
                             }
                         };
-                        let subject_str = claims.subject(local_issuers);
+                        let subject_str = claims.subject(&local_issuers_refs);
                         if let Some(subject_name) = subject_str.name() {
                             self.cache_key_binding(
                                 vk,

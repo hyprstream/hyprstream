@@ -91,11 +91,8 @@ pub struct WorkerService {
     authorize_fn: Option<AuthorizeFn>,
     /// Expected JWT audience for token validation (RFC 8707).
     expected_audience: Option<String>,
-    /// Local OAuth issuer URL — JWTs whose `iss` matches this are treated as
-    /// locally-issued tokens rather than federated ones.
-    local_issuer_url: Option<String>,
-    /// Federation key source for verifying externally-issued JWTs.
-    federation_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>>,
+    /// JWT key source for verifying JWTs (local and federated).
+    jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
 }
 
 impl WorkerService {
@@ -130,8 +127,7 @@ impl WorkerService {
             signing_key,
             authorize_fn: None,
             expected_audience: None,
-            local_issuer_url: None,
-            federation_key_source: None,
+            jwt_key_source: None,
         })
     }
 
@@ -145,17 +141,12 @@ impl WorkerService {
         self.expected_audience = Some(audience);
     }
 
-    /// Set the local OAuth issuer URL so that locally-issued JWTs are accepted.
-    pub fn set_local_issuer_url(&mut self, url: String) {
-        self.local_issuer_url = Some(url);
-    }
-
-    /// Set the federation key source for verifying externally-issued JWTs.
-    pub fn set_federation_key_source(
+    /// Set the JWT key source for verifying JWTs (local and federated).
+    pub fn set_jwt_key_source(
         &mut self,
-        src: std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>,
+        src: std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>,
     ) {
-        self.federation_key_source = Some(src);
+        self.jwt_key_source = Some(src);
     }
 
     /// Initialize the service (start warm pool)
@@ -1324,14 +1315,8 @@ impl ZmqService for WorkerService {
         self.expected_audience.as_deref()
     }
 
-    fn local_issuer_url(&self) -> Option<&str> {
-        self.local_issuer_url.as_deref()
-    }
-
-    fn federation_key_source(
-        &self,
-    ) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>> {
-        self.federation_key_source.clone()
+    fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>> {
+        self.jwt_key_source.clone()
     }
 }
 

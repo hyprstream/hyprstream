@@ -218,11 +218,8 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     );
     if let Some(issuer) = ctx.oauth_issuer_url() {
         policy_service = policy_service.with_default_audience(issuer.to_owned());
-        policy_service = policy_service.with_local_issuer_url(issuer.to_owned());
     }
-    if let Some(fed) = ctx.federation_key_source() {
-        policy_service = policy_service.with_federation_key_source(fed);
-    }
+    policy_service = policy_service.with_jwt_key_source(ctx.cluster_key_source());
 
     Ok(ctx.into_spawnable_quic(policy_service, config.policy.quic_port))
 }
@@ -261,11 +258,8 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     })?;
     if let Some(issuer) = ctx.oauth_issuer_url() {
         registry_service = registry_service.with_expected_audience(issuer.to_owned());
-        registry_service = registry_service.with_local_issuer_url(issuer.to_owned());
     }
-    if let Some(fed) = ctx.federation_key_source() {
-        registry_service = registry_service.with_federation_key_source(fed);
-    }
+    registry_service = registry_service.with_jwt_key_source(ctx.cluster_key_source());
 
     Ok(ctx.into_spawnable_quic(registry_service, config.registry.quic_port))
 }
@@ -302,7 +296,7 @@ fn create_streams_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Factory for ModelService (model lifecycle management)
-#[service_factory("model", schema = "../../../hyprstream-rpc-std/schema/model.capnp", metadata = crate::services::generated::model_client::schema_metadata, depends_on = ["policy", "registry", "discovery"])]
+#[service_factory("model", schema = "../../../hyprstream-rpc-std/schema/model.capnp", metadata = crate::services::generated::model_client::schema_metadata, depends_on = ["policy", "registry", "discovery", "notification"])]
 fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating ModelService");
 
@@ -331,8 +325,12 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     );
 
     let mut model_service = tokio::task::block_in_place(|| {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(ModelService::new(
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to create runtime for model factory");
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, ModelService::new(
             ModelServiceConfig::default(),
             sk.clone(),
             policy_client,
@@ -343,11 +341,8 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     })?;
     if let Some(issuer) = ctx.oauth_issuer_url() {
         model_service = model_service.with_expected_audience(issuer.to_owned());
-        model_service = model_service.with_local_issuer_url(issuer.to_owned());
     }
-    if let Some(fed) = ctx.federation_key_source() {
-        model_service = model_service.with_federation_key_source(fed);
-    }
+    model_service = model_service.with_jwt_key_source(ctx.cluster_key_source());
 
     Ok(ctx.into_spawnable_quic(model_service, config.model.quic_port))
 }
@@ -441,11 +436,8 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     worker_service.set_authorize_fn(super::worker::build_authorize_fn(policy_client));
     if let Some(issuer) = ctx.oauth_issuer_url() {
         worker_service.set_expected_audience(issuer.to_owned());
-        worker_service.set_local_issuer_url(issuer.to_owned());
     }
-    if let Some(fed) = ctx.federation_key_source() {
-        worker_service.set_federation_key_source(fed);
-    }
+    worker_service.set_jwt_key_source(ctx.cluster_key_source());
 
     Ok(ctx.into_spawnable_quic(worker_service, worker_quic_port))
 }
@@ -602,6 +594,7 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
         global_context(),
         ctx.transport("oauth", SocketKind::Rep),
         ctx.verifying_key(),
+        ctx.jwt_verifying_key(),
     );
 
     Ok(Box::new(oauth_service))
@@ -646,8 +639,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         ctx: None, // ServiceContext not yet available as Arc — handlers use signing_key directly
         policy_verifying_key: policy_vk,
         expected_audience: Some(config.mcp.resource_url()),
-        local_issuer_url: oauth_issuer.clone(),
-        federation_key_source: federation_key_source.clone(),
+        jwt_key_source: Some(ctx.cluster_key_source()),
     };
 
     // Clone config for HTTP/SSE server before consuming it for ZMQ service
@@ -917,12 +909,9 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
      .with_vfs(vfs_ns, vfs_subject);
 
     if let Some(issuer) = ctx.oauth_issuer_url() {
-        tui_service = tui_service.with_local_issuer_url(issuer.to_owned());
         tui_service = tui_service.with_expected_audience(issuer.to_owned());
     }
-    if let Some(fed) = ctx.federation_key_source() {
-        tui_service = tui_service.with_federation_key_source(fed);
-    }
+    tui_service = tui_service.with_jwt_key_source(ctx.cluster_key_source());
 
     Ok(ctx.into_spawnable_quic(tui_service, tui_config.quic_port))
 }
@@ -963,6 +952,7 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
         // Use the issuer URL as the audience for discovery tokens
         discovery_service = discovery_service.with_expected_audience(issuer.to_owned());
     }
+    discovery_service = discovery_service.with_jwt_key_source(ctx.cluster_key_source());
 
     // Pre-compute TLS endorsement if QUIC is enabled with a TLS cert.
     // Uses the root verifying key — TLS endorsement is a node-level trust assertion,
@@ -1014,12 +1004,9 @@ fn create_notification_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn S
         ctx.transport("notification", SocketKind::Rep),
     ).with_policy_client(policy_client);
     if let Some(issuer) = ctx.oauth_issuer_url() {
-        notification_service = notification_service.with_local_issuer_url(issuer.to_owned());
         notification_service = notification_service.with_expected_audience(issuer.to_owned());
     }
-    if let Some(fed) = ctx.federation_key_source() {
-        notification_service = notification_service.with_federation_key_source(fed);
-    }
+    notification_service = notification_service.with_jwt_key_source(ctx.cluster_key_source());
 
     Ok(ctx.into_spawnable(notification_service))
 }
@@ -1082,11 +1069,8 @@ fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
     );
     if let Some(issuer) = ctx.oauth_issuer_url() {
         metrics_service = metrics_service.with_expected_audience(issuer.to_owned());
-        metrics_service = metrics_service.with_local_issuer_url(issuer.to_owned());
     }
-    if let Some(fed) = ctx.federation_key_source() {
-        metrics_service = metrics_service.with_federation_key_source(fed);
-    }
+    metrics_service = metrics_service.with_jwt_key_source(ctx.cluster_key_source());
 
     Ok(ctx.into_spawnable_quic(metrics_service, mc.quic_port))
 }

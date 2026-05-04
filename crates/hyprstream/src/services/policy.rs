@@ -64,10 +64,8 @@ pub struct PolicyService {
     /// Default audience for issued tokens (OAuth issuer URL, shared instance identifier).
     /// Used when IssueToken.audience is empty, ensuring all tokens get an `aud` claim.
     default_audience: Option<String>,
-    /// Local OAuth issuer URL for distinguishing local vs. federated JWTs.
-    local_issuer_url: Option<String>,
-    /// Federation key source for verifying externally-issued JWTs.
-    federation_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>>,
+    /// JWT key source for verifying JWTs (local and federated).
+    jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
     // Infrastructure (for Spawnable)
     context: Arc<zmq::Context>,
     transport: TransportConfig,
@@ -97,8 +95,7 @@ impl PolicyService {
             git2db,
             registry_repo_id,
             default_audience: None,
-            local_issuer_url: None,
-            federation_key_source: None,
+            jwt_key_source: None,
             context,
             transport,
             event_prefixes: RwLock::new(HashMap::new()),
@@ -111,18 +108,12 @@ impl PolicyService {
         self
     }
 
-    /// Set the local OAuth issuer URL for distinguishing local vs. federated JWTs.
-    pub fn with_local_issuer_url(mut self, url: String) -> Self {
-        self.local_issuer_url = Some(url);
-        self
-    }
-
-    /// Set the federation key source for verifying externally-issued JWTs.
-    pub fn with_federation_key_source(
+    /// Set the JWT key source for verifying JWTs (local and federated).
+    pub fn with_jwt_key_source(
         mut self,
-        src: std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>,
+        src: std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>,
     ) -> Self {
-        self.federation_key_source = Some(src);
+        self.jwt_key_source = Some(src);
         self
     }
 
@@ -312,7 +303,7 @@ impl PolicyHandler for PolicyService {
 
         // Service tokens: derive the Ed25519 pubkey from the root key.
         // The CA (PolicyService) is authoritative — the pubkey is not caller-provided.
-        // User tokens: use the caller-provided pubkey (from OAuth Ed25519 challenge-response).
+        // User tokens: use the caller-provided pubkey (from OAuth consent page).
         let service_pub_key = if is_service_token {
             let svc_name = &subject["service:".len()..];
             let svc_signing_key = hyprstream_rpc::node_identity::derive_purpose_key(
@@ -1309,14 +1300,8 @@ impl ZmqService for PolicyService {
         self.default_audience.as_deref()
     }
 
-    fn local_issuer_url(&self) -> Option<&str> {
-        self.local_issuer_url.as_deref()
-    }
-
-    fn federation_key_source(
-        &self,
-    ) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>> {
-        self.federation_key_source.clone()
+    fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>> {
+        self.jwt_key_source.clone()
     }
 
     fn resolve_key_subject(&self, signer_pubkey: &[u8; 32]) -> Option<hyprstream_rpc::envelope::Subject> {

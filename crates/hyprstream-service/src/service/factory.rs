@@ -465,6 +465,7 @@ impl ServiceContext {
     /// Lookup order:
     /// 1. `service_keys` registry (independent keypair per service)
     /// 2. PolicyService special case (returns root key — it IS the CA)
+    /// 3. "multi" fallback (multi-service IPC mode shares one key for all services)
     ///
     /// Panics if no key is registered. Ensure `generate_independent_service_keys()`
     /// was called (inproc) or the service's own key was loaded from credentials (IPC).
@@ -474,6 +475,10 @@ impl ServiceContext {
         }
         if service_name == "policy" {
             return self.signing_key.clone();
+        }
+        // Multi-service IPC mode registers a single "multi" key; fall back to it.
+        if let Some(sk) = self.service_keys.get("multi") {
+            return sk.clone();
         }
         panic!(
             "service_signing_key({service_name}): no independent key registered. \
@@ -505,6 +510,21 @@ impl ServiceContext {
                  generate_independent_service_keys() was called (inproc mode)."
             ),
         }
+    }
+
+    /// Create a ClusterKeySource for regular services.
+    ///
+    /// This is the standard key source for services within a cluster. It trusts
+    /// only the cluster's CA key (from PolicyService) for JWT verification.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ca_verifying_key` is not set.
+    pub fn cluster_key_source(&self) -> std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource> {
+        std::sync::Arc::new(hyprstream_rpc::auth::ClusterKeySource::new(
+            self.jwt_verifying_key(),
+            self.oauth_issuer_url().unwrap_or_default().to_owned(),
+        ))
     }
 
     /// Get the identity provider for purpose-keyed signing.

@@ -148,11 +148,8 @@ pub struct TuiService {
     policy_client: Option<PolicyClient>,
     /// Expected audience (resource URL) for JWT validation.
     expected_audience: Option<String>,
-    /// Local OAuth issuer URL — JWTs whose `iss` matches this are treated as
-    /// locally-issued tokens rather than federated ones.
-    local_issuer_url: Option<String>,
-    /// Federation key source for verifying externally-issued JWTs.
-    federation_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>>,
+    /// JWT key source for verifying tokens (local and federated).
+    jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
     /// Shared VFS namespace for ChatApps spawned via RPC.
     vfs_ns: Option<std::sync::Arc<hyprstream_vfs::Namespace>>,
     /// VFS subject identity for ChatApps spawned via RPC.
@@ -180,8 +177,7 @@ impl TuiService {
             stdin_queues: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             policy_client: None,
             expected_audience: None,
-            local_issuer_url: None,
-            federation_key_source: None,
+            jwt_key_source: None,
             vfs_ns: None,
             vfs_subject: None,
             vfs_proxy_tx: std::sync::OnceLock::new(),
@@ -200,18 +196,12 @@ impl TuiService {
         self
     }
 
-    /// Set the local OAuth issuer URL so that locally-issued JWTs are accepted.
-    pub fn with_local_issuer_url(mut self, url: String) -> Self {
-        self.local_issuer_url = Some(url);
-        self
-    }
-
-    /// Set the federation key source for verifying externally-issued JWTs.
-    pub fn with_federation_key_source(
+    /// Set the JWT key source for verifying tokens.
+    pub fn with_jwt_key_source(
         mut self,
-        src: std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>,
+        src: std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>,
     ) -> Self {
-        self.federation_key_source = Some(src);
+        self.jwt_key_source = Some(src);
         self
     }
 
@@ -1556,14 +1546,8 @@ impl ZmqService for TuiService {
         self.expected_audience.as_deref()
     }
 
-    fn local_issuer_url(&self) -> Option<&str> {
-        self.local_issuer_url.as_deref()
-    }
-
-    fn federation_key_source(
-        &self,
-    ) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>> {
-        self.federation_key_source.clone()
+    fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>> {
+        self.jwt_key_source.clone()
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {

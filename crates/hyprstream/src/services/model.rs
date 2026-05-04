@@ -144,10 +144,8 @@ pub struct ModelServiceInner {
     transport: TransportConfig,
     /// Expected JWT audience for token validation (RFC 8707).
     expected_audience: Option<String>,
-    /// Local OAuth issuer URL for distinguishing local vs. federated JWTs.
-    local_issuer_url: Option<String>,
-    /// Federation key source for verifying externally-issued JWTs.
-    federation_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>>,
+    /// Unified JWT key source for verifying JWTs (local and federated).
+    jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
     /// Persistent 9P synthetic tree for the fs scope (lazily initialized).
     fs_tree: std::sync::OnceLock<crate::services::fs::SyntheticTree>,
 }
@@ -222,8 +220,7 @@ impl ModelService {
             context,
             transport,
             expected_audience: None,
-            local_issuer_url: None,
-            federation_key_source: None,
+            jwt_key_source: None,
             fs_tree: std::sync::OnceLock::new(),
         })})
     }
@@ -241,30 +238,18 @@ impl ModelService {
         self
     }
 
-    /// Set the local OAuth issuer URL for distinguishing local vs. federated JWTs.
+    /// Set the unified JWT key source for verifying JWTs.
     ///
     /// # Panics
     /// Panics if called after the service has been cloned (Arc refcount > 1).
     #[allow(clippy::expect_used)]
-    pub fn with_local_issuer_url(mut self, url: String) -> Self {
-        Arc::get_mut(&mut self.inner)
-            .expect("with_local_issuer_url must be called before service is shared")
-            .local_issuer_url = Some(url);
-        self
-    }
-
-    /// Set the federation key source for verifying externally-issued JWTs.
-    ///
-    /// # Panics
-    /// Panics if called after the service has been cloned (Arc refcount > 1).
-    #[allow(clippy::expect_used)]
-    pub fn with_federation_key_source(
+    pub fn with_jwt_key_source(
         mut self,
-        src: std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>,
+        src: std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>,
     ) -> Self {
         Arc::get_mut(&mut self.inner)
-            .expect("with_federation_key_source must be called before service is shared")
-            .federation_key_source = Some(src);
+            .expect("with_jwt_key_source must be called before service is shared")
+            .jwt_key_source = Some(src);
         self
     }
 
@@ -313,8 +298,7 @@ impl ModelService {
             context,
             transport,
             expected_audience: None,
-            local_issuer_url: None,
-            federation_key_source: None,
+            jwt_key_source: None,
             fs_tree: std::sync::OnceLock::new(),
         })})
     }
@@ -422,11 +406,8 @@ impl ModelService {
         if let Some(ref aud) = self.expected_audience {
             service_config = service_config.with_expected_audience(aud.clone());
         }
-        if let Some(ref url) = self.local_issuer_url {
-            service_config = service_config.with_local_issuer_url(url.clone());
-        }
-        if let Some(ref fed) = self.federation_key_source {
-            service_config = service_config.with_federation_key_source(fed.clone());
+        if let Some(ref src) = self.jwt_key_source {
+            service_config = service_config.with_jwt_key_source(src.clone());
         }
         let service_handle = spawner.spawn(service_config).await
             .map_err(|e| anyhow!("Failed to spawn inference service: {}", e))?;
@@ -1445,14 +1426,8 @@ impl crate::services::ZmqService for ModelService {
         self.expected_audience.as_deref()
     }
 
-    fn local_issuer_url(&self) -> Option<&str> {
-        self.inner.local_issuer_url.as_deref()
-    }
-
-    fn federation_key_source(
-        &self,
-    ) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>> {
-        self.inner.federation_key_source.clone()
+    fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>> {
+        self.inner.jwt_key_source.clone()
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {

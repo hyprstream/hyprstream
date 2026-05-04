@@ -27,7 +27,6 @@
 //! ```
 
 pub mod authorize;
-pub mod challenge;
 pub mod device;
 pub mod federation_entity;
 pub mod jwks;
@@ -37,24 +36,29 @@ pub mod oidc_callback;
 pub mod oidc_discovery;
 pub mod registration;
 pub mod revocation;
+pub mod scim;
+pub mod scim_types;
 pub mod session;
 pub mod state;
 pub mod token;
 pub mod user_mapping;
 pub mod user_service;
-pub mod scim;
-pub mod scim_types;
 pub mod userinfo;
 pub mod zmq_handler;
 
 use std::sync::Arc;
 
 use anyhow::Result;
-use axum::{extract::State, response::IntoResponse, routing::{get, post}, Router};
+use axum::{
+    extract::State,
+    response::IntoResponse,
+    routing::{get, post},
+    Router,
+};
 use hyprstream_rpc::registry::SocketKind;
 use hyprstream_rpc::service::{RequestLoop, ZmqService};
-use hyprstream_service::Spawnable;
 use hyprstream_rpc::transport::TransportConfig;
+use hyprstream_service::Spawnable;
 use tokio::sync::Notify;
 use tracing::info;
 
@@ -92,13 +96,16 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             "/oauth/device/verify",
             get(device::verify_get).post(device::verify_post),
         )
-        .route("/oauth/device/nonce", get(device::device_nonce))
         .route(
             "/oauth/userinfo",
             get(userinfo::userinfo).post(userinfo::userinfo),
         )
         .route("/oauth/revoke", post(revocation::revoke_token))
         .route("/oauth/logout", post(handle_logout))
+        .route(
+            "/oauth/login",
+            get(login_page::login_get).post(login_page::login_post),
+        )
         .route(
             "/oauth/external/authorize/:provider",
             get(oidc_callback::external_authorize),
@@ -132,12 +139,14 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             "/.well-known/openid-federation",
             get(federation_entity::entity_configuration),
         )
-        .layer(axum::middleware::from_fn(|req: axum::extract::Request, next: axum::middleware::Next| async move {
-            let method = req.method().clone();
-            let uri = req.uri().clone();
-            tracing::info!(%method, %uri, "OAuth request");
-            next.run(req).await
-        }));
+        .layer(axum::middleware::from_fn(
+            |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                let method = req.method().clone();
+                let uri = req.uri().clone();
+                tracing::info!(%method, %uri, "OAuth request");
+                next.run(req).await
+            },
+        ));
 
     // CORS outermost (added last = runs first on request)
     if cors_config.enabled {
@@ -157,9 +166,13 @@ async fn handle_logout(
     }
     (
         axum::http::StatusCode::OK,
-        [(axum::http::header::SET_COOKIE, session::clear_session_cookie())],
+        [(
+            axum::http::header::SET_COOKIE,
+            session::clear_session_cookie(),
+        )],
         "Logged out",
-    ).into_response()
+    )
+        .into_response()
 }
 
 /// RFC 9728 Protected Resource Metadata for the OAuth server itself.
@@ -168,35 +181,19 @@ async fn handle_logout(
 /// browsers can bootstrap a WebTransport connection via DiscoveryService,
 /// then resolve all other service endpoints from there.
 ///
-/// Queries the DiscoveryService via ZMQ IPC to get its QUIC endpoint address,
-/// since each service runs in a separate process and the in-process registry
-/// only contains endpoints registered by that process.
+/// Uses the cached discovery URL (resolved at startup) to avoid RPC calls
+/// in HTTP handlers, which would require LocalSet context.
 async fn oauth_self_protected_resource_metadata(
     State(state): State<Arc<OAuthState>>,
 ) -> axum::Json<ProtectedResourceMetadata> {
     let config = crate::config::HyprConfig::load().unwrap_or_default();
     let issuer_url = config.oauth.issuer_url();
 
-    // Query the DiscoveryService (via ZMQ IPC) for its own QUIC endpoint.
-    let discovery_url = match state.discovery_client.get_endpoints("discovery").await {
-        Ok(service_endpoints) => service_endpoints
-            .endpoints
-            .iter()
-            .find(|ep| ep.socket_kind == "quic")
-            .and_then(|ep| {
-                // Parse "quic://server_name:bind_ip:port" into "https://server_name:port"
-                let stripped = ep.endpoint.strip_prefix("quic://")?;
-                let parts: Vec<&str> = stripped.splitn(3, ':').collect();
-                if parts.len() >= 3 {
-                    Some(format!("https://{}:{}", parts[0], parts[2]))
-                } else {
-                    None
-                }
-            }),
-        Err(_) => None,
-    };
-
-    let resource = discovery_url.unwrap_or_else(|| issuer_url.clone());
+    // Use cached discovery URL (resolved at startup with LocalSet context)
+    let resource = state
+        .cached_discovery_url
+        .clone()
+        .unwrap_or_else(|| issuer_url.clone());
 
     let mut meta = protected_resource_metadata(&resource, &issuer_url);
     meta.resource_name = Some("HyprStream OAuth 2.1 Authorization Server".to_owned());
@@ -209,7 +206,9 @@ async fn oauth_self_protected_resource_metadata(
 
     // Include the QUIC TLS cert hash so browsers can pin the self-signed certificate.
     if let Ok((cert_chain, _)) = config.quic.load_tls_materials() {
-        meta.x_cert_hash = Some(hyprstream_rpc::transport::zmtp_quic::cert_hash(&cert_chain[0]));
+        meta.x_cert_hash = Some(hyprstream_rpc::transport::zmtp_quic::cert_hash(
+            &cert_chain[0],
+        ));
     }
 
     axum::Json(meta)
@@ -235,6 +234,9 @@ pub struct OAuthService {
     control_transport: TransportConfig,
     #[allow(dead_code)]
     verifying_key: ed25519_dalek::VerifyingKey,
+    /// JWT verifying key (CA key) for JWKS endpoint. This is the key that verifies
+    /// JWTs signed by PolicyService, derived from the root signing key.
+    jwt_verifying_key: [u8; 32],
 }
 
 impl OAuthService {
@@ -245,6 +247,7 @@ impl OAuthService {
         context: Arc<zmq::Context>,
         control_transport: TransportConfig,
         verifying_key: ed25519_dalek::VerifyingKey,
+        jwt_verifying_key: ed25519_dalek::VerifyingKey,
     ) -> Self {
         Self {
             config,
@@ -253,6 +256,7 @@ impl OAuthService {
             context,
             control_transport,
             verifying_key,
+            jwt_verifying_key: jwt_verifying_key.to_bytes(),
         }
     }
 }
@@ -275,12 +279,15 @@ impl Spawnable for OAuthService {
         shutdown: Arc<Notify>,
         on_ready: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<(), hyprstream_rpc::error::RpcError> {
-        let rt = tokio::runtime::Builder::new_multi_thread()
+        // Use single-threaded runtime + LocalSet because HTTP handlers make ZMQ RPC
+        // calls (e.g., policy_client.issue_token()), and ZMQ clients use spawn_local.
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("runtime: {e}")))?;
 
-        rt.block_on(async move {
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async move {
             let addr_str = format!("{}:{}", self.config.host, self.config.port);
             let addr: std::net::SocketAddr = addr_str.parse().map_err(|e| {
                 hyprstream_rpc::error::RpcError::SpawnFailed(format!("Invalid address: {e}"))
@@ -301,8 +308,8 @@ impl Spawnable for OAuthService {
             // async I/O (TMQ) registers socket FDs with THIS runtime's epoll.
             // Creating them in the factory (main runtime) would cause hangs.
 
-            // Bootstrap: PolicyClient requires the policy service's verifying key.
-            // The trust store holds PolicyService's key — populated during startup.
+            // Bootstrap: Get service verifying keys from trust store.
+            // The trust store is populated during startup by depends_on services.
             let policy_vk = match hyprstream_service::global_trust_store().resolve_one("policy") {
                 Some(vk) => vk,
                 None => {
@@ -317,24 +324,24 @@ impl Spawnable for OAuthService {
                 None,
             );
 
-            // Resolve discovery service verifying key via PolicyService RPC.
-            let key_resp = policy_client.resolve_service_key(
-                &crate::services::generated::policy_client::ResolveServiceKey {
-                    service_name: "discovery".to_owned(),
-                },
-            ).await.map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("resolve discovery key: {e}")))?;
-            let discovery_vk = ed25519_dalek::VerifyingKey::from_bytes(
-                key_resp.verifying_key.as_slice().try_into()
-                    .map_err(|_| hyprstream_rpc::error::RpcError::SpawnFailed("Invalid verifying key length".to_owned()))?,
-            ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("Invalid Ed25519 key: {e}")))?;
+            // Get discovery key from trust store (populated by depends_on = ["discovery"]).
+            // Using trust store avoids RPC calls which require LocalSet context.
+            let discovery_vk = match hyprstream_service::global_trust_store().resolve_one("discovery") {
+                Some(vk) => vk,
+                None => {
+                    return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                        "trust store has no discovery key — ensure discovery is in depends_on".to_owned(),
+                    ));
+                }
+            };
             let discovery_client = crate::services::DiscoveryClient::for_service(
                 self.signing_key.clone(),
                 discovery_vk,
                 None,
             );
 
-            // Attempt to load the user credential store for Ed25519 device verification.
-            // Failure is non-fatal; the verify endpoint will report "not configured" instead.
+            // Load the user store (RocksDB for concurrent access).
+            // Failure is non-fatal; endpoints will report "not configured" instead.
             let user_store: Option<Box<dyn crate::auth::user_store::UserStore + Send + Sync>> = {
                 let credentials_dir = crate::config::HyprConfig::load()
                     .map(|c| c.config_dir().join("credentials"))
@@ -344,14 +351,14 @@ impl Spawnable for OAuthService {
                             .join("hyprstream")
                             .join("credentials")
                     });
-                match crate::auth::user_store::LocalKeyStore::load(&credentials_dir) {
+                match crate::auth::RocksDbUserStore::open(&credentials_dir) {
                     Ok(store) => {
-                        info!("User credential store loaded from {:?}", credentials_dir);
+                        info!("User store (RocksDB) opened at {:?}", credentials_dir);
                         Some(Box::new(store))
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "Could not load user credential store (device verify will require manual setup): {}",
+                            "Could not open user store (endpoints will report 'not configured'): {}",
                             e
                         );
                         None
@@ -359,20 +366,56 @@ impl Spawnable for OAuthService {
                 }
             };
 
-            // Create shared state — JWKS serves the purpose-derived JWT verifying key
-            let jwt_verifying_key = hyprstream_rpc::node_identity::derive_purpose_key(
-                &self.signing_key, "hyprstream-jwt-v1"
-            ).verifying_key().to_bytes();
+            // Create shared state — JWKS serves the CA JWT verifying key (from PolicyService)
+            let jwt_verifying_key = self.jwt_verifying_key;
             let mut oauth_state = OAuthState::new(
                 &self.config,
                 policy_client,
-                discovery_client,
+                discovery_client.clone(),
                 jwt_verifying_key,
             );
             if let Some(store) = user_store {
                 oauth_state = oauth_state.with_user_store(store);
             }
             oauth_state = oauth_state.with_signing_key(self.signing_key.clone());
+
+            // Resolve discovery URL at startup with LocalSet (RPC calls need LocalSet context).
+            // Cache it so HTTP handlers don't need to make RPC calls.
+            let cached_discovery_url = {
+                let dc = discovery_client;
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("failed to create discovery resolve runtime");
+                    let local = tokio::task::LocalSet::new();
+                    local.block_on(&rt, async {
+                        match dc.get_endpoints("discovery").await {
+                            Ok(service_endpoints) => service_endpoints
+                                .endpoints
+                                .iter()
+                                .find(|ep| ep.socket_kind == "quic")
+                                .and_then(|ep| {
+                                    let stripped = ep.endpoint.strip_prefix("quic://")?;
+                                    let parts: Vec<&str> = stripped.splitn(3, ':').collect();
+                                    if parts.len() >= 3 {
+                                        Some(format!("https://{}:{}", parts[0], parts[2]))
+                                    } else {
+                                        None
+                                    }
+                                }),
+                            Err(_) => None,
+                        }
+                    })
+                })
+                .join()
+                .ok()
+                .flatten()
+            };
+            if let Some(url) = cached_discovery_url {
+                oauth_state = oauth_state.with_cached_discovery_url(url);
+            }
+
             let state = Arc::new(oauth_state);
             state.spawn_code_sweeper();
 
@@ -390,11 +433,12 @@ impl Spawnable for OAuthService {
             let _ = hyprstream_rpc::notify::ready();
 
             // ZMQ RPC loop for user CRUD (alongside HTTP server)
+            // Must use spawn_local because RequestLoop uses spawn_local internally
             let zmq_transport = self.control_transport.clone();
             let zmq_context = Arc::clone(&self.context);
             let zmq_signing_key = self.signing_key.clone();
             let zmq_state = state.clone();
-            let zmq_loop = tokio::spawn(async move {
+            let zmq_loop = tokio::task::spawn_local(async move {
                 let handler = zmq_handler::OAuthZmqHandler::new(
                     zmq_state,
                     zmq_context,
@@ -444,7 +488,10 @@ pub struct ProtectedResourceMetadata {
 /// Create a Protected Resource Metadata response (RFC 9728).
 ///
 /// Used by MCP and OAI servers to advertise their OAuth authorization server.
-pub fn protected_resource_metadata(resource_url: &str, oauth_issuer_url: &str) -> ProtectedResourceMetadata {
+pub fn protected_resource_metadata(
+    resource_url: &str,
+    oauth_issuer_url: &str,
+) -> ProtectedResourceMetadata {
     ProtectedResourceMetadata {
         resource: resource_url.to_owned(),
         authorization_servers: vec![oauth_issuer_url.to_owned()],
@@ -458,38 +505,53 @@ pub fn protected_resource_metadata(resource_url: &str, oauth_issuer_url: &str) -
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::registration::validate_redirect_uri;
+    use super::*;
 
     #[test]
     fn test_protected_resource_metadata() {
-        let meta = protected_resource_metadata(
-            "http://localhost:6790",
-            "http://localhost:6791",
-        );
+        let meta = protected_resource_metadata("http://localhost:6790", "http://localhost:6791");
         assert_eq!(meta.resource, "http://localhost:6790");
         assert_eq!(meta.authorization_servers[0], "http://localhost:6791");
-        assert_eq!(meta.bearer_methods_supported.as_deref(), Some(&["header".to_owned()][..]));
+        assert_eq!(
+            meta.bearer_methods_supported.as_deref(),
+            Some(&["header".to_owned()][..])
+        );
     }
 
     #[test]
     fn test_validate_redirect_uri_exact_match() {
         let registered = vec!["http://127.0.0.1:3000/callback".to_owned()];
-        assert!(validate_redirect_uri("http://127.0.0.1:3000/callback", &registered));
+        assert!(validate_redirect_uri(
+            "http://127.0.0.1:3000/callback",
+            &registered
+        ));
         // Loopback URIs: port is ignored per RFC 8252, so different port still matches
-        assert!(validate_redirect_uri("http://127.0.0.1:4000/callback", &registered));
+        assert!(validate_redirect_uri(
+            "http://127.0.0.1:4000/callback",
+            &registered
+        ));
         // Different path should NOT match
-        assert!(!validate_redirect_uri("http://127.0.0.1:3000/other", &registered));
+        assert!(!validate_redirect_uri(
+            "http://127.0.0.1:3000/other",
+            &registered
+        ));
     }
 
     #[test]
     fn test_validate_redirect_uri_loopback_port_ignored() {
         let registered = vec!["http://127.0.0.1:3000/callback".to_owned()];
         // Different port on loopback should match per RFC 8252
-        assert!(validate_redirect_uri("http://127.0.0.1:9999/callback", &registered));
+        assert!(validate_redirect_uri(
+            "http://127.0.0.1:9999/callback",
+            &registered
+        ));
         // Non-loopback should require exact match
         let non_loopback = vec!["https://example.com:3000/callback".to_owned()];
-        assert!(!validate_redirect_uri("https://example.com:4000/callback", &non_loopback));
+        assert!(!validate_redirect_uri(
+            "https://example.com:4000/callback",
+            &non_loopback
+        ));
     }
 
     #[test]

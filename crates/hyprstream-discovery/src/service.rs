@@ -68,6 +68,8 @@ pub struct DiscoveryService {
     signing_key: Arc<SigningKey>,
     /// JWT verifying key for service JWT verification (derived from root via HKDF)
     jwt_verifying_key: hyprstream_rpc::prelude::VerifyingKey,
+    /// JWT key source for client JWT verification (ZmqService trait)
+    jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
     /// OAuth issuer URL for RFC 9728 metadata (None = not configured)
     oauth_issuer_url: Option<String>,
     /// Expected audience for JWT validation (resource URL)
@@ -103,6 +105,7 @@ impl DiscoveryService {
             started_at: Instant::now(),
             signing_key,
             jwt_verifying_key,
+            jwt_key_source: None,
             oauth_issuer_url: None,
             expected_audience: None,
             auth_provider: None,
@@ -134,6 +137,15 @@ impl DiscoveryService {
     /// Set the expected audience for JWT validation.
     pub fn with_expected_audience(mut self, audience: String) -> Self {
         self.expected_audience = Some(audience);
+        self
+    }
+
+    /// Set the JWT key source for client JWT verification.
+    pub fn with_jwt_key_source(
+        mut self,
+        src: std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>,
+    ) -> Self {
+        self.jwt_key_source = Some(src);
         self
     }
 
@@ -548,6 +560,10 @@ impl ZmqService for DiscoveryService {
 
     fn expected_audience(&self) -> Option<&str> {
         self.expected_audience.as_deref()
+    }
+
+    fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>> {
+        self.jwt_key_source.clone()
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
