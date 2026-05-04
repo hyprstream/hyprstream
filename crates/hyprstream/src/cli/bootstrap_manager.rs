@@ -17,10 +17,10 @@ use hyprstream_tui::wizard::backend::*;
 
 use crate::auth::identity_store;
 use crate::auth::policy_templates::{get_template, get_templates};
-use crate::auth::{LocalKeyStore, PolicyManager, UserStore};
+use crate::auth::{RocksDbUserStore, PolicyManager, UserStore};
 use crate::cli::gpu_detect;
 use crate::cli::policy_handlers::{
-    ensure_user_signing_key, load_or_generate_signing_key, mint_local_token, parse_duration,
+    load_or_generate_signing_key, mint_local_token, parse_duration,
 };
 
 
@@ -75,16 +75,29 @@ impl Drop for BootstrapManager {
     }
 }
 
-/// Returns true if this is the first run (no signing key exists yet).
+/// Returns true if this is the first run (no bootstrap completed yet).
 ///
 /// Used by the no-args entry point to decide between wizard and ShellClient.
-/// Checks the OS keyring directly — the canonical store for signing keys.
+/// Checks for the presence of `bootstrap-pubkeys` in the credentials directory,
+/// which is written at the end of a successful bootstrap.
 pub fn is_first_run(_models_dir: &std::path::Path) -> bool {
-    let entry = match keyring::Entry::new("hyprstream", "signing-key") {
-        Ok(e) => e,
-        Err(_) => return true,
-    };
-    matches!(entry.get_secret(), Err(keyring::Error::NoEntry))
+    // Check env var first — if signing key is provided externally, not first run
+    if std::env::var("HYPRSTREAM__SIGNING_KEY").is_ok() {
+        return false;
+    }
+
+    // Resolve credentials directory
+    let credentials_dir = crate::config::HyprConfig::load()
+        .map(|c| c.config_dir().join("credentials"))
+        .unwrap_or_else(|_| {
+            dirs::config_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("hyprstream")
+                .join("credentials")
+        });
+
+    // bootstrap-pubkeys is written last during bootstrap — best indicator
+    !credentials_dir.join("bootstrap-pubkeys").exists()
 }
 
 impl BootstrapManager {
@@ -138,7 +151,7 @@ impl BootstrapManager {
             return;
         }
         let credentials_dir = self.credentials_dir();
-        let mut store = match LocalKeyStore::load(&credentials_dir) {
+        let store = match RocksDbUserStore::open(&credentials_dir) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(
@@ -148,20 +161,10 @@ impl BootstrapManager {
                 return;
             }
         };
-        if store.get_pubkey(username).ok().flatten().is_some() {
+        if self.rt.block_on(store.get_profile(username)).ok().flatten().is_some() {
             return; // already registered
         }
-        let (_sk, vk) = match ensure_user_signing_key() {
-            Ok(pair) => pair,
-            Err(e) => {
-                tracing::warn!(
-                    username,
-                    "Failed to generate/load user identity key — user OAuth identity will not be registered: {e}"
-                );
-                return;
-            }
-        };
-        if let Err(e) = store.register(username, vk) {
+        if let Err(e) = self.rt.block_on(store.register(username)) {
             tracing::warn!(
                 username,
                 "Failed to register user identity in UserStore — user OAuth identity will not be registered: {e}"
