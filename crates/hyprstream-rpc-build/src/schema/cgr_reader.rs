@@ -49,7 +49,10 @@ pub fn parse_from_cgr(name: &str) -> Result<ParsedSchema, String> {
     // Fall back to dependency crate OUT_DIRs.
     // Cargo exposes DEP_<CRATE>_<KEY> from dependency build scripts.
     // hyprstream-rpc-std exports its OUT_DIR via `cargo:out_dir=...`
-    for env_key in ["DEP_HYPRSTREAM_RPC_STD_OUT_DIR", "DEP_HYPRSTREAM_RPC_OUT_DIR"] {
+    for env_key in [
+        "DEP_HYPRSTREAM_RPC_STD_OUT_DIR",
+        "DEP_HYPRSTREAM_RPC_OUT_DIR",
+    ] {
         if let Ok(dep_out_dir) = std::env::var(env_key) {
             let dep_cgr = Path::new(&dep_out_dir).join(format!("{name}.cgr"));
             if dep_cgr.exists() {
@@ -153,12 +156,24 @@ fn parse_cgr(
             let response_node = nodes.get(node_map[&resp_id].index);
 
             let rv = extract_union_variants(
-                request_node, &nodes, &node_map,
-                mcp_desc_id, param_desc_id, mcp_scope_id, cli_hidden_id, doc_example_id,
+                request_node,
+                &nodes,
+                &node_map,
+                mcp_desc_id,
+                param_desc_id,
+                mcp_scope_id,
+                cli_hidden_id,
+                doc_example_id,
             )?;
             let rs = extract_union_variants(
-                response_node, &nodes, &node_map,
-                mcp_desc_id, param_desc_id, mcp_scope_id, cli_hidden_id, doc_example_id,
+                response_node,
+                &nodes,
+                &node_map,
+                mcp_desc_id,
+                param_desc_id,
+                mcp_scope_id,
+                cli_hidden_id,
+                doc_example_id,
             )?;
 
             if rv.is_empty() || rs.is_empty() {
@@ -317,14 +332,26 @@ fn resolve_type_name(
 fn field_section_from_type(type_reader: capnp::schema_capnp::type_::Reader) -> FieldSection {
     use capnp::schema_capnp::type_;
     match type_reader.which() {
-        Ok(type_::Text(())) | Ok(type_::Data(())) | Ok(type_::List(_)) | Ok(type_::Struct(_))
-        | Ok(type_::Interface(_)) | Ok(type_::AnyPointer(_)) => FieldSection::Pointer,
-        Ok(type_::Void(())) | Ok(type_::Bool(())) | Ok(type_::Int8(())) | Ok(type_::Int16(()))
-        | Ok(type_::Int32(())) | Ok(type_::Int64(())) | Ok(type_::Uint8(()))
-        | Ok(type_::Uint16(())) | Ok(type_::Uint32(())) | Ok(type_::Uint64(()))
-        | Ok(type_::Float32(())) | Ok(type_::Float64(())) | Ok(type_::Enum(_)) | Err(_) => {
-            FieldSection::Data
-        }
+        Ok(type_::Text(()))
+        | Ok(type_::Data(()))
+        | Ok(type_::List(_))
+        | Ok(type_::Struct(_))
+        | Ok(type_::Interface(_))
+        | Ok(type_::AnyPointer(_)) => FieldSection::Pointer,
+        Ok(type_::Void(()))
+        | Ok(type_::Bool(()))
+        | Ok(type_::Int8(()))
+        | Ok(type_::Int16(()))
+        | Ok(type_::Int32(()))
+        | Ok(type_::Int64(()))
+        | Ok(type_::Uint8(()))
+        | Ok(type_::Uint16(()))
+        | Ok(type_::Uint32(()))
+        | Ok(type_::Uint64(()))
+        | Ok(type_::Float32(()))
+        | Ok(type_::Float64(()))
+        | Ok(type_::Enum(_))
+        | Err(_) => FieldSection::Data,
     }
 }
 
@@ -600,9 +627,7 @@ fn extract_struct_from_node(
                 let sec = field_section_from_type(type_reader);
                 (tn, offset, sec)
             }
-            Ok(capnp::schema_capnp::field::Group(_)) => {
-                ("Group".into(), 0, FieldSection::Group)
-            }
+            Ok(capnp::schema_capnp::field::Group(_)) => ("Group".into(), 0, FieldSection::Group),
             Err(e) => return Err(format!("Field error: {e}")),
         };
 
@@ -634,7 +659,11 @@ fn extract_struct_from_node(
                 field.get_annotations().map_err(|e| format!("{e}"))?,
                 serde_rename_id,
             );
-            if sr.is_empty() { None } else { Some(sr) }
+            if sr.is_empty() {
+                None
+            } else {
+                Some(sr)
+            }
         };
 
         // For non-union fields, skip adding to fields if it's a union member
@@ -698,8 +727,16 @@ fn extract_all_structs(
 
         let node = nodes.get(info.index);
         if let Some(s) = extract_struct_from_node(
-            node, info, node_map, mcp_desc_id, param_desc_id, domain_type_id, fixed_size_id,
-            optional_id, serde_rename_id, None,
+            node,
+            info,
+            node_map,
+            mcp_desc_id,
+            param_desc_id,
+            domain_type_id,
+            fixed_size_id,
+            optional_id,
+            serde_rename_id,
+            None,
         )? {
             structs.push(s);
         }
@@ -757,8 +794,16 @@ fn extract_all_structs(
                     let origin = extract_file_stem(&info.display_name);
                     let node = nodes.get(info.index);
                     if let Some(s) = extract_struct_from_node(
-                        node, info, node_map, mcp_desc_id, param_desc_id, domain_type_id,
-                        fixed_size_id, optional_id, serde_rename_id, Some(origin),
+                        node,
+                        info,
+                        node_map,
+                        mcp_desc_id,
+                        param_desc_id,
+                        domain_type_id,
+                        fixed_size_id,
+                        optional_id,
+                        serde_rename_id,
+                        Some(origin),
                     )? {
                         known_names.insert(ref_name.clone());
                         structs.push(s);
@@ -792,7 +837,10 @@ fn extract_file_stem(display_name: &str) -> String {
 
 /// Collect struct/enum type references from a capnp type name string.
 fn collect_type_refs(type_name: &str, refs: &mut std::collections::HashSet<String>) {
-    if let Some(inner) = type_name.strip_prefix("List(").and_then(|s| s.strip_suffix(')')) {
+    if let Some(inner) = type_name
+        .strip_prefix("List(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
         collect_type_refs(inner, refs);
     } else if !is_primitive_type(type_name) {
         refs.insert(type_name.to_owned());
@@ -864,8 +912,7 @@ fn extract_all_enums(
     let local_struct_names: std::collections::HashSet<String> =
         all_structs.iter().map(|s| s.name.clone()).collect();
 
-    let mut referenced_names: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut referenced_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     for s in all_structs {
         for f in &s.fields {
             collect_type_refs(&f.type_name, &mut referenced_names);
@@ -942,7 +989,10 @@ fn build_scoped_client_for_variant(
     }
 
     let resp_variant_name = format!("{}Result", req_variant.name);
-    let resp_variant = match response_variants.iter().find(|v| v.name == resp_variant_name) {
+    let resp_variant = match response_variants
+        .iter()
+        .find(|v| v.name == resp_variant_name)
+    {
         Some(v) => v,
         None => return Ok(None),
     };
@@ -953,7 +1003,14 @@ fn build_scoped_client_for_variant(
     };
     let inner_node = nodes.get(node_map[&inner_node_id].index);
     let inner_req_variants = extract_union_variants(
-        inner_node, nodes, node_map, mcp_desc_id, param_desc_id, mcp_scope_id, cli_hidden_id, doc_example_id,
+        inner_node,
+        nodes,
+        node_map,
+        mcp_desc_id,
+        param_desc_id,
+        mcp_scope_id,
+        cli_hidden_id,
+        doc_example_id,
     )?;
 
     let resp_node_id = match find_struct_node_id(node_map, &resp_variant.type_name) {
@@ -962,7 +1019,14 @@ fn build_scoped_client_for_variant(
     };
     let resp_node = nodes.get(node_map[&resp_node_id].index);
     let inner_resp_variants = extract_union_variants(
-        resp_node, nodes, node_map, mcp_desc_id, param_desc_id, mcp_scope_id, cli_hidden_id, doc_example_id,
+        resp_node,
+        nodes,
+        node_map,
+        mcp_desc_id,
+        param_desc_id,
+        mcp_scope_id,
+        cli_hidden_id,
+        doc_example_id,
     )?;
 
     if inner_req_variants.is_empty() || inner_resp_variants.is_empty() {

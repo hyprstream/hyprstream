@@ -34,20 +34,14 @@ pub fn has_streaming_methods(schema: &ParsedSchema) -> bool {
         .response_variants
         .iter()
         .any(|v| v.type_name == "StreamInfo")
-        || schema
-            .scoped_clients
-            .iter()
-            .any(has_streaming_in_scoped)
+        || schema.scoped_clients.iter().any(has_streaming_in_scoped)
 }
 
 fn has_streaming_in_scoped(sc: &ScopedClient) -> bool {
     sc.inner_response_variants
         .iter()
         .any(|v| v.type_name == "StreamInfo")
-        || sc
-            .nested_clients
-            .iter()
-            .any(has_streaming_in_scoped)
+        || sc.nested_clients.iter().any(has_streaming_in_scoped)
 }
 
 /// Generate the main client class and scoped client classes.
@@ -63,16 +57,14 @@ pub fn generate_client(out: &mut String, service_name: &str, schema: &ParsedSche
     out.push_str(
         "/** RPC client interface (matches RpcClient from wasm-bindgen). */\n\
          export interface RpcTransport {\n\
-         \x20 call(bytes: Uint8Array): Promise<Uint8Array>;\n"
+         \x20 call(bytes: Uint8Array): Promise<Uint8Array>;\n",
     );
     if has_streaming {
-        out.push_str(
-            "  openStream(bytes: Uint8Array): Promise<StreamHandle>;\n"
-        );
+        out.push_str("  openStream(bytes: Uint8Array): Promise<StreamHandle>;\n");
     }
     out.push_str(
         "\x20 nextId(): bigint;\n\
-         }\n\n"
+         }\n\n",
     );
 
     // Main client class
@@ -108,7 +100,9 @@ pub fn generate_client(out: &mut String, service_name: &str, schema: &ParsedSche
             .response_variants
             .iter()
             .find(|v| v.name == resp_variant_name);
-        let resp_type_name = resp_variant.map(|v| v.type_name.as_str()).unwrap_or("unknown");
+        let resp_type_name = resp_variant
+            .map(|v| v.type_name.as_str())
+            .unwrap_or("unknown");
         let is_streaming = resp_type_name == "StreamInfo";
         let return_type = if is_streaming {
             "StreamHandle".into()
@@ -155,10 +149,7 @@ pub fn generate_client(out: &mut String, service_name: &str, schema: &ParsedSche
 
             // Error handling
             emit_error_throw(out, "parsed");
-            out.push_str(&format!(
-                "    return parsed.data as {};\n",
-                return_type
-            ));
+            out.push_str(&format!("    return parsed.data as {};\n", return_type));
         }
         out.push_str("  }\n\n");
     }
@@ -245,9 +236,7 @@ fn generate_scoped_client(
         .collect();
 
     out.push_str(&format!("export class {} {{\n", sc.client_name));
-    out.push_str(
-        "  constructor(\n    private readonly client: RpcTransport,\n"
-    );
+    out.push_str("  constructor(\n    private readonly client: RpcTransport,\n");
     for p in &scope_params {
         out.push_str(&format!("    {p},\n"));
     }
@@ -284,7 +273,9 @@ fn generate_scoped_client(
             .inner_response_variants
             .iter()
             .find(|v| v.name == variant.name);
-        let resp_type_name = resp_variant.map(|v| v.type_name.as_str()).unwrap_or("unknown");
+        let resp_type_name = resp_variant
+            .map(|v| v.type_name.as_str())
+            .unwrap_or("unknown");
         let is_streaming = resp_type_name == "StreamInfo";
         let return_type = if is_streaming {
             "StreamHandle".into()
@@ -421,7 +412,5 @@ fn generate_scoped_client(
 fn generate_streaming_body(out: &mut String, _pascal: &str, _chain_depth: usize) {
     // All crypto (ECDH, key derivation, HMAC verification) happens in Rust.
     // JS just gets a StreamHandle back.
-    out.push_str(
-        "    return await this.client.openStream(bytes);\n",
-    );
+    out.push_str("    return await this.client.openStream(bytes);\n");
 }

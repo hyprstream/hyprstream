@@ -99,7 +99,9 @@ impl StructDef {
     /// TypeScript codegen should use `.fields` directly since it needs all fields
     /// including union members for wire format slot offsets and discriminant values.
     pub fn non_union_fields(&self) -> impl Iterator<Item = &FieldDef> {
-        self.fields.iter().filter(|f| f.discriminant_value == 0xFFFF)
+        self.fields
+            .iter()
+            .filter(|f| f.discriminant_value == 0xFFFF)
     }
 
     /// Fields that ARE union members (discriminant_value != 0xFFFF).
@@ -107,7 +109,9 @@ impl StructDef {
     /// These are the variant arms of a union within the struct.
     /// Each has a distinct `discriminant_value` that identifies which arm is active.
     pub fn union_fields(&self) -> impl Iterator<Item = &FieldDef> {
-        self.fields.iter().filter(|f| f.discriminant_value != 0xFFFF)
+        self.fields
+            .iter()
+            .filter(|f| f.discriminant_value != 0xFFFF)
     }
 
     /// True if this struct is a pure union (has_union and no non-union fields).

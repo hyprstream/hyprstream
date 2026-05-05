@@ -6,7 +6,9 @@
 //! Scoped clients get builder functions that construct the full chain:
 //! root → init inner struct → set scope fields → set discriminant → payload.
 
-use hyprstream_rpc_build::schema::types::{EnumDef, FieldDef, FieldSection, ParsedSchema, ScopedClient, StructDef};
+use hyprstream_rpc_build::schema::types::{
+    EnumDef, FieldDef, FieldSection, ParsedSchema, ScopedClient, StructDef,
+};
 use hyprstream_rpc_build::util::{to_camel_case, to_pascal_case};
 
 use super::{bool_bit_index, capnp_to_ts_type, data_byte_offset, is_data_scalar, is_primitive};
@@ -87,7 +89,16 @@ pub fn generate_builders(out: &mut String, service_name: &str, schema: &ParsedSc
 
         // Set non-union fields
         for f in &non_union_fields {
-            emit_field_setter(out, "msg", f, &to_camel_case(&f.name), "  ", &schema.enums, &schema.structs, &mut counter);
+            emit_field_setter(
+                out,
+                "msg",
+                f,
+                &to_camel_case(&f.name),
+                "  ",
+                &schema.enums,
+                &schema.structs,
+                &mut counter,
+            );
         }
 
         // Set discriminant
@@ -101,7 +112,16 @@ pub fn generate_builders(out: &mut String, service_name: &str, schema: &ParsedSc
             // Nothing
         } else if is_prim {
             if let Some(vf) = variant_field {
-                emit_field_setter(out, "msg", vf, "p", "  ", &schema.enums, &schema.structs, &mut counter);
+                emit_field_setter(
+                    out,
+                    "msg",
+                    vf,
+                    "p",
+                    "  ",
+                    &schema.enums,
+                    &schema.structs,
+                    &mut counter,
+                );
             }
         } else if let Some(ps) = payload_struct {
             if let Some(vf) = variant_field {
@@ -217,12 +237,25 @@ fn generate_scoped_builders(
 
         // Set root non-union fields
         for f in root_non_union_fields {
-            emit_field_setter(out, "msg", f, &to_camel_case(&f.name), "  ", &schema.enums, &schema.structs, &mut counter);
+            emit_field_setter(
+                out,
+                "msg",
+                f,
+                &to_camel_case(&f.name),
+                "  ",
+                &schema.enums,
+                &schema.structs,
+                &mut counter,
+            );
         }
 
         // Build the chain: root → ancestors → current → method
         // Level 0: root → first scope (sc or first ancestor)
-        let chain: Vec<&ScopedClient> = ancestors.iter().copied().chain(std::iter::once(sc)).collect();
+        let chain: Vec<&ScopedClient> = ancestors
+            .iter()
+            .copied()
+            .chain(std::iter::once(sc))
+            .collect();
 
         let mut builder_var = "msg".to_owned();
         for (i, level) in chain.iter().enumerate() {
@@ -249,7 +282,16 @@ fn generate_scoped_builders(
 
                 // Set scope fields on this level's struct
                 for sf in &level.scope_fields {
-                    emit_field_setter(out, &var_name, sf, &to_camel_case(&sf.name), "  ", &schema.enums, &schema.structs, &mut counter);
+                    emit_field_setter(
+                        out,
+                        &var_name,
+                        sf,
+                        &to_camel_case(&sf.name),
+                        "  ",
+                        &schema.enums,
+                        &schema.structs,
+                        &mut counter,
+                    );
                 }
 
                 builder_var = var_name;
@@ -279,7 +321,16 @@ fn generate_scoped_builders(
                 if is_void {
                     // Nothing
                 } else if is_prim {
-                    emit_field_setter(out, &builder_var, mf, "p", "  ", &schema.enums, &schema.structs, &mut counter);
+                    emit_field_setter(
+                        out,
+                        &builder_var,
+                        mf,
+                        "p",
+                        "  ",
+                        &schema.enums,
+                        &schema.structs,
+                        &mut counter,
+                    );
                 } else if let Some(ps) = payload_struct {
                     emit_struct_init(out, mf, ps, &builder_var, "p", "  ", schema, &mut counter);
                 }
@@ -326,12 +377,8 @@ fn find_chain_variant_info(
         (disc_byte_off, disc_value, slot_offset)
     } else {
         // Parent is the inner struct of chain[level-1]
-        let parent_inner_name =
-            find_inner_struct_name(level - 1, chain, root_struct, schema);
-        let parent_struct = schema
-            .structs
-            .iter()
-            .find(|s| s.name == parent_inner_name);
+        let parent_inner_name = find_inner_struct_name(level - 1, chain, root_struct, schema);
+        let parent_struct = schema.structs.iter().find(|s| s.name == parent_inner_name);
         if let Some(ps) = parent_struct {
             let disc_byte_off = ps.discriminant_offset * 2;
             let variant_field = ps
@@ -367,12 +414,8 @@ fn find_inner_struct_name(
             .unwrap_or_default()
     } else {
         // Look up the variant type in chain[level-1]'s inner struct
-        let parent_inner_name =
-            find_inner_struct_name(level - 1, chain, root_struct, schema);
-        let parent_struct = schema
-            .structs
-            .iter()
-            .find(|s| s.name == parent_inner_name);
+        let parent_inner_name = find_inner_struct_name(level - 1, chain, root_struct, schema);
+        let parent_struct = schema.structs.iter().find(|s| s.name == parent_inner_name);
         if let Some(ps) = parent_struct {
             let variant_field = ps
                 .fields
@@ -522,27 +565,7 @@ fn generate_plain_struct_builder(out: &mut String, sd: &StructDef, schema: &Pars
     let mut counter = 0u32;
     for f in &sd.fields {
         let raw_expr = format!("p.{}", to_camel_case(&f.name));
-        // Optional fields carry `T | undefined`; coalesce to the capnp default so
-        // TypeScript strict mode doesn't reject passing `T | undefined` to a setter.
-        let value_expr = if f.optional {
-            let default = if f.section == FieldSection::Data
-                && !is_data_scalar(&f.type_name)
-                && f.type_name != "Bool"
-            {
-                schema
-                    .enums
-                    .iter()
-                    .find(|e| e.name == f.type_name)
-                    .and_then(|e| e.variants.first())
-                    .map(|(name, _)| format!("'{}'", to_camel_case(name)))
-                    .unwrap_or_else(|| "0".into())
-            } else {
-                super::default_value_expr(&f.type_name).to_owned()
-            };
-            format!("{raw_expr} ?? {default}")
-        } else {
-            raw_expr
-        };
+        let value_expr = value_expr_for_field(f, &raw_expr, &schema.enums);
         emit_field_setter(
             out,
             "msg",
@@ -646,7 +669,8 @@ fn emit_field_setter(
                             continue;
                         }
                         let inner_builder = format!("{sl}[{si}]");
-                        let inner_value = format!("{sv}.{}", to_camel_case(&sf.name));
+                        let raw_inner_value = format!("{sv}.{}", to_camel_case(&sf.name));
+                        let inner_value = value_expr_for_field(sf, &raw_inner_value, enums);
                         emit_field_setter(
                             out,
                             &inner_builder,
@@ -692,9 +716,7 @@ fn emit_field_setter(
                     let sp_id = *counter;
                     *counter += 1;
                     let sp_var = format!("_sp{sp_id}");
-                    out.push_str(&format!(
-                        "{indent}if ({value_expr} != null) {{\n"
-                    ));
+                    out.push_str(&format!("{indent}if ({value_expr} != null) {{\n"));
                     out.push_str(&format!(
                         "{indent}  const {sp_var} = {builder_var}.initStruct({}, {}, {});\n",
                         field.slot_offset, sd.data_words, sd.pointer_words
@@ -703,12 +725,25 @@ fn emit_field_setter(
                         if sf.discriminant_value != 0xFFFF {
                             continue;
                         }
-                        let val_expr = format!("{value_expr}.{}", to_camel_case(&sf.name));
+                        let raw_val_expr = format!("{value_expr}.{}", to_camel_case(&sf.name));
+                        let val_expr = value_expr_for_field(sf, &raw_val_expr, enums);
                         emit_field_setter(
                             out,
                             &sp_var,
                             sf,
                             &val_expr,
+                            &format!("{indent}  "),
+                            enums,
+                            structs,
+                            counter,
+                        );
+                    }
+                    if sd.has_union {
+                        emit_union_element_setter(
+                            out,
+                            sd,
+                            &sp_var,
+                            value_expr,
                             &format!("{indent}  "),
                             enums,
                             structs,
@@ -754,29 +789,42 @@ fn emit_struct_init(
             continue;
         }
         let raw_expr = format!("{param_name}.{}", to_camel_case(&f.name));
-        let value_expr = if f.optional {
-            // For enum types (Data section, non-scalar), default to the first variant string
-            let default = if f.section == FieldSection::Data
-                && !is_data_scalar(&f.type_name)
-                && f.type_name != "Bool"
-            {
-                // Enum type — default to first variant name or '0' if not found
-                schema
-                    .enums
-                    .iter()
-                    .find(|e| e.name == f.type_name)
-                    .and_then(|e| e.variants.first())
-                    .map(|(name, _)| format!("'{}'", to_camel_case(name)))
-                    .unwrap_or_else(|| "0".into())
-            } else {
-                super::default_value_expr(&f.type_name).to_owned()
-            };
-            format!("{raw_expr} ?? {default}")
-        } else {
-            raw_expr
-        };
-        emit_field_setter(out, "_ps", f, &value_expr, indent, &schema.enums, &schema.structs, counter);
+        let value_expr = value_expr_for_field(f, &raw_expr, &schema.enums);
+        emit_field_setter(
+            out,
+            "_ps",
+            f,
+            &value_expr,
+            indent,
+            &schema.enums,
+            &schema.structs,
+            counter,
+        );
     }
+}
+
+/// Optional fields carry `T | undefined`; coalesce to the capnp default so
+/// TypeScript strict mode doesn't reject passing `T | undefined` to a setter.
+fn value_expr_for_field(field: &FieldDef, raw_expr: &str, enums: &[EnumDef]) -> String {
+    if !field.optional {
+        return raw_expr.to_owned();
+    }
+
+    let default = if field.section == FieldSection::Data
+        && !is_data_scalar(&field.type_name)
+        && field.type_name != "Bool"
+    {
+        enums
+            .iter()
+            .find(|e| e.name == field.type_name)
+            .and_then(|e| e.variants.first())
+            .map(|(name, _)| format!("'{}'", to_camel_case(name)))
+            .unwrap_or_else(|| "0".into())
+    } else {
+        super::default_value_expr(&field.type_name).to_owned()
+    };
+
+    format!("{raw_expr} ?? {default}")
 }
 
 /// Emit code to write an Option* wrapper struct at a pointer slot.
@@ -794,7 +842,9 @@ fn emit_option_setter(
 ) {
     let disc_byte_off = opt_struct.discriminant_offset * 2;
 
-    out.push_str(&format!("{indent}if ({value_expr} !== undefined && {value_expr} !== null) {{\n"));
+    out.push_str(&format!(
+        "{indent}if ({value_expr} !== undefined && {value_expr} !== null) {{\n"
+    ));
     out.push_str(&format!(
         "{indent}  const _opt = {builder_var}.initStruct({}, {}, {});\n",
         field.slot_offset, opt_struct.data_words, opt_struct.pointer_words
@@ -814,16 +864,22 @@ fn emit_option_setter(
             let some_byte_off = super::data_byte_offset(sf);
             if inner_type_name == "Bool" {
                 let bit = super::bool_bit_index(sf);
-                out.push_str(&format!("{indent}  _opt.setBool({some_byte_off}, {bit}, {value_expr});\n"));
+                out.push_str(&format!(
+                    "{indent}  _opt.setBool({some_byte_off}, {bit}, {value_expr});\n"
+                ));
             } else {
-                out.push_str(&format!("{indent}  _opt.{method}({some_byte_off}, {value_expr});\n"));
+                out.push_str(&format!(
+                    "{indent}  _opt.{method}({some_byte_off}, {value_expr});\n"
+                ));
             }
         }
     }
     // else: unsupported inner type (nested struct, etc.) — leave as-is with discriminant set
 
     out.push_str(&format!("{indent}}}\n"));
-    out.push_str(&format!("{indent}// else: null pointer = none (cap'n proto default)\n"));
+    out.push_str(&format!(
+        "{indent}// else: null pointer = none (cap'n proto default)\n"
+    ));
 }
 
 /// Emit a switch statement that writes union discriminant + variant payload for a list element.
@@ -888,8 +944,18 @@ fn emit_union_element_setter(
                 if sf.discriminant_value != 0xFFFF {
                     continue;
                 }
-                let val_expr = format!("_upd.{}", to_camel_case(&sf.name));
-                emit_field_setter(out, "_ups", sf, &val_expr, &format!("{bi}  "), enums, structs, counter);
+                let raw_val_expr = format!("_upd.{}", to_camel_case(&sf.name));
+                let val_expr = value_expr_for_field(sf, &raw_val_expr, enums);
+                emit_field_setter(
+                    out,
+                    "_ups",
+                    sf,
+                    &val_expr,
+                    &format!("{bi}  "),
+                    enums,
+                    structs,
+                    counter,
+                );
             }
             out.push_str(&format!("{bi}}}\n"));
         }
