@@ -97,6 +97,7 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             "/oauth/device/verify",
             get(device::verify_get).post(device::verify_post),
         )
+        .route("/oauth/device/nonce", get(device::device_nonce))
         .route(
             "/oauth/userinfo",
             get(userinfo::userinfo).post(userinfo::userinfo),
