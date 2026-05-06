@@ -13,7 +13,7 @@ use inquire::{Confirm, Select, Text};
 
 use crate::auth::identity_store;
 use crate::auth::policy_templates::{get_templates, PolicyTemplate};
-use crate::auth::{write_policy_file, LocalKeyStore, PolicyManager, UserStore};
+use crate::auth::{write_policy_file, RocksDbUserStore, PolicyManager, UserStore};
 use crate::cli::policy_handlers::{
     ensure_user_signing_key, load_or_generate_signing_key, mint_local_token, parse_duration,
 };
@@ -484,7 +484,7 @@ async fn phase_users(state: &mut WizardState, non_interactive: bool) -> Result<(
         .context("Failed to load PolicyManager")?;
 
     let credentials_dir = state.credentials_dir();
-    let user_store = LocalKeyStore::load(&credentials_dir)
+    let user_store = RocksDbUserStore::open(&credentials_dir)
         .context("Failed to open credential store")?;
 
     // Separate Casbin subjects into local (bare names) vs federated/OIDC (contain "://")

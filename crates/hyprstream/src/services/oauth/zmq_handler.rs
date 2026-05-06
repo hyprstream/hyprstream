@@ -8,15 +8,17 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD, Engine};
+use ed25519_dalek::VerifyingKey;
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::service::{Continuation, EnvelopeContext, ZmqService};
 use hyprstream_rpc::transport::TransportConfig;
 
 use crate::auth::UserFilter;
 use crate::services::generated::oauth_client::{
-    dispatch_oauth, serialize_response, ErrorInfo, ListUsers, OauthHandler,
-    OauthResponseVariant, RegisterUser, UpdateUser, UserInfo as RpcUserInfo,
-    UserListResult,
+    AddPubkey, dispatch_oauth, serialize_response, ErrorInfo, ListUsers, OauthHandler,
+    OauthResponseVariant, PubkeyEntry as RpcPubkeyEntry, RemovePubkey, RegisterUser, UpdateUser,
+    UserInfo as RpcUserInfo, UserListResult,
 };
 
 use super::user_service::{self, UserUpdate};
@@ -95,7 +97,8 @@ impl OauthHandler for OAuthZmqHandler {
         data: &RegisterUser,
     ) -> Result<OauthResponseVariant> {
         let svc = self.user_service()?;
-        let info = svc.register(&data.username, &data.pubkey_base64).await?;
+        let pubkey_b64 = data.pubkey_base64.as_deref().unwrap_or("");
+        let info = svc.register(&data.username, pubkey_b64).await?;
         Ok(OauthResponseVariant::RegisterUserResult(Self::user_info_to_rpc(&info)))
     }
 
@@ -209,6 +212,85 @@ impl OauthHandler for OAuthZmqHandler {
         svc.remove(username).await?;
         Ok(OauthResponseVariant::RemoveUserResult)
     }
+
+    async fn handle_add_pubkey(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &AddPubkey,
+    ) -> Result<OauthResponseVariant> {
+        let svc = self.user_service()?;
+        let vk = decode_pubkey_base64(&data.pubkey_base64)?;
+        let label = data.label.as_ref().filter(|s| !s.is_empty()).cloned();
+        let entry = svc.add_pubkey(&data.username, vk, label).await?;
+        Ok(OauthResponseVariant::AddPubkeyResult(RpcPubkeyEntry {
+            fingerprint: entry.fingerprint,
+            pubkey_base64: entry.pubkey_base64,
+            label: entry.label.unwrap_or_default(),
+            created_at: entry.created_at,
+            last_used_at: entry.last_used_at.unwrap_or(0),
+        }))
+    }
+
+    async fn handle_remove_pubkey(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &RemovePubkey,
+    ) -> Result<OauthResponseVariant> {
+        let svc = self.user_service()?;
+        let removed = svc.remove_pubkey(&data.username, &data.fingerprint).await?;
+        Ok(OauthResponseVariant::RemovePubkeyResult(removed))
+    }
+
+    async fn handle_list_pubkeys(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        username: &str,
+    ) -> Result<OauthResponseVariant> {
+        let svc = self.user_service()?;
+        let entries = svc.list_pubkeys(username).await?;
+        Ok(OauthResponseVariant::ListPubkeysResult(
+            entries
+                .into_iter()
+                .map(|e| RpcPubkeyEntry {
+                    fingerprint: e.fingerprint,
+                    pubkey_base64: e.pubkey_base64,
+                    label: e.label.unwrap_or_default(),
+                    created_at: e.created_at,
+                    last_used_at: e.last_used_at.unwrap_or(0),
+                })
+                .collect(),
+        ))
+    }
+}
+
+/// Decode a base64-encoded Ed25519 public key.
+///
+/// Accepts SSH wire format (prefix + 32-byte key, 51 bytes decoded) or raw base64
+/// (32 bytes decoded). SSH wire format: u32be(11) "ssh-ed25519" u32be(32) <key>.
+fn decode_pubkey_base64(s: &str) -> Result<VerifyingKey> {
+    let raw = STANDARD
+        .decode(s.trim())
+        .map_err(|e| anyhow!("Invalid base64: {e}"))?;
+
+    let key_bytes: [u8; 32] = if raw.len() == 51 {
+        // SSH wire format: 4-byte length prefix (11) + "ssh-ed25519" (11) + 4-byte length (32) + key (32)
+        raw[19..51]
+            .try_into()
+            .map_err(|_| anyhow!("Malformed SSH wire format"))?
+    } else if raw.len() == 32 {
+        raw.try_into()
+            .map_err(|_| anyhow!("Expected 32-byte raw Ed25519 key"))?
+    } else {
+        anyhow::bail!(
+            "Expected 32-byte raw or 51-byte SSH wire Ed25519 key, got {} bytes",
+            raw.len()
+        );
+    };
+
+    VerifyingKey::from_bytes(&key_bytes).map_err(|e| anyhow!("Invalid Ed25519 key: {e}"))
 }
 
 #[async_trait(?Send)]

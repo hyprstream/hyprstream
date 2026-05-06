@@ -15,7 +15,7 @@ struct OauthRequest {
 
   union {
     registerUser @1 :RegisterUser
-      $mcpScope(manage) $mcpDescription("Register a new user with public key");
+      $mcpScope(manage) $mcpDescription("Register a new user");
     getUser @2 :Text
       $mcpScope(query) $mcpDescription("Get user profile by username");
     listUsers @3 :ListUsers
@@ -28,6 +28,12 @@ struct OauthRequest {
       $mcpScope(manage) $mcpDescription("Resume suspended user (set active=true)");
     removeUser @7 :Text
       $mcpScope(manage) $mcpDescription("Permanently remove user");
+    addPubkey @8 :AddPubkey
+      $mcpScope(manage) $mcpDescription("Add an Ed25519 public key to a user");
+    removePubkey @9 :RemovePubkey
+      $mcpScope(manage) $mcpDescription("Remove a public key by fingerprint");
+    listPubkeys @10 :Text
+      $mcpScope(query) $mcpDescription("List all public keys for a user");
   }
 }
 
@@ -43,15 +49,29 @@ struct OauthResponse {
     suspendUserResult @6 :Void;
     resumeUserResult @7 :Void;
     removeUserResult @8 :Void;
+    addPubkeyResult @9 :PubkeyEntry;
+    removePubkeyResult @10 :Bool;
+    listPubkeysResult @11 :List(PubkeyEntry);
   }
 }
 
 struct RegisterUser {
   username @0 :Text;
-  pubkeyBase64 @1 :Text;
+  pubkeyBase64 @1 :Text $optional;
   name @2 :Text $optional;
   email @3 :Text $optional;
   externalId @4 :Text $optional;
+}
+
+struct AddPubkey {
+  username @0 :Text;
+  pubkeyBase64 @1 :Text;
+  label @2 :Text $optional;
+}
+
+struct RemovePubkey {
+  username @0 :Text;
+  fingerprint @1 :Text;
 }
 
 struct ListUsers {

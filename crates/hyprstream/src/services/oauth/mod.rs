@@ -123,6 +123,14 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
                 .put(scim::replace_user)
                 .delete(scim::delete_user),
         )
+        .route(
+            "/scim/v2/Users/:id/keys",
+            get(scim::list_user_keys).post(scim::add_user_key),
+        )
+        .route(
+            "/scim/v2/Users/:id/keys/:fingerprint",
+            axum::routing::delete(scim::remove_user_key),
+        )
         .route("/scim/v2/Schemas", get(scim::schemas))
         .route("/scim/v2/ResourceTypes", get(scim::resource_types))
         .route(

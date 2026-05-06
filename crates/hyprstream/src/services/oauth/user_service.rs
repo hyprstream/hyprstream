@@ -72,22 +72,21 @@ impl UserService {
         Self { store }
     }
 
-    /// Register a new user with their Ed25519 public key.
+    /// Register a new user. If `pubkey_base64` is non-empty, adds it as the first key.
     pub async fn register(&self, username: &str, pubkey_base64: &str) -> Result<UserInfo> {
-        let raw = STANDARD
-            .decode(pubkey_base64)
-            .map_err(|e| anyhow!("Invalid base64 for public key: {e}"))?;
-        let bytes: [u8; 32] = raw
-            .try_into()
-            .map_err(|_| anyhow!("Public key must be 32 bytes (Ed25519)"))?;
-        let pubkey = VerifyingKey::from_bytes(&bytes)
-            .map_err(|e| anyhow!("Invalid Ed25519 public key: {e}"))?;
-
-        // Register user first (creates UUID sub)
         self.store.register(username).await?;
 
-        // Then add the pubkey
-        self.store.add_pubkey(username, pubkey, None).await?;
+        if !pubkey_base64.is_empty() {
+            let raw = STANDARD
+                .decode(pubkey_base64)
+                .map_err(|e| anyhow!("Invalid base64 for public key: {e}"))?;
+            let bytes: [u8; 32] = raw
+                .try_into()
+                .map_err(|_| anyhow!("Public key must be 32 bytes (Ed25519)"))?;
+            let pubkey = VerifyingKey::from_bytes(&bytes)
+                .map_err(|e| anyhow!("Invalid Ed25519 public key: {e}"))?;
+            self.store.add_pubkey(username, pubkey, None).await?;
+        }
 
         self.get(username)
             .await?
@@ -193,6 +192,33 @@ impl UserService {
     /// Permanently remove a user.
     pub async fn remove(&self, username: &str) -> Result<bool> {
         self.store.remove(username).await
+    }
+
+    /// Add a public key to a user. Returns the new PubkeyInfo.
+    pub async fn add_pubkey(
+        &self,
+        username: &str,
+        pubkey: VerifyingKey,
+        label: Option<String>,
+    ) -> Result<PubkeyInfo> {
+        let fingerprint = self.store.add_pubkey(username, pubkey, label).await?;
+        let entries = self.store.list_pubkeys(username).await?;
+        entries
+            .iter()
+            .find(|e| e.fingerprint == fingerprint)
+            .map(PubkeyInfo::from)
+            .ok_or_else(|| anyhow!("pubkey not found after insert"))
+    }
+
+    /// Remove a public key by fingerprint. Returns true if removed.
+    pub async fn remove_pubkey(&self, username: &str, fingerprint: &str) -> Result<bool> {
+        self.store.remove_pubkey(username, fingerprint).await
+    }
+
+    /// List all public keys for a user.
+    pub async fn list_pubkeys(&self, username: &str) -> Result<Vec<PubkeyInfo>> {
+        let entries = self.store.list_pubkeys(username).await?;
+        Ok(entries.iter().map(PubkeyInfo::from).collect())
     }
 
     /// Get the underlying store for direct access (e.g., by OAuth handlers).

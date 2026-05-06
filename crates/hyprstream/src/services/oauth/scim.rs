@@ -11,6 +11,8 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use base64::Engine;
+use ed25519_dalek::VerifyingKey;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use hex;
@@ -465,6 +467,115 @@ pub async fn delete_user(
     }
 
     StatusCode::NO_CONTENT.into_response()
+}
+
+// ─── Key management endpoints ─────────────────────────────────────────────────
+
+/// GET /scim/v2/Users/:id/keys — List public keys for a user.
+pub async fn list_user_keys(
+    State(state): State<Arc<OAuthState>>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    let svc = match user_service(&state) {
+        Ok(s) => s,
+        Err(e) => return *e,
+    };
+
+    let info = match find_user(svc, &id).await {
+        Some(i) => i,
+        None => return scim_error_simple(404, "Resource not found"),
+    };
+
+    let keys: Vec<serde_json::Value> = info.pubkeys.iter().map(|pk| {
+        serde_json::json!({
+            "fingerprint": pk.fingerprint,
+            "pubkeyBase64": pk.pubkey_base64,
+            "label": pk.label,
+            "createdAt": pk.created_at,
+            "lastUsedAt": pk.last_used_at,
+        })
+    }).collect();
+    let total = keys.len();
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        Json(serde_json::json!({ "keys": keys, "totalResults": total })),
+    )
+        .into_response()
+}
+
+/// POST /scim/v2/Users/:id/keys — Add a public key for a user.
+pub async fn add_user_key(
+    State(state): State<Arc<OAuthState>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> axum::response::Response {
+    let svc = match user_service(&state) {
+        Ok(s) => s,
+        Err(e) => return *e,
+    };
+
+    let info = match find_user(svc, &id).await {
+        Some(i) => i,
+        None => return scim_error_simple(404, "Resource not found"),
+    };
+
+    let pubkey_base64 = match body.get("pubkeyBase64").and_then(|v| v.as_str()) {
+        Some(s) => s.to_owned(),
+        None => return scim_error(400, "invalidValue", "pubkeyBase64 is required"),
+    };
+    let label = body.get("label").and_then(|v| v.as_str()).map(str::to_owned);
+
+    let raw = match base64::engine::general_purpose::STANDARD.decode(pubkey_base64.trim()) {
+        Ok(r) => r,
+        Err(e) => return scim_error(400, "invalidValue", &format!("Invalid base64: {e}")),
+    };
+    let key_bytes: [u8; 32] = match raw.try_into() {
+        Ok(b) => b,
+        Err(_) => return scim_error(400, "invalidValue", "Public key must be 32 bytes (Ed25519)"),
+    };
+    let pubkey = match VerifyingKey::from_bytes(&key_bytes) {
+        Ok(k) => k,
+        Err(e) => return scim_error(400, "invalidValue", &format!("Invalid Ed25519 key: {e}")),
+    };
+
+    match svc.add_pubkey(&info.username, pubkey, label).await {
+        Ok(entry) => (
+            StatusCode::CREATED,
+            [(header::CONTENT_TYPE, "application/json")],
+            Json(serde_json::json!({
+                "fingerprint": entry.fingerprint,
+                "pubkeyBase64": entry.pubkey_base64,
+                "label": entry.label,
+                "createdAt": entry.created_at,
+            })),
+        )
+            .into_response(),
+        Err(e) => scim_error_simple(500, &e.to_string()),
+    }
+}
+
+/// DELETE /scim/v2/Users/:id/keys/:fingerprint — Remove a public key.
+pub async fn remove_user_key(
+    State(state): State<Arc<OAuthState>>,
+    Path((id, fingerprint)): Path<(String, String)>,
+) -> axum::response::Response {
+    let svc = match user_service(&state) {
+        Ok(s) => s,
+        Err(e) => return *e,
+    };
+
+    let info = match find_user(svc, &id).await {
+        Some(i) => i,
+        None => return scim_error_simple(404, "Resource not found"),
+    };
+
+    match svc.remove_pubkey(&info.username, &fingerprint).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => scim_error_simple(404, "Key not found"),
+        Err(e) => scim_error_simple(500, &e.to_string()),
+    }
 }
 
 // ─── Discovery endpoints ─────────────────────────────────────────────────────

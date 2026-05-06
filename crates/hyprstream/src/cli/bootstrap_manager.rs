@@ -17,7 +17,7 @@ use hyprstream_tui::wizard::backend::*;
 
 use crate::auth::identity_store;
 use crate::auth::policy_templates::{get_template, get_templates};
-use crate::auth::{LocalKeyStore, PolicyManager, UserStore};
+use crate::auth::{RocksDbUserStore, PolicyManager, UserStore};
 use crate::cli::gpu_detect;
 use crate::cli::policy_handlers::{
     load_or_generate_signing_key, mint_local_token, parse_duration,
@@ -151,7 +151,7 @@ impl BootstrapManager {
             return;
         }
         let credentials_dir = self.credentials_dir();
-        let store = match LocalKeyStore::load(&credentials_dir) {
+        let store = match RocksDbUserStore::open(&credentials_dir) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(
