@@ -8,13 +8,11 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD, Engine};
-use ed25519_dalek::VerifyingKey;
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::service::{Continuation, EnvelopeContext, ZmqService};
 use hyprstream_rpc::transport::TransportConfig;
 
-use crate::auth::UserFilter;
+use crate::auth::{UserFilter, decode_pubkey_base64};
 use crate::services::generated::oauth_client::{
     AddPubkey, dispatch_oauth, serialize_response, ErrorInfo, ListUsers, OauthHandler,
     OauthResponseVariant, PubkeyEntry as RpcPubkeyEntry, RemovePubkey, RegisterUser, UpdateUser,
@@ -266,32 +264,6 @@ impl OauthHandler for OAuthZmqHandler {
     }
 }
 
-/// Decode a base64-encoded Ed25519 public key.
-///
-/// Accepts SSH wire format (prefix + 32-byte key, 51 bytes decoded) or raw base64
-/// (32 bytes decoded). SSH wire format: u32be(11) "ssh-ed25519" u32be(32) <key>.
-fn decode_pubkey_base64(s: &str) -> Result<VerifyingKey> {
-    let raw = STANDARD
-        .decode(s.trim())
-        .map_err(|e| anyhow!("Invalid base64: {e}"))?;
-
-    let key_bytes: [u8; 32] = if raw.len() == 51 {
-        // SSH wire format: 4-byte length prefix (11) + "ssh-ed25519" (11) + 4-byte length (32) + key (32)
-        raw[19..51]
-            .try_into()
-            .map_err(|_| anyhow!("Malformed SSH wire format"))?
-    } else if raw.len() == 32 {
-        raw.try_into()
-            .map_err(|_| anyhow!("Expected 32-byte raw Ed25519 key"))?
-    } else {
-        anyhow::bail!(
-            "Expected 32-byte raw or 51-byte SSH wire Ed25519 key, got {} bytes",
-            raw.len()
-        );
-    };
-
-    VerifyingKey::from_bytes(&key_bytes).map_err(|e| anyhow!("Invalid Ed25519 key: {e}"))
-}
 
 #[async_trait(?Send)]
 impl ZmqService for OAuthZmqHandler {

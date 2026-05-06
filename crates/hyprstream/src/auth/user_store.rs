@@ -115,13 +115,69 @@ pub trait UserStore: Send + Sync {
     async fn touch_pubkey(&self, username: &str, fingerprint: &str) -> Result<()>;
 }
 
-/// Compute the fingerprint of a pubkey (base64url SHA-256).
+/// Compute the SSH fingerprint of a pubkey (matches `ssh-keygen -l -E sha256`).
+///
+/// Hashes the SSH wire-format blob (u32be(11) "ssh-ed25519" u32be(32) <key>)
+/// with SHA-256 and encodes as standard base64 without padding, prefixed "SHA256:".
 pub fn pubkey_fingerprint(pubkey: &VerifyingKey) -> String {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::engine::general_purpose::STANDARD_NO_PAD;
     use base64::Engine;
     use sha2::{Digest, Sha256};
-    let hash = Sha256::digest(pubkey.as_bytes());
-    URL_SAFE_NO_PAD.encode(hash)
+    let wire = ssh_wire_encode(pubkey);
+    format!("SHA256:{}", STANDARD_NO_PAD.encode(Sha256::digest(wire)))
+}
+
+/// Encode an Ed25519 verifying key in SSH wire format (51 bytes).
+///
+/// Format: u32be(11) "ssh-ed25519" u32be(32) <32-byte key>
+fn ssh_wire_encode(pubkey: &VerifyingKey) -> [u8; 51] {
+    let mut wire = [0u8; 51];
+    wire[0..4].copy_from_slice(&11u32.to_be_bytes());
+    wire[4..15].copy_from_slice(b"ssh-ed25519");
+    wire[15..19].copy_from_slice(&32u32.to_be_bytes());
+    wire[19..51].copy_from_slice(pubkey.as_bytes());
+    wire
+}
+
+/// Decode a base64-encoded Ed25519 public key.
+///
+/// Accepts two formats:
+/// - SSH wire format (base64 of 51-byte blob): validates the "ssh-ed25519" type tag.
+/// - Raw Ed25519 (base64 of 32-byte key).
+pub fn decode_pubkey_base64(s: &str) -> anyhow::Result<VerifyingKey> {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    let raw = STANDARD
+        .decode(s.trim())
+        .map_err(|e| anyhow::anyhow!("Invalid base64: {e}"))?;
+
+    let key_bytes: [u8; 32] = if raw.len() == 51 {
+        let type_len = u32::from_be_bytes(
+            raw[0..4]
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("Malformed SSH wire prefix"))?,
+        ) as usize;
+        if type_len != 11 || &raw[4..15] != b"ssh-ed25519" {
+            anyhow::bail!(
+                "Unsupported SSH key type: only Ed25519 is accepted. \
+                 Use: ssh-keygen -t ed25519"
+            );
+        }
+        raw[19..51]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Malformed SSH wire payload"))?
+    } else if raw.len() == 32 {
+        raw.try_into()
+            .map_err(|_| anyhow::anyhow!("Expected 32-byte raw Ed25519 key"))?
+    } else {
+        anyhow::bail!(
+            "Expected 32-byte raw or 51-byte SSH wire Ed25519 key, got {} bytes",
+            raw.len()
+        );
+    };
+
+    VerifyingKey::from_bytes(&key_bytes).map_err(|e| anyhow::anyhow!("Invalid Ed25519 key: {e}"))
 }
 
 /// Evaluate a simple SCIM filter expression against a user entry.

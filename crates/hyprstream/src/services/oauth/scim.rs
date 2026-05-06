@@ -11,15 +11,13 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use base64::Engine;
-use ed25519_dalek::VerifyingKey;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use hex;
 
 use super::state::OAuthState;
 use super::user_service;
-use crate::auth::UserFilter;
+use crate::auth::{UserFilter, decode_pubkey_base64};
 
 use super::scim_types::*;
 
@@ -298,10 +296,6 @@ pub async fn create_user(
         .unwrap_or("")
         .to_owned();
 
-    if pubkey_base64.is_empty() {
-        return scim_error(400, "invalidValue", "pubkey_base64 is required (hyprstream extension)");
-    }
-
     let display_name = body.get("displayName").and_then(|v| v.as_str()).map(std::borrow::ToOwned::to_owned);
     let email = body
         .get("emails")
@@ -486,7 +480,7 @@ pub async fn list_user_keys(
         None => return scim_error_simple(404, "Resource not found"),
     };
 
-    let keys: Vec<serde_json::Value> = info.pubkeys.iter().map(|pk| {
+    let resources: Vec<serde_json::Value> = info.pubkeys.iter().map(|pk| {
         serde_json::json!({
             "fingerprint": pk.fingerprint,
             "pubkeyBase64": pk.pubkey_base64,
@@ -495,12 +489,16 @@ pub async fn list_user_keys(
             "lastUsedAt": pk.last_used_at,
         })
     }).collect();
-    let total = keys.len();
+    let total = resources.len();
 
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json")],
-        Json(serde_json::json!({ "keys": keys, "totalResults": total })),
+        [(header::CONTENT_TYPE, "application/scim+json")],
+        Json(serde_json::json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:ListResponse"],
+            "totalResults": total,
+            "Resources": resources,
+        })),
     )
         .into_response()
 }
@@ -521,29 +519,21 @@ pub async fn add_user_key(
         None => return scim_error_simple(404, "Resource not found"),
     };
 
-    let pubkey_base64 = match body.get("pubkeyBase64").and_then(|v| v.as_str()) {
-        Some(s) => s.to_owned(),
+    let pubkey_b64 = match body.get("pubkeyBase64").and_then(|v| v.as_str()) {
+        Some(s) => s,
         None => return scim_error(400, "invalidValue", "pubkeyBase64 is required"),
     };
     let label = body.get("label").and_then(|v| v.as_str()).map(str::to_owned);
 
-    let raw = match base64::engine::general_purpose::STANDARD.decode(pubkey_base64.trim()) {
-        Ok(r) => r,
-        Err(e) => return scim_error(400, "invalidValue", &format!("Invalid base64: {e}")),
-    };
-    let key_bytes: [u8; 32] = match raw.try_into() {
-        Ok(b) => b,
-        Err(_) => return scim_error(400, "invalidValue", "Public key must be 32 bytes (Ed25519)"),
-    };
-    let pubkey = match VerifyingKey::from_bytes(&key_bytes) {
+    let pubkey = match decode_pubkey_base64(pubkey_b64) {
         Ok(k) => k,
-        Err(e) => return scim_error(400, "invalidValue", &format!("Invalid Ed25519 key: {e}")),
+        Err(e) => return scim_error(400, "invalidValue", &e.to_string()),
     };
 
     match svc.add_pubkey(&info.username, pubkey, label).await {
         Ok(entry) => (
             StatusCode::CREATED,
-            [(header::CONTENT_TYPE, "application/json")],
+            [(header::CONTENT_TYPE, "application/scim+json")],
             Json(serde_json::json!({
                 "fingerprint": entry.fingerprint,
                 "pubkeyBase64": entry.pubkey_base64,
@@ -571,7 +561,8 @@ pub async fn remove_user_key(
         None => return scim_error_simple(404, "Resource not found"),
     };
 
-    match svc.remove_pubkey(&info.username, &fingerprint).await {
+    let fp = fingerprint.strip_prefix("SHA256:").unwrap_or(&fingerprint);
+    match svc.remove_pubkey(&info.username, fp).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => scim_error_simple(404, "Key not found"),
         Err(e) => scim_error_simple(500, &e.to_string()),
