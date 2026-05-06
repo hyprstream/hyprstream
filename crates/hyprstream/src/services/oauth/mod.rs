@@ -26,6 +26,7 @@
 //!   /oauth/device/verify                     → user verification page
 //! ```
 
+pub mod auth;
 pub mod authorize;
 pub mod challenge;
 pub mod device;
@@ -76,7 +77,10 @@ pub const SERVICE_NAME: &str = "oauth";
 /// any inner middleware (like logging) runs. This fixes the previous ordering
 /// where logging was outermost and CORS was inner.
 pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfig) -> Router {
-    let mut router = Router::new()
+    // ── Public routes ──────────────────────────────────────────────────────────
+    // No Bearer token required. Includes all OAuth flow endpoints (clients are
+    // unauthenticated when they arrive) and SCIM discovery (RFC 7644 §4).
+    let public_router = Router::new()
         .route(
             "/.well-known/oauth-authorization-server",
             get(metadata::authorization_server_metadata),
@@ -84,6 +88,14 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
         .route(
             "/.well-known/oauth-protected-resource",
             get(oauth_self_protected_resource_metadata),
+        )
+        .route(
+            "/.well-known/openid-configuration",
+            get(metadata::openid_configuration),
+        )
+        .route(
+            "/.well-known/openid-federation",
+            get(federation_entity::entity_configuration),
         )
         .route("/oauth/register", post(registration::register_client))
         .route(
@@ -98,10 +110,6 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             get(device::verify_get).post(device::verify_post),
         )
         .route("/oauth/device/nonce", get(device::device_nonce))
-        .route(
-            "/oauth/userinfo",
-            get(userinfo::userinfo).post(userinfo::userinfo),
-        )
         .route("/oauth/revoke", post(revocation::revoke_token))
         .route("/oauth/logout", post(handle_logout))
         .route(
@@ -112,7 +120,23 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             "/oauth/callback/:provider",
             get(oidc_callback::external_callback),
         )
-        // SCIM 2.0 endpoints (RFC 7644)
+        // SCIM discovery endpoints — RFC 7644 §4 requires these to be unauthenticated
+        .route("/scim/v2/Schemas", get(scim::schemas))
+        .route("/scim/v2/ResourceTypes", get(scim::resource_types))
+        .route(
+            "/scim/v2/ServiceProviderConfig",
+            get(scim::service_provider_config),
+        );
+
+    // ── Protected routes ───────────────────────────────────────────────────────
+    // All require a valid Bearer token (validated by require_bearer_token).
+    // Inserts AuthenticatedUser into request extensions for downstream handlers.
+    let protected_router = Router::new()
+        .route(
+            "/oauth/userinfo",
+            get(userinfo::userinfo).post(userinfo::userinfo),
+        )
+        // SCIM 2.0 user management (RFC 7644)
         .route(
             "/scim/v2/Users",
             get(scim::list_users).post(scim::create_user),
@@ -131,20 +155,13 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             "/scim/v2/Users/:id/keys/:fingerprint",
             axum::routing::delete(scim::remove_user_key),
         )
-        .route("/scim/v2/Schemas", get(scim::schemas))
-        .route("/scim/v2/ResourceTypes", get(scim::resource_types))
-        .route(
-            "/scim/v2/ServiceProviderConfig",
-            get(scim::service_provider_config),
-        )
-        .route(
-            "/.well-known/openid-configuration",
-            get(metadata::openid_configuration),
-        )
-        .route(
-            "/.well-known/openid-federation",
-            get(federation_entity::entity_configuration),
-        )
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_bearer_token,
+        ));
+
+    let mut router = public_router
+        .merge(protected_router)
         .layer(axum::middleware::from_fn(
             |req: axum::extract::Request, next: axum::middleware::Next| async move {
                 let method = req.method().clone();
