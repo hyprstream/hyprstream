@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use axum::{
     extract::State,
-    http::{header, StatusCode},
+    http::{HeaderMap, header, StatusCode},
     response::{IntoResponse, Response},
     Form, Json,
 };
@@ -57,6 +57,7 @@ pub struct TokenRequest {
 /// POST /oauth/token — token exchange
 pub async fn exchange_token(
     State(state): State<Arc<OAuthState>>,
+    req_headers: HeaderMap,
     Form(params): Form<TokenRequest>,
 ) -> Response {
     tracing::info!(
@@ -67,10 +68,16 @@ pub async fn exchange_token(
         has_code_verifier = params.code_verifier.is_some(),
         "Token exchange request received"
     );
+    // Extract optional DPoP proof header (RFC 9449).
+    let dpop_header: Option<String> = req_headers
+        .get("DPoP")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
     match params.grant_type.as_str() {
-        "authorization_code" => exchange_authorization_code(state, params).await,
-        "refresh_token" => exchange_refresh_token(state, params).await,
-        gt if gt == DEVICE_CODE_GRANT_TYPE => exchange_device_code(state, params).await,
+        "authorization_code" => exchange_authorization_code(state, params, dpop_header).await,
+        "refresh_token" => exchange_refresh_token(state, params, dpop_header).await,
+        gt if gt == DEVICE_CODE_GRANT_TYPE => exchange_device_code(state, params, dpop_header).await,
         gt if gt == JWT_BEARER_GRANT_TYPE => {
             let assertion = match params.assertion {
                 Some(a) => a,
@@ -86,10 +93,30 @@ pub async fn exchange_token(
     }
 }
 
+/// Verify a DPoP proof for the token endpoint and return the jkt string.
+///
+/// Returns `None` when no DPoP header is present (DPoP is optional at the token endpoint).
+/// Returns `Some(Err(...))` if the header is present but invalid.
+fn verify_dpop_at_token_endpoint(
+    state: &OAuthState,
+    dpop_header: Option<&str>,
+) -> Option<Result<String, Response>> {
+    let proof_str = dpop_header?;
+    let token_endpoint = format!("{}/oauth/token", state.issuer_url.trim_end_matches('/'));
+    match super::dpop::verify_dpop_proof(proof_str, "POST", &token_endpoint, None) {
+        Ok(proof) => Some(Ok(proof.jkt)),
+        Err(e) => {
+            tracing::warn!("DPoP proof verification failed: {e}");
+            Some(Err(token_error(StatusCode::BAD_REQUEST, "invalid_dpop_proof", &e.to_string())))
+        }
+    }
+}
+
 /// Handle authorization_code grant type.
 async fn exchange_authorization_code(
     state: Arc<OAuthState>,
     params: TokenRequest,
+    dpop_header: Option<String>,
 ) -> Response {
     let code = match params.code {
         Some(c) => c,
@@ -159,17 +186,24 @@ async fn exchange_authorization_code(
         );
     }
 
+    // Verify DPoP if present.
+    let dpop_jkt = match verify_dpop_at_token_endpoint(&state, dpop_header.as_deref()) {
+        None => None,
+        Some(Ok(jkt)) => Some(jkt),
+        Some(Err(resp)) => return resp,
+    };
+
     tracing::info!(client_id = %params.client_id, username = %pending.username, "PKCE verified, issuing token");
-    // Use the authenticated username as JWT sub (set during Ed25519 challenge-response on consent page).
     let sub = pending.username.clone();
     let vk_ref = pending.verifying_key.as_ref();
-    issue_token_with_refresh(&state, &params.client_id, pending.scopes, pending.resource, &sub, pending.oidc_nonce, true, vk_ref).await
+    issue_token_with_refresh(&state, &params.client_id, pending.scopes, pending.resource, &sub, pending.oidc_nonce, true, vk_ref, dpop_jkt).await
 }
 
 /// Handle refresh_token grant type (OAuth 2.1 with rotation).
 async fn exchange_refresh_token(
     state: Arc<OAuthState>,
     params: TokenRequest,
+    dpop_header: Option<String>,
 ) -> Response {
     let refresh_token = match params.refresh_token {
         Some(rt) => rt,
@@ -207,18 +241,26 @@ async fn exchange_refresh_token(
         );
     }
 
+    // Verify DPoP if present.
+    let dpop_jkt = match verify_dpop_at_token_endpoint(&state, dpop_header.as_deref()) {
+        None => None,
+        Some(Ok(jkt)) => Some(jkt),
+        Some(Err(resp)) => return resp,
+    };
+
     // Reconstruct verifying key from stored bytes (cnf continuity across refreshes).
     let stored_vk: Option<ed25519_dalek::VerifyingKey> = entry.verifying_key_bytes
         .and_then(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).ok());
 
     // Issue new access token + rotated refresh token. No id_token on refresh (OIDC Core § 12.2).
-    issue_token_with_refresh(&state, &entry.client_id, entry.scopes, entry.resource, &entry.username, None, false, stored_vk.as_ref()).await
+    issue_token_with_refresh(&state, &entry.client_id, entry.scopes, entry.resource, &entry.username, None, false, stored_vk.as_ref(), dpop_jkt).await
 }
 
 /// Handle urn:ietf:params:oauth:grant-type:device_code grant type (RFC 8628 Section 3.4).
 async fn exchange_device_code(
     state: Arc<OAuthState>,
     params: TokenRequest,
+    dpop_header: Option<String>,
 ) -> Response {
     let device_code = match params.device_code {
         Some(dc) => dc,
@@ -299,8 +341,16 @@ async fn exchange_device_code(
             let mut user_code_map = state.device_code_by_user_code.write().await;
             user_code_map.remove(&user_code);
             drop(user_code_map);
+
+            // Verify DPoP if present.
+            let dpop_jkt = match verify_dpop_at_token_endpoint(&state, dpop_header.as_deref()) {
+                None => None,
+                Some(Ok(jkt)) => Some(jkt),
+                Some(Err(resp)) => return resp,
+            };
+
             // Device flow: no OIDC nonce and not initial OIDC auth.
-            issue_token_with_refresh(&state, &client_id, scopes, resource, &approved_by, None, false, device_vk.as_ref()).await
+            issue_token_with_refresh(&state, &client_id, scopes, resource, &approved_by, None, false, device_vk.as_ref(), dpop_jkt).await
         }
     }
 }
@@ -331,13 +381,16 @@ async fn issue_token_with_refresh(
     oidc_nonce: Option<String>,
     initial_auth: bool,
     user_verifying_key: Option<&ed25519_dalek::VerifyingKey>,
+    dpop_jkt: Option<String>,
 ) -> Response {
     let scope_str = scopes.join(" ");
 
-    // Encode user's Ed25519 pubkey for the JWT pub_key claim
-    let user_pub_key_b64 = user_verifying_key.map(|vk| {
-        URL_SAFE_NO_PAD.encode(vk.to_bytes())
-    });
+    // DPoP jkt takes priority; fall back to raw key bytes for cnf.jwk.
+    let user_pub_key_b64 = if dpop_jkt.is_none() {
+        user_verifying_key.map(|vk| URL_SAFE_NO_PAD.encode(vk.to_bytes()))
+    } else {
+        None
+    };
 
     let result = state
         .policy_client
@@ -347,6 +400,7 @@ async fn issue_token_with_refresh(
             audience: resource.clone(),
             subject: Some(sub.to_owned()),
             user_pub_key: user_pub_key_b64,
+            dpop_jkt: dpop_jkt.clone(),
         })
         .await;
 

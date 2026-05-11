@@ -11,6 +11,20 @@ use crate::capnp::{ToCapnp, FromCapnp};
 use anyhow::Result;
 use serde::{Deserialize, Serialize, Serializer, Deserializer};
 
+/// Compute the RFC 7638 JWK Thumbprint for an Ed25519 key.
+///
+/// The thumbprint is SHA-256 of the lexicographic canonical JWK JSON:
+/// `{"crv":"Ed25519","kty":"OKP","x":"<base64url>"}` — keys in lexicographic order.
+pub fn compute_jkt(key_bytes: &[u8; 32]) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use sha2::{Digest, Sha256};
+    let x = URL_SAFE_NO_PAD.encode(key_bytes);
+    // Keys in lexicographic order per RFC 7638 § 3.
+    let canonical = format!(r#"{{"crv":"Ed25519","kty":"OKP","x":"{x}"}}"#);
+    let hash = Sha256::digest(canonical.as_bytes());
+    URL_SAFE_NO_PAD.encode(hash)
+}
+
 /// Returns true if `iss` belongs to a local node.
 ///
 /// Used for pre-decode key routing (before a `Claims` object exists) and by
@@ -38,10 +52,20 @@ pub struct CnfJwk {
     pub x: String,
 }
 
-/// RFC 8705 Proof-of-Possession `cnf` claim containing a JWK.
+/// RFC 8705 Proof-of-Possession `cnf` claim.
+///
+/// Two key-binding modes:
+/// - `jwk`: Full OKP JWK object — used for WIMSE service WITs (`cnf.jwk`).
+/// - `jkt`: JWK Thumbprint (RFC 7638 SHA-256, base64url) — used for DPoP user
+///   tokens (`cnf.jkt`, per RFC 9449 § 6).
+///
+/// Both fields are optional so the struct serialises correctly for each mode.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Cnf {
-    pub jwk: CnfJwk,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jwk: Option<CnfJwk>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jkt: Option<String>,
 }
 
 /// JWT claims for authentication.
@@ -116,7 +140,9 @@ impl ToCapnp for Claims {
             builder.set_iss(&self.iss);
         }
         if let Some(ref cnf) = self.cnf {
-            builder.set_pub_key(&cnf.jwk.x);
+            if let Some(ref jwk) = cnf.jwk {
+                builder.set_pub_key(&jwk.x);
+            }
         }
         // Write empty scopes list for wire compatibility
         builder.reborrow().init_scopes(0);
@@ -147,11 +173,12 @@ impl FromCapnp for Claims {
             .and_then(|s| s.to_str().ok())
             .filter(|s| !s.is_empty())
             .map(|x| Cnf {
-                jwk: CnfJwk {
+                jwk: Some(CnfJwk {
                     kty: "OKP".to_owned(),
                     crv: "Ed25519".to_owned(),
                     x: x.to_owned(),
-                },
+                }),
+                jkt: None,
             });
 
         Ok(Self {
@@ -206,11 +233,25 @@ impl Claims {
     pub fn with_cnf_jwk(mut self, key_bytes: &[u8; 32]) -> Self {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         self.cnf = Some(Cnf {
-            jwk: CnfJwk {
+            jwk: Some(CnfJwk {
                 kty: "OKP".to_owned(),
                 crv: "Ed25519".to_owned(),
                 x: URL_SAFE_NO_PAD.encode(key_bytes),
-            },
+            }),
+            jkt: None,
+        });
+        self
+    }
+
+    /// Set the RFC 9449 `cnf.jkt` confirmation claim (DPoP JWK thumbprint).
+    ///
+    /// `key_bytes` is the raw 32-byte Ed25519 public key. The thumbprint is
+    /// computed per RFC 7638: SHA-256 of the lexicographic canonical JWK JSON,
+    /// base64url-encoded.
+    pub fn with_cnf_jkt(mut self, key_bytes: &[u8; 32]) -> Self {
+        self.cnf = Some(Cnf {
+            jwk: None,
+            jkt: Some(compute_jkt(key_bytes)),
         });
         self
     }
@@ -218,9 +259,14 @@ impl Claims {
     /// Extract the raw 32-byte Ed25519 public key from `cnf.jwk.x`, if present.
     pub fn cnf_key_bytes(&self) -> Option<[u8; 32]> {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-        let x = self.cnf.as_ref()?.jwk.x.as_str();
+        let x = self.cnf.as_ref()?.jwk.as_ref()?.x.as_str();
         let bytes = URL_SAFE_NO_PAD.decode(x).ok()?;
         bytes.try_into().ok()
+    }
+
+    /// Return the `cnf.jkt` thumbprint string, if present.
+    pub fn cnf_jkt(&self) -> Option<&str> {
+        self.cnf.as_ref()?.jkt.as_deref()
     }
 
     /// Independently verify the embedded JWT token.

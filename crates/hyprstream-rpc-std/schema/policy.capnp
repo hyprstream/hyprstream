@@ -121,6 +121,11 @@ struct IssueToken {
   # When present, included in the JWT `pub_key` claim to bind the user's key identity.
   # Ignored for service tokens (pubkey is CA-derived).
   userPubKey @4 :Text $optional;
+
+  # DPoP JWK thumbprint (RFC 7638 SHA-256 base64url) for DPoP user tokens.
+  # When present, the issued token carries cnf.jkt instead of cnf.jwk.
+  # Takes precedence over userPubKey.
+  dpopJkt @5 :Text $optional;
 }
 
 # Apply a built-in policy template

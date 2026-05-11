@@ -31,6 +31,7 @@ pub mod authorize;
 pub mod challenge;
 pub mod device;
 pub mod federation_entity;
+pub mod dpop;
 pub mod introspection;
 pub mod jwks;
 pub mod jwt_bearer;

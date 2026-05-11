@@ -329,7 +329,13 @@ impl PolicyHandler for PolicyService {
         ).with_issuer(issuer)
          .with_audience(audience);
 
-        if let Some(key_bytes) = service_key_bytes {
+        // DPoP jkt takes priority over userPubKey (RFC 9449 § 6).
+        if let Some(ref jkt) = data.dpop_jkt {
+            claims.cnf = Some(hyprstream_rpc::auth::Cnf {
+                jwk: None,
+                jkt: Some(jkt.clone()),
+            });
+        } else if let Some(key_bytes) = service_key_bytes {
             claims = claims.with_cnf_jwk(&key_bytes);
         }
 
