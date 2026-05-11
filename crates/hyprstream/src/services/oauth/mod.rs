@@ -31,7 +31,9 @@ pub mod authorize;
 pub mod challenge;
 pub mod device;
 pub mod federation_entity;
+pub mod introspection;
 pub mod jwks;
+pub mod jwt_bearer;
 pub mod login_page;
 pub mod metadata;
 pub mod oidc_callback;
@@ -111,6 +113,7 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
         )
         .route("/oauth/device/nonce", get(device::device_nonce))
         .route("/oauth/revoke", post(revocation::revoke_token))
+        .route("/oauth/introspect", post(introspection::introspect_token))
         .route("/oauth/logout", post(handle_logout))
         .route(
             "/oauth/external/authorize/:provider",

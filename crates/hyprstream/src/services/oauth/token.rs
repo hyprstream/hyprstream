@@ -26,6 +26,8 @@ use crate::services::generated::policy_client::IssueToken;
 
 /// Device code grant type URN (RFC 8628).
 const DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+/// JWT bearer grant type URN (RFC 7523).
+const JWT_BEARER_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
 
 /// Token exchange request (application/x-www-form-urlencoded).
 ///
@@ -47,6 +49,9 @@ pub struct TokenRequest {
     // refresh_token field
     #[serde(default)]
     pub refresh_token: Option<String>,
+    // jwt-bearer assertion (RFC 7523)
+    #[serde(default)]
+    pub assertion: Option<String>,
 }
 
 /// POST /oauth/token — token exchange
@@ -66,10 +71,17 @@ pub async fn exchange_token(
         "authorization_code" => exchange_authorization_code(state, params).await,
         "refresh_token" => exchange_refresh_token(state, params).await,
         gt if gt == DEVICE_CODE_GRANT_TYPE => exchange_device_code(state, params).await,
+        gt if gt == JWT_BEARER_GRANT_TYPE => {
+            let assertion = match params.assertion {
+                Some(a) => a,
+                None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", "assertion is required"),
+            };
+            super::jwt_bearer::exchange_jwt_bearer(&state, &params.client_id, &assertion).await
+        }
         _ => token_error(
             StatusCode::BAD_REQUEST,
             "unsupported_grant_type",
-            "Supported: authorization_code, refresh_token, device_code",
+            "Supported: authorization_code, refresh_token, device_code, jwt-bearer",
         ),
     }
 }
