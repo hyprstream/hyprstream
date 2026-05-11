@@ -306,7 +306,6 @@ impl ServiceContext {
     /// Populates `service_keys`, `ca_verifying_key`, and the global trust store
     /// from the generated materials.
     pub fn generate_independent_service_keys(self, service_names: &[String]) -> Self {
-        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
         let ca_signing_key = hyprstream_rpc::node_identity::derive_purpose_key(
             &self.signing_key, "hyprstream-jwt-v1",
@@ -372,14 +371,14 @@ impl ServiceContext {
                 now,
                 expiry,
             )
-            .with_pub_key(URL_SAFE_NO_PAD.encode(service_vk.as_bytes()));
+            .with_cnf_jwk(service_vk.as_bytes());
             if let Some(ref iss) = oauth_issuer {
                 claims = claims
                     .with_issuer(iss.clone())
                     .with_audience(Some(iss.clone()));
             }
 
-            let jwt = hyprstream_rpc::auth::jwt::encode(&claims, &ca_signing_key);
+            let jwt = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &ca_signing_key);
 
             ctx = ctx
                 .with_service_key(name, service_key);

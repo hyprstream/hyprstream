@@ -15,6 +15,7 @@ fn test_envelope_serialization_deterministic() {
         claims: None,
         jwt_token: None,
         delegated_bearer: None,
+        wit_hash: None,
     };
 
     let envelope2 = envelope1.clone();
@@ -49,6 +50,7 @@ fn test_envelope_signature_verification_stable() {
         claims: None,
         jwt_token: None,
         delegated_bearer: None,
+        wit_hash: None,
     };
 
     // Sign envelope
@@ -107,6 +109,7 @@ fn test_envelope_canonical_form() {
         claims: None,
         jwt_token: None,
         delegated_bearer: None,
+        wit_hash: None,
     };
 
     let bytes = envelope.to_bytes();
@@ -143,6 +146,7 @@ fn test_envelope_with_claims_deterministic() {
         claims: None,
         jwt_token: None,
         delegated_bearer: None,
+        wit_hash: None,
     };
 
     // Multiple serializations must produce identical bytes
@@ -166,6 +170,7 @@ fn test_envelope_different_data_different_bytes() {
         claims: None,
         jwt_token: None,
         delegated_bearer: None,
+        wit_hash: None,
     };
 
     let envelope2 = RequestEnvelope {
@@ -178,6 +183,7 @@ fn test_envelope_different_data_different_bytes() {
         claims: None,
         jwt_token: None,
         delegated_bearer: None,
+        wit_hash: None,
     };
 
     let bytes1 = envelope1.to_bytes();

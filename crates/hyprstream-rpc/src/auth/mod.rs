@@ -20,7 +20,7 @@ pub mod scope_registry;
 pub use claims::{Claims, IdTokenClaims, OneOrMany, is_local_iss};
 #[cfg(not(target_arch = "wasm32"))]
 pub use federation::FederationKeySource;
-pub use jwt::{decode, decode_unverified, decode_with_key, encode, JwtError};
+pub use jwt::{decode, decode_unverified, decode_with_key, encode, encode_service_jwt, JwtError};
 #[cfg(not(target_arch = "wasm32"))]
 pub use key_source::{ClusterKeySource, FederatedKeySource, JwtKeySource};
 pub use scope::Scope;

@@ -17,8 +17,11 @@ use thiserror::Error;
 
 use super::Claims;
 
-/// JWT header (static for EdDSA)
-const JWT_HEADER: &str = r#"{"alg":"EdDSA","typ":"JWT"}"#;
+/// RFC 9068 JWT Profile for OAuth 2.0 Access Tokens — user/client tokens.
+const JWT_HEADER_ACCESS_TOKEN: &str = r#"{"alg":"EdDSA","typ":"at+jwt"}"#;
+
+/// WIMSE Workload Identity Token — service-to-service JWTs (WIT).
+const JWT_HEADER_SERVICE: &str = r#"{"alg":"EdDSA","typ":"wit+jwt"}"#;
 
 /// Errors from JWT operations
 #[derive(Error, Debug)]
@@ -48,28 +51,29 @@ pub enum JwtError {
     InvalidAudience,
 }
 
-/// Encode and sign a JWT token
-///
-/// Returns a standard RFC 7519 JWT (no prefix).
-pub fn encode(claims: &Claims, signing_key: &SigningKey) -> String {
-    // Encode header and payload
-    let header_b64 = URL_SAFE_NO_PAD.encode(JWT_HEADER);
+/// Encode and sign a JWT with a specific JOSE header.
+fn encode_with_header(claims: &Claims, signing_key: &SigningKey, header_json: &str) -> String {
+    let header_b64 = URL_SAFE_NO_PAD.encode(header_json);
     let payload_json = serde_json::to_string(claims).unwrap_or_else(|_e| {
         #[cfg(not(target_arch = "wasm32"))]
         tracing::error!("JWT claims serialization failed: {}", _e);
         "{}".to_owned()
     });
     let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
-
-    // Create signing input
     let signing_input = format!("{header_b64}.{payload_b64}");
-
-    // Sign with Ed25519
     let signature = signing_key.sign(signing_input.as_bytes());
     let signature_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
-
-    // Combine into JWT
     format!("{signing_input}.{signature_b64}")
+}
+
+/// Encode a user/client OAuth 2.0 access token (`typ: "at+jwt"`, RFC 9068).
+pub fn encode(claims: &Claims, signing_key: &SigningKey) -> String {
+    encode_with_header(claims, signing_key, JWT_HEADER_ACCESS_TOKEN)
+}
+
+/// Encode a WIMSE Workload Identity Token (`typ: "wit+jwt"`) for service JWTs.
+pub fn encode_service_jwt(claims: &Claims, signing_key: &SigningKey) -> String {
+    encode_with_header(claims, signing_key, JWT_HEADER_SERVICE)
 }
 
 /// Encode and sign an OIDC ID Token (EdDSA with `kid` in header).

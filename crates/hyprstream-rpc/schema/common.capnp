@@ -1,4 +1,4 @@
-@0xb1c2d3e4f5a6b7c8;
+@0xa7752df0b011394c;
 
 using import "annotations.capnp".fixedSize;
 using import "annotations.capnp".optional;
@@ -54,6 +54,7 @@ struct RequestEnvelope {
   claims @6 :Claims $optional;     # DEPRECATED: use jwtToken instead. Kept for wire compat.
   jwtToken @7 :Text $optional;     # Opaque JWT token string. Server decodes and verifies.
   delegatedBearer @8 :Text $optional;  # Bearer token relayed by a trusted service (e.g., OAI, MCP). Verified at envelope layer.
+  witHash @9 :Data $fixedSize(32) $optional;  # SHA-256 of jwtToken (WIT). Binds this proof to a specific WIT even when jwtToken is omitted (cache-hit path).
 }
 
 # Signed wrapper - signature covers serialized RequestEnvelope bytes

@@ -29,6 +29,21 @@ pub fn is_local_iss(iss: &str, local_issuers: &[&str]) -> bool {
     }
 }
 
+/// JWK (JSON Web Key) for an Ed25519 public key — RFC 7517 OKP key type.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CnfJwk {
+    pub kty: String,
+    pub crv: String,
+    /// Base64url-encoded Ed25519 public key (32 bytes), RFC 8037 §2.
+    pub x: String,
+}
+
+/// RFC 8705 Proof-of-Possession `cnf` claim containing a JWK.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Cnf {
+    pub jwk: CnfJwk,
+}
+
 /// JWT claims for authentication.
 ///
 /// Note: Authorization is enforced via Casbin policies server-side.
@@ -47,14 +62,14 @@ pub struct Claims {
     /// RFC 8707 audience claim for resource indicator binding.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aud: Option<String>,
-    /// Ed25519 public key (base64url-encoded) binding the signer's key to the JWT subject.
+    /// RFC 8705 / WIMSE proof-of-possession confirmation claim.
     ///
-    /// Present in both service and user tokens. Binds the Ed25519 signing key to the
-    /// JWT-attested identity, allowing callers to verify envelope signatures match the
-    /// JWT-attested subject. For service tokens, derived by the CA from the root key.
-    /// For user tokens, set during OAuth flow from the verified Ed25519 challenge-response.
-    #[serde(alias = "pub", rename = "pub_key", skip_serializing_if = "Option::is_none")]
-    pub pub_key: Option<String>,
+    /// Binds the Ed25519 signing key to the JWT-attested identity via a standard
+    /// JWK object (`cnf.jwk`). For service tokens (WIT), derived by the CA from
+    /// the root key. For user tokens, set during OAuth flow from the verified
+    /// Ed25519 challenge-response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cnf: Option<Cnf>,
     /// Original JWT token for end-to-end verification.
     /// When present, downstream services MUST verify this token
     /// independently rather than trusting the envelope claims alone.
@@ -77,7 +92,7 @@ impl std::fmt::Debug for Claims {
             .field("exp", &self.exp)
             .field("iat", &self.iat)
             .field("aud", &self.aud)
-            .field("pub_key", &self.pub_key)
+            .field("cnf", &self.cnf)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
             .finish()
     }
@@ -100,8 +115,8 @@ impl ToCapnp for Claims {
         if !self.iss.is_empty() {
             builder.set_iss(&self.iss);
         }
-        if let Some(ref pub_key) = self.pub_key {
-            builder.set_pub_key(pub_key);
+        if let Some(ref cnf) = self.cnf {
+            builder.set_pub_key(&cnf.jwk.x);
         }
         // Write empty scopes list for wire compatibility
         builder.reborrow().init_scopes(0);
@@ -128,10 +143,16 @@ impl FromCapnp for Claims {
             .map(std::borrow::ToOwned::to_owned)
             .unwrap_or_default();
 
-        let pub_key = reader.get_pub_key().ok()
+        let cnf = reader.get_pub_key().ok()
             .and_then(|s| s.to_str().ok())
-            .map(std::borrow::ToOwned::to_owned)
-            .filter(|s| !s.is_empty());
+            .filter(|s| !s.is_empty())
+            .map(|x| Cnf {
+                jwk: CnfJwk {
+                    kty: "OKP".to_owned(),
+                    crv: "Ed25519".to_owned(),
+                    x: x.to_owned(),
+                },
+            });
 
         Ok(Self {
             iss,
@@ -139,7 +160,7 @@ impl FromCapnp for Claims {
             exp: reader.get_exp(),
             iat: reader.get_iat(),
             aud,
-            pub_key,
+            cnf,
             token,
         })
     }
@@ -154,7 +175,7 @@ impl Claims {
             exp,
             iat,
             aud: None,
-            pub_key: None,
+            cnf: None,
             token: None,
         }
     }
@@ -178,10 +199,28 @@ impl Claims {
         self
     }
 
-    /// Set the Ed25519 public key (base64url-encoded) for service identity tokens.
-    pub fn with_pub_key(mut self, pubkey: String) -> Self {
-        self.pub_key = Some(pubkey);
+    /// Set the RFC 8705 `cnf.jwk` confirmation claim (WIMSE WIT key binding).
+    ///
+    /// `key_bytes` is the raw 32-byte Ed25519 public key. Produces a standard
+    /// OKP JWK object with `kty: "OKP"`, `crv: "Ed25519"`, `x: <base64url>`.
+    pub fn with_cnf_jwk(mut self, key_bytes: &[u8; 32]) -> Self {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        self.cnf = Some(Cnf {
+            jwk: CnfJwk {
+                kty: "OKP".to_owned(),
+                crv: "Ed25519".to_owned(),
+                x: URL_SAFE_NO_PAD.encode(key_bytes),
+            },
+        });
         self
+    }
+
+    /// Extract the raw 32-byte Ed25519 public key from `cnf.jwk.x`, if present.
+    pub fn cnf_key_bytes(&self) -> Option<[u8; 32]> {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let x = self.cnf.as_ref()?.jwk.x.as_str();
+        let bytes = URL_SAFE_NO_PAD.decode(x).ok()?;
+        bytes.try_into().ok()
     }
 
     /// Independently verify the embedded JWT token.

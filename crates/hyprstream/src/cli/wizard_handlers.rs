@@ -124,6 +124,16 @@ const PREDEFINED_ROLES: &[RoleDef] = &[
 
 /// Handle `hyprstream wizard --tui` — TUI setup wizard with bootstrap manager.
 ///
+/// Decode the `exp` (expiry) claim from a JWT without verifying the signature.
+/// Used only for wizard-local decisions about whether to renew a service JWT.
+fn decode_jwt_exp_wizard(jwt: &str) -> Option<i64> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let payload_b64 = jwt.split('.').nth(1)?;
+    let payload = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    value.get("exp")?.as_i64()
+}
+
 /// Runs the TUI on a blocking thread so that `BootstrapManager`'s synchronous
 /// trait methods can safely call `block_on` without panicking inside Tokio.
 pub async fn handle_wizard_tui(models_dir: &Path) -> Result<()> {
@@ -203,11 +213,21 @@ async fn phase_bootstrap(state: &mut WizardState, _non_interactive: bool) -> Res
                 .join("credentials")
         });
 
-    // Write CA signing key (the root key becomes the CA key)
-    identity_store::write_ca_signing_key(&credentials_dir, &signing_key)?;
-    // Also write as 'signing-key' so PolicyService can load it via the flat credstore
+    // Write CA signing key only if not already present (idempotent)
+    match identity_store::load_ca_signing_key(&credentials_dir) {
+        Ok(_) => {
+            // CA key already exists; preserve it so running services stay valid
+        }
+        Err(_) => {
+            identity_store::write_ca_signing_key(&credentials_dir, &signing_key)?;
+            // Also write as 'signing-key' so PolicyService can load it via the flat credstore
+            identity_store::write_secret(&credentials_dir, "signing-key", &signing_key.to_bytes())?;
+            // Write CA verifying key (public, distributed to all services)
+            identity_store::write_ca_verifying_key(&credentials_dir, &signing_key.verifying_key())?;
+        }
+    }
+    // Always ensure signing-key and verifying key are in sync with what we loaded
     identity_store::write_secret(&credentials_dir, "signing-key", &signing_key.to_bytes())?;
-    // Write CA verifying key (public, distributed to all services)
     identity_store::write_ca_verifying_key(&credentials_dir, &signing_key.verifying_key())?;
 
     // CA JWT signing key (purpose-derived for JWT signature separation)
@@ -215,10 +235,10 @@ async fn phase_bootstrap(state: &mut WizardState, _non_interactive: bool) -> Res
         &signing_key, "hyprstream-jwt-v1",
     );
 
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     let mut bootstrap_pubkeys = std::collections::HashMap::new();
     let now = chrono::Utc::now().timestamp();
-    let expiry = now + 7 * 86_400;
+    const NEW_EXPIRY_TTL: i64 = 30 * 86_400; // 30 days
+    const RENEW_THRESHOLD: i64 = 7 * 86_400;  // renew if ≤7 days remain
 
     for factory in hyprstream_service::list_factories() {
         let service_name = factory.name;
@@ -231,11 +251,24 @@ async fn phase_bootstrap(state: &mut WizardState, _non_interactive: bool) -> Res
         )?;
         let service_vk = service_key.verifying_key();
 
-        let claims = hyprstream_rpc::auth::Claims::new(
-            format!("service:{service_name}"), now, expiry,
-        ).with_pub_key(URL_SAFE_NO_PAD.encode(service_vk.as_bytes()));
-        let jwt = hyprstream_rpc::auth::jwt::encode(&claims, &ca_jwt_key);
-        identity_store::write_service_jwt(&credentials_dir, service_name, &jwt)?;
+        // Only (re)issue JWT if absent or within 7 days of expiry
+        let needs_jwt = match identity_store::load_service_jwt(&credentials_dir, service_name)? {
+            None => true,
+            Some(ref existing) => {
+                let exp = decode_jwt_exp_wizard(existing).unwrap_or(0);
+                (exp - now) <= RENEW_THRESHOLD
+            }
+        };
+
+        if needs_jwt {
+            let expiry = now + NEW_EXPIRY_TTL;
+            let claims = hyprstream_rpc::auth::Claims::new(
+                format!("service:{service_name}"), now, expiry,
+            ).with_cnf_jwk(service_vk.as_bytes());
+            let jwt = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &ca_jwt_key);
+            identity_store::write_service_jwt(&credentials_dir, service_name, &jwt)?;
+        }
+
         bootstrap_pubkeys.insert(service_name.to_owned(), service_vk);
     }
     identity_store::write_bootstrap_pubkeys(&credentials_dir, &bootstrap_pubkeys)?;

@@ -97,6 +97,10 @@ pub struct EnvelopeContext {
     /// Raw signer pubkey bytes from the verified `SignedEnvelope`.
     /// Cryptographically verified by Ed25519 signature check.
     pub signer_pubkey: [u8; 32],
+
+    /// WIMSE wth binding: SHA-256 of the WIT JWT from the envelope (if present).
+    /// Populated from `RequestEnvelope.wit_hash` during context construction.
+    pub(crate) envelope_wit_hash: Option<[u8; 32]>,
 }
 
 impl EnvelopeContext {
@@ -117,6 +121,7 @@ impl EnvelopeContext {
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
             signer_pubkey: envelope.signer_pubkey,
+            envelope_wit_hash: envelope.envelope.wit_hash,
         }
     }
 
@@ -135,6 +140,7 @@ impl EnvelopeContext {
             key_derived_subject: Subject::new("system"),
             jwt_subject: None,
             signer_pubkey: envelope.signer_pubkey,
+            envelope_wit_hash: envelope.envelope.wit_hash,
         }
     }
 
@@ -157,6 +163,7 @@ impl EnvelopeContext {
             key_derived_subject: Subject::new(format!("service:{service_name}")),
             jwt_subject: None,
             signer_pubkey: [0u8; 32],
+            envelope_wit_hash: None,
         }
     }
 
@@ -413,65 +420,43 @@ pub trait ZmqService: 'static {
         }
         ctx.claims = Some(verified.clone());
 
-        // R2: Bind JWT pub_key claim to envelope signer for ALL tokens.
-        // When a JWT carries a pub_key (Ed25519 pubkey, base64url), the envelope's
-        // signer must match. This prevents a valid JWT holder from signing envelopes
-        // with a different key and being attributed the JWT's subject identity.
-        // Applies to both service tokens and user tokens.
+        // R2: Bind JWT cnf.jwk claim to envelope signer (WIMSE WIT key binding).
+        // When a JWT carries a cnf.jwk (Ed25519 pubkey), the envelope signer must
+        // match. Prevents a valid JWT holder from signing envelopes with a different
+        // key and being attributed the JWT's subject identity.
         if let Some(ref claims) = ctx.claims {
-            if let Some(ref pub_key_b64) = claims.pub_key {
-                use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-                match URL_SAFE_NO_PAD.decode(pub_key_b64) {
-                    Ok(pub_key_bytes) => {
-                        if pub_key_bytes.len() != 32 {
-                            tracing::warn!(
-                                "JWT pubkey has invalid length: {} bytes (expected 32)",
-                                pub_key_bytes.len()
-                            );
-                            anyhow::bail!(
-                                "JWT pubkey has invalid length: {} bytes",
-                                pub_key_bytes.len()
-                            );
-                        }
-                        let mut expected = [0u8; 32];
-                        expected.copy_from_slice(&pub_key_bytes);
-                        use subtle::ConstantTimeEq as _;
-                        if expected.ct_ne(&ctx.signer_pubkey).into() {
-                            tracing::warn!(
-                                "JWT pubkey mismatch: sub={}",
-                                claims.sub
-                            );
-                            anyhow::bail!("JWT pubkey does not match envelope signer");
-                        }
-
-                        // Cache the (key → subject) binding in the trust store.
-                        // Uses namespaced subject for federated tokens.
-                        let vk = match ed25519_dalek::VerifyingKey::from_bytes(&expected) {
-                            Ok(vk) => vk,
-                            Err(_) => {
-                                tracing::warn!("Invalid Ed25519 verifying key in JWT pub_key");
-                                anyhow::bail!("Invalid Ed25519 verifying key in JWT");
-                            }
-                        };
-                        let subject_str = claims.subject(&local_issuers_refs);
-                        if let Some(subject_name) = subject_str.name() {
-                            self.cache_key_binding(
-                                vk,
-                                subject_name,
-                                &token,
-                                claims.exp,
-                            );
-                            tracing::info!(
-                                subject = %subject_name,
-                                "Cached key binding in trust store"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Invalid base64 in JWT pub_key claim: {}", e);
-                        anyhow::bail!("Invalid JWT pubkey encoding");
-                    }
+            if let Some(expected) = claims.cnf_key_bytes() {
+                use subtle::ConstantTimeEq as _;
+                if expected.ct_ne(&ctx.signer_pubkey).into() {
+                    tracing::warn!("JWT cnf.jwk mismatch: sub={}", claims.sub);
+                    anyhow::bail!("JWT cnf.jwk does not match envelope signer");
                 }
+
+                // Cache the (key → subject) binding in the trust store.
+                let vk = match ed25519_dalek::VerifyingKey::from_bytes(&expected) {
+                    Ok(vk) => vk,
+                    Err(_) => {
+                        tracing::warn!("Invalid Ed25519 verifying key in JWT cnf.jwk");
+                        anyhow::bail!("Invalid Ed25519 verifying key in JWT cnf.jwk");
+                    }
+                };
+                let subject_str = claims.subject(&local_issuers_refs);
+                if let Some(subject_name) = subject_str.name() {
+                    self.cache_key_binding(vk, subject_name, &token, claims.exp);
+                    tracing::info!(subject = %subject_name, "Cached key binding in trust store");
+                }
+            }
+        }
+
+        // R3: Verify WIMSE wth binding — envelope proof is committed to a specific WIT.
+        // If the envelope carries a witHash, it must match SHA-256(jwtToken we just verified).
+        if let Some(ref claimed_hash) = ctx.envelope_wit_hash {
+            use sha2::{Digest, Sha256};
+            use subtle::ConstantTimeEq as _;
+            let expected: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+            if expected.ct_ne(claimed_hash.as_slice()).into() {
+                tracing::warn!("witHash mismatch — possible rotation-window replay");
+                anyhow::bail!("witHash does not match WIT — possible rotation-window replay");
             }
         }
 

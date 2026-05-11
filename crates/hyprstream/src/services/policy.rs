@@ -17,6 +17,7 @@ use crate::services::generated::policy_client::{
     RegisterEventPrefix, SubscribeEventPrefix, GetPendingSubscribers, DepositWrappedKeys,
     EventPrefixAccess, PendingSubscribers,
     ResolveServiceKey, RegisterServiceKey, ServiceKeyResponse,
+    RefreshServiceTokenRequest,
     dispatch_policy, serialize_response,
 };
 use anyhow::{anyhow, Result};
@@ -301,19 +302,21 @@ impl PolicyHandler for PolicyService {
         let audience = data.audience.as_ref().filter(|s| !s.is_empty()).cloned()
             .or_else(|| self.default_audience.clone());
 
-        // Service tokens: derive the Ed25519 pubkey from the root key.
+        // Service tokens: derive the Ed25519 key bytes from the root CA key.
         // The CA (PolicyService) is authoritative — the pubkey is not caller-provided.
-        // User tokens: use the caller-provided pubkey (from OAuth consent page).
-        let service_pub_key = if is_service_token {
+        // User tokens: decode the caller-provided pubkey (from OAuth consent page).
+        let service_key_bytes: Option<[u8; 32]> = if is_service_token {
             let svc_name = &subject["service:".len()..];
             let svc_signing_key = hyprstream_rpc::node_identity::derive_purpose_key(
                 &self.signing_key,
                 &format!("service:{svc_name}"),
             );
-            use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-            Some(URL_SAFE_NO_PAD.encode(svc_signing_key.verifying_key().to_bytes()))
+            Some(*svc_signing_key.verifying_key().as_bytes())
         } else {
-            data.user_pub_key.clone()
+            use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+            data.user_pub_key.as_deref().and_then(|s| {
+                URL_SAFE_NO_PAD.decode(s).ok()?.try_into().ok()
+            })
         };
 
         // Populate iss with the OAuth issuer URL so federation peers can fetch JWKS.
@@ -326,11 +329,15 @@ impl PolicyHandler for PolicyService {
         ).with_issuer(issuer)
          .with_audience(audience);
 
-        if let Some(pub_key) = service_pub_key {
-            claims = claims.with_pub_key(pub_key);
+        if let Some(key_bytes) = service_key_bytes {
+            claims = claims.with_cnf_jwk(&key_bytes);
         }
 
-        let token = crate::auth::jwt::encode(&claims, &self.jwt_signing_key);
+        let token = if is_service_token {
+            crate::auth::jwt::encode_service_jwt(&claims, &self.jwt_signing_key)
+        } else {
+            crate::auth::jwt::encode(&claims, &self.jwt_signing_key)
+        };
 
         Ok(PolicyResponseVariant::IssueTokenResult(TokenInfo {
             token,
@@ -1237,18 +1244,15 @@ impl PolicyHandler for PolicyService {
             );
         }
 
-        // Verify the provided verifying key matches the JWT's pub_key claim.
+        // Verify the provided verifying key matches the JWT's cnf.jwk claim.
         let vk_bytes: [u8; 32] = data.verifying_key.as_slice().try_into()
             .map_err(|_| anyhow!("verifying_key must be 32 bytes"))?;
         let vk = VerifyingKey::from_bytes(&vk_bytes)
             .map_err(|e| anyhow!("Invalid Ed25519 verifying key: {e}"))?;
 
-        if let Some(ref pub_key_b64) = claims.pub_key {
-            use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-            let decoded = URL_SAFE_NO_PAD.decode(pub_key_b64)
-                .map_err(|_| anyhow!("Invalid base64 in JWT pub_key claim"))?;
-            if decoded != vk_bytes {
-                anyhow::bail!("JWT pub_key does not match provided verifying key");
+        if let Some(cnf_bytes) = claims.cnf_key_bytes() {
+            if cnf_bytes != vk_bytes {
+                anyhow::bail!("JWT cnf.jwk does not match provided verifying key");
             }
         }
 
@@ -1266,6 +1270,72 @@ impl PolicyHandler for PolicyService {
         info!(service = %data.service_name, caller = %caller, "Registered service verifying key");
 
         Ok(PolicyResponseVariant::RegisterServiceKeyResult)
+    }
+
+    async fn handle_refresh_service_token(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &RefreshServiceTokenRequest,
+    ) -> Result<PolicyResponseVariant> {
+        const MAX_TTL: i64 = 2_592_000; // 30 days
+        const MIN_TTL: i64 = 3_600;     // 1 hour
+
+        let subject = match ctx.subject().name() {
+            Some(s) if s.starts_with("service:") => s.to_owned(),
+            Some(s) => {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: format!("Subject '{s}' is not a service identity; only services may self-renew"),
+                    code: "NOT_A_SERVICE".to_owned(),
+                    details: String::new(),
+                }));
+            }
+            None => {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: "Anonymous callers cannot refresh service tokens".to_owned(),
+                    code: "ANONYMOUS".to_owned(),
+                    details: String::new(),
+                }));
+            }
+        };
+
+        let ttl = data.ttl_seconds.clamp(MIN_TTL, MAX_TTL);
+        let svc_name = &subject["service:".len()..];
+
+        let now = chrono::Utc::now().timestamp();
+        let expires_at = now + ttl;
+
+        // Derive the service's pubkey from the root CA key (same as issue_token)
+        let svc_signing_key = hyprstream_rpc::node_identity::derive_purpose_key(
+            &self.signing_key,
+            &format!("service:{svc_name}"),
+        );
+
+        let issuer = self.default_audience.clone().unwrap_or_default();
+        let claims = hyprstream_rpc::auth::Claims::new(subject.clone(), now, expires_at)
+            .with_issuer(issuer)
+            .with_cnf_jwk(svc_signing_key.verifying_key().as_bytes());
+
+        let token = crate::auth::jwt::encode_service_jwt(&claims, &self.jwt_signing_key);
+
+        // Persist renewed JWT to disk so it survives a server restart
+        let credentials_dir = crate::config::HyprConfig::load()
+            .map(|c| c.config_dir().join("credentials"))
+            .unwrap_or_else(|_| {
+                dirs::config_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                    .join("hyprstream")
+                    .join("credentials")
+            });
+        if let Err(e) = crate::auth::identity_store::write_service_jwt(&credentials_dir, svc_name, &token) {
+            warn!(service = svc_name, "Failed to persist renewed JWT to disk: {e}");
+        }
+
+        info!(service = svc_name, expires_at, "Renewed service JWT");
+        Ok(PolicyResponseVariant::RefreshServiceTokenResult(TokenInfo {
+            token,
+            expires_at,
+        }))
     }
 }
 

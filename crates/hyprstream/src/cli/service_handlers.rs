@@ -620,7 +620,42 @@ pub(crate) async fn run_repair_checks(
         }
     }
 
-    // 6. Policy active
+    // 6. Service JWT presence
+    {
+        let credentials_dir = crate::config::HyprConfig::load()
+            .map(|c| c.config_dir().join("credentials"))
+            .unwrap_or_else(|_| {
+                dirs::config_dir()
+                    .unwrap_or_else(|| models_dir.to_path_buf())
+                    .join("hyprstream")
+                    .join("credentials")
+            });
+
+        let mut missing_jwts = Vec::new();
+        for factory in hyprstream_service::list_factories() {
+            let svc = factory.name;
+            if svc == "policy" {
+                continue; // PolicyService uses the root CA key, not a per-service JWT
+            }
+            match crate::auth::identity_store::load_service_jwt(&credentials_dir, svc) {
+                Ok(Some(_)) => {}
+                _ => missing_jwts.push(svc),
+            }
+        }
+
+        if missing_jwts.is_empty() {
+            print_check("Service JWTs", CheckStatus::Ok, "all present");
+        } else {
+            print_check(
+                "Service JWTs",
+                CheckStatus::Warn,
+                &format!("missing for: {}. Run: hyprstream wizard", missing_jwts.join(", ")),
+            );
+            warnings.push("Run 'hyprstream wizard' to generate missing service JWTs".to_owned());
+        }
+    }
+
+    // 7. Policy active
     {
         let label = "Policy active";
         let policies_dir = models_dir.join(".registry").join("policies");

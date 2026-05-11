@@ -443,6 +443,11 @@ pub struct RequestEnvelope {
     /// 2. The bearer token is valid
     /// 3. The resolved subject comes from the bearer, not the service identity
     pub delegated_bearer: Option<String>,
+
+    /// SHA-256 hash of the WIT JWT string (WIMSE wth claim).
+    /// Binds this proof to a specific Workload Identity Token even when
+    /// jwtToken is omitted (trust-store cache-hit path).
+    pub wit_hash: Option<[u8; 32]>,
 }
 
 impl RequestEnvelope {
@@ -458,6 +463,7 @@ impl RequestEnvelope {
             claims: None,
             jwt_token: None,
             delegated_bearer: None,
+            wit_hash: None,
         }
     }
 
@@ -483,6 +489,14 @@ impl RequestEnvelope {
     /// Set delegated bearer token for relay by a trusted service.
     pub fn with_delegated_bearer(mut self, bearer: String) -> Self {
         self.delegated_bearer = Some(bearer);
+        self
+    }
+
+    /// Bind this proof to a specific WIT by storing SHA-256(jwt).
+    /// Call this on cached-identity requests where jwtToken is omitted.
+    pub fn with_wit_hash_of(mut self, jwt: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        self.wit_hash = Some(Sha256::digest(jwt.as_bytes()).into());
         self
     }
 
@@ -767,7 +781,17 @@ impl SignedEnvelope {
     /// Create and sign a new envelope.
     ///
     /// The signature covers the Cap'n Proto serialized bytes of the envelope.
-    pub fn new_signed(envelope: RequestEnvelope, signing_key: &SigningKey) -> Self {
+    /// If `jwt_token` is present and `wit_hash` is not already set, `wit_hash`
+    /// is auto-populated as SHA-256(jwt_token) per the WIMSE wth binding.
+    pub fn new_signed(mut envelope: RequestEnvelope, signing_key: &SigningKey) -> Self {
+        // Auto-populate witHash from jwtToken when present and not already set
+        if envelope.wit_hash.is_none() {
+            if let Some(ref jwt) = envelope.jwt_token {
+                use sha2::{Digest, Sha256};
+                envelope.wit_hash = Some(Sha256::digest(jwt.as_bytes()).into());
+            }
+        }
+
         // Serialize the envelope to get canonical bytes
         let envelope_bytes = envelope.to_bytes();
 
@@ -950,6 +974,9 @@ impl ToCapnp for RequestEnvelope {
         if let Some(ref bearer) = self.delegated_bearer {
             builder.set_delegated_bearer(bearer);
         }
+        if let Some(ref hash) = self.wit_hash {
+            builder.set_wit_hash(hash);
+        }
     }
 }
 
@@ -1012,6 +1039,22 @@ impl FromCapnp for RequestEnvelope {
             }
         };
 
+        let wit_hash = {
+            let data = reader.get_wit_hash()?;
+            if data.is_empty() {
+                None
+            } else if data.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(data);
+                Some(arr)
+            } else {
+                return Err(anyhow!(
+                    "Invalid witHash length: expected 32, got {}",
+                    data.len()
+                ));
+            }
+        };
+
         Ok(Self {
             request_id: reader.get_request_id(),
             identity: RequestIdentity::read_from(reader.get_identity()?)?,
@@ -1022,6 +1065,7 @@ impl FromCapnp for RequestEnvelope {
             claims,
             jwt_token,
             delegated_bearer,
+            wit_hash,
         })
     }
 }

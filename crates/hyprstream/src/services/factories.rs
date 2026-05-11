@@ -35,7 +35,7 @@ use tracing::info;
 use crate::auth::PolicyManager;
 use crate::config::{HyprConfig, TokenConfig};
 use crate::services::{DiscoveryService, McpService, McpConfig, PolicyService, PolicyClient, RegistryService, RegistryClient};
-use crate::services::generated::policy_client::RegisterServiceKey;
+use crate::services::generated::policy_client::{RefreshServiceTokenRequest, RegisterServiceKey};
 use crate::zmq::global_context;
 
 /// Load HyprConfig, falling back to default on error.
@@ -123,7 +123,115 @@ fn register_service_key(
     }).map_err(|e| anyhow::anyhow!("registerServiceKey RPC failed for '{service_name}': {e}"))?;
 
     info!(service = service_name, "Registered verifying key with PolicyService");
+
+    // Spawn background JWT renewal for this service
+    let credentials_dir = HyprConfig::load()
+        .map(|c| c.config_dir().join("credentials"))
+        .unwrap_or_else(|_| {
+            dirs::config_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                .join("hyprstream")
+                .join("credentials")
+        });
+    spawn_jwt_renewal_task(service_name, signing_key.clone(), credentials_dir);
+
     Ok(())
+}
+
+/// Decode the `exp` claim from a JWT without verifying the signature.
+///
+/// Used for local-disk JWTs that we issued ourselves — signature is verified
+/// by PolicyService; here we only need the expiry to decide whether to renew.
+fn decode_jwt_exp(jwt: &str) -> Option<i64> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    let payload_b64 = jwt.split('.').nth(1)?;
+    let payload = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    value.get("exp")?.as_i64()
+}
+
+/// Spawn a background task that renews this service's JWT when it approaches expiry.
+///
+/// Checks hourly; renews when ≤7 days remain. Writes the renewed JWT to disk and
+/// updates the global trust store so in-flight RPC calls stay authenticated.
+fn spawn_jwt_renewal_task(
+    service_name: &str,
+    signing_key: SigningKey,
+    credentials_dir: std::path::PathBuf,
+) {
+    let service_name = service_name.to_owned();
+    tokio::spawn(async move {
+        const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3_600);
+        const RENEW_THRESHOLD: i64 = 7 * 24 * 3_600; // 7 days remaining
+
+        loop {
+            tokio::time::sleep(CHECK_INTERVAL).await;
+
+            let jwt = match crate::auth::identity_store::load_service_jwt(&credentials_dir, &service_name) {
+                Ok(Some(j)) => j,
+                _ => continue,
+            };
+
+            let expires_at = match decode_jwt_exp(&jwt) {
+                Some(exp) => exp,
+                None => continue,
+            };
+
+            let remaining = expires_at - chrono::Utc::now().timestamp();
+            if remaining > RENEW_THRESHOLD {
+                continue;
+            }
+
+            // Build a PolicyClient using current trust-store JWT
+            let (policy_vk, current_jwt) = {
+                let trust = hyprstream_service::global_trust_store();
+                let vk = match trust.resolve_one("policy") {
+                    Some(v) => v,
+                    None => {
+                        tracing::warn!(service = service_name, "policy key not in trust store; skipping JWT renewal");
+                        continue;
+                    }
+                };
+                let svc_jwt = match trust.resolve_one(&service_name)
+                    .and_then(|vk| trust.get(&vk))
+                    .and_then(|att| att.jwt.clone())
+                {
+                    Some(j) => j,
+                    None => {
+                        tracing::warn!(service = service_name, "service JWT not in trust store; skipping renewal");
+                        continue;
+                    }
+                };
+                (vk, svc_jwt)
+            };
+
+            let policy_client = PolicyClient::for_service(signing_key.clone(), policy_vk, Some(current_jwt));
+            let req = RefreshServiceTokenRequest { ttl_seconds: 2_592_000 };
+
+            match policy_client.refresh_service_token(&req).await {
+                Ok(info) => {
+                    // Update trust store with renewed JWT
+                    let trust = hyprstream_service::global_trust_store();
+                    if let Some(vk) = trust.resolve_one(&service_name) {
+                        if let Some(mut att) = trust.get(&vk) {
+                            att.jwt = Some(info.token.clone());
+                            att.expires_at = info.expires_at;
+                            trust.insert(vk, att);
+                        }
+                    }
+                    tracing::info!(
+                        service = service_name,
+                        expires_at = info.expires_at,
+                        "Renewed service JWT"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(service = service_name, "JWT renewal RPC failed: {e}");
+                }
+            }
+        }
+    });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

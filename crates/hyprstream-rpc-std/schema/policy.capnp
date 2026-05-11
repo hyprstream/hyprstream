@@ -77,6 +77,11 @@ struct PolicyRequest {
     # Internal CA operation — any caller with a valid CA-signed JWT can register.
     # No authorization scope required; the JWT itself proves CA attestation.
     registerServiceKey @19 :RegisterServiceKey $mcpDescription("Register a service verifying key with the CA");
+
+    # Renew the caller's service JWT. Identity is taken from the signed envelope —
+    # no explicit subject field; the CA signs a fresh 30-day JWT for the caller.
+    refreshServiceToken @20 :RefreshServiceTokenRequest
+      $mcpScope(manage) $mcpDescription("Renew the caller's service JWT; identity from signed envelope");
   }
 }
 
@@ -216,6 +221,9 @@ struct PolicyResponse {
 
     # Service key registration result
     registerServiceKeyResult @20 :Void;
+
+    # Fresh JWT from refreshServiceToken
+    refreshServiceTokenResult @21 :TokenInfo;
   }
 }
 
@@ -351,4 +359,11 @@ struct RegisterServiceKey {
   verifyingKey @1 :Data;
   # CA-signed JWT proving key ownership (subject must be "service:{serviceName}")
   serviceJwt @2 :Text;
+}
+
+# Request to renew the caller's service JWT. Subject is taken from the
+# signed envelope context — the caller does not specify it.
+struct RefreshServiceTokenRequest {
+  # Requested TTL in seconds. Server clamps to [3600, 2592000] (1h – 30d).
+  ttlSeconds @0 :Int64 = 2592000;
 }
