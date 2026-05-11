@@ -114,7 +114,6 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
         )
         .route("/oauth/device/nonce", get(device::device_nonce))
         .route("/oauth/revoke", post(revocation::revoke_token))
-        .route("/oauth/introspect", post(introspection::introspect_token))
         .route("/oauth/logout", post(handle_logout))
         .route(
             "/oauth/external/authorize/:provider",
@@ -136,6 +135,7 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
     // All require a valid Bearer token (validated by require_bearer_token).
     // Inserts AuthenticatedUser into request extensions for downstream handlers.
     let protected_router = Router::new()
+        .route("/oauth/introspect", post(introspection::introspect_token))
         .route(
             "/oauth/userinfo",
             get(userinfo::userinfo).post(userinfo::userinfo),

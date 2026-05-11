@@ -42,6 +42,16 @@ pub async fn exchange_jwt_bearer(
         iss
     };
 
+    // nbf (not-before) check: reject assertions that aren't valid yet (RFC 7523 §3).
+    {
+        let now = chrono::Utc::now().timestamp();
+        if let Some(nbf) = decode_jwt_nbf(assertion) {
+            if nbf > now + 5 {
+                return jwt_bearer_error(StatusCode::BAD_REQUEST, "invalid_grant", "Assertion not yet valid (nbf)");
+            }
+        }
+    }
+
     // Resolve the verification key based on subject / issuer.
     let verifying_key: VerifyingKey = if sub.starts_with("service:") {
         // Local service WIT — look up via global trust store.
@@ -57,8 +67,19 @@ pub async fn exchange_jwt_bearer(
             }
         }
     } else {
-        // Federated subject — fetch JWKS from the issuer's discovery document.
-        match fetch_federated_key(state, &iss, assertion).await {
+        // Federated subject — issuer must be explicitly trusted (RFC 7523 §3 allow-listing).
+        let issuer_config = match state.trusted_issuers.get(&iss) {
+            Some(cfg) => cfg.clone(),
+            None => {
+                return jwt_bearer_error(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_grant",
+                    &format!("Issuer not in trusted_issuers allow-list: {iss}"),
+                );
+            }
+        };
+        // Fetch JWKS from the issuer's discovery document.
+        match fetch_federated_key(state, &iss, assertion, issuer_config.allow_http).await {
             Ok(vk) => vk,
             Err(e) => {
                 return jwt_bearer_error(StatusCode::UNAUTHORIZED, "invalid_grant", &e);
@@ -87,6 +108,7 @@ pub async fn exchange_jwt_bearer(
             audience: claims.aud.clone(),
             subject: Some(sub.clone()),
             user_pub_key: None,
+            dpop_jkt: None,
         })
         .await;
 
@@ -120,10 +142,10 @@ pub async fn exchange_jwt_bearer(
 ///
 /// Matches the `kid` JWT header against the keys in the JWKS endpoint.
 /// Falls back to the first Ed25519 (OKP/Ed25519) key when no `kid` matches.
-async fn fetch_federated_key(state: &Arc<OAuthState>, issuer: &str, assertion: &str) -> Result<VerifyingKey, String> {
+async fn fetch_federated_key(state: &Arc<OAuthState>, issuer: &str, assertion: &str, allow_http: bool) -> Result<VerifyingKey, String> {
     let metadata = state
         .oidc_discovery
-        .get_metadata(issuer, false)
+        .get_metadata(issuer, allow_http)
         .await
         .map_err(|e| format!("OIDC discovery failed for {issuer}: {e}"))?;
 
@@ -171,6 +193,14 @@ async fn fetch_federated_key(state: &Arc<OAuthState>, issuer: &str, assertion: &
     }
 
     Err(format!("No matching Ed25519 key in JWKS for issuer {issuer}"))
+}
+
+/// Decode `nbf` from a JWT payload without verifying the signature.
+fn decode_jwt_nbf(jwt: &str) -> Option<i64> {
+    let payload_b64 = jwt.split('.').nth(1)?;
+    let payload = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    value.get("nbf")?.as_i64()
 }
 
 fn jwt_bearer_error(status: StatusCode, error: &str, description: &str) -> Response {

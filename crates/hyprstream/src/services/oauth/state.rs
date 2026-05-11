@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use base64::Engine as _;
 use tokio::sync::RwLock;
 use serde::{Deserialize, Serialize};
 
@@ -270,6 +271,12 @@ pub struct OAuthState {
     pub rsa_jwk: Option<serde_json::Value>,
     /// RSA key kid (for the JWT header).
     pub rsa_kid: Option<String>,
+    /// Seen DPoP JTIs for replay prevention. Value = expiry (iat + 120s).
+    pub dpop_jti_seen: RwLock<HashMap<String, i64>>,
+    /// Server-issued DPoP nonces. Value = expiry unix timestamp.
+    pub dpop_nonces: RwLock<HashMap<String, i64>>,
+    /// Trusted external OIDC issuers for the JWT bearer grant (RFC 7523).
+    pub trusted_issuers: std::collections::HashMap<String, crate::config::TrustedIssuerConfig>,
 }
 
 impl OAuthState {
@@ -301,6 +308,9 @@ impl OAuthState {
             rsa_encoding_key: None,
             rsa_jwk: None,
             rsa_kid: None,
+            dpop_jti_seen: RwLock::new(HashMap::new()),
+            dpop_nonces: RwLock::new(HashMap::new()),
+            trusted_issuers: config.trusted_issuers.clone(),
         }
     }
 
@@ -383,6 +393,45 @@ impl OAuthState {
         Ok(())
     }
 
+    /// Check a DPoP JTI for replay and record it if new.
+    ///
+    /// Returns `true` when the JTI is fresh (caller should proceed).
+    /// Returns `false` when the JTI has been seen within its validity window (replay).
+    /// Expired entries are pruned opportunistically on each call.
+    pub async fn check_and_record_dpop_jti(&self, jti: &str, iat: i64) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        let expiry = iat + 120; // ±60s window + 60s buffer
+        let mut store = self.dpop_jti_seen.write().await;
+        // Prune expired entries.
+        store.retain(|_, exp| *exp > now);
+        if store.contains_key(jti) {
+            return false;
+        }
+        store.insert(jti.to_owned(), expiry);
+        true
+    }
+
+    /// Issue a fresh server-side DPoP nonce (RFC 9449 §8).
+    ///
+    /// Returns the base64url nonce string that should be placed in the
+    /// `DPoP-Nonce` response header. Stored with a 5-minute TTL.
+    pub async fn issue_dpop_nonce(&self) -> String {
+        use rand::RngCore;
+        let mut bytes = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        let nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let expiry = chrono::Utc::now().timestamp() + 300; // 5-minute TTL
+        self.dpop_nonces.write().await.insert(nonce.clone(), expiry);
+        nonce
+    }
+
+    /// Validate a DPoP nonce issued by this server. Returns `true` if valid and unexpired.
+    pub async fn verify_dpop_nonce(&self, nonce: &str) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        let store = self.dpop_nonces.read().await;
+        store.get(nonce).is_some_and(|&exp| exp > now)
+    }
+
     /// Attach an RSA key for RS256 id_token signing (OIDC interop).
     ///
     /// `rsa_der` is the PKCS#8 DER-encoded RSA private key.
@@ -433,6 +482,13 @@ impl OAuthState {
                             true
                         }
                     });
+                }
+
+                // Sweep expired DPoP JTIs and nonces
+                {
+                    let now = chrono::Utc::now().timestamp();
+                    state.dpop_jti_seen.write().await.retain(|_, exp| *exp > now);
+                    state.dpop_nonces.write().await.retain(|_, exp| *exp > now);
                 }
 
                 // Sweep expired external auth flows

@@ -109,6 +109,15 @@ pub async fn require_bearer_token(
                     .into_response();
             }
         };
+        // JTI replay prevention for resource requests (RFC 9449 §11.1).
+        if !state.check_and_record_dpop_jti(&proof.jti, proof.iat).await {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "Bearer error=\"invalid_token\"")],
+                axum::Json(serde_json::json!({"error": "invalid_dpop_proof", "error_description": "DPoP proof jti already used"})),
+            )
+                .into_response();
+        }
         // Verify cnf.jkt in token matches the DPoP proof key.
         if let Some(token_jkt) = claims.cnf_jkt() {
             if token_jkt != proof.jkt {

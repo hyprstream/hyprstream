@@ -93,23 +93,36 @@ pub async fn exchange_token(
     }
 }
 
-/// Verify a DPoP proof for the token endpoint and return the jkt string.
+/// Verify a DPoP proof for the token endpoint, check JTI replay, validate nonce.
 ///
 /// Returns `None` when no DPoP header is present (DPoP is optional at the token endpoint).
-/// Returns `Some(Err(...))` if the header is present but invalid.
-fn verify_dpop_at_token_endpoint(
+/// Returns `Some(Ok(jkt))` on success; `Some(Err(response))` on failure.
+async fn verify_dpop_at_token_endpoint(
     state: &OAuthState,
     dpop_header: Option<&str>,
 ) -> Option<Result<String, Response>> {
     let proof_str = dpop_header?;
     let token_endpoint = format!("{}/oauth/token", state.issuer_url.trim_end_matches('/'));
-    match super::dpop::verify_dpop_proof(proof_str, "POST", &token_endpoint, None) {
-        Ok(proof) => Some(Ok(proof.jkt)),
+    let proof = match super::dpop::verify_dpop_proof(proof_str, "POST", &token_endpoint, None) {
+        Ok(p) => p,
         Err(e) => {
             tracing::warn!("DPoP proof verification failed: {e}");
-            Some(Err(token_error(StatusCode::BAD_REQUEST, "invalid_dpop_proof", &e.to_string())))
+            return Some(Err(token_error(StatusCode::BAD_REQUEST, "invalid_dpop_proof", &e.to_string())));
+        }
+    };
+    // JTI replay check.
+    if !state.check_and_record_dpop_jti(&proof.jti, proof.iat).await {
+        tracing::warn!(jti = %proof.jti, "DPoP JTI replay detected");
+        return Some(Err(token_error(StatusCode::BAD_REQUEST, "invalid_dpop_proof", "DPoP proof jti already used")));
+    }
+    // Nonce validation: if proof carries a nonce, it must be one we issued.
+    if let Some(ref nonce) = proof.nonce {
+        if !state.verify_dpop_nonce(nonce).await {
+            tracing::warn!("DPoP nonce invalid or expired");
+            return Some(Err(token_error(StatusCode::BAD_REQUEST, "use_dpop_nonce", "DPoP nonce invalid or expired")));
         }
     }
+    Some(Ok(proof.jkt))
 }
 
 /// Handle authorization_code grant type.
@@ -187,7 +200,7 @@ async fn exchange_authorization_code(
     }
 
     // Verify DPoP if present.
-    let dpop_jkt = match verify_dpop_at_token_endpoint(&state, dpop_header.as_deref()) {
+    let dpop_jkt = match verify_dpop_at_token_endpoint(&state, dpop_header.as_deref()).await {
         None => None,
         Some(Ok(jkt)) => Some(jkt),
         Some(Err(resp)) => return resp,
@@ -242,7 +255,7 @@ async fn exchange_refresh_token(
     }
 
     // Verify DPoP if present.
-    let dpop_jkt = match verify_dpop_at_token_endpoint(&state, dpop_header.as_deref()) {
+    let dpop_jkt = match verify_dpop_at_token_endpoint(&state, dpop_header.as_deref()).await {
         None => None,
         Some(Ok(jkt)) => Some(jkt),
         Some(Err(resp)) => return resp,
@@ -343,7 +356,7 @@ async fn exchange_device_code(
             drop(user_code_map);
 
             // Verify DPoP if present.
-            let dpop_jkt = match verify_dpop_at_token_endpoint(&state, dpop_header.as_deref()) {
+            let dpop_jkt = match verify_dpop_at_token_endpoint(&state, dpop_header.as_deref()).await {
                 None => None,
                 Some(Ok(jkt)) => Some(jkt),
                 Some(Err(resp)) => return resp,
@@ -409,6 +422,12 @@ async fn issue_token_with_refresh(
             tracing::info!(client_id = %client_id, "Token issued successfully");
             let now = chrono::Utc::now().timestamp();
             let expires_in = (token_info.expires_at - now).max(0);
+            // Issue a fresh DPoP nonce when the client used DPoP (RFC 9449 §8).
+            let dpop_nonce = if dpop_jkt.is_some() {
+                Some(state.issue_dpop_nonce().await)
+            } else {
+                None
+            };
 
             // Generate and persist a refresh token (RocksDB).
             let refresh_token = generate_refresh_token();
@@ -479,7 +498,7 @@ async fn issue_token_with_refresh(
                 response_json["id_token"] = serde_json::Value::String(id_token);
             }
 
-            (
+            let mut resp = (
                 StatusCode::OK,
                 [
                     (header::CACHE_CONTROL, "no-store"),
@@ -487,7 +506,13 @@ async fn issue_token_with_refresh(
                 ],
                 Json(response_json),
             )
-                .into_response()
+                .into_response();
+            if let Some(nonce) = dpop_nonce {
+                if let Ok(val) = axum::http::HeaderValue::from_str(&nonce) {
+                    resp.headers_mut().insert("DPoP-Nonce", val);
+                }
+            }
+            resp
         }
         Err(e) => {
             tracing::error!(client_id = %client_id, error = %e, "Token issuance failed");
