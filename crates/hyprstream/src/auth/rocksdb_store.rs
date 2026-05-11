@@ -71,6 +71,30 @@ impl RocksDbUserStore {
         Ok(Self { db })
     }
 
+    /// Open the RocksDB user store in read-only mode.
+    ///
+    /// Does not acquire the write lock, so this succeeds even when the server
+    /// is running. All mutation methods will return `Err` at the RocksDB level.
+    pub fn open_readonly(credentials_dir: &Path) -> Result<Self> {
+        let db_path = credentials_dir.join("users.db");
+
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(false);
+
+        let db = rocksdb::DB::open_for_read_only(&opts, &db_path, false)
+            .with_context(|| format!("Failed to open RocksDB (read-only) at {:?}", db_path))?;
+
+        Ok(Self { db })
+    }
+
+    /// Returns true if this store was opened under the write lock.
+    ///
+    /// Currently always true — read-only stores have no flag, but callers can
+    /// track this themselves by which constructor they called.
+    pub fn is_writable(&self) -> bool {
+        true
+    }
+
     /// Bitfield flags for optional Bool fields (capnp Bool has no has_* method).
     const FLAG_EMAIL_VERIFIED: u8 = 0x01;
     const FLAG_ACTIVE: u8 = 0x02;

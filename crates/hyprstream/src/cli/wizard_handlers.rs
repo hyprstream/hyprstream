@@ -484,8 +484,16 @@ async fn phase_users(state: &mut WizardState, non_interactive: bool) -> Result<(
         .context("Failed to load PolicyManager")?;
 
     let credentials_dir = state.credentials_dir();
-    let user_store = RocksDbUserStore::open(&credentials_dir)
-        .context("Failed to open credential store")?;
+    let (user_store, server_locked) = match RocksDbUserStore::open(&credentials_dir) {
+        Ok(s) => (s, false),
+        Err(e) if e.to_string().contains("temporarily unavailable") || e.to_string().contains("LOCK") => {
+            // Server is running and holds the write lock — open read-only for display.
+            let ro = RocksDbUserStore::open_readonly(&credentials_dir)
+                .context("Failed to open credential store (server is running and holds the lock)")?;
+            (ro, true)
+        }
+        Err(e) => return Err(e.context("Failed to open credential store")),
+    };
 
     // Separate Casbin subjects into local (bare names) vs federated/OIDC (contain "://")
     let existing_policies = pm.get_policy().await;
@@ -538,6 +546,12 @@ async fn phase_users(state: &mut WizardState, non_interactive: bool) -> Result<(
 
     // Non-interactive: auto-create admin if no local users exist in UserStore
     if non_interactive {
+        if server_locked {
+            println!("    Server is running — skipping user creation in non-interactive mode.");
+            println!("    Use 'hyprstream user register' to add users while the server is active.");
+            println!();
+            return Ok(());
+        }
         if registered_users.is_empty() {
             // Register identity FIRST — UserStore is authoritative
             let (_sk, vk) = ensure_user_signing_key()?;
@@ -559,6 +573,18 @@ async fn phase_users(state: &mut WizardState, non_interactive: bool) -> Result<(
         } else {
             println!("    Local users already configured. Skipping.");
         }
+        println!();
+        return Ok(());
+    }
+
+    // If the server is running (DB locked), skip writes and guide the user to the CLI/API.
+    if server_locked {
+        println!("    Server is running — user database is locked for writing.");
+        println!("    To manage users while the server is active:");
+        println!("      hyprstream user register <username>");
+        println!("      hyprstream user keys import <username> ssh-ed25519 -f ~/.ssh/id_ed25519.pub");
+        println!("      hyprstream user list");
+        println!("    Or use the SCIM API: POST/GET /scim/v2/Users");
         println!();
         return Ok(());
     }
