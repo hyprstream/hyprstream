@@ -24,14 +24,6 @@ use crate::cli::policy_handlers::{
 };
 
 
-/// Decode the `exp` claim from a JWT without verifying the signature.
-fn decode_jwt_exp_bootstrap(jwt: &str) -> Option<i64> {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-    let payload_b64 = jwt.split('.').nth(1)?;
-    let payload = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&payload).ok()?;
-    value.get("exp")?.as_i64()
-}
 
 /// Pre-service bootstrap manager for the wizard TUI.
 ///
@@ -664,8 +656,6 @@ async fn do_bootstrap(
 
         let mut bootstrap_pubkeys = std::collections::HashMap::new();
         let now = chrono::Utc::now().timestamp();
-        const NEW_EXPIRY_TTL: i64 = 30 * 86_400; // 30 days
-        const RENEW_THRESHOLD: i64 = 7 * 86_400;  // renew if ≤7 days remain
 
         for factory in list_factories() {
             let service_name = factory.name;
@@ -685,27 +675,10 @@ async fn do_bootstrap(
             )?;
             let service_vk = service_key.verifying_key();
 
-            // Only (re)issue JWT if absent or within 7 days of expiry
-            let needs_jwt = match identity_store::load_service_jwt(&credentials_dir, service_name)? {
-                None => true,
-                Some(ref existing) => {
-                    let exp = decode_jwt_exp_bootstrap(existing).unwrap_or(0);
-                    (exp - now) <= RENEW_THRESHOLD
-                }
-            };
-
-            if needs_jwt {
-                let expiry = now + NEW_EXPIRY_TTL;
-                let claims = hyprstream_rpc::auth::Claims::new(
-                    format!("service:{service_name}"),
-                    now,
-                    expiry,
-                )
-                .with_cnf_jwk(service_vk.as_bytes());
-
-                let jwt = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &ca_jwt_key);
-                identity_store::write_service_jwt(&credentials_dir, service_name, &jwt)?;
-            }
+            let jwt = crate::auth::service_jwt::issue_or_load_service_jwt(
+                &credentials_dir, service_name, &ca_jwt_key, &service_vk, now,
+            )?;
+            identity_store::write_service_jwt(&credentials_dir, service_name, &jwt)?;
 
             bootstrap_pubkeys.insert(service_name.to_owned(), service_vk);
         }

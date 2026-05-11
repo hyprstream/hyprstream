@@ -6,6 +6,7 @@
 //! Also provides JWT token authentication with Ed25519 signatures.
 
 pub mod identity_store;
+pub mod service_jwt;
 pub mod federation;
 pub mod id_token_verify;
 pub mod jwt;
