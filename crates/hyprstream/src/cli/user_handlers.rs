@@ -129,7 +129,7 @@ pub async fn handle_user_keys_list(credentials_dir: &Path, username: &str) -> Re
         for pk in &pubkeys {
             let label = pk.label.as_deref().unwrap_or("(no label)");
             let ts = pk.created_at;
-            println!("SHA256:{}  {}  (added {})", pk.fingerprint, label, ts);
+            println!("{}  {}  (added {})", pk.fingerprint, label, ts);
         }
     }
     Ok(())
@@ -165,7 +165,7 @@ pub async fn handle_user_keys_import(
         .add_pubkey(username, pubkey, label)
         .await
         .context("Failed to add key")?;
-    println!("Added key SHA256:{fingerprint}");
+    println!("Added key {fingerprint}");
     Ok(())
 }
 
@@ -175,14 +175,20 @@ pub async fn handle_user_keys_remove(
     username: &str,
     fingerprint: &str,
 ) -> Result<()> {
-    // Strip "SHA256:" prefix if present (user may copy-paste from keys list output)
-    let fp = fingerprint.strip_prefix("SHA256:").unwrap_or(fingerprint);
+    // Normalize: ensure SHA256: prefix is present regardless of whether user included it
+    let owned;
+    let fp = if fingerprint.starts_with("SHA256:") {
+        fingerprint
+    } else {
+        owned = format!("SHA256:{fingerprint}");
+        &owned
+    };
     let store = open_store(credentials_dir)?;
     let removed = store.remove_pubkey(username, fp).await?;
     if removed {
-        println!("Removed key SHA256:{fp}");
+        println!("Removed key {fp}");
     } else {
-        println!("Key SHA256:{fp} not found for '{username}'");
+        println!("Key {fp} not found for '{username}'");
     }
     Ok(())
 }

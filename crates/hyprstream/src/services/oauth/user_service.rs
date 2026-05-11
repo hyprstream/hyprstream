@@ -8,7 +8,7 @@ use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::VerifyingKey;
 
-use crate::auth::{UserFilter, UserProfile, UserStore, PubkeyEntry};
+use crate::auth::{UserFilter, UserProfile, UserStore, PubkeyEntry, decode_pubkey_base64};
 
 /// Shared user information type (SCIM-informed).
 #[derive(Debug, Clone)]
@@ -77,14 +77,7 @@ impl UserService {
         self.store.register(username).await?;
 
         if !pubkey_base64.is_empty() {
-            let raw = STANDARD
-                .decode(pubkey_base64)
-                .map_err(|e| anyhow!("Invalid base64 for public key: {e}"))?;
-            let bytes: [u8; 32] = raw
-                .try_into()
-                .map_err(|_| anyhow!("Public key must be 32 bytes (Ed25519)"))?;
-            let pubkey = VerifyingKey::from_bytes(&bytes)
-                .map_err(|e| anyhow!("Invalid Ed25519 public key: {e}"))?;
+            let pubkey = decode_pubkey_base64(pubkey_base64)?;
             self.store.add_pubkey(username, pubkey, None).await?;
         }
 

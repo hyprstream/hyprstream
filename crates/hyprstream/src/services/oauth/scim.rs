@@ -561,7 +561,14 @@ pub async fn remove_user_key(
         None => return scim_error_simple(404, "Resource not found"),
     };
 
-    let fp = fingerprint.strip_prefix("SHA256:").unwrap_or(&fingerprint);
+    // Normalize: ensure SHA256: prefix is present regardless of whether client included it
+    let owned;
+    let fp = if fingerprint.starts_with("SHA256:") {
+        fingerprint.as_str()
+    } else {
+        owned = format!("SHA256:{fingerprint}");
+        &owned
+    };
     match svc.remove_pubkey(&info.username, fp).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => scim_error_simple(404, "Key not found"),
