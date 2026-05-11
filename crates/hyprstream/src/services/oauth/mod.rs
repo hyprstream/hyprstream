@@ -357,17 +357,18 @@ impl Spawnable for OAuthService {
                 None,
             );
 
+            let credentials_dir = crate::config::HyprConfig::load()
+                .map(|c| c.config_dir().join("credentials"))
+                .unwrap_or_else(|_| {
+                    dirs::config_dir()
+                        .unwrap_or_else(|| std::path::PathBuf::from("/etc/hyprstream"))
+                        .join("hyprstream")
+                        .join("credentials")
+                });
+
             // Load the user store (RocksDB for concurrent access).
             // Failure is non-fatal; endpoints will report "not configured" instead.
             let user_store: Option<Arc<dyn crate::auth::user_store::UserStore>> = {
-                let credentials_dir = crate::config::HyprConfig::load()
-                    .map(|c| c.config_dir().join("credentials"))
-                    .unwrap_or_else(|_| {
-                        dirs::config_dir()
-                            .unwrap_or_else(|| std::path::PathBuf::from("/etc/hyprstream"))
-                            .join("hyprstream")
-                            .join("credentials")
-                    });
                 match crate::auth::RocksDbUserStore::open(&credentials_dir) {
                     Ok(store) => {
                         info!("User store (RocksDB) opened at {:?}", credentials_dir);
@@ -395,6 +396,13 @@ impl Spawnable for OAuthService {
                 oauth_state = oauth_state.with_user_store(store);
             }
             oauth_state = oauth_state.with_signing_key(self.signing_key.clone());
+
+            // Open persistent refresh token store (non-fatal — tokens simply don't survive restart).
+            let token_db_path = credentials_dir.join("oauth-tokens");
+            match oauth_state.with_token_store(&token_db_path) {
+                Ok(()) => info!("Refresh token store (RocksDB) opened at {:?}", token_db_path),
+                Err(e) => tracing::warn!("Could not open refresh token store (tokens will not survive restart): {}", e),
+            }
 
             // Resolve discovery URL at startup with LocalSet (RPC calls need LocalSet context).
             // Cache it so HTTP handlers don't need to make RPC calls.

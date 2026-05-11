@@ -9,7 +9,7 @@
 //! - `grant_type=refresh_token` — OAuth 2.1 token refresh with rotation
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use axum::{
     extract::State,
@@ -164,29 +164,27 @@ async fn exchange_refresh_token(
         None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", "refresh_token is required"),
     };
 
-    // Look up and remove refresh token (single-use rotation)
-    let entry = {
-        let mut tokens = state.refresh_tokens.write().await;
-        tokens.remove(&refresh_token)
-    };
-
-    let entry = match entry {
-        Some(e) => e,
-        None => {
+    // Look up and atomically consume the refresh token (single-use rotation).
+    // get_refresh_token handles lazy expiry; returns None if expired or missing.
+    let entry = match state.get_refresh_token(&refresh_token) {
+        Ok(Some(e)) => e,
+        Ok(None) => {
             return token_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_grant",
                 "Refresh token not found or already used",
             );
         }
+        Err(e) => {
+            tracing::error!(error = %e, "Refresh token store read failed");
+            return token_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "Token store error");
+        }
     };
 
-    if entry.is_expired() {
-        return token_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_grant",
-            "Refresh token has expired",
-        );
+    // Delete before issuing new token (rotation; prevents replay on store errors).
+    if let Err(e) = state.delete_refresh_token(&refresh_token) {
+        tracing::error!(error = %e, "Refresh token store delete failed");
+        return token_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "Token store error");
     }
 
     if params.client_id != entry.client_id {
@@ -197,9 +195,12 @@ async fn exchange_refresh_token(
         );
     }
 
-    // Issue new access token + rotated refresh token with the stored scopes/resource and original subject.
-    // No id_token on refresh per OIDC Core Section 12.2.
-    issue_token_with_refresh(&state, &entry.client_id, entry.scopes, entry.resource, &entry.username, None, false, None).await
+    // Reconstruct verifying key from stored bytes (cnf continuity across refreshes).
+    let stored_vk: Option<ed25519_dalek::VerifyingKey> = entry.verifying_key_bytes
+        .and_then(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).ok());
+
+    // Issue new access token + rotated refresh token. No id_token on refresh (OIDC Core § 12.2).
+    issue_token_with_refresh(&state, &entry.client_id, entry.scopes, entry.resource, &entry.username, None, false, stored_vk.as_ref()).await
 }
 
 /// Handle urn:ietf:params:oauth:grant-type:device_code grant type (RFC 8628 Section 3.4).
@@ -343,17 +344,20 @@ async fn issue_token_with_refresh(
             let now = chrono::Utc::now().timestamp();
             let expires_in = (token_info.expires_at - now).max(0);
 
-            // Generate and store a refresh token
+            // Generate and persist a refresh token (RocksDB).
             let refresh_token = generate_refresh_token();
             {
-                let mut tokens = state.refresh_tokens.write().await;
-                tokens.insert(refresh_token.clone(), RefreshTokenEntry {
+                let entry = RefreshTokenEntry {
                     client_id: client_id.to_owned(),
                     username: sub.to_owned(),
                     scopes: scopes.clone(),
                     resource,
-                    expires_at: Instant::now() + Duration::from_secs(state.refresh_token_ttl as u64),
-                });
+                    expires_at_unix: now + state.refresh_token_ttl as i64,
+                    verifying_key_bytes: user_verifying_key.map(|vk| *vk.as_bytes()),
+                };
+                if let Err(e) = state.put_refresh_token(&refresh_token, &entry) {
+                    tracing::error!(error = %e, "Failed to persist refresh token");
+                }
             }
 
             // Build OIDC id_token when: scope includes "openid", signing key is available,

@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+use serde::{Deserialize, Serialize};
 
 use crate::auth::user_store::UserStore;
 use crate::config::OAuthConfig;
@@ -196,20 +197,22 @@ impl PendingDeviceCode {
 }
 
 /// A stored refresh token entry (OAuth 2.1 rotation).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshTokenEntry {
     pub client_id: String,
     /// JWT subject (username) of the token owner.
-    /// Used to re-issue the access token on refresh with the correct sub.
     pub username: String,
     pub scopes: Vec<String>,
     pub resource: Option<String>,
-    pub expires_at: Instant,
+    /// Unix timestamp (seconds) at which this token expires.
+    pub expires_at_unix: i64,
+    /// Ed25519 verifying key bytes bound to this token (cnf key continuity on refresh).
+    pub verifying_key_bytes: Option<[u8; 32]>,
 }
 
 impl RefreshTokenEntry {
     pub fn is_expired(&self) -> bool {
-        Instant::now() > self.expires_at
+        chrono::Utc::now().timestamp() > self.expires_at_unix
     }
 }
 
@@ -226,8 +229,9 @@ pub struct OAuthState {
     pub pending_device_codes: RwLock<HashMap<String, PendingDeviceCode>>,
     /// Reverse lookup: user_code -> device_code
     pub device_code_by_user_code: RwLock<HashMap<String, String>>,
-    /// Refresh tokens (keyed by opaque token string, rotated on use)
-    pub refresh_tokens: RwLock<HashMap<String, RefreshTokenEntry>>,
+    /// Persistent refresh token store (RocksDB). Keyed by opaque token string.
+    /// None when no credentials path is configured (tokens silently lost on restart).
+    pub token_db: Option<Arc<rocksdb::DB>>,
     /// PolicyClient for JWT token issuance via ZMQ
     pub policy_client: PolicyClient,
     /// DiscoveryClient for resolving service QUIC endpoints via ZMQ
@@ -276,7 +280,7 @@ impl OAuthState {
             pending_nonces: RwLock::new(HashMap::new()),
             pending_device_codes: RwLock::new(HashMap::new()),
             device_code_by_user_code: RwLock::new(HashMap::new()),
-            refresh_tokens: RwLock::new(HashMap::new()),
+            token_db: None,
             policy_client,
             discovery_client,
             issuer_url: config.issuer_url(),
@@ -331,6 +335,54 @@ impl OAuthState {
         self
     }
 
+    /// Open (or create) the RocksDB token store at `path` for persistent refresh tokens.
+    pub fn with_token_store(&mut self, path: impl AsRef<std::path::Path>) -> anyhow::Result<()> {
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        let db = rocksdb::DB::open(&opts, path)?;
+        self.token_db = Some(Arc::new(db));
+        Ok(())
+    }
+
+    /// Persist a refresh token entry to the DB.
+    pub fn put_refresh_token(&self, token: &str, entry: &RefreshTokenEntry) -> anyhow::Result<()> {
+        let Some(ref db) = self.token_db else {
+            tracing::warn!("Refresh token store not configured — token will not survive restart");
+            return Ok(());
+        };
+        let bytes = serde_json::to_vec(entry)?;
+        db.put(token.as_bytes(), bytes)?;
+        Ok(())
+    }
+
+    /// Look up a refresh token. Returns `None` if not found or expired (lazy expiry).
+    pub fn get_refresh_token(&self, token: &str) -> anyhow::Result<Option<RefreshTokenEntry>> {
+        let Some(ref db) = self.token_db else {
+            return Ok(None);
+        };
+        match db.get(token.as_bytes())? {
+            None => Ok(None),
+            Some(bytes) => {
+                let entry: RefreshTokenEntry = serde_json::from_slice(&bytes)?;
+                if entry.is_expired() {
+                    let _ = db.delete(token.as_bytes());
+                    Ok(None)
+                } else {
+                    Ok(Some(entry))
+                }
+            }
+        }
+    }
+
+    /// Remove a refresh token (revocation / rotation).
+    pub fn delete_refresh_token(&self, token: &str) -> anyhow::Result<()> {
+        let Some(ref db) = self.token_db else {
+            return Ok(());
+        };
+        db.delete(token.as_bytes())?;
+        Ok(())
+    }
+
     /// Attach an RSA key for RS256 id_token signing (OIDC interop).
     ///
     /// `rsa_der` is the PKCS#8 DER-encoded RSA private key.
@@ -381,12 +433,6 @@ impl OAuthState {
                             true
                         }
                     });
-                }
-
-                // Sweep expired refresh tokens
-                {
-                    let mut tokens = state.refresh_tokens.write().await;
-                    tokens.retain(|_, entry| !entry.is_expired());
                 }
 
                 // Sweep expired external auth flows

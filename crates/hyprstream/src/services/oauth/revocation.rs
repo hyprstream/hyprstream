@@ -30,12 +30,11 @@ pub async fn revoke_token(
     State(state): State<Arc<OAuthState>>,
     Form(params): Form<RevocationRequest>,
 ) -> Response {
-    // Try to remove as a refresh token
-    {
-        let mut tokens = state.refresh_tokens.write().await;
-        if tokens.remove(&params.token).is_some() {
-            tracing::info!("Revoked refresh token");
-        }
+    // Try to remove as a refresh token (RocksDB; always 200 per RFC 7009 even if absent).
+    if let Err(e) = state.delete_refresh_token(&params.token) {
+        tracing::warn!(error = %e, "Refresh token store delete failed during revocation");
+    } else {
+        tracing::info!("Revoked refresh token");
     }
 
     // RFC 7009: always return 200 OK regardless of whether the token was found.
