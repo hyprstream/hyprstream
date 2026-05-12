@@ -1472,6 +1472,45 @@ fn main() -> Result<()> {
     }
     // ========== END ENDPOINT REGISTRY INITIALIZATION ==========
 
+    // ── Wizard / first-run early dispatch ───────────────────────────────────
+    // The wizard is a bootstrap command: it creates credentials that the
+    // registry client init (below) depends on. Handle both `wizard` and the
+    // no-subcommand first-run path here so they work on a completely fresh
+    // machine with no credentials yet. Neither path needs registry_client/ctx.
+    {
+        let models_dir = config.models_dir().clone();
+        let is_wizard = matches!(matches.subcommand_name(), Some("wizard"));
+        let is_first_run = is_wizard
+            || (matches.subcommand_name().is_none()
+                && hyprstream_core::cli::bootstrap_manager::is_first_run(&models_dir));
+
+        if is_first_run {
+            let services = config.services.startup.clone();
+            if let Some(("wizard", sub_m)) = matches.subcommand() {
+                let tui_mode = sub_m.get_flag("tui");
+                let non_interactive = sub_m.get_flag("non_interactive");
+                let start_services = sub_m.get_flag("start");
+                return with_runtime(
+                    RuntimeConfig { device: DeviceConfig::request_cpu(), multi_threaded: true },
+                    || async move {
+                        if tui_mode {
+                            hyprstream_core::cli::handle_wizard_tui(&models_dir).await
+                        } else {
+                            hyprstream_core::cli::handle_wizard(
+                                &models_dir, &services, non_interactive, start_services,
+                            ).await
+                        }
+                    },
+                );
+            }
+            // No subcommand + first run → TUI wizard
+            return with_runtime(
+                RuntimeConfig { device: DeviceConfig::request_cpu(), multi_threaded: true },
+                || async move { hyprstream_core::cli::handle_wizard_tui(&models_dir).await },
+            );
+        }
+    }
+
     // Start registry service ONCE at CLI level
     let _registry_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -2119,32 +2158,9 @@ fn main() -> Result<()> {
             )?;
         }
 
-        // ── Interactive setup wizard ─────────────────────────────────────
-        Some(("wizard", sub_m)) => {
-            let tui_mode = sub_m.get_flag("tui");
-            let non_interactive = sub_m.get_flag("non_interactive");
-            let start_services = sub_m.get_flag("start");
-            let models_dir = config_for_service.models_dir().clone();
-            let services = config_for_service.services.startup.clone();
-            with_runtime(
-                RuntimeConfig {
-                    device: DeviceConfig::request_cpu(),
-                    multi_threaded: true,
-                },
-                || async move {
-                    if tui_mode {
-                        hyprstream_core::cli::handle_wizard_tui(&models_dir).await
-                    } else {
-                        hyprstream_core::cli::handle_wizard(
-                            &models_dir,
-                            &services,
-                            non_interactive,
-                            start_services,
-                        )
-                        .await
-                    }
-                },
-            )?;
+        // ── Wizard ── handled early (before registry init) above ────────────
+        Some(("wizard", _)) => {
+            unreachable!("wizard command is dispatched before registry init")
         }
 
         // ── Self-update ──────────────────────────────────────────────────
