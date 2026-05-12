@@ -5850,7 +5850,6 @@ dependencies = [
  "async-stream",
  "async-trait",
  "automerge",
- "avt",
  "axum 0.7.9",
  "axum-server",
  "base64 0.22.1",
@@ -5933,11 +5932,9 @@ dependencies = [
  "rlimit 0.10.2",
  "rmcp",
  "rocksdb",
- "rtrb",
  "rustls 0.23.31",
  "rustls-pemfile 2.2.0",
  "safetensors 0.4.5",
- "schemars",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -11696,12 +11693,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
 ]
-
-[[package]]
-name = "rtrb"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7204ed6420f698836b76d4d5c2ec5dec7585fd5c3a788fd1cde855d1de598239"
 
 [[package]]
 name = "runtime-spec"
