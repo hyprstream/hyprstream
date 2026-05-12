@@ -90,10 +90,21 @@ pub async fn exchange_token(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
 
+    // Extract __Secure-VaultDevice cookie for silent device-user linking.
+    let vault_device_cookie: Option<String> = req_headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').find_map(|part| {
+                let part = part.trim();
+                part.strip_prefix("__Secure-VaultDevice=").map(str::to_owned)
+            })
+        });
+
     match params.grant_type.as_str() {
-        "authorization_code" => exchange_authorization_code(state, params, dpop_header).await,
-        "refresh_token" => exchange_refresh_token(state, params, dpop_header).await,
-        gt if gt == DEVICE_CODE_GRANT_TYPE => exchange_device_code(state, params, dpop_header).await,
+        "authorization_code" => exchange_authorization_code(state, params, dpop_header, vault_device_cookie).await,
+        "refresh_token" => exchange_refresh_token(state, params, dpop_header, vault_device_cookie).await,
+        gt if gt == DEVICE_CODE_GRANT_TYPE => exchange_device_code(state, params, dpop_header, vault_device_cookie).await,
         gt if gt == JWT_BEARER_GRANT_TYPE => {
             let assertion = match params.assertion {
                 Some(a) => a,
@@ -165,6 +176,7 @@ async fn exchange_authorization_code(
     state: Arc<OAuthState>,
     params: TokenRequest,
     dpop_header: Option<String>,
+    vault_device_cookie: Option<String>,
 ) -> Response {
     let code = match params.code {
         Some(c) => c,
@@ -244,7 +256,7 @@ async fn exchange_authorization_code(
     tracing::info!(client_id = %params.client_id, username = %pending.username, "PKCE verified, issuing token");
     let sub = pending.username.clone();
     let vk_ref = pending.verifying_key.as_ref();
-    issue_token_with_refresh(&state, &params.client_id, pending.scopes, pending.resource, &sub, pending.oidc_nonce, true, vk_ref, dpop_jkt).await
+    issue_token_with_refresh(&state, &params.client_id, pending.scopes, pending.resource, &sub, pending.oidc_nonce, true, vk_ref, dpop_jkt, vault_device_cookie).await
 }
 
 /// Handle refresh_token grant type (OAuth 2.1 with rotation).
@@ -252,6 +264,7 @@ async fn exchange_refresh_token(
     state: Arc<OAuthState>,
     params: TokenRequest,
     dpop_header: Option<String>,
+    vault_device_cookie: Option<String>,
 ) -> Response {
     let refresh_token = match params.refresh_token {
         Some(rt) => rt,
@@ -301,7 +314,7 @@ async fn exchange_refresh_token(
         .and_then(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).ok());
 
     // Issue new access token + rotated refresh token. No id_token on refresh (OIDC Core § 12.2).
-    issue_token_with_refresh(&state, &entry.client_id, entry.scopes, entry.resource, &entry.username, None, false, stored_vk.as_ref(), dpop_jkt).await
+    issue_token_with_refresh(&state, &entry.client_id, entry.scopes, entry.resource, &entry.username, None, false, stored_vk.as_ref(), dpop_jkt, vault_device_cookie).await
 }
 
 /// Handle urn:ietf:params:oauth:grant-type:device_code grant type (RFC 8628 Section 3.4).
@@ -309,6 +322,7 @@ async fn exchange_device_code(
     state: Arc<OAuthState>,
     params: TokenRequest,
     dpop_header: Option<String>,
+    vault_device_cookie: Option<String>,
 ) -> Response {
     let device_code = match params.device_code {
         Some(dc) => dc,
@@ -398,7 +412,7 @@ async fn exchange_device_code(
             };
 
             // Device flow: no OIDC nonce and not initial OIDC auth.
-            issue_token_with_refresh(&state, &client_id, scopes, resource, &approved_by, None, false, device_vk.as_ref(), dpop_jkt).await
+            issue_token_with_refresh(&state, &client_id, scopes, resource, &approved_by, None, false, device_vk.as_ref(), dpop_jkt, vault_device_cookie).await
         }
     }
 }
@@ -430,6 +444,7 @@ async fn issue_token_with_refresh(
     initial_auth: bool,
     user_verifying_key: Option<&ed25519_dalek::VerifyingKey>,
     dpop_jkt: Option<String>,
+    vault_device_cookie: Option<String>,
 ) -> Response {
     let scope_str = scopes.join(" ");
 
@@ -455,6 +470,28 @@ async fn issue_token_with_refresh(
     match result {
         Ok(token_info) => {
             tracing::info!(client_id = %client_id, "Token issued successfully");
+
+            // Silently link device → user when __Secure-VaultDevice cookie accompanies the request.
+            if let (Some(cookie_val), Some(ref ds), Some(ref sk)) =
+                (&vault_device_cookie, &state.device_store, &state.signing_key)
+            {
+                let sk_bytes = sk.to_bytes();
+                if let Some(pubkey) =
+                    crate::auth::device_challenge::verify_vault_device_cookie(&sk_bytes, cookie_val)
+                {
+                    let fingerprint = bs58::encode(&pubkey).into_string();
+                    let ds = ds.clone();
+                    let sub_owned = sub.to_owned();
+                    tokio::spawn(async move {
+                        if let Err(e) = ds.link_device_user(&fingerprint, &sub_owned).await {
+                            tracing::warn!(fingerprint = %fingerprint, error = %e, "device-user link failed");
+                        } else {
+                            tracing::debug!(fingerprint = %fingerprint, sub = %sub_owned, "device linked to user");
+                        }
+                    });
+                }
+            }
+
             let now = chrono::Utc::now().timestamp();
             let expires_in = (token_info.expires_at - now).max(0);
             // Issue a fresh DPoP nonce when the client used DPoP (RFC 9449 §8).

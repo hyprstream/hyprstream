@@ -104,6 +104,42 @@ pub fn compute_kid(verifying_key_bytes: &[u8]) -> String {
     hex::encode(&hash[..8])
 }
 
+/// Verify a `__Secure-VaultDevice` cookie and return the device pubkey on success.
+///
+/// Returns `None` on any malformation or signature failure (including kid mismatch
+/// after key rotation — the client should silently re-enroll in that case).
+pub fn verify_vault_device_cookie(signing_key_bytes: &[u8; 32], cookie_value: &str) -> Option<[u8; 32]> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use ed25519_dalek::{Signature, Verifier};
+
+    let raw = URL_SAFE_NO_PAD.decode(cookie_value).ok()?;
+    if raw.len() != 8 + 32 + 64 {
+        return None;
+    }
+    let kid_bytes = &raw[..8];
+    let mut pubkey_arr = [0u8; 32];
+    pubkey_arr.copy_from_slice(&raw[8..40]);
+    let mut sig_arr = [0u8; 64];
+    sig_arr.copy_from_slice(&raw[40..104]);
+
+    let cookie_seed = derive_cookie_key_seed(signing_key_bytes);
+    let cookie_sk = ed25519_dalek::SigningKey::from_bytes(&cookie_seed);
+    let expected_kid = compute_kid(cookie_sk.verifying_key().as_bytes());
+
+    // kid mismatch → key rotation; caller should signal client to re-enroll
+    if kid_bytes != expected_kid.as_bytes() {
+        return None;
+    }
+
+    let mut msg = Vec::with_capacity(8 + 32);
+    msg.extend_from_slice(kid_bytes);
+    msg.extend_from_slice(&pubkey_arr);
+
+    let sig = Signature::from_bytes(&sig_arr);
+    cookie_sk.verifying_key().verify(&msg, &sig).ok()?;
+    Some(pubkey_arr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
