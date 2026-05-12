@@ -163,6 +163,7 @@ ed25519-dalek.workspace = true           # JWT Ed25519 signatures
 keyring = { version = "3", features = ["linux-native"] }  # OS keyring — Linux keyutils
 curve25519-dalek.workspace = true        # Ristretto255 DH for stream authentication
 hkdf.workspace = true                    # HKDF key derivation
+bs58 = "0.5"                             # Base58 encoding for device fingerprints
 subtle.workspace = true                  # Constant-time operations
 ring = "0.17"                            # TLS endorsement signing (key-type-agnostic)
 

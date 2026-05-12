@@ -286,6 +286,8 @@ pub struct OAuthState {
     /// Derived from the root CA key via derive_purpose_key("hyprstream-jwt-v1").
     /// None when credentials are unavailable (WIT endpoint returns 503).
     pub ca_jwt_key: Option<Arc<ed25519_dalek::SigningKey>>,
+    /// Anonymous device identity store.
+    pub device_store: Option<Arc<dyn crate::auth::DeviceStore>>,
     /// Unix timestamp of when the JWT signing key became active (nbf for JWKS entry).
     pub jwt_key_nbf: i64,
     /// Unix timestamp of when the JWT signing key expires (exp for JWKS entry).
@@ -326,9 +328,16 @@ impl OAuthState {
             dpop_nonces: RwLock::new(HashMap::new()),
             trusted_issuers: config.trusted_issuers.clone(),
             ca_jwt_key: None,
+            device_store: None,
             jwt_key_nbf: chrono::Utc::now().timestamp(),
             jwt_key_exp: chrono::Utc::now().timestamp() + 14 * 86400,
         }
+    }
+
+    /// Attach the anonymous device store.
+    pub fn with_device_store(mut self, store: Arc<dyn crate::auth::DeviceStore>) -> Self {
+        self.device_store = Some(store);
+        self
     }
 
     /// Set JWT signing key validity window for the JWKS endpoint.

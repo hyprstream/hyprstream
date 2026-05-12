@@ -276,6 +276,54 @@ fn unquote(s: &str) -> &str {
     s.trim().trim_matches('"')
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Anonymous device identity
+// ────────────────────────────────────────────────────────────────────────────
+
+/// An anonymous device identity record.
+///
+/// Created by the device enrollment flow (`POST /api/device/enroll`). Exists
+/// independently before any user logs in. `user_sub` is populated when the
+/// device cookie accompanies an OAuth token request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceRecord {
+    /// Raw 32-byte Ed25519 public key.
+    pub pubkey: [u8; 32],
+    /// Base58 encoding of `pubkey` — used as the RocksDB key suffix and JWT `sub`.
+    pub fingerprint: String,
+    /// Optional human-readable label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Unix timestamp of first enrollment.
+    pub enrolled_at: i64,
+    /// Unix timestamp of most recent activity (`touch_device`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_at: Option<i64>,
+    /// Subject of the linked user, if OAuth login has been observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_sub: Option<String>,
+}
+
+/// Storage operations for anonymous device records.
+#[async_trait]
+pub trait DeviceStore: Send + Sync {
+    /// Upsert a device record. On conflict (same fingerprint), updates `enrolled_at`
+    /// but preserves any existing `user_sub` and `label`.
+    async fn enroll_device(&self, record: DeviceRecord) -> Result<()>;
+
+    /// Associate a user subject with an existing device record.
+    async fn link_device_user(&self, fingerprint: &str, user_sub: &str) -> Result<()>;
+
+    /// Retrieve a device record by fingerprint.
+    async fn get_device(&self, fingerprint: &str) -> Result<Option<DeviceRecord>>;
+
+    /// Update `last_seen_at` to now.
+    async fn touch_device(&self, fingerprint: &str) -> Result<()>;
+
+    /// Delete a device record. Returns `true` if the record existed.
+    async fn revoke_device(&self, fingerprint: &str) -> Result<bool>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -53,6 +53,7 @@ pub mod user_mapping;
 pub mod wit_bootstrap;
 pub mod user_service;
 pub mod userinfo;
+pub mod device_enrollment;
 pub mod zmq_handler;
 
 use std::sync::Arc;
@@ -117,6 +118,8 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             get(device::verify_get).post(device::verify_post),
         )
         .route("/oauth/device/nonce", get(device::device_nonce))
+        .route("/api/device/challenge", post(device_enrollment::device_challenge_handler))
+        .route("/api/device/enroll", post(device_enrollment::device_enroll_handler))
         .route("/oauth/revoke", post(revocation::revoke_token))
         .route("/oauth/logout", post(handle_logout))
         .route(
@@ -382,12 +385,15 @@ impl Spawnable for OAuthService {
                 .map(|c| c.credentials)
                 .unwrap_or_default();
 
+            let mut device_store_opt: Option<Arc<dyn crate::auth::DeviceStore>> = None;
             let user_store: Option<Arc<dyn crate::auth::user_store::UserStore>> = match credentials_config.backend {
                 CredentialsBackend::Rocksdb => {
                     match crate::auth::RocksDbUserStore::open(&credentials_dir) {
                         Ok(store) => {
                             info!("User store (RocksDB) opened at {:?}", credentials_dir);
-                            Some(Arc::new(store))
+                            let arc = Arc::new(store);
+                            device_store_opt = Some(arc.clone() as Arc<dyn crate::auth::DeviceStore>);
+                            Some(arc as Arc<dyn crate::auth::user_store::UserStore>)
                         }
                         Err(e) => {
                             tracing::warn!("Could not open user store (endpoints will report 'not configured'): {}", e);
@@ -441,6 +447,9 @@ impl Spawnable for OAuthService {
             );
             if let Some(store) = user_store {
                 oauth_state = oauth_state.with_user_store(store);
+            }
+            if let Some(ds) = device_store_opt {
+                oauth_state = oauth_state.with_device_store(ds);
             }
             oauth_state = oauth_state.with_signing_key(self.signing_key.clone());
             if let Some(key) = ca_jwt_key {

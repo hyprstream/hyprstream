@@ -16,7 +16,7 @@ use ed25519_dalek::VerifyingKey;
 use std::io::Cursor;
 use std::path::Path;
 
-use super::user_store::{pubkey_fingerprint, matches_filter, PubkeyEntry, UserFilter, UserProfile, UserStore};
+use super::user_store::{pubkey_fingerprint, matches_filter, DeviceRecord, DeviceStore, PubkeyEntry, UserFilter, UserProfile, UserStore};
 
 const USER_PREFIX: &[u8] = b"user:";
 const PUBKEY_PREFIX: &[u8] = b"pubkey:";
@@ -492,6 +492,75 @@ impl UserStore for RocksDbUserStore {
 
         self.put_user(username, &sub, &profile, &pubkeys)?;
         Ok(())
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// DeviceStore — anonymous device identity
+// ────────────────────────────────────────────────────────────────────────────
+
+const DEVICE_PREFIX: &[u8] = b"device:";
+
+fn device_key(fingerprint: &str) -> Vec<u8> {
+    let mut key = DEVICE_PREFIX.to_vec();
+    key.extend_from_slice(fingerprint.as_bytes());
+    key
+}
+
+#[async_trait]
+impl DeviceStore for RocksDbUserStore {
+    async fn enroll_device(&self, record: DeviceRecord) -> anyhow::Result<()> {
+        let key = device_key(&record.fingerprint);
+        // Preserve existing user_sub and label on re-enrollment.
+        let existing: Option<DeviceRecord> = self.db.get(&key)?
+            .and_then(|v| serde_json::from_slice(&v).ok());
+        let to_store = if let Some(existing) = existing {
+            DeviceRecord {
+                user_sub: existing.user_sub.or(record.user_sub),
+                label: existing.label.or(record.label),
+                enrolled_at: record.enrolled_at,
+                ..existing
+            }
+        } else {
+            record
+        };
+        let bytes = serde_json::to_vec(&to_store)?;
+        self.db.put(&key, &bytes)?;
+        Ok(())
+    }
+
+    async fn link_device_user(&self, fingerprint: &str, user_sub: &str) -> anyhow::Result<()> {
+        let key = device_key(fingerprint);
+        let Some(bytes) = self.db.get(&key)? else {
+            anyhow::bail!("device {} not found", fingerprint);
+        };
+        let mut record: DeviceRecord = serde_json::from_slice(&bytes)?;
+        record.user_sub = Some(user_sub.to_owned());
+        self.db.put(&key, serde_json::to_vec(&record)?)?;
+        Ok(())
+    }
+
+    async fn get_device(&self, fingerprint: &str) -> anyhow::Result<Option<DeviceRecord>> {
+        let key = device_key(fingerprint);
+        Ok(self.db.get(&key)?.and_then(|v| serde_json::from_slice(&v).ok()))
+    }
+
+    async fn touch_device(&self, fingerprint: &str) -> anyhow::Result<()> {
+        let key = device_key(fingerprint);
+        let Some(bytes) = self.db.get(&key)? else { return Ok(()); };
+        let mut record: DeviceRecord = serde_json::from_slice(&bytes)?;
+        record.last_seen_at = Some(chrono::Utc::now().timestamp());
+        self.db.put(&key, serde_json::to_vec(&record)?)?;
+        Ok(())
+    }
+
+    async fn revoke_device(&self, fingerprint: &str) -> anyhow::Result<bool> {
+        let key = device_key(fingerprint);
+        let exists = self.db.get(&key)?.is_some();
+        if exists {
+            self.db.delete(&key)?;
+        }
+        Ok(exists)
     }
 }
 
