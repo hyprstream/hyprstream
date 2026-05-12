@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use subtle::ConstantTimeEq;
 use axum::{
     extract::{Request, State},
     http::{StatusCode, header},
@@ -120,7 +121,7 @@ pub async fn require_bearer_token(
         }
         // Verify cnf.jkt in token matches the DPoP proof key.
         if let Some(token_jkt) = claims.cnf_jkt() {
-            if token_jkt != proof.jkt {
+            if token_jkt.as_bytes().ct_eq(proof.jkt.as_bytes()).unwrap_u8() == 0 {
                 return (
                     StatusCode::UNAUTHORIZED,
                     [(header::WWW_AUTHENTICATE, "Bearer error=\"invalid_token\"")],

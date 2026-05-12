@@ -15,6 +15,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::VerifyingKey;
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 /// Parsed and verified DPoP proof.
 #[derive(Debug, Clone)]
@@ -163,7 +164,7 @@ pub fn verify_dpop_proof(
     if let Some(token) = access_token {
         let expected_ath = URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes()));
         match &ath {
-            Some(a) if *a == expected_ath => {}
+            Some(a) if a.as_bytes().ct_eq(expected_ath.as_bytes()).unwrap_u8() == 1 => {}
             _ => return Err(DpopError::AthMismatch),
         }
     }

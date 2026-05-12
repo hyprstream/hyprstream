@@ -20,6 +20,7 @@ use axum::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use super::state::{DeviceCodeStatus, OAuthState, RefreshTokenEntry};
 use crate::services::generated::policy_client::IssueToken;
@@ -225,7 +226,7 @@ async fn exchange_authorization_code(
         URL_SAFE_NO_PAD.encode(digest)
     };
 
-    if computed_challenge != pending.code_challenge {
+    if computed_challenge.as_bytes().ct_eq(pending.code_challenge.as_bytes()).unwrap_u8() == 0 {
         return token_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
