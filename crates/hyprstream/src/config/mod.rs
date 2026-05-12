@@ -661,6 +661,57 @@ pub struct TrustedIssuerConfig {
 
 fn default_jwks_cache_ttl() -> u64 { 300 }
 
+/// Protocol kind for an external OAuth/OIDC provider.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderKind {
+    /// Full OpenID Connect — discovery document + id_token JWT verification. Default.
+    #[default]
+    Oidc,
+    /// Generic OAuth 2.0 with a userinfo endpoint. No discovery, no id_token.
+    /// Requires `authorization_endpoint`, `token_endpoint_url`, and `userinfo_endpoint`.
+    OAuth2,
+    /// GitHub OAuth 2.0 preset. Hardcoded endpoints, PKCE not supported,
+    /// subject mapped from numeric `id` field.
+    GitHub,
+}
+
+/// Claim field name overrides for mapping a userinfo JSON response to standard claims.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimMapping {
+    /// Field name for the stable subject identifier. Default: `"sub"`.
+    /// GitHub uses `"id"` (numeric integer, coerced to string).
+    /// Discord uses `"id"` (string snowflake).
+    #[serde(default = "default_claim_sub")]
+    pub sub: String,
+    /// Field name for display name. `None` omits the name from the synthetic claims.
+    #[serde(default = "default_claim_name")]
+    pub name: Option<String>,
+    /// Field name for email address. `None` omits email.
+    #[serde(default = "default_claim_email")]
+    pub email: Option<String>,
+    /// Field name for the email-verified boolean.
+    /// `None`, or a field that is absent/null in the response, is treated as `false`.
+    #[serde(default = "default_claim_email_verified")]
+    pub email_verified: Option<String>,
+}
+
+impl Default for ClaimMapping {
+    fn default() -> Self {
+        Self {
+            sub: default_claim_sub(),
+            name: default_claim_name(),
+            email: default_claim_email(),
+            email_verified: default_claim_email_verified(),
+        }
+    }
+}
+
+fn default_claim_sub() -> String { "sub".into() }
+fn default_claim_name() -> Option<String> { Some("name".into()) }
+fn default_claim_email() -> Option<String> { Some("email".into()) }
+fn default_claim_email_verified() -> Option<String> { Some("email_verified".into()) }
+
 /// Configuration for an external OIDC provider (login delegation).
 ///
 /// Hyprstream acts as an OIDC Relying Party to this provider. Users authenticate
@@ -668,17 +719,41 @@ fn default_jwks_cache_ttl() -> u64 { 300 }
 /// own JWT with scopes from the policy engine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OidcProviderConfig {
-    /// OIDC issuer URL (must support `/.well-known/openid-configuration`).
-    pub issuer_url: String,
+    /// Provider protocol kind. Default: `"oidc"`.
+    #[serde(default)]
+    pub kind: ProviderKind,
+    /// OIDC issuer URL. Required for `kind = "oidc"`.
+    /// Must support `/.well-known/openid-configuration`.
+    #[serde(default)]
+    pub issuer_url: Option<String>,
+    /// Authorization endpoint URL. Required for `kind = "oauth2"`.
+    /// Preset for `kind = "github"`.
+    #[serde(default)]
+    pub authorization_endpoint: Option<String>,
+    /// Token endpoint URL. Required for `kind = "oauth2"`.
+    /// Preset for `kind = "github"`. Named `token_endpoint_url` to avoid
+    /// collision with method names on OIDC metadata types.
+    #[serde(default)]
+    pub token_endpoint_url: Option<String>,
+    /// Userinfo endpoint URL. Required for `kind = "oauth2"` and `kind = "github"`.
+    #[serde(default)]
+    pub userinfo_endpoint: Option<String>,
+    /// Whether the provider supports PKCE (`code_challenge`). Default: `true`.
+    /// Set to `false` for GitHub, which ignores the parameter.
+    #[serde(default = "default_pkce_supported")]
+    pub pkce_supported: bool,
+    /// Claim field name overrides for mapping userinfo JSON to synthetic claims.
+    #[serde(default)]
+    pub claim_mapping: ClaimMapping,
     /// Client ID registered with the external provider.
     pub client_id: String,
     /// Client secret (optional — omit for public client with PKCE).
     #[serde(default)]
     pub client_secret: Option<String>,
     /// Scopes to request from the provider.
-    #[serde(default = "default_oidc_scopes")]
+    #[serde(default)]
     pub scopes: Vec<String>,
-    /// Display name for the login UI (e.g., "Corporate SSO").
+    /// Display name for the login UI (e.g., "Sign in with GitHub").
     #[serde(default)]
     pub display_name: Option<String>,
     /// Allow plain HTTP for discovery (dev only).
@@ -696,9 +771,70 @@ pub struct OidcProviderConfig {
     /// Default hyprstream scopes for auto-provisioned users.
     #[serde(default)]
     pub default_scopes: Vec<String>,
-    /// Clock skew tolerance for JWT validation (seconds).
+    /// Clock skew tolerance for JWT validation (seconds). OIDC only.
     #[serde(default = "default_clock_skew")]
     pub clock_skew_seconds: u64,
+}
+
+fn default_pkce_supported() -> bool { true }
+
+impl OidcProviderConfig {
+    /// Effective authorization endpoint, applying presets for known kinds.
+    pub fn effective_authorization_endpoint(&self) -> Option<&str> {
+        match self.kind {
+            ProviderKind::GitHub => Some("https://github.com/login/oauth/authorize"),
+            _ => self.authorization_endpoint.as_deref(),
+        }
+    }
+
+    /// Effective token endpoint URL, applying presets for known kinds.
+    pub fn effective_token_endpoint_url(&self) -> Option<&str> {
+        match self.kind {
+            ProviderKind::GitHub => Some("https://github.com/login/oauth/access_token"),
+            _ => self.token_endpoint_url.as_deref(),
+        }
+    }
+
+    /// Effective userinfo endpoint URL, applying presets for known kinds.
+    pub fn effective_userinfo_endpoint(&self) -> Option<&str> {
+        match self.kind {
+            ProviderKind::GitHub => Some("https://api.github.com/user"),
+            _ => self.userinfo_endpoint.as_deref(),
+        }
+    }
+
+    /// Whether to send PKCE parameters to this provider.
+    pub fn effective_pkce_supported(&self) -> bool {
+        match self.kind {
+            ProviderKind::GitHub => false,
+            _ => self.pkce_supported,
+        }
+    }
+
+    /// Effective claim mapping, applying preset overrides for known kinds.
+    pub fn effective_claim_mapping(&self) -> ClaimMapping {
+        match self.kind {
+            ProviderKind::GitHub => ClaimMapping {
+                sub: "id".into(),
+                name: Some("login".into()),
+                email: Some("email".into()),
+                email_verified: None,
+            },
+            _ => self.claim_mapping.clone(),
+        }
+    }
+
+    /// Effective scopes list, applying preset defaults for known kinds.
+    pub fn effective_scopes(&self) -> Vec<String> {
+        if !self.scopes.is_empty() {
+            return self.scopes.clone();
+        }
+        match self.kind {
+            ProviderKind::GitHub => vec!["read:user".into()],
+            ProviderKind::Oidc => default_oidc_scopes(),
+            ProviderKind::OAuth2 => vec![],
+        }
+    }
 }
 
 fn default_oidc_scopes() -> Vec<String> {

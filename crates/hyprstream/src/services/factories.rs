@@ -307,7 +307,7 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 
     // Expose globally so other services (e.g. OAuthService) can write policy rules
     // for federated users without a ZMQ round-trip.
-    crate::auth::policy_manager::set_global_policy_manager(Arc::clone(&policy_manager));
+    crate::auth::set_global_policy_manager(Arc::clone(&policy_manager));
 
     // Spawn file watcher for policy hot-reload
     let pm_clone = Arc::clone(&policy_manager);

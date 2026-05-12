@@ -1,8 +1,14 @@
-//! External OIDC provider callback handler.
+//! External OAuth/OIDC provider callback handler.
 //!
-//! Handles the return redirect from an external OIDC provider after the user
-//! authenticates. Validates the external id_token, maps the identity to a
-//! local hyprstream subject, and resumes the original authorize flow.
+//! Handles the return redirect from an external provider after the user
+//! authenticates. Supports three provider kinds:
+//!
+//! - `oidc`   — full OpenID Connect: discovery + id_token JWT verification
+//! - `oauth2` — generic OAuth 2.0: fixed endpoints + userinfo HTTP call
+//! - `github` — GitHub OAuth 2.0 preset (no PKCE, numeric id, login endpoint)
+//!
+//! After claims are obtained (via either path), identity mapping, provisioning,
+//! and auth code issuance are identical regardless of provider kind.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,20 +21,22 @@ use serde::Deserialize;
 use sha2::{Sha256, Digest};
 
 use crate::auth::user_store::UserProfile;
+use crate::config::ProviderKind;
 use super::state::{OAuthState, PendingAuthCode, PendingExternalAuth};
 
-/// Initiate external OIDC login by redirecting to the provider.
+/// Initiate external OAuth/OIDC login by redirecting to the provider.
 ///
 /// `GET /oauth/external/authorize/:provider`
 ///
-/// Stores the original hyprstream authorize request in `pending_external_auths`,
-/// then redirects to the external provider's authorization endpoint with PKCE.
+/// Dispatches on `provider.kind`:
+/// - `oidc`   — fetches OIDC discovery, sends PKCE + nonce
+/// - `oauth2` / `github` — uses configured/preset endpoints, omits nonce,
+///   skips PKCE when `pkce_supported = false`
 pub async fn external_authorize(
     State(state): State<Arc<OAuthState>>,
     Path(provider_slug): Path<String>,
     Query(params): Query<super::authorize::AuthorizeParams>,
 ) -> Response {
-    // Look up provider config
     let config = crate::config::HyprConfig::load().unwrap_or_default();
     let provider = match config.oauth.oidc_providers.get(&provider_slug) {
         Some(p) => p.clone(),
@@ -38,67 +46,134 @@ pub async fn external_authorize(
         }
     };
 
-    // Fetch OIDC discovery
-    let metadata = match state.oidc_discovery.get_metadata(&provider.issuer_url, provider.allow_http).await {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::error!(provider = %provider_slug, error = %e, "OIDC discovery failed");
-            return (axum::http::StatusCode::BAD_GATEWAY, format!("OIDC discovery failed: {e}"))
-                .into_response();
-        }
-    };
-
-    // Generate PKCE challenge (defense in depth even as confidential client)
-    let mut verifier_bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut verifier_bytes);
-    let pkce_verifier = URL_SAFE_NO_PAD.encode(verifier_bytes);
-    let pkce_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(pkce_verifier.as_bytes()));
-
-    // Generate state + nonce for the external flow
     let mut state_bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut state_bytes);
     let external_state = URL_SAFE_NO_PAD.encode(state_bytes);
 
-    let mut nonce_bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
-    let external_nonce = URL_SAFE_NO_PAD.encode(nonce_bytes);
-
-    // Store pending external auth
-    let pending = PendingExternalAuth {
-        provider_slug: provider_slug.clone(),
-        external_state: external_state.clone(),
-        external_nonce: external_nonce.clone(),
-        pkce_verifier,
-        client_secret: provider.client_secret.clone(),
-        token_endpoint: metadata.token_endpoint.clone(),
-        // Original hyprstream authorize request (to resume after external auth)
-        original_client_id: params.client_id.clone(),
-        original_redirect_uri: params.redirect_uri.clone(),
-        original_code_challenge: params.code_challenge.clone(),
-        original_scopes: params.scope.as_deref().unwrap_or("openid").to_owned(),
-        original_state: params.state.clone(),
-        original_resource: params.resource.clone(),
-        original_oidc_nonce: params.nonce.clone(),
-        created_at: Instant::now(),
-        expires_at: Instant::now() + Duration::from_secs(600), // 10-minute TTL
-    };
-    state.pending_external_auths.write().await.insert(external_state.clone(), pending);
-
-    // Build external provider's authorize URL
     let callback_url = format!("{}/oauth/callback/{}", state.issuer_url, provider_slug);
-    let scopes = provider.scopes.join(" ");
-    let authorize_url = format!(
-        "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&nonce={}&code_challenge={}&code_challenge_method=S256",
-        metadata.authorization_endpoint,
-        urlencoding::encode(&provider.client_id),
-        urlencoding::encode(&callback_url),
-        urlencoding::encode(&scopes),
-        urlencoding::encode(&external_state),
-        urlencoding::encode(&external_nonce),
-        urlencoding::encode(&pkce_challenge),
-    );
 
-    Redirect::temporary(&authorize_url).into_response()
+    match provider.kind {
+        ProviderKind::Oidc => {
+            let issuer = match provider.issuer_url.as_deref() {
+                Some(u) => u,
+                None => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "oidc provider missing issuer_url").into_response(),
+            };
+            let metadata = match state.oidc_discovery.get_metadata(issuer, provider.allow_http).await {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!(provider = %provider_slug, error = %e, "OIDC discovery failed");
+                    return (axum::http::StatusCode::BAD_GATEWAY,
+                        format!("OIDC discovery failed: {e}")).into_response();
+                }
+            };
+
+            let mut verifier_bytes = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut verifier_bytes);
+            let pkce_verifier = URL_SAFE_NO_PAD.encode(verifier_bytes);
+            let pkce_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(pkce_verifier.as_bytes()));
+
+            let mut nonce_bytes = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+            let external_nonce = URL_SAFE_NO_PAD.encode(nonce_bytes);
+
+            let scopes = provider.effective_scopes().join(" ");
+            let authorize_url = format!(
+                "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&nonce={}&code_challenge={}&code_challenge_method=S256",
+                metadata.authorization_endpoint,
+                urlencoding::encode(&provider.client_id),
+                urlencoding::encode(&callback_url),
+                urlencoding::encode(&scopes),
+                urlencoding::encode(&external_state),
+                urlencoding::encode(&external_nonce),
+                urlencoding::encode(&pkce_challenge),
+            );
+
+            let pending = PendingExternalAuth {
+                provider_slug: provider_slug.clone(),
+                external_state: external_state.clone(),
+                external_nonce,
+                provider_kind: ProviderKind::Oidc,
+                pkce_supported: true,
+                pkce_verifier,
+                client_secret: provider.client_secret.clone(),
+                token_endpoint: metadata.token_endpoint.clone(),
+                original_client_id: params.client_id.clone(),
+                original_redirect_uri: params.redirect_uri.clone(),
+                original_code_challenge: params.code_challenge.clone(),
+                original_scopes: params.scope.as_deref().unwrap_or("openid").to_owned(),
+                original_state: params.state.clone(),
+                original_resource: params.resource.clone(),
+                original_oidc_nonce: params.nonce.clone(),
+                created_at: Instant::now(),
+                expires_at: Instant::now() + Duration::from_secs(600),
+            };
+            state.pending_external_auths.write().await.insert(external_state.clone(), pending);
+            Redirect::temporary(&authorize_url).into_response()
+        }
+
+        ProviderKind::OAuth2 | ProviderKind::GitHub => {
+            let auth_endpoint = match provider.effective_authorization_endpoint() {
+                Some(u) => u,
+                None => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "oauth2 provider missing authorization_endpoint").into_response(),
+            };
+            let token_endpoint = match provider.effective_token_endpoint_url() {
+                Some(u) => u.to_owned(),
+                None => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "oauth2 provider missing token_endpoint_url").into_response(),
+            };
+
+            let pkce_supported = provider.effective_pkce_supported();
+            let (pkce_verifier, pkce_challenge) = if pkce_supported {
+                let mut verifier_bytes = [0u8; 32];
+                rand::rngs::OsRng.fill_bytes(&mut verifier_bytes);
+                let v = URL_SAFE_NO_PAD.encode(verifier_bytes);
+                let c = URL_SAFE_NO_PAD.encode(Sha256::digest(v.as_bytes()));
+                (v, Some(c))
+            } else {
+                (String::new(), None)
+            };
+
+            let scopes = provider.effective_scopes().join(" ");
+            let mut authorize_url = format!(
+                "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}",
+                auth_endpoint,
+                urlencoding::encode(&provider.client_id),
+                urlencoding::encode(&callback_url),
+                urlencoding::encode(&scopes),
+                urlencoding::encode(&external_state),
+            );
+            if let Some(ref challenge) = pkce_challenge {
+                authorize_url.push_str(&format!(
+                    "&code_challenge={}&code_challenge_method=S256",
+                    urlencoding::encode(challenge)
+                ));
+            }
+
+            let pending = PendingExternalAuth {
+                provider_slug: provider_slug.clone(),
+                external_state: external_state.clone(),
+                external_nonce: String::new(),
+                provider_kind: provider.kind.clone(),
+                pkce_supported,
+                pkce_verifier,
+                client_secret: provider.client_secret.clone(),
+                token_endpoint,
+                original_client_id: params.client_id.clone(),
+                original_redirect_uri: params.redirect_uri.clone(),
+                original_code_challenge: params.code_challenge.clone(),
+                original_scopes: params.scope.as_deref().unwrap_or("openid").to_owned(),
+                original_state: params.state.clone(),
+                original_resource: params.resource.clone(),
+                original_oidc_nonce: params.nonce.clone(),
+                created_at: Instant::now(),
+                expires_at: Instant::now() + Duration::from_secs(600),
+            };
+            state.pending_external_auths.write().await.insert(external_state.clone(), pending);
+            Redirect::temporary(&authorize_url).into_response()
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -152,19 +227,26 @@ pub async fn external_callback(
         ("code", params.code.clone()),
         ("redirect_uri", callback_url),
         ("client_id", provider.client_id.clone()),
-        ("code_verifier", pending.pkce_verifier.clone()),
     ];
+    if pending.pkce_supported {
+        token_params.push(("code_verifier", pending.pkce_verifier.clone()));
+    }
     if let Some(ref secret) = pending.client_secret {
         token_params.push(("client_secret", secret.clone()));
     }
 
-    let token_response = match state.http_client
+    let mut request = state.http_client
         .post(&pending.token_endpoint)
         .form(&token_params)
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await
-    {
+        .timeout(Duration::from_secs(10));
+
+    // GitHub (and many generic OAuth 2.0 providers) default to form-encoded responses;
+    // Accept: application/json ensures we always get parseable JSON.
+    if matches!(pending.provider_kind, ProviderKind::OAuth2 | ProviderKind::GitHub) {
+        request = request.header("Accept", "application/json");
+    }
+
+    let token_response = match request.send().await {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(provider = %provider_slug, error = %e, "External token exchange failed");
@@ -186,92 +268,141 @@ pub async fn external_callback(
         }
     };
 
-    // Extract and validate external id_token
-    let external_id_token = match token_json["id_token"].as_str() {
-        Some(t) => t,
-        None => {
-            tracing::error!(provider = %provider_slug, "No id_token in external token response");
-            return (axum::http::StatusCode::BAD_GATEWAY, "No id_token from external provider").into_response();
-        }
-    };
+    // Obtain normalised claims — dispatching on provider kind.
+    // Both paths produce the same structure: { sub, name, email, email_verified }.
+    let external_claims: serde_json::Value = match pending.provider_kind {
+        ProviderKind::Oidc => {
+            // Full OpenID Connect: verify the id_token JWT against provider JWKS.
+            let external_id_token = match token_json["id_token"].as_str() {
+                Some(t) => t,
+                None => {
+                    tracing::error!(provider = %provider_slug, "No id_token in external token response");
+                    return (axum::http::StatusCode::BAD_GATEWAY, "No id_token from external provider").into_response();
+                }
+            };
 
-    // Verify external id_token signature against the provider's JWKS.
-    //
-    // Fetches the JWKS from the provider's discovery endpoint, selects the
-    // appropriate key (by kid or algorithm), and verifies the JWT signature.
-    // Supports RS256, ES256, and EdDSA algorithms.
-    let external_claims: serde_json::Value = {
-        // Get JWKS URI from OIDC discovery
-        let metadata = match state.oidc_discovery.get_metadata(&provider.issuer_url, provider.allow_http).await {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::error!(provider = %provider_slug, error = %e, "OIDC discovery for JWKS failed");
-                return (axum::http::StatusCode::BAD_GATEWAY, "OIDC discovery for JWKS verification failed").into_response();
+            let issuer = match provider.issuer_url.as_deref() {
+                Some(u) => u,
+                None => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "oidc provider missing issuer_url").into_response(),
+            };
+
+            // Verify external id_token signature against the provider's JWKS.
+            //
+            // Fetches the JWKS from the provider's discovery endpoint, selects the
+            // appropriate key (by kid or algorithm), and verifies the JWT signature.
+            // Supports RS256, ES256, and EdDSA algorithms.
+            let metadata = match state.oidc_discovery.get_metadata(issuer, provider.allow_http).await {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!(provider = %provider_slug, error = %e, "OIDC discovery for JWKS failed");
+                    return (axum::http::StatusCode::BAD_GATEWAY, "OIDC discovery for JWKS verification failed").into_response();
+                }
+            };
+
+            let verified = match crate::auth::id_token_verify::verify_id_token(
+                external_id_token,
+                &metadata.jwks_uri,
+                issuer,
+                &provider.client_id,
+                &state.http_client,
+            ).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(provider = %provider_slug, error = %e, "External id_token JWKS verification failed");
+                    return (axum::http::StatusCode::BAD_GATEWAY, "External id_token verification failed").into_response();
+                }
+            };
+
+            let claims = verified.claims;
+
+            // Validate issuer (OIDC Core Section 3.1.3.7)
+            if claims["iss"].as_str() != Some(issuer) {
+                tracing::error!(
+                    provider = %provider_slug,
+                    expected = %issuer,
+                    got = %claims["iss"],
+                    "External id_token issuer mismatch"
+                );
+                return (axum::http::StatusCode::BAD_REQUEST, "Issuer mismatch").into_response();
             }
-        };
 
-        match crate::auth::id_token_verify::verify_id_token(
-            external_id_token,
-            &metadata.jwks_uri,
-            &provider.issuer_url,
-            &provider.client_id,
-            &state.http_client,
-        ).await {
-            Ok(verified) => verified.claims,
-            Err(e) => {
-                tracing::error!(provider = %provider_slug, error = %e, "External id_token JWKS verification failed");
-                return (axum::http::StatusCode::BAD_GATEWAY, "External id_token verification failed").into_response();
+            // Validate audience (OIDC Core Section 3.1.3.6)
+            let aud_valid = match &claims["aud"] {
+                serde_json::Value::String(s) => s == &provider.client_id,
+                serde_json::Value::Array(arr) => arr.iter().any(|v| v.as_str() == Some(&provider.client_id)),
+                _ => false,
+            };
+            if !aud_valid {
+                tracing::error!(provider = %provider_slug, "External id_token audience mismatch");
+                return (axum::http::StatusCode::BAD_REQUEST, "Audience mismatch").into_response();
+            }
+
+            // Validate expiration (OIDC Core Section 3.1.3.6)
+            if let Some(exp) = claims["exp"].as_i64() {
+                let now = chrono::Utc::now().timestamp();
+                let skew = provider.clock_skew_seconds as i64;
+                if now > exp + skew {
+                    tracing::error!(provider = %provider_slug, "External id_token expired");
+                    return (axum::http::StatusCode::BAD_REQUEST, "Token expired").into_response();
+                }
+            } else {
+                tracing::error!(provider = %provider_slug, "External id_token missing exp claim");
+                return (axum::http::StatusCode::BAD_REQUEST, "Missing exp claim").into_response();
+            }
+
+            // Validate nonce (REQUIRED when sent in auth request — OIDC Core Section 3.1.3.6)
+            match claims["nonce"].as_str() {
+                Some(nonce) if nonce == pending.external_nonce => { /* valid */ }
+                Some(_) => {
+                    tracing::error!(provider = %provider_slug, "External id_token nonce mismatch");
+                    return (axum::http::StatusCode::BAD_REQUEST, "Nonce mismatch").into_response();
+                }
+                None => {
+                    tracing::error!(provider = %provider_slug, "External id_token missing nonce (required)");
+                    return (axum::http::StatusCode::BAD_REQUEST, "Missing nonce").into_response();
+                }
+            }
+
+            claims
+        }
+
+        ProviderKind::OAuth2 | ProviderKind::GitHub => {
+            // Generic OAuth 2.0 / GitHub: exchange gave us an opaque access_token.
+            // Fetch user identity from the provider's userinfo endpoint.
+            let access_token = match token_json["access_token"].as_str() {
+                Some(t) => t,
+                None => {
+                    tracing::error!(provider = %provider_slug, "No access_token in external token response");
+                    return (axum::http::StatusCode::BAD_GATEWAY, "No access_token from external provider").into_response();
+                }
+            };
+
+            let userinfo_url = match provider.effective_userinfo_endpoint() {
+                Some(u) => u.to_owned(),
+                None => {
+                    tracing::error!(provider = %provider_slug, "OAuth2 provider missing userinfo_endpoint");
+                    return (axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        "oauth2 provider missing userinfo_endpoint").into_response();
+                }
+            };
+
+            let mapping = provider.effective_claim_mapping();
+            match super::oauth2_userinfo::fetch_oauth2_claims(
+                &state.http_client,
+                &userinfo_url,
+                access_token,
+                &mapping,
+            ).await {
+                Ok(claims) => claims,
+                Err(e) => {
+                    tracing::error!(provider = %provider_slug, error = %e, "OAuth2 userinfo fetch failed");
+                    return (axum::http::StatusCode::BAD_GATEWAY,
+                        format!("Userinfo fetch failed: {e}")).into_response();
+                }
             }
         }
     };
-
-    // Validate issuer (OIDC Core Section 3.1.3.7)
-    if external_claims["iss"].as_str() != Some(&provider.issuer_url) {
-        tracing::error!(
-            provider = %provider_slug,
-            expected = %provider.issuer_url,
-            got = %external_claims["iss"],
-            "External id_token issuer mismatch"
-        );
-        return (axum::http::StatusCode::BAD_REQUEST, "Issuer mismatch").into_response();
-    }
-
-    // Validate audience (OIDC Core Section 3.1.3.6)
-    let aud_valid = match &external_claims["aud"] {
-        serde_json::Value::String(s) => s == &provider.client_id,
-        serde_json::Value::Array(arr) => arr.iter().any(|v| v.as_str() == Some(&provider.client_id)),
-        _ => false,
-    };
-    if !aud_valid {
-        tracing::error!(provider = %provider_slug, "External id_token audience mismatch");
-        return (axum::http::StatusCode::BAD_REQUEST, "Audience mismatch").into_response();
-    }
-
-    // Validate expiration (OIDC Core Section 3.1.3.6)
-    if let Some(exp) = external_claims["exp"].as_i64() {
-        let now = chrono::Utc::now().timestamp();
-        let skew = provider.clock_skew_seconds as i64;
-        if now > exp + skew {
-            tracing::error!(provider = %provider_slug, "External id_token expired");
-            return (axum::http::StatusCode::BAD_REQUEST, "Token expired").into_response();
-        }
-    } else {
-        tracing::error!(provider = %provider_slug, "External id_token missing exp claim");
-        return (axum::http::StatusCode::BAD_REQUEST, "Missing exp claim").into_response();
-    }
-
-    // Validate nonce (REQUIRED when sent in auth request — OIDC Core Section 3.1.3.6)
-    match external_claims["nonce"].as_str() {
-        Some(nonce) if nonce == pending.external_nonce => { /* valid */ }
-        Some(_) => {
-            tracing::error!(provider = %provider_slug, "External id_token nonce mismatch");
-            return (axum::http::StatusCode::BAD_REQUEST, "Nonce mismatch").into_response();
-        }
-        None => {
-            tracing::error!(provider = %provider_slug, "External id_token missing nonce (required)");
-            return (axum::http::StatusCode::BAD_REQUEST, "Missing nonce").into_response();
-        }
-    }
 
     // Map external identity to local subject
     let mapped_subject = match super::user_mapping::map_external_identity(
@@ -422,7 +553,7 @@ async fn provision_federated_user(
 
     // Write Casbin rules for default_scopes.
     // Scope format: "action:resource_type:resource_id" — e.g. "infer:model:*", "read:*:*"
-    let Some(pm) = crate::auth::policy_manager::global_policy_manager() else {
+    let Some(pm) = crate::auth::global_policy_manager() else {
         tracing::warn!(provider = %provider_slug, "PolicyManager not available — default_scopes not applied");
         return;
     };

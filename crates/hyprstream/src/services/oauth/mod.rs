@@ -37,6 +37,7 @@ pub mod jwks;
 pub mod jwt_bearer;
 pub mod login_page;
 pub mod metadata;
+pub mod oauth2_userinfo;
 pub mod oidc_callback;
 pub mod oidc_discovery;
 pub mod registration;

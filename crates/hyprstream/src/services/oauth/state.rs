@@ -140,6 +140,10 @@ pub struct PendingExternalAuth {
     pub provider_slug: String,
     pub external_state: String,
     pub external_nonce: String,
+    /// Provider kind, carried through for dispatch in the callback handler.
+    pub provider_kind: crate::config::ProviderKind,
+    /// Whether PKCE was sent to the external provider.
+    pub pkce_supported: bool,
     pub pkce_verifier: String,
     pub client_secret: Option<String>,
     pub token_endpoint: String,
