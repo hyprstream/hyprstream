@@ -21,6 +21,23 @@ use hyprstream_rpc::stream_consumer::{StreamHandle, StreamHandleImpl, StreamPayl
 use hyprstream_rpc::web_transport::WtConnection;
 
 // ============================================================================
+// JsTokenProvider — Send+Sync wrapper for a JS token callback
+// ============================================================================
+
+/// Wraps a `js_sys::Function` so it satisfies `Send + Sync`.
+///
+/// SAFETY: WASM is single-threaded; there is no concurrent access possible.
+struct JsTokenProvider(js_sys::Function);
+unsafe impl Send for JsTokenProvider {}
+unsafe impl Sync for JsTokenProvider {}
+
+impl JsTokenProvider {
+    fn call(&self) -> Option<String> {
+        self.0.call0(&wasm_bindgen::JsValue::NULL).ok().and_then(|v| v.as_string())
+    }
+}
+
+// ============================================================================
 // WtConnection — standalone WebTransport connection (Step 1)
 // ============================================================================
 
@@ -121,11 +138,22 @@ impl WasmRpcClient {
         Self::new(conn, signer_pubkey, sign_fn, server_verifying_key)
     }
 
-    /// Builder: set the default JWT token for all calls.
+    /// Builder: set a dynamic token provider called on every RPC request.
     ///
-    /// The token is stored immutably in the underlying `RpcClientImpl`.
-    /// Per-call override is available via `callWithOptions()`.
-    /// Consumes and returns a new client — matches the Rust `with_default_jwt()` pattern.
+    /// `provider` is a JS `() => string | null` function invoked before each call.
+    /// This keeps short-lived tokens (OAuth at+jwt, WIT) fresh without reconstructing
+    /// the client. Consumes and returns a new client.
+    #[wasm_bindgen(js_name = "withTokenProvider")]
+    pub fn with_token_provider(self, provider: js_sys::Function) -> WasmRpcClient {
+        let wrapped = JsTokenProvider(provider);
+        WasmRpcClient {
+            inner: self.inner.with_token_provider(move || wrapped.call()),
+        }
+    }
+
+    /// Builder: set a static default JWT token for all calls.
+    ///
+    /// Sugar over `withTokenProvider`. Consumes and returns a new client.
     #[wasm_bindgen(js_name = "withDefaultJwt")]
     pub fn with_default_jwt(self, token: &str) -> WasmRpcClient {
         WasmRpcClient {

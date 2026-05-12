@@ -24,6 +24,8 @@ use crate::transport_traits::{Signer, Transport};
 use crate::capnp::{FromCapnp, ToCapnp};
 use crate::stream_consumer::{StreamHandle, StreamHandleImpl};
 
+type TokenProviderBox = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
 // ============================================================================
 // Per-call options (non-mutating, Send+Sync, owned data)
 // ============================================================================
@@ -139,7 +141,7 @@ pub struct RpcClientImpl<S: Signer, T: Transport + 'static> {
     pub signer: S,
     pub transport: T,
     pub server_verifying_key: Option<VerifyingKey>,
-    default_jwt: Option<String>,
+    token_provider: Option<TokenProviderBox>,
     request_id: AtomicU64,
 }
 
@@ -153,25 +155,39 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             signer,
             transport,
             server_verifying_key,
-            default_jwt: None,
+            token_provider: None,
             request_id: AtomicU64::new(1),
         }
     }
 
-    /// Create a new RPC client with a default JWT token.
+    /// Set a dynamic token provider called on every RPC request.
     ///
-    /// The token is stored immutably and used for all calls unless
-    /// overridden by `call_with_options()`.
-    pub fn with_default_jwt(mut self, token: String) -> Self {
-        self.default_jwt = Some(token);
+    /// The closure is called once per `call()` / `call_with_options()` invocation
+    /// so short-lived tokens (OAuth at+jwt, WIT) are always fresh without
+    /// reconstructing the client. On WASM, wrap `js_sys::Function` in a
+    /// `Send + Sync` newtype before passing it here (WASM is single-threaded).
+    pub fn with_token_provider<F>(mut self, f: F) -> Self
+    where
+        F: Fn() -> Option<String> + Send + Sync + 'static,
+    {
+        self.token_provider = Some(Arc::new(f));
         self
+    }
+
+    /// Set a static default JWT. Sugar over `with_token_provider`.
+    pub fn with_default_jwt(self, token: String) -> Self {
+        self.with_token_provider(move || Some(token.clone()))
+    }
+
+    fn effective_jwt(&self) -> Option<String> {
+        self.token_provider.as_ref().and_then(|f| f())
     }
 
     /// Send a request and return the verified, unwrapped response payload.
     /// Uses the client's default JWT.
     pub async fn call(&self, payload: Vec<u8>) -> Result<Vec<u8>> {
         let request_id = self.next_id();
-        let signed_bytes = self.sign_envelope(request_id, payload, None, self.default_jwt.clone(), None).await?;
+        let signed_bytes = self.sign_envelope(request_id, payload, None, self.effective_jwt(), None).await?;
         let timeout = self.calculate_timeout();
         let response_bytes = self.transport.send(signed_bytes, timeout).await?;
         let (_req_id, inner) = envelope::unwrap_response(
@@ -191,7 +207,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
     ) -> Result<Vec<u8>> {
         let request_id = self.next_id();
         let signed_bytes = self
-            .sign_envelope(request_id, payload, Some(ephemeral_pubkey), self.default_jwt.clone(), None)
+            .sign_envelope(request_id, payload, Some(ephemeral_pubkey), self.effective_jwt(), None)
             .await?;
         let timeout = self.calculate_timeout();
         let response_bytes = self.transport.send(signed_bytes, timeout).await?;
@@ -212,7 +228,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         options: CallOptions,
     ) -> Result<Vec<u8>> {
         let request_id = self.next_id();
-        let jwt = options.jwt.or_else(|| self.default_jwt.clone());
+        let jwt = options.jwt.or_else(|| self.effective_jwt());
         let signed_bytes = self
             .sign_envelope(request_id, payload, Some(ephemeral_pubkey), jwt, options.delegated_bearer)
             .await?;
@@ -235,7 +251,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         options: CallOptions,
     ) -> Result<Vec<u8>> {
         let request_id = self.next_id();
-        let jwt = options.jwt.or_else(|| self.default_jwt.clone());
+        let jwt = options.jwt.or_else(|| self.effective_jwt());
         let signed_bytes = self
             .sign_envelope(request_id, payload, None, jwt, options.delegated_bearer)
             .await?;
