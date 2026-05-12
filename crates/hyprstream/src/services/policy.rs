@@ -4,7 +4,7 @@
 //! Handlers are async and use `.await` directly (compatible with single-threaded runtime).
 
 use async_trait::async_trait;
-use crate::auth::{Operation, PolicyManager};
+use crate::auth::PolicyManager;
 use crate::auth::policy_templates;
 use crate::services::{EnvelopeContext, ZmqService};
 use crate::services::generated::policy_client::{
@@ -253,7 +253,7 @@ impl PolicyHandler for PolicyService {
                 &caller,
                 "*",
                 "policy:IssueToken",
-                Operation::Manage.as_str(),
+                "manage",
             ).await;
             if !allowed {
                 return Ok(PolicyResponseVariant::Error(ErrorInfo {

@@ -32,12 +32,16 @@ pub fn compute_jkt(key_bytes: &[u8; 32]) -> String {
 /// identical criteria so routing and subject resolution are always consistent.
 ///
 /// Rules:
+/// - Empty `iss` is always local (cluster-internal tokens have no issuer claim).
 /// - If `local_issuers` is non-empty: `iss` must exactly match one entry.
 /// - If `local_issuers` is empty (unconfigured node): only an empty `iss` is
 ///   accepted as local; any non-empty `iss` is treated as federated.
 pub fn is_local_iss(iss: &str, local_issuers: &[&str]) -> bool {
+    if iss.is_empty() {
+        return true;
+    }
     if local_issuers.is_empty() {
-        iss.is_empty()
+        false
     } else {
         local_issuers.contains(&iss)
     }
@@ -392,9 +396,9 @@ mod tests {
         assert!(local.is_local_to(&["https://local.example.com"]));
         assert!(!local.is_local_to(&["https://other.example.com"]));
         assert!(!federated.is_local_to(&["https://local.example.com"]));
-        // Empty iss is local only when no local issuers configured
+        // Empty iss is always local — cluster-internal tokens have no issuer claim
         assert!(legacy.is_local_to(&[]));
-        assert!(!legacy.is_local_to(&["https://local.example.com"]));
+        assert!(legacy.is_local_to(&["https://local.example.com"]));
     }
 
     #[test]

@@ -961,6 +961,11 @@ mod tests {
 
         // Other service grants from SERVICE_BASE_POLICIES
         assert!(pm.check_with_domain("service:policy", "*", "policy:IssueToken", "manage").await);
+        // The OAuth token issuance path: service:oauth must be able to issue tokens via
+        // the wildcard rule (service:*,*,policy:IssueToken,manage,allow). Action must be
+        // "manage" (not Operation::Manage.as_str() which returns "ttt.writeback").
+        assert!(pm.check_with_domain("service:oauth", "*", "policy:IssueToken", "manage").await,
+            "service:oauth must be allowed to issue tokens (service:* wildcard rule)");
         assert!(pm.check_with_domain("service:model", "*", "policy:Check", "check").await);
         assert!(pm.check_with_domain("service:model", "*", "registry:ListModels", "infer").await);
         assert!(pm.check_with_domain("service:oai", "*", "model:Generate", "infer.generate").await);

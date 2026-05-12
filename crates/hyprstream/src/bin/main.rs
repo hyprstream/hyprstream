@@ -1759,18 +1759,13 @@ fn main() -> Result<()> {
                                             }),
                                     );
 
-                                    // Load CA verifying key (trust anchor) into trust store
+                                    // Load CA verifying key (trust anchor) for JWT verification only.
+                                    // Do NOT insert into the trust store as "policy" scope — the trust
+                                    // store maps ZMQ signing keys to subjects, and the policy service
+                                    // signs ZMQ responses with its own independent keypair (not the CA
+                                    // key). The CA key is only used to verify service JWTs (at+jwt).
                                     if let Ok(ca_vk) = hyprstream_core::auth::identity_store::load_ca_verifying_key(&secrets_dir) {
                                         ctx = ctx.with_ca_verifying_key(ca_vk);
-                                        hyprstream_service::global_trust_store().insert(
-                                            ca_vk,
-                                            hyprstream_service::Attestation {
-                                                scopes: std::iter::once("policy".to_owned()).collect(),
-                                                subject: None,
-                                                jwt: None,
-                                                expires_at: 0,
-                                            },
-                                        );
                                     }
 
                                     // Load bootstrap pubkeys (all service pubkeys) into trust store
@@ -1815,16 +1810,8 @@ fn main() -> Result<()> {
                                     // Load CA verifying key (trust anchor)
                                     let ca_vk = hyprstream_core::auth::identity_store::load_ca_verifying_key(&secrets_dir)
                                         .context("CA key not found — run 'hyprstream wizard' first")?;
+                                    // CA key is for JWT verification only — not a ZMQ signing key.
                                     ctx = ctx.with_ca_verifying_key(ca_vk);
-                                    hyprstream_service::global_trust_store().insert(
-                                        ca_vk,
-                                        hyprstream_service::Attestation {
-                                            scopes: std::iter::once("policy".to_owned()).collect(),
-                                            subject: None,
-                                            jwt: None,
-                                            expires_at: 0,
-                                        },
-                                    );
 
                                     // Load bootstrap pubkeys (all service pubkeys) into trust store
                                     let pubkeys = hyprstream_core::auth::identity_store::load_bootstrap_pubkeys(&secrets_dir)
