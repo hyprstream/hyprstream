@@ -46,6 +46,7 @@ pub mod scim_types;
 pub mod session;
 pub mod state;
 pub mod token;
+pub mod token_exchange;
 pub mod user_mapping;
 pub mod user_service;
 pub mod userinfo;

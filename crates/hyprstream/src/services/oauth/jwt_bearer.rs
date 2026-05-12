@@ -79,7 +79,7 @@ pub async fn exchange_jwt_bearer(
             }
         };
         // Fetch JWKS from the issuer's discovery document.
-        match fetch_federated_key(state, &iss, assertion, issuer_config.allow_http).await {
+        match resolve_federated_key(state, &iss, assertion, issuer_config.allow_http).await {
             Ok(vk) => vk,
             Err(e) => {
                 return jwt_bearer_error(StatusCode::UNAUTHORIZED, "invalid_grant", &e);
@@ -139,10 +139,10 @@ pub async fn exchange_jwt_bearer(
 }
 
 /// Fetch a verifying key for a federated issuer by resolving JWKS.
-///
-/// Matches the `kid` JWT header against the keys in the JWKS endpoint.
+/// Matches the `kid` JWT header against keys in the JWKS endpoint.
 /// Falls back to the first Ed25519 (OKP/Ed25519) key when no `kid` matches.
-async fn fetch_federated_key(state: &Arc<OAuthState>, issuer: &str, assertion: &str, allow_http: bool) -> Result<VerifyingKey, String> {
+/// Shared by jwt_bearer (RFC 7523) and token_exchange (RFC 8693).
+pub(super) async fn resolve_federated_key(state: &Arc<OAuthState>, issuer: &str, assertion: &str, allow_http: bool) -> Result<VerifyingKey, String> {
     let metadata = state
         .oidc_discovery
         .get_metadata(issuer, allow_http)

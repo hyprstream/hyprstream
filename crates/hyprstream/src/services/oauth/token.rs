@@ -28,6 +28,8 @@ use crate::services::generated::policy_client::IssueToken;
 const DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 /// JWT bearer grant type URN (RFC 7523).
 const JWT_BEARER_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
+/// Token exchange grant type URN (RFC 8693).
+const TOKEN_EXCHANGE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 
 /// Token exchange request (application/x-www-form-urlencoded).
 ///
@@ -52,6 +54,19 @@ pub struct TokenRequest {
     // jwt-bearer assertion (RFC 7523)
     #[serde(default)]
     pub assertion: Option<String>,
+    // token-exchange fields (RFC 8693)
+    #[serde(default)]
+    pub subject_token: Option<String>,
+    #[serde(default)]
+    pub subject_token_type: Option<String>,
+    #[serde(default)]
+    pub requested_token_type: Option<String>,
+    #[serde(default)]
+    pub actor_token: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub audience: Option<String>,
 }
 
 /// POST /oauth/token — token exchange
@@ -84,6 +99,25 @@ pub async fn exchange_token(
                 None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", "assertion is required"),
             };
             super::jwt_bearer::exchange_jwt_bearer(&state, &params.client_id, &assertion).await
+        }
+        gt if gt == TOKEN_EXCHANGE_GRANT_TYPE => {
+            let subject_token = match params.subject_token {
+                Some(t) => t,
+                None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", "subject_token is required"),
+            };
+            let subject_token_type = match params.subject_token_type {
+                Some(t) => t,
+                None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", "subject_token_type is required"),
+            };
+            super::token_exchange::exchange_token_exchange(
+                &state,
+                &subject_token,
+                &subject_token_type,
+                params.audience.as_deref(),
+                params.scope.as_deref(),
+                params.actor_token.as_deref(),
+                params.requested_token_type.as_deref(),
+            ).await
         }
         _ => token_error(
             StatusCode::BAD_REQUEST,

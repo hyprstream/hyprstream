@@ -82,6 +82,12 @@ struct PolicyRequest {
     # no explicit subject field; the CA signs a fresh 30-day JWT for the caller.
     refreshServiceToken @20 :RefreshServiceTokenRequest
       $mcpScope(manage) $mcpDescription("Renew the caller's service JWT; identity from signed envelope");
+
+    # Exchange the caller's envelope WIT for an OAuth at+jwt.
+    # Identity and cnf.jwk are read from the verified envelope — no credential submission.
+    # Requires 'exchange' permission on 'policy:exchange-wit' in Casbin policy.
+    exchangeWit @21 :ExchangeWit
+      $mcpScope(manage) $mcpDescription("Exchange the caller's envelope WIT for an OAuth at+jwt; identity from signed envelope");
   }
 }
 
@@ -229,6 +235,9 @@ struct PolicyResponse {
 
     # Fresh JWT from refreshServiceToken
     refreshServiceTokenResult @21 :TokenInfo;
+
+    # at+jwt from exchangeWit
+    exchangeWitResult @22 :TokenInfo;
   }
 }
 
@@ -371,4 +380,20 @@ struct RegisterServiceKey {
 struct RefreshServiceTokenRequest {
   # Requested TTL in seconds. Server clamps to [3600, 2592000] (1h – 30d).
   ttlSeconds @0 :Int64 = 2592000;
+}
+
+# Exchange the caller's envelope WIT for an OAuth at+jwt (ZMQ-native token bridge).
+# The caller's identity and cnf.jwk are read from the verified envelope WIT —
+# no credential is submitted in the request body.
+struct ExchangeWit {
+  # RFC 8707 resource indicator for audience binding.
+  # If absent, PolicyService applies the configured default audience.
+  audience @0 :Text $optional;
+
+  # Requested scopes (space-delimited).
+  # PolicyService intersects with Casbin-permitted scopes for the caller.
+  scopes @1 :Text $optional;
+
+  # TTL override in seconds. Server clamps to configured [min, max].
+  ttl @2 :Opt.OptionUint32;
 }

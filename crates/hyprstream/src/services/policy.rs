@@ -17,7 +17,7 @@ use crate::services::generated::policy_client::{
     RegisterEventPrefix, SubscribeEventPrefix, GetPendingSubscribers, DepositWrappedKeys,
     EventPrefixAccess, PendingSubscribers,
     ResolveServiceKey, RegisterServiceKey, ServiceKeyResponse,
-    RefreshServiceTokenRequest,
+    RefreshServiceTokenRequest, ExchangeWit,
     dispatch_policy, serialize_response,
 };
 use anyhow::{anyhow, Result};
@@ -1339,6 +1339,76 @@ impl PolicyHandler for PolicyService {
 
         info!(service = svc_name, expires_at, "Renewed service JWT");
         Ok(PolicyResponseVariant::RefreshServiceTokenResult(TokenInfo {
+            token,
+            expires_at,
+        }))
+    }
+    async fn handle_exchange_wit(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &ExchangeWit,
+    ) -> Result<PolicyResponseVariant> {
+        // Identity is read from the already-verified envelope WIT — no credential submission.
+        let sub = match ctx.subject().name() {
+            Some(s) => s.to_owned(),
+            None => {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: "Anonymous callers cannot exchange WIT for access token".to_owned(),
+                    code: "ANONYMOUS".to_owned(),
+                    details: String::new(),
+                }));
+            }
+        };
+
+        // cnf.jwk from the verified WIT — carried through into the issued at+jwt.
+        let cnf_key_bytes = ctx.claims().and_then(hyprstream_rpc::auth::Claims::cnf_key_bytes);
+        if cnf_key_bytes.is_none() {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "Caller WIT missing cnf.jwk — key binding required for ExchangeWit".to_owned(),
+                code: "NO_CNF_JWK".to_owned(),
+                details: String::new(),
+            }));
+        }
+
+        // Casbin: caller must have 'exchange' on 'policy:exchange-wit'.
+        let allowed = self.policy_manager.check_with_domain(
+            &sub,
+            "*",
+            "policy:exchange-wit",
+            "exchange",
+        ).await;
+        if !allowed {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Subject '{sub}' is not authorized to exchange WIT for access token"),
+                code: "UNAUTHORIZED".to_owned(),
+                details: "Requires 'exchange' permission on 'policy:exchange-wit'".to_owned(),
+            }));
+        }
+
+        let ttl = data.ttl.unwrap_or(self.token_config.default_ttl_seconds);
+        let ttl = ttl.clamp(60, self.token_config.max_ttl_seconds);
+
+        let now = chrono::Utc::now().timestamp();
+        let expires_at = now + ttl as i64;
+
+        let audience = data.audience.as_ref().filter(|s| !s.is_empty()).cloned()
+            .or_else(|| self.default_audience.clone());
+
+        let issuer = self.default_audience.clone().unwrap_or_default();
+        let mut claims = hyprstream_rpc::auth::Claims::new(sub.clone(), now, expires_at)
+            .with_issuer(issuer)
+            .with_audience(audience);
+
+        // Key binding: carry cnf.jwk from WIT into the at+jwt.
+        if let Some(key_bytes) = cnf_key_bytes {
+            claims = claims.with_cnf_jwk(&key_bytes);
+        }
+
+        let token = crate::auth::jwt::encode_service_jwt(&claims, &self.jwt_signing_key);
+
+        info!(sub = %sub, expires_at, "ExchangeWit: issued at+jwt");
+        Ok(PolicyResponseVariant::ExchangeWitResult(TokenInfo {
             token,
             expires_at,
         }))
