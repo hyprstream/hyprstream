@@ -240,8 +240,15 @@ impl UserStore for RocksDbUserStore {
     }
 
     async fn register(&self, username: &str) -> Result<String> {
-        if username.contains(':') {
-            anyhow::bail!("Username '{}' must not contain ':'", username);
+        // Allow exactly one colon for OIDC namespaced subjects (e.g. "google:abc123").
+        // The RocksDB key is stored as b"user:" + username, so "user:google:abc" is
+        // still unambiguous under prefix_iterator(b"user:").
+        let colon_count = username.matches(':').count();
+        if colon_count > 1 || username.starts_with(':') || username.ends_with(':') {
+            anyhow::bail!(
+                "Username '{}' must not contain more than one ':', and must not start or end with ':'",
+                username
+            );
         }
         if self.get_raw(username)?.is_some() {
             tracing::warn!(
@@ -534,13 +541,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_register_rejects_colon_in_username() -> Result<()> {
+    async fn test_register_allows_namespaced_oidc_subject() -> Result<()> {
         let dir = TempDir::new()?;
         let store = make_store(dir.path());
-        let result = store.register("bad:user").await;
+        // Single colon (provider:external_id) is allowed for federated OIDC identities.
+        store.register("google:abc123").await?;
+        let profile = store.get_profile("google:abc123").await?;
+        assert!(profile.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_register_rejects_multiple_colons() -> Result<()> {
+        let dir = TempDir::new()?;
+        let store = make_store(dir.path());
+        let result = store.register("a:b:c").await;
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("must not contain"));
+        assert!(result.unwrap_err().to_string().contains("must not contain more than one"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_register_rejects_leading_trailing_colon() -> Result<()> {
+        let dir = TempDir::new()?;
+        let store = make_store(dir.path());
+        assert!(store.register(":bad").await.is_err());
+        assert!(store.register("bad:").await.is_err());
         Ok(())
     }
 

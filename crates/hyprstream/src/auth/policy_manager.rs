@@ -35,10 +35,22 @@ use crate::auth::policy_templates::{base_policies_to_csv, base_policies_to_vec, 
 use crate::auth::Operation;
 use casbin::{CoreApi, DefaultModel, Enforcer, FileAdapter, MemoryAdapter, MgmtApi, RbacApi};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+
+static GLOBAL_POLICY_MANAGER: OnceLock<Arc<PolicyManager>> = OnceLock::new();
+
+/// Set the process-global PolicyManager. Called once by the PolicyService factory.
+pub fn set_global_policy_manager(pm: Arc<PolicyManager>) {
+    let _ = GLOBAL_POLICY_MANAGER.set(pm);
+}
+
+/// Access the process-global PolicyManager. Returns `None` before PolicyService starts.
+pub fn global_policy_manager() -> Option<Arc<PolicyManager>> {
+    GLOBAL_POLICY_MANAGER.get().cloned()
+}
 
 /// Errors from policy operations
 #[derive(Error, Debug)]

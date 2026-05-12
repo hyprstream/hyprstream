@@ -14,6 +14,7 @@ use rand::RngCore;
 use serde::Deserialize;
 use sha2::{Sha256, Digest};
 
+use crate::auth::user_store::UserProfile;
 use super::state::{OAuthState, PendingAuthCode, PendingExternalAuth};
 
 /// Initiate external OIDC login by redirecting to the provider.
@@ -292,11 +293,36 @@ pub async fn external_callback(
         &provider.allowed_domains,
     ) {
         Ok(true) => {
-            tracing::info!(provider = %provider_slug, subject = %mapped_subject, "Auto-provisioning external user");
-            // TODO: Create UserStore entry with profile from external claims
+            provision_federated_user(
+                &state,
+                &provider_slug,
+                &mapped_subject,
+                &external_claims,
+                &provider.default_scopes,
+            ).await;
         }
         Ok(false) => {
-            // User must already exist — check will happen at policy evaluation time
+            // Deny mode: user must already exist; reject unknown subjects early.
+            if let Some(ref user_svc) = state.user_service {
+                match user_svc.store().get_profile(&mapped_subject).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        tracing::warn!(
+                            provider = %provider_slug,
+                            subject = %mapped_subject,
+                            "Deny mode: user not registered — rejecting"
+                        );
+                        return (
+                            axum::http::StatusCode::FORBIDDEN,
+                            format!("Access denied: '{mapped_subject}' is not registered. Contact your administrator."),
+                        ).into_response();
+                    }
+                    Err(e) => {
+                        tracing::error!(subject = %mapped_subject, error = %e, "User lookup failed");
+                        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "User lookup failed").into_response();
+                    }
+                }
+            }
         }
         Err(e) => {
             tracing::warn!(provider = %provider_slug, subject = %mapped_subject, error = %e, "Provisioning denied");
@@ -343,4 +369,83 @@ pub async fn external_callback(
     }
 
     Redirect::temporary(&redirect_url).into_response()
+}
+
+/// Create a UserStore entry and write Casbin rules for a first-time federated login.
+///
+/// Idempotent: if the subject already has a profile, skips all writes silently.
+/// Non-fatal: errors are logged but do not abort the login flow.
+async fn provision_federated_user(
+    state: &OAuthState,
+    provider_slug: &str,
+    subject: &str,
+    external_claims: &serde_json::Value,
+    default_scopes: &[String],
+) {
+    let Some(ref user_svc) = state.user_service else {
+        tracing::warn!(provider = %provider_slug, "No user store — skipping federated provisioning");
+        return;
+    };
+    let store = user_svc.store();
+
+    // Check idempotency before writing.
+    let already_exists = match store.get_profile(subject).await {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(e) => {
+            tracing::error!(subject = %subject, error = %e, "Failed to check user existence");
+            return;
+        }
+    };
+
+    if already_exists {
+        tracing::debug!(subject = %subject, "Federated user already provisioned — skipping");
+        return;
+    }
+
+    // First login: register and populate profile from external claims.
+    if let Err(e) = store.register(subject).await {
+        tracing::error!(subject = %subject, error = %e, "Failed to register federated user");
+        return;
+    }
+    let profile = UserProfile {
+        sub: None,
+        name: external_claims["name"].as_str().map(str::to_owned),
+        email: external_claims["email"].as_str().map(str::to_owned),
+        email_verified: external_claims["email_verified"].as_bool(),
+        active: Some(true),
+        external_id: external_claims["sub"].as_str().map(str::to_owned),
+    };
+    if let Err(e) = store.set_profile(subject, profile).await {
+        tracing::warn!(subject = %subject, error = %e, "Failed to set profile for federated user");
+    }
+
+    // Write Casbin rules for default_scopes.
+    // Scope format: "action:resource_type:resource_id" — e.g. "infer:model:*", "read:*:*"
+    let Some(pm) = crate::auth::policy_manager::global_policy_manager() else {
+        tracing::warn!(provider = %provider_slug, "PolicyManager not available — default_scopes not applied");
+        return;
+    };
+    for scope in default_scopes {
+        let parts: Vec<&str> = scope.splitn(3, ':').collect();
+        let (action, resource) = match parts.as_slice() {
+            [action, rtype, rid] if *rtype == "*" && *rid == "*" => (*action, "*".to_owned()),
+            [action, rtype, rid] => (*action, format!("{rtype}:{rid}")),
+            [action] => (*action, "*".to_owned()),
+            _ => continue,
+        };
+        if let Err(e) = pm.add_policy_with_domain(subject, "*", &resource, action, "allow").await {
+            tracing::error!(subject = %subject, scope = %scope, error = %e, "Failed to write Casbin rule");
+        }
+    }
+    if let Err(e) = pm.save().await {
+        tracing::error!(subject = %subject, error = %e, "Failed to persist Casbin rules after provisioning");
+    }
+
+    tracing::info!(
+        provider = %provider_slug,
+        subject = %subject,
+        scopes = ?default_scopes,
+        "Federated user provisioned"
+    );
 }

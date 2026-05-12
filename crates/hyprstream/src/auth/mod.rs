@@ -18,7 +18,7 @@ pub mod rocksdb_store;
 
 pub use federation::FederationKeyResolver;
 pub use jwt::{Claims, JwtError};
-pub use policy_manager::{PolicyManager, PolicyError, write_policy_file};
+pub use policy_manager::{PolicyManager, PolicyError, write_policy_file, global_policy_manager, set_global_policy_manager};
 pub use policy_migration::migrate_policy_csv;
 pub use policy_templates::{PolicyTemplate, ServicePolicyRule, SERVICE_BASE_POLICIES, get_template, get_templates};
 pub use user_store::{UserFilter, UserProfile, UserStore, PubkeyEntry, pubkey_fingerprint, decode_pubkey_base64};
