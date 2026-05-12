@@ -48,6 +48,7 @@ pub mod state;
 pub mod token;
 pub mod token_exchange;
 pub mod user_mapping;
+pub mod wit_bootstrap;
 pub mod user_service;
 pub mod userinfo;
 pub mod zmq_handler;
@@ -137,6 +138,7 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
     // Inserts AuthenticatedUser into request extensions for downstream handlers.
     let protected_router = Router::new()
         .route("/oauth/introspect", post(introspection::introspect_token))
+        .route("/oauth/wit", post(wit_bootstrap::issue_browser_wit))
         .route(
             "/oauth/userinfo",
             get(userinfo::userinfo).post(userinfo::userinfo),
@@ -389,6 +391,19 @@ impl Spawnable for OAuthService {
                 }
             };
 
+            // Load the CA JWT signing key for browser WIT issuance (POST /oauth/wit).
+            let ca_jwt_key: Option<ed25519_dalek::SigningKey> = match crate::auth::identity_store::load_ca_signing_key(&credentials_dir) {
+                Ok(root_key) => {
+                    let key = hyprstream_rpc::node_identity::derive_purpose_key(&root_key, "hyprstream-jwt-v1");
+                    info!("CA JWT signing key loaded — POST /oauth/wit available");
+                    Some(key)
+                }
+                Err(e) => {
+                    tracing::warn!("Cannot load CA signing key — POST /oauth/wit unavailable: {e}");
+                    None
+                }
+            };
+
             // Create shared state — JWKS serves the CA JWT verifying key (from PolicyService)
             let jwt_verifying_key = self.jwt_verifying_key;
             let mut oauth_state = OAuthState::new(
@@ -401,6 +416,9 @@ impl Spawnable for OAuthService {
                 oauth_state = oauth_state.with_user_store(store);
             }
             oauth_state = oauth_state.with_signing_key(self.signing_key.clone());
+            if let Some(key) = ca_jwt_key {
+                oauth_state = oauth_state.with_ca_jwt_key(key);
+            }
 
             // Open persistent refresh token store (non-fatal — tokens simply don't survive restart).
             let token_db_path = credentials_dir.join("oauth-tokens");

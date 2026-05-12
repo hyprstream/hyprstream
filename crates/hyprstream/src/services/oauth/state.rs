@@ -277,6 +277,10 @@ pub struct OAuthState {
     pub dpop_nonces: RwLock<HashMap<String, i64>>,
     /// Trusted external OIDC issuers for the JWT bearer grant (RFC 7523).
     pub trusted_issuers: std::collections::HashMap<String, crate::config::TrustedIssuerConfig>,
+    /// CA JWT signing key for browser WIT issuance (POST /oauth/wit).
+    /// Derived from the root CA key via derive_purpose_key("hyprstream-jwt-v1").
+    /// None when credentials are unavailable (WIT endpoint returns 503).
+    pub ca_jwt_key: Option<Arc<ed25519_dalek::SigningKey>>,
 }
 
 impl OAuthState {
@@ -311,7 +315,14 @@ impl OAuthState {
             dpop_jti_seen: RwLock::new(HashMap::new()),
             dpop_nonces: RwLock::new(HashMap::new()),
             trusted_issuers: config.trusted_issuers.clone(),
+            ca_jwt_key: None,
         }
+    }
+
+    /// Attach the CA JWT signing key for browser WIT issuance (`POST /oauth/wit`).
+    pub fn with_ca_jwt_key(mut self, key: ed25519_dalek::SigningKey) -> Self {
+        self.ca_jwt_key = Some(Arc::new(key));
+        self
     }
 
     /// Attach a user credential store. Creates a `UserService` backed by the store
