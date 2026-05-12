@@ -142,8 +142,8 @@ pub struct HyprConfig {
 
     /// Persistent secrets storage configuration.
     ///
-    /// Controls where signing keys, TLS materials, and credential store keys are
-    /// read from and written to. On systemd, overridden at runtime by
+    /// Controls where signing keys and TLS materials are read from and written to.
+    /// On systemd, overridden at runtime by
     /// `HYPRSTREAM__SECRETS__PATH=%d` in the service unit (pointing to the
     /// systemd credentials directory).
     #[serde(default)]
@@ -153,7 +153,7 @@ pub struct HyprConfig {
 /// Persistent secrets storage configuration.
 ///
 /// Determines the directory used for reading and writing persistent secret key
-/// material: signing keys, TLS certificates/keys, and the age credential store key.
+/// material: signing keys and TLS certificates/keys.
 ///
 /// On systemd, the generated service unit sets
 /// `Environment=HYPRSTREAM__SECRETS__PATH=%d` so that at runtime `path` resolves
@@ -913,14 +913,6 @@ pub struct OAuthConfig {
     #[serde(default)]
     pub oidc_providers: std::collections::HashMap<String, OidcProviderConfig>,
 
-    /// age x25519 identity string for the credential store (bypasses OS keyring lookup).
-    ///
-    /// **TEST USE ONLY.** Set via `HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY` env var.
-    /// Allows isolated test environments to encrypt/decrypt `users.toml.age` without
-    /// a keyring daemon. Never set this in production config files.
-    #[serde(default, skip_serializing)]
-    pub credential_store_key: Option<String>,
-
     /// Hex-encoded Ed25519 private key bytes for the local user identity (bypasses OS keyring).
     ///
     /// **TEST USE ONLY.** Set via `HYPRSTREAM__OAUTH__USER_SIGNING_KEY` env var.
@@ -951,7 +943,6 @@ impl Default for OAuthConfig {
             trusted_issuers: std::collections::HashMap::new(),
             authority_hints: Vec::new(),
             oidc_providers: std::collections::HashMap::new(),
-            credential_store_key: None,
             user_signing_key: None,
         }
     }
@@ -1767,23 +1758,6 @@ impl HyprConfig {
                 let vk = sk.verifying_key();
                 tracing::info!("Using user signing key from config (test bypass)");
                 return Ok(Some((sk, vk)));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Check for the `HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY` test bypass.
-    ///
-    /// Returns `Ok(Some(identity))` when the bypass is set and valid,
-    /// `Ok(None)` when not configured, `Err` when malformed.
-    pub fn credential_store_key_bypass() -> anyhow::Result<Option<age::x25519::Identity>> {
-        if let Ok(cfg) = Self::load() {
-            if let Some(ref age_key) = cfg.oauth.credential_store_key {
-                let identity = age_key
-                    .trim()
-                    .parse::<age::x25519::Identity>()
-                    .map_err(|e| anyhow::anyhow!("HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY: invalid age identity: {e}"))?;
-                return Ok(Some(identity));
             }
         }
         Ok(None)

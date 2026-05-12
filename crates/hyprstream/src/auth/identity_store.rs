@@ -16,7 +16,6 @@
 //!   the systemd credentials ramfs), missing secrets are a hard error rather than
 //!   triggering key generation.
 
-use age::secrecy::ExposeSecret;
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -406,80 +405,6 @@ pub fn load_or_generate_node_signing_key(secrets_dir: &std::path::Path) -> Resul
     Ok(key)
 }
 
-/// Load or generate the age credential-store key.
-///
-/// Callers **must** check the `config.oauth.credential_store_key` bypass before
-/// calling this.
-///
-/// When `store_file_path` already exists on disk and the key is missing from a
-/// read-only secrets directory, the error includes recovery instructions (since
-/// generating a new key would make the existing store unreadable).
-pub fn load_or_generate_credential_store_key(
-    secrets_dir: &std::path::Path,
-    store_file_path: &std::path::Path,
-) -> Result<age::x25519::Identity> {
-    const NAME: &str = "credential-store-key";
-
-    if let Some(bytes) = read_secret(secrets_dir, NAME)? {
-        let s = String::from_utf8(bytes)
-            .context("credential-store-key is not valid UTF-8")?;
-        return s
-            .trim()
-            .parse::<age::x25519::Identity>()
-            .map_err(|e| anyhow!("failed to parse credential-store-key: {}", e));
-    }
-
-    let store_exists = store_file_path.exists();
-
-    if !is_writable(secrets_dir) {
-        if store_exists {
-            return Err(anyhow!(
-                "Credential store key not found in credentials directory '{}'.\n\
-                 The encrypted store exists at '{}' but cannot be decrypted.\n\
-                 Recovery options:\n\
-                 - Set HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY=<age-secret-key-...> \
-                   if you have a backup of the original key.\n\
-                 - Delete the store file to start fresh (existing users will be lost).",
-                secrets_dir.display(),
-                store_file_path.display()
-            ));
-        }
-        return Err(missing_in_readonly(secrets_dir, NAME));
-    }
-
-    if store_exists {
-        // Store exists but key is gone — generating a new key would make the
-        // existing store unreadable (age "no matching keys" error).
-        return Err(anyhow!(
-            "Credential store key not found in secrets directory '{}'.\n\
-             The encrypted store exists at '{}' but cannot be decrypted.\n\
-             Recovery options:\n\
-             - Set HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY=<age-secret-key-...> \
-               if you have a backup of the original key.\n\
-             - Delete the store file to start fresh (existing users will be lost).",
-            secrets_dir.display(),
-            store_file_path.display()
-        ));
-    }
-
-    // First run — no store file, safe to generate a new key.
-    let identity = age::x25519::Identity::generate();
-    let secret_str = identity.to_string();
-    let result = write_secret(
-        secrets_dir,
-        NAME,
-        secret_str.expose_secret().as_bytes(),
-    );
-    drop(secret_str); // SecretString zeroizes on drop
-    result?;
-    tracing::info!(
-        "Generated new age credential-store key → '{}/{}'",
-        secrets_dir.display(),
-        NAME
-    );
-    Ok(identity)
-}
-
 /// Load or generate the user signing key (Ed25519).
 ///
 /// Callers **must** check the `config.oauth.user_signing_key` bypass before
@@ -824,35 +749,6 @@ mod tests {
     }
 
     #[test]
-    fn test_credential_store_key_roundtrip() {
-        let dir = TempDir::new().unwrap();
-        let store_path = dir.path().join("users.toml.age");
-        let id1 = load_or_generate_credential_store_key(dir.path(), &store_path).unwrap();
-        // Load again from disk
-        let id2 = load_or_generate_credential_store_key(dir.path(), &store_path).unwrap();
-        // Both identities should produce the same public key
-        assert_eq!(
-            id1.to_public().to_string(),
-            id2.to_public().to_string()
-        );
-    }
-
-    #[test]
-    fn test_credential_store_key_missing_with_existing_store_errors() {
-        let dir = TempDir::new().unwrap();
-        let store_path = dir.path().join("users.toml.age");
-        // Simulate: store exists but key file does not
-        std::fs::write(&store_path, b"fake encrypted data").unwrap();
-        match load_or_generate_credential_store_key(dir.path(), &store_path) {
-            Ok(_) => panic!("expected error when store exists but key is missing"),
-            Err(e) => assert!(
-                e.to_string().contains("cannot be decrypted"),
-                "unexpected error message: {e}"
-            ),
-        }
-    }
-
-    #[test]
     fn test_user_signing_key_roundtrip() {
         let dir = TempDir::new().unwrap();
         let (sk1, vk1) = load_or_generate_user_signing_key(dir.path()).unwrap();
@@ -1035,18 +931,4 @@ mod tests {
         assert_ne!(h1, h2, "renewed cert should have different DER due to new timestamps");
     }
 
-    // ── Credential store key: readonly + no store ────────────────────────────
-
-    #[test]
-    #[cfg(unix)]
-    fn test_credential_store_key_readonly_no_store_fails() {
-        use std::os::unix::fs::PermissionsExt;
-        let parent = TempDir::new().unwrap();
-        let secrets_dir = parent.path().join("secrets");
-        std::fs::create_dir(&secrets_dir).unwrap();
-        std::fs::set_permissions(&secrets_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let store_path = secrets_dir.join("users.toml.age");
-        let result = load_or_generate_credential_store_key(&secrets_dir, &store_path);
-        assert!(result.is_err());
-    }
 }

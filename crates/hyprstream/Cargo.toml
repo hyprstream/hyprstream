@@ -140,7 +140,6 @@ notify = { version = "7", default-features = false, features = ["macos_kqueue"] 
 libc = "0.2"  # For system calls in overlay2 driver
 reflink-copy = "0.1"  # COW file copying (reflink when available)
 hyprstream-containedfs.workspace = true  # Path-contained filesystem operations
-age = { version = "0.11.2", features = ["armor"] }
 rocksdb = "0.23"  # User credential store (RocksDbUserStore)
 fred = { version = "9", optional = true }  # Async Redis/Valkey client (ValkeyUserStore, ValkeyTokenStore)
 hyprstream-tui = { path = "../hyprstream-tui" }  # Setup wizard TUI (WizardBackend trait + WizardApp)
