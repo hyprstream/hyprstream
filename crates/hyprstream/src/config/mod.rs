@@ -671,9 +671,6 @@ pub enum ProviderKind {
     /// Generic OAuth 2.0 with a userinfo endpoint. No discovery, no id_token.
     /// Requires `authorization_endpoint`, `token_endpoint_url`, and `userinfo_endpoint`.
     OAuth2,
-    /// GitHub OAuth 2.0 preset. Hardcoded endpoints, PKCE not supported,
-    /// subject mapped from numeric `id` field.
-    GitHub,
 }
 
 /// Claim field name overrides for mapping a userinfo JSON response to standard claims.
@@ -727,19 +724,17 @@ pub struct OidcProviderConfig {
     #[serde(default)]
     pub issuer_url: Option<String>,
     /// Authorization endpoint URL. Required for `kind = "oauth2"`.
-    /// Preset for `kind = "github"`.
     #[serde(default)]
     pub authorization_endpoint: Option<String>,
-    /// Token endpoint URL. Required for `kind = "oauth2"`.
-    /// Preset for `kind = "github"`. Named `token_endpoint_url` to avoid
-    /// collision with method names on OIDC metadata types.
+    /// Token endpoint URL. Required for `kind = "oauth2"`. Named `token_endpoint_url`
+    /// to avoid collision with method names on OIDC metadata types.
     #[serde(default)]
     pub token_endpoint_url: Option<String>,
-    /// Userinfo endpoint URL. Required for `kind = "oauth2"` and `kind = "github"`.
+    /// Userinfo endpoint URL. Required for `kind = "oauth2"`.
     #[serde(default)]
     pub userinfo_endpoint: Option<String>,
     /// Whether the provider supports PKCE (`code_challenge`). Default: `true`.
-    /// Set to `false` for GitHub, which ignores the parameter.
+    /// Set to `false` for providers that reject the parameter (e.g. GitHub).
     #[serde(default = "default_pkce_supported")]
     pub pkce_supported: bool,
     /// Claim field name overrides for mapping userinfo JSON to synthetic claims.
@@ -779,58 +774,31 @@ pub struct OidcProviderConfig {
 fn default_pkce_supported() -> bool { true }
 
 impl OidcProviderConfig {
-    /// Effective authorization endpoint, applying presets for known kinds.
     pub fn effective_authorization_endpoint(&self) -> Option<&str> {
-        match self.kind {
-            ProviderKind::GitHub => Some("https://github.com/login/oauth/authorize"),
-            _ => self.authorization_endpoint.as_deref(),
-        }
+        self.authorization_endpoint.as_deref()
     }
 
-    /// Effective token endpoint URL, applying presets for known kinds.
     pub fn effective_token_endpoint_url(&self) -> Option<&str> {
-        match self.kind {
-            ProviderKind::GitHub => Some("https://github.com/login/oauth/access_token"),
-            _ => self.token_endpoint_url.as_deref(),
-        }
+        self.token_endpoint_url.as_deref()
     }
 
-    /// Effective userinfo endpoint URL, applying presets for known kinds.
     pub fn effective_userinfo_endpoint(&self) -> Option<&str> {
-        match self.kind {
-            ProviderKind::GitHub => Some("https://api.github.com/user"),
-            _ => self.userinfo_endpoint.as_deref(),
-        }
+        self.userinfo_endpoint.as_deref()
     }
 
-    /// Whether to send PKCE parameters to this provider.
     pub fn effective_pkce_supported(&self) -> bool {
-        match self.kind {
-            ProviderKind::GitHub => false,
-            _ => self.pkce_supported,
-        }
+        self.pkce_supported
     }
 
-    /// Effective claim mapping, applying preset overrides for known kinds.
     pub fn effective_claim_mapping(&self) -> ClaimMapping {
-        match self.kind {
-            ProviderKind::GitHub => ClaimMapping {
-                sub: "id".into(),
-                name: Some("login".into()),
-                email: Some("email".into()),
-                email_verified: None,
-            },
-            _ => self.claim_mapping.clone(),
-        }
+        self.claim_mapping.clone()
     }
 
-    /// Effective scopes list, applying preset defaults for known kinds.
     pub fn effective_scopes(&self) -> Vec<String> {
         if !self.scopes.is_empty() {
             return self.scopes.clone();
         }
         match self.kind {
-            ProviderKind::GitHub => vec!["read:user".into()],
             ProviderKind::Oidc => default_oidc_scopes(),
             ProviderKind::OAuth2 => vec![],
         }

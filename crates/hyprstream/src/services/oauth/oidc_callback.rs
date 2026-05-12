@@ -1,11 +1,10 @@
 //! External OAuth/OIDC provider callback handler.
 //!
 //! Handles the return redirect from an external provider after the user
-//! authenticates. Supports three provider kinds:
+//! authenticates. Supports two provider kinds:
 //!
 //! - `oidc`   — full OpenID Connect: discovery + id_token JWT verification
 //! - `oauth2` — generic OAuth 2.0: fixed endpoints + userinfo HTTP call
-//! - `github` — GitHub OAuth 2.0 preset (no PKCE, numeric id, login endpoint)
 //!
 //! After claims are obtained (via either path), identity mapping, provisioning,
 //! and auth code issuance are identical regardless of provider kind.
@@ -30,7 +29,7 @@ use super::state::{OAuthState, PendingAuthCode, PendingExternalAuth};
 ///
 /// Dispatches on `provider.kind`:
 /// - `oidc`   — fetches OIDC discovery, sends PKCE + nonce
-/// - `oauth2` / `github` — uses configured/preset endpoints, omits nonce,
+/// - `oauth2` — uses configured endpoints, omits nonce,
 ///   skips PKCE when `pkce_supported = false`
 pub async fn external_authorize(
     State(state): State<Arc<OAuthState>>,
@@ -112,7 +111,7 @@ pub async fn external_authorize(
             Redirect::temporary(&authorize_url).into_response()
         }
 
-        ProviderKind::OAuth2 | ProviderKind::GitHub => {
+        ProviderKind::OAuth2 => {
             let auth_endpoint = match provider.effective_authorization_endpoint() {
                 Some(u) => u,
                 None => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -242,7 +241,7 @@ pub async fn external_callback(
 
     // GitHub (and many generic OAuth 2.0 providers) default to form-encoded responses;
     // Accept: application/json ensures we always get parseable JSON.
-    if matches!(pending.provider_kind, ProviderKind::OAuth2 | ProviderKind::GitHub) {
+    if matches!(pending.provider_kind, ProviderKind::OAuth2) {
         request = request.header("Accept", "application/json");
     }
 
@@ -367,7 +366,7 @@ pub async fn external_callback(
             claims
         }
 
-        ProviderKind::OAuth2 | ProviderKind::GitHub => {
+        ProviderKind::OAuth2 => {
             // Generic OAuth 2.0 / GitHub: exchange gave us an opaque access_token.
             // Fetch user identity from the provider's userinfo endpoint.
             let access_token = match token_json["access_token"].as_str() {

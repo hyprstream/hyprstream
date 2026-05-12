@@ -6,8 +6,7 @@ provider kinds are supported, each with different discovery and token-validation
 | Kind | Discovery | Token validation | Use when |
 |------|-----------|-----------------|----------|
 | `oidc` | Automatic (OIDC discovery) | `id_token` JWT + JWKS | Google, Dex, Keycloak, Okta, any compliant OIDC IdP |
-| `oauth2` | Manual (fixed endpoints) | Userinfo HTTP call | Discord, any OAuth 2.0 provider without OIDC |
-| `github` | Preset (hardcoded) | Userinfo HTTP call | GitHub.com |
+| `oauth2` | Manual (fixed endpoints) | Userinfo HTTP call | GitHub, Discord, any OAuth 2.0 provider without OIDC |
 
 Providers are configured under `oauth.oidc_providers` in `hyprstream.toml`:
 
@@ -125,35 +124,7 @@ provisioning = "deny"   # users must be pre-registered
 
 ---
 
-## Kind: `github` — GitHub OAuth
-
-GitHub does not support OIDC discovery or PKCE. The `github` kind uses preset endpoints
-and fetches identity from the GitHub userinfo API (`https://api.github.com/user`).
-
-The external `id` field is a JSON number (e.g. `12345678`); Hyprstream coerces it to a
-string for the `sub` claim. With `user_mapping = "namespaced"` the local username
-becomes `github:12345678` — stable across GitHub username changes.
-
-No additional fields are required beyond the common ones.
-
-```toml
-[oauth.oidc_providers.github]
-kind = "github"
-client_id = "YOUR_GITHUB_CLIENT_ID"
-client_secret = "YOUR_GITHUB_CLIENT_SECRET"
-user_mapping = "namespaced"
-provisioning = "auto"
-default_scopes = ["infer:model:*"]
-```
-
-**GitHub OAuth app setup:**
-1. Go to GitHub → Settings → Developer Settings → OAuth Apps → New OAuth App
-2. Set *Authorization callback URL* to `https://YOUR_HYPRSTREAM_HOST/oauth/callback/github`
-3. Copy the client ID and generate a client secret
-
----
-
-## Kind: `oauth2` — Generic OAuth 2.0 (Discord, etc.)
+## Kind: `oauth2` — Generic OAuth 2.0 (GitHub, Discord, etc.)
 
 For providers that offer OAuth 2.0 but not OIDC. You must supply all three endpoints
 manually, plus a `claim_mapping` if the userinfo response uses non-standard field names.
@@ -179,6 +150,38 @@ uses different field names, override them:
 | `name` | `"name"` | Display name (nullable) |
 | `email` | `"email"` | Email address (nullable) |
 | `email_verified` | `"email_verified"` | bool (absent → `false`) |
+
+### GitHub
+
+GitHub does not support OIDC discovery or PKCE. The `id` field in the userinfo response
+is a JSON number (e.g. `12345678`); Hyprstream coerces it to a string. With
+`user_mapping = "namespaced"` the local username becomes `github:12345678` — stable
+across GitHub username changes.
+
+```toml
+[oauth.oidc_providers.github]
+kind = "oauth2"
+client_id = "YOUR_GITHUB_CLIENT_ID"
+client_secret = "YOUR_GITHUB_CLIENT_SECRET"
+authorization_endpoint = "https://github.com/login/oauth/authorize"
+token_endpoint_url = "https://github.com/login/oauth/access_token"
+userinfo_endpoint = "https://api.github.com/user"
+scopes = ["read:user", "user:email"]
+pkce_supported = false
+user_mapping = "namespaced"
+provisioning = "auto"
+default_scopes = ["infer:model:*"]
+
+[oauth.oidc_providers.github.claim_mapping]
+sub = "id"
+name = "login"
+email = "email"
+```
+
+**GitHub OAuth app setup:**
+1. Go to GitHub → Settings → Developer Settings → OAuth Apps → New OAuth App
+2. Set *Authorization callback URL* to `https://YOUR_HYPRSTREAM_HOST/oauth/callback/github`
+3. Copy the client ID and generate a client secret
 
 ### Discord
 
