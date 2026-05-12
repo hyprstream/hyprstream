@@ -172,7 +172,6 @@ axum-server.workspace = true
 tower-http.workspace = true
 url.workspace = true
 urlencoding.workspace = true
-half.workspace = true
 shellexpand.workspace = true
 
 # macOS/iOS: Keychain via apple-native

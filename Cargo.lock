@@ -5878,7 +5878,6 @@ dependencies = [
  "git2db",
  "gittorrent",
  "glob",
- "half",
  "hex",
  "hkdf",
  "hmac 0.12.1",
