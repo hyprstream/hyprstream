@@ -246,13 +246,13 @@ impl PolicyHandler for PolicyService {
         // system adds the namespace prefix ("token:randy") when the JWT is decoded.
         // For service tokens: sub = "service:{name}", e.g. "service:model".
         let subject = if let Some(ref subj) = data.subject.as_ref().filter(|s| !s.is_empty()) {
-            // Explicit subject requires `manage` permission on `policy:issue-token`.
-            // All callers go through Casbin — no identity-based bypasses.
+            // Explicit subject requires `manage` permission on `policy:IssueToken`
+            // (matches the capnp type name used by the transport-level Casbin check).
             let caller = ctx.subject().to_string();
             let allowed = self.policy_manager.check_with_domain(
                 &caller,
                 "*",
-                "policy:issue-token",
+                "policy:IssueToken",
                 Operation::Manage.as_str(),
             ).await;
             if !allowed {
@@ -262,7 +262,7 @@ impl PolicyHandler for PolicyService {
                         caller, subj
                     ),
                     code: "UNAUTHORIZED_SUBJECT".to_owned(),
-                    details: "Requires 'manage' permission on 'policy:issue-token'".to_owned(),
+                    details: "Requires 'manage' permission on 'policy:IssueToken'".to_owned(),
                 }));
             }
             (*subj).clone()

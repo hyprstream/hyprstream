@@ -118,7 +118,7 @@ struct IssueToken {
   audience @2 :Text $optional;
 
   # Explicit subject for token (empty = use envelope identity).
-  # Requires caller to have `manage` permission on `policy:issue-token`.
+  # Requires caller to have `manage` permission on `policy:IssueToken` (capnp type name).
   # For service tokens: sub = "service:{name}" (e.g. "service:model").
   # The "pub" claim is derived from the root key by the CA — not caller-provided.
   subject @3 :Text $optional;

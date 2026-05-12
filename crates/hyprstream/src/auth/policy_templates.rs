@@ -73,8 +73,8 @@ impl ServiceGrouping {
 pub const SERVICE_BASE_POLICIES: &[ServicePolicyRule] = &[
     // PolicyService: CA — issues tokens, manages policy rules, assigns roles
     ServicePolicyRule { subject: "service:policy", domain: "*", resource: "*", action: "*", effect: "allow" },
-    // Token self-renewal: any service can request its own token renewal
-    ServicePolicyRule { subject: "service:*", domain: "*", resource: "policy:issue-token", action: "manage", effect: "allow" },
+    // Token issuance: any service can call PolicyService::issueToken (capnp type name = IssueToken)
+    ServicePolicyRule { subject: "service:*", domain: "*", resource: "policy:IssueToken", action: "manage", effect: "allow" },
     // Services that perform policy authorization checks
     ServicePolicyRule { subject: "service:registry", domain: "*", resource: "policy:*", action: "check", effect: "allow" },
     ServicePolicyRule { subject: "service:model", domain: "*", resource: "policy:*", action: "check", effect: "allow" },
