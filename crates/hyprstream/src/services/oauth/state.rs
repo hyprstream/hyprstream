@@ -286,6 +286,11 @@ pub struct OAuthState {
     /// Derived from the root CA key via derive_purpose_key("hyprstream-jwt-v1").
     /// None when credentials are unavailable (WIT endpoint returns 503).
     pub ca_jwt_key: Option<Arc<ed25519_dalek::SigningKey>>,
+    /// Unix timestamp of when the JWT signing key became active (nbf for JWKS entry).
+    pub jwt_key_nbf: i64,
+    /// Unix timestamp of when the JWT signing key expires (exp for JWKS entry).
+    /// Default: jwt_key_nbf + 14 days.
+    pub jwt_key_exp: i64,
 }
 
 impl OAuthState {
@@ -321,7 +326,16 @@ impl OAuthState {
             dpop_nonces: RwLock::new(HashMap::new()),
             trusted_issuers: config.trusted_issuers.clone(),
             ca_jwt_key: None,
+            jwt_key_nbf: chrono::Utc::now().timestamp(),
+            jwt_key_exp: chrono::Utc::now().timestamp() + 14 * 86400,
         }
+    }
+
+    /// Set JWT signing key validity window for the JWKS endpoint.
+    pub fn with_jwt_key_timestamps(mut self, nbf: i64, exp: i64) -> Self {
+        self.jwt_key_nbf = nbf;
+        self.jwt_key_exp = exp;
+        self
     }
 
     /// Attach the CA JWT signing key for browser WIT issuance (`POST /oauth/wit`).

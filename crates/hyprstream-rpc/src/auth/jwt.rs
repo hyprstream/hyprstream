@@ -17,11 +17,13 @@ use thiserror::Error;
 
 use super::Claims;
 
-/// RFC 9068 JWT Profile for OAuth 2.0 Access Tokens — user/client tokens.
-const JWT_HEADER_ACCESS_TOKEN: &str = r#"{"alg":"EdDSA","typ":"at+jwt"}"#;
-
-/// WIMSE Workload Identity Token — service-to-service JWTs (WIT).
-const JWT_HEADER_SERVICE: &str = r#"{"alg":"EdDSA","typ":"wit+jwt"}"#;
+/// Compute the JWT `kid` for a signing key: first 8 hex chars of SHA-256 of
+/// the verifying key bytes. Matches `compute_kid` in `services/oauth/jwks.rs`.
+pub fn kid_for_key(signing_key: &SigningKey) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(signing_key.verifying_key().as_bytes());
+    hex::encode(&hash[..8])
+}
 
 /// Errors from JWT operations
 #[derive(Error, Debug)]
@@ -67,13 +69,19 @@ fn encode_with_header(claims: &Claims, signing_key: &SigningKey, header_json: &s
 }
 
 /// Encode a user/client OAuth 2.0 access token (`typ: "at+jwt"`, RFC 9068).
+/// Includes `kid` in the JOSE header for key rotation support.
 pub fn encode(claims: &Claims, signing_key: &SigningKey) -> String {
-    encode_with_header(claims, signing_key, JWT_HEADER_ACCESS_TOKEN)
+    let kid = kid_for_key(signing_key);
+    let header = format!(r#"{{"alg":"EdDSA","typ":"at+jwt","kid":"{}"}}"#, kid);
+    encode_with_header(claims, signing_key, &header)
 }
 
 /// Encode a WIMSE Workload Identity Token (`typ: "wit+jwt"`) for service JWTs.
+/// Includes `kid` in the JOSE header for key rotation support.
 pub fn encode_service_jwt(claims: &Claims, signing_key: &SigningKey) -> String {
-    encode_with_header(claims, signing_key, JWT_HEADER_SERVICE)
+    let kid = kid_for_key(signing_key);
+    let header = format!(r#"{{"alg":"EdDSA","typ":"wit+jwt","kid":"{}"}}"#, kid);
+    encode_with_header(claims, signing_key, &header)
 }
 
 /// Encode and sign an OIDC ID Token (EdDSA with `kid` in header).

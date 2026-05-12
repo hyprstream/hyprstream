@@ -405,6 +405,18 @@ pub fn load_or_generate_node_signing_key(secrets_dir: &std::path::Path) -> Resul
     Ok(key)
 }
 
+/// Return the Unix mtime of `secrets_dir/signing-key`, or `now` if missing.
+/// Used to populate the `nbf` field in JWKS entries (key was valid since written).
+pub fn node_signing_key_mtime(secrets_dir: &std::path::Path) -> i64 {
+    let path = secrets_dir.join("signing-key");
+    path.metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_else(|| chrono::Utc::now().timestamp())
+}
+
 /// Load or generate the user signing key (Ed25519).
 ///
 /// Callers **must** check the `config.oauth.user_signing_key` bypass before

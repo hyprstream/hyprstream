@@ -28,6 +28,8 @@ pub async fn jwks(State(state): State<Arc<OAuthState>>) -> impl IntoResponse {
         "alg": "EdDSA",
         "kid": eddsa_kid,
         "x": x,
+        "nbf": state.jwt_key_nbf,
+        "exp": state.jwt_key_exp,
     })];
 
     // Add RSA public key if available

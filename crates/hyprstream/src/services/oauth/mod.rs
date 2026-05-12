@@ -446,6 +446,10 @@ impl Spawnable for OAuthService {
             if let Some(key) = ca_jwt_key {
                 oauth_state = oauth_state.with_ca_jwt_key(key);
             }
+            // Populate JWKS nbf/exp from signing-key file mtime so verifiers have
+            // temporal context for the active key during the drain window.
+            let key_nbf = crate::auth::identity_store::node_signing_key_mtime(&credentials_dir);
+            oauth_state = oauth_state.with_jwt_key_timestamps(key_nbf, key_nbf + 14 * 86400);
 
             // Open persistent refresh token store (non-fatal — tokens simply don't survive restart).
             let token_db_path = credentials_dir.join("oauth-tokens");
