@@ -48,6 +48,7 @@ pub mod session;
 pub mod state;
 pub mod token;
 pub mod token_exchange;
+pub mod token_store;
 pub mod user_mapping;
 pub mod wit_bootstrap;
 pub mod user_service;
@@ -374,19 +375,44 @@ impl Spawnable for OAuthService {
                         .join("credentials")
                 });
 
-            // Load the user store (RocksDB for concurrent access).
+            // Load the user store and token store based on configured backend.
             // Failure is non-fatal; endpoints will report "not configured" instead.
-            let user_store: Option<Arc<dyn crate::auth::user_store::UserStore>> = {
-                match crate::auth::RocksDbUserStore::open(&credentials_dir) {
-                    Ok(store) => {
-                        info!("User store (RocksDB) opened at {:?}", credentials_dir);
-                        Some(Arc::new(store))
+            use crate::config::CredentialsBackend;
+            let credentials_config = crate::config::HyprConfig::load()
+                .map(|c| c.credentials)
+                .unwrap_or_default();
+
+            let user_store: Option<Arc<dyn crate::auth::user_store::UserStore>> = match credentials_config.backend {
+                CredentialsBackend::Rocksdb => {
+                    match crate::auth::RocksDbUserStore::open(&credentials_dir) {
+                        Ok(store) => {
+                            info!("User store (RocksDB) opened at {:?}", credentials_dir);
+                            Some(Arc::new(store))
+                        }
+                        Err(e) => {
+                            tracing::warn!("Could not open user store (endpoints will report 'not configured'): {}", e);
+                            None
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Could not open user store (endpoints will report 'not configured'): {}",
-                            e
-                        );
+                }
+                CredentialsBackend::Valkey => {
+                    #[cfg(feature = "valkey")]
+                    {
+                        let url = &credentials_config.valkey.url;
+                        match crate::auth::ValkeyUserStore::connect(url).await {
+                            Ok(store) => {
+                                info!("User store (Valkey) connected at {url}");
+                                Some(Arc::new(store))
+                            }
+                            Err(e) => {
+                                tracing::warn!("Could not connect user store (Valkey): {e}");
+                                None
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "valkey"))]
+                    {
+                        tracing::error!("credentials.backend = \"valkey\" but binary was not compiled with --features valkey");
                         None
                     }
                 }
@@ -423,9 +449,42 @@ impl Spawnable for OAuthService {
 
             // Open persistent refresh token store (non-fatal — tokens simply don't survive restart).
             let token_db_path = credentials_dir.join("oauth-tokens");
-            match oauth_state.with_token_store(&token_db_path) {
-                Ok(()) => info!("Refresh token store (RocksDB) opened at {:?}", token_db_path),
-                Err(e) => tracing::warn!("Could not open refresh token store (tokens will not survive restart): {}", e),
+            let token_store: Option<Arc<dyn crate::services::oauth::token_store::TokenStore>> = match credentials_config.backend {
+                CredentialsBackend::Rocksdb => {
+                    match crate::services::oauth::token_store::RocksDbTokenStore::open(&token_db_path) {
+                        Ok(s) => {
+                            info!("Refresh token store (RocksDB) opened at {:?}", token_db_path);
+                            Some(Arc::new(s))
+                        }
+                        Err(e) => {
+                            tracing::warn!("Could not open refresh token store (tokens will not survive restart): {}", e);
+                            None
+                        }
+                    }
+                }
+                CredentialsBackend::Valkey => {
+                    #[cfg(feature = "valkey")]
+                    {
+                        let url = &credentials_config.valkey.url;
+                        match crate::services::oauth::token_store::ValkeyTokenStore::connect(url).await {
+                            Ok(s) => {
+                                info!("Refresh token store (Valkey) connected at {url}");
+                                Some(Arc::new(s))
+                            }
+                            Err(e) => {
+                                tracing::warn!("Could not connect refresh token store (Valkey): {e}");
+                                None
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "valkey"))]
+                    {
+                        None
+                    }
+                }
+            };
+            if let Some(store) = token_store {
+                oauth_state.with_token_store_impl(store);
             }
 
             // Resolve discovery URL at startup with LocalSet (RPC calls need LocalSet context).

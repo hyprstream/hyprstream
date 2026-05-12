@@ -72,7 +72,7 @@ fn introspect_jwt(state: &Arc<OAuthState>, token: &str) -> Response {
 }
 
 async fn introspect_refresh(state: &Arc<OAuthState>, token: &str) -> Response {
-    match state.get_refresh_token(token) {
+    match state.get_refresh_token(token).await {
         Ok(Some(entry)) => (
             StatusCode::OK,
             [(header::CACHE_CONTROL, "no-store"), (header::PRAGMA, "no-cache")],

@@ -31,7 +31,7 @@ pub async fn revoke_token(
     Form(params): Form<RevocationRequest>,
 ) -> Response {
     // Try to remove as a refresh token (RocksDB; always 200 per RFC 7009 even if absent).
-    if let Err(e) = state.delete_refresh_token(&params.token) {
+    if let Err(e) = state.delete_refresh_token(&params.token).await {
         tracing::warn!(error = %e, "Refresh token store delete failed during revocation");
     } else {
         tracing::info!("Revoked refresh token");

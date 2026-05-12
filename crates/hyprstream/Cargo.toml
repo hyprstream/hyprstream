@@ -142,6 +142,7 @@ reflink-copy = "0.1"  # COW file copying (reflink when available)
 hyprstream-containedfs.workspace = true  # Path-contained filesystem operations
 age = { version = "0.11.2", features = ["armor"] }
 rocksdb = "0.23"  # User credential store (RocksDbUserStore)
+fred = { version = "9", optional = true }  # Async Redis/Valkey client (ValkeyUserStore, ValkeyTokenStore)
 hyprstream-tui = { path = "../hyprstream-tui" }  # Setup wizard TUI (WizardBackend trait + WizardApp)
 hyprstream-compositor = { path = "../hyprstream-compositor" }  # Pure TUI compositor (chrome state machine)
 waxterm = { path = "../waxterm", features = ["avt"] }  # Terminal abstraction for TUI rendering
@@ -193,6 +194,7 @@ keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 [features]
 default = ["gittorrent", "xet", "systemd", "otel"]
 cuda = []
+valkey = ["dep:fred"]  # Enable Valkey/Redis-backed user and token stores
 bnb = ["dep:bitsandbytes-sys"]  # Enable bitsandbytes KV cache quantization (requires compatible ROCm/CUDA)
 xet = ["git2db/xet-storage"]  # Enable XET large file storage
 otel = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:opentelemetry-semantic-conventions", "dep:opentelemetry-stdout"]

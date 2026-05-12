@@ -259,7 +259,7 @@ async fn exchange_refresh_token(
 
     // Look up and atomically consume the refresh token (single-use rotation).
     // get_refresh_token handles lazy expiry; returns None if expired or missing.
-    let entry = match state.get_refresh_token(&refresh_token) {
+    let entry = match state.get_refresh_token(&refresh_token).await {
         Ok(Some(e)) => e,
         Ok(None) => {
             return token_error(
@@ -275,7 +275,7 @@ async fn exchange_refresh_token(
     };
 
     // Delete before issuing new token (rotation; prevents replay on store errors).
-    if let Err(e) = state.delete_refresh_token(&refresh_token) {
+    if let Err(e) = state.delete_refresh_token(&refresh_token).await {
         tracing::error!(error = %e, "Refresh token store delete failed");
         return token_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "Token store error");
     }
@@ -474,7 +474,7 @@ async fn issue_token_with_refresh(
                     expires_at_unix: now + state.refresh_token_ttl as i64,
                     verifying_key_bytes: user_verifying_key.map(|vk| *vk.as_bytes()),
                 };
-                if let Err(e) = state.put_refresh_token(&refresh_token, &entry) {
+                if let Err(e) = state.put_refresh_token(&refresh_token, &entry, state.refresh_token_ttl as u64).await {
                     tracing::error!(error = %e, "Failed to persist refresh token");
                 }
             }

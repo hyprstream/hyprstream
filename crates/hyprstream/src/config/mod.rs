@@ -85,6 +85,10 @@ pub struct HyprConfig {
     #[serde(default)]
     pub oauth: OAuthConfig,
 
+    /// Credentials storage backend (user profiles, pubkeys, refresh tokens).
+    #[serde(default)]
+    pub credentials: CredentialsConfig,
+
     /// StreamService configuration (buffer sizes, TTL, etc.)
     #[serde(default)]
     pub streaming: StreamingConfig,
@@ -973,6 +977,47 @@ impl OAuthConfig {
 
 fn default_oauth_host() -> String { "0.0.0.0".to_owned() }
 fn default_oauth_port() -> u16 { 6791 }
+
+/// Which backend stores user credentials and refresh tokens.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CredentialsBackend {
+    #[default]
+    Rocksdb,
+    Valkey,
+}
+
+/// Valkey connection settings (used when `backend = "valkey"`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValkeyCredentialsConfig {
+    #[serde(default = "default_valkey_url")]
+    pub url: String,
+}
+
+fn default_valkey_url() -> String { "redis://127.0.0.1:6379".to_owned() }
+
+impl Default for ValkeyCredentialsConfig {
+    fn default() -> Self { Self { url: default_valkey_url() } }
+}
+
+/// Credentials storage configuration.
+///
+/// Selects the backend for user profiles, pubkeys, and refresh tokens.
+///
+/// # Example TOML
+/// ```toml
+/// [credentials]
+/// backend = "valkey"
+/// [credentials.valkey]
+/// url = "redis://127.0.0.1:6379"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CredentialsConfig {
+    #[serde(default)]
+    pub backend: CredentialsBackend,
+    #[serde(default)]
+    pub valkey: ValkeyCredentialsConfig,
+}
 fn default_oauth_scopes() -> Vec<String> {
     vec![
         "read:*:*".to_owned(),
@@ -1501,6 +1546,7 @@ impl HyprConfigBuilder {
             flight: self.flight,
             mcp: self.mcp,
             oauth: self.oauth,
+            credentials: Default::default(),
             streaming: self.streaming,
             tls: self.tls,
             quic: self.quic,

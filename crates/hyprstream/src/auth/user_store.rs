@@ -180,6 +180,43 @@ pub fn decode_pubkey_base64(s: &str) -> anyhow::Result<VerifyingKey> {
     VerifyingKey::from_bytes(&key_bytes).map_err(|e| anyhow::anyhow!("Invalid Ed25519 key: {e}"))
 }
 
+/// A parsed SCIM filter expression (RFC 7644 §3.4.2.2).
+///
+/// Only the subset actually sent by IdP SCIM clients is parsed.
+/// Unsupported expressions are captured as `Unrecognised` — RocksDB falls
+/// through to in-memory evaluation; Valkey returns `invalidFilter` (HTTP 400).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScimFilter {
+    UserNameEq(String),
+    IdEq(String),
+    ExternalIdEq(String),
+    ActiveEq(bool),
+    Presence(String),
+    Unrecognised(String),
+}
+
+impl ScimFilter {
+    pub fn parse(expr: &str) -> Self {
+        let expr = expr.trim();
+        if let Some(attr) = expr.strip_suffix(" pr") {
+            return ScimFilter::Presence(attr.trim().to_owned());
+        }
+        if let Some(rest) = expr.strip_prefix("userName eq ") {
+            return ScimFilter::UserNameEq(unquote(rest).to_owned());
+        }
+        if let Some(rest) = expr.strip_prefix("id eq ").or_else(|| expr.strip_prefix("sub eq ")) {
+            return ScimFilter::IdEq(unquote(rest).to_owned());
+        }
+        if let Some(rest) = expr.strip_prefix("externalId eq ") {
+            return ScimFilter::ExternalIdEq(unquote(rest).to_owned());
+        }
+        if let Some(rest) = expr.strip_prefix("active eq ") {
+            return ScimFilter::ActiveEq(rest.trim() == "true");
+        }
+        ScimFilter::Unrecognised(expr.to_owned())
+    }
+}
+
 /// Evaluate a simple SCIM filter expression against a user entry.
 ///
 /// Supports:

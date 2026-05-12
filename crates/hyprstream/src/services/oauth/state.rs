@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::user_store::UserStore;
 use crate::config::OAuthConfig;
 use crate::services::{DiscoveryClient, PolicyClient};
+use super::token_store::TokenStore;
 use super::user_service::UserService;
 
 /// Extract RSA public key components (n, e) from PKCS#8 DER and build a JWK.
@@ -234,9 +235,9 @@ pub struct OAuthState {
     pub pending_device_codes: RwLock<HashMap<String, PendingDeviceCode>>,
     /// Reverse lookup: user_code -> device_code
     pub device_code_by_user_code: RwLock<HashMap<String, String>>,
-    /// Persistent refresh token store (RocksDB). Keyed by opaque token string.
+    /// Persistent refresh token store. Keyed by opaque token string.
     /// None when no credentials path is configured (tokens silently lost on restart).
-    pub token_db: Option<Arc<rocksdb::DB>>,
+    pub token_db: Option<Arc<dyn TokenStore>>,
     /// PolicyClient for JWT token issuance via ZMQ
     pub policy_client: PolicyClient,
     /// DiscoveryClient for resolving service QUIC endpoints via ZMQ
@@ -360,52 +361,34 @@ impl OAuthState {
         self
     }
 
-    /// Open (or create) the RocksDB token store at `path` for persistent refresh tokens.
-    pub fn with_token_store(&mut self, path: impl AsRef<std::path::Path>) -> anyhow::Result<()> {
-        let mut opts = rocksdb::Options::default();
-        opts.create_if_missing(true);
-        let db = rocksdb::DB::open(&opts, path)?;
-        self.token_db = Some(Arc::new(db));
-        Ok(())
+    /// Inject a pre-built token store implementation.
+    pub fn with_token_store_impl(&mut self, store: Arc<dyn TokenStore>) {
+        self.token_db = Some(store);
     }
 
-    /// Persist a refresh token entry to the DB.
-    pub fn put_refresh_token(&self, token: &str, entry: &RefreshTokenEntry) -> anyhow::Result<()> {
-        let Some(ref db) = self.token_db else {
+    /// Persist a refresh token entry to the store.
+    pub async fn put_refresh_token(&self, token: &str, entry: &RefreshTokenEntry, ttl_secs: u64) -> anyhow::Result<()> {
+        let Some(ref store) = self.token_db else {
             tracing::warn!("Refresh token store not configured — token will not survive restart");
             return Ok(());
         };
-        let bytes = serde_json::to_vec(entry)?;
-        db.put(token.as_bytes(), bytes)?;
-        Ok(())
+        store.put(token, entry, ttl_secs).await
     }
 
     /// Look up a refresh token. Returns `None` if not found or expired (lazy expiry).
-    pub fn get_refresh_token(&self, token: &str) -> anyhow::Result<Option<RefreshTokenEntry>> {
-        let Some(ref db) = self.token_db else {
+    pub async fn get_refresh_token(&self, token: &str) -> anyhow::Result<Option<RefreshTokenEntry>> {
+        let Some(ref store) = self.token_db else {
             return Ok(None);
         };
-        match db.get(token.as_bytes())? {
-            None => Ok(None),
-            Some(bytes) => {
-                let entry: RefreshTokenEntry = serde_json::from_slice(&bytes)?;
-                if entry.is_expired() {
-                    let _ = db.delete(token.as_bytes());
-                    Ok(None)
-                } else {
-                    Ok(Some(entry))
-                }
-            }
-        }
+        store.get(token).await
     }
 
     /// Remove a refresh token (revocation / rotation).
-    pub fn delete_refresh_token(&self, token: &str) -> anyhow::Result<()> {
-        let Some(ref db) = self.token_db else {
+    pub async fn delete_refresh_token(&self, token: &str) -> anyhow::Result<()> {
+        let Some(ref store) = self.token_db else {
             return Ok(());
         };
-        db.delete(token.as_bytes())?;
-        Ok(())
+        store.delete(token).await
     }
 
     /// Check a DPoP JTI for replay and record it if new.
