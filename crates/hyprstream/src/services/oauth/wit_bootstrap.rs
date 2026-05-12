@@ -89,6 +89,7 @@ pub async fn issue_browser_wit(
     let expires_at = now + BROWSER_WIT_TTL;
 
     let claims = hyprstream_rpc::auth::Claims::new(sub.clone(), now, expires_at)
+        .with_issuer(state.issuer_url.clone())
         .with_cnf_jwk(&pubkey_bytes);
 
     let wit = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, ca_key);

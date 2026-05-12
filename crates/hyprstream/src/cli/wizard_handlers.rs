@@ -214,6 +214,13 @@ async fn phase_bootstrap(state: &mut WizardState, _non_interactive: bool) -> Res
                 .join("credentials")
         });
 
+    // CA JWT signing key (purpose-derived for JWT signature separation).
+    // Derived BEFORE writing ca-pubkey so we can store the JWT key's verifying key,
+    // not the root key's verifying key. Services verify JWTs with the derived key.
+    let ca_jwt_key = hyprstream_rpc::node_identity::derive_purpose_key(
+        &signing_key, "hyprstream-jwt-v1",
+    );
+
     // Write CA signing key only if not already present (idempotent)
     match identity_store::load_ca_signing_key(&credentials_dir) {
         Ok(_) => {
@@ -223,18 +230,14 @@ async fn phase_bootstrap(state: &mut WizardState, _non_interactive: bool) -> Res
             identity_store::write_ca_signing_key(&credentials_dir, &signing_key)?;
             // Also write as 'signing-key' so PolicyService can load it via the flat credstore
             identity_store::write_secret(&credentials_dir, "signing-key", &signing_key.to_bytes())?;
-            // Write CA verifying key (public, distributed to all services)
-            identity_store::write_ca_verifying_key(&credentials_dir, &signing_key.verifying_key())?;
+            // Write the JWT-derived verifying key as ca-pubkey (not the root key).
+            // PolicyService signs JWTs with ca_jwt_key; services must verify with its pubkey.
+            identity_store::write_ca_verifying_key(&credentials_dir, &ca_jwt_key.verifying_key())?;
         }
     }
     // Always ensure signing-key and verifying key are in sync with what we loaded
     identity_store::write_secret(&credentials_dir, "signing-key", &signing_key.to_bytes())?;
-    identity_store::write_ca_verifying_key(&credentials_dir, &signing_key.verifying_key())?;
-
-    // CA JWT signing key (purpose-derived for JWT signature separation)
-    let ca_jwt_key = hyprstream_rpc::node_identity::derive_purpose_key(
-        &signing_key, "hyprstream-jwt-v1",
-    );
+    identity_store::write_ca_verifying_key(&credentials_dir, &ca_jwt_key.verifying_key())?;
 
     let mut bootstrap_pubkeys = std::collections::HashMap::new();
     let now = chrono::Utc::now().timestamp();

@@ -632,6 +632,13 @@ async fn do_bootstrap(
                     .join("credentials")
             });
 
+        // CA JWT signing key (purpose-derived for JWT signature separation).
+        // Derived BEFORE writing ca-pubkey so we can store the JWT key's verifying key,
+        // not the root key's verifying key. Services verify JWTs with the derived key.
+        let ca_jwt_key = hyprstream_rpc::node_identity::derive_purpose_key(
+            &root_key, "hyprstream-jwt-v1",
+        );
+
         // Write CA signing key only if not already present (idempotent)
         match identity_store::load_ca_signing_key(&credentials_dir) {
             Ok(_) => {
@@ -639,17 +646,14 @@ async fn do_bootstrap(
             }
             Err(_) => {
                 identity_store::write_ca_signing_key(&credentials_dir, &root_key)?;
-                identity_store::write_ca_verifying_key(&credentials_dir, &root_key.verifying_key())?;
+                // Write the JWT-derived verifying key as ca-pubkey (not the root key).
+                // PolicyService signs JWTs with ca_jwt_key; services must verify with its pubkey.
+                identity_store::write_ca_verifying_key(&credentials_dir, &ca_jwt_key.verifying_key())?;
             }
         }
         // Always sync signing-key and verifying key (derived from root_key, harmless to overwrite)
         identity_store::write_secret(&credentials_dir, "signing-key", &root_key.to_bytes())?;
-        identity_store::write_ca_verifying_key(&credentials_dir, &root_key.verifying_key())?;
-
-        // CA JWT signing key (purpose-derived for JWT signature separation)
-        let ca_jwt_key = hyprstream_rpc::node_identity::derive_purpose_key(
-            &root_key, "hyprstream-jwt-v1",
-        );
+        identity_store::write_ca_verifying_key(&credentials_dir, &ca_jwt_key.verifying_key())?;
 
         // Generate independent keypairs for each registered service
         use hyprstream_service::list_factories;

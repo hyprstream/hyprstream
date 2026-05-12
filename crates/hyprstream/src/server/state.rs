@@ -88,13 +88,15 @@ impl ServerState {
         policy_client: PolicyClient,
         registry: RegistryClient,
         signing_key: SigningKey,
+        jwt_verifying_key: VerifyingKey,
         resource_url: String,
         oauth_issuer_url: String,
         trusted_issuers: &std::collections::HashMap<String, crate::config::TrustedIssuerConfig>,
     ) -> Result<Self, anyhow::Error> {
-        let verifying_key = signing_key.verifying_key();
         let signing_key = Arc::new(signing_key);
-        let verifying_key = Arc::new(verifying_key);
+        // Use the CA JWT verifying key (not the service's own key) so HTTP Bearer tokens
+        // issued by PolicyService can be verified correctly.
+        let verifying_key = Arc::new(jwt_verifying_key);
 
         // Preload models for faster first request
         if !config.preload_models.is_empty() {

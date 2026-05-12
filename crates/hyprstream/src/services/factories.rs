@@ -605,6 +605,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
             policy_client,
             registry_client,
             sk.clone(),
+            ctx.jwt_verifying_key(),
             resource_url,
             oauth_issuer_url,
             &config.oauth.trusted_issuers,
