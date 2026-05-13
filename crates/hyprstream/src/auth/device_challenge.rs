@@ -68,29 +68,34 @@ pub fn verify_device_enrollment(
 
 /// Encode a `__Secure-VaultDevice` cookie value.
 ///
-/// Format: `base64url( kid[8 ASCII bytes] || pubkey[32 bytes] || sig[64 bytes] )`
+/// Format: `base64url( kid[8 ASCII bytes] || exp[8 bytes, big-endian i64] || pubkey[32 bytes] || sig[64 bytes] )`
 ///
-/// `kid` is the 8-character hex kid of the cookie signing key.
-/// The signed message is `kid_bytes || pubkey`.
+/// `kid` identifies the rotation slot. `exp` is a Unix timestamp; the server
+/// rejects the cookie when `now >= exp` without touching the signature.
+/// The signed message covers `kid || exp || pubkey` so expiry cannot be forged.
 pub fn encode_vault_device_cookie(
     cookie_signing_key: &ed25519_dalek::SigningKey,
     kid: &str,
     pubkey: &[u8; 32],
+    exp: i64,
 ) -> String {
     use ed25519_dalek::Signer;
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 
     assert_eq!(kid.len(), 8, "kid must be exactly 8 ASCII characters");
     let kid_bytes = kid.as_bytes();
+    let exp_bytes = exp.to_be_bytes();
 
-    let mut msg = Vec::with_capacity(8 + 32);
+    let mut msg = Vec::with_capacity(8 + 8 + 32);
     msg.extend_from_slice(kid_bytes);
+    msg.extend_from_slice(&exp_bytes);
     msg.extend_from_slice(pubkey);
 
     let sig = cookie_signing_key.sign(&msg);
 
-    let mut payload = Vec::with_capacity(8 + 32 + 64);
+    let mut payload = Vec::with_capacity(8 + 8 + 32 + 64);
     payload.extend_from_slice(kid_bytes);
+    payload.extend_from_slice(&exp_bytes);
     payload.extend_from_slice(pubkey);
     payload.extend_from_slice(&sig.to_bytes());
 
@@ -108,33 +113,41 @@ pub fn compute_kid(verifying_key_bytes: &[u8]) -> String {
 
 /// Verify a `__Secure-VaultDevice` cookie and return the device pubkey on success.
 ///
-/// Returns `None` on any malformation or signature failure (including kid mismatch
-/// after key rotation — the client should silently re-enroll in that case).
+/// Returns `None` on malformation, signature failure, kid mismatch (key rotation),
+/// or expiry (`now >= exp`).
 pub fn verify_vault_device_cookie(signing_key_bytes: &[u8; 32], cookie_value: &str) -> Option<[u8; 32]> {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use ed25519_dalek::{Signature, Verifier};
 
     let raw = URL_SAFE_NO_PAD.decode(cookie_value).ok()?;
-    if raw.len() != 8 + 32 + 64 {
+    if raw.len() != 8 + 8 + 32 + 64 {
         return None;
     }
     let kid_bytes = &raw[..8];
+    let exp = i64::from_be_bytes(raw[8..16].try_into().ok()?);
     let mut pubkey_arr = [0u8; 32];
-    pubkey_arr.copy_from_slice(&raw[8..40]);
+    pubkey_arr.copy_from_slice(&raw[16..48]);
     let mut sig_arr = [0u8; 64];
-    sig_arr.copy_from_slice(&raw[40..104]);
+    sig_arr.copy_from_slice(&raw[48..112]);
+
+    // Expiry check before any crypto work.
+    let now = chrono::Utc::now().timestamp();
+    if now >= exp {
+        return None;
+    }
 
     let cookie_seed = derive_cookie_key_seed(signing_key_bytes);
     let cookie_sk = ed25519_dalek::SigningKey::from_bytes(&cookie_seed);
     let expected_kid = compute_kid(cookie_sk.verifying_key().as_bytes());
 
-    // kid mismatch → key rotation; caller should signal client to re-enroll
+    // kid mismatch → key rotation; client should silently re-enroll
     if kid_bytes != expected_kid.as_bytes() {
         return None;
     }
 
-    let mut msg = Vec::with_capacity(8 + 32);
+    let mut msg = Vec::with_capacity(8 + 8 + 32);
     msg.extend_from_slice(kid_bytes);
+    msg.extend_from_slice(&raw[8..16]); // exp bytes
     msg.extend_from_slice(&pubkey_arr);
 
     let sig = Signature::from_bytes(&sig_arr);
@@ -188,15 +201,30 @@ mod tests {
         use ed25519_dalek::SigningKey;
         let sk_bytes = [7u8; 32];
         let pubkey = [1u8; 32];
+        let exp = chrono::Utc::now().timestamp() + 86400;
 
         let cookie_seed = derive_cookie_key_seed(&sk_bytes);
         let cookie_sk = SigningKey::from_bytes(&cookie_seed);
         let kid = compute_kid(cookie_sk.verifying_key().as_bytes());
         assert_eq!(kid.len(), 8, "kid must be 8 ASCII hex chars");
 
-        let cookie_val = encode_vault_device_cookie(&cookie_sk, &kid, &pubkey);
+        let cookie_val = encode_vault_device_cookie(&cookie_sk, &kid, &pubkey, exp);
         let recovered = verify_vault_device_cookie(&sk_bytes, &cookie_val);
         assert_eq!(recovered, Some(pubkey));
+    }
+
+    #[test]
+    fn cookie_expired_fails() {
+        use ed25519_dalek::SigningKey;
+        let sk_bytes = [7u8; 32];
+        let pubkey = [1u8; 32];
+        let exp = chrono::Utc::now().timestamp() - 1; // already expired
+
+        let cookie_seed = derive_cookie_key_seed(&sk_bytes);
+        let cookie_sk = SigningKey::from_bytes(&cookie_seed);
+        let kid = compute_kid(cookie_sk.verifying_key().as_bytes());
+        let cookie_val = encode_vault_device_cookie(&cookie_sk, &kid, &pubkey, exp);
+        assert!(verify_vault_device_cookie(&sk_bytes, &cookie_val).is_none());
     }
 
     #[test]
@@ -204,11 +232,12 @@ mod tests {
         use ed25519_dalek::SigningKey;
         let sk_bytes = [7u8; 32];
         let pubkey = [1u8; 32];
+        let exp = chrono::Utc::now().timestamp() + 86400;
 
         let cookie_seed = derive_cookie_key_seed(&sk_bytes);
         let cookie_sk = SigningKey::from_bytes(&cookie_seed);
         let kid = compute_kid(cookie_sk.verifying_key().as_bytes());
-        let mut cookie_val = encode_vault_device_cookie(&cookie_sk, &kid, &pubkey);
+        let mut cookie_val = encode_vault_device_cookie(&cookie_sk, &kid, &pubkey, exp);
         // Corrupt the last character to invalidate the signature
         if let Some(last) = cookie_val.pop() {
             cookie_val.push(if last == 'A' { 'B' } else { 'A' });

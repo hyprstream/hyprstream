@@ -145,7 +145,8 @@ pub async fn device_enroll_handler(
     let cookie_seed = derive_cookie_key_seed(&sk_bytes);
     let cookie_sk = SigningKey::from_bytes(&cookie_seed);
     let cookie_kid = compute_kid(cookie_sk.verifying_key().as_bytes());
-    let cookie_value = encode_vault_device_cookie(&cookie_sk, &cookie_kid, &pubkey_arr);
+    let cookie_exp = now + 2_592_000; // 30 days, matches Max-Age
+    let cookie_value = encode_vault_device_cookie(&cookie_sk, &cookie_kid, &pubkey_arr, cookie_exp);
 
     // Issue ADT JWT
     let sub = format!("device:{fingerprint}");
