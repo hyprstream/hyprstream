@@ -220,6 +220,97 @@ migration since they do not touch the token store until refresh.
 
 ---
 
+## OAuth clients
+
+A separate concept from users and tokens: an OAuth **client** is the app
+asking to authenticate a user. Hyprstream supports two identification
+mechanisms for clients, chosen at request time:
+
+### CIMD (Client ID Metadata Document) — preferred for production
+
+The client's `client_id` is itself an **HTTPS URL** pointing to a JSON
+metadata document the authorization server fetches at request time.
+Implemented in `services/oauth/authorize.rs:116-133` via
+`fetch_client_metadata` (`services/oauth/registration.rs:96`).
+
+```
+client_id = "https://app.example.com/.well-known/oauth-client-metadata"
+```
+
+At `GET /oauth/authorize` time the AS:
+
+1. Recognises the HTTPS-prefixed `client_id`.
+2. Fetches the URL over HTTPS with public CA trust.
+3. Validates the document's own `client_id` field matches the URL it
+   was fetched from.
+4. Checks the request's `redirect_uri` against the document's
+   `redirect_uris` array.
+5. Caches the resulting `RegisteredClient` in memory for the process
+   lifetime; cache misses re-fetch.
+
+**Trust model:** the AS trusts the document because it was served over a
+publicly-trusted TLS channel from the URL the document claims. There is
+no AS-side registration step, no shared secret, no DCR endpoint
+interaction. Whoever controls the domain controls the client.
+
+**No AS-side storage** of the client record is required (the cache is a
+performance hint, not a source of truth). This is the path that scales
+to many independent clients without operator coordination, and is the
+client-identification model used by atproto OAuth.
+
+Suitable for any client served from a public HTTPS origin with
+CA-trusted certificates. Unsuitable when the AS cannot reach the URL
+(air-gapped deployments, loopback dev workflows).
+
+### DCR (Dynamic Client Registration, RFC 7591) — dev / fallback
+
+The client `POST`s to `/oauth/register` describing itself; the AS
+returns a generated UUID `client_id` the client uses thereafter. The
+record lives in `OAuthState.clients`
+(`services/oauth/state.rs:228`) — a `RwLock<HashMap>` populated by
+`register_client` (`services/oauth/registration.rs:38`).
+
+**State is in-memory only.** Process restart wipes all DCR registrations.
+This is correct behaviour for dev workflows where the client (a webapp
+running on `localhost:3000`) cannot expose a CIMD URL reachable by the AS,
+and is acceptable because the dev session lifetime maps cleanly to the
+process lifetime.
+
+### Which path does a given request take?
+
+The branch is decided at `authorize.rs:115-150` purely by whether the
+incoming `client_id` starts with `https://`. There is no per-deployment
+toggle; CIMD and DCR coexist and clients pick by how they identify
+themselves.
+
+| If `client_id` is… | Path | Storage |
+|---|---|---|
+| `https://...` | CIMD: fetch, validate, cache | None persisted; in-memory cache only |
+| anything else (UUID, etc.) | DCR: lookup in `state.clients` | In-memory HashMap |
+
+### Storage backends
+
+Neither path currently persists OAuth client records to RocksDB or
+Valkey — both rely on the in-memory cache in `OAuthState`. CIMD doesn't
+need persistence (re-fetch is correct). DCR doesn't have persistence
+today; the in-memory cache survives only the process lifetime. See the
+project obsidian vault `Retire DCR.md` and `Bounded clients cache.md`
+follow-ups.
+
+### Recommendation for new deployments
+
+- **Production webapps:** publish a CIMD metadata document at a stable
+  HTTPS URL. Use that URL as `client_id`. No registration call ever.
+- **Local dev:** use DCR. The browser at `http://localhost:3000` cannot
+  serve CIMD reachable by hyprstream over HTTPS, so DCR is the right
+  fallback. The in-memory state is bounded by dev session length.
+- **Air-gapped / private CA deployments:** publish the CIMD document on
+  the internal HTTPS endpoint, and ensure hyprstream's HTTP client
+  trusts the internal CA. (Not currently a configurable knob; track in
+  the obsidian vault if you need this.)
+
+---
+
 ## Related
 
 - [OAuth provider configuration](deployment/oauth-providers.md) — configuring
