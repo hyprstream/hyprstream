@@ -161,6 +161,12 @@ fn build_cli() -> ClapCommand {
                     .long("tui")
                     .action(clap::ArgAction::SetTrue)
                     .help("Use TUI wizard with GPU detection and install phase"),
+            )
+            .arg(
+                Arg::new("bootstrap_only")
+                    .long("bootstrap-only")
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Run only the trust-root bootstrap (phase 1); skip binary install, policy templates, user creation, token mint, and systemd"),
             ),
     );
 
@@ -1490,6 +1496,7 @@ fn main() -> Result<()> {
                 let tui_mode = sub_m.get_flag("tui");
                 let non_interactive = sub_m.get_flag("non_interactive");
                 let start_services = sub_m.get_flag("start");
+                let bootstrap_only = sub_m.get_flag("bootstrap_only");
                 return with_runtime(
                     RuntimeConfig { device: DeviceConfig::request_cpu(), multi_threaded: true },
                     || async move {
@@ -1497,7 +1504,7 @@ fn main() -> Result<()> {
                             hyprstream_core::cli::handle_wizard_tui(&models_dir).await
                         } else {
                             hyprstream_core::cli::handle_wizard(
-                                &models_dir, &services, non_interactive, start_services,
+                                &models_dir, &services, non_interactive, start_services, bootstrap_only,
                             ).await
                         }
                     },

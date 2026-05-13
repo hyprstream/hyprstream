@@ -151,11 +151,19 @@ pub async fn handle_wizard_tui(models_dir: &Path) -> Result<()> {
 }
 
 /// Handle `hyprstream wizard` — interactive setup wizard
+///
+/// When `bootstrap_only` is true, only phase 1 (trust-root setup) runs.
+/// Phases 2-6 (binary install, policy templates, user/role creation,
+/// token mint, systemd install / service start) are skipped. This is
+/// the operation a test fixture, scripted bootstrap, or container build
+/// step wants when it only needs the trust-root material on disk and
+/// will manage everything else externally.
 pub async fn handle_wizard(
     models_dir: &Path,
     config_services: &[String],
     non_interactive: bool,
     start_services: bool,
+    bootstrap_only: bool,
 ) -> Result<()> {
     println!();
     println!("  Hyprstream Setup Wizard");
@@ -166,6 +174,10 @@ pub async fn handle_wizard(
 
     // Phase 1: Environment bootstrap
     phase_bootstrap(&mut state, non_interactive).await?;
+
+    if bootstrap_only {
+        return Ok(());
+    }
 
     // Phase 2: Binary installation
     phase_binary_install(&mut state, non_interactive)?;
