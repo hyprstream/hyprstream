@@ -1017,7 +1017,7 @@ fn default_oauth_scopes() -> Vec<String> {
     ]
 }
 fn default_oauth_token_ttl() -> u32 { 3600 }
-fn default_refresh_token_ttl() -> u32 { 259_200 } // 72 hours
+fn default_refresh_token_ttl() -> u32 { 2_628_000 } // 730 hours (~30 days)
 
 /// StreamService configuration
 ///
