@@ -293,6 +293,9 @@ pub struct OAuthState {
     /// Unix timestamp of when the JWT signing key expires (exp for JWKS entry).
     /// Default: jwt_key_nbf + 14 days.
     pub jwt_key_exp: i64,
+    /// Multi-slot JWT signing key store for rotation (drain/active/lead lifecycle).
+    /// When present, JWKS serves all slots and issuance uses the active key.
+    pub signing_key_store: Option<Arc<crate::auth::SigningKeyStore>>,
 }
 
 impl OAuthState {
@@ -331,6 +334,7 @@ impl OAuthState {
             device_store: None,
             jwt_key_nbf: chrono::Utc::now().timestamp(),
             jwt_key_exp: chrono::Utc::now().timestamp() + 14 * 86400,
+            signing_key_store: None,
         }
     }
 
@@ -351,6 +355,39 @@ impl OAuthState {
     pub fn with_ca_jwt_key(mut self, key: ed25519_dalek::SigningKey) -> Self {
         self.ca_jwt_key = Some(Arc::new(key));
         self
+    }
+
+    /// Attach the multi-slot signing key store (rotation).
+    ///
+    /// When set, JWKS serves all slots and WIT issuance uses the active key.
+    pub fn with_signing_key_store(mut self, store: Arc<crate::auth::SigningKeyStore>) -> Self {
+        self.signing_key_store = Some(store);
+        self
+    }
+
+    /// Return the verifying key to use for JWT bearer token validation.
+    ///
+    /// Prefers the active slot from the signing key store; falls back to the
+    /// legacy `verifying_key_bytes` field (policy-service-issued key).
+    pub async fn jwt_bearer_verifying_key(&self) -> Option<ed25519_dalek::VerifyingKey> {
+        if let Some(store) = &self.signing_key_store {
+            if let Some(bytes) = store.active_verifying_key_bytes().await {
+                return ed25519_dalek::VerifyingKey::from_bytes(&bytes).ok();
+            }
+        }
+        ed25519_dalek::VerifyingKey::from_bytes(&self.verifying_key_bytes).ok()
+    }
+
+    /// Return the active JWT signing key for token issuance (WIT/ADT).
+    ///
+    /// Prefers the active slot from the signing key store; falls back to `ca_jwt_key`.
+    pub async fn active_jwt_signing_key(&self) -> Option<Arc<ed25519_dalek::SigningKey>> {
+        if let Some(store) = &self.signing_key_store {
+            if let Some(key) = store.active_key().await {
+                return Some(key);
+            }
+        }
+        self.ca_jwt_key.clone()
     }
 
     /// Attach a user credential store. Creates a `UserService` backed by the store

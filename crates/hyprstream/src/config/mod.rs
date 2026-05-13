@@ -199,64 +199,97 @@ impl SecretsConfig {
 ///
 /// ```toml
 /// [tls]
-/// enabled = true
+/// mode = "self-signed"   # or "acme" or "files"
 /// server_name = "localhost"
-/// # Leave cert_path/key_path unset for auto-generated self-signed cert
+/// # ACME mode:
+/// # acme_domain = "node.example.com"
+/// # acme_contact = "mailto:ops@example.com"
+/// # acme_cache_dir = "/var/lib/hyprstream/acme"
 /// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TlsMode {
+    /// Auto-generate a self-signed certificate at startup (dev/air-gapped only).
+    #[default]
+    SelfSigned,
+    /// Obtain a certificate automatically via ACME (RFC 8555) — Let's Encrypt or step-ca.
+    Acme,
+    /// Load certificate and key from `cert_path`/`key_path` (operator-managed).
+    Files,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsConfig {
     /// Whether TLS is enabled for HTTP services (defaults to true)
     #[serde(default = "default_tls_enabled")]
     pub enabled: bool,
 
-    /// Path to TLS certificate (PEM). None = generate self-signed.
+    /// TLS provisioning mode. Defaults to `self-signed` when cert_path/key_path are unset.
+    #[serde(default)]
+    pub mode: TlsMode,
+
+    /// Path to TLS certificate (PEM). Used when mode = "files".
     #[serde(default)]
     pub cert_path: Option<PathBuf>,
 
-    /// Path to TLS private key (PEM). None = generate self-signed.
+    /// Path to TLS private key (PEM). Used when mode = "files".
     #[serde(default)]
     pub key_path: Option<PathBuf>,
 
-    /// Server name for TLS certificate (used in self-signed cert generation)
+    /// Server name for TLS certificate (self-signed CN or ACME domain).
     #[serde(default = "default_tls_server_name")]
     pub server_name: String,
+
+    /// ACME: domain to obtain a certificate for. Required when mode = "acme".
+    #[serde(default)]
+    pub acme_domain: Option<String>,
+
+    /// ACME: contact email URI, e.g. "mailto:ops@example.com".
+    #[serde(default)]
+    pub acme_contact: Option<String>,
+
+    /// ACME: directory URL. Defaults to Let's Encrypt production.
+    /// Set to a step-ca or Pebble URL for self-hosted ACME.
+    #[serde(default)]
+    pub acme_directory: Option<String>,
+
+    /// ACME: directory for certificate cache and account keys.
+    #[serde(default)]
+    pub acme_cache_dir: Option<PathBuf>,
 }
 
 impl Default for TlsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            mode: TlsMode::SelfSigned,
             cert_path: None,
             key_path: None,
             server_name: default_tls_server_name(),
+            acme_domain: None,
+            acme_contact: None,
+            acme_directory: None,
+            acme_cache_dir: None,
         }
     }
 }
 
 impl TlsConfig {
-    /// Check if self-signed certificate should be generated.
-    ///
-    /// Returns `true` when both cert_path and key_path are None.
-    /// Warns if only one is set (likely misconfiguration).
-    pub fn use_self_signed(&self) -> bool {
-        match (&self.cert_path, &self.key_path) {
-            (None, None) => true,
-            (Some(_), Some(_)) => false,
-            (Some(cert), None) => {
-                tracing::warn!(
-                    "tls.cert_path is set ({}) but tls.key_path is missing — generating self-signed cert instead",
-                    cert.display()
-                );
-                true
-            }
-            (None, Some(key)) => {
-                tracing::warn!(
-                    "tls.key_path is set ({}) but tls.cert_path is missing — generating self-signed cert instead",
-                    key.display()
-                );
-                true
-            }
+    /// Effective TLS mode, resolving legacy cert_path/key_path into Files mode.
+    pub fn effective_mode(&self) -> TlsMode {
+        // Explicit mode overrides; legacy cert_path/key_path implies Files.
+        if self.mode != TlsMode::SelfSigned {
+            return self.mode.clone();
         }
+        if self.cert_path.is_some() && self.key_path.is_some() {
+            return TlsMode::Files;
+        }
+        TlsMode::SelfSigned
+    }
+
+    /// Check if self-signed certificate should be generated.
+    pub fn use_self_signed(&self) -> bool {
+        self.effective_mode() == TlsMode::SelfSigned
     }
 }
 
@@ -921,6 +954,18 @@ pub struct OAuthConfig {
     /// Never set this in production config files.
     #[serde(default, skip_serializing)]
     pub user_signing_key: Option<String>,
+
+    /// How many days a JWT signing key remains in the active (issuance) slot.
+    #[serde(default = "default_jwt_key_active_days")]
+    pub jwt_key_active_days: u32,
+
+    /// How many days before active-key expiry a lead key is pre-generated.
+    #[serde(default = "default_jwt_key_lead_days")]
+    pub jwt_key_lead_days: u32,
+
+    /// How many extra days after active-key expiry the drain key remains in JWKS for verification.
+    #[serde(default = "default_jwt_key_drain_days")]
+    pub jwt_key_drain_days: u32,
 }
 
 fn default_oauth_cors() -> server::CorsConfig {
@@ -944,6 +989,9 @@ impl Default for OAuthConfig {
             authority_hints: Vec::new(),
             oidc_providers: std::collections::HashMap::new(),
             user_signing_key: None,
+            jwt_key_active_days: default_jwt_key_active_days(),
+            jwt_key_lead_days: default_jwt_key_lead_days(),
+            jwt_key_drain_days: default_jwt_key_drain_days(),
         }
     }
 }
@@ -1018,6 +1066,9 @@ fn default_oauth_scopes() -> Vec<String> {
 }
 fn default_oauth_token_ttl() -> u32 { 3600 }
 fn default_refresh_token_ttl() -> u32 { 2_628_000 } // 730 hours (~30 days)
+fn default_jwt_key_active_days() -> u32 { 14 }
+fn default_jwt_key_lead_days() -> u32 { 7 }
+fn default_jwt_key_drain_days() -> u32 { 30 }
 
 /// StreamService configuration
 ///

@@ -40,7 +40,8 @@ pub async fn issue_browser_wit(
     Extension(user): Extension<AuthenticatedUser>,
     Json(body): Json<WitRequest>,
 ) -> Response {
-    let ca_key = match state.ca_jwt_key.as_deref() {
+    let ca_key_arc = state.active_jwt_signing_key().await;
+    let ca_key = match ca_key_arc.as_deref() {
         Some(k) => k,
         None => {
             return (

@@ -7,6 +7,7 @@
 
 pub mod device_challenge;
 pub mod identity_store;
+pub mod key_rotation;
 pub mod service_jwt;
 pub mod federation;
 pub mod id_token_verify;
@@ -21,6 +22,7 @@ pub mod valkey;
 
 pub use federation::FederationKeyResolver;
 pub use jwt::{Claims, JwtError};
+pub use key_rotation::SigningKeyStore;
 pub use policy_manager::{PolicyManager, PolicyError, write_policy_file, global_policy_manager, set_global_policy_manager};
 pub use policy_migration::migrate_policy_csv;
 pub use policy_templates::{PolicyTemplate, ServicePolicyRule, SERVICE_BASE_POLICIES, get_template, get_templates};

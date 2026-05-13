@@ -12,25 +12,46 @@ use super::state::OAuthState;
 pub fn compute_kid(key_bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(key_bytes);
-    hex::encode(&hash[..8])
+    hex::encode(&hash[..4])
 }
 
 /// GET /oauth/jwks
 pub async fn jwks(State(state): State<Arc<OAuthState>>) -> impl IntoResponse {
-    let key_bytes = state.verifying_key_bytes;
-    let x = URL_SAFE_NO_PAD.encode(key_bytes);
-    let eddsa_kid = compute_kid(&key_bytes);
+    let mut keys: Vec<serde_json::Value> = Vec::new();
 
-    let mut keys = vec![serde_json::json!({
-        "kty": "OKP",
-        "crv": "Ed25519",
-        "use": "sig",
-        "alg": "EdDSA",
-        "kid": eddsa_kid,
-        "x": x,
-        "nbf": state.jwt_key_nbf,
-        "exp": state.jwt_key_exp,
-    })];
+    // Serve all rotation slots (drain + active + lead) when the store is present.
+    if let Some(ref store) = state.signing_key_store {
+        for slot in store.all_slots_snapshot().await {
+            let vk_bytes = slot.verifying_key_bytes();
+            let kid = compute_kid(&vk_bytes);
+            let x = URL_SAFE_NO_PAD.encode(vk_bytes);
+            keys.push(serde_json::json!({
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "use": "sig",
+                "alg": "EdDSA",
+                "kid": kid,
+                "x": x,
+                "nbf": slot.nbf,
+                "exp": slot.exp,
+            }));
+        }
+    } else {
+        // Legacy single-key path (policy-service verifying key).
+        let key_bytes = state.verifying_key_bytes;
+        let x = URL_SAFE_NO_PAD.encode(key_bytes);
+        let eddsa_kid = compute_kid(&key_bytes);
+        keys.push(serde_json::json!({
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "use": "sig",
+            "alg": "EdDSA",
+            "kid": eddsa_kid,
+            "x": x,
+            "nbf": state.jwt_key_nbf,
+            "exp": state.jwt_key_exp,
+        }));
+    }
 
     // Add RSA public key if available
     if let Some(ref rsa_jwk) = state.rsa_jwk {

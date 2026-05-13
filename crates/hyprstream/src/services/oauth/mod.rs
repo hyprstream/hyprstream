@@ -425,15 +425,39 @@ impl Spawnable for OAuthService {
             };
 
             // Load the CA JWT signing key for browser WIT issuance (POST /oauth/wit).
-            let ca_jwt_key: Option<ed25519_dalek::SigningKey> = match crate::auth::identity_store::load_ca_signing_key(&credentials_dir) {
+            // Also seed the signing key store from the same root key.
+            let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
+            let oauth_config_arc = Arc::new(self.config.clone());
+
+            let (ca_jwt_key, signing_key_store) = match crate::auth::identity_store::load_ca_signing_key(&credentials_dir) {
                 Ok(root_key) => {
                     let key = hyprstream_rpc::node_identity::derive_purpose_key(&root_key, "hyprstream-jwt-v1");
                     info!("CA JWT signing key loaded — POST /oauth/wit available");
-                    Some(key)
+
+                    // Load or initialize the multi-slot rotation store.
+                    let store = crate::auth::key_rotation::load_or_init_key_store(
+                        &secrets_dir,
+                        &self.config,
+                    );
+                    let store_arc = Arc::new(store);
+
+                    // Spawn the background rotation task.
+                    crate::auth::key_rotation::spawn_rotation_task(
+                        Arc::clone(&oauth_config_arc),
+                        secrets_dir.clone(),
+                        Arc::clone(&store_arc),
+                    );
+                    info!("JWT signing key rotation task started (active_days={}, lead_days={}, drain_days={})",
+                        self.config.jwt_key_active_days,
+                        self.config.jwt_key_lead_days,
+                        self.config.jwt_key_drain_days,
+                    );
+
+                    (Some(key), Some(store_arc))
                 }
                 Err(e) => {
-                    tracing::warn!("Cannot load CA signing key — POST /oauth/wit unavailable: {e}");
-                    None
+                    tracing::warn!("Cannot load CA signing key — POST /oauth/wit unavailable and key rotation disabled: {e}");
+                    (None, None)
                 }
             };
 
@@ -455,8 +479,10 @@ impl Spawnable for OAuthService {
             if let Some(key) = ca_jwt_key {
                 oauth_state = oauth_state.with_ca_jwt_key(key);
             }
-            // Populate JWKS nbf/exp from signing-key file mtime so verifiers have
-            // temporal context for the active key during the drain window.
+            if let Some(store) = signing_key_store {
+                oauth_state = oauth_state.with_signing_key_store(store);
+            }
+            // Populate legacy JWKS nbf/exp from signing-key file mtime (used when store absent).
             let key_nbf = crate::auth::identity_store::node_signing_key_mtime(&credentials_dir);
             oauth_state = oauth_state.with_jwt_key_timestamps(key_nbf, key_nbf + 14 * 86400);
 
