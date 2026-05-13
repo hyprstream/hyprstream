@@ -97,11 +97,13 @@ pub fn encode_vault_device_cookie(
     URL_SAFE_NO_PAD.encode(&payload)
 }
 
-/// Compute the `kid` for a signing key (first 8 hex chars of SHA-256 of verifying key bytes).
+/// Compute the `kid` for a cookie signing key (first 4 bytes of SHA-256 → 8 hex chars).
+///
+/// 8 ASCII hex characters fit the cookie format's `kid[8]` field exactly.
 pub fn compute_kid(verifying_key_bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(verifying_key_bytes);
-    hex::encode(&hash[..8])
+    hex::encode(&hash[..4])
 }
 
 /// Verify a `__Secure-VaultDevice` cookie and return the device pubkey on success.
@@ -179,5 +181,38 @@ mod tests {
         let pubkey = [0u8; 32];
         let bad_sig = [0u8; 64];
         assert!(!verify_device_enrollment(&challenge_key, &pubkey, &bad_sig));
+    }
+
+    #[test]
+    fn cookie_roundtrip() {
+        use ed25519_dalek::SigningKey;
+        let sk_bytes = [7u8; 32];
+        let pubkey = [1u8; 32];
+
+        let cookie_seed = derive_cookie_key_seed(&sk_bytes);
+        let cookie_sk = SigningKey::from_bytes(&cookie_seed);
+        let kid = compute_kid(cookie_sk.verifying_key().as_bytes());
+        assert_eq!(kid.len(), 8, "kid must be 8 ASCII hex chars");
+
+        let cookie_val = encode_vault_device_cookie(&cookie_sk, &kid, &pubkey);
+        let recovered = verify_vault_device_cookie(&sk_bytes, &cookie_val);
+        assert_eq!(recovered, Some(pubkey));
+    }
+
+    #[test]
+    fn cookie_bad_sig_fails() {
+        use ed25519_dalek::SigningKey;
+        let sk_bytes = [7u8; 32];
+        let pubkey = [1u8; 32];
+
+        let cookie_seed = derive_cookie_key_seed(&sk_bytes);
+        let cookie_sk = SigningKey::from_bytes(&cookie_seed);
+        let kid = compute_kid(cookie_sk.verifying_key().as_bytes());
+        let mut cookie_val = encode_vault_device_cookie(&cookie_sk, &kid, &pubkey);
+        // Corrupt the last character to invalidate the signature
+        if let Some(last) = cookie_val.pop() {
+            cookie_val.push(if last == 'A' { 'B' } else { 'A' });
+        }
+        assert!(verify_vault_device_cookie(&sk_bytes, &cookie_val).is_none());
     }
 }
