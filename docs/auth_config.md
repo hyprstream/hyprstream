@@ -200,9 +200,10 @@ The `hyprstream user` CLI reads directly from the RocksDB user store:
 
 ```bash
 hyprstream user list
-hyprstream user show alice
-hyprstream user list-keys alice
+hyprstream user keys list alice
 ```
+
+See [`users.md`](users.md) for the full CLI surface and rotation procedure.
 
 ### Migrating from RocksDB to Valkey
 
