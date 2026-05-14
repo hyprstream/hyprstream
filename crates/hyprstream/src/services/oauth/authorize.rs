@@ -8,9 +8,11 @@
 //! stored server-side (`OAuthState::pending_nonces`, 5-min TTL) and embedded as a hidden
 //! form field. On POST, the server verifies the nonce was issued by itself and consumes it
 //! (single-use). Challenge format:
-//!   `"{username}:{nonce}:{code_challenge}"`
+//!   `"{fingerprint}:{nonce}:{code_challenge}"`
 //! The `code_challenge` binding prevents the signature from being reused against a different
-//! PKCE session; the server-side nonce store enforces TTL and prevents replay.
+//! PKCE session; the server-side nonce store enforces TTL and prevents replay. The client
+//! never asserts a username — the server resolves it from `fingerprint` via the
+//! `pubkey:{fingerprint} → username` reverse index in the UserStore.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -80,7 +82,12 @@ pub struct AuthorizeQuery {
     pub nonce: Option<String>,
 }
 
-/// Consent form submission (Ed25519 challenge-response)
+/// Consent form submission (Ed25519 challenge-response).
+///
+/// The client supplies its key fingerprint (not a username). The server
+/// resolves the username from the `pubkey:{fingerprint} → username` reverse
+/// index, then verifies the signature. The challenge string is
+/// `"{fingerprint}:{nonce}:{code_challenge}"`.
 #[derive(Debug, Deserialize)]
 pub struct ConsentForm {
     pub client_id: String,
@@ -93,8 +100,8 @@ pub struct ConsentForm {
     pub resource: Option<String>,
     /// Ed25519 nonce (from hidden form field; validated server-side against pending_nonces)
     pub nonce: String,
-    /// Username entered by the user
-    pub username: String,
+    /// SSH-style key fingerprint (`SHA256:...`) of the signing key.
+    pub fingerprint: String,
     /// Base64-encoded Ed25519 signature
     pub signature: String,
     /// OIDC nonce (passed through from authorize request, stored in auth code)
@@ -271,9 +278,11 @@ pub async fn authorize_post(
         return Html(html).into_response();
     }
 
-    // Reconstruct challenge: "{username}:{nonce}:{code_challenge}"
-    // Binds signature to both the user identity and the PKCE session.
-    let challenge_str = format!("{}:{}:{}", form.username, form.nonce, form.code_challenge);
+    // Reconstruct challenge: "{fingerprint}:{nonce}:{code_challenge}"
+    // Binds signature to the key identity and the PKCE session. The server
+    // does not trust client-declared usernames — it resolves the username
+    // from the pubkey reverse index keyed by `form.fingerprint`.
+    let challenge_str = format!("{}:{}:{}", form.fingerprint, form.nonce, form.code_challenge);
 
     // Get user store
     let user_store = match state.user_store_reader() {
@@ -286,17 +295,18 @@ pub async fn authorize_post(
         }
     };
 
-    // Verify Ed25519 challenge-response
-    let verifying_key = match challenge::verify_ed25519_response(
+    // Verify Ed25519 challenge-response. The resolved username comes back
+    // from the reverse index; the client never asserts an identity.
+    let (resolved_username, verifying_key) = match challenge::verify_ed25519_response_by_fingerprint(
         user_store.as_ref(),
-        &form.username,
+        &form.fingerprint,
         &challenge_str,
         &form.signature,
     ).await {
-        Ok(vk) => vk,
+        Ok(pair) => pair,
         Err(e) => {
             if matches!(e, challenge::ChallengeError::UserStoreError(_)) {
-                tracing::error!(username = %form.username, "UserStore lookup error during authorize");
+                tracing::error!(fingerprint = %form.fingerprint, "UserStore lookup error during authorize");
             }
             // Validate redirect_uri and re-derive client display info from the registry.
             // Never trust the POST body for display values; return an error page if
@@ -346,7 +356,7 @@ pub async fn authorize_post(
         resource,
         created_at: Instant::now(),
         expires_at: Instant::now() + Duration::from_secs(60),
-        username: form.username.clone(),
+        username: resolved_username.clone(),
         verifying_key: Some(verifying_key),
     };
 
@@ -354,7 +364,8 @@ pub async fn authorize_post(
 
     tracing::info!(
         client_id = %form.client_id,
-        username = %form.username,
+        username = %resolved_username,
+        fingerprint = %form.fingerprint,
         redirect_uri = %form.redirect_uri,
         "Authorization code issued, redirecting"
     );
@@ -606,7 +617,7 @@ fn render_challenge_page(
   <div class="step">
     <strong>Sign the challenge on your workstation:</strong><br/>
     <code>hyprstream sign-challenge --nonce {nonce_esc} --code-challenge {code_challenge_esc}</code><br/>
-    Copy the printed <em>Username</em> and <em>Signature</em> below.
+    Copy the printed <em>Fingerprint</em> and <em>Signature</em> below.
   </div>
   <form method="post" action="/oauth/authorize">
     <input type="hidden" name="client_id" value="{client_id_val}">
@@ -617,8 +628,9 @@ fn render_challenge_page(
     <input type="hidden" name="resource" value="{resource_val}">
     <input type="hidden" name="nonce" value="{nonce_val}">
     <input type="hidden" name="oidc_nonce" value="{oidc_nonce_val}">
-    <label>Username:
-      <input type="text" name="username" required autocomplete="username" autofocus/>
+    <label>Key fingerprint (SHA256:...):
+      <input type="text" name="fingerprint" required autocomplete="off" autofocus
+             placeholder="SHA256:..." spellcheck="false"/>
     </label>
     <label>Signature (base64, 88 chars):
       <input type="text" name="signature" required size="88" autocomplete="off"

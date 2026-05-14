@@ -11,9 +11,13 @@
 //!    - Prints: `"✓ Device authorized for {username}."`
 //!
 //! 2. **Auth code flow**: `hyprstream sign-challenge --nonce <n> --code-challenge <cc>`
-//!    - Constructs challenge: `"{username}:{nonce}:{code_challenge}"`
-//!    - Prints: `"Username: {username}\nSignature: {base64}"`
-//!    - User pastes these into the browser challenge form.
+//!    - Derives the SSH-style key fingerprint (`SHA256:...`) of the local
+//!      user signing key.
+//!    - Constructs challenge: `"{fingerprint}:{nonce}:{code_challenge}"`
+//!    - Prints: `"Fingerprint: {fingerprint}\nSignature: {base64}"`
+//!    - User pastes these into the browser challenge form. The server
+//!      resolves the username from the fingerprint via the pubkey reverse
+//!      index — the client never declares an identity.
 // CLI handler intentionally prints to stdout/stderr for user interaction
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
@@ -139,28 +143,42 @@ async fn handle_device_flow(
     Ok(())
 }
 
-/// Auth code flow: sign and print Username + Signature for browser paste.
+/// Auth code flow: sign and print Fingerprint + Signature for browser paste.
 fn handle_auth_code_flow(
     signing_key: ed25519_dalek::SigningKey,
-    username: String,
+    _username: String,
     nonce: String,
     code_challenge: String,
 ) -> Result<()> {
-    // Construct challenge: "{username}:{nonce}:{code_challenge}"
-    let challenge = format!("{}:{}:{}", username, nonce, code_challenge);
+    let verifying_key = signing_key.verifying_key();
+    let fingerprint = crate::auth::pubkey_fingerprint(&verifying_key);
+
+    // Construct challenge: "{fingerprint}:{nonce}:{code_challenge}"
+    // The server resolves the user from the fingerprint via the pubkey
+    // reverse index — no username on the wire.
+    let challenge = format!("{}:{}:{}", fingerprint, nonce, code_challenge);
     let signature = signing_key.sign(challenge.as_bytes());
     let sig_b64 = STANDARD.encode(signature.to_bytes());
 
-    println!("Username: {}", username);
+    println!("Fingerprint: {}", fingerprint);
     println!("Signature: {}", sig_b64);
 
     Ok(())
 }
 
 /// Load the user's Ed25519 signing key from the configured secrets directory.
-/// Returns (signing_key, username).
+///
+/// Returns `(signing_key, os_username)`. The OS username is kept for the
+/// device flow (which embeds it in the challenge string and posts it to
+/// `/oauth/device/verify`); the auth-code flow ignores it and uses the
+/// signing key's fingerprint instead.
 fn load_user_signing_key() -> Result<(ed25519_dalek::SigningKey, String)> {
-    let username = hyprstream_rpc::envelope::RequestIdentity::anonymous().user().to_owned();
+    // Device flow embeds the username in the challenge string. The OS user
+    // matches what the wizard registers; falls back to "anonymous" for the
+    // edge case where USER/LOGNAME aren't set.
+    let username = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "anonymous".to_owned());
 
     if let Some((sk, _vk)) = crate::config::HyprConfig::user_signing_key_bypass()? {
         return Ok((sk, username));

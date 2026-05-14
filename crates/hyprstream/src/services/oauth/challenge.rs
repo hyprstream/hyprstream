@@ -14,6 +14,8 @@ use crate::auth::user_store::UserStore;
 pub(super) enum ChallengeError {
     /// Username contains ':', which would make the challenge string ambiguous.
     InvalidUsername,
+    /// Fingerprint string is malformed (empty, contains ':' delimiter conflict, etc.).
+    InvalidFingerprint,
     /// Signature is not valid base64.
     InvalidSignatureEncoding,
     /// Signature is not exactly 64 bytes (88 base64 chars).
@@ -22,6 +24,8 @@ pub(super) enum ChallengeError {
     UserNotFound,
     /// User has no pubkeys registered.
     NoPubkeys,
+    /// No user is registered with the supplied key fingerprint.
+    UnknownFingerprint,
     /// UserStore returned an error.
     UserStoreError(#[allow(dead_code)] anyhow::Error),
     /// Signature is syntactically valid but does not verify against any registered key.
@@ -33,6 +37,8 @@ impl ChallengeError {
     pub(super) fn message(&self) -> &'static str {
         match self {
             ChallengeError::InvalidUsername => "Username must not contain ':'",
+            ChallengeError::InvalidFingerprint =>
+                "Invalid key fingerprint format. Expected `SHA256:...` from `hyprstream sign-challenge`.",
             ChallengeError::InvalidSignatureEncoding =>
                 "Invalid signature encoding (expected base64).",
             ChallengeError::InvalidSignatureLength =>
@@ -41,6 +47,8 @@ impl ChallengeError {
                 "Unknown user. Please contact your administrator.",
             ChallengeError::NoPubkeys =>
                 "No public keys registered for this user.",
+            ChallengeError::UnknownFingerprint =>
+                "Key fingerprint not registered to any user. Run `hyprstream wizard` or have an admin register your key.",
             ChallengeError::UserStoreError(_) =>
                 "Internal error looking up user credentials.",
             ChallengeError::SignatureInvalid =>
@@ -96,6 +104,57 @@ pub(super) async fn verify_ed25519_response(
     }
 
     Err(ChallengeError::SignatureInvalid)
+}
+
+/// Verify an Ed25519 challenge-response identified by the signer's key
+/// fingerprint rather than a client-declared username.
+///
+/// Resolves the user via the `pubkey:{fingerprint} → username` reverse index
+/// the UserStore already maintains. Builds the challenge string as
+/// `"{fingerprint}:{nonce}:{code_challenge}"` so the client and server agree
+/// on the binding without the client ever asserting an identity.
+///
+/// Returns `(username, VerifyingKey)` on success: the resolved username (for
+/// the JWT `sub` claim) and the key that verified the signature.
+pub(super) async fn verify_ed25519_response_by_fingerprint(
+    user_store: &dyn UserStore,
+    fingerprint: &str,
+    challenge: &str,
+    sig_b64: &str,
+) -> Result<(String, ed25519_dalek::VerifyingKey), ChallengeError> {
+    // Accept only the canonical `SHA256:...` form. The client and server
+    // build the challenge with the exact same string, so additional ':' inside
+    // the fingerprint don't cause delimiter ambiguity — but rejecting other
+    // shapes early gives a better error than "unknown fingerprint".
+    if !fingerprint.starts_with("SHA256:") {
+        return Err(ChallengeError::InvalidFingerprint);
+    }
+
+    let sig_bytes = STANDARD.decode(sig_b64)
+        .map_err(|_| ChallengeError::InvalidSignatureEncoding)?;
+    let sig_array: [u8; 64] = sig_bytes.try_into()
+        .map_err(|_| ChallengeError::InvalidSignatureLength)?;
+    let signature = ed25519_dalek::Signature::from_bytes(&sig_array);
+
+    let Some(username) = user_store.get_pubkey_user(fingerprint).await
+        .map_err(ChallengeError::UserStoreError)?
+    else {
+        return Err(ChallengeError::UnknownFingerprint);
+    };
+
+    let pubkeys = user_store.list_pubkeys(&username).await
+        .map_err(ChallengeError::UserStoreError)?;
+    let Some(entry) = pubkeys.into_iter().find(|e| e.fingerprint == fingerprint) else {
+        // Reverse index pointed at this user but the key is gone — treat as unknown.
+        return Err(ChallengeError::UnknownFingerprint);
+    };
+
+    if entry.pubkey.verify_strict(challenge.as_bytes(), &signature).is_err() {
+        return Err(ChallengeError::SignatureInvalid);
+    }
+
+    let _ = user_store.touch_pubkey(&username, &entry.fingerprint).await;
+    Ok((username, entry.pubkey))
 }
 
 /// HTML-escape a string for safe embedding in HTML attributes and text.
