@@ -31,7 +31,7 @@ use super::registration::{fetch_client_metadata, validate_redirect_uri};
 use super::state::{OAuthState, PendingAuthCode};
 
 /// Authorization request query parameters
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AuthorizeParams {
     pub client_id: String,
     pub redirect_uri: String,
@@ -46,6 +46,36 @@ pub struct AuthorizeParams {
     #[serde(default)]
     pub resource: Option<String>,
     /// OIDC nonce — echoed into id_token (OpenID Connect Core 1.0, Section 3.1.2.1)
+    #[serde(default)]
+    pub nonce: Option<String>,
+}
+
+/// Loosely-typed authorize query.
+///
+/// Accepts either inline parameters (the original authorize URL form) or a
+/// `request_uri` reference to a Pushed Authorization Request (RFC 9126).
+/// When `request_uri` is present, the inline parameters (except `client_id`)
+/// are ignored and the pushed snapshot is used instead.
+#[derive(Debug, Deserialize)]
+pub struct AuthorizeQuery {
+    #[serde(default)]
+    pub request_uri: Option<String>,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub redirect_uri: Option<String>,
+    #[serde(default)]
+    pub code_challenge: Option<String>,
+    #[serde(default)]
+    pub code_challenge_method: Option<String>,
+    #[serde(default)]
+    pub response_type: Option<String>,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub resource: Option<String>,
     #[serde(default)]
     pub nonce: Option<String>,
 }
@@ -75,8 +105,15 @@ pub struct ConsentForm {
 /// GET /oauth/authorize — validate params and render Ed25519 challenge form
 pub async fn authorize_get(
     State(state): State<Arc<OAuthState>>,
-    Query(params): Query<AuthorizeParams>,
+    Query(query): Query<AuthorizeQuery>,
 ) -> Response {
+    // Resolve params: either from a Pushed Authorization Request (RFC 9126)
+    // referenced by `request_uri`, or from inline query parameters.
+    let params = match resolve_authorize_query(&state, query).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+
     // Validate response_type
     if params.response_type != "code" {
         return error_response(
@@ -345,6 +382,85 @@ pub async fn authorize_post(
     };
 
     Redirect::to(&redirect_url).into_response()
+}
+
+/// Resolve an `AuthorizeQuery` into a concrete `AuthorizeParams`.
+///
+/// Two paths:
+/// - **PAR (RFC 9126):** if `request_uri` is set, look it up in
+///   `pending_par_requests`, check TTL, consume (single-use), and return the
+///   stored snapshot. If a `client_id` is also present on the URL, it must
+///   match the pushed snapshot's `client_id` (RFC 9126 §4).
+/// - **Inline:** require the same fields the legacy URL form required.
+async fn resolve_authorize_query(
+    state: &OAuthState,
+    query: AuthorizeQuery,
+) -> Result<AuthorizeParams, Response> {
+    if let Some(request_uri) = query.request_uri.as_deref() {
+        let entry = {
+            let mut store = state.pending_par_requests.write().await;
+            store.remove(request_uri)
+        };
+        let Some(entry) = entry else {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Unknown or already-consumed request_uri",
+            ));
+        };
+        if entry.is_expired() {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "request_uri expired",
+            ));
+        }
+        // RFC 9126 §4: client_id MAY appear alongside request_uri; if present,
+        // it MUST match the pushed snapshot.
+        if let Some(client_id) = query.client_id.as_deref() {
+            if client_id != entry.params.client_id {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "client_id does not match pushed authorization request",
+                ));
+            }
+        }
+        return Ok(entry.params);
+    }
+
+    // Inline path: enforce the originally-required fields.
+    let AuthorizeQuery {
+        client_id,
+        redirect_uri,
+        code_challenge,
+        code_challenge_method,
+        response_type,
+        state: state_param,
+        scope,
+        resource,
+        nonce,
+        ..
+    } = query;
+    let missing = |field: &str| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            &format!("{field} is required"),
+        )
+    };
+    Ok(AuthorizeParams {
+        client_id: client_id.ok_or_else(|| missing("client_id"))?,
+        redirect_uri: redirect_uri.ok_or_else(|| missing("redirect_uri"))?,
+        code_challenge: code_challenge.ok_or_else(|| missing("code_challenge"))?,
+        code_challenge_method: code_challenge_method
+            .ok_or_else(|| missing("code_challenge_method"))?,
+        response_type: response_type.ok_or_else(|| missing("response_type"))?,
+        state: state_param,
+        scope,
+        resource,
+        nonce,
+    })
 }
 
 /// Generate a fresh nonce and record it in `pending_nonces` with a 5-min expiry.

@@ -104,6 +104,22 @@ pub struct RegisteredClient {
     pub registered_at: Instant,
 }
 
+/// A Pushed Authorization Request (RFC 9126) awaiting consumption.
+///
+/// Holds the already-validated authorize parameters keyed by the `request_uri`
+/// returned to the client. Single-use, short TTL.
+#[derive(Debug, Clone)]
+pub struct PushedAuthRequest {
+    pub params: super::authorize::AuthorizeParams,
+    pub expires_at: Instant,
+}
+
+impl PushedAuthRequest {
+    pub fn is_expired(&self) -> bool {
+        Instant::now() > self.expires_at
+    }
+}
+
 /// A pending authorization code awaiting token exchange.
 #[derive(Debug, Clone)]
 pub struct PendingAuthCode {
@@ -231,6 +247,9 @@ pub struct OAuthState {
     /// Pending authorize nonces (single-use, 5-min TTL).
     /// Proves a nonce was issued by this server and hasn't been replayed.
     pub pending_nonces: RwLock<HashMap<String, Instant>>,
+    /// Pending Pushed Authorization Requests (RFC 9126), keyed by `request_uri`.
+    /// Single-use, 60s TTL. In-memory is correct here — no value to persistence.
+    pub pending_par_requests: RwLock<HashMap<String, super::state::PushedAuthRequest>>,
     /// Pending device authorization codes (RFC 8628), keyed by device_code
     pub pending_device_codes: RwLock<HashMap<String, PendingDeviceCode>>,
     /// Reverse lookup: user_code -> device_code
@@ -304,6 +323,7 @@ impl OAuthState {
             clients: RwLock::new(HashMap::new()),
             pending_codes: RwLock::new(HashMap::new()),
             pending_nonces: RwLock::new(HashMap::new()),
+            pending_par_requests: RwLock::new(HashMap::new()),
             pending_device_codes: RwLock::new(HashMap::new()),
             device_code_by_user_code: RwLock::new(HashMap::new()),
             token_db: None,
@@ -526,6 +546,12 @@ impl OAuthState {
                     let now = Instant::now();
                     let mut nonces = state.pending_nonces.write().await;
                     nonces.retain(|_, expiry| *expiry > now);
+                }
+
+                // Sweep expired PAR requests (60s TTL)
+                {
+                    let mut par = state.pending_par_requests.write().await;
+                    par.retain(|_, req| !req.is_expired());
                 }
 
                 // Sweep expired device codes

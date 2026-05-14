@@ -40,6 +40,7 @@ pub mod metadata;
 pub mod oauth2_userinfo;
 pub mod oidc_callback;
 pub mod oidc_discovery;
+pub mod par;
 pub mod registration;
 pub mod revocation;
 pub mod scim;
@@ -110,6 +111,7 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             "/oauth/authorize",
             get(authorize::authorize_get).post(authorize::authorize_post),
         )
+        .route("/oauth/par", post(par::push_authorization_request))
         .route("/oauth/token", post(token::exchange_token))
         .route("/oauth/jwks", get(jwks::jwks))
         .route("/oauth/device", post(device::device_authorize))
