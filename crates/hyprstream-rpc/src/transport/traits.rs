@@ -26,6 +26,8 @@ pub trait Signer: Send + Sync {
     fn pubkey(&self) -> [u8; 32];
 
     /// Request identity for envelope construction.
+    /// DEPRECATED: Identity is no longer in the envelope. TODO: remove in Phase 2
+    #[allow(deprecated)]
     fn identity(&self) -> crate::envelope::RequestIdentity;
 
     /// Sign canonical envelope bytes. Returns 64-byte Ed25519 signature.

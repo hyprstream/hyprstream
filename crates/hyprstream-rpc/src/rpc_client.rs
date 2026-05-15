@@ -270,32 +270,31 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
     }
 
     /// Build, sign, and serialize a request envelope.
+    #[allow(deprecated)]
     async fn sign_envelope(
         &self,
         request_id: u64,
         payload: Vec<u8>,
-        ephemeral_pubkey: Option<[u8; 32]>,
+        _ephemeral_pubkey: Option<[u8; 32]>,
         jwt: Option<String>,
         delegated_bearer: Option<String>,
     ) -> Result<Vec<u8>> {
-        let mut envelope = RequestEnvelope::new(self.signer.identity(), payload);
+        let mut envelope = RequestEnvelope::new(payload);
         envelope.request_id = request_id;
         if let Some(token) = jwt {
             envelope = envelope.with_jwt_token(token);
         }
         if let Some(bearer) = delegated_bearer {
-            envelope = envelope.with_delegated_bearer(bearer);
+            envelope = envelope.with_delegation_token(bearer);
         }
-        if let Some(pubkey) = ephemeral_pubkey {
-            envelope = envelope.with_ephemeral_pubkey(pubkey);
-        }
+        // ephemeral_pubkey is no longer in the envelope — ignored
 
         let canonical = envelope.to_bytes();
         let signature = self.signer.sign(&canonical).await?;
         let signed = SignedEnvelope {
             envelope,
-            signature,
-            signer_pubkey: self.signer.pubkey(),
+            sig: signature,
+            cnf: self.signer.pubkey(),
         };
 
         let mut message = capnp::message::Builder::new_default();

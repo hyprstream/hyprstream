@@ -29,6 +29,7 @@ use std::sync::Arc;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use zeroize::Zeroizing;
 
+#[allow(deprecated)]
 use hyprstream_rpc::envelope::RequestIdentity;
 use hyprstream_rpc::registry::{global as global_registry, SocketKind};
 use crate::service::metadata::SchemaMetadataFn;
@@ -594,6 +595,7 @@ impl ServiceContext {
     /// Create a typed client for a compile-time-known service.
     ///
     /// Uses `RpcClient<LocalSigner, ZmqConnection>` via the generated `connect_to()` constructor.
+    #[allow(deprecated)]
     pub fn rpc_client(&self, service: &str) -> std::sync::Arc<dyn hyprstream_rpc::RpcClient> {
         let endpoint = self.endpoint(service, SocketKind::Rep).to_zmq_string();
         let signer = hyprstream_rpc::signer::LocalSigner::new(

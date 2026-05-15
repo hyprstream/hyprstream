@@ -21,7 +21,7 @@ impl crate::capnp::ToCapnp for StreamInfo {
     fn write_to(&self, builder: &mut Self::Builder<'_>) {
         builder.set_stream_id(&self.stream_id);
         builder.set_endpoint(&self.endpoint);
-        builder.set_server_pubkey(&self.server_pubkey);
+        builder.set_dh_public(&self.server_pubkey);
     }
 }
 
@@ -29,7 +29,7 @@ impl crate::capnp::FromCapnp for StreamInfo {
     type Reader<'a> = crate::streaming_capnp::stream_info::Reader<'a>;
 
     fn read_from(reader: Self::Reader<'_>) -> anyhow::Result<Self> {
-        let pubkey_data = reader.get_server_pubkey()?;
+        let pubkey_data = reader.get_dh_public()?;
         let mut server_pubkey = [0u8; 32];
         if pubkey_data.len() == 32 {
             server_pubkey.copy_from_slice(pubkey_data);

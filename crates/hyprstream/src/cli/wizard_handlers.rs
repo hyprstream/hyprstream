@@ -391,6 +391,7 @@ fn phase_binary_install(_state: &mut WizardState, non_interactive: bool) -> Resu
 // Phase 3: Policy Templates
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[allow(deprecated)]
 async fn phase_policy_templates(state: &mut WizardState, non_interactive: bool) -> Result<()> {
     println!("  Phase 3: Policy Template");
     println!("  {}", "-".repeat(40));
@@ -509,6 +510,7 @@ async fn apply_template(state: &mut WizardState, template: &PolicyTemplate) -> R
 // Phase 4: Users
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[allow(deprecated)]
 async fn phase_users(state: &mut WizardState, non_interactive: bool) -> Result<()> {
     println!("  Phase 4: Users & Roles");
     println!("  {}", "-".repeat(40));
@@ -753,6 +755,7 @@ async fn phase_users(state: &mut WizardState, non_interactive: bool) -> Result<(
 // Phase 5: Tokens
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[allow(deprecated)]
 async fn phase_tokens(state: &mut WizardState, non_interactive: bool) -> Result<()> {
     println!("  Phase 5: API Tokens");
     println!("  {}", "-".repeat(40));

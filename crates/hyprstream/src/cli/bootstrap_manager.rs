@@ -441,6 +441,7 @@ impl WizardBackend for BootstrapManager {
         result
     }
 
+    #[allow(deprecated)]
     fn local_username(&self) -> String {
         hyprstream_rpc::envelope::RequestIdentity::anonymous()
             .user()

@@ -147,6 +147,7 @@ impl PolicyTemplate {
     /// For the "local" template, dynamically expands to the current OS username.
     /// For static templates, returns the predefined rules.
     /// Returns owned Vec because the "local" template generates rules at runtime.
+    #[allow(deprecated)]
     pub fn expanded_policies(&self) -> Vec<ServicePolicyRule> {
         if let Some(rules) = self.policies {
             rules.iter().map(|r| ServicePolicyRule {

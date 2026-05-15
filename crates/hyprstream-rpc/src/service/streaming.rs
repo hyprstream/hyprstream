@@ -786,11 +786,11 @@ fn is_signed_envelope(msg: &[u8]) -> bool {
         return false;
     };
 
-    // Also check that signature is exactly 64 bytes (Ed25519 signature)
-    let Ok(signature) = envelope.get_signature() else {
+    // Also check that sig is exactly 64 bytes (Ed25519 signature)
+    let Ok(sig) = envelope.get_sig() else {
         return false;
     };
-    signature.len() == 64
+    sig.len() == 64
 }
 
 /// Send a multipart message over a ZMQ socket

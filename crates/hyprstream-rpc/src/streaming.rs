@@ -1836,14 +1836,15 @@ impl StreamGuard {
 /// Build a StreamRegister message wrapped in SignedEnvelope.
 ///
 /// Used by `StreamChannel::pre_authorize()` to register streams with StreamService.
+#[allow(deprecated)]
 fn build_stream_register_envelope(
     topic: &str,
     expiry: i64,
     signing_key: &SigningKey,
-    claims: Option<Claims>,
+    _claims: Option<Claims>,
 ) -> Vec<u8> {
     use crate::common_capnp;
-    use crate::envelope::{RequestEnvelope, RequestIdentity, SignedEnvelope};
+    use crate::envelope::{RequestEnvelope, SignedEnvelope};
     use crate::ToCapnp;
 
     // Build StreamRegister message
@@ -1862,10 +1863,8 @@ fn build_stream_register_envelope(
     }
 
     // Wrap in SignedEnvelope
-    let mut envelope = RequestEnvelope::new(RequestIdentity::anonymous(), inner_bytes);
-    if let Some(c) = claims {
-        envelope = envelope.with_claims(c);
-    }
+    let envelope = RequestEnvelope::new(inner_bytes);
+    // Claims are no longer carried in the envelope — authorization is via JWT/Authorization field
 
     let signed = SignedEnvelope::new_signed(envelope, signing_key);
 

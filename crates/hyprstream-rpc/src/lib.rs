@@ -177,10 +177,12 @@ pub use crypto::{
 pub use crypto::{generate_ephemeral_keypair, ristretto_dh, RistrettoPublic, RistrettoSecret};
 
 pub use envelope::{
-    unwrap_and_verify, InMemoryNonceCache, NonceCache,
-    RequestEnvelope, RequestIdentity, ResponseEnvelope, SignedEnvelope, Subject,
+    unwrap_and_verify, Authorization, FederatedToken, InMemoryNonceCache, NonceCache,
+    RequestEnvelope, ResponseEnvelope, SignedEnvelope, Subject, TokenClaims,
     MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
 };
+#[allow(deprecated)]
+pub use envelope::RequestIdentity;
 #[cfg(not(target_arch = "wasm32"))]
 pub use envelope::{
     unwrap_envelope, unwrap_envelope_as_system,
@@ -227,8 +229,8 @@ pub mod prelude {
         generate_signing_keypair, signing_key_from_bytes, verifying_key_from_bytes,
         DefaultKeyExchange, KeyExchange, SharedSecret, SigningKey, StreamHmacState, VerifyingKey,
         // Envelope
-        unwrap_envelope, unwrap_and_verify, InMemoryNonceCache, NonceCache, RequestEnvelope,
-        RequestIdentity, ResponseEnvelope, SignedEnvelope, Subject,
+        unwrap_envelope, unwrap_and_verify, Authorization, InMemoryNonceCache, NonceCache,
+        RequestEnvelope, ResponseEnvelope, SignedEnvelope, Subject,
         MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
         // Error
         EnvelopeError, EnvelopeResult, Result, RpcError,
@@ -237,6 +239,10 @@ pub mod prelude {
         // Streaming
         StreamContext, StreamPublisher,
     };
+
+    // Deprecated but still needed by downstream code (Phase 2 will remove)
+    #[allow(deprecated)]
+    pub use crate::RequestIdentity;
 
     #[cfg(not(feature = "fips"))]
     pub use crate::{generate_ephemeral_keypair, ristretto_dh, RistrettoPublic, RistrettoSecret};

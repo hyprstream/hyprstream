@@ -29,7 +29,7 @@ using import "annotations.capnp".fixedSize;
 struct StreamInfo {
   streamId @0 :Text;      # Unique stream identifier (e.g., "stream-{uuid}")
   endpoint @1 :Text;      # XPUB endpoint to subscribe to
-  serverPubkey @2 :Data $fixedSize(32);  # Server's ephemeral Ristretto255 public key for DH
+  dhPublic @2 :Data $fixedSize(32);  # Server's ephemeral Ristretto255 public key for DH
 }
 
 # Stream registration - wrapped in SignedEnvelope for authorization

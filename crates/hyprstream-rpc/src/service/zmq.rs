@@ -65,9 +65,11 @@ pub struct EnvelopeContext {
 
     /// Claimed identity from the envelope (caller-asserted, NOT authoritative).
     ///
-    /// This field is preserved for logging and legacy compatibility only.
+    /// DEPRECATED: This field is preserved for logging and legacy compatibility only.
     /// Authorization decisions MUST use `subject()`, which is derived from
     /// the verified Ed25519 signer key via `KeyRegistry`.
+    /// TODO: remove in Phase 2
+    #[allow(deprecated)]
     pub identity: RequestIdentity,
 
     /// Ephemeral public key for stream HMAC derivation (if streaming)
@@ -111,17 +113,18 @@ impl EnvelopeContext {
     ///
     /// `pub(crate)` — external callers should use the named constructors above
     /// to make the trust level explicit.
+    #[allow(deprecated)]
     pub(crate) fn from_verified(envelope: &SignedEnvelope) -> Self {
         Self {
             request_id: envelope.request_id(),
             identity: envelope.identity().clone(),
-            ephemeral_pubkey: envelope.ephemeral_pubkey().copied(),
-            claims: envelope.envelope.claims.clone(),
-            jwt_token: envelope.envelope.jwt_token.clone(),
+            ephemeral_pubkey: None,
+            claims: None,
+            jwt_token: envelope.envelope.jwt_token().map(ToOwned::to_owned),
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
-            signer_pubkey: envelope.signer_pubkey,
-            envelope_wit_hash: envelope.envelope.wit_hash,
+            signer_pubkey: envelope.cnf,
+            envelope_wit_hash: envelope.envelope.wth,
         }
     }
 
@@ -130,17 +133,18 @@ impl EnvelopeContext {
     /// Sets `key_derived_subject = Subject::new("system")`, so `subject()` always
     /// returns `"system"` for this context regardless of any caller-asserted
     /// `RequestIdentity` field. Used in `process_request` for the ZMQ path.
+    #[allow(deprecated)]
     pub fn from_verified_as_system(envelope: &SignedEnvelope) -> Self {
         Self {
             request_id: envelope.request_id(),
             identity: envelope.identity().clone(),
-            ephemeral_pubkey: envelope.ephemeral_pubkey().copied(),
-            claims: envelope.envelope.claims.clone(),
-            jwt_token: envelope.envelope.jwt_token.clone(),
+            ephemeral_pubkey: None,
+            claims: None,
+            jwt_token: envelope.envelope.jwt_token().map(ToOwned::to_owned),
             key_derived_subject: Subject::new("system"),
             jwt_subject: None,
-            signer_pubkey: envelope.signer_pubkey,
-            envelope_wit_hash: envelope.envelope.wit_hash,
+            signer_pubkey: envelope.cnf,
+            envelope_wit_hash: envelope.envelope.wth,
         }
     }
 
@@ -153,6 +157,7 @@ impl EnvelopeContext {
     /// `signer_pubkey` is zeroed because there is no real envelope; the service subject
     /// is asserted directly and is trusted because this constructor is only reachable
     /// from internal code paths that never cross a network boundary.
+    #[allow(deprecated)]
     pub fn from_callback_service(request_id: u64, service_name: &str) -> Self {
         Self {
             request_id,

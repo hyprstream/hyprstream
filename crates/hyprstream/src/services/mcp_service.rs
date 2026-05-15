@@ -32,6 +32,7 @@ use crate::services::generated::policy_client::PolicyCheck;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures::future::BoxFuture;
 use hyprstream_rpc::auth::jwt;
+#[allow(deprecated)]
 use hyprstream_rpc::envelope::RequestIdentity;
 use hyprstream_service::ServiceContext;
 use hyprstream_rpc::service::ZmqService;
@@ -105,6 +106,7 @@ pub enum ToolResult {
 }
 
 /// Context passed to handler — carries auth + ZMQ infra + optional ServiceContext
+#[allow(deprecated)]
 pub struct ToolCallContext {
     pub args: Value,
     pub signing_key: SigningKey,
@@ -731,6 +733,7 @@ impl McpService {
     ///    - Absent with Authorization header → log warning, return anonymous
     ///    - Absent without header → `RequestIdentity::anonymous()`
     /// 2. Stdio/ZMQ transport (no HTTP Parts): use env var claims or `local()`
+    #[allow(deprecated)]
     fn extract_identity(&self, context: &RequestContext<RoleServer>) -> RequestIdentity {
         // Check for HTTP transport by looking for http::request::Parts in extensions
         if let Some(parts) = context.extensions.get::<http::request::Parts>() {
@@ -767,6 +770,7 @@ impl McpService {
     }
 
     /// Dispatch a tool call by UUID with a specific identity
+    #[allow(deprecated)]
     async fn dispatch_tool(&self, uuid: &Uuid, args: Value, identity: RequestIdentity) -> Result<CallToolResult, ErrorData> {
         let entry = self.registry.get(uuid)
             .ok_or_else(|| ErrorData::invalid_request(format!("Unknown tool: {}", uuid), None))?;
@@ -971,6 +975,7 @@ impl McpHandler for McpService {
         }))
     }
 
+    #[allow(deprecated)]
     async fn handle_call_tool(
         &self,
         ctx: &crate::services::EnvelopeContext,

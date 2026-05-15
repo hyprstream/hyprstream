@@ -54,6 +54,167 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// ============================================================================
+// Authorization (new envelope auth model)
+// ============================================================================
+
+/// Authorization context carried inside a `RequestEnvelope`.
+///
+/// Replaces the legacy `identity` + `jwt_token` + `claims` fields.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Authorization {
+    /// No authorization context.
+    #[default]
+    None,
+    /// Locally-issued verified token claims.
+    Local(TokenClaims),
+    /// Token from a foreign (federated) issuer.
+    Federated(FederatedToken),
+    /// Opaque identity JAG string.
+    IdJag(String),
+}
+
+/// Verified token claims (local issuer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenClaims {
+    pub iss: String,
+    pub sub: String,
+    pub aud: Vec<String>,
+    pub exp: i64,
+    pub iat: i64,
+    pub jti: String,
+    pub scope: Vec<crate::auth::scope::Scope>,
+    pub cnf_jkt: String,
+}
+
+/// Federated token from a foreign issuer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FederatedToken {
+    pub raw: String,
+    pub claims: TokenClaims,
+    pub dpop_proof: Option<String>,
+}
+
+// Cap'n Proto impls for new Authorization types
+
+impl ToCapnp for TokenClaims {
+    type Builder<'a> = common_capnp::token_claims::Builder<'a>;
+
+    fn write_to(&self, builder: &mut Self::Builder<'_>) {
+        builder.set_iss(&self.iss);
+        builder.set_sub(&self.sub);
+        {
+            let mut aud_builder = builder.reborrow().init_aud(self.aud.len() as u32);
+            for (i, a) in self.aud.iter().enumerate() {
+                aud_builder.set(i as u32, a);
+            }
+        }
+        builder.set_exp(self.exp);
+        builder.set_iat(self.iat);
+        builder.set_jti(&self.jti);
+        {
+            let mut scope_builder = builder.reborrow().init_scope(self.scope.len() as u32);
+            for (i, s) in self.scope.iter().enumerate() {
+                let mut sb = scope_builder.reborrow().get(i as u32);
+                s.write_to(&mut sb);
+            }
+        }
+        builder.set_cnf_jkt(&self.cnf_jkt);
+    }
+}
+
+impl FromCapnp for TokenClaims {
+    type Reader<'a> = common_capnp::token_claims::Reader<'a>;
+
+    fn read_from(reader: Self::Reader<'_>) -> Result<Self> {
+        let aud_reader = reader.get_aud()?;
+        let mut aud = Vec::with_capacity(aud_reader.len() as usize);
+        for i in 0..aud_reader.len() {
+            aud.push(aud_reader.get(i)?.to_str()?.to_owned());
+        }
+
+        let scope_reader = reader.get_scope()?;
+        let mut scope = Vec::with_capacity(scope_reader.len() as usize);
+        for i in 0..scope_reader.len() {
+            scope.push(crate::auth::scope::Scope::read_from(scope_reader.get(i))?);
+        }
+
+        Ok(Self {
+            iss: reader.get_iss()?.to_str()?.to_owned(),
+            sub: reader.get_sub()?.to_str()?.to_owned(),
+            aud,
+            exp: reader.get_exp(),
+            iat: reader.get_iat(),
+            jti: reader.get_jti()?.to_str()?.to_owned(),
+            scope,
+            cnf_jkt: reader.get_cnf_jkt()?.to_str()?.to_owned(),
+        })
+    }
+}
+
+impl ToCapnp for FederatedToken {
+    type Builder<'a> = common_capnp::federated_token::Builder<'a>;
+
+    fn write_to(&self, builder: &mut Self::Builder<'_>) {
+        builder.set_raw(&self.raw);
+        self.claims.write_to(&mut builder.reborrow().init_claims());
+        if let Some(ref proof) = self.dpop_proof {
+            builder.set_dpop_proof(proof);
+        }
+    }
+}
+
+impl FromCapnp for FederatedToken {
+    type Reader<'a> = common_capnp::federated_token::Reader<'a>;
+
+    fn read_from(reader: Self::Reader<'_>) -> Result<Self> {
+        let dpop_proof = if reader.has_dpop_proof() {
+            let p = reader.get_dpop_proof()?.to_str()?;
+            if p.is_empty() { None } else { Some(p.to_owned()) }
+        } else {
+            None
+        };
+        Ok(Self {
+            raw: reader.get_raw()?.to_str()?.to_owned(),
+            claims: TokenClaims::read_from(reader.get_claims()?)?,
+            dpop_proof,
+        })
+    }
+}
+
+impl ToCapnp for Authorization {
+    type Builder<'a> = common_capnp::authorization::Builder<'a>;
+
+    fn write_to(&self, builder: &mut Self::Builder<'_>) {
+        match self {
+            Self::None => builder.set_none(()),
+            Self::Local(claims) => {
+                claims.write_to(&mut builder.reborrow().init_local());
+            }
+            Self::Federated(token) => {
+                token.write_to(&mut builder.reborrow().init_federated());
+            }
+            Self::IdJag(jag) => {
+                builder.set_id_jag(jag);
+            }
+        }
+    }
+}
+
+impl FromCapnp for Authorization {
+    type Reader<'a> = common_capnp::authorization::Reader<'a>;
+
+    fn read_from(reader: Self::Reader<'_>) -> Result<Self> {
+        use common_capnp::authorization::Which;
+        match reader.which()? {
+            Which::None(()) => Ok(Self::None),
+            Which::Local(r) => Ok(Self::Local(TokenClaims::read_from(r?)?)),
+            Which::Federated(r) => Ok(Self::Federated(FederatedToken::read_from(r?)?)),
+            Which::IdJag(r) => Ok(Self::IdJag(r?.to_str()?.to_owned())),
+        }
+    }
+}
+
 /// Cap'n Proto reader options with bounded traversal limits to prevent DoS.
 fn envelope_reader_options() -> capnp::message::ReaderOptions {
     let mut opts = capnp::message::ReaderOptions::new();
@@ -100,14 +261,14 @@ pub fn generate_nonce() -> [u8; 16] {
 
 /// Identity of a request sender.
 ///
-/// This enum represents the different ways a client can authenticate.
-/// The identity is preserved for logging only; authorization decisions use
-/// `EnvelopeContext::subject()`, which is derived from the verified Ed25519
-/// signer key via `KeyRegistry`.
+/// DEPRECATED: This type is retained for downstream compilation compatibility
+/// only. It is no longer serialized to or deserialized from Cap'n Proto wire
+/// format. Authorization decisions use `EnvelopeContext::subject()`, derived
+/// from the verified Ed25519 signer key via `KeyRegistry`.
 ///
-/// Note: The `Local` variant has been removed. Any `Local` identity received
-/// over the wire is silently downgraded to `Anonymous` in `FromCapnp`.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// TODO: remove in Phase 2
+#[deprecated(note = "Use Authorization instead — this type is no longer on the wire")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestIdentity {
     /// Authenticated via API token.
     /// User is from the token record.
@@ -122,10 +283,17 @@ pub enum RequestIdentity {
 
     /// No authentication provided.
     /// User is "anonymous".
-    #[default]
     Anonymous,
 }
 
+#[allow(deprecated, clippy::derivable_impls)]
+impl Default for RequestIdentity {
+    fn default() -> Self {
+        Self::Anonymous
+    }
+}
+
+#[allow(deprecated)]
 impl RequestIdentity {
     /// Create an API token identity.
     pub fn api_token(user: impl Into<String>, token_name: impl Into<String>) -> Self {
@@ -166,6 +334,7 @@ impl RequestIdentity {
     }
 }
 
+#[allow(deprecated)]
 impl std::fmt::Display for RequestIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -300,6 +469,7 @@ impl FromStr for Subject {
     }
 }
 
+#[allow(deprecated)]
 impl From<&RequestIdentity> for Subject {
     fn from(id: &RequestIdentity) -> Self {
         match id {
@@ -339,68 +509,12 @@ impl FromCapnp for Subject {
     }
 }
 
-// Manual Cap'n Proto implementation for RequestIdentity (union type)
-impl ToCapnp for RequestIdentity {
-    type Builder<'a> = common_capnp::request_identity::Builder<'a>;
+// NOTE: ToCapnp/FromCapnp impls for RequestIdentity have been removed.
+// The capnp types (RequestIdentity, LocalIdentity, ApiTokenIdentity, PeerIdentity)
+// no longer exist in the schema. The Rust enum is kept temporarily for downstream compat.
+// TODO: remove in Phase 2
 
-    fn write_to(&self, builder: &mut Self::Builder<'_>) {
-        match self {
-            Self::ApiToken { user, token_name } => {
-                let mut api_token = builder.reborrow().init_api_token();
-                api_token.set_user(user);
-                api_token.set_token_name(token_name);
-            }
-            Self::Peer { name, curve_key } => {
-                let mut peer = builder.reborrow().init_peer();
-                peer.set_name(name);
-                peer.set_curve_key(curve_key);
-            }
-            Self::Anonymous => {
-                builder.set_anonymous(());
-            }
-        }
-    }
-}
-
-impl FromCapnp for RequestIdentity {
-    type Reader<'a> = common_capnp::request_identity::Reader<'a>;
-
-    fn read_from(reader: Self::Reader<'_>) -> Result<Self> {
-        use common_capnp::request_identity::Which;
-
-        match reader.which()? {
-            // Wire backward compat: Local was removed from the Rust enum.
-            // Both Local and Anonymous wire variants produce Anonymous — authorization
-            // comes from the verified Ed25519 signer key, not this field.
-            Which::Local(_) | Which::Anonymous(()) => Ok(Self::Anonymous),
-            Which::ApiToken(api_token) => {
-                let api_token = api_token?;
-                Ok(Self::ApiToken {
-                    user: api_token.get_user()?.to_str()?.to_owned(),
-                    token_name: api_token.get_token_name()?.to_str()?.to_owned(),
-                })
-            }
-            Which::Peer(peer) => {
-                let peer = peer?;
-                let key_data = peer.get_curve_key()?;
-                if key_data.len() != 32 {
-                    return Err(anyhow!(
-                        "Invalid CURVE key length: expected 32, got {}",
-                        key_data.len()
-                    ));
-                }
-                let mut curve_key = [0u8; 32];
-                curve_key.copy_from_slice(key_data);
-                Ok(Self::Peer {
-                    name: peer.get_name()?.to_str()?.to_owned(),
-                    curve_key,
-                })
-            }
-        }
-    }
-}
-
-/// Unsigned envelope wrapping an RPC request with identity context.
+/// Unsigned envelope wrapping an RPC request.
 ///
 /// This struct contains all request metadata and is signed by `SignedEnvelope`.
 /// The entire serialized RequestEnvelope is covered by the signature.
@@ -408,121 +522,133 @@ impl FromCapnp for RequestIdentity {
 /// # Replay Protection
 ///
 /// - `nonce`: 16 random bytes, must be unique per request
-/// - `timestamp`: Unix milliseconds, requests older than 5 minutes are rejected
+/// - `iat`: Unix milliseconds, requests older than 5 minutes are rejected
 #[derive(Debug, Clone)]
 pub struct RequestEnvelope {
     /// Unique request ID for correlation and logging
     pub request_id: u64,
 
-    /// Identity of the requester
-    pub identity: RequestIdentity,
-
     /// Serialized inner request (e.g., RegistryRequest, InferenceRequest)
     pub payload: Vec<u8>,
 
-    /// Ristretto255/P-256 ephemeral public key for stream HMAC key derivation (optional)
-    pub ephemeral_pubkey: Option<[u8; 32]>,
+    /// Unix timestamp in milliseconds for expiration check
+    pub iat: i64,
 
     /// Random nonce for replay protection (16 bytes)
     pub nonce: [u8; 16],
 
-    /// Unix timestamp in milliseconds for expiration check
-    pub timestamp: i64,
+    /// Authorization context
+    pub authorization: Authorization,
 
-    /// User authorization claims (protected by envelope signature).
-    /// DEPRECATED: use jwt_token instead. Kept for wire compat deserialization only.
-    pub claims: Option<Claims>,
-
-    /// Opaque JWT token string. Server decodes and verifies.
-    /// Client treats this as opaque — no decoding, no trust in individual fields.
-    pub jwt_token: Option<String>,
-
-    /// Bearer token relayed by a trusted service (e.g., OAI, MCP adapter).
-    /// The service's envelope signature covers this field. The server verifies:
-    /// 1. The service is trusted for bearer relay (policy-gated)
-    /// 2. The bearer token is valid
-    /// 3. The resolved subject comes from the bearer, not the service identity
-    pub delegated_bearer: Option<String>,
+    /// Delegation token relayed by a trusted service (e.g., OAI, MCP adapter).
+    pub delegation_token: Option<String>,
 
     /// SHA-256 hash of the WIT JWT string (WIMSE wth claim).
     /// Binds this proof to a specific Workload Identity Token even when
-    /// jwtToken is omitted (trust-store cache-hit path).
-    pub wit_hash: Option<[u8; 32]>,
+    /// the JWT is omitted (trust-store cache-hit path).
+    pub wth: Option<[u8; 32]>,
 }
 
 impl RequestEnvelope {
     /// Create a new request envelope with fresh request ID, nonce, and timestamp.
-    pub fn new(identity: RequestIdentity, payload: Vec<u8>) -> Self {
+    #[allow(deprecated)]
+    pub fn new(payload: Vec<u8>) -> Self {
         Self {
             request_id: next_request_id(),
-            identity,
             payload,
-            ephemeral_pubkey: None,
+            iat: current_timestamp(),
             nonce: generate_nonce(),
-            timestamp: current_timestamp(),
-            claims: None,
-            jwt_token: None,
-            delegated_bearer: None,
-            wit_hash: None,
+            authorization: Authorization::None,
+            delegation_token: None,
+            wth: None,
         }
     }
 
-    /// Set ephemeral public key for streaming requests (DH key exchange).
-    pub fn with_ephemeral_pubkey(mut self, pubkey: [u8; 32]) -> Self {
-        self.ephemeral_pubkey = Some(pubkey);
+    /// Set authorization context.
+    pub fn with_authorization(mut self, auth: Authorization) -> Self {
+        self.authorization = auth;
         self
     }
 
-    /// Set user authorization claims.
-    /// DEPRECATED: use with_jwt_token instead.
-    pub fn with_claims(mut self, claims: Claims) -> Self {
-        self.claims = Some(claims);
-        self
-    }
-
-    /// Set opaque JWT token. Server decodes and verifies.
+    /// Set opaque JWT token as IdJag authorization.
     pub fn with_jwt_token(mut self, token: String) -> Self {
-        self.jwt_token = Some(token);
+        self.authorization = Authorization::IdJag(token);
         self
     }
 
-    /// Set delegated bearer token for relay by a trusted service.
-    pub fn with_delegated_bearer(mut self, bearer: String) -> Self {
-        self.delegated_bearer = Some(bearer);
+    /// Set delegation token for relay by a trusted service.
+    pub fn with_delegation_token(mut self, token: String) -> Self {
+        self.delegation_token = Some(token);
         self
     }
 
     /// Bind this proof to a specific WIT by storing SHA-256(jwt).
     /// Call this on cached-identity requests where jwtToken is omitted.
-    pub fn with_wit_hash_of(mut self, jwt: &str) -> Self {
+    pub fn with_wth_of(mut self, jwt: &str) -> Self {
         use sha2::{Digest, Sha256};
-        self.wit_hash = Some(Sha256::digest(jwt.as_bytes()).into());
+        self.wth = Some(Sha256::digest(jwt.as_bytes()).into());
         self
-    }
-
-    /// Create an envelope for an API token authenticated request.
-    pub fn with_token(user: impl Into<String>, token_name: impl Into<String>, payload: Vec<u8>) -> Self {
-        Self::new(RequestIdentity::api_token(user, token_name), payload)
-    }
-
-    /// Create an envelope for a peer authenticated request.
-    pub fn with_peer(name: impl Into<String>, curve_key: [u8; 32], payload: Vec<u8>) -> Self {
-        Self::new(RequestIdentity::peer(name, curve_key), payload)
     }
 
     /// Create an envelope for an anonymous request.
     pub fn anonymous(payload: Vec<u8>) -> Self {
-        Self::new(RequestIdentity::anonymous(), payload)
+        Self::new(payload)
     }
 
-    /// Get the bare username string.
-    pub fn user(&self) -> &str {
-        self.identity.user()
+    // --- Temporary compatibility shims (TODO: remove in Phase 2) ---
+
+    /// Compatibility shim: create with legacy identity parameter (ignored).
+    #[allow(deprecated)]
+    pub fn new_compat(_identity: RequestIdentity, payload: Vec<u8>) -> Self {
+        Self::new(payload)
     }
 
-    /// Get the authorization subject.
-    pub fn subject(&self) -> Subject {
-        Subject::from(&self.identity)
+    /// Compatibility shim for `with_delegated_bearer`.
+    #[deprecated(note = "Use with_delegation_token instead")]
+    pub fn with_delegated_bearer(self, bearer: String) -> Self {
+        self.with_delegation_token(bearer)
+    }
+
+    /// Compatibility shim for `with_wit_hash_of`.
+    #[deprecated(note = "Use with_wth_of instead")]
+    pub fn with_wit_hash_of(self, jwt: &str) -> Self {
+        self.with_wth_of(jwt)
+    }
+
+    /// Compatibility shim: set legacy claims as authorization context.
+    #[deprecated(note = "Use with_authorization instead")]
+    pub fn with_claims(self, _claims: Claims) -> Self {
+        // Claims are no longer carried in the envelope — this is a no-op shim.
+        self
+    }
+
+    /// Compatibility shim: set ephemeral pubkey (no longer in envelope).
+    #[deprecated(note = "Ephemeral pubkey is no longer in the envelope")]
+    pub fn with_ephemeral_pubkey(self, _pubkey: [u8; 32]) -> Self {
+        // Ephemeral pubkey has been removed from the envelope.
+        self
+    }
+
+    /// Compatibility shim: create with token identity.
+    #[allow(deprecated)]
+    #[deprecated(note = "Use new() instead — identity is no longer in the envelope")]
+    pub fn with_token(_user: impl Into<String>, _token_name: impl Into<String>, payload: Vec<u8>) -> Self {
+        Self::new(payload)
+    }
+
+    /// Compatibility shim: create with peer identity.
+    #[allow(deprecated)]
+    #[deprecated(note = "Use new() instead — identity is no longer in the envelope")]
+    pub fn with_peer(_name: impl Into<String>, _curve_key: [u8; 32], payload: Vec<u8>) -> Self {
+        Self::new(payload)
+    }
+
+    /// Extract the JWT string from authorization, if it's an IdJag.
+    pub fn jwt_token(&self) -> Option<&str> {
+        match &self.authorization {
+            Authorization::IdJag(s) => Some(s.as_str()),
+            _ => None,
+        }
     }
 
     /// Serialize this envelope to canonical Cap'n Proto bytes for signing.
@@ -623,10 +749,10 @@ pub struct SignedEnvelope {
     pub envelope: RequestEnvelope,
 
     /// Ed25519 signature over serialized envelope (64 bytes)
-    pub signature: [u8; 64],
+    pub sig: [u8; 64],
 
     /// Ed25519 public key of the signer (32 bytes)
-    pub signer_pubkey: [u8; 32],
+    pub cnf: [u8; 32],
 }
 
 /// Replay protection cache interface.
@@ -781,14 +907,14 @@ impl SignedEnvelope {
     /// Create and sign a new envelope.
     ///
     /// The signature covers the Cap'n Proto serialized bytes of the envelope.
-    /// If `jwt_token` is present and `wit_hash` is not already set, `wit_hash`
-    /// is auto-populated as SHA-256(jwt_token) per the WIMSE wth binding.
+    /// If the authorization is `IdJag` and `wth` is not already set, `wth`
+    /// is auto-populated as SHA-256(jwt) per the WIMSE wth binding.
     pub fn new_signed(mut envelope: RequestEnvelope, signing_key: &SigningKey) -> Self {
-        // Auto-populate witHash from jwtToken when present and not already set
-        if envelope.wit_hash.is_none() {
-            if let Some(ref jwt) = envelope.jwt_token {
+        // Auto-populate wth from IdJag JWT when present and not already set
+        if envelope.wth.is_none() {
+            if let Some(jwt) = envelope.jwt_token() {
                 use sha2::{Digest, Sha256};
-                envelope.wit_hash = Some(Sha256::digest(jwt.as_bytes()).into());
+                envelope.wth = Some(Sha256::digest(jwt.as_bytes()).into());
             }
         }
 
@@ -800,8 +926,8 @@ impl SignedEnvelope {
 
         Self {
             envelope,
-            signature: signature.to_bytes(),
-            signer_pubkey: signing_key.verifying_key().to_bytes(),
+            sig: signature.to_bytes(),
+            cnf: signing_key.verifying_key().to_bytes(),
         }
     }
 
@@ -825,17 +951,17 @@ impl SignedEnvelope {
         nonce_cache: &dyn NonceCache,
     ) -> EnvelopeResult<()> {
         // 1. Verify signer matches expected (constant-time comparison)
-        if !bool::from(self.signer_pubkey.ct_eq(&expected_pubkey.to_bytes())) {
+        if !bool::from(self.cnf.ct_eq(&expected_pubkey.to_bytes())) {
             return Err(EnvelopeError::SignerMismatch {
                 expected: hex::encode(expected_pubkey.to_bytes()),
-                actual: hex::encode(self.signer_pubkey),
+                actual: hex::encode(self.cnf),
             });
         }
 
         // 2. Check timestamp window
         let now = current_timestamp();
 
-        let age = now - self.envelope.timestamp;
+        let age = now - self.envelope.iat;
         if age > MAX_TIMESTAMP_AGE_MS {
             return Err(EnvelopeError::ReplayAttack(format!(
                 "timestamp too old: {age}ms > {MAX_TIMESTAMP_AGE_MS}ms"
@@ -857,7 +983,7 @@ impl SignedEnvelope {
 
         // 4. Verify signature (strict: rejects small-order public keys)
         let envelope_bytes = self.envelope.to_bytes();
-        let signature = Signature::from_bytes(&self.signature);
+        let signature = Signature::from_bytes(&self.sig);
         expected_pubkey.verify_strict(&envelope_bytes, &signature)?;
 
         Ok(())
@@ -867,15 +993,15 @@ impl SignedEnvelope {
     ///
     /// Use this for testing or when replay protection is handled elsewhere.
     pub fn verify_signature_only(&self, expected_pubkey: &VerifyingKey) -> EnvelopeResult<()> {
-        if !bool::from(self.signer_pubkey.ct_eq(&expected_pubkey.to_bytes())) {
+        if !bool::from(self.cnf.ct_eq(&expected_pubkey.to_bytes())) {
             return Err(EnvelopeError::SignerMismatch {
                 expected: hex::encode(expected_pubkey.to_bytes()),
-                actual: hex::encode(self.signer_pubkey),
+                actual: hex::encode(self.cnf),
             });
         }
 
         let envelope_bytes = self.envelope.to_bytes();
-        let signature = Signature::from_bytes(&self.signature);
+        let signature = Signature::from_bytes(&self.sig);
         expected_pubkey.verify_strict(&envelope_bytes, &signature)?;
 
         Ok(())
@@ -890,12 +1016,12 @@ impl SignedEnvelope {
         nonce_cache: &dyn NonceCache,
     ) -> EnvelopeResult<()> {
         // 1. Reconstruct the verifying key from the embedded pubkey
-        let verifying_key = VerifyingKey::from_bytes(&self.signer_pubkey)
+        let verifying_key = VerifyingKey::from_bytes(&self.cnf)
             .map_err(|_| EnvelopeError::InvalidPublicKey { expected: 32, actual: 0 })?;
 
         // 2. Check timestamp window
         let now = current_timestamp();
-        let age = now - self.envelope.timestamp;
+        let age = now - self.envelope.iat;
         if age > MAX_TIMESTAMP_AGE_MS {
             return Err(EnvelopeError::ReplayAttack(format!(
                 "timestamp too old: {age}ms > {MAX_TIMESTAMP_AGE_MS}ms"
@@ -917,7 +1043,7 @@ impl SignedEnvelope {
 
         // 4. Verify signature against the embedded public key
         let envelope_bytes = self.envelope.to_bytes();
-        let signature = Signature::from_bytes(&self.signature);
+        let signature = Signature::from_bytes(&self.sig);
         verifying_key.verify_strict(&envelope_bytes, &signature)?;
 
         Ok(())
@@ -928,24 +1054,41 @@ impl SignedEnvelope {
         self.envelope.request_id
     }
 
-    /// Get the identity from the inner envelope.
-    pub fn identity(&self) -> &RequestIdentity {
-        &self.envelope.identity
-    }
-
-    /// Get the authorization subject.
-    pub fn subject(&self) -> Subject {
-        self.envelope.subject()
-    }
-
     /// Get the payload from the inner envelope.
     pub fn payload(&self) -> &[u8] {
         &self.envelope.payload
     }
 
-    /// Get the ephemeral pubkey for stream HMAC derivation.
+    /// Get the authorization context.
+    pub fn authorization(&self) -> &Authorization {
+        &self.envelope.authorization
+    }
+
+    // --- Temporary compatibility shims (TODO: remove in Phase 2) ---
+
+    /// Compatibility shim: get a deprecated RequestIdentity (always Anonymous).
+    #[allow(deprecated)]
+    pub fn identity(&self) -> &RequestIdentity {
+        // Return a static reference to Anonymous since identity is no longer on the wire
+        static ANONYMOUS: RequestIdentity = RequestIdentity::Anonymous;
+        &ANONYMOUS
+    }
+
+    /// Compatibility shim: get the authorization subject (always anonymous from envelope).
+    pub fn subject(&self) -> Subject {
+        Subject::anonymous()
+    }
+
+    /// Compatibility shim: ephemeral pubkey is no longer in the envelope.
+    #[deprecated(note = "Ephemeral pubkey is no longer in the envelope")]
     pub fn ephemeral_pubkey(&self) -> Option<&[u8; 32]> {
-        self.envelope.ephemeral_pubkey.as_ref()
+        None
+    }
+
+    /// Compatibility shim: access signer_pubkey via the old name.
+    #[deprecated(note = "Use .cnf instead")]
+    pub fn signer_pubkey(&self) -> [u8; 32] {
+        self.cnf
     }
 }
 
@@ -954,28 +1097,16 @@ impl ToCapnp for RequestEnvelope {
 
     fn write_to(&self, builder: &mut Self::Builder<'_>) {
         builder.set_request_id(self.request_id);
-        self.identity
-            .write_to(&mut builder.reborrow().init_identity());
         builder.set_payload(&self.payload);
-        if let Some(ref pubkey) = self.ephemeral_pubkey {
-            builder.set_ephemeral_pubkey(pubkey);
-        }
+        builder.set_iat(self.iat);
         builder.set_nonce(&self.nonce);
-        builder.set_timestamp(self.timestamp);
-        // DEPRECATED: claims @6 — no longer written by clients.
-        // Server-side code that re-serializes envelopes may still write claims
-        // for backwards compat with older peers, but new envelopes use jwt_token.
-        if let Some(ref claims) = self.claims {
-            claims.write_to(&mut builder.reborrow().init_claims());
+        self.authorization
+            .write_to(&mut builder.reborrow().init_authorization());
+        if let Some(ref token) = self.delegation_token {
+            builder.set_delegation_token(token);
         }
-        if let Some(ref token) = self.jwt_token {
-            builder.set_jwt_token(token);
-        }
-        if let Some(ref bearer) = self.delegated_bearer {
-            builder.set_delegated_bearer(bearer);
-        }
-        if let Some(ref hash) = self.wit_hash {
-            builder.set_wit_hash(hash);
+        if let Some(ref hash) = self.wth {
+            builder.set_wth(hash);
         }
     }
 }
@@ -984,22 +1115,6 @@ impl FromCapnp for RequestEnvelope {
     type Reader<'a> = common_capnp::request_envelope::Reader<'a>;
 
     fn read_from(reader: Self::Reader<'_>) -> Result<Self> {
-        let ephemeral_pubkey = {
-            let data = reader.get_ephemeral_pubkey()?;
-            if data.is_empty() {
-                None
-            } else if data.len() == 32 {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(data);
-                Some(arr)
-            } else {
-                return Err(anyhow!(
-                    "Invalid ephemeral pubkey length: expected 32, got {}",
-                    data.len()
-                ));
-            }
-        };
-
         let nonce = {
             let data = reader.get_nonce()?;
             if data.len() != 16 {
@@ -1013,34 +1128,19 @@ impl FromCapnp for RequestEnvelope {
             arr
         };
 
-        let claims = {
-            if reader.has_claims() {
-                Some(Claims::read_from(reader.get_claims()?)?)
-            } else {
-                None
-            }
-        };
+        let authorization = Authorization::read_from(reader.get_authorization()?)?;
 
-        let jwt_token = {
-            if reader.has_jwt_token() {
-                let t = reader.get_jwt_token()?.to_str()?;
+        let delegation_token = {
+            if reader.has_delegation_token() {
+                let t = reader.get_delegation_token()?.to_str()?;
                 if t.is_empty() { None } else { Some(t.to_owned()) }
             } else {
                 None
             }
         };
 
-        let delegated_bearer = {
-            if reader.has_delegated_bearer() {
-                let t = reader.get_delegated_bearer()?.to_str()?;
-                if t.is_empty() { None } else { Some(t.to_owned()) }
-            } else {
-                None
-            }
-        };
-
-        let wit_hash = {
-            let data = reader.get_wit_hash()?;
+        let wth = {
+            let data = reader.get_wth()?;
             if data.is_empty() {
                 None
             } else if data.len() == 32 {
@@ -1049,7 +1149,7 @@ impl FromCapnp for RequestEnvelope {
                 Some(arr)
             } else {
                 return Err(anyhow!(
-                    "Invalid witHash length: expected 32, got {}",
+                    "Invalid wth length: expected 32, got {}",
                     data.len()
                 ));
             }
@@ -1057,15 +1157,12 @@ impl FromCapnp for RequestEnvelope {
 
         Ok(Self {
             request_id: reader.get_request_id(),
-            identity: RequestIdentity::read_from(reader.get_identity()?)?,
             payload: reader.get_payload()?.to_vec(),
-            ephemeral_pubkey,
+            iat: reader.get_iat(),
             nonce,
-            timestamp: reader.get_timestamp(),
-            claims,
-            jwt_token,
-            delegated_bearer,
-            wit_hash,
+            authorization,
+            delegation_token,
+            wth,
         })
     }
 }
@@ -1076,8 +1173,8 @@ impl ToCapnp for SignedEnvelope {
     fn write_to(&self, builder: &mut Self::Builder<'_>) {
         self.envelope
             .write_to(&mut builder.reborrow().init_envelope());
-        builder.set_signature(&self.signature);
-        builder.set_signer_pubkey(&self.signer_pubkey);
+        builder.set_sig(&self.sig);
+        builder.set_cnf(&self.cnf);
     }
 }
 
@@ -1085,11 +1182,11 @@ impl FromCapnp for SignedEnvelope {
     type Reader<'a> = common_capnp::signed_envelope::Reader<'a>;
 
     fn read_from(reader: Self::Reader<'_>) -> Result<Self> {
-        let signature = {
-            let data = reader.get_signature()?;
+        let sig = {
+            let data = reader.get_sig()?;
             if data.len() != 64 {
                 return Err(anyhow!(
-                    "Invalid signature length: expected 64, got {}",
+                    "Invalid sig length: expected 64, got {}",
                     data.len()
                 ));
             }
@@ -1098,11 +1195,11 @@ impl FromCapnp for SignedEnvelope {
             arr
         };
 
-        let signer_pubkey = {
-            let data = reader.get_signer_pubkey()?;
+        let cnf = {
+            let data = reader.get_cnf()?;
             if data.len() != 32 {
                 return Err(anyhow!(
-                    "Invalid signer pubkey length: expected 32, got {}",
+                    "Invalid cnf length: expected 32, got {}",
                     data.len()
                 ));
             }
@@ -1113,8 +1210,8 @@ impl FromCapnp for SignedEnvelope {
 
         Ok(Self {
             envelope: RequestEnvelope::read_from(reader.get_envelope()?)?,
-            signature,
-            signer_pubkey,
+            sig,
+            cnf,
         })
     }
 }
@@ -1137,10 +1234,10 @@ pub struct ResponseEnvelope {
     pub payload: Vec<u8>,
 
     /// Ed25519 signature (64 bytes) over request_id || payload
-    pub signature: [u8; 64],
+    pub sig: [u8; 64],
 
     /// Ed25519 public key of the signer (32 bytes)
-    pub signer_pubkey: [u8; 32],
+    pub cnf: [u8; 32],
 }
 
 impl ResponseEnvelope {
@@ -1155,30 +1252,20 @@ impl ResponseEnvelope {
         signing_data.extend_from_slice(&payload);
 
         let signature_obj = signing_key.sign(&signing_data);
-        let signature: [u8; 64] = signature_obj.to_bytes();
-        let signer_pubkey: [u8; 32] = signing_key.verifying_key().to_bytes();
+        let sig: [u8; 64] = signature_obj.to_bytes();
+        let cnf: [u8; 32] = signing_key.verifying_key().to_bytes();
 
         Self {
             request_id,
             payload,
-            signature,
-            signer_pubkey,
+            sig,
+            cnf,
         }
     }
 
     /// Verify the response signature.
-    ///
-    /// # Arguments
-    ///
-    /// * `expected_pubkey` - Optional expected signer public key. If provided,
-    ///   verification fails if the signer doesn't match.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` if signature is valid, `Err` otherwise.
     pub fn verify(&self, expected_pubkey: Option<&VerifyingKey>) -> Result<()> {
-        // Check signer matches expected key if provided
-        let verifying_key = VerifyingKey::from_bytes(&self.signer_pubkey)
+        let verifying_key = VerifyingKey::from_bytes(&self.cnf)
             .map_err(|_| anyhow::anyhow!("Invalid signer public key"))?;
 
         if let Some(expected) = expected_pubkey {
@@ -1187,22 +1274,26 @@ impl ResponseEnvelope {
             }
         }
 
-        // Reconstruct signing data
         let mut signing_data = Vec::with_capacity(8 + self.payload.len());
         signing_data.extend_from_slice(&self.request_id.to_le_bytes());
         signing_data.extend_from_slice(&self.payload);
 
-        // Verify signature
-        let signature = ed25519_dalek::Signature::from_bytes(&self.signature);
+        let signature = ed25519_dalek::Signature::from_bytes(&self.sig);
         verifying_key
             .verify_strict(&signing_data, &signature)
             .map_err(|_| anyhow::anyhow!("Response signature verification failed"))
     }
 
     /// Get the signer's public key.
-    pub fn signer_pubkey(&self) -> Result<VerifyingKey> {
-        VerifyingKey::from_bytes(&self.signer_pubkey)
+    pub fn cnf_key(&self) -> Result<VerifyingKey> {
+        VerifyingKey::from_bytes(&self.cnf)
             .map_err(|_| anyhow::anyhow!("Invalid signer public key"))
+    }
+
+    /// Compatibility shim for old name.
+    #[deprecated(note = "Use cnf_key() instead")]
+    pub fn signer_pubkey(&self) -> Result<VerifyingKey> {
+        self.cnf_key()
     }
 }
 
@@ -1212,8 +1303,8 @@ impl ToCapnp for ResponseEnvelope {
     fn write_to(&self, builder: &mut Self::Builder<'_>) {
         builder.set_request_id(self.request_id);
         builder.set_payload(&self.payload);
-        builder.set_signature(&self.signature);
-        builder.set_signer_pubkey(&self.signer_pubkey);
+        builder.set_sig(&self.sig);
+        builder.set_cnf(&self.cnf);
     }
 }
 
@@ -1221,25 +1312,25 @@ impl FromCapnp for ResponseEnvelope {
     type Reader<'a> = common_capnp::response_envelope::Reader<'a>;
 
     fn read_from(reader: Self::Reader<'_>) -> Result<Self> {
-        let sig_data = reader.get_signature()?;
+        let sig_data = reader.get_sig()?;
         if sig_data.len() != 64 {
-            anyhow::bail!("Invalid signature length: {}", sig_data.len());
+            anyhow::bail!("Invalid sig length: {}", sig_data.len());
         }
-        let mut signature = [0u8; 64];
-        signature.copy_from_slice(sig_data);
+        let mut sig = [0u8; 64];
+        sig.copy_from_slice(sig_data);
 
-        let pubkey_data = reader.get_signer_pubkey()?;
-        if pubkey_data.len() != 32 {
-            anyhow::bail!("Invalid signer pubkey length: {}", pubkey_data.len());
+        let cnf_data = reader.get_cnf()?;
+        if cnf_data.len() != 32 {
+            anyhow::bail!("Invalid cnf length: {}", cnf_data.len());
         }
-        let mut signer_pubkey = [0u8; 32];
-        signer_pubkey.copy_from_slice(pubkey_data);
+        let mut cnf = [0u8; 32];
+        cnf.copy_from_slice(cnf_data);
 
         Ok(Self {
             request_id: reader.get_request_id(),
             payload: reader.get_payload()?.to_vec(),
-            signature,
-            signer_pubkey,
+            sig,
+            cnf,
         })
     }
 }
@@ -1385,6 +1476,7 @@ pub fn unwrap_response(
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::crypto::signing::generate_signing_keypair;
@@ -1418,14 +1510,6 @@ mod tests {
     }
 
     #[test]
-    fn test_peer_identity() {
-        let key = [0u8; 32];
-        let identity = RequestIdentity::peer("gpu-server-1", key);
-        assert_eq!(identity.user(), "gpu-server-1");
-        assert!(identity.is_authenticated());
-    }
-
-    #[test]
     fn test_anonymous_identity() {
         let identity = RequestIdentity::anonymous();
         assert_eq!(identity.user(), "anonymous");
@@ -1433,52 +1517,12 @@ mod tests {
     }
 
     #[test]
-    fn test_identity_user_extraction() {
-        // API token identity
-        let token = RequestIdentity::ApiToken {
-            user: "bob".into(),
-            token_name: "ci".into(),
-        };
-        assert_eq!(token.user(), "bob");
-
-        // Peer identity
-        let peer = RequestIdentity::Peer {
-            name: "gpu-server-1".into(),
-            curve_key: [0u8; 32],
-        };
-        assert_eq!(peer.user(), "gpu-server-1");
-
-        // Anonymous
-        let anon = RequestIdentity::Anonymous;
-        assert_eq!(anon.user(), "anonymous");
-
-        // Different identity types for the same user produce equal subjects
-        let alice_token = RequestIdentity::ApiToken {
-            user: "alice".into(),
-            token_name: "ci".into(),
-        };
-        let alice_peer = RequestIdentity::Peer {
-            name: "alice".into(),
-            curve_key: [0u8; 32],
-        };
-        assert_eq!(Subject::from(&alice_token), Subject::from(&alice_peer));
-    }
-
-    #[test]
     fn test_request_envelope() {
         let envelope = RequestEnvelope::anonymous(vec![1, 2, 3]);
-        assert_eq!(envelope.user(), "anonymous");
         assert_eq!(envelope.payload, vec![1, 2, 3]);
         assert!(envelope.request_id > 0);
-        assert!(envelope.timestamp > 0);
+        assert!(envelope.iat > 0);
         assert!(envelope.nonce.iter().any(|&b| b != 0)); // Not all zeros
-    }
-
-    #[test]
-    fn test_request_envelope_with_ephemeral_pubkey() {
-        let pubkey = [42u8; 32];
-        let envelope = RequestEnvelope::anonymous(vec![]).with_ephemeral_pubkey(pubkey);
-        assert_eq!(envelope.ephemeral_pubkey, Some(pubkey));
     }
 
     #[test]
@@ -1545,95 +1589,18 @@ mod tests {
     fn test_signed_envelope_accessors() {
         let (signing_key, _) = generate_signing_keypair();
 
-        let envelope =
-            RequestEnvelope::with_token("alice", "deploy", vec![5, 6, 7]).with_ephemeral_pubkey([99u8; 32]);
+        let envelope = RequestEnvelope::anonymous(vec![5, 6, 7]);
         let signed = SignedEnvelope::new_signed(envelope, &signing_key);
 
         assert!(signed.request_id() > 0);
-        assert_eq!(signed.identity().user(), "alice");
-        assert_eq!(signed.subject().to_string(), "alice");
         assert_eq!(signed.payload(), &[5, 6, 7]);
-        assert_eq!(signed.ephemeral_pubkey(), Some(&[99u8; 32]));
-    }
-
-    #[test]
-    fn test_capnp_local_wire_downgrade() -> anyhow::Result<()> {
-        // Wire backward compat: a peer running old code may send Local identity.
-        // Verify that FromCapnp silently downgrades it to Anonymous.
-        use capnp::message::Builder;
-
-        let mut message = Builder::new_default();
-        let mut builder = message.init_root::<common_capnp::request_identity::Builder>();
-        // Write the Local variant directly via the Cap'n Proto builder (no Rust variant needed).
-        let mut local = builder.reborrow().init_local();
-        local.set_user("alice");
-
-        let reader = builder.into_reader();
-        let decoded = RequestIdentity::read_from(reader)?;
-
-        // Must be downgraded — Local is no longer trusted.
-        assert_eq!(decoded, RequestIdentity::Anonymous);
-        Ok(())
-    }
-
-    #[test]
-    fn test_capnp_roundtrip_api_token() -> anyhow::Result<()> {
-        use capnp::message::Builder;
-
-        let identity = RequestIdentity::api_token("alice", "prod-key");
-
-        let mut message = Builder::new_default();
-        let mut builder = message.init_root::<common_capnp::request_identity::Builder>();
-        identity.write_to(&mut builder);
-
-        let reader = builder.into_reader();
-        let decoded = RequestIdentity::read_from(reader)?;
-
-        assert_eq!(identity, decoded);
-        Ok(())
-    }
-
-    #[test]
-    fn test_capnp_roundtrip_peer() -> anyhow::Result<()> {
-        use capnp::message::Builder;
-
-        let curve_key = [42u8; 32];
-        let identity = RequestIdentity::peer("gpu-node-1", curve_key);
-
-        let mut message = Builder::new_default();
-        let mut builder = message.init_root::<common_capnp::request_identity::Builder>();
-        identity.write_to(&mut builder);
-
-        let reader = builder.into_reader();
-        let decoded = RequestIdentity::read_from(reader)?;
-
-        assert_eq!(identity, decoded);
-        Ok(())
-    }
-
-    #[test]
-    fn test_capnp_roundtrip_anonymous() -> anyhow::Result<()> {
-        use capnp::message::Builder;
-
-        let identity = RequestIdentity::anonymous();
-
-        let mut message = Builder::new_default();
-        let mut builder = message.init_root::<common_capnp::request_identity::Builder>();
-        identity.write_to(&mut builder);
-
-        let reader = builder.into_reader();
-        let decoded = RequestIdentity::read_from(reader)?;
-
-        assert_eq!(identity, decoded);
-        Ok(())
     }
 
     #[test]
     fn test_capnp_roundtrip_envelope() -> anyhow::Result<()> {
         use capnp::message::Builder;
 
-        let envelope = RequestEnvelope::with_token("bob", "ci-pipeline", vec![1, 2, 3, 4])
-            .with_ephemeral_pubkey([77u8; 32]);
+        let envelope = RequestEnvelope::anonymous(vec![1, 2, 3, 4]);
 
         let mut message = Builder::new_default();
         let mut builder = message.init_root::<common_capnp::request_envelope::Builder>();
@@ -1643,11 +1610,9 @@ mod tests {
         let decoded = RequestEnvelope::read_from(reader)?;
 
         assert_eq!(envelope.request_id, decoded.request_id);
-        assert_eq!(envelope.identity, decoded.identity);
         assert_eq!(envelope.payload, decoded.payload);
         assert_eq!(envelope.nonce, decoded.nonce);
-        assert_eq!(envelope.timestamp, decoded.timestamp);
-        assert_eq!(envelope.ephemeral_pubkey, decoded.ephemeral_pubkey);
+        assert_eq!(envelope.iat, decoded.iat);
         Ok(())
     }
 
@@ -1668,8 +1633,8 @@ mod tests {
 
         assert_eq!(signed.envelope.request_id, decoded.envelope.request_id);
         assert_eq!(signed.envelope.payload, decoded.envelope.payload);
-        assert_eq!(signed.signature, decoded.signature);
-        assert_eq!(signed.signer_pubkey, decoded.signer_pubkey);
+        assert_eq!(signed.sig, decoded.sig);
+        assert_eq!(signed.cnf, decoded.cnf);
 
         // Verify the decoded envelope still has valid signature
         decoded.verify_signature_only(&verifying_key)?;
@@ -1717,28 +1682,20 @@ mod tests {
 
     #[test]
     fn test_subject_legacy_prefix_parsing() {
-        // Legacy prefixed formats should strip the prefix
         assert_eq!("local:alice".parse::<Subject>().expect("parse local:alice"), Subject::new("alice"));
         assert_eq!("token:bob".parse::<Subject>().expect("parse token:bob"), Subject::new("bob"));
         assert_eq!("peer:gpu-1".parse::<Subject>().expect("parse peer:gpu-1"), Subject::new("gpu-1"));
         assert_eq!("user:charlie".parse::<Subject>().expect("parse user:charlie"), Subject::new("charlie"));
-
-        // Bare names pass through
         assert_eq!("alice".parse::<Subject>().expect("parse alice"), Subject::new("alice"));
-
-        // Unknown prefixes are treated as bare names (contain ':')
         assert_eq!("unknown:foo".parse::<Subject>().expect("parse unknown:foo"), Subject::new("unknown:foo"));
     }
 
     #[test]
     fn test_subject_validate() {
-        // Valid names
         assert!(Subject::new("alice").validate().is_ok());
         assert!(Subject::new("bob_123").validate().is_ok());
         assert!(Subject::new("gpu-server.1").validate().is_ok());
         assert!(Subject::anonymous().validate().is_ok());
-
-        // Invalid names
         assert!(Subject::new("../evil").validate().is_err());
         assert!(Subject::new("bob/root").validate().is_err());
         assert!(Subject::new("").validate().is_err());
@@ -1754,7 +1711,6 @@ mod tests {
         set.insert(Subject::new("bob"));
         assert_eq!(set.len(), 2);
 
-        // Same user from different identity types produces equal subjects
         let from_token = Subject::from(&RequestIdentity::ApiToken { user: "alice".into(), token_name: "ci".into() });
         let from_peer = Subject::from(&RequestIdentity::Peer { name: "alice".into(), curve_key: [0u8; 32] });
         assert_eq!(from_token, from_peer);
@@ -1818,26 +1774,47 @@ mod tests {
         use crate::auth::{jwt, Claims};
         use ed25519_dalek::SigningKey;
 
-        // Node A issues a JWT
         let key_a = SigningKey::from_bytes(&[0xAAu8; 32]);
         let vk_a = key_a.verifying_key();
         let claims = Claims::new("alice".to_owned(), 0, 9_999_999_999)
             .with_issuer("https://node-a".to_owned());
         let token = jwt::encode(&claims, &key_a);
 
-        // Node B verifies using decode_with_key (key obtained from FederationKeyResolver)
         let decoded = jwt::decode_with_key(&token, &vk_a, None)
             .expect("federated token must verify with issuer key");
         assert_eq!(decoded.iss, "https://node-a");
         assert_eq!(decoded.sub, "alice");
 
-        // Construct the federated subject
         let subject = Subject::federated(&decoded.iss, &decoded.sub);
         assert_eq!(subject.to_string(), "https://node-a:alice");
         assert!(subject.is_federated());
 
-        // Local tokens produce non-federated subjects
         let local = Subject::new(&decoded.sub);
         assert!(!local.is_federated());
+    }
+
+    #[test]
+    fn test_authorization_capnp_roundtrip() -> anyhow::Result<()> {
+        use capnp::message::Builder;
+
+        // Test None variant
+        let auth = Authorization::None;
+        let mut msg = Builder::new_default();
+        let mut builder = msg.init_root::<common_capnp::authorization::Builder>();
+        auth.write_to(&mut builder);
+        let reader = builder.into_reader();
+        let decoded = Authorization::read_from(reader)?;
+        assert_eq!(auth, decoded);
+
+        // Test IdJag variant
+        let auth = Authorization::IdJag("test-token".to_owned());
+        let mut msg = Builder::new_default();
+        let mut builder = msg.init_root::<common_capnp::authorization::Builder>();
+        auth.write_to(&mut builder);
+        let reader = builder.into_reader();
+        let decoded = Authorization::read_from(reader)?;
+        assert_eq!(auth, decoded);
+
+        Ok(())
     }
 }

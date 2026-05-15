@@ -8,6 +8,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::crypto::SigningKey;
+#[allow(deprecated)]
 use crate::envelope::RequestIdentity;
 use crate::identity::SigningIdentity;
 use crate::transport_traits::Signer;
@@ -16,11 +17,13 @@ use crate::transport_traits::Signer;
 ///
 /// Signs synchronously — the async wrapper resolves immediately.
 /// Used for server-to-server RPC where the signing key is local.
+#[allow(deprecated)]
 pub struct LocalSigner {
     signing_key: SigningKey,
     identity: RequestIdentity,
 }
 
+#[allow(deprecated)]
 impl LocalSigner {
     pub fn new(signing_key: SigningKey, identity: RequestIdentity) -> Self {
         Self { signing_key, identity }
@@ -31,6 +34,7 @@ impl LocalSigner {
     }
 }
 
+#[allow(deprecated)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl Signer for LocalSigner {
@@ -52,17 +56,20 @@ impl Signer for LocalSigner {
 ///
 /// Bridges the `IdentityProvider` abstraction to the `Signer` trait
 /// used by `RpcClientImpl`. Created via `IdentityProvider::identity_open()`.
+#[allow(deprecated)]
 pub struct IdentitySigner {
     identity_handle: Box<dyn SigningIdentity>,
     request_identity: RequestIdentity,
 }
 
+#[allow(deprecated)]
 impl IdentitySigner {
     pub fn new(identity_handle: Box<dyn SigningIdentity>, request_identity: RequestIdentity) -> Self {
         Self { identity_handle, request_identity }
     }
 }
 
+#[allow(deprecated)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl Signer for IdentitySigner {

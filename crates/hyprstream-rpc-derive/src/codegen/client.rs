@@ -479,6 +479,7 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
 
     quote! {
         #[cfg(not(target_arch = "wasm32"))]
+        #[allow(deprecated)]
         impl #client_name {
             /// The service name used for endpoint resolution.
             pub const SERVICE_NAME: &'static str = #service_name_lit;
