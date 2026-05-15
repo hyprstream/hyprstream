@@ -1066,14 +1066,6 @@ impl SignedEnvelope {
 
     // --- Temporary compatibility shims (TODO: remove in Phase 2) ---
 
-    /// Compatibility shim: get a deprecated RequestIdentity (always Anonymous).
-    #[allow(deprecated)]
-    pub fn identity(&self) -> &RequestIdentity {
-        // Return a static reference to Anonymous since identity is no longer on the wire
-        static ANONYMOUS: RequestIdentity = RequestIdentity::Anonymous;
-        &ANONYMOUS
-    }
-
     /// Compatibility shim: get the authorization subject (always anonymous from envelope).
     pub fn subject(&self) -> Subject {
         Subject::anonymous()

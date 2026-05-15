@@ -63,14 +63,8 @@ pub struct EnvelopeContext {
     /// Unique request ID for correlation and logging
     pub request_id: u64,
 
-    /// Claimed identity from the envelope (caller-asserted, NOT authoritative).
-    ///
-    /// DEPRECATED: This field is preserved for logging and legacy compatibility only.
-    /// Authorization decisions MUST use `subject()`, which is derived from
-    /// the verified Ed25519 signer key via `KeyRegistry`.
-    /// TODO: remove in Phase 2
-    #[allow(deprecated)]
-    pub identity: RequestIdentity,
+    /// Authorization context from the envelope.
+    pub authorization: Authorization,
 
     /// Ephemeral public key for stream HMAC derivation (if streaming)
     pub ephemeral_pubkey: Option<[u8; 32]>,
@@ -113,11 +107,10 @@ impl EnvelopeContext {
     ///
     /// `pub(crate)` — external callers should use the named constructors above
     /// to make the trust level explicit.
-    #[allow(deprecated)]
     pub(crate) fn from_verified(envelope: &SignedEnvelope) -> Self {
         Self {
             request_id: envelope.request_id(),
-            identity: envelope.identity().clone(),
+            authorization: envelope.envelope.authorization.clone(),
             ephemeral_pubkey: None,
             claims: None,
             jwt_token: envelope.envelope.jwt_token().map(ToOwned::to_owned),
@@ -132,12 +125,11 @@ impl EnvelopeContext {
     ///
     /// Sets `key_derived_subject = Subject::new("system")`, so `subject()` always
     /// returns `"system"` for this context regardless of any caller-asserted
-    /// `RequestIdentity` field. Used in `process_request` for the ZMQ path.
-    #[allow(deprecated)]
+    /// authorization field. Used in `process_request` for the ZMQ path.
     pub fn from_verified_as_system(envelope: &SignedEnvelope) -> Self {
         Self {
             request_id: envelope.request_id(),
-            identity: envelope.identity().clone(),
+            authorization: envelope.envelope.authorization.clone(),
             ephemeral_pubkey: None,
             claims: None,
             jwt_token: envelope.envelope.jwt_token().map(ToOwned::to_owned),
@@ -157,11 +149,10 @@ impl EnvelopeContext {
     /// `signer_pubkey` is zeroed because there is no real envelope; the service subject
     /// is asserted directly and is trusted because this constructor is only reachable
     /// from internal code paths that never cross a network boundary.
-    #[allow(deprecated)]
     pub fn from_callback_service(request_id: u64, service_name: &str) -> Self {
         Self {
             request_id,
-            identity: RequestIdentity::Anonymous,
+            authorization: Authorization::None,
             ephemeral_pubkey: None,
             claims: None,
             jwt_token: None,
@@ -181,7 +172,7 @@ impl EnvelopeContext {
     ///    Federated JWTs (`iss` non-empty) produce `Subject::federated(iss, sub)`.
     /// 3. `Subject::anonymous()` — no verified identity.
     ///
-    /// The caller-asserted `RequestIdentity` field is never consulted for
+    /// The caller-asserted authorization field is never consulted for
     /// authorization. It is preserved only for logging.
     pub fn subject(&self) -> Subject {
         // Prefer key-derived subject (cryptographically proven via signer key)
@@ -199,12 +190,19 @@ impl EnvelopeContext {
 
     /// Get the bare username string.
     pub fn user(&self) -> &str {
-        self.identity.user()
+        // Resolution order mirrors subject(): prefer key-derived, then JWT, then anonymous.
+        if !self.key_derived_subject.is_anonymous() {
+            return self.key_derived_subject.name().unwrap_or("anonymous");
+        }
+        if let Some(ref s) = self.jwt_subject {
+            return s.name().unwrap_or("anonymous");
+        }
+        "anonymous"
     }
 
     /// Check if the identity is authenticated (not anonymous).
     pub fn is_authenticated(&self) -> bool {
-        self.identity.is_authenticated()
+        !self.subject().is_anonymous()
     }
 
     /// Get user claims (if present, after verify_claims has run).

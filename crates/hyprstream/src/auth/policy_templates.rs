@@ -147,7 +147,6 @@ impl PolicyTemplate {
     /// For the "local" template, dynamically expands to the current OS username.
     /// For static templates, returns the predefined rules.
     /// Returns owned Vec because the "local" template generates rules at runtime.
-    #[allow(deprecated)]
     pub fn expanded_policies(&self) -> Vec<ServicePolicyRule> {
         if let Some(rules) = self.policies {
             rules.iter().map(|r| ServicePolicyRule {
@@ -158,7 +157,7 @@ impl PolicyTemplate {
                 effect: r.effect,
             }).collect::<Vec<_>>()
         } else if self.name == "local" {
-            let user = hyprstream_rpc::envelope::RequestIdentity::anonymous().user().to_owned();
+            let user = "anonymous".to_owned();
             vec![ServicePolicyRule {
                 subject: user.leak(),
                 domain: "*",

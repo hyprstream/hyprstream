@@ -57,9 +57,8 @@ mod tests {
         }
     }
 
-    #[allow(deprecated)]
     fn make_client(endpoint: &str, signing_key: SigningKey, server_verifying_key: VerifyingKey) -> RpcClientImpl<LocalSigner, ZmqConnection> {
-        let signer = LocalSigner::new(signing_key, RequestIdentity::anonymous());
+        let signer = LocalSigner::new(signing_key);
         let transport = ZmqConnection::new(endpoint, global_context());
         RpcClientImpl::new(signer, transport, Some(server_verifying_key))
     }

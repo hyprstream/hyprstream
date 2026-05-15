@@ -441,11 +441,8 @@ impl WizardBackend for BootstrapManager {
         result
     }
 
-    #[allow(deprecated)]
     fn local_username(&self) -> String {
-        hyprstream_rpc::envelope::RequestIdentity::anonymous()
-            .user()
-            .to_owned()
+        "anonymous".to_owned()
     }
 
     fn templates(&self) -> Vec<TemplateInfo> {

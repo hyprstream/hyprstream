@@ -391,7 +391,6 @@ fn phase_binary_install(_state: &mut WizardState, non_interactive: bool) -> Resu
 // Phase 3: Policy Templates
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[allow(deprecated)]
 async fn phase_policy_templates(state: &mut WizardState, non_interactive: bool) -> Result<()> {
     println!("  Phase 3: Policy Template");
     println!("  {}", "-".repeat(40));
@@ -436,9 +435,7 @@ async fn phase_policy_templates(state: &mut WizardState, non_interactive: bool) 
     }
 
     // Build selection options
-    let local_user = hyprstream_rpc::envelope::RequestIdentity::anonymous()
-        .user()
-        .to_owned();
+    let local_user = "anonymous".to_owned();
 
     let mut options: Vec<String> = templates
         .iter()
@@ -510,7 +507,6 @@ async fn apply_template(state: &mut WizardState, template: &PolicyTemplate) -> R
 // Phase 4: Users
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[allow(deprecated)]
 async fn phase_users(state: &mut WizardState, non_interactive: bool) -> Result<()> {
     println!("  Phase 4: Users & Roles");
     println!("  {}", "-".repeat(40));
@@ -576,9 +572,7 @@ async fn phase_users(state: &mut WizardState, non_interactive: bool) -> Result<(
         println!();
     }
 
-    let local_user = hyprstream_rpc::envelope::RequestIdentity::anonymous()
-        .user()
-        .to_owned();
+    let local_user = "anonymous".to_owned();
 
     // Non-interactive: auto-create admin if no local users exist in UserStore
     if non_interactive {
@@ -755,7 +749,6 @@ async fn phase_users(state: &mut WizardState, non_interactive: bool) -> Result<(
 // Phase 5: Tokens
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[allow(deprecated)]
 async fn phase_tokens(state: &mut WizardState, non_interactive: bool) -> Result<()> {
     println!("  Phase 5: API Tokens");
     println!("  {}", "-".repeat(40));
@@ -779,9 +772,7 @@ async fn phase_tokens(state: &mut WizardState, non_interactive: bool) -> Result<
 
     // In non-interactive mode, generate a token for the local user
     if non_interactive {
-        let local_user = hyprstream_rpc::envelope::RequestIdentity::anonymous()
-            .user()
-            .to_owned();
+        let local_user = "anonymous".to_owned();
 
         generate_token(state, &signing_key, &local_user, "90d")?;
         println!();
@@ -790,9 +781,7 @@ async fn phase_tokens(state: &mut WizardState, non_interactive: bool) -> Result<
 
     // If no users created, ask if they want to create a token for the local user
     if users_for_tokens.is_empty() {
-        let local_user = hyprstream_rpc::envelope::RequestIdentity::anonymous()
-            .user()
-            .to_owned();
+        let local_user = "anonymous".to_owned();
 
         let create_local = Confirm::new(&format!(
             "  Generate API token for local user '{local_user}'?"

@@ -1836,7 +1836,6 @@ impl StreamGuard {
 /// Build a StreamRegister message wrapped in SignedEnvelope.
 ///
 /// Used by `StreamChannel::pre_authorize()` to register streams with StreamService.
-#[allow(deprecated)]
 fn build_stream_register_envelope(
     topic: &str,
     expiry: i64,

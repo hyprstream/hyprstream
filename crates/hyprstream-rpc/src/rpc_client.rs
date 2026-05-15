@@ -270,7 +270,6 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
     }
 
     /// Build, sign, and serialize a request envelope.
-    #[allow(deprecated)]
     async fn sign_envelope(
         &self,
         request_id: u64,

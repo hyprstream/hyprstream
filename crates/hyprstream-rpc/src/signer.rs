@@ -8,8 +8,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::crypto::SigningKey;
-#[allow(deprecated)]
-use crate::envelope::RequestIdentity;
 use crate::identity::SigningIdentity;
 use crate::transport_traits::Signer;
 
@@ -17,16 +15,13 @@ use crate::transport_traits::Signer;
 ///
 /// Signs synchronously — the async wrapper resolves immediately.
 /// Used for server-to-server RPC where the signing key is local.
-#[allow(deprecated)]
 pub struct LocalSigner {
     signing_key: SigningKey,
-    identity: RequestIdentity,
 }
 
-#[allow(deprecated)]
 impl LocalSigner {
-    pub fn new(signing_key: SigningKey, identity: RequestIdentity) -> Self {
-        Self { signing_key, identity }
+    pub fn new(signing_key: SigningKey) -> Self {
+        Self { signing_key }
     }
 
     pub fn signing_key(&self) -> &SigningKey {
@@ -34,16 +29,11 @@ impl LocalSigner {
     }
 }
 
-#[allow(deprecated)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl Signer for LocalSigner {
     fn pubkey(&self) -> [u8; 32] {
         self.signing_key.verifying_key().to_bytes()
-    }
-
-    fn identity(&self) -> RequestIdentity {
-        self.identity.clone()
     }
 
     async fn sign(&self, canonical_bytes: &[u8]) -> Result<[u8; 64]> {
@@ -56,29 +46,21 @@ impl Signer for LocalSigner {
 ///
 /// Bridges the `IdentityProvider` abstraction to the `Signer` trait
 /// used by `RpcClientImpl`. Created via `IdentityProvider::identity_open()`.
-#[allow(deprecated)]
 pub struct IdentitySigner {
     identity_handle: Box<dyn SigningIdentity>,
-    request_identity: RequestIdentity,
 }
 
-#[allow(deprecated)]
 impl IdentitySigner {
-    pub fn new(identity_handle: Box<dyn SigningIdentity>, request_identity: RequestIdentity) -> Self {
-        Self { identity_handle, request_identity }
+    pub fn new(identity_handle: Box<dyn SigningIdentity>) -> Self {
+        Self { identity_handle }
     }
 }
 
-#[allow(deprecated)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl Signer for IdentitySigner {
     fn pubkey(&self) -> [u8; 32] {
         self.identity_handle.pubkey()
-    }
-
-    fn identity(&self) -> RequestIdentity {
-        self.request_identity.clone()
     }
 
     async fn sign(&self, canonical_bytes: &[u8]) -> Result<[u8; 64]> {
@@ -98,7 +80,6 @@ mod wasm {
     use wasm_bindgen::prelude::*;
     use wasm_bindgen_futures::JsFuture;
 
-    use crate::envelope::RequestIdentity;
     use crate::transport_traits::Signer;
 
     /// WASM signer that delegates to a JavaScript async callback.
@@ -132,11 +113,6 @@ mod wasm {
     impl Signer for JsSigner {
         fn pubkey(&self) -> [u8; 32] {
             self.pubkey
-        }
-
-        fn identity(&self) -> RequestIdentity {
-            // Client identity is Anonymous — server derives subject from verified JWT.
-            RequestIdentity::Anonymous
         }
 
         async fn sign(&self, canonical_bytes: &[u8]) -> Result<[u8; 64]> {

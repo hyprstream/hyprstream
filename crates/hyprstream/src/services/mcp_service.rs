@@ -32,8 +32,6 @@ use crate::services::generated::policy_client::PolicyCheck;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures::future::BoxFuture;
 use hyprstream_rpc::auth::jwt;
-#[allow(deprecated)]
-use hyprstream_rpc::envelope::RequestIdentity;
 use hyprstream_service::ServiceContext;
 use hyprstream_rpc::service::ZmqService;
 use hyprstream_rpc::streaming::{StreamHandle, StreamPayload};
@@ -106,13 +104,12 @@ pub enum ToolResult {
 }
 
 /// Context passed to handler — carries auth + ZMQ infra + optional ServiceContext
-#[allow(deprecated)]
 pub struct ToolCallContext {
     pub args: Value,
     pub signing_key: SigningKey,
     pub zmq_context: Arc<zmq::Context>,
-    /// Authenticated identity propagated to backend services
-    pub identity: RequestIdentity,
+    /// Authenticated user string propagated to backend services
+    pub user: String,
     /// ServiceContext for typed_client() / client() access (optional for backward compat)
     pub ctx: Option<Arc<ServiceContext>>,
     /// PolicyClient for resolving peer verifying keys
@@ -729,49 +726,39 @@ impl McpService {
     ///
     /// Priority:
     /// 1. HTTP transport: use `AuthenticatedUser` from middleware (already validated)
-    ///    - Present → `RequestIdentity::api_token(user, "mcp")`
-    ///    - Absent with Authorization header → log warning, return anonymous
-    ///    - Absent without header → `RequestIdentity::anonymous()`
-    /// 2. Stdio/ZMQ transport (no HTTP Parts): use env var claims or `local()`
-    #[allow(deprecated)]
-    fn extract_identity(&self, context: &RequestContext<RoleServer>) -> RequestIdentity {
-        // Check for HTTP transport by looking for http::request::Parts in extensions
+    /// 2. Stdio/ZMQ transport (no HTTP Parts): use env var JWT claims or `"anonymous"`
+    fn extract_user(&self, context: &RequestContext<RoleServer>) -> String {
         if let Some(parts) = context.extensions.get::<http::request::Parts>() {
-            // HTTP transport — use AuthenticatedUser from middleware (already JWT-validated)
             if let Some(auth_user) = parts.extensions.get::<crate::server::middleware::AuthenticatedUser>() {
                 trace!("MCP HTTP auth: using validated identity for {}", auth_user.user);
-                return RequestIdentity::api_token(&auth_user.user, "mcp");
+                return auth_user.user.clone();
             }
 
-            // No AuthenticatedUser — check if there was an Authorization header
-            // (if present, middleware already rejected invalid tokens, so this shouldn't happen)
             if parts.headers.contains_key(AUTHORIZATION) {
                 warn!("MCP HTTP auth: Authorization header present but no AuthenticatedUser — middleware should have rejected");
             } else {
                 trace!("MCP HTTP auth: no Authorization header, anonymous access");
             }
-            RequestIdentity::anonymous()
+            "anonymous".to_owned()
         } else {
             trace!("MCP HTTP auth: no http::request::Parts in extensions (stdio/zmq transport)");
-            // Stdio/ZMQ transport — decode env token per-request
             match &self.stdio_token {
                 Some(token) => {
                     match jwt::decode(token, &self.verifying_key, self.expected_audience.as_deref()) {
-                        Ok(claims) => RequestIdentity::api_token(&claims.sub, "mcp"),
+                        Ok(claims) => claims.sub.clone(),
                         Err(e) => {
                             warn!("MCP stdio auth: token decode failed ({}), downgrading to anonymous", e);
-                            RequestIdentity::anonymous()
+                            "anonymous".to_owned()
                         }
                     }
                 }
-                None => RequestIdentity::anonymous(),
+                None => "anonymous".to_owned(),
             }
         }
     }
 
     /// Dispatch a tool call by UUID with a specific identity
-    #[allow(deprecated)]
-    async fn dispatch_tool(&self, uuid: &Uuid, args: Value, identity: RequestIdentity) -> Result<CallToolResult, ErrorData> {
+    async fn dispatch_tool(&self, uuid: &Uuid, args: Value, user: String) -> Result<CallToolResult, ErrorData> {
         let entry = self.registry.get(uuid)
             .ok_or_else(|| ErrorData::invalid_request(format!("Unknown tool: {}", uuid), None))?;
 
@@ -779,7 +766,7 @@ impl McpService {
             args,
             signing_key: self.signing_key.clone(),
             zmq_context: self.context.clone(),
-            identity,
+            user,
             ctx: self.service_ctx.clone(),
             policy_client: self.policy_client.clone(),
         };
@@ -868,7 +855,7 @@ impl ServerHandler for McpService {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<CallToolResult, ErrorData>> + Send + '_ {
-        let identity = self.extract_identity(&context);
+        let user = self.extract_user(&context);
         async move {
             let uuid = Uuid::parse_str(&request.name)
                 .map_err(|e| ErrorData::invalid_request(format!("Invalid UUID: {}", e), None))?;
@@ -878,7 +865,7 @@ impl ServerHandler for McpService {
                 None => Value::Object(serde_json::Map::new()),
             };
 
-            self.dispatch_tool(&uuid, args, identity).await
+            self.dispatch_tool(&uuid, args, user).await
         }
     }
 }
@@ -975,7 +962,6 @@ impl McpHandler for McpService {
         }))
     }
 
-    #[allow(deprecated)]
     async fn handle_call_tool(
         &self,
         ctx: &crate::services::EnvelopeContext,
@@ -991,9 +977,8 @@ impl McpHandler for McpService {
             serde_json::from_str(&data.arguments)?
         };
 
-        // ZMQ transport: use envelope identity (already authenticated by ZMQ layer)
-        let identity = RequestIdentity::api_token(ctx.user(), "mcp");
-        let result = self.dispatch_tool(&uuid, args, identity).await;
+        let user = ctx.user().to_owned();
+        let result = self.dispatch_tool(&uuid, args, user).await;
 
         match result {
             Ok(call_result) => {

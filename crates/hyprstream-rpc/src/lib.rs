@@ -181,8 +181,6 @@ pub use envelope::{
     RequestEnvelope, ResponseEnvelope, SignedEnvelope, Subject, TokenClaims,
     MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
 };
-#[allow(deprecated)]
-pub use envelope::RequestIdentity;
 #[cfg(not(target_arch = "wasm32"))]
 pub use envelope::{
     unwrap_envelope, unwrap_envelope_as_system,
@@ -239,10 +237,6 @@ pub mod prelude {
         // Streaming
         StreamContext, StreamPublisher,
     };
-
-    // Deprecated but still needed by downstream code (Phase 2 will remove)
-    #[allow(deprecated)]
-    pub use crate::RequestIdentity;
 
     #[cfg(not(feature = "fips"))]
     pub use crate::{generate_ephemeral_keypair, ristretto_dh, RistrettoPublic, RistrettoSecret};
