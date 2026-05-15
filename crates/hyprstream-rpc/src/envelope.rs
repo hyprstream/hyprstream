@@ -1,44 +1,31 @@
-//! Request envelope for identity-aware RPC with Ed25519 signatures.
+//! Request envelope for RPC with Ed25519 signatures and E2E integrity.
 //!
 //! Every RPC request is wrapped in a `SignedEnvelope` that carries:
 //! - A unique request ID for correlation
-//! - The identity of the requester (for authorization)
 //! - The serialized inner request payload
+//! - Authorization context (local claims, federated JWT, or ID-JAG)
 //! - Ed25519 signature over the entire RequestEnvelope
-//! - Nonce + timestamp for replay protection
+//! - Nonce + timestamp (iat) for replay protection
 //!
 //! # Two-Layer Security
 //!
 //! | Layer | Mechanism | Purpose |
 //! |-------|-----------|---------|
-//! | Transport | CURVE | Encrypts connection, authenticates immediate peer |
-//! | Application | Signed envelope | Authenticates request originator, survives forwarding |
+//! | Transport | CURVE/QUIC-TLS | Encrypts connection, authenticates immediate peer |
+//! | Application | Signed envelope | E2E integrity through brokers, authenticates originator |
 //!
-//! # Identity → Subject Mapping
-//!
-//! All identity types produce bare username subjects for Casbin policy checks:
-//!
-//! | Identity | Subject | Example |
-//! |----------|---------|---------|
-//! | Local | `<username>` | `"alice"` |
-//! | ApiToken | `<username>` | `"bob"` |
-//! | Peer | `<name>` | `"gpu-server-1"` |
-//! | Anonymous | `anonymous` | `"anonymous"` |
-//!
-//! # Nested Envelope Structure
+//! # Envelope Structure
 //!
 //! ```text
 //! SignedEnvelope {
-//!     envelope: RequestEnvelope {  // This is what gets signed
-//!         request_id, identity, payload,
-//!         ephemeral_pubkey, nonce, timestamp
+//!     envelope: RequestEnvelope {
+//!         request_id, payload, iat, nonce,
+//!         authorization, delegation_token, wth
 //!     },
-//!     signature,      // Ed25519(signing_key, serialize(envelope))
-//!     signer_pubkey,  // Ed25519 public key
+//!     sig,  // Ed25519 signature over canonical(envelope)
+//!     cnf,  // Ed25519 public key (RFC 7800 confirmation key)
 //! }
 //! ```
-//!
-//! The nested structure makes clear exactly what is being signed.
 
 use crate::auth::Claims;
 use crate::capnp::{FromCapnp, ToCapnp};
@@ -259,92 +246,6 @@ pub fn generate_nonce() -> [u8; 16] {
     nonce
 }
 
-/// Identity of a request sender.
-///
-/// DEPRECATED: This type is retained for downstream compilation compatibility
-/// only. It is no longer serialized to or deserialized from Cap'n Proto wire
-/// format. Authorization decisions use `EnvelopeContext::subject()`, derived
-/// from the verified Ed25519 signer key via `KeyRegistry`.
-///
-/// TODO: remove in Phase 2
-#[deprecated(note = "Use Authorization instead — this type is no longer on the wire")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RequestIdentity {
-    /// Authenticated via API token.
-    /// User is from the token record.
-    ApiToken { user: String, token_name: String },
-
-    /// Authenticated remote peer via CURVE.
-    /// User is the peer's registered name.
-    Peer {
-        name: String,
-        curve_key: [u8; 32],
-    },
-
-    /// No authentication provided.
-    /// User is "anonymous".
-    Anonymous,
-}
-
-#[allow(deprecated, clippy::derivable_impls)]
-impl Default for RequestIdentity {
-    fn default() -> Self {
-        Self::Anonymous
-    }
-}
-
-#[allow(deprecated)]
-impl RequestIdentity {
-    /// Create an API token identity.
-    pub fn api_token(user: impl Into<String>, token_name: impl Into<String>) -> Self {
-        Self::ApiToken {
-            user: user.into(),
-            token_name: token_name.into(),
-        }
-    }
-
-    /// Create a peer identity.
-    pub fn peer(name: impl Into<String>, curve_key: [u8; 32]) -> Self {
-        Self::Peer {
-            name: name.into(),
-            curve_key,
-        }
-    }
-
-    /// Create an anonymous identity.
-    pub fn anonymous() -> Self {
-        Self::Anonymous
-    }
-
-    /// Extract the bare username string.
-    ///
-    /// This is the canonical form used for logging only.
-    /// Authorization decisions must use `EnvelopeContext::subject()`.
-    pub fn user(&self) -> &str {
-        match self {
-            Self::ApiToken { user, .. } => user,
-            Self::Peer { name, .. } => name,
-            Self::Anonymous => "anonymous",
-        }
-    }
-
-    /// Check if this is authenticated (not anonymous).
-    pub fn is_authenticated(&self) -> bool {
-        !matches!(self, Self::Anonymous)
-    }
-}
-
-#[allow(deprecated)]
-impl std::fmt::Display for RequestIdentity {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ApiToken { user, token_name } => write!(f, "token:{user}:{token_name}"),
-            Self::Peer { name, .. } => write!(f, "peer:{name}"),
-            Self::Anonymous => write!(f, "anonymous"),
-        }
-    }
-}
-
 /// Authorization subject for Casbin policy checks and resource isolation.
 ///
 /// A simple newtype over `Option<String>`:
@@ -469,16 +370,6 @@ impl FromStr for Subject {
     }
 }
 
-#[allow(deprecated)]
-impl From<&RequestIdentity> for Subject {
-    fn from(id: &RequestIdentity) -> Self {
-        match id {
-            RequestIdentity::Anonymous => Subject::anonymous(),
-            other => Subject::new(other.user()),
-        }
-    }
-}
-
 impl From<&Claims> for Subject {
     fn from(claims: &Claims) -> Self {
         // Phase 7: Federated subjects use "iss:sub" format so that
@@ -508,11 +399,6 @@ impl FromCapnp for Subject {
         name.parse()
     }
 }
-
-// NOTE: ToCapnp/FromCapnp impls for RequestIdentity have been removed.
-// The capnp types (RequestIdentity, LocalIdentity, ApiTokenIdentity, PeerIdentity)
-// no longer exist in the schema. The Rust enum is kept temporarily for downstream compat.
-// TODO: remove in Phase 2
 
 /// Unsigned envelope wrapping an RPC request.
 ///
@@ -551,7 +437,6 @@ pub struct RequestEnvelope {
 
 impl RequestEnvelope {
     /// Create a new request envelope with fresh request ID, nonce, and timestamp.
-    #[allow(deprecated)]
     pub fn new(payload: Vec<u8>) -> Self {
         Self {
             request_id: next_request_id(),
@@ -592,54 +477,6 @@ impl RequestEnvelope {
 
     /// Create an envelope for an anonymous request.
     pub fn anonymous(payload: Vec<u8>) -> Self {
-        Self::new(payload)
-    }
-
-    // --- Temporary compatibility shims (TODO: remove in Phase 2) ---
-
-    /// Compatibility shim: create with legacy identity parameter (ignored).
-    #[allow(deprecated)]
-    pub fn new_compat(_identity: RequestIdentity, payload: Vec<u8>) -> Self {
-        Self::new(payload)
-    }
-
-    /// Compatibility shim for `with_delegated_bearer`.
-    #[deprecated(note = "Use with_delegation_token instead")]
-    pub fn with_delegated_bearer(self, bearer: String) -> Self {
-        self.with_delegation_token(bearer)
-    }
-
-    /// Compatibility shim for `with_wit_hash_of`.
-    #[deprecated(note = "Use with_wth_of instead")]
-    pub fn with_wit_hash_of(self, jwt: &str) -> Self {
-        self.with_wth_of(jwt)
-    }
-
-    /// Compatibility shim: set legacy claims as authorization context.
-    #[deprecated(note = "Use with_authorization instead")]
-    pub fn with_claims(self, _claims: Claims) -> Self {
-        // Claims are no longer carried in the envelope — this is a no-op shim.
-        self
-    }
-
-    /// Compatibility shim: set ephemeral pubkey (no longer in envelope).
-    #[deprecated(note = "Ephemeral pubkey is no longer in the envelope")]
-    pub fn with_ephemeral_pubkey(self, _pubkey: [u8; 32]) -> Self {
-        // Ephemeral pubkey has been removed from the envelope.
-        self
-    }
-
-    /// Compatibility shim: create with token identity.
-    #[allow(deprecated)]
-    #[deprecated(note = "Use new() instead — identity is no longer in the envelope")]
-    pub fn with_token(_user: impl Into<String>, _token_name: impl Into<String>, payload: Vec<u8>) -> Self {
-        Self::new(payload)
-    }
-
-    /// Compatibility shim: create with peer identity.
-    #[allow(deprecated)]
-    #[deprecated(note = "Use new() instead — identity is no longer in the envelope")]
-    pub fn with_peer(_name: impl Into<String>, _curve_key: [u8; 32], payload: Vec<u8>) -> Self {
         Self::new(payload)
     }
 
@@ -1071,17 +908,6 @@ impl SignedEnvelope {
         Subject::anonymous()
     }
 
-    /// Compatibility shim: ephemeral pubkey is no longer in the envelope.
-    #[deprecated(note = "Ephemeral pubkey is no longer in the envelope")]
-    pub fn ephemeral_pubkey(&self) -> Option<&[u8; 32]> {
-        None
-    }
-
-    /// Compatibility shim: access signer_pubkey via the old name.
-    #[deprecated(note = "Use .cnf instead")]
-    pub fn signer_pubkey(&self) -> [u8; 32] {
-        self.cnf
-    }
 }
 
 impl ToCapnp for RequestEnvelope {
@@ -1282,11 +1108,6 @@ impl ResponseEnvelope {
             .map_err(|_| anyhow::anyhow!("Invalid signer public key"))
     }
 
-    /// Compatibility shim for old name.
-    #[deprecated(note = "Use cnf_key() instead")]
-    pub fn signer_pubkey(&self) -> Result<VerifyingKey> {
-        self.cnf_key()
-    }
 }
 
 impl ToCapnp for ResponseEnvelope {
@@ -1413,7 +1234,7 @@ pub fn unwrap_envelope_any_signer(
 /// Used for inproc/IPC callers who sign with the node key. Sets
 /// `Subject::new("system")` as the key-derived subject so that
 /// `EnvelopeContext::subject()` returns `"system"` regardless of any
-/// caller-asserted `RequestIdentity` field in the envelope.
+/// caller-asserted authorization context in the envelope.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn unwrap_envelope_as_system(
     request: &[u8],
@@ -1468,7 +1289,6 @@ pub fn unwrap_response(
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::crypto::signing::generate_signing_keypair;
@@ -1495,20 +1315,6 @@ mod tests {
     }
 
     #[test]
-    fn test_api_token_identity() {
-        let identity = RequestIdentity::api_token("bob", "ci-token");
-        assert_eq!(identity.user(), "bob");
-        assert!(identity.is_authenticated());
-    }
-
-    #[test]
-    fn test_anonymous_identity() {
-        let identity = RequestIdentity::anonymous();
-        assert_eq!(identity.user(), "anonymous");
-        assert!(!identity.is_authenticated());
-    }
-
-    #[test]
     fn test_request_envelope() {
         let envelope = RequestEnvelope::anonymous(vec![1, 2, 3]);
         assert_eq!(envelope.payload, vec![1, 2, 3]);
@@ -1522,15 +1328,6 @@ mod tests {
         let e1 = RequestEnvelope::anonymous(vec![]);
         let e2 = RequestEnvelope::anonymous(vec![]);
         assert!(e2.request_id > e1.request_id);
-    }
-
-    #[test]
-    fn test_identity_display() {
-        assert_eq!(
-            format!("{}", RequestIdentity::api_token("bob", "ci")),
-            "token:bob:ci"
-        );
-        assert_eq!(format!("{}", RequestIdentity::anonymous()), "anonymous");
     }
 
     #[test]
@@ -1638,17 +1435,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_subject_from_identity() {
-        let token = RequestIdentity::ApiToken { user: "bob".into(), token_name: "ci".into() };
-        assert_eq!(Subject::from(&token), Subject::new("bob"));
-
-        let peer = RequestIdentity::Peer { name: "gpu-1".into(), curve_key: [0u8; 32] };
-        assert_eq!(Subject::from(&peer), Subject::new("gpu-1"));
-
-        assert_eq!(Subject::from(&RequestIdentity::Anonymous), Subject::anonymous());
-    }
-
-    #[test]
     fn test_subject_display_roundtrip() {
         let cases = vec![
             Subject::new("alice"),
@@ -1702,10 +1488,6 @@ mod tests {
         set.insert(Subject::new("alice")); // duplicate
         set.insert(Subject::new("bob"));
         assert_eq!(set.len(), 2);
-
-        let from_token = Subject::from(&RequestIdentity::ApiToken { user: "alice".into(), token_name: "ci".into() });
-        let from_peer = Subject::from(&RequestIdentity::Peer { name: "alice".into(), curve_key: [0u8; 32] });
-        assert_eq!(from_token, from_peer);
     }
 
     #[test]
