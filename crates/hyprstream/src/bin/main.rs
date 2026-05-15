@@ -1874,6 +1874,27 @@ fn main() -> Result<()> {
                                     ctx = ctx.with_quic(shared);
                                 }
 
+                                // Wire JWKS-backed key resolution (kid-based, on-miss-refetch).
+                                {
+                                    let issuer_url = config.oauth.issuer_url();
+                                    let jwks_url = format!("{}/oauth/jwks", issuer_url.trim_end_matches('/'));
+                                    let fetcher: hyprstream_rpc::auth::JwksFetcher = std::sync::Arc::new(move |url: String| {
+                                        Box::pin(async move {
+                                            let resp = reqwest::Client::builder()
+                                                .danger_accept_invalid_certs(true)
+                                                .build()?
+                                                .get(&url)
+                                                .send()
+                                                .await?
+                                                .error_for_status()?;
+                                            let json: serde_json::Value = resp.json().await?;
+                                            Ok(json)
+                                        })
+                                    });
+                                    ctx.set_jwks_fetcher(fetcher);
+                                    tracing::debug!("JWKS-backed key source configured: {}", jwks_url);
+                                }
+
                                 let manager = InprocManager::new();
                                 let mut handles = Vec::new();
 

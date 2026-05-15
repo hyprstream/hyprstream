@@ -227,6 +227,11 @@ pub struct ServiceContext {
     /// In single-process mode, this is derived from the root key.
     /// In multi-process mode, this is loaded from the ca-pubkey credential.
     ca_verifying_key: Option<VerifyingKey>,
+
+    /// Optional JWKS fetcher for JWKS-backed key resolution.
+    /// When set, `cluster_key_source()` returns `JwksKeySource(Mode::Isolated)`
+    /// instead of `ClusterKeySource`.
+    jwks_fetcher: Option<hyprstream_rpc::auth::JwksFetcher>,
 }
 
 impl ServiceContext {
@@ -253,6 +258,7 @@ impl ServiceContext {
             federation_key_source: None,
             service_keys: HashMap::new(),
             ca_verifying_key: None,
+            jwks_fetcher: None,
         }
     }
 
@@ -511,19 +517,40 @@ impl ServiceContext {
         }
     }
 
-    /// Create a ClusterKeySource for regular services.
+    /// Create a key source for regular services.
     ///
-    /// This is the standard key source for services within a cluster. It trusts
-    /// only the cluster's CA key (from PolicyService) for JWT verification.
+    /// When a JWKS fetcher is configured, returns `JwksKeySource(Mode::Isolated)`
+    /// with kid-based resolution. Otherwise falls back to `ClusterKeySource`
+    /// (single hardcoded CA key).
     ///
     /// # Panics
     ///
     /// Panics if `ca_verifying_key` is not set.
     pub fn cluster_key_source(&self) -> std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource> {
-        std::sync::Arc::new(hyprstream_rpc::auth::ClusterKeySource::new(
-            self.jwt_verifying_key(),
-            self.oauth_issuer_url().unwrap_or_default().to_owned(),
-        ))
+        let issuer_url = self.oauth_issuer_url().unwrap_or_default().to_owned();
+
+        if let Some(ref fetcher) = self.jwks_fetcher {
+            let jwks_url = format!("{}/oauth/jwks", issuer_url.trim_end_matches('/'));
+            std::sync::Arc::new(hyprstream_rpc::auth::JwksKeySource::new(
+                hyprstream_rpc::auth::JwksMode::Isolated { jwks_url },
+                issuer_url,
+                fetcher.clone(),
+            ))
+        } else {
+            std::sync::Arc::new(hyprstream_rpc::auth::ClusterKeySource::new(
+                self.jwt_verifying_key(),
+                issuer_url,
+            ))
+        }
+    }
+
+    /// Set the JWKS fetcher for JWKS-backed key resolution.
+    ///
+    /// When set, `cluster_key_source()` returns `JwksKeySource(Mode::Isolated)`
+    /// instead of `ClusterKeySource`, enabling kid-based key selection from
+    /// the local `/oauth/jwks` endpoint.
+    pub fn set_jwks_fetcher(&mut self, fetcher: hyprstream_rpc::auth::JwksFetcher) {
+        self.jwks_fetcher = Some(fetcher);
     }
 
     /// Get the identity provider for purpose-keyed signing.
