@@ -63,9 +63,6 @@ pub struct EnvelopeContext {
     /// Unique request ID for correlation and logging
     pub request_id: u64,
 
-    /// Authorization context from the envelope.
-    pub authorization: Authorization,
-
     /// Ephemeral public key for stream HMAC derivation (if streaming)
     pub ephemeral_pubkey: Option<[u8; 32]>,
 
@@ -110,7 +107,6 @@ impl EnvelopeContext {
     pub(crate) fn from_verified(envelope: &SignedEnvelope) -> Self {
         Self {
             request_id: envelope.request_id(),
-            authorization: envelope.envelope.authorization.clone(),
             ephemeral_pubkey: None,
             claims: None,
             jwt_token: envelope.envelope.jwt_token().map(ToOwned::to_owned),
@@ -129,7 +125,6 @@ impl EnvelopeContext {
     pub fn from_verified_as_system(envelope: &SignedEnvelope) -> Self {
         Self {
             request_id: envelope.request_id(),
-            authorization: envelope.envelope.authorization.clone(),
             ephemeral_pubkey: None,
             claims: None,
             jwt_token: envelope.envelope.jwt_token().map(ToOwned::to_owned),
@@ -152,7 +147,6 @@ impl EnvelopeContext {
     pub fn from_callback_service(request_id: u64, service_name: &str) -> Self {
         Self {
             request_id,
-            authorization: Authorization::None,
             ephemeral_pubkey: None,
             claims: None,
             jwt_token: None,
@@ -172,8 +166,8 @@ impl EnvelopeContext {
     ///    Federated JWTs (`iss` non-empty) produce `Subject::federated(iss, sub)`.
     /// 3. `Subject::anonymous()` — no verified identity.
     ///
-    /// The caller-asserted authorization field is never consulted for
-    /// authorization. It is preserved only for logging.
+    /// The caller-asserted envelope authorization is not preserved in the
+    /// context — only verified state is available to handlers.
     pub fn subject(&self) -> Subject {
         // Prefer key-derived subject (cryptographically proven via signer key)
         if !self.key_derived_subject.is_anonymous() {
