@@ -17,12 +17,60 @@ use thiserror::Error;
 
 use super::Claims;
 
-/// Compute the JWT `kid` for a signing key: first 8 hex chars of SHA-256 of
-/// the verifying key bytes. Matches `compute_kid` in `services/oauth/jwks.rs`.
-pub fn kid_for_key(signing_key: &SigningKey) -> String {
+/// Input for RFC 7638 JWK Thumbprint computation.
+///
+/// Each variant carries the required members for its key type's canonical
+/// JSON representation (RFC 7638 §3.2: members sorted lexicographically).
+pub enum JwkThumbprintInput<'a> {
+    /// OKP / Ed25519: canonical `{"crv":"Ed25519","kty":"OKP","x":"..."}`
+    Ed25519 { x: &'a [u8; 32] },
+    /// EC / P-256 (ES256): canonical `{"crv":"P-256","kty":"EC","x":"...","y":"..."}`
+    Es256 { x: &'a [u8; 32], y: &'a [u8; 32] },
+    /// RSA: canonical `{"e":"...","kty":"RSA","n":"..."}` (n, e already base64url)
+    Rsa { n: &'a str, e: &'a str },
+}
+
+/// Compute the RFC 7638 JWK Thumbprint for any supported key type.
+///
+/// Returns `base64url(SHA-256(canonical_jwk_json))` — a 43-char string.
+pub fn jwk_thumbprint(input: &JwkThumbprintInput<'_>) -> String {
     use sha2::{Digest, Sha256};
-    let hash = Sha256::digest(signing_key.verifying_key().as_bytes());
-    hex::encode(&hash[..8])
+    let canonical = match input {
+        JwkThumbprintInput::Ed25519 { x } => {
+            let x_b64 = URL_SAFE_NO_PAD.encode(x);
+            format!(r#"{{"crv":"Ed25519","kty":"OKP","x":"{}"}}"#, x_b64)
+        }
+        JwkThumbprintInput::Es256 { x, y } => {
+            let x_b64 = URL_SAFE_NO_PAD.encode(x);
+            let y_b64 = URL_SAFE_NO_PAD.encode(y);
+            format!(r#"{{"crv":"P-256","kty":"EC","x":"{}","y":"{}"}}"#, x_b64, y_b64)
+        }
+        JwkThumbprintInput::Rsa { n, e } => {
+            format!(r#"{{"e":"{}","kty":"RSA","n":"{}"}}"#, e, n)
+        }
+    };
+    let hash = Sha256::digest(canonical.as_bytes());
+    URL_SAFE_NO_PAD.encode(hash)
+}
+
+/// Compute the JWT `kid` for an Ed25519 signing key using RFC 7638 JWK Thumbprint.
+pub fn kid_for_key(signing_key: &SigningKey) -> String {
+    jwk_thumbprint(&JwkThumbprintInput::Ed25519 {
+        x: signing_key.verifying_key().as_bytes(),
+    })
+}
+
+/// Extract the `kid` from a JWT's JOSE header without verifying the signature.
+///
+/// Returns `Ok(None)` if the header has no `kid` field.
+pub fn header_kid(token: &str) -> Result<Option<String>, JwtError> {
+    let header_b64 = token.split('.').next().ok_or(JwtError::InvalidFormat)?;
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(header_b64)
+        .map_err(|_| JwtError::InvalidBase64)?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
+        .map_err(|e| JwtError::InvalidJson(e.to_string()))?;
+    Ok(header.get("kid").and_then(|v| v.as_str()).map(String::from))
 }
 
 /// Errors from JWT operations
@@ -89,11 +137,7 @@ pub fn encode_service_jwt(claims: &Claims, signing_key: &SigningKey) -> String {
 /// The header includes `kid` (SHA-256 of the public key, first 8 hex chars)
 /// and `typ: "JWT"` per OIDC convention.
 pub fn encode_id_token(claims: &super::IdTokenClaims, signing_key: &SigningKey) -> String {
-    use sha2::{Sha256, Digest};
-    let kid = {
-        let hash = Sha256::digest(signing_key.verifying_key().as_bytes());
-        hex::encode(&hash[..8])
-    };
+    let kid = kid_for_key(signing_key);
     let header = serde_json::json!({
         "alg": "EdDSA",
         "typ": "JWT",
@@ -346,5 +390,65 @@ mod tests {
             matches!(result, Err(JwtError::InvalidAudience)),
             "lenient mode must reject wrong aud"
         );
+    }
+
+    #[test]
+    fn test_jwk_thumbprint_ed25519() {
+        let key = make_key(0x01);
+        let kid = kid_for_key(&key);
+        // RFC 7638: base64url(SHA-256(...)) = 43 chars
+        assert_eq!(kid.len(), 43);
+        assert!(!kid.contains('='));
+        // Deterministic
+        assert_eq!(kid, kid_for_key(&key));
+    }
+
+    #[test]
+    fn test_jwk_thumbprint_rsa() {
+        let kid = jwk_thumbprint(&JwkThumbprintInput::Rsa {
+            n: "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw",
+            e: "AQAB",
+        });
+        assert_eq!(kid.len(), 43);
+        assert!(!kid.contains('='));
+    }
+
+    #[test]
+    fn test_jwk_thumbprint_es256() {
+        let x = [1u8; 32];
+        let y = [2u8; 32];
+        let kid = jwk_thumbprint(&JwkThumbprintInput::Es256 { x: &x, y: &y });
+        assert_eq!(kid.len(), 43);
+        assert!(!kid.contains('='));
+    }
+
+    #[test]
+    fn test_jwk_thumbprint_different_algorithms_differ() {
+        let bytes = [1u8; 32];
+        let ed_kid = jwk_thumbprint(&JwkThumbprintInput::Ed25519 { x: &bytes });
+        let es_kid = jwk_thumbprint(&JwkThumbprintInput::Es256 { x: &bytes, y: &[2u8; 32] });
+        assert_ne!(ed_kid, es_kid);
+    }
+
+    #[test]
+    fn test_header_kid_extraction() {
+        let key = make_key(0x42);
+        let claims = Claims::new("test".to_owned(), 0, 9_999_999_999);
+        let token = encode(&claims, &key);
+
+        let kid = header_kid(&token).unwrap();
+        assert!(kid.is_some());
+        assert_eq!(kid.unwrap(), kid_for_key(&key));
+    }
+
+    #[test]
+    fn test_header_kid_missing() {
+        // Manually craft a JWT with no kid in header
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"EdDSA","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(r#"{"sub":"test","exp":9999999999,"iat":0}"#);
+        let token = format!("{}.{}.AAAA", header, payload);
+
+        let kid = header_kid(&token).unwrap();
+        assert!(kid.is_none());
     }
 }

@@ -518,10 +518,14 @@ impl OAuthState {
         self.rsa_encoding_key = Some(jsonwebtoken::EncodingKey::from_rsa_der(rsa_der));
 
         // Extract public key components for JWKS using jsonwebtoken's DecodingKey
-        let kid = super::jwks::compute_kid(rsa_der);
-        self.rsa_kid = Some(kid.clone());
-
-        if let Some(jwk) = extract_rsa_jwk_from_der(rsa_der, &kid) {
+        if let Some(mut jwk) = extract_rsa_jwk_from_der(rsa_der, "") {
+            let n = jwk.get("n").and_then(|v| v.as_str()).unwrap_or_default();
+            let e = jwk.get("e").and_then(|v| v.as_str()).unwrap_or_default();
+            let kid = super::jwks::compute_rsa_kid(n, e);
+            if let Some(obj) = jwk.as_object_mut() {
+                obj.insert("kid".to_owned(), serde_json::Value::String(kid.clone()));
+            }
+            self.rsa_kid = Some(kid);
             self.rsa_jwk = Some(jwk);
         }
 

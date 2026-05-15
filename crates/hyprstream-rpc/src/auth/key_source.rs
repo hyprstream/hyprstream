@@ -33,15 +33,17 @@ use ed25519_dalek::VerifyingKey;
 /// binding them to their trust anchors.
 #[async_trait::async_trait]
 pub trait JwtKeySource: Send + Sync + 'static {
-    /// Get the verifying key for a given issuer.
+    /// Get the verifying key for a given issuer and optional kid.
     ///
     /// For local issuers (empty or matching `local_issuers()`), returns the
     /// cluster CA key. For federated issuers, fetches from JWKS or SPIFFE bundle.
+    /// The `kid` hint enables key selection when multiple keys exist (e.g.
+    /// rotation slots). Implementations may ignore `kid` if they only have one key.
     ///
     /// # Errors
     ///
     /// Returns error if the issuer is untrusted or key resolution fails.
-    async fn get_key(&self, issuer: &str) -> Result<VerifyingKey>;
+    async fn get_key(&self, issuer: &str, kid: Option<&str>) -> Result<VerifyingKey>;
 
     /// Check if an issuer is trusted (before attempting key fetch).
     ///
@@ -95,7 +97,7 @@ impl ClusterKeySource {
 
 #[async_trait::async_trait]
 impl JwtKeySource for ClusterKeySource {
-    async fn get_key(&self, issuer: &str) -> Result<VerifyingKey> {
+    async fn get_key(&self, issuer: &str, _kid: Option<&str>) -> Result<VerifyingKey> {
         if self.is_trusted(issuer) {
             Ok(self.ca_verifying_key)
         } else {
@@ -146,10 +148,10 @@ impl FederatedKeySource {
 
 #[async_trait::async_trait]
 impl JwtKeySource for FederatedKeySource {
-    async fn get_key(&self, issuer: &str) -> Result<VerifyingKey> {
+    async fn get_key(&self, issuer: &str, kid: Option<&str>) -> Result<VerifyingKey> {
         // Try local first
         if self.local.is_trusted(issuer) {
-            return self.local.get_key(issuer).await;
+            return self.local.get_key(issuer, kid).await;
         }
         // Fall back to federation
         if self.federation.is_trusted(issuer) {
@@ -185,7 +187,7 @@ mod tests {
         assert!(ks.is_trusted("")); // Empty issuer is always local
         assert!(!ks.is_trusted("http://other.example.com"));
 
-        let key = ks.get_key("http://localhost:9080").await?;
+        let key = ks.get_key("http://localhost:9080", None).await?;
         assert_eq!(key, test_ca_key());
         Ok(())
     }
@@ -194,7 +196,7 @@ mod tests {
     async fn cluster_key_source_rejects_untrusted() {
         let ks = ClusterKeySource::new(test_ca_key(), "http://localhost:9080".to_owned());
 
-        let result = ks.get_key("http://evil.example.com").await;
+        let result = ks.get_key("http://evil.example.com", None).await;
         assert!(result.is_err());
         let err_msg = result.err().map(|e| e.to_string()).unwrap_or_default();
         assert!(err_msg.contains("Untrusted issuer"));

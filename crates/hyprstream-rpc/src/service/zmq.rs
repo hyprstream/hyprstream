@@ -386,6 +386,10 @@ pub trait ZmqService: 'static {
         let unverified = crate::auth::decode_unverified(&token)
             .map_err(|e| anyhow::anyhow!("JWT decode failed: {}", e))?;
 
+        // Extract kid from JOSE header for key selection
+        let kid = crate::auth::header_kid(&token)
+            .map_err(|e| anyhow::anyhow!("JWT header parse failed: {}", e))?;
+
         // Check if issuer is trusted
         if !key_source.is_trusted(&unverified.iss) {
             tracing::warn!(
@@ -396,7 +400,7 @@ pub trait ZmqService: 'static {
         }
 
         // Get verifying key from key source
-        let verifying_key = key_source.get_key(&unverified.iss).await.map_err(|e| {
+        let verifying_key = key_source.get_key(&unverified.iss, kid.as_deref()).await.map_err(|e| {
             tracing::warn!(
                 "JWT key resolution failed for iss={}: {}",
                 unverified.iss, e
