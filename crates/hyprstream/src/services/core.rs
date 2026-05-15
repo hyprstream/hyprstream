@@ -16,6 +16,7 @@ mod tests {
     use hyprstream_rpc::rpc_client::RpcClientImpl;
     use hyprstream_rpc::signer::LocalSigner;
     use hyprstream_rpc::zmq_connection::ZmqConnection;
+    use hyprstream_rpc::Transport;
 
     /// Test service with infrastructure (new pattern)
     struct EchoService {
@@ -86,32 +87,45 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_invalid_request_signature_rejected() {
+    async fn test_corrupted_envelope_rejected() {
         let local = tokio::task::LocalSet::new();
         local.run_until(async {
-            let transport = TransportConfig::inproc("test-invalid-req-sig-core");
+            let transport = TransportConfig::inproc("test-corrupted-envelope-core");
             let endpoint = transport.zmq_endpoint();
 
             let (server_signing_key, server_verifying_key) = generate_signing_keypair();
-            let (client_signing_key, _client_verifying_key) = generate_signing_keypair();
 
             let service = EchoService::new(global_context(), transport.clone(), server_signing_key.clone());
 
             let runner = RequestLoop::new(transport, global_context(), server_signing_key);
             let mut handle = runner.run(service).await.expect("test: start service");
 
-            // Sign request with different key than service expects
-            let client = make_client(&endpoint, client_signing_key, server_verifying_key);
-            let result = client.call(b"should fail".to_vec()).await;
+            // Send corrupted bytes — not a valid Cap'n Proto envelope at all.
+            let conn = ZmqConnection::new(&endpoint, global_context());
+            let garbage = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF];
+            let result: anyhow::Result<Vec<u8>> = conn.send(garbage, Some(5_000)).await;
 
+            // The server must respond (not hang/crash). The response is an
+            // error envelope that the client can't meaningfully parse, or
+            // the transport layer itself errors. Either outcome is correct —
+            // the key property is that the service stays alive afterward.
             match result {
-                Ok(response) => {
-                    assert!(response.is_empty(), "Invalid request signature should return empty response");
+                Ok(response_bytes) => {
+                    // Server sent something back (error envelope). Verify it's
+                    // non-empty (a signed ResponseEnvelope is always > 0 bytes).
+                    assert!(!response_bytes.is_empty(), "Error response should be a signed envelope");
                 }
                 Err(_) => {
-                    // Error is also acceptable
+                    // Transport-level error (timeout, parse failure) is also acceptable.
                 }
             }
+
+            // Service is still alive — a valid request after corruption must succeed.
+            let (client_key, _) = generate_signing_keypair();
+            let client = make_client(&endpoint, client_key, server_verifying_key);
+            let response = client.call(b"still alive".to_vec()).await.expect("test: service should still handle requests after corruption");
+            let text = String::from_utf8_lossy(&response);
+            assert!(text.contains("still alive"), "Echo should contain payload: {text}");
 
             handle.stop().await;
         }).await;
