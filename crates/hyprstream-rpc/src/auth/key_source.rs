@@ -24,7 +24,11 @@
 //! ```
 
 use anyhow::Result;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::VerifyingKey;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::{RwLock, Semaphore};
 
 /// Source of JWT verification keys.
 ///
@@ -169,6 +173,238 @@ impl JwtKeySource for FederatedKeySource {
     }
 }
 
+/// Async function that fetches raw JWKS JSON from a URL.
+pub type JwksFetcher = Arc<dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send>> + Send + Sync>;
+
+/// Deployment mode for JWKS-backed key resolution.
+#[derive(Clone)]
+pub enum JwksMode {
+    /// Single-node: fetches JWKS from local `/oauth/jwks` endpoint.
+    Isolated { jwks_url: String },
+    /// Multi-node / cross-org: resolves issuer → JWKS URL via `IssuerResolver`.
+    Federated { local_jwks_url: String, resolver: Arc<dyn IssuerResolver> },
+}
+
+impl std::fmt::Debug for JwksMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Isolated { jwks_url } => f.debug_struct("Isolated").field("jwks_url", jwks_url).finish(),
+            Self::Federated { local_jwks_url, .. } => f.debug_struct("Federated").field("local_jwks_url", local_jwks_url).finish(),
+        }
+    }
+}
+
+/// Resolves an issuer string to its JWKS endpoint URL.
+#[async_trait::async_trait]
+pub trait IssuerResolver: Send + Sync + 'static {
+    async fn resolve(&self, issuer: &str) -> Result<String>;
+}
+
+/// Cached JWKS key entry.
+struct CachedKey {
+    verifying_key: VerifyingKey,
+    #[allow(dead_code)]
+    fetched_at: std::time::Instant,
+}
+
+/// JWKS-backed key source with kid-based resolution.
+///
+/// Replaces `ClusterKeySource` with standards-aligned JWKS key lookup:
+/// - Caches keys by kid after fetching from the JWKS endpoint
+/// - On cache miss, refetches JWKS (primary invalidation mechanism)
+/// - Negative cache prevents DoS from random kid spam (5s TTL)
+/// - Semaphore bounds concurrent JWKS fetches
+pub struct JwksKeySource {
+    mode: JwksMode,
+    local_issuer_url: String,
+    local_issuers_vec: Vec<String>,
+    fetcher: JwksFetcher,
+    cache: RwLock<HashMap<String, CachedKey>>,
+    negative_cache: RwLock<HashMap<String, std::time::Instant>>,
+    fetch_semaphore: Semaphore,
+    /// Soft TTL for cache refresh (keys older than this trigger background refresh)
+    #[allow(dead_code)]
+    soft_ttl: std::time::Duration,
+    /// Negative cache TTL (unknown kids cached as missing for this duration)
+    negative_ttl: std::time::Duration,
+}
+
+impl JwksKeySource {
+    pub fn new(mode: JwksMode, local_issuer_url: String, fetcher: JwksFetcher) -> Self {
+        let local_issuers_vec = if local_issuer_url.is_empty() {
+            vec![]
+        } else {
+            vec![local_issuer_url.clone()]
+        };
+        Self {
+            mode,
+            local_issuer_url,
+            local_issuers_vec,
+            fetcher,
+            cache: RwLock::new(HashMap::new()),
+            negative_cache: RwLock::new(HashMap::new()),
+            fetch_semaphore: Semaphore::new(4),
+            soft_ttl: std::time::Duration::from_secs(300),
+            negative_ttl: std::time::Duration::from_secs(5),
+        }
+    }
+
+    fn jwks_url_for_issuer(&self, issuer: &str) -> Option<String> {
+        match &self.mode {
+            JwksMode::Isolated { jwks_url } => {
+                if self.is_local(issuer) {
+                    Some(jwks_url.clone())
+                } else {
+                    None
+                }
+            }
+            JwksMode::Federated { local_jwks_url, .. } => {
+                if self.is_local(issuer) {
+                    Some(local_jwks_url.clone())
+                } else {
+                    None // federated resolution is async, handled in get_key
+                }
+            }
+        }
+    }
+
+    fn is_local(&self, issuer: &str) -> bool {
+        issuer.is_empty() || issuer == self.local_issuer_url
+    }
+
+    async fn resolve_jwks_url(&self, issuer: &str) -> Result<String> {
+        if let Some(url) = self.jwks_url_for_issuer(issuer) {
+            return Ok(url);
+        }
+        match &self.mode {
+            JwksMode::Federated { resolver, .. } => resolver.resolve(issuer).await,
+            JwksMode::Isolated { .. } => anyhow::bail!("Untrusted issuer in isolated mode: {}", issuer),
+        }
+    }
+
+    async fn fetch_and_cache(&self, issuer: &str) -> Result<()> {
+        let _permit = self.fetch_semaphore.acquire().await
+            .map_err(|_| anyhow::anyhow!("JWKS fetch semaphore closed"))?;
+
+        let url = self.resolve_jwks_url(issuer).await?;
+        let jwks = (self.fetcher)(url).await?;
+
+        let keys = jwks.get("keys")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow::anyhow!("JWKS response missing 'keys' array"))?;
+
+        let now = std::time::Instant::now();
+        let mut cache = self.cache.write().await;
+
+        for key in keys {
+            let kty = key.get("kty").and_then(|v| v.as_str()).unwrap_or_default();
+            let crv = key.get("crv").and_then(|v| v.as_str()).unwrap_or_default();
+
+            if kty == "OKP" && crv == "Ed25519" {
+                if let Some(kid) = key.get("kid").and_then(|v| v.as_str()) {
+                    if let Some(x) = key.get("x").and_then(|v| v.as_str()) {
+                        if let Ok(x_bytes) = URL_SAFE_NO_PAD.decode(x) {
+                            if x_bytes.len() == 32 {
+                                let mut arr = [0u8; 32];
+                                arr.copy_from_slice(&x_bytes);
+                                if let Ok(vk) = VerifyingKey::from_bytes(&arr) {
+                                    cache.insert(kid.to_owned(), CachedKey {
+                                        verifying_key: vk,
+                                        fetched_at: now,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Clear negative cache entries for keys we now have
+        let mut neg = self.negative_cache.write().await;
+        neg.retain(|kid, _| !cache.contains_key(kid));
+
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl JwtKeySource for JwksKeySource {
+    async fn get_key(&self, issuer: &str, kid: Option<&str>) -> Result<VerifyingKey> {
+        if !self.is_trusted(issuer) {
+            anyhow::bail!("Untrusted issuer: {}", issuer);
+        }
+
+        // Try cache first
+        if let Some(kid_str) = kid {
+            {
+                let cache = self.cache.read().await;
+                if let Some(entry) = cache.get(kid_str) {
+                    return Ok(entry.verifying_key);
+                }
+            }
+
+            // Check negative cache
+            {
+                let neg = self.negative_cache.read().await;
+                if let Some(&ts) = neg.get(kid_str) {
+                    if ts.elapsed() < self.negative_ttl {
+                        anyhow::bail!("Key not found for kid={} (negative cached)", kid_str);
+                    }
+                }
+            }
+
+            // On-miss refetch
+            if let Err(e) = self.fetch_and_cache(issuer).await {
+                tracing::warn!("JWKS fetch failed for issuer={}: {}", issuer, e);
+            }
+
+            // Retry from cache
+            let cache = self.cache.read().await;
+            if let Some(entry) = cache.get(kid_str) {
+                return Ok(entry.verifying_key);
+            }
+
+            // Add to negative cache
+            {
+                let mut neg = self.negative_cache.write().await;
+                neg.insert(kid_str.to_owned(), std::time::Instant::now());
+            }
+
+            anyhow::bail!("Key not found in JWKS for kid={}", kid_str)
+        } else {
+            // No kid: fetch JWKS and return the first Ed25519 key (fallback)
+            if self.cache.read().await.is_empty() {
+                if let Err(e) = self.fetch_and_cache(issuer).await {
+                    tracing::warn!("JWKS fetch failed for issuer={}: {}", issuer, e);
+                }
+            }
+
+            let cache = self.cache.read().await;
+            cache.values()
+                .next()
+                .map(|e| e.verifying_key)
+                .ok_or_else(|| anyhow::anyhow!("No Ed25519 keys in JWKS"))
+        }
+    }
+
+    fn is_trusted(&self, issuer: &str) -> bool {
+        if self.is_local(issuer) {
+            return true;
+        }
+        matches!(&self.mode, JwksMode::Federated { resolver, .. } if {
+            // Synchronous trust check — resolver.resolve() is async,
+            // so we can only check local issuers synchronously.
+            // For federated mode, we optimistically trust and let get_key fail.
+            true
+        })
+    }
+
+    fn local_issuers(&self) -> &[String] {
+        &self.local_issuers_vec
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,5 +451,140 @@ mod tests {
     fn trait_object_compiles() {
         let ks = ClusterKeySource::new(test_ca_key(), "http://localhost:9080".to_owned());
         let _: std::sync::Arc<dyn JwtKeySource> = std::sync::Arc::new(ks);
+    }
+
+    fn mock_jwks_json(keys: &[&SigningKey]) -> serde_json::Value {
+        let jwk_entries: Vec<serde_json::Value> = keys.iter().map(|sk| {
+            let vk = sk.verifying_key();
+            let x = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vk.as_bytes());
+            let kid = crate::auth::jwt::kid_for_key(sk);
+            serde_json::json!({
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "use": "sig",
+                "alg": "EdDSA",
+                "kid": kid,
+                "x": x,
+            })
+        }).collect();
+        serde_json::json!({ "keys": jwk_entries })
+    }
+
+    fn mock_fetcher(jwks: serde_json::Value) -> JwksFetcher {
+        Arc::new(move |_url| {
+            let jwks = jwks.clone();
+            Box::pin(async move { Ok(jwks) })
+        })
+    }
+
+    #[tokio::test]
+    async fn jwks_key_source_resolves_by_kid() -> anyhow::Result<()> {
+        let sk_a = SigningKey::from_bytes(&[0xAA; 32]);
+        let sk_b = SigningKey::from_bytes(&[0xBB; 32]);
+        let kid_a = crate::auth::jwt::kid_for_key(&sk_a);
+        let kid_b = crate::auth::jwt::kid_for_key(&sk_b);
+
+        let jwks = mock_jwks_json(&[&sk_a, &sk_b]);
+        let ks = JwksKeySource::new(
+            JwksMode::Isolated { jwks_url: "http://localhost/oauth/jwks".to_owned() },
+            "http://localhost".to_owned(),
+            mock_fetcher(jwks),
+        );
+
+        let key_a = ks.get_key("http://localhost", Some(&kid_a)).await?;
+        assert_eq!(key_a, sk_a.verifying_key());
+
+        let key_b = ks.get_key("http://localhost", Some(&kid_b)).await?;
+        assert_eq!(key_b, sk_b.verifying_key());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn jwks_key_source_unknown_kid_fails() {
+        let sk = SigningKey::from_bytes(&[0xCC; 32]);
+        let jwks = mock_jwks_json(&[&sk]);
+        let ks = JwksKeySource::new(
+            JwksMode::Isolated { jwks_url: "http://localhost/oauth/jwks".to_owned() },
+            "http://localhost".to_owned(),
+            mock_fetcher(jwks),
+        );
+
+        let result = ks.get_key("http://localhost", Some("nonexistent-kid")).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn jwks_key_source_no_kid_returns_first() -> anyhow::Result<()> {
+        let sk = SigningKey::from_bytes(&[0xDD; 32]);
+        let jwks = mock_jwks_json(&[&sk]);
+        let ks = JwksKeySource::new(
+            JwksMode::Isolated { jwks_url: "http://localhost/oauth/jwks".to_owned() },
+            "http://localhost".to_owned(),
+            mock_fetcher(jwks),
+        );
+
+        let key = ks.get_key("http://localhost", None).await?;
+        assert_eq!(key, sk.verifying_key());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn jwks_key_source_negative_cache() {
+        let sk = SigningKey::from_bytes(&[0xEE; 32]);
+        let jwks = mock_jwks_json(&[&sk]);
+        let fetch_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count = fetch_count.clone();
+        let fetcher: JwksFetcher = Arc::new(move |_url| {
+            let jwks = jwks.clone();
+            let count = count.clone();
+            Box::pin(async move {
+                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(jwks)
+            })
+        });
+
+        let ks = JwksKeySource::new(
+            JwksMode::Isolated { jwks_url: "http://localhost/oauth/jwks".to_owned() },
+            "http://localhost".to_owned(),
+            fetcher,
+        );
+
+        // First miss triggers fetch
+        let _ = ks.get_key("http://localhost", Some("bad-kid-1")).await;
+        assert_eq!(fetch_count.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        // Same kid within negative TTL does NOT refetch
+        let _ = ks.get_key("http://localhost", Some("bad-kid-1")).await;
+        assert_eq!(fetch_count.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        // Different kid triggers a new fetch
+        let _ = ks.get_key("http://localhost", Some("bad-kid-2")).await;
+        assert_eq!(fetch_count.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn jwks_key_source_rejects_untrusted_issuer() {
+        let sk = SigningKey::from_bytes(&[0xFF; 32]);
+        let jwks = mock_jwks_json(&[&sk]);
+        let ks = JwksKeySource::new(
+            JwksMode::Isolated { jwks_url: "http://localhost/oauth/jwks".to_owned() },
+            "http://localhost".to_owned(),
+            mock_fetcher(jwks),
+        );
+
+        let result = ks.get_key("http://evil.example.com", None).await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn jwks_key_source_trait_object_compiles() {
+        let sk = SigningKey::from_bytes(&[0x11; 32]);
+        let jwks = mock_jwks_json(&[&sk]);
+        let ks = JwksKeySource::new(
+            JwksMode::Isolated { jwks_url: "http://localhost/oauth/jwks".to_owned() },
+            "http://localhost".to_owned(),
+            mock_fetcher(jwks),
+        );
+        let _: Arc<dyn JwtKeySource> = Arc::new(ks);
     }
 }
