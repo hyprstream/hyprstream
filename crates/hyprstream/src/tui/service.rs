@@ -335,7 +335,7 @@ impl TuiService {
         // DH key exchange derives context from client's ephemeral pubkey.
         // If no pubkey (local/test connections), generate random standalone contexts.
         let make_stream_ctx = |label: &str| -> Result<StreamContext> {
-            match ctx.ephemeral_pubkey() {
+            match None {
                 Some(pubkey) => StreamContext::from_dh(pubkey),
                 None => {
                     use rand::RngCore;

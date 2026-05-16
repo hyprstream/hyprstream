@@ -1272,7 +1272,7 @@ impl InferenceService {
         &self,
         ctx: &EnvelopeContext,
     ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::streaming::StreamContext)> {
-        let client_pub_bytes = ctx.ephemeral_pubkey()
+        let client_pub_bytes = None
             .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
         let stream_channel = self.stream_channel.as_ref()
             .ok_or_else(|| anyhow!("StreamChannel not initialized"))?;
@@ -2130,7 +2130,7 @@ impl InferenceHandler for InferenceService {
             .unwrap_or(600)
             .max(600);
 
-        let client_ephemeral_pubkey = ctx.ephemeral_pubkey();
+        let client_ephemeral_pubkey = None;
         let claims = ctx.claims().cloned();
         let (stream_id, server_pubkey, pending) = self.prepare_stream(request, client_ephemeral_pubkey, claims, expiry_secs, &subject, ttt_overrides).await?;
 
@@ -2323,7 +2323,7 @@ impl InferenceHandler for InferenceService {
         let subject = ctx.subject();
 
         // DH key derivation
-        let client_pub_bytes = ctx.ephemeral_pubkey()
+        let client_pub_bytes = None
             .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
         let stream_channel = self.stream_channel.as_ref()
             .ok_or_else(|| anyhow!("StreamChannel not initialized"))?;

@@ -804,7 +804,7 @@ impl WorkerService {
         drop(containers);
 
         // Extract ephemeral pubkey from SignedEnvelope (required for E2E auth)
-        let client_pubkey = ctx.ephemeral_pubkey()
+        let client_pubkey = None
             .ok_or_else(|| anyhow::anyhow!("Attach requires client ephemeral pubkey for E2E authentication"))?;
 
         // Forward user claims for StreamService subscription-time validation
