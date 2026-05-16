@@ -12,6 +12,7 @@ fn test_envelope_serialization_deterministic() {
         authorization: Authorization::None,
         delegation_token: None,
         wth: None,
+        client_dh_public: None,
     };
 
     let envelope2 = envelope1.clone();
@@ -43,6 +44,7 @@ fn test_envelope_signature_verification_stable() {
         authorization: Authorization::None,
         delegation_token: None,
         wth: None,
+        client_dh_public: None,
     };
 
     let signed1 = SignedEnvelope::new_signed(envelope.clone(), &signing_key);
@@ -94,6 +96,7 @@ fn test_envelope_canonical_form() {
         authorization: Authorization::None,
         delegation_token: None,
         wth: None,
+        client_dh_public: None,
     };
 
     let bytes = envelope.to_bytes();
@@ -118,6 +121,7 @@ fn test_envelope_with_authorization_deterministic() {
         authorization: Authorization::None,
         delegation_token: None,
         wth: None,
+        client_dh_public: None,
     };
 
     let bytes1 = envelope.to_bytes();
@@ -138,6 +142,7 @@ fn test_envelope_different_data_different_bytes() {
         authorization: Authorization::None,
         delegation_token: None,
         wth: None,
+        client_dh_public: None,
     };
 
     let envelope2 = RequestEnvelope {
@@ -148,6 +153,7 @@ fn test_envelope_different_data_different_bytes() {
         authorization: Authorization::None,
         delegation_token: None,
         wth: None,
+        client_dh_public: None,
     };
 
     let bytes1 = envelope1.to_bytes();

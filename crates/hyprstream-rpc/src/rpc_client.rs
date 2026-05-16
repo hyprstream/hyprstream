@@ -274,7 +274,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         &self,
         request_id: u64,
         payload: Vec<u8>,
-        _ephemeral_pubkey: Option<[u8; 32]>,
+        ephemeral_pubkey: Option<[u8; 32]>,
         jwt: Option<String>,
         delegated_bearer: Option<String>,
     ) -> Result<Vec<u8>> {
@@ -286,7 +286,9 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         if let Some(bearer) = delegated_bearer {
             envelope = envelope.with_delegation_token(bearer);
         }
-        // ephemeral_pubkey is no longer in the envelope — ignored
+        if let Some(key) = ephemeral_pubkey {
+            envelope = envelope.with_client_dh_public(key);
+        }
 
         let canonical = envelope.to_bytes();
         let signature = self.signer.sign(&canonical).await?;

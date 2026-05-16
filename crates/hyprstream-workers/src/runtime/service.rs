@@ -803,8 +803,8 @@ impl WorkerService {
         }
         drop(containers);
 
-        // Extract ephemeral pubkey from SignedEnvelope (required for E2E auth)
-        let client_pubkey = None
+        // Extract ephemeral pubkey from envelope (required for E2E auth)
+        let client_pubkey = ctx.ephemeral_pubkey()
             .ok_or_else(|| anyhow::anyhow!("Attach requires client ephemeral pubkey for E2E authentication"))?;
 
         // Forward user claims for StreamService subscription-time validation
@@ -812,7 +812,7 @@ impl WorkerService {
 
         // DH + pre-authorization via StreamChannel — atomic, no pending state
         let stream_ctx = self.stream_channel
-            .prepare_stream_with_claims(client_pubkey, 600, claims).await
+            .prepare_stream_with_claims(&client_pubkey, 600, claims).await
             .map_err(|e| anyhow::anyhow!("Stream preparation failed: {}", e))?;
 
         let stream_id = stream_ctx.stream_id().to_owned();

@@ -1272,8 +1272,9 @@ impl InferenceService {
         &self,
         ctx: &EnvelopeContext,
     ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::streaming::StreamContext)> {
-        let client_pub_bytes = None
+        let client_pub_bytes = ctx.ephemeral_pubkey()
             .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
+        let client_pub_ref: &[u8] = &client_pub_bytes;
         let stream_channel = self.stream_channel.as_ref()
             .ok_or_else(|| anyhow!("StreamChannel not initialized"))?;
 
@@ -1283,7 +1284,7 @@ impl InferenceService {
             .max(600);
         let claims = ctx.claims().cloned();
 
-        let stream_ctx = stream_channel.prepare_stream_with_claims(client_pub_bytes, expiry_secs, claims).await?;
+        let stream_ctx = stream_channel.prepare_stream_with_claims(client_pub_ref, expiry_secs, claims).await?;
 
         let stream_id = stream_ctx.stream_id().to_owned();
         let server_pubkey = *stream_ctx.server_pubkey();
@@ -2130,9 +2131,9 @@ impl InferenceHandler for InferenceService {
             .unwrap_or(600)
             .max(600);
 
-        let client_ephemeral_pubkey = None;
+        let client_ephemeral_pubkey = ctx.ephemeral_pubkey();
         let claims = ctx.claims().cloned();
-        let (stream_id, server_pubkey, pending) = self.prepare_stream(request, client_ephemeral_pubkey, claims, expiry_secs, &subject, ttt_overrides).await?;
+        let (stream_id, server_pubkey, pending) = self.prepare_stream(request, client_ephemeral_pubkey.as_ref().map(<[u8; 32]>::as_slice), claims, expiry_secs, &subject, ttt_overrides).await?;
 
         let stream_sub_endpoint = hyprstream_rpc::registry::global()
             .endpoint("streams", hyprstream_rpc::registry::SocketKind::Sub)
@@ -2323,8 +2324,9 @@ impl InferenceHandler for InferenceService {
         let subject = ctx.subject();
 
         // DH key derivation
-        let client_pub_bytes = None
+        let client_pub_bytes = ctx.ephemeral_pubkey()
             .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
+        let client_pub_ref: &[u8] = &client_pub_bytes;
         let stream_channel = self.stream_channel.as_ref()
             .ok_or_else(|| anyhow!("StreamChannel not initialized"))?;
 
@@ -2334,7 +2336,7 @@ impl InferenceHandler for InferenceService {
             .max(600);
         let claims = ctx.claims().cloned();
 
-        let stream_ctx = stream_channel.prepare_stream_with_claims(client_pub_bytes, expiry_secs, claims).await?;
+        let stream_ctx = stream_channel.prepare_stream_with_claims(client_pub_ref, expiry_secs, claims).await?;
 
         let stream_id = stream_ctx.stream_id().to_owned();
         let server_pubkey = *stream_ctx.server_pubkey();

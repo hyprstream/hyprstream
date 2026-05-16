@@ -1432,13 +1432,13 @@ impl RegistryHandler for RegistryService {
         }
     }
 
-    async fn handle_clone_stream(&self, _ctx: &EnvelopeContext, _request_id: u64,
+    async fn handle_clone_stream(&self, ctx: &EnvelopeContext, _request_id: u64,
         data: &CloneRequest,
     ) -> Result<(StreamInfo, hyprstream_rpc::service::Continuation)> {
         let name_opt = if data.name.is_empty() { None } else { Some(data.name.as_str()) };
         let branch_opt = if data.branch.is_empty() { None } else { Some(data.branch.as_str()) };
-        let client_ephemeral_pubkey = None;
-        self.prepare_clone_stream(&data.url, name_opt, data.shallow, Some(data.depth), branch_opt, client_ephemeral_pubkey).await
+        let client_ephemeral_pubkey = ctx.ephemeral_pubkey();
+        self.prepare_clone_stream(&data.url, name_opt, data.shallow, Some(data.depth), branch_opt, client_ephemeral_pubkey.as_ref().map(<[u8; 32]>::as_slice)).await
     }
 
     async fn handle_register(&self, _ctx: &EnvelopeContext, _request_id: u64,

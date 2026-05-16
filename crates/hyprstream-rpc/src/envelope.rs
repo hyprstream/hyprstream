@@ -439,6 +439,11 @@ pub struct RequestEnvelope {
     /// Binds this proof to a specific Workload Identity Token even when
     /// the JWT is omitted (trust-store cache-hit path).
     pub wth: Option<[u8; 32]>,
+
+    /// Client's ephemeral DH public key for stream key derivation.
+    /// Present on streaming requests; the server uses this with its own
+    /// ephemeral keypair to derive the shared secret for HMAC chain keys.
+    pub client_dh_public: Option<[u8; 32]>,
 }
 
 impl RequestEnvelope {
@@ -452,6 +457,7 @@ impl RequestEnvelope {
             authorization: Authorization::None,
             delegation_token: None,
             wth: None,
+            client_dh_public: None,
         }
     }
 
@@ -478,6 +484,12 @@ impl RequestEnvelope {
     pub fn with_wth_of(mut self, jwt: &str) -> Self {
         use sha2::{Digest, Sha256};
         self.wth = Some(Sha256::digest(jwt.as_bytes()).into());
+        self
+    }
+
+    /// Set the client's ephemeral DH public key for stream key derivation.
+    pub fn with_client_dh_public(mut self, key: [u8; 32]) -> Self {
+        self.client_dh_public = Some(key);
         self
     }
 
@@ -931,6 +943,9 @@ impl ToCapnp for RequestEnvelope {
         if let Some(ref hash) = self.wth {
             builder.set_wth(hash);
         }
+        if let Some(ref key) = self.client_dh_public {
+            builder.set_client_dh_public(key);
+        }
     }
 }
 
@@ -978,6 +993,22 @@ impl FromCapnp for RequestEnvelope {
             }
         };
 
+        let client_dh_public = {
+            let data = reader.get_client_dh_public()?;
+            if data.is_empty() {
+                None
+            } else if data.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(data);
+                Some(arr)
+            } else {
+                return Err(anyhow!(
+                    "Invalid clientDhPublic length: expected 32, got {}",
+                    data.len()
+                ));
+            }
+        };
+
         Ok(Self {
             request_id: reader.get_request_id(),
             payload: reader.get_payload()?.to_vec(),
@@ -986,6 +1017,7 @@ impl FromCapnp for RequestEnvelope {
             authorization,
             delegation_token,
             wth,
+            client_dh_public,
         })
     }
 }
@@ -1410,6 +1442,7 @@ mod tests {
         assert_eq!(envelope.authorization, decoded.authorization);
         assert_eq!(envelope.delegation_token, decoded.delegation_token);
         assert_eq!(envelope.wth, decoded.wth);
+        assert_eq!(envelope.client_dh_public, decoded.client_dh_public);
         Ok(())
     }
 
@@ -1674,6 +1707,7 @@ mod tests {
             authorization: Authorization::IdJag("my-jwt-token".to_owned()),
             delegation_token: Some("delegated".to_owned()),
             wth: Some([0xAB; 32]),
+            client_dh_public: Some([0xCD; 32]),
         };
 
         let mut message = Builder::new_default();
@@ -1690,6 +1724,7 @@ mod tests {
         assert_eq!(envelope.authorization, decoded.authorization);
         assert_eq!(envelope.delegation_token, decoded.delegation_token);
         assert_eq!(envelope.wth, decoded.wth);
+        assert_eq!(envelope.client_dh_public, decoded.client_dh_public);
         Ok(())
     }
 
@@ -1705,6 +1740,7 @@ mod tests {
             authorization: Authorization::None,
             delegation_token: None,
             wth: None,
+            client_dh_public: None,
         };
 
         let mut signed = SignedEnvelope::new_signed(envelope, &signing_key);
@@ -1742,6 +1778,7 @@ mod tests {
             authorization: Authorization::None,
             delegation_token: None,
             wth: Some([0xAA; 32]),
+            client_dh_public: None,
         };
 
         let mut signed = SignedEnvelope::new_signed(envelope, &signing_key);

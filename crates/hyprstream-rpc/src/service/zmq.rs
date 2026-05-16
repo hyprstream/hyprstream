@@ -90,6 +90,10 @@ pub struct EnvelopeContext {
     /// WIMSE wth binding: SHA-256 of the WIT JWT from the envelope (if present).
     /// Populated from `RequestEnvelope.wit_hash` during context construction.
     pub(crate) envelope_wit_hash: Option<[u8; 32]>,
+
+    /// Client's ephemeral DH public key for stream key derivation.
+    /// Present on streaming requests; extracted from `RequestEnvelope.client_dh_public`.
+    client_dh_public: Option<[u8; 32]>,
 }
 
 impl EnvelopeContext {
@@ -109,6 +113,7 @@ impl EnvelopeContext {
             jwt_subject: None,
             cnf: envelope.cnf,
             envelope_wit_hash: envelope.envelope.wth,
+            client_dh_public: envelope.envelope.client_dh_public,
         }
     }
 
@@ -126,6 +131,7 @@ impl EnvelopeContext {
             jwt_subject: None,
             cnf: envelope.cnf,
             envelope_wit_hash: envelope.envelope.wth,
+            client_dh_public: envelope.envelope.client_dh_public,
         }
     }
 
@@ -147,6 +153,7 @@ impl EnvelopeContext {
             jwt_subject: None,
             cnf: [0u8; 32],
             envelope_wit_hash: None,
+            client_dh_public: None,
         }
     }
 
@@ -205,6 +212,12 @@ impl EnvelopeContext {
     /// Check if request has user context
     pub fn has_user_context(&self) -> bool {
         self.claims.is_some()
+    }
+
+    /// Get the client's ephemeral DH public key (if present).
+    /// Used by streaming handlers to derive shared secrets for HMAC chain keys.
+    pub fn ephemeral_pubkey(&self) -> Option<[u8; 32]> {
+        self.client_dh_public
     }
 
 }
