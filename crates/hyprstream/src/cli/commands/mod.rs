@@ -202,6 +202,14 @@ pub enum ServiceAction {
         #[arg(long, short = 'd')]
         daemon: bool,
 
+        /// Run all services in a single foreground process
+        ///
+        /// Starts every configured service in-process without systemd.
+        /// Useful for containers, testing, and environments without a
+        /// systemd user session.
+        #[arg(long, conflicts_with_all = ["foreground", "daemon", "services"])]
+        standalone: bool,
+
         /// Use IPC sockets for distributed mode
         #[arg(long)]
         ipc: bool,

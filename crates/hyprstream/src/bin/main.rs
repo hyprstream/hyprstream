@@ -1619,15 +1619,21 @@ fn main() -> Result<()> {
                     services: multi_services,
                     quic_bind,
                     print_cert_hash,
+                    standalone,
                 } => {
-                    if foreground {
-                        // --foreground requires either a service name or --services list
-                        let name = match (name, &multi_services) {
-                            (Some(n), _) => n,
-                            (None, Some(_)) => String::from("multi"), // placeholder for multi-service mode
-                            (None, None) => return Err(anyhow::anyhow!(
-                                "--foreground requires a service name or --services list"
-                            )),
+                    if foreground || standalone {
+                        // --foreground requires a service name or --services list;
+                        // --standalone uses all configured services.
+                        let (name, multi_services) = if standalone {
+                            (String::from("standalone"), Some(services.clone()))
+                        } else {
+                            match (name, &multi_services) {
+                                (Some(n), _) => (n, multi_services),
+                                (None, Some(_)) => (String::from("multi"), multi_services),
+                                (None, None) => return Err(anyhow::anyhow!(
+                                    "--foreground requires a service name or --services list"
+                                )),
+                            }
                         };
 
                         // Check if this is inference callback mode
