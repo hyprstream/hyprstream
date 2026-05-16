@@ -118,18 +118,30 @@ fn encode_with_header(claims: &Claims, signing_key: &SigningKey, header_json: &s
 
 /// Encode a user/client OAuth 2.0 access token (`typ: "at+jwt"`, RFC 9068).
 /// Includes `kid` in the JOSE header for key rotation support.
+/// Automatically assigns a `jti` if the claims don't already have one.
 pub fn encode(claims: &Claims, signing_key: &SigningKey) -> String {
     let kid = kid_for_key(signing_key);
     let header = format!(r#"{{"alg":"EdDSA","typ":"at+jwt","kid":"{}"}}"#, kid);
-    encode_with_header(claims, signing_key, &header)
+    let claims = ensure_jti(claims);
+    encode_with_header(&claims, signing_key, &header)
 }
 
 /// Encode a WIMSE Workload Identity Token (`typ: "wit+jwt"`) for service JWTs.
 /// Includes `kid` in the JOSE header for key rotation support.
+/// Automatically assigns a `jti` if the claims don't already have one.
 pub fn encode_service_jwt(claims: &Claims, signing_key: &SigningKey) -> String {
     let kid = kid_for_key(signing_key);
     let header = format!(r#"{{"alg":"EdDSA","typ":"wit+jwt","kid":"{}"}}"#, kid);
-    encode_with_header(claims, signing_key, &header)
+    let claims = ensure_jti(claims);
+    encode_with_header(&claims, signing_key, &header)
+}
+
+fn ensure_jti(claims: &Claims) -> std::borrow::Cow<'_, Claims> {
+    if claims.jti.is_some() {
+        std::borrow::Cow::Borrowed(claims)
+    } else {
+        std::borrow::Cow::Owned(claims.clone().with_jti())
+    }
 }
 
 /// Encode and sign an OIDC ID Token (EdDSA with `kid` in header).

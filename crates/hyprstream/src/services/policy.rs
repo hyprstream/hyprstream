@@ -73,6 +73,8 @@ pub struct PolicyService {
     /// Event prefix state for secure event transport (Phase 7).
     /// PolicyService is a blind relay — stores opaque wrapped blobs, never plaintext keys.
     event_prefixes: RwLock<HashMap<String, EventPrefixState>>,
+    /// Shared JWT ID blocklist for access token revocation.
+    jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
 }
 
 impl PolicyService {
@@ -100,7 +102,13 @@ impl PolicyService {
             context,
             transport,
             event_prefixes: RwLock::new(HashMap::new()),
+            jti_blocklist: Arc::new(hyprstream_rpc::auth::InMemoryJtiBlocklist::new()),
         }
+    }
+
+    /// Get a shared reference to the JWT ID blocklist (for wiring into OAuthState).
+    pub fn jti_blocklist_arc(&self) -> Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist> {
+        Arc::clone(&self.jti_blocklist)
     }
 
     /// Set the default audience for issued tokens (typically the OAuth issuer URL).
@@ -1453,6 +1461,10 @@ impl ZmqService for PolicyService {
 
     fn resolve_key_subject(&self, signer_pubkey: &[u8; 32]) -> Option<hyprstream_rpc::envelope::Subject> {
         hyprstream_service::global_trust_store().resolve_subject(signer_pubkey)
+    }
+
+    fn jti_blocklist(&self) -> Option<&dyn hyprstream_rpc::auth::JtiBlocklist> {
+        Some(self.jti_blocklist.as_ref())
     }
 
     fn cache_key_binding(

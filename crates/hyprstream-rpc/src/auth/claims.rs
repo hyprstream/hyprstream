@@ -87,6 +87,9 @@ pub struct Claims {
     pub sub: String,
     pub exp: i64,
     pub iat: i64,
+    /// RFC 7519 JWT ID — unique token identifier for revocation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jti: Option<String>,
     /// RFC 8707 audience claim for resource indicator binding.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aud: Option<String>,
@@ -119,6 +122,7 @@ impl std::fmt::Debug for Claims {
             .field("sub", &self.sub)
             .field("exp", &self.exp)
             .field("iat", &self.iat)
+            .field("jti", &self.jti)
             .field("aud", &self.aud)
             .field("cnf", &self.cnf)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
@@ -190,6 +194,7 @@ impl FromCapnp for Claims {
             sub: reader.get_sub()?.to_str()?.to_owned(),
             exp: reader.get_exp(),
             iat: reader.get_iat(),
+            jti: None,
             aud,
             cnf,
             token,
@@ -205,10 +210,21 @@ impl Claims {
             sub,
             exp,
             iat,
+            jti: None,
             aud: None,
             cnf: None,
             token: None,
         }
+    }
+
+    /// Set a random JWT ID (RFC 7519 `jti` claim) for revocation support.
+    pub fn with_jti(mut self) -> Self {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use rand::RngCore as _;
+        let mut bytes = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        self.jti = Some(URL_SAFE_NO_PAD.encode(bytes));
+        self
     }
 
     /// Set the issuer URL (RFC 7519 `iss` claim).

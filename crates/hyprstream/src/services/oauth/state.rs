@@ -315,6 +315,8 @@ pub struct OAuthState {
     /// Multi-slot JWT signing key store for rotation (drain/active/lead lifecycle).
     /// When present, JWKS serves all slots and issuance uses the active key.
     pub signing_key_store: Option<Arc<crate::auth::SigningKeyStore>>,
+    /// Shared JWT ID blocklist for access token revocation (shared with PolicyService).
+    pub jti_blocklist: Option<Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>>,
 }
 
 impl OAuthState {
@@ -355,6 +357,7 @@ impl OAuthState {
             jwt_key_nbf: chrono::Utc::now().timestamp(),
             jwt_key_exp: chrono::Utc::now().timestamp() + 14 * 86400,
             signing_key_store: None,
+            jti_blocklist: None,
         }
     }
 

@@ -10,6 +10,7 @@
 pub mod claims;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod federation;
+pub mod jti_blocklist;
 pub mod jwt;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod key_source;
@@ -18,6 +19,7 @@ pub mod scope;
 pub mod scope_registry;
 
 pub use claims::{Claims, Cnf, CnfJwk, IdTokenClaims, OneOrMany, compute_jkt, is_local_iss};
+pub use jti_blocklist::{InMemoryJtiBlocklist, JtiBlocklist};
 #[cfg(not(target_arch = "wasm32"))]
 pub use federation::FederationKeySource;
 pub use jwt::{decode, decode_unverified, decode_with_key, encode, encode_service_jwt, header_kid, jwk_thumbprint, JwkThumbprintInput, JwtError};

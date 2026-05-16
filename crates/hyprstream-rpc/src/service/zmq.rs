@@ -331,6 +331,14 @@ pub trait ZmqService: 'static {
         true
     }
 
+    /// JWT ID blocklist for access token revocation.
+    ///
+    /// When `Some`, `verify_claims()` rejects tokens whose `jti` appears
+    /// in the blocklist. Override to provide a shared blocklist instance.
+    fn jti_blocklist(&self) -> Option<&dyn crate::auth::JtiBlocklist> {
+        None
+    }
+
     /// Resolve a signer key to an authorization subject via the trust store.
     ///
     /// Returns `Some(subject)` if the key is cached and not expired.
@@ -422,6 +430,16 @@ pub trait ZmqService: 'static {
                 tracing::warn!("JWT verification failed: {}", e);
                 anyhow::anyhow!("JWT verification failed")
             })?;
+
+        // Check jti against blocklist (revoked access tokens)
+        if let Some(ref jti) = verified.jti {
+            if let Some(blocklist) = self.jti_blocklist() {
+                if blocklist.is_revoked(jti) {
+                    tracing::warn!(jti = %jti, sub = %verified.sub, "Revoked JWT rejected");
+                    anyhow::bail!("JWT has been revoked");
+                }
+            }
+        }
 
         // Store verified claims on context for downstream use
         let local_issuers = key_source.local_issuers();
