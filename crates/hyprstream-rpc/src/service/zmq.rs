@@ -319,14 +319,16 @@ pub trait ZmqService: 'static {
         None
     }
 
-    /// Whether to reject JWTs that lack a `cnf.jwk` key binding.
+    /// Whether to reject JWTs that lack a `cnf` key binding (jwk or jkt).
     ///
     /// When `true`, `verify_claims()` will reject any JWT that does not carry
     /// a `cnf` confirmation key, ensuring every authenticated request is
-    /// cryptographically bound to its envelope signer. Default is `false`
-    /// for backwards compatibility.
+    /// cryptographically bound to its envelope signer.
+    ///
+    /// Default is `true` — override to `false` only for services that
+    /// intentionally accept unbound JWTs (e.g., legacy compatibility).
     fn require_cnf_binding(&self) -> bool {
-        false
+        true
     }
 
     /// Resolve a signer key to an authorization subject via the trust store.

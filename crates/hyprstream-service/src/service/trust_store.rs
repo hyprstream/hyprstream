@@ -39,6 +39,8 @@ pub struct Attestation {
     pub jwt: Option<String>,
     /// Unix timestamp when this attestation expires.
     pub expires_at: i64,
+    /// Root/CA key that issued this attestation (for chain revocation).
+    pub attested_by: Option<[u8; 32]>,
 }
 
 /// Key-centric trust store. Thread-safe, lock-free reads.
@@ -178,11 +180,24 @@ impl TrustStore {
         })
     }
 
-    /// Remove all entries whose attestation was issued by a revoked root key.
+    /// Remove all entries whose attestation was issued by the given root key.
     ///
-    /// Not yet implemented — needs attestation chain tracking.
-    pub fn invalidate_by_root(&_root_key: &VerifyingKey) {
-        // TODO: Track which root attested each key, then remove by root.
+    /// Returns the number of entries removed.
+    pub fn invalidate_by_root(&self, root_key: &VerifyingKey) -> usize {
+        let root_bytes = root_key.to_bytes();
+        let before = self.inner.len();
+        self.inner.retain(|_, att| {
+            att.attested_by.as_ref() != Some(&root_bytes)
+        });
+        let removed = before - self.inner.len();
+        if removed > 0 {
+            tracing::info!(
+                root = ?root_bytes[..8],
+                removed,
+                "Invalidated keys attested by revoked root"
+            );
+        }
+        removed
     }
 
     /// Number of entries in the trust store (including expired).
@@ -232,6 +247,7 @@ mod tests {
             subject: None,
             jwt: None,
             expires_at,
+            attested_by: None,
         }
     }
 

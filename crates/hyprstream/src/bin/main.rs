@@ -1264,6 +1264,7 @@ fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
                     subject: None,
                     jwt: None,
                     expires_at: 0,
+                    attested_by: None,
                 },
             );
         }
@@ -1785,6 +1786,7 @@ fn main() -> Result<()> {
                                                     subject: None,
                                                     jwt: None,
                                                     expires_at: 0,
+                                                    attested_by: None,
                                                 },
                                             );
                                         }
@@ -1834,6 +1836,7 @@ fn main() -> Result<()> {
                                                 subject: None,
                                                 jwt: None,
                                                 expires_at: 0,
+                                                attested_by: None,
                                             },
                                         );
                                     }

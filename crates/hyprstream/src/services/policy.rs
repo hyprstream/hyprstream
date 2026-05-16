@@ -1267,9 +1267,10 @@ impl PolicyHandler for PolicyService {
             let trust = hyprstream_service::global_trust_store();
             trust.insert(vk, hyprstream_service::Attestation {
                 scopes: std::iter::once(data.service_name.clone()).collect(),
-                subject: None, // service keys derive subject from scope
+                subject: None,
                 jwt: Some(data.service_jwt.clone()),
                 expires_at: claims.exp,
+                attested_by: Some(self.signing_key.verifying_key().to_bytes()),
             });
         }
 
@@ -1466,6 +1467,7 @@ impl ZmqService for PolicyService {
             subject: Some(subject.to_owned()),
             jwt: Some(jwt.to_owned()),
             expires_at,
+            attested_by: Some(self.signing_key.verifying_key().to_bytes()),
         });
     }
 

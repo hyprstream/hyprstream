@@ -359,6 +359,7 @@ impl ServiceContext {
                     subject: None,
                     jwt: None,
                     expires_at: 0,
+                    attested_by: None,
                 });
                 continue;
             }
@@ -394,6 +395,7 @@ impl ServiceContext {
                 subject: None,
                 jwt: Some(jwt),
                 expires_at: expiry,
+                attested_by: Some(root_verifying_key.to_bytes()),
             });
         }
 
