@@ -660,6 +660,12 @@ pub struct SignedEnvelope {
 
     /// X25519 ephemeral public key for DH key agreement (present when encrypted)
     pub client_ephemeral_public: Option<[u8; 32]>,
+
+    /// ML-DSA-65 signature (3309 bytes, present when pq-hybrid is enabled)
+    pub pq_sig: Option<Vec<u8>>,
+
+    /// ML-DSA-65 verifying key (1952 bytes, present when pq-hybrid is enabled)
+    pub pq_cnf: Option<Vec<u8>>,
 }
 
 /// Replay protection cache interface.
@@ -837,6 +843,40 @@ impl SignedEnvelope {
             cnf: signing_key.verifying_key().to_bytes(),
             encrypted_envelope: None,
             client_ephemeral_public: None,
+            pq_sig: None,
+            pq_cnf: None,
+        }
+    }
+
+    /// Create and dual-sign a new envelope with Ed25519 + ML-DSA-65.
+    #[cfg(feature = "pq-hybrid")]
+    pub fn new_signed_hybrid(
+        mut envelope: RequestEnvelope,
+        signing_key: &SigningKey,
+        pq_signing_key: &crate::crypto::pq::MlDsaSigningKey,
+    ) -> Self {
+        if envelope.wth.is_none() {
+            if let Some(jwt) = envelope.jwt_token() {
+                use sha2::{Digest, Sha256};
+                envelope.wth = Some(Sha256::digest(jwt.as_bytes()).into());
+            }
+        }
+
+        let envelope_bytes = envelope.to_bytes();
+        let signature = signing_key.sign(&envelope_bytes);
+        let pq_sig = crate::crypto::pq::ml_dsa_sign(pq_signing_key, &envelope_bytes);
+        let pq_cnf = crate::crypto::pq::ml_dsa_vk_bytes(
+            &ml_dsa::Keypair::verifying_key(pq_signing_key),
+        );
+
+        Self {
+            envelope,
+            sig: signature.to_bytes(),
+            cnf: signing_key.verifying_key().to_bytes(),
+            encrypted_envelope: None,
+            client_ephemeral_public: None,
+            pq_sig: Some(pq_sig),
+            pq_cnf: Some(pq_cnf),
         }
     }
 
@@ -873,6 +913,48 @@ impl SignedEnvelope {
             cnf: signing_key.verifying_key().to_bytes(),
             encrypted_envelope: Some(ciphertext),
             client_ephemeral_public: Some(eph_public),
+            pq_sig: None,
+            pq_cnf: None,
+        })
+    }
+
+    /// Create, encrypt, and dual-sign a new envelope with Ed25519 + ML-DSA-65.
+    #[cfg(feature = "pq-hybrid")]
+    pub fn new_signed_encrypted_hybrid(
+        mut envelope: RequestEnvelope,
+        signing_key: &SigningKey,
+        server_pubkey: &VerifyingKey,
+        pq_signing_key: &crate::crypto::pq::MlDsaSigningKey,
+    ) -> EnvelopeResult<Self> {
+        use crate::crypto::envelope_crypto::encrypt_envelope;
+
+        if envelope.wth.is_none() {
+            if let Some(jwt) = envelope.jwt_token() {
+                use sha2::{Digest, Sha256};
+                envelope.wth = Some(Sha256::digest(jwt.as_bytes()).into());
+            }
+        }
+
+        let envelope_bytes = envelope.to_bytes();
+        let (ciphertext, eph_public) = encrypt_envelope(&envelope_bytes, server_pubkey)?;
+
+        let mut signing_data = Vec::with_capacity(ciphertext.len() + 32);
+        signing_data.extend_from_slice(&ciphertext);
+        signing_data.extend_from_slice(&eph_public);
+        let signature = signing_key.sign(&signing_data);
+        let pq_sig = crate::crypto::pq::ml_dsa_sign(pq_signing_key, &signing_data);
+        let pq_cnf = crate::crypto::pq::ml_dsa_vk_bytes(
+            &ml_dsa::Keypair::verifying_key(pq_signing_key),
+        );
+
+        Ok(Self {
+            envelope,
+            sig: signature.to_bytes(),
+            cnf: signing_key.verifying_key().to_bytes(),
+            encrypted_envelope: Some(ciphertext),
+            client_ephemeral_public: Some(eph_public),
+            pq_sig: Some(pq_sig),
+            pq_cnf: Some(pq_cnf),
         })
     }
 
@@ -936,6 +1018,9 @@ impl SignedEnvelope {
         let signature = Signature::from_bytes(&self.sig);
         expected_pubkey.verify_strict(&signing_data, &signature)?;
 
+        // 5. Verify PQ signature
+        self.verify_pq_signature(&signing_data)?;
+
         Ok(())
     }
 
@@ -953,6 +1038,7 @@ impl SignedEnvelope {
         let signing_data = self.signed_bytes();
         let signature = Signature::from_bytes(&self.sig);
         expected_pubkey.verify_strict(&signing_data, &signature)?;
+        self.verify_pq_signature(&signing_data)?;
 
         Ok(())
     }
@@ -996,7 +1082,44 @@ impl SignedEnvelope {
         let signature = Signature::from_bytes(&self.sig);
         verifying_key.verify_strict(&signing_data, &signature)?;
 
+        // 5. Verify PQ signature
+        self.verify_pq_signature(&signing_data)?;
+
         Ok(())
+    }
+
+    /// Verify ML-DSA-65 post-quantum signature if present.
+    ///
+    /// When `pq-hybrid` feature is enabled, PQ signatures are mandatory —
+    /// envelopes without them are rejected.
+    fn verify_pq_signature(&self, signing_data: &[u8]) -> EnvelopeResult<()> {
+        match (&self.pq_sig, &self.pq_cnf) {
+            (Some(sig), Some(cnf)) => {
+                #[cfg(feature = "pq-hybrid")]
+                {
+                    let vk = crate::crypto::pq::ml_dsa_vk_from_bytes(cnf)
+                        .map_err(|e| EnvelopeError::PqSignatureInvalid(e.to_string()))?;
+                    crate::crypto::pq::ml_dsa_verify(&vk, signing_data, sig)
+                        .map_err(|e| EnvelopeError::PqSignatureInvalid(e.to_string()))?;
+                }
+                #[cfg(not(feature = "pq-hybrid"))]
+                {
+                    let _ = (sig, cnf, signing_data);
+                }
+                Ok(())
+            }
+            (None, None) => {
+                #[cfg(feature = "pq-hybrid")]
+                return Err(EnvelopeError::PqSignatureInvalid(
+                    "missing mandatory PQ signature".to_owned(),
+                ));
+                #[cfg(not(feature = "pq-hybrid"))]
+                Ok(())
+            }
+            _ => Err(EnvelopeError::PqSignatureInvalid(
+                "incomplete PQ signature fields (need both pq_sig and pq_cnf)".to_owned(),
+            )),
+        }
     }
 
     /// Compute the bytes that were signed.
@@ -1178,6 +1301,12 @@ impl ToCapnp for SignedEnvelope {
         if let Some(ref eph) = self.client_ephemeral_public {
             builder.set_client_ephemeral_public(eph);
         }
+        if let Some(ref pq_sig) = self.pq_sig {
+            builder.set_pq_sig(pq_sig);
+        }
+        if let Some(ref pq_cnf) = self.pq_cnf {
+            builder.set_pq_cnf(pq_cnf);
+        }
     }
 }
 
@@ -1232,12 +1361,24 @@ impl FromCapnp for SignedEnvelope {
             }
         };
 
+        let pq_sig = {
+            let data = reader.get_pq_sig()?;
+            if data.is_empty() { None } else { Some(data.to_vec()) }
+        };
+
+        let pq_cnf = {
+            let data = reader.get_pq_cnf()?;
+            if data.is_empty() { None } else { Some(data.to_vec()) }
+        };
+
         Ok(Self {
             envelope: RequestEnvelope::read_from(reader.get_envelope()?)?,
             sig,
             cnf,
             encrypted_envelope,
             client_ephemeral_public,
+            pq_sig,
+            pq_cnf,
         })
     }
 }
@@ -1487,6 +1628,22 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "pq-hybrid")]
+    fn test_pq_keypair() -> crate::crypto::pq::MlDsaSigningKey {
+        let (sk, _vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        sk
+    }
+
+    fn test_new_signed(envelope: RequestEnvelope, signing_key: &SigningKey) -> SignedEnvelope {
+        #[cfg(feature = "pq-hybrid")]
+        {
+            let pq_sk = test_pq_keypair();
+            SignedEnvelope::new_signed_hybrid(envelope, signing_key, &pq_sk)
+        }
+        #[cfg(not(feature = "pq-hybrid"))]
+        SignedEnvelope::new_signed(envelope, signing_key)
+    }
+
     #[test]
     fn test_request_envelope() {
         let envelope = RequestEnvelope::anonymous(vec![1, 2, 3]);
@@ -1509,7 +1666,7 @@ mod tests {
         let nonce_cache = TestNonceCache::new();
 
         let envelope = RequestEnvelope::anonymous(vec![1, 2, 3, 4]);
-        let signed = SignedEnvelope::new_signed(envelope, &signing_key);
+        let signed = test_new_signed(envelope, &signing_key);
 
         // Verify should succeed
         signed.verify(&verifying_key, &nonce_cache)?;
@@ -1523,7 +1680,7 @@ mod tests {
         let nonce_cache = TestNonceCache::new();
 
         let envelope = RequestEnvelope::anonymous(vec![1, 2, 3, 4]);
-        let signed = SignedEnvelope::new_signed(envelope, &signing_key);
+        let signed = test_new_signed(envelope, &signing_key);
 
         // Verify with wrong key should fail
         let result = signed.verify(&wrong_verifying_key, &nonce_cache);
@@ -1536,7 +1693,7 @@ mod tests {
         let nonce_cache = TestNonceCache::new();
 
         let envelope = RequestEnvelope::anonymous(vec![1, 2, 3, 4]);
-        let signed = SignedEnvelope::new_signed(envelope, &signing_key);
+        let signed = test_new_signed(envelope, &signing_key);
 
         // First verify succeeds
         signed.verify(&verifying_key, &nonce_cache)?;
@@ -1552,7 +1709,7 @@ mod tests {
         let (signing_key, _) = generate_signing_keypair();
 
         let envelope = RequestEnvelope::anonymous(vec![5, 6, 7]);
-        let signed = SignedEnvelope::new_signed(envelope, &signing_key);
+        let signed = test_new_signed(envelope, &signing_key);
 
         assert!(signed.request_id() > 0);
         assert_eq!(signed.payload(), &[5, 6, 7]);
@@ -1588,7 +1745,7 @@ mod tests {
 
         let (signing_key, verifying_key) = generate_signing_keypair();
         let envelope = RequestEnvelope::anonymous(vec![1, 2, 3]);
-        let signed = SignedEnvelope::new_signed(envelope, &signing_key);
+        let signed = test_new_signed(envelope, &signing_key);
 
         let mut message = Builder::new_default();
         let mut builder = message.init_root::<common_capnp::signed_envelope::Builder>();
@@ -1879,7 +2036,7 @@ mod tests {
             client_dh_public: None,
         };
 
-        let mut signed = SignedEnvelope::new_signed(envelope, &signing_key);
+        let mut signed = test_new_signed(envelope, &signing_key);
 
         // Tamper with the authorization after signing
         signed.envelope.authorization = Authorization::IdJag("evil-token".to_owned());
@@ -1894,7 +2051,7 @@ mod tests {
         let (signing_key, verifying_key) = generate_signing_keypair();
 
         let envelope = RequestEnvelope::anonymous(vec![1, 2, 3]);
-        let mut signed = SignedEnvelope::new_signed(envelope, &signing_key);
+        let mut signed = test_new_signed(envelope, &signing_key);
 
         signed.envelope.payload = vec![9, 9, 9];
 
@@ -1917,7 +2074,7 @@ mod tests {
             client_dh_public: None,
         };
 
-        let mut signed = SignedEnvelope::new_signed(envelope, &signing_key);
+        let mut signed = test_new_signed(envelope, &signing_key);
         signed.envelope.wth = Some([0xBB; 32]);
 
         let result = signed.verify_signature_only(&verifying_key);

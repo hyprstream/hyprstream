@@ -2,6 +2,16 @@ use hyprstream_rpc::envelope::{Authorization, RequestEnvelope, SignedEnvelope};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 
+fn make_signed(envelope: RequestEnvelope, signing_key: &SigningKey) -> SignedEnvelope {
+    #[cfg(feature = "pq-hybrid")]
+    {
+        let (pq_sk, _) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+        SignedEnvelope::new_signed_hybrid(envelope, signing_key, &pq_sk)
+    }
+    #[cfg(not(feature = "pq-hybrid"))]
+    SignedEnvelope::new_signed(envelope, signing_key)
+}
+
 #[test]
 fn test_envelope_serialization_deterministic() {
     let envelope1 = RequestEnvelope {
@@ -47,13 +57,13 @@ fn test_envelope_signature_verification_stable() {
         client_dh_public: None,
     };
 
-    let signed1 = SignedEnvelope::new_signed(envelope.clone(), &signing_key);
-    let signed2 = SignedEnvelope::new_signed(envelope.clone(), &signing_key);
+    let signed1 = make_signed(envelope.clone(), &signing_key);
+    let signed2 = make_signed(envelope.clone(), &signing_key);
 
-    // Signatures MUST be identical (deterministic serialization)
+    // Ed25519 signatures MUST be identical (deterministic serialization)
     assert_eq!(
         signed1.sig, signed2.sig,
-        "Identical envelopes MUST produce identical signatures"
+        "Identical envelopes MUST produce identical Ed25519 signatures"
     );
 
     assert!(
@@ -73,13 +83,15 @@ fn test_envelope_signature_verification_stable() {
         "Envelope bytes must be identical for cross-verification"
     );
 
-    // Verify with switched envelope/signature
+    // Verify with switched envelope/signature (Ed25519 cross-verification)
     let mixed = SignedEnvelope {
         envelope: signed2.envelope.clone(),
         sig: signed1.sig,
         cnf: signed1.cnf,
         encrypted_envelope: None,
         client_ephemeral_public: None,
+        pq_sig: signed1.pq_sig.clone(),
+        pq_cnf: signed1.pq_cnf.clone(),
     };
 
     assert!(
