@@ -161,6 +161,7 @@ blake3.workspace = true                  # Fast cryptographic hashing for checks
 tempfile.workspace = true                # Temporary files for model conversion
 base64.workspace = true                  # JWT token encoding
 ed25519-dalek.workspace = true           # JWT Ed25519 signatures
+p256.workspace = true                    # ES256 DPoP verification (atproto interop)
 keyring = { version = "3", features = ["linux-native"] }  # OS keyring — Linux keyutils
 curve25519-dalek.workspace = true        # Ristretto255 DH for stream authentication
 hkdf.workspace = true                    # HKDF key derivation
