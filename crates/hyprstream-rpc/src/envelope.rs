@@ -210,6 +210,53 @@ fn envelope_reader_options() -> capnp::message::ReaderOptions {
     opts
 }
 
+// ============================================================================
+// Envelope Unwrap Options
+// ============================================================================
+
+/// How to verify the envelope signer.
+pub enum EnvelopeVerification<'a> {
+    /// Require the envelope signer to match this specific verifying key.
+    FixedSigner(&'a VerifyingKey),
+    /// Accept any valid Ed25519 signer (self-signed).
+    AnySigner,
+}
+
+/// Options controlling envelope unwrap, verification, and optional decryption.
+pub struct UnwrapOptions<'a> {
+    /// How to verify the envelope signer.
+    pub verification: EnvelopeVerification<'a>,
+    /// Nonce cache for replay protection.
+    pub nonce_cache: &'a dyn NonceCache,
+    /// Server signing key for decrypting encrypted envelopes.
+    /// When present and the envelope has `encrypted_envelope`, the server's
+    /// Ed25519 key is converted to X25519 for DH decryption.
+    pub decryption_key: Option<&'a crate::crypto::SigningKey>,
+}
+
+impl<'a> UnwrapOptions<'a> {
+    pub fn fixed_signer(pubkey: &'a VerifyingKey, nonce_cache: &'a dyn NonceCache) -> Self {
+        Self {
+            verification: EnvelopeVerification::FixedSigner(pubkey),
+            nonce_cache,
+            decryption_key: None,
+        }
+    }
+
+    pub fn any_signer(nonce_cache: &'a dyn NonceCache) -> Self {
+        Self {
+            verification: EnvelopeVerification::AnySigner,
+            nonce_cache,
+            decryption_key: None,
+        }
+    }
+
+    pub fn with_decryption_key(mut self, key: &'a crate::crypto::SigningKey) -> Self {
+        self.decryption_key = Some(key);
+        self
+    }
+}
+
 /// Global request ID counter for unique IDs
 static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -599,14 +646,20 @@ impl RequestEnvelope {
 /// ```
 #[derive(Debug, Clone)]
 pub struct SignedEnvelope {
-    /// The unsigned envelope (this is what gets signed)
+    /// The unsigned envelope (cleartext path, or decrypted from encrypted_envelope)
     pub envelope: RequestEnvelope,
 
-    /// Ed25519 signature over serialized envelope (64 bytes)
+    /// Ed25519 signature (64 bytes)
     pub sig: [u8; 64],
 
     /// Ed25519 public key of the signer (32 bytes)
     pub cnf: [u8; 32],
+
+    /// AES-256-GCM-SIV ciphertext of serialized RequestEnvelope (None = cleartext mode)
+    pub encrypted_envelope: Option<Vec<u8>>,
+
+    /// X25519 ephemeral public key for DH key agreement (present when encrypted)
+    pub client_ephemeral_public: Option<[u8; 32]>,
 }
 
 /// Replay protection cache interface.
@@ -782,7 +835,50 @@ impl SignedEnvelope {
             envelope,
             sig: signature.to_bytes(),
             cnf: signing_key.verifying_key().to_bytes(),
+            encrypted_envelope: None,
+            client_ephemeral_public: None,
         }
+    }
+
+    /// Create, encrypt, and sign a new envelope (encrypt-then-sign).
+    ///
+    /// The envelope is serialized, encrypted with AES-256-GCM-SIV using a key
+    /// derived from X25519 DH(client_ephemeral, server_static), then signed.
+    /// The signature covers `encrypted_envelope || client_ephemeral_public`.
+    pub fn new_signed_encrypted(
+        mut envelope: RequestEnvelope,
+        signing_key: &SigningKey,
+        server_pubkey: &VerifyingKey,
+    ) -> EnvelopeResult<Self> {
+        use crate::crypto::envelope_crypto::encrypt_envelope;
+
+        if envelope.wth.is_none() {
+            if let Some(jwt) = envelope.jwt_token() {
+                use sha2::{Digest, Sha256};
+                envelope.wth = Some(Sha256::digest(jwt.as_bytes()).into());
+            }
+        }
+
+        let envelope_bytes = envelope.to_bytes();
+        let (ciphertext, eph_public) = encrypt_envelope(&envelope_bytes, server_pubkey)?;
+
+        let mut signing_data = Vec::with_capacity(ciphertext.len() + 32);
+        signing_data.extend_from_slice(&ciphertext);
+        signing_data.extend_from_slice(&eph_public);
+        let signature = signing_key.sign(&signing_data);
+
+        Ok(Self {
+            envelope,
+            sig: signature.to_bytes(),
+            cnf: signing_key.verifying_key().to_bytes(),
+            encrypted_envelope: Some(ciphertext),
+            client_ephemeral_public: Some(eph_public),
+        })
+    }
+
+    /// Returns true if this envelope uses the encrypted path.
+    pub fn is_encrypted(&self) -> bool {
+        self.encrypted_envelope.is_some()
     }
 
     /// Verify the signature and check replay protection.
@@ -836,9 +932,9 @@ impl SignedEnvelope {
         }
 
         // 4. Verify signature (strict: rejects small-order public keys)
-        let envelope_bytes = self.envelope.to_bytes();
+        let signing_data = self.signed_bytes();
         let signature = Signature::from_bytes(&self.sig);
-        expected_pubkey.verify_strict(&envelope_bytes, &signature)?;
+        expected_pubkey.verify_strict(&signing_data, &signature)?;
 
         Ok(())
     }
@@ -854,9 +950,9 @@ impl SignedEnvelope {
             });
         }
 
-        let envelope_bytes = self.envelope.to_bytes();
+        let signing_data = self.signed_bytes();
         let signature = Signature::from_bytes(&self.sig);
-        expected_pubkey.verify_strict(&envelope_bytes, &signature)?;
+        expected_pubkey.verify_strict(&signing_data, &signature)?;
 
         Ok(())
     }
@@ -896,9 +992,55 @@ impl SignedEnvelope {
         }
 
         // 4. Verify signature against the embedded public key
-        let envelope_bytes = self.envelope.to_bytes();
+        let signing_data = self.signed_bytes();
         let signature = Signature::from_bytes(&self.sig);
-        verifying_key.verify_strict(&envelope_bytes, &signature)?;
+        verifying_key.verify_strict(&signing_data, &signature)?;
+
+        Ok(())
+    }
+
+    /// Compute the bytes that were signed.
+    ///
+    /// Encrypted mode: `encrypted_envelope || client_ephemeral_public`
+    /// Cleartext mode: `canonical(envelope)`
+    fn signed_bytes(&self) -> Vec<u8> {
+        match (&self.encrypted_envelope, &self.client_ephemeral_public) {
+            (Some(ct), Some(eph)) => {
+                let mut data = Vec::with_capacity(ct.len() + 32);
+                data.extend_from_slice(ct);
+                data.extend_from_slice(eph);
+                data
+            }
+            _ => self.envelope.to_bytes(),
+        }
+    }
+
+    /// Decrypt the envelope in-place, replacing the cleartext `envelope` field.
+    ///
+    /// After calling this, `self.envelope` contains the decrypted data and
+    /// the encrypted fields remain for signature verification.
+    pub fn decrypt_in_place(
+        &mut self,
+        server_signing_key: &crate::crypto::SigningKey,
+    ) -> EnvelopeResult<()> {
+        use crate::crypto::envelope_crypto::decrypt_envelope;
+
+        let ct = self.encrypted_envelope.as_ref()
+            .ok_or_else(|| EnvelopeError::Decryption("no encrypted envelope present".into()))?;
+        let eph = self.client_ephemeral_public.as_ref()
+            .ok_or_else(|| EnvelopeError::Decryption("no client ephemeral public key".into()))?;
+
+        let plaintext = decrypt_envelope(ct, eph, server_signing_key)?;
+
+        let reader = capnp::serialize::read_message(
+            &mut std::io::Cursor::new(&plaintext),
+            envelope_reader_options(),
+        ).map_err(|e| EnvelopeError::Decryption(format!("capnp parse after decrypt: {e}")))?;
+        let env_reader = reader
+            .get_root::<crate::common_capnp::request_envelope::Reader>()
+            .map_err(|e| EnvelopeError::Decryption(format!("envelope read after decrypt: {e}")))?;
+        self.envelope = RequestEnvelope::read_from(env_reader)
+            .map_err(|e| EnvelopeError::Decryption(format!("envelope decode after decrypt: {e}")))?;
 
         Ok(())
     }
@@ -1030,6 +1172,12 @@ impl ToCapnp for SignedEnvelope {
             .write_to(&mut builder.reborrow().init_envelope());
         builder.set_sig(&self.sig);
         builder.set_cnf(&self.cnf);
+        if let Some(ref ct) = self.encrypted_envelope {
+            builder.set_encrypted_envelope(ct);
+        }
+        if let Some(ref eph) = self.client_ephemeral_public {
+            builder.set_client_ephemeral_public(eph);
+        }
     }
 }
 
@@ -1063,10 +1211,33 @@ impl FromCapnp for SignedEnvelope {
             arr
         };
 
+        let encrypted_envelope = {
+            let data = reader.get_encrypted_envelope()?;
+            if data.is_empty() { None } else { Some(data.to_vec()) }
+        };
+
+        let client_ephemeral_public = {
+            let data = reader.get_client_ephemeral_public()?;
+            if data.is_empty() {
+                None
+            } else if data.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(data);
+                Some(arr)
+            } else {
+                return Err(anyhow!(
+                    "Invalid clientEphemeralPublic length: expected 32, got {}",
+                    data.len()
+                ));
+            }
+        };
+
         Ok(Self {
             envelope: RequestEnvelope::read_from(reader.get_envelope()?)?,
             sig,
             cnf,
+            encrypted_envelope,
+            client_ephemeral_public,
         })
     }
 }
@@ -1185,14 +1356,14 @@ impl FromCapnp for ResponseEnvelope {
     }
 }
 
-/// Unwrap and verify a SignedEnvelope from wire bytes (core logic, all targets).
+/// Unwrap and verify a SignedEnvelope from wire bytes.
 ///
-/// Deserializes, verifies signature and replay protection, then extracts
-/// the verified envelope and payload.
+/// Dispatches on `opts.verification` to select FixedSigner or AnySigner mode.
+/// If `opts.decryption_key` is set and the envelope is encrypted, decrypts
+/// the envelope after signature verification.
 pub fn unwrap_and_verify(
     request: &[u8],
-    server_pubkey: &VerifyingKey,
-    nonce_cache: &dyn NonceCache,
+    opts: &UnwrapOptions<'_>,
 ) -> Result<(SignedEnvelope, Vec<u8>)> {
     use capnp::serialize;
 
@@ -1201,85 +1372,50 @@ pub fn unwrap_and_verify(
         envelope_reader_options(),
     )?;
     let signed_reader = reader.get_root::<crate::common_capnp::signed_envelope::Reader>()?;
-    let signed = SignedEnvelope::read_from(signed_reader)?;
+    let mut signed = SignedEnvelope::read_from(signed_reader)?;
 
-    signed.verify(server_pubkey, nonce_cache)?;
+    match &opts.verification {
+        EnvelopeVerification::FixedSigner(pubkey) => {
+            signed.verify(pubkey, opts.nonce_cache)?;
+        }
+        EnvelopeVerification::AnySigner => {
+            signed.verify_any_signer(opts.nonce_cache)?;
+        }
+    }
+
+    if signed.is_encrypted() {
+        if let Some(decryption_key) = opts.decryption_key {
+            signed.decrypt_in_place(decryption_key)?;
+        } else {
+            return Err(anyhow!("encrypted envelope but no decryption key configured"));
+        }
+    }
 
     let payload = signed.payload().to_vec();
     Ok((signed, payload))
 }
 
-/// Unwrap and verify a FixedSigner envelope, returning `EnvelopeContext` + payload.
+/// Unwrap, verify, and build an `EnvelopeContext` from wire bytes.
 ///
-/// Sets `key_derived_subject = Subject::new("system")` on the context, so
-/// `EnvelopeContext::subject()` returns `"system"` for any caller that passes
-/// signature verification against `server_pubkey`. Use this for inproc/IPC
-/// callers that share the node's signing key.
-///
-/// Native only — `EnvelopeContext` requires the `service` module.
+/// Context construction depends on verification mode:
+/// - `FixedSigner` → `key_derived_subject = "system"` (inproc/IPC callers)
+/// - `AnySigner` → `key_derived_subject = anonymous` (WebTransport, identity from JWT)
 #[cfg(not(target_arch = "wasm32"))]
 pub fn unwrap_envelope(
     request: &[u8],
-    server_pubkey: &VerifyingKey,
-    nonce_cache: &dyn NonceCache,
+    opts: &UnwrapOptions<'_>,
 ) -> Result<(crate::service::EnvelopeContext, Vec<u8>)> {
-    let (signed, payload) = unwrap_and_verify(request, server_pubkey, nonce_cache)?;
-    let ctx = crate::service::EnvelopeContext::from_verified_as_system(&signed);
-    Ok((ctx, payload))
-}
+    let (signed, payload) = unwrap_and_verify(request, opts)?;
 
-/// Unwrap and verify a SignedEnvelope from any signer (WebTransport clients).
-///
-/// Unlike `unwrap_and_verify`, this does NOT require the signer to match a
-/// specific server pubkey. Instead, it verifies the signature against the
-/// envelope's own embedded public key. Used for browser clients that sign
-/// with their own keypair.
-pub fn unwrap_and_verify_any_signer(
-    request: &[u8],
-    nonce_cache: &dyn NonceCache,
-) -> Result<(SignedEnvelope, Vec<u8>)> {
-    use capnp::serialize;
+    let ctx = match &opts.verification {
+        EnvelopeVerification::FixedSigner(_) => {
+            crate::service::EnvelopeContext::from_verified_as_system(&signed)
+        }
+        EnvelopeVerification::AnySigner => {
+            crate::service::EnvelopeContext::from_verified(&signed)
+        }
+    };
 
-    let reader = serialize::read_message(
-        &mut std::io::Cursor::new(request),
-        envelope_reader_options(),
-    )?;
-    let signed_reader = reader.get_root::<crate::common_capnp::signed_envelope::Reader>()?;
-    let signed = SignedEnvelope::read_from(signed_reader)?;
-
-    signed.verify_any_signer(nonce_cache)?;
-
-    let payload = signed.payload().to_vec();
-    Ok((signed, payload))
-}
-
-/// Unwrap and verify a SignedEnvelope from any signer, returning `EnvelopeContext` + payload.
-///
-/// WebTransport variant of `unwrap_envelope` — accepts any valid Ed25519 signer.
-#[cfg(not(target_arch = "wasm32"))]
-pub fn unwrap_envelope_any_signer(
-    request: &[u8],
-    nonce_cache: &dyn NonceCache,
-) -> Result<(crate::service::EnvelopeContext, Vec<u8>)> {
-    let (signed, payload) = unwrap_and_verify_any_signer(request, nonce_cache)?;
-    let ctx = crate::service::EnvelopeContext::from_verified(&signed);
-    Ok((ctx, payload))
-}
-
-/// Unwrap and verify a FixedSigner envelope, setting `key_derived_subject = system`.
-///
-/// Used for inproc/IPC callers who sign with the node key. Sets
-/// `Subject::new("system")` as the key-derived subject so that
-/// `EnvelopeContext::subject()` returns `"system"` regardless of any
-/// caller-asserted authorization context in the envelope.
-#[cfg(not(target_arch = "wasm32"))]
-pub fn unwrap_envelope_as_system(
-    request: &[u8],
-    server_pubkey: &VerifyingKey,
-    nonce_cache: &dyn NonceCache,
-) -> Result<(crate::service::EnvelopeContext, Vec<u8>)> {
-    let (signed, payload) = unwrap_and_verify(request, server_pubkey, nonce_cache)?;
-    let ctx = crate::service::EnvelopeContext::from_verified_as_system(&signed);
     Ok((ctx, payload))
 }
 

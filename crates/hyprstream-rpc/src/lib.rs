@@ -177,15 +177,13 @@ pub use crypto::{
 pub use crypto::{generate_ephemeral_keypair, ristretto_dh, RistrettoPublic, RistrettoSecret};
 
 pub use envelope::{
-    unwrap_and_verify, Authorization, FederatedToken, InMemoryNonceCache, NonceCache,
-    RequestEnvelope, ResponseEnvelope, SignedEnvelope, Subject, TokenClaims,
+    unwrap_and_verify,
+    Authorization, EnvelopeVerification, FederatedToken, InMemoryNonceCache, NonceCache,
+    RequestEnvelope, ResponseEnvelope, SignedEnvelope, Subject, TokenClaims, UnwrapOptions,
     MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
 };
 #[cfg(not(target_arch = "wasm32"))]
-pub use envelope::{
-    unwrap_envelope, unwrap_envelope_as_system,
-    unwrap_envelope_any_signer,
-};
+pub use envelope::unwrap_envelope;
 pub use error::{EnvelopeError, EnvelopeResult, Result, RpcError};
 
 // ============================================================================
@@ -227,8 +225,9 @@ pub mod prelude {
         generate_signing_keypair, signing_key_from_bytes, verifying_key_from_bytes,
         DefaultKeyExchange, KeyExchange, SharedSecret, SigningKey, StreamHmacState, VerifyingKey,
         // Envelope
-        unwrap_envelope, unwrap_and_verify, Authorization, InMemoryNonceCache, NonceCache,
-        RequestEnvelope, ResponseEnvelope, SignedEnvelope, Subject,
+        unwrap_envelope, unwrap_and_verify, Authorization, EnvelopeVerification,
+        InMemoryNonceCache, NonceCache, RequestEnvelope, ResponseEnvelope,
+        SignedEnvelope, Subject, UnwrapOptions,
         MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
         // Error
         EnvelopeError, EnvelopeResult, Result, RpcError,

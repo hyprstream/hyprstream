@@ -296,6 +296,8 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             envelope,
             sig: signature,
             cnf: self.signer.pubkey(),
+            encrypted_envelope: None,
+            client_ephemeral_public: None,
         };
 
         let mut message = capnp::message::Builder::new_default();

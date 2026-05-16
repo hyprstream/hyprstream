@@ -62,12 +62,20 @@ struct RequestEnvelope {
 # All RPC requests should be wrapped in this envelope.
 # The nested structure makes clear exactly what is being signed.
 #
-# Signing: sig = Ed25519.sign(signing_key, serialize(envelope))
-# Verification: Ed25519.verify(cnf, serialize(envelope), sig)
+# Cleartext mode:
+#   sig = Ed25519.sign(signing_key, serialize(envelope))
+#   Verification: Ed25519.verify(cnf, serialize(envelope), sig)
+#
+# Encrypted mode (when encryptedEnvelope is present):
+#   sig = Ed25519.sign(signing_key, encryptedEnvelope || clientEphemeralPublic)
+#   Verification: Ed25519.verify(cnf, encryptedEnvelope || clientEphemeralPublic, sig)
+#   Decryption: X25519 DH(server_sk, clientEphemeralPublic) -> AES-256-GCM-SIV
 struct SignedEnvelope {
-  envelope @0 :RequestEnvelope;    # The data being signed
-  sig @1 :Data $fixedSize(64);     # Ed25519 signature (64 bytes) over serialized envelope
+  envelope @0 :RequestEnvelope;    # Cleartext envelope (used when encryptedEnvelope is absent)
+  sig @1 :Data $fixedSize(64);     # Ed25519 signature (64 bytes)
   cnf @2 :Data $fixedSize(32);     # Ed25519 public key (32 bytes)
+  encryptedEnvelope @3 :Data;      # AES-256-GCM-SIV ciphertext of serialized RequestEnvelope
+  clientEphemeralPublic @4 :Data $fixedSize(32);  # X25519 ephemeral public key for DH
 }
 
 # Signed response envelope

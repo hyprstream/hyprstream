@@ -194,6 +194,7 @@ hmac = "0.12"
 zeroize = { version = "1", features = ["derive"] }
 subtle = "2"
 aes-gcm = "0.10"  # AES-256-GCM for notification broadcast encryption
+aes-gcm-siv = "0.11"  # AES-256-GCM-SIV for envelope encryption (nonce-misuse resistant)
 p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }  # P-256 ECDH (FIPS) + ECDSA (ES256 DPoP verification)
 jsonwebtoken = "9"  # RS256/ES256 JWT verification for external OIDC providers
 

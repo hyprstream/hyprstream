@@ -1967,14 +1967,7 @@ pub fn client_tls_system_roots() -> Result<rustls::ClientConfig> {
 ///
 /// Both modes share: timestamp window (5 min), nonce replay protection, JWT claims
 /// verification. The only difference is step 1 of 4 in the verification pipeline.
-pub enum EnvelopeVerification<'a> {
-    /// Require the envelope signer to match this specific verifying key.
-    /// Used for ZMQ transport where peers pre-share Ed25519 keys.
-    FixedSigner(&'a ed25519_dalek::VerifyingKey),
-    /// Accept any valid Ed25519 signer.
-    /// Used for WebTransport where TLS 1.3 provides channel authentication.
-    AnySigner,
-}
+pub use crate::envelope::EnvelopeVerification;
 
 /// Process a request through the full envelope verification pipeline.
 ///
@@ -2016,16 +2009,15 @@ where
     use capnp::serialize;
     use tracing::warn;
 
-    // 1. Unwrap and verify SignedEnvelope based on verification mode.
-    //
-    // FixedSigner: callers sign with a known service key → key_derived_subject = "service:{name}".
-    // AnySigner: external callers (WebTransport) use their own key → Anonymous until JWT.
-    let (mut ctx, payload) = match match verification {
+    // 1. Unwrap, verify, and optionally decrypt the SignedEnvelope.
+    let opts = match verification {
         EnvelopeVerification::FixedSigner(pubkey) =>
-            crate::envelope::unwrap_envelope_as_system(raw_bytes, pubkey, nonce_cache),
+            crate::envelope::UnwrapOptions::fixed_signer(pubkey, nonce_cache),
         EnvelopeVerification::AnySigner =>
-            crate::envelope::unwrap_envelope_any_signer(raw_bytes, nonce_cache),
-    } {
+            crate::envelope::UnwrapOptions::any_signer(nonce_cache),
+    }.with_decryption_key(signing_key);
+
+    let (mut ctx, payload) = match crate::envelope::unwrap_envelope(raw_bytes, &opts) {
         Ok(result) => result,
         Err(e) => {
             warn!("{} envelope verification failed: {}", service.name(), e);

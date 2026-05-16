@@ -259,7 +259,7 @@ pub fn verify_signed_envelope(
     expected_signer_pubkey: &[u8],
 ) -> Result<Vec<u8>, JsError> {
     use crate::crypto::signing::verifying_key_from_bytes;
-    use crate::envelope::unwrap_and_verify;
+    use crate::envelope::{unwrap_and_verify, UnwrapOptions};
 
     if expected_signer_pubkey.len() != 32 {
         return Err(JsError::new("expected_signer_pubkey must be 32 bytes"));
@@ -271,8 +271,9 @@ pub fn verify_signed_envelope(
         .map_err(|e| JsError::new(&format!("invalid verifying key: {}", e)))?;
 
     let nonce_cache = WASM_NONCE_CACHE.with(|c| c.clone());
+    let opts = UnwrapOptions::fixed_signer(&verifying_key, &*nonce_cache);
 
-    let (_signed, payload) = unwrap_and_verify(envelope_bytes, &verifying_key, &*nonce_cache)
+    let (_signed, payload) = unwrap_and_verify(envelope_bytes, &opts)
         .map_err(|e| JsError::new(&format!("envelope verification failed: {}", e)))?;
 
     Ok(payload)

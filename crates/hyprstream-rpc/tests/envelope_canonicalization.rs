@@ -78,6 +78,8 @@ fn test_envelope_signature_verification_stable() {
         envelope: signed2.envelope.clone(),
         sig: signed1.sig,
         cnf: signed1.cnf,
+        encrypted_envelope: None,
+        client_ephemeral_public: None,
     };
 
     assert!(
