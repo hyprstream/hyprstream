@@ -272,9 +272,10 @@ Hyprstream implements layered security-in-depth:
 
 | Layer | Technology | Purpose |
 |-------|------------|---------|
-| **Transport** | CURVE encryption (TCP) | End-to-end encryption for TCP connections |
-| **Application** | Ed25519 signed envelopes | Request authentication and integrity |
-| **Authorization** | Casbin policy engine | RBAC/ABAC access control |
+| **Transport** | CURVE/QUIC-TLS | Hop-to-hop encryption for TCP connections |
+| **Application** | Ed25519 signed envelopes | E2E integrity through blind brokers |
+| **Streaming** | Ristretto255 DH + chained HMAC | E2E authenticated streaming through blind forwarders |
+| **Authorization** | OAuth 2.0 + Casbin policy engine | RBAC/ABAC access control with PKCE, DPoP |
 | **Isolation** | Kata Containers (optional) | VM-level workload isolation for workers |
 
 ### RPC Architecture
@@ -282,14 +283,33 @@ Hyprstream implements layered security-in-depth:
 All inter-service communication uses ZeroMQ with Cap'n Proto serialization:
 
 - **REQ/REP**: Synchronous RPC calls (policy checks, model queries)
+- **PUSH/PULL → XPUB/SUB**: Streaming inference with blind broker (StreamService)
 - **PUB/SUB**: Event streaming (sandbox lifecycle, training progress)
-- **XPUB/XSUB**: Steerable proxy for event distribution
 
 Every request is wrapped in a `SignedEnvelope`:
-- Ed25519 signature over the request payload
-- Nonce for replay protection
-- Timestamp for clock skew validation
-- Request identity (Local user, API token, Peer, or Anonymous)
+- Ed25519 signature over canonical Cap'n Proto serialization
+- Nonce + issued-at timestamp for replay protection
+- Authorization union (local claims, federated JWT, or cross-domain ID-JAG)
+- Proof-of-possession binding via RFC 7800 `cnf` key
+
+### OAuth 2.0
+
+Hyprstream includes a built-in OAuth 2.0 authorization server supporting:
+- **PKCE** (RFC 7636) with S256 code challenge
+- **DPoP** (RFC 9449) for sender-constrained tokens
+- **PAR** (RFC 9126) for pushed authorization requests
+- **CIMD** for client identification by metadata URL (atproto-compatible)
+- **JWKS key rotation** with drain/active/lead lifecycle
+- **Ed25519 challenge-response** authentication (client never asserts username)
+
+### Post-Quantum Readiness
+
+Hyprstream is planning a phased migration to post-quantum cryptography (target: pre-2029):
+- **Phase 1**: Encrypt-then-sign envelopes with AES-256-GCM-SIV for perfect forward secrecy
+- **Phase 2**: Hybrid ML-DSA-65 + Ed25519 dual signatures, ML-KEM-768 + X25519 key agreement
+- **Phase 3**: Require PQ signatures
+
+The streaming data plane (HMAC chain) already uses symmetric cryptography and is PQ-safe. PQ overhead only applies to the signaling plane (REQ/REP setup), not the high-throughput data path. See [docs/cryptography-architecture.md](docs/cryptography-architecture.md) for details.
 
 ### Service Spawning
 

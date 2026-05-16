@@ -65,17 +65,14 @@ StreamService is a **blind forwarder** - it does NOT verify HMACs.
 | **StreamService** | Routes by topic, buffers for retransmit (blind), verifies registrations |
 | **Client** | Derives same DH keys, verifies HMAC chain, verifies response signatures |
 
-### Shared Signing Key
+### Signing Keys
 
-All services use the **same Ed25519 signing key** loaded from:
-```
-~/.local/share/hyprstream/models/.registry/keys/signing.key
-```
+Each client and service has its own Ed25519 keypair. Identity is established via the TrustStore (key attestation at OAuth challenge-response time) or JWT authorization — not by sharing a single key.
 
-This key is:
-- **Generated once** on first startup (32 bytes, persisted)
-- **Loaded by all services** (systemd units and CLI)
-- **Used for both requests and responses** (bidirectional authentication)
+- **Clients** sign envelopes with their Ed25519 key; the `cnf` field carries the pubkey
+- **Services** sign responses with their service key
+- **StreamService** verifies `SignedEnvelope(StreamRegister)` signatures against the `cnf` pubkey
+- **TrustStore** maps `cnf` pubkeys to authenticated subjects and scopes
 
 ### Security Properties
 
@@ -98,12 +95,13 @@ Request Flow:
 │  Client                                          Service   │
 │    │                                                │      │
 │    │─── SignedEnvelope(RequestEnvelope) ───────────►│      │
-│    │       [signed with shared key]                 │      │
+│    │       [signed with client Ed25519 key]         │      │
+│    │       [sig verified against cnf pubkey]         │      │
 │    │                                     [verify]   │      │
 │    │                                     [process]  │      │
 │    │◄── ResponseEnvelope ──────────────────────────│      │
-│    │       [signed with shared key]                 │      │
-│    │  [verify]                                      │      │
+│    │       [signed with service Ed25519 key]        │      │
+│    │  [verify against expected service key]          │      │
 └────────────────────────────────────────────────────────────┘
 ```
 
@@ -166,9 +164,12 @@ SignedEnvelope {
             topic: "abc123...",  // 64 hex chars (DH-derived)
             exp: 1762974327,     // Unix timestamp
         },
-        claims: Claims { scopes: ["publish:stream:abc123..."] },
+        authorization: Local(TokenClaims { scopes: ["publish:stream:abc123..."], ... }),
+        iat: 1762974327000,
+        nonce: [16 bytes],
     },
-    signature: [64 bytes],  // Ed25519
+    sig: [64 bytes],   // Ed25519 over canonical(envelope)
+    cnf: [32 bytes],   // Signer's Ed25519 pubkey
 }
 ```
 
@@ -178,15 +179,14 @@ All service responses are wrapped in signed `ResponseEnvelope`:
 
 ```
 ResponseEnvelope {
-    requestId: 12345,           // Correlates with request
-    payload: [bytes],           // Service-specific response data
-    timestamp: 1762974327000,   // Unix timestamp (ms)
-    signature: [64 bytes],      // Ed25519 signature
-    signerPubkey: [32 bytes],   // Server's verifying key
+    requestId: 12345,       // Correlates with request
+    payload: [bytes],       // Service-specific response data
+    sig: [64 bytes],        // Ed25519 signature over (requestId || payload)
+    cnf: [32 bytes],        // Server's Ed25519 verifying key
 }
 ```
 
-**Verification**: Client verifies `signature` over `(requestId || payload || timestamp)` using `signerPubkey`.
+**Verification**: Client verifies `sig` over `(requestId || payload)` using `cnf`.
 
 ### Wire Formats: StreamChunk vs StreamBlock
 
@@ -512,48 +512,33 @@ loop {
 
 ### With InferenceService
 
-InferenceService receives the shared signing key from ModelService:
+InferenceService receives its signing key and the service verifying key at startup:
 
 ```rust
-// ModelService starts InferenceService with shared key
 let service_handle = InferenceService::start_at(
     &model_path,
     runtime_config,
-    signing_key.verifying_key(),  // For request verification
-    signing_key.clone(),          // For response signing (MUST match)
+    verifying_key,   // For request verification (AnySigner or FixedSigner)
+    signing_key,     // For response signing
     policy_client,
     &endpoint,
 ).await?;
 ```
 
-InferenceService uses the shared key for stream registration and response signing:
+InferenceService derives DH keys and registers streams:
 
 ```rust
-// InferenceService derives keys and registers stream
+// Derive keys from client's DH public key (from envelope) + server ephemeral
 let (topic, mac_key) = derive_stream_keys(&shared_secret, ...)?;
 
-// Send registration via PUSH (signed with shared key)
+// Send registration via PUSH (signed envelope)
 let register = StreamRegister { topic: topic.clone(), exp };
 let signed = sign_envelope(register, &signing_key)?;
 push_socket.send(serialize(&signed), 0)?;
 
-// Stream chunks via PUSH (HMAC authenticated)
+// Stream data via PUSH (HMAC-chained StreamBlocks)
 let mut hmac = ChainedStreamHmac::from_bytes(mac_key, request_id);
-for token in tokens {
-    let mac = hmac.compute_next(&token);
-    let chunk = StreamChunk { topic: topic.clone(), data: token, hmac: mac };
-    push_socket.send(serialize(&chunk), 0)?;
-}
-
-// REQ/REP responses are signed with ResponseEnvelope (automatic in service loop)
-let response_bytes = {
-    let signed_response = ResponseEnvelope::new_signed(
-        request_id,
-        response_payload,
-        &signing_key,  // Same shared key
-    );
-    serialize(&signed_response)
-};
+// StreamBlock payloads are batched and MAC'd per-block
 ```
 
 ### With Client

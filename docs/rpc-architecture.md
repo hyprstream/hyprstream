@@ -71,25 +71,26 @@ This document describes the ZeroMQ-based RPC infrastructure used by hyprstream f
 │                                                                             │
 │  SignedEnvelope                                                             │
 │  ┌─────────────────────────────────────────────────────────────────┐       │
-│  │  signature: [u8; 64]    ← Ed25519 over RequestEnvelope          │       │
-│  │  signer_pubkey: [u8; 32]                                        │       │
+│  │  sig: [u8; 64]          ← Ed25519 over canonical(envelope)      │       │
+│  │  cnf: [u8; 32]          ← Signer's Ed25519 pubkey (RFC 7800)   │       │
 │  │  ┌───────────────────────────────────────────────────────────┐  │       │
 │  │  │ RequestEnvelope                                           │  │       │
 │  │  │   request_id: u64                                         │  │       │
-│  │  │   identity: RequestIdentity                               │  │       │
-│  │  │   nonce: [u8; 16]     ← Replay protection                 │  │       │
-│  │  │   timestamp: i64      ← Clock skew check                  │  │       │
-│  │  │   ephemeral_pubkey    ← Stream HMAC derivation            │  │       │
 │  │  │   payload: Vec<u8>    ← Actual request (Cap'n Proto)      │  │       │
+│  │  │   iat: i64            ← Issued-at (RFC 7519)              │  │       │
+│  │  │   nonce: [u8; 16]     ← Replay protection                 │  │       │
+│  │  │   authorization: Authorization  ← Auth union               │  │       │
+│  │  │   delegation_token: Option<String>                         │  │       │
+│  │  │   wth: Option<[u8;32]> ← WIMSE binding                    │  │       │
 │  │  └───────────────────────────────────────────────────────────┘  │       │
 │  └─────────────────────────────────────────────────────────────────┘       │
 │                                                                             │
-│  RequestIdentity → casbin_subject()                                         │
+│  Subject resolution (from Authorization, not caller-asserted):              │
 │  ┌─────────────────────────────────────────────────────────────────┐       │
-│  │  Local { user }        → "local:alice"                          │       │
-│  │  ApiToken { user, .. } → "token:bob"                            │       │
-│  │  Peer { name, .. }     → "peer:gpu-server-1"                    │       │
-│  │  Anonymous             → "anonymous"                            │       │
+│  │  Local(claims)    → claims.sub   (covered by envelope sig)      │       │
+│  │  Federated(token) → token.sub    (after JWKS verification)      │       │
+│  │  IdJag(jwt)       → sub claim    (after JWT + aud check)        │       │
+│  │  None             → TrustStore key→subject, or Anonymous        │       │
 │  └─────────────────────────────────────────────────────────────────┘       │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -186,16 +187,16 @@ Layer 3: JWT scope validation (least privilege)
 # Schema: common.capnp
 struct RequestEnvelope {
   requestId @0 :UInt64;
-  identity @1 :RequestIdentity;
-  payload @2 :Data;
-  ephemeralPubkey @3 :Data;
-  nonce @4 :Data;
-  timestamp @5 :Int64;
-  jwtToken @6 :Text;  # Signed JWT token string (added 2026-01-15)
+  payload @1 :Data;
+  iat @2 :Int64;                            # Issued-at (RFC 7519)
+  nonce @3 :Data $fixedSize(16);
+  authorization @4 :Authorization;          # Union: None | Local | Federated | IdJag
+  delegationToken @5 :Text $optional;       # Bearer relay by trusted service
+  wth @6 :Data $fixedSize(32) $optional;    # WIMSE binding
 }
 ```
 
-The `jwtToken` field contains a **signed JWT token string** (not deserialized Claims), ensuring independent signature verification by services.
+The `authorization` field is a structured union. Local tokens use Cap'n Proto-native `TokenClaims` (covered by the envelope Ed25519 sig — no separate JWT verification needed). Federated tokens carry the raw JWT string for JWKS verification plus optional DPoP proof.
 
 #### Service Implementation
 
@@ -231,31 +232,22 @@ The `#[authorize]` macro generates code that:
 3. Validates JWT scopes match required scope
 4. Rejects request if any check fails
 
-#### EnvelopeContext Extensions
+#### EnvelopeContext
 
 ```rust
 pub struct EnvelopeContext {
     pub request_id: u64,
-    pub identity: RequestIdentity,
-    // ... existing fields ...
-
-    jwt_token: Option<String>,              // Signed JWT token string
-    user_claims: Option<Arc<Claims>>,       // Validated claims (lazy-initialized)
+    claims: Option<Claims>,                     // Verified claims (from authorization)
+    jwt_token: Option<String>,                  // Raw JWT for downstream forwarding
+    key_derived_subject: Subject,               // From TrustStore key→subject binding
+    pub(crate) jwt_subject: Option<Subject>,    // From JWT claims after verification
+    pub cnf: [u8; 32],                          // Signer's Ed25519 pubkey
+    pub(crate) envelope_wit_hash: Option<[u8; 32]>, // WIMSE wth binding
 }
+```
 
-impl EnvelopeContext {
-    /// Validate JWT token and extract Claims (stateless)
-    pub fn validate_jwt(&mut self, verifying_key: &VerifyingKey) -> Result<Arc<Claims>>;
-
-    /// Get validated user claims (None if not yet validated)
-    pub fn user_claims(&self) -> Option<&Arc<Claims>>;
-
-    /// Get user subject for Casbin checks (if JWT validated)
-    pub fn user_subject(&self) -> Option<String>;
-
-    /// Get effective subject (user if present, otherwise service identity)
-    pub fn effective_subject(&self) -> String;
-}
+Subject resolution chain: `key_derived_subject` → `jwt_subject` → `Anonymous`.
+The `cnf` field (signer pubkey) is the canonical audit identifier for all envelopes.
 ```
 
 #### Security Properties
