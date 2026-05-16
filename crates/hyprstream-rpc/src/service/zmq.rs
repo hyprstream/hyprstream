@@ -44,7 +44,6 @@ pub type Continuation = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>
 /// has verified the envelope signature. Handlers use this for:
 /// - Authorization checks via `subject()`
 /// - Correlation via `request_id`
-/// - Stream HMAC key derivation via `ephemeral_pubkey`
 ///
 /// # Example
 ///
@@ -62,9 +61,6 @@ pub type Continuation = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>
 pub struct EnvelopeContext {
     /// Unique request ID for correlation and logging
     pub request_id: u64,
-
-    /// Ephemeral public key for stream HMAC derivation (if streaming)
-    pub ephemeral_pubkey: Option<[u8; 32]>,
 
     /// User claims decoded from jwt_token (or legacy claims field).
     /// Populated by `verify_claims()` after JWT signature verification.
@@ -87,9 +83,9 @@ pub struct EnvelopeContext {
     /// `None` until `verify_claims()` runs, or when no JWT is present.
     pub(crate) jwt_subject: Option<Subject>,
 
-    /// Raw signer pubkey bytes from the verified `SignedEnvelope`.
+    /// Ed25519 public key of the envelope signer (RFC 7800 confirmation key).
     /// Cryptographically verified by Ed25519 signature check.
-    pub signer_pubkey: [u8; 32],
+    pub cnf: [u8; 32],
 
     /// WIMSE wth binding: SHA-256 of the WIT JWT from the envelope (if present).
     /// Populated from `RequestEnvelope.wit_hash` during context construction.
@@ -107,12 +103,11 @@ impl EnvelopeContext {
     pub(crate) fn from_verified(envelope: &SignedEnvelope) -> Self {
         Self {
             request_id: envelope.request_id(),
-            ephemeral_pubkey: None,
             claims: None,
             jwt_token: envelope.envelope.jwt_token().map(ToOwned::to_owned),
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
-            signer_pubkey: envelope.cnf,
+            cnf: envelope.cnf,
             envelope_wit_hash: envelope.envelope.wth,
         }
     }
@@ -125,12 +120,11 @@ impl EnvelopeContext {
     pub fn from_verified_as_system(envelope: &SignedEnvelope) -> Self {
         Self {
             request_id: envelope.request_id(),
-            ephemeral_pubkey: None,
             claims: None,
             jwt_token: envelope.envelope.jwt_token().map(ToOwned::to_owned),
             key_derived_subject: Subject::new("system"),
             jwt_subject: None,
-            signer_pubkey: envelope.cnf,
+            cnf: envelope.cnf,
             envelope_wit_hash: envelope.envelope.wth,
         }
     }
@@ -141,18 +135,17 @@ impl EnvelopeContext {
     /// (e.g., `InferenceService` callback mode). Sets `key_derived_subject = "service:{name}"`
     /// so that `subject()` returns a proper service identity for authorization.
     ///
-    /// `signer_pubkey` is zeroed because there is no real envelope; the service subject
+    /// `cnf` is zeroed because there is no real envelope; the service subject
     /// is asserted directly and is trusted because this constructor is only reachable
     /// from internal code paths that never cross a network boundary.
     pub fn from_callback_service(request_id: u64, service_name: &str) -> Self {
         Self {
             request_id,
-            ephemeral_pubkey: None,
             claims: None,
             jwt_token: None,
             key_derived_subject: Subject::new(format!("service:{service_name}")),
             jwt_subject: None,
-            signer_pubkey: [0u8; 32],
+            cnf: [0u8; 32],
             envelope_wit_hash: None,
         }
     }
@@ -214,13 +207,6 @@ impl EnvelopeContext {
         self.claims.is_some()
     }
 
-    /// Get the client's ephemeral public key for DH key exchange (if provided).
-    ///
-    /// This is used for deriving stream keys in E2E authenticated streaming.
-    /// Returns None if the client didn't include an ephemeral pubkey.
-    pub fn ephemeral_pubkey(&self) -> Option<&[u8]> {
-        self.ephemeral_pubkey.as_ref().map(<[u8; 32]>::as_slice)
-    }
 }
 
 /// Trait for ZMQ-based REQ/REP services.
@@ -320,6 +306,16 @@ pub trait ZmqService: 'static {
         None
     }
 
+    /// Whether to reject JWTs that lack a `cnf.jwk` key binding.
+    ///
+    /// When `true`, `verify_claims()` will reject any JWT that does not carry
+    /// a `cnf` confirmation key, ensuring every authenticated request is
+    /// cryptographically bound to its envelope signer. Default is `false`
+    /// for backwards compatibility.
+    fn require_cnf_binding(&self) -> bool {
+        false
+    }
+
     /// Resolve a signer key to an authorization subject via the trust store.
     ///
     /// Returns `Some(subject)` if the key is cached and not expired.
@@ -359,7 +355,7 @@ pub trait ZmqService: 'static {
 
         let Some(token) = token else {
             // No JWT — try trust store lookup for cached key bindings
-            if let Some(subject) = self.resolve_key_subject(&ctx.signer_pubkey) {
+            if let Some(subject) = self.resolve_key_subject(&ctx.cnf) {
                 ctx.key_derived_subject = subject;
                 return Ok(());
             }
@@ -428,7 +424,7 @@ pub trait ZmqService: 'static {
         if let Some(ref claims) = ctx.claims {
             if let Some(expected) = claims.cnf_key_bytes() {
                 use subtle::ConstantTimeEq as _;
-                if expected.ct_ne(&ctx.signer_pubkey).into() {
+                if expected.ct_ne(&ctx.cnf).into() {
                     tracing::warn!("JWT cnf.jwk mismatch: sub={}", claims.sub);
                     anyhow::bail!("JWT cnf.jwk does not match envelope signer");
                 }
@@ -446,6 +442,9 @@ pub trait ZmqService: 'static {
                     self.cache_key_binding(vk, subject_name, &token, claims.exp);
                     tracing::info!(subject = %subject_name, "Cached key binding in trust store");
                 }
+            } else if self.require_cnf_binding() {
+                tracing::warn!("JWT missing cnf.jwk but service requires key binding: sub={}", claims.sub);
+                anyhow::bail!("JWT must include cnf.jwk for key binding (required by this service)");
             }
         }
 

@@ -427,6 +427,12 @@ pub struct RequestEnvelope {
     pub authorization: Authorization,
 
     /// Delegation token relayed by a trusted service (e.g., OAI, MCP adapter).
+    ///
+    /// **Reserved.** Serialized in the envelope and covered by the signature,
+    /// but not yet consumed server-side. Intended for bearer delegation flows
+    /// where a gateway service forwards a user's JWT on their behalf.
+    /// Server-side extraction will be added when the delegation trust model
+    /// is finalized.
     pub delegation_token: Option<String>,
 
     /// SHA-256 hash of the WIT JWT string (WIMSE wth claim).
@@ -546,8 +552,7 @@ impl RequestEnvelope {
             Err(_e) => {
                 #[cfg(not(target_arch = "wasm32"))]
                 tracing::error!("Envelope canonicalization failed: {}", _e);
-                // Fall back to temp_bytes if canonicalization fails
-                return temp_bytes;
+                return Vec::new();
             }
         };
 
@@ -1402,6 +1407,9 @@ mod tests {
         assert_eq!(envelope.payload, decoded.payload);
         assert_eq!(envelope.nonce, decoded.nonce);
         assert_eq!(envelope.iat, decoded.iat);
+        assert_eq!(envelope.authorization, decoded.authorization);
+        assert_eq!(envelope.delegation_token, decoded.delegation_token);
+        assert_eq!(envelope.wth, decoded.wth);
         Ok(())
     }
 
@@ -1589,6 +1597,157 @@ mod tests {
         let decoded = Authorization::read_from(reader)?;
         assert_eq!(auth, decoded);
 
+        // Test Local variant
+        let auth = Authorization::Local(TokenClaims {
+            iss: "https://hyprstream.local".to_owned(),
+            sub: "alice".to_owned(),
+            aud: vec!["inference".to_owned(), "registry".to_owned()],
+            exp: 1700000000,
+            iat: 1699999000,
+            jti: "unique-id-123".to_owned(),
+            scope: vec![],
+            cnf_jkt: "thumbprint-abc".to_owned(),
+        });
+        let mut msg = Builder::new_default();
+        let mut builder = msg.init_root::<common_capnp::authorization::Builder>();
+        auth.write_to(&mut builder);
+        let reader = builder.into_reader();
+        let decoded = Authorization::read_from(reader)?;
+        assert_eq!(auth, decoded);
+
+        // Test Federated variant
+        let auth = Authorization::Federated(FederatedToken {
+            raw: "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.test".to_owned(),
+            claims: TokenClaims {
+                iss: "https://node-a".to_owned(),
+                sub: "bob".to_owned(),
+                aud: vec!["https://node-b".to_owned()],
+                exp: 1700000000,
+                iat: 1699999000,
+                jti: "fed-id-456".to_owned(),
+                scope: vec![],
+                cnf_jkt: "fed-thumbprint".to_owned(),
+            },
+            dpop_proof: Some("dpop-proof-xyz".to_owned()),
+        });
+        let mut msg = Builder::new_default();
+        let mut builder = msg.init_root::<common_capnp::authorization::Builder>();
+        auth.write_to(&mut builder);
+        let reader = builder.into_reader();
+        let decoded = Authorization::read_from(reader)?;
+        assert_eq!(auth, decoded);
+
+        // Test Federated without DPoP proof
+        let auth = Authorization::Federated(FederatedToken {
+            raw: "raw-jwt".to_owned(),
+            claims: TokenClaims {
+                iss: "https://node-c".to_owned(),
+                sub: "carol".to_owned(),
+                aud: vec![],
+                exp: 0,
+                iat: 0,
+                jti: String::new(),
+                scope: vec![],
+                cnf_jkt: String::new(),
+            },
+            dpop_proof: None,
+        });
+        let mut msg = Builder::new_default();
+        let mut builder = msg.init_root::<common_capnp::authorization::Builder>();
+        auth.write_to(&mut builder);
+        let reader = builder.into_reader();
+        let decoded = Authorization::read_from(reader)?;
+        assert_eq!(auth, decoded);
+
         Ok(())
+    }
+
+    #[test]
+    fn test_capnp_roundtrip_envelope_with_authorization() -> anyhow::Result<()> {
+        use capnp::message::Builder;
+
+        let envelope = RequestEnvelope {
+            request_id: 42,
+            payload: vec![1, 2, 3],
+            nonce: [7u8; 16],
+            iat: 1699999000,
+            authorization: Authorization::IdJag("my-jwt-token".to_owned()),
+            delegation_token: Some("delegated".to_owned()),
+            wth: Some([0xAB; 32]),
+        };
+
+        let mut message = Builder::new_default();
+        let mut builder = message.init_root::<common_capnp::request_envelope::Builder>();
+        envelope.write_to(&mut builder);
+
+        let reader = builder.into_reader();
+        let decoded = RequestEnvelope::read_from(reader)?;
+
+        assert_eq!(envelope.request_id, decoded.request_id);
+        assert_eq!(envelope.payload, decoded.payload);
+        assert_eq!(envelope.nonce, decoded.nonce);
+        assert_eq!(envelope.iat, decoded.iat);
+        assert_eq!(envelope.authorization, decoded.authorization);
+        assert_eq!(envelope.delegation_token, decoded.delegation_token);
+        assert_eq!(envelope.wth, decoded.wth);
+        Ok(())
+    }
+
+    #[test]
+    fn test_tampered_authorization_breaks_signature() {
+        let (signing_key, verifying_key) = generate_signing_keypair();
+
+        let envelope = RequestEnvelope {
+            request_id: 100,
+            payload: vec![1, 2, 3],
+            nonce: [1u8; 16],
+            iat: current_timestamp(),
+            authorization: Authorization::None,
+            delegation_token: None,
+            wth: None,
+        };
+
+        let mut signed = SignedEnvelope::new_signed(envelope, &signing_key);
+
+        // Tamper with the authorization after signing
+        signed.envelope.authorization = Authorization::IdJag("evil-token".to_owned());
+
+        // Signature verification must fail
+        let result = signed.verify_signature_only(&verifying_key);
+        assert!(result.is_err(), "Tampered authorization must invalidate signature");
+    }
+
+    #[test]
+    fn test_tampered_payload_breaks_signature() {
+        let (signing_key, verifying_key) = generate_signing_keypair();
+
+        let envelope = RequestEnvelope::anonymous(vec![1, 2, 3]);
+        let mut signed = SignedEnvelope::new_signed(envelope, &signing_key);
+
+        signed.envelope.payload = vec![9, 9, 9];
+
+        let result = signed.verify_signature_only(&verifying_key);
+        assert!(result.is_err(), "Tampered payload must invalidate signature");
+    }
+
+    #[test]
+    fn test_tampered_wth_breaks_signature() {
+        let (signing_key, verifying_key) = generate_signing_keypair();
+
+        let envelope = RequestEnvelope {
+            request_id: 100,
+            payload: vec![1, 2, 3],
+            nonce: [1u8; 16],
+            iat: current_timestamp(),
+            authorization: Authorization::None,
+            delegation_token: None,
+            wth: Some([0xAA; 32]),
+        };
+
+        let mut signed = SignedEnvelope::new_signed(envelope, &signing_key);
+        signed.envelope.wth = Some([0xBB; 32]);
+
+        let result = signed.verify_signature_only(&verifying_key);
+        assert!(result.is_err(), "Tampered wth must invalidate signature");
     }
 }
