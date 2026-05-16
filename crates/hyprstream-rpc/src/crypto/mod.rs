@@ -32,6 +32,8 @@ pub mod event_crypto;
 pub mod hmac;
 pub mod key_exchange;
 pub mod notification;
+#[cfg(feature = "pq-hybrid")]
+pub mod pq;
 pub mod signing;
 
 pub use backend::{derive_key, keyed_mac, keyed_mac_truncated};
