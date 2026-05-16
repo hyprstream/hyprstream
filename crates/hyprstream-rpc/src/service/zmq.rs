@@ -455,9 +455,33 @@ pub trait ZmqService: 'static {
                     self.cache_key_binding(vk, subject_name, &token, claims.exp);
                     tracing::info!(subject = %subject_name, "Cached key binding in trust store");
                 }
+            } else if let Some(jkt) = claims.cnf_jkt() {
+                // R2b: DPoP path — JWT has cnf.jkt (thumbprint) instead of cnf.jwk.
+                // Compute the JWK thumbprint of the envelope signer and compare.
+                use subtle::ConstantTimeEq as _;
+                let envelope_jkt = crate::auth::jwk_thumbprint(
+                    &crate::auth::JwkThumbprintInput::Ed25519 { x: &ctx.cnf },
+                );
+                if envelope_jkt.as_bytes().ct_ne(jkt.as_bytes()).into() {
+                    tracing::warn!("JWT cnf.jkt mismatch: sub={}", claims.sub);
+                    anyhow::bail!("JWT cnf.jkt does not match envelope signer");
+                }
+
+                let vk = match ed25519_dalek::VerifyingKey::from_bytes(&ctx.cnf) {
+                    Ok(vk) => vk,
+                    Err(_) => {
+                        tracing::warn!("Invalid Ed25519 verifying key in envelope cnf");
+                        anyhow::bail!("Invalid Ed25519 verifying key in envelope cnf");
+                    }
+                };
+                let subject_str = claims.subject(&local_issuers_refs);
+                if let Some(subject_name) = subject_str.name() {
+                    self.cache_key_binding(vk, subject_name, &token, claims.exp);
+                    tracing::info!(subject = %subject_name, "Cached key binding from cnf.jkt");
+                }
             } else if self.require_cnf_binding() {
-                tracing::warn!("JWT missing cnf.jwk but service requires key binding: sub={}", claims.sub);
-                anyhow::bail!("JWT must include cnf.jwk for key binding (required by this service)");
+                tracing::warn!("JWT missing cnf binding (jwk or jkt): sub={}", claims.sub);
+                anyhow::bail!("JWT must include cnf binding for key binding (required by this service)");
             }
         }
 
