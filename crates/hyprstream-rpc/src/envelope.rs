@@ -1030,7 +1030,7 @@ impl SignedEnvelope {
         expected_pubkey.verify_strict(&signing_data, &signature)?;
 
         // 5. Verify PQ signature
-        self.verify_pq_signature(&signing_data)?;
+        self.verify_pq_signature(&signing_data, None)?;
 
         Ok(())
     }
@@ -1049,7 +1049,7 @@ impl SignedEnvelope {
         let signing_data = self.signed_bytes();
         let signature = Signature::from_bytes(&self.sig);
         expected_pubkey.verify_strict(&signing_data, &signature)?;
-        self.verify_pq_signature(&signing_data)?;
+        self.verify_pq_signature(&signing_data, None)?;
 
         Ok(())
     }
@@ -1094,7 +1094,7 @@ impl SignedEnvelope {
         verifying_key.verify_strict(&signing_data, &signature)?;
 
         // 5. Verify PQ signature
-        self.verify_pq_signature(&signing_data)?;
+        self.verify_pq_signature(&signing_data, None)?;
 
         Ok(())
     }
@@ -1103,11 +1103,26 @@ impl SignedEnvelope {
     ///
     /// When `pq-hybrid` feature is enabled, PQ signatures are mandatory —
     /// envelopes without them are rejected.
-    fn verify_pq_signature(&self, signing_data: &[u8]) -> EnvelopeResult<()> {
+    ///
+    /// When `expected_pq_cnf` is `Some`, the envelope's `pq_cnf` must match
+    /// (constant-time comparison). This binds the PQ key to an identity,
+    /// preventing an attacker from stripping the PQ signature and re-signing
+    /// with their own ML-DSA key. When `None`, the PQ key is self-certified
+    /// and the hybrid scheme degrades to Ed25519-level authentication.
+    fn verify_pq_signature(&self, signing_data: &[u8], expected_pq_cnf: Option<&[u8]>) -> EnvelopeResult<()> {
         match (&self.pq_sig, &self.pq_cnf) {
             (Some(sig), Some(cnf)) => {
                 #[cfg(feature = "pq-hybrid")]
                 {
+                    if let Some(expected) = expected_pq_cnf {
+                        if cnf.len() != expected.len()
+                            || !bool::from(cnf.as_slice().ct_eq(expected))
+                        {
+                            return Err(EnvelopeError::PqSignatureInvalid(
+                                "pq_cnf does not match expected PQ verifying key".to_owned(),
+                            ));
+                        }
+                    }
                     let vk = crate::crypto::pq::ml_dsa_vk_from_bytes(cnf)
                         .map_err(|e| EnvelopeError::PqSignatureInvalid(e.to_string()))?;
                     crate::crypto::pq::ml_dsa_verify(&vk, signing_data, sig)
@@ -1115,7 +1130,7 @@ impl SignedEnvelope {
                 }
                 #[cfg(not(feature = "pq-hybrid"))]
                 {
-                    let _ = (sig, cnf, signing_data);
+                    let _ = (sig, cnf, signing_data, expected_pq_cnf);
                 }
                 Ok(())
             }

@@ -168,12 +168,15 @@ fn derive_hybrid_envelope_key(
     ephemeral_public: &[u8; 32],
     server_x25519_public: &[u8; 32],
 ) -> Zeroizing<[u8; 32]> {
+    use zeroize::Zeroize;
     let mut ikm = Vec::with_capacity(128);
     ikm.extend_from_slice(shared_x25519);
     ikm.extend_from_slice(shared_kem);
     ikm.extend_from_slice(ephemeral_public);
     ikm.extend_from_slice(server_x25519_public);
-    Zeroizing::new(blake3::derive_key("hyprstream-hybrid-envelope-v1", &ikm))
+    let key = blake3::derive_key("hyprstream-hybrid-envelope-v1", &ikm);
+    ikm.zeroize();
+    Zeroizing::new(key)
 }
 
 #[cfg(test)]

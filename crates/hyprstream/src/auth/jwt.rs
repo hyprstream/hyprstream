@@ -364,4 +364,63 @@ mod tests {
             &token, &ml_dsa_vk, &wrong_ed25519_vk, None,
         ).is_err());
     }
+
+    #[cfg(feature = "pq-hybrid")]
+    #[test]
+    fn ml_dsa_65_expired_token_rejected() {
+        let (sk, vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+        let claims = Claims::new("alice".to_owned(), 0, 1);
+        let token = encode_ml_dsa_65(&claims, &sk);
+        let err = hyprstream_rpc::auth::jwt::decode_ml_dsa_65(&token, &vk, None).unwrap_err();
+        assert!(matches!(err, hyprstream_rpc::auth::JwtError::Expired));
+    }
+
+    #[cfg(feature = "pq-hybrid")]
+    #[test]
+    fn composite_expired_token_rejected() {
+        let (ml_dsa_sk, ml_dsa_vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+        let ed25519_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let ed25519_vk = ed25519_sk.verifying_key();
+        let claims = Claims::new("bob".to_owned(), 0, 1);
+        let token = encode_composite_ml_dsa_65_ed25519(&claims, &ml_dsa_sk, &ed25519_sk);
+        let err = hyprstream_rpc::auth::jwt::decode_composite(
+            &token, &ml_dsa_vk, &ed25519_vk, None,
+        ).unwrap_err();
+        assert!(matches!(err, hyprstream_rpc::auth::JwtError::Expired));
+    }
+
+    #[cfg(feature = "pq-hybrid")]
+    #[test]
+    fn ml_dsa_65_rejects_eddsa_token() {
+        let ed25519_sk = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let claims = Claims::new("alice".to_owned(), 0, 9_999_999_999);
+        let token = hyprstream_rpc::auth::encode(&claims, &ed25519_sk);
+        let (_, vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+        assert!(hyprstream_rpc::auth::jwt::decode_ml_dsa_65(&token, &vk, None).is_err());
+    }
+
+    #[cfg(feature = "pq-hybrid")]
+    #[test]
+    fn ml_dsa_65_lenient_audience() {
+        let (sk, vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+        let claims = Claims::new("alice".to_owned(), 0, 9_999_999_999);
+        // Token without aud should be accepted even when expected_aud is set
+        let token = encode_ml_dsa_65(&claims, &sk);
+        assert!(hyprstream_rpc::auth::jwt::decode_ml_dsa_65(
+            &token, &vk, Some("https://example.com"),
+        ).is_ok());
+    }
+
+    #[cfg(feature = "pq-hybrid")]
+    #[test]
+    fn ml_dsa_65_wrong_audience_rejected() {
+        let (sk, vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+        let mut claims = Claims::new("alice".to_owned(), 0, 9_999_999_999);
+        claims.aud = Some("https://wrong.example.com".to_owned());
+        let token = encode_ml_dsa_65(&claims, &sk);
+        let err = hyprstream_rpc::auth::jwt::decode_ml_dsa_65(
+            &token, &vk, Some("https://example.com"),
+        ).unwrap_err();
+        assert!(matches!(err, hyprstream_rpc::auth::JwtError::InvalidAudience));
+    }
 }

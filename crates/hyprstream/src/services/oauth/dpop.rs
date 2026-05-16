@@ -199,7 +199,7 @@ pub fn verify_dpop_proof(
             let mut ed_sig_arr = [0u8; 64];
             ed_sig_arr.copy_from_slice(ed_sig);
             let ed_signature = ed25519_dalek::Signature::from_bytes(&ed_sig_arr);
-            ed25519_dalek::Verifier::verify(&ed25519_vk, signing_input.as_bytes(), &ed_signature)
+            ed25519_vk.verify_strict(signing_input.as_bytes(), &ed_signature)
                 .map_err(|_| DpopError::SignatureInvalid)?;
             DpopKey::MlDsa65Ed25519 { pub_bytes }
         }

@@ -315,6 +315,10 @@ pub fn decode_unverified(token: &str) -> Result<Claims, JwtError> {
 }
 
 /// Decode and verify a JWT signed with ML-DSA-65 (`alg: "ML-DSA-65"`).
+///
+/// Uses lenient audience validation (same as `decode_with_key`): if
+/// `expected_aud` is `Some`, a wrong `aud` is rejected but an absent
+/// `aud` is accepted.
 #[cfg(feature = "pq-hybrid")]
 pub fn decode_ml_dsa_65(
     token: &str,
@@ -362,7 +366,8 @@ pub fn decode_ml_dsa_65(
     if let Some(expected) = expected_aud {
         match &claims.aud {
             Some(aud) if aud == expected => {}
-            _ => return Err(JwtError::InvalidAudience),
+            None => {}                                    // lenient: absent aud accepted
+            Some(_) => return Err(JwtError::InvalidAudience), // wrong aud rejected
         }
     }
 
@@ -413,7 +418,7 @@ pub fn decode_composite(
     ed_sig_arr.copy_from_slice(ed25519_sig);
     let ed_signature = Signature::from_bytes(&ed_sig_arr);
     ed25519_vk
-        .verify(message, &ed_signature)
+        .verify_strict(message, &ed_signature)
         .map_err(|_| JwtError::InvalidSignature)?;
 
     let header_bytes = URL_SAFE_NO_PAD
@@ -444,7 +449,8 @@ pub fn decode_composite(
     if let Some(expected) = expected_aud {
         match &claims.aud {
             Some(aud) if aud == expected => {}
-            _ => return Err(JwtError::InvalidAudience),
+            None => {}                                    // lenient: absent aud accepted
+            Some(_) => return Err(JwtError::InvalidAudience), // wrong aud rejected
         }
     }
 
