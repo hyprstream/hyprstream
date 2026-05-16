@@ -78,6 +78,7 @@ struct SignedEnvelope {
   clientEphemeralPublic @4 :Data $fixedSize(32);  # X25519 ephemeral public key for DH
   pqSig @5 :Data;                  # ML-DSA-65 signature (3309 bytes when present, pq-hybrid)
   pqCnf @6 :Data;                  # ML-DSA-65 verifying key (1952 bytes when present, pq-hybrid)
+  pqKemCiphertext @7 :Data;        # ML-KEM-768 ciphertext (1088 bytes when present, pq-hybrid)
 }
 
 # Signed response envelope

@@ -300,6 +300,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             client_ephemeral_public: None,
             pq_sig: None,
             pq_cnf: None,
+            pq_kem_ciphertext: None,
         };
 
         let mut message = capnp::message::Builder::new_default();

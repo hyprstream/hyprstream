@@ -666,6 +666,9 @@ pub struct SignedEnvelope {
 
     /// ML-DSA-65 verifying key (1952 bytes, present when pq-hybrid is enabled)
     pub pq_cnf: Option<Vec<u8>>,
+
+    /// ML-KEM-768 ciphertext (1088 bytes, present when hybrid encryption is used)
+    pub pq_kem_ciphertext: Option<Vec<u8>>,
 }
 
 /// Replay protection cache interface.
@@ -845,6 +848,7 @@ impl SignedEnvelope {
             client_ephemeral_public: None,
             pq_sig: None,
             pq_cnf: None,
+            pq_kem_ciphertext: None,
         }
     }
 
@@ -877,6 +881,7 @@ impl SignedEnvelope {
             client_ephemeral_public: None,
             pq_sig: Some(pq_sig),
             pq_cnf: Some(pq_cnf),
+            pq_kem_ciphertext: None,
         }
     }
 
@@ -915,18 +920,20 @@ impl SignedEnvelope {
             client_ephemeral_public: Some(eph_public),
             pq_sig: None,
             pq_cnf: None,
+            pq_kem_ciphertext: None,
         })
     }
 
-    /// Create, encrypt, and dual-sign a new envelope with Ed25519 + ML-DSA-65.
+    /// Create, encrypt (hybrid X25519+ML-KEM-768), and dual-sign with Ed25519 + ML-DSA-65.
     #[cfg(feature = "pq-hybrid")]
     pub fn new_signed_encrypted_hybrid(
         mut envelope: RequestEnvelope,
         signing_key: &SigningKey,
         server_pubkey: &VerifyingKey,
         pq_signing_key: &crate::crypto::pq::MlDsaSigningKey,
+        server_kem_ek: &crate::crypto::pq::MlKemEncapsKey,
     ) -> EnvelopeResult<Self> {
-        use crate::crypto::envelope_crypto::encrypt_envelope;
+        use crate::crypto::envelope_crypto::encrypt_envelope_hybrid;
 
         if envelope.wth.is_none() {
             if let Some(jwt) = envelope.jwt_token() {
@@ -936,11 +943,14 @@ impl SignedEnvelope {
         }
 
         let envelope_bytes = envelope.to_bytes();
-        let (ciphertext, eph_public) = encrypt_envelope(&envelope_bytes, server_pubkey)?;
+        let (ciphertext, eph_public, kem_ct) =
+            encrypt_envelope_hybrid(&envelope_bytes, server_pubkey, server_kem_ek)?;
 
-        let mut signing_data = Vec::with_capacity(ciphertext.len() + 32);
+        // Sign ciphertext ∥ eph_x25519_public ∥ kem_ciphertext
+        let mut signing_data = Vec::with_capacity(ciphertext.len() + 32 + kem_ct.len());
         signing_data.extend_from_slice(&ciphertext);
         signing_data.extend_from_slice(&eph_public);
+        signing_data.extend_from_slice(&kem_ct);
         let signature = signing_key.sign(&signing_data);
         let pq_sig = crate::crypto::pq::ml_dsa_sign(pq_signing_key, &signing_data);
         let pq_cnf = crate::crypto::pq::ml_dsa_vk_bytes(
@@ -955,6 +965,7 @@ impl SignedEnvelope {
             client_ephemeral_public: Some(eph_public),
             pq_sig: Some(pq_sig),
             pq_cnf: Some(pq_cnf),
+            pq_kem_ciphertext: Some(kem_ct),
         })
     }
 
@@ -1129,9 +1140,13 @@ impl SignedEnvelope {
     fn signed_bytes(&self) -> Vec<u8> {
         match (&self.encrypted_envelope, &self.client_ephemeral_public) {
             (Some(ct), Some(eph)) => {
-                let mut data = Vec::with_capacity(ct.len() + 32);
+                let kem_len = self.pq_kem_ciphertext.as_ref().map_or(0, Vec::len);
+                let mut data = Vec::with_capacity(ct.len() + 32 + kem_len);
                 data.extend_from_slice(ct);
                 data.extend_from_slice(eph);
+                if let Some(ref kem_ct) = self.pq_kem_ciphertext {
+                    data.extend_from_slice(kem_ct);
+                }
                 data
             }
             _ => self.envelope.to_bytes(),
@@ -1154,6 +1169,37 @@ impl SignedEnvelope {
             .ok_or_else(|| EnvelopeError::Decryption("no client ephemeral public key".into()))?;
 
         let plaintext = decrypt_envelope(ct, eph, server_signing_key)?;
+
+        let reader = capnp::serialize::read_message(
+            &mut std::io::Cursor::new(&plaintext),
+            envelope_reader_options(),
+        ).map_err(|e| EnvelopeError::Decryption(format!("capnp parse after decrypt: {e}")))?;
+        let env_reader = reader
+            .get_root::<crate::common_capnp::request_envelope::Reader>()
+            .map_err(|e| EnvelopeError::Decryption(format!("envelope read after decrypt: {e}")))?;
+        self.envelope = RequestEnvelope::read_from(env_reader)
+            .map_err(|e| EnvelopeError::Decryption(format!("envelope decode after decrypt: {e}")))?;
+
+        Ok(())
+    }
+
+    /// Decrypt a hybrid-encrypted envelope in-place (X25519 + ML-KEM-768).
+    #[cfg(feature = "pq-hybrid")]
+    pub fn decrypt_in_place_hybrid(
+        &mut self,
+        server_signing_key: &crate::crypto::SigningKey,
+        server_kem_dk: &crate::crypto::pq::MlKemDecapsKey,
+    ) -> EnvelopeResult<()> {
+        use crate::crypto::envelope_crypto::decrypt_envelope_hybrid;
+
+        let ct = self.encrypted_envelope.as_ref()
+            .ok_or_else(|| EnvelopeError::Decryption("no encrypted envelope present".into()))?;
+        let eph = self.client_ephemeral_public.as_ref()
+            .ok_or_else(|| EnvelopeError::Decryption("no client ephemeral public key".into()))?;
+        let kem_ct = self.pq_kem_ciphertext.as_ref()
+            .ok_or_else(|| EnvelopeError::Decryption("no KEM ciphertext present".into()))?;
+
+        let plaintext = decrypt_envelope_hybrid(ct, eph, kem_ct, server_signing_key, server_kem_dk)?;
 
         let reader = capnp::serialize::read_message(
             &mut std::io::Cursor::new(&plaintext),
@@ -1307,6 +1353,9 @@ impl ToCapnp for SignedEnvelope {
         if let Some(ref pq_cnf) = self.pq_cnf {
             builder.set_pq_cnf(pq_cnf);
         }
+        if let Some(ref kem_ct) = self.pq_kem_ciphertext {
+            builder.set_pq_kem_ciphertext(kem_ct);
+        }
     }
 }
 
@@ -1371,6 +1420,11 @@ impl FromCapnp for SignedEnvelope {
             if data.is_empty() { None } else { Some(data.to_vec()) }
         };
 
+        let pq_kem_ciphertext = {
+            let data = reader.get_pq_kem_ciphertext()?;
+            if data.is_empty() { None } else { Some(data.to_vec()) }
+        };
+
         Ok(Self {
             envelope: RequestEnvelope::read_from(reader.get_envelope()?)?,
             sig,
@@ -1379,6 +1433,7 @@ impl FromCapnp for SignedEnvelope {
             client_ephemeral_public,
             pq_sig,
             pq_cnf,
+            pq_kem_ciphertext,
         })
     }
 }

@@ -92,6 +92,7 @@ fn test_envelope_signature_verification_stable() {
         client_ephemeral_public: None,
         pq_sig: signed1.pq_sig.clone(),
         pq_cnf: signed1.pq_cnf.clone(),
+        pq_kem_ciphertext: None,
     };
 
     assert!(

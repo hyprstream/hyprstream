@@ -95,6 +95,87 @@ pub fn decrypt_envelope(
         .map_err(|_| EnvelopeError::Decryption("AES-256-GCM-SIV decrypt failed".into()))
 }
 
+/// Hybrid envelope encryption: X25519 DH + ML-KEM-768 + AES-256-GCM-SIV.
+///
+/// Two shared secrets are derived independently and combined via KDF.
+/// Returns `(ciphertext, ephemeral_public, kem_ciphertext)`.
+#[cfg(feature = "pq-hybrid")]
+pub fn encrypt_envelope_hybrid(
+    plaintext: &[u8],
+    server_ed25519_pubkey: &VerifyingKey,
+    server_kem_ek: &crate::crypto::pq::MlKemEncapsKey,
+) -> EnvelopeResult<(Vec<u8>, [u8; 32], Vec<u8>)> {
+    let server_x25519 = ed25519_to_x25519_public(server_ed25519_pubkey);
+
+    let mut csprng = rand::rngs::OsRng;
+    let eph_secret = ed25519_dalek::SigningKey::generate(&mut csprng);
+    let eph_public_ed = eph_secret.verifying_key();
+    let eph_x25519_secret = ed25519_to_x25519_secret(&eph_secret);
+    let eph_x25519_public = ed25519_to_x25519_public(&eph_public_ed);
+
+    let shared_x25519 = x25519_dh(&eph_x25519_secret, &server_x25519);
+    let (kem_ct, shared_kem) = crate::crypto::pq::ml_kem_encapsulate(server_kem_ek);
+
+    let key = derive_hybrid_envelope_key(
+        &shared_x25519,
+        &shared_kem,
+        &eph_x25519_public,
+        &server_x25519,
+    );
+
+    let cipher = Aes256GcmSiv::new((&*key).into());
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&ZERO_NONCE), plaintext)
+        .map_err(|_| EnvelopeError::Encryption("AES-256-GCM-SIV hybrid encrypt failed".into()))?;
+
+    Ok((ciphertext, eph_x25519_public, kem_ct))
+}
+
+/// Hybrid envelope decryption: X25519 DH + ML-KEM-768 + AES-256-GCM-SIV.
+#[cfg(feature = "pq-hybrid")]
+pub fn decrypt_envelope_hybrid(
+    ciphertext: &[u8],
+    client_ephemeral_public: &[u8; 32],
+    kem_ciphertext: &[u8],
+    server_signing_key: &ed25519_dalek::SigningKey,
+    server_kem_dk: &crate::crypto::pq::MlKemDecapsKey,
+) -> EnvelopeResult<Vec<u8>> {
+    let server_x25519_secret = ed25519_to_x25519_secret(server_signing_key);
+    let server_x25519_public = ed25519_to_x25519_public(&server_signing_key.verifying_key());
+
+    let shared_x25519 = x25519_dh(&server_x25519_secret, client_ephemeral_public);
+    let shared_kem = crate::crypto::pq::ml_kem_decapsulate(server_kem_dk, kem_ciphertext)
+        .map_err(|e| EnvelopeError::Decryption(format!("ML-KEM-768 decapsulate failed: {e}")))?;
+
+    let key = derive_hybrid_envelope_key(
+        &shared_x25519,
+        &shared_kem,
+        client_ephemeral_public,
+        &server_x25519_public,
+    );
+
+    let cipher = Aes256GcmSiv::new((&*key).into());
+    cipher
+        .decrypt(Nonce::from_slice(&ZERO_NONCE), ciphertext)
+        .map_err(|_| EnvelopeError::Decryption("AES-256-GCM-SIV hybrid decrypt failed".into()))
+}
+
+/// Derive AES-256 key from combined X25519 + ML-KEM shared secrets.
+#[cfg(feature = "pq-hybrid")]
+fn derive_hybrid_envelope_key(
+    shared_x25519: &[u8; 32],
+    shared_kem: &[u8; 32],
+    ephemeral_public: &[u8; 32],
+    server_x25519_public: &[u8; 32],
+) -> Zeroizing<[u8; 32]> {
+    let mut ikm = Vec::with_capacity(128);
+    ikm.extend_from_slice(shared_x25519);
+    ikm.extend_from_slice(shared_kem);
+    ikm.extend_from_slice(ephemeral_public);
+    ikm.extend_from_slice(server_x25519_public);
+    Zeroizing::new(blake3::derive_key("hyprstream-hybrid-envelope-v1", &ikm))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -152,5 +233,40 @@ mod tests {
         let (ct2, _) = encrypt_envelope(plaintext, &server_key.verifying_key()).unwrap();
 
         assert_ne!(ct1, ct2);
+    }
+
+    #[cfg(feature = "pq-hybrid")]
+    #[test]
+    fn hybrid_roundtrip() {
+        let server_key = SigningKey::generate(&mut OsRng);
+        let (kem_dk, kem_ek) = crate::crypto::pq::ml_kem_generate_keypair();
+        let plaintext = b"hybrid envelope payload";
+
+        let (ciphertext, eph_pub, kem_ct) =
+            encrypt_envelope_hybrid(plaintext, &server_key.verifying_key(), &kem_ek).unwrap();
+
+        assert_ne!(&ciphertext[..], plaintext.as_slice());
+        assert_eq!(kem_ct.len(), 1088);
+
+        let decrypted =
+            decrypt_envelope_hybrid(&ciphertext, &eph_pub, &kem_ct, &server_key, &kem_dk)
+                .unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[cfg(feature = "pq-hybrid")]
+    #[test]
+    fn hybrid_wrong_kem_key_fails() {
+        let server_key = SigningKey::generate(&mut OsRng);
+        let (_kem_dk, kem_ek) = crate::crypto::pq::ml_kem_generate_keypair();
+        let (wrong_dk, _) = crate::crypto::pq::ml_kem_generate_keypair();
+        let plaintext = b"wrong key test";
+
+        let (ciphertext, eph_pub, kem_ct) =
+            encrypt_envelope_hybrid(plaintext, &server_key.verifying_key(), &kem_ek).unwrap();
+
+        let result =
+            decrypt_envelope_hybrid(&ciphertext, &eph_pub, &kem_ct, &server_key, &wrong_dk);
+        assert!(result.is_err());
     }
 }
