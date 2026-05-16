@@ -110,7 +110,7 @@ impl TrustStore {
         match self.inner.get(key) {
             Some(att) => {
                 let now = chrono::Utc::now().timestamp();
-                att.expires_at == 0 || att.expires_at > now
+                (att.expires_at == 0 || att.expires_at > now)
                     && att.scopes.contains(scope)
             }
             None => false,
