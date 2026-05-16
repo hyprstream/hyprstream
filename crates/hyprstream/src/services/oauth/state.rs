@@ -317,6 +317,8 @@ pub struct OAuthState {
     pub signing_key_store: Option<Arc<crate::auth::SigningKeyStore>>,
     /// Shared JWT ID blocklist for access token revocation (shared with PolicyService).
     pub jti_blocklist: Option<Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>>,
+    /// P-256 signing key for ES256 JWT issuance (atproto interop).
+    pub es256_signing_key: Option<p256::ecdsa::SigningKey>,
 }
 
 impl OAuthState {
@@ -358,6 +360,7 @@ impl OAuthState {
             jwt_key_exp: chrono::Utc::now().timestamp() + 14 * 86400,
             signing_key_store: None,
             jti_blocklist: None,
+            es256_signing_key: Some(crate::auth::jwt::generate_es256_key()),
         }
     }
 

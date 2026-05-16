@@ -78,6 +78,11 @@ pub async fn jwks(State(state): State<Arc<OAuthState>>) -> impl IntoResponse {
         }
     }
 
+    // Add ES256 (P-256) public key if available
+    if let Some(ref es256_key) = state.es256_signing_key {
+        keys.push(crate::auth::jwt::es256_jwk(es256_key));
+    }
+
     // Add RSA public key if available
     if let Some(ref rsa_jwk) = state.rsa_jwk {
         keys.push(rsa_jwk.clone());
