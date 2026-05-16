@@ -71,6 +71,136 @@ pub fn generate_es256_key() -> Es256SigningKey {
     Es256SigningKey::random(&mut rand::rngs::OsRng)
 }
 
+// ── ML-DSA-65 JWT encoding (draft-ietf-cose-dilithium-11) ──────────────
+
+/// Encode and sign a JWT with ML-DSA-65 (`alg: "ML-DSA-65"`, `kty: "AKP"`).
+#[cfg(feature = "pq-hybrid")]
+pub fn encode_ml_dsa_65(
+    claims: &Claims,
+    signing_key: &hyprstream_rpc::crypto::pq::MlDsaSigningKey,
+) -> String {
+    let claims = if claims.jti.is_some() {
+        std::borrow::Cow::Borrowed(claims)
+    } else {
+        std::borrow::Cow::Owned(claims.clone().with_jti())
+    };
+    let vk = ml_dsa::Keypair::verifying_key(signing_key);
+    let vk_bytes = hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&vk);
+    let kid = hyprstream_rpc::auth::jwk_thumbprint(
+        &hyprstream_rpc::auth::JwkThumbprintInput::Akp {
+            alg: "ML-DSA-65",
+            pub_bytes: &vk_bytes,
+        },
+    );
+    let header = format!(r#"{{"alg":"ML-DSA-65","typ":"at+jwt","kid":"{}"}}"#, kid);
+    let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
+    let payload_json = serde_json::to_string(claims.as_ref()).unwrap_or_else(|_e| {
+        tracing::error!("JWT claims serialization failed: {}", _e);
+        "{}".to_owned()
+    });
+    let payload_b64 = URL_SAFE_NO_PAD.encode(payload_json.as_bytes());
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let sig = hyprstream_rpc::crypto::pq::ml_dsa_sign(signing_key, signing_input.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(&sig);
+    format!("{signing_input}.{sig_b64}")
+}
+
+/// Encode and sign a composite ML-DSA-65-Ed25519 JWT.
+///
+/// Signature = ML-DSA-65 sig (3309 bytes) ∥ Ed25519 sig (64 bytes).
+/// Per draft-ietf-jose-pq-composite-sigs.
+#[cfg(feature = "pq-hybrid")]
+pub fn encode_composite_ml_dsa_65_ed25519(
+    claims: &Claims,
+    ml_dsa_key: &hyprstream_rpc::crypto::pq::MlDsaSigningKey,
+    ed25519_key: &ed25519_dalek::SigningKey,
+) -> String {
+    use ed25519_dalek::Signer;
+
+    let claims = if claims.jti.is_some() {
+        std::borrow::Cow::Borrowed(claims)
+    } else {
+        std::borrow::Cow::Owned(claims.clone().with_jti())
+    };
+    let vk = ml_dsa::Keypair::verifying_key(ml_dsa_key);
+    let ml_dsa_vk_bytes = hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&vk);
+    let ed25519_vk_bytes = ed25519_key.verifying_key().to_bytes();
+    let mut composite_pub = Vec::with_capacity(ml_dsa_vk_bytes.len() + 32);
+    composite_pub.extend_from_slice(&ml_dsa_vk_bytes);
+    composite_pub.extend_from_slice(&ed25519_vk_bytes);
+    let kid = hyprstream_rpc::auth::jwk_thumbprint(
+        &hyprstream_rpc::auth::JwkThumbprintInput::Akp {
+            alg: "ML-DSA-65-Ed25519",
+            pub_bytes: &composite_pub,
+        },
+    );
+    let header = format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"at+jwt","kid":"{}"}}"#, kid);
+    let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
+    let payload_json = serde_json::to_string(claims.as_ref()).unwrap_or_else(|_e| {
+        tracing::error!("JWT claims serialization failed: {}", _e);
+        "{}".to_owned()
+    });
+    let payload_b64 = URL_SAFE_NO_PAD.encode(payload_json.as_bytes());
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let message = signing_input.as_bytes();
+
+    let ml_dsa_sig = hyprstream_rpc::crypto::pq::ml_dsa_sign(ml_dsa_key, message);
+    let ed25519_sig = ed25519_key.sign(message);
+
+    let mut composite_sig = Vec::with_capacity(ml_dsa_sig.len() + 64);
+    composite_sig.extend_from_slice(&ml_dsa_sig);
+    composite_sig.extend_from_slice(&ed25519_sig.to_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(&composite_sig);
+    format!("{signing_input}.{sig_b64}")
+}
+
+/// Build a JWK for an ML-DSA-65 key (`kty: "AKP"`).
+#[cfg(feature = "pq-hybrid")]
+pub fn ml_dsa_65_jwk(
+    vk: &hyprstream_rpc::crypto::pq::MlDsaVerifyingKey,
+) -> serde_json::Value {
+    let vk_bytes = hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(vk);
+    let kid = hyprstream_rpc::auth::jwk_thumbprint(
+        &hyprstream_rpc::auth::JwkThumbprintInput::Akp {
+            alg: "ML-DSA-65",
+            pub_bytes: &vk_bytes,
+        },
+    );
+    serde_json::json!({
+        "kty": "AKP",
+        "alg": "ML-DSA-65",
+        "use": "sig",
+        "kid": kid,
+        "pub": URL_SAFE_NO_PAD.encode(&vk_bytes),
+    })
+}
+
+/// Build a JWK for a composite ML-DSA-65-Ed25519 key (`kty: "AKP"`).
+#[cfg(feature = "pq-hybrid")]
+pub fn composite_jwk(
+    ml_dsa_vk: &hyprstream_rpc::crypto::pq::MlDsaVerifyingKey,
+    ed25519_vk: &ed25519_dalek::VerifyingKey,
+) -> serde_json::Value {
+    let ml_dsa_vk_bytes = hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(ml_dsa_vk);
+    let ed25519_vk_bytes = ed25519_vk.to_bytes();
+    let mut composite_pub = Vec::with_capacity(ml_dsa_vk_bytes.len() + 32);
+    composite_pub.extend_from_slice(&ml_dsa_vk_bytes);
+    composite_pub.extend_from_slice(&ed25519_vk_bytes);
+    let kid = hyprstream_rpc::auth::jwk_thumbprint(
+        &hyprstream_rpc::auth::JwkThumbprintInput::Akp {
+            alg: "ML-DSA-65-Ed25519",
+            pub_bytes: &composite_pub,
+        },
+    );
+    serde_json::json!({
+        "kty": "AKP",
+        "alg": "ML-DSA-65-Ed25519",
+        "use": "sig",
+        "kid": kid,
+        "pub": URL_SAFE_NO_PAD.encode(&composite_pub),
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -135,5 +265,103 @@ mod tests {
         let payload_bytes = URL_SAFE_NO_PAD.decode(parts[1]).unwrap();
         let decoded: Claims = serde_json::from_slice(&payload_bytes).unwrap();
         assert!(decoded.jti.is_some());
+    }
+
+    #[cfg(feature = "pq-hybrid")]
+    #[test]
+    fn ml_dsa_65_roundtrip() {
+        let (sk, vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+        let claims = Claims::new("alice".to_owned(), 0, 9_999_999_999);
+        let token = encode_ml_dsa_65(&claims, &sk);
+
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 3);
+
+        let header_bytes = URL_SAFE_NO_PAD.decode(parts[0]).unwrap();
+        let header: serde_json::Value = serde_json::from_slice(&header_bytes).unwrap();
+        assert_eq!(header["alg"], "ML-DSA-65");
+        assert_eq!(header["typ"], "at+jwt");
+        assert!(header["kid"].as_str().unwrap().len() == 43);
+
+        let decoded = hyprstream_rpc::auth::jwt::decode_ml_dsa_65(&token, &vk, None).unwrap();
+        assert_eq!(decoded.sub, "alice");
+        assert!(decoded.jti.is_some());
+    }
+
+    #[cfg(feature = "pq-hybrid")]
+    #[test]
+    fn ml_dsa_65_jwk_structure() {
+        let (sk, _) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+        let vk = ml_dsa::Keypair::verifying_key(&sk);
+        let jwk = ml_dsa_65_jwk(&vk);
+        assert_eq!(jwk["kty"], "AKP");
+        assert_eq!(jwk["alg"], "ML-DSA-65");
+        assert_eq!(jwk["use"], "sig");
+        assert!(jwk["kid"].as_str().unwrap().len() == 43);
+        assert!(jwk["pub"].as_str().is_some());
+    }
+
+    #[cfg(feature = "pq-hybrid")]
+    #[test]
+    fn composite_ml_dsa_65_ed25519_roundtrip() {
+        let (ml_dsa_sk, ml_dsa_vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+        let ed25519_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let ed25519_vk = ed25519_sk.verifying_key();
+
+        let claims = Claims::new("bob".to_owned(), 0, 9_999_999_999);
+        let token = encode_composite_ml_dsa_65_ed25519(&claims, &ml_dsa_sk, &ed25519_sk);
+
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 3);
+
+        let header_bytes = URL_SAFE_NO_PAD.decode(parts[0]).unwrap();
+        let header: serde_json::Value = serde_json::from_slice(&header_bytes).unwrap();
+        assert_eq!(header["alg"], "ML-DSA-65-Ed25519");
+
+        let decoded = hyprstream_rpc::auth::jwt::decode_composite(
+            &token, &ml_dsa_vk, &ed25519_vk, None,
+        ).unwrap();
+        assert_eq!(decoded.sub, "bob");
+        assert!(decoded.jti.is_some());
+    }
+
+    #[cfg(feature = "pq-hybrid")]
+    #[test]
+    fn composite_jwk_structure() {
+        let (ml_dsa_sk, _) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+        let ml_dsa_vk = ml_dsa::Keypair::verifying_key(&ml_dsa_sk);
+        let ed25519_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let ed25519_vk = ed25519_sk.verifying_key();
+
+        let jwk = composite_jwk(&ml_dsa_vk, &ed25519_vk);
+        assert_eq!(jwk["kty"], "AKP");
+        assert_eq!(jwk["alg"], "ML-DSA-65-Ed25519");
+        assert_eq!(jwk["use"], "sig");
+        assert!(jwk["kid"].as_str().unwrap().len() == 43);
+        assert!(jwk["pub"].as_str().is_some());
+    }
+
+    #[cfg(feature = "pq-hybrid")]
+    #[test]
+    fn ml_dsa_65_wrong_key_rejects() {
+        let (sk, _) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+        let (_, wrong_vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+        let claims = Claims::new("alice".to_owned(), 0, 9_999_999_999);
+        let token = encode_ml_dsa_65(&claims, &sk);
+        assert!(hyprstream_rpc::auth::jwt::decode_ml_dsa_65(&token, &wrong_vk, None).is_err());
+    }
+
+    #[cfg(feature = "pq-hybrid")]
+    #[test]
+    fn composite_wrong_ed25519_key_rejects() {
+        let (ml_dsa_sk, ml_dsa_vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+        let ed25519_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let wrong_ed25519_vk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
+
+        let claims = Claims::new("bob".to_owned(), 0, 9_999_999_999);
+        let token = encode_composite_ml_dsa_65_ed25519(&claims, &ml_dsa_sk, &ed25519_sk);
+        assert!(hyprstream_rpc::auth::jwt::decode_composite(
+            &token, &ml_dsa_vk, &wrong_ed25519_vk, None,
+        ).is_err());
     }
 }

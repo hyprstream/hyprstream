@@ -28,6 +28,10 @@ pub enum JwkThumbprintInput<'a> {
     Es256 { x: &'a [u8; 32], y: &'a [u8; 32] },
     /// RSA: canonical `{"e":"...","kty":"RSA","n":"..."}` (n, e already base64url)
     Rsa { n: &'a str, e: &'a str },
+    /// AKP / ML-DSA-65 (draft-ietf-cose-dilithium-11): canonical
+    /// `{"alg":"ML-DSA-65","kty":"AKP","pub":"<base64url>"}`
+    #[cfg(feature = "pq-hybrid")]
+    Akp { alg: &'a str, pub_bytes: &'a [u8] },
 }
 
 /// Compute the RFC 7638 JWK Thumbprint for any supported key type.
@@ -48,6 +52,11 @@ pub fn jwk_thumbprint(input: &JwkThumbprintInput<'_>) -> String {
         JwkThumbprintInput::Rsa { n, e } => {
             format!(r#"{{"e":"{}","kty":"RSA","n":"{}"}}"#, e, n)
         }
+        #[cfg(feature = "pq-hybrid")]
+        JwkThumbprintInput::Akp { alg, pub_bytes } => {
+            let pub_b64 = URL_SAFE_NO_PAD.encode(pub_bytes);
+            format!(r#"{{"alg":"{}","kty":"AKP","pub":"{}"}}"#, alg, pub_b64)
+        }
     };
     let hash = Sha256::digest(canonical.as_bytes());
     URL_SAFE_NO_PAD.encode(hash)
@@ -58,6 +67,19 @@ pub fn kid_for_key(signing_key: &SigningKey) -> String {
     jwk_thumbprint(&JwkThumbprintInput::Ed25519 {
         x: signing_key.verifying_key().as_bytes(),
     })
+}
+
+/// Extract the `alg` from a JWT's JOSE header without verifying the signature.
+///
+/// Returns `Ok(None)` if the header has no `alg` field.
+pub fn header_alg(token: &str) -> Result<Option<String>, JwtError> {
+    let header_b64 = token.split('.').next().ok_or(JwtError::InvalidFormat)?;
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(header_b64)
+        .map_err(|_| JwtError::InvalidBase64)?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
+        .map_err(|e| JwtError::InvalidJson(e.to_string()))?;
+    Ok(header.get("alg").and_then(|v| v.as_str()).map(String::from))
 }
 
 /// Extract the `kid` from a JWT's JOSE header without verifying the signature.
@@ -99,6 +121,9 @@ pub enum JwtError {
 
     #[error("Invalid audience")]
     InvalidAudience,
+
+    #[error("Unsupported algorithm: {0}")]
+    UnsupportedAlgorithm(String),
 }
 
 /// Encode and sign a JWT with a specific JOSE header.
@@ -287,6 +312,143 @@ pub fn decode_unverified(token: &str) -> Result<Claims, JwtError> {
 
     serde_json::from_slice(&payload_bytes)
         .map_err(|e| JwtError::InvalidJson(e.to_string()))
+}
+
+/// Decode and verify a JWT signed with ML-DSA-65 (`alg: "ML-DSA-65"`).
+#[cfg(feature = "pq-hybrid")]
+pub fn decode_ml_dsa_65(
+    token: &str,
+    vk: &crate::crypto::pq::MlDsaVerifyingKey,
+    expected_aud: Option<&str>,
+) -> Result<Claims, JwtError> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(JwtError::InvalidFormat);
+    }
+
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    let sig_bytes = URL_SAFE_NO_PAD
+        .decode(parts[2])
+        .map_err(|_| JwtError::InvalidBase64)?;
+
+    crate::crypto::pq::ml_dsa_verify(vk, signing_input.as_bytes(), &sig_bytes)
+        .map_err(|_| JwtError::InvalidSignature)?;
+
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(parts[0])
+        .map_err(|_| JwtError::InvalidBase64)?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
+        .map_err(|e| JwtError::InvalidJson(e.to_string()))?;
+    if header.get("alg").and_then(|v| v.as_str()) != Some("ML-DSA-65") {
+        return Err(JwtError::UnsupportedAlgorithm(
+            header.get("alg").and_then(|v| v.as_str()).unwrap_or("none").to_owned(),
+        ));
+    }
+
+    let payload_bytes = URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .map_err(|_| JwtError::InvalidBase64)?;
+    let claims: Claims = serde_json::from_slice(&payload_bytes)
+        .map_err(|e| JwtError::InvalidJson(e.to_string()))?;
+
+    if claims.is_expired() {
+        return Err(JwtError::Expired);
+    }
+    let now = Utc::now().timestamp();
+    if claims.iat > now + 60 {
+        return Err(JwtError::NotYetValid);
+    }
+
+    if let Some(expected) = expected_aud {
+        match &claims.aud {
+            Some(aud) if aud == expected => {}
+            _ => return Err(JwtError::InvalidAudience),
+        }
+    }
+
+    Ok(claims)
+}
+
+/// Decode and verify a composite ML-DSA-65-Ed25519 JWT.
+///
+/// Per draft-ietf-jose-pq-composite-sigs, the signature is
+/// `ml_dsa_sig (3309 bytes) ∥ ed25519_sig (64 bytes)`.
+#[cfg(feature = "pq-hybrid")]
+pub fn decode_composite(
+    token: &str,
+    ml_dsa_vk: &crate::crypto::pq::MlDsaVerifyingKey,
+    ed25519_vk: &VerifyingKey,
+    expected_aud: Option<&str>,
+) -> Result<Claims, JwtError> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(JwtError::InvalidFormat);
+    }
+
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    let sig_bytes = URL_SAFE_NO_PAD
+        .decode(parts[2])
+        .map_err(|_| JwtError::InvalidBase64)?;
+
+    // Composite signature: ML-DSA-65 (3309 bytes) + Ed25519 (64 bytes) = 3373 bytes
+    if sig_bytes.len() != 3309 + 64 {
+        return Err(JwtError::InvalidSignature);
+    }
+
+    let (ml_dsa_sig, ed25519_sig) = sig_bytes.split_at(3309);
+
+    // Build message per draft-ietf-jose-pq-composite-sigs:
+    // Hash(header.payload) used as message for both algorithms
+    let message = signing_input.as_bytes();
+
+    // Verify ML-DSA-65
+    crate::crypto::pq::ml_dsa_verify(ml_dsa_vk, message, ml_dsa_sig)
+        .map_err(|_| JwtError::InvalidSignature)?;
+
+    // Verify Ed25519
+    if ed25519_sig.len() != 64 {
+        return Err(JwtError::InvalidSignature);
+    }
+    let mut ed_sig_arr = [0u8; 64];
+    ed_sig_arr.copy_from_slice(ed25519_sig);
+    let ed_signature = Signature::from_bytes(&ed_sig_arr);
+    ed25519_vk
+        .verify(message, &ed_signature)
+        .map_err(|_| JwtError::InvalidSignature)?;
+
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(parts[0])
+        .map_err(|_| JwtError::InvalidBase64)?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
+        .map_err(|e| JwtError::InvalidJson(e.to_string()))?;
+    if header.get("alg").and_then(|v| v.as_str()) != Some("ML-DSA-65-Ed25519") {
+        return Err(JwtError::UnsupportedAlgorithm(
+            header.get("alg").and_then(|v| v.as_str()).unwrap_or("none").to_owned(),
+        ));
+    }
+
+    let payload_bytes = URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .map_err(|_| JwtError::InvalidBase64)?;
+    let claims: Claims = serde_json::from_slice(&payload_bytes)
+        .map_err(|e| JwtError::InvalidJson(e.to_string()))?;
+
+    if claims.is_expired() {
+        return Err(JwtError::Expired);
+    }
+    let now = Utc::now().timestamp();
+    if claims.iat > now + 60 {
+        return Err(JwtError::NotYetValid);
+    }
+
+    if let Some(expected) = expected_aud {
+        match &claims.aud {
+            Some(aud) if aud == expected => {}
+            _ => return Err(JwtError::InvalidAudience),
+        }
+    }
+
+    Ok(claims)
 }
 
 #[cfg(test)]

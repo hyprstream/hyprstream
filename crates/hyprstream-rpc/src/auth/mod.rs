@@ -22,7 +22,7 @@ pub use claims::{Claims, Cnf, CnfJwk, IdTokenClaims, OneOrMany, compute_jkt, is_
 pub use jti_blocklist::{InMemoryJtiBlocklist, JtiBlocklist};
 #[cfg(not(target_arch = "wasm32"))]
 pub use federation::FederationKeySource;
-pub use jwt::{decode, decode_unverified, decode_with_key, encode, encode_service_jwt, header_kid, jwk_thumbprint, JwkThumbprintInput, JwtError};
+pub use jwt::{decode, decode_unverified, decode_with_key, encode, encode_service_jwt, header_alg, header_kid, jwk_thumbprint, JwkThumbprintInput, JwtError};
 #[cfg(not(target_arch = "wasm32"))]
 pub use key_source::{ClusterKeySource, FederatedKeySource, IssuerResolver, JwksFetcher, JwksKeySource, JwksMode, JwtKeySource};
 pub use scope::Scope;

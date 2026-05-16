@@ -6103,6 +6103,7 @@ dependencies = [
  "lru 0.16.1",
  "memmap2",
  "minijinja",
+ "ml-dsa",
  "nix 0.27.1",
  "notify",
  "num_cpus",

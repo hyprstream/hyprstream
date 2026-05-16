@@ -83,6 +83,21 @@ pub async fn jwks(State(state): State<Arc<OAuthState>>) -> impl IntoResponse {
         keys.push(crate::auth::jwt::es256_jwk(es256_key));
     }
 
+    // Add ML-DSA-65 (AKP) public key if available
+    #[cfg(feature = "pq-hybrid")]
+    if let Some(ref ml_dsa_key) = state.ml_dsa_signing_key {
+        let vk = ml_dsa::Keypair::verifying_key(ml_dsa_key);
+        keys.push(crate::auth::jwt::ml_dsa_65_jwk(&vk));
+
+        // Also publish composite ML-DSA-65-Ed25519 key if we have the Ed25519 key
+        if let Some(ref signing_key) = state.signing_key {
+            keys.push(crate::auth::jwt::composite_jwk(
+                &vk,
+                &signing_key.verifying_key(),
+            ));
+        }
+    }
+
     // Add RSA public key if available
     if let Some(ref rsa_jwk) = state.rsa_jwk {
         keys.push(rsa_jwk.clone());

@@ -319,6 +319,9 @@ pub struct OAuthState {
     pub jti_blocklist: Option<Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>>,
     /// P-256 signing key for ES256 JWT issuance (atproto interop).
     pub es256_signing_key: Option<p256::ecdsa::SigningKey>,
+    /// ML-DSA-65 signing key for PQ JWT issuance (pq-hybrid).
+    #[cfg(feature = "pq-hybrid")]
+    pub ml_dsa_signing_key: Option<hyprstream_rpc::crypto::pq::MlDsaSigningKey>,
 }
 
 impl OAuthState {
@@ -361,6 +364,11 @@ impl OAuthState {
             signing_key_store: None,
             jti_blocklist: None,
             es256_signing_key: Some(crate::auth::jwt::generate_es256_key()),
+            #[cfg(feature = "pq-hybrid")]
+            ml_dsa_signing_key: {
+                let (sk, _vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+                Some(sk)
+            },
         }
     }
 

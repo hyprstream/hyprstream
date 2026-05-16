@@ -339,6 +339,16 @@ pub trait ZmqService: 'static {
         None
     }
 
+    /// ML-DSA-65 verifying key for post-quantum JWT verification.
+    ///
+    /// When `Some`, `verify_claims()` can verify JWTs signed with
+    /// `alg: "ML-DSA-65"` or composite `"ML-DSA-65-Ed25519"`.
+    /// Default returns `None` (PQ JWT verification disabled).
+    #[cfg(feature = "pq-hybrid")]
+    fn ml_dsa_verifying_key(&self) -> Option<crate::crypto::pq::MlDsaVerifyingKey> {
+        None
+    }
+
     /// Resolve a signer key to an authorization subject via the trust store.
     ///
     /// Returns `Some(subject)` if the key is cached and not expired.
@@ -415,21 +425,50 @@ pub trait ZmqService: 'static {
             anyhow::bail!("JWT issuer not trusted: {}", unverified.iss);
         }
 
-        // Get verifying key from key source
-        let verifying_key = key_source.get_key(&unverified.iss, kid.as_deref()).await.map_err(|e| {
-            tracing::warn!(
-                "JWT key resolution failed for iss={}: {}",
-                unverified.iss, e
-            );
-            anyhow::anyhow!("JWT key resolution failed")
-        })?;
+        // Extract algorithm for routing
+        let alg = crate::auth::header_alg(&token)
+            .map_err(|e| anyhow::anyhow!("JWT header parse failed: {}", e))?
+            .unwrap_or_default();
 
-        // Verify JWT signature
-        let verified = crate::auth::decode_with_key(&token, &verifying_key, self.expected_audience())
-            .map_err(|e| {
-                tracing::warn!("JWT verification failed: {}", e);
-                anyhow::anyhow!("JWT verification failed")
-            })?;
+        // Route verification by algorithm
+        let verified = match alg.as_str() {
+            #[cfg(feature = "pq-hybrid")]
+            "ML-DSA-65" => {
+                let ml_dsa_vk = self.ml_dsa_verifying_key()
+                    .ok_or_else(|| anyhow::anyhow!("ML-DSA-65 JWT received but no PQ verifying key configured"))?;
+                crate::auth::jwt::decode_ml_dsa_65(&token, &ml_dsa_vk, self.expected_audience())
+                    .map_err(|e| {
+                        tracing::warn!("ML-DSA-65 JWT verification failed: {}", e);
+                        anyhow::anyhow!("JWT verification failed")
+                    })?
+            }
+            #[cfg(feature = "pq-hybrid")]
+            "ML-DSA-65-Ed25519" => {
+                let ml_dsa_vk = self.ml_dsa_verifying_key()
+                    .ok_or_else(|| anyhow::anyhow!("Composite JWT received but no PQ verifying key configured"))?;
+                let verifying_key = key_source.get_key(&unverified.iss, kid.as_deref()).await.map_err(|e| {
+                    tracing::warn!("JWT key resolution failed for iss={}: {}", unverified.iss, e);
+                    anyhow::anyhow!("JWT key resolution failed")
+                })?;
+                crate::auth::jwt::decode_composite(&token, &ml_dsa_vk, &verifying_key, self.expected_audience())
+                    .map_err(|e| {
+                        tracing::warn!("Composite ML-DSA-65-Ed25519 JWT verification failed: {}", e);
+                        anyhow::anyhow!("JWT verification failed")
+                    })?
+            }
+            _ => {
+                // EdDSA (default path)
+                let verifying_key = key_source.get_key(&unverified.iss, kid.as_deref()).await.map_err(|e| {
+                    tracing::warn!("JWT key resolution failed for iss={}: {}", unverified.iss, e);
+                    anyhow::anyhow!("JWT key resolution failed")
+                })?;
+                crate::auth::decode_with_key(&token, &verifying_key, self.expected_audience())
+                    .map_err(|e| {
+                        tracing::warn!("JWT verification failed: {}", e);
+                        anyhow::anyhow!("JWT verification failed")
+                    })?
+            }
+        };
 
         // Check jti against blocklist (revoked access tokens)
         if let Some(ref jti) = verified.jti {

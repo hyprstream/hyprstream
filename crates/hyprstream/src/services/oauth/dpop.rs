@@ -27,6 +27,10 @@ use subtle::ConstantTimeEq;
 pub enum DpopKey {
     Ed25519 { bytes: [u8; 32] },
     Es256 { x: [u8; 32], y: [u8; 32] },
+    #[cfg(feature = "pq-hybrid")]
+    MlDsa65 { pub_bytes: Vec<u8> },
+    #[cfg(feature = "pq-hybrid")]
+    MlDsa65Ed25519 { pub_bytes: Vec<u8> },
 }
 
 impl DpopKey {
@@ -37,6 +41,14 @@ impl DpopKey {
             }
             DpopKey::Es256 { x, y } => {
                 jwk_thumbprint(&JwkThumbprintInput::Es256 { x, y })
+            }
+            #[cfg(feature = "pq-hybrid")]
+            DpopKey::MlDsa65 { pub_bytes } => {
+                jwk_thumbprint(&JwkThumbprintInput::Akp { alg: "ML-DSA-65", pub_bytes })
+            }
+            #[cfg(feature = "pq-hybrid")]
+            DpopKey::MlDsa65Ed25519 { pub_bytes } => {
+                jwk_thumbprint(&JwkThumbprintInput::Akp { alg: "ML-DSA-65-Ed25519", pub_bytes })
             }
         }
     }
@@ -151,6 +163,48 @@ pub fn verify_dpop_proof(
         let (x, y) = extract_p256_key(jwk)?;
         verify_es256(&x, &y, signing_input.as_bytes(), &sig_bytes)?;
         DpopKey::Es256 { x, y }
+    } else if cfg!(feature = "pq-hybrid") && alg == "ML-DSA-65" {
+        #[cfg(feature = "pq-hybrid")]
+        {
+            let pub_bytes = extract_akp_pub(jwk)?;
+            let vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(&pub_bytes)
+                .map_err(|_| DpopError::InvalidJwk)?;
+            hyprstream_rpc::crypto::pq::ml_dsa_verify(&vk, signing_input.as_bytes(), &sig_bytes)
+                .map_err(|_| DpopError::SignatureInvalid)?;
+            DpopKey::MlDsa65 { pub_bytes }
+        }
+        #[cfg(not(feature = "pq-hybrid"))]
+        return Err(DpopError::WrongAlg(alg.to_owned()))
+    } else if cfg!(feature = "pq-hybrid") && alg == "ML-DSA-65-Ed25519" {
+        #[cfg(feature = "pq-hybrid")]
+        {
+            let pub_bytes = extract_akp_pub(jwk)?;
+            // Composite: ML-DSA-65 vk (1952) + Ed25519 vk (32) = 1984
+            if pub_bytes.len() != 1952 + 32 {
+                return Err(DpopError::InvalidJwk);
+            }
+            let (ml_dsa_pub, ed25519_pub) = pub_bytes.split_at(1952);
+            let ml_dsa_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(ml_dsa_pub)
+                .map_err(|_| DpopError::InvalidJwk)?;
+            let ed25519_vk = ed25519_dalek::VerifyingKey::from_bytes(
+                ed25519_pub.try_into().map_err(|_| DpopError::InvalidJwk)?
+            ).map_err(|_| DpopError::InvalidJwk)?;
+            // Composite sig: ML-DSA-65 (3309) + Ed25519 (64)
+            if sig_bytes.len() != 3309 + 64 {
+                return Err(DpopError::SignatureInvalid);
+            }
+            let (ml_sig, ed_sig) = sig_bytes.split_at(3309);
+            hyprstream_rpc::crypto::pq::ml_dsa_verify(&ml_dsa_vk, signing_input.as_bytes(), ml_sig)
+                .map_err(|_| DpopError::SignatureInvalid)?;
+            let mut ed_sig_arr = [0u8; 64];
+            ed_sig_arr.copy_from_slice(ed_sig);
+            let ed_signature = ed25519_dalek::Signature::from_bytes(&ed_sig_arr);
+            ed25519_dalek::Verifier::verify(&ed25519_vk, signing_input.as_bytes(), &ed_signature)
+                .map_err(|_| DpopError::SignatureInvalid)?;
+            DpopKey::MlDsa65Ed25519 { pub_bytes }
+        }
+        #[cfg(not(feature = "pq-hybrid"))]
+        return Err(DpopError::WrongAlg(alg.to_owned()))
     } else {
         return Err(DpopError::WrongAlg(alg.to_owned()));
     };
@@ -242,6 +296,15 @@ fn extract_p256_key(jwk: &serde_json::Value) -> Result<([u8; 32], [u8; 32]), Dpo
         .map_err(|_| DpopError::InvalidJwk)?
         .try_into().map_err(|_| DpopError::InvalidJwk)?;
     Ok((x_bytes, y_bytes))
+}
+
+#[cfg(feature = "pq-hybrid")]
+fn extract_akp_pub(jwk: &serde_json::Value) -> Result<Vec<u8>, DpopError> {
+    if jwk["kty"].as_str() != Some("AKP") {
+        return Err(DpopError::InvalidJwk);
+    }
+    let pub_str = jwk["pub"].as_str().ok_or(DpopError::InvalidJwk)?;
+    URL_SAFE_NO_PAD.decode(pub_str).map_err(|_| DpopError::InvalidJwk)
 }
 
 fn verify_ed25519(key_bytes: &[u8; 32], msg: &[u8], sig_bytes: &[u8]) -> Result<(), DpopError> {
