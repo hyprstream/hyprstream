@@ -292,14 +292,18 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
 
         let canonical = envelope.to_bytes();
         let signature = self.signer.sign(&canonical).await?;
+
+        let pq_sig = self.signer.pq_sign(&canonical).await?;
+        let pq_cnf = self.signer.pq_pubkey();
+
         let signed = SignedEnvelope {
             envelope,
             sig: signature,
             cnf: self.signer.pubkey(),
             encrypted_envelope: None,
             client_ephemeral_public: None,
-            pq_sig: None,
-            pq_cnf: None,
+            pq_sig,
+            pq_cnf,
             pq_kem_ciphertext: None,
         };
 

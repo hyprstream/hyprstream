@@ -27,6 +27,16 @@ pub trait Signer: Send + Sync {
 
     /// Sign canonical envelope bytes. Returns 64-byte Ed25519 signature.
     async fn sign(&self, canonical_bytes: &[u8]) -> Result<[u8; 64]>;
+
+    /// ML-DSA-65 verifying key bytes (1952 bytes) when PQ hybrid is available.
+    fn pq_pubkey(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// ML-DSA-65 signature over canonical envelope bytes.
+    async fn pq_sign(&self, _canonical_bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
 }
 
 /// Wire transport abstraction.
