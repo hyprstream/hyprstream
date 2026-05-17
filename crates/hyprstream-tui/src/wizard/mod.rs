@@ -149,7 +149,8 @@ impl<B: WizardBackend> WizardApp<B> {
             .collect();
 
         if self.token_queue.is_empty() {
-            self.token_queue.push(self.backend.local_username());
+            self.advance_to_services();
+            return;
         }
 
         self.token_queue_idx = 0;
@@ -170,7 +171,7 @@ impl<B: WizardBackend> WizardApp<B> {
 
     fn advance_to_services(&mut self) {
         self.phase = WizardPhase::Services(ServiceScreen::AskStart(
-            ConfirmDialog::new("Start services now?").with_default(false),
+            ConfirmDialog::new("Start services now?").with_default(true),
         ));
     }
 
