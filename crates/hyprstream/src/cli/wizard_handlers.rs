@@ -764,7 +764,7 @@ async fn phase_tokens(state: &mut WizardState, non_interactive: bool) -> Result<
     };
 
     // Collect users who need tokens
-    let mut users_for_tokens: Vec<String> = state
+    let users_for_tokens: Vec<String> = state
         .users_created
         .iter()
         .map(|u| u.username.clone())
@@ -779,27 +779,14 @@ async fn phase_tokens(state: &mut WizardState, non_interactive: bool) -> Result<
         return Ok(());
     }
 
-    // If no users created, ask if they want to create a token for the local user
+    // If no users created, skip token generation
     if users_for_tokens.is_empty() {
-        let local_user = "anonymous".to_owned();
-
-        let create_local = Confirm::new(&format!(
-            "  Generate API token for local user '{local_user}'?"
-        ))
-        .with_default(true)
-        .prompt()
-        .unwrap_or(false);
-
-        if create_local {
-            users_for_tokens.push(local_user);
-        }
-    }
-
-    if users_for_tokens.is_empty() {
-        println!("    No tokens to generate.");
+        println!("    No users created — skipping token generation.");
         println!();
         return Ok(());
     }
+
+
 
     let expiration_options = vec![
         "30 days",
@@ -905,7 +892,7 @@ async fn phase_services(
         false
     } else {
         Confirm::new("  Start services now?")
-            .with_default(false)
+            .with_default(true)
             .prompt()
             .unwrap_or(false)
     };

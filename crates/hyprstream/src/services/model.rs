@@ -741,7 +741,9 @@ impl TttHandler for ModelService {
         model_ref: &str, data: &TrainStepRequest,
     ) -> Result<(crate::services::generated::model_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
         let client = self.get_inference_client(model_ref, ctx).await?;
-        let stream_info = client.train_step_stream(data, [0u8; 32]).await?;
+        let ephemeral_pubkey = ctx.ephemeral_pubkey()
+            .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
+        let stream_info = client.train_step_stream(data, ephemeral_pubkey).await?;
         Ok((stream_info, Box::pin(async {})))
     }
 
@@ -965,7 +967,9 @@ impl InferHandler for ModelService {
         model_ref: &str, data: &GenerationRequest,
     ) -> Result<(crate::services::generated::model_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
         let client = self.get_inference_client(model_ref, ctx).await?;
-        let stream_info = client.generate_stream(data, [0u8; 32]).await?;
+        let ephemeral_pubkey = ctx.ephemeral_pubkey()
+            .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
+        let stream_info = client.generate_stream(data, ephemeral_pubkey).await?;
         Ok((stream_info, Box::pin(async {})))
     }
 
