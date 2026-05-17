@@ -409,7 +409,14 @@ fn create_streams_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
         pub_transport,
         pull_transport,
         ctx.verifying_key(),
-    );
+    )
+    .with_authorize_signer(|pubkey| {
+        use ed25519_dalek::VerifyingKey;
+        let Ok(vk) = VerifyingKey::from_bytes(pubkey) else {
+            return false;
+        };
+        hyprstream_service::global_trust_store().get(&vk).is_some()
+    });
 
     Ok(Box::new(stream_service))
 }

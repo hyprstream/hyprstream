@@ -766,9 +766,11 @@ impl RequestLoop {
             }
         };
         socket.set_linger(0).ok();
-        // ROUTER_MANDATORY: return errors instead of silently dropping messages
-        // when routing identity is unknown
-        socket.set_router_mandatory(true).ok();
+        // Do NOT set ROUTER_MANDATORY: EHOSTUNREACH errors on send can
+        // poison TMQ's Sink state, preventing subsequent recv. Silently
+        // dropping responses to disconnected clients is acceptable — the
+        // client already timed out.
+        // socket.set_router_mandatory(true).ok();
 
         // Bind or connect
         let bind_result = match transport.bind_mode() {
