@@ -966,6 +966,23 @@ pub struct OAuthConfig {
     /// How many extra days after active-key expiry the drain key remains in JWKS for verification.
     #[serde(default = "default_jwt_key_drain_days")]
     pub jwt_key_drain_days: u32,
+
+    /// Override active key lifetime in seconds (takes precedence over `jwt_key_active_days`).
+    /// Intended for integration tests with short rotation cycles.
+    #[serde(default)]
+    pub jwt_key_active_secs: Option<u32>,
+
+    /// Override lead key pre-generation window in seconds (takes precedence over `jwt_key_lead_days`).
+    #[serde(default)]
+    pub jwt_key_lead_secs: Option<u32>,
+
+    /// Override drain key retention window in seconds (takes precedence over `jwt_key_drain_days`).
+    #[serde(default)]
+    pub jwt_key_drain_secs: Option<u32>,
+
+    /// Override rotation check interval in seconds (default: 21600 = 6 hours).
+    #[serde(default)]
+    pub jwt_key_rotation_check_secs: Option<u64>,
 }
 
 fn default_oauth_cors() -> server::CorsConfig {
@@ -992,11 +1009,44 @@ impl Default for OAuthConfig {
             jwt_key_active_days: default_jwt_key_active_days(),
             jwt_key_lead_days: default_jwt_key_lead_days(),
             jwt_key_drain_days: default_jwt_key_drain_days(),
+            jwt_key_active_secs: None,
+            jwt_key_lead_secs: None,
+            jwt_key_drain_secs: None,
+            jwt_key_rotation_check_secs: None,
         }
     }
 }
 
 impl OAuthConfig {
+    /// Active key lifetime in seconds (`_secs` override wins over `_days * 86400`).
+    pub fn active_secs(&self) -> i64 {
+        self.jwt_key_active_secs.map_or_else(
+            || i64::from(self.jwt_key_active_days) * 86400,
+            i64::from,
+        )
+    }
+
+    /// Lead pre-generation window in seconds.
+    pub fn lead_secs(&self) -> i64 {
+        self.jwt_key_lead_secs.map_or_else(
+            || i64::from(self.jwt_key_lead_days) * 86400,
+            i64::from,
+        )
+    }
+
+    /// Drain retention window in seconds.
+    pub fn drain_secs(&self) -> i64 {
+        self.jwt_key_drain_secs.map_or_else(
+            || i64::from(self.jwt_key_drain_days) * 86400,
+            i64::from,
+        )
+    }
+
+    /// Rotation check interval (default 6 hours).
+    pub fn rotation_check_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.jwt_key_rotation_check_secs.unwrap_or(6 * 3600))
+    }
+
     /// Get the issuer URL, using external_url if set, otherwise deriving from host:port.
     /// Auto-derives `https://` when global TLS is enabled.
     pub fn issuer_url(&self) -> String {
@@ -2180,6 +2230,36 @@ mod tests {
         assert_eq!(resolved.top_p, 0.95);
         assert_eq!(resolved.repeat_penalty, 1.0);
         assert!(resolved.do_sample);
+    }
+
+    #[test]
+    fn test_oauth_secs_overrides() {
+        let mut config = OAuthConfig::default();
+        assert_eq!(config.active_secs(), i64::from(config.jwt_key_active_days) * 86400);
+        config.jwt_key_active_secs = Some(30);
+        config.jwt_key_lead_secs = Some(25);
+        config.jwt_key_drain_secs = Some(20);
+        config.jwt_key_rotation_check_secs = Some(3);
+        assert_eq!(config.active_secs(), 30);
+        assert_eq!(config.lead_secs(), 25);
+        assert_eq!(config.drain_secs(), 20);
+        assert_eq!(config.rotation_check_interval(), std::time::Duration::from_secs(3));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn test_oauth_secs_from_env() {
+        // Simulate env vars the same way HyprConfig::load() does
+        std::env::set_var("HYPRSTREAM__OAUTH__JWT_KEY_ACTIVE_SECS", "30");
+        let result = config::Config::builder()
+            .add_source(config::Config::try_from(&HyprConfig::default()).unwrap())
+            .add_source(config::Environment::with_prefix("HYPRSTREAM").separator("__").try_parsing(true))
+            .build()
+            .and_then(config::Config::try_deserialize::<HyprConfig>);
+        std::env::remove_var("HYPRSTREAM__OAUTH__JWT_KEY_ACTIVE_SECS");
+        let cfg = result.expect("config should parse with env var");
+        assert_eq!(cfg.oauth.jwt_key_active_secs, Some(30), "jwt_key_active_secs should be 30 from env");
+        assert_eq!(cfg.oauth.active_secs(), 30);
     }
 }
 

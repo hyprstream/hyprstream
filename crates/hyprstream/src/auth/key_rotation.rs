@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio::time::{Duration, MissedTickBehavior};
+use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
 use crate::config::OAuthConfig;
@@ -200,8 +200,8 @@ fn generate_slot(nbf: i64, exp: i64) -> KeySlot {
 /// Slot files: `jwt-signing-key.{active,drain,lead}` + `.meta` JSON.
 pub fn load_or_init_key_store(secrets_dir: &Path, config: &OAuthConfig) -> SigningKeyStore {
     let now = chrono::Utc::now().timestamp();
-    let active_secs = i64::from(config.jwt_key_active_days) * 86400;
-    let lead_secs = i64::from(config.jwt_key_lead_days) * 86400;
+    let active_secs = config.active_secs();
+    let lead_secs = config.lead_secs();
 
     let drain = load_slot(secrets_dir, "drain");
     let mut active = load_slot(secrets_dir, "active");
@@ -248,9 +248,9 @@ pub async fn rotate_jwt_keys(
 ) {
     let mut slots = store.0.write().await;
 
-    let active_secs = i64::from(config.jwt_key_active_days) * 86400;
-    let lead_secs = i64::from(config.jwt_key_lead_days) * 86400;
-    let drain_secs = i64::from(config.jwt_key_drain_days) * 86400;
+    let active_secs = config.active_secs();
+    let lead_secs = config.lead_secs();
+    let drain_secs = config.drain_secs();
 
     // 1. Promote lead → active if lead.nbf has passed.
     if let Some(new_lead) = slots.lead.take().filter(|l| l.nbf <= now) {
@@ -318,7 +318,7 @@ pub fn spawn_rotation_task(
     extra: RotationStores,
 ) {
     tokio::task::spawn_local(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(6 * 3600));
+        let mut interval = tokio::time::interval(config.rotation_check_interval());
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         // Skip the first tick (fires immediately on creation)
         interval.tick().await;
@@ -442,8 +442,8 @@ fn generate_es256_slot(nbf: i64, exp: i64) -> Es256KeySlot {
 
 pub fn load_or_init_es256_key_store(secrets_dir: &Path, config: &OAuthConfig) -> Es256SigningKeyStore {
     let now = chrono::Utc::now().timestamp();
-    let active_secs = i64::from(config.jwt_key_active_days) * 86400;
-    let lead_secs = i64::from(config.jwt_key_lead_days) * 86400;
+    let active_secs = config.active_secs();
+    let lead_secs = config.lead_secs();
 
     let drain = load_es256_slot(secrets_dir, "drain");
     let mut active = load_es256_slot(secrets_dir, "active");
@@ -482,9 +482,9 @@ pub async fn rotate_es256_keys(
     now: i64,
 ) {
     let mut slots = store.0.write().await;
-    let active_secs = i64::from(config.jwt_key_active_days) * 86400;
-    let lead_secs = i64::from(config.jwt_key_lead_days) * 86400;
-    let drain_secs = i64::from(config.jwt_key_drain_days) * 86400;
+    let active_secs = config.active_secs();
+    let lead_secs = config.lead_secs();
+    let drain_secs = config.drain_secs();
 
     // Phase 1: promote lead → active if lead.nbf <= now
     if let Some(ref lead) = slots.lead {
@@ -639,8 +639,8 @@ mod ml_dsa_rotation {
 
     pub fn load_or_init_ml_dsa_key_store(secrets_dir: &Path, config: &OAuthConfig) -> MlDsaSigningKeyStore {
         let now = chrono::Utc::now().timestamp();
-        let active_secs = i64::from(config.jwt_key_active_days) * 86400;
-        let lead_secs = i64::from(config.jwt_key_lead_days) * 86400;
+        let active_secs = config.active_secs();
+        let lead_secs = config.lead_secs();
 
         let drain = load_ml_dsa_slot(secrets_dir, "drain");
         let mut active = load_ml_dsa_slot(secrets_dir, "active");
@@ -679,9 +679,9 @@ mod ml_dsa_rotation {
         now: i64,
     ) {
         let mut slots = store.0.write().await;
-        let active_secs = i64::from(config.jwt_key_active_days) * 86400;
-        let lead_secs = i64::from(config.jwt_key_lead_days) * 86400;
-        let drain_secs = i64::from(config.jwt_key_drain_days) * 86400;
+        let active_secs = config.active_secs();
+        let lead_secs = config.lead_secs();
+        let drain_secs = config.drain_secs();
 
         // Phase 1: promote lead → active
         if let Some(ref lead) = slots.lead {
