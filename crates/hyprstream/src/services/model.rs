@@ -412,20 +412,13 @@ impl ModelService {
         let service_handle = spawner.spawn(service_config).await
             .map_err(|e| anyhow!("Failed to spawn inference service: {}", e))?;
 
-        // Create client for this service
-        let key_resp = self.policy_client.resolve_service_key(
-            &crate::services::generated::policy_client::ResolveServiceKey {
-                service_name: "inference".to_owned(),
-            },
-        ).await?;
-        let inference_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
-            key_resp.verifying_key.as_slice().try_into()
-                .map_err(|_| anyhow!("Invalid verifying key length"))?,
-        ).map_err(|e| anyhow!("Invalid Ed25519 key: {e}"))?;
+        // Create client for this service.
+        // Inference services share the model service's signing key (line 401),
+        // so use our own verifying key directly — no PolicyService lookup needed.
         let client = InferenceClient::for_endpoint(
             &endpoint,
             self.signing_key.clone(),
-            inference_vk,
+            self.signing_key.verifying_key(),
             None,
         );
 
