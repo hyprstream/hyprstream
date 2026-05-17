@@ -819,6 +819,15 @@ pub async fn handle_shell_tui(
     let _ = terminal.show_cursor();
     let _ = terminal.flush();
     restore_terminal(&orig);
+
+    // Drop ZMQ clients off-thread: TMQ's RequestSender holds an internal
+    // runtime that panics if dropped inside an async context.
+    tokio::task::spawn_blocking(move || {
+        drop(client);
+        drop(model_client);
+        drop(worker_client);
+    });
+
     Ok(())
 }
 
