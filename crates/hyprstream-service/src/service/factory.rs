@@ -231,6 +231,11 @@ pub struct ServiceContext {
     /// When set, `cluster_key_source()` returns `JwksKeySource(Mode::Isolated)`
     /// instead of `ClusterKeySource`.
     jwks_fetcher: Option<hyprstream_rpc::auth::JwksFetcher>,
+
+    /// Shared ML-DSA-65 verifying keys for PQ-hybrid JWT verification.
+    /// Updated by the rotation task; shared across all key sources.
+    #[cfg(feature = "pq-hybrid")]
+    ml_dsa_verifying_keys: std::sync::Arc<std::sync::RwLock<Vec<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>>>,
 }
 
 impl ServiceContext {
@@ -258,7 +263,21 @@ impl ServiceContext {
             service_keys: HashMap::new(),
             ca_verifying_key: None,
             jwks_fetcher: None,
+            #[cfg(feature = "pq-hybrid")]
+            ml_dsa_verifying_keys: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
         }
+    }
+
+    /// Set the shared ML-DSA-65 verifying keys for PQ-hybrid JWT verification.
+    #[cfg(feature = "pq-hybrid")]
+    pub fn set_ml_dsa_verifying_keys(&mut self, keys: std::sync::Arc<std::sync::RwLock<Vec<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>>>) {
+        self.ml_dsa_verifying_keys = keys;
+    }
+
+    /// Get a clone of the shared ML-DSA verifying keys Arc.
+    #[cfg(feature = "pq-hybrid")]
+    pub fn ml_dsa_verifying_keys_arc(&self) -> std::sync::Arc<std::sync::RwLock<Vec<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>>> {
+        self.ml_dsa_verifying_keys.clone()
     }
 
     /// Add a per-service independent signing key.
@@ -532,16 +551,22 @@ impl ServiceContext {
 
         if let Some(ref fetcher) = self.jwks_fetcher {
             let jwks_url = format!("{}/oauth/jwks", issuer_url.trim_end_matches('/'));
-            std::sync::Arc::new(hyprstream_rpc::auth::JwksKeySource::new(
+            let source = hyprstream_rpc::auth::JwksKeySource::new(
                 hyprstream_rpc::auth::JwksMode::Isolated { jwks_url },
                 issuer_url,
                 fetcher.clone(),
-            ))
+            );
+            #[cfg(feature = "pq-hybrid")]
+            let source = source.with_ml_dsa_verifying_keys(self.ml_dsa_verifying_keys.clone());
+            std::sync::Arc::new(source)
         } else {
-            std::sync::Arc::new(hyprstream_rpc::auth::ClusterKeySource::new(
+            let source = hyprstream_rpc::auth::ClusterKeySource::new(
                 self.jwt_verifying_key(),
                 issuer_url,
-            ))
+            );
+            #[cfg(feature = "pq-hybrid")]
+            let source = source.with_ml_dsa_verifying_keys(self.ml_dsa_verifying_keys.clone());
+            std::sync::Arc::new(source)
         }
     }
 

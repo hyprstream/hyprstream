@@ -333,6 +333,17 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     }
     policy_service = policy_service.with_jwt_key_source(ctx.cluster_key_source());
 
+    // Wire ES256 + ML-DSA rotation stores into PolicyService for composite token issuance.
+    // Uses global singletons so PolicyService shares the same store the rotation task updates.
+    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
+    let es256_store = crate::auth::key_rotation::global_es256_key_store(&secrets_dir, &config.oauth);
+    policy_service = policy_service.with_es256_key_store(es256_store);
+    #[cfg(feature = "pq-hybrid")]
+    {
+        let ml_dsa_store = crate::auth::key_rotation::global_ml_dsa_key_store(&secrets_dir, &config.oauth);
+        policy_service = policy_service.with_ml_dsa_key_store(ml_dsa_store);
+    }
+
     Ok(ctx.into_spawnable_quic(policy_service, config.policy.quic_port))
 }
 

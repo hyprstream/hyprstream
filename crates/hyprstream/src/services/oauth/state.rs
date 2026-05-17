@@ -317,11 +317,11 @@ pub struct OAuthState {
     pub signing_key_store: Option<Arc<crate::auth::SigningKeyStore>>,
     /// Shared JWT ID blocklist for access token revocation (shared with PolicyService).
     pub jti_blocklist: Option<Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>>,
-    /// P-256 signing key for ES256 JWT issuance (atproto interop).
-    pub es256_signing_key: Option<p256::ecdsa::SigningKey>,
-    /// ML-DSA-65 signing key for PQ JWT issuance (pq-hybrid).
+    /// ES256 (P-256) signing key rotation store for JWKS and DPoP/atproto interop.
+    pub es256_key_store: Option<Arc<crate::auth::Es256SigningKeyStore>>,
+    /// ML-DSA-65 signing key rotation store for PQ-hybrid JWT issuance.
     #[cfg(feature = "pq-hybrid")]
-    pub ml_dsa_signing_key: Option<hyprstream_rpc::crypto::pq::MlDsaSigningKey>,
+    pub ml_dsa_key_store: Option<Arc<crate::auth::MlDsaSigningKeyStore>>,
 }
 
 impl OAuthState {
@@ -363,12 +363,9 @@ impl OAuthState {
             jwt_key_exp: chrono::Utc::now().timestamp() + 14 * 86400,
             signing_key_store: None,
             jti_blocklist: None,
-            es256_signing_key: Some(crate::auth::jwt::generate_es256_key()),
+            es256_key_store: None,
             #[cfg(feature = "pq-hybrid")]
-            ml_dsa_signing_key: {
-                let (sk, _vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
-                Some(sk)
-            },
+            ml_dsa_key_store: None,
         }
     }
 
@@ -396,6 +393,19 @@ impl OAuthState {
     /// When set, JWKS serves all slots and WIT issuance uses the active key.
     pub fn with_signing_key_store(mut self, store: Arc<crate::auth::SigningKeyStore>) -> Self {
         self.signing_key_store = Some(store);
+        self
+    }
+
+    /// Attach the ES256 (P-256) key rotation store.
+    pub fn with_es256_key_store(mut self, store: Arc<crate::auth::Es256SigningKeyStore>) -> Self {
+        self.es256_key_store = Some(store);
+        self
+    }
+
+    /// Attach the ML-DSA-65 key rotation store.
+    #[cfg(feature = "pq-hybrid")]
+    pub fn with_ml_dsa_key_store(mut self, store: Arc<crate::auth::MlDsaSigningKeyStore>) -> Self {
+        self.ml_dsa_key_store = Some(store);
         self
     }
 

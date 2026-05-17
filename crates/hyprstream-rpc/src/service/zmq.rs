@@ -339,16 +339,6 @@ pub trait ZmqService: 'static {
         None
     }
 
-    /// ML-DSA-65 verifying key for post-quantum JWT verification.
-    ///
-    /// When `Some`, `verify_claims()` can verify JWTs signed with
-    /// `alg: "ML-DSA-65"` or composite `"ML-DSA-65-Ed25519"`.
-    /// Default returns `None` (PQ JWT verification disabled).
-    #[cfg(feature = "pq-hybrid")]
-    fn ml_dsa_verifying_key(&self) -> Option<crate::crypto::pq::MlDsaVerifyingKey> {
-        None
-    }
-
     /// Resolve a signer key to an authorization subject via the trust store.
     ///
     /// Returns `Some(subject)` if the key is cached and not expired.
@@ -434,27 +424,53 @@ pub trait ZmqService: 'static {
         let verified = match alg.as_str() {
             #[cfg(feature = "pq-hybrid")]
             "ML-DSA-65" => {
-                let ml_dsa_vk = self.ml_dsa_verifying_key()
-                    .ok_or_else(|| anyhow::anyhow!("ML-DSA-65 JWT received but no PQ verifying key configured"))?;
-                crate::auth::jwt::decode_ml_dsa_65(&token, &ml_dsa_vk, self.expected_audience())
-                    .map_err(|e| {
-                        tracing::warn!("ML-DSA-65 JWT verification failed: {}", e);
-                        anyhow::anyhow!("JWT verification failed")
-                    })?
+                let vks = key_source.ml_dsa_verifying_keys();
+                if vks.is_empty() {
+                    anyhow::bail!("ML-DSA-65 JWT received but no PQ verifying keys available");
+                }
+                let aud = self.expected_audience();
+                let mut last_err = None;
+                let mut result = None;
+                for vk in &vks {
+                    match crate::auth::jwt::decode_ml_dsa_65(&token, vk, aud) {
+                        Ok(claims) => { result = Some(claims); break; }
+                        Err(e) => { last_err = Some(e); }
+                    }
+                }
+                match result {
+                    Some(claims) => claims,
+                    None => {
+                        tracing::warn!("ML-DSA-65 JWT verification failed (tried {} keys): {:?}", vks.len(), last_err);
+                        anyhow::bail!("JWT verification failed");
+                    }
+                }
             }
             #[cfg(feature = "pq-hybrid")]
             "ML-DSA-65-Ed25519" => {
-                let ml_dsa_vk = self.ml_dsa_verifying_key()
-                    .ok_or_else(|| anyhow::anyhow!("Composite JWT received but no PQ verifying key configured"))?;
+                let vks = key_source.ml_dsa_verifying_keys();
+                if vks.is_empty() {
+                    anyhow::bail!("Composite JWT received but no PQ verifying keys available");
+                }
                 let verifying_key = key_source.get_key(&unverified.iss, kid.as_deref()).await.map_err(|e| {
                     tracing::warn!("JWT key resolution failed for iss={}: {}", unverified.iss, e);
                     anyhow::anyhow!("JWT key resolution failed")
                 })?;
-                crate::auth::jwt::decode_composite(&token, &ml_dsa_vk, &verifying_key, self.expected_audience())
-                    .map_err(|e| {
-                        tracing::warn!("Composite ML-DSA-65-Ed25519 JWT verification failed: {}", e);
-                        anyhow::anyhow!("JWT verification failed")
-                    })?
+                let aud = self.expected_audience();
+                let mut last_err = None;
+                let mut result = None;
+                for vk in &vks {
+                    match crate::auth::jwt::decode_composite(&token, vk, &verifying_key, aud) {
+                        Ok(claims) => { result = Some(claims); break; }
+                        Err(e) => { last_err = Some(e); }
+                    }
+                }
+                match result {
+                    Some(claims) => claims,
+                    None => {
+                        tracing::warn!("Composite ML-DSA-65-Ed25519 JWT verification failed (tried {} keys): {:?}", vks.len(), last_err);
+                        anyhow::bail!("JWT verification failed");
+                    }
+                }
             }
             _ => {
                 // EdDSA (default path)

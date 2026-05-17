@@ -78,23 +78,39 @@ pub async fn jwks(State(state): State<Arc<OAuthState>>) -> impl IntoResponse {
         }
     }
 
-    // Add ES256 (P-256) public key if available
-    if let Some(ref es256_key) = state.es256_signing_key {
-        keys.push(crate::auth::jwt::es256_jwk(es256_key));
+    // ES256 from rotation store — publish all slots (drain/active/lead)
+    if let Some(ref store) = state.es256_key_store {
+        for slot in store.all_slots_snapshot().await {
+            let mut jwk = crate::auth::jwt::es256_jwk(&slot.key);
+            if let Some(obj) = jwk.as_object_mut() {
+                obj.insert("nbf".to_owned(), slot.nbf.into());
+                obj.insert("exp".to_owned(), slot.exp.into());
+            }
+            keys.push(jwk);
+        }
     }
 
-    // Add ML-DSA-65 (AKP) public key if available
+    // ML-DSA-65 from rotation store — publish all slots + composite pairing
     #[cfg(feature = "pq-hybrid")]
-    if let Some(ref ml_dsa_key) = state.ml_dsa_signing_key {
-        let vk = ml_dsa::Keypair::verifying_key(ml_dsa_key);
-        keys.push(crate::auth::jwt::ml_dsa_65_jwk(&vk));
+    if let Some(ref store) = state.ml_dsa_key_store {
+        for slot in store.all_slots_snapshot().await {
+            let vk = ml_dsa::Keypair::verifying_key(&*slot.key);
+            let mut jwk = crate::auth::jwt::ml_dsa_65_jwk(&vk);
+            if let Some(obj) = jwk.as_object_mut() {
+                obj.insert("nbf".to_owned(), slot.nbf.into());
+                obj.insert("exp".to_owned(), slot.exp.into());
+            }
+            keys.push(jwk);
 
-        // Also publish composite ML-DSA-65-Ed25519 key if we have the Ed25519 key
-        if let Some(ref signing_key) = state.signing_key {
-            keys.push(crate::auth::jwt::composite_jwk(
-                &vk,
-                &signing_key.verifying_key(),
-            ));
+            // Composite key pairing with active Ed25519 from rotation store
+            if let Some(ref ed_store) = state.signing_key_store {
+                if let Some(ed_key) = ed_store.active_key().await {
+                    keys.push(crate::auth::jwt::composite_jwk(
+                        &vk,
+                        &ed_key.verifying_key(),
+                    ));
+                }
+            }
         }
     }
 

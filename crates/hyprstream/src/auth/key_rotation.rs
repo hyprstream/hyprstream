@@ -20,6 +20,49 @@ use tracing::{info, warn};
 
 use crate::config::OAuthConfig;
 
+/// Global shared ML-DSA-65 verifying keys for PQ-hybrid JWT verification.
+///
+/// Populated at startup from the ML-DSA rotation store's current slots.
+/// Updated by the rotation task after each promotion. Services read from this
+/// via their `JwtKeySource` implementation.
+#[cfg(feature = "pq-hybrid")]
+static ML_DSA_VERIFYING_KEYS: std::sync::OnceLock<std::sync::Arc<std::sync::RwLock<Vec<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>>>> = std::sync::OnceLock::new();
+
+/// Get or initialize the global ML-DSA verifying keys Arc.
+#[cfg(feature = "pq-hybrid")]
+pub fn global_ml_dsa_verifying_keys() -> std::sync::Arc<std::sync::RwLock<Vec<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>>> {
+    ML_DSA_VERIFYING_KEYS.get_or_init(|| {
+        std::sync::Arc::new(std::sync::RwLock::new(Vec::new()))
+    }).clone()
+}
+
+/// Global ML-DSA signing key store singleton.
+///
+/// Ensures all services (PolicyService, OAuthService, rotation task) share
+/// the same store instance — rotation applies universally.
+#[cfg(feature = "pq-hybrid")]
+static ML_DSA_SIGNING_STORE: std::sync::OnceLock<Arc<MlDsaSigningKeyStore>> = std::sync::OnceLock::new();
+
+/// Get or initialize the global ML-DSA signing key store.
+///
+/// First call initializes from disk; subsequent calls return the same Arc.
+#[cfg(feature = "pq-hybrid")]
+pub fn global_ml_dsa_key_store(secrets_dir: &Path, config: &OAuthConfig) -> Arc<MlDsaSigningKeyStore> {
+    ML_DSA_SIGNING_STORE.get_or_init(|| {
+        Arc::new(load_or_init_ml_dsa_key_store(secrets_dir, config))
+    }).clone()
+}
+
+/// Global ES256 signing key store singleton.
+static ES256_SIGNING_STORE: std::sync::OnceLock<Arc<Es256SigningKeyStore>> = std::sync::OnceLock::new();
+
+/// Get or initialize the global ES256 signing key store.
+pub fn global_es256_key_store(secrets_dir: &Path, config: &OAuthConfig) -> Arc<Es256SigningKeyStore> {
+    ES256_SIGNING_STORE.get_or_init(|| {
+        Arc::new(load_or_init_es256_key_store(secrets_dir, config))
+    }).clone()
+}
+
 // ── Key slot ────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -261,10 +304,18 @@ pub async fn rotate_jwt_keys(
 
 // ── Background task ─────────────────────────────────────────────────────────
 
+/// Additional stores to rotate alongside the primary Ed25519 store.
+pub struct RotationStores {
+    pub es256: Option<Arc<Es256SigningKeyStore>>,
+    #[cfg(feature = "pq-hybrid")]
+    pub ml_dsa: Option<Arc<MlDsaSigningKeyStore>>,
+}
+
 pub fn spawn_rotation_task(
     config: Arc<OAuthConfig>,
     secrets_dir: PathBuf,
     store: Arc<SigningKeyStore>,
+    extra: RotationStores,
 ) {
     tokio::task::spawn_local(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(6 * 3600));
@@ -275,9 +326,411 @@ pub fn spawn_rotation_task(
             interval.tick().await;
             let now = chrono::Utc::now().timestamp();
             rotate_jwt_keys(&config, &secrets_dir, &store, now).await;
+            if let Some(ref es256) = extra.es256 {
+                rotate_es256_keys(&config, &secrets_dir, es256, now).await;
+            }
+            #[cfg(feature = "pq-hybrid")]
+            if let Some(ref ml_dsa) = extra.ml_dsa {
+                rotate_ml_dsa_keys(&config, &secrets_dir, ml_dsa, now).await;
+                // Refresh the global verifying key snapshot.
+                let vks: Vec<_> = ml_dsa.all_slots_snapshot().await.iter()
+                    .map(|slot| slot.verifying_key())
+                    .collect();
+                let shared = global_ml_dsa_verifying_keys();
+                let _ = shared.write().map(|mut guard| *guard = vks);
+            }
         }
     });
 }
+
+// ════════════════════════════════════════════════════════════════════════════════
+// ES256 (P-256) Key Rotation Store
+// ════════════════════════════════════════════════════════════════════════════════
+
+use p256::ecdsa::SigningKey as Es256SigningKey;
+
+#[derive(Clone)]
+pub struct Es256KeySlot {
+    pub key: Arc<Es256SigningKey>,
+    pub nbf: i64,
+    pub exp: i64,
+}
+
+impl Es256KeySlot {
+    pub fn new(key: Es256SigningKey, nbf: i64, exp: i64) -> Self {
+        Self { key: Arc::new(key), nbf, exp }
+    }
+
+    pub fn kid(&self) -> String {
+        crate::auth::jwt::es256_kid(&self.key)
+    }
+}
+
+#[derive(Default)]
+pub struct Es256KeySlots {
+    pub drain: Option<Es256KeySlot>,
+    pub active: Option<Es256KeySlot>,
+    pub lead: Option<Es256KeySlot>,
+}
+
+impl Es256KeySlots {
+    pub fn all(&self) -> Vec<&Es256KeySlot> {
+        [&self.drain, &self.active, &self.lead]
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+}
+
+#[derive(Clone)]
+pub struct Es256SigningKeyStore(pub Arc<RwLock<Es256KeySlots>>);
+
+impl Es256SigningKeyStore {
+    pub fn new(slots: Es256KeySlots) -> Self {
+        Self(Arc::new(RwLock::new(slots)))
+    }
+
+    pub async fn active_key(&self) -> Option<Arc<Es256SigningKey>> {
+        self.0.read().await.active.as_ref().map(|s| Arc::clone(&s.key))
+    }
+
+    pub async fn all_slots_snapshot(&self) -> Vec<Es256KeySlot> {
+        self.0.read().await.all().into_iter().cloned().collect()
+    }
+}
+
+// ── ES256 persistence ──────────────────────────────────────────────────────
+
+fn es256_slot_paths(secrets_dir: &Path, name: &str) -> (PathBuf, PathBuf) {
+    (
+        secrets_dir.join(format!("es256-signing-key.{name}")),
+        secrets_dir.join(format!("es256-signing-key.{name}.meta")),
+    )
+}
+
+fn load_es256_slot(secrets_dir: &Path, name: &str) -> Option<Es256KeySlot> {
+    let (key_path, meta_path) = es256_slot_paths(secrets_dir, name);
+    let seed = std::fs::read(&key_path).ok()?;
+    if seed.len() != 32 {
+        warn!("ES256 key slot '{name}': unexpected seed length {}", seed.len());
+        return None;
+    }
+    let meta_bytes = std::fs::read(&meta_path).ok()?;
+    let meta: SlotMeta = serde_json::from_slice(&meta_bytes).ok()?;
+    let key = Es256SigningKey::from_bytes(seed.as_slice().into()).ok()?;
+    Some(Es256KeySlot::new(key, meta.nbf, meta.exp))
+}
+
+fn persist_es256_slot(secrets_dir: &Path, name: &str, slot: &Es256KeySlot) -> anyhow::Result<()> {
+    let (key_path, meta_path) = es256_slot_paths(secrets_dir, name);
+    std::fs::write(&key_path, slot.key.to_bytes())?;
+    let meta = SlotMeta { nbf: slot.nbf, exp: slot.exp };
+    std::fs::write(&meta_path, serde_json::to_vec(&meta)?)?;
+    Ok(())
+}
+
+fn delete_es256_slot(secrets_dir: &Path, name: &str) {
+    let (key_path, meta_path) = es256_slot_paths(secrets_dir, name);
+    let _ = std::fs::remove_file(&key_path);
+    let _ = std::fs::remove_file(&meta_path);
+}
+
+fn generate_es256_slot(nbf: i64, exp: i64) -> Es256KeySlot {
+    let key = Es256SigningKey::random(&mut rand::rngs::OsRng);
+    Es256KeySlot::new(key, nbf, exp)
+}
+
+pub fn load_or_init_es256_key_store(secrets_dir: &Path, config: &OAuthConfig) -> Es256SigningKeyStore {
+    let now = chrono::Utc::now().timestamp();
+    let active_secs = i64::from(config.jwt_key_active_days) * 86400;
+    let lead_secs = i64::from(config.jwt_key_lead_days) * 86400;
+
+    let drain = load_es256_slot(secrets_dir, "drain");
+    let mut active = load_es256_slot(secrets_dir, "active");
+    let lead = load_es256_slot(secrets_dir, "lead");
+
+    if active.is_none() {
+        info!("No active ES256 signing key found — generating on first boot");
+        let slot = generate_es256_slot(now, now + active_secs);
+        if let Err(e) = persist_es256_slot(secrets_dir, "active", &slot) {
+            warn!("Could not persist active ES256 key: {e}");
+        } else {
+            info!("Active ES256 key generated (kid={})", slot.kid());
+        }
+        active = Some(slot);
+    }
+
+    let should_gen_lead = lead.is_none() && active.as_ref()
+        .is_some_and(|a| a.exp - now < lead_secs);
+    if should_gen_lead {
+        let lead_nbf = active.as_ref().map(|a| a.exp).unwrap_or(now) - lead_secs;
+        let lead_exp = lead_nbf + active_secs;
+        let slot = generate_es256_slot(lead_nbf, lead_exp);
+        if let Err(e) = persist_es256_slot(secrets_dir, "lead", &slot) {
+            warn!("Could not persist lead ES256 key: {e}");
+        }
+    }
+
+    let lead = if should_gen_lead { load_es256_slot(secrets_dir, "lead") } else { lead };
+    Es256SigningKeyStore::new(Es256KeySlots { drain, active, lead })
+}
+
+pub async fn rotate_es256_keys(
+    config: &OAuthConfig,
+    secrets_dir: &Path,
+    store: &Es256SigningKeyStore,
+    now: i64,
+) {
+    let mut slots = store.0.write().await;
+    let active_secs = i64::from(config.jwt_key_active_days) * 86400;
+    let lead_secs = i64::from(config.jwt_key_lead_days) * 86400;
+    let drain_secs = i64::from(config.jwt_key_drain_days) * 86400;
+
+    // Phase 1: promote lead → active if lead.nbf <= now
+    if let Some(ref lead) = slots.lead {
+        if lead.nbf <= now {
+            if let Some(old_active) = slots.active.take() {
+                delete_es256_slot(secrets_dir, "drain");
+                if let Err(e) = persist_es256_slot(secrets_dir, "drain", &old_active) {
+                    warn!("ES256: failed to persist drain slot: {e}");
+                }
+                slots.drain = Some(old_active);
+            }
+            if let Some(new_active) = slots.lead.take() {
+                if let Err(e) = persist_es256_slot(secrets_dir, "active", &new_active) {
+                    warn!("ES256: failed to persist promoted active: {e}");
+                }
+                delete_es256_slot(secrets_dir, "lead");
+                slots.active = Some(new_active);
+                info!("ES256: promoted lead → active");
+            }
+        }
+    }
+
+    // Phase 2: remove expired drain
+    if let Some(ref drain) = slots.drain {
+        if now >= drain.exp + drain_secs {
+            delete_es256_slot(secrets_dir, "drain");
+            slots.drain = None;
+            info!("ES256: removed expired drain slot");
+        }
+    }
+
+    // Phase 3: generate lead if active is near expiry
+    if let Some(ref active) = slots.active {
+        if slots.lead.is_none() && active.exp - now < lead_secs {
+            let lead_nbf = active.exp - lead_secs;
+            let lead_exp = lead_nbf + active_secs;
+            let new_lead = generate_es256_slot(lead_nbf, lead_exp);
+            if let Err(e) = persist_es256_slot(secrets_dir, "lead", &new_lead) {
+                warn!("ES256: failed to persist new lead: {e}");
+            } else {
+                info!("ES256: generated new lead key (kid={})", new_lead.kid());
+            }
+            slots.lead = Some(new_lead);
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// ML-DSA-65 Key Rotation Store (pq-hybrid feature)
+// ════════════════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "pq-hybrid")]
+mod ml_dsa_rotation {
+    use super::*;
+    use hyprstream_rpc::crypto::pq::{
+        MlDsaSigningKey, ml_dsa_generate_keypair, ml_dsa_sk_to_seed, ml_dsa_sk_from_seed,
+    };
+
+    #[derive(Clone)]
+    pub struct MlDsaKeySlot {
+        pub key: Arc<MlDsaSigningKey>,
+        pub nbf: i64,
+        pub exp: i64,
+    }
+
+    impl MlDsaKeySlot {
+        pub fn new(key: MlDsaSigningKey, nbf: i64, exp: i64) -> Self {
+            Self { key: Arc::new(key), nbf, exp }
+        }
+
+        pub fn verifying_key(&self) -> hyprstream_rpc::crypto::pq::MlDsaVerifyingKey {
+            ml_dsa::Keypair::verifying_key(&*self.key).clone()
+        }
+    }
+
+    #[derive(Default)]
+    pub struct MlDsaKeySlots {
+        pub drain: Option<MlDsaKeySlot>,
+        pub active: Option<MlDsaKeySlot>,
+        pub lead: Option<MlDsaKeySlot>,
+    }
+
+    impl MlDsaKeySlots {
+        pub fn all(&self) -> Vec<&MlDsaKeySlot> {
+            [&self.drain, &self.active, &self.lead]
+                .into_iter()
+                .flatten()
+                .collect()
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct MlDsaSigningKeyStore(pub Arc<RwLock<MlDsaKeySlots>>);
+
+    impl MlDsaSigningKeyStore {
+        pub fn new(slots: MlDsaKeySlots) -> Self {
+            Self(Arc::new(RwLock::new(slots)))
+        }
+
+        pub async fn active_key(&self) -> Option<Arc<MlDsaSigningKey>> {
+            self.0.read().await.active.as_ref().map(|s| Arc::clone(&s.key))
+        }
+
+        pub async fn all_slots_snapshot(&self) -> Vec<MlDsaKeySlot> {
+            self.0.read().await.all().into_iter().cloned().collect()
+        }
+    }
+
+    // ── ML-DSA persistence ─────────────────────────────────────────────────
+
+    fn ml_dsa_slot_paths(secrets_dir: &Path, name: &str) -> (PathBuf, PathBuf) {
+        (
+            secrets_dir.join(format!("ml-dsa-signing-key.{name}")),
+            secrets_dir.join(format!("ml-dsa-signing-key.{name}.meta")),
+        )
+    }
+
+    pub(super) fn load_ml_dsa_slot(secrets_dir: &Path, name: &str) -> Option<MlDsaKeySlot> {
+        let (key_path, meta_path) = ml_dsa_slot_paths(secrets_dir, name);
+        let seed_bytes = std::fs::read(&key_path).ok()?;
+        if seed_bytes.len() != 32 {
+            warn!("ML-DSA key slot '{name}': unexpected seed length {}", seed_bytes.len());
+            return None;
+        }
+        let meta_bytes = std::fs::read(&meta_path).ok()?;
+        let meta: SlotMeta = serde_json::from_slice(&meta_bytes).ok()?;
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&seed_bytes);
+        let key = ml_dsa_sk_from_seed(&seed);
+        Some(MlDsaKeySlot::new(key, meta.nbf, meta.exp))
+    }
+
+    pub(super) fn persist_ml_dsa_slot(secrets_dir: &Path, name: &str, slot: &MlDsaKeySlot) -> anyhow::Result<()> {
+        let (key_path, meta_path) = ml_dsa_slot_paths(secrets_dir, name);
+        let seed = ml_dsa_sk_to_seed(&slot.key);
+        std::fs::write(&key_path, seed)?;
+        let meta = SlotMeta { nbf: slot.nbf, exp: slot.exp };
+        std::fs::write(&meta_path, serde_json::to_vec(&meta)?)?;
+        Ok(())
+    }
+
+    fn delete_ml_dsa_slot(secrets_dir: &Path, name: &str) {
+        let (key_path, meta_path) = ml_dsa_slot_paths(secrets_dir, name);
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_file(&meta_path);
+    }
+
+    pub(super) fn generate_ml_dsa_slot(nbf: i64, exp: i64) -> MlDsaKeySlot {
+        let (key, _vk) = ml_dsa_generate_keypair();
+        MlDsaKeySlot::new(key, nbf, exp)
+    }
+
+    pub fn load_or_init_ml_dsa_key_store(secrets_dir: &Path, config: &OAuthConfig) -> MlDsaSigningKeyStore {
+        let now = chrono::Utc::now().timestamp();
+        let active_secs = i64::from(config.jwt_key_active_days) * 86400;
+        let lead_secs = i64::from(config.jwt_key_lead_days) * 86400;
+
+        let drain = load_ml_dsa_slot(secrets_dir, "drain");
+        let mut active = load_ml_dsa_slot(secrets_dir, "active");
+        let lead = load_ml_dsa_slot(secrets_dir, "lead");
+
+        if active.is_none() {
+            info!("No active ML-DSA-65 signing key found — generating on first boot");
+            let slot = generate_ml_dsa_slot(now, now + active_secs);
+            if let Err(e) = persist_ml_dsa_slot(secrets_dir, "active", &slot) {
+                warn!("Could not persist active ML-DSA key: {e}");
+            } else {
+                info!("Active ML-DSA-65 key generated");
+            }
+            active = Some(slot);
+        }
+
+        let should_gen_lead = lead.is_none() && active.as_ref()
+            .is_some_and(|a| a.exp - now < lead_secs);
+        if should_gen_lead {
+            let lead_nbf = active.as_ref().map(|a| a.exp).unwrap_or(now) - lead_secs;
+            let lead_exp = lead_nbf + active_secs;
+            let slot = generate_ml_dsa_slot(lead_nbf, lead_exp);
+            if let Err(e) = persist_ml_dsa_slot(secrets_dir, "lead", &slot) {
+                warn!("Could not persist lead ML-DSA key: {e}");
+            }
+        }
+
+        let lead = if should_gen_lead { load_ml_dsa_slot(secrets_dir, "lead") } else { lead };
+        MlDsaSigningKeyStore::new(MlDsaKeySlots { drain, active, lead })
+    }
+
+    pub async fn rotate_ml_dsa_keys(
+        config: &OAuthConfig,
+        secrets_dir: &Path,
+        store: &MlDsaSigningKeyStore,
+        now: i64,
+    ) {
+        let mut slots = store.0.write().await;
+        let active_secs = i64::from(config.jwt_key_active_days) * 86400;
+        let lead_secs = i64::from(config.jwt_key_lead_days) * 86400;
+        let drain_secs = i64::from(config.jwt_key_drain_days) * 86400;
+
+        // Phase 1: promote lead → active
+        if let Some(ref lead) = slots.lead {
+            if lead.nbf <= now {
+                if let Some(old_active) = slots.active.take() {
+                    delete_ml_dsa_slot(secrets_dir, "drain");
+                    if let Err(e) = persist_ml_dsa_slot(secrets_dir, "drain", &old_active) {
+                        warn!("ML-DSA: failed to persist drain slot: {e}");
+                    }
+                    slots.drain = Some(old_active);
+                }
+                let new_active = slots.lead.take().unwrap();
+                if let Err(e) = persist_ml_dsa_slot(secrets_dir, "active", &new_active) {
+                    warn!("ML-DSA: failed to persist promoted active: {e}");
+                }
+                delete_ml_dsa_slot(secrets_dir, "lead");
+                slots.active = Some(new_active);
+                info!("ML-DSA: promoted lead → active");
+            }
+        }
+
+        // Phase 2: remove expired drain
+        if let Some(ref drain) = slots.drain {
+            if now >= drain.exp + drain_secs {
+                delete_ml_dsa_slot(secrets_dir, "drain");
+                slots.drain = None;
+                info!("ML-DSA: removed expired drain slot");
+            }
+        }
+
+        // Phase 3: generate lead if active is near expiry
+        if let Some(ref active) = slots.active {
+            if slots.lead.is_none() && active.exp - now < lead_secs {
+                let lead_nbf = active.exp - lead_secs;
+                let lead_exp = lead_nbf + active_secs;
+                let new_lead = generate_ml_dsa_slot(lead_nbf, lead_exp);
+                if let Err(e) = persist_ml_dsa_slot(secrets_dir, "lead", &new_lead) {
+                    warn!("ML-DSA: failed to persist new lead: {e}");
+                } else {
+                    info!("ML-DSA: generated new lead key");
+                }
+                slots.lead = Some(new_lead);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "pq-hybrid")]
+pub use ml_dsa_rotation::{MlDsaKeySlot, MlDsaKeySlots, MlDsaSigningKeyStore, load_or_init_ml_dsa_key_store, rotate_ml_dsa_keys};
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
@@ -414,5 +867,126 @@ mod tests {
 
         let slots = store.0.read().await;
         assert!(slots.lead.is_some(), "lead must be generated when active is within lead window");
+    }
+
+    // ── ES256 store tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn es256_load_or_init_creates_active_key() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let store = load_or_init_es256_key_store(dir.path(), &config);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let key = rt.block_on(store.active_key());
+        assert!(key.is_some());
+    }
+
+    #[test]
+    fn es256_persist_and_reload() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let store1 = load_or_init_es256_key_store(dir.path(), &config);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let kid1 = {
+            let slots = rt.block_on(store1.all_slots_snapshot());
+            slots[0].kid()
+        };
+        let store2 = load_or_init_es256_key_store(dir.path(), &config);
+        let kid2 = {
+            let slots = rt.block_on(store2.all_slots_snapshot());
+            slots[0].kid()
+        };
+        assert_eq!(kid1, kid2, "ES256 key must survive reload from disk");
+    }
+
+    #[tokio::test]
+    async fn es256_rotate_promotes_lead() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+
+        let active = generate_es256_slot(now - 14 * 86400, now + 1);
+        let lead = generate_es256_slot(now - 1, now + 14 * 86400);
+        persist_es256_slot(dir.path(), "active", &active).unwrap();
+        persist_es256_slot(dir.path(), "lead", &lead).unwrap();
+        let lead_kid = lead.kid();
+
+        let store = Es256SigningKeyStore::new(Es256KeySlots {
+            drain: None,
+            active: Some(active),
+            lead: Some(lead),
+        });
+
+        rotate_es256_keys(&config, dir.path(), &store, now).await;
+
+        let slots = store.0.read().await;
+        assert_eq!(slots.active.as_ref().unwrap().kid(), lead_kid);
+        assert!(slots.drain.is_some());
+        assert!(slots.lead.is_none());
+    }
+
+    // ── ML-DSA store tests ─────────────────────────────────────────────────
+
+    #[cfg(feature = "pq-hybrid")]
+    #[test]
+    fn ml_dsa_load_or_init_creates_active_key() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let store = load_or_init_ml_dsa_key_store(dir.path(), &config);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let key = rt.block_on(store.active_key());
+        assert!(key.is_some());
+    }
+
+    #[cfg(feature = "pq-hybrid")]
+    #[test]
+    fn ml_dsa_persist_and_reload() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let store1 = load_or_init_ml_dsa_key_store(dir.path(), &config);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let vk1 = {
+            let key = rt.block_on(store1.active_key()).unwrap();
+            hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&ml_dsa::Keypair::verifying_key(&*key).clone())
+        };
+        let store2 = load_or_init_ml_dsa_key_store(dir.path(), &config);
+        let vk2 = {
+            let key = rt.block_on(store2.active_key()).unwrap();
+            hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&ml_dsa::Keypair::verifying_key(&*key).clone())
+        };
+        assert_eq!(vk1, vk2, "ML-DSA key must survive reload from disk");
+    }
+
+    #[cfg(feature = "pq-hybrid")]
+    #[tokio::test]
+    async fn ml_dsa_rotate_promotes_lead() {
+        use super::ml_dsa_rotation::*;
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+
+        let active = generate_ml_dsa_slot(now - 14 * 86400, now + 1);
+        let lead = generate_ml_dsa_slot(now - 1, now + 14 * 86400);
+        persist_ml_dsa_slot(dir.path(), "active", &active).unwrap();
+        persist_ml_dsa_slot(dir.path(), "lead", &lead).unwrap();
+        let lead_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(
+            &ml_dsa::Keypair::verifying_key(&*lead.key).clone(),
+        );
+
+        let store = MlDsaSigningKeyStore::new(MlDsaKeySlots {
+            drain: None,
+            active: Some(active),
+            lead: Some(lead),
+        });
+
+        rotate_ml_dsa_keys(&config, dir.path(), &store, now).await;
+
+        let slots = store.0.read().await;
+        let active_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(
+            &ml_dsa::Keypair::verifying_key(&*slots.active.as_ref().unwrap().key).clone(),
+        );
+        assert_eq!(active_vk, lead_vk, "lead must become active after promotion");
+        assert!(slots.drain.is_some());
+        assert!(slots.lead.is_none());
     }
 }

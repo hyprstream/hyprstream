@@ -54,6 +54,20 @@ pub fn ml_dsa_vk_from_bytes(bytes: &[u8]) -> Result<MlDsaVerifyingKey> {
     Ok(MlDsaVerifyingKey::decode(&encoded))
 }
 
+/// Serialize an ML-DSA-65 signing key to its 32-byte seed.
+pub fn ml_dsa_sk_to_seed(key: &MlDsaSigningKey) -> [u8; 32] {
+    let seed = key.to_seed();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(seed.as_slice());
+    out
+}
+
+/// Reconstruct an ML-DSA-65 signing key from its 32-byte seed.
+pub fn ml_dsa_sk_from_seed(seed: &[u8; 32]) -> MlDsaSigningKey {
+    let arr = ml_dsa::B32::from(*seed);
+    MlDsaSigningKey::from_seed(&arr)
+}
+
 // ── ML-KEM-768 operations ───────────────────────────────────────────────────
 
 pub fn ml_kem_generate_keypair() -> (MlKemDecapsKey, MlKemEncapsKey) {
@@ -126,6 +140,20 @@ mod tests {
         assert_eq!(bytes.len(), 1952);
         let vk2 = ml_dsa_vk_from_bytes(&bytes).unwrap();
         assert_eq!(ml_dsa_vk_bytes(&vk2), bytes);
+    }
+
+    #[test]
+    fn ml_dsa_seed_roundtrip() {
+        let (sk, vk) = ml_dsa_generate_keypair();
+        let seed = ml_dsa_sk_to_seed(&sk);
+        assert_eq!(seed.len(), 32);
+        let sk2 = ml_dsa_sk_from_seed(&seed);
+        let vk2 = sk2.verifying_key().clone();
+        assert_eq!(ml_dsa_vk_bytes(&vk), ml_dsa_vk_bytes(&vk2));
+        // Sign with restored key, verify with original vk
+        let msg = b"seed roundtrip test";
+        let sig = ml_dsa_sign(&sk2, msg);
+        ml_dsa_verify(&vk, msg, &sig).unwrap();
     }
 
     #[test]

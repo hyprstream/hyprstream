@@ -154,6 +154,52 @@ pub fn encode_composite_ml_dsa_65_ed25519(
     format!("{signing_input}.{sig_b64}")
 }
 
+/// Encode a service WIT (`typ: "wit+jwt"`) with ML-DSA-65-Ed25519 composite signature.
+#[cfg(feature = "pq-hybrid")]
+pub fn encode_composite_service_jwt(
+    claims: &Claims,
+    ml_dsa_key: &hyprstream_rpc::crypto::pq::MlDsaSigningKey,
+    ed25519_key: &ed25519_dalek::SigningKey,
+) -> String {
+    use ed25519_dalek::Signer;
+
+    let claims = if claims.jti.is_some() {
+        std::borrow::Cow::Borrowed(claims)
+    } else {
+        std::borrow::Cow::Owned(claims.clone().with_jti())
+    };
+    let vk = ml_dsa::Keypair::verifying_key(ml_dsa_key);
+    let ml_dsa_vk_bytes = hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&vk);
+    let ed25519_vk_bytes = ed25519_key.verifying_key().to_bytes();
+    let mut composite_pub = Vec::with_capacity(ml_dsa_vk_bytes.len() + 32);
+    composite_pub.extend_from_slice(&ml_dsa_vk_bytes);
+    composite_pub.extend_from_slice(&ed25519_vk_bytes);
+    let kid = hyprstream_rpc::auth::jwk_thumbprint(
+        &hyprstream_rpc::auth::JwkThumbprintInput::Akp {
+            alg: "ML-DSA-65-Ed25519",
+            pub_bytes: &composite_pub,
+        },
+    );
+    let header = format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"wit+jwt","kid":"{}"}}"#, kid);
+    let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
+    let payload_json = serde_json::to_string(claims.as_ref()).unwrap_or_else(|_e| {
+        tracing::error!("JWT claims serialization failed: {}", _e);
+        "{}".to_owned()
+    });
+    let payload_b64 = URL_SAFE_NO_PAD.encode(payload_json.as_bytes());
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let message = signing_input.as_bytes();
+
+    let ml_dsa_sig = hyprstream_rpc::crypto::pq::ml_dsa_sign(ml_dsa_key, message);
+    let ed25519_sig = ed25519_key.sign(message);
+
+    let mut composite_sig = Vec::with_capacity(ml_dsa_sig.len() + 64);
+    composite_sig.extend_from_slice(&ml_dsa_sig);
+    composite_sig.extend_from_slice(&ed25519_sig.to_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(&composite_sig);
+    format!("{signing_input}.{sig_b64}")
+}
+
 /// Build a JWK for an ML-DSA-65 key (`kty: "AKP"`).
 #[cfg(feature = "pq-hybrid")]
 pub fn ml_dsa_65_jwk(

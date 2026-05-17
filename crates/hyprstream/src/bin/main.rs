@@ -1904,6 +1904,27 @@ fn main() -> Result<()> {
                                     tracing::debug!("JWKS-backed key source configured: {}", jwks_url);
                                 }
 
+                                // Populate ML-DSA-65 verifying keys for PQ-hybrid JWT verification.
+                                #[cfg(feature = "pq-hybrid")]
+                                {
+                                    let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir();
+                                    let ml_dsa_store = hyprstream_core::auth::key_rotation::global_ml_dsa_key_store(
+                                        &secrets_dir,
+                                        &config.oauth,
+                                    );
+                                    let vks: Vec<_> = tokio::task::block_in_place(|| {
+                                        let rt = tokio::runtime::Handle::current();
+                                        rt.block_on(ml_dsa_store.all_slots_snapshot())
+                                    })
+                                    .iter()
+                                    .map(|slot| slot.verifying_key())
+                                    .collect();
+                                    let shared_vks = hyprstream_core::auth::key_rotation::global_ml_dsa_verifying_keys();
+                                    let _ = shared_vks.write().map(|mut guard| *guard = vks);
+                                    ctx.set_ml_dsa_verifying_keys(shared_vks);
+                                    tracing::info!("PQ-hybrid: ML-DSA-65 verifying keys loaded for JWT verification");
+                                }
+
                                 let manager = InprocManager::new();
                                 let mut handles = Vec::new();
 

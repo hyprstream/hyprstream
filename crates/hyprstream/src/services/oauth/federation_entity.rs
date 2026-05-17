@@ -62,10 +62,57 @@ pub async fn entity_configuration(
         "client_id_metadata_document_supported": true,
     });
 
-    let jwt = build_entity_configuration(
+    // Build the entity JWKS. The first key is always the entity signing key
+    // (verifies the entity-statement JWT itself). Additional keys from the
+    // rotation store and CA/PolicyService key are appended so federation
+    // consumers see the same key set published at /oauth/jwks.
+    let mut jwks_keys: Vec<serde_json::Value> = Vec::new();
+
+    // Entity signing key first — verifies this JWT.
+    let signing_jwk = verifying_key_as_okp_jwk(&vk);
+    let signing_x = signing_jwk.get("x").and_then(|v| v.as_str()).unwrap_or_default().to_owned();
+    jwks_keys.push(signing_jwk);
+
+    if let Some(ref store) = state.signing_key_store {
+        for slot in store.all_slots_snapshot().await {
+            let vk_bytes = slot.verifying_key_bytes();
+            let jwk = verifying_key_bytes_as_okp_jwk(&vk_bytes);
+            let x = jwk.get("x").and_then(|v| v.as_str()).unwrap_or_default();
+            if x != signing_x {
+                jwks_keys.push(jwk);
+            }
+        }
+    }
+
+    // Include the CA/PolicyService verifying key (de-dup by x value).
+    {
+        let ca_jwk = verifying_key_bytes_as_okp_jwk(&state.verifying_key_bytes);
+        let ca_x = ca_jwk.get("x").and_then(|v| v.as_str()).unwrap_or_default();
+        if !jwks_keys.iter().any(|k| k.get("x").and_then(|v| v.as_str()) == Some(ca_x)) {
+            jwks_keys.push(ca_jwk);
+        }
+    }
+
+    // ES256 keys from rotation store.
+    if let Some(ref store) = state.es256_key_store {
+        for slot in store.all_slots_snapshot().await {
+            jwks_keys.push(crate::auth::jwt::es256_jwk(&slot.key));
+        }
+    }
+
+    // ML-DSA-65 keys from rotation store.
+    #[cfg(feature = "pq-hybrid")]
+    if let Some(ref store) = state.ml_dsa_key_store {
+        for slot in store.all_slots_snapshot().await {
+            let ml_vk = ml_dsa::Keypair::verifying_key(&*slot.key);
+            jwks_keys.push(crate::auth::jwt::ml_dsa_65_jwk(&ml_vk));
+        }
+    }
+
+    let jwt = build_entity_configuration_with_keys(
         issuer,
         sk,
-        &vk,
+        jwks_keys,
         as_metadata,
         &state.authority_hints,
     );
@@ -133,13 +180,59 @@ fn base64url_json(value: serde_json::Value) -> String {
 
 /// Represent an Ed25519 verifying key as an OKP JWK (RFC 8037).
 fn verifying_key_as_okp_jwk(vk: &VerifyingKey) -> serde_json::Value {
-    let x_b64 = URL_SAFE_NO_PAD.encode(vk.as_bytes());
+    verifying_key_bytes_as_okp_jwk(vk.as_bytes())
+}
+
+/// Represent raw Ed25519 verifying-key bytes as an OKP JWK (RFC 8037).
+fn verifying_key_bytes_as_okp_jwk(bytes: &[u8; 32]) -> serde_json::Value {
+    let x_b64 = URL_SAFE_NO_PAD.encode(bytes);
     serde_json::json!({
         "kty": "OKP",
         "crv": "Ed25519",
         "x": x_b64,
         "use": "sig",
     })
+}
+
+/// Build and sign an entity configuration JWT with an explicit set of JWKS keys.
+pub fn build_entity_configuration_with_keys(
+    issuer_url: &str,
+    signing_key: &SigningKey,
+    jwks_keys: Vec<serde_json::Value>,
+    as_metadata: serde_json::Value,
+    authority_hints: &[String],
+) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let exp = now + 86400;
+
+    let header = base64url_json(serde_json::json!({
+        "alg": "EdDSA",
+        "typ": "entity-statement+jwt",
+    }));
+
+    let payload = base64url_json(serde_json::json!({
+        "iss": issuer_url,
+        "sub": issuer_url,
+        "iat": now,
+        "exp": exp,
+        "jwks": { "keys": jwks_keys },
+        "metadata": {
+            "oauth_authorization_server": as_metadata,
+            "federation_entity": {
+                "organization_name": "hyprstream",
+            },
+        },
+        "authority_hints": authority_hints,
+    }));
+
+    let signing_input = format!("{header}.{payload}");
+    let signature = signing_key.sign(signing_input.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+
+    format!("{signing_input}.{sig_b64}")
 }
 
 #[cfg(test)]
@@ -204,5 +297,43 @@ mod tests {
             vk.verify_strict(signing_input.as_bytes(), &sig).is_ok(),
             "entity configuration JWT signature must verify"
         );
+    }
+
+    #[test]
+    fn test_build_with_keys_embeds_multiple_keys() {
+        let sk = make_key();
+        let key1 = make_key().verifying_key();
+        let key2 = make_key().verifying_key();
+        let keys = vec![
+            verifying_key_as_okp_jwk(&key1),
+            verifying_key_as_okp_jwk(&key2),
+        ];
+        let as_meta = serde_json::json!({"issuer": "http://localhost:6791"});
+        let jwt = build_entity_configuration_with_keys(
+            "http://localhost:6791",
+            &sk,
+            keys,
+            as_meta,
+            &[],
+        );
+
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(parts.len(), 3);
+
+        let payload_json = URL_SAFE_NO_PAD.decode(parts[1]).expect("valid base64url");
+        let payload: serde_json::Value = serde_json::from_slice(&payload_json).expect("valid JSON");
+        let jwks_keys = payload["jwks"]["keys"].as_array().unwrap();
+        assert_eq!(jwks_keys.len(), 2, "should embed both keys");
+        assert_eq!(jwks_keys[0]["x"], URL_SAFE_NO_PAD.encode(key1.as_bytes()));
+        assert_eq!(jwks_keys[1]["x"], URL_SAFE_NO_PAD.encode(key2.as_bytes()));
+    }
+
+    #[test]
+    fn test_verifying_key_bytes_as_okp_jwk_matches() {
+        let sk = make_key();
+        let vk = sk.verifying_key();
+        let from_ref = verifying_key_as_okp_jwk(&vk);
+        let from_bytes = verifying_key_bytes_as_okp_jwk(vk.as_bytes());
+        assert_eq!(from_ref, from_bytes);
     }
 }

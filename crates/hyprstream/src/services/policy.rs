@@ -75,6 +75,11 @@ pub struct PolicyService {
     event_prefixes: RwLock<HashMap<String, EventPrefixState>>,
     /// Shared JWT ID blocklist for access token revocation.
     jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
+    /// ES256 (P-256) key rotation store for DPoP/atproto interop.
+    es256_key_store: Option<Arc<crate::auth::Es256SigningKeyStore>>,
+    /// ML-DSA-65 key rotation store for PQ-hybrid composite token issuance.
+    #[cfg(feature = "pq-hybrid")]
+    ml_dsa_key_store: Option<Arc<crate::auth::MlDsaSigningKeyStore>>,
 }
 
 impl PolicyService {
@@ -103,6 +108,9 @@ impl PolicyService {
             transport,
             event_prefixes: RwLock::new(HashMap::new()),
             jti_blocklist: Arc::new(hyprstream_rpc::auth::InMemoryJtiBlocklist::new()),
+            es256_key_store: None,
+            #[cfg(feature = "pq-hybrid")]
+            ml_dsa_key_store: None,
         }
     }
 
@@ -117,12 +125,53 @@ impl PolicyService {
         self
     }
 
+    /// Sign a token with composite PQ signature when available, falling back to Ed25519.
+    async fn sign_token(&self, claims: &hyprstream_rpc::auth::Claims, is_service: bool) -> String {
+        #[cfg(feature = "pq-hybrid")]
+        {
+            let ml_dsa_key = if let Some(ref store) = self.ml_dsa_key_store {
+                store.active_key().await
+            } else {
+                None
+            };
+            if let Some(ref ml_key) = ml_dsa_key {
+                return if is_service {
+                    crate::auth::jwt::encode_composite_service_jwt(
+                        claims, ml_key, &self.jwt_signing_key,
+                    )
+                } else {
+                    crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
+                        claims, ml_key, &self.jwt_signing_key,
+                    )
+                };
+            }
+        }
+        if is_service {
+            crate::auth::jwt::encode_service_jwt(claims, &self.jwt_signing_key)
+        } else {
+            crate::auth::jwt::encode(claims, &self.jwt_signing_key)
+        }
+    }
+
     /// Set the JWT key source for verifying JWTs (local and federated).
     pub fn with_jwt_key_source(
         mut self,
         src: std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>,
     ) -> Self {
         self.jwt_key_source = Some(src);
+        self
+    }
+
+    /// Attach the ES256 (P-256) key rotation store.
+    pub fn with_es256_key_store(mut self, store: Arc<crate::auth::Es256SigningKeyStore>) -> Self {
+        self.es256_key_store = Some(store);
+        self
+    }
+
+    /// Attach the ML-DSA-65 key rotation store for composite token issuance.
+    #[cfg(feature = "pq-hybrid")]
+    pub fn with_ml_dsa_key_store(mut self, store: Arc<crate::auth::MlDsaSigningKeyStore>) -> Self {
+        self.ml_dsa_key_store = Some(store);
         self
     }
 
@@ -347,11 +396,7 @@ impl PolicyHandler for PolicyService {
             claims = claims.with_cnf_jwk(&key_bytes);
         }
 
-        let token = if is_service_token {
-            crate::auth::jwt::encode_service_jwt(&claims, &self.jwt_signing_key)
-        } else {
-            crate::auth::jwt::encode(&claims, &self.jwt_signing_key)
-        };
+        let token = self.sign_token(&claims, is_service_token).await;
 
         Ok(PolicyResponseVariant::IssueTokenResult(TokenInfo {
             token,
@@ -1331,7 +1376,7 @@ impl PolicyHandler for PolicyService {
             .with_issuer(issuer)
             .with_cnf_jwk(svc_signing_key.verifying_key().as_bytes());
 
-        let token = crate::auth::jwt::encode_service_jwt(&claims, &self.jwt_signing_key);
+        let token = self.sign_token(&claims, true).await;
 
         // Persist renewed JWT to disk so it survives a server restart
         let credentials_dir = crate::config::HyprConfig::load()
@@ -1414,7 +1459,7 @@ impl PolicyHandler for PolicyService {
             claims = claims.with_cnf_jwk(&key_bytes);
         }
 
-        let token = crate::auth::jwt::encode_service_jwt(&claims, &self.jwt_signing_key);
+        let token = self.sign_token(&claims, false).await;
 
         info!(sub = %sub, expires_at, "ExchangeWit: issued at+jwt");
         Ok(PolicyResponseVariant::ExchangeWitResult(TokenInfo {

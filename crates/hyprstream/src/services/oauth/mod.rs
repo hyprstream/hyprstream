@@ -431,23 +431,44 @@ impl Spawnable for OAuthService {
             let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
             let oauth_config_arc = Arc::new(self.config.clone());
 
+            // Load or initialize ES256 + ML-DSA rotation stores (independent of CA key).
+            // Uses global singletons — shared with PolicyService and ServiceContext.
+            let es256_store = crate::auth::key_rotation::global_es256_key_store(
+                &secrets_dir,
+                &self.config,
+            );
+            info!("ES256 (P-256) signing key rotation store loaded");
+
+            #[cfg(feature = "pq-hybrid")]
+            let ml_dsa_store = crate::auth::key_rotation::global_ml_dsa_key_store(
+                &secrets_dir,
+                &self.config,
+            );
+            #[cfg(feature = "pq-hybrid")]
+            info!("ML-DSA-65 signing key rotation store loaded");
+
             let (ca_jwt_key, signing_key_store) = match crate::auth::identity_store::load_ca_signing_key(&credentials_dir) {
                 Ok(root_key) => {
                     let key = hyprstream_rpc::node_identity::derive_purpose_key(&root_key, "hyprstream-jwt-v1");
                     info!("CA JWT signing key loaded — POST /oauth/wit available");
 
-                    // Load or initialize the multi-slot rotation store.
+                    // Load or initialize the multi-slot Ed25519 rotation store.
                     let store = crate::auth::key_rotation::load_or_init_key_store(
                         &secrets_dir,
                         &self.config,
                     );
                     let store_arc = Arc::new(store);
 
-                    // Spawn the background rotation task.
+                    // Spawn the background rotation task (rotates all algorithm stores).
                     crate::auth::key_rotation::spawn_rotation_task(
                         Arc::clone(&oauth_config_arc),
                         secrets_dir.clone(),
                         Arc::clone(&store_arc),
+                        crate::auth::key_rotation::RotationStores {
+                            es256: Some(Arc::clone(&es256_store)),
+                            #[cfg(feature = "pq-hybrid")]
+                            ml_dsa: Some(Arc::clone(&ml_dsa_store)),
+                        },
                     );
                     info!("JWT signing key rotation task started (active_days={}, lead_days={}, drain_days={})",
                         self.config.jwt_key_active_days,
@@ -483,6 +504,11 @@ impl Spawnable for OAuthService {
             }
             if let Some(store) = signing_key_store {
                 oauth_state = oauth_state.with_signing_key_store(store);
+            }
+            oauth_state = oauth_state.with_es256_key_store(Arc::clone(&es256_store));
+            #[cfg(feature = "pq-hybrid")]
+            {
+                oauth_state = oauth_state.with_ml_dsa_key_store(Arc::clone(&ml_dsa_store));
             }
             // Populate legacy JWKS nbf/exp from signing-key file mtime (used when store absent).
             let key_nbf = crate::auth::identity_store::node_signing_key_mtime(&credentials_dir);
