@@ -258,6 +258,7 @@ Description=Hyprstream {service} Service{dep_section}
 Type=notify
 ExecStart={exec} service start {service} --foreground{env_section}{creds_section}{hardening}
 Restart=on-failure
+RestartSec=2s
 
 [Install]
 WantedBy=default.target

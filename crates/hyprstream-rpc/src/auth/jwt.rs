@@ -281,12 +281,13 @@ fn decode_inner(token: &str, verifying_key: &VerifyingKey, expected_aud: Option<
         return Err(JwtError::NotYetValid);
     }
 
-    // Validate audience if expected
+    // Validate audience if expected (trailing-slash tolerant)
     if let Some(expected) = expected_aud {
+        let expected_norm = expected.trim_end_matches('/');
         match &claims.aud {
-            Some(aud) if aud == expected => {}        // correct audience
-            None if lenient_aud => {}                 // absent — accept in lenient mode
-            Some(_) | None => return Err(JwtError::InvalidAudience), // wrong or absent audience
+            Some(aud) if aud.trim_end_matches('/') == expected_norm => {}
+            None if lenient_aud => {}
+            Some(_) | None => return Err(JwtError::InvalidAudience),
         }
     }
 

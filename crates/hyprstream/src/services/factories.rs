@@ -807,7 +807,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
             use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 
             let session_mgr = std::sync::Arc::new(LocalSessionManager::default());
-            let verifying_key = mcp_config_clone.verifying_key;
+            let jwt_key_source = mcp_config_clone.jwt_key_source.clone();
             let service: StreamableHttpService<McpService, LocalSessionManager> =
                 StreamableHttpService::new(
                     move || McpService::new(mcp_config_clone.clone()).map_err(|e| {
@@ -850,11 +850,13 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                     let mcp_resource_url = mcp_resource_url.clone();
                     let mcp_oauth_issuer_clone = mcp_oauth_issuer.clone();
                     let mcp_federation_resolver = mcp_federation_resolver.clone();
+                    let jwt_key_source = jwt_key_source.clone();
                     move |req: axum::extract::Request, next: axum::middleware::Next| {
                         let www_authenticate = www_authenticate.clone();
                         let mcp_resource_url = mcp_resource_url.clone();
-                        let mcp_oauth_issuer = mcp_oauth_issuer_clone.clone();
+                        let _mcp_oauth_issuer = mcp_oauth_issuer_clone.clone();
                         let federation_resolver = mcp_federation_resolver.clone();
+                        let jwt_key_source = jwt_key_source.clone();
                         async move {
                             use axum::http::{header, StatusCode};
                             use axum::response::IntoResponse;
@@ -882,9 +884,19 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                             match token {
                                 Some(t) => {
                                     let iss = crate::server::middleware::extract_iss_from_token(t);
-                                    let local_issuers: &[&str] = &[mcp_oauth_issuer.as_str()];
-                                    let result = if hyprstream_rpc::auth::is_local_iss(&iss, local_issuers) {
-                                        crate::auth::jwt::decode(t, &verifying_key, Some(mcp_resource_url.as_str()))
+                                    let kid = crate::server::middleware::extract_kid_from_token(t);
+                                    let result = if let Some(ref key_source) = jwt_key_source {
+                                        match key_source.get_key(&iss, kid.as_deref()).await {
+                                            Ok(key) => crate::auth::jwt::decode(t, &key, Some(mcp_resource_url.as_str())),
+                                            Err(e) => {
+                                                tracing::debug!(%method, %uri, issuer = %iss, error = %e, "MCP JWT key resolution failed");
+                                                let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
+                                                if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
+                                                    res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
+                                                }
+                                                return res;
+                                            }
+                                        }
                                     } else {
                                         match federation_resolver.get_key(&iss).await {
                                             Ok(key) => crate::auth::jwt::decode_with_key(t, &key, Some(mcp_resource_url.as_str())),
