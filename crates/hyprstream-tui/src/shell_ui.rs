@@ -17,7 +17,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Tabs};
 use ratatui::Frame;
 
 use crate::background::PREVIEW_W;
-use crate::shell_app::{PaneWindow, ShellApp, ShellMode, MENU_ITEMS};
+use crate::shell_app::{CloneScreen, PaneWindow, ShellApp, ShellMode, MENU_ITEMS};
 use crate::theme;
 
 // ============================================================================
@@ -38,10 +38,12 @@ pub fn draw(frame: &mut Frame, app: &ShellApp) {
     draw_window_strip(frame, chunks[2], app);
 
     match app.mode {
-        ShellMode::ModelList              => draw_model_modal(frame, area, app),
-        ShellMode::Settings               => draw_settings_modal(frame, area, app),
-        ShellMode::StartMenu { selected } => draw_start_menu(frame, area, selected),
-        ShellMode::Normal                 => {}
+        ShellMode::ModelList                 => draw_model_modal(frame, area, app),
+        ShellMode::Settings                  => draw_settings_modal(frame, area, app),
+        ShellMode::StartMenu { selected }    => draw_start_menu(frame, area, selected),
+        ShellMode::CloneFlow(_)              => draw_clone_modal(frame, area, app),
+        ShellMode::GitOpInProgress { .. }    => draw_git_op_modal(frame, area, app),
+        ShellMode::Normal                    => {}
     }
 }
 
@@ -166,22 +168,21 @@ fn draw_model_modal(frame: &mut Frame, full_area: Rect, app: &ShellApp) {
 
     let mut hint_spans = vec![
         Span::styled("c",     theme::help_key()),
-        Span::styled(" private  ",  theme::help_text()),
-        Span::styled("C",     theme::help_key()),
-        Span::styled("/",     theme::help_text()),
-        Span::styled("Enter", theme::help_key()),
-        Span::styled(" server  ",   theme::help_text()),
-    ];
-    // Scoped terminal is only available on platforms with filesystem sandbox support.
-    if cfg!(any(target_os = "linux", target_os = "openbsd")) {
-        hint_spans.push(Span::styled("T",     theme::help_key()));
-        hint_spans.push(Span::styled(" terminal  ", theme::help_text()));
-    }
-    hint_spans.extend([
+        Span::styled(" clone  ",    theme::help_text()),
+        Span::styled("p",     theme::help_key()),
+        Span::styled(" pull  ",     theme::help_text()),
+        Span::styled("P",     theme::help_key()),
+        Span::styled(" push  ",     theme::help_text()),
         Span::styled("l",     theme::help_key()),
         Span::styled(" load  ",     theme::help_text()),
         Span::styled("u",     theme::help_key()),
         Span::styled(" unload  ",   theme::help_text()),
+    ];
+    if cfg!(any(target_os = "linux", target_os = "openbsd")) {
+        hint_spans.push(Span::styled("T",     theme::help_key()));
+        hint_spans.push(Span::styled(" term  ",    theme::help_text()));
+    }
+    hint_spans.extend([
         Span::styled("Esc",   theme::help_key()),
         Span::styled(" close",      theme::help_text()),
     ]);
@@ -190,6 +191,128 @@ fn draw_model_modal(frame: &mut Frame, full_area: Rect, app: &ShellApp) {
     frame.render_widget(hint, hint_area);
 
     app.model_list.render(frame, list_area);
+}
+
+// ============================================================================
+// Clone flow modal
+// ============================================================================
+
+fn draw_clone_modal(frame: &mut Frame, full_area: Rect, app: &ShellApp) {
+    let modal = centered_rect(55, 30, full_area);
+    frame.render_widget(Clear, modal);
+
+    let title = match &app.mode {
+        ShellMode::CloneFlow(CloneScreen::EnterUrl(_)) => " Clone — URL ",
+        ShellMode::CloneFlow(CloneScreen::EnterName(..)) => " Clone — Name ",
+        ShellMode::CloneFlow(CloneScreen::Cloning { .. }) => " Cloning… ",
+        ShellMode::CloneFlow(CloneScreen::Done(_)) => " Clone Complete ",
+        ShellMode::CloneFlow(CloneScreen::Failed(_)) => " Clone Failed ",
+        _ => " Clone ",
+    };
+
+    let block = Block::default()
+        .title(Span::styled(title, theme::title_style()))
+        .borders(Borders::ALL)
+        .border_style(theme::border_style())
+        .style(Style::default().bg(theme::BG_PANEL));
+
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    match &app.mode {
+        ShellMode::CloneFlow(CloneScreen::EnterUrl(input)) => {
+            input.render(frame, inner);
+        }
+        ShellMode::CloneFlow(CloneScreen::EnterName(input, _url)) => {
+            input.render(frame, inner);
+        }
+        ShellMode::CloneFlow(CloneScreen::Cloning { name, progress_msg, progress_pct, .. }) => {
+            let bar_width = inner.width.saturating_sub(8) as usize;
+            let filled = (bar_width as u16 * (*progress_pct as u16) / 100) as usize;
+            let empty = bar_width.saturating_sub(filled);
+            let bar = format!("[{}{}] {:>3}%", "#".repeat(filled), " ".repeat(empty), progress_pct);
+
+            let text = vec![
+                Line::from(Span::styled(name.as_str(), theme::help_text())),
+                Line::from(""),
+                Line::from(Span::styled(bar, Style::default().fg(Color::Green))),
+                Line::from(Span::styled(progress_msg.as_str(), theme::help_text())),
+            ];
+            frame.render_widget(Paragraph::new(text), inner);
+        }
+        ShellMode::CloneFlow(CloneScreen::Done(msg)) => {
+            let text = vec![
+                Line::from(Span::styled(msg.as_str(), Style::default().fg(Color::Green))),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Enter", theme::help_key()),
+                    Span::styled(" to continue", theme::help_text()),
+                ]),
+            ];
+            frame.render_widget(Paragraph::new(text), inner);
+        }
+        ShellMode::CloneFlow(CloneScreen::Failed(msg)) => {
+            let text = vec![
+                Line::from(Span::styled(msg.as_str(), Style::default().fg(Color::Red))),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Enter", theme::help_key()),
+                    Span::styled(" to continue", theme::help_text()),
+                ]),
+            ];
+            frame.render_widget(Paragraph::new(text), inner);
+        }
+        _ => {}
+    }
+}
+
+// ============================================================================
+// Git operation progress modal
+// ============================================================================
+
+fn draw_git_op_modal(frame: &mut Frame, full_area: Rect, app: &ShellApp) {
+    let modal = centered_rect(50, 25, full_area);
+    frame.render_widget(Clear, modal);
+
+    let (title, model_ref, progress_msg) = match &app.mode {
+        ShellMode::GitOpInProgress { op_name, model_ref, progress_msg } => {
+            (op_name.as_str(), model_ref.as_str(), progress_msg.as_str())
+        }
+        _ => return,
+    };
+
+    let display_title = if title.is_empty() { "Git" } else { title };
+    let block = Block::default()
+        .title(Span::styled(format!(" {display_title} "), theme::title_style()))
+        .borders(Borders::ALL)
+        .border_style(theme::border_style())
+        .style(Style::default().bg(theme::BG_PANEL));
+
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    let is_terminal = progress_msg.starts_with("Done:") || progress_msg.starts_with("Error:");
+    let msg_style = if progress_msg.starts_with("Error:") {
+        Style::default().fg(Color::Red)
+    } else if progress_msg.starts_with("Done:") {
+        Style::default().fg(Color::Green)
+    } else {
+        theme::help_text()
+    };
+
+    let mut lines = vec![
+        Line::from(Span::styled(model_ref, theme::help_text())),
+        Line::from(""),
+        Line::from(Span::styled(progress_msg, msg_style)),
+    ];
+    if is_terminal {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("Enter", theme::help_key()),
+            Span::styled(" to continue", theme::help_text()),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 // ============================================================================

@@ -889,7 +889,10 @@ impl TuiService {
                             let model_ref = format!("{}:{}", name, branch);
                             let loaded = *status_map.get(&model_ref).unwrap_or(&false);
                             let path = rmd.join(&name).join("worktrees").join(&branch);
-                            hyprstream_tui::shell_app::ModelEntry { model_ref, path, loaded }
+                            hyprstream_tui::shell_app::ModelEntry {
+                                model_ref, path, loaded,
+                                ahead: 0, behind: 0, is_dirty: false,
+                            }
                         }).collect::<Vec<_>>()
                     })
                     .collect::<Vec<_>>(),
@@ -962,7 +965,170 @@ impl TuiService {
             })
         });
 
-        let app = hyprstream_tui::shell_app::ShellApp::new(models, cols, rows, load_fn, unload_fn);
+        let git_ops = {
+            use hyprstream_tui::shell_app::{GitOps, GitOpProgress, GitProgressSender, ModelEntry as ShellModelEntry};
+            use crate::services::generated::registry_client::{CloneRequest, CreateWorktreeRequest, PushRequest, UpdateRequest};
+
+            let sk_clone = self.signing_key.clone();
+            let h_clone = handle.clone();
+            let rvk_clone = registry_vk;
+            let rmd_clone = registry_models_dir.clone();
+            let clone_fn: hyprstream_tui::shell_app::CloneFn = Box::new(move |url, name, branch, tx: GitProgressSender| {
+                let sk = sk_clone.clone();
+                let h = h_clone.clone();
+                let rvk = rvk_clone;
+                let rmd = rmd_clone.clone();
+                std::thread::spawn(move || {
+                    h.block_on(async {
+                        let registry = crate::services::RegistryClient::for_service(sk, rvk, None);
+                        let model_name = name.unwrap_or_else(|| {
+                            url.rsplit('/').next().unwrap_or("model")
+                                .trim_end_matches(".git").to_owned()
+                        });
+                        let _ = tx.send(GitOpProgress::Status(format!("Cloning {model_name}…")));
+
+                        if let Err(e) = registry.clone(&CloneRequest {
+                            url: url.clone(),
+                            name: model_name.clone(),
+                            shallow: false,
+                            depth: 0,
+                            branch: branch.unwrap_or_default(),
+                        }).await {
+                            let _ = tx.send(GitOpProgress::Failed(format!("Clone failed: {e}")));
+                            return;
+                        }
+
+                        let _ = tx.send(GitOpProgress::CloneProgress { stage: "Creating worktree…".to_owned(), pct: 80 });
+
+                        let tracked = match registry.get_by_name(&model_name).await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                let _ = tx.send(GitOpProgress::Failed(format!("Failed to get repo: {e}")));
+                                return;
+                            }
+                        };
+                        let repo_client = registry.repo(&tracked.id);
+                        let wt_branch = if tracked.tracking_ref.is_empty() { "main".to_owned() } else { tracked.tracking_ref.clone() };
+                        let _ = repo_client.create_worktree(&CreateWorktreeRequest {
+                            branch: wt_branch.clone(),
+                        }).await;
+
+                        let model_ref = format!("{model_name}:{wt_branch}");
+                        let path = rmd.join(&model_name).join("worktrees").join(&wt_branch);
+                        let _ = tx.send(GitOpProgress::Done {
+                            message: format!("Cloned {model_name} successfully"),
+                            new_model: Some(ShellModelEntry {
+                                model_ref, path, loaded: false,
+                                ahead: 0, behind: 0, is_dirty: false,
+                            }),
+                        });
+                    });
+                });
+            });
+
+            let sk_pull = self.signing_key.clone();
+            let h_pull = handle.clone();
+            let rvk_pull = registry_vk;
+            let pull_fn: hyprstream_tui::shell_app::PullFn = Box::new(move |model_ref, tx: GitProgressSender| {
+                let sk = sk_pull.clone();
+                let h = h_pull.clone();
+                let rvk = rvk_pull;
+                std::thread::spawn(move || {
+                    h.block_on(async {
+                        let registry = crate::services::RegistryClient::for_service(sk, rvk, None);
+                        let model_name = model_ref.split(':').next().unwrap_or(&model_ref);
+                        let tracked = match registry.get_by_name(model_name).await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                let _ = tx.send(GitOpProgress::Failed(format!("Not found: {e}")));
+                                return;
+                            }
+                        };
+                        let repo_client = registry.repo(&tracked.id);
+                        let _ = tx.send(GitOpProgress::Status("Fetching…".to_owned()));
+                        match repo_client.update(&UpdateRequest { refspec: String::new() }).await {
+                            Ok(()) => {
+                                let _ = tx.send(GitOpProgress::Done {
+                                    message: format!("Pulled {model_ref}"),
+                                    new_model: None,
+                                });
+                            }
+                            Err(e) => {
+                                let _ = tx.send(GitOpProgress::Failed(format!("Pull failed: {e}")));
+                            }
+                        }
+                    });
+                });
+            });
+
+            let sk_push = self.signing_key.clone();
+            let h_push = handle.clone();
+            let rvk_push = registry_vk;
+            let push_fn: hyprstream_tui::shell_app::PushFn = Box::new(move |model_ref, tx: GitProgressSender| {
+                let sk = sk_push.clone();
+                let h = h_push.clone();
+                let rvk = rvk_push;
+                std::thread::spawn(move || {
+                    h.block_on(async {
+                        let registry = crate::services::RegistryClient::for_service(sk, rvk, None);
+                        let model_name = model_ref.split(':').next().unwrap_or(&model_ref);
+                        let branch = model_ref.split(':').nth(1).unwrap_or("main");
+                        let tracked = match registry.get_by_name(model_name).await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                let _ = tx.send(GitOpProgress::Failed(format!("Not found: {e}")));
+                                return;
+                            }
+                        };
+                        let repo_client = registry.repo(&tracked.id);
+                        let _ = tx.send(GitOpProgress::Status("Pushing…".to_owned()));
+                        let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+                        match repo_client.push(&PushRequest {
+                            remote: "origin".to_owned(),
+                            refspec,
+                            force: false,
+                        }).await {
+                            Ok(()) => {
+                                let _ = tx.send(GitOpProgress::Done {
+                                    message: format!("Pushed {model_ref}"),
+                                    new_model: None,
+                                });
+                            }
+                            Err(e) => {
+                                let _ = tx.send(GitOpProgress::Failed(format!("Push failed: {e}")));
+                            }
+                        }
+                    });
+                });
+            });
+
+            let sk_status = self.signing_key.clone();
+            let h_status = handle.clone();
+            let rvk_status = registry_vk;
+            let fetch_status_fn: hyprstream_tui::shell_app::FetchStatusFn = Box::new(move |model_refs, tx| {
+                let sk = sk_status.clone();
+                let h = h_status.clone();
+                let rvk = rvk_status;
+                std::thread::spawn(move || {
+                    h.block_on(async {
+                        let registry = crate::services::RegistryClient::for_service(sk, rvk, None);
+                        for mr in model_refs {
+                            let model_name = mr.split(':').next().unwrap_or(&mr);
+                            if let Ok(tracked) = registry.get_by_name(model_name).await {
+                                let repo_client = registry.repo(&tracked.id);
+                                if let Ok(status) = repo_client.status().await {
+                                    let _ = tx.send((mr, status.ahead, status.behind, !status.is_clean));
+                                }
+                            }
+                        }
+                    });
+                });
+            });
+
+            GitOps { clone_fn, pull_fn, push_fn, fetch_status_fn }
+        };
+
+        let app = hyprstream_tui::shell_app::ShellApp::new(models, cols, rows, load_fn, unload_fn, Some(git_ops));
         let config = waxterm::app::TerminalConfig::new().cols(cols).rows(rows);
         let process = super::process::spawn_app_process(app, config);
 
