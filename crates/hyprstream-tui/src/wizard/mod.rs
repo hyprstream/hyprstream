@@ -136,7 +136,7 @@ impl<B: WizardBackend> WizardApp<B> {
 
     fn advance_to_users(&mut self) {
         self.phase = WizardPhase::Users(UserScreen::AskAdd(
-            ConfirmDialog::new("Add a user?"),
+            ConfirmDialog::new("Add a user?").with_default(false),
         ));
     }
 
@@ -210,7 +210,7 @@ impl<B: WizardBackend> WizardApp<B> {
             .iter()
             .map(|(name, desc)| format!("{name} — {desc}"))
             .collect();
-        SelectList::new("Role:", options)
+        SelectList::new("Role:", options).with_selected(1)
     }
 
     fn make_expiry_select() -> SelectList<String> {

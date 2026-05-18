@@ -33,6 +33,7 @@ use crate::cli::policy_handlers::{
 pub struct BootstrapManager {
     rt: tokio::runtime::Handle,
     models_dir: PathBuf,
+    config_services: Vec<String>,
     signing_key: Option<SigningKey>,
 
     // Install phase state
@@ -103,10 +104,11 @@ pub fn is_first_run(_models_dir: &std::path::Path) -> bool {
 
 impl BootstrapManager {
     /// Create a new bootstrap manager.
-    pub fn new(rt: tokio::runtime::Handle, models_dir: PathBuf) -> Self {
+    pub fn new(rt: tokio::runtime::Handle, models_dir: PathBuf, config_services: Vec<String>) -> Self {
         Self {
             rt,
             models_dir,
+            config_services,
             signing_key: None,
             install_rx: None,
             install_handle: None,
@@ -407,10 +409,11 @@ impl WizardBackend for BootstrapManager {
     fn start_services(&mut self) {
         let (tx, rx) = mpsc::sync_channel(8);
         self.service_rx = Some(rx);
+        let services = self.config_services.clone();
 
         self.service_handle = Some(self.rt.spawn(async move {
             let _ = tx.send(OpStatus::InProgress);
-            match crate::cli::handle_service_start(&[], None, false).await {
+            match crate::cli::handle_service_start(&services, None, false).await {
                 Ok(()) => {
                     let _ = tx.send(OpStatus::Done);
                 }

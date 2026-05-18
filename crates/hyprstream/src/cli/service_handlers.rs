@@ -713,6 +713,7 @@ pub(crate) async fn run_repair_checks(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub(crate) enum CheckStatus {
     Ok,
     Fixed,

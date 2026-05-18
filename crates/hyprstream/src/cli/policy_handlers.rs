@@ -451,6 +451,7 @@ pub(crate) fn mint_local_token(
 /// Loads from `<secrets_dir>/user-signing-key`, generating on first run.
 /// This key is per-OS-user (not per-hyprstream-user). The wizard only
 /// registers it for the local admin. Other users generate their own keys.
+#[allow(dead_code)]
 pub(crate) fn ensure_user_signing_key() -> Result<(SigningKey, ed25519_dalek::VerifyingKey)> {
     if let Some(pair) = crate::config::HyprConfig::user_signing_key_bypass()? {
         return Ok(pair);

@@ -57,6 +57,26 @@ use std::sync::Arc;
 use hyprstream_service::{get_factory, InprocManager, ServiceContext, ServiceManager};
 use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_rpc::{SigningKey, VerifyingKey};
+
+fn supports_tui() -> bool {
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
+        return false;
+    }
+    match std::env::var("TERM").as_deref() {
+        Ok("dumb") | Ok("") | Err(_) => return false,
+        _ => {}
+    }
+    #[cfg(unix)]
+    {
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        let ok = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
+        if ok == 0 {
+            return ws.ws_col >= 60 && ws.ws_row >= 20;
+        }
+    }
+    true
+}
 // Tracing imports (feature-gated)
 #[cfg(feature = "otel")]
 use opentelemetry::trace::TracerProvider;
@@ -160,7 +180,7 @@ fn build_cli() -> ClapCommand {
                 Arg::new("tui")
                     .long("tui")
                     .action(clap::ArgAction::SetTrue)
-                    .help("Use TUI wizard with GPU detection and install phase"),
+                    .help("Force TUI wizard (auto-detected when terminal supports it)"),
             )
             .arg(
                 Arg::new("bootstrap_only")
@@ -1498,11 +1518,12 @@ fn main() -> Result<()> {
                 let non_interactive = sub_m.get_flag("non_interactive");
                 let start_services = sub_m.get_flag("start");
                 let bootstrap_only = sub_m.get_flag("bootstrap_only");
+                let use_tui = tui_mode || (!non_interactive && !bootstrap_only && supports_tui());
                 return with_runtime(
                     RuntimeConfig { device: DeviceConfig::request_cpu(), multi_threaded: true },
                     || async move {
-                        if tui_mode {
-                            hyprstream_core::cli::handle_wizard_tui(&models_dir).await
+                        if use_tui {
+                            hyprstream_core::cli::handle_wizard_tui(&models_dir, &services).await
                         } else {
                             hyprstream_core::cli::handle_wizard(
                                 &models_dir, &services, non_interactive, start_services, bootstrap_only,
@@ -1511,10 +1532,18 @@ fn main() -> Result<()> {
                     },
                 );
             }
-            // No subcommand + first run → TUI wizard
+            // No subcommand + first run → TUI wizard (with text fallback)
             return with_runtime(
                 RuntimeConfig { device: DeviceConfig::request_cpu(), multi_threaded: true },
-                || async move { hyprstream_core::cli::handle_wizard_tui(&models_dir).await },
+                || async move {
+                    if supports_tui() {
+                        hyprstream_core::cli::handle_wizard_tui(&models_dir, &services).await
+                    } else {
+                        hyprstream_core::cli::handle_wizard(
+                            &models_dir, &services, false, false, false,
+                        ).await
+                    }
+                },
             );
         }
     }
@@ -2227,10 +2256,17 @@ fn main() -> Result<()> {
         _ => {
             let models_dir = config_for_service.models_dir().clone();
             if hyprstream_core::cli::bootstrap_manager::is_first_run(&models_dir) {
+                let services = config_for_service.services.startup.clone();
                 with_runtime(
                     RuntimeConfig { device: DeviceConfig::request_cpu(), multi_threaded: true },
                     || async move {
-                        hyprstream_core::cli::handle_wizard_tui(&models_dir).await
+                        if supports_tui() {
+                            hyprstream_core::cli::handle_wizard_tui(&models_dir, &services).await
+                        } else {
+                            hyprstream_core::cli::handle_wizard(
+                                &models_dir, &services, false, false, false,
+                            ).await
+                        }
                     },
                 )?;
             } else {
