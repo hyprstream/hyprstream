@@ -532,15 +532,12 @@ pub async fn handle_worker_terminal(
 
     // 4. Set up terminal control
     let running = Arc::new(AtomicBool::new(true));
-    let cancel = stream_handle.cancel_token().clone();
 
     // Spawn task to handle Ctrl-C
     let running_signal = running.clone();
-    let cancel_signal = cancel.clone();
     tokio::spawn(async move {
         let _ = signal::ctrl_c().await;
         running_signal.store(false, Ordering::SeqCst);
-        cancel_signal.cancel();
     });
 
     // Parse detach key sequence
@@ -550,7 +547,6 @@ pub async fn handle_worker_terminal(
 
     // 5. Main I/O loop — StreamHandle handles HMAC-verified receive
     let running_recv = running.clone();
-    let cancel_recv = cancel.clone();
     let recv_handle = std::thread::spawn(move || {
         // Drop guard ensures `running` is set to false on all exit paths (normal, break, panic)
         struct RunGuard(Arc<AtomicBool>);
@@ -575,25 +571,27 @@ pub async fn handle_worker_terminal(
             }
         };
         rt.block_on(async move {
-            use futures::StreamExt;
-            while let Some(payload) = stream_handle.next().await {
-                match payload {
-                    Ok(StreamPayload::Data(data)) => {
+            loop {
+                match stream_handle.recv_next().await {
+                    Ok(Some(StreamPayload::Data(data))) => {
                         // Worker FD data is raw bytes (terminal output)
                         print!("{}", String::from_utf8_lossy(&data));
                         let _ = io::stdout().flush();
                     }
-                    Ok(StreamPayload::Complete(_)) => {
+                    Ok(Some(StreamPayload::Complete(_))) => {
                         println!("\n--- Stream complete ---");
                         break;
                     }
-                    Ok(StreamPayload::Error(message)) => {
+                    Ok(Some(StreamPayload::Error(message))) => {
                         eprintln!("\n--- Stream error: {message} ---");
                         break;
                     }
-                    Ok(StreamPayload::Tagged { .. }) => {
+                    Ok(Some(StreamPayload::Tagged { .. })) => {
                         // encrypted event payload, skip
                         continue;
+                    }
+                    Ok(None) => {
+                        break;
                     }
                     Err(e) => {
                         tracing::warn!("Stream receive error: {}", e);
@@ -602,7 +600,6 @@ pub async fn handle_worker_terminal(
                 }
             }
         });
-        cancel_recv.cancel();  // notify server promptly on all exit paths
         // _guard drops here, storing false into running
     });
 
@@ -628,7 +625,6 @@ pub async fn handle_worker_terminal(
         }
     }
 
-    cancel.cancel();              // fires token → wakes poll_next → returns None → loop exits
     running.store(false, Ordering::SeqCst);
     let _ = recv_handle.join();
 
