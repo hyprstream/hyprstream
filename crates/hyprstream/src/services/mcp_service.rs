@@ -22,6 +22,7 @@
 use async_trait::async_trait;
 use crate::services::{RegistryClient, PolicyClient};
 use crate::services::generated::model_client::ModelClient;
+use crate::services::generated::tui_client::TuiClient;
 use http::header::AUTHORIZATION;
 use crate::services::generated::mcp_client::{
     McpHandler, McpResponseVariant, ToolDefinition, ServiceStatus,
@@ -49,6 +50,7 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
+use parking_lot::RwLock;
 use tracing::{trace, warn};
 use uuid::Uuid;
 
@@ -64,6 +66,69 @@ const MCP_NS: Uuid = Uuid::from_bytes([
     0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1,
     0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
 ]);
+
+// b07676df-be7f-56eb-9cd8-e91cfd689158 = UUID v5(MCP_NS, "mcp.refresh_tools")
+const REFRESH_TOOLS_UUID: Uuid = Uuid::from_bytes([
+    0xb0, 0x76, 0x76, 0xdf, 0xbe, 0x7f, 0x56, 0xeb,
+    0x9c, 0xd8, 0xe9, 0x1c, 0xfd, 0x68, 0x91, 0x58,
+]);
+
+/// Normalize MCP tool arguments for backend deserialization.
+///
+/// MCP tool schemas expose snake_case parameter names with string types,
+/// but the generated request structs use `#[serde(rename_all = "camelCase")]`
+/// with native numeric types. This function:
+/// 1. Converts object keys from snake_case to camelCase
+/// 2. Coerces string values to numbers/booleans where possible
+fn normalize_mcp_args(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let converted: serde_json::Map<String, Value> = map
+                .into_iter()
+                .map(|(k, v)| {
+                    let camel = snake_to_camel(&k);
+                    (camel, normalize_mcp_args(v))
+                })
+                .collect();
+            Value::Object(converted)
+        }
+        Value::Array(arr) => Value::Array(arr.into_iter().map(normalize_mcp_args).collect()),
+        Value::String(ref s) if s.is_empty() => value,
+        Value::String(ref s) => {
+            if s == "true" { return Value::Bool(true); }
+            if s == "false" { return Value::Bool(false); }
+            if let Ok(n) = s.parse::<u64>() {
+                return Value::Number(n.into());
+            }
+            if let Ok(n) = s.parse::<i64>() {
+                return Value::Number(n.into());
+            }
+            if let Ok(n) = s.parse::<f64>() {
+                if let Some(num) = serde_json::Number::from_f64(n) {
+                    return Value::Number(num);
+                }
+            }
+            value
+        }
+        other => other,
+    }
+}
+
+fn snake_to_camel(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut capitalize_next = false;
+    for ch in s.chars() {
+        if ch == '_' {
+            capitalize_next = true;
+        } else if capitalize_next {
+            result.extend(ch.to_uppercase());
+            capitalize_next = false;
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Configuration
@@ -181,7 +246,7 @@ impl ToolRegistry {
 /// Scope and streaming flags are read from MethodSchema.
 fn register_schema_tools(reg: &mut ToolRegistry) {
     use crate::services::generated::{
-        model_client, registry_client, policy_client,
+        model_client, registry_client, policy_client, tui_client,
     };
     // Each service generates its own MethodSchema type, so we use a macro
     // to iterate each service's methods with the correct type.
@@ -221,6 +286,7 @@ fn register_schema_tools(reg: &mut ToolRegistry) {
     register_top_level!(reg, model_client::schema_metadata());
     register_top_level!(reg, registry_client::schema_metadata());
     register_top_level!(reg, policy_client::schema_metadata());
+    register_top_level!(reg, tui_client::schema_metadata());
     // Scoped tools: recursive tree walk for all services with nested scopes
     register_scoped_tools_recursive(reg, "registry", registry_client::scoped_client_tree(), "registry", &[]);
     register_scoped_tools_recursive(reg, "model", model_client::scoped_client_tree(), "model", &[]);
@@ -335,9 +401,11 @@ fn register_scoped_tools_recursive(
                         let scope_pairs = scope_pairs.clone();
                         Box::pin(async move {
                             // Build scope chain from args BEFORE moving ctx fields
+                            // Args are already normalized to camelCase by normalize_mcp_args()
                             let scope_chain: Vec<(String, String)> = scope_pairs.iter()
                                 .map(|(scope_name, field_name)| {
-                                    let val_str = ctx.args.get(field_name.as_str())
+                                    let camel_key = snake_to_camel(field_name);
+                                    let val_str = ctx.args.get(camel_key.as_str())
                                         .map(|v| match v {
                                             Value::String(s) => s.clone(),
                                             Value::Number(n) => n.to_string(),
@@ -401,9 +469,11 @@ fn register_scoped_tools_recursive(
                         let scope_pairs = scope_pairs.clone();
                         Box::pin(async move {
                             // Build scope chain from args: [("repo", repo_id_val), ("worktree", name_val), ...]
+                            // Args are already normalized to camelCase by normalize_mcp_args()
                             let scope_chain: Vec<(String, String)> = scope_pairs.iter()
                                 .map(|(scope_name, field_name)| {
-                                    let val_str = ctx.args.get(field_name.as_str())
+                                    let camel_key = snake_to_camel(field_name);
+                                    let val_str = ctx.args.get(camel_key.as_str())
                                         .map(|v| match v {
                                             Value::String(s) => s.clone(),
                                             Value::Number(n) => n.to_string(),
@@ -521,6 +591,11 @@ fn register_streaming_tool(
                         let client = ModelClient::for_service(ctx.signing_key, server_vk, None);
                         client.call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?
                     }
+                    "tui" => {
+                        let server_vk = ctx.resolve_peer_key("tui").await?;
+                        let client = TuiClient::for_service(ctx.signing_key, server_vk, None);
+                        client.call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?
+                    }
                     _ => anyhow::bail!("No streaming support for service: {}", service),
                 };
 
@@ -579,15 +654,15 @@ fn params_to_json_schema(params: &[(&str, &str, bool, &str)]) -> Value {
     })
 }
 
-/// Parse stream_id, endpoint, and server_pubkey from a streaming response JSON.
+/// Parse streamId, endpoint, and serverPubkey from a streaming response JSON.
+/// StreamInfo serializes with `#[serde(rename_all = "camelCase")]`, so all keys are camelCase.
 fn parse_stream_info(json: &Value) -> anyhow::Result<(String, String, Vec<u8>)> {
-    let stream_id = json["stream_id"].as_str()
-        .ok_or_else(|| anyhow::anyhow!("missing stream_id in streaming response"))?.to_owned();
+    let stream_id = json["streamId"].as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing streamId in streaming response"))?.to_owned();
     let endpoint = json["endpoint"].as_str()
-        .or_else(|| json["stream_endpoint"].as_str())
         .ok_or_else(|| anyhow::anyhow!("missing endpoint in streaming response"))?.to_owned();
-    let server_pubkey: Vec<u8> = json["server_pubkey"].as_array()
-        .ok_or_else(|| anyhow::anyhow!("missing server_pubkey in streaming response"))?
+    let server_pubkey: Vec<u8> = json["serverPubkey"].as_array()
+        .ok_or_else(|| anyhow::anyhow!("missing serverPubkey in streaming response"))?
         .iter()
         .map(|v| v.as_u64().unwrap_or(0) as u8)
         .collect();
@@ -616,6 +691,11 @@ async fn dispatch_schema_call(service: &str, method: &str, ctx: &ToolCallContext
             let client = PolicyClient::for_service(signing_key, server_vk, None);
             client.call_method(method, &ctx.args).await
         }
+        "tui" => {
+            let server_vk = ctx.resolve_peer_key("tui").await?;
+            let client = TuiClient::for_service(signing_key, server_vk, None);
+            client.call_method(method, &ctx.args).await
+        }
         _ => anyhow::bail!("Unknown service: {service}"),
     }
 }
@@ -626,8 +706,8 @@ async fn dispatch_schema_call(service: &str, method: &str, ctx: &ToolCallContext
 
 /// MCP service implementation — UUID-keyed tool registry
 pub struct McpService {
-    /// UUID-keyed tool registry
-    registry: Arc<ToolRegistry>,
+    /// UUID-keyed tool registry (RwLock for live refresh)
+    registry: Arc<RwLock<ToolRegistry>>,
     /// Raw HYPRSTREAM_TOKEN from env (stdio transport — decoded per-request)
     stdio_token: Option<String>,
     /// Verifying key for JWT validation
@@ -666,7 +746,7 @@ impl McpService {
         );
 
         Ok(Self {
-            registry: Arc::new(tool_reg),
+            registry: Arc::new(RwLock::new(tool_reg)),
             stdio_token,
             verifying_key: config.verifying_key,
             context: config.zmq_context.clone(),
@@ -692,9 +772,10 @@ impl McpService {
             .map_err(|e| anyhow::anyhow!("Invalid Ed25519 key: {e}"))
     }
 
-    /// Convert registry to rmcp Tool list
+    /// Convert registry to rmcp Tool list (includes built-in refresh_tools meta-tool)
     fn tools_list(&self) -> Vec<Tool> {
-        self.registry.list().map(|entry| {
+        let reg = self.registry.read();
+        let mut tools: Vec<Tool> = reg.list().map(|entry| {
             let schema: JsonObject = match &entry.args_schema {
                 Value::Object(m) => m.clone(),
                 _ => JsonObject::new(),
@@ -716,7 +797,30 @@ impl McpService {
                 icons: None,
                 meta: None,
             }
-        }).collect()
+        }).collect();
+
+        tools.push(Tool {
+            name: Cow::Owned(REFRESH_TOOLS_UUID.to_string()),
+            title: Some("mcp.refresh_tools".to_owned()),
+            description: Some(Cow::Borrowed(
+                "Rebuild the tool registry from current service schemas and notify \
+                 this session to re-fetch the tool list. Call after new services come \
+                 online to discover their tools without reconnecting.",
+            )),
+            input_schema: Arc::new(JsonObject::new()),
+            output_schema: None,
+            annotations: Some(ToolAnnotations {
+                title: Some("mcp.refresh_tools".to_owned()),
+                read_only_hint: Some(false),
+                destructive_hint: Some(false),
+                open_world_hint: Some(false),
+                idempotent_hint: Some(true),
+            }),
+            icons: None,
+            meta: None,
+        });
+
+        tools
     }
 
     /// Extract identity from validated middleware state or fall back to env/local.
@@ -759,11 +863,15 @@ impl McpService {
 
     /// Dispatch a tool call by UUID with a specific identity
     async fn dispatch_tool(&self, uuid: &Uuid, args: Value, user: String) -> Result<CallToolResult, ErrorData> {
-        let entry = self.registry.get(uuid)
-            .ok_or_else(|| ErrorData::invalid_request(format!("Unknown tool: {}", uuid), None))?;
+        let handler = {
+            let reg = self.registry.read();
+            let entry = reg.get(uuid)
+                .ok_or_else(|| ErrorData::invalid_request(format!("Unknown tool: {}", uuid), None))?;
+            entry.handler.clone()
+        };
 
         let ctx = ToolCallContext {
-            args,
+            args: normalize_mcp_args(args),
             signing_key: self.signing_key.clone(),
             zmq_context: self.context.clone(),
             user,
@@ -771,7 +879,7 @@ impl McpService {
             policy_client: self.policy_client.clone(),
         };
 
-        let result = (entry.handler)(ctx).await
+        let result = handler(ctx).await
             .map_err(|e| ErrorData::internal_error(format!("Tool failed: {}", e), None))?;
 
         match result {
@@ -820,6 +928,7 @@ impl ServerHandler for McpService {
             protocol_version: Default::default(),
             capabilities: ServerCapabilities::builder()
                 .enable_tools()
+                .enable_tool_list_changed()
                 .build(),
             server_info: rmcp::model::Implementation {
                 name: "hyprstream".into(),
@@ -859,6 +968,24 @@ impl ServerHandler for McpService {
         async move {
             let uuid = Uuid::parse_str(&request.name)
                 .map_err(|e| ErrorData::invalid_request(format!("Invalid UUID: {}", e), None))?;
+
+            if uuid == REFRESH_TOOLS_UUID {
+                let old_count;
+                let new_count;
+                {
+                    let mut reg = self.registry.write();
+                    old_count = reg.by_uuid.len();
+                    let mut fresh = ToolRegistry::new();
+                    register_schema_tools(&mut fresh);
+                    new_count = fresh.by_uuid.len();
+                    *reg = fresh;
+                }
+                let _ = context.peer.notify_tool_list_changed().await;
+                tracing::info!("MCP refresh_tools: {} -> {} tools", old_count, new_count);
+                return Ok(CallToolResult::success(vec![Content::text(
+                    format!("Refreshed tool registry: {} tools (was {})", new_count, old_count),
+                )]));
+            }
 
             let args = match request.arguments {
                 Some(map) => Value::Object(map),
@@ -935,7 +1062,8 @@ impl McpHandler for McpService {
         _ctx: &crate::services::EnvelopeContext,
         _request_id: u64,
     ) -> anyhow::Result<McpResponseVariant> {
-        let tools: Vec<ToolDefinition> = self.registry.list().map(|entry| {
+        let reg = self.registry.read();
+        let tools: Vec<ToolDefinition> = reg.list().map(|entry| {
             ToolDefinition {
                 name: entry.uuid.to_string(),
                 description: entry.description.clone(),

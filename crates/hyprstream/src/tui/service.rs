@@ -967,7 +967,8 @@ impl TuiService {
 
         let git_ops = {
             use hyprstream_tui::shell_app::{GitOps, GitOpProgress, GitProgressSender, ModelEntry as ShellModelEntry};
-            use crate::services::generated::registry_client::{CloneRequest, CreateWorktreeRequest, PushRequest, UpdateRequest};
+            use crate::services::generated::registry_client::{CloneRequest, CreateWorktreeRequest, PushRequest, UpdateRequest, RegistryRpc};
+            use hyprstream_rpc::streaming::StreamPayload;
 
             let sk_clone = self.signing_key.clone();
             let h_clone = handle.clone();
@@ -985,17 +986,57 @@ impl TuiService {
                             url.rsplit('/').next().unwrap_or("model")
                                 .trim_end_matches(".git").to_owned()
                         });
-                        let _ = tx.send(GitOpProgress::Status(format!("Cloning {model_name}…")));
+                        let _ = tx.send(GitOpProgress::CloneProgress { stage: "Connecting…".to_owned(), pct: 0 });
 
-                        if let Err(e) = registry.clone(&CloneRequest {
+                        let mut stream_handle = match RegistryRpc::clone_stream(&registry, &CloneRequest {
                             url: url.clone(),
                             name: model_name.clone(),
                             shallow: false,
                             depth: 0,
                             branch: branch.unwrap_or_default(),
                         }).await {
-                            let _ = tx.send(GitOpProgress::Failed(format!("Clone failed: {e}")));
-                            return;
+                            Ok(h) => h,
+                            Err(e) => {
+                                let _ = tx.send(GitOpProgress::Failed(format!("Clone failed: {e}")));
+                                return;
+                            }
+                        };
+
+                        loop {
+                            match stream_handle.recv_next().await {
+                                Ok(Some(StreamPayload::Data(data))) => {
+                                    if let Ok(text) = String::from_utf8(data) {
+                                        let parts: Vec<&str> = text.split(':').collect();
+                                        if parts.len() >= 3 {
+                                            let stage = parts[0];
+                                            let current: u64 = parts[1].parse().unwrap_or(0);
+                                            let total: u64 = parts[2].parse().unwrap_or(0);
+                                            let pct = if total > 0 { ((current * 70) / total).min(70) as u8 } else { 0 };
+                                            let label = match stage {
+                                                "fetch" => "Fetching objects",
+                                                "indexing" => "Indexing",
+                                                "smudge" => "Downloading model files",
+                                                "lfs" => "Downloading LFS files",
+                                                other => other,
+                                            };
+                                            let _ = tx.send(GitOpProgress::CloneProgress {
+                                                stage: label.to_owned(),
+                                                pct,
+                                            });
+                                        }
+                                    }
+                                }
+                                Ok(Some(StreamPayload::Complete(_))) | Ok(None) => break,
+                                Ok(Some(StreamPayload::Error(message))) => {
+                                    let _ = tx.send(GitOpProgress::Failed(format!("Clone failed: {message}")));
+                                    return;
+                                }
+                                Ok(Some(StreamPayload::Tagged { .. })) => {}
+                                Err(e) => {
+                                    let _ = tx.send(GitOpProgress::Failed(format!("Clone stream error: {e}")));
+                                    return;
+                                }
+                            }
                         }
 
                         let _ = tx.send(GitOpProgress::CloneProgress { stage: "Creating worktree…".to_owned(), pct: 80 });
