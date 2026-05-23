@@ -299,6 +299,12 @@ pub struct OAuthState {
     pub dpop_jti_seen: RwLock<HashMap<String, i64>>,
     /// Server-issued DPoP nonces. Value = expiry unix timestamp.
     pub dpop_nonces: RwLock<HashMap<String, i64>>,
+    /// Per-client (keyed by DPoP `jkt` thumbprint) nonce-issuance state.
+    /// Once a jkt appears here, RFC 9449 §8 enforcement kicks in: subsequent
+    /// proofs from the same key MUST carry a server-issued nonce. Value =
+    /// expiry unix timestamp (matches nonce TTL; entry pruned when expired
+    /// to allow re-bootstrap after silence).
+    pub dpop_clients_seen: RwLock<HashMap<String, i64>>,
     /// Trusted external OIDC issuers for the JWT bearer grant (RFC 7523).
     pub trusted_issuers: std::collections::HashMap<String, crate::config::TrustedIssuerConfig>,
     /// CA JWT signing key for browser WIT issuance (POST /oauth/wit).
@@ -356,6 +362,7 @@ impl OAuthState {
             rsa_kid: None,
             dpop_jti_seen: RwLock::new(HashMap::new()),
             dpop_nonces: RwLock::new(HashMap::new()),
+            dpop_clients_seen: RwLock::new(HashMap::new()),
             trusted_issuers: config.trusted_issuers.clone(),
             ca_jwt_key: None,
             device_store: None,
@@ -534,6 +541,24 @@ impl OAuthState {
         store.get(nonce).is_some_and(|&exp| exp > now)
     }
 
+    /// RFC 9449 §8 nonce-enforcement bookkeeping: has this client (`jkt`)
+    /// previously been issued a nonce that has not yet expired? If so the
+    /// next DPoP proof from this key MUST include a valid nonce.
+    pub async fn dpop_client_requires_nonce(&self, jkt: &str) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        let mut store = self.dpop_clients_seen.write().await;
+        store.retain(|_, exp| *exp > now);
+        store.contains_key(jkt)
+    }
+
+    /// Record that this client (`jkt`) has been issued a server nonce.
+    /// Future proofs from this key are required to carry one (sliding 5-min
+    /// window per nonce TTL).
+    pub async fn mark_dpop_client_nonced(&self, jkt: &str) {
+        let expiry = chrono::Utc::now().timestamp() + 300;
+        self.dpop_clients_seen.write().await.insert(jkt.to_owned(), expiry);
+    }
+
     /// Attach an RSA key for RS256 id_token signing (OIDC interop).
     ///
     /// `rsa_der` is the PKCS#8 DER-encoded RSA private key.
@@ -601,6 +626,7 @@ impl OAuthState {
                     let now = chrono::Utc::now().timestamp();
                     state.dpop_jti_seen.write().await.retain(|_, exp| *exp > now);
                     state.dpop_nonces.write().await.retain(|_, exp| *exp > now);
+                    state.dpop_clients_seen.write().await.retain(|_, exp| *exp > now);
                 }
 
                 // Sweep expired external auth flows

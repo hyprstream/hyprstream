@@ -139,10 +139,22 @@ pub async fn exchange_token(
     }
 }
 
-/// Verify a DPoP proof for the token endpoint, check JTI replay, validate nonce.
+/// Verify a DPoP proof for the token endpoint, check JTI replay, enforce
+/// server-side nonces per RFC 9449 §8.
 ///
-/// Returns `None` when no DPoP header is present (DPoP is optional at the token endpoint).
+/// Returns `None` when no DPoP header is present (DPoP is optional at the
+/// token endpoint).
 /// Returns `Some(Ok(jkt))` on success; `Some(Err(response))` on failure.
+///
+/// Nonce enforcement policy:
+/// - First proof from a given `jkt` (no prior nonce issuance recorded for
+///   this key) is accepted as a bootstrap and a fresh nonce is issued in
+///   the response `DPoP-Nonce` header.
+/// - Subsequent proofs from the same `jkt` MUST include a server-issued
+///   nonce; otherwise we reject with `error: "use_dpop_nonce"` and a fresh
+///   nonce in the response header.
+/// - Any presented nonce MUST be one we issued and not expired (5-min
+///   sliding window).
 async fn verify_dpop_at_token_endpoint(
     state: &OAuthState,
     dpop_header: Option<&str>,
@@ -161,14 +173,45 @@ async fn verify_dpop_at_token_endpoint(
         tracing::warn!(jti = %proof.jti, "DPoP JTI replay detected");
         return Some(Err(token_error(StatusCode::BAD_REQUEST, "invalid_dpop_proof", "DPoP proof jti already used")));
     }
-    // Nonce validation: if proof carries a nonce, it must be one we issued.
-    if let Some(ref nonce) = proof.nonce {
-        if !state.verify_dpop_nonce(nonce).await {
-            tracing::warn!("DPoP nonce invalid or expired");
-            return Some(Err(token_error(StatusCode::BAD_REQUEST, "use_dpop_nonce", "DPoP nonce invalid or expired")));
+
+    // RFC 9449 §8 nonce enforcement.
+    let client_needs_nonce = state.dpop_client_requires_nonce(&proof.jkt).await;
+    match (client_needs_nonce, proof.nonce.as_deref()) {
+        (true, None) => {
+            // Subsequent request without nonce — reject with fresh nonce.
+            let fresh = state.issue_dpop_nonce().await;
+            state.mark_dpop_client_nonced(&proof.jkt).await;
+            tracing::warn!(jkt = %proof.jkt, "DPoP nonce required but proof omitted it");
+            return Some(Err(use_dpop_nonce_error(&fresh, "DPoP proof must include a server-issued nonce")));
+        }
+        (_, Some(presented)) => {
+            // Whether bootstrap or subsequent: a presented nonce must be one
+            // we issued. If invalid/expired, reject and rotate.
+            if !state.verify_dpop_nonce(presented).await {
+                let fresh = state.issue_dpop_nonce().await;
+                state.mark_dpop_client_nonced(&proof.jkt).await;
+                tracing::warn!(jkt = %proof.jkt, "DPoP nonce invalid or expired");
+                return Some(Err(use_dpop_nonce_error(&fresh, "DPoP nonce invalid or expired")));
+            }
+        }
+        (false, None) => {
+            // Bootstrap: first request from this jkt with no nonce. Accept;
+            // a fresh nonce will be issued on the success path (see
+            // `issue_token_with_refresh`).
         }
     }
+
     Some(Ok(proof.jkt))
+}
+
+/// Build a `400 use_dpop_nonce` response with the current nonce in the
+/// `DPoP-Nonce` header (RFC 9449 §8).
+fn use_dpop_nonce_error(nonce: &str, description: &str) -> Response {
+    let mut resp = token_error(StatusCode::BAD_REQUEST, "use_dpop_nonce", description);
+    if let Ok(val) = axum::http::HeaderValue::from_str(nonce) {
+        resp.headers_mut().insert("DPoP-Nonce", val);
+    }
+    resp
 }
 
 /// Handle authorization_code grant type.
@@ -495,8 +538,12 @@ async fn issue_token_with_refresh(
             let now = chrono::Utc::now().timestamp();
             let expires_in = (token_info.expires_at - now).max(0);
             // Issue a fresh DPoP nonce when the client used DPoP (RFC 9449 §8).
-            let dpop_nonce = if dpop_jkt.is_some() {
-                Some(state.issue_dpop_nonce().await)
+            // Also record that this jkt has now been issued a nonce so future
+            // proofs are required to carry one.
+            let dpop_nonce = if let Some(ref jkt) = dpop_jkt {
+                let n = state.issue_dpop_nonce().await;
+                state.mark_dpop_client_nonced(jkt).await;
+                Some(n)
             } else {
                 None
             };

@@ -68,6 +68,21 @@ pub trait JwtKeySource: Send + Sync + 'static {
     fn ml_dsa_verifying_keys(&self) -> Vec<crate::crypto::pq::MlDsaVerifyingKey> {
         vec![]
     }
+
+    /// Return the list of `alg` values bound to a given `kid` in the JWKS.
+    ///
+    /// This is used as a **stripping defense**: when a JWKS entry carries a
+    /// composite-signature `alg` (e.g. `ML-DSA-65-Ed25519`) under a kid, the
+    /// verifier MUST require that any JWT presenting that kid uses the exact
+    /// same alg — preventing an attacker who controls one component key from
+    /// presenting a single-algorithm JWT under the composite kid.
+    ///
+    /// Default implementation returns an empty vec, which means "no policy
+    /// constraint" (legacy behavior). Implementations backed by JWKS should
+    /// override to surface the algs they observed.
+    fn kid_algs(&self, _kid: &str) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Key source for regular services — trusts only the cluster CA.
@@ -203,6 +218,10 @@ impl JwtKeySource for FederatedKeySource {
     fn ml_dsa_verifying_keys(&self) -> Vec<crate::crypto::pq::MlDsaVerifyingKey> {
         self.local.ml_dsa_verifying_keys()
     }
+
+    fn kid_algs(&self, kid: &str) -> Vec<String> {
+        self.local.kid_algs(kid)
+    }
 }
 
 /// Async function that fetches raw JWKS JSON from a URL.
@@ -253,6 +272,11 @@ pub struct JwksKeySource {
     fetcher: JwksFetcher,
     cache: RwLock<HashMap<String, CachedKey>>,
     negative_cache: RwLock<HashMap<String, std::time::Instant>>,
+    /// Multi-alg map: kid → all `alg` values present in the JWKS for that kid.
+    /// Populated alongside `cache` during `fetch_and_cache`. Used by `kid_algs`
+    /// to implement the stripping-defense policy (verifier must require all
+    /// listed algs for a composite-signed kid).
+    kid_alg_map: std::sync::RwLock<HashMap<String, Vec<String>>>,
     fetch_semaphore: Semaphore,
     /// Soft TTL for cache refresh (keys older than this trigger background refresh)
     #[allow(dead_code)]
@@ -277,6 +301,7 @@ impl JwksKeySource {
             fetcher,
             cache: RwLock::new(HashMap::new()),
             negative_cache: RwLock::new(HashMap::new()),
+            kid_alg_map: std::sync::RwLock::new(HashMap::new()),
             fetch_semaphore: Semaphore::new(4),
             soft_ttl: std::time::Duration::from_secs(300),
             negative_ttl: std::time::Duration::from_secs(5),
@@ -339,19 +364,35 @@ impl JwksKeySource {
         let now = std::time::Instant::now();
         let mut cache = self.cache.write().await;
 
+        // Rebuild kid → algs map from this JWKS snapshot.
+        let mut new_kid_algs: HashMap<String, Vec<String>> = HashMap::new();
+
         for key in keys {
             let kty = key.get("kty").and_then(|v| v.as_str()).unwrap_or_default();
             let crv = key.get("crv").and_then(|v| v.as_str()).unwrap_or_default();
+            let kid = key.get("kid").and_then(|v| v.as_str()).map(str::to_owned);
+            let alg = key.get("alg").and_then(|v| v.as_str()).map(str::to_owned);
+
+            // Track ALL JWKS entries (Ed25519, P-256, AKP) under their kid.
+            // The stripping defense fires when a kid has a composite alg, so we
+            // need to record those algs even though we can't verify-decode them
+            // here.
+            if let (Some(ref kid), Some(alg)) = (kid.as_ref(), alg) {
+                let entry = new_kid_algs.entry(kid.clone()).or_default();
+                if !entry.contains(&alg) {
+                    entry.push(alg);
+                }
+            }
 
             if kty == "OKP" && crv == "Ed25519" {
-                if let Some(kid) = key.get("kid").and_then(|v| v.as_str()) {
+                if let Some(kid) = kid {
                     if let Some(x) = key.get("x").and_then(|v| v.as_str()) {
                         if let Ok(x_bytes) = URL_SAFE_NO_PAD.decode(x) {
                             if x_bytes.len() == 32 {
                                 let mut arr = [0u8; 32];
                                 arr.copy_from_slice(&x_bytes);
                                 if let Ok(vk) = VerifyingKey::from_bytes(&arr) {
-                                    cache.insert(kid.to_owned(), CachedKey {
+                                    cache.insert(kid, CachedKey {
                                         verifying_key: vk,
                                         fetched_at: now,
                                     });
@@ -361,6 +402,11 @@ impl JwksKeySource {
                     }
                 }
             }
+        }
+
+        // Publish the new kid→algs view atomically.
+        if let Ok(mut map) = self.kid_alg_map.write() {
+            *map = new_kid_algs;
         }
 
         // Clear negative cache entries for keys we now have
@@ -450,6 +496,14 @@ impl JwtKeySource for JwksKeySource {
     #[cfg(feature = "pq-hybrid")]
     fn ml_dsa_verifying_keys(&self) -> Vec<crate::crypto::pq::MlDsaVerifyingKey> {
         self.ml_dsa_vks.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    fn kid_algs(&self, kid: &str) -> Vec<String> {
+        self.kid_alg_map
+            .read()
+            .ok()
+            .and_then(|m| m.get(kid).cloned())
+            .unwrap_or_default()
     }
 }
 
@@ -622,6 +676,74 @@ mod tests {
 
         let result = ks.get_key("http://evil.example.com", None).await;
         assert!(result.is_err());
+    }
+
+    /// dpop_stripping_jwks_lists_composite_alg:
+    /// When the JWKS lists a kid with a composite alg (e.g.
+    /// `ML-DSA-65-Ed25519`), `kid_algs` must surface that alg so the
+    /// verifier's stripping-defense policy can require all components.
+    #[tokio::test]
+    async fn dpop_stripping_jwks_kid_algs_surface_composite() -> anyhow::Result<()> {
+        let kid = "composite-test-kid";
+        let jwks = serde_json::json!({
+            "keys": [
+                {
+                    "kty": "AKP",
+                    "alg": "ML-DSA-65-Ed25519",
+                    "use": "sig",
+                    "kid": kid,
+                    "pub": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 16]),
+                }
+            ]
+        });
+        let ks = JwksKeySource::new(
+            JwksMode::Isolated { jwks_url: "http://localhost/oauth/jwks".to_owned() },
+            "http://localhost".to_owned(),
+            mock_fetcher(jwks),
+        );
+        // Trigger cache fill (looking up an unknown Ed25519 kid still pulls JWKS).
+        let _ = ks.get_key("http://localhost", Some("unknown")).await;
+        let algs = ks.kid_algs(kid);
+        assert_eq!(algs, vec!["ML-DSA-65-Ed25519".to_owned()]);
+        Ok(())
+    }
+
+    /// dpop_stripping_jwks_multi_alg_per_kid:
+    /// When the JWKS publishes two entries sharing a kid with different algs
+    /// (e.g. an Ed25519 entry and an ML-DSA-65 entry under the same kid for
+    /// composite key publication), `kid_algs` must return both, so the
+    /// verifier's "all-listed-required" policy can fire.
+    #[tokio::test]
+    async fn dpop_stripping_jwks_multi_alg_per_kid() -> anyhow::Result<()> {
+        let sk = SigningKey::from_bytes(&[0x77; 32]);
+        let kid = crate::auth::jwt::kid_for_key(&sk);
+        let x = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sk.verifying_key().as_bytes());
+        let jwks = serde_json::json!({
+            "keys": [
+                {"kty": "OKP", "crv": "Ed25519", "use": "sig", "alg": "EdDSA", "kid": kid.clone(), "x": x},
+                {"kty": "AKP", "alg": "ML-DSA-65", "use": "sig", "kid": kid.clone(),
+                 "pub": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 16])},
+            ]
+        });
+        let ks = JwksKeySource::new(
+            JwksMode::Isolated { jwks_url: "http://localhost/oauth/jwks".to_owned() },
+            "http://localhost".to_owned(),
+            mock_fetcher(jwks),
+        );
+        let _ = ks.get_key("http://localhost", Some(&kid)).await?;
+        let mut algs = ks.kid_algs(&kid);
+        algs.sort();
+        assert_eq!(algs, vec!["EdDSA".to_owned(), "ML-DSA-65".to_owned()]);
+        Ok(())
+    }
+
+    /// dpop_stripping_default_impl_empty:
+    /// `ClusterKeySource` doesn't track JWKS metadata, so `kid_algs` returns
+    /// empty (legacy behavior, no policy constraint).
+    #[test]
+    fn dpop_stripping_default_impl_empty() {
+        let ks = ClusterKeySource::new(test_ca_key(), "http://localhost:9080".to_owned());
+        assert!(ks.kid_algs("anything").is_empty());
     }
 
     #[test]

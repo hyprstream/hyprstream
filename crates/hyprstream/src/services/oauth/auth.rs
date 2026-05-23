@@ -119,6 +119,50 @@ pub async fn require_bearer_token(
             )
                 .into_response();
         }
+
+        // RFC 9449 §8 nonce enforcement (resource server).
+        // Once this jkt has been issued a nonce by us, all subsequent proofs
+        // must include a valid server-issued nonce.
+        let needs_nonce = state.dpop_client_requires_nonce(&proof.jkt).await;
+        let nonce_ok = match proof.nonce.as_deref() {
+            Some(n) => state.verify_dpop_nonce(n).await,
+            None => false,
+        };
+        if needs_nonce && !nonce_ok {
+            let fresh = state.issue_dpop_nonce().await;
+            state.mark_dpop_client_nonced(&proof.jkt).await;
+            let mut resp = (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "DPoP error=\"use_dpop_nonce\"")],
+                axum::Json(serde_json::json!({
+                    "error": "use_dpop_nonce",
+                    "error_description": "DPoP proof must include a server-issued nonce",
+                })),
+            )
+                .into_response();
+            if let Ok(val) = axum::http::HeaderValue::from_str(&fresh) {
+                resp.headers_mut().insert("DPoP-Nonce", val);
+            }
+            return resp;
+        }
+        if proof.nonce.is_some() && !nonce_ok {
+            // Presented nonce but it was bogus — same rejection.
+            let fresh = state.issue_dpop_nonce().await;
+            state.mark_dpop_client_nonced(&proof.jkt).await;
+            let mut resp = (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "DPoP error=\"use_dpop_nonce\"")],
+                axum::Json(serde_json::json!({
+                    "error": "use_dpop_nonce",
+                    "error_description": "DPoP nonce invalid or expired",
+                })),
+            )
+                .into_response();
+            if let Ok(val) = axum::http::HeaderValue::from_str(&fresh) {
+                resp.headers_mut().insert("DPoP-Nonce", val);
+            }
+            return resp;
+        }
         // Verify cnf.jkt in token matches the DPoP proof key.
         if let Some(token_jkt) = claims.cnf_jkt() {
             if token_jkt.as_bytes().ct_eq(proof.jkt.as_bytes()).unwrap_u8() == 0 {

@@ -31,6 +31,24 @@ use tracing::{debug, error, info, warn};
 /// Returns a boxed future to support async policy checks on single-threaded runtimes.
 pub type AuthorizeFn = Arc<dyn Fn(String, String, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send>> + Send + Sync>;
 
+/// Decompose a composite JWT alg into its underlying component algs.
+///
+/// Used by the stripping defense in `verify_claims`: when a JWKS lists
+/// multiple algs under one kid, the verifier needs to know that an
+/// incoming alg like `ML-DSA-65-Ed25519` covers both `ML-DSA-65` and
+/// `EdDSA`, so a composite-signed JWT is sufficient. Single algs return
+/// just themselves.
+fn composite_alg_components(alg: &str) -> Vec<&'static str> {
+    match alg {
+        "ML-DSA-65-Ed25519" => vec!["ML-DSA-65", "EdDSA", "ML-DSA-65-Ed25519"],
+        "ML-DSA-65" => vec!["ML-DSA-65"],
+        "EdDSA" => vec!["EdDSA"],
+        "ES256" => vec!["ES256"],
+        "RS256" => vec!["RS256"],
+        _ => Vec::new(),
+    }
+}
+
 /// Work to execute after the REP response is sent (e.g., stream publishing).
 ///
 /// Built by streaming handlers, spawned by `RequestLoop` after the response
@@ -419,6 +437,42 @@ pub trait ZmqService: 'static {
         let alg = crate::auth::header_alg(&token)
             .map_err(|e| anyhow::anyhow!("JWT header parse failed: {}", e))?
             .unwrap_or_default();
+
+        // ── Stripping defense (composite signature hardening) ───────────────
+        //
+        // If the JWKS lists this kid with one or more `alg` values, the JWT's
+        // header alg MUST exactly match a JWKS alg, AND when the JWKS lists
+        // multiple algs for this kid, the JWT MUST use a composite alg that
+        // covers all of them. This prevents an attacker from stripping the
+        // post-quantum half of a composite signature and presenting only the
+        // classical EdDSA half under the composite kid.
+        if let Some(ref kid_str) = kid {
+            let listed_algs = key_source.kid_algs(kid_str);
+            if !listed_algs.is_empty() {
+                if !listed_algs.iter().any(|a| a == &alg) {
+                    tracing::warn!(
+                        "JWT alg={} not listed in JWKS for kid={} (listed: {:?}) — possible stripping attack",
+                        alg, kid_str, listed_algs
+                    );
+                    anyhow::bail!("JWT alg does not match JWKS for kid (stripping defense)");
+                }
+                // When the JWKS lists multiple algs for the kid (e.g. a
+                // composite-signature publication that names both halves),
+                // require ALL of them — i.e. require a composite alg whose
+                // covered components include every listed alg.
+                if listed_algs.len() > 1 {
+                    let covered = composite_alg_components(&alg);
+                    let all_covered = listed_algs.iter().all(|need| covered.iter().any(|c| c == need) || need == &alg);
+                    if !all_covered {
+                        tracing::warn!(
+                            "JWT alg={} does not cover all JWKS-listed algs {:?} for kid={} — stripping rejected",
+                            alg, listed_algs, kid_str
+                        );
+                        anyhow::bail!("JWT alg does not cover all JWKS-listed algs (stripping defense)");
+                    }
+                }
+            }
+        }
 
         // Route verification by algorithm
         let verified = match alg.as_str() {
@@ -1068,5 +1122,42 @@ impl ServiceHandle {
     /// Check if the service is still running
     pub fn is_running(&self) -> bool {
         self.task.as_ref().map(|t| !t.is_finished()).unwrap_or(true)
+    }
+}
+
+#[cfg(test)]
+mod stripping_defense_tests {
+    use super::composite_alg_components;
+
+    /// stripping_composite_covers_components:
+    /// `ML-DSA-65-Ed25519` (composite) MUST cover both component algs so a
+    /// JWKS that lists both `EdDSA` and `ML-DSA-65` under one kid still
+    /// accepts a composite-signed token.
+    #[test]
+    fn stripping_composite_covers_components() {
+        let c = composite_alg_components("ML-DSA-65-Ed25519");
+        assert!(c.contains(&"ML-DSA-65"));
+        assert!(c.contains(&"EdDSA"));
+        assert!(c.contains(&"ML-DSA-65-Ed25519"));
+    }
+
+    /// stripping_eddsa_does_not_cover_ml_dsa:
+    /// Classical-only EdDSA must NOT cover ML-DSA-65; this is the core
+    /// stripping defense — an attacker presenting an EdDSA JWT under a kid
+    /// that the JWKS lists with ML-DSA-65 (or composite) must be rejected.
+    #[test]
+    fn stripping_eddsa_does_not_cover_ml_dsa() {
+        let c = composite_alg_components("EdDSA");
+        assert!(!c.contains(&"ML-DSA-65"));
+        assert!(!c.contains(&"ML-DSA-65-Ed25519"));
+    }
+
+    /// stripping_unknown_alg_is_empty:
+    /// Unknown algs return an empty component list so the verifier's
+    /// "all-covered" check fails closed.
+    #[test]
+    fn stripping_unknown_alg_is_empty() {
+        assert!(composite_alg_components("HS256").is_empty());
+        assert!(composite_alg_components("none").is_empty());
     }
 }
