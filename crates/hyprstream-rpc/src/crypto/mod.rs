@@ -27,6 +27,7 @@
 //! - `fips`: ECDH P-256 for FIPS 140-2 compliance
 
 pub mod backend;
+pub mod cose_sign1;
 pub mod envelope_crypto;
 pub mod event_crypto;
 pub mod hmac;

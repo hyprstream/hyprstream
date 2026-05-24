@@ -199,6 +199,8 @@ p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }  # P-256 ECDH (FIPS) +
 ml-dsa = "0.1.0-rc.11"  # ML-DSA-65 (FIPS 204) post-quantum signatures
 ml-kem = { version = "0.3", features = ["getrandom"] }  # ML-KEM-768 (FIPS 203) post-quantum key encapsulation
 jsonwebtoken = "9"  # RS256/ES256 JWT verification for external OIDC providers
+coset = "0.4"       # COSE_Sign1 (RFC 9052) envelope signing
+ciborium = "0.2"    # CBOR runtime (external_aad construction)
 
 # Hot-reloading (dev only — zero overhead in release builds)
 subsecond = "0.7"

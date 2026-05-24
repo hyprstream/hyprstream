@@ -24,6 +24,8 @@ blake3 = { workspace = true }            # Default: fast KDF and MAC
 aes-gcm = { workspace = true }          # AES-256-GCM for notification broadcast encryption
 aes-gcm-siv = { workspace = true }     # AES-256-GCM-SIV for envelope encryption (nonce-misuse resistant)
 hkdf = { workspace = true }                    # HKDF-SHA256 for identity derivation + FIPS
+coset = { workspace = true }                   # COSE_Sign1 (RFC 9052) envelope signing
+ciborium = { workspace = true }                # CBOR runtime (external_aad)
 hmac = { workspace = true, optional = true }   # FIPS mode only
 zeroize = { workspace = true }
 subtle = { workspace = true }
