@@ -14,6 +14,8 @@ use crate::generated::discovery_client::{
     DiscoveryHandler, DiscoveryResponseVariant,
     ErrorInfo, ServiceList, ServiceSummary, ServiceEndpoints, EndpointInfo,
     PingInfo, AuthMetadata, AuthMetadataList, ServiceAnnouncement,
+    RegisterEntityStatementRequest, RegisterEnvelopeKeysetRequest,
+    EntityStatement, EnvelopeKeyset, IssuerList,
     dispatch_discovery, serialize_response,
 };
 
@@ -60,6 +62,30 @@ struct AnnouncedEndpoint {
     last_heartbeat: Instant,
 }
 
+/// Phase 0.5 Stage D — cached signed OIDF entity statement.
+struct CachedEntityStatement {
+    /// Signed OpenID Federation 1.0 entity statement (compact JWS).
+    jwt: String,
+    /// Unix seconds when this was registered (set on push from issuer).
+    fetched_at: i64,
+}
+
+/// Phase 0.5 Stage D — cached envelope COSE_KeySet.
+struct CachedEnvelopeKeyset {
+    /// CBOR-encoded COSE_KeySet (RFC 9052 §7).
+    cose_keyset_cbor: Vec<u8>,
+    /// Unix seconds when this was registered.
+    fetched_at: i64,
+}
+
+fn unix_seconds_now() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Discovery service that exposes EndpointRegistry over ZMQ RPC.
 pub struct DiscoveryService {
     /// Timestamp when the service was created
@@ -79,6 +105,14 @@ pub struct DiscoveryService {
     /// Endpoints announced by other services (cross-process).
     /// Maps service_name → Vec<AnnouncedEndpoint>.
     announced_endpoints: RwLock<HashMap<String, Vec<AnnouncedEndpoint>>>,
+    /// Phase 0.5 Stage D — cached signed OIDF entity statements per issuer URL.
+    /// Pushed by IdPService/OAuth at startup + on every signing-key rotation.
+    /// Consumed by FederationKeyResolver before falling back to HTTPS.
+    entity_statements: RwLock<HashMap<String, CachedEntityStatement>>,
+    /// Phase 0.5 Stage D — cached envelope COSE_KeySets per service did:web.
+    /// Pushed by each service at startup + rotation. Consumed by ZmqService
+    /// receivers verifying COSE_Sign1 envelope signatures.
+    envelope_keysets: RwLock<HashMap<String, CachedEnvelopeKeyset>>,
     /// Pre-computed TLS endorsement: Sign(tls_key, ed25519_pubkey || domain).
     /// Empty when TLS endorsement is not available (e.g. self-signed certs).
     tls_endorsement: Vec<u8>,
@@ -110,6 +144,8 @@ impl DiscoveryService {
             expected_audience: None,
             auth_provider: None,
             announced_endpoints: RwLock::new(HashMap::new()),
+            entity_statements: RwLock::new(HashMap::new()),
+            envelope_keysets: RwLock::new(HashMap::new()),
             tls_endorsement: Vec::new(),
             tls_domain: String::new(),
             context,
@@ -520,6 +556,148 @@ impl DiscoveryHandler for DiscoveryService {
         }
 
         Ok(DiscoveryResponseVariant::AnnounceResult)
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Phase 0.5 Stage D — federation directory
+    // ────────────────────────────────────────────────────────────────────
+
+    async fn handle_register_entity_statement(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &RegisterEntityStatementRequest,
+    ) -> Result<DiscoveryResponseVariant> {
+        if data.issuer.is_empty() {
+            return Ok(DiscoveryResponseVariant::Error(ErrorInfo {
+                message: "issuer is required".to_owned(),
+                code: "INVALID_ARGUMENT".to_owned(),
+                details: String::new(),
+            }));
+        }
+        if data.jwt.is_empty() {
+            return Ok(DiscoveryResponseVariant::Error(ErrorInfo {
+                message: "jwt is required".to_owned(),
+                code: "INVALID_ARGUMENT".to_owned(),
+                details: String::new(),
+            }));
+        }
+
+        let cached = CachedEntityStatement {
+            jwt: data.jwt.clone(),
+            fetched_at: unix_seconds_now(),
+        };
+        let mut map = self.entity_statements.write();
+        map.insert(data.issuer.clone(), cached);
+        let total = map.len();
+        drop(map);
+
+        info!(
+            issuer = %data.issuer,
+            caller = %ctx.subject(),
+            total_cached = total,
+            "Discovery: entity statement registered"
+        );
+        Ok(DiscoveryResponseVariant::RegisterEntityStatementResult)
+    }
+
+    async fn handle_get_entity_statement(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &str,
+    ) -> Result<DiscoveryResponseVariant> {
+        let issuer = data;
+        let map = self.entity_statements.read();
+        match map.get(issuer) {
+            Some(cached) => {
+                trace!(issuer = %issuer, "Discovery: entity statement cache hit");
+                Ok(DiscoveryResponseVariant::GetEntityStatementResult(EntityStatement {
+                    issuer: issuer.to_owned(),
+                    jwt: cached.jwt.clone(),
+                    fetched_at: cached.fetched_at,
+                }))
+            }
+            None => Ok(DiscoveryResponseVariant::Error(ErrorInfo {
+                message: format!("no entity statement cached for issuer: {}", issuer),
+                code: "NOT_FOUND".to_owned(),
+                details: String::new(),
+            })),
+        }
+    }
+
+    async fn handle_register_envelope_keyset(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &RegisterEnvelopeKeysetRequest,
+    ) -> Result<DiscoveryResponseVariant> {
+        if data.service_did.is_empty() {
+            return Ok(DiscoveryResponseVariant::Error(ErrorInfo {
+                message: "serviceDid is required".to_owned(),
+                code: "INVALID_ARGUMENT".to_owned(),
+                details: String::new(),
+            }));
+        }
+        if data.cose_keyset_cbor.is_empty() {
+            return Ok(DiscoveryResponseVariant::Error(ErrorInfo {
+                message: "coseKeysetCbor is required".to_owned(),
+                code: "INVALID_ARGUMENT".to_owned(),
+                details: String::new(),
+            }));
+        }
+
+        let cached = CachedEnvelopeKeyset {
+            cose_keyset_cbor: data.cose_keyset_cbor.clone(),
+            fetched_at: unix_seconds_now(),
+        };
+        let mut map = self.envelope_keysets.write();
+        map.insert(data.service_did.clone(), cached);
+        let total = map.len();
+        drop(map);
+
+        info!(
+            service_did = %data.service_did,
+            caller = %ctx.subject(),
+            total_cached = total,
+            "Discovery: envelope keyset registered"
+        );
+        Ok(DiscoveryResponseVariant::RegisterEnvelopeKeysetResult)
+    }
+
+    async fn handle_get_envelope_keyset(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &str,
+    ) -> Result<DiscoveryResponseVariant> {
+        let service_did = data;
+        let map = self.envelope_keysets.read();
+        match map.get(service_did) {
+            Some(cached) => {
+                trace!(service_did = %service_did, "Discovery: envelope keyset cache hit");
+                Ok(DiscoveryResponseVariant::GetEnvelopeKeysetResult(EnvelopeKeyset {
+                    service_did: service_did.to_owned(),
+                    cose_keyset_cbor: cached.cose_keyset_cbor.clone(),
+                    fetched_at: cached.fetched_at,
+                }))
+            }
+            None => Ok(DiscoveryResponseVariant::Error(ErrorInfo {
+                message: format!("no envelope keyset cached for service: {}", service_did),
+                code: "NOT_FOUND".to_owned(),
+                details: String::new(),
+            })),
+        }
+    }
+
+    async fn handle_list_known_issuers(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+    ) -> Result<DiscoveryResponseVariant> {
+        let map = self.entity_statements.read();
+        let issuers: Vec<String> = map.keys().cloned().collect();
+        Ok(DiscoveryResponseVariant::ListKnownIssuersResult(IssuerList { issuers }))
     }
 }
 
