@@ -30,6 +30,7 @@ pub mod auth;
 pub mod authorize;
 pub mod challenge;
 pub mod device;
+pub mod did_document;
 pub mod federation_entity;
 pub mod dpop;
 pub mod introspection;
@@ -123,6 +124,10 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
         .route("/api/device/challenge", post(device_enrollment::device_challenge_handler))
         .route("/api/device/enroll", post(device_enrollment::device_enroll_handler))
         .route("/oauth/revoke", post(revocation::revoke_token))
+        // Phase 0c — did:web document endpoints
+        .route("/.well-known/did.json", get(did_document::root_did_document))
+        .route("/users/:username/did.json", get(did_document::user_did_document))
+        .route("/clients/:client_id/did.json", get(did_document::client_did_document))
         .route("/oauth/logout", post(handle_logout))
         .route(
             "/oauth/external/authorize/:provider",
