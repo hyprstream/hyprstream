@@ -4,12 +4,14 @@
 //! keys by fetching and caching JWKS (RFC 7517) documents.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::VerifyingKey;
 use hyprstream_rpc::auth::FederationKeySource;
+use hyprstream_discovery::DiscoveryClient;
 
 struct CachedKey {
     key: VerifyingKey,
@@ -43,6 +45,15 @@ pub struct FederationKeyResolver {
     /// issuer_url → (optional jwks_uri_override, ttl, allow_http)
     config: HashMap<String, (Option<String>, Duration, bool)>,
     http: reqwest::Client,
+    /// Phase 0.5 Stage D — optional DiscoveryService client.
+    ///
+    /// When configured, `get_key` consults DiscoveryService for a cached
+    /// signed entity statement before falling back to HTTPS JWKS fetch.
+    /// This avoids the HTTPS round-trip for local-issuer verification and
+    /// the 300s TTL becomes irrelevant for cluster-internal traffic.
+    /// Falls through to HTTPS on miss/error (conservative: never downgrade
+    /// trust on missing data).
+    discovery_client: Option<Arc<DiscoveryClient>>,
 }
 
 impl FederationKeyResolver {
@@ -70,7 +81,23 @@ impl FederationKeyResolver {
                 .timeout(Duration::from_secs(10))
                 .build()
                 .unwrap_or_default(),
+            discovery_client: None,
         }
+    }
+
+    /// Phase 0.5 Stage D — wire a DiscoveryService client for federation
+    /// directory consultation. When set, [`get_key`] will try fetching the
+    /// issuer's signed entity statement via DiscoveryService before falling
+    /// back to HTTPS JWKS fetch.
+    ///
+    /// Conservative on errors: any failure of the DiscoveryService path
+    /// (network, parse, missing entity, no Ed25519 key) falls through to
+    /// the existing HTTPS path. The resolver never downgrades trust based
+    /// on missing data — if both Discovery AND HTTPS fail, key resolution
+    /// fails and the caller rejects the JWT.
+    pub fn with_discovery_client(mut self, client: Arc<DiscoveryClient>) -> Self {
+        self.discovery_client = Some(client);
+        self
     }
 
     /// Returns true if this issuer is in the trusted list.
@@ -100,6 +127,34 @@ impl FederationKeyResolver {
             }
         }
 
+        // Phase 0.5 Stage D — try DiscoveryService first if configured.
+        // This is an optimization: federation peers can cache signed
+        // entity statements that contain JWKS, letting us skip the HTTPS
+        // round-trip. Conservative on errors: any failure falls through
+        // to the existing HTTPS path. Never downgrades trust.
+        if let Some(ref dc) = self.discovery_client {
+            match self.try_get_key_from_discovery(dc, issuer).await {
+                Ok(key) => {
+                    cache.insert(
+                        issuer.to_owned(),
+                        CachedKey {
+                            key,
+                            fetched_at: Instant::now(),
+                            ttl,
+                        },
+                    );
+                    return Ok(key);
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        issuer = %issuer,
+                        error = %e,
+                        "DiscoveryService federation lookup miss; falling through to HTTPS"
+                    );
+                }
+            }
+        }
+
         // Cache miss or expired — fetch while holding the lock so concurrent
         // callers for the same issuer block here and reuse the result.
         let jwks_uri = if let Some(uri) = jwks_uri_override {
@@ -121,6 +176,87 @@ impl FederationKeyResolver {
         );
 
         Ok(key)
+    }
+
+    /// Try fetching the Ed25519 verifying key for `issuer` via DiscoveryService.
+    ///
+    /// Calls `DiscoveryClient::get_entity_statement(issuer)` to retrieve a
+    /// cached signed OIDF entity statement. Decodes the JWT payload
+    /// (without verifying its signature — that's a Phase 0.5b follow-up
+    /// tied to trust-anchor verification) and extracts the first Ed25519
+    /// key from the embedded `jwks` claim.
+    ///
+    /// Returns `Err` on any of:
+    ///   - DiscoveryService RPC failure
+    ///   - No entity statement cached for the issuer
+    ///   - JWT structurally invalid
+    ///   - No Ed25519 key in the embedded JWKS
+    ///
+    /// The caller treats `Err` as "fall through to HTTPS" — never as
+    /// "trust failure" — so a Discovery miss is operationally benign.
+    async fn try_get_key_from_discovery(
+        &self,
+        dc: &DiscoveryClient,
+        issuer: &str,
+    ) -> Result<VerifyingKey> {
+        let stmt = dc
+            .get_entity_statement(issuer)
+            .await
+            .map_err(|e| anyhow!("DiscoveryService.getEntityStatement RPC failed: {}", e))?;
+
+        if stmt.jwt.is_empty() {
+            anyhow::bail!("DiscoveryService returned empty entity statement JWT");
+        }
+
+        // Decode JWT payload (header.payload.signature) — we extract `jwks`
+        // and find an Ed25519 key. Signature verification of this entity
+        // statement against trust anchors is deferred to a follow-up commit
+        // (Phase 0.5 Decision 4); for now we treat DiscoveryService as a
+        // trusted intra-bus delivery channel.
+        let parts: Vec<&str> = stmt.jwt.split('.').collect();
+        if parts.len() != 3 {
+            anyhow::bail!("entity statement JWT not in 3-part compact form");
+        }
+        let payload_bytes = URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .map_err(|e| anyhow!("entity statement JWT payload not base64url: {}", e))?;
+        let claims: serde_json::Value = serde_json::from_slice(&payload_bytes)
+            .map_err(|e| anyhow!("entity statement JWT payload not JSON: {}", e))?;
+
+        // OIDF places the JWKS at `jwks.keys`. Some emitters use the
+        // `metadata.openid_provider.jwks_uri` path instead; the simple
+        // first-cut here looks for the embedded keyset.
+        let keys = claims
+            .get("jwks")
+            .and_then(|j| j.get("keys"))
+            .and_then(|k| k.as_array())
+            .ok_or_else(|| anyhow!("entity statement missing jwks.keys"))?;
+
+        for key in keys {
+            if key.get("kty").and_then(|v| v.as_str()) == Some("OKP")
+                && key.get("crv").and_then(|v| v.as_str()) == Some("Ed25519")
+            {
+                let x = key
+                    .get("x")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("OKP key missing 'x'"))?;
+                let raw = URL_SAFE_NO_PAD
+                    .decode(x)
+                    .map_err(|e| anyhow!("Ed25519 'x' not base64url: {}", e))?;
+                let bytes: [u8; 32] = raw
+                    .try_into()
+                    .map_err(|_| anyhow!("Ed25519 key not 32 bytes"))?;
+                let vk = VerifyingKey::from_bytes(&bytes)
+                    .map_err(|e| anyhow!("invalid Ed25519 key bytes: {}", e))?;
+                tracing::debug!(
+                    issuer = %issuer,
+                    "Resolved Ed25519 key from DiscoveryService entity statement"
+                );
+                return Ok(vk);
+            }
+        }
+
+        anyhow::bail!("entity statement JWKS contains no Ed25519 key")
     }
 
     /// Validate that `url` uses HTTPS (or HTTP when explicitly permitted).
