@@ -33,11 +33,25 @@ use super::state::OAuthState;
 pub async fn entity_configuration(
     State(state): State<Arc<OAuthState>>,
 ) -> Response {
+    match build_entity_configuration_jwt(&state).await {
+        Ok(jwt) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/entity-statement+jwt")],
+            jwt,
+        ).into_response(),
+        Err(reason) => (StatusCode::SERVICE_UNAVAILABLE, reason).into_response(),
+    }
+}
+
+/// Build the signed OpenID Federation 1.0 entity-configuration JWT for
+/// this AS, suitable for serving at `/.well-known/openid-federation` OR
+/// publishing to DiscoveryService.
+///
+/// Factored out of the HTTP handler so Phase 0.5 Stage D
+/// (`publish_entity_statement_to_discovery`) can reuse it.
+pub async fn build_entity_configuration_jwt(state: &OAuthState) -> Result<String, &'static str> {
     let Some(ref sk) = state.signing_key else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "signing key not configured for OpenID Federation",
-        ).into_response();
+        return Err("signing key not configured for OpenID Federation");
     };
     let vk = sk.verifying_key();
 
@@ -109,19 +123,55 @@ pub async fn entity_configuration(
         }
     }
 
-    let jwt = build_entity_configuration_with_keys(
+    Ok(build_entity_configuration_with_keys(
         issuer,
         sk,
         jwks_keys,
         as_metadata,
         &state.authority_hints,
-    );
+    ))
+}
 
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/entity-statement+jwt")],
+/// Phase 0.5 Stage D — publish this AS's signed entity statement to the
+/// federation directory (DiscoveryService).
+///
+/// Once published, federation peers in the cluster can resolve this
+/// issuer's JWKS via `DiscoveryClient.get_entity_statement(issuer)` —
+/// no HTTPS round-trip required. The entity statement carries an `exp`
+/// (24h); callers should re-publish after each signing-key rotation so
+/// the embedded JWKS stays fresh.
+///
+/// Logs success/failure at debug level. Discovery push failures are
+/// **non-fatal**: the OAuth server continues to serve the entity
+/// statement at `/.well-known/openid-federation` and consumers can fall
+/// back to HTTPS resolution.
+pub async fn publish_entity_statement_to_discovery(state: Arc<OAuthState>) {
+    let jwt = match build_entity_configuration_jwt(&state).await {
+        Ok(j) => j,
+        Err(reason) => {
+            tracing::debug!(
+                reason = %reason,
+                "Skipping DiscoveryService entity-statement publish"
+            );
+            return;
+        }
+    };
+
+    let req = crate::services::generated::discovery_client::RegisterEntityStatementRequest {
+        issuer: state.issuer_url.clone(),
         jwt,
-    ).into_response()
+    };
+    match state.discovery_client.register_entity_statement(&req).await {
+        Ok(_) => tracing::info!(
+            issuer = %state.issuer_url,
+            "Published OIDF entity statement to DiscoveryService"
+        ),
+        Err(e) => tracing::warn!(
+            issuer = %state.issuer_url,
+            error = %e,
+            "Failed to publish entity statement to DiscoveryService (non-fatal — HTTPS fallback still works)"
+        ),
+    }
 }
 
 /// Build and sign an OpenID Federation 1.0 entity configuration JWT.

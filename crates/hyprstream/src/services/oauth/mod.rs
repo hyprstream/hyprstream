@@ -595,6 +595,16 @@ impl Spawnable for OAuthService {
             let state = Arc::new(oauth_state);
             state.spawn_code_sweeper();
 
+            // Phase 0.5 Stage D — publish OIDF entity statement to DiscoveryService
+            // so federation peers can resolve our JWKS over ZMQ without HTTPS.
+            // Non-fatal on failure; HTTPS fallback continues to work.
+            {
+                let publish_state = state.clone();
+                tokio::task::spawn_local(async move {
+                    federation_entity::publish_entity_statement_to_discovery(publish_state).await;
+                });
+            }
+
             // Create router with configurable CORS
             let app = create_app(state.clone(), &self.config.cors);
 
