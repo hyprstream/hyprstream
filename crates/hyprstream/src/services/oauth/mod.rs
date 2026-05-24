@@ -596,12 +596,29 @@ impl Spawnable for OAuthService {
             state.spawn_code_sweeper();
 
             // Phase 0.5 Stage D — publish OIDF entity statement to DiscoveryService
-            // so federation peers can resolve our JWKS over ZMQ without HTTPS.
-            // Non-fatal on failure; HTTPS fallback continues to work.
+            // at startup AND periodically thereafter. Periodic re-publish keeps
+            // the cached statement fresh as signing keys rotate and the embedded
+            // JWKS changes; entity statements carry a 24h exp so any longer gap
+            // leaves federation peers falling through to HTTPS unnecessarily.
+            //
+            // Non-fatal on failure: HTTPS fallback continues to work either way.
             {
                 let publish_state = state.clone();
+                // Re-publish at 1/4 of the entity-statement exp (24h) so we
+                // refresh the cached statement well before consumers reject it
+                // as expired. Concretely: every 6h. Initial publish happens
+                // immediately on the first iteration of the loop.
+                let republish_interval = std::time::Duration::from_secs(6 * 3600);
                 tokio::task::spawn_local(async move {
-                    federation_entity::publish_entity_statement_to_discovery(publish_state).await;
+                    let mut tick = tokio::time::interval(republish_interval);
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tick.tick().await;
+                        federation_entity::publish_entity_statement_to_discovery(
+                            publish_state.clone(),
+                        )
+                        .await;
+                    }
                 });
             }
 

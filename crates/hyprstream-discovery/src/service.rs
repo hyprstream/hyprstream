@@ -692,9 +692,20 @@ impl DiscoveryHandler for DiscoveryService {
 
     async fn handle_list_known_issuers(
         &self,
-        _ctx: &EnvelopeContext,
+        ctx: &EnvelopeContext,
         _request_id: u64,
     ) -> Result<DiscoveryResponseVariant> {
+        // Federation topology leak — require authentication. Per
+        // Phase 0.5 plan Q10: getEntityStatement/getEnvelopeKeyset are
+        // anonymous-readable (public artifacts), but listKnownIssuers
+        // enumerates which partners we trust, which is operator-sensitive.
+        if let Err(e) = self.authorize(ctx, "discovery:federation", "list-known-issuers").await {
+            return Ok(DiscoveryResponseVariant::Error(ErrorInfo {
+                message: format!("unauthorized: {}", e),
+                code: "UNAUTHORIZED".to_owned(),
+                details: String::new(),
+            }));
+        }
         let map = self.entity_statements.read();
         let issuers: Vec<String> = map.keys().cloned().collect();
         Ok(DiscoveryResponseVariant::ListKnownIssuersResult(IssuerList { issuers }))
