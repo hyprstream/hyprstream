@@ -274,6 +274,12 @@ pub struct OAuthState {
     /// fetched + verified once, then cached respecting HTTP cache
     /// headers, bounded TTL and capacity. See `cimd_cache` module.
     pub cimd_cache: Arc<super::cimd_cache::CimdCache>,
+    /// JWKS-URI fetch cache for `private_key_jwt` client auth. Keyed by
+    /// the absolute URL; value is `(parsed_jwks_json, fetched_at)`.
+    /// Entries expire after `JWKS_URI_TTL` and are evicted lazily on
+    /// read. Capacity is implicitly bounded by the number of registered
+    /// clients with jwks_uri (typically small).
+    pub jwks_uri_cache: RwLock<HashMap<String, (serde_json::Value, Instant)>>,
     /// Pending authorization codes (single-use, 60s TTL)
     pub pending_codes: RwLock<HashMap<String, PendingAuthCode>>,
     /// Pending authorize nonces (single-use, 5-min TTL).
@@ -369,6 +375,7 @@ impl OAuthState {
             cimd_cache: Arc::new(super::cimd_cache::CimdCache::new(
                 super::cimd_cache::CimdCacheConfig::default(),
             )),
+            jwks_uri_cache: RwLock::new(HashMap::new()),
             pending_codes: RwLock::new(HashMap::new()),
             pending_nonces: RwLock::new(HashMap::new()),
             pending_par_requests: RwLock::new(HashMap::new()),

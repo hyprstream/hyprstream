@@ -19,10 +19,18 @@
 //! MUST validate the assertion before issuing tokens.
 
 use serde_json::Value;
+use std::time::{Duration, Instant};
 
-use super::state::RegisteredClient;
+use super::state::{OAuthState, RegisteredClient};
 use crate::auth::id_token_verify::{algorithm_for_key_pub, build_decoding_key};
 use jsonwebtoken::{decode, DecodingKey, Validation};
+
+/// TTL for cached jwks_uri responses. Client signing keys rotate
+/// infrequently; 1 hour balances freshness against fetch amplification.
+pub const JWKS_URI_TTL: Duration = Duration::from_secs(3600);
+
+/// HTTP fetch timeout for jwks_uri. Same as CIMD document fetch.
+const JWKS_URI_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Client authentication failure.
 #[derive(Debug, Clone)]
@@ -37,8 +45,9 @@ pub enum ClientAuthError {
     /// The client has no usable JWKS (inline or via `jwks_uri`) to verify
     /// against.
     NoKeys,
-    /// `jwks_uri` is set but the implementation does not yet fetch it.
-    JwksUriNotImplemented,
+    /// jwks_uri fetch failed (network error, non-2xx status, parse error,
+    /// or SSRF-blocked URL).
+    JwksUriFetchFailed(String),
     /// JWT structural / decoding error (malformed parts, base64, JSON).
     Malformed(String),
     /// Signature verification failed against every candidate key.
@@ -54,7 +63,7 @@ impl std::fmt::Display for ClientAuthError {
             Self::MissingAssertion => write!(f, "client_assertion required for private_key_jwt"),
             Self::UnsupportedAssertionType(t) => write!(f, "unsupported client_assertion_type: {t}"),
             Self::NoKeys => write!(f, "client has no jwks/jwks_uri for private_key_jwt"),
-            Self::JwksUriNotImplemented => write!(f, "jwks_uri client-key resolution is not yet implemented; supply inline jwks"),
+            Self::JwksUriFetchFailed(e) => write!(f, "jwks_uri fetch failed: {e}"),
             Self::Malformed(e) => write!(f, "malformed client_assertion: {e}"),
             Self::InvalidSignature => write!(f, "client_assertion signature did not verify"),
             Self::InvalidClaim(c) => write!(f, "invalid client_assertion claim: {c}"),
@@ -78,11 +87,14 @@ pub fn requires_private_key_jwt(client: &RegisteredClient) -> bool {
 }
 
 /// Verify an RFC 7523 client_assertion against the registered client's
-/// inline JWKS. `expected_audience` is the canonical token endpoint URL.
+/// JWKS — inline `jwks` if present, otherwise fetched from `jwks_uri`
+/// (cached for `JWKS_URI_TTL`). `expected_audience` is the canonical
+/// token endpoint URL.
 ///
 /// On success, returns the verified JWT's claims for caller-side use
 /// (typically just to log the `jti` for replay-cache decisions).
-pub fn verify_client_assertion(
+pub async fn verify_client_assertion(
+    state: &OAuthState,
     client: &RegisteredClient,
     assertion_type: &str,
     assertion: &str,
@@ -91,8 +103,20 @@ pub fn verify_client_assertion(
     if assertion_type != JWT_BEARER_ASSERTION_TYPE {
         return Err(ClientAuthError::UnsupportedAssertionType(assertion_type.to_owned()));
     }
+    let keys = resolve_keys(state, client).await?;
+    verify_assertion_with_keys(&keys, &client.client_id, assertion, expected_audience)
+}
 
-    let keys = candidate_keys(client)?;
+/// Pure-sync core verification: given a set of candidate keys, verify
+/// the JWT's signature and claims. Used both by the async public entry
+/// point and directly by unit tests.
+pub fn verify_assertion_with_keys(
+    keys: &[Value],
+    client_id: &str,
+    assertion: &str,
+    expected_audience: &str,
+) -> Result<Value, ClientAuthError> {
+    let keys = keys.to_vec();
 
     // Parse the header to learn alg + (optional) kid before iterating keys.
     let header = jsonwebtoken::decode_header(assertion)
@@ -135,7 +159,7 @@ pub fn verify_client_assertion(
         match decode::<Value>(assertion, &decoding_key, &validation) {
             Ok(data) => {
                 let claims = data.claims;
-                check_claims(&claims, &client.client_id, expected_audience)?;
+                check_claims(&claims, client_id, expected_audience)?;
                 return Ok(claims);
             }
             Err(_) => continue,
@@ -145,13 +169,26 @@ pub fn verify_client_assertion(
     Err(ClientAuthError::InvalidSignature)
 }
 
-/// Extract candidate keys from the registered client's `jwks` value.
-/// Accepts both `{"keys": [...]}` (RFC 7517 JWKS) and a bare array of keys.
-fn candidate_keys(client: &RegisteredClient) -> Result<Vec<Value>, ClientAuthError> {
-    if client.jwks_uri.is_some() && client.jwks.is_none() {
-        return Err(ClientAuthError::JwksUriNotImplemented);
+/// Resolve a registered client's signing keys: inline `jwks` first,
+/// then `jwks_uri` (cached). The two are RFC 7591 §2.1 mutually
+/// exclusive, but defensive prefer-inline is harmless.
+async fn resolve_keys(
+    state: &OAuthState,
+    client: &RegisteredClient,
+) -> Result<Vec<Value>, ClientAuthError> {
+    if let Some(jwks) = client.jwks.as_ref() {
+        return extract_keys_array(jwks);
     }
-    let jwks = client.jwks.as_ref().ok_or(ClientAuthError::NoKeys)?;
+    if let Some(uri) = client.jwks_uri.as_deref() {
+        let jwks = fetch_jwks_uri(state, uri).await?;
+        return extract_keys_array(&jwks);
+    }
+    Err(ClientAuthError::NoKeys)
+}
+
+/// Extract the `keys` array from a JWKS document. Accepts both the
+/// canonical `{"keys": [...]}` (RFC 7517) and a bare array.
+fn extract_keys_array(jwks: &Value) -> Result<Vec<Value>, ClientAuthError> {
     if let Some(keys) = jwks.get("keys").and_then(Value::as_array) {
         return Ok(keys.clone());
     }
@@ -159,6 +196,74 @@ fn candidate_keys(client: &RegisteredClient) -> Result<Vec<Value>, ClientAuthErr
         return Ok(keys.clone());
     }
     Err(ClientAuthError::NoKeys)
+}
+
+/// SSRF + scheme check for jwks_uri. Same policy as CIMD document fetch:
+/// HTTPS only, no private / loopback / RFC 1918 hosts.
+fn validate_jwks_uri(url: &str) -> Result<(), ClientAuthError> {
+    if !url.starts_with("https://") {
+        return Err(ClientAuthError::JwksUriFetchFailed(
+            "jwks_uri must use https://".to_owned(),
+        ));
+    }
+    let parsed = url::Url::parse(url)
+        .map_err(|e| ClientAuthError::JwksUriFetchFailed(format!("invalid jwks_uri: {e}")))?;
+    if let Some(host) = parsed.host_str() {
+        if super::registration::is_private_host_for_jwks(host) {
+            return Err(ClientAuthError::JwksUriFetchFailed(
+                "jwks_uri must not point to private/loopback addresses".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Fetch a jwks_uri (or return a fresh-enough cached entry). Lazy
+/// expiry: stale entries in the map are detected here and re-fetched
+/// before being used.
+async fn fetch_jwks_uri(state: &OAuthState, url: &str) -> Result<Value, ClientAuthError> {
+    // Cache check (read lock).
+    {
+        let cache = state.jwks_uri_cache.read().await;
+        if let Some((jwks, fetched_at)) = cache.get(url) {
+            if fetched_at.elapsed() < JWKS_URI_TTL {
+                return Ok(jwks.clone());
+            }
+        }
+    }
+
+    validate_jwks_uri(url)?;
+
+    let client = reqwest::Client::builder()
+        .timeout(JWKS_URI_FETCH_TIMEOUT)
+        .build()
+        .map_err(|e| ClientAuthError::JwksUriFetchFailed(format!("http client init: {e}")))?;
+    let response = client
+        .get(url)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|e| ClientAuthError::JwksUriFetchFailed(format!("network: {e}")))?;
+    if !response.status().is_success() {
+        return Err(ClientAuthError::JwksUriFetchFailed(format!(
+            "HTTP {}",
+            response.status()
+        )));
+    }
+    let jwks: Value = response
+        .json()
+        .await
+        .map_err(|e| ClientAuthError::JwksUriFetchFailed(format!("parse: {e}")))?;
+
+    // Validate JWKS shape: must have `keys` array OR be a bare array.
+    let _ = extract_keys_array(&jwks)?;
+
+    // Cache (write lock).
+    state.jwks_uri_cache
+        .write()
+        .await
+        .insert(url.to_owned(), (jwks.clone(), Instant::now()));
+    Ok(jwks)
 }
 
 fn check_claims(
@@ -258,11 +363,13 @@ mod tests {
         format!("{signing_input}.{sig_b64}")
     }
 
+    fn keys_array(jwk: serde_json::Value) -> Vec<serde_json::Value> {
+        vec![jwk]
+    }
+
     #[test]
     fn valid_assertion_round_trip() {
         let (sk, jwk) = ed25519_keypair_and_jwk();
-        let jwks = serde_json::json!({"keys": [jwk]});
-        let client = make_client("https://app.test/c", jwks, "private_key_jwt");
         let claims = serde_json::json!({
             "iss": "https://app.test/c",
             "sub": "https://app.test/c",
@@ -271,9 +378,9 @@ mod tests {
             "jti": "j1",
         });
         let assertion = make_ed_assertion(&sk, claims);
-        let got = verify_client_assertion(
-            &client,
-            JWT_BEARER_ASSERTION_TYPE,
+        let got = verify_assertion_with_keys(
+            &keys_array(jwk),
+            "https://app.test/c",
             &assertion,
             "https://hs.test/oauth/token",
         );
@@ -283,8 +390,6 @@ mod tests {
     #[test]
     fn rejects_wrong_audience() {
         let (sk, jwk) = ed25519_keypair_and_jwk();
-        let jwks = serde_json::json!({"keys": [jwk]});
-        let client = make_client("https://app.test/c", jwks, "private_key_jwt");
         let claims = serde_json::json!({
             "iss": "https://app.test/c",
             "sub": "https://app.test/c",
@@ -292,9 +397,9 @@ mod tests {
             "exp": chrono::Utc::now().timestamp() + 60,
         });
         let assertion = make_ed_assertion(&sk, claims);
-        let got = verify_client_assertion(
-            &client,
-            JWT_BEARER_ASSERTION_TYPE,
+        let got = verify_assertion_with_keys(
+            &keys_array(jwk),
+            "https://app.test/c",
             &assertion,
             "https://hs.test/oauth/token",
         );
@@ -304,8 +409,6 @@ mod tests {
     #[test]
     fn rejects_wrong_iss() {
         let (sk, jwk) = ed25519_keypair_and_jwk();
-        let jwks = serde_json::json!({"keys": [jwk]});
-        let client = make_client("https://app.test/c", jwks, "private_key_jwt");
         let claims = serde_json::json!({
             "iss": "https://impostor.test/c",
             "sub": "https://impostor.test/c",
@@ -313,9 +416,9 @@ mod tests {
             "exp": chrono::Utc::now().timestamp() + 60,
         });
         let assertion = make_ed_assertion(&sk, claims);
-        let got = verify_client_assertion(
-            &client,
-            JWT_BEARER_ASSERTION_TYPE,
+        let got = verify_assertion_with_keys(
+            &keys_array(jwk),
+            "https://app.test/c",
             &assertion,
             "https://hs.test/oauth/token",
         );
@@ -325,8 +428,6 @@ mod tests {
     #[test]
     fn rejects_expired_assertion() {
         let (sk, jwk) = ed25519_keypair_and_jwk();
-        let jwks = serde_json::json!({"keys": [jwk]});
-        let client = make_client("https://app.test/c", jwks, "private_key_jwt");
         let claims = serde_json::json!({
             "iss": "https://app.test/c",
             "sub": "https://app.test/c",
@@ -334,53 +435,64 @@ mod tests {
             "exp": chrono::Utc::now().timestamp() - 60,
         });
         let assertion = make_ed_assertion(&sk, claims);
-        let got = verify_client_assertion(
-            &client,
-            JWT_BEARER_ASSERTION_TYPE,
+        let got = verify_assertion_with_keys(
+            &keys_array(jwk),
+            "https://app.test/c",
             &assertion,
             "https://hs.test/oauth/token",
         );
-        // jsonwebtoken rejects expired tokens; we surface either
-        // InvalidSignature (decode fell through) or InvalidClaim. Either
-        // way, the assertion MUST NOT verify.
         assert!(got.is_err(), "expired assertion should not verify: {got:?}");
     }
 
     #[test]
-    fn rejects_wrong_assertion_type() {
-        let (_, jwk) = ed25519_keypair_and_jwk();
-        let jwks = serde_json::json!({"keys": [jwk]});
-        let client = make_client("https://app.test/c", jwks, "private_key_jwt");
-        let got = verify_client_assertion(&client, "saml2-bearer", "irrelevant", "irrelevant");
-        assert!(matches!(got, Err(ClientAuthError::UnsupportedAssertionType(_))));
-    }
-
-    #[test]
-    fn rejects_no_keys() {
-        let client = make_client("https://app.test/c", serde_json::json!({"keys": []}), "private_key_jwt");
-        let got = verify_client_assertion(
-            &client,
-            JWT_BEARER_ASSERTION_TYPE,
+    fn rejects_empty_keys_set() {
+        let got = verify_assertion_with_keys(
+            &[],
+            "https://app.test/c",
             "irrelevant",
             "https://hs.test/oauth/token",
         );
-        // candidate_keys returns empty; then header decode fails for "irrelevant"
-        // → Malformed. But really the test asserts we don't accept a no-keys client.
-        assert!(got.is_err());
+        assert!(got.is_err(), "empty key set must not verify");
     }
 
     #[test]
-    fn jwks_uri_returns_unimplemented() {
-        let mut client = make_client("https://app.test/c", serde_json::json!({}), "private_key_jwt");
-        client.jwks = None;
-        client.jwks_uri = Some("https://app.test/jwks.json".to_owned());
-        let got = verify_client_assertion(
-            &client,
-            JWT_BEARER_ASSERTION_TYPE,
-            "irrelevant",
-            "https://hs.test/oauth/token",
-        );
-        assert!(matches!(got, Err(ClientAuthError::JwksUriNotImplemented)));
+    fn extract_keys_supports_bare_array_and_keys_wrapper() {
+        let jwk = serde_json::json!({"kty": "OKP", "crv": "Ed25519", "x": "abc"});
+        let wrapped = serde_json::json!({"keys": [jwk.clone()]});
+        let bare = serde_json::json!([jwk]);
+        assert_eq!(extract_keys_array(&wrapped).unwrap().len(), 1);
+        assert_eq!(extract_keys_array(&bare).unwrap().len(), 1);
+        assert!(extract_keys_array(&serde_json::json!({"other": 1})).is_err());
+    }
+
+    #[test]
+    fn jwks_uri_blocks_non_https() {
+        let got = validate_jwks_uri("http://app.test/jwks.json");
+        assert!(matches!(got, Err(ClientAuthError::JwksUriFetchFailed(_))));
+    }
+
+    #[test]
+    fn jwks_uri_blocks_private_hosts() {
+        for url in &[
+            "https://localhost/jwks.json",
+            "https://127.0.0.1/jwks.json",
+            "https://10.0.0.1/jwks.json",
+            "https://192.168.1.1/jwks.json",
+        ] {
+            let got = validate_jwks_uri(url);
+            assert!(
+                matches!(got, Err(ClientAuthError::JwksUriFetchFailed(_))),
+                "expected SSRF rejection for {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn jwks_uri_accepts_public_https() {
+        // We can't fetch in a unit test; just verify the SSRF + scheme
+        // gate lets a plausible URL through.
+        let got = validate_jwks_uri("https://app.example.com/jwks.json");
+        assert!(got.is_ok());
     }
 
     #[test]

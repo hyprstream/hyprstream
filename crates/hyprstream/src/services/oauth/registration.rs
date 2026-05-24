@@ -311,6 +311,12 @@ pub(crate) fn is_loopback_uri(uri: &str) -> bool {
     }
 }
 
+/// Public re-export of `is_private_host` for sibling modules
+/// (client_auth) that need the same SSRF policy for fetches.
+pub(crate) fn is_private_host_for_jwks(host: &str) -> bool {
+    is_private_host(host)
+}
+
 /// Check if a hostname resolves to a private/loopback address.
 fn is_private_host(host: &str) -> bool {
     matches!(

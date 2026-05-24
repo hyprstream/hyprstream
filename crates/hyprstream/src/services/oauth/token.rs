@@ -204,8 +204,8 @@ async fn enforce_client_authentication(
             state.issuer_url.trim_end_matches('/')
         );
         if let Err(e) = super::client_auth::verify_client_assertion(
-            &client, atype, assertion, &token_endpoint,
-        ) {
+            state, &client, atype, assertion, &token_endpoint,
+        ).await {
             tracing::warn!(
                 client_id = %params.client_id,
                 error = %e,
