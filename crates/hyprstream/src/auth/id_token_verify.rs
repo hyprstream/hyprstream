@@ -172,6 +172,11 @@ fn determine_algorithm(jwks_key: &Value, header: &Value) -> Result<Algorithm> {
     }
 
     // Infer from JWKS key type
+    algorithm_for_key_pub(jwks_key)
+}
+
+/// Public alias for the algorithm-from-JWK helper. Used by client_auth.
+pub fn algorithm_for_key_pub(jwks_key: &Value) -> Result<Algorithm> {
     let kty = jwks_key.get("kty").and_then(|v| v.as_str()).unwrap_or("");
     match kty {
         "RSA" => Ok(Algorithm::RS256),
@@ -194,7 +199,7 @@ fn determine_algorithm(jwks_key: &Value, header: &Value) -> Result<Algorithm> {
 }
 
 /// Build a jsonwebtoken::DecodingKey from a JWKS key object.
-fn build_decoding_key(jwks_key: &Value) -> Result<DecodingKey> {
+pub fn build_decoding_key(jwks_key: &Value) -> Result<DecodingKey> {
     let kty = jwks_key.get("kty").and_then(|v| v.as_str()).unwrap_or("");
 
     match kty {

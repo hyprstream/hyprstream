@@ -55,6 +55,11 @@ pub struct TokenRequest {
     // jwt-bearer assertion (RFC 7523)
     #[serde(default)]
     pub assertion: Option<String>,
+    // private_key_jwt client auth (RFC 7521 §4.2, RFC 7523 §2.2)
+    #[serde(default)]
+    pub client_assertion: Option<String>,
+    #[serde(default)]
+    pub client_assertion_type: Option<String>,
     // token-exchange fields (RFC 8693)
     #[serde(default)]
     pub subject_token: Option<String>,
@@ -101,6 +106,16 @@ pub async fn exchange_token(
             })
         });
 
+    // Client authentication gate. For confidential clients (those that
+    // declared token_endpoint_auth_method=private_key_jwt at
+    // registration), verify the client_assertion JWT against the
+    // client's JWKS BEFORE dispatching the grant. Public clients
+    // (auth_method=none or unset) skip this — PKCE substitutes for
+    // client auth per OAuth 2.1.
+    if let Err(resp) = enforce_client_authentication(&state, &params).await {
+        return resp;
+    }
+
     match params.grant_type.as_str() {
         "authorization_code" => exchange_authorization_code(state, params, dpop_header, vault_device_cookie).await,
         "refresh_token" => exchange_refresh_token(state, params, dpop_header, vault_device_cookie).await,
@@ -137,6 +152,74 @@ pub async fn exchange_token(
             "Supported: authorization_code, refresh_token, device_code, jwt-bearer",
         ),
     }
+}
+
+/// Enforce token endpoint client authentication.
+///
+/// Resolves the registered client (DCR or CIMD-cached), then:
+///   - If the client requires `private_key_jwt`: `client_assertion` and
+///     `client_assertion_type` MUST be present and verify successfully.
+///   - If the client does NOT require it but an assertion was sent
+///     anyway: we still verify it (best-effort, defense in depth).
+///   - Unknown client_ids return invalid_client.
+///
+/// Returns Ok on success; the caller proceeds with the grant. Returns
+/// Err(Response) with the appropriate token error response on failure.
+async fn enforce_client_authentication(
+    state: &OAuthState,
+    params: &TokenRequest,
+) -> Result<(), Response> {
+    // CIMD client_ids are HTTPS URLs; DCR client_ids are UUIDs.
+    let client = if params.client_id.starts_with("https://") {
+        state.cimd_cache.get(&params.client_id).await
+    } else {
+        state.clients.read().await.get(&params.client_id).cloned()
+    };
+
+    let Some(client) = client else {
+        // Permit absence here only when the assertion-less, public-client
+        // path is valid for this grant. The downstream handler will
+        // reject unknown clients with its own error. (token_exchange and
+        // jwt-bearer grants are looked up differently — they don't need
+        // RegisteredClient at all.)
+        return Ok(());
+    };
+
+    let needs_auth = super::client_auth::requires_private_key_jwt(&client);
+    let has_assertion = params.client_assertion.is_some() && params.client_assertion_type.is_some();
+
+    if needs_auth && !has_assertion {
+        return Err(token_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_client",
+            "client_assertion required for private_key_jwt",
+        ));
+    }
+
+    if has_assertion {
+        let assertion = params.client_assertion.as_deref().unwrap_or_else(|| unreachable!());
+        let atype = params.client_assertion_type.as_deref().unwrap_or_else(|| unreachable!());
+        let token_endpoint = format!(
+            "{}/oauth/token",
+            state.issuer_url.trim_end_matches('/')
+        );
+        if let Err(e) = super::client_auth::verify_client_assertion(
+            &client, atype, assertion, &token_endpoint,
+        ) {
+            tracing::warn!(
+                client_id = %params.client_id,
+                error = %e,
+                "client_assertion verification failed"
+            );
+            return Err(token_error(
+                StatusCode::UNAUTHORIZED,
+                "invalid_client",
+                &format!("client_assertion verification failed: {e}"),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Verify a DPoP proof for the token endpoint, check JTI replay, enforce

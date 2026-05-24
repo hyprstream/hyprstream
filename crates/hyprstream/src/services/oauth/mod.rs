@@ -30,6 +30,7 @@ pub mod auth;
 pub mod authorize;
 pub mod challenge;
 pub mod cimd_cache;
+pub mod client_auth;
 pub mod device;
 pub mod did_document;
 pub mod federation_entity;
