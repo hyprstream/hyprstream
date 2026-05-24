@@ -276,7 +276,7 @@ pub struct JwksKeySource {
     /// Populated alongside `cache` during `fetch_and_cache`. Used by `kid_algs`
     /// to implement the stripping-defense policy (verifier must require all
     /// listed algs for a composite-signed kid).
-    kid_alg_map: std::sync::RwLock<HashMap<String, Vec<String>>>,
+    kid_alg_map: parking_lot::RwLock<HashMap<String, Vec<String>>>,
     fetch_semaphore: Semaphore,
     /// Soft TTL for cache refresh (keys older than this trigger background refresh)
     #[allow(dead_code)]
@@ -301,7 +301,7 @@ impl JwksKeySource {
             fetcher,
             cache: RwLock::new(HashMap::new()),
             negative_cache: RwLock::new(HashMap::new()),
-            kid_alg_map: std::sync::RwLock::new(HashMap::new()),
+            kid_alg_map: parking_lot::RwLock::new(HashMap::new()),
             fetch_semaphore: Semaphore::new(4),
             soft_ttl: std::time::Duration::from_secs(300),
             negative_ttl: std::time::Duration::from_secs(5),
@@ -377,8 +377,8 @@ impl JwksKeySource {
             // The stripping defense fires when a kid has a composite alg, so we
             // need to record those algs even though we can't verify-decode them
             // here.
-            if let (Some(ref kid), Some(alg)) = (kid.as_ref(), alg) {
-                let entry = new_kid_algs.entry(kid.clone()).or_default();
+            if let (Some(kid_str), Some(alg)) = (kid.as_ref(), alg) {
+                let entry = new_kid_algs.entry(kid_str.clone()).or_default();
                 if !entry.contains(&alg) {
                     entry.push(alg);
                 }
@@ -405,9 +405,7 @@ impl JwksKeySource {
         }
 
         // Publish the new kid→algs view atomically.
-        if let Ok(mut map) = self.kid_alg_map.write() {
-            *map = new_kid_algs;
-        }
+        *self.kid_alg_map.write() = new_kid_algs;
 
         // Clear negative cache entries for keys we now have
         let mut neg = self.negative_cache.write().await;
@@ -499,11 +497,7 @@ impl JwtKeySource for JwksKeySource {
     }
 
     fn kid_algs(&self, kid: &str) -> Vec<String> {
-        self.kid_alg_map
-            .read()
-            .ok()
-            .and_then(|m| m.get(kid).cloned())
-            .unwrap_or_default()
+        self.kid_alg_map.read().get(kid).cloned().unwrap_or_default()
     }
 }
 
