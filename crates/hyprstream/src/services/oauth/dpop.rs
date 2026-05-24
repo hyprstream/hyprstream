@@ -333,3 +333,155 @@ fn verify_es256(x: &[u8; 32], y: &[u8; 32], msg: &[u8], sig_bytes: &[u8]) -> Res
     verifying_key.verify(msg, &signature)
         .map_err(|_| DpopError::SignatureInvalid)
 }
+
+#[cfg(test)]
+mod dpop_nonce_tests {
+    //! Unit tests for the per-client nonce-enforcement bookkeeping logic.
+    //! Building a full `OAuthState` requires a live `PolicyClient` (ZMQ),
+    //! so we mirror the `HashMap<jkt, expiry>` shape used in `state.rs`
+    //! and assert the invariants the verifier relies on.
+    use std::collections::HashMap;
+    use parking_lot::Mutex;
+
+    struct NonceState {
+        nonces: Mutex<HashMap<String, i64>>,
+        clients: Mutex<HashMap<String, i64>>,
+    }
+    impl NonceState {
+        fn new() -> Self {
+            Self {
+                nonces: Mutex::new(HashMap::new()),
+                clients: Mutex::new(HashMap::new()),
+            }
+        }
+        fn issue_nonce(&self) -> String {
+            use base64::Engine as _;
+            use rand::RngCore;
+            let mut b = [0u8; 16];
+            rand::rngs::OsRng.fill_bytes(&mut b);
+            let n = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+            let exp = chrono::Utc::now().timestamp() + 300;
+            #[allow(clippy::unwrap_used)]
+            self.nonces.lock().insert(n.clone(), exp);
+            n
+        }
+        fn verify_nonce(&self, n: &str) -> bool {
+            let now = chrono::Utc::now().timestamp();
+            #[allow(clippy::unwrap_used)]
+            let g = self.nonces.lock();
+            g.get(n).is_some_and(|&e| e > now)
+        }
+        fn client_requires_nonce(&self, jkt: &str) -> bool {
+            let now = chrono::Utc::now().timestamp();
+            #[allow(clippy::unwrap_used)]
+            let mut g = self.clients.lock();
+            g.retain(|_, e| *e > now);
+            g.contains_key(jkt)
+        }
+        fn mark_nonced(&self, jkt: &str) {
+            let exp = chrono::Utc::now().timestamp() + 300;
+            #[allow(clippy::unwrap_used)]
+            self.clients.lock().insert(jkt.to_owned(), exp);
+        }
+    }
+
+    /// dpop_bootstrap_accepted_first_request:
+    /// First proof from a jkt with no nonce is accepted as a bootstrap.
+    #[test]
+    fn dpop_bootstrap_accepted_first_request() {
+        let s = NonceState::new();
+        assert!(!s.client_requires_nonce("jkt-1"));
+    }
+
+    /// dpop_subsequent_without_nonce_rejected:
+    /// After `mark_nonced`, the same jkt is required to present a nonce.
+    #[test]
+    fn dpop_subsequent_without_nonce_rejected() {
+        let s = NonceState::new();
+        let _n = s.issue_nonce();
+        s.mark_nonced("jkt-1");
+        assert!(s.client_requires_nonce("jkt-1"));
+    }
+
+    /// dpop_valid_nonce_accepted:
+    /// A presented nonce that we issued and not yet expired verifies.
+    #[test]
+    fn dpop_valid_nonce_accepted() {
+        let s = NonceState::new();
+        let n = s.issue_nonce();
+        s.mark_nonced("jkt-1");
+        assert!(s.verify_nonce(&n));
+    }
+
+    /// dpop_unknown_nonce_rejected:
+    /// A nonce we never issued is rejected.
+    #[test]
+    fn dpop_unknown_nonce_rejected() {
+        let s = NonceState::new();
+        s.mark_nonced("jkt-1");
+        assert!(!s.verify_nonce("not-a-real-nonce"));
+    }
+
+    /// dpop_jkt_isolation:
+    /// Different jkts have independent enforcement state.
+    #[test]
+    fn dpop_jkt_isolation() {
+        let s = NonceState::new();
+        s.mark_nonced("jkt-A");
+        assert!(s.client_requires_nonce("jkt-A"));
+        assert!(!s.client_requires_nonce("jkt-B"));
+    }
+}
+
+/// Regression test: take a JWT-style DPoP proof signed with a composite alg,
+/// strip the ML-DSA-65 sig half, confirm `verify_dpop_proof` rejects.
+#[cfg(all(test, feature = "pq-hybrid"))]
+mod dpop_stripping_tests {
+    use super::*;
+    use base64::Engine as _;
+    use ed25519_dalek::Signer as _;
+
+    #[test]
+    fn dpop_composite_stripped_signature_rejected() {
+        let (ml_sk, ml_vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+        let ml_vk_bytes = hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&ml_vk);
+        let ed_sk = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let ed_vk_bytes = ed_sk.verifying_key().to_bytes();
+        let mut composite_pub = Vec::with_capacity(ml_vk_bytes.len() + 32);
+        composite_pub.extend_from_slice(&ml_vk_bytes);
+        composite_pub.extend_from_slice(&ed_vk_bytes);
+        let pub_b64 = URL_SAFE_NO_PAD.encode(&composite_pub);
+
+        let header = serde_json::json!({
+            "typ": "dpop+jwt",
+            "alg": "ML-DSA-65-Ed25519",
+            "jwk": { "kty": "AKP", "alg": "ML-DSA-65-Ed25519", "pub": pub_b64 },
+        });
+        let now = chrono::Utc::now().timestamp();
+        let payload = serde_json::json!({
+            "jti": "test-jti-1",
+            "htm": "POST",
+            "htu": "https://example.test/oauth/token",
+            "iat": now,
+        });
+        let h_b64 = URL_SAFE_NO_PAD.encode(header.to_string());
+        let p_b64 = URL_SAFE_NO_PAD.encode(payload.to_string());
+        let signing_input = format!("{h_b64}.{p_b64}");
+        let ml_sig = hyprstream_rpc::crypto::pq::ml_dsa_sign(&ml_sk, signing_input.as_bytes());
+        let ed_sig = ed_sk.sign(signing_input.as_bytes());
+
+        // Properly composed composite proof verifies.
+        let mut composite = Vec::with_capacity(ml_sig.len() + 64);
+        composite.extend_from_slice(&ml_sig);
+        composite.extend_from_slice(&ed_sig.to_bytes());
+        let good = format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(&composite));
+        assert!(verify_dpop_proof(&good, "POST", "https://example.test/oauth/token", None).is_ok());
+
+        // Stripped: only Ed25519 half (64 bytes) — composite-alg verifier
+        // requires 3309 + 64 bytes. Stripping must fail.
+        let stripped = format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(ed_sig.to_bytes()));
+        let err = verify_dpop_proof(&stripped, "POST", "https://example.test/oauth/token", None).err();
+        assert!(matches!(err, Some(DpopError::SignatureInvalid)),
+            "expected SignatureInvalid, got {err:?}");
+    }
+}
