@@ -94,11 +94,36 @@ fn extract_rsa_jwk_from_der(pkcs8_der: &[u8], kid: &str) -> Option<serde_json::V
 }
 
 /// A dynamically registered OAuth client (RFC 7591) or Client ID Metadata Document client.
+///
+/// Field set tracks
+/// [draft-ietf-oauth-client-id-metadata-document-00] §4 (Client Metadata
+/// Document) and [RFC 7591] §2 (Client Metadata): only the fields hyprstream
+/// actually consumes are kept; unknown fields in the source document are
+/// dropped at parse time.
 #[derive(Debug, Clone)]
 pub struct RegisteredClient {
     pub client_id: String,
     pub redirect_uris: Vec<String>,
     pub client_name: Option<String>,
+    /// Homepage / informational URI. Shown on the consent screen.
+    pub client_uri: Option<String>,
+    /// Logo URL. Shown on the consent screen.
+    pub logo_uri: Option<String>,
+    /// Grant types this client is permitted to use. Empty = AS default
+    /// (`authorization_code` + `refresh_token`).
+    pub grant_types: Vec<String>,
+    /// Response types this client is permitted to request. Empty = `code`.
+    pub response_types: Vec<String>,
+    /// Token endpoint client auth method. `"none"` = public client (PKCE
+    /// is mandatory). `"private_key_jwt"` requires a non-empty `jwks` /
+    /// `jwks_uri`.
+    pub token_endpoint_auth_method: Option<String>,
+    /// Inlined JWKS (CIMD §4 / RFC 7591 §2). Mutually exclusive with
+    /// `jwks_uri` per RFC 7591. Used for `private_key_jwt` client auth and
+    /// future request-object signing.
+    pub jwks: Option<serde_json::Value>,
+    /// JWKS endpoint URL — alternative to inline `jwks`.
+    pub jwks_uri: Option<String>,
     /// True if this client was registered via Client ID Metadata Document (HTTPS URL client_id)
     pub is_cimd: bool,
     pub registered_at: Instant,

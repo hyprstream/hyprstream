@@ -17,21 +17,52 @@ use std::time::Instant;
 
 use super::state::{OAuthState, RegisteredClient};
 
-/// Dynamic client registration request (RFC 7591)
+/// Dynamic client registration request (RFC 7591 §3.1).
+///
+/// Only the fields hyprstream actually honors are deserialized; unknown
+/// fields are dropped per RFC 7591 §2 ("server MAY ignore them").
 #[derive(Debug, Deserialize)]
 pub struct RegistrationRequest {
     pub redirect_uris: Vec<String>,
     #[serde(default)]
     pub client_name: Option<String>,
+    #[serde(default)]
+    pub client_uri: Option<String>,
+    #[serde(default)]
+    pub logo_uri: Option<String>,
+    #[serde(default)]
+    pub grant_types: Vec<String>,
+    #[serde(default)]
+    pub response_types: Vec<String>,
+    #[serde(default)]
+    pub token_endpoint_auth_method: Option<String>,
+    #[serde(default)]
+    pub jwks: Option<serde_json::Value>,
+    #[serde(default)]
+    pub jwks_uri: Option<String>,
 }
 
-/// Dynamic client registration response
+/// Dynamic client registration response (RFC 7591 §3.2.1).
 #[derive(Debug, Serialize)]
 pub struct RegistrationResponse {
     pub client_id: String,
     pub redirect_uris: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logo_uri: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub grant_types: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub response_types: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint_auth_method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jwks: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jwks_uri: Option<String>,
 }
 
 /// POST /oauth/register — Dynamic Client Registration (RFC 7591)
@@ -62,12 +93,43 @@ pub async fn register_client(
         ).into_response();
     }
 
+    // RFC 7591 §2.1: jwks and jwks_uri are mutually exclusive.
+    if req.jwks.is_some() && req.jwks_uri.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_client_metadata",
+                "error_description": "jwks and jwks_uri are mutually exclusive (RFC 7591 §2.1)"
+            })),
+        ).into_response();
+    }
+
+    // If token_endpoint_auth_method requires a key, enforce key presence.
+    if matches!(req.token_endpoint_auth_method.as_deref(), Some("private_key_jwt"))
+        && req.jwks.is_none() && req.jwks_uri.is_none()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_client_metadata",
+                "error_description": "private_key_jwt requires jwks or jwks_uri"
+            })),
+        ).into_response();
+    }
+
     let client_id = uuid::Uuid::new_v4().to_string();
 
     let client = RegisteredClient {
         client_id: client_id.clone(),
         redirect_uris: req.redirect_uris.clone(),
         client_name: req.client_name.clone(),
+        client_uri: req.client_uri.clone(),
+        logo_uri: req.logo_uri.clone(),
+        grant_types: req.grant_types.clone(),
+        response_types: req.response_types.clone(),
+        token_endpoint_auth_method: req.token_endpoint_auth_method.clone(),
+        jwks: req.jwks.clone(),
+        jwks_uri: req.jwks_uri.clone(),
         is_cimd: false,
         registered_at: Instant::now(),
     };
@@ -78,16 +140,37 @@ pub async fn register_client(
         client_id,
         redirect_uris: req.redirect_uris,
         client_name: req.client_name,
+        client_uri: req.client_uri,
+        logo_uri: req.logo_uri,
+        grant_types: req.grant_types,
+        response_types: req.response_types,
+        token_endpoint_auth_method: req.token_endpoint_auth_method,
+        jwks: req.jwks,
+        jwks_uri: req.jwks_uri,
     }).into_response()
 }
 
-/// Client ID Metadata Document (draft-ietf-oauth-client-id-metadata-document-00)
+/// Client ID Metadata Document (draft-ietf-oauth-client-id-metadata-document-00 §4).
 #[derive(Debug, Deserialize)]
 pub struct ClientIdMetadataDocument {
     pub client_id: String,
     pub redirect_uris: Vec<String>,
     #[serde(default)]
     pub client_name: Option<String>,
+    #[serde(default)]
+    pub client_uri: Option<String>,
+    #[serde(default)]
+    pub logo_uri: Option<String>,
+    #[serde(default)]
+    pub grant_types: Vec<String>,
+    #[serde(default)]
+    pub response_types: Vec<String>,
+    #[serde(default)]
+    pub token_endpoint_auth_method: Option<String>,
+    #[serde(default)]
+    pub jwks: Option<serde_json::Value>,
+    #[serde(default)]
+    pub jwks_uri: Option<String>,
 }
 
 /// Fetch and validate a Client ID Metadata Document from an HTTPS URL.
@@ -142,10 +225,28 @@ pub async fn fetch_client_metadata(
         return Err("Client metadata must include at least one redirect_uri".to_owned());
     }
 
+    // RFC 7591 §2.1 (mirrored by CIMD §4): jwks and jwks_uri are mutually exclusive.
+    if doc.jwks.is_some() && doc.jwks_uri.is_some() {
+        return Err("CIMD must not declare both jwks and jwks_uri".to_owned());
+    }
+
+    if matches!(doc.token_endpoint_auth_method.as_deref(), Some("private_key_jwt"))
+        && doc.jwks.is_none() && doc.jwks_uri.is_none()
+    {
+        return Err("CIMD declares token_endpoint_auth_method=private_key_jwt but provides no jwks/jwks_uri".to_owned());
+    }
+
     Ok(RegisteredClient {
         client_id: client_id_url.to_owned(),
         redirect_uris: doc.redirect_uris,
         client_name: doc.client_name,
+        client_uri: doc.client_uri,
+        logo_uri: doc.logo_uri,
+        grant_types: doc.grant_types,
+        response_types: doc.response_types,
+        token_endpoint_auth_method: doc.token_endpoint_auth_method,
+        jwks: doc.jwks,
+        jwks_uri: doc.jwks_uri,
         is_cimd: true,
         registered_at: Instant::now(),
     })
@@ -205,4 +306,95 @@ pub fn validate_redirect_uri(requested: &str, registered: &[String]) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cimd_parses_extended_fields() {
+        let json = serde_json::json!({
+            "client_id": "https://app.example.com/client.json",
+            "redirect_uris": ["http://127.0.0.1:3000/cb"],
+            "client_name": "Example",
+            "client_uri": "https://app.example.com",
+            "logo_uri": "https://app.example.com/logo.png",
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+        });
+        let doc: ClientIdMetadataDocument = serde_json::from_value(json).unwrap();
+        assert_eq!(doc.client_uri.as_deref(), Some("https://app.example.com"));
+        assert_eq!(doc.logo_uri.as_deref(), Some("https://app.example.com/logo.png"));
+        assert_eq!(doc.grant_types, vec!["authorization_code", "refresh_token"]);
+        assert_eq!(doc.response_types, vec!["code"]);
+        assert_eq!(doc.token_endpoint_auth_method.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn cimd_drops_unknown_fields() {
+        let json = serde_json::json!({
+            "client_id": "https://app.example.com/client.json",
+            "redirect_uris": ["http://127.0.0.1:3000/cb"],
+            "future_extension": "ignored",
+            "policy_uri": "https://app.example.com/policy",
+        });
+        let doc: ClientIdMetadataDocument = serde_json::from_value(json).unwrap();
+        assert!(doc.client_name.is_none());
+    }
+
+    #[test]
+    fn registration_request_jwks_and_jwks_uri_default_empty() {
+        let json = serde_json::json!({
+            "redirect_uris": ["http://localhost:3000/cb"]
+        });
+        let req: RegistrationRequest = serde_json::from_value(json).unwrap();
+        assert!(req.jwks.is_none());
+        assert!(req.jwks_uri.is_none());
+        assert!(req.grant_types.is_empty());
+    }
+
+    #[test]
+    fn registration_response_omits_empty_fields() {
+        let resp = RegistrationResponse {
+            client_id: "abc".into(),
+            redirect_uris: vec!["http://localhost/cb".into()],
+            client_name: None,
+            client_uri: None,
+            logo_uri: None,
+            grant_types: vec![],
+            response_types: vec![],
+            token_endpoint_auth_method: None,
+            jwks: None,
+            jwks_uri: None,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(!obj.contains_key("client_name"));
+        assert!(!obj.contains_key("jwks"));
+        assert!(!obj.contains_key("grant_types"));
+        assert!(obj.contains_key("client_id"));
+        assert!(obj.contains_key("redirect_uris"));
+    }
+
+    #[test]
+    fn loopback_uri_rejects_external() {
+        assert!(is_loopback_uri("http://127.0.0.1:8080/cb"));
+        assert!(is_loopback_uri("http://localhost:8080/cb"));
+        assert!(is_loopback_uri("http://[::1]:8080/cb"));
+        assert!(!is_loopback_uri("http://example.com/cb"));
+        assert!(!is_loopback_uri("ftp://localhost/cb"));
+    }
+
+    #[test]
+    fn private_host_blocks_rfc1918() {
+        assert!(is_private_host("localhost"));
+        assert!(is_private_host("127.0.0.1"));
+        assert!(is_private_host("10.0.0.1"));
+        assert!(is_private_host("192.168.1.1"));
+        assert!(!is_private_host("example.com"));
+        assert!(!is_private_host("8.8.8.8"));
+    }
 }
