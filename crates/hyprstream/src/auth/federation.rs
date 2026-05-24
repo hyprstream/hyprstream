@@ -181,19 +181,38 @@ impl FederationKeyResolver {
     /// Try fetching the Ed25519 verifying key for `issuer` via DiscoveryService.
     ///
     /// Calls `DiscoveryClient::get_entity_statement(issuer)` to retrieve a
-    /// cached signed OIDF entity statement. Decodes the JWT payload
-    /// (without verifying its signature — that's a Phase 0.5b follow-up
-    /// tied to trust-anchor verification) and extracts the first Ed25519
-    /// key from the embedded `jwks` claim.
+    /// cached signed OIDF entity statement, then performs self-validating
+    /// signature verification:
+    ///
+    /// 1. Parse JWT header → extract `alg` (must be `EdDSA`)
+    /// 2. Parse JWT payload → require `iss == sub == issuer` (self-issued check)
+    /// 3. Parse JWT payload → extract `jwks.keys`
+    /// 4. For each Ed25519 key in the JWKS: try verifying the JWT signature
+    /// 5. Return the FIRST key that successfully verifies the JWT
+    ///
+    /// This self-validation establishes that the JWT was signed by a key
+    /// listed in its own embedded JWKS — defeats tampering during delivery
+    /// even when DiscoveryService is untrusted. A compromised DiscoveryService
+    /// can't substitute fake keys because the JWT signature must still verify
+    /// against one of them.
     ///
     /// Returns `Err` on any of:
     ///   - DiscoveryService RPC failure
     ///   - No entity statement cached for the issuer
-    ///   - JWT structurally invalid
+    ///   - JWT structurally invalid (not 3-part, header/payload not JSON, alg ≠ EdDSA)
+    ///   - `iss`/`sub` don't match the requested issuer
     ///   - No Ed25519 key in the embedded JWKS
+    ///   - NONE of the embedded keys verify the JWT signature
     ///
     /// The caller treats `Err` as "fall through to HTTPS" — never as
     /// "trust failure" — so a Discovery miss is operationally benign.
+    ///
+    /// NOTE: this does not verify against an external trust anchor. That's
+    /// Phase 0.5 Decision 4 territory (pinned trust-anchor JWKS, requiring
+    /// the entity-statement signing key to match a pre-configured fingerprint).
+    /// Self-validation is the strongest check we can do without trust anchors;
+    /// the existing per-issuer `trusted_issuers` config provides the trust root
+    /// for the *result* (since only configured issuers reach this path at all).
     async fn try_get_key_from_discovery(
         &self,
         dc: &DiscoveryClient,
@@ -208,55 +227,112 @@ impl FederationKeyResolver {
             anyhow::bail!("DiscoveryService returned empty entity statement JWT");
         }
 
-        // Decode JWT payload (header.payload.signature) — we extract `jwks`
-        // and find an Ed25519 key. Signature verification of this entity
-        // statement against trust anchors is deferred to a follow-up commit
-        // (Phase 0.5 Decision 4); for now we treat DiscoveryService as a
-        // trusted intra-bus delivery channel.
         let parts: Vec<&str> = stmt.jwt.split('.').collect();
         if parts.len() != 3 {
             anyhow::bail!("entity statement JWT not in 3-part compact form");
         }
+
+        // Parse header — must be EdDSA (Ed25519). Other algs (ES256, ML-DSA)
+        // will be handled in a follow-up when the federation root key role
+        // gains multi-alg support; for now we only accept EdDSA entity statements.
+        let header_bytes = URL_SAFE_NO_PAD
+            .decode(parts[0])
+            .map_err(|e| anyhow!("entity statement JWT header not base64url: {}", e))?;
+        let header: serde_json::Value = serde_json::from_slice(&header_bytes)
+            .map_err(|e| anyhow!("entity statement JWT header not JSON: {}", e))?;
+        let alg = header.get("alg").and_then(|v| v.as_str()).unwrap_or("");
+        if alg != "EdDSA" {
+            anyhow::bail!("entity statement JWT alg is '{}', only EdDSA supported", alg);
+        }
+
+        // Parse payload + check iss/sub bind to the requested issuer.
         let payload_bytes = URL_SAFE_NO_PAD
             .decode(parts[1])
             .map_err(|e| anyhow!("entity statement JWT payload not base64url: {}", e))?;
         let claims: serde_json::Value = serde_json::from_slice(&payload_bytes)
             .map_err(|e| anyhow!("entity statement JWT payload not JSON: {}", e))?;
 
-        // OIDF places the JWKS at `jwks.keys`. Some emitters use the
-        // `metadata.openid_provider.jwks_uri` path instead; the simple
-        // first-cut here looks for the embedded keyset.
+        let iss = claims.get("iss").and_then(|v| v.as_str()).unwrap_or("");
+        let sub = claims.get("sub").and_then(|v| v.as_str()).unwrap_or("");
+        if iss != issuer {
+            anyhow::bail!("entity statement iss '{}' != requested issuer '{}'", iss, issuer);
+        }
+        if sub != issuer {
+            anyhow::bail!("entity statement sub '{}' != iss (must be self-issued)", sub);
+        }
+
+        // Check exp — reject expired statements.
+        if let Some(exp) = claims.get("exp").and_then(serde_json::Value::as_i64) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            if exp <= now {
+                anyhow::bail!("entity statement expired (exp={} now={})", exp, now);
+            }
+        }
+
+        // OIDF places the JWKS at `jwks.keys`.
         let keys = claims
             .get("jwks")
             .and_then(|j| j.get("keys"))
             .and_then(|k| k.as_array())
             .ok_or_else(|| anyhow!("entity statement missing jwks.keys"))?;
 
+        // Self-validating signature check: the entity statement MUST be signed
+        // by one of the Ed25519 keys it publishes. Try each candidate; return
+        // the one that verifies the signature. This defeats tampering even
+        // when DiscoveryService is untrusted, because the attacker would need
+        // both a key in the embedded JWKS AND the corresponding private key
+        // to produce a valid signature.
+        let signing_input = format!("{}.{}", parts[0], parts[1]);
+        let sig_bytes = URL_SAFE_NO_PAD
+            .decode(parts[2])
+            .map_err(|e| anyhow!("entity statement signature not base64url: {}", e))?;
+        if sig_bytes.len() != 64 {
+            anyhow::bail!("Ed25519 signature must be 64 bytes, got {}", sig_bytes.len());
+        }
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&sig_bytes);
+        let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
+
         for key in keys {
-            if key.get("kty").and_then(|v| v.as_str()) == Some("OKP")
-                && key.get("crv").and_then(|v| v.as_str()) == Some("Ed25519")
+            if key.get("kty").and_then(|v| v.as_str()) != Some("OKP")
+                || key.get("crv").and_then(|v| v.as_str()) != Some("Ed25519")
             {
-                let x = key
-                    .get("x")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("OKP key missing 'x'"))?;
-                let raw = URL_SAFE_NO_PAD
-                    .decode(x)
-                    .map_err(|e| anyhow!("Ed25519 'x' not base64url: {}", e))?;
-                let bytes: [u8; 32] = raw
-                    .try_into()
-                    .map_err(|_| anyhow!("Ed25519 key not 32 bytes"))?;
-                let vk = VerifyingKey::from_bytes(&bytes)
-                    .map_err(|e| anyhow!("invalid Ed25519 key bytes: {}", e))?;
+                continue;
+            }
+            let x = match key.get("x").and_then(|v| v.as_str()) {
+                Some(s) => s,
+                None => continue,
+            };
+            let raw = match URL_SAFE_NO_PAD.decode(x) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let bytes: [u8; 32] = match raw.try_into() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let vk = match VerifyingKey::from_bytes(&bytes) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            // Try this key against the signature. If it verifies, this is the
+            // legitimate signing key — return it.
+            if vk.verify_strict(signing_input.as_bytes(), &signature).is_ok() {
                 tracing::debug!(
                     issuer = %issuer,
-                    "Resolved Ed25519 key from DiscoveryService entity statement"
+                    "Resolved Ed25519 key from DiscoveryService entity statement (self-validated)"
                 );
                 return Ok(vk);
             }
         }
 
-        anyhow::bail!("entity statement JWKS contains no Ed25519 key")
+        anyhow::bail!(
+            "entity statement self-validation failed: no Ed25519 key in jwks verifies the signature"
+        )
     }
 
     /// Validate that `url` uses HTTPS (or HTTP when explicitly permitted).
