@@ -210,6 +210,13 @@ pub async fn authorize_get(
         .and_then(|u| u.host_str().map(std::borrow::ToOwned::to_owned))
         .unwrap_or_else(|| params.redirect_uri.clone());
 
+    // MCP spec § Localhost Redirect URI Risks: warn when the registered
+    // client only ever uses loopback redirect URIs. Such a client cannot
+    // be distinguished from another process on the same host binding the
+    // same loopback range, so users should be told explicitly that the
+    // app they're authorizing only proves local-machine presence.
+    let localhost_warning = compute_localhost_warning(&redirect_uris);
+
     // Generate a nonce, store it server-side (5-min TTL, single-use on POST).
     let nonce = issue_nonce(&state).await;
 
@@ -226,6 +233,7 @@ pub async fn authorize_get(
         &nonce,
         params.nonce.as_deref().unwrap_or(""),
         None,
+        localhost_warning.as_deref(),
     );
 
     Html(html).into_response()
@@ -250,7 +258,7 @@ pub async fn authorize_post(
         // Validate redirect_uri and re-derive client info from the registry.
         // If either fails, return an error page rather than re-rendering with
         // attacker-controlled values.
-        let Some((client_name, redirect_host)) =
+        let Some((client_name, redirect_host, localhost_warning)) =
             derive_display_info(&state, &form.client_id, &form.redirect_uri).await
         else {
             return Html(render_error_page(
@@ -271,6 +279,7 @@ pub async fn authorize_post(
             &fresh_nonce,
             form.oidc_nonce.as_deref().unwrap_or(""),
             Some("Authorization request expired. Please try again."),
+            localhost_warning.as_deref(),
         );
         return Html(html).into_response();
     }
@@ -308,7 +317,7 @@ pub async fn authorize_post(
             // Validate redirect_uri and re-derive client display info from the registry.
             // Never trust the POST body for display values; return an error page if
             // the client or redirect_uri is no longer valid.
-            let Some((client_name, redirect_host)) =
+            let Some((client_name, redirect_host, localhost_warning)) =
                 derive_display_info(&state, &form.client_id, &form.redirect_uri).await
             else {
                 return Html(render_error_page(
@@ -330,6 +339,7 @@ pub async fn authorize_post(
                 &fresh_nonce,
                 form.oidc_nonce.as_deref().unwrap_or(""),
                 Some(e.message()),
+                localhost_warning.as_deref(),
             );
             return Html(html).into_response();
         }
@@ -492,7 +502,7 @@ async fn derive_display_info(
     state: &OAuthState,
     client_id: &str,
     redirect_uri: &str,
-) -> Option<(String, String)> {
+) -> Option<(String, String, Option<String>)> {
     // CIMD-shaped client_ids (HTTPS URLs) live in cimd_cache; DCR-issued
     // UUIDs live in state.clients. Try CIMD first since the cache hit
     // path is cheap and CIMD URLs never collide with DCR UUIDs.
@@ -515,7 +525,36 @@ async fn derive_display_info(
         .ok()
         .and_then(|u| u.host_str().map(std::borrow::ToOwned::to_owned))
         .unwrap_or_else(|| redirect_uri.to_owned());
-    Some((client_name, redirect_host))
+    let localhost_warning = compute_localhost_warning(&client.redirect_uris);
+    Some((client_name, redirect_host, localhost_warning))
+}
+
+/// Build the consent-screen localhost warning when every registered
+/// redirect URI is loopback. Returns `None` if at least one non-loopback
+/// URI is registered (the client can prove ownership via that URI).
+///
+/// MCP 2025-11-25 § Localhost Redirect URI Risks: a malicious app on the
+/// same host can claim any localhost port, so a localhost-only client
+/// cannot be cryptographically distinguished from an impostor. Users
+/// SHOULD see a clear warning.
+fn compute_localhost_warning(redirect_uris: &[String]) -> Option<String> {
+    if redirect_uris.is_empty() {
+        return None;
+    }
+    let all_loopback = redirect_uris
+        .iter()
+        .all(|u| super::registration::is_loopback_uri(u));
+    if !all_loopback {
+        return None;
+    }
+    Some(format!(
+        "This application only redirects to localhost. \
+         Any program running on this machine can claim to be it — \
+         only authorize if you started this flow yourself. \
+         ({} loopback URI{} registered)",
+        redirect_uris.len(),
+        if redirect_uris.len() == 1 { "" } else { "s" },
+    ))
 }
 
 fn error_response(status: StatusCode, error: &str, description: &str) -> Response {
@@ -571,9 +610,14 @@ fn render_challenge_page(
     nonce: &str,
     oidc_nonce: &str,
     error: Option<&str>,
+    localhost_warning: Option<&str>,
 ) -> String {
     let error_html = match error {
         Some(msg) => format!(r#"<div class="error">{}</div>"#, html_escape(msg)),
+        None => String::new(),
+    };
+    let warning_html = match localhost_warning {
+        Some(msg) => format!(r#"<div class="warn">{}</div>"#, html_escape(msg)),
         None => String::new(),
     };
 
@@ -595,6 +639,8 @@ fn render_challenge_page(
   .redirect {{ font-size: 0.85rem; color: #666; margin: 12px 0; }}
   .error {{ background: #fff0f0; color: #cc0000; border-radius: 8px; padding: 12px 16px;
             margin: 12px 0; font-size: 0.9rem; }}
+  .warn {{ background: #fff7e6; color: #8a5a00; border-left: 3px solid #d4960c;
+           border-radius: 0 8px 8px 0; padding: 12px 14px; margin: 12px 0; font-size: 0.88rem; }}
   .step {{ background: #f0f6ff; border-left: 3px solid #0066cc; padding: 10px 14px;
            margin: 12px 0; border-radius: 0 6px 6px 0; font-size: 0.88rem; color: #333; }}
   code {{ background: #f0f0f0; padding: 2px 6px; border-radius: 4px; font-size: 0.9em; word-break: break-all; }}
@@ -616,6 +662,7 @@ fn render_challenge_page(
     {scopes_display}
   </div>
   <p class="redirect">Will redirect to: <code>{redirect_host_esc}</code></p>
+  {warning_html}
   {error_html}
   <div class="step">
     <strong>Sign the challenge on your workstation:</strong><br/>
@@ -650,6 +697,7 @@ fn render_challenge_page(
             .collect::<Vec<_>>()
             .join(", "),
         redirect_host_esc = html_escape(redirect_host),
+        warning_html = warning_html,
         error_html = error_html,
         nonce_esc = html_escape(nonce),
         code_challenge_esc = html_escape(code_challenge),
@@ -662,4 +710,42 @@ fn render_challenge_page(
         nonce_val = html_escape(nonce),
         oidc_nonce_val = html_escape(oidc_nonce),
     )
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn localhost_warning_fires_when_all_loopback() {
+        let uris = vec![
+            "http://127.0.0.1:3000/cb".to_owned(),
+            "http://localhost:8080/cb".to_owned(),
+        ];
+        let warn = compute_localhost_warning(&uris).unwrap();
+        assert!(warn.contains("localhost"));
+        assert!(warn.contains('2'), "should mention the count");
+    }
+
+    #[test]
+    fn localhost_warning_suppressed_when_any_public_uri() {
+        let uris = vec![
+            "http://127.0.0.1:3000/cb".to_owned(),
+            "https://app.example.com/cb".to_owned(),
+        ];
+        assert!(compute_localhost_warning(&uris).is_none());
+    }
+
+    #[test]
+    fn localhost_warning_singular_count_grammar() {
+        let uris = vec!["http://localhost:3000/cb".to_owned()];
+        let warn = compute_localhost_warning(&uris).unwrap();
+        assert!(warn.contains("1 loopback URI registered"));
+    }
+
+    #[test]
+    fn localhost_warning_empty_returns_none() {
+        assert!(compute_localhost_warning(&[]).is_none());
+    }
 }
