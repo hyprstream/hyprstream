@@ -861,6 +861,18 @@ pub enum UserMappingStrategy {
         /// The claim name to use as the local subject.
         name: String,
     },
+    /// `did:web:{issuer_authority}:users:{external_sub}` per Phase 0.5
+    /// architecture-doc Subject Identity Format.
+    ///
+    /// Uses the OAuth issuer URL's authority (host[:port]) as the DID
+    /// method-specific identifier and the external `sub` claim as the
+    /// user path component. Example: `did:web:hyprstream.example.com:users:12345`.
+    ///
+    /// **Opt-in**: existing deployments continue to use [`Namespaced`] by
+    /// default so Casbin policies don't break. Operators migrating to
+    /// did:web should land Phase 0e (Casbin policy migration) before
+    /// switching this strategy.
+    DidWeb,
 }
 
 /// Whether to auto-create users on first external login.

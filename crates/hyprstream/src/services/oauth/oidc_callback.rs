@@ -408,6 +408,7 @@ pub async fn external_callback(
         &provider_slug,
         &external_claims,
         &provider.user_mapping,
+        &state.issuer_url,
     ) {
         Ok(s) => s,
         Err(e) => {
