@@ -265,8 +265,15 @@ impl RefreshTokenEntry {
 
 /// Shared OAuth server state.
 pub struct OAuthState {
-    /// Registered clients (dynamic + CIMD)
+    /// Dynamically-registered (RFC 7591) clients keyed by issued UUID
+    /// client_id. CIMD clients live in `cimd_cache` instead — DCR
+    /// entries have no TTL and outlive cache evictions, so storage is
+    /// separated.
     pub clients: RwLock<HashMap<String, RegisteredClient>>,
+    /// CIMD metadata cache. CIMD documents (HTTPS-URL client_ids) are
+    /// fetched + verified once, then cached respecting HTTP cache
+    /// headers, bounded TTL and capacity. See `cimd_cache` module.
+    pub cimd_cache: Arc<super::cimd_cache::CimdCache>,
     /// Pending authorization codes (single-use, 60s TTL)
     pub pending_codes: RwLock<HashMap<String, PendingAuthCode>>,
     /// Pending authorize nonces (single-use, 5-min TTL).
@@ -359,6 +366,9 @@ impl OAuthState {
     pub fn new(config: &OAuthConfig, policy_client: PolicyClient, discovery_client: DiscoveryClient, verifying_key_bytes: [u8; 32]) -> Self {
         Self {
             clients: RwLock::new(HashMap::new()),
+            cimd_cache: Arc::new(super::cimd_cache::CimdCache::new(
+                super::cimd_cache::CimdCacheConfig::default(),
+            )),
             pending_codes: RwLock::new(HashMap::new()),
             pending_nonces: RwLock::new(HashMap::new()),
             pending_par_requests: RwLock::new(HashMap::new()),

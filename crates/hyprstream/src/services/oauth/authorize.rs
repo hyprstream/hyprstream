@@ -29,7 +29,7 @@ use serde::Deserialize;
 
 use super::challenge;
 use super::device::html_escape;
-use super::registration::{fetch_client_metadata, validate_redirect_uri};
+use super::registration::{resolve_cimd_client, validate_redirect_uri};
 use super::state::{OAuthState, PendingAuthCode};
 
 /// Authorization request query parameters
@@ -158,15 +158,12 @@ pub async fn authorize_get(
 
     // Resolve client
     let (client_name, redirect_uris) = if params.client_id.starts_with("https://") {
-        // Client ID Metadata Document flow
-        match fetch_client_metadata(&state, &params.client_id).await {
-            Ok(client) => {
-                let name = client.client_name.clone();
-                let uris = client.redirect_uris.clone();
-                // Cache the client
-                state.clients.write().await.insert(client.client_id.clone(), client);
-                (name.unwrap_or_else(|| params.client_id.clone()), uris)
-            }
+        // Client ID Metadata Document flow (cache-aside via cimd_cache).
+        match resolve_cimd_client(&state, &params.client_id).await {
+            Ok(client) => (
+                client.client_name.unwrap_or_else(|| params.client_id.clone()),
+                client.redirect_uris,
+            ),
             Err(e) => {
                 return error_response(
                     StatusCode::BAD_REQUEST,
@@ -496,8 +493,14 @@ async fn derive_display_info(
     client_id: &str,
     redirect_uri: &str,
 ) -> Option<(String, String)> {
-    let clients = state.clients.read().await;
-    let client = clients.get(client_id)?;
+    // CIMD-shaped client_ids (HTTPS URLs) live in cimd_cache; DCR-issued
+    // UUIDs live in state.clients. Try CIMD first since the cache hit
+    // path is cheap and CIMD URLs never collide with DCR UUIDs.
+    let client = if client_id.starts_with("https://") {
+        state.cimd_cache.get(client_id).await?
+    } else {
+        state.clients.read().await.get(client_id)?.clone()
+    };
 
     // Validate redirect_uri against the client's registered URIs before displaying it.
     if !validate_redirect_uri(redirect_uri, &client.redirect_uris) {

@@ -32,7 +32,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use super::authorize::AuthorizeParams;
-use super::registration::{fetch_client_metadata, validate_redirect_uri};
+use super::registration::{resolve_cimd_client, validate_redirect_uri};
 use super::state::{OAuthState, PushedAuthRequest};
 
 /// PAR request lifetime. RFC 9126 recommends short-lived (e.g. <= 60s).
@@ -119,12 +119,8 @@ pub async fn push_authorization_request(
 
     // Resolve client (CIMD or dynamically registered) and pull redirect URIs.
     let redirect_uris = if form.client_id.starts_with("https://") {
-        match fetch_client_metadata(&state, &form.client_id).await {
-            Ok(client) => {
-                let uris = client.redirect_uris.clone();
-                state.clients.write().await.insert(client.client_id.clone(), client);
-                uris
-            }
+        match resolve_cimd_client(&state, &form.client_id).await {
+            Ok(client) => client.redirect_uris,
             Err(e) => {
                 return par_error(
                     StatusCode::BAD_REQUEST,

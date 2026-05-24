@@ -61,16 +61,25 @@ pub async fn device_authorize(
     State(state): State<Arc<OAuthState>>,
     Form(params): Form<DeviceAuthRequest>,
 ) -> Response {
-    // Validate client exists
-    {
-        let clients = state.clients.read().await;
-        if !clients.contains_key(&params.client_id) {
-            return device_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_client",
-                "Unknown client_id. Register first via POST /oauth/register",
-            );
-        }
+    // Validate client exists. CIMD URLs live in cimd_cache; DCR UUIDs
+    // live in state.clients. The device flow doesn't need full client
+    // metadata here — just existence — so a cheap presence check suffices.
+    let known = if params.client_id.starts_with("https://") {
+        // For CIMD, an absent cache entry doesn't necessarily mean an
+        // unknown client — it may just be a cold cache. Resolve through
+        // the cache-aside path which will fetch on miss.
+        super::registration::resolve_cimd_client(&state, &params.client_id)
+            .await
+            .is_ok()
+    } else {
+        state.clients.read().await.contains_key(&params.client_id)
+    };
+    if !known {
+        return device_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_client",
+            "Unknown client_id. Register first via POST /oauth/register",
+        );
     }
 
     // Generate device_code (32 bytes, URL-safe base64)

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
 use super::state::{OAuthState, RegisteredClient};
+use std::time::Duration;
 
 /// Dynamic client registration request (RFC 7591 §3.1).
 ///
@@ -173,13 +174,53 @@ pub struct ClientIdMetadataDocument {
     pub jwks_uri: Option<String>,
 }
 
-/// Fetch and validate a Client ID Metadata Document from an HTTPS URL.
+/// Resolve a CIMD client: cache-aside lookup, fetch on miss.
 ///
-/// Returns the registered client on success, or an error description on failure.
-pub async fn fetch_client_metadata(
+/// Hot-path entry point used by `/oauth/par` and `/oauth/authorize`.
+/// Returns the registered client (cached or freshly fetched + cached).
+pub async fn resolve_cimd_client(
     state: &OAuthState,
     client_id_url: &str,
 ) -> Result<RegisteredClient, String> {
+    if let Some(cached) = state.cimd_cache.get(client_id_url).await {
+        return Ok(cached);
+    }
+    let (client, max_age) = fetch_client_metadata(state, client_id_url).await?;
+    let ttl = state.cimd_cache.clamp_ttl(max_age);
+    state.cimd_cache.insert(client.clone(), ttl).await;
+    Ok(client)
+}
+
+/// Parse `Cache-Control: max-age=N` from response headers. `None` if
+/// absent, malformed, or directive set to `no-store`/`no-cache`/`private`
+/// (the cache will fall back to `min_ttl` in that case via `clamp_ttl`).
+pub(crate) fn extract_max_age(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let raw = headers.get(reqwest::header::CACHE_CONTROL)?.to_str().ok()?;
+    let mut max_age: Option<Duration> = None;
+    for part in raw.split(',') {
+        let part = part.trim();
+        let lower = part.to_ascii_lowercase();
+        if lower == "no-store" || lower == "no-cache" || lower == "private" {
+            return None;
+        }
+        if let Some(value) = lower.strip_prefix("max-age=") {
+            if let Ok(secs) = value.trim().parse::<u64>() {
+                max_age = Some(Duration::from_secs(secs));
+            }
+        }
+    }
+    max_age
+}
+
+/// Fetch and validate a Client ID Metadata Document from an HTTPS URL.
+///
+/// Returns `(client, max_age_from_cache_control)`; the latter is passed
+/// to `CimdCache::clamp_ttl` by the caller. Callers should usually go
+/// through [`resolve_cimd_client`] instead, which handles caching.
+pub async fn fetch_client_metadata(
+    state: &OAuthState,
+    client_id_url: &str,
+) -> Result<(RegisteredClient, Option<Duration>), String> {
     // SSRF protection: must be HTTPS
     if !client_id_url.starts_with("https://") {
         return Err("Client ID Metadata Document URL must use HTTPS".to_owned());
@@ -207,6 +248,8 @@ pub async fn fetch_client_metadata(
             response.status()
         ));
     }
+
+    let max_age = extract_max_age(response.headers());
 
     let doc: ClientIdMetadataDocument = response
         .json()
@@ -236,20 +279,23 @@ pub async fn fetch_client_metadata(
         return Err("CIMD declares token_endpoint_auth_method=private_key_jwt but provides no jwks/jwks_uri".to_owned());
     }
 
-    Ok(RegisteredClient {
-        client_id: client_id_url.to_owned(),
-        redirect_uris: doc.redirect_uris,
-        client_name: doc.client_name,
-        client_uri: doc.client_uri,
-        logo_uri: doc.logo_uri,
-        grant_types: doc.grant_types,
-        response_types: doc.response_types,
-        token_endpoint_auth_method: doc.token_endpoint_auth_method,
-        jwks: doc.jwks,
-        jwks_uri: doc.jwks_uri,
-        is_cimd: true,
-        registered_at: Instant::now(),
-    })
+    Ok((
+        RegisteredClient {
+            client_id: client_id_url.to_owned(),
+            redirect_uris: doc.redirect_uris,
+            client_name: doc.client_name,
+            client_uri: doc.client_uri,
+            logo_uri: doc.logo_uri,
+            grant_types: doc.grant_types,
+            response_types: doc.response_types,
+            token_endpoint_auth_method: doc.token_endpoint_auth_method,
+            jwks: doc.jwks,
+            jwks_uri: doc.jwks_uri,
+            is_cimd: true,
+            registered_at: Instant::now(),
+        },
+        max_age,
+    ))
 }
 
 /// Check if a redirect URI is a loopback address.
@@ -386,6 +432,31 @@ mod tests {
         assert!(is_loopback_uri("http://[::1]:8080/cb"));
         assert!(!is_loopback_uri("http://example.com/cb"));
         assert!(!is_loopback_uri("ftp://localhost/cb"));
+    }
+
+    #[test]
+    fn extract_max_age_parses_cache_control() {
+        use reqwest::header::{HeaderMap, HeaderValue, CACHE_CONTROL};
+
+        let mut h = HeaderMap::new();
+        h.insert(CACHE_CONTROL, HeaderValue::from_static("max-age=3600"));
+        assert_eq!(extract_max_age(&h), Some(Duration::from_secs(3600)));
+
+        let mut h = HeaderMap::new();
+        h.insert(CACHE_CONTROL, HeaderValue::from_static("public, max-age=600, must-revalidate"));
+        assert_eq!(extract_max_age(&h), Some(Duration::from_secs(600)));
+
+        // no-store / no-cache / private force a None result (we fall back to min_ttl).
+        let mut h = HeaderMap::new();
+        h.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        assert!(extract_max_age(&h).is_none());
+
+        let mut h = HeaderMap::new();
+        h.insert(CACHE_CONTROL, HeaderValue::from_static("max-age=300, no-cache"));
+        assert!(extract_max_age(&h).is_none());
+
+        // Missing header → None.
+        assert!(extract_max_age(&HeaderMap::new()).is_none());
     }
 
     #[test]
