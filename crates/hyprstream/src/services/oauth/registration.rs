@@ -247,17 +247,97 @@ pub struct ClientIdMetadataDocument {
 ///
 /// Hot-path entry point used by `/oauth/par` and `/oauth/authorize`.
 /// Returns the registered client (cached or freshly fetched + cached).
+///
+/// Trust gate (Phase 1b-CIMD-trust): before fetching unknown metadata
+/// from the network, the client_id URL's **origin** must pass a
+/// PolicyService `cimd:register` check. Fails CLOSED — any RPC error
+/// (PolicyService outage, network partition) rejects the registration
+/// rather than silently degrading the security posture. Operators see
+/// the dependency outage instead of a fail-open hole.
 pub async fn resolve_cimd_client(
     state: &OAuthState,
     client_id_url: &str,
 ) -> Result<RegisteredClient, String> {
+    // Cache hit short-circuits the policy check: the entry was admitted
+    // by policy at insert time and is governed by cache TTL. If
+    // operators flip policy mid-flight, they should also invalidate the
+    // cache (handled by a separate reload signal — out of scope for
+    // v1).
     if let Some(cached) = state.cimd_cache.get(client_id_url).await {
         return Ok(cached);
     }
+
+    let origin = extract_origin(client_id_url)
+        .ok_or_else(|| format!("invalid client_id URL: {client_id_url}"))?;
+    check_cimd_register(state, &origin).await?;
+
     let (client, max_age) = fetch_client_metadata(state, client_id_url).await?;
     let ttl = state.cimd_cache.clamp_ttl(max_age);
     state.cimd_cache.insert(client.clone(), ttl).await;
     Ok(client)
+}
+
+/// Extract the **origin** (scheme + host + non-default port) from a
+/// URL, per RFC 6454 §4 normalization rules. Returns `None` for
+/// malformed URLs or URLs without a host.
+///
+/// Default ports elide: `https://app.example.com:443` → `https://app.example.com`.
+/// Host is lowercased; scheme is already lowercased by url::Url.
+pub(crate) fn extract_origin(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let scheme = parsed.scheme();
+    let host = parsed.host_str()?;
+    let port = parsed.port();
+    let default_port = match scheme {
+        "https" => Some(443),
+        "http" => Some(80),
+        _ => None,
+    };
+    let host_lower = host.to_ascii_lowercase();
+    Some(match port {
+        Some(p) if Some(p) != default_port => format!("{scheme}://{host_lower}:{p}"),
+        _ => format!("{scheme}://{host_lower}"),
+    })
+}
+
+/// Crate-public alias of [`check_cimd_register`] for client_auth's
+/// defense-in-depth re-check at the token endpoint.
+pub(crate) async fn check_cimd_register_for_client_auth(
+    state: &OAuthState,
+    origin: &str,
+) -> Result<(), String> {
+    check_cimd_register(state, origin).await
+}
+
+/// Consult PolicyService for `cimd:register` on the given origin.
+/// Fails closed on RPC errors.
+async fn check_cimd_register(state: &OAuthState, origin: &str) -> Result<(), String> {
+    use crate::services::generated::policy_client::PolicyCheck;
+    match state
+        .policy_client
+        .check(&PolicyCheck {
+            subject: origin.to_owned(),
+            domain: "*".to_owned(),
+            resource: "cimd:register".to_owned(),
+            operation: "check".to_owned(),
+        })
+        .await
+    {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!(
+            "CIMD origin {origin} is not permitted by policy (cimd:register denied)"
+        )),
+        Err(e) => {
+            tracing::error!(
+                origin = %origin,
+                error = %e,
+                "PolicyService unreachable during CIMD registration check — failing closed"
+            );
+            Err(format!(
+                "PolicyService unreachable; CIMD registration rejected (fail-closed): {e}"
+            ))
+        }
+    }
 }
 
 /// Parse `Cache-Control: max-age=N` from response headers. `None` if
@@ -532,6 +612,49 @@ mod tests {
 
         // Missing header → None.
         assert!(extract_max_age(&HeaderMap::new()).is_none());
+    }
+
+    #[test]
+    fn extract_origin_basic_forms() {
+        assert_eq!(
+            extract_origin("https://app.example.com/client.json").unwrap(),
+            "https://app.example.com"
+        );
+        assert_eq!(
+            extract_origin("https://app.example.com:8443/client.json").unwrap(),
+            "https://app.example.com:8443"
+        );
+        assert_eq!(
+            extract_origin("http://internal.test/client").unwrap(),
+            "http://internal.test"
+        );
+    }
+
+    #[test]
+    fn extract_origin_elides_default_ports() {
+        // RFC 6454 §4: default ports elide.
+        assert_eq!(
+            extract_origin("https://app.example.com:443/c").unwrap(),
+            "https://app.example.com"
+        );
+        assert_eq!(
+            extract_origin("http://app.example.com:80/c").unwrap(),
+            "http://app.example.com"
+        );
+    }
+
+    #[test]
+    fn extract_origin_lowercases_host() {
+        assert_eq!(
+            extract_origin("https://APP.Example.COM/c").unwrap(),
+            "https://app.example.com"
+        );
+    }
+
+    #[test]
+    fn extract_origin_rejects_malformed() {
+        assert!(extract_origin("not a url").is_none());
+        assert!(extract_origin("https://").is_none(), "URL without host must reject");
     }
 
     #[test]

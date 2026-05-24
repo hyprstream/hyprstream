@@ -108,6 +108,12 @@ pub const SERVICE_BASE_POLICIES: &[ServicePolicyRule] = &[
     ServicePolicyRule { subject: "service:model", domain: "*", resource: "discovery:*", action: "*", effect: "allow" },
     ServicePolicyRule { subject: "service:oai", domain: "*", resource: "discovery:*", action: "*", effect: "allow" },
     ServicePolicyRule { subject: "service:worker", domain: "*", resource: "discovery:*", action: "*", effect: "allow" },
+    // CIMD trust gate (Phase 1b-CIMD-trust): default-allow any HTTPS
+    // origin to register a Client ID Metadata Document. Operators
+    // tighten by adding origin-specific deny rules — Casbin's effect
+    // model resolves deny over allow:
+    //   p, https://bad.example.com, *, cimd:register, check, deny
+    ServicePolicyRule { subject: "*", domain: "*", resource: "cimd:register", action: "check", effect: "allow" },
     // Infra services — scoped to their own domain
     ServicePolicyRule { subject: "service:oauth", domain: "*", resource: "oauth:*", action: "*", effect: "allow" },
     ServicePolicyRule { subject: "service:streams", domain: "*", resource: "streams:*", action: "*", effect: "allow" },

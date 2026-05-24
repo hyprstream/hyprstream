@@ -48,6 +48,9 @@ pub enum ClientAuthError {
     /// jwks_uri fetch failed (network error, non-2xx status, parse error,
     /// or SSRF-blocked URL).
     JwksUriFetchFailed(String),
+    /// Trust-policy denied this CIMD origin between PAR/authorize and
+    /// the token-endpoint client-assertion verification.
+    TrustPolicyDenied(String),
     /// JWT structural / decoding error (malformed parts, base64, JSON).
     Malformed(String),
     /// Signature verification failed against every candidate key.
@@ -64,6 +67,7 @@ impl std::fmt::Display for ClientAuthError {
             Self::UnsupportedAssertionType(t) => write!(f, "unsupported client_assertion_type: {t}"),
             Self::NoKeys => write!(f, "client has no jwks/jwks_uri for private_key_jwt"),
             Self::JwksUriFetchFailed(e) => write!(f, "jwks_uri fetch failed: {e}"),
+            Self::TrustPolicyDenied(e) => write!(f, "CIMD trust policy denied: {e}"),
             Self::Malformed(e) => write!(f, "malformed client_assertion: {e}"),
             Self::InvalidSignature => write!(f, "client_assertion signature did not verify"),
             Self::InvalidClaim(c) => write!(f, "invalid client_assertion claim: {c}"),
@@ -176,6 +180,19 @@ async fn resolve_keys(
     state: &OAuthState,
     client: &RegisteredClient,
 ) -> Result<Vec<Value>, ClientAuthError> {
+    // Defense in depth: re-check the CIMD trust policy at the token
+    // endpoint. The cimd_cache entry was admitted at PAR/authorize time
+    // by policy, but operators may have flipped policy in the interim
+    // (the cache TTL bounds the window). Fail-closed on RPC error,
+    // matching resolve_cimd_client.
+    if client.is_cimd {
+        if let Some(origin) = super::registration::extract_origin(&client.client_id) {
+            if let Err(e) = super::registration::check_cimd_register_for_client_auth(state, &origin).await {
+                return Err(ClientAuthError::TrustPolicyDenied(e));
+            }
+        }
+    }
+
     if let Some(jwks) = client.jwks.as_ref() {
         return extract_keys_array(jwks);
     }
