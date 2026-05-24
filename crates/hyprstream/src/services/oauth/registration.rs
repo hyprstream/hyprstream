@@ -18,6 +18,23 @@ use std::time::Instant;
 use super::state::{OAuthState, RegisteredClient};
 use std::time::Duration;
 
+/// Maximum number of dynamically-registered (RFC 7591) clients held in
+/// `state.clients`. The DCR endpoint is unauthenticated by design (the
+/// whole point is bootstrapping new clients), so a hard cap bounds the
+/// memory amplifier even when an attacker pummels POST /oauth/register.
+/// CIMD clients are NOT counted here — they live in cimd_cache, which
+/// has its own capacity bound.
+///
+/// 1000 is comfortable for an operator with a handful of MCP clients
+/// per user and the occasional dev/test churn. Operators expecting more
+/// can override via configuration in a future change.
+pub const DCR_MAX_CLIENTS: usize = 1000;
+
+/// Maximum DCR field lengths to bound request-payload memory.
+pub const DCR_MAX_REDIRECT_URIS: usize = 16;
+pub const DCR_MAX_URI_LEN: usize = 2048;
+pub const DCR_MAX_NAME_LEN: usize = 256;
+
 /// Dynamic client registration request (RFC 7591 §3.1).
 ///
 /// Only the fields hyprstream actually honors are deserialized; unknown
@@ -71,8 +88,39 @@ pub async fn register_client(
     State(state): State<Arc<OAuthState>>,
     Json(req): Json<RegistrationRequest>,
 ) -> impl IntoResponse {
-    // Validate redirect URIs are loopback only
+    if req.redirect_uris.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_client_metadata",
+                "error_description": "At least one redirect_uri is required"
+            })),
+        ).into_response();
+    }
+
+    if req.redirect_uris.len() > DCR_MAX_REDIRECT_URIS {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_client_metadata",
+                "error_description": format!(
+                    "Too many redirect_uris (max {DCR_MAX_REDIRECT_URIS})"
+                ),
+            })),
+        ).into_response();
+    }
+
+    // Validate redirect URIs: loopback only, bounded length.
     for uri in &req.redirect_uris {
+        if uri.len() > DCR_MAX_URI_LEN {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_redirect_uri",
+                    "error_description": format!("redirect_uri exceeds {DCR_MAX_URI_LEN} chars"),
+                })),
+            ).into_response();
+        }
         if !is_loopback_uri(uri) {
             return (
                 StatusCode::BAD_REQUEST,
@@ -84,14 +132,17 @@ pub async fn register_client(
         }
     }
 
-    if req.redirect_uris.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "invalid_client_metadata",
-                "error_description": "At least one redirect_uri is required"
-            })),
-        ).into_response();
+    // Bound the display-name field (rendered on consent screen).
+    if let Some(name) = req.client_name.as_deref() {
+        if name.len() > DCR_MAX_NAME_LEN {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_client_metadata",
+                    "error_description": format!("client_name exceeds {DCR_MAX_NAME_LEN} chars"),
+                })),
+            ).into_response();
+        }
     }
 
     // RFC 7591 §2.1: jwks and jwks_uri are mutually exclusive.
@@ -135,7 +186,25 @@ pub async fn register_client(
         registered_at: Instant::now(),
     };
 
-    state.clients.write().await.insert(client_id.clone(), client);
+    // Capacity gate: refuse new registrations when at DCR_MAX_CLIENTS.
+    // Hold the write lock across the size check + insert so two
+    // concurrent registrations can't both squeeze in at len == cap-1.
+    {
+        let mut clients = state.clients.write().await;
+        if clients.len() >= DCR_MAX_CLIENTS {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "registration_capacity_exhausted",
+                    "error_description": format!(
+                        "DCR client registry at capacity ({DCR_MAX_CLIENTS}). \
+                         Operator must rotate stale clients or migrate to CIMD."
+                    ),
+                })),
+            ).into_response();
+        }
+        clients.insert(client_id.clone(), client);
+    }
 
     Json(RegistrationResponse {
         client_id,
