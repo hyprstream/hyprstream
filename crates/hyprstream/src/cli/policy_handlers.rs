@@ -57,7 +57,7 @@ pub async fn handle_policy_show(
         if policy_info.rules.is_empty() && policy_info.groupings.is_empty() {
             println!("No policies defined.");
             println!("\nTo get started, apply a template:");
-            println!("  hyprstream quick policy apply-template local    # local CLI full access");
+            println!("  hyprstream quick policy list-templates  # see all available templates");
             println!("\nOr edit manually:");
             println!("  hyprstream quick policy edit");
             return Ok(());

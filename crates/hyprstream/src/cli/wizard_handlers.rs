@@ -344,17 +344,9 @@ fn text_phase_templates(
         return Ok(());
     }
 
-    let local_user = backend.local_username();
-
     let mut options: Vec<String> = templates
         .iter()
-        .map(|t| {
-            if t.name == "local" {
-                format!("local — Full access for {} (recommended)", local_user)
-            } else {
-                format!("{} — {}", t.name, t.description)
-            }
-        })
+        .map(|t| format!("{} — {}", t.name, t.description))
         .collect();
     options.push("None — skip template".to_owned());
 

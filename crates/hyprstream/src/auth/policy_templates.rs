@@ -10,6 +10,7 @@
 ///
 /// Casbin format: `p, subject, domain, resource, action, effect`
 /// This struct makes field order impossible to get wrong.
+#[derive(Clone, Copy)]
 pub struct ServicePolicyRule {
     pub subject: &'static str,
     pub domain: &'static str,
@@ -142,32 +143,13 @@ pub struct PolicyTemplate {
 }
 
 impl PolicyTemplate {
-    /// Get expanded policy rules for this template.
-    ///
-    /// For the "local" template, dynamically expands to the current OS username.
-    /// For static templates, returns the predefined rules.
-    /// Returns owned Vec because the "local" template generates rules at runtime.
+    /// Get expanded policy rules for this template. All templates now
+    /// carry static `policies`; the dynamic-OS-username "local" template
+    /// was removed because its expansion (`anonymous → *`) was
+    /// indistinguishable from `public-*` templates and the name
+    /// misrepresented its scope.
     pub fn expanded_policies(&self) -> Vec<ServicePolicyRule> {
-        if let Some(rules) = self.policies {
-            rules.iter().map(|r| ServicePolicyRule {
-                subject: r.subject,
-                domain: r.domain,
-                resource: r.resource,
-                action: r.action,
-                effect: r.effect,
-            }).collect::<Vec<_>>()
-        } else if self.name == "local" {
-            let user = "anonymous".to_owned();
-            vec![ServicePolicyRule {
-                subject: user.leak(),
-                domain: "*",
-                resource: "*",
-                action: "*",
-                effect: "allow",
-            }]
-        } else {
-            Vec::new()
-        }
+        self.policies.map(<[_]>::to_vec).unwrap_or_default()
     }
 
     /// Convert all rules (policies + groupings) to a CSV string.
@@ -192,12 +174,6 @@ impl PolicyTemplate {
 /// Get all available policy templates
 pub fn get_templates() -> &'static [PolicyTemplate] {
     &[
-        PolicyTemplate {
-            name: "local",
-            description: "Full access for the current local user",
-            policies: None, // Dynamic: expands to current OS username
-            groupings: None,
-        },
         PolicyTemplate {
             name: "public-inference",
             description: "Anonymous users can infer and query models",

@@ -146,7 +146,6 @@ m = (g(r.sub, p.sub) || keyMatch(r.sub, p.sub)) && \
 /// Default policy rules: deny-by-default with service grants
 ///
 /// All access is denied until the operator explicitly configures policy via:
-///   hyprstream quick policy apply-template local    # grant local CLI full access
 ///   hyprstream quick policy apply-template public-inference  # open inference API
 ///
 /// Service-to-service rules are defined in [`policy_templates::SERVICE_BASE_POLICIES`].
@@ -163,7 +162,6 @@ fn default_policy_csv() -> String {
         #\n\
         # No other access is granted until you apply a policy template:\n\
         #\n\
-        #   hyprstream quick policy apply-template local             # local CLI full access\n\
         #   hyprstream quick policy apply-template public-inference  # anonymous inference\n\
         #   hyprstream quick policy apply-template public-read       # anonymous registry browse\n\
         #\n\
@@ -276,7 +274,7 @@ impl PolicyManager {
 
         // Create default policy.csv if not exists
         if !policy_path.exists() {
-            info!("Creating default policy.csv (deny-by-default — run `hyprstream quick policy apply-template local` to grant access)");
+            info!("Creating default policy.csv (deny-by-default — run `hyprstream quick policy apply-template <name>` to grant access; see `policy list-templates`)");
             write_policy_file(&policy_path, default_policy_csv()).await?;
         }
 
