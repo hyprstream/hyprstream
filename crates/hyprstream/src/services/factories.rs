@@ -789,12 +789,21 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let mcp_tls_key = config.mcp.tls_key.clone();
     // Use the shared FederationKeySource from ServiceContext if available,
     // otherwise fall back to a locally-constructed resolver from config.
+    // The fallback path wires its own PolicyClient so the unified
+    // federation:register trust gate stays in effect — never downgrade
+    // security posture just because the shared resolver wasn't provided.
     let mcp_federation_resolver: std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource> =
         if let Some(fed) = federation_key_source {
             fed
         } else {
+            let fallback_policy_client = std::sync::Arc::new(PolicyClient::for_service(
+                ctx.service_signing_key("mcp"),
+                policy_vk,
+                service_token("mcp"),
+            ));
             std::sync::Arc::new(
                 crate::auth::FederationKeyResolver::new(&config.oauth.trusted_issuers)
+                    .with_policy_client(fallback_policy_client)
             )
         };
     tokio::task::block_in_place(|| {

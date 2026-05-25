@@ -117,7 +117,13 @@ impl ServerState {
         // Initialize metrics
         let metrics = Arc::new(Metrics::default());
 
-        let federation_resolver = Arc::new(crate::auth::FederationKeyResolver::new(trusted_issuers));
+        // Wire the unified federation:register PolicyService gate. Same
+        // gate as CIMD client registration — single atproto-style
+        // trust decision applies to both clients and peers.
+        let federation_resolver = Arc::new(
+            crate::auth::FederationKeyResolver::new(trusted_issuers)
+                .with_policy_client(Arc::new(policy_client.clone()))
+        );
 
         Ok(Self {
             model_client,

@@ -108,16 +108,23 @@ pub const SERVICE_BASE_POLICIES: &[ServicePolicyRule] = &[
     ServicePolicyRule { subject: "service:model", domain: "*", resource: "discovery:*", action: "*", effect: "allow" },
     ServicePolicyRule { subject: "service:oai", domain: "*", resource: "discovery:*", action: "*", effect: "allow" },
     ServicePolicyRule { subject: "service:worker", domain: "*", resource: "discovery:*", action: "*", effect: "allow" },
-    // NOTE: Client federation (`cimd:register` resource — the internal
-    // name follows the OAuth spec for Client ID Metadata Documents) is
-    // deny-by-default. The base policy intentionally has no allow rule
-    // for it. Operators opt in by applying the `federation-open`
-    // template, or by allowlisting specific origins:
-    //   p, https://app.example.com, *, cimd:register, check, allow
-    //   p, https://*.example.com,   *, cimd:register, check, allow
-    // The wizard may suggest `federation-open` at setup time for
-    // operators who want MCP-spec-aligned no-prior-relationship client
-    // onboarding.
+    // NOTE: Federation (`federation:register` resource) is deny-by-default.
+    // This is the single, atproto-style trust gate that governs both:
+    //   - third-party clients registering via CIMD (Client ID Metadata
+    //     Documents — published metadata at an HTTPS origin), and
+    //   - remote peer servers whose entity statements we'd resolve via
+    //     FederationKeyResolver / DiscoveryService.
+    //
+    // Operators opt in by applying the `federation-open` template, or
+    // by allowlisting specific origins:
+    //   p, https://app.partner.org,        *, federation:register, check, allow
+    //   p, https://*.partner.org,          *, federation:register, check, allow
+    //   p, https://hyprstream.partner.org, *, federation:register, check, allow
+    //
+    // The same rule shape covers a CIMD client at app.partner.org and
+    // a peer hyprstream instance at hyprstream.partner.org. Wizard may
+    // suggest `federation-open` at setup time for operators who want
+    // to join the broader MCP/atproto network.
     //
     // Infra services — scoped to their own domain
     ServicePolicyRule { subject: "service:oauth", domain: "*", resource: "oauth:*", action: "*", effect: "allow" },
@@ -197,15 +204,17 @@ pub fn get_templates() -> &'static [PolicyTemplate] {
     &[
         PolicyTemplate {
             name: "federation-open",
-            description: "Open client federation: any third-party app may connect via its published metadata (recommended for MCP compatibility)",
+            description: "Open federation: accept third-party apps and remote peer servers from any HTTPS origin (atproto-style, recommended for MCP/peer compatibility)",
             policies: Some(&[
-                // Allow any HTTPS origin to publish a Client ID Metadata
-                // Document and use it as its OAuth client_id. This is
-                // the MCP-spec "no prior relationship" path.
+                // Unified federation trust gate. Covers BOTH:
+                //   - CIMD third-party clients (their HTTPS metadata URL)
+                //   - Remote peer servers (their entity-statement URL)
+                // Operators wanting tighter posture replace with origin-
+                // specific allow rules; the matcher is the same.
                 ServicePolicyRule {
                     subject: "*",
                     domain: "*",
-                    resource: "cimd:register",
+                    resource: "federation:register",
                     action: "check",
                     effect: "allow",
                 },

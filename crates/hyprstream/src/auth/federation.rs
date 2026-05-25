@@ -54,6 +54,16 @@ pub struct FederationKeyResolver {
     /// Falls through to HTTPS on miss/error (conservative: never downgrade
     /// trust on missing data).
     discovery_client: Option<Arc<DiscoveryClient>>,
+    /// Unified federation trust gate (atproto-style). When set, every
+    /// `get_key` call additionally verifies the issuer's origin is
+    /// permitted by PolicyService `federation:register` — same gate as
+    /// CIMD client registration. The `trusted_issuers` config carries
+    /// operational metadata (jwks_uri override, scheme, TTL); this
+    /// PolicyService check carries the hot-reloadable trust decision.
+    ///
+    /// `None` retains the legacy posture (config-only trust) for
+    /// callers that haven't wired PolicyService access yet.
+    policy_client: Option<Arc<crate::services::PolicyClient>>,
 }
 
 impl FederationKeyResolver {
@@ -82,7 +92,18 @@ impl FederationKeyResolver {
                 .build()
                 .unwrap_or_default(),
             discovery_client: None,
+            policy_client: None,
         }
+    }
+
+    /// Wire the PolicyService client so [`get_key`] enforces the
+    /// `federation:register` trust gate before any HTTPS fetch. When
+    /// set, calls to `get_key` for issuers that aren't currently
+    /// permitted by PolicyService policy return Err — fail-closed,
+    /// matching the CIMD client path.
+    pub fn with_policy_client(mut self, client: Arc<crate::services::PolicyClient>) -> Self {
+        self.policy_client = Some(client);
+        self
     }
 
     /// Phase 0.5 Stage D — wire a DiscoveryService client for federation
@@ -118,6 +139,51 @@ impl FederationKeyResolver {
             .get(issuer)
             .map(|(u, t, h)| (u.clone(), *t, *h))
             .ok_or_else(|| anyhow!("Issuer not in trusted list: {}", issuer))?;
+
+        // Unified federation trust gate: when PolicyService is wired,
+        // also require the issuer's origin to be permitted by the
+        // `federation:register` policy. Layered on top of the
+        // trusted_issuers config — both must accept. Operators see
+        // `trusted_issuers` as operational config (how to reach this
+        // peer) and PolicyService as the hot-reloadable trust decision
+        // (do we currently accept this peer). Same gate as CIMD; same
+        // fail-closed semantics on RPC outage.
+        if let Some(ref pc) = self.policy_client {
+            use crate::services::generated::policy_client::PolicyCheck;
+            // Reuse the OAuth-side RFC 6454 origin extractor: same
+            // normalization (scheme + lowercase host + non-default port)
+            // means a single Casbin rule covers a CIMD client at
+            // app.partner.org AND a peer at hyprstream.partner.org.
+            let origin = crate::services::oauth::registration::extract_origin(issuer)
+                .ok_or_else(|| anyhow!("Invalid issuer URL: {issuer}"))?;
+            match pc
+                .check(&PolicyCheck {
+                    subject: origin.clone(),
+                    domain: "*".to_owned(),
+                    resource: "federation:register".to_owned(),
+                    operation: "check".to_owned(),
+                })
+                .await
+            {
+                Ok(true) => { /* permitted, fall through to fetch */ }
+                Ok(false) => {
+                    anyhow::bail!(
+                        "peer {origin} is not permitted by policy (federation:register denied)"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        issuer = %issuer,
+                        origin = %origin,
+                        error = %e,
+                        "PolicyService unreachable during peer federation:register check — failing closed"
+                    );
+                    anyhow::bail!(
+                        "PolicyService unreachable; peer federation rejected (fail-closed): {e}"
+                    );
+                }
+            }
+        }
 
         // Acquire the cache lock once. Check first; only fetch if expired/absent.
         let mut cache = self.cache.lock().await;

@@ -583,6 +583,16 @@ impl DiscoveryHandler for DiscoveryService {
             }));
         }
 
+        // NOTE: we intentionally do NOT gate cache writes by the
+        // `federation:register` policy here. The load-bearing trust
+        // check happens at use time in FederationKeyResolver::get_key,
+        // which queries policy before accepting any cached entity
+        // statement for verification. Gating writes too would force
+        // discovery to call PolicyService on every register, which is
+        // a perf hit on a hot path that already requires a passing
+        // `authorize()` check on the caller side. Cache may contain
+        // statements for issuers no operator currently trusts —
+        // they're inert until the resolver's policy check admits them.
         let cached = CachedEntityStatement {
             jwt: data.jwt.clone(),
             fetched_at: unix_seconds_now(),

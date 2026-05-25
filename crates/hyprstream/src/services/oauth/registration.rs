@@ -248,12 +248,12 @@ pub struct ClientIdMetadataDocument {
 /// Hot-path entry point used by `/oauth/par` and `/oauth/authorize`.
 /// Returns the registered client (cached or freshly fetched + cached).
 ///
-/// Trust gate (Phase 1b-CIMD-trust): before fetching unknown metadata
-/// from the network, the client_id URL's **origin** must pass a
-/// PolicyService `cimd:register` check. Fails CLOSED — any RPC error
-/// (PolicyService outage, network partition) rejects the registration
-/// rather than silently degrading the security posture. Operators see
-/// the dependency outage instead of a fail-open hole.
+/// Trust gate (unified federation policy): before fetching unknown
+/// metadata from the network, the client_id URL's **origin** must pass
+/// a PolicyService `federation:register` check. Same gate used for peer
+/// entity statements — one trust decision for "isolated vs federated"
+/// per the atproto model. Fails CLOSED — any RPC error rejects the
+/// registration rather than silently degrading security posture.
 pub async fn resolve_cimd_client(
     state: &OAuthState,
     client_id_url: &str,
@@ -269,7 +269,7 @@ pub async fn resolve_cimd_client(
 
     let origin = extract_origin(client_id_url)
         .ok_or_else(|| format!("invalid client_id URL: {client_id_url}"))?;
-    check_cimd_register(state, &origin).await?;
+    check_federation_register(state, &origin).await?;
 
     let (client, max_age) = fetch_client_metadata(state, client_id_url).await?;
     let ttl = state.cimd_cache.clamp_ttl(max_age);
@@ -300,51 +300,63 @@ pub(crate) fn extract_origin(url: &str) -> Option<String> {
     })
 }
 
-/// Crate-public alias of [`check_cimd_register`] for client_auth's
-/// defense-in-depth re-check at the token endpoint.
-pub(crate) async fn check_cimd_register_for_client_auth(
+/// Crate-public alias of [`check_federation_register`] for callers
+/// outside this module (client_auth's defense-in-depth re-check at the
+/// token endpoint, FederationKeyResolver's peer trust gate).
+pub(crate) async fn check_federation_register_for_client_auth(
     state: &OAuthState,
     origin: &str,
 ) -> Result<(), String> {
-    check_cimd_register(state, origin).await
+    check_federation_register(state, origin).await
 }
 
-/// Consult PolicyService for `cimd:register` on the given origin.
+/// Consult PolicyService for `federation:register` on the given origin.
 /// Fails closed on RPC errors.
 ///
-/// **Default posture is deny.** The shipped base policy has no
-/// `cimd:register` allow rule; operators opt in to client federation by:
-///   - applying the `federation-open` template (any HTTPS origin allowed), or
-///   - allowlisting specific origins:
-///     `p, https://app.example.com, *, cimd:register, check, allow`
+/// This is the **unified federation trust gate** (atproto-style: one
+/// decision for "isolated vs federated"). The same Casbin resource is
+/// checked at three points:
+///   - CIMD client metadata fetch  (resolve_cimd_client)
+///   - private_key_jwt token-endpoint re-check  (client_auth::resolve_keys)
+///   - Peer entity-statement fetch  (FederationKeyResolver::get_key,
+///     DiscoveryService::handle_get_entity_statement)
 ///
-/// PolicyService outage → reject, with operator-visible error. We do
-/// NOT silently fall back to allow on outage; security posture is
-/// preserved over availability of new CIMD registrations.
-async fn check_cimd_register(state: &OAuthState, origin: &str) -> Result<(), String> {
+/// **Default posture is deny.** The shipped base policy has no
+/// `federation:register` allow rule; operators opt in by:
+///   - applying the `federation-open` template (any HTTPS origin allowed —
+///     covers both third-party clients AND remote peer servers), or
+///   - allowlisting specific origins:
+///     `p, https://*.partner.org, *, federation:register, check, allow`
+///
+/// The same rule covers a CIMD client at app.partner.org AND a peer
+/// hyprstream instance at hyprstream.partner.org.
+///
+/// PolicyService outage → reject, with operator-visible error. Security
+/// posture is preserved over availability of new federation registrations.
+async fn check_federation_register(state: &OAuthState, origin: &str) -> Result<(), String> {
     use crate::services::generated::policy_client::PolicyCheck;
     match state
         .policy_client
         .check(&PolicyCheck {
             subject: origin.to_owned(),
             domain: "*".to_owned(),
-            resource: "cimd:register".to_owned(),
+            resource: "federation:register".to_owned(),
             operation: "check".to_owned(),
         })
         .await
     {
         Ok(true) => Ok(()),
         Ok(false) => Err(format!(
-            "CIMD origin {origin} is not permitted by policy (cimd:register denied)"
+            "federation origin {origin} is not permitted by policy (federation:register denied)"
         )),
         Err(e) => {
             tracing::error!(
                 origin = %origin,
                 error = %e,
-                "PolicyService unreachable during CIMD registration check — failing closed"
+                "PolicyService unreachable during federation:register check — failing closed"
             );
             Err(format!(
-                "PolicyService unreachable; CIMD registration rejected (fail-closed): {e}"
+                "PolicyService unreachable; federation registration rejected (fail-closed): {e}"
             ))
         }
     }

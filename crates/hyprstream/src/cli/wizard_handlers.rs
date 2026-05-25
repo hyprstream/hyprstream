@@ -401,8 +401,9 @@ fn prompt_federation_interactive(
     summary: &mut TextWizardSummary,
 ) {
     let enable = Confirm::new(
-        "  Enable open client federation? \
-         Lets any third-party app connect using a published metadata URL (MCP-compatible).",
+        "  Enable open federation? \
+         Accepts third-party apps and remote peer servers from any origin \
+         (atproto-style; MCP/peer compatible).",
     )
     .with_default(false)
     .prompt()

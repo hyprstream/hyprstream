@@ -180,14 +180,14 @@ async fn resolve_keys(
     state: &OAuthState,
     client: &RegisteredClient,
 ) -> Result<Vec<Value>, ClientAuthError> {
-    // Defense in depth: re-check the CIMD trust policy at the token
-    // endpoint. The cimd_cache entry was admitted at PAR/authorize time
-    // by policy, but operators may have flipped policy in the interim
-    // (the cache TTL bounds the window). Fail-closed on RPC error,
-    // matching resolve_cimd_client.
+    // Defense in depth: re-check the unified federation:register policy
+    // at the token endpoint. The cimd_cache entry was admitted at
+    // PAR/authorize time, but operators may have flipped policy in the
+    // interim (the cache TTL bounds the window). Fail-closed on RPC
+    // error, matching resolve_cimd_client.
     if client.is_cimd {
         if let Some(origin) = super::registration::extract_origin(&client.client_id) {
-            if let Err(e) = super::registration::check_cimd_register_for_client_auth(state, &origin).await {
+            if let Err(e) = super::registration::check_federation_register_for_client_auth(state, &origin).await {
                 return Err(ClientAuthError::TrustPolicyDenied(e));
             }
         }

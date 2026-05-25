@@ -192,7 +192,7 @@ fn build_cli() -> ClapCommand {
                 Arg::new("enable_federation")
                     .long("enable-federation")
                     .action(clap::ArgAction::SetTrue)
-                    .help("Apply the federation-open policy template (allow any HTTPS origin to register as an OAuth client via published metadata). Default is disabled; under -y this flag is the only way to enable it."),
+                    .help("Apply the federation-open policy template — accept third-party apps AND remote peer servers from any HTTPS origin (atproto-style federation). Default is disabled; under -y this flag is the only way to enable it."),
             ),
     );
 
