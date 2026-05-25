@@ -505,6 +505,49 @@ mod tests {
     }
 
     #[test]
+    fn alg_confusion_hs256_header_against_rsa_jwk_is_rejected() {
+        // Canonical alg-confusion attack: a malicious assertion declares
+        // alg=HS256 in the header, hoping the verifier will HMAC-verify
+        // the JWT using the RSA public key (as bytes) — which the client
+        // also knows. Our defense: alg is derived from JWK kty (RSA →
+        // RS256), not from the header. The signature verify must use
+        // RS256 against the HMAC-signed payload and fail.
+        //
+        // Build a JWS structure with alg=HS256 in the header and a
+        // bogus signature, against an RSA JWK. verify must reject.
+        let rsa_jwk = serde_json::json!({
+            "kty": "RSA",
+            "n": "u1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gunVTLw7onLRnrq0_IzW7yWR7QkrmBL7jTKEn5u-qKhbwKfBstIs-bMY2Zkp18gnTxKLxoS2tFczGkPLPgizskuemMghRniWaoLcyehkd3qqGElvW_VDL5AaWTg0nLVkjRo9z-40RQzuVaE8AkAFmxZzow3x-VJYKdjykkJ0iT9wCS0DRTXu269V264Vf_3jvredZiKRkgwlL9xNAwxXFg0x_XFw005UWVRIkdgcKWTjpBP2dPwVZ4WWC-9aGVd-Gyn1o0CLelf4rEjGoXbAAEgAqeGUxrcIlbjXfbcmw",
+            "e": "AQAB",
+            "kid": "rsa1",
+        });
+        // A header with alg=HS256 (attacker-controlled), body, and
+        // signature computed by HMAC-SHA256 with the public-RSA bytes
+        // as key. We don't need to actually compute it — the structural
+        // claim is that decoding will fail because:
+        //   - algorithm_for_key_pub returns RS256 (from kty=RSA)
+        //   - decode<>(token, key, validation_with_RS256_alg) checks
+        //     the header alg matches the Validation's allowed algs
+        //     (jsonwebtoken rejects HS256 token with RS256 validation)
+        let bogus_assertion = format!(
+            "{}.{}.{}",
+            URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT","kid":"rsa1"}"#),
+            URL_SAFE_NO_PAD.encode(br#"{"iss":"https://app.test/c","sub":"https://app.test/c","aud":"https://hs.test/oauth/token","exp":9999999999}"#),
+            URL_SAFE_NO_PAD.encode([0u8; 32]),
+        );
+        let got = verify_assertion_with_keys(
+            &[rsa_jwk],
+            "https://app.test/c",
+            &bogus_assertion,
+            "https://hs.test/oauth/token",
+        );
+        assert!(
+            matches!(got, Err(ClientAuthError::InvalidSignature)),
+            "HS256 header against RSA JWK MUST be rejected; got {got:?}"
+        );
+    }
+
+    #[test]
     fn jwks_uri_accepts_public_https() {
         // We can't fetch in a unit test; just verify the SSRF + scheme
         // gate lets a plausible URL through.

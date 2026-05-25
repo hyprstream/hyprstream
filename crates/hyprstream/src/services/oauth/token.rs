@@ -170,18 +170,40 @@ async fn enforce_client_authentication(
     params: &TokenRequest,
 ) -> Result<(), Response> {
     // CIMD client_ids are HTTPS URLs; DCR client_ids are UUIDs.
+    //
+    // For CIMD: on cache miss (entry expired between PAR/authorize
+    // admission and now), we MUST re-resolve via resolve_cimd_client,
+    // not fall through. Otherwise a client that declared
+    // token_endpoint_auth_method=private_key_jwt could pass through
+    // without an assertion check just because its cache entry aged
+    // out — a security regression.
+    //
+    // resolve_cimd_client re-runs the federation:register policy check
+    // and re-fetches metadata, so a revocation that happened during
+    // the user's consent step is honored at token time.
     let client = if params.client_id.starts_with("https://") {
-        state.cimd_cache.get(&params.client_id).await
+        match state.cimd_cache.get(&params.client_id).await {
+            Some(c) => Some(c),
+            None => super::registration::resolve_cimd_client(state, &params.client_id)
+                .await
+                .ok(),
+        }
     } else {
         state.clients.read().await.get(&params.client_id).cloned()
     };
 
     let Some(client) = client else {
-        // Permit absence here only when the assertion-less, public-client
-        // path is valid for this grant. The downstream handler will
-        // reject unknown clients with its own error. (token_exchange and
-        // jwt-bearer grants are looked up differently — they don't need
-        // RegisteredClient at all.)
+        // Genuinely unknown client_id. For grants that don't need a
+        // RegisteredClient (jwt-bearer, token_exchange) the downstream
+        // handler dispatches without it. For grants that DO need one
+        // (authorization_code, refresh_token, device_code), the
+        // downstream handler's own client_id check on the pending entry
+        // will reject — but only if the IDs don't match. Permitting
+        // pass-through here is safe because:
+        //   - CIMD path above already attempts re-resolve, so a real
+        //     CIMD client_id has had two chances to be found.
+        //   - DCR clients with UUID IDs are only "absent" if they were
+        //     never registered, in which case no pending entry exists.
         return Ok(());
     };
 

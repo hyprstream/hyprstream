@@ -286,6 +286,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn evict_one_terminates_under_stale_heap_pressure() {
+        // Repeatedly re-insert the same key with bumped versions to
+        // accumulate stale heap nodes, then trigger evict_one by
+        // overfilling. Must terminate (not infinite-loop) and must
+        // actually evict the right entry.
+        let cache = CimdCache::new(CimdCacheConfig {
+            max_entries: 2,
+            reap_budget: 4, // small budget keeps reap from clearing the stale nodes
+            min_ttl: Duration::from_secs(60),
+            max_ttl: Duration::from_secs(3600),
+        });
+
+        // 50 stale heap nodes for client A, all "live" entry version.
+        for _ in 0..50 {
+            cache.insert(make_client("https://a.test/c"), Duration::from_secs(120)).await;
+        }
+        // One entry for client B at capacity.
+        cache.insert(make_client("https://b.test/c"), Duration::from_secs(60)).await;
+        assert_eq!(cache.len().await, 2, "A + B at capacity");
+
+        // Insert C — triggers evict_one which must walk past stale A
+        // heap nodes to find a fresh victim and terminate.
+        cache.insert(make_client("https://c.test/c"), Duration::from_secs(180)).await;
+        assert_eq!(cache.len().await, 2, "still 2 after eviction");
+        // B had the shortest TTL among current map entries, so should be evicted.
+        assert!(
+            cache.get("https://b.test/c").await.is_none(),
+            "B (shortest TTL) should have been the victim"
+        );
+        assert!(cache.get("https://a.test/c").await.is_some(), "A still present");
+        assert!(cache.get("https://c.test/c").await.is_some(), "C just inserted");
+    }
+
+    #[tokio::test]
     async fn capacity_bound_evicts_next_to_expire() {
         let cache = CimdCache::new(CimdCacheConfig {
             max_entries: 2,

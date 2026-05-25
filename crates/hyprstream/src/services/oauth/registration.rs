@@ -488,20 +488,77 @@ pub(crate) fn is_private_host_for_jwks(host: &str) -> bool {
     is_private_host(host)
 }
 
-/// Check if a hostname resolves to a private/loopback address.
+/// Reject hosts that point at private/loopback/internal address space.
+///
+/// **Important defense-in-depth limitation**: this only inspects the
+/// hostname *as written in the URL*. It does NOT resolve DNS — a name
+/// like `attacker.example.com` that resolves to `127.0.0.1` (DNS
+/// rebinding / pinning attack) will pass this check. To close that
+/// hole we'd need a custom reqwest connector that resolves and re-
+/// checks the IP at connect time; tracked as separate hardening work.
+///
+/// What we DO block at the URL layer:
+///   - `localhost` literal
+///   - IPv4 literals in any of the IANA-reserved/private ranges
+///     (loopback, RFC1918, link-local, CGNAT)
+///   - IPv6 literals in loopback, ULA (fc00::/7), link-local
+///     (fe80::/10), unspecified, and IPv4-mapped equivalents of the
+///     above (e.g. `::ffff:127.0.0.1`)
 fn is_private_host(host: &str) -> bool {
-    matches!(
-        host,
-        "localhost" | "127.0.0.1" | "::1" | "[::1]" | "0.0.0.0"
-    ) || host.starts_with("10.")
-        || host.starts_with("192.168.")
-        || host.starts_with("172.16.")
-        || host.starts_with("172.17.")
-        || host.starts_with("172.18.")
-        || host.starts_with("172.19.")
-        || host.starts_with("172.2")
-        || host.starts_with("172.30.")
-        || host.starts_with("172.31.")
+    use std::net::IpAddr;
+
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    // url::Url::host_str() returns IPv6 without surrounding brackets, but
+    // be tolerant in case a caller passes a bracketed form.
+    let stripped = host.strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+
+    let Ok(ip) = stripped.parse::<IpAddr>() else {
+        // Hostname (not an IP literal). We can't safely classify without
+        // resolving — fall through to allow. The TLS + cert-chain check
+        // on connect is the real gate for hostname-based URLs.
+        return false;
+    };
+
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()        // RFC 1918: 10/8, 172.16/12, 192.168/16
+                || v4.is_link_local()     // 169.254/16
+                || v4.is_unspecified()    // 0.0.0.0
+                || v4.is_broadcast()      // 255.255.255.255
+                || v4.is_multicast()
+                // CGNAT (RFC 6598) — not in std::net's classifier as of
+                // current stable. 100.64.0.0/10.
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0b1100_0000) == 0b0100_0000)
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // ULA fc00::/7
+                || (v6.segments()[0] & 0xfe00 == 0xfc00)
+                // Link-local fe80::/10
+                || (v6.segments()[0] & 0xffc0 == 0xfe80)
+                // IPv4-mapped IPv6 (::ffff:0:0/96) — recurse into v4 check
+                || v6
+                    .to_ipv4_mapped()
+                    .map(|v4| {
+                        v4.is_loopback()
+                            || v4.is_private()
+                            || v4.is_link_local()
+                            || v4.is_unspecified()
+                            || v4.is_broadcast()
+                            || (v4.octets()[0] == 100
+                                && (v4.octets()[1] & 0b1100_0000) == 0b0100_0000)
+                    })
+                    .unwrap_or(false)
+        }
+    }
 }
 
 /// Validate a redirect_uri against a client's registered URIs.
@@ -687,5 +744,91 @@ mod tests {
         assert!(is_private_host("192.168.1.1"));
         assert!(!is_private_host("example.com"));
         assert!(!is_private_host("8.8.8.8"));
+    }
+
+    #[test]
+    fn private_host_blocks_full_172_16_through_31() {
+        // RFC 1918 172.16.0.0/12 = 172.16-172.31 only
+        for octet in 16..=31 {
+            assert!(
+                is_private_host(&format!("172.{octet}.0.1")),
+                "172.{octet}.0.1 must block (RFC 1918)"
+            );
+        }
+    }
+
+    #[test]
+    fn private_host_does_not_overshoot_into_public_172() {
+        // The old `starts_with("172.2")` heuristic would block these
+        // public IPs. Regression guard.
+        assert!(!is_private_host("172.200.0.1"));
+        assert!(!is_private_host("172.32.0.1"));
+        assert!(!is_private_host("172.15.0.1")); // also outside RFC 1918
+    }
+
+    #[test]
+    fn private_host_blocks_link_local_ipv4() {
+        // 169.254/16
+        assert!(is_private_host("169.254.169.254"));
+        assert!(is_private_host("169.254.0.1"));
+        // 169.255 is OUTSIDE link-local
+        assert!(!is_private_host("169.255.0.1"));
+    }
+
+    #[test]
+    fn private_host_blocks_cgnat() {
+        // RFC 6598 100.64.0.0/10
+        assert!(is_private_host("100.64.0.1"));
+        assert!(is_private_host("100.127.255.254"));
+        // 100.128.0.1 is OUTSIDE CGNAT
+        assert!(!is_private_host("100.128.0.1"));
+        assert!(!is_private_host("100.63.0.1"));
+    }
+
+    #[test]
+    fn private_host_blocks_unspecified_and_broadcast() {
+        assert!(is_private_host("0.0.0.0"));
+        assert!(is_private_host("255.255.255.255"));
+    }
+
+    #[test]
+    fn private_host_blocks_ipv6_loopback_variants() {
+        assert!(is_private_host("::1"));
+        assert!(is_private_host("[::1]"));
+        // expanded forms
+        assert!(is_private_host("0:0:0:0:0:0:0:1"));
+        // bracketed expanded
+        assert!(is_private_host("[0:0:0:0:0:0:0:1]"));
+    }
+
+    #[test]
+    fn private_host_blocks_ipv6_ula_and_link_local() {
+        // ULA fc00::/7
+        assert!(is_private_host("fc00::1"));
+        assert!(is_private_host("fd00::1"));
+        // Link-local fe80::/10
+        assert!(is_private_host("fe80::1"));
+        assert!(is_private_host("febf::1"));
+    }
+
+    #[test]
+    fn private_host_blocks_ipv4_mapped_ipv6() {
+        // IPv4-mapped IPv6 must inherit IPv4 classification — these were
+        // the previous bypass.
+        assert!(is_private_host("::ffff:127.0.0.1"));
+        assert!(is_private_host("::ffff:10.0.0.1"));
+        assert!(is_private_host("::ffff:192.168.1.1"));
+        assert!(is_private_host("::ffff:169.254.169.254"));
+        // Public IPv4 mapped through IPv6 should still NOT block.
+        assert!(!is_private_host("::ffff:8.8.8.8"));
+    }
+
+    #[test]
+    fn private_host_passes_through_public_dns_names() {
+        // Hostnames (non-IP-literal) can't be classified without DNS.
+        // We fall through to allow — the TLS chain check on connect is
+        // the gate. Documented limitation.
+        assert!(!is_private_host("attacker.example.com"));
+        assert!(!is_private_host("github.com"));
     }
 }
