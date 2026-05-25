@@ -313,8 +313,8 @@ pub(crate) async fn check_cimd_register_for_client_auth(
 /// Fails closed on RPC errors.
 ///
 /// **Default posture is deny.** The shipped base policy has no
-/// `cimd:register` allow rule; operators opt in to CIMD federation by:
-///   - applying the `cimd-open` template (any HTTPS origin allowed), or
+/// `cimd:register` allow rule; operators opt in to client federation by:
+///   - applying the `federation-open` template (any HTTPS origin allowed), or
 ///   - allowlisting specific origins:
 ///     `p, https://app.example.com, *, cimd:register, check, allow`
 ///

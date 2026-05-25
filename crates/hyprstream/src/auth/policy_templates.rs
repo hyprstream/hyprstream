@@ -108,15 +108,16 @@ pub const SERVICE_BASE_POLICIES: &[ServicePolicyRule] = &[
     ServicePolicyRule { subject: "service:model", domain: "*", resource: "discovery:*", action: "*", effect: "allow" },
     ServicePolicyRule { subject: "service:oai", domain: "*", resource: "discovery:*", action: "*", effect: "allow" },
     ServicePolicyRule { subject: "service:worker", domain: "*", resource: "discovery:*", action: "*", effect: "allow" },
-    // NOTE: CIMD (`cimd:register`) is deny-by-default. The base policy
-    // intentionally has no allow rule for it. Operators opt in to open
-    // federation by applying the `cimd-open` template, or allowlist
-    // specific origins:
+    // NOTE: Client federation (`cimd:register` resource — the internal
+    // name follows the OAuth spec for Client ID Metadata Documents) is
+    // deny-by-default. The base policy intentionally has no allow rule
+    // for it. Operators opt in by applying the `federation-open`
+    // template, or by allowlisting specific origins:
     //   p, https://app.example.com, *, cimd:register, check, allow
     //   p, https://*.example.com,   *, cimd:register, check, allow
-    // The wizard and helm chart may suggest `cimd-open` at setup time
-    // for operators who want MCP-spec-aligned no-prior-relationship
-    // client onboarding.
+    // The wizard may suggest `federation-open` at setup time for
+    // operators who want MCP-spec-aligned no-prior-relationship client
+    // onboarding.
     //
     // Infra services — scoped to their own domain
     ServicePolicyRule { subject: "service:oauth", domain: "*", resource: "oauth:*", action: "*", effect: "allow" },
@@ -195,9 +196,12 @@ impl PolicyTemplate {
 pub fn get_templates() -> &'static [PolicyTemplate] {
     &[
         PolicyTemplate {
-            name: "cimd-open",
-            description: "Open CIMD federation: any HTTPS origin may register a Client ID Metadata Document (MCP-spec posture)",
+            name: "federation-open",
+            description: "Open client federation: any third-party app may connect via its published metadata (recommended for MCP compatibility)",
             policies: Some(&[
+                // Allow any HTTPS origin to publish a Client ID Metadata
+                // Document and use it as its OAuth client_id. This is
+                // the MCP-spec "no prior relationship" path.
                 ServicePolicyRule {
                     subject: "*",
                     domain: "*",
