@@ -96,6 +96,7 @@ pub async fn handle_wizard(
     non_interactive: bool,
     start_services: bool,
     bootstrap_only: bool,
+    enable_federation: bool,
 ) -> Result<()> {
     // Install systemd units before entering spawn_blocking (async operation).
     if !bootstrap_only && hyprstream_rpc::has_systemd() {
@@ -114,6 +115,7 @@ pub async fn handle_wizard(
             non_interactive,
             bootstrap_only,
             start_services,
+            enable_federation,
             &config_services,
         )
     })
@@ -131,6 +133,7 @@ fn run_text_wizard(
     non_interactive: bool,
     bootstrap_only: bool,
     start_services_flag: bool,
+    enable_federation: bool,
     config_services: &[String],
 ) -> Result<()> {
     println!();
@@ -151,7 +154,7 @@ fn run_text_wizard(
     text_phase_binary_install(non_interactive)?;
 
     // Phase 3: Policy template selection
-    text_phase_templates(backend, non_interactive, &mut summary)?;
+    text_phase_templates(backend, non_interactive, enable_federation, &mut summary)?;
 
     // Phase 4: User/role creation
     text_phase_users(backend, non_interactive, &mut summary)?;
@@ -300,9 +303,15 @@ fn text_phase_binary_install(non_interactive: bool) -> Result<()> {
 // Phase 3: Policy Templates (via WizardBackend)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Template name for the opt-in open-federation grant. Kept here so the
+/// wizard can show it as a separate confirm prompt (rather than
+/// burying it in the main Select alongside server-access templates).
+const FEDERATION_TEMPLATE: &str = "federation-open";
+
 fn text_phase_templates(
     backend: &mut impl WizardBackend,
     non_interactive: bool,
+    enable_federation: bool,
     summary: &mut TextWizardSummary,
 ) -> Result<()> {
     println!("  Phase 3: Policy Template");
@@ -316,6 +325,11 @@ fn text_phase_templates(
 
         if non_interactive {
             println!("    Keeping existing policy (non-interactive mode).");
+            // Federation is composable, so even with an existing policy
+            // we honor --enable-federation by layering it on top.
+            if enable_federation {
+                apply_federation_template(backend, summary);
+            }
             println!();
             return Ok(());
         }
@@ -327,18 +341,27 @@ fn text_phase_templates(
 
         if !overwrite {
             println!("    Keeping existing policy.");
+            prompt_federation_interactive(backend, summary);
             println!();
             return Ok(());
         }
     }
 
-    let templates = backend.templates();
+    // Server-access templates only — federation handled separately.
+    let templates: Vec<_> = backend
+        .templates()
+        .into_iter()
+        .filter(|t| t.name != FEDERATION_TEMPLATE)
+        .collect();
 
     if non_interactive {
         if let Some(first) = templates.first() {
             backend.apply_template(&first.name);
             print_check("Template", CheckStatus::Ok, &format!("applied '{}'", first.name));
             summary.templates_applied.push(first.name.clone());
+        }
+        if enable_federation {
+            apply_federation_template(backend, summary);
         }
         println!();
         return Ok(());
@@ -356,20 +379,51 @@ fn text_phase_templates(
 
     if selection.starts_with("None") {
         println!("    Skipping template.");
-        println!();
-        return Ok(());
+    } else {
+        let template_name = selection.split(" —").next().unwrap_or("").trim();
+        if let Some(template) = templates.iter().find(|t| t.name == template_name) {
+            backend.apply_template(&template.name);
+            backend.save_policies();
+            print_check("Template", CheckStatus::Ok, &format!("applied '{}'", template.name));
+            summary.templates_applied.push(template.name.clone());
+        }
     }
 
-    let template_name = selection.split(" —").next().unwrap_or("").trim();
-    if let Some(template) = templates.iter().find(|t| t.name == template_name) {
-        backend.apply_template(&template.name);
-        backend.save_policies();
-        print_check("Template", CheckStatus::Ok, &format!("applied '{}'", template.name));
-        summary.templates_applied.push(template.name.clone());
-    }
-
+    prompt_federation_interactive(backend, summary);
     println!();
     Ok(())
+}
+
+/// Interactive prompt for the federation-open template. Default is N
+/// — opening third-party client federation is opt-in.
+fn prompt_federation_interactive(
+    backend: &mut impl WizardBackend,
+    summary: &mut TextWizardSummary,
+) {
+    let enable = Confirm::new(
+        "  Enable open client federation? \
+         Lets any third-party app connect using a published metadata URL (MCP-compatible).",
+    )
+    .with_default(false)
+    .prompt()
+    .unwrap_or(false);
+    if enable {
+        apply_federation_template(backend, summary);
+    } else {
+        println!("    Federation left disabled — operators can enable later with");
+        println!("    `hyprstream quick policy apply-template {FEDERATION_TEMPLATE}`.");
+    }
+}
+
+fn apply_federation_template(backend: &mut impl WizardBackend, summary: &mut TextWizardSummary) {
+    backend.apply_template(FEDERATION_TEMPLATE);
+    backend.save_policies();
+    print_check(
+        "Federation",
+        CheckStatus::Ok,
+        &format!("applied '{FEDERATION_TEMPLATE}'"),
+    );
+    summary.templates_applied.push(FEDERATION_TEMPLATE.to_owned());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

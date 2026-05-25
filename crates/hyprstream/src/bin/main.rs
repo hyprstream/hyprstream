@@ -187,6 +187,12 @@ fn build_cli() -> ClapCommand {
                     .long("bootstrap-only")
                     .action(clap::ArgAction::SetTrue)
                     .help("Run only the trust-root bootstrap (phase 1); skip binary install, policy templates, user creation, token mint, and systemd"),
+            )
+            .arg(
+                Arg::new("enable_federation")
+                    .long("enable-federation")
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Apply the federation-open policy template (allow any HTTPS origin to register as an OAuth client via published metadata). Default is disabled; under -y this flag is the only way to enable it."),
             ),
     );
 
@@ -1518,6 +1524,7 @@ fn main() -> Result<()> {
                 let non_interactive = sub_m.get_flag("non_interactive");
                 let start_services = sub_m.get_flag("start");
                 let bootstrap_only = sub_m.get_flag("bootstrap_only");
+                let enable_federation = sub_m.get_flag("enable_federation");
                 let use_tui = tui_mode || (!non_interactive && !bootstrap_only && supports_tui());
                 return with_runtime(
                     RuntimeConfig { device: DeviceConfig::request_cpu(), multi_threaded: true },
@@ -1526,7 +1533,8 @@ fn main() -> Result<()> {
                             hyprstream_core::cli::handle_wizard_tui(&models_dir, &services).await
                         } else {
                             hyprstream_core::cli::handle_wizard(
-                                &models_dir, &services, non_interactive, start_services, bootstrap_only,
+                                &models_dir, &services, non_interactive, start_services,
+                                bootstrap_only, enable_federation,
                             ).await
                         }
                     },
@@ -1539,8 +1547,10 @@ fn main() -> Result<()> {
                     if supports_tui() {
                         hyprstream_core::cli::handle_wizard_tui(&models_dir, &services).await
                     } else {
+                        // First-run fallback (no `wizard` subcommand) defaults
+                        // federation to off — explicit opt-in only.
                         hyprstream_core::cli::handle_wizard(
-                            &models_dir, &services, false, false, false,
+                            &models_dir, &services, false, false, false, false,
                         ).await
                     }
                 },
@@ -2263,8 +2273,9 @@ fn main() -> Result<()> {
                         if supports_tui() {
                             hyprstream_core::cli::handle_wizard_tui(&models_dir, &services).await
                         } else {
+                            // First-run auto-wizard defaults federation to off.
                             hyprstream_core::cli::handle_wizard(
-                                &models_dir, &services, false, false, false,
+                                &models_dir, &services, false, false, false, false,
                             ).await
                         }
                     },
