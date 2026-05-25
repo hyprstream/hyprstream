@@ -108,12 +108,16 @@ pub const SERVICE_BASE_POLICIES: &[ServicePolicyRule] = &[
     ServicePolicyRule { subject: "service:model", domain: "*", resource: "discovery:*", action: "*", effect: "allow" },
     ServicePolicyRule { subject: "service:oai", domain: "*", resource: "discovery:*", action: "*", effect: "allow" },
     ServicePolicyRule { subject: "service:worker", domain: "*", resource: "discovery:*", action: "*", effect: "allow" },
-    // CIMD trust gate (Phase 1b-CIMD-trust): default-allow any HTTPS
-    // origin to register a Client ID Metadata Document. Operators
-    // tighten by adding origin-specific deny rules — Casbin's effect
-    // model resolves deny over allow:
-    //   p, https://bad.example.com, *, cimd:register, check, deny
-    ServicePolicyRule { subject: "*", domain: "*", resource: "cimd:register", action: "check", effect: "allow" },
+    // NOTE: CIMD (`cimd:register`) is deny-by-default. The base policy
+    // intentionally has no allow rule for it. Operators opt in to open
+    // federation by applying the `cimd-open` template, or allowlist
+    // specific origins:
+    //   p, https://app.example.com, *, cimd:register, check, allow
+    //   p, https://*.example.com,   *, cimd:register, check, allow
+    // The wizard and helm chart may suggest `cimd-open` at setup time
+    // for operators who want MCP-spec-aligned no-prior-relationship
+    // client onboarding.
+    //
     // Infra services — scoped to their own domain
     ServicePolicyRule { subject: "service:oauth", domain: "*", resource: "oauth:*", action: "*", effect: "allow" },
     ServicePolicyRule { subject: "service:streams", domain: "*", resource: "streams:*", action: "*", effect: "allow" },
@@ -177,9 +181,33 @@ impl PolicyTemplate {
     }
 }
 
-/// Get all available policy templates
+/// Get all available policy templates.
+///
+/// Templates are **composable and additive**: each `policy apply-template`
+/// adds the template's rules to the running policy via Casbin's
+/// `add_policies` / `add_grouping_policies` (deduplicating, so repeat
+/// application is idempotent). Operators can layer templates as
+/// needed — e.g. `cimd-open` + `public-inference` + `ttt.user`.
+///
+/// No template removes rules. To revoke a previously-applied template
+/// operators use `policy edit` to remove the lines, or
+/// `policy rollback <ref>` to restore an earlier commit.
 pub fn get_templates() -> &'static [PolicyTemplate] {
     &[
+        PolicyTemplate {
+            name: "cimd-open",
+            description: "Open CIMD federation: any HTTPS origin may register a Client ID Metadata Document (MCP-spec posture)",
+            policies: Some(&[
+                ServicePolicyRule {
+                    subject: "*",
+                    domain: "*",
+                    resource: "cimd:register",
+                    action: "check",
+                    effect: "allow",
+                },
+            ]),
+            groupings: None,
+        },
         PolicyTemplate {
             name: "public-inference",
             description: "Anonymous users can infer and query models",

@@ -311,6 +311,16 @@ pub(crate) async fn check_cimd_register_for_client_auth(
 
 /// Consult PolicyService for `cimd:register` on the given origin.
 /// Fails closed on RPC errors.
+///
+/// **Default posture is deny.** The shipped base policy has no
+/// `cimd:register` allow rule; operators opt in to CIMD federation by:
+///   - applying the `cimd-open` template (any HTTPS origin allowed), or
+///   - allowlisting specific origins:
+///     `p, https://app.example.com, *, cimd:register, check, allow`
+///
+/// PolicyService outage → reject, with operator-visible error. We do
+/// NOT silently fall back to allow on outage; security posture is
+/// preserved over availability of new CIMD registrations.
 async fn check_cimd_register(state: &OAuthState, origin: &str) -> Result<(), String> {
     use crate::services::generated::policy_client::PolicyCheck;
     match state
