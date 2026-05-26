@@ -276,10 +276,13 @@ pub struct OAuthState {
     pub cimd_cache: Arc<super::cimd_cache::CimdCache>,
     /// JWKS-URI fetch cache for `private_key_jwt` client auth. Keyed by
     /// the absolute URL; value is `(parsed_jwks_json, fetched_at)`.
-    /// Entries expire after `JWKS_URI_TTL` and are evicted lazily on
-    /// read. Capacity is implicitly bounded by the number of registered
-    /// clients with jwks_uri (typically small).
+    /// Entries expire after `client_jwks_uri_cache_ttl_secs` and are
+    /// evicted lazily on read. Capacity is implicitly bounded by the
+    /// number of registered clients with jwks_uri (typically small).
     pub jwks_uri_cache: RwLock<HashMap<String, (serde_json::Value, Instant)>>,
+    /// TTL for the `jwks_uri_cache`. Copied from
+    /// [`OAuthConfig::client_jwks_uri_cache_ttl_secs`] at construction.
+    pub client_jwks_uri_cache_ttl: Duration,
     /// Pending authorization codes (single-use, 60s TTL)
     pub pending_codes: RwLock<HashMap<String, PendingAuthCode>>,
     /// Pending authorize nonces (single-use, 5-min TTL).
@@ -376,6 +379,7 @@ impl OAuthState {
                 super::cimd_cache::CimdCacheConfig::default(),
             )),
             jwks_uri_cache: RwLock::new(HashMap::new()),
+            client_jwks_uri_cache_ttl: Duration::from_secs(config.client_jwks_uri_cache_ttl_secs),
             pending_codes: RwLock::new(HashMap::new()),
             pending_nonces: RwLock::new(HashMap::new()),
             pending_par_requests: RwLock::new(HashMap::new()),

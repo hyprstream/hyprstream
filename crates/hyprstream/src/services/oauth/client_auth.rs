@@ -25,10 +25,6 @@ use super::state::{OAuthState, RegisteredClient};
 use crate::auth::id_token_verify::{algorithm_for_key_pub, build_decoding_key};
 use jsonwebtoken::{decode, DecodingKey, Validation};
 
-/// TTL for cached jwks_uri responses. Client signing keys rotate
-/// infrequently; 1 hour balances freshness against fetch amplification.
-pub const JWKS_URI_TTL: Duration = Duration::from_secs(3600);
-
 /// HTTP fetch timeout for jwks_uri. Same as CIMD document fetch.
 const JWKS_URI_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -92,7 +88,7 @@ pub fn requires_private_key_jwt(client: &RegisteredClient) -> bool {
 
 /// Verify an RFC 7523 client_assertion against the registered client's
 /// JWKS — inline `jwks` if present, otherwise fetched from `jwks_uri`
-/// (cached for `JWKS_URI_TTL`). `expected_audience` is the canonical
+/// (cached for `state.client_jwks_uri_cache_ttl`). `expected_audience` is the canonical
 /// token endpoint URL.
 ///
 /// On success, returns the verified JWT's claims for caller-side use
@@ -243,7 +239,7 @@ async fn fetch_jwks_uri(state: &OAuthState, url: &str) -> Result<Value, ClientAu
     {
         let cache = state.jwks_uri_cache.read().await;
         if let Some((jwks, fetched_at)) = cache.get(url) {
-            if fetched_at.elapsed() < JWKS_URI_TTL {
+            if fetched_at.elapsed() < state.client_jwks_uri_cache_ttl {
                 return Ok(jwks.clone());
             }
         }

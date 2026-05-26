@@ -967,6 +967,20 @@ pub struct OAuthConfig {
     #[serde(default, skip_serializing)]
     pub user_signing_key: Option<String>,
 
+    /// How long to cache a third-party OAuth client's JWKS fetched
+    /// via `jwks_uri` (RFC 7591 §2.1). Applies to `private_key_jwt`
+    /// client authentication at the token endpoint.
+    ///
+    /// Clients that rotate signing keys faster than this should keep
+    /// the old key in their JWKS for at least one cache window so
+    /// verification spans the rotation (standard JWKS rotation
+    /// hygiene). Default: 3600 seconds (1 hour).
+    ///
+    /// Distinct from `trusted_issuers[*].jwks_cache_ttl_secs` (which
+    /// configures hyprstream federation peers, not OAuth clients).
+    #[serde(default = "default_client_jwks_uri_cache_ttl")]
+    pub client_jwks_uri_cache_ttl_secs: u64,
+
     /// How many days a JWT signing key remains in the active (issuance) slot.
     #[serde(default = "default_jwt_key_active_days")]
     pub jwt_key_active_days: u32,
@@ -1010,6 +1024,7 @@ impl Default for OAuthConfig {
             default_scopes: default_oauth_scopes(),
             token_ttl_seconds: default_oauth_token_ttl(),
             refresh_token_ttl_seconds: default_refresh_token_ttl(),
+            client_jwks_uri_cache_ttl_secs: default_client_jwks_uri_cache_ttl(),
             tls_cert: None,
             tls_key: None,
             quic_port: None,
@@ -1128,6 +1143,7 @@ fn default_oauth_scopes() -> Vec<String> {
 }
 fn default_oauth_token_ttl() -> u32 { 3600 }
 fn default_refresh_token_ttl() -> u32 { 2_628_000 } // 730 hours (~30 days)
+fn default_client_jwks_uri_cache_ttl() -> u64 { 3600 } // 1 hour
 fn default_jwt_key_active_days() -> u32 { 14 }
 fn default_jwt_key_lead_days() -> u32 { 7 }
 fn default_jwt_key_drain_days() -> u32 { 30 }
