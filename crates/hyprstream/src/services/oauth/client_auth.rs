@@ -141,10 +141,27 @@ pub fn verify_assertion_with_keys(
     // Try each candidate. jsonwebtoken::decode validates exp and aud
     // when set in Validation. We disable aud-via-validation and check it
     // manually so we can produce a precise error.
+    //
+    // Per-key failures log at `debug!` — this loop is expected to
+    // discard non-matching candidates in the happy path (a JWKS may
+    // hold many keys and only the kid-matched one is the right
+    // verifier). Promoting to warn would flood logs. The final
+    // `InvalidSignature` carries an aggregate warn-level summary so
+    // operators can correlate a verification failure with the keys
+    // that were considered.
+    let mut attempts = 0u32;
     for jwk in &candidates {
+        let kid_for_log = jwk.get("kid").and_then(Value::as_str);
         let alg = match algorithm_for_key_pub(jwk) {
             Ok(a) => a,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::debug!(
+                    kid = ?kid_for_log,
+                    error = %e,
+                    "client_assertion: skipping JWKS key (unsupported algorithm)"
+                );
+                continue;
+            }
         };
         let mut validation = Validation::new(alg);
         validation.validate_exp = true;
@@ -153,19 +170,47 @@ pub fn verify_assertion_with_keys(
 
         let decoding_key: DecodingKey = match build_decoding_key(jwk) {
             Ok(k) => k,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::debug!(
+                    kid = ?kid_for_log,
+                    error = %e,
+                    "client_assertion: skipping JWKS key (invalid key material)"
+                );
+                continue;
+            }
         };
 
+        attempts += 1;
         match decode::<Value>(assertion, &decoding_key, &validation) {
             Ok(data) => {
                 let claims = data.claims;
                 check_claims(&claims, client_id, expected_audience)?;
                 return Ok(claims);
             }
-            Err(_) => continue,
+            Err(e) => {
+                tracing::debug!(
+                    kid = ?kid_for_log,
+                    error = %e,
+                    "client_assertion: signature/claims verification failed for this key"
+                );
+                continue;
+            }
         }
     }
 
+    // Aggregate summary at warn level: emits once per failed assertion
+    // with the kid the assertion was *signed for*, helping operators
+    // pinpoint a misconfigured client.
+    let header_kid = jsonwebtoken::decode_header(assertion)
+        .ok()
+        .and_then(|h| h.kid);
+    tracing::warn!(
+        client_id = %client_id,
+        header_kid = ?header_kid,
+        candidates = candidates.len(),
+        actual_verify_attempts = attempts,
+        "client_assertion verification failed against every candidate key"
+    );
     Err(ClientAuthError::InvalidSignature)
 }
 
