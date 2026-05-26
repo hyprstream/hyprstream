@@ -123,18 +123,18 @@ pub async fn exchange_token(
         gt if gt == JWT_BEARER_GRANT_TYPE => {
             let assertion = match params.assertion {
                 Some(a) => a,
-                None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", "assertion is required"),
+                None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", Some("assertion is required")),
             };
             super::jwt_bearer::exchange_jwt_bearer(&state, &params.client_id, &assertion).await
         }
         gt if gt == TOKEN_EXCHANGE_GRANT_TYPE => {
             let subject_token = match params.subject_token {
                 Some(t) => t,
-                None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", "subject_token is required"),
+                None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", Some("subject_token is required")),
             };
             let subject_token_type = match params.subject_token_type {
                 Some(t) => t,
-                None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", "subject_token_type is required"),
+                None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", Some("subject_token_type is required")),
             };
             super::token_exchange::exchange_token_exchange(
                 &state,
@@ -149,7 +149,7 @@ pub async fn exchange_token(
         _ => token_error(
             StatusCode::BAD_REQUEST,
             "unsupported_grant_type",
-            "Supported: authorization_code, refresh_token, device_code, jwt-bearer",
+            Some("Supported: authorization_code, refresh_token, device_code, jwt-bearer"),
         ),
     }
 }
@@ -211,10 +211,13 @@ async fn enforce_client_authentication(
     let has_assertion = params.client_assertion.is_some() && params.client_assertion_type.is_some();
 
     if needs_auth && !has_assertion {
+        // Client-actionable: the client knows their own
+        // token_endpoint_auth_method registration; we can tell them
+        // what's missing from the request they sent.
         return Err(token_error(
             StatusCode::UNAUTHORIZED,
             "invalid_client",
-            "client_assertion required for private_key_jwt",
+            Some("client_assertion required"),
         ));
     }
 
@@ -228,6 +231,9 @@ async fn enforce_client_authentication(
         if let Err(e) = super::client_auth::verify_client_assertion(
             state, &client, atype, assertion, &token_endpoint,
         ).await {
+            // Full reason goes to logs; the public response stays
+            // opaque so we don't leak the validation logic / order
+            // (iss/sub/aud/exp/signature) to probing attackers.
             tracing::warn!(
                 client_id = %params.client_id,
                 error = %e,
@@ -236,7 +242,7 @@ async fn enforce_client_authentication(
             return Err(token_error(
                 StatusCode::UNAUTHORIZED,
                 "invalid_client",
-                &format!("client_assertion verification failed: {e}"),
+                None,
             ));
         }
     }
@@ -269,14 +275,17 @@ async fn verify_dpop_at_token_endpoint(
     let proof = match super::dpop::verify_dpop_proof(proof_str, "POST", &token_endpoint, None) {
         Ok(p) => p,
         Err(e) => {
+            // The DPoP module's error variants describe internal
+            // checks (signature, jkt match, htm/htu, alg). Keep them
+            // out of the public response; logs carry the detail.
             tracing::warn!("DPoP proof verification failed: {e}");
-            return Some(Err(token_error(StatusCode::BAD_REQUEST, "invalid_dpop_proof", &e.to_string())));
+            return Some(Err(token_error(StatusCode::BAD_REQUEST, "invalid_dpop_proof", None)));
         }
     };
     // JTI replay check.
     if !state.check_and_record_dpop_jti(&proof.jti, proof.iat).await {
         tracing::warn!(jti = %proof.jti, "DPoP JTI replay detected");
-        return Some(Err(token_error(StatusCode::BAD_REQUEST, "invalid_dpop_proof", "DPoP proof jti already used")));
+        return Some(Err(token_error(StatusCode::BAD_REQUEST, "invalid_dpop_proof", Some("DPoP proof jti already used"))));
     }
 
     // RFC 9449 §8 nonce enforcement.
@@ -312,7 +321,10 @@ async fn verify_dpop_at_token_endpoint(
 /// Build a `400 use_dpop_nonce` response with the current nonce in the
 /// `DPoP-Nonce` header (RFC 9449 §8).
 fn use_dpop_nonce_error(nonce: &str, description: &str) -> Response {
-    let mut resp = token_error(StatusCode::BAD_REQUEST, "use_dpop_nonce", description);
+    // `description` here is always client-actionable ("nonce required",
+    // "nonce expired") — that's the whole point of RFC 9449 §8: tell
+    // the client to retry with the nonce we just issued in the header.
+    let mut resp = token_error(StatusCode::BAD_REQUEST, "use_dpop_nonce", Some(description));
     if let Ok(val) = axum::http::HeaderValue::from_str(nonce) {
         resp.headers_mut().insert("DPoP-Nonce", val);
     }
@@ -328,15 +340,15 @@ async fn exchange_authorization_code(
 ) -> Response {
     let code = match params.code {
         Some(c) => c,
-        None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", "code is required"),
+        None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", Some("code is required")),
     };
     let redirect_uri = match params.redirect_uri {
         Some(r) => r,
-        None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", "redirect_uri is required"),
+        None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", Some("redirect_uri is required")),
     };
     let code_verifier = match params.code_verifier {
         Some(v) => v,
-        None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", "code_verifier is required"),
+        None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", Some("code_verifier is required")),
     };
 
     // Look up and remove pending code (single-use)
@@ -351,7 +363,7 @@ async fn exchange_authorization_code(
             return token_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_grant",
-                "Authorization code not found or already used",
+                Some("Authorization code not found or already used"),
             );
         }
     };
@@ -360,7 +372,7 @@ async fn exchange_authorization_code(
         return token_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
-            "Authorization code has expired",
+            Some("Authorization code has expired"),
         );
     }
 
@@ -368,7 +380,7 @@ async fn exchange_authorization_code(
         return token_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
-            "client_id does not match",
+            Some("client_id does not match"),
         );
     }
 
@@ -376,7 +388,7 @@ async fn exchange_authorization_code(
         return token_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
-            "redirect_uri does not match",
+            Some("redirect_uri does not match"),
         );
     }
 
@@ -390,7 +402,7 @@ async fn exchange_authorization_code(
         return token_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
-            "PKCE code_verifier verification failed",
+            Some("PKCE code_verifier verification failed"),
         );
     }
 
@@ -416,7 +428,7 @@ async fn exchange_refresh_token(
 ) -> Response {
     let refresh_token = match params.refresh_token {
         Some(rt) => rt,
-        None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", "refresh_token is required"),
+        None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", Some("refresh_token is required")),
     };
 
     // Look up and atomically consume the refresh token (single-use rotation).
@@ -427,26 +439,26 @@ async fn exchange_refresh_token(
             return token_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_grant",
-                "Refresh token not found or already used",
+                Some("Refresh token not found or already used"),
             );
         }
         Err(e) => {
             tracing::error!(error = %e, "Refresh token store read failed");
-            return token_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "Token store error");
+            return token_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", None);
         }
     };
 
     // Delete before issuing new token (rotation; prevents replay on store errors).
     if let Err(e) = state.delete_refresh_token(&refresh_token).await {
         tracing::error!(error = %e, "Refresh token store delete failed");
-        return token_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "Token store error");
+        return token_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", None);
     }
 
     if params.client_id != entry.client_id {
         return token_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
-            "client_id does not match",
+            Some("client_id does not match"),
         );
     }
 
@@ -474,7 +486,7 @@ async fn exchange_device_code(
 ) -> Response {
     let device_code = match params.device_code {
         Some(dc) => dc,
-        None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", "device_code is required"),
+        None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", Some("device_code is required")),
     };
 
     let mut device_codes = state.pending_device_codes.write().await;
@@ -485,7 +497,7 @@ async fn exchange_device_code(
             return token_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_grant",
-                "Device code not found or already used",
+                Some("Device code not found or already used"),
             );
         }
     };
@@ -496,7 +508,7 @@ async fn exchange_device_code(
         device_codes.remove(&device_code);
         let mut user_code_map = state.device_code_by_user_code.write().await;
         user_code_map.remove(&user_code);
-        return token_error(StatusCode::BAD_REQUEST, "expired_token", "The device code has expired");
+        return token_error(StatusCode::BAD_REQUEST, "expired_token", Some("The device code has expired"));
     }
 
     // Validate client_id
@@ -504,7 +516,7 @@ async fn exchange_device_code(
         return token_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
-            "client_id does not match",
+            Some("client_id does not match"),
         );
     }
 
@@ -512,21 +524,21 @@ async fn exchange_device_code(
     let now = Instant::now();
     if let Some(last) = pending.last_polled {
         if now.duration_since(last).as_secs() < pending.interval {
-            return token_error(StatusCode::BAD_REQUEST, "slow_down", "Polling too frequently");
+            return token_error(StatusCode::BAD_REQUEST, "slow_down", Some("Polling too frequently"));
         }
     }
     pending.last_polled = Some(now);
 
     match pending.status {
         DeviceCodeStatus::Pending => {
-            token_error(StatusCode::BAD_REQUEST, "authorization_pending", "The authorization request is still pending")
+            token_error(StatusCode::BAD_REQUEST, "authorization_pending", Some("The authorization request is still pending"))
         }
         DeviceCodeStatus::Denied => {
             let user_code = pending.user_code.clone();
             device_codes.remove(&device_code);
             let mut user_code_map = state.device_code_by_user_code.write().await;
             user_code_map.remove(&user_code);
-            token_error(StatusCode::BAD_REQUEST, "access_denied", "The user denied the authorization request")
+            token_error(StatusCode::BAD_REQUEST, "access_denied", Some("The user denied the authorization request"))
         }
         DeviceCodeStatus::Approved => {
             let client_id = pending.client_id.clone();
@@ -538,10 +550,16 @@ async fn exchange_device_code(
             let approved_by = match pending.approved_by.clone() {
                 Some(u) => u,
                 None => {
+                    // Internal invariant violation; do not surface
+                    // server state shape to the polling client.
+                    tracing::error!(
+                        device_code_prefix = %&device_code[..8.min(device_code.len())],
+                        "Device code approved but no approver identity recorded"
+                    );
                     return token_error(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "server_error",
-                        "Device code approved but no approver identity recorded",
+                        None,
                     );
                 }
             };
@@ -743,22 +761,101 @@ async fn issue_token_with_refresh(
             token_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "server_error",
-                "Failed to issue access token",
+                None,
             )
         }
     }
 }
 
-fn token_error(status: StatusCode, error: &str, description: &str) -> Response {
+/// Build an OAuth 2.1 §5.3 token-endpoint error response.
+///
+/// `description` is `Some(...)` only when the message is **client-
+/// actionable** (refers to something the client themselves can fix in
+/// their request — missing field, wrong assertion type, redirect_uri
+/// mismatch). For server-internal failures (policy denials, dependency
+/// outages, claim mismatches, signature failures) pass `None`: the
+/// public response carries only the OAuth error code, and the caller
+/// logs the full reason via tracing for operators.
+///
+/// Rationale: returning details like "PolicyService unreachable" or
+/// "iss does not match client_id" leaks internal IAM topology and
+/// validation order to unauthenticated callers. OAuth 2.1 §5.3
+/// permits `error_description` to be omitted; standard practice
+/// among hardened IdPs is to omit it for security-sensitive failures.
+fn token_error(status: StatusCode, error: &str, description: Option<&str>) -> Response {
     (
         status,
         [
             (header::CACHE_CONTROL, "no-store"),
             (header::PRAGMA, "no-cache"),
         ],
-        Json(serde_json::json!({
-            "error": error,
-            "error_description": description,
-        })),
+        Json(token_error_body(error, description)),
     ).into_response()
+}
+
+/// Pure JSON-body construction for `token_error`. Split out so unit
+/// tests can assert on the body shape (notably: `error_description`
+/// is omitted entirely when `description` is `None`, not serialized
+/// as `null`).
+fn token_error_body(error: &str, description: Option<&str>) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    body.insert("error".to_owned(), serde_json::Value::String(error.to_owned()));
+    if let Some(d) = description {
+        body.insert(
+            "error_description".to_owned(),
+            serde_json::Value::String(d.to_owned()),
+        );
+    }
+    serde_json::Value::Object(body)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_error_body_omits_description_when_none() {
+        let body = token_error_body("invalid_client", None);
+        let obj = body.as_object().unwrap();
+        assert_eq!(obj.get("error").and_then(|v| v.as_str()), Some("invalid_client"));
+        assert!(
+            !obj.contains_key("error_description"),
+            "description field MUST be absent when None — leaks happen via null/empty too"
+        );
+        assert_eq!(obj.len(), 1, "no extra fields");
+    }
+
+    #[test]
+    fn token_error_body_includes_description_when_some() {
+        let body = token_error_body("invalid_request", Some("code is required"));
+        let obj = body.as_object().unwrap();
+        assert_eq!(obj.get("error_description").and_then(|v| v.as_str()), Some("code is required"));
+    }
+
+    #[test]
+    fn token_error_body_never_carries_internal_substrings() {
+        // Regression guard: no caller in token.rs should ever pass a
+        // description containing these internal-state markers. The
+        // sweep in 2026-05-26 stripped them all to None. If a future
+        // change adds one back, this test won't catch it directly —
+        // but the documented rule for token_error makes it a code-
+        // review item. The test here pins the API: `None` yields an
+        // empty object, so any leak would have to be explicit in a
+        // caller's `Some(...)`.
+        let body = token_error_body("invalid_client", None);
+        let serialized = body.to_string();
+        for forbidden in &[
+            "PolicyService",
+            "federation:register",
+            "Failed to fetch",
+            "iss does not match",
+            "Token store error",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "opaque response unexpectedly leaks `{forbidden}`: {serialized}"
+            );
+        }
+    }
 }

@@ -70,15 +70,21 @@ pub struct ParResponse {
 #[derive(Debug, Serialize)]
 struct ParError {
     error: &'static str,
-    error_description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_description: Option<String>,
 }
 
-fn par_error(status: StatusCode, error: &'static str, description: impl Into<String>) -> Response {
+/// Build a PAR error response. `description` is `Some(...)` only when
+/// the message is client-actionable (refers to the client's own
+/// request). Server-internal failures pass `None`; the public response
+/// then carries only the OAuth error code. See `token_error` for the
+/// same rationale at the token endpoint.
+fn par_error(status: StatusCode, error: &'static str, description: Option<&str>) -> Response {
     (
         status,
         Json(ParError {
             error,
-            error_description: description.into(),
+            error_description: description.map(str::to_owned),
         }),
     )
         .into_response()
@@ -97,7 +103,7 @@ pub async fn push_authorization_request(
         return par_error(
             StatusCode::BAD_REQUEST,
             "unsupported_response_type",
-            "Only response_type=code is supported",
+            Some("Only response_type=code is supported"),
         );
     }
 
@@ -106,14 +112,14 @@ pub async fn push_authorization_request(
         return par_error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
-            "Only code_challenge_method=S256 is supported",
+            Some("Only code_challenge_method=S256 is supported"),
         );
     }
     if form.code_challenge.is_empty() {
         return par_error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
-            "code_challenge is required (PKCE mandatory per OAuth 2.1)",
+            Some("code_challenge is required (PKCE mandatory per OAuth 2.1)"),
         );
     }
 
@@ -122,10 +128,20 @@ pub async fn push_authorization_request(
         match resolve_cimd_client(&state, &form.client_id).await {
             Ok(client) => client.redirect_uris,
             Err(e) => {
+                // The resolver's error spans federation:register policy
+                // denial, PolicyService RPC outage, and CIMD doc fetch
+                // failures — all of which describe internal trust
+                // state to the unauthenticated PAR caller. Log full
+                // detail; respond opaquely.
+                tracing::warn!(
+                    client_id = %form.client_id,
+                    error = %e,
+                    "CIMD resolution failed during PAR"
+                );
                 return par_error(
                     StatusCode::BAD_REQUEST,
                     "invalid_client",
-                    format!("Failed to resolve client metadata: {e}"),
+                    None,
                 );
             }
         }
@@ -137,7 +153,7 @@ pub async fn push_authorization_request(
                 return par_error(
                     StatusCode::BAD_REQUEST,
                     "invalid_client",
-                    "Unknown client_id. Register first via POST /oauth/register",
+                    Some("Unknown client_id. Register first via POST /oauth/register"),
                 );
             }
         }
@@ -147,7 +163,7 @@ pub async fn push_authorization_request(
         return par_error(
             StatusCode::BAD_REQUEST,
             "invalid_redirect_uri",
-            "redirect_uri does not match registered URIs",
+            Some("redirect_uri does not match registered URIs"),
         );
     }
 
