@@ -113,7 +113,7 @@ impl Namespace {
             }
         }
         // Sort by prefix length descending for longest-prefix match.
-        self.mounts.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
+        self.mounts.sort_by_key(|b| std::cmp::Reverse(b.prefix.len()));
         Ok(())
     }
 
