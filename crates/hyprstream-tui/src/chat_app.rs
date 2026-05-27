@@ -560,22 +560,6 @@ impl ChatApp {
         self
     }
 
-    /// Attach VFS namespace for `/path` command routing (compat shim).
-    ///
-    /// The `_vfs_tx` parameter is ignored — TclShell now awaits namespace
-    /// operations directly. This method exists for call-site compatibility;
-    /// prefer `with_vfs` for new code.
-    pub fn with_vfs_proxy(
-        mut self,
-        ns: std::sync::Arc<hyprstream_vfs::Namespace>,
-        subject: hyprstream_vfs::Subject,
-        _vfs_tx: tokio::sync::mpsc::Sender<hyprstream_vfs::proxy::VfsRequest>,
-    ) -> Self {
-        self.tcl_shell_init = Some((subject.clone(), std::sync::Arc::clone(&ns)));
-        self.vfs = Some(ns);
-        self.vfs_subject = subject;
-        self
-    }
 
     /// Attach the receiver end of a `/lang/tcl` mount channel.
     ///
