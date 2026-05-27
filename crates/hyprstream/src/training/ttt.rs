@@ -1366,8 +1366,10 @@ mod tests {
         assert_eq!(config.min_input_length, 32);
         assert_eq!(config.max_ttt_context, 512);
         assert!(config.enabled);
-        assert_eq!(config.max_adaptation_ms, 5_000);
-        assert_eq!(config.max_gradient_steps, 10);
+        // Defaults sized for consumer GPUs (per RTX 4090 ~7s/step):
+        // see `default_max_adaptation_ms` and `default_max_gradient_steps`.
+        assert_eq!(config.max_adaptation_ms, 30_000);
+        assert_eq!(config.max_gradient_steps, 50);
         assert!((config.tau_reject - 200.0).abs() < 0.1);
     }
 

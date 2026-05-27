@@ -101,7 +101,7 @@ impl<B: WizardBackend> WizardApp<B> {
             WizardPhase::Users(_) => 4,
             WizardPhase::Tokens(_) => 5,
             WizardPhase::Services(_) => 6,
-            WizardPhase::Summary(_) => 6,
+            WizardPhase::Summary(_) => 7,
         }
     }
 
@@ -284,15 +284,14 @@ impl<B: WizardBackend> waxterm::TerminalApp for WizardApp<B> {
             3 => self.handle_policy_input(&key),
             4 => self.handle_users_input(&key),
             5 => self.handle_tokens_input(&key),
-            6 => {
-                if matches!(&self.phase, WizardPhase::Summary(_)) {
-                    if key == KeyPress::Enter {
-                        self.quit = true;
-                    }
-                    true
-                } else {
-                    self.handle_services_input(&key)
+            6 => self.handle_services_input(&key),
+            7 => {
+                // Summary screen: Enter exits the wizard. ('q' is also
+                // handled via the global quit shortcut above, line 264.)
+                if key == KeyPress::Enter {
+                    self.quit = true;
                 }
+                true
             }
             _ => false,
         }
@@ -1575,20 +1574,22 @@ mod tests {
         complete_bootstrap(&mut app);
         assert_eq!(app.phase_number(), 3);
 
-        // Policy: select "None — skip template" (last option)
-        for _ in 0..5 {
+        // Policy: navigate to "None — skip template" (always the last
+        // option regardless of how many templates the backend reports).
+        // SelectList clamps at the bottom, so pressing Down more times
+        // than there are items still lands on the last entry.
+        for _ in 0..10 {
             app.handle_input(WizardCommand::Key(KeyPress::ArrowDown));
         }
         app.handle_input(WizardCommand::Key(KeyPress::Enter));
         assert_eq!(app.phase_number(), 4, "Should be at Users phase");
 
-        // Users: decline to add user (press 'n')
+        // Users: decline to add user (press 'n'). The token-queue
+        // auto-skips when no users were created (advance_to_tokens →
+        // advance_to_services), so we land on Services directly, NOT
+        // Tokens.
         app.handle_input(WizardCommand::Key(KeyPress::Char(b'n')));
-        assert_eq!(app.phase_number(), 5, "Should be at Tokens phase");
-
-        // Tokens: decline to generate (press 'n')
-        app.handle_input(WizardCommand::Key(KeyPress::Char(b'n')));
-        assert_eq!(app.phase_number(), 6, "Should be at Services phase");
+        assert_eq!(app.phase_number(), 6, "Should be at Services phase (Tokens auto-skipped)");
 
         // Services: decline to start (press 'n')
         app.handle_input(WizardCommand::Key(KeyPress::Char(b'n')));
