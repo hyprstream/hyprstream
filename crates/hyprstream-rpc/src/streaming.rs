@@ -207,6 +207,13 @@ pub enum StreamPayloadData {
     Error(String),
     /// Completion with app-specific metadata
     Complete(Vec<u8>),
+    /// Encrypted tagged payload with key commitment
+    Tagged {
+        tag: Vec<u8>,
+        payload: Vec<u8>,
+        nonce: Vec<u8>,
+        key_commitment: Vec<u8>,
+    },
 }
 
 /// Output payload from StreamVerifier (what gets parsed).
@@ -220,6 +227,13 @@ pub enum StreamPayload {
     Error(String),
     /// Completion with app-specific metadata
     Complete(Vec<u8>),
+    /// Encrypted tagged payload with key commitment
+    Tagged {
+        tag: Vec<u8>,
+        payload: Vec<u8>,
+        nonce: Vec<u8>,
+        key_commitment: Vec<u8>,
+    },
 }
 
 // ============================================================================
@@ -503,6 +517,13 @@ impl StreamBuilder {
                     }
                     StreamPayloadData::Complete(data) => {
                         p.set_complete(data);
+                    }
+                    StreamPayloadData::Tagged { tag, payload, nonce, key_commitment } => {
+                        let mut tagged = p.init_tagged();
+                        tagged.set_tag(tag);
+                        tagged.set_payload(payload);
+                        tagged.set_nonce(nonce);
+                        tagged.set_key_commitment(key_commitment);
                     }
                 }
             }
@@ -1158,6 +1179,15 @@ impl StreamVerifier {
                 }
                 Which::Heartbeat(()) => {
                     continue;
+                }
+                Which::Tagged(tagged_result) => {
+                    let tagged = tagged_result?;
+                    StreamPayload::Tagged {
+                        tag: tagged.get_tag()?.to_vec(),
+                        payload: tagged.get_payload()?.to_vec(),
+                        nonce: tagged.get_nonce()?.to_vec(),
+                        key_commitment: tagged.get_key_commitment()?.to_vec(),
+                    }
                 }
             };
 

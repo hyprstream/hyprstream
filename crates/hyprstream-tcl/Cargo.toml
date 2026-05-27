@@ -6,7 +6,11 @@ license = "MIT"
 description = "Tcl (molt) shell for hyprstream VFS namespace"
 
 [dependencies]
-molt = { path = "../../../../../../molt/.worktrees/hyprstream/molt" }
+molt = { git = "https://github.com/hyprstream/hyprstream-molt.git", branch = "hyprstream" }
 hyprstream-vfs = { path = "../hyprstream-vfs" }
 async-trait = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

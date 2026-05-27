@@ -31,15 +31,22 @@ pub mod challenge;
 pub mod device;
 pub mod federation_entity;
 pub mod jwks;
+pub mod login_page;
 pub mod metadata;
+pub mod oidc_callback;
+pub mod oidc_discovery;
 pub mod registration;
+pub mod revocation;
+pub mod session;
 pub mod state;
 pub mod token;
+pub mod user_mapping;
+pub mod userinfo;
 
 use std::sync::Arc;
 
 use anyhow::Result;
-use axum::{routing::{get, post}, Router};
+use axum::{extract::State, response::IntoResponse, routing::{get, post}, Router};
 use hyprstream_rpc::registry::SocketKind;
 use hyprstream_service::Spawnable;
 use hyprstream_rpc::transport::TransportConfig;
@@ -82,6 +89,24 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
         )
         .route("/oauth/device/nonce", get(device::device_nonce))
         .route(
+            "/oauth/userinfo",
+            get(userinfo::userinfo).post(userinfo::userinfo),
+        )
+        .route("/oauth/revoke", post(revocation::revoke_token))
+        .route("/oauth/logout", post(handle_logout))
+        .route(
+            "/oauth/external/authorize/:provider",
+            get(oidc_callback::external_authorize),
+        )
+        .route(
+            "/oauth/callback/:provider",
+            get(oidc_callback::external_callback),
+        )
+        .route(
+            "/.well-known/openid-configuration",
+            get(metadata::openid_configuration),
+        )
+        .route(
             "/.well-known/openid-federation",
             get(federation_entity::entity_configuration),
         )
@@ -98,6 +123,21 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
     }
 
     router.with_state(state)
+}
+
+/// POST /oauth/logout — clear session and redirect.
+async fn handle_logout(
+    State(state): State<Arc<OAuthState>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if let Some(session_id) = session::extract_session_id(&headers) {
+        state.sessions.remove(&session_id).await;
+    }
+    (
+        axum::http::StatusCode::OK,
+        [(axum::http::header::SET_COOKIE, session::clear_session_cookie())],
+        "Logged out",
+    ).into_response()
 }
 
 /// RFC 9728 Protected Resource Metadata for the OAuth server itself.

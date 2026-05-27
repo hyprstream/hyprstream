@@ -1,11 +1,15 @@
 //! JWT claims for authentication.
 //!
-//! Authorization is enforced server-side via Casbin policies, not JWT scopes.
+//! Two claim types:
+//! - [`Claims`] — access token claims used throughout the RPC layer.
+//!   Authorization is enforced server-side via Casbin policies, not JWT scopes.
+//! - [`IdTokenClaims`] — OIDC ID Token claims (Section 2 of OpenID Connect
+//!   Core 1.0). Only used by the OAuth token endpoint when `scope=openid`.
 
 use crate::common_capnp;
 use crate::capnp::{ToCapnp, FromCapnp};
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer, Deserializer};
 
 /// Returns true if `iss` belongs to a local node.
 ///
@@ -337,5 +341,251 @@ mod tests {
             .with_issuer("https://cloud.example.com".to_owned());
         let json = serde_json::to_string(&claims).unwrap();
         assert!(json.contains("\"iss\":\"https://cloud.example.com\""));
+    }
+}
+
+// ─── OIDC ID Token Claims ──────────────────────────────────────────────────
+
+/// A value that serializes as either a single string or an array of strings.
+///
+/// OIDC Core Section 2 says `aud` is a JSON string or array. Many RPs break
+/// if they receive an unexpected format, so we serialize as a string when there
+/// is exactly one value and as an array otherwise.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OneOrMany {
+    /// Single value — serialized as a JSON string.
+    One(String),
+    /// Multiple values — serialized as a JSON array.
+    Many(Vec<String>),
+}
+
+impl OneOrMany {
+    /// Create from a single value.
+    pub fn one(value: impl Into<String>) -> Self {
+        Self::One(value.into())
+    }
+
+    /// Create from a list. Collapses to `One` when the list has a single element.
+    pub fn from_vec(mut values: Vec<String>) -> Self {
+        if values.len() == 1 {
+            Self::One(values.swap_remove(0))
+        } else {
+            Self::Many(values)
+        }
+    }
+
+    /// Get the values as a slice-like iterator.
+    pub fn as_slice(&self) -> &[String] {
+        match self {
+            Self::One(v) => std::slice::from_ref(v),
+            Self::Many(v) => v,
+        }
+    }
+}
+
+impl Serialize for OneOrMany {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Self::One(v) => serializer.serialize_str(v),
+            Self::Many(v) => v.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OneOrMany {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::String(s) => Ok(Self::One(s)),
+            serde_json::Value::Array(arr) => {
+                let strings: std::result::Result<Vec<String>, _> = arr
+                    .into_iter()
+                    .map(|v| {
+                        v.as_str()
+                            .map(String::from)
+                            .ok_or_else(|| serde::de::Error::custom("aud array must contain strings"))
+                    })
+                    .collect();
+                Ok(Self::from_vec(strings?))
+            }
+            _ => Err(serde::de::Error::custom("aud must be a string or array")),
+        }
+    }
+}
+
+/// OIDC ID Token claims (OpenID Connect Core 1.0, Section 2).
+///
+/// Separate from [`Claims`] because:
+/// - `aud` is the `client_id` (not the resource indicator)
+/// - Includes user profile claims (name, email)
+/// - Only issued by the OAuth token endpoint, not used in the RPC layer
+/// - Different `typ` header (`"JWT"` vs `"at+jwt"` for access tokens)
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IdTokenClaims {
+    // ── Required (OIDC Core Section 2) ──────────────────────────────────
+    /// Issuer URL.
+    pub iss: String,
+    /// Subject identifier — a stable UUID, not a username.
+    pub sub: String,
+    /// Audience — the client_id. Supports single string or array.
+    pub aud: OneOrMany,
+    /// Expiration time (Unix timestamp).
+    pub exp: i64,
+    /// Issued at (Unix timestamp).
+    pub iat: i64,
+
+    // ── Conditional ─────────────────────────────────────────────────────
+    /// OIDC nonce echoed from the authorization request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<String>,
+    /// Time of user authentication (Unix timestamp).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_time: Option<i64>,
+    /// Authorized party (REQUIRED when aud has multiple values).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub azp: Option<String>,
+
+    // ── Profile claims (included based on requested scopes) ─────────────
+    /// Full name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Email address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// Whether the email is verified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email_verified: Option<bool>,
+    /// Preferred display username.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferred_username: Option<String>,
+}
+
+impl IdTokenClaims {
+    /// Create minimal id_token claims (required fields only).
+    pub fn new(iss: String, sub: String, aud: String, iat: i64, exp: i64) -> Self {
+        Self {
+            iss,
+            sub,
+            aud: OneOrMany::one(aud),
+            exp,
+            iat,
+            nonce: None,
+            auth_time: None,
+            azp: None,
+            name: None,
+            email: None,
+            email_verified: None,
+            preferred_username: None,
+        }
+    }
+
+    /// Set the OIDC nonce (echoed from the authorization request).
+    pub fn with_nonce(mut self, nonce: Option<String>) -> Self {
+        self.nonce = nonce;
+        self
+    }
+
+    /// Set the authentication time.
+    pub fn with_auth_time(mut self, auth_time: i64) -> Self {
+        self.auth_time = Some(auth_time);
+        self
+    }
+
+    /// Set profile claims from a user profile.
+    pub fn with_profile(
+        mut self,
+        name: Option<String>,
+        email: Option<String>,
+        email_verified: Option<bool>,
+        preferred_username: Option<String>,
+    ) -> Self {
+        self.name = name;
+        self.email = email;
+        self.email_verified = email_verified;
+        self.preferred_username = preferred_username;
+        self
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod id_token_tests {
+    use super::*;
+
+    #[test]
+    fn test_id_token_claims_serialization() {
+        let claims = IdTokenClaims::new(
+            "https://example.com".into(),
+            "f47ac10b-58cc-4372-a567-0e02b2c3d479".into(),
+            "my-client".into(),
+            1000,
+            2000,
+        );
+        let json = serde_json::to_string(&claims).unwrap();
+        // aud should be a single string, not array
+        assert!(json.contains("\"aud\":\"my-client\""));
+        assert!(json.contains("\"sub\":\"f47ac10b-"));
+        // Optional fields should not appear
+        assert!(!json.contains("nonce"));
+        assert!(!json.contains("name"));
+        assert!(!json.contains("email"));
+    }
+
+    #[test]
+    fn test_id_token_claims_with_profile() {
+        let claims = IdTokenClaims::new(
+            "https://example.com".into(),
+            "uuid-123".into(),
+            "client-1".into(),
+            1000,
+            2000,
+        )
+        .with_nonce(Some("abc123".into()))
+        .with_auth_time(999)
+        .with_profile(
+            Some("Alice".into()),
+            Some("alice@example.com".into()),
+            Some(true),
+            Some("alice".into()),
+        );
+        let json = serde_json::to_string(&claims).unwrap();
+        assert!(json.contains("\"nonce\":\"abc123\""));
+        assert!(json.contains("\"auth_time\":999"));
+        assert!(json.contains("\"name\":\"Alice\""));
+        assert!(json.contains("\"email\":\"alice@example.com\""));
+        assert!(json.contains("\"email_verified\":true"));
+        assert!(json.contains("\"preferred_username\":\"alice\""));
+    }
+
+    #[test]
+    fn test_one_or_many_single() {
+        let aud = OneOrMany::one("client-1");
+        let json = serde_json::to_string(&aud).unwrap();
+        assert_eq!(json, "\"client-1\"");
+    }
+
+    #[test]
+    fn test_one_or_many_multiple() {
+        let aud = OneOrMany::from_vec(vec!["a".into(), "b".into()]);
+        let json = serde_json::to_string(&aud).unwrap();
+        assert_eq!(json, "[\"a\",\"b\"]");
+    }
+
+    #[test]
+    fn test_one_or_many_deserialize_string() {
+        let aud: OneOrMany = serde_json::from_str("\"client-1\"").unwrap();
+        assert_eq!(aud, OneOrMany::One("client-1".into()));
+    }
+
+    #[test]
+    fn test_one_or_many_deserialize_array() {
+        let aud: OneOrMany = serde_json::from_str("[\"a\",\"b\"]").unwrap();
+        assert_eq!(aud, OneOrMany::Many(vec!["a".into(), "b".into()]));
+    }
+
+    #[test]
+    fn test_one_or_many_collapse_single_element() {
+        let aud = OneOrMany::from_vec(vec!["only-one".into()]);
+        assert_eq!(aud, OneOrMany::One("only-one".into()));
     }
 }

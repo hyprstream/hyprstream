@@ -225,6 +225,47 @@ pub enum ChatMode {
 // ChatApp
 // ============================================================================
 
+/// Create a no-op waker for polling futures that don't need wake notifications.
+///
+/// Safe for TclShell/VFS futures which are purely computational (no IO reactor,
+/// no timers) — they always make progress on each poll without needing external
+/// wake-ups.
+fn noop_waker() -> std::task::Waker {
+    fn noop(_: *const ()) {}
+    fn clone(p: *const ()) -> std::task::RawWaker {
+        std::task::RawWaker::new(p, &VTABLE)
+    }
+    static VTABLE: std::task::RawWakerVTable =
+        std::task::RawWakerVTable::new(clone, noop, noop, noop);
+    // SAFETY: The vtable functions are valid no-ops. The data pointer is never dereferenced.
+    unsafe { std::task::Waker::from_raw(std::task::RawWaker::new(std::ptr::null(), &VTABLE)) }
+}
+
+/// Wrapper that asserts `Send` for a `!Send` value.
+///
+/// **Not thread-local storage** — this is a Send bypass for values that are
+/// constructed and accessed on a single thread but must transit a thread boundary
+/// wrapped in `Option<AssertSend<T>>` where the Option is `None` during the move.
+///
+/// SAFETY: This is used exclusively for `TclShell` which uses `Rc` internally
+/// (making it `!Send`). The wrapper is safe because:
+/// - The value is always wrapped in `Option` that is `None` during cross-thread moves
+/// - It is only populated via `ensure_tcl_shell()` on the app thread
+/// - It is only accessed from that same thread thereafter
+/// - `UnsafeCell` ensures `AssertSend<T>` is `!Sync` (cannot be shared across threads)
+struct AssertSend<T>(std::cell::UnsafeCell<T>);
+
+// SAFETY: See struct-level documentation.
+unsafe impl<T> Send for AssertSend<T> {}
+
+impl<T> std::ops::Deref for AssertSend<T> {
+    type Target = T;
+    fn deref(&self) -> &T { unsafe { &*self.0.get() } }
+}
+impl<T> std::ops::DerefMut for AssertSend<T> {
+    fn deref_mut(&mut self) -> &mut T { unsafe { &mut *self.0.get() } }
+}
+
 /// Double-Esc close window: two Esc presses within this interval close the app.
 #[cfg(not(target_os = "wasi"))]
 const DOUBLE_ESC_MS: u128 = 1500;
@@ -316,11 +357,20 @@ pub struct ChatApp {
     vfs: Option<std::sync::Arc<hyprstream_vfs::Namespace>>,
     /// Caller identity for VFS operations.
     vfs_subject: hyprstream_vfs::Subject,
-    /// Tcl shell for / command evaluation. !Send/!Sync (molt Value uses Rc).
-    tcl_shell: Option<hyprstream_tcl::TclShell>,
+    /// Tcl shell for / command evaluation. Created lazily on first use because
+    /// TclShell is !Send (molt Value uses Rc) and ChatApp is moved across threads
+    /// in spawn_app_process. The init data (vfs_tx + subject) IS Send.
+    ///
+    /// SAFETY: TclShell is wrapped in `AssertSend` (unsafe Send impl) because:
+    /// 1. It is always `None` when ChatApp crosses a thread boundary
+    /// 2. It is only constructed inside `ensure_tcl_shell()` on the app thread
+    /// 3. It is only accessed from that same thread thereafter
+    tcl_shell: Option<AssertSend<hyprstream_tcl::TclShell>>,
+    /// Deferred init data for tcl_shell (Send-safe). Consumed on first access.
+    tcl_shell_init: Option<(hyprstream_vfs::Subject, std::sync::Arc<hyprstream_vfs::Namespace>)>,
     /// Receiver for TclMount commands (polled in tick()). Shared across tabs.
     #[cfg(not(target_os = "wasi"))]
-    tcl_mount_rx: Option<std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>>,
+    tcl_mount_rx: Option<std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>>,
 }
 
 impl ChatApp {
@@ -363,6 +413,7 @@ impl ChatApp {
             vfs: None,
             vfs_subject: hyprstream_vfs::Subject::anonymous(),
             tcl_shell: None,
+            tcl_shell_init: None,
             #[cfg(not(target_os = "wasi"))]
             tcl_mount_rx: None,
         }
@@ -395,6 +446,7 @@ impl ChatApp {
             vfs: None,
             vfs_subject: hyprstream_vfs::Subject::anonymous(),
             tcl_shell: None,
+            tcl_shell_init: None,
             #[cfg(not(target_os = "wasi"))]
             tcl_mount_rx: None,
         }
@@ -473,6 +525,7 @@ impl ChatApp {
             vfs: None,
             vfs_subject: hyprstream_vfs::Subject::anonymous(),
             tcl_shell: None,
+            tcl_shell_init: None,
             #[cfg(not(target_os = "wasi"))]
             tcl_mount_rx: None,
         }
@@ -497,13 +550,28 @@ impl ChatApp {
 
     /// Attach a VFS namespace for `/path` command routing.
     ///
-    /// The `rt` handle is used by the Tcl shell to `block_on()` async VFS operations.
-    pub fn with_vfs(mut self, ns: std::sync::Arc<hyprstream_vfs::Namespace>, subject: hyprstream_vfs::Subject, rt: tokio::runtime::Handle) -> Self {
-        self.tcl_shell = Some(hyprstream_tcl::TclShell::new(
-            std::sync::Arc::clone(&ns),
-            subject.clone(),
-            rt,
-        ));
+    /// The TclShell is created lazily on first use (inside the app thread)
+    /// because it is `!Send` and ChatApp must cross a thread boundary in
+    /// `spawn_app_process`.
+    pub fn with_vfs(mut self, ns: std::sync::Arc<hyprstream_vfs::Namespace>, subject: hyprstream_vfs::Subject) -> Self {
+        self.tcl_shell_init = Some((subject.clone(), std::sync::Arc::clone(&ns)));
+        self.vfs = Some(ns);
+        self.vfs_subject = subject;
+        self
+    }
+
+    /// Attach VFS namespace for `/path` command routing (compat shim).
+    ///
+    /// The `_vfs_tx` parameter is ignored — TclShell now awaits namespace
+    /// operations directly. This method exists for call-site compatibility;
+    /// prefer `with_vfs` for new code.
+    pub fn with_vfs_proxy(
+        mut self,
+        ns: std::sync::Arc<hyprstream_vfs::Namespace>,
+        subject: hyprstream_vfs::Subject,
+        _vfs_tx: tokio::sync::mpsc::Sender<hyprstream_vfs::proxy::VfsRequest>,
+    ) -> Self {
+        self.tcl_shell_init = Some((subject.clone(), std::sync::Arc::clone(&ns)));
         self.vfs = Some(ns);
         self.vfs_subject = subject;
         self
@@ -515,7 +583,7 @@ impl ChatApp {
     /// namespace at `/lang/tcl` before this is called. The ChatApp drains this
     /// channel in `tick()`, forwarding commands to the Tcl interpreter.
     #[cfg(not(target_os = "wasi"))]
-    pub fn with_tcl_mount_rx(mut self, rx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>) -> Self {
+    pub fn with_tcl_mount_rx(mut self, rx: std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>) -> Self {
         self.tcl_mount_rx = Some(rx);
         self
     }
@@ -756,11 +824,42 @@ impl ChatApp {
         self.scroll_offset = 0;
     }
 
+    /// Lazily initialize the TclShell. Must be called from the app thread
+    /// (after the ChatApp has been moved into spawn_app_process).
+    fn ensure_tcl_shell(&mut self) {
+        if self.tcl_shell.is_none() {
+            if let Some((subject, namespace)) = self.tcl_shell_init.take() {
+                self.tcl_shell = Some(AssertSend(std::cell::UnsafeCell::new(
+                    hyprstream_tcl::TclShell::new(subject, namespace),
+                )));
+            }
+        }
+    }
+
+    /// Poll a `!Send` future to completion on the current thread.
+    ///
+    /// Works in both contexts: inside an existing tokio runtime (shell_handlers
+    /// compositor loop) and on a bare OS thread (spawn_app_process). Uses a
+    /// noop-waker poll loop — safe because TclShell/VFS futures are pure async
+    /// (no IO reactor, no timers — just trait method dispatch).
+    fn poll_local<F: std::future::Future>(fut: F) -> F::Output {
+        let mut fut = std::pin::pin!(fut);
+        let waker = noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        loop {
+            match fut.as_mut().poll(&mut cx) {
+                std::task::Poll::Ready(val) => return val,
+                std::task::Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
     /// Handle a `/`-prefixed command by evaluating it as Tcl against the VFS.
     ///
     /// Bare paths (e.g. `/srv/model/status`) are treated as `cat /srv/model/status`.
     /// Commands (e.g. `/ls /srv/model`) are evaluated directly.
     fn handle_vfs_command(&mut self, input: &str) {
+        self.ensure_tcl_shell();
         let Some(shell) = &mut self.tcl_shell else {
             self.push_system_message("VFS not available");
             return;
@@ -785,7 +884,8 @@ impl ChatApp {
             stripped.to_owned()
         };
 
-        match shell.eval(&script) {
+        let result = Self::poll_local(shell.eval(&script));
+        match result {
             Ok(output) if !output.is_empty() => {
                 self.push_system_message(&output);
             }
@@ -1341,11 +1441,14 @@ impl TerminalApp for ChatApp {
         let mut redraw = false;
 
         // Process pending TclMount requests from /lang/tcl VFS mount.
-        if let Some(ref rx_arc) = self.tcl_mount_rx {
-            if let Some(ref mut shell) = self.tcl_shell {
-                if let Ok(rx) = rx_arc.try_lock() {
+        if self.tcl_mount_rx.is_some() {
+            self.ensure_tcl_shell();
+            if let (Some(ref rx_arc), Some(ref mut shell)) =
+                (&self.tcl_mount_rx, &mut self.tcl_shell)
+            {
+                if let Ok(mut rx) = rx_arc.try_lock() {
                     while let Ok(cmd) = rx.try_recv() {
-                        shell.process_command(cmd);
+                        Self::poll_local(shell.process_command(cmd));
                     }
                 }
             }

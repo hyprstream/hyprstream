@@ -120,61 +120,6 @@ impl std::fmt::Display for ExecutionMode {
     }
 }
 
-/// Top-level commands for the hyprstream CLI.
-///
-/// Schema-driven commands (registry, model, inference, policy) are built
-/// at runtime from Cap'n Proto schema metadata — see `schema_cli.rs`.
-///
-/// This enum only contains commands that require hand-coded dispatch:
-/// `quick` (orchestrated workflows), `worker`, `service`, and `flight`.
-#[derive(Subcommand)]
-pub enum Commands {
-    /// Quick workflows — multi-step convenience commands
-    ///
-    /// These commands involve multiple RPC calls, interactive prompts,
-    /// progress bars, or other complex orchestration.
-    Quick {
-        #[command(subcommand)]
-        command: super::quick::QuickCommand,
-    },
-
-    /// Flight SQL client to query datasets
-    Flight(FlightArgs),
-
-    /// Service management and lifecycle commands
-    ///
-    /// Install, manage, and control hyprstream services. Supports both systemd
-    /// (when available) and standalone process management.
-    Service {
-        #[command(subcommand)]
-        action: ServiceAction,
-    },
-
-    /// Sign an Ed25519 challenge for OAuth device or auth code flow
-    ///
-    /// Device flow:    hyprstream sign-challenge ABCD-EFGH
-    /// Auth code flow: hyprstream sign-challenge --nonce <n> --code-challenge <cc>
-    SignChallenge {
-        /// User code from device flow (e.g., ABCD-EFGH)
-        user_code: Option<String>,
-        /// Nonce from the browser authorization challenge form
-        #[arg(long, allow_hyphen_values = true)]
-        nonce: Option<String>,
-        /// PKCE code_challenge from the browser authorization URL
-        #[arg(long, allow_hyphen_values = true)]
-        code_challenge: Option<String>,
-        /// OAuth server URL (default: from config or http://localhost:6791)
-        #[arg(long)]
-        server: Option<String>,
-    },
-
-    /// TUI display server — terminal multiplexer with session persistence
-    Tui {
-        #[command(subcommand)]
-        action: TuiAction,
-    },
-}
-
 /// TUI display server actions
 #[derive(Subcommand)]
 pub enum TuiAction {

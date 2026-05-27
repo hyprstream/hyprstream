@@ -258,30 +258,60 @@ impl Namespace {
             return Ok(self.root_dir_entries());
         }
 
-        let (targets, remainder) = self.resolve(path)?;
-        let components: Vec<&str> = split_path(&remainder);
-        let mut seen = std::collections::HashSet::new();
-        let mut merged = Vec::new();
-        let mut any_ok = false;
-        for mount in targets {
-            if let Ok(mut fid) = mount.walk(&components, caller).await {
-                if mount.open(&mut fid, 0, caller).await.is_ok() {
-                    if let Ok(entries) = mount.readdir(&fid, caller).await {
-                        any_ok = true;
-                        for entry in entries {
-                            if seen.insert(entry.name.clone()) {
-                                merged.push(entry);
+        match self.resolve(path) {
+            Ok((targets, remainder)) => {
+                let components: Vec<&str> = split_path(&remainder);
+                let mut seen = std::collections::HashSet::new();
+                let mut merged = Vec::new();
+                let mut any_ok = false;
+                for mount in targets {
+                    if let Ok(mut fid) = mount.walk(&components, caller).await {
+                        if mount.open(&mut fid, 0, caller).await.is_ok() {
+                            if let Ok(entries) = mount.readdir(&fid, caller).await {
+                                any_ok = true;
+                                for entry in entries {
+                                    if seen.insert(entry.name.clone()) {
+                                        merged.push(entry);
+                                    }
+                                }
                             }
+                        }
+                        mount.clunk(fid, caller).await;
+                    }
+                }
+                if any_ok {
+                    Ok(merged)
+                } else {
+                    Err(NamespaceError::Mount(MountError::NotFound(path.to_owned())))
+                }
+            }
+            Err(_) => {
+                // Path doesn't match any mount prefix directly. Check if it's an
+                // intermediate directory — i.e., some mount's prefix starts with
+                // "{path}/". Synthesize directory entries from sub-mount components.
+                let normalized = normalize_path(path);
+                let prefix_with_slash = format!("{}/", normalized);
+                let mut seen = std::collections::HashSet::new();
+                let mut entries = Vec::new();
+                for m in &self.mounts {
+                    if let Some(rest) = m.prefix.strip_prefix(&prefix_with_slash[..]) {
+                        let next = rest.split('/').next().unwrap_or("");
+                        if !next.is_empty() && seen.insert(next.to_owned()) {
+                            entries.push(DirEntry {
+                                name: next.to_owned(),
+                                is_dir: true,
+                                size: 0,
+                                stat: None,
+                            });
                         }
                     }
                 }
-                mount.clunk(fid, caller).await;
+                if entries.is_empty() {
+                    Err(NamespaceError::Mount(MountError::NotFound(path.to_owned())))
+                } else {
+                    Ok(entries)
+                }
             }
-        }
-        if any_ok {
-            Ok(merged)
-        } else {
-            Err(NamespaceError::Mount(MountError::NotFound(path.to_owned())))
         }
     }
 
@@ -534,12 +564,12 @@ mod tests {
         let mut ns = Namespace::new();
 
         struct ChunkedMount { data: Vec<u8> }
-        struct ChunkedFid { offset_limit: bool }
+        struct ChunkedFid { _offset_limit: bool }
 
         #[async_trait]
         impl Mount for ChunkedMount {
             async fn walk(&self, _c: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
-                Ok(Fid::new(ChunkedFid { offset_limit: false }))
+                Ok(Fid::new(ChunkedFid { _offset_limit: false }))
             }
             async fn open(&self, _fid: &mut Fid, _mode: u8, _caller: &Subject) -> Result<(), MountError> { Ok(()) }
             async fn read(&self, _fid: &Fid, offset: u64, count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
@@ -701,5 +731,57 @@ mod tests {
 
         // "extra" should be gone (replaced)
         assert!(ns.cat("/bin/extra", &test_subject()).await.is_err());
+    }
+
+    // ── Intermediate directory synthesis ─────────────────────────────────────
+
+    /// `ls /srv` should synthesize directory entries when mounts exist at
+    /// `/srv/model` but not at `/srv` itself.
+    ///
+    /// This catches the bug where intermediate paths between root and mount
+    /// points returned "not found".
+    #[tokio::test]
+    async fn ls_intermediate_directory() {
+        let mut ns = Namespace::new();
+        let mount = Arc::new(MemMount::new(vec![("status", b"ok")]));
+        ns.mount("/srv/model", mount).unwrap();
+        let lang_mount = Arc::new(MemMount::new(vec![("interp", b"tcl")]));
+        ns.mount("/lang/tcl", lang_mount).unwrap();
+
+        // /srv is not a mount point but /srv/model is — ls should synthesize.
+        let entries = ns.ls("/srv", &test_subject()).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "model");
+        assert!(entries[0].is_dir);
+
+        // /lang is not a mount point but /lang/tcl is — same pattern.
+        let entries = ns.ls("/lang", &test_subject()).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "tcl");
+        assert!(entries[0].is_dir);
+
+        // /nonexistent has no mounts beneath it — still errors.
+        assert!(ns.ls("/nonexistent", &test_subject()).await.is_err());
+    }
+
+    /// Multiple mounts under the same intermediate prefix synthesize correctly.
+    #[tokio::test]
+    async fn ls_intermediate_multiple_children() {
+        let mut ns = Namespace::new();
+        ns.mount("/a/b", Arc::new(MemMount::new(vec![("x", b"")]))).unwrap();
+        ns.mount("/a/c", Arc::new(MemMount::new(vec![("y", b"")]))).unwrap();
+        ns.mount("/a/d/e", Arc::new(MemMount::new(vec![("z", b"")]))).unwrap();
+
+        let entries = ns.ls("/a", &test_subject()).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"b"));
+        assert!(names.contains(&"c"));
+        assert!(names.contains(&"d"));
+        assert_eq!(entries.len(), 3);
+
+        // Deeper intermediate: /a/d should show "e"
+        let entries = ns.ls("/a/d", &test_subject()).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "e");
     }
 }

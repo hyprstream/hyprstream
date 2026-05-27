@@ -26,6 +26,7 @@
 use std::sync::Arc;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use zeroize::Zeroizing;
 
 use hyprstream_rpc::envelope::RequestIdentity;
 use hyprstream_rpc::registry::{global as global_registry, SocketKind};
@@ -42,8 +43,8 @@ use hyprstream_rpc::transport::TransportConfig;
 pub struct QuicSharedConfig {
     /// DER-encoded TLS certificate
     pub cert_der: Vec<u8>,
-    /// DER-encoded TLS private key
-    pub key_der: Vec<u8>,
+    /// DER-encoded TLS private key — zeroed on drop.
+    pub key_der: Zeroizing<Vec<u8>>,
     /// Base IP address for binding (e.g., 0.0.0.0)
     pub base_ip: std::net::IpAddr,
     /// TLS server name (for certificate validation and discovery)
@@ -67,7 +68,7 @@ impl QuicSharedConfig {
         });
         hyprstream_rpc::service::QuicLoopConfig {
             cert_der: self.cert_der.clone(),
-            key_der: self.key_der.clone(),
+            key_der: Zeroizing::new((*self.key_der).clone()),
             bind_addr,
             server_name: self.server_name.clone(),
             protected_resource_json: metadata,
@@ -349,6 +350,15 @@ impl ServiceFactory {
         metadata: SchemaMetadataFn,
     ) -> Self {
         Self { name, factory, schema: Some(schema), metadata: Some(metadata), depends_on: &[] }
+    }
+
+    /// Set service dependencies (chained builder).
+    ///
+    /// Services listed in `depends_on` must be started before this one.
+    /// Used by the `#[service_factory("name", depends_on = ["policy"])]` macro.
+    pub const fn with_depends_on(mut self, deps: &'static [&'static str]) -> Self {
+        self.depends_on = deps;
+        self
     }
 }
 

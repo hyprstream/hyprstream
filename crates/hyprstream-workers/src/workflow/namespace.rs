@@ -108,7 +108,7 @@ mod tests {
         name: &'static str,
     }
 
-    struct MockFid(String);
+    struct MockFid(#[allow(dead_code)] String);
 
     #[async_trait]
     impl Mount for MockServiceMount {

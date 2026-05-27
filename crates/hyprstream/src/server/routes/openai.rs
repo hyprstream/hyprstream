@@ -130,6 +130,10 @@ async fn collect_stream_to_result(
                 StreamPayload::Error(msg) => {
                     anyhow::bail!("Generation error: {msg}");
                 }
+                StreamPayload::Tagged { .. } => {
+                    // encrypted event payload, skip
+                    continue;
+                }
             },
             Some(Err(e)) => {
                 anyhow::bail!("Stream error: {e}");
@@ -705,13 +709,12 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
         // Accumulate full response text for tool call parsing
         let mut accumulated_text = String::new();
 
-        use futures::StreamExt;
 
         'outer: loop {
             tokio::select! {
-                payload = stream_handle.next() => {
+                payload = stream_handle.recv_next() => {
                     match payload {
-                        Some(Ok(payload)) => {
+                        Ok(Some(payload)) => {
                             use crate::services::rpc_types::{InferenceStreamPayload, StreamPayloadExt};
                             match payload.to_inference() {
                                 Ok(InferenceStreamPayload::Token(text)) => {
@@ -819,12 +822,12 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                                 }
                             }
                         }
-                        Some(Err(e)) => {
-                            error!("Stream receive error: {}", e);
-                            let _ = tx.send(Err(anyhow::anyhow!("Stream receive error: {}", e))).await;
+                        Ok(None) => {
                             break 'outer;
                         }
-                        None => {
+                        Err(e) => {
+                            error!("Stream receive error: {}", e);
+                            let _ = tx.send(Err(anyhow::anyhow!("Stream receive error: {}", e))).await;
                             break 'outer;
                         }
                     }

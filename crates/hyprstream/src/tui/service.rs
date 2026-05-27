@@ -153,6 +153,10 @@ pub struct TuiService {
     local_issuer_url: Option<String>,
     /// Federation key source for verifying externally-issued JWTs.
     federation_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>>,
+    /// Shared VFS namespace for ChatApps spawned via RPC.
+    vfs_ns: Option<std::sync::Arc<hyprstream_vfs::Namespace>>,
+    /// VFS subject identity for ChatApps spawned via RPC.
+    vfs_subject: Option<hyprstream_rpc::Subject>,
 }
 
 impl TuiService {
@@ -175,6 +179,8 @@ impl TuiService {
             expected_audience: None,
             local_issuer_url: None,
             federation_key_source: None,
+            vfs_ns: None,
+            vfs_subject: None,
         }
     }
 
@@ -202,6 +208,20 @@ impl TuiService {
         src: std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>,
     ) -> Self {
         self.federation_key_source = Some(src);
+        self
+    }
+
+    /// Attach a VFS namespace so ChatApps spawned via RPC have VFS access.
+    ///
+    /// The VFS proxy task is spawned lazily on the first ChatApp spawn,
+    /// on the service's own tokio runtime (inside the LocalSet).
+    pub fn with_vfs(
+        mut self,
+        ns: std::sync::Arc<hyprstream_vfs::Namespace>,
+        subject: hyprstream_rpc::Subject,
+    ) -> Self {
+        self.vfs_ns = Some(ns);
+        self.vfs_subject = Some(subject);
         self
     }
 
@@ -1040,6 +1060,16 @@ impl TuiService {
                 .unwrap_or(hyprstream_tui::chat_app::ToolCallFormat::Qwen3Xml),
         )
         .with_server_spawned();
+
+        // Wire VFS namespace if available.
+        let app = if let (Some(vfs_ns), Some(vfs_subject)) =
+            (&self.vfs_ns, &self.vfs_subject)
+        {
+            app.with_vfs(vfs_ns.clone(), vfs_subject.clone())
+        } else {
+            app
+        };
+
         let config = waxterm::app::TerminalConfig::new().cols(cols).rows(rows);
         let process = super::process::spawn_app_process(app, config);
 

@@ -185,6 +185,10 @@ pub fn make_chat_spawner(
                                     let _ = tx.send(ChatEvent::StreamError(m));
                                     break;
                                 }
+                                Ok(Some(StreamPayload::Tagged { .. })) => {
+                                    // encrypted event payload, skip
+                                    continue;
+                                }
                                 Err(e) => {
                                     let _ = tx.send(ChatEvent::StreamError(e.to_string()));
                                     break;

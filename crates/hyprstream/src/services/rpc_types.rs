@@ -170,6 +170,9 @@ impl StreamPayloadExt for StreamPayload {
                 let stats = InferenceComplete::from_bytes(&data)?;
                 Ok(InferenceStreamPayload::Complete(stats))
             }
+            StreamPayload::Tagged { .. } => {
+                Err(anyhow::anyhow!("Unexpected Tagged payload in inference stream"))
+            }
         }
     }
 }

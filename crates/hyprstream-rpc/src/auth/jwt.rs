@@ -72,6 +72,34 @@ pub fn encode(claims: &Claims, signing_key: &SigningKey) -> String {
     format!("{signing_input}.{signature_b64}")
 }
 
+/// Encode and sign an OIDC ID Token (EdDSA with `kid` in header).
+///
+/// The header includes `kid` (SHA-256 of the public key, first 8 hex chars)
+/// and `typ: "JWT"` per OIDC convention.
+pub fn encode_id_token(claims: &super::IdTokenClaims, signing_key: &SigningKey) -> String {
+    use sha2::{Sha256, Digest};
+    let kid = {
+        let hash = Sha256::digest(signing_key.verifying_key().as_bytes());
+        hex::encode(&hash[..4])
+    };
+    let header = serde_json::json!({
+        "alg": "EdDSA",
+        "typ": "JWT",
+        "kid": kid,
+    });
+    let header_b64 = URL_SAFE_NO_PAD.encode(header.to_string().as_bytes());
+    let payload_json = serde_json::to_string(claims).unwrap_or_else(|_e| {
+        #[cfg(not(target_arch = "wasm32"))]
+        tracing::error!("id_token claims serialization failed: {}", _e);
+        "{}".to_owned()
+    });
+    let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let signature = signing_key.sign(signing_input.as_bytes());
+    let signature_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+    format!("{signing_input}.{signature_b64}")
+}
+
 /// Decode and verify a JWT token issued by the **local** node.
 ///
 /// For tokens from foreign issuers (federation), use [`decode_with_key`]

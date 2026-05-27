@@ -462,6 +462,7 @@ pub async fn handle_training_infer(
                 }
                 Some(StreamPayload::Complete(_)) | None => break,
                 Some(StreamPayload::Error(msg)) => bail!("Generation error: {msg}"),
+                Some(StreamPayload::Tagged { .. }) => continue,
             }
         }
         println!();
@@ -537,6 +538,10 @@ async fn collect_inference_stream(
                 }
                 StreamPayload::Error(msg) => {
                     bail!("Generation error: {msg}");
+                }
+                StreamPayload::Tagged { .. } => {
+                    // encrypted event payload, skip
+                    continue;
                 }
             },
             None => {

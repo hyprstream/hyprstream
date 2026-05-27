@@ -193,7 +193,7 @@ impl<M: Mount + 'static> VfsDaemon<M> {
                 let _ = std::fs::remove_file(&socket_path);
                 tracing::info!("VFS daemon stopped");
             })
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
 
         self.thread_handle = Some(handle);
         Ok(())
@@ -231,6 +231,7 @@ impl<M: Mount + 'static> Drop for VfsDaemon<M> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use async_trait::async_trait;

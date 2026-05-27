@@ -11,8 +11,6 @@
 //! - `/lang/tcl/vars/`  — dynamic dir: list Tcl variables as readable files
 //! - `/lang/tcl/procs/` — dynamic dir: list defined procs as readable files
 
-use std::sync::mpsc;
-
 use async_trait::async_trait;
 use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat, Subject};
 
@@ -25,25 +23,25 @@ pub enum TclCommand {
     /// Evaluate a Tcl script. Response: `Ok(result)` or `Err(error_msg)`.
     Eval {
         script: String,
-        resp: mpsc::SyncSender<Result<String, String>>,
+        resp: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
     /// List all variable names in the current scope.
     ListVars {
-        resp: mpsc::SyncSender<Vec<String>>,
+        resp: tokio::sync::oneshot::Sender<Vec<String>>,
     },
     /// Get the value of a scalar variable.
     GetVar {
         name: String,
-        resp: mpsc::SyncSender<Option<String>>,
+        resp: tokio::sync::oneshot::Sender<Option<String>>,
     },
     /// List all user-defined procedure names.
     ListProcs {
-        resp: mpsc::SyncSender<Vec<String>>,
+        resp: tokio::sync::oneshot::Sender<Vec<String>>,
     },
     /// Get the body of a procedure.
     GetProc {
         name: String,
-        resp: mpsc::SyncSender<Option<String>>,
+        resp: tokio::sync::oneshot::Sender<Option<String>>,
     },
     /// Set the instruction limit on the interpreter.
     SetInstructionLimit {
@@ -89,24 +87,25 @@ struct TclFid {
 /// `Receiver<TclCommand>` returned by [`create_mount_channel`] in its event
 /// loop (e.g., `ChatApp::tick()`).
 pub struct TclMount {
-    tx: mpsc::SyncSender<TclCommand>,
+    tx: tokio::sync::mpsc::Sender<TclCommand>,
 }
 
 impl TclMount {
     /// Create a new `TclMount` from the sending half of a mount channel.
-    pub fn new(tx: mpsc::SyncSender<TclCommand>) -> Self {
+    pub fn new(tx: tokio::sync::mpsc::Sender<TclCommand>) -> Self {
         Self { tx }
     }
 
-    /// Send a command and block until the interpreter responds.
-    fn request<T>(&self, build: impl FnOnce(mpsc::SyncSender<T>) -> TclCommand) -> Result<T, MountError> {
-        let (resp_tx, resp_rx) = mpsc::sync_channel(1);
+    /// Send a command and await the interpreter response.
+    async fn request<T>(&self, build: impl FnOnce(tokio::sync::oneshot::Sender<T>) -> TclCommand) -> Result<T, MountError> {
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         let cmd = build(resp_tx);
         self.tx
             .send(cmd)
+            .await
             .map_err(|_| MountError::Io("tcl interpreter gone".into()))?;
         resp_rx
-            .recv()
+            .await
             .map_err(|_| MountError::Io("tcl interpreter did not respond".into()))
     }
 }
@@ -160,7 +159,7 @@ impl Mount for TclMount {
                 let val: Option<String> = self.request(|resp| TclCommand::GetVar {
                     name: name.clone(),
                     resp,
-                })?;
+                }).await?;
                 val.map(|s| s.into_bytes())
                     .ok_or_else(|| MountError::NotFound(format!("vars/{name}")))?
             }
@@ -168,7 +167,7 @@ impl Mount for TclMount {
                 let body: Option<String> = self.request(|resp| TclCommand::GetProc {
                     name: name.clone(),
                     resp,
-                })?;
+                }).await?;
                 body.map(|s| s.into_bytes())
                     .ok_or_else(|| MountError::NotFound(format!("procs/{name}")))?
             }
@@ -201,7 +200,7 @@ impl Mount for TclMount {
                 let result = self.request(|resp| TclCommand::Eval {
                     script,
                     resp,
-                })?;
+                }).await?;
                 let response_bytes = match result {
                     Ok(s) => s.into_bytes(),
                     Err(e) => format!("error: {e}").into_bytes(),
@@ -247,7 +246,7 @@ impl Mount for TclMount {
             ]),
             TclFidKind::VarsDir => {
                 let names: Vec<String> =
-                    self.request(|resp| TclCommand::ListVars { resp })?;
+                    self.request(|resp| TclCommand::ListVars { resp }).await?;
                 Ok(names
                     .into_iter()
                     .map(|name| DirEntry {
@@ -260,7 +259,7 @@ impl Mount for TclMount {
             }
             TclFidKind::ProcsDir => {
                 let names: Vec<String> =
-                    self.request(|resp| TclCommand::ListProcs { resp })?;
+                    self.request(|resp| TclCommand::ListProcs { resp }).await?;
                 Ok(names
                     .into_iter()
                     .map(|name| DirEntry {
@@ -308,8 +307,8 @@ impl Mount for TclMount {
 ///
 /// Returns `(sender, receiver)`. Pass the sender to [`TclMount::new`] and
 /// poll the receiver from the thread owning the `TclShell`.
-pub fn create_mount_channel() -> (mpsc::SyncSender<TclCommand>, mpsc::Receiver<TclCommand>) {
-    mpsc::sync_channel(16)
+pub fn create_mount_channel() -> (tokio::sync::mpsc::Sender<TclCommand>, tokio::sync::mpsc::Receiver<TclCommand>) {
+    tokio::sync::mpsc::channel(16)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -320,14 +319,13 @@ pub fn create_mount_channel() -> (mpsc::SyncSender<TclCommand>, mpsc::Receiver<T
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use std::thread;
 
-    /// Spawn a fake interpreter thread that handles commands.
+    /// Spawn a fake interpreter task that handles commands.
     fn spawn_fake_interp(
-        rx: mpsc::Receiver<TclCommand>,
-    ) -> thread::JoinHandle<()> {
-        thread::spawn(move || {
-            while let Ok(cmd) = rx.recv() {
+        mut rx: tokio::sync::mpsc::Receiver<TclCommand>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
                 match cmd {
                     TclCommand::Eval { script, resp } => {
                         if script == "error" {

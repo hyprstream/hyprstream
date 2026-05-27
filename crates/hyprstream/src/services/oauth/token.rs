@@ -150,7 +150,7 @@ async fn exchange_authorization_code(
     tracing::info!(client_id = %params.client_id, username = %pending.username, "PKCE verified, issuing token");
     // Use the authenticated username as JWT sub (set during Ed25519 challenge-response on consent page).
     let sub = pending.username.clone();
-    issue_token_with_refresh(&state, &params.client_id, pending.scopes, pending.resource, &sub).await
+    issue_token_with_refresh(&state, &params.client_id, pending.scopes, pending.resource, &sub, pending.oidc_nonce, true).await
 }
 
 /// Handle refresh_token grant type (OAuth 2.1 with rotation).
@@ -197,7 +197,8 @@ async fn exchange_refresh_token(
     }
 
     // Issue new access token + rotated refresh token with the stored scopes/resource and original subject.
-    issue_token_with_refresh(&state, &entry.client_id, entry.scopes, entry.resource, &entry.username).await
+    // No id_token on refresh per OIDC Core Section 12.2.
+    issue_token_with_refresh(&state, &entry.client_id, entry.scopes, entry.resource, &entry.username, None, false).await
 }
 
 /// Handle urn:ietf:params:oauth:grant-type:device_code grant type (RFC 8628 Section 3.4).
@@ -283,7 +284,8 @@ async fn exchange_device_code(
             let mut user_code_map = state.device_code_by_user_code.write().await;
             user_code_map.remove(&user_code);
             drop(user_code_map);
-            issue_token_with_refresh(&state, &client_id, scopes, resource, &approved_by).await
+            // Device flow: no OIDC nonce and not initial OIDC auth.
+            issue_token_with_refresh(&state, &client_id, scopes, resource, &approved_by, None, false).await
         }
     }
 }
@@ -302,12 +304,17 @@ fn generate_refresh_token() -> String {
 /// - authorization_code flow: pass `pending.username` (the Ed25519-authenticated user from the consent page)
 /// - refresh_token flow: pass the original sub from the RefreshTokenEntry
 /// - device_code flow: pass the approving user's username (from challenge-response)
+///
+/// `initial_auth`: true for authorization_code exchange (may issue id_token),
+/// false for refresh_token and device_code (never issues id_token per OIDC Core § 12.2).
 async fn issue_token_with_refresh(
     state: &OAuthState,
     client_id: &str,
     scopes: Vec<String>,
     resource: Option<String>,
     sub: &str,
+    oidc_nonce: Option<String>,
+    initial_auth: bool,
 ) -> Response {
     let scope_str = scopes.join(" ");
 
@@ -334,10 +341,62 @@ async fn issue_token_with_refresh(
                 tokens.insert(refresh_token.clone(), RefreshTokenEntry {
                     client_id: client_id.to_owned(),
                     username: sub.to_owned(),
-                    scopes,
+                    scopes: scopes.clone(),
                     resource,
                     expires_at: Instant::now() + Duration::from_secs(state.refresh_token_ttl as u64),
                 });
+            }
+
+            // Build OIDC id_token when: scope includes "openid", signing key is available,
+            // and this is an initial authorization (not refresh/device per OIDC Core § 12.2).
+            let has_openid = scopes.iter().any(|s| s == "openid");
+            let id_token = if has_openid && initial_auth && state.signing_key.is_some() {
+                let id_exp = now + 300; // 5-minute id_token lifetime
+                let mut id_claims = hyprstream_rpc::auth::IdTokenClaims::new(
+                    state.issuer_url.clone(),
+                    sub.to_owned(),
+                    client_id.to_owned(),
+                    now,
+                    id_exp,
+                )
+                .with_nonce(oidc_nonce)
+                .with_auth_time(now);
+
+                // Add profile claims based on requested scopes.
+                if let Some(ref user_store) = state.user_store {
+                    if let Ok(Some(profile)) = user_store.get_profile(sub) {
+                        if scopes.iter().any(|s| s == "profile") {
+                            id_claims.preferred_username = Some(sub.to_owned());
+                            id_claims.name = profile.name;
+                        }
+                        if scopes.iter().any(|s| s == "email") {
+                            id_claims.email = profile.email;
+                            id_claims.email_verified = profile.email_verified;
+                        }
+                        // Use stable UUID sub if available.
+                        if let Some(uuid_sub) = profile.sub {
+                            id_claims.sub = uuid_sub;
+                        }
+                    }
+                }
+
+                // SAFETY: signing_key.is_some() checked in the outer condition.
+                let Some(ref sk) = state.signing_key else { unreachable!() };
+                let id_token_jwt = hyprstream_rpc::auth::jwt::encode_id_token(&id_claims, sk);
+                Some(id_token_jwt)
+            } else {
+                None
+            };
+
+            let mut response_json = serde_json::json!({
+                "access_token": token_info.token,
+                "token_type": "Bearer",
+                "expires_in": expires_in,
+                "scope": scope_str,
+                "refresh_token": refresh_token,
+            });
+            if let Some(id_token) = id_token {
+                response_json["id_token"] = serde_json::Value::String(id_token);
             }
 
             (
@@ -346,13 +405,7 @@ async fn issue_token_with_refresh(
                     (header::CACHE_CONTROL, "no-store"),
                     (header::PRAGMA, "no-cache"),
                 ],
-                Json(serde_json::json!({
-                    "access_token": token_info.token,
-                    "token_type": "Bearer",
-                    "expires_in": expires_in,
-                    "scope": scope_str,
-                    "refresh_token": refresh_token,
-                })),
+                Json(response_json),
             )
                 .into_response()
         }

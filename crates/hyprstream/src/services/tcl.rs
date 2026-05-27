@@ -61,8 +61,7 @@ impl TclService {
         transport: TransportConfig,
         signing_key: SigningKey,
     ) -> Self {
-        let rt = tokio::runtime::Handle::current();
-        let executor = TclExecutor::spawn(ns, Subject::new("system"), rt);
+        let executor = TclExecutor::spawn(ns, Subject::new("system"));
         Self {
             executor,
             context,

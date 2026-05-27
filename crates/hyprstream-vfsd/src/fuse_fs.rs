@@ -129,7 +129,7 @@ impl<M: Mount + 'static> FileSystem for VfsFuse<M> {
             .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
 
         let mut child_path = parent_path;
-        child_path.push(name_str.to_string());
+        child_path.push(name_str.to_owned());
 
         // Walk the VFS to verify existence and get metadata.
         let (is_dir, size) = self.walk_and_stat(&child_path)?;

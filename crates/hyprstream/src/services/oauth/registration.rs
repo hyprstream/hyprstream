@@ -154,7 +154,8 @@ pub async fn fetch_client_metadata(
 /// Check if a redirect URI is a loopback address.
 pub(crate) fn is_loopback_uri(uri: &str) -> bool {
     if let Ok(url) = url::Url::parse(uri) {
-        if url.scheme() != "http" {
+        // Accept both http and https for loopback URIs (https is used with mkcert in dev)
+        if url.scheme() != "http" && url.scheme() != "https" {
             return false;
         }
         matches!(url.host_str(), Some("127.0.0.1") | Some("localhost") | Some("[::1]"))

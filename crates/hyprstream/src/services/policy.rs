@@ -14,12 +14,15 @@ use crate::services::generated::policy_client::{
     PolicyInfo, PolicyRule, Grouping,
     PolicyHistory, PolicyHistoryEntry, DraftStatus,
     AddGrouping, RemoveGrouping, SetBranchVisibility,
+    RegisterEventPrefix, SubscribeEventPrefix, GetPendingSubscribers, DepositWrappedKeys,
+    EventPrefixAccess, PendingSubscribers,
     dispatch_policy, serialize_response,
 };
 use anyhow::{anyhow, Result};
 use git2db::{Git2DB, RepoId};
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::transport::TransportConfig;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, trace, warn};
@@ -30,6 +33,20 @@ use tracing::{debug, info, trace, warn};
 
 /// Policy service that wraps PolicyManager.
 /// Receives policy check requests over ZMQ and delegates to PolicyManager.
+/// Per-prefix event state (blind key relay).
+///
+/// PolicyService stores opaque wrapped key blobs — it never sees plaintext
+/// group keys or wrap keys. The publisher wraps directly against subscriber
+/// pubkeys via DH.
+struct EventPrefixState {
+    publisher_pubkey: [u8; 32],
+    schema: String,
+    /// Subscriber ephemeral pubkeys, keyed by Blake3 hash of pubkey.
+    subscriber_pubkeys: HashMap<[u8; 32], [u8; 32]>,
+    /// Opaque wrapped key blobs deposited by the publisher, keyed by subscriber pubkey hash.
+    wrapped_keys: HashMap<[u8; 32], Vec<u8>>,
+}
+
 pub struct PolicyService {
     // Business logic
     policy_manager: Arc<PolicyManager>,
@@ -51,6 +68,9 @@ pub struct PolicyService {
     // Infrastructure (for Spawnable)
     context: Arc<zmq::Context>,
     transport: TransportConfig,
+    /// Event prefix state for secure event transport (Phase 7).
+    /// PolicyService is a blind relay — stores opaque wrapped blobs, never plaintext keys.
+    event_prefixes: RwLock<HashMap<String, EventPrefixState>>,
 }
 
 impl PolicyService {
@@ -76,6 +96,7 @@ impl PolicyService {
             federation_key_source: None,
             context,
             transport,
+            event_prefixes: RwLock::new(HashMap::new()),
         }
     }
 
@@ -146,6 +167,31 @@ fn compute_supported_scopes() -> Vec<String> {
 // ============================================================================
 // PolicyHandler implementation (generated trait)
 // ============================================================================
+
+/// Validate an event prefix string.
+///
+/// Rejects empty strings, path traversal (`..`), and Casbin metacharacters (`*`, `#`).
+/// Only allows alphanumeric, `.`, `-`, and `_`.
+fn validate_event_prefix(prefix: &str) -> Result<(), String> {
+    if prefix.is_empty() {
+        return Err("prefix must not be empty".to_owned());
+    }
+    if prefix.len() > 128 {
+        return Err("prefix exceeds 128 characters".to_owned());
+    }
+    if prefix.contains("..") {
+        return Err("prefix must not contain '..'".to_owned());
+    }
+    if !prefix
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
+    {
+        return Err(
+            "prefix may only contain alphanumeric, '.', '-', '_' characters".to_owned(),
+        );
+    }
+    Ok(())
+}
 
 #[async_trait::async_trait(?Send)]
 impl PolicyHandler for PolicyService {
@@ -935,6 +981,201 @@ impl PolicyHandler for PolicyService {
             data.model_name, data.branch_name, vis_str, caller
         );
         Ok(PolicyResponseVariant::SetBranchVisibilityResult(sha))
+    }
+
+    /// Publisher registers a topic prefix. No group key stored here — publisher holds it.
+    async fn handle_register_event_prefix(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &RegisterEventPrefix,
+    ) -> Result<PolicyResponseVariant> {
+        // Validate prefix BEFORE constructing scope (prevents Casbin metacharacter injection)
+        if let Err(e) = validate_event_prefix(&data.prefix) {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: e,
+                code: "INVALID_ARGUMENT".to_owned(),
+                details: String::new(),
+            }));
+        }
+
+        // Authorization: publish:events:{prefix}.*
+        let scope = format!("publish:events:{}.*", data.prefix);
+        self.authorize(ctx, &scope, "register").await?;
+
+        let mut pubkey = [0u8; 32];
+        if data.publisher_ephemeral_pubkey.len() != 32 {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "publisher pubkey must be 32 bytes".to_owned(),
+                code: "INVALID_ARGUMENT".to_owned(),
+                details: String::new(),
+            }));
+        }
+        pubkey.copy_from_slice(&data.publisher_ephemeral_pubkey);
+
+        let mut prefixes = self.event_prefixes.write().await;
+        prefixes.insert(data.prefix.clone(), EventPrefixState {
+            publisher_pubkey: pubkey,
+            schema: data.schema.clone(),
+            subscriber_pubkeys: HashMap::new(),
+            wrapped_keys: HashMap::new(),
+        });
+
+        tracing::info!(prefix = %data.prefix, "Registered event prefix");
+        Ok(PolicyResponseVariant::RegisterEventPrefixResult)
+    }
+
+    /// Subscriber requests access. Checks scope, stores subscriber pubkey,
+    /// returns publisher pubkey + any pre-wrapped key blob.
+    async fn handle_subscribe_event_prefix(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &SubscribeEventPrefix,
+    ) -> Result<PolicyResponseVariant> {
+        // Validate prefix BEFORE constructing scope
+        if let Err(e) = validate_event_prefix(&data.prefix) {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: e,
+                code: "INVALID_ARGUMENT".to_owned(),
+                details: String::new(),
+            }));
+        }
+
+        // Authorization: subscribe:events:{prefix}.*
+        let scope = format!("subscribe:events:{}.*", data.prefix);
+        self.authorize(ctx, &scope, "subscribe").await?;
+
+        let mut sub_pubkey = [0u8; 32];
+        if data.subscriber_ephemeral_pubkey.len() != 32 {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "subscriber pubkey must be 32 bytes".to_owned(),
+                code: "INVALID_ARGUMENT".to_owned(),
+                details: String::new(),
+            }));
+        }
+        sub_pubkey.copy_from_slice(&data.subscriber_ephemeral_pubkey);
+
+        let sub_hash = blake3::hash(&sub_pubkey);
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes.copy_from_slice(sub_hash.as_bytes());
+
+        let mut prefixes = self.event_prefixes.write().await;
+        let state = match prefixes.get_mut(&data.prefix) {
+            Some(s) => s,
+            None => return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("prefix '{}' not registered", data.prefix),
+                code: "NOT_FOUND".to_owned(),
+                details: String::new(),
+            })),
+        };
+
+        state.subscriber_pubkeys.insert(hash_bytes, sub_pubkey);
+
+        // If publisher has already wrapped a key for this subscriber, return it.
+        let wrapped = state.wrapped_keys.get(&hash_bytes).cloned().unwrap_or_default();
+
+        Ok(PolicyResponseVariant::SubscribeEventPrefixResult(EventPrefixAccess {
+            publisher_ephemeral_pubkey: state.publisher_pubkey.to_vec(),
+            wrapped_group_key: wrapped,
+            schema: state.schema.clone(),
+        }))
+    }
+
+    /// Publisher fetches new subscriber pubkeys that need wrapping.
+    async fn handle_get_pending_subscribers(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &GetPendingSubscribers,
+    ) -> Result<PolicyResponseVariant> {
+        // Validate prefix BEFORE constructing scope
+        if let Err(e) = validate_event_prefix(&data.prefix) {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: e,
+                code: "INVALID_ARGUMENT".to_owned(),
+                details: String::new(),
+            }));
+        }
+
+        // Authorization: publish:events:{prefix}.*
+        let scope = format!("publish:events:{}.*", data.prefix);
+        self.authorize(ctx, &scope, "get_subscribers").await?;
+
+        let prefixes = self.event_prefixes.read().await;
+        let state = match prefixes.get(&data.prefix) {
+            Some(s) => s,
+            None => return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("prefix '{}' not registered", data.prefix),
+                code: "NOT_FOUND".to_owned(),
+                details: String::new(),
+            })),
+        };
+
+        // Return pubkeys that don't have wrapped keys yet.
+        let pending: Vec<Vec<u8>> = state.subscriber_pubkeys.iter()
+            .filter(|(hash, _)| !state.wrapped_keys.contains_key(*hash))
+            .map(|(_, pubkey)| pubkey.to_vec())
+            .collect();
+
+        Ok(PolicyResponseVariant::GetPendingSubscribersResult(PendingSubscribers {
+            pubkeys: pending,
+        }))
+    }
+
+    /// Publisher deposits wrapped group key blobs (opaque to PolicyService).
+    async fn handle_deposit_wrapped_keys(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &DepositWrappedKeys,
+    ) -> Result<PolicyResponseVariant> {
+        // Validate prefix BEFORE constructing scope
+        if let Err(e) = validate_event_prefix(&data.prefix) {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: e,
+                code: "INVALID_ARGUMENT".to_owned(),
+                details: String::new(),
+            }));
+        }
+
+        // Authorization: publish:events:{prefix}.*
+        let scope = format!("publish:events:{}.*", data.prefix);
+        self.authorize(ctx, &scope, "deposit_keys").await?;
+
+        let mut prefixes = self.event_prefixes.write().await;
+        let state = match prefixes.get_mut(&data.prefix) {
+            Some(s) => s,
+            None => return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("prefix '{}' not registered", data.prefix),
+                code: "NOT_FOUND".to_owned(),
+                details: String::new(),
+            })),
+        };
+
+        let mut deposited = 0u32;
+        for entry in &data.entries {
+            if entry.sub_pubkey_hash.len() != 32 {
+                warn!(
+                    prefix = %data.prefix,
+                    hash_len = entry.sub_pubkey_hash.len(),
+                    "Rejecting malformed wrapped key entry: sub_pubkey_hash must be 32 bytes"
+                );
+                continue;
+            }
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&entry.sub_pubkey_hash);
+            state.wrapped_keys.insert(hash, entry.wrapped_blob.clone());
+            deposited += 1;
+        }
+
+        tracing::debug!(
+            prefix = %data.prefix,
+            deposited,
+            submitted = data.entries.len(),
+            "Deposited wrapped keys"
+        );
+        Ok(PolicyResponseVariant::DepositWrappedKeysResult)
     }
 }
 

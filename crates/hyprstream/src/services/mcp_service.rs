@@ -767,6 +767,9 @@ impl McpService {
                         StreamPayload::Error(msg) => {
                             return Err(ErrorData::internal_error(msg, None));
                         }
+                        StreamPayload::Tagged { .. } => {
+                            // encrypted event payload, skip
+                        }
                     }
                 }
                 Ok(CallToolResult::success(contents))

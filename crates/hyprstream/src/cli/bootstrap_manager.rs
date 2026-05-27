@@ -19,7 +19,7 @@ use crate::auth::policy_templates::{get_template, get_templates};
 use crate::auth::{LocalKeyStore, PolicyManager, UserStore, write_policy_file};
 use crate::cli::gpu_detect;
 use crate::cli::policy_handlers::{
-    ensure_user_identity, load_or_generate_signing_key, mint_local_token, parse_duration,
+    ensure_user_signing_key, load_or_generate_signing_key, mint_local_token, parse_duration,
 };
 
 
@@ -150,7 +150,7 @@ impl BootstrapManager {
         if store.get_pubkey(username).ok().flatten().is_some() {
             return; // already registered
         }
-        let (_sk, vk) = match ensure_user_identity() {
+        let (_sk, vk) = match ensure_user_signing_key() {
             Ok(pair) => pair,
             Err(e) => {
                 tracing::warn!(

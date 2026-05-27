@@ -295,7 +295,7 @@ pub async fn handle_shell_tui(
 
     // Build VFS namespace for `/path` routing in ChatApps.
     #[allow(clippy::type_complexity)]
-    let (vfs_ns, tcl_mount_rx): (std::sync::Arc<hyprstream_vfs::Namespace>, std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>) = {
+    let (vfs_ns, tcl_mount_rx): (std::sync::Arc<hyprstream_vfs::Namespace>, std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>) = {
         use crate::services::fs::{SyntheticNode, SyntheticTree};
 
         let mut ns = hyprstream_vfs::Namespace::new();
@@ -313,90 +313,57 @@ pub async fn handle_shell_tui(
             std::sync::Arc::new(remote_model_mount),
         );
 
-        // Wrap in Arc, then build /bin/ with Weak captures to avoid circular ref.
-        // Weak doesn't block Arc::get_mut, so we can still mount after.
-        let mut ns = std::sync::Arc::new(ns);
-        let weak = std::sync::Arc::downgrade(&ns);
-        let subj = vfs_subject.clone();
-
-        let rt_handle = tokio::runtime::Handle::current();
+        // /bin/ — static directory entries for listing purposes.
+        // Actual command execution goes through TclShell builtins via VFS proxy,
+        // not through these nodes. These exist so `ls /bin` shows available commands.
         let bin_tree = {
             let mut children = std::collections::HashMap::new();
 
-            // /bin/cat — write path(s), read file contents.
-            let w = weak.clone();
-            let s = subj.clone();
-            let h = rt_handle.clone();
-            children.insert("cat".to_owned(), SyntheticNode::CtlFile {
-                handler: Box::new(move |data, _subject| {
-                    let ns = w.upgrade().ok_or("namespace dropped")?;
-                    let input = std::str::from_utf8(data).map_err(|e| e.to_string())?;
-                    let mut out = Vec::new();
-                    for path in input.split_whitespace() {
-                        out.extend_from_slice(
-                            &h.block_on(ns.cat(path, &s)).map_err(|e| e.to_string())?,
-                        );
-                    }
-                    Ok(out)
-                }),
-            });
-
-            // /bin/ls — write path, read directory listing.
-            let w = weak.clone();
-            let s = subj.clone();
-            let h = rt_handle.clone();
-            children.insert("ls".to_owned(), SyntheticNode::CtlFile {
-                handler: Box::new(move |data, _subject| {
-                    let ns = w.upgrade().ok_or("namespace dropped")?;
-                    let input = std::str::from_utf8(data).map_err(|e| e.to_string())?;
-                    let path = input.trim();
-                    let path = if path.is_empty() { "/" } else { path };
-                    let entries = h.block_on(ns.ls(path, &s)).map_err(|e| e.to_string())?;
-                    let listing: Vec<String> = entries.iter().map(|e| {
-                        if e.is_dir { format!("{}/", e.name) } else { e.name.clone() }
-                    }).collect();
-                    Ok(listing.join("\n").into_bytes())
-                }),
-            });
-
-            // /bin/help — read-only, lists available commands.
-            let w = weak.clone();
-            let s = subj.clone();
-            let h = rt_handle.clone();
-            children.insert("help".to_owned(), SyntheticNode::CtlFile {
-                handler: Box::new(move |_data, _subject| {
-                    let mut out = String::from("VFS commands:\n");
-                    out.push_str("  cat <path>           read file contents\n");
-                    out.push_str("  ls [path]            list directory\n");
-                    out.push_str("  echo <path> <data>   write to file\n");
-                    out.push_str("  ctl <path> <cmd>     control file (write+read)\n");
-                    out.push_str("  mount [prefix]       list mount points\n");
-                    out.push_str("  help                 this message\n");
-                    if let Some(ns) = w.upgrade() {
-                        if let Ok(entries) = h.block_on(ns.ls("/bin", &s)) {
-                            if !entries.is_empty() {
-                                out.push_str("\nCommands (/bin/):\n");
-                                for entry in &entries {
-                                    out.push_str(&format!("  {}\n", entry.name));
-                                }
-                            }
-                        }
-                    }
-                    Ok(out.into_bytes())
-                }),
-            });
-
-            // /bin/mount — read-only, lists mount prefixes.
-            let w = weak.clone();
-            children.insert("mount".to_owned(), SyntheticNode::CtlFile {
-                handler: Box::new(move |_data, _subject| {
-                    let ns = w.upgrade().ok_or("namespace dropped")?;
-                    Ok(ns.mount_prefixes().join("\n").into_bytes())
-                }),
-            });
+            children.insert("cat".to_owned(), SyntheticNode::ReadFile(Box::new(|| {
+                b"usage: cat <path> [path ...]".to_vec()
+            })));
+            children.insert("ls".to_owned(), SyntheticNode::ReadFile(Box::new(|| {
+                b"usage: ls [path]".to_vec()
+            })));
+            children.insert("help".to_owned(), SyntheticNode::ReadFile(Box::new(|| {
+                let mut out = String::from("VFS commands:\n");
+                out.push_str("  cat <path>           read file contents\n");
+                out.push_str("  ls [path]            list directory\n");
+                out.push_str("  write <path> <data>  write to file\n");
+                out.push_str("  ctl <path> <cmd>     control file (write+read)\n");
+                out.push_str("  json parse <str>     convert JSON to Tcl dict\n");
+                out.push_str("  mount [prefix]       list mount points\n");
+                out.push_str("  help                 this message\n");
+                out.into_bytes()
+            })));
+            children.insert("mount".to_owned(), SyntheticNode::ReadFile(Box::new(|| {
+                b"usage: mount".to_vec()
+            })));
+            children.insert("write".to_owned(), SyntheticNode::ReadFile(Box::new(|| {
+                b"usage: write <path> <data>".to_vec()
+            })));
 
             SyntheticTree::new(SyntheticNode::Dir { children })
         };
+        let _ = ns.mount("/bin",
+            std::sync::Arc::new(bin_tree),
+        );
+
+        // Discover .tcl tool scripts and bind them into /bin/ (After = fallback).
+        let tools_dir = std::env::var("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                dirs::home_dir().unwrap_or_default().join(".config")
+            })
+            .join("hyprstream/tools");
+        let tools = discover_tools(&tools_dir);
+        if !tools.is_empty() {
+            let tools_tree = SyntheticTree::new(SyntheticNode::Dir { children: tools });
+            let _ = ns.bind_mount("/bin",
+                std::sync::Arc::new(tools_tree),
+                hyprstream_vfs::BindFlag::After,
+            );
+        }
 
         // /env/ — session variables as files (Plan9 per-process /env/).
         let env_store: std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<String, String>>> =
@@ -424,42 +391,29 @@ pub async fn handle_shell_tui(
                 }),
             })
         };
+        let _ = ns.mount("/env",
+            std::sync::Arc::new(env_tree),
+        );
 
         // Create /lang/tcl mount channel — the TclMount exposes interpreter state
         // as files. The receiver is polled by ChatApp::tick().
         let (tcl_mount_tx, tcl_mount_rx) = hyprstream_tcl::create_mount_channel();
         let tcl_mount = std::sync::Arc::new(hyprstream_tcl::TclMount::new(tcl_mount_tx));
+        let _ = ns.mount("/lang/tcl", tcl_mount);
 
-        // Mount /bin/, /env/, /lang/tcl — Arc::get_mut works because only Weak refs exist (no strong clones).
-        if let Some(ns_mut) = std::sync::Arc::get_mut(&mut ns) {
-            let _ = ns_mut.mount("/bin",
-                std::sync::Arc::new(bin_tree),
-            );
+        let ns = std::sync::Arc::new(ns);
 
-            // Discover .tcl tool scripts and bind them into /bin/ (After = fallback).
-            let tools_dir = std::env::var("XDG_CONFIG_HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| {
-                    dirs::home_dir().unwrap_or_default().join(".config")
-                })
-                .join("hyprstream/tools");
-            let tools = discover_tools(&tools_dir);
-            if !tools.is_empty() {
-                let tools_tree = SyntheticTree::new(SyntheticNode::Dir { children: tools });
-                let _ = ns_mut.bind_mount("/bin",
-                    std::sync::Arc::new(tools_tree),
-                    hyprstream_vfs::BindFlag::After,
-                );
-            }
-
-            let _ = ns_mut.mount("/env",
-                std::sync::Arc::new(env_tree),
-            );
-            let _ = ns_mut.mount("/lang/tcl", tcl_mount);
-        }
-
-        (ns, std::sync::Arc::new(std::sync::Mutex::new(tcl_mount_rx)))
+        (ns, std::sync::Arc::new(tokio::sync::Mutex::new(tcl_mount_rx)))
     };
+
+    // Spawn VFS proxy on a dedicated OS thread with its own tokio runtime.
+    // The CLI shell's ChatApps run directly in the LocalSet event loop (not
+    // via spawn_app_process), so the proxy must NOT share the same runtime —
+    // otherwise reply_rx.recv() blocks the runtime and deadlocks the proxy.
+    let vfs_proxy_tx = crate::tui::vfs::spawn_dedicated_vfs_proxy(
+        vfs_ns.clone(),
+        vfs_subject.clone(),
+    );
 
     // Console overlay for log viewing (F9 / Ctrl-L).
     let mut console_app = ConsoleApp::new();
@@ -524,7 +478,7 @@ pub async fn handle_shell_tui(
                     &mut compositor, &client, &model_client, &worker_client,
                     &model_status_tx, &mut terminal, &mut console_app,
                     &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                    &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
+                    &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
                 ).await { break; }
             }
 
@@ -548,7 +502,7 @@ pub async fn handle_shell_tui(
                             &mut compositor, &client, &model_client, &worker_client,
                             &model_status_tx, &mut terminal, &mut console_app,
                             &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                            &vfs_ns, &vfs_subject, &tcl_mount_rx, close_outputs,
+                            &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, close_outputs,
                         ).await { break; }
                         continue;
                     }
@@ -599,7 +553,7 @@ pub async fn handle_shell_tui(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                        &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
+                        &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
                     ).await {
                         should_exit = true;
                         break;
@@ -615,7 +569,7 @@ pub async fn handle_shell_tui(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                        &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
+                        &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
                     ).await { break; }
                 }
             }
@@ -661,7 +615,7 @@ pub async fn handle_shell_tui(
                             &mut compositor, &client, &model_client, &worker_client,
                             &model_status_tx, &mut terminal, &mut console_app,
                             &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                            &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
+                            &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
                         ).await { break; }
                     }
                     // Poll images
@@ -683,7 +637,7 @@ pub async fn handle_shell_tui(
                             &mut compositor, &client, &model_client, &worker_client,
                             &model_status_tx, &mut terminal, &mut console_app,
                             &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                            &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
+                            &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
                         ).await { break; }
                     }
                 }
@@ -746,7 +700,7 @@ pub async fn handle_shell_tui(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                        &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
+                        &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
                     ).await { should_exit = true; break; }
                 }
                 // Remove quitting apps.
@@ -771,7 +725,7 @@ pub async fn handle_shell_tui(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                        &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
+                        &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
                     ).await;
                 }
                 if should_exit { break; }
@@ -798,7 +752,7 @@ pub async fn handle_shell_tui(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                        &vfs_ns, &vfs_subject, &tcl_mount_rx,
+                        &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx,
                         vec![CompositorOutput::Rpc(rpc_req)],
                     ).await;
                 }
@@ -815,7 +769,7 @@ pub async fn handle_shell_tui(
                     &mut compositor, &client, &model_client, &worker_client,
                     &model_status_tx, &mut terminal, &mut console_app,
                     &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                    &vfs_ns, &vfs_subject, &tcl_mount_rx, outputs,
+                    &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
                 ).await { break; }
                 composite_draw(&mut terminal, &compositor, &mut console_app);
             }
@@ -886,7 +840,8 @@ async fn dispatch_outputs(
     signing_key: &SigningKey,
     vfs_ns: &std::sync::Arc<hyprstream_vfs::Namespace>,
     vfs_subject: &hyprstream_rpc::Subject,
-    tcl_mount_rx: &std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>,
+    vfs_proxy_tx: &tokio::sync::mpsc::Sender<hyprstream_vfs::proxy::VfsRequest>,
+    tcl_mount_rx: &std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>,
     outputs: Vec<CompositorOutput>,
 ) -> bool {
     for output in outputs {
@@ -899,7 +854,7 @@ async fn dispatch_outputs(
                 let feed_back = handle_rpc(
                     compositor, client, model_client, worker_client, model_status_tx,
                     active_apps, next_local_id, storage_key, signing_key,
-                    &vfs_ns, &vfs_subject, tcl_mount_rx, req,
+                    vfs_ns, vfs_subject, vfs_proxy_tx, tcl_mount_rx, req,
                 ).await;
                 for input in feed_back {
                     let follow = compositor.handle(input);
@@ -947,7 +902,8 @@ async fn handle_rpc(
     signing_key: &SigningKey,
     vfs_ns: &std::sync::Arc<hyprstream_vfs::Namespace>,
     vfs_subject: &hyprstream_rpc::Subject,
-    tcl_mount_rx: &std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>,
+    _vfs_proxy_tx: &tokio::sync::mpsc::Sender<hyprstream_vfs::proxy::VfsRequest>,
+    tcl_mount_rx: &std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>,
     req: RpcRequest,
 ) -> Vec<CompositorInput> {
     let session_id = compositor.chrome.session_id;
@@ -1147,7 +1103,7 @@ async fn handle_rpc(
                         session_uuid, load_hook, save_hook,
                     )
                     .with_gen_config(gen_config)
-                    .with_vfs(vfs_ns.clone(), vfs_subject.clone(), tokio::runtime::Handle::current())
+                    .with_vfs(vfs_ns.clone(), vfs_subject.clone())
                     .with_tcl_mount_rx(tcl_mount_rx.clone())
                 }
                 Err(e) => {
@@ -1161,7 +1117,7 @@ async fn handle_rpc(
                     );
                     ChatApp::new(model_ref.clone(), cols, rows, spawner)
                         .with_gen_config(gen_config)
-                        .with_vfs(vfs_ns.clone(), vfs_subject.clone(), tokio::runtime::Handle::current())
+                        .with_vfs(vfs_ns.clone(), vfs_subject.clone())
                     .with_tcl_mount_rx(tcl_mount_rx.clone())
                 }
             };
@@ -1928,7 +1884,7 @@ fn unpack_color(packed: u32) -> ratatui::style::Color {
 ///
 /// Returns a HashMap suitable for constructing a `SyntheticNode::Dir`.
 /// Returns an empty map if the directory doesn't exist or is unreadable.
-fn discover_tools(dir: &std::path::Path) -> HashMap<String, crate::services::fs::SyntheticNode> {
+pub(crate) fn discover_tools(dir: &std::path::Path) -> HashMap<String, crate::services::fs::SyntheticNode> {
     use crate::services::fs::SyntheticNode;
 
     let mut tools = HashMap::new();
@@ -1952,19 +1908,12 @@ fn discover_tools(dir: &std::path::Path) -> HashMap<String, crate::services::fs:
         }
 
         let script_path = path.clone();
-        tools.insert(name, SyntheticNode::CtlFile {
-            handler: Box::new(move |data, _subject| {
-                let script = std::fs::read_to_string(&script_path)
-                    .map_err(|e| format!("failed to read tool script: {e}"))?;
-                let args = String::from_utf8_lossy(data);
-                // Wrap the script: set $args before executing, capture the result.
-                let wrapped = format!("set args {{{}}}\n{}", args.trim(), script);
-                // Return the wrapped script for evaluation by the caller's TclShell.
-                // The ctl response is the script to eval — the /bin/ fallback in
-                // TclShell.try_cmd_resolve() will pass this through eval.
-                Ok(wrapped.into_bytes())
-            }),
-        });
+        tools.insert(name, SyntheticNode::ReadFile(Box::new(move || {
+            // Read script from disk at access time so edits take effect immediately.
+            std::fs::read_to_string(&script_path)
+                .unwrap_or_else(|e| format!("# error reading tool script: {e}"))
+                .into_bytes()
+        })));
     }
 
     tools

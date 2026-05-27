@@ -2,13 +2,16 @@
 //!
 //! The molt `Interp` uses `Rc` internally and is `!Send`. `TclExecutor` spawns a
 //! dedicated OS thread that owns the interpreter and processes commands via a bounded
-//! `mpsc::sync_channel`. The executor handle is `Send + Sync` (it only holds a
-//! `SyncSender`) so it can be shared across async tasks and stored in service state.
+//! `tokio::sync::mpsc` channel. The executor handle is `Send + Sync` (it only holds a
+//! `Sender`) so it can be shared across async tasks and stored in service state.
+//!
+//! The dedicated thread runs its own single-threaded tokio runtime with a `LocalSet`
+//! so that the `!Send` TclShell can `.await` VFS operations directly.
 
-use std::sync::mpsc;
 use std::sync::Arc;
 
 use hyprstream_vfs::{Namespace, Subject};
+use tokio::sync::mpsc;
 
 use crate::{TclCommand, TclShell};
 
@@ -18,7 +21,7 @@ use crate::{TclCommand, TclShell};
 /// sequentially. Dropping the executor closes the channel, which causes the
 /// interpreter thread to exit.
 pub struct TclExecutor {
-    tx: mpsc::SyncSender<TclCommand>,
+    tx: mpsc::Sender<TclCommand>,
 }
 
 impl TclExecutor {
@@ -26,14 +29,22 @@ impl TclExecutor {
     ///
     /// The interpreter runs in a loop processing commands until the sender is dropped.
     /// `ns` and `subject` define the VFS namespace and caller identity for builtins.
-    /// `rt` is a tokio runtime handle used by builtins that call async VFS operations.
-    pub fn spawn(ns: Arc<Namespace>, subject: Subject, rt: tokio::runtime::Handle) -> Self {
-        let (tx, rx) = mpsc::sync_channel(64);
+    pub fn spawn(ns: Arc<Namespace>, subject: Subject) -> Self {
+        let (tx, mut rx) = mpsc::channel(64);
         std::thread::spawn(move || {
-            let mut shell = TclShell::new(ns, subject, rt);
-            while let Ok(cmd) = rx.recv() {
-                shell.process_command(cmd);
-            }
+            // Build a single-threaded runtime + LocalSet so that TclShell
+            // (which is !Send due to molt's Rc-based Value) can .await directly.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("TclExecutor: failed to build tokio runtime");
+            let local = tokio::task::LocalSet::new();
+            rt.block_on(local.run_until(async move {
+                let mut shell = TclShell::new(subject, ns);
+                while let Some(cmd) = rx.recv().await {
+                    shell.process_command(cmd).await;
+                }
+            }));
         });
         Self { tx }
     }
@@ -41,40 +52,32 @@ impl TclExecutor {
     /// Evaluate a Tcl script asynchronously.
     ///
     /// Sends the script to the interpreter thread and awaits the result.
-    /// Uses `spawn_blocking` internally so the async runtime is not blocked
-    /// while waiting for the interpreter to respond.
     pub async fn eval(&self, script: &str) -> Result<String, String> {
-        let (resp_tx, resp_rx) = mpsc::sync_channel(1);
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(TclCommand::Eval {
                 script: script.to_owned(),
                 resp: resp_tx,
             })
+            .await
             .map_err(|e| format!("executor channel closed: {e}"))?;
 
-        // Use spawn_blocking to avoid blocking the async runtime on the std mpsc recv.
-        let result = tokio::task::spawn_blocking(move || {
-            resp_rx
-                .recv()
-                .map_err(|e| format!("executor response failed: {e}"))
-        })
-        .await
-        .map_err(|e| format!("spawn_blocking failed: {e}"))??;
-
-        result
+        resp_rx
+            .await
+            .map_err(|e| format!("executor response failed: {e}"))?
     }
 
     /// Evaluate a Tcl script synchronously (blocking the calling thread).
     pub fn eval_blocking(&self, script: &str) -> Result<String, String> {
-        let (resp_tx, resp_rx) = mpsc::sync_channel(1);
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         self.tx
-            .send(TclCommand::Eval {
+            .blocking_send(TclCommand::Eval {
                 script: script.to_owned(),
                 resp: resp_tx,
             })
             .map_err(|e| format!("executor channel closed: {e}"))?;
         resp_rx
-            .recv()
+            .blocking_recv()
             .map_err(|e| format!("executor response failed: {e}"))?
     }
 
@@ -82,9 +85,9 @@ impl TclExecutor {
     ///
     /// Takes effect for the next `eval` call. Set to 0 for unlimited
     /// (not recommended for untrusted input).
-    pub fn set_instruction_limit(&self, limit: usize) {
+    pub async fn set_instruction_limit(&self, limit: usize) {
         // Fire-and-forget: if the channel is closed, we silently ignore.
-        let _ = self.tx.send(TclCommand::SetInstructionLimit { limit });
+        let _ = self.tx.send(TclCommand::SetInstructionLimit { limit }).await;
     }
 }
 
@@ -232,14 +235,13 @@ mod tests {
     }
 
     fn make_executor() -> TclExecutor {
-        let rt = tokio::runtime::Handle::current();
         let mut ns = Namespace::new();
         let mount = Arc::new(MemMount::new(vec![
             ("temperature", b"0.7"),
             ("status", b"loaded"),
         ]));
         ns.mount("/config", mount).unwrap();
-        TclExecutor::spawn(Arc::new(ns), Subject::new("test"), rt)
+        TclExecutor::spawn(Arc::new(ns), Subject::new("test"))
     }
 
     #[tokio::test]
@@ -267,7 +269,7 @@ mod tests {
     #[tokio::test]
     async fn eval_instruction_limit() {
         let exec = make_executor();
-        exec.set_instruction_limit(500);
+        exec.set_instruction_limit(500).await;
         // Give the set_instruction_limit message time to be processed.
         // We send a dummy eval first to ensure ordering.
         let _ = exec.eval("expr 1").await;
@@ -320,13 +322,9 @@ mod tests {
     async fn eval_after_shutdown_errors() {
         let exec = make_executor();
         let _ = exec.eval("expr 1").await.unwrap();
-        // Clone the sender before dropping (not possible — we need to test differently).
-        // Instead, we test by dropping and trying eval_blocking from a new reference.
-        // Since TclExecutor owns the sender, we can't clone it. Test the error path
-        // by creating an executor and dropping it, then trying to use a stale reference.
 
         // We'll test this via the channel directly.
-        let (tx, rx) = mpsc::sync_channel::<TclCommand>(1);
+        let (tx, rx) = tokio::sync::mpsc::channel::<TclCommand>(1);
         drop(rx); // Simulate interpreter thread gone.
         let stale = TclExecutor { tx };
         let result = stale.eval("expr 1").await;

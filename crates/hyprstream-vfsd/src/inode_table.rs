@@ -146,7 +146,7 @@ mod tests {
     #[test]
     fn lookup_allocates_new_inode() {
         let table = InodeTable::new();
-        let ino = table.lookup_or_insert(vec!["srv".to_string()], true);
+        let ino = table.lookup_or_insert(vec!["srv".to_owned()], true);
         assert!(ino > ROOT_INODE);
         assert_eq!(table.len(), 2);
 
@@ -154,15 +154,15 @@ mod tests {
         assert!(data.as_ref().is_some_and(|d| d.is_dir));
         assert!(
             data.as_ref()
-                .is_some_and(|d| d.path == vec!["srv".to_string()])
+                .is_some_and(|d| d.path == vec!["srv".to_owned()])
         );
     }
 
     #[test]
     fn lookup_deduplicates() {
         let table = InodeTable::new();
-        let ino1 = table.lookup_or_insert(vec!["srv".to_string()], true);
-        let ino2 = table.lookup_or_insert(vec!["srv".to_string()], true);
+        let ino1 = table.lookup_or_insert(vec!["srv".to_owned()], true);
+        let ino2 = table.lookup_or_insert(vec!["srv".to_owned()], true);
         assert_eq!(ino1, ino2);
         assert_eq!(table.len(), 2); // root + srv
 
@@ -177,7 +177,7 @@ mod tests {
     #[test]
     fn forget_removes_inode() {
         let table = InodeTable::new();
-        let ino = table.lookup_or_insert(vec!["tmp".to_string()], false);
+        let ino = table.lookup_or_insert(vec!["tmp".to_owned()], false);
         assert_eq!(table.len(), 2);
 
         table.forget(ino, 1);
@@ -195,9 +195,9 @@ mod tests {
     #[test]
     fn forget_partial_keeps_inode() {
         let table = InodeTable::new();
-        let ino = table.lookup_or_insert(vec!["a".to_string()], true);
+        let ino = table.lookup_or_insert(vec!["a".to_owned()], true);
         // Bump lookup count to 2.
-        table.lookup_or_insert(vec!["a".to_string()], true);
+        table.lookup_or_insert(vec!["a".to_owned()], true);
 
         table.forget(ino, 1);
         // Should still exist with count 1.
@@ -208,13 +208,13 @@ mod tests {
     #[test]
     fn hierarchical_paths() {
         let table = InodeTable::new();
-        let srv = table.lookup_or_insert(vec!["srv".to_string()], true);
-        let model = table.lookup_or_insert(vec!["srv".to_string(), "model".to_string()], true);
+        let srv = table.lookup_or_insert(vec!["srv".to_owned()], true);
+        let model = table.lookup_or_insert(vec!["srv".to_owned(), "model".to_owned()], true);
         let status = table.lookup_or_insert(
             vec![
-                "srv".to_string(),
-                "model".to_string(),
-                "status".to_string(),
+                "srv".to_owned(),
+                "model".to_owned(),
+                "status".to_owned(),
             ],
             false,
         );
@@ -224,9 +224,9 @@ mod tests {
         assert_eq!(table.len(), 4); // root + 3 nodes
 
         assert_eq!(table.path_of(status), Some(vec![
-            "srv".to_string(),
-            "model".to_string(),
-            "status".to_string(),
+            "srv".to_owned(),
+            "model".to_owned(),
+            "status".to_owned(),
         ]));
     }
 }

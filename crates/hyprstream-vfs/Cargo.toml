@@ -18,3 +18,6 @@ dashmap = { workspace = true }
 
 # Error handling
 anyhow = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }

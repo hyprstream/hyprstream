@@ -7,6 +7,7 @@ pub mod spawner;
 pub mod manager;
 pub mod factory;
 pub mod metadata;
+pub mod ordering;
 
 pub use spawner::{InprocManager, Spawnable, SpawnedService};
 pub use factory::{get_factory, list_factories, QuicSharedConfig, ServiceClient, ServiceContext, ServiceFactory};

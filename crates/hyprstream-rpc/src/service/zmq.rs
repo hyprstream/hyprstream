@@ -13,6 +13,7 @@
 use crate::prelude::*;
 use crate::transport::TransportConfig;
 use anyhow::{anyhow, Result};
+use zeroize::Zeroizing;
 use async_trait::async_trait;
 use chrono::Utc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -539,8 +540,8 @@ pub struct RequestLoop {
 pub struct QuicLoopConfig {
     /// DER-encoded certificate
     pub cert_der: Vec<u8>,
-    /// DER-encoded private key
-    pub key_der: Vec<u8>,
+    /// DER-encoded private key — zeroed on drop.
+    pub key_der: Zeroizing<Vec<u8>>,
     /// Address to bind the WebTransport server
     pub bind_addr: std::net::SocketAddr,
     /// TLS server name (for endpoint discovery registration)
@@ -683,7 +684,7 @@ impl RequestLoop {
             match crate::transport::zmtp_quic::WebTransportServer::bind(
                 qc.bind_addr,
                 qc.cert_der.clone(),
-                qc.key_der.clone(),
+                (*qc.key_der).clone(),
             ) {
                 Ok(mut wts) => {
                     if let Some(ref meta) = qc.protected_resource_json {

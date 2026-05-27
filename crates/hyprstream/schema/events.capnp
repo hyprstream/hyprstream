@@ -3,9 +3,10 @@
 # Cap'n Proto schema for hyprstream events
 #
 # Events are published via ZMQ PUB/SUB pattern.
-# The EventEnvelope wraps all event types for unified handling.
+# The TypedEventEnvelope wraps all event types for unified handling.
+# (Renamed from EventEnvelope to avoid collision with the RPC-level EventEnvelope.)
 
-struct EventEnvelope {
+struct TypedEventEnvelope {
   # Unique event ID (UUID bytes)
   id @0 :Data;
 

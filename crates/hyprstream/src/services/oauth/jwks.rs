@@ -1,34 +1,41 @@
-//! GET /oauth/jwks — JSON Web Key Set (RFC 7517) for the local signing key.
+//! GET /oauth/jwks — JSON Web Key Set (RFC 7517).
 //!
-//! Returns the node's Ed25519 verifying key as an OKP JWK (RFC 8037).
-//! Federation peers use this to verify JWTs issued by this node.
+//! Returns the node's signing keys: Ed25519 (OKP, RFC 8037) and optionally
+//! RSA (for RS256 interop with enterprise RPs).
 
 use axum::{extract::State, response::IntoResponse, Json};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use std::sync::Arc;
 use super::state::OAuthState;
 
+/// Compute a stable kid from raw key bytes (first 8 hex chars of SHA-256).
+pub fn compute_kid(key_bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(key_bytes);
+    hex::encode(&hash[..4])
+}
+
 /// GET /oauth/jwks
 pub async fn jwks(State(state): State<Arc<OAuthState>>) -> impl IntoResponse {
     let key_bytes = state.verifying_key_bytes;
     let x = URL_SAFE_NO_PAD.encode(key_bytes);
+    let eddsa_kid = compute_kid(&key_bytes);
 
-    // Stable key ID: first 8 hex chars of SHA-256 of the raw key bytes
-    let kid = {
-        use sha2::{Digest, Sha256};
-        let hash = Sha256::digest(key_bytes);
-        hex::encode(&hash[..4])
-    };
+    let mut keys = vec![serde_json::json!({
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "use": "sig",
+        "alg": "EdDSA",
+        "kid": eddsa_kid,
+        "x": x,
+    })];
 
-    Json(serde_json::json!({
-        "keys": [{
-            "kty": "OKP",
-            "crv": "Ed25519",
-            "use": "sig",
-            "kid": kid,
-            "x": x,
-        }]
-    }))
+    // Add RSA public key if available
+    if let Some(ref rsa_jwk) = state.rsa_jwk {
+        keys.push(rsa_jwk.clone());
+    }
+
+    Json(serde_json::json!({ "keys": keys }))
 }
 
 #[cfg(test)]

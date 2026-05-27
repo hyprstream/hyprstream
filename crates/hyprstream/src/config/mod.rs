@@ -18,6 +18,7 @@ use crate::storage::paths::StoragePaths;
 use config::{Config, ConfigError, Environment, File};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use zeroize::{Zeroize, Zeroizing};
 
 /// Unified configuration for the Hyprstream system
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +135,54 @@ pub struct HyprConfig {
     /// unavailable. Never set this in production config files.
     #[serde(default, skip_serializing)]
     pub signing_key: Option<String>,
+
+    /// Persistent secrets storage configuration.
+    ///
+    /// Controls where signing keys, TLS materials, and credential store keys are
+    /// read from and written to. On systemd, overridden at runtime by
+    /// `HYPRSTREAM__SECRETS__PATH=%d` in the service unit (pointing to the
+    /// systemd credentials directory).
+    #[serde(default)]
+    pub secrets: SecretsConfig,
+}
+
+/// Persistent secrets storage configuration.
+///
+/// Determines the directory used for reading and writing persistent secret key
+/// material: signing keys, TLS certificates/keys, and the age credential store key.
+///
+/// On systemd, the generated service unit sets
+/// `Environment=HYPRSTREAM__SECRETS__PATH=%d` so that at runtime `path` resolves
+/// to the systemd credentials directory (non-swappable ramfs, access-restricted).
+///
+/// On non-systemd systems the default (`<config_dir>/credentials`) is used.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SecretsConfig {
+    /// Override the directory from which secret files are read (and written on
+    /// first run).  `None` → resolved at runtime to `<config_dir>/credentials`.
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+}
+
+impl SecretsConfig {
+    /// Resolve the secrets directory.
+    ///
+    /// Returns `path` if set, otherwise `<config_dir>/credentials`.
+    pub fn resolve_dir(&self, config_dir: &Path) -> PathBuf {
+        self.path.clone().unwrap_or_else(|| config_dir.join("credentials"))
+    }
+
+    /// Return the default secrets directory when no config is available.
+    ///
+    /// Routes through `StoragePaths` so `XDG_CONFIG_HOME` is respected
+    /// consistently with every other directory in the application.
+    /// Falls back to `/etc/hyprstream/credentials` if XDG resolution fails.
+    pub fn default_dir() -> PathBuf {
+        StoragePaths::new()
+            .and_then(|p| p.config_dir())
+            .map(|d| d.join("credentials"))
+            .unwrap_or_else(|_| PathBuf::from("/etc/hyprstream/credentials"))
+    }
 }
 
 /// TLS configuration for HTTP services (OAI, OAuth, MCP).
@@ -267,25 +316,50 @@ impl QuicConfig {
     }
 
     /// Check if self-signed certificate should be generated.
+    ///
+    /// Warns when only one of cert_path/key_path is set (misconfiguration).
     pub fn use_self_signed(&self) -> bool {
-        self.cert_path.is_empty() || self.key_path.is_empty()
+        match (self.cert_path.is_empty(), self.key_path.is_empty()) {
+            (true, true) => true,
+            (false, false) => false,
+            (false, true) => {
+                tracing::warn!(
+                    "quic.cert_path is set but quic.key_path is missing — generating self-signed cert"
+                );
+                true
+            }
+            (true, false) => {
+                tracing::warn!(
+                    "quic.key_path is set but quic.cert_path is missing — generating self-signed cert"
+                );
+                true
+            }
+        }
     }
 
-    /// Generate or load TLS materials, returning (cert_der, key_der).
+    /// Generate or load TLS materials, returning `(cert_der, key_der)`.
     ///
-    /// For self-signed certs, generates an ECDSA P-256 certificate with ≤14 day validity,
-    /// as required by WebTransport `serverCertificateHashes` (W3C spec).
-    pub fn load_tls_materials(&self) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    /// `key_der` is wrapped in `Zeroizing` to ensure it is zeroed on drop.
+    ///
+    /// For self-signed certs, loads persisted ECDSA P-256 materials from the secrets
+    /// directory (generating on first run) with ≤14 day validity, as required by
+    /// WebTransport `serverCertificateHashes` (W3C spec).
+    ///
+    /// QUIC uses a separate cert (`quic-cert`) from the HTTP cert (`tls-cert`) because
+    /// WebTransport requires ≤14-day validity while HTTP allows 365 days.
+    pub fn load_tls_materials(&self) -> anyhow::Result<(Vec<u8>, Zeroizing<Vec<u8>>)> {
         if self.use_self_signed() {
-            // Generate self-signed cert with ≤14 day validity for WebTransport compat
-            let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
-            let mut params = rcgen::CertificateParams::new(vec![self.server_name.clone()])?;
-            params.not_before = time::OffsetDateTime::now_utc();
-            params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(14);
-            let cert = params.self_signed(&key_pair)?;
-            let cert_der = cert.der().to_vec();
-            let key_der = key_pair.serialize_der();
-            Ok((cert_der, key_der))
+            let secrets_dir = HyprConfig::resolve_secrets_dir();
+            // Use quic-specific secret names so QUIC and HTTP certs have different
+            // validity windows without stomping each other's files.
+            let materials = crate::auth::credentials::load_or_generate_tls_materials_named(
+                &secrets_dir,
+                &self.server_name,
+                14,
+                "quic-key",
+                "quic-cert",
+            )?;
+            Ok((materials.cert_der, materials.key_der))
         } else {
             // Load from files
             let cert_pem = std::fs::read(&self.cert_path)
@@ -300,11 +374,13 @@ impl QuicConfig {
                 .map_err(|e| anyhow::anyhow!("invalid certificate PEM: {}", e))?
                 .to_vec();
 
-            let key_der = rustls_pemfile::private_key(&mut &key_pem[..])
-                .map_err(|e| anyhow::anyhow!("invalid key PEM: {}", e))?
-                .ok_or_else(|| anyhow::anyhow!("no private key found in {}", self.key_path))?
-                .secret_der()
-                .to_vec();
+            let key_der = Zeroizing::new(
+                rustls_pemfile::private_key(&mut &key_pem[..])
+                    .map_err(|e| anyhow::anyhow!("invalid key PEM: {}", e))?
+                    .ok_or_else(|| anyhow::anyhow!("no private key found in {}", self.key_path))?
+                    .secret_der()
+                    .to_vec(),
+            );
 
             Ok((cert_der, key_der))
         }
@@ -573,6 +649,80 @@ pub struct TrustedIssuerConfig {
 
 fn default_jwks_cache_ttl() -> u64 { 300 }
 
+/// Configuration for an external OIDC provider (login delegation).
+///
+/// Hyprstream acts as an OIDC Relying Party to this provider. Users authenticate
+/// with the provider; hyprstream validates the external id_token and issues its
+/// own JWT with scopes from the policy engine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OidcProviderConfig {
+    /// OIDC issuer URL (must support `/.well-known/openid-configuration`).
+    pub issuer_url: String,
+    /// Client ID registered with the external provider.
+    pub client_id: String,
+    /// Client secret (optional — omit for public client with PKCE).
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    /// Scopes to request from the provider.
+    #[serde(default = "default_oidc_scopes")]
+    pub scopes: Vec<String>,
+    /// Display name for the login UI (e.g., "Corporate SSO").
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Allow plain HTTP for discovery (dev only).
+    #[serde(default)]
+    pub allow_http: bool,
+    /// User identity mapping strategy.
+    #[serde(default)]
+    pub user_mapping: UserMappingStrategy,
+    /// User provisioning mode.
+    #[serde(default)]
+    pub provisioning: ProvisioningMode,
+    /// Allowed email domains (when provisioning = allowlist).
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+    /// Default hyprstream scopes for auto-provisioned users.
+    #[serde(default)]
+    pub default_scopes: Vec<String>,
+    /// Clock skew tolerance for JWT validation (seconds).
+    #[serde(default = "default_clock_skew")]
+    pub clock_skew_seconds: u64,
+}
+
+fn default_oidc_scopes() -> Vec<String> {
+    vec!["openid".into(), "profile".into(), "email".into()]
+}
+fn default_clock_skew() -> u64 { 60 }
+
+/// How to map an external OIDC identity to a local hyprstream subject.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum UserMappingStrategy {
+    /// `provider_slug:external_sub` (e.g., `keycloak:12345`). Default.
+    #[default]
+    Namespaced,
+    /// Use the `email` claim (requires `email_verified=true`).
+    Email,
+    /// Use a specific claim value.
+    Claim {
+        /// The claim name to use as the local subject.
+        name: String,
+    },
+}
+
+/// Whether to auto-create users on first external login.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ProvisioningMode {
+    /// Reject unknown users (admin must pre-create).
+    #[default]
+    Deny,
+    /// Auto-provision on first login.
+    Auto,
+    /// Auto-provision only for matching `allowed_domains`.
+    Allowlist,
+}
+
 /// OAuth 2.1 authorization server configuration
 ///
 /// Provides OAuth 2.1 (draft-ietf-oauth-v2-1-13) authorization for MCP and OAI services.
@@ -634,6 +784,15 @@ pub struct OAuthConfig {
     #[serde(default)]
     pub authority_hints: Vec<String>,
 
+    /// External OIDC providers for login delegation (IdP-agnostic).
+    ///
+    /// Users authenticate with the external provider; hyprstream validates the
+    /// external id_token and issues its own JWT with scopes from the policy engine.
+    /// Separate from `trusted_issuers` which is for hyprstream federation (direct
+    /// JWT acceptance between nodes).
+    #[serde(default)]
+    pub oidc_providers: std::collections::HashMap<String, OidcProviderConfig>,
+
     /// age x25519 identity string for the credential store (bypasses OS keyring lookup).
     ///
     /// **TEST USE ONLY.** Set via `HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY` env var.
@@ -671,6 +830,7 @@ impl Default for OAuthConfig {
             cors: default_oauth_cors(),
             trusted_issuers: std::collections::HashMap::new(),
             authority_hints: Vec::new(),
+            oidc_providers: std::collections::HashMap::new(),
             credential_store_key: None,
             user_signing_key: None,
         }
@@ -1235,6 +1395,7 @@ impl HyprConfigBuilder {
             tui: self.tui,
             metrics: self.metrics,
             signing_key: None,
+            secrets: Default::default(),
         }
     }
 
@@ -1389,6 +1550,81 @@ impl HyprConfig {
 
         tracing::info!("✅ Configuration saved to: {}", config_path.display());
         Ok(())
+    }
+
+    // ── Secrets / key bypass helpers ────────────────────────────────────────
+
+    /// Resolve the secrets directory from config, or the platform XDG default.
+    ///
+    /// Prefer calling this over inlining the fallback logic everywhere.
+    pub fn resolve_secrets_dir() -> PathBuf {
+        match Self::load() {
+            Ok(cfg) => cfg.secrets.resolve_dir(cfg.config_dir()),
+            Err(_) => SecretsConfig::default_dir(),
+        }
+    }
+
+    /// Check for the `HYPRSTREAM__SIGNING_KEY` test bypass.
+    ///
+    /// Returns `Ok(Some(key))` when the bypass is set and valid,
+    /// `Ok(None)` when not configured, `Err` when malformed.
+    pub fn node_signing_key_bypass() -> anyhow::Result<Option<ed25519_dalek::SigningKey>> {
+        if let Ok(cfg) = Self::load() {
+            if let Some(ref hex_key) = cfg.signing_key {
+                let mut bytes = hex::decode(hex_key)
+                    .map_err(|e| anyhow::anyhow!("HYPRSTREAM__SIGNING_KEY: invalid hex: {e}"))?;
+                let mut arr: [u8; 32] = bytes.as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("HYPRSTREAM__SIGNING_KEY: expected 32 bytes"))?;
+                let sk = ed25519_dalek::SigningKey::from_bytes(&arr);
+                bytes.zeroize();
+                arr.zeroize();
+                tracing::info!("Using node signing key from config (test bypass)");
+                return Ok(Some(sk));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Check for the `HYPRSTREAM__OAUTH__USER_SIGNING_KEY` test bypass.
+    ///
+    /// Returns `Ok(Some((sk, vk)))` when the bypass is set and valid,
+    /// `Ok(None)` when not configured, `Err` when malformed.
+    pub fn user_signing_key_bypass(
+    ) -> anyhow::Result<Option<(ed25519_dalek::SigningKey, ed25519_dalek::VerifyingKey)>> {
+        if let Ok(cfg) = Self::load() {
+            if let Some(ref hex_key) = cfg.oauth.user_signing_key {
+                let mut bytes = hex::decode(hex_key)
+                    .map_err(|e| anyhow::anyhow!("HYPRSTREAM__OAUTH__USER_SIGNING_KEY: invalid hex: {e}"))?;
+                let mut arr: [u8; 32] = bytes.as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("HYPRSTREAM__OAUTH__USER_SIGNING_KEY: expected 32 bytes"))?;
+                let sk = ed25519_dalek::SigningKey::from_bytes(&arr);
+                bytes.zeroize();
+                arr.zeroize();
+                let vk = sk.verifying_key();
+                tracing::info!("Using user signing key from config (test bypass)");
+                return Ok(Some((sk, vk)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Check for the `HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY` test bypass.
+    ///
+    /// Returns `Ok(Some(identity))` when the bypass is set and valid,
+    /// `Ok(None)` when not configured, `Err` when malformed.
+    pub fn credential_store_key_bypass() -> anyhow::Result<Option<age::x25519::Identity>> {
+        if let Ok(cfg) = Self::load() {
+            if let Some(ref age_key) = cfg.oauth.credential_store_key {
+                let identity = age_key
+                    .trim()
+                    .parse::<age::x25519::Identity>()
+                    .map_err(|e| anyhow::anyhow!("HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY: invalid age identity: {e}"))?;
+                return Ok(Some(identity));
+            }
+        }
+        Ok(None)
     }
 
     /// Create a default configuration for a specific model path
