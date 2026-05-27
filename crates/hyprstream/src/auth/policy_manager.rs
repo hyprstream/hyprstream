@@ -31,13 +31,26 @@
 //! g, alice, trainer
 //! ```
 
+use crate::auth::policy_templates::{base_policies_to_csv, base_policies_to_vec, ServiceGrouping, ServicePolicyRule};
 use crate::auth::Operation;
 use casbin::{CoreApi, DefaultModel, Enforcer, FileAdapter, MemoryAdapter, MgmtApi, RbacApi};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+
+static GLOBAL_POLICY_MANAGER: OnceLock<Arc<PolicyManager>> = OnceLock::new();
+
+/// Set the process-global PolicyManager. Called once by the PolicyService factory.
+pub fn set_global_policy_manager(pm: Arc<PolicyManager>) {
+    let _ = GLOBAL_POLICY_MANAGER.set(pm);
+}
+
+/// Access the process-global PolicyManager. Returns `None` before PolicyService starts.
+pub fn global_policy_manager() -> Option<Arc<PolicyManager>> {
+    GLOBAL_POLICY_MANAGER.get().cloned()
+}
 
 /// Errors from policy operations
 #[derive(Error, Debug)]
@@ -130,41 +143,36 @@ m = (g(r.sub, p.sub) || keyMatch(r.sub, p.sub)) && \
     (p.act == "*" || keyMatch(r.act, p.act))
 "#;
 
-/// Default policy rules: deny-by-default with system grant
+/// Default policy rules: deny-by-default with service grants
 ///
 /// All access is denied until the operator explicitly configures policy via:
-///   hyprstream quick policy apply-template local    # grant local CLI full access
 ///   hyprstream quick policy apply-template public-inference  # open inference API
 ///
-/// The `system` subject (derived from the node's Ed25519 signing key) is granted
-/// full access. This allows inproc/IPC callers (CLI, services) to function without
-/// requiring explicit policy configuration.
+/// Service-to-service rules are defined in [`policy_templates::SERVICE_BASE_POLICIES`].
 ///
 /// Policy format: p, subject, domain, resource, action, effect
-const DEFAULT_POLICY_CSV: &str = r#"# Hyprstream Access Control Policy — deny-by-default
-#
-# The 'system' subject (local node key → inproc/IPC callers) has full access.
-p, system, *, *, *, allow
-#
-# The TUI display server is a local-only service; anonymous browser clients
-# (connecting via WebTransport from localhost) may access TUI resources.
-p, anonymous, *, tui:*, *, allow
-#
-# No other access is granted until you apply a policy template:
-#
-#   hyprstream quick policy apply-template local             # local CLI full access
-#   hyprstream quick policy apply-template public-inference  # anonymous inference
-#   hyprstream quick policy apply-template public-read       # anonymous registry browse
-#
-# Or add rules manually:
-#   p, alice, *, *, *, allow                           # Alice full access
-#   p, alice, *, model:*, infer, allow                 # Alice can infer
-#   p, anonymous, *, inference:*, infer, allow         # public inference
-#
-# Role assignments:
-#   g, alice, trainer
-#   p, trainer, *, model:*, train, allow
-"#;
+fn default_policy_csv() -> String {
+    format!(
+        "# Hyprstream Access Control Policy — deny-by-default\n\
+        # Service-to-service base rules\n\
+        {}\n\
+        # The TUI display server is a local-only service; anonymous browser clients\n\
+        # (connecting via WebTransport from localhost) may access TUI resources.\n\
+        p, anonymous, *, tui:*, *, allow\n\
+        #\n\
+        # No other access is granted until you apply a policy template:\n\
+        #\n\
+        #   hyprstream quick policy apply-template public-inference  # anonymous inference\n\
+        #   hyprstream quick policy apply-template public-read       # anonymous registry browse\n\
+        #\n\
+        # Or add rules manually:\n\
+        #   p, alice, *, *, *, allow                           # Alice full access\n\
+        #   p, alice, *, model:*, infer, allow                 # Alice can infer\n\
+        #   p, anonymous, *, inference:*, infer, allow         # public inference\n\
+        #\n",
+        base_policies_to_csv(),
+    )
+}
 
 /// Validate policy.csv format before loading
 ///
@@ -266,8 +274,8 @@ impl PolicyManager {
 
         // Create default policy.csv if not exists
         if !policy_path.exists() {
-            info!("Creating default policy.csv (deny-by-default — run `hyprstream quick policy apply-template local` to grant access)");
-            write_policy_file(&policy_path, DEFAULT_POLICY_CSV).await?;
+            info!("Creating default policy.csv (deny-by-default — run `hyprstream quick policy apply-template <name>` to grant access; see `policy list-templates`)");
+            write_policy_file(&policy_path, default_policy_csv()).await?;
         }
 
         // Validate policy.csv format before loading
@@ -281,9 +289,30 @@ impl PolicyManager {
 
         // Create enforcer with file adapter
         let adapter = FileAdapter::new(policy_path.to_string_lossy().to_string());
-        let enforcer = Enforcer::new(model, adapter)
+        let mut enforcer = Enforcer::new(model, adapter)
             .await
             .map_err(|e| PolicyError::PolicyLoadError(e.to_string()))?;
+
+        // Inject SERVICE_BASE_POLICIES into the in-memory enforcer.
+        // These are code-defined infrastructure rules (service key resolution,
+        // policy checks, registry access) that must always be present regardless
+        // of what's in the on-disk policy.csv.
+        //
+        // Casbin's add_policies() aborts the ENTIRE batch if ANY rule already
+        // exists (early return on first duplicate), so we must filter out
+        // rules that were already loaded from the CSV.
+        let base = base_policies_to_vec();
+        let existing = enforcer.get_policy();
+        let new_rules: Vec<Vec<String>> = base
+            .into_iter()
+            .filter(|rule| !existing.contains(rule))
+            .collect();
+        if !new_rules.is_empty() {
+            enforcer
+                .add_policies(new_rules)
+                .await
+                .map_err(PolicyError::CasbinError)?;
+        }
 
         info!(
             "PolicyManager initialized with {} policies",
@@ -623,13 +652,70 @@ impl PolicyManager {
         Ok(())
     }
 
-    /// Reload policies from disk
+    /// Reload policies from disk and re-inject base rules.
+    ///
+    /// `load_policy()` wipes in-memory additions, so base rules must be
+    /// re-injected after every reload to guarantee they're always present.
     pub async fn reload(&self) -> Result<(), PolicyError> {
         let mut enforcer = self.enforcer.write().await;
         enforcer
             .load_policy()
             .await
             .map_err(|e| PolicyError::PolicyLoadError(e.to_string()))?;
+        // Filter out rules already loaded from CSV (Casbin add_policies
+        // aborts the entire batch on first duplicate).
+        let base = base_policies_to_vec();
+        let existing = enforcer.get_policy();
+        let new_rules: Vec<Vec<String>> = base
+            .into_iter()
+            .filter(|rule| !existing.contains(rule))
+            .collect();
+        if !new_rules.is_empty() {
+            enforcer
+                .add_policies(new_rules)
+                .await
+                .map_err(PolicyError::CasbinError)?;
+        }
+        Ok(())
+    }
+
+    /// Apply a template's policies and groupings to the enforcer, then persist to disk.
+    ///
+    /// Uses the Casbin enforcer's `add_policies()` + `add_grouping_policies()` APIs,
+    /// then calls `save_policy()` to write everything (including base rules) to disk.
+    pub async fn apply_template(
+        &self,
+        template: &crate::auth::policy_templates::PolicyTemplate,
+    ) -> Result<(), PolicyError> {
+        let mut enforcer = self.enforcer.write().await;
+
+        // Add policy rules
+        let policies = template.expanded_policies();
+        let policy_vecs: Vec<Vec<String>> = policies.iter().map(ServicePolicyRule::to_vec).collect();
+        if !policy_vecs.is_empty() {
+            enforcer
+                .add_policies(policy_vecs)
+                .await
+                .map_err(PolicyError::CasbinError)?;
+        }
+
+        // Add grouping rules
+        if let Some(groupings) = template.groupings {
+            let grouping_vecs: Vec<Vec<String>> = groupings.iter().map(ServiceGrouping::to_vec).collect();
+            if !grouping_vecs.is_empty() {
+                enforcer
+                    .add_grouping_policies(grouping_vecs)
+                    .await
+                    .map_err(PolicyError::CasbinError)?;
+            }
+        }
+
+        // Persist full enforcer state (base + template) to disk via FileAdapter
+        enforcer
+            .save_policy()
+            .await
+            .map_err(|e| PolicyError::PolicySaveError(e.to_string()))?;
+
         Ok(())
     }
 
@@ -863,5 +949,78 @@ mod tests {
 
         // Alice still has manage access (her rule was not removed)
         assert!(pm.check_with_domain("alice", "*", "model:qwen3:main", "ttt.writeback").await);
+    }
+
+    /// Verify that SERVICE_BASE_POLICIES are injected on init and allow
+    /// service-to-service authorization (the exact scenario that broke OAuth startup).
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn test_base_rules_injected_on_init() {
+        let temp = TempDir::new().map_err(PolicyError::IoError).unwrap();
+        let policies_dir = temp.path().join("policies");
+
+        let pm = PolicyManager::new(&policies_dir).await.unwrap();
+
+        // The OAuth startup failure: service:oauth cannot query on policy.
+        // The dispatch codegen now passes resource="policy:ResolveServiceKey"
+        // for struct-type RPCs. Base rules use "policy:*" which keyMatch matches.
+        assert!(
+            pm.check_with_domain("service:oauth", "*", "policy:ResolveServiceKey", "query").await,
+            "service:oauth should be able to query policy:ResolveServiceKey via base rules"
+        );
+
+        // Other service grants from SERVICE_BASE_POLICIES
+        assert!(pm.check_with_domain("service:policy", "*", "policy:IssueToken", "manage").await);
+        // The OAuth token issuance path: service:oauth must be able to issue tokens via
+        // the wildcard rule (service:*,*,policy:IssueToken,manage,allow). Action must be
+        // "manage" (not Operation::Manage.as_str() which returns "ttt.writeback").
+        assert!(pm.check_with_domain("service:oauth", "*", "policy:IssueToken", "manage").await,
+            "service:oauth must be allowed to issue tokens (service:* wildcard rule)");
+        assert!(pm.check_with_domain("service:model", "*", "policy:Check", "check").await);
+        assert!(pm.check_with_domain("service:model", "*", "registry:ListModels", "infer").await);
+        assert!(pm.check_with_domain("service:oai", "*", "model:Generate", "infer.generate").await);
+
+        // Non-granted service should be denied
+        assert!(!pm.check_with_domain("service:unknown", "*", "policy:ResolveServiceKey", "query").await);
+    }
+
+    /// Reproduce the exact server failure: load from the production policy.csv
+    /// and verify service:oauth can query policy:ResolveServiceKey.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::print_stderr)]
+    async fn test_production_policy_csv_oauth_query() {
+        let prod_path = std::path::Path::new("/home/birdetta/.local/share/hyprstream/models/.registry/policies");
+        if !prod_path.exists() {
+            eprintln!("Skipping: production policy dir not found");
+            return;
+        }
+
+        // Copy production files to temp dir to avoid mutating real data
+        let temp = TempDir::new().map_err(PolicyError::IoError).unwrap();
+        let temp_policies = temp.path().join("policies");
+        tokio::fs::create_dir_all(&temp_policies).await.unwrap();
+        tokio::fs::copy(prod_path.join("model.conf"), temp_policies.join("model.conf")).await.unwrap();
+        tokio::fs::copy(prod_path.join("policy.csv"), temp_policies.join("policy.csv")).await.unwrap();
+
+        let pm = PolicyManager::new(&temp_policies).await.unwrap();
+
+        let all_policies = pm.get_policy().await;
+        eprintln!("Loaded {} policies from production CSV:", all_policies.len());
+        for p in &all_policies {
+            eprintln!("  p, {}", p.join(", "));
+        }
+
+        // The exact failing check from the server
+        let allowed = pm.check_with_domain("service:oauth", "*", "policy:ResolveServiceKey", "query").await;
+        eprintln!("service:oauth query policy:ResolveServiceKey = {}", allowed);
+
+        // List all rules that match oauth
+        for p in &all_policies {
+            if p[0].contains("oauth") || p[0] == "service:*" {
+                eprintln!("  oauth-relevant: p, {}", p.join(", "));
+            }
+        }
+
+        assert!(allowed, "service:oauth should be able to query policy:ResolveServiceKey");
     }
 }

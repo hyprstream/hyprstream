@@ -8,9 +8,11 @@
 //! stored server-side (`OAuthState::pending_nonces`, 5-min TTL) and embedded as a hidden
 //! form field. On POST, the server verifies the nonce was issued by itself and consumes it
 //! (single-use). Challenge format:
-//!   `"{username}:{nonce}:{code_challenge}"`
+//!   `"{fingerprint}:{nonce}:{code_challenge}"`
 //! The `code_challenge` binding prevents the signature from being reused against a different
-//! PKCE session; the server-side nonce store enforces TTL and prevents replay.
+//! PKCE session; the server-side nonce store enforces TTL and prevents replay. The client
+//! never asserts a username — the server resolves it from `fingerprint` via the
+//! `pubkey:{fingerprint} → username` reverse index in the UserStore.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,11 +29,11 @@ use serde::Deserialize;
 
 use super::challenge;
 use super::device::html_escape;
-use super::registration::{fetch_client_metadata, validate_redirect_uri};
+use super::registration::{resolve_cimd_client, validate_redirect_uri};
 use super::state::{OAuthState, PendingAuthCode};
 
 /// Authorization request query parameters
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AuthorizeParams {
     pub client_id: String,
     pub redirect_uri: String,
@@ -50,7 +52,42 @@ pub struct AuthorizeParams {
     pub nonce: Option<String>,
 }
 
-/// Consent form submission (Ed25519 challenge-response)
+/// Loosely-typed authorize query.
+///
+/// Accepts either inline parameters (the original authorize URL form) or a
+/// `request_uri` reference to a Pushed Authorization Request (RFC 9126).
+/// When `request_uri` is present, the inline parameters (except `client_id`)
+/// are ignored and the pushed snapshot is used instead.
+#[derive(Debug, Deserialize)]
+pub struct AuthorizeQuery {
+    #[serde(default)]
+    pub request_uri: Option<String>,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub redirect_uri: Option<String>,
+    #[serde(default)]
+    pub code_challenge: Option<String>,
+    #[serde(default)]
+    pub code_challenge_method: Option<String>,
+    #[serde(default)]
+    pub response_type: Option<String>,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub resource: Option<String>,
+    #[serde(default)]
+    pub nonce: Option<String>,
+}
+
+/// Consent form submission (Ed25519 challenge-response).
+///
+/// The client supplies its key fingerprint (not a username). The server
+/// resolves the username from the `pubkey:{fingerprint} → username` reverse
+/// index, then verifies the signature. The challenge string is
+/// `"{fingerprint}:{nonce}:{code_challenge}"`.
 #[derive(Debug, Deserialize)]
 pub struct ConsentForm {
     pub client_id: String,
@@ -63,8 +100,8 @@ pub struct ConsentForm {
     pub resource: Option<String>,
     /// Ed25519 nonce (from hidden form field; validated server-side against pending_nonces)
     pub nonce: String,
-    /// Username entered by the user
-    pub username: String,
+    /// SSH-style key fingerprint (`SHA256:...`) of the signing key.
+    pub fingerprint: String,
     /// Base64-encoded Ed25519 signature
     pub signature: String,
     /// OIDC nonce (passed through from authorize request, stored in auth code)
@@ -75,8 +112,15 @@ pub struct ConsentForm {
 /// GET /oauth/authorize — validate params and render Ed25519 challenge form
 pub async fn authorize_get(
     State(state): State<Arc<OAuthState>>,
-    Query(params): Query<AuthorizeParams>,
+    Query(query): Query<AuthorizeQuery>,
 ) -> Response {
+    // Resolve params: either from a Pushed Authorization Request (RFC 9126)
+    // referenced by `request_uri`, or from inline query parameters.
+    let params = match resolve_authorize_query(&state, query).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+
     // Validate response_type
     if params.response_type != "code" {
         return error_response(
@@ -104,7 +148,7 @@ pub async fn authorize_get(
     }
 
     // Require UserStore for identity verification
-    if state.user_store.is_none() {
+    if !state.has_user_store() {
         return Html(render_error_page(
             "Server Not Configured",
             "This server is not configured for local user authentication. \
@@ -114,15 +158,12 @@ pub async fn authorize_get(
 
     // Resolve client
     let (client_name, redirect_uris) = if params.client_id.starts_with("https://") {
-        // Client ID Metadata Document flow
-        match fetch_client_metadata(&state, &params.client_id).await {
-            Ok(client) => {
-                let name = client.client_name.clone();
-                let uris = client.redirect_uris.clone();
-                // Cache the client
-                state.clients.write().await.insert(client.client_id.clone(), client);
-                (name.unwrap_or_else(|| params.client_id.clone()), uris)
-            }
+        // Client ID Metadata Document flow (cache-aside via cimd_cache).
+        match resolve_cimd_client(&state, &params.client_id).await {
+            Ok(client) => (
+                client.client_name.unwrap_or_else(|| params.client_id.clone()),
+                client.redirect_uris,
+            ),
             Err(e) => {
                 return error_response(
                     StatusCode::BAD_REQUEST,
@@ -169,6 +210,13 @@ pub async fn authorize_get(
         .and_then(|u| u.host_str().map(std::borrow::ToOwned::to_owned))
         .unwrap_or_else(|| params.redirect_uri.clone());
 
+    // MCP spec § Localhost Redirect URI Risks: warn when the registered
+    // client only ever uses loopback redirect URIs. Such a client cannot
+    // be distinguished from another process on the same host binding the
+    // same loopback range, so users should be told explicitly that the
+    // app they're authorizing only proves local-machine presence.
+    let localhost_warning = compute_localhost_warning(&redirect_uris);
+
     // Generate a nonce, store it server-side (5-min TTL, single-use on POST).
     let nonce = issue_nonce(&state).await;
 
@@ -185,6 +233,7 @@ pub async fn authorize_get(
         &nonce,
         params.nonce.as_deref().unwrap_or(""),
         None,
+        localhost_warning.as_deref(),
     );
 
     Html(html).into_response()
@@ -209,7 +258,7 @@ pub async fn authorize_post(
         // Validate redirect_uri and re-derive client info from the registry.
         // If either fails, return an error page rather than re-rendering with
         // attacker-controlled values.
-        let Some((client_name, redirect_host)) =
+        let Some((client_name, redirect_host, localhost_warning)) =
             derive_display_info(&state, &form.client_id, &form.redirect_uri).await
         else {
             return Html(render_error_page(
@@ -230,17 +279,20 @@ pub async fn authorize_post(
             &fresh_nonce,
             form.oidc_nonce.as_deref().unwrap_or(""),
             Some("Authorization request expired. Please try again."),
+            localhost_warning.as_deref(),
         );
         return Html(html).into_response();
     }
 
-    // Reconstruct challenge: "{username}:{nonce}:{code_challenge}"
-    // Binds signature to both the user identity and the PKCE session.
-    let challenge_str = format!("{}:{}:{}", form.username, form.nonce, form.code_challenge);
+    // Reconstruct challenge: "{fingerprint}:{nonce}:{code_challenge}"
+    // Binds signature to the key identity and the PKCE session. The server
+    // does not trust client-declared usernames — it resolves the username
+    // from the pubkey reverse index keyed by `form.fingerprint`.
+    let challenge_str = format!("{}:{}:{}", form.fingerprint, form.nonce, form.code_challenge);
 
     // Get user store
-    let user_store = match state.user_store.as_ref() {
-        Some(s) => s,
+    let user_store = match state.user_store_reader() {
+        Some(store) => store,
         None => {
             return Html(render_error_page(
                 "Server Not Configured",
@@ -249,44 +301,49 @@ pub async fn authorize_post(
         }
     };
 
-    // Verify Ed25519 challenge-response
-    if let Err(e) = challenge::verify_ed25519_response(
+    // Verify Ed25519 challenge-response. The resolved username comes back
+    // from the reverse index; the client never asserts an identity.
+    let (resolved_username, verifying_key) = match challenge::verify_ed25519_response_by_fingerprint(
         user_store.as_ref(),
-        &form.username,
+        &form.fingerprint,
         &challenge_str,
         &form.signature,
-    ) {
-        if matches!(e, challenge::ChallengeError::UserStoreError(_)) {
-            tracing::error!(username = %form.username, "UserStore lookup error during authorize");
+    ).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            if matches!(e, challenge::ChallengeError::UserStoreError(_)) {
+                tracing::error!(fingerprint = %form.fingerprint, "UserStore lookup error during authorize");
+            }
+            // Validate redirect_uri and re-derive client display info from the registry.
+            // Never trust the POST body for display values; return an error page if
+            // the client or redirect_uri is no longer valid.
+            let Some((client_name, redirect_host, localhost_warning)) =
+                derive_display_info(&state, &form.client_id, &form.redirect_uri).await
+            else {
+                return Html(render_error_page(
+                    "Invalid Request",
+                    "Unknown client or redirect URI. Please restart the authorization flow.",
+                )).into_response();
+            };
+            // Issue a fresh nonce so re-render shows a signable challenge.
+            let fresh_nonce = issue_nonce(&state).await;
+            let html = render_challenge_page(
+                &client_name,
+                &form.scope,
+                &redirect_host,
+                &form.client_id,
+                &form.redirect_uri,
+                &form.code_challenge,
+                form.state.as_deref().unwrap_or(""),
+                form.resource.as_deref().unwrap_or(""),
+                &fresh_nonce,
+                form.oidc_nonce.as_deref().unwrap_or(""),
+                Some(e.message()),
+                localhost_warning.as_deref(),
+            );
+            return Html(html).into_response();
         }
-        // Validate redirect_uri and re-derive client display info from the registry.
-        // Never trust the POST body for display values; return an error page if
-        // the client or redirect_uri is no longer valid.
-        let Some((client_name, redirect_host)) =
-            derive_display_info(&state, &form.client_id, &form.redirect_uri).await
-        else {
-            return Html(render_error_page(
-                "Invalid Request",
-                "Unknown client or redirect URI. Please restart the authorization flow.",
-            )).into_response();
-        };
-        // Issue a fresh nonce so re-render shows a signable challenge.
-        let fresh_nonce = issue_nonce(&state).await;
-        let html = render_challenge_page(
-            &client_name,
-            &form.scope,
-            &redirect_host,
-            &form.client_id,
-            &form.redirect_uri,
-            &form.code_challenge,
-            form.state.as_deref().unwrap_or(""),
-            form.resource.as_deref().unwrap_or(""),
-            &fresh_nonce,
-            form.oidc_nonce.as_deref().unwrap_or(""),
-            Some(e.message()),
-        );
-        return Html(html).into_response();
-    }
+    };
 
     // Signature valid — generate auth code
     let mut code_bytes = [0u8; 32];
@@ -306,14 +363,16 @@ pub async fn authorize_post(
         resource,
         created_at: Instant::now(),
         expires_at: Instant::now() + Duration::from_secs(60),
-        username: form.username.clone(),
+        username: resolved_username.clone(),
+        verifying_key: Some(verifying_key),
     };
 
     state.pending_codes.write().await.insert(code.clone(), pending);
 
     tracing::info!(
         client_id = %form.client_id,
-        username = %form.username,
+        username = %resolved_username,
+        fingerprint = %form.fingerprint,
         redirect_uri = %form.redirect_uri,
         "Authorization code issued, redirecting"
     );
@@ -343,6 +402,85 @@ pub async fn authorize_post(
     Redirect::to(&redirect_url).into_response()
 }
 
+/// Resolve an `AuthorizeQuery` into a concrete `AuthorizeParams`.
+///
+/// Two paths:
+/// - **PAR (RFC 9126):** if `request_uri` is set, look it up in
+///   `pending_par_requests`, check TTL, consume (single-use), and return the
+///   stored snapshot. If a `client_id` is also present on the URL, it must
+///   match the pushed snapshot's `client_id` (RFC 9126 §4).
+/// - **Inline:** require the same fields the legacy URL form required.
+async fn resolve_authorize_query(
+    state: &OAuthState,
+    query: AuthorizeQuery,
+) -> Result<AuthorizeParams, Response> {
+    if let Some(request_uri) = query.request_uri.as_deref() {
+        let entry = {
+            let mut store = state.pending_par_requests.write().await;
+            store.remove(request_uri)
+        };
+        let Some(entry) = entry else {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Unknown or already-consumed request_uri",
+            ));
+        };
+        if entry.is_expired() {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "request_uri expired",
+            ));
+        }
+        // RFC 9126 §4: client_id MAY appear alongside request_uri; if present,
+        // it MUST match the pushed snapshot.
+        if let Some(client_id) = query.client_id.as_deref() {
+            if client_id != entry.params.client_id {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "client_id does not match pushed authorization request",
+                ));
+            }
+        }
+        return Ok(entry.params);
+    }
+
+    // Inline path: enforce the originally-required fields.
+    let AuthorizeQuery {
+        client_id,
+        redirect_uri,
+        code_challenge,
+        code_challenge_method,
+        response_type,
+        state: state_param,
+        scope,
+        resource,
+        nonce,
+        ..
+    } = query;
+    let missing = |field: &str| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            &format!("{field} is required"),
+        )
+    };
+    Ok(AuthorizeParams {
+        client_id: client_id.ok_or_else(|| missing("client_id"))?,
+        redirect_uri: redirect_uri.ok_or_else(|| missing("redirect_uri"))?,
+        code_challenge: code_challenge.ok_or_else(|| missing("code_challenge"))?,
+        code_challenge_method: code_challenge_method
+            .ok_or_else(|| missing("code_challenge_method"))?,
+        response_type: response_type.ok_or_else(|| missing("response_type"))?,
+        state: state_param,
+        scope,
+        resource,
+        nonce,
+    })
+}
+
 /// Generate a fresh nonce and record it in `pending_nonces` with a 5-min expiry.
 async fn issue_nonce(state: &OAuthState) -> String {
     let mut nonce_bytes = [0u8; 32];
@@ -364,9 +502,15 @@ async fn derive_display_info(
     state: &OAuthState,
     client_id: &str,
     redirect_uri: &str,
-) -> Option<(String, String)> {
-    let clients = state.clients.read().await;
-    let client = clients.get(client_id)?;
+) -> Option<(String, String, Option<String>)> {
+    // CIMD-shaped client_ids (HTTPS URLs) live in cimd_cache; DCR-issued
+    // UUIDs live in state.clients. Try CIMD first since the cache hit
+    // path is cheap and CIMD URLs never collide with DCR UUIDs.
+    let client = if client_id.starts_with("https://") {
+        state.cimd_cache.get(client_id).await?
+    } else {
+        state.clients.read().await.get(client_id)?.clone()
+    };
 
     // Validate redirect_uri against the client's registered URIs before displaying it.
     if !validate_redirect_uri(redirect_uri, &client.redirect_uris) {
@@ -381,7 +525,36 @@ async fn derive_display_info(
         .ok()
         .and_then(|u| u.host_str().map(std::borrow::ToOwned::to_owned))
         .unwrap_or_else(|| redirect_uri.to_owned());
-    Some((client_name, redirect_host))
+    let localhost_warning = compute_localhost_warning(&client.redirect_uris);
+    Some((client_name, redirect_host, localhost_warning))
+}
+
+/// Build the consent-screen localhost warning when every registered
+/// redirect URI is loopback. Returns `None` if at least one non-loopback
+/// URI is registered (the client can prove ownership via that URI).
+///
+/// MCP 2025-11-25 § Localhost Redirect URI Risks: a malicious app on the
+/// same host can claim any localhost port, so a localhost-only client
+/// cannot be cryptographically distinguished from an impostor. Users
+/// SHOULD see a clear warning.
+fn compute_localhost_warning(redirect_uris: &[String]) -> Option<String> {
+    if redirect_uris.is_empty() {
+        return None;
+    }
+    let all_loopback = redirect_uris
+        .iter()
+        .all(|u| super::registration::is_loopback_uri(u));
+    if !all_loopback {
+        return None;
+    }
+    Some(format!(
+        "This application only redirects to localhost. \
+         Any program running on this machine can claim to be it — \
+         only authorize if you started this flow yourself. \
+         ({} loopback URI{} registered)",
+        redirect_uris.len(),
+        if redirect_uris.len() == 1 { "" } else { "s" },
+    ))
 }
 
 fn error_response(status: StatusCode, error: &str, description: &str) -> Response {
@@ -437,9 +610,14 @@ fn render_challenge_page(
     nonce: &str,
     oidc_nonce: &str,
     error: Option<&str>,
+    localhost_warning: Option<&str>,
 ) -> String {
     let error_html = match error {
         Some(msg) => format!(r#"<div class="error">{}</div>"#, html_escape(msg)),
+        None => String::new(),
+    };
+    let warning_html = match localhost_warning {
+        Some(msg) => format!(r#"<div class="warn">{}</div>"#, html_escape(msg)),
         None => String::new(),
     };
 
@@ -461,6 +639,8 @@ fn render_challenge_page(
   .redirect {{ font-size: 0.85rem; color: #666; margin: 12px 0; }}
   .error {{ background: #fff0f0; color: #cc0000; border-radius: 8px; padding: 12px 16px;
             margin: 12px 0; font-size: 0.9rem; }}
+  .warn {{ background: #fff7e6; color: #8a5a00; border-left: 3px solid #d4960c;
+           border-radius: 0 8px 8px 0; padding: 12px 14px; margin: 12px 0; font-size: 0.88rem; }}
   .step {{ background: #f0f6ff; border-left: 3px solid #0066cc; padding: 10px 14px;
            margin: 12px 0; border-radius: 0 6px 6px 0; font-size: 0.88rem; color: #333; }}
   code {{ background: #f0f0f0; padding: 2px 6px; border-radius: 4px; font-size: 0.9em; word-break: break-all; }}
@@ -482,11 +662,12 @@ fn render_challenge_page(
     {scopes_display}
   </div>
   <p class="redirect">Will redirect to: <code>{redirect_host_esc}</code></p>
+  {warning_html}
   {error_html}
   <div class="step">
     <strong>Sign the challenge on your workstation:</strong><br/>
     <code>hyprstream sign-challenge --nonce {nonce_esc} --code-challenge {code_challenge_esc}</code><br/>
-    Copy the printed <em>Username</em> and <em>Signature</em> below.
+    Copy the printed <em>Fingerprint</em> and <em>Signature</em> below.
   </div>
   <form method="post" action="/oauth/authorize">
     <input type="hidden" name="client_id" value="{client_id_val}">
@@ -497,8 +678,9 @@ fn render_challenge_page(
     <input type="hidden" name="resource" value="{resource_val}">
     <input type="hidden" name="nonce" value="{nonce_val}">
     <input type="hidden" name="oidc_nonce" value="{oidc_nonce_val}">
-    <label>Username:
-      <input type="text" name="username" required autocomplete="username" autofocus/>
+    <label>Key fingerprint (SHA256:...):
+      <input type="text" name="fingerprint" required autocomplete="off" autofocus
+             placeholder="SHA256:..." spellcheck="false"/>
     </label>
     <label>Signature (base64, 88 chars):
       <input type="text" name="signature" required size="88" autocomplete="off"
@@ -515,6 +697,7 @@ fn render_challenge_page(
             .collect::<Vec<_>>()
             .join(", "),
         redirect_host_esc = html_escape(redirect_host),
+        warning_html = warning_html,
         error_html = error_html,
         nonce_esc = html_escape(nonce),
         code_challenge_esc = html_escape(code_challenge),
@@ -527,4 +710,42 @@ fn render_challenge_page(
         nonce_val = html_escape(nonce),
         oidc_nonce_val = html_escape(oidc_nonce),
     )
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn localhost_warning_fires_when_all_loopback() {
+        let uris = vec![
+            "http://127.0.0.1:3000/cb".to_owned(),
+            "http://localhost:8080/cb".to_owned(),
+        ];
+        let warn = compute_localhost_warning(&uris).unwrap();
+        assert!(warn.contains("localhost"));
+        assert!(warn.contains('2'), "should mention the count");
+    }
+
+    #[test]
+    fn localhost_warning_suppressed_when_any_public_uri() {
+        let uris = vec![
+            "http://127.0.0.1:3000/cb".to_owned(),
+            "https://app.example.com/cb".to_owned(),
+        ];
+        assert!(compute_localhost_warning(&uris).is_none());
+    }
+
+    #[test]
+    fn localhost_warning_singular_count_grammar() {
+        let uris = vec!["http://localhost:3000/cb".to_owned()];
+        let warn = compute_localhost_warning(&uris).unwrap();
+        assert!(warn.contains("1 loopback URI registered"));
+    }
+
+    #[test]
+    fn localhost_warning_empty_returns_none() {
+        assert!(compute_localhost_warning(&[]).is_none());
+    }
 }

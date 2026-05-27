@@ -19,6 +19,8 @@ pub fn register_all(interp: &mut Interp, ctx_id: ContextID) {
     interp.add_async_context_command("ctl", cmd_ctl, ctx_id);
     interp.add_context_command("json", cmd_json, ctx_id);
     interp.add_async_context_command("help", cmd_help, ctx_id);
+    interp.add_async_context_command("man", cmd_man, ctx_id);
+    interp.add_async_context_command("stream", cmd_stream, ctx_id);
     interp.add_async_context_command("mount", cmd_mount, ctx_id);
 }
 
@@ -180,6 +182,8 @@ fn cmd_help<'a>(interp: &'a mut Interp, ctx_id: ContextID, argv: &'a [Value]) ->
         out.push_str("  ctl <path> <cmd>     control file (write+read)\n");
         out.push_str("  json parse <str>     convert JSON to Tcl dict\n");
         out.push_str("  mount [prefix]       list mount points\n");
+        out.push_str("  man [svc] [method]   service documentation\n");
+        out.push_str("  stream <path> <method> <args> <var> <body>  stream with callback\n");
         out.push_str("  help                 this message\n");
 
         let ctx = interp.context::<ShellContext>(ctx_id);
@@ -200,6 +204,162 @@ fn cmd_help<'a>(interp: &'a mut Interp, ctx_id: ContextID, argv: &'a [Value]) ->
 
         molt_ok!(out)
     })
+}
+
+/// `man [service [method ...]]` — display service documentation.
+///
+/// Reads from `/srv/{service}/doc/{method}` in the VFS namespace.
+/// Without arguments, lists all available services.
+fn cmd_man<'a>(interp: &'a mut Interp, ctx_id: ContextID, argv: &'a [Value]) -> BoxFuture<'a, MoltResult> {
+    Box::pin(async move {
+        molt::check_args(1, argv, 1, 0, "?service? ?method ...?")?;
+
+        let ctx = interp.context::<ShellContext>(ctx_id);
+        let namespace = Arc::clone(&ctx.namespace);
+        let subject = ctx.subject.clone();
+
+        if argv.len() == 1 {
+            // No args: list available services under /srv
+            match namespace.ls("/srv", &subject).await {
+                Ok(entries) => {
+                    let mut out = String::from("Available services:\n");
+                    for e in &entries {
+                        let name = e.name.trim_end_matches('/');
+                        if !name.is_empty() {
+                            out.push_str(&format!("  {}\n", name));
+                        }
+                    }
+                    out.push_str("\nUsage: man <service> [method]");
+                    molt_ok!(out)
+                }
+                Err(e) => molt_err!("cannot list services: {}", e),
+            }
+        } else {
+            // Build doc path: /srv/{service}/doc/{method...}
+            let service = argv[1].to_string();
+            let mut path = format!("/srv/{}/doc", service);
+            for arg in &argv[2..] {
+                path.push('/');
+                path.push_str(&arg.to_string());
+            }
+
+            match namespace.cat(&path, &subject).await {
+                Ok(data) => molt_ok!(String::from_utf8_lossy(&data).into_owned()),
+                Err(_) => {
+                    // Fallback: try listing if it's a directory
+                    match namespace.ls(&path, &subject).await {
+                        Ok(entries) => {
+                            let mut out = format!("{}:\n", path);
+                            for e in &entries {
+                                let name = e.name.trim_end_matches('/');
+                                if !name.is_empty() {
+                                    out.push_str(&format!("  {}\n", name));
+                                }
+                            }
+                            molt_ok!(out)
+                        }
+                        Err(e) => molt_err!("{}: {}", path, e),
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// `stream path method args varname body` — start a stream and iterate blocks.
+///
+/// Starts a streaming RPC via `ctl`, reads blocks from `/stream/{topic}/data`,
+/// and evaluates `body` for each block with the data bound to `varname`.
+///
+/// Example:
+///   stream /srv/model infer.generate_stream {"prompt":"hello"} chunk { puts $chunk }
+///
+/// Also supports `stream start path method args` which returns the topic.
+fn cmd_stream<'a>(interp: &'a mut Interp, ctx_id: ContextID, argv: &'a [Value]) -> BoxFuture<'a, MoltResult> {
+    Box::pin(async move {
+        // stream start path method args → returns topic
+        // stream path method args varname body → iterate blocks
+        if argv.len() >= 5 && argv[1].to_string() == "start" {
+            // stream start /srv/model method args
+            molt::check_args(1, argv, 5, 5, "start path method args")?;
+            let path = argv[2].to_string();
+            let method = argv[3].to_string();
+            let args = argv[4].to_string();
+
+            let ctx = interp.context::<ShellContext>(ctx_id);
+            let namespace = Arc::clone(&ctx.namespace);
+            let subject = ctx.subject.clone();
+
+            let topic = start_stream(&namespace, &subject, &path, &method, &args).await?;
+            molt_ok!(topic)
+        } else if argv.len() == 6 {
+            // stream path method args varname body
+            let path = argv[1].to_string();
+            let method = argv[2].to_string();
+            let args_str = argv[3].to_string();
+            let var_name = argv[4].to_string();
+            let body = argv[5].clone();
+
+            let ctx = interp.context::<ShellContext>(ctx_id);
+            let namespace = Arc::clone(&ctx.namespace);
+            let subject = ctx.subject.clone();
+
+            let topic = start_stream(&namespace, &subject, &path, &method, &args_str).await?;
+
+            // Read blocks from /stream/{topic}/data until EOF
+            let data_path = format!("/stream/{}/data", topic);
+            let var_val = Value::from(var_name.as_str());
+            let mut total_output = String::new();
+
+            // Read one block at a time, evaluating body between reads.
+            // Each read_one() yields to the event loop, allowing other JS work.
+            loop {
+                match namespace.read_one(&data_path, &subject).await {
+                    Ok(data) if data.is_empty() => break, // EOF
+                    Ok(data) => {
+                        let chunk = String::from_utf8_lossy(&data);
+                        interp.set_var(&var_val, Value::from(chunk.as_ref()))?;
+                        match interp.eval_value(&body).await {
+                            Ok(val) => total_output.push_str(&val.to_string()),
+                            Err(e) => {
+                                let ctl_path = format!("/stream/{}/ctl", topic);
+                                let _ = namespace.echo(&ctl_path, b"cancel", &subject).await;
+                                return Err(e);
+                            }
+                        }
+                    }
+                    Err(e) => return molt_err!("stream read: {}", e),
+                }
+            }
+
+            molt_ok!(total_output)
+        } else {
+            molt_err!("usage: stream path method args varname body\n       stream start path method args")
+        }
+    })
+}
+
+/// Start a stream via ctl and return the topic string.
+async fn start_stream(
+    namespace: &hyprstream_vfs::Namespace,
+    subject: &hyprstream_vfs::Subject,
+    path: &str,
+    method: &str,
+    args: &str,
+) -> Result<String, molt::Exception> {
+    let ctl_data = format!("{} {}", method, args);
+    let result = namespace.ctl(path, ctl_data.as_bytes(), subject).await
+        .map_err(|e| molt::Exception::molt_err(Value::from(format!("stream start: {}", e))))?;
+    let result_str = String::from_utf8_lossy(&result);
+
+    let parsed: serde_json::Value = serde_json::from_str(&result_str)
+        .map_err(|e| molt::Exception::molt_err(Value::from(format!("stream start: invalid response: {}", e))))?;
+
+    parsed.get("topic")
+        .or_else(|| parsed.get("streamId"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_owned())
+        .ok_or_else(|| molt::Exception::molt_err(Value::from("stream start: no topic in response")))
 }
 
 /// `mount [prefix]` — list mount points (read-only).

@@ -5,11 +5,11 @@
 //! - `{service}.ts`     — Per-service interfaces, builders, parsers, clients
 //! - `index.ts`         — Re-exports
 
-mod message;
-mod interfaces;
 mod builders;
-mod parsers;
 mod client;
+mod interfaces;
+mod message;
+mod parsers;
 
 use std::path::Path;
 
@@ -71,10 +71,18 @@ fn generate_service_file(service_name: &str, schema: &ParsedSchema) -> String {
         label = if is_service { "Service" } else { "Schema" }
     ));
 
-    // Conditional streaming import (only for service schemas with streaming methods)
+    // Inline StreamHandle interface (only for service schemas with streaming methods)
     if is_service && client::has_streaming_methods(schema) {
         out.push_str(
-            "import { type StreamSubscription, createStreamSubscription } from '../stream-client';\n"
+            "/** Verified stream handle (duck-type compatible with WASM StreamHandle). */\n\
+             export interface StreamHandle {\n\
+             \x20 nextPayload(): Promise<Uint8Array | null>;\n\
+             \x20 cancel(): Promise<void>;\n\
+             \x20 streamId(): string;\n\
+             \x20 isCompleted(): boolean;\n\
+             \x20 free(): void;\n\
+             \x20 [Symbol.dispose](): void;\n\
+             }\n\n",
         );
     }
     out.push('\n');
@@ -123,11 +131,15 @@ fn capnp_to_ts_type(type_name: &str) -> String {
             // Normalize to the canonical capnp type name before mapping.
             let suffix = &type_name["Option".len()..];
             let normalized = match suffix {
-                "Uint8"  => "UInt8",  "Uint16" => "UInt16",
-                "Uint32" => "UInt32", "Uint64" => "UInt64",
-                "Int8"   => "Int8",   "Int16"  => "Int16",
-                "Int32"  => "Int32",  "Int64"  => "Int64",
-                other    => other,
+                "Uint8" => "UInt8",
+                "Uint16" => "UInt16",
+                "Uint32" => "UInt32",
+                "Uint64" => "UInt64",
+                "Int8" => "Int8",
+                "Int16" => "Int16",
+                "Int32" => "Int32",
+                "Int64" => "Int64",
+                other => other,
             };
             format!("{} | undefined", capnp_to_ts_type(normalized))
         }
@@ -350,7 +362,10 @@ impl CodegenBackend for TypeScriptBackend {
         all_names: &[String],
         client_names: &[String],
     ) -> Option<(String, String)> {
-        Some(("index.ts".to_owned(), generate_index(all_names, client_names)))
+        Some((
+            "index.ts".to_owned(),
+            generate_index(all_names, client_names),
+        ))
     }
 }
 
@@ -366,9 +381,7 @@ fn generate_index(all_names: &[String], client_names: &[String]) -> String {
     for name in all_names {
         if client_names.contains(name) {
             let pascal = to_pascal_case(name);
-            out.push_str(&format!(
-                "export {{ {pascal}Client }} from './{name}';\n"
-            ));
+            out.push_str(&format!("export {{ {pascal}Client }} from './{name}';\n"));
         } else {
             // Data-only schema: re-export all standalone builders, parsers, and interfaces
             out.push_str(&format!("export * from './{name}';\n"));

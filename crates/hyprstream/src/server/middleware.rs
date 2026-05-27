@@ -206,6 +206,18 @@ pub fn extract_iss_from_token(token: &str) -> String {
         .to_owned()
 }
 
+/// Extract `kid` from a JWT header without full validation.
+pub fn extract_kid_from_token(token: &str) -> Option<String> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let header_b64 = token.split('.').next()?;
+    if header_b64.len() > 4096 {
+        return None;
+    }
+    let header_bytes = URL_SAFE_NO_PAD.decode(header_b64).ok()?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes).ok()?;
+    header.get("kid").and_then(|v| v.as_str()).map(str::to_owned)
+}
+
 /// CORS middleware configuration
 pub fn cors_layer(config: &crate::server::state::CorsConfig) -> tower_http::cors::CorsLayer {
     use axum::http::{HeaderName, HeaderValue, Method};

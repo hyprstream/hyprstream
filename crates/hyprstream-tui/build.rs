@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 fn main() {
     // Compile compositor_ipc.capnp for WASI IPC protocol
     compile_capnp();

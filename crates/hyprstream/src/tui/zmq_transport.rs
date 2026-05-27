@@ -22,7 +22,6 @@ pub fn make_chat_spawner(
     available_tools: Option<Vec<serde_json::Value>>,
     gen_config: Arc<RwLock<hyprstream_tui::chat_app::ChatGenConfig>>,
 ) -> hyprstream_tui::chat_app::StreamSpawner {
-    use hyprstream_rpc::envelope::RequestIdentity;
     use hyprstream_rpc::streaming::StreamPayload;
 
     use crate::services::generated::inference_client::{ChatMessage, ToolCall, ToolCallFunction};
@@ -60,8 +59,39 @@ pub fn make_chat_spawner(
             };
 
             rt.block_on(async move {
+                // Resolve model service key via PolicyClient.
+                let policy_vk = sk_inner.verifying_key();
+                let policy_client = crate::services::PolicyClient::for_service(
+                    sk_inner.clone(),
+                    policy_vk,
+                    None,
+                );
+                let model_key_resp = match policy_client.resolve_service_key(
+                    &crate::services::generated::policy_client::ResolveServiceKey {
+                        service_name: "model".to_owned(),
+                    },
+                ).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx.send(ChatEvent::StreamError(format!("Failed to resolve model key: {e}")));
+                        return;
+                    }
+                };
+                let model_vk = match <[u8; 32]>::try_from(model_key_resp.verifying_key.as_slice()) {
+                    Ok(bytes) => match hyprstream_rpc::crypto::VerifyingKey::from_bytes(&bytes) {
+                        Ok(vk) => vk,
+                        Err(e) => {
+                            let _ = tx.send(ChatEvent::StreamError(format!("Invalid model key: {e}")));
+                            return;
+                        }
+                    },
+                    Err(_) => {
+                        let _ = tx.send(ChatEvent::StreamError("Invalid model key length".to_owned()));
+                        return;
+                    }
+                };
                 let model_client =
-                    ModelClient::new(sk_inner.clone(), RequestIdentity::anonymous());
+                    ModelClient::for_service(sk_inner.clone(), model_vk, None);
 
                 // Map ChatHistoryEntry → ChatMessage, handling all roles.
                 // Skip the trailing empty assistant placeholder — it's only a
@@ -128,6 +158,8 @@ pub fn make_chat_spawner(
                             add_generation_prompt: true,
                             tools_json: Some(tools_json.clone()).filter(|s| !s.is_empty()),
                             max_tokens: Some(gen_cfg.max_tokens as u32),
+                            enable_thinking: None,
+                            template_vars_json: None,
                         }),
                 ).await;
                 let prompt = match template_result {
@@ -219,7 +251,6 @@ pub fn make_chat_spawner(
 pub fn make_tool_caller(
     signing_key: &SigningKey,
 ) -> (hyprstream_tui::chat_app::ToolCaller, HashMap<String, String>, Vec<serde_json::Value>) {
-    use hyprstream_rpc::envelope::RequestIdentity;
     use hyprstream_rpc::registry::{global as registry, SocketKind};
     use crate::services::generated::mcp_client::McpClient as GenMcpClient;
     use hyprstream_tui::chat_app::ChatEvent;
@@ -238,8 +269,23 @@ pub fn make_tool_caller(
                 .build()
                 .ok()?;
             rt.block_on(async move {
+                // Resolve MCP service key via PolicyClient.
+                let policy_vk = sk_fetch.verifying_key();
+                let policy_client = crate::services::PolicyClient::for_service(
+                    sk_fetch.clone(),
+                    policy_vk,
+                    None,
+                );
+                let mcp_key_resp = policy_client.resolve_service_key(
+                    &crate::services::generated::policy_client::ResolveServiceKey {
+                        service_name: "mcp".to_owned(),
+                    },
+                ).await.ok()?;
+                let mcp_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+                    mcp_key_resp.verifying_key.as_slice().try_into().ok()?
+                ).ok()?;
                 let gen: GenMcpClient =
-                    GenMcpClient::with_endpoint(&endpoint, sk_fetch, RequestIdentity::anonymous());
+                    GenMcpClient::for_endpoint(&endpoint, sk_fetch, mcp_vk, None);
                 let tool_list = gen.list_tools().await.ok()?;
                 let mut descs = HashMap::new();
                 let mut tools = Vec::new();
@@ -281,7 +327,31 @@ pub fn make_tool_caller(
                         Err(e) => return format!("error: {e}"),
                     };
                     rt.block_on(async move {
-                        match GenMcpClient::with_endpoint(&endpoint, sk_c, RequestIdentity::anonymous())
+                        // Resolve MCP service key via PolicyClient.
+                        let policy_vk = sk_c.verifying_key();
+                        let policy_client = crate::services::PolicyClient::for_service(
+                            sk_c.clone(),
+                            policy_vk,
+                            None,
+                        );
+                        let mcp_vk = match policy_client.resolve_service_key(
+                            &crate::services::generated::policy_client::ResolveServiceKey {
+                                service_name: "mcp".to_owned(),
+                            },
+                        ).await {
+                            Ok(resp) => {
+                                let bytes: [u8; 32] = match resp.verifying_key.as_slice().try_into() {
+                                    Ok(b) => b,
+                                    Err(_) => return "error: invalid MCP key length".to_owned(),
+                                };
+                                match hyprstream_rpc::crypto::VerifyingKey::from_bytes(&bytes) {
+                                    Ok(vk) => vk,
+                                    Err(e) => return format!("error: invalid MCP key: {e}"),
+                                }
+                            },
+                            Err(e) => return format!("error: failed to resolve MCP key: {e}"),
+                        };
+                        match GenMcpClient::for_endpoint(&endpoint, sk_c, mcp_vk, None)
                             .call_tool(&crate::services::generated::mcp_client::CallTool {
                                 tool_name: uuid_c,
                                 arguments,

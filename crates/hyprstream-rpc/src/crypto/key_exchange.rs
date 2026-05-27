@@ -957,9 +957,9 @@ mod tests {
     #[cfg(not(feature = "fips"))]
     #[test]
     fn test_stream_keys_e2e_mac_verification() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::crypto::hmac::ChainedStreamHmac;
+        use crate::crypto::StreamHmacState;
 
-        // Full E2E test: DH → stream keys → MAC chain
+        // Full E2E test: DH → stream keys → MAC chain (matches wire format)
         let (client_secret, client_pubkey) = generate_ephemeral_keypair();
         let (server_secret, server_pubkey) = generate_ephemeral_keypair();
 
@@ -978,21 +978,20 @@ mod tests {
             &server_pubkey.to_bytes(),
         )?;
 
-        // Server produces MAC chain
-        // Use topic prefix as initial prev_mac (converted to u64 for request_id)
-        let prefix = server_keys.topic_prefix_bytes()?;
-        let request_id = u64::from_le_bytes(prefix[..8].try_into()?);
+        // Both sides should derive identical topic + mac_key
+        assert_eq!(client_keys.topic, server_keys.topic);
 
-        let mut producer = ChainedStreamHmac::from_bytes(*server_keys.mac_key, request_id);
+        // Server produces 16-byte truncated MACs (wire format)
+        let mut producer = StreamHmacState::new(*server_keys.mac_key, server_keys.topic.clone());
         let mac1 = producer.compute_next(b"token 1");
         let mac2 = producer.compute_next(b"token 2");
         let mac3 = producer.compute_next(b"[DONE]");
 
-        // Client verifies MAC chain
-        let mut verifier = ChainedStreamHmac::from_bytes(*client_keys.mac_key, request_id);
-        verifier.verify_next(b"token 1", &mac1)?;
-        verifier.verify_next(b"token 2", &mac2)?;
-        verifier.verify_next(b"[DONE]", &mac3)?;
+        // Client verifies the same chain
+        let mut verifier = StreamHmacState::new(*client_keys.mac_key, client_keys.topic);
+        assert!(verifier.verify_next(b"token 1", &mac1));
+        assert!(verifier.verify_next(b"token 2", &mac2));
+        assert!(verifier.verify_next(b"[DONE]", &mac3));
         Ok(())
     }
 

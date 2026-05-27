@@ -101,7 +101,7 @@ impl<B: WizardBackend> WizardApp<B> {
             WizardPhase::Users(_) => 4,
             WizardPhase::Tokens(_) => 5,
             WizardPhase::Services(_) => 6,
-            WizardPhase::Summary(_) => 6,
+            WizardPhase::Summary(_) => 7,
         }
     }
 
@@ -136,7 +136,7 @@ impl<B: WizardBackend> WizardApp<B> {
 
     fn advance_to_users(&mut self) {
         self.phase = WizardPhase::Users(UserScreen::AskAdd(
-            ConfirmDialog::new("Add a user?"),
+            ConfirmDialog::new("Add a user?").with_default(false),
         ));
     }
 
@@ -149,7 +149,8 @@ impl<B: WizardBackend> WizardApp<B> {
             .collect();
 
         if self.token_queue.is_empty() {
-            self.token_queue.push(self.backend.local_username());
+            self.advance_to_services();
+            return;
         }
 
         self.token_queue_idx = 0;
@@ -170,7 +171,7 @@ impl<B: WizardBackend> WizardApp<B> {
 
     fn advance_to_services(&mut self) {
         self.phase = WizardPhase::Services(ServiceScreen::AskStart(
-            ConfirmDialog::new("Start services now?").with_default(false),
+            ConfirmDialog::new("Start services now?").with_default(true),
         ));
     }
 
@@ -209,7 +210,7 @@ impl<B: WizardBackend> WizardApp<B> {
             .iter()
             .map(|(name, desc)| format!("{name} — {desc}"))
             .collect();
-        SelectList::new("Role:", options)
+        SelectList::new("Role:", options).with_selected(1)
     }
 
     fn make_expiry_select() -> SelectList<String> {
@@ -283,15 +284,14 @@ impl<B: WizardBackend> waxterm::TerminalApp for WizardApp<B> {
             3 => self.handle_policy_input(&key),
             4 => self.handle_users_input(&key),
             5 => self.handle_tokens_input(&key),
-            6 => {
-                if matches!(&self.phase, WizardPhase::Summary(_)) {
-                    if key == KeyPress::Enter {
-                        self.quit = true;
-                    }
-                    true
-                } else {
-                    self.handle_services_input(&key)
+            6 => self.handle_services_input(&key),
+            7 => {
+                // Summary screen: Enter exits the wizard. ('q' is also
+                // handled via the global quit shortcut above, line 264.)
+                if key == KeyPress::Enter {
+                    self.quit = true;
                 }
+                true
             }
             _ => false,
         }
@@ -1574,20 +1574,22 @@ mod tests {
         complete_bootstrap(&mut app);
         assert_eq!(app.phase_number(), 3);
 
-        // Policy: select "None — skip template" (last option)
-        for _ in 0..5 {
+        // Policy: navigate to "None — skip template" (always the last
+        // option regardless of how many templates the backend reports).
+        // SelectList clamps at the bottom, so pressing Down more times
+        // than there are items still lands on the last entry.
+        for _ in 0..10 {
             app.handle_input(WizardCommand::Key(KeyPress::ArrowDown));
         }
         app.handle_input(WizardCommand::Key(KeyPress::Enter));
         assert_eq!(app.phase_number(), 4, "Should be at Users phase");
 
-        // Users: decline to add user (press 'n')
+        // Users: decline to add user (press 'n'). The token-queue
+        // auto-skips when no users were created (advance_to_tokens →
+        // advance_to_services), so we land on Services directly, NOT
+        // Tokens.
         app.handle_input(WizardCommand::Key(KeyPress::Char(b'n')));
-        assert_eq!(app.phase_number(), 5, "Should be at Tokens phase");
-
-        // Tokens: decline to generate (press 'n')
-        app.handle_input(WizardCommand::Key(KeyPress::Char(b'n')));
-        assert_eq!(app.phase_number(), 6, "Should be at Services phase");
+        assert_eq!(app.phase_number(), 6, "Should be at Services phase (Tokens auto-skipped)");
 
         // Services: decline to start (press 'n')
         app.handle_input(WizardCommand::Key(KeyPress::Char(b'n')));

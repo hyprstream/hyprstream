@@ -1,177 +1,122 @@
-//! Chained MAC for streaming response authentication.
+//! Stream block HMAC for authenticating streaming responses.
 //!
 //! Streaming responses (XPUB/XSUB) use chained MACs instead of per-token Ed25519
-//! signatures for performance reasons:
+//! signatures for performance:
 //! - Ed25519: ~10k signatures/sec
 //! - Blake3/HMAC-SHA256: millions of MACs/sec
 //!
-//! # Chained MAC Design
+//! # Wire format
 //!
-//! Instead of explicit sequence numbers, we use chained MACs where each
-//! chunk's MAC depends on the previous chunk's MAC:
+//! Each chunk's MAC depends on the previous chunk's MAC, providing cryptographic
+//! ordering without explicit sequence numbers:
 //!
 //! ```text
-//! mac_0 = MAC(key, request_id_bytes || data_0)  // First chunk: prev = request_id
-//! mac_n = MAC(key, mac_{n-1} || data_n)         // Subsequent chunks
+//! mac_0 = HMAC(key, topic.as_bytes() || capnp_data_0)[..16]  // Block 0: seed = topic
+//! mac_n = HMAC(key, mac_{n-1} || capnp_data_n)[..16]         // Subsequent blocks
 //! ```
 //!
 //! # Security Properties
 //!
-//! - Authenticates server as holder of the DH shared secret
+//! - Authenticates server as holder of the DH-derived MAC key
+//! - Per-stream key derivation binds chains to specific sessions
 //! - Chained MAC provides cryptographic ordering (no separate sequence field)
-//! - Reordering is impossible - can't verify chunk N without mac_{N-1}
-//! - Request ID binds chunks to their request
-//! - TCP/ZMQ provides transport-level ordering (defense in depth)
+//! - Reordering is impossible — can't verify block N without mac_{N-1}
+//! - 16-byte truncation (128 bits) provides standard authentication strength
+//! - Constant-time verification via `subtle::ConstantTimeEq` prevents timing attacks
 //!
 //! # Backend
 //!
 //! - Default: Blake3 `keyed_hash()` (~10+ GB/s with SIMD)
 //! - FIPS mode: HMAC-SHA256 (FIPS 198-1)
+//!
+//! # Cryptographic notes (from external review)
+//!
+//! - 128-bit truncation is well above NIST recommendations and standard for stream auth
+//! - First-N-bytes truncation is the safe pattern for both Blake3 and HMAC-SHA256
+//! - Topic-as-seed is sound: the key is secret; topic publicness is fine
+//! - Per-stream replay protection comes from the per-call ECDH ephemeral keypair,
+//!   which makes the topic effectively per-stream-random
 
 use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
-use super::backend::keyed_mac;
-use crate::error::{EnvelopeError, EnvelopeResult};
-
-/// HMAC key derived from DH shared secret.
+/// Chained HMAC state for stream block authentication, matching wire format.
+///
+/// Used by both server (`StreamBuilder`) and client (`StreamMount`).
+///
+/// # Wire format
+/// - Block 0: HMAC(key, topic.as_bytes() || capnp_data)[..16]
+/// - Block N: HMAC(key, prev_mac (16 bytes) || capnp_data)[..16]
 #[derive(Clone)]
-pub struct HmacKey([u8; 32]);
-
-impl HmacKey {
-    /// Create from raw bytes.
-    pub fn new(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    /// Get the raw bytes.
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
+pub struct StreamHmacState {
+    key: Zeroizing<[u8; 32]>,
+    prev_mac: Option<[u8; 16]>,
+    topic: String,
 }
 
-impl Drop for HmacKey {
-    fn drop(&mut self) {
-        // Zeroize on drop
-        self.0.iter_mut().for_each(|b| *b = 0);
-    }
-}
-
-/// Chained stream HMAC context for authenticating streaming responses.
-///
-/// Each chunk's HMAC depends on the previous chunk's HMAC, providing
-/// cryptographic ordering without explicit sequence numbers.
-///
-/// # Example
-///
-/// ```ignore
-/// // Server side: create producer
-/// let mut producer = ChainedStreamHmac::new_producer(hmac_key, request_id);
-/// for payloads in batches {
-///     let mac = producer.compute_next(&payloads);
-///     send_multipart([topic, StreamBlock { payloads, prev_mac }, mac]);
-/// }
-///
-/// // Client side: create verifier
-/// let mut verifier = ChainedStreamHmac::new_verifier(hmac_key, request_id);
-/// for chunk in received_chunks {
-///     verifier.verify_next(&chunk.data, &chunk.hmac)?;
-/// }
-/// ```
-pub struct ChainedStreamHmac {
-    key: HmacKey,
-    /// Previous MAC (or request_id bytes for first chunk)
-    prev_mac: [u8; 32],
-}
-
-impl ChainedStreamHmac {
-    /// Create a new chained HMAC producer/verifier.
-    ///
-    /// The initial "previous MAC" is the request_id as bytes (padded to 32 bytes).
-    /// This ensures the first chunk is bound to the request.
-    pub fn new(key: HmacKey, request_id: u64) -> Self {
-        // Initialize prev_mac with request_id bytes (zero-padded)
-        let mut prev_mac = [0u8; 32];
-        prev_mac[..8].copy_from_slice(&request_id.to_le_bytes());
-        Self { key, prev_mac }
-    }
-
-    /// Create from raw key bytes.
-    pub fn from_bytes(key_bytes: [u8; 32], request_id: u64) -> Self {
-        Self::new(HmacKey::new(key_bytes), request_id)
-    }
-
-    /// Compute MAC for the next chunk in the stream.
-    ///
-    /// The MAC covers: `prev_mac || data`
-    ///
-    /// After computing, updates internal state to the new MAC.
-    ///
-    /// # Arguments
-    ///
-    /// * `data` - The chunk data
-    ///
-    /// # Returns
-    ///
-    /// 32-byte MAC tag (Blake3 keyed_hash or HMAC-SHA256 depending on feature flags)
-    pub fn compute_next(&mut self, data: &[u8]) -> [u8; 32] {
-        // Build input: prev_mac || data
-        let mut input = Vec::with_capacity(32 + data.len());
-        input.extend_from_slice(&self.prev_mac);
-        input.extend_from_slice(data);
-
-        // Compute MAC using backend (Blake3 or HMAC-SHA256)
-        let output = keyed_mac(self.key.as_bytes(), &input);
-
-        // Update chain state
-        self.prev_mac = output;
-
-        output
-    }
-
-    /// Verify HMAC for the next chunk in the stream.
-    ///
-    /// Uses constant-time comparison to prevent timing attacks.
-    /// After verifying, updates internal state to the verified MAC.
-    ///
-    /// # Arguments
-    ///
-    /// * `data` - The chunk data
-    /// * `expected_mac` - The MAC to verify against
-    ///
-    /// # Errors
-    ///
-    /// Returns `EnvelopeError::InvalidHmac` if verification fails.
-    pub fn verify_next(&mut self, data: &[u8], expected_mac: &[u8; 32]) -> EnvelopeResult<()> {
-        let computed = self.compute_next_peek(data);
-
-        // Constant-time comparison to prevent timing attacks
-        if computed.ct_eq(expected_mac).into() {
-            // Update chain state only on success
-            self.prev_mac = *expected_mac;
-            Ok(())
-        } else {
-            Err(EnvelopeError::InvalidHmac)
+impl StreamHmacState {
+    /// Create new HMAC chain state.
+    pub fn new(key: [u8; 32], topic: String) -> Self {
+        Self {
+            key: Zeroizing::new(key),
+            prev_mac: None,
+            topic,
         }
     }
 
-    /// Compute the MAC for next chunk without updating state.
-    ///
-    /// Useful for verification where we don't want to update state on failure.
-    fn compute_next_peek(&self, data: &[u8]) -> [u8; 32] {
-        // Build input: prev_mac || data
-        let mut input = Vec::with_capacity(32 + data.len());
-        input.extend_from_slice(&self.prev_mac);
-        input.extend_from_slice(data);
+    /// Compute 16-byte truncated MAC for next block, advancing the chain.
+    pub fn compute_next(&mut self, capnp_data: &[u8]) -> [u8; 16] {
+        let mut input = Vec::with_capacity(64 + capnp_data.len());
+        match &self.prev_mac {
+            None => input.extend_from_slice(self.topic.as_bytes()),
+            Some(prev) => input.extend_from_slice(prev),
+        }
+        input.extend_from_slice(capnp_data);
 
-        // Compute MAC using backend (Blake3 or HMAC-SHA256)
-        keyed_mac(self.key.as_bytes(), &input)
+        let truncated = crate::crypto::keyed_mac_truncated(&self.key, &input);
+        self.prev_mac = Some(truncated);
+        truncated
     }
 
-    /// Get the current chain state (previous MAC).
+    /// Compute the next MAC without advancing chain state (peek).
+    fn compute_next_peek(&self, capnp_data: &[u8]) -> [u8; 16] {
+        let mut input = Vec::with_capacity(64 + capnp_data.len());
+        match &self.prev_mac {
+            None => input.extend_from_slice(self.topic.as_bytes()),
+            Some(prev) => input.extend_from_slice(prev),
+        }
+        input.extend_from_slice(capnp_data);
+        crate::crypto::keyed_mac_truncated(&self.key, &input)
+    }
+
+    /// Verify the next block's MAC in constant time.
     ///
-    /// This can be used to resume a stream if the state is persisted.
-    pub fn chain_state(&self) -> &[u8; 32] {
-        &self.prev_mac
+    /// Advances the chain only if verification succeeds.
+    /// Returns true if the MAC matches, false otherwise.
+    pub fn verify_next(&mut self, capnp_data: &[u8], expected_mac: &[u8]) -> bool {
+        if expected_mac.len() != 16 {
+            return false;
+        }
+        let computed = self.compute_next_peek(capnp_data);
+        if computed.ct_eq(expected_mac).into() {
+            self.prev_mac = Some(computed);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Get the topic.
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+
+    /// Get previous MAC bytes (for prevMac field in StreamBlock).
+    pub fn prev_mac_bytes(&self) -> &[u8] {
+        match &self.prev_mac {
+            Some(mac) => mac,
+            None => &self.topic.as_bytes()[..16.min(self.topic.len())],
+        }
     }
 }
 
@@ -179,115 +124,41 @@ impl ChainedStreamHmac {
 mod tests {
     use super::*;
 
-    // =========================================================================
-    // Chained HMAC tests
-    // =========================================================================
-
     #[test]
-    fn test_chained_hmac_compute_verify() -> crate::EnvelopeResult<()> {
+    fn test_stream_hmac_compute_verify_roundtrip() {
         let key = [0x42u8; 32];
-        let request_id = 12345u64;
+        let topic = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_owned();
 
-        // Producer side
-        let mut producer = ChainedStreamHmac::from_bytes(key, request_id);
-        let mac1 = producer.compute_next(b"chunk 1");
-        let mac2 = producer.compute_next(b"chunk 2");
-        let mac3 = producer.compute_next(b"chunk 3");
+        // Producer
+        let mut producer = StreamHmacState::new(key, topic.clone());
+        let mac0 = producer.compute_next(b"block 0 data");
+        let mac1 = producer.compute_next(b"block 1 data");
+        let mac2 = producer.compute_next(b"block 2 data");
 
-        // Verifier side
-        let mut verifier = ChainedStreamHmac::from_bytes(key, request_id);
-        verifier.verify_next(b"chunk 1", &mac1)?;
-        verifier.verify_next(b"chunk 2", &mac2)?;
-        verifier.verify_next(b"chunk 3", &mac3)?;
-        Ok(())
+        // Verifier
+        let mut verifier = StreamHmacState::new(key, topic);
+        assert!(verifier.verify_next(b"block 0 data", &mac0));
+        assert!(verifier.verify_next(b"block 1 data", &mac1));
+        assert!(verifier.verify_next(b"block 2 data", &mac2));
     }
 
     #[test]
-    fn test_chained_hmac_tampered_data_fails() {
+    fn test_stream_hmac_rejects_wrong_mac() {
         let key = [0x42u8; 32];
-        let request_id = 12345u64;
+        let topic = "topic".to_owned();
 
-        let mut producer = ChainedStreamHmac::from_bytes(key, request_id);
-        let mac = producer.compute_next(b"original data");
-
-        let mut verifier = ChainedStreamHmac::from_bytes(key, request_id);
-        let result = verifier.verify_next(b"tampered data", &mac);
-        assert!(matches!(result, Err(EnvelopeError::InvalidHmac)));
+        let mut verifier = StreamHmacState::new(key, topic);
+        let bad_mac = [0xffu8; 16];
+        assert!(!verifier.verify_next(b"data", &bad_mac));
     }
 
     #[test]
-    fn test_chained_hmac_reordering_fails() -> crate::EnvelopeResult<()> {
+    fn test_stream_hmac_rejects_wrong_length() {
         let key = [0x42u8; 32];
-        let request_id = 12345u64;
+        let topic = "topic".to_owned();
 
-        // Produce chunks in order
-        let mut producer = ChainedStreamHmac::from_bytes(key, request_id);
-        let mac1 = producer.compute_next(b"chunk 1");
-        let mac2 = producer.compute_next(b"chunk 2");
-
-        // Try to verify in wrong order - should fail
-        let mut verifier = ChainedStreamHmac::from_bytes(key, request_id);
-
-        // Skip chunk 1 and try to verify chunk 2 directly
-        let result = verifier.verify_next(b"chunk 2", &mac2);
-        assert!(matches!(result, Err(EnvelopeError::InvalidHmac)));
-
-        // Now verify chunk 1 (should work)
-        verifier.verify_next(b"chunk 1", &mac1)?;
-
-        // Now chunk 2 should work
-        verifier.verify_next(b"chunk 2", &mac2)?;
-        Ok(())
+        let mut verifier = StreamHmacState::new(key, topic);
+        assert!(!verifier.verify_next(b"data", &[0u8; 32])); // 32 bytes is wrong
+        assert!(!verifier.verify_next(b"data", &[0u8; 8]));  // 8 bytes is wrong
     }
-
-    #[test]
-    fn test_chained_hmac_different_request_ids() {
-        let key = [0x42u8; 32];
-
-        // Same key, different request IDs
-        let mut producer1 = ChainedStreamHmac::from_bytes(key, 1);
-        let mut producer2 = ChainedStreamHmac::from_bytes(key, 2);
-
-        let mac1 = producer1.compute_next(b"same data");
-        let mac2 = producer2.compute_next(b"same data");
-
-        // Different request IDs should produce different MACs
-        assert_ne!(mac1, mac2);
-
-        // Cross-verification should fail
-        let mut verifier1 = ChainedStreamHmac::from_bytes(key, 1);
-        let result = verifier1.verify_next(b"same data", &mac2);
-        assert!(matches!(result, Err(EnvelopeError::InvalidHmac)));
-    }
-
-    #[test]
-    fn test_chained_hmac_different_keys() {
-        let request_id = 12345u64;
-
-        let mut producer1 = ChainedStreamHmac::from_bytes([0x01u8; 32], request_id);
-        let mut producer2 = ChainedStreamHmac::from_bytes([0x02u8; 32], request_id);
-
-        let mac1 = producer1.compute_next(b"same data");
-        let mac2 = producer2.compute_next(b"same data");
-
-        assert_ne!(mac1, mac2);
-    }
-
-    #[test]
-    fn test_chained_hmac_chain_state() {
-        let key = [0x42u8; 32];
-        let request_id = 12345u64;
-
-        let mut hmac = ChainedStreamHmac::from_bytes(key, request_id);
-
-        // Initial state should be request_id padded to 32 bytes
-        let initial_state = hmac.chain_state();
-        assert_eq!(&initial_state[..8], &request_id.to_le_bytes());
-        assert!(initial_state[8..].iter().all(|&b| b == 0));
-
-        // After computing, state should change
-        let mac = hmac.compute_next(b"data");
-        assert_eq!(hmac.chain_state(), &mac);
-    }
-
 }

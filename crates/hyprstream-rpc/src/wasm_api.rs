@@ -2,8 +2,7 @@
 //!
 //! Compiled via: wasm-pack build --target web crates/hyprstream-rpc
 //!
-//! This module provides all the cryptographic primitives needed for:
-//! - Building signed request envelopes
+//! This module provides the cryptographic primitives needed for:
 //! - Generating ephemeral keypairs for streaming DH
 //! - Deriving stream keys (topic + MAC)
 //! - Verifying stream blocks (chained HMAC) — stateless (verify_stream_block) and
@@ -12,10 +11,15 @@
 //! - Verifying incoming envelopes (for browser-side services)
 //! - ZMTP 3.1 framing (encode/decode frames, greeting, handshake commands)
 //! - Notification broadcast encryption (blinded DH, AES-GCM, one-shot MAC)
-//! - Session-stable state (set_session_key, set_session_jwt, clear_session) for
-//!   eliminating per-call JWT re-parsing and seed copies
-//! - WASM linear memory allocator (alloc/dealloc) for zero-copy JS→WASM payload passing
-//! - Pointer-based signing (sign_envelope_from_ptr) using session state
+//!
+//! # Signing is handled externally
+//!
+//! Signing Ed25519 request envelopes is **not** in this module. It moved to
+//! `hyprstream-rpc-std::wasm_exports::RpcSession`, which takes an external
+//! signing callback (a JS async function) that produces signatures over
+//! canonical envelope bytes. This lets consumers keep signing keys in an
+//! isolated context — an aegis-vault wasm module, a cross-origin iframe, a
+//! Wanix worker process, etc. The seed never enters this crate.
 //!
 //! All crypto is compiled from Rust - no TypeScript reimplementation.
 
@@ -28,108 +32,17 @@ thread_local! {
     static WASM_NONCE_CACHE: std::sync::Arc<crate::envelope::InMemoryNonceCache> =
         std::sync::Arc::new(crate::envelope::InMemoryNonceCache::new());
 
-    // Stateful HMAC chain for streaming block verification (one per active subscription).
-    // Initialized by init_stream_hmac; advanced by verify_stream_block_step.
-    static STREAM_HMAC: std::cell::RefCell<Option<crate::crypto::ChainedStreamHmac>> =
-        std::cell::RefCell::new(None);
-
-    // Session-stable state: set once at connect time, reused for every call.
-    static SESSION_SEED: std::cell::RefCell<Option<[u8; 32]>> =
-        std::cell::RefCell::new(None);
-    static SESSION_CLAIMS: std::cell::RefCell<Option<crate::auth::Claims>> =
-        std::cell::RefCell::new(None);
+    // Per-stream HMAC chains for concurrent stream verification.
+    // Each stream gets a unique handle from init_stream_hmac.
+    // Uses the same StreamHmacState as the server for wire-format compatibility.
+    static STREAM_HMAC_TABLE: std::cell::RefCell<std::collections::HashMap<u32, crate::crypto::StreamHmacState>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    static NEXT_HMAC_HANDLE: std::cell::Cell<u32> = std::cell::Cell::new(1);
 }
 
 // ============================================================================
-// Envelope signing
+// Key generation (ephemeral-only)
 // ============================================================================
-
-/// Build a signed envelope from raw payload bytes.
-///
-/// # Arguments
-///
-/// * `payload` - Raw payload bytes (Cap'n Proto serialized request)
-/// * `privkey_seed` - 32-byte Ed25519 seed (from generate_signing_keypair)
-/// * `ephemeral_pubkey` - 32-byte Ristretto255 pubkey (empty slice = no DH; 32 bytes = with DH)
-/// * `request_id` - Request ID for correlation
-///
-/// # Returns
-///
-/// Cap'n Proto serialized SignedEnvelope bytes
-#[wasm_bindgen]
-pub fn build_signed_envelope(
-    payload: &[u8],
-    privkey_seed: &[u8],
-    ephemeral_pubkey: &[u8],
-    request_id: u64,
-) -> Result<Vec<u8>, JsError> {
-    if privkey_seed.len() != 32 {
-        return Err(JsError::new("privkey_seed must be 32 bytes"));
-    }
-
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(privkey_seed);
-
-    build_signed_envelope_inner(payload, &seed, ephemeral_pubkey, request_id, None)
-}
-
-/// Build a signed envelope with JWT claims from raw payload bytes.
-///
-/// The JWT token is NOT verified here — the server verifies via `claims.verify_token()`.
-/// This function decodes the JWT payload section to extract claims for the envelope,
-/// and attaches the original token for end-to-end verification server-side.
-///
-/// # Arguments
-///
-/// * `payload` - Raw payload bytes (Cap'n Proto serialized request)
-/// * `privkey_seed` - 32-byte Ed25519 seed (from generate_signing_keypair)
-/// * `ephemeral_pubkey` - 32-byte Ristretto255 pubkey (empty slice = no DH; 32 bytes = with DH)
-/// * `request_id` - Request ID for correlation
-/// * `jwt_token` - JWT token string (header.payload.signature)
-///
-/// # Returns
-///
-/// Cap'n Proto serialized SignedEnvelope bytes with claims populated
-#[wasm_bindgen]
-pub fn build_signed_envelope_with_token(
-    payload: &[u8],
-    privkey_seed: &[u8],
-    ephemeral_pubkey: &[u8],
-    request_id: u64,
-    jwt_token: &str,
-) -> Result<Vec<u8>, JsError> {
-    if privkey_seed.len() != 32 {
-        return Err(JsError::new("privkey_seed must be 32 bytes"));
-    }
-
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(privkey_seed);
-
-    let claims = parse_jwt_claims(jwt_token)?;
-    build_signed_envelope_inner(payload, &seed, ephemeral_pubkey, request_id, claims.as_ref())
-}
-
-// ============================================================================
-// Key generation
-// ============================================================================
-
-/// Generate an Ed25519 signing keypair.
-///
-/// # Returns
-///
-/// 64 bytes: [privkey_seed (32) || pubkey_bytes (32)]
-#[wasm_bindgen]
-pub fn generate_signing_keypair() -> Result<Vec<u8>, JsError> {
-    use crate::crypto::signing::generate_signing_keypair;
-
-    let (signing_key, verifying_key) = generate_signing_keypair();
-
-    let mut result = Vec::with_capacity(64);
-    result.extend_from_slice(signing_key.as_bytes());
-    result.extend_from_slice(verifying_key.as_bytes());
-
-    Ok(result)
-}
 
 /// Generate an ephemeral Ristretto255 keypair for streaming DH.
 ///
@@ -212,377 +125,70 @@ pub fn derive_stream_keys(
 // Stream block verification
 // ============================================================================
 
-/// Verify one stream block in the ChainedStreamHmac chain.
+/// Initialize a per-stream HMAC chain for stateful block verification.
+///
+/// Returns a handle (u32) to identify this stream's HMAC state. Pass the handle
+/// to `verify_stream_block_step` and `close_stream_hmac`. Supports concurrent streams.
+///
+/// Uses `StreamHmacState` which matches the server's wire-format implementation:
+/// 16-byte truncated MACs with `topic.as_bytes()` as the initial chain state.
 ///
 /// # Arguments
 ///
 /// * `mac_key` - 32 bytes MAC key from derive_stream_keys
-/// * `request_id` - Request ID that seeded this HMAC chain
-/// * `capnp_data` - Cap'n Proto frame data
-/// * `expected_mac` - 32 bytes expected MAC
-///
-/// # Returns
-///
-/// true if MAC verification passes
+/// * `topic` - Hex topic string (64 chars) used as the initial chain state
 #[wasm_bindgen]
-pub fn verify_stream_block(
-    mac_key: &[u8],
-    request_id: u64,
-    capnp_data: &[u8],
-    expected_mac: &[u8],
-) -> Result<bool, JsError> {
-    use crate::crypto::ChainedStreamHmac;
-
-    if mac_key.len() != 32 {
-        return Err(JsError::new("mac_key must be 32 bytes"));
-    }
-    if expected_mac.len() != 32 {
-        return Err(JsError::new("expected_mac must be 32 bytes"));
-    }
-
-    let mut key_arr = [0u8; 32];
-    key_arr.copy_from_slice(mac_key);
-    let mut mac_arr = [0u8; 32];
-    mac_arr.copy_from_slice(expected_mac);
-
-    let mut hmac = ChainedStreamHmac::from_bytes(key_arr, request_id);
-
-    // verify_next advances the chain and returns Result
-    match hmac.verify_next(capnp_data, &mac_arr) {
-        Ok(()) => Ok(true),
-        Err(crate::error::EnvelopeError::InvalidHmac) => Ok(false),
-        Err(e) => Err(JsError::new(&format!("stream block verification error: {}", e))),
-    }
-}
-
-/// Initialize the stateful HMAC chain for streaming block verification.
-///
-/// Must be called once per subscription before verify_stream_block_step.
-/// The chain state is seeded from `request_id`, matching server-side initialization.
-///
-/// # Arguments
-///
-/// * `mac_key` - 32 bytes MAC key from derive_stream_keys (bytes 32..64)
-/// * `request_id` - Request ID that seeds the HMAC chain
-#[wasm_bindgen]
-pub fn init_stream_hmac(mac_key: &[u8], request_id: u64) -> Result<(), JsError> {
-    use crate::crypto::ChainedStreamHmac;
+pub fn init_stream_hmac(mac_key: &[u8], topic: &str) -> Result<u32, JsError> {
+    use crate::crypto::StreamHmacState;
 
     let key: [u8; 32] = mac_key
         .try_into()
         .map_err(|_| JsError::new("mac_key must be 32 bytes"))?;
-    STREAM_HMAC.with(|s| {
-        *s.borrow_mut() = Some(ChainedStreamHmac::from_bytes(key, request_id));
+    let handle = NEXT_HMAC_HANDLE.with(|h| {
+        let id = h.get();
+        h.set(id + 1);
+        id
     });
-    Ok(())
+    STREAM_HMAC_TABLE.with(|t| {
+        t.borrow_mut().insert(handle, StreamHmacState::new(key, topic.to_owned()));
+    });
+    Ok(handle)
 }
 
 /// Verify the next stream block in the stateful HMAC chain.
 ///
-/// Unlike verify_stream_block (stateless, only works for block 0), this advances the
-/// chain state so that blocks 1..N verify correctly. Must call init_stream_hmac first.
+/// Uses constant-time comparison via `subtle::ConstantTimeEq` to prevent timing
+/// attacks. Advances the chain state only on success.
 ///
 /// # Arguments
 ///
-/// * `capnp_data` - Cap'n Proto StreamBlock bytes (WITHOUT the trailing 32-byte MAC)
-/// * `mac` - 32 bytes trailing MAC extracted from the WebTransport message
+/// * `handle` - HMAC chain handle from init_stream_hmac
+/// * `capnp_data` - Cap'n Proto StreamBlock bytes (WITHOUT the trailing MAC)
+/// * `mac` - 16-byte truncated MAC extracted from the WebTransport message
 ///
 /// # Returns
 ///
 /// true if MAC verification passes; false if MAC is wrong (stream integrity violation)
 #[wasm_bindgen]
-pub fn verify_stream_block_step(capnp_data: &[u8], mac: &[u8]) -> Result<bool, JsError> {
-    let mac_arr: [u8; 32] = mac
-        .try_into()
-        .map_err(|_| JsError::new("mac must be 32 bytes"))?;
-    STREAM_HMAC.with(|s| {
-        let mut s = s.borrow_mut();
-        let hmac = s
-            .as_mut()
-            .ok_or_else(|| JsError::new("stream HMAC not initialized; call init_stream_hmac first"))?;
-        match hmac.verify_next(capnp_data, &mac_arr) {
-            Ok(()) => Ok(true),
-            Err(crate::error::EnvelopeError::InvalidHmac) => Ok(false),
-            Err(e) => Err(JsError::new(&format!("stream block verification error: {}", e))),
-        }
+pub fn verify_stream_block_step(handle: u32, capnp_data: &[u8], mac: &[u8]) -> Result<bool, JsError> {
+    STREAM_HMAC_TABLE.with(|t| {
+        let mut table = t.borrow_mut();
+        let hmac = table
+            .get_mut(&handle)
+            .ok_or_else(|| JsError::new(&format!("stream HMAC handle {} not found; call init_stream_hmac first", handle)))?;
+        Ok(hmac.verify_next(capnp_data, mac))
     })
 }
 
-// ============================================================================
-// Session state (set once at connect, reused per call)
-// ============================================================================
-
-/// Store the Ed25519 seed for this session.
+/// Close a stream HMAC chain, zeroing key material.
 ///
-/// Call once on connect. The seed is reused by sign_envelope_from_ptr without
-/// copying it on every call.
-///
-/// # Arguments
-///
-/// * `seed` - 32 bytes Ed25519 seed (first 32 bytes of generate_signing_keypair output)
+/// Call when the stream is complete or cancelled to clean up state.
 #[wasm_bindgen]
-pub fn set_session_key(seed: &[u8]) -> Result<(), JsError> {
-    let arr: [u8; 32] = seed
-        .try_into()
-        .map_err(|_| JsError::new("seed must be 32 bytes"))?;
-    SESSION_SEED.with(|s| *s.borrow_mut() = Some(arr));
-    Ok(())
-}
-
-/// Store and pre-parse a JWT token for this session.
-///
-/// Call on connect and whenever the token changes (setJwtToken). Parses the JWT
-/// once — sign_envelope_from_ptr reuses the parsed Claims without re-parsing.
-/// Pass an empty string to clear (anonymous session).
-///
-/// # Arguments
-///
-/// * `token` - JWT string (header.payload.signature), or empty string for anonymous
-#[wasm_bindgen]
-pub fn set_session_jwt(token: &str) {
-    if token.is_empty() {
-        SESSION_CLAIMS.with(|c| *c.borrow_mut() = None);
-        return;
-    }
-    match parse_jwt_claims(token) {
-        Ok(Some(claims)) => SESSION_CLAIMS.with(|c| *c.borrow_mut() = Some(claims)),
-        // On any failure (malformed base64, invalid JSON, wrong format) clear claims so
-        // we don't sign with stale claims from a previous session. The server will treat
-        // the request as anonymous, which is the correct failure mode.
-        _ => SESSION_CLAIMS.with(|c| *c.borrow_mut() = None),
-    }
-}
-
-/// Clear session state on disconnect.
-///
-/// Zeroes the stored seed and drops Claims to avoid leaving secrets in WASM memory.
-#[wasm_bindgen]
-pub fn clear_session() {
-    SESSION_SEED.with(|s| *s.borrow_mut() = None);
-    SESSION_CLAIMS.with(|c| *c.borrow_mut() = None);
-}
-
-// ============================================================================
-// WASM linear memory allocator (for zero-copy JS→WASM payload passing)
-// ============================================================================
-
-/// Allocate `size` bytes in WASM linear memory and return the pointer.
-///
-/// Uses Vec so the allocation routes through the same wasm-bindgen allocator
-/// (__wbindgen_malloc / __wbindgen_free). The caller must call dealloc when done.
-#[wasm_bindgen]
-pub fn alloc(size: u32) -> u32 {
-    let mut v = vec![0u8; size as usize];
-    let ptr = v.as_mut_ptr() as u32;
-    std::mem::forget(v);
-    ptr
-}
-
-/// Free a block previously allocated by alloc.
-///
-/// # Safety
-///
-/// `ptr` must have been returned by alloc with the matching `size`.
-#[wasm_bindgen]
-pub fn dealloc(ptr: u32, size: u32) {
-    unsafe {
-        drop(Vec::from_raw_parts(ptr as *mut u8, 0, size as usize));
-    }
-}
-
-// ============================================================================
-// Pointer-based signing (uses session state; no per-call JWT re-parsing)
-// ============================================================================
-
-/// Sign a request envelope using session state (seed + claims set at connect time).
-///
-/// Reads the payload from WASM linear memory at `payload_ptr` — JS writes into
-/// a buffer obtained from alloc() so no copy occurs on the JS→WASM boundary.
-/// Use for normal RPC calls (no ephemeral key). The streaming path continues to
-/// use build_signed_envelope_with_token (which accepts an ephemeral key).
-///
-/// # Arguments
-///
-/// * `payload_ptr` - Pointer into WASM memory (from alloc)
-/// * `payload_len` - Length of payload in bytes
-/// * `request_id`  - Request ID for this call
-///
-/// # Returns
-///
-/// Cap'n Proto serialized SignedEnvelope bytes
-#[wasm_bindgen]
-pub fn sign_envelope_from_ptr(
-    payload_ptr: u32,
-    payload_len: u32,
-    request_id: u64,
-) -> Result<Vec<u8>, JsError> {
-    let payload =
-        unsafe { std::slice::from_raw_parts(payload_ptr as *const u8, payload_len as usize) };
-
-    SESSION_SEED.with(|s| {
-        let s = s.borrow();
-        let seed = s
-            .as_ref()
-            .ok_or_else(|| JsError::new("session key not set; call set_session_key first"))?;
-        SESSION_CLAIMS.with(|c| {
-            let c = c.borrow();
-            build_signed_envelope_inner(payload, seed, &[], request_id, c.as_ref())
-        })
-    })
-}
-
-/// Sign a request envelope using session state, writing the result directly into
-/// a pre-allocated WASM output buffer.
-///
-/// Both `payload_ptr` and `out_ptr` are pointers into WASM linear memory.  When
-/// the arena is WASM-backed (Phase 2), no JS↔WASM copies occur:
-///   1. Payload already lives at `payload_ptr` (from CapnpArena.intoWasm).
-///   2. The signed envelope is written to `out_ptr` (from wasm.alloc in call()).
-///   3. JS reads the result as a SharedArrayBuffer view — no copy into JS heap.
-///
-/// # Arguments
-///
-/// * `payload_ptr` - WASM linear-memory pointer to the Cap'n Proto payload
-/// * `payload_len` - Length of the payload in bytes
-/// * `out_ptr`     - WASM linear-memory pointer to the output buffer
-/// * `out_max`     - Maximum bytes the output buffer can hold
-/// * `request_id`  - Request ID for this call
-///
-/// # Returns
-///
-/// Number of bytes written to `out_ptr`, or an error if the buffer is too small.
-#[wasm_bindgen]
-pub fn sign_envelope_into(
-    payload_ptr: u32,
-    payload_len: u32,
-    out_ptr: u32,
-    out_max: u32,
-    request_id: u64,
-) -> Result<u32, JsError> {
-    let payload =
-        unsafe { std::slice::from_raw_parts(payload_ptr as *const u8, payload_len as usize) };
-
-    SESSION_SEED.with(|s| {
-        let s = s.borrow();
-        let seed = s
-            .as_ref()
-            .ok_or_else(|| JsError::new("session key not set; call set_session_key first"))?;
-        SESSION_CLAIMS.with(|c| {
-            let c = c.borrow();
-            let bytes =
-                build_signed_envelope_inner(payload, seed, &[], request_id, c.as_ref())?;
-            if bytes.len() > out_max as usize {
-                return Err(JsError::new("output buffer too small for signed envelope"));
-            }
-            unsafe {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_ptr as *mut u8, bytes.len());
-            }
-            Ok(bytes.len() as u32)
-        })
-    })
-}
-
-// ============================================================================
-// Private helpers
-// ============================================================================
-
-/// Shared signing implementation used by build_signed_envelope_with_token and
-/// sign_envelope_from_ptr.
-fn build_signed_envelope_inner(
-    payload: &[u8],
-    seed: &[u8; 32],
-    ephemeral_pubkey: &[u8],
-    request_id: u64,
-    claims: Option<&crate::auth::Claims>,
-) -> Result<Vec<u8>, JsError> {
-    use crate::crypto::signing::signing_key_from_bytes;
-    use crate::envelope::{RequestEnvelope, RequestIdentity, SignedEnvelope};
-
-    let signing_key = signing_key_from_bytes(seed);
-
-    let ephemeral = if ephemeral_pubkey.is_empty() {
-        None
-    } else if ephemeral_pubkey.len() == 32 {
-        let mut buf = [0u8; 32];
-        buf.copy_from_slice(ephemeral_pubkey);
-        Some(buf)
-    } else {
-        return Err(JsError::new("ephemeral_pubkey must be empty or 32 bytes"));
-    };
-
-    let identity = match claims {
-        Some(c) => RequestIdentity::api_token(&c.sub, "jwt"),
-        None => RequestIdentity::Anonymous,
-    };
-
-    let mut envelope = RequestEnvelope {
-        request_id,
-        identity,
-        timestamp: crate::envelope::current_timestamp(),
-        nonce: crate::envelope::generate_nonce(),
-        ephemeral_pubkey: ephemeral,
-        payload: payload.to_vec(),
-        claims: None,
-    };
-    envelope.claims = claims.cloned();
-
-    let signed = SignedEnvelope::new_signed(envelope, &signing_key);
-
-    use capnp::message::Builder;
-    use capnp::serialize;
-    use crate::ToCapnp;
-
-    let mut message = Builder::new_default();
-    let mut builder = message.init_root::<crate::common_capnp::signed_envelope::Builder>();
-    signed.write_to(&mut builder);
-
-    let mut bytes = Vec::new();
-    serialize::write_message(&mut bytes, &message)
-        .map_err(|e| JsError::new(&format!("serialization failed: {}", e)))?;
-
-    Ok(bytes)
-}
-
-/// Decode a JWT token and construct a Claims struct (without signature verification).
-///
-/// Returns None for empty tokens. The server performs signature verification.
-fn parse_jwt_claims(jwt_token: &str) -> Result<Option<crate::auth::Claims>, JsError> {
-    if jwt_token.is_empty() {
-        return Ok(None);
-    }
-
-    let parts: Vec<&str> = jwt_token.splitn(3, '.').collect();
-    if parts.len() != 3 {
-        return Err(JsError::new("Invalid JWT format: expected header.payload.signature"));
-    }
-
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-
-    let payload_json = URL_SAFE_NO_PAD
-        .decode(parts[1])
-        .map_err(|e| JsError::new(&format!("JWT payload base64 decode failed: {}", e)))?;
-
-    #[derive(serde::Deserialize)]
-    struct JwtPayload {
-        sub: String,
-        exp: i64,
-        iat: i64,
-        #[serde(default)]
-        iss: String,
-        aud: Option<String>,
-    }
-
-    let jwt_payload: JwtPayload = serde_json::from_slice(&payload_json)
-        .map_err(|e| JsError::new(&format!("JWT payload JSON parse failed: {}", e)))?;
-
-    let mut claims = crate::auth::Claims::new(jwt_payload.sub, jwt_payload.iat, jwt_payload.exp)
-        .with_audience(jwt_payload.aud)
-        .with_token(jwt_token.to_string());
-    if !jwt_payload.iss.is_empty() {
-        claims = claims.with_issuer(jwt_payload.iss);
-    }
-
-    Ok(Some(claims))
+pub fn close_stream_hmac(handle: u32) {
+    STREAM_HMAC_TABLE.with(|t| {
+        t.borrow_mut().remove(&handle);
+        // StreamHmacState drops; key is wrapped in Zeroizing<[u8; 32]> and zeroed automatically
+    });
 }
 
 // ============================================================================
@@ -653,7 +259,7 @@ pub fn verify_signed_envelope(
     expected_signer_pubkey: &[u8],
 ) -> Result<Vec<u8>, JsError> {
     use crate::crypto::signing::verifying_key_from_bytes;
-    use crate::envelope::unwrap_and_verify;
+    use crate::envelope::{unwrap_and_verify, UnwrapOptions};
 
     if expected_signer_pubkey.len() != 32 {
         return Err(JsError::new("expected_signer_pubkey must be 32 bytes"));
@@ -665,8 +271,9 @@ pub fn verify_signed_envelope(
         .map_err(|e| JsError::new(&format!("invalid verifying key: {}", e)))?;
 
     let nonce_cache = WASM_NONCE_CACHE.with(|c| c.clone());
+    let opts = UnwrapOptions::fixed_signer(&verifying_key, &*nonce_cache);
 
-    let (_signed, payload) = unwrap_and_verify(envelope_bytes, &verifying_key, &*nonce_cache)
+    let (_signed, payload) = unwrap_and_verify(envelope_bytes, &opts)
         .map_err(|e| JsError::new(&format!("envelope verification failed: {}", e)))?;
 
     Ok(payload)

@@ -142,8 +142,14 @@ pub struct StreamService {
     /// Nonce cache for replay protection on SignedEnvelope
     nonce_cache: Arc<InMemoryNonceCache>,
 
-    /// Verifying key for signature verification on StreamRegister messages
+    /// Verifying key — retained for future per-service authorization checks
+    #[allow(dead_code)]
     verifying_key: VerifyingKey,
+
+    /// Optional callback to authorize a signer's pubkey before accepting
+    /// a StreamRegister. Returns `true` if the key is trusted.
+    /// When `None`, any valid signature is accepted (testing/bootstrap).
+    authorize_signer: Option<Arc<dyn Fn(&[u8; 32]) -> bool + Send + Sync>>,
 }
 
 impl StreamService {
@@ -198,6 +204,7 @@ impl StreamService {
             compact_interval: Duration::from_secs(5),
             nonce_cache: Arc::new(InMemoryNonceCache::new()),
             verifying_key,
+            authorize_signer: None,
         }
     }
 
@@ -216,6 +223,19 @@ impl StreamService {
         self.max_pending_per_topic = max_pending_per_topic;
         self.message_ttl = message_ttl;
         self.compact_interval = compact_interval;
+        self
+    }
+
+    /// Set a callback that authorizes signer pubkeys for stream registration.
+    ///
+    /// The callback receives the 32-byte Ed25519 pubkey from the envelope's
+    /// `cnf` field and returns `true` if the key is trusted. Use this to
+    /// gate registration to keys attested in the trust store.
+    pub fn with_authorize_signer(
+        mut self,
+        f: impl Fn(&[u8; 32]) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.authorize_signer = Some(Arc::new(f));
         self
     }
 
@@ -244,17 +264,23 @@ impl StreamService {
         let signed_reader = reader.get_root::<common_capnp::signed_envelope::Reader>()?;
         let signed = SignedEnvelope::read_from(signed_reader)?;
 
-        // Verify signature against expected service pubkey (mandatory)
-        // Full verification with nonce cache for replay protection
-        signed.verify(&self.verifying_key, &*self.nonce_cache)?;
+        // Verify signature against the envelope's embedded pubkey.
+        signed.verify_any_signer(&*self.nonce_cache)?;
+
+        // Reject signers not attested in the trust store.
+        if let Some(ref authorize) = self.authorize_signer {
+            if !authorize(&signed.cnf) {
+                anyhow::bail!(
+                    "signer pubkey not in trust store: {}",
+                    hex::encode(signed.cnf)
+                );
+            }
+        }
 
         // Parse StreamRegister from payload
         // Topic is DH-derived (64 hex chars), unpredictable
         let (topic, exp) = parse_stream_register(&signed.envelope.payload)
             .ok_or_else(|| anyhow!("Invalid StreamRegister payload"))?;
-
-        // Authorization is enforced via Casbin policies server-side.
-        // The signed envelope verification above ensures authenticity.
 
         // Register the stream (blind forwarder - no HMAC key needed)
         streams.insert(topic.clone(), StreamState {
@@ -786,11 +812,11 @@ fn is_signed_envelope(msg: &[u8]) -> bool {
         return false;
     };
 
-    // Also check that signature is exactly 64 bytes (Ed25519 signature)
-    let Ok(signature) = envelope.get_signature() else {
+    // Also check that sig is exactly 64 bytes (Ed25519 signature)
+    let Ok(sig) = envelope.get_sig() else {
         return false;
     };
-    signature.len() == 64
+    sig.len() == 64
 }
 
 /// Send a multipart message over a ZMQ socket

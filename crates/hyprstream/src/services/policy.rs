@@ -4,7 +4,7 @@
 //! Handlers are async and use `.await` directly (compatible with single-threaded runtime).
 
 use async_trait::async_trait;
-use crate::auth::{Operation, PolicyManager};
+use crate::auth::PolicyManager;
 use crate::auth::policy_templates;
 use crate::services::{EnvelopeContext, ZmqService};
 use crate::services::generated::policy_client::{
@@ -16,6 +16,8 @@ use crate::services::generated::policy_client::{
     AddGrouping, RemoveGrouping, SetBranchVisibility,
     RegisterEventPrefix, SubscribeEventPrefix, GetPendingSubscribers, DepositWrappedKeys,
     EventPrefixAccess, PendingSubscribers,
+    ResolveServiceKey, RegisterServiceKey, ServiceKeyResponse,
+    RefreshServiceTokenRequest, ExchangeWit,
     dispatch_policy, serialize_response,
 };
 use anyhow::{anyhow, Result};
@@ -51,6 +53,8 @@ pub struct PolicyService {
     // Business logic
     policy_manager: Arc<PolicyManager>,
     signing_key: Arc<SigningKey>,
+    /// Purpose-derived key for JWT token signing (isolated from envelope signing)
+    jwt_signing_key: SigningKey,
     token_config: crate::config::TokenConfig,
     /// Supported scopes computed once at construction from ServiceFactory inventory
     supported_scopes: Vec<String>,
@@ -61,16 +65,21 @@ pub struct PolicyService {
     /// Default audience for issued tokens (OAuth issuer URL, shared instance identifier).
     /// Used when IssueToken.audience is empty, ensuring all tokens get an `aud` claim.
     default_audience: Option<String>,
-    /// Local OAuth issuer URL for distinguishing local vs. federated JWTs.
-    local_issuer_url: Option<String>,
-    /// Federation key source for verifying externally-issued JWTs.
-    federation_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>>,
+    /// JWT key source for verifying JWTs (local and federated).
+    jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
     // Infrastructure (for Spawnable)
     context: Arc<zmq::Context>,
     transport: TransportConfig,
     /// Event prefix state for secure event transport (Phase 7).
     /// PolicyService is a blind relay — stores opaque wrapped blobs, never plaintext keys.
     event_prefixes: RwLock<HashMap<String, EventPrefixState>>,
+    /// Shared JWT ID blocklist for access token revocation.
+    jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
+    /// ES256 (P-256) key rotation store for DPoP/atproto interop.
+    es256_key_store: Option<Arc<crate::auth::Es256SigningKeyStore>>,
+    /// ML-DSA-65 key rotation store for PQ-hybrid composite token issuance.
+    #[cfg(feature = "pq-hybrid")]
+    ml_dsa_key_store: Option<Arc<crate::auth::MlDsaSigningKeyStore>>,
 }
 
 impl PolicyService {
@@ -84,20 +93,30 @@ impl PolicyService {
         transport: TransportConfig,
     ) -> Self {
         let registry_repo_id = RepoId::from_uuid(git2db::registry::registry_self_uuid());
+        let jwt_signing_key = hyprstream_rpc::node_identity::derive_purpose_key(&signing_key, "hyprstream-jwt-v1");
         Self {
             policy_manager,
             signing_key,
+            jwt_signing_key,
             token_config,
             supported_scopes: compute_supported_scopes(),
             git2db,
             registry_repo_id,
             default_audience: None,
-            local_issuer_url: None,
-            federation_key_source: None,
+            jwt_key_source: None,
             context,
             transport,
             event_prefixes: RwLock::new(HashMap::new()),
+            jti_blocklist: Arc::new(hyprstream_rpc::auth::InMemoryJtiBlocklist::new()),
+            es256_key_store: None,
+            #[cfg(feature = "pq-hybrid")]
+            ml_dsa_key_store: None,
         }
+    }
+
+    /// Get a shared reference to the JWT ID blocklist (for wiring into OAuthState).
+    pub fn jti_blocklist_arc(&self) -> Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist> {
+        Arc::clone(&self.jti_blocklist)
     }
 
     /// Set the default audience for issued tokens (typically the OAuth issuer URL).
@@ -106,18 +125,53 @@ impl PolicyService {
         self
     }
 
-    /// Set the local OAuth issuer URL for distinguishing local vs. federated JWTs.
-    pub fn with_local_issuer_url(mut self, url: String) -> Self {
-        self.local_issuer_url = Some(url);
+    /// Sign a token with composite PQ signature when available, falling back to Ed25519.
+    async fn sign_token(&self, claims: &hyprstream_rpc::auth::Claims, is_service: bool) -> String {
+        #[cfg(feature = "pq-hybrid")]
+        {
+            let ml_dsa_key = if let Some(ref store) = self.ml_dsa_key_store {
+                store.active_key().await
+            } else {
+                None
+            };
+            if let Some(ref ml_key) = ml_dsa_key {
+                return if is_service {
+                    crate::auth::jwt::encode_composite_service_jwt(
+                        claims, ml_key, &self.jwt_signing_key,
+                    )
+                } else {
+                    crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
+                        claims, ml_key, &self.jwt_signing_key,
+                    )
+                };
+            }
+        }
+        if is_service {
+            crate::auth::jwt::encode_service_jwt(claims, &self.jwt_signing_key)
+        } else {
+            crate::auth::jwt::encode(claims, &self.jwt_signing_key)
+        }
+    }
+
+    /// Set the JWT key source for verifying JWTs (local and federated).
+    pub fn with_jwt_key_source(
+        mut self,
+        src: std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>,
+    ) -> Self {
+        self.jwt_key_source = Some(src);
         self
     }
 
-    /// Set the federation key source for verifying externally-issued JWTs.
-    pub fn with_federation_key_source(
-        mut self,
-        src: std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>,
-    ) -> Self {
-        self.federation_key_source = Some(src);
+    /// Attach the ES256 (P-256) key rotation store.
+    pub fn with_es256_key_store(mut self, store: Arc<crate::auth::Es256SigningKeyStore>) -> Self {
+        self.es256_key_store = Some(store);
+        self
+    }
+
+    /// Attach the ML-DSA-65 key rotation store for composite token issuance.
+    #[cfg(feature = "pq-hybrid")]
+    pub fn with_ml_dsa_key_store(mut self, store: Arc<crate::auth::MlDsaSigningKeyStore>) -> Self {
+        self.ml_dsa_key_store = Some(store);
         self
     }
 
@@ -242,17 +296,21 @@ impl PolicyHandler for PolicyService {
     ) -> Result<PolicyResponseVariant> {
         trace!("Issuing JWT token");
 
+        let is_service_token = data.subject.as_ref().is_some_and(|s| s.starts_with("service:"));
+
         // Determine subject: explicit subject (if provided and authorized) or envelope identity.
         // JWT sub must contain a bare username (e.g. "randy", "birdetta") — the identity
         // system adds the namespace prefix ("token:randy") when the JWT is decoded.
+        // For service tokens: sub = "service:{name}", e.g. "service:model".
         let subject = if let Some(ref subj) = data.subject.as_ref().filter(|s| !s.is_empty()) {
-            // Explicit subject requires `manage` permission on `policy:issue-token`
+            // Explicit subject requires `manage` permission on `policy:IssueToken`
+            // (matches the capnp type name used by the transport-level Casbin check).
             let caller = ctx.subject().to_string();
             let allowed = self.policy_manager.check_with_domain(
                 &caller,
                 "*",
-                "policy:issue-token",
-                Operation::Manage.as_str(),
+                "policy:IssueToken",
+                "manage",
             ).await;
             if !allowed {
                 return Ok(PolicyResponseVariant::Error(ErrorInfo {
@@ -261,7 +319,7 @@ impl PolicyHandler for PolicyService {
                         caller, subj
                     ),
                     code: "UNAUTHORIZED_SUBJECT".to_owned(),
-                    details: "Requires 'manage' permission on 'policy:issue-token'".to_owned(),
+                    details: "Requires 'manage' permission on 'policy:IssueToken'".to_owned(),
                 }));
             }
             (*subj).clone()
@@ -270,8 +328,13 @@ impl PolicyHandler for PolicyService {
             ctx.user().to_owned()
         };
 
-        // Validate TTL
-        let requested_ttl = data.ttl.filter(|&t| t != 0).unwrap_or(self.token_config.default_ttl_seconds);
+        // Validate TTL — service tokens get a longer default (7 days)
+        let default_ttl = if is_service_token {
+            data.ttl.filter(|&t| t != 0).unwrap_or(604800) // 7 days for service tokens
+        } else {
+            data.ttl.filter(|&t| t != 0).unwrap_or(self.token_config.default_ttl_seconds)
+        };
+        let requested_ttl = default_ttl;
 
         const MIN_TTL_SECONDS: u32 = 60;
         if requested_ttl < MIN_TTL_SECONDS {
@@ -296,17 +359,44 @@ impl PolicyHandler for PolicyService {
         let audience = data.audience.as_ref().filter(|s| !s.is_empty()).cloned()
             .or_else(|| self.default_audience.clone());
 
+        // Service tokens: derive the Ed25519 key bytes from the root CA key.
+        // The CA (PolicyService) is authoritative — the pubkey is not caller-provided.
+        // User tokens: decode the caller-provided pubkey (from OAuth consent page).
+        let service_key_bytes: Option<[u8; 32]> = if is_service_token {
+            let svc_name = &subject["service:".len()..];
+            let svc_signing_key = hyprstream_rpc::node_identity::derive_purpose_key(
+                &self.signing_key,
+                &format!("service:{svc_name}"),
+            );
+            Some(*svc_signing_key.verifying_key().as_bytes())
+        } else {
+            use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+            data.user_pub_key.as_deref().and_then(|s| {
+                URL_SAFE_NO_PAD.decode(s).ok()?.try_into().ok()
+            })
+        };
+
         // Populate iss with the OAuth issuer URL so federation peers can fetch JWKS.
         // default_audience is the OAuth issuer URL (set via with_default_audience).
         let issuer = self.default_audience.clone().unwrap_or_default();
-        let claims = hyprstream_rpc::auth::Claims::new(
+        let mut claims = hyprstream_rpc::auth::Claims::new(
             subject,
             now,
             now + requested_ttl as i64,
         ).with_issuer(issuer)
          .with_audience(audience);
 
-        let token = crate::auth::jwt::encode(&claims, &self.signing_key);
+        // DPoP jkt takes priority over userPubKey (RFC 9449 § 6).
+        if let Some(ref jkt) = data.dpop_jkt {
+            claims.cnf = Some(hyprstream_rpc::auth::Cnf {
+                jwk: None,
+                jkt: Some(jkt.clone()),
+            });
+        } else if let Some(key_bytes) = service_key_bytes {
+            claims = claims.with_cnf_jwk(&key_bytes);
+        }
+
+        let token = self.sign_token(&claims, is_service_token).await;
 
         Ok(PolicyResponseVariant::IssueTokenResult(TokenInfo {
             token,
@@ -399,27 +489,14 @@ impl PolicyHandler for PolicyService {
             }
         };
 
-        // Get the expanded rules
-        let new_content = template.expanded_rules();
-
-        // Read existing content for rollback on validation failure
-        let policy_path = self.policy_manager.policy_csv_path();
-        let existing_content = tokio::fs::read_to_string(&policy_path).await
-            .unwrap_or_default();
-
-        // Write the new policy with restrictive permissions
-        crate::auth::write_policy_file(&policy_path, &new_content).await
-            .map_err(|e| anyhow!("Failed to write policy file: {}", e))?;
-
-        // Validate by reloading
-        if let Err(e) = self.policy_manager.reload().await {
-            // Rollback on validation failure
-            warn!("Template validation failed, rolling back: {}", e);
-            let _ = crate::auth::write_policy_file(&policy_path, &existing_content).await;
-            let _ = self.policy_manager.reload().await;
+        // Apply template rules via the Casbin enforcer.
+        // Base rules are always present (injected at init/reload), so templates
+        // only add their own rules on top. The enforcer's save_policy() persists
+        // everything (base + template) to disk via the FileAdapter.
+        if let Err(e) = self.policy_manager.apply_template(template).await {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                message: format!("Policy validation failed: {}", e),
-                code: "VALIDATION_FAILED".to_owned(),
+                message: format!("Failed to apply template: {}", e),
+                code: "TEMPLATE_APPLY_FAILED".to_owned(),
                 details: String::new(),
             }));
         }
@@ -814,25 +891,28 @@ impl PolicyHandler for PolicyService {
             }));
         }
 
-        // Elevated roles require system identity (node key / inproc caller)
+        // Elevated roles can only be assigned by policy service.
         const ELEVATED_ROLES: &[&str] = &["ttt.privileged", "operator"];
-        if ELEVATED_ROLES.contains(&data.role.as_str()) && ctx.subject() != Subject::new("system") {
+        let caller_subject = ctx.subject().to_string();
+        if ELEVATED_ROLES.contains(&data.role.as_str())
+            && caller_subject != "service:policy"
+        {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: format!(
-                    "Role '{}' is an elevated role and can only be assigned by the system",
+                    "Role '{}' is an elevated role and can only be assigned by policy service",
                     data.role
                 ),
                 code: "UNAUTHORIZED".to_owned(),
-                details: "Elevated roles require system identity (node signing key)".to_owned(),
+                details: "Elevated roles require service:policy identity".to_owned(),
             }));
         }
 
-        // Non-system callers cannot assign roles to themselves
-        if ctx.subject() != Subject::new("system") && data.user == caller {
+        // Callers cannot assign roles to themselves
+        if data.user == caller {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: "Cannot assign roles to yourself".to_owned(),
                 code: "SELF_ASSIGNMENT".to_owned(),
-                details: "Non-system callers may not assign roles to themselves".to_owned(),
+                details: "Callers may not assign roles to themselves".to_owned(),
             }));
         }
 
@@ -1177,6 +1257,216 @@ impl PolicyHandler for PolicyService {
         );
         Ok(PolicyResponseVariant::DepositWrappedKeysResult)
     }
+
+    async fn handle_resolve_service_key(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &ResolveServiceKey,
+    ) -> Result<PolicyResponseVariant> {
+        let trust = hyprstream_service::global_trust_store();
+        let vk = trust.resolve_one(&data.service_name)
+            .ok_or_else(|| anyhow!("No verifying key registered for service '{}'", data.service_name))?;
+        let att = trust.get(&vk)
+            .ok_or_else(|| anyhow!("No attestation for service '{}'", data.service_name))?;
+        debug!("Resolved service key for '{}'", data.service_name);
+        Ok(PolicyResponseVariant::ResolveServiceKeyResult(
+            ServiceKeyResponse {
+                verifying_key: vk.to_bytes().to_vec(),
+                service_jwt: att.jwt.clone(),
+            }
+        ))
+    }
+
+    async fn handle_register_service_key(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &RegisterServiceKey,
+    ) -> Result<PolicyResponseVariant> {
+        let caller = ctx.subject().to_string();
+
+        // Verify the caller is who they claim to be.
+        // The service JWT must be signed by the CA (our jwt_signing_key) and
+        // its subject must match "service:{serviceName}".
+        let claims = hyprstream_rpc::auth::jwt::decode_with_key(
+            &data.service_jwt,
+            &self.jwt_signing_key.verifying_key(),
+            None,
+        ).map_err(|e| anyhow!("Invalid service JWT: {e}"))?;
+
+        let expected_sub = format!("service:{}", data.service_name);
+        if claims.sub != expected_sub {
+            anyhow::bail!(
+                "JWT subject '{}' does not match service name '{}'",
+                claims.sub, data.service_name
+            );
+        }
+
+        // Verify the provided verifying key matches the JWT's cnf.jwk claim.
+        let vk_bytes: [u8; 32] = data.verifying_key.as_slice().try_into()
+            .map_err(|_| anyhow!("verifying_key must be 32 bytes"))?;
+        let vk = VerifyingKey::from_bytes(&vk_bytes)
+            .map_err(|e| anyhow!("Invalid Ed25519 verifying key: {e}"))?;
+
+        if let Some(cnf_bytes) = claims.cnf_key_bytes() {
+            if cnf_bytes != vk_bytes {
+                anyhow::bail!("JWT cnf.jwk does not match provided verifying key");
+            }
+        }
+
+        // Store in trust store (key-centric: the key IS the identity)
+        {
+            let trust = hyprstream_service::global_trust_store();
+            trust.insert(vk, hyprstream_service::Attestation {
+                scopes: std::iter::once(data.service_name.clone()).collect(),
+                subject: None,
+                jwt: Some(data.service_jwt.clone()),
+                expires_at: claims.exp,
+                attested_by: Some(self.signing_key.verifying_key().to_bytes()),
+            });
+        }
+
+        info!(service = %data.service_name, caller = %caller, "Registered service verifying key");
+
+        Ok(PolicyResponseVariant::RegisterServiceKeyResult)
+    }
+
+    async fn handle_refresh_service_token(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &RefreshServiceTokenRequest,
+    ) -> Result<PolicyResponseVariant> {
+        const MAX_TTL: i64 = 2_592_000; // 30 days
+        const MIN_TTL: i64 = 3_600;     // 1 hour
+
+        let subject = match ctx.subject().name() {
+            Some(s) if s.starts_with("service:") => s.to_owned(),
+            Some(s) => {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: format!("Subject '{s}' is not a service identity; only services may self-renew"),
+                    code: "NOT_A_SERVICE".to_owned(),
+                    details: String::new(),
+                }));
+            }
+            None => {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: "Anonymous callers cannot refresh service tokens".to_owned(),
+                    code: "ANONYMOUS".to_owned(),
+                    details: String::new(),
+                }));
+            }
+        };
+
+        let ttl = data.ttl_seconds.clamp(MIN_TTL, MAX_TTL);
+        let svc_name = &subject["service:".len()..];
+
+        let now = chrono::Utc::now().timestamp();
+        let expires_at = now + ttl;
+
+        // Derive the service's pubkey from the root CA key (same as issue_token)
+        let svc_signing_key = hyprstream_rpc::node_identity::derive_purpose_key(
+            &self.signing_key,
+            &format!("service:{svc_name}"),
+        );
+
+        let issuer = self.default_audience.clone().unwrap_or_default();
+        let claims = hyprstream_rpc::auth::Claims::new(subject.clone(), now, expires_at)
+            .with_issuer(issuer)
+            .with_cnf_jwk(svc_signing_key.verifying_key().as_bytes());
+
+        let token = self.sign_token(&claims, true).await;
+
+        // Persist renewed JWT to disk so it survives a server restart
+        let credentials_dir = crate::config::HyprConfig::load()
+            .map(|c| c.config_dir().join("credentials"))
+            .unwrap_or_else(|_| {
+                dirs::config_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                    .join("hyprstream")
+                    .join("credentials")
+            });
+        if let Err(e) = crate::auth::identity_store::write_service_jwt(&credentials_dir, svc_name, &token) {
+            warn!(service = svc_name, "Failed to persist renewed JWT to disk: {e}");
+        }
+
+        info!(service = svc_name, expires_at, "Renewed service JWT");
+        Ok(PolicyResponseVariant::RefreshServiceTokenResult(TokenInfo {
+            token,
+            expires_at,
+        }))
+    }
+    async fn handle_exchange_wit(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &ExchangeWit,
+    ) -> Result<PolicyResponseVariant> {
+        // Identity is read from the already-verified envelope WIT — no credential submission.
+        let sub = match ctx.subject().name() {
+            Some(s) => s.to_owned(),
+            None => {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: "Anonymous callers cannot exchange WIT for access token".to_owned(),
+                    code: "ANONYMOUS".to_owned(),
+                    details: String::new(),
+                }));
+            }
+        };
+
+        // cnf.jwk from the verified WIT — carried through into the issued at+jwt.
+        let cnf_key_bytes = ctx.claims().and_then(hyprstream_rpc::auth::Claims::cnf_key_bytes);
+        if cnf_key_bytes.is_none() {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "Caller WIT missing cnf.jwk — key binding required for ExchangeWit".to_owned(),
+                code: "NO_CNF_JWK".to_owned(),
+                details: String::new(),
+            }));
+        }
+
+        // Casbin: caller must have 'exchange' on 'policy:exchange-wit'.
+        let allowed = self.policy_manager.check_with_domain(
+            &sub,
+            "*",
+            "policy:exchange-wit",
+            "exchange",
+        ).await;
+        if !allowed {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Subject '{sub}' is not authorized to exchange WIT for access token"),
+                code: "UNAUTHORIZED".to_owned(),
+                details: "Requires 'exchange' permission on 'policy:exchange-wit'".to_owned(),
+            }));
+        }
+
+        let ttl = data.ttl.unwrap_or(self.token_config.default_ttl_seconds);
+        let ttl = ttl.clamp(60, self.token_config.max_ttl_seconds);
+
+        let now = chrono::Utc::now().timestamp();
+        let expires_at = now + ttl as i64;
+
+        let audience = data.audience.as_ref().filter(|s| !s.is_empty()).cloned()
+            .or_else(|| self.default_audience.clone());
+
+        let issuer = self.default_audience.clone().unwrap_or_default();
+        let mut claims = hyprstream_rpc::auth::Claims::new(sub.clone(), now, expires_at)
+            .with_issuer(issuer)
+            .with_audience(audience);
+
+        // Key binding: carry cnf.jwk from WIT into the at+jwt.
+        if let Some(key_bytes) = cnf_key_bytes {
+            claims = claims.with_cnf_jwk(&key_bytes);
+        }
+
+        let token = self.sign_token(&claims, false).await;
+
+        info!(sub = %sub, expires_at, "ExchangeWit: issued at+jwt");
+        Ok(PolicyResponseVariant::ExchangeWitResult(TokenInfo {
+            token,
+            expires_at,
+        }))
+    }
 }
 
 #[async_trait(?Send)]
@@ -1210,14 +1500,32 @@ impl ZmqService for PolicyService {
         self.default_audience.as_deref()
     }
 
-    fn local_issuer_url(&self) -> Option<&str> {
-        self.local_issuer_url.as_deref()
+    fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>> {
+        self.jwt_key_source.clone()
     }
 
-    fn federation_key_source(
+    fn resolve_key_subject(&self, signer_pubkey: &[u8; 32]) -> Option<hyprstream_rpc::envelope::Subject> {
+        hyprstream_service::global_trust_store().resolve_subject(signer_pubkey)
+    }
+
+    fn jti_blocklist(&self) -> Option<&dyn hyprstream_rpc::auth::JtiBlocklist> {
+        Some(self.jti_blocklist.as_ref())
+    }
+
+    fn cache_key_binding(
         &self,
-    ) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>> {
-        self.federation_key_source.clone()
+        verifying_key: ed25519_dalek::VerifyingKey,
+        subject: &str,
+        jwt: &str,
+        expires_at: i64,
+    ) {
+        hyprstream_service::global_trust_store().insert(verifying_key, hyprstream_service::Attestation {
+            scopes: std::collections::HashSet::new(),
+            subject: Some(subject.to_owned()),
+            jwt: Some(jwt.to_owned()),
+            expires_at,
+            attested_by: Some(self.signing_key.verifying_key().to_bytes()),
+        });
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {

@@ -146,10 +146,10 @@ fn default_adaptive_steps() -> bool {
     true
 }
 fn default_max_adaptation_ms() -> u64 {
-    5_000  // 5 seconds — sufficient for H100 (5-7 steps), marginal for RTX 4090 (3-5 steps)
+    30_000  // 30 seconds — sufficient for consumer GPUs (RTX 4090: ~7s/step)
 }
 fn default_max_gradient_steps() -> usize {
-    10  // Safety ceiling for client overrides; perplexity gating caps at 5 steps anyway
+    50  // Safety ceiling for client overrides; explicit training needs more steps
 }
 fn default_pending_rollback_ms() -> u64 {
     60_000
@@ -194,9 +194,7 @@ impl Default for GradientGatingConfig {
     }
 }
 
-/// Compute per-layer gradient norms from VarStore.
-///
-/// Returns map of "layer_idx.module_name" -> L2 norm of combined A+B gradients.
+#[allow(dead_code)]
 fn compute_per_layer_grad_norms(
     vs: &tch::nn::VarStore,
 ) -> HashMap<String, f64> {
@@ -217,7 +215,7 @@ fn compute_per_layer_grad_norms(
     norms
 }
 
-/// Identify layers to gate (freeze) based on gradient norms.
+#[allow(dead_code)]
 fn identify_gated_layers(norms: &HashMap<String, f64>, threshold: f64) -> Vec<String> {
     norms
         .iter()
@@ -226,7 +224,7 @@ fn identify_gated_layers(norms: &HashMap<String, f64>, threshold: f64) -> Vec<St
         .collect()
 }
 
-/// Parse VarStore key "layer_{idx}.{module}.lora_{a|b}" to delta key "idx.module"
+#[allow(dead_code)]
 fn parse_varstore_key_to_delta_key(name: &str) -> Option<String> {
     let parts: Vec<&str> = name.split('.').collect();
     if parts.len() >= 3 {
@@ -934,8 +932,7 @@ impl TestTimeTrainer {
         }
     }
 
-    /// Apply gradient gating: freeze low-signal layers after warmup.
-    /// Returns list of gated layer keys (for restoration later).
+    #[allow(dead_code)]
     fn apply_gradient_gating(&self, delta: &TenantDelta, step: usize, total_steps: usize) -> Vec<String> {
         if !self.gradient_gating.enabled || total_steps <= self.gradient_gating.warmup_steps {
             return Vec::new();
@@ -992,16 +989,6 @@ impl TestTimeTrainer {
         let mut grad_norms = Vec::with_capacity(gated_steps);
         let mut any_clipped = false;
 
-        // Diagnostic: log autograd state before first backward pass
-        if delta.accumulated_steps == 0 {
-            let vars = delta.vs.trainable_variables();
-            let any_requires_grad = vars.iter().any(tch::Tensor::requires_grad);
-            tracing::info!(
-                "[TTT] Pre-backward check: loss.requires_grad={}, vars_require_grad={}, num_vars={}",
-                initial_loss_tensor.requires_grad(), any_requires_grad, vars.len()
-            );
-        }
-
         // First step (always runs at least one)
         let (gn, clipped) = self.ttt_step(&initial_loss_tensor, delta, Some(lr))?;
         grad_norms.push(gn as f32);
@@ -1010,19 +997,9 @@ impl TestTimeTrainer {
         }
         let mut actual_steps = 1;
 
-        // Diagnostic: log gradient state after first backward pass
-        if delta.accumulated_steps == 0 {
-            let variables = delta.vs.trainable_variables();
-            let defined_count = variables.iter().filter(|v| v.grad().defined()).count();
-            tracing::info!(
-                "[TTT] Post-backward: {}/{} vars have defined grad, grad_norm={:.6}",
-                defined_count, variables.len(), gn
-            );
-        }
-
-        // Per-layer gradient gating: after warmup, freeze low-signal layers
-        // to save backward FLOPs and prevent momentum drift
-        let gated_layer_keys = self.apply_gradient_gating(delta, 1, gated_steps);
+        // Skip gradient gating — short TTT runs (1-5 steps) need all layers
+        // active for meaningful adaptation.
+        let gated_layer_keys: Vec<String> = Vec::new();
 
         // Remaining steps with time budget check BEFORE each step
         for _ in 1..gated_steps {
@@ -1308,8 +1285,9 @@ impl TestTimeTrainer {
         }
         let mut actual_steps = 1;
 
-        // Per-layer gradient gating: after warmup, freeze low-signal layers
-        let gated_layer_keys = self.apply_gradient_gating(delta, 1, clamped_steps);
+        // Skip gradient gating in explicit train_step — short training runs
+        // (3-5 steps) need all layers active for meaningful adaptation.
+        let gated_layer_keys: Vec<String> = Vec::new();
 
         // Remaining steps with time budget check
         for _ in 1..clamped_steps {
@@ -1388,8 +1366,10 @@ mod tests {
         assert_eq!(config.min_input_length, 32);
         assert_eq!(config.max_ttt_context, 512);
         assert!(config.enabled);
-        assert_eq!(config.max_adaptation_ms, 5_000);
-        assert_eq!(config.max_gradient_steps, 10);
+        // Defaults sized for consumer GPUs (per RTX 4090 ~7s/step):
+        // see `default_max_adaptation_ms` and `default_max_gradient_steps`.
+        assert_eq!(config.max_adaptation_ms, 30_000);
+        assert_eq!(config.max_gradient_steps, 50);
         assert!((config.tau_reject - 200.0).abs() < 0.1);
     }
 

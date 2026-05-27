@@ -26,30 +26,53 @@
 //!   /oauth/device/verify                     → user verification page
 //! ```
 
+pub mod auth;
 pub mod authorize;
 pub mod challenge;
+pub mod cimd_cache;
+pub mod client_auth;
 pub mod device;
+pub mod did_document;
 pub mod federation_entity;
+pub mod dpop;
+pub mod introspection;
 pub mod jwks;
+pub mod jwt_bearer;
 pub mod login_page;
 pub mod metadata;
+pub mod oauth2_userinfo;
 pub mod oidc_callback;
 pub mod oidc_discovery;
+pub mod par;
 pub mod registration;
 pub mod revocation;
+pub mod scim;
+pub mod scim_types;
 pub mod session;
 pub mod state;
 pub mod token;
+pub mod token_exchange;
+pub mod token_store;
 pub mod user_mapping;
+pub mod wit_bootstrap;
+pub mod user_service;
 pub mod userinfo;
+pub mod device_enrollment;
+pub mod zmq_handler;
 
 use std::sync::Arc;
 
 use anyhow::Result;
-use axum::{extract::State, response::IntoResponse, routing::{get, post}, Router};
+use axum::{
+    extract::State,
+    response::IntoResponse,
+    routing::{get, post},
+    Router,
+};
 use hyprstream_rpc::registry::SocketKind;
-use hyprstream_service::Spawnable;
+use hyprstream_rpc::service::{RequestLoop, ZmqService};
 use hyprstream_rpc::transport::TransportConfig;
+use hyprstream_service::Spawnable;
 use tokio::sync::Notify;
 use tracing::info;
 
@@ -66,7 +89,10 @@ pub const SERVICE_NAME: &str = "oauth";
 /// any inner middleware (like logging) runs. This fixes the previous ordering
 /// where logging was outermost and CORS was inner.
 pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfig) -> Router {
-    let mut router = Router::new()
+    // ── Public routes ──────────────────────────────────────────────────────────
+    // No Bearer token required. Includes all OAuth flow endpoints (clients are
+    // unauthenticated when they arrive) and SCIM discovery (RFC 7644 §4).
+    let public_router = Router::new()
         .route(
             "/.well-known/oauth-authorization-server",
             get(metadata::authorization_server_metadata),
@@ -74,33 +100,6 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
         .route(
             "/.well-known/oauth-protected-resource",
             get(oauth_self_protected_resource_metadata),
-        )
-        .route("/oauth/register", post(registration::register_client))
-        .route(
-            "/oauth/authorize",
-            get(authorize::authorize_get).post(authorize::authorize_post),
-        )
-        .route("/oauth/token", post(token::exchange_token))
-        .route("/oauth/jwks", get(jwks::jwks))
-        .route("/oauth/device", post(device::device_authorize))
-        .route(
-            "/oauth/device/verify",
-            get(device::verify_get).post(device::verify_post),
-        )
-        .route("/oauth/device/nonce", get(device::device_nonce))
-        .route(
-            "/oauth/userinfo",
-            get(userinfo::userinfo).post(userinfo::userinfo),
-        )
-        .route("/oauth/revoke", post(revocation::revoke_token))
-        .route("/oauth/logout", post(handle_logout))
-        .route(
-            "/oauth/external/authorize/:provider",
-            get(oidc_callback::external_authorize),
-        )
-        .route(
-            "/oauth/callback/:provider",
-            get(oidc_callback::external_callback),
         )
         .route(
             "/.well-known/openid-configuration",
@@ -110,12 +109,88 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             "/.well-known/openid-federation",
             get(federation_entity::entity_configuration),
         )
-        .layer(axum::middleware::from_fn(|req: axum::extract::Request, next: axum::middleware::Next| async move {
-            let method = req.method().clone();
-            let uri = req.uri().clone();
-            tracing::info!(%method, %uri, "OAuth request");
-            next.run(req).await
-        }));
+        .route("/oauth/register", post(registration::register_client))
+        .route(
+            "/oauth/authorize",
+            get(authorize::authorize_get).post(authorize::authorize_post),
+        )
+        .route("/oauth/par", post(par::push_authorization_request))
+        .route("/oauth/token", post(token::exchange_token))
+        .route("/oauth/jwks", get(jwks::jwks))
+        .route("/oauth/device", post(device::device_authorize))
+        .route(
+            "/oauth/device/verify",
+            get(device::verify_get).post(device::verify_post),
+        )
+        .route("/oauth/device/nonce", get(device::device_nonce))
+        .route("/api/device/challenge", post(device_enrollment::device_challenge_handler))
+        .route("/api/device/enroll", post(device_enrollment::device_enroll_handler))
+        .route("/oauth/revoke", post(revocation::revoke_token))
+        // Phase 0c — did:web document endpoints
+        .route("/.well-known/did.json", get(did_document::root_did_document))
+        .route("/users/:username/did.json", get(did_document::user_did_document))
+        .route("/clients/:client_id/did.json", get(did_document::client_did_document))
+        .route("/oauth/logout", post(handle_logout))
+        .route(
+            "/oauth/external/authorize/:provider",
+            get(oidc_callback::external_authorize),
+        )
+        .route(
+            "/oauth/callback/:provider",
+            get(oidc_callback::external_callback),
+        )
+        // SCIM discovery endpoints — RFC 7644 §4 requires these to be unauthenticated
+        .route("/scim/v2/Schemas", get(scim::schemas))
+        .route("/scim/v2/ResourceTypes", get(scim::resource_types))
+        .route(
+            "/scim/v2/ServiceProviderConfig",
+            get(scim::service_provider_config),
+        );
+
+    // ── Protected routes ───────────────────────────────────────────────────────
+    // All require a valid Bearer token (validated by require_bearer_token).
+    // Inserts AuthenticatedUser into request extensions for downstream handlers.
+    let protected_router = Router::new()
+        .route("/oauth/introspect", post(introspection::introspect_token))
+        .route("/oauth/wit", post(wit_bootstrap::issue_browser_wit))
+        .route(
+            "/oauth/userinfo",
+            get(userinfo::userinfo).post(userinfo::userinfo),
+        )
+        // SCIM 2.0 user management (RFC 7644)
+        .route(
+            "/scim/v2/Users",
+            get(scim::list_users).post(scim::create_user),
+        )
+        .route(
+            "/scim/v2/Users/:id",
+            get(scim::get_user)
+                .put(scim::replace_user)
+                .delete(scim::delete_user),
+        )
+        .route(
+            "/scim/v2/Users/:id/keys",
+            get(scim::list_user_keys).post(scim::add_user_key),
+        )
+        .route(
+            "/scim/v2/Users/:id/keys/:fingerprint",
+            axum::routing::delete(scim::remove_user_key),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_bearer_token,
+        ));
+
+    let mut router = public_router
+        .merge(protected_router)
+        .layer(axum::middleware::from_fn(
+            |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                let method = req.method().clone();
+                let uri = req.uri().clone();
+                tracing::info!(%method, %uri, "OAuth request");
+                next.run(req).await
+            },
+        ));
 
     // CORS outermost (added last = runs first on request)
     if cors_config.enabled {
@@ -135,16 +210,30 @@ async fn handle_logout(
     }
     (
         axum::http::StatusCode::OK,
-        [(axum::http::header::SET_COOKIE, session::clear_session_cookie())],
+        [(
+            axum::http::header::SET_COOKIE,
+            session::clear_session_cookie(),
+        )],
         "Logged out",
-    ).into_response()
+    )
+        .into_response()
 }
 
 /// RFC 9728 Protected Resource Metadata for the OAuth server itself.
-async fn oauth_self_protected_resource_metadata() -> axum::Json<ProtectedResourceMetadata> {
+///
+/// Returns the DiscoveryService QUIC endpoint as the `resource` URL so that
+/// browsers can bootstrap a WebTransport connection via DiscoveryService,
+/// then resolve all other service endpoints from there.
+async fn oauth_self_protected_resource_metadata(
+    State(_state): State<Arc<OAuthState>>,
+) -> axum::Json<ProtectedResourceMetadata> {
     let config = crate::config::HyprConfig::load().unwrap_or_default();
     let issuer_url = config.oauth.issuer_url();
-    let mut meta = protected_resource_metadata(&issuer_url, &issuer_url);
+
+    // Use issuer URL as the resource
+    let resource = issuer_url.clone();
+
+    let mut meta = protected_resource_metadata(&resource, &issuer_url);
     meta.resource_name = Some("HyprStream OAuth 2.1 Authorization Server".to_owned());
     meta.scopes_supported = Some(vec![
         "openid".into(),
@@ -152,6 +241,14 @@ async fn oauth_self_protected_resource_metadata() -> axum::Json<ProtectedResourc
         "write:*:*".into(),
         "infer:model:*".into(),
     ]);
+
+    // Include the QUIC TLS cert hash so browsers can pin the self-signed certificate.
+    if let Ok((cert_chain, _)) = config.quic.load_tls_materials() {
+        meta.x_cert_hash = Some(hyprstream_rpc::transport::zmtp_quic::cert_hash(
+            &cert_chain[0],
+        ));
+    }
+
     axum::Json(meta)
 }
 
@@ -175,6 +272,9 @@ pub struct OAuthService {
     control_transport: TransportConfig,
     #[allow(dead_code)]
     verifying_key: ed25519_dalek::VerifyingKey,
+    /// JWT verifying key (CA key) for JWKS endpoint. This is the key that verifies
+    /// JWTs signed by PolicyService, derived from the root signing key.
+    jwt_verifying_key: [u8; 32],
 }
 
 impl OAuthService {
@@ -185,6 +285,7 @@ impl OAuthService {
         context: Arc<zmq::Context>,
         control_transport: TransportConfig,
         verifying_key: ed25519_dalek::VerifyingKey,
+        jwt_verifying_key: ed25519_dalek::VerifyingKey,
     ) -> Self {
         Self {
             config,
@@ -193,6 +294,7 @@ impl OAuthService {
             context,
             control_transport,
             verifying_key,
+            jwt_verifying_key: jwt_verifying_key.to_bytes(),
         }
     }
 }
@@ -215,12 +317,15 @@ impl Spawnable for OAuthService {
         shutdown: Arc<Notify>,
         on_ready: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<(), hyprstream_rpc::error::RpcError> {
-        let rt = tokio::runtime::Builder::new_multi_thread()
+        // Use single-threaded runtime + LocalSet because HTTP handlers make ZMQ RPC
+        // calls (e.g., policy_client.issue_token()), and ZMQ clients use spawn_local.
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("runtime: {e}")))?;
 
-        rt.block_on(async move {
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async move {
             let addr_str = format!("{}:{}", self.config.host, self.config.port);
             let addr: std::net::SocketAddr = addr_str.parse().map_err(|e| {
                 hyprstream_rpc::error::RpcError::SpawnFailed(format!("Invalid address: {e}"))
@@ -237,55 +342,295 @@ impl Spawnable for OAuthService {
 
             let scheme = if rustls_config.is_some() { "https" } else { "http" };
 
-            // Create PolicyClient HERE, inside the OAuth runtime, so that ZMQ
+            // Create RPC clients HERE, inside the OAuth runtime, so that ZMQ
             // async I/O (TMQ) registers socket FDs with THIS runtime's epoll.
-            // Creating it in the factory (main runtime) would cause hangs.
-            let policy_client = PolicyClient::new(
+            // Creating them in the factory (main runtime) would cause hangs.
+
+            // Bootstrap: Get service verifying keys from trust store.
+            // The trust store is populated during startup by depends_on services.
+            let policy_vk = match hyprstream_service::global_trust_store().resolve_one("policy") {
+                Some(vk) => vk,
+                None => {
+                    return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                        "trust store has no policy key — startup must populate it".to_owned(),
+                    ));
+                }
+            };
+            let policy_client = PolicyClient::for_service(
                 self.signing_key.clone(),
-                hyprstream_rpc::RequestIdentity::anonymous(),
+                policy_vk,
+                None,
             );
 
-            // Attempt to load the user credential store for Ed25519 device verification.
-            // Failure is non-fatal; the verify endpoint will report "not configured" instead.
-            let user_store: Option<Arc<dyn crate::auth::user_store::UserStore + Send + Sync>> = {
-                let credentials_dir = crate::config::HyprConfig::load()
-                    .map(|c| c.config_dir().join("credentials"))
-                    .unwrap_or_else(|_| {
-                        dirs::config_dir()
-                            .unwrap_or_else(|| std::path::PathBuf::from("/etc/hyprstream"))
-                            .join("hyprstream")
-                            .join("credentials")
-                    });
-                match crate::auth::user_store::LocalKeyStore::load(&credentials_dir) {
-                    Ok(store) => {
-                        info!("User credential store loaded from {:?}", credentials_dir);
-                        Some(Arc::new(store))
+            // Get discovery key from trust store (populated by depends_on = ["discovery"]).
+            // Using trust store avoids RPC calls which require LocalSet context.
+            let discovery_vk = match hyprstream_service::global_trust_store().resolve_one("discovery") {
+                Some(vk) => vk,
+                None => {
+                    return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                        "trust store has no discovery key — ensure discovery is in depends_on".to_owned(),
+                    ));
+                }
+            };
+            let discovery_client = crate::services::DiscoveryClient::for_service(
+                self.signing_key.clone(),
+                discovery_vk,
+                None,
+            );
+
+            let credentials_dir = crate::config::HyprConfig::load()
+                .map(|c| c.config_dir().join("credentials"))
+                .unwrap_or_else(|_| {
+                    dirs::config_dir()
+                        .unwrap_or_else(|| std::path::PathBuf::from("/etc/hyprstream"))
+                        .join("hyprstream")
+                        .join("credentials")
+                });
+
+            // Load the user store and token store based on configured backend.
+            // Failure is non-fatal; endpoints will report "not configured" instead.
+            use crate::config::CredentialsBackend;
+            let credentials_config = crate::config::HyprConfig::load()
+                .map(|c| c.credentials)
+                .unwrap_or_default();
+
+            let mut device_store_opt: Option<Arc<dyn crate::auth::DeviceStore>> = None;
+            let user_store: Option<Arc<dyn crate::auth::user_store::UserStore>> = match credentials_config.backend {
+                CredentialsBackend::Rocksdb => {
+                    match crate::auth::RocksDbUserStore::open(&credentials_dir) {
+                        Ok(store) => {
+                            info!("User store (RocksDB) opened at {:?}", credentials_dir);
+                            let arc = Arc::new(store);
+                            device_store_opt = Some(arc.clone() as Arc<dyn crate::auth::DeviceStore>);
+                            Some(arc as Arc<dyn crate::auth::user_store::UserStore>)
+                        }
+                        Err(e) => {
+                            tracing::warn!("Could not open user store (endpoints will report 'not configured'): {}", e);
+                            None
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Could not load user credential store (device verify will require manual setup): {}",
-                            e
-                        );
+                }
+                CredentialsBackend::Valkey => {
+                    #[cfg(feature = "valkey")]
+                    {
+                        let url = &credentials_config.valkey.url;
+                        match crate::auth::ValkeyUserStore::connect(url).await {
+                            Ok(store) => {
+                                info!("User store (Valkey) connected at {url}");
+                                Some(Arc::new(store))
+                            }
+                            Err(e) => {
+                                tracing::warn!("Could not connect user store (Valkey): {e}");
+                                None
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "valkey"))]
+                    {
+                        tracing::error!("credentials.backend = \"valkey\" but binary was not compiled with --features valkey");
                         None
                     }
                 }
             };
 
-            // Create shared state
+            // Load the CA JWT signing key for browser WIT issuance (POST /oauth/wit).
+            // Also seed the signing key store from the same root key.
+            let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
+            let oauth_config_arc = Arc::new(self.config.clone());
+
+            // Load or initialize ES256 + ML-DSA rotation stores (independent of CA key).
+            // Uses global singletons — shared with PolicyService and ServiceContext.
+            let es256_store = crate::auth::key_rotation::global_es256_key_store(
+                &secrets_dir,
+                &self.config,
+            );
+            info!("ES256 (P-256) signing key rotation store loaded");
+
+            #[cfg(feature = "pq-hybrid")]
+            let ml_dsa_store = crate::auth::key_rotation::global_ml_dsa_key_store(
+                &secrets_dir,
+                &self.config,
+            );
+            #[cfg(feature = "pq-hybrid")]
+            info!("ML-DSA-65 signing key rotation store loaded");
+
+            let (ca_jwt_key, signing_key_store) = match crate::auth::identity_store::load_ca_signing_key(&credentials_dir) {
+                Ok(root_key) => {
+                    let key = hyprstream_rpc::node_identity::derive_purpose_key(&root_key, "hyprstream-jwt-v1");
+                    info!("CA JWT signing key loaded — POST /oauth/wit available");
+
+                    // Load or initialize the multi-slot Ed25519 rotation store.
+                    let store = crate::auth::key_rotation::load_or_init_key_store(
+                        &secrets_dir,
+                        &self.config,
+                    );
+                    let store_arc = Arc::new(store);
+
+                    // Spawn the background rotation task (rotates all algorithm stores).
+                    crate::auth::key_rotation::spawn_rotation_task(
+                        Arc::clone(&oauth_config_arc),
+                        secrets_dir.clone(),
+                        Arc::clone(&store_arc),
+                        crate::auth::key_rotation::RotationStores {
+                            es256: Some(Arc::clone(&es256_store)),
+                            #[cfg(feature = "pq-hybrid")]
+                            ml_dsa: Some(Arc::clone(&ml_dsa_store)),
+                        },
+                    );
+                    info!("JWT signing key rotation task started (active_days={}, lead_days={}, drain_days={})",
+                        self.config.jwt_key_active_days,
+                        self.config.jwt_key_lead_days,
+                        self.config.jwt_key_drain_days,
+                    );
+
+                    (Some(key), Some(store_arc))
+                }
+                Err(e) => {
+                    tracing::warn!("Cannot load CA signing key — POST /oauth/wit unavailable and key rotation disabled: {e}");
+                    (None, None)
+                }
+            };
+
+            // Create shared state — JWKS serves the CA JWT verifying key (from PolicyService)
+            let jwt_verifying_key = self.jwt_verifying_key;
             let mut oauth_state = OAuthState::new(
                 &self.config,
                 policy_client,
-                self.verifying_key.to_bytes(),
+                discovery_client.clone(),
+                jwt_verifying_key,
             );
             if let Some(store) = user_store {
                 oauth_state = oauth_state.with_user_store(store);
             }
+            if let Some(ds) = device_store_opt {
+                oauth_state = oauth_state.with_device_store(ds);
+            }
             oauth_state = oauth_state.with_signing_key(self.signing_key.clone());
+            if let Some(key) = ca_jwt_key {
+                oauth_state = oauth_state.with_ca_jwt_key(key);
+            }
+            if let Some(store) = signing_key_store {
+                oauth_state = oauth_state.with_signing_key_store(store);
+            }
+            oauth_state = oauth_state.with_es256_key_store(Arc::clone(&es256_store));
+            #[cfg(feature = "pq-hybrid")]
+            {
+                oauth_state = oauth_state.with_ml_dsa_key_store(Arc::clone(&ml_dsa_store));
+            }
+            // Populate legacy JWKS nbf/exp from signing-key file mtime (used when store absent).
+            let key_nbf = crate::auth::identity_store::node_signing_key_mtime(&credentials_dir);
+            oauth_state = oauth_state.with_jwt_key_timestamps(key_nbf, key_nbf + 14 * 86400);
+
+            // Open persistent refresh token store (non-fatal — tokens simply don't survive restart).
+            let token_db_path = credentials_dir.join("oauth-tokens");
+            let token_store: Option<Arc<dyn crate::services::oauth::token_store::TokenStore>> = match credentials_config.backend {
+                CredentialsBackend::Rocksdb => {
+                    match crate::services::oauth::token_store::RocksDbTokenStore::open(&token_db_path) {
+                        Ok(s) => {
+                            info!("Refresh token store (RocksDB) opened at {:?}", token_db_path);
+                            Some(Arc::new(s))
+                        }
+                        Err(e) => {
+                            tracing::warn!("Could not open refresh token store (tokens will not survive restart): {}", e);
+                            None
+                        }
+                    }
+                }
+                CredentialsBackend::Valkey => {
+                    #[cfg(feature = "valkey")]
+                    {
+                        let url = &credentials_config.valkey.url;
+                        match crate::services::oauth::token_store::ValkeyTokenStore::connect(url).await {
+                            Ok(s) => {
+                                info!("Refresh token store (Valkey) connected at {url}");
+                                Some(Arc::new(s))
+                            }
+                            Err(e) => {
+                                tracing::warn!("Could not connect refresh token store (Valkey): {e}");
+                                None
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "valkey"))]
+                    {
+                        None
+                    }
+                }
+            };
+            if let Some(store) = token_store {
+                oauth_state.with_token_store_impl(store);
+            }
+
+            // Resolve discovery URL at startup with LocalSet (RPC calls need LocalSet context).
+            // Cache it so HTTP handlers don't need to make RPC calls.
+            #[allow(clippy::expect_used)]
+            let cached_discovery_url = {
+                let dc = discovery_client;
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("failed to create discovery resolve runtime");
+                    let local = tokio::task::LocalSet::new();
+                    local.block_on(&rt, async {
+                        match dc.get_endpoints("discovery").await {
+                            Ok(service_endpoints) => service_endpoints
+                                .endpoints
+                                .iter()
+                                .find(|ep| ep.socket_kind == "quic")
+                                .and_then(|ep| {
+                                    let stripped = ep.endpoint.strip_prefix("quic://")?;
+                                    let parts: Vec<&str> = stripped.splitn(3, ':').collect();
+                                    if parts.len() >= 3 {
+                                        Some(format!("https://{}:{}", parts[0], parts[2]))
+                                    } else {
+                                        None
+                                    }
+                                }),
+                            Err(_) => None,
+                        }
+                    })
+                })
+                .join()
+                .ok()
+                .flatten()
+            };
+            if let Some(_url) = cached_discovery_url {
+                // Discovery URL caching removed - use issuer URL directly
+            }
+
             let state = Arc::new(oauth_state);
             state.spawn_code_sweeper();
 
+            // Phase 0.5 Stage D — publish OIDF entity statement to DiscoveryService
+            // at startup AND periodically thereafter. Periodic re-publish keeps
+            // the cached statement fresh as signing keys rotate and the embedded
+            // JWKS changes; entity statements carry a 24h exp so any longer gap
+            // leaves federation peers falling through to HTTPS unnecessarily.
+            //
+            // Non-fatal on failure: HTTPS fallback continues to work either way.
+            {
+                let publish_state = state.clone();
+                // Re-publish at 1/4 of the entity-statement exp (24h) so we
+                // refresh the cached statement well before consumers reject it
+                // as expired. Concretely: every 6h. Initial publish happens
+                // immediately on the first iteration of the loop.
+                let republish_interval = std::time::Duration::from_secs(6 * 3600);
+                tokio::task::spawn_local(async move {
+                    let mut tick = tokio::time::interval(republish_interval);
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tick.tick().await;
+                        federation_entity::publish_entity_statement_to_discovery(
+                            publish_state.clone(),
+                        )
+                        .await;
+                    }
+                });
+            }
+
             // Create router with configurable CORS
-            let app = create_app(state, &self.config.cors);
+            let app = create_app(state.clone(), &self.config.cors);
 
             info!(
                 "Authorization server metadata at {scheme}://{addr}/.well-known/oauth-authorization-server",
@@ -297,8 +642,34 @@ impl Spawnable for OAuthService {
 
             let _ = hyprstream_rpc::notify::ready();
 
+            // ZMQ RPC loop for user CRUD (alongside HTTP server)
+            // Must use spawn_local because RequestLoop uses spawn_local internally
+            let zmq_transport = self.control_transport.clone();
+            let zmq_context = Arc::clone(&self.context);
+            let zmq_signing_key = self.signing_key.clone();
+            let zmq_state = state.clone();
+            let zmq_loop = tokio::task::spawn_local(async move {
+                let handler = zmq_handler::OAuthZmqHandler::new(
+                    zmq_state,
+                    zmq_context,
+                    zmq_transport,
+                    zmq_signing_key,
+                );
+                let zmq_transport = ZmqService::transport(&handler).clone();
+                let zmq_context = Arc::clone(ZmqService::context(&handler));
+                let zmq_signing_key = ZmqService::signing_key(&handler);
+                let loop_ = RequestLoop::new(zmq_transport, zmq_context, zmq_signing_key);
+                if let Err(e) = loop_.run(handler).await {
+                    tracing::error!("OAuth ZMQ loop error: {}", e);
+                }
+            });
+
             // Run HTTP(S) server with graceful shutdown
-            crate::server::tls::serve_app(addr, app, rustls_config, shutdown, "OAuthService").await
+            let _ = crate::server::tls::serve_app(addr, app, rustls_config, shutdown, "OAuthService").await;
+
+            let _ = zmq_loop.await;
+
+            Ok(())
         })
     }
 }
@@ -319,12 +690,18 @@ pub struct ProtectedResourceMetadata {
     pub resource_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_documentation: Option<String>,
+    /// Base64 SHA-256 hash of the TLS certificate for WebTransport cert pinning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_cert_hash: Option<String>,
 }
 
 /// Create a Protected Resource Metadata response (RFC 9728).
 ///
 /// Used by MCP and OAI servers to advertise their OAuth authorization server.
-pub fn protected_resource_metadata(resource_url: &str, oauth_issuer_url: &str) -> ProtectedResourceMetadata {
+pub fn protected_resource_metadata(
+    resource_url: &str,
+    oauth_issuer_url: &str,
+) -> ProtectedResourceMetadata {
     ProtectedResourceMetadata {
         resource: resource_url.to_owned(),
         authorization_servers: vec![oauth_issuer_url.to_owned()],
@@ -332,43 +709,59 @@ pub fn protected_resource_metadata(resource_url: &str, oauth_issuer_url: &str) -
         scopes_supported: None,
         resource_name: None,
         resource_documentation: None,
+        x_cert_hash: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::registration::validate_redirect_uri;
+    use super::*;
 
     #[test]
     fn test_protected_resource_metadata() {
-        let meta = protected_resource_metadata(
-            "http://localhost:6790",
-            "http://localhost:6791",
-        );
+        let meta = protected_resource_metadata("http://localhost:6790", "http://localhost:6791");
         assert_eq!(meta.resource, "http://localhost:6790");
         assert_eq!(meta.authorization_servers[0], "http://localhost:6791");
-        assert_eq!(meta.bearer_methods_supported.as_deref(), Some(&["header".to_owned()][..]));
+        assert_eq!(
+            meta.bearer_methods_supported.as_deref(),
+            Some(&["header".to_owned()][..])
+        );
     }
 
     #[test]
     fn test_validate_redirect_uri_exact_match() {
         let registered = vec!["http://127.0.0.1:3000/callback".to_owned()];
-        assert!(validate_redirect_uri("http://127.0.0.1:3000/callback", &registered));
+        assert!(validate_redirect_uri(
+            "http://127.0.0.1:3000/callback",
+            &registered
+        ));
         // Loopback URIs: port is ignored per RFC 8252, so different port still matches
-        assert!(validate_redirect_uri("http://127.0.0.1:4000/callback", &registered));
+        assert!(validate_redirect_uri(
+            "http://127.0.0.1:4000/callback",
+            &registered
+        ));
         // Different path should NOT match
-        assert!(!validate_redirect_uri("http://127.0.0.1:3000/other", &registered));
+        assert!(!validate_redirect_uri(
+            "http://127.0.0.1:3000/other",
+            &registered
+        ));
     }
 
     #[test]
     fn test_validate_redirect_uri_loopback_port_ignored() {
         let registered = vec!["http://127.0.0.1:3000/callback".to_owned()];
         // Different port on loopback should match per RFC 8252
-        assert!(validate_redirect_uri("http://127.0.0.1:9999/callback", &registered));
+        assert!(validate_redirect_uri(
+            "http://127.0.0.1:9999/callback",
+            &registered
+        ));
         // Non-loopback should require exact match
         let non_loopback = vec!["https://example.com:3000/callback".to_owned()];
-        assert!(!validate_redirect_uri("https://example.com:4000/callback", &non_loopback));
+        assert!(!validate_redirect_uri(
+            "https://example.com:4000/callback",
+            &non_loopback
+        ));
     }
 
     #[test]

@@ -18,8 +18,9 @@ impl CodegenBackend for PythonBackend {
         match capnp_type {
             "Void" => "None".into(),
             "Bool" => "bool".into(),
-            "UInt8" | "UInt16" | "UInt32" | "UInt64"
-            | "Int8" | "Int16" | "Int32" | "Int64" => "int".into(),
+            "UInt8" | "UInt16" | "UInt32" | "UInt64" | "Int8" | "Int16" | "Int32" | "Int64" => {
+                "int".into()
+            }
             "Float32" | "Float64" => "float".into(),
             "Text" => "str".into(),
             "Data" => "bytes".into(),

@@ -6,11 +6,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use base64::Engine as _;
 use tokio::sync::RwLock;
+use serde::{Deserialize, Serialize};
 
 use crate::auth::user_store::UserStore;
 use crate::config::OAuthConfig;
-use crate::services::PolicyClient;
+use crate::services::{DiscoveryClient, PolicyClient};
+use super::token_store::TokenStore;
+use super::user_service::UserService;
 
 /// Extract RSA public key components (n, e) from PKCS#8 DER and build a JWK.
 ///
@@ -90,14 +94,55 @@ fn extract_rsa_jwk_from_der(pkcs8_der: &[u8], kid: &str) -> Option<serde_json::V
 }
 
 /// A dynamically registered OAuth client (RFC 7591) or Client ID Metadata Document client.
+///
+/// Field set tracks
+/// [draft-ietf-oauth-client-id-metadata-document-00] §4 (Client Metadata
+/// Document) and [RFC 7591] §2 (Client Metadata): only the fields hyprstream
+/// actually consumes are kept; unknown fields in the source document are
+/// dropped at parse time.
 #[derive(Debug, Clone)]
 pub struct RegisteredClient {
     pub client_id: String,
     pub redirect_uris: Vec<String>,
     pub client_name: Option<String>,
+    /// Homepage / informational URI. Shown on the consent screen.
+    pub client_uri: Option<String>,
+    /// Logo URL. Shown on the consent screen.
+    pub logo_uri: Option<String>,
+    /// Grant types this client is permitted to use. Empty = AS default
+    /// (`authorization_code` + `refresh_token`).
+    pub grant_types: Vec<String>,
+    /// Response types this client is permitted to request. Empty = `code`.
+    pub response_types: Vec<String>,
+    /// Token endpoint client auth method. `"none"` = public client (PKCE
+    /// is mandatory). `"private_key_jwt"` requires a non-empty `jwks` /
+    /// `jwks_uri`.
+    pub token_endpoint_auth_method: Option<String>,
+    /// Inlined JWKS (CIMD §4 / RFC 7591 §2). Mutually exclusive with
+    /// `jwks_uri` per RFC 7591. Used for `private_key_jwt` client auth and
+    /// future request-object signing.
+    pub jwks: Option<serde_json::Value>,
+    /// JWKS endpoint URL — alternative to inline `jwks`.
+    pub jwks_uri: Option<String>,
     /// True if this client was registered via Client ID Metadata Document (HTTPS URL client_id)
     pub is_cimd: bool,
     pub registered_at: Instant,
+}
+
+/// A Pushed Authorization Request (RFC 9126) awaiting consumption.
+///
+/// Holds the already-validated authorize parameters keyed by the `request_uri`
+/// returned to the client. Single-use, short TTL.
+#[derive(Debug, Clone)]
+pub struct PushedAuthRequest {
+    pub params: super::authorize::AuthorizeParams,
+    pub expires_at: Instant,
+}
+
+impl PushedAuthRequest {
+    pub fn is_expired(&self) -> bool {
+        Instant::now() > self.expires_at
+    }
 }
 
 /// A pending authorization code awaiting token exchange.
@@ -117,6 +162,9 @@ pub struct PendingAuthCode {
     /// Authenticated username from Ed25519 challenge-response on the consent page.
     /// Used as the JWT `sub` claim for the issued token.
     pub username: String,
+    /// Ed25519 verifying key verified during challenge-response.
+    /// Included in the JWT `pub_key` claim to bind the user's key identity.
+    pub verifying_key: Option<ed25519_dalek::VerifyingKey>,
 }
 
 impl PendingAuthCode {
@@ -134,6 +182,10 @@ pub struct PendingExternalAuth {
     pub provider_slug: String,
     pub external_state: String,
     pub external_nonce: String,
+    /// Provider kind, carried through for dispatch in the callback handler.
+    pub provider_kind: crate::config::ProviderKind,
+    /// Whether PKCE was sent to the external provider.
+    pub pkce_supported: bool,
     pub pkce_verifier: String,
     pub client_secret: Option<String>,
     pub token_endpoint: String,
@@ -180,6 +232,9 @@ pub struct PendingDeviceCode {
     pub nonce: String,
     /// Username of the person who approved this code (set on POST /verify success)
     pub approved_by: Option<String>,
+    /// Ed25519 verifying key verified during device challenge-response.
+    /// Included in the JWT `pub_key` claim to bind the user's key identity.
+    pub verifying_key: Option<ed25519_dalek::VerifyingKey>,
 }
 
 impl PendingDeviceCode {
@@ -189,40 +244,64 @@ impl PendingDeviceCode {
 }
 
 /// A stored refresh token entry (OAuth 2.1 rotation).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshTokenEntry {
     pub client_id: String,
     /// JWT subject (username) of the token owner.
-    /// Used to re-issue the access token on refresh with the correct sub.
     pub username: String,
     pub scopes: Vec<String>,
     pub resource: Option<String>,
-    pub expires_at: Instant,
+    /// Unix timestamp (seconds) at which this token expires.
+    pub expires_at_unix: i64,
+    /// Ed25519 verifying key bytes bound to this token (cnf key continuity on refresh).
+    pub verifying_key_bytes: Option<[u8; 32]>,
 }
 
 impl RefreshTokenEntry {
     pub fn is_expired(&self) -> bool {
-        Instant::now() > self.expires_at
+        chrono::Utc::now().timestamp() > self.expires_at_unix
     }
 }
 
 /// Shared OAuth server state.
 pub struct OAuthState {
-    /// Registered clients (dynamic + CIMD)
+    /// Dynamically-registered (RFC 7591) clients keyed by issued UUID
+    /// client_id. CIMD clients live in `cimd_cache` instead — DCR
+    /// entries have no TTL and outlive cache evictions, so storage is
+    /// separated.
     pub clients: RwLock<HashMap<String, RegisteredClient>>,
+    /// CIMD metadata cache. CIMD documents (HTTPS-URL client_ids) are
+    /// fetched + verified once, then cached respecting HTTP cache
+    /// headers, bounded TTL and capacity. See `cimd_cache` module.
+    pub cimd_cache: Arc<super::cimd_cache::CimdCache>,
+    /// JWKS-URI fetch cache for `private_key_jwt` client auth. Keyed by
+    /// the absolute URL; value is `(parsed_jwks_json, fetched_at)`.
+    /// Entries expire after `client_jwks_uri_cache_ttl_secs` and are
+    /// evicted lazily on read. Capacity is implicitly bounded by the
+    /// number of registered clients with jwks_uri (typically small).
+    pub jwks_uri_cache: RwLock<HashMap<String, (serde_json::Value, Instant)>>,
+    /// TTL for the `jwks_uri_cache`. Copied from
+    /// [`OAuthConfig::client_jwks_uri_cache_ttl_secs`] at construction.
+    pub client_jwks_uri_cache_ttl: Duration,
     /// Pending authorization codes (single-use, 60s TTL)
     pub pending_codes: RwLock<HashMap<String, PendingAuthCode>>,
     /// Pending authorize nonces (single-use, 5-min TTL).
     /// Proves a nonce was issued by this server and hasn't been replayed.
     pub pending_nonces: RwLock<HashMap<String, Instant>>,
+    /// Pending Pushed Authorization Requests (RFC 9126), keyed by `request_uri`.
+    /// Single-use, 60s TTL. In-memory is correct here — no value to persistence.
+    pub pending_par_requests: RwLock<HashMap<String, super::state::PushedAuthRequest>>,
     /// Pending device authorization codes (RFC 8628), keyed by device_code
     pub pending_device_codes: RwLock<HashMap<String, PendingDeviceCode>>,
     /// Reverse lookup: user_code -> device_code
     pub device_code_by_user_code: RwLock<HashMap<String, String>>,
-    /// Refresh tokens (keyed by opaque token string, rotated on use)
-    pub refresh_tokens: RwLock<HashMap<String, RefreshTokenEntry>>,
+    /// Persistent refresh token store. Keyed by opaque token string.
+    /// None when no credentials path is configured (tokens silently lost on restart).
+    pub token_db: Option<Arc<dyn TokenStore>>,
     /// PolicyClient for JWT token issuance via ZMQ
     pub policy_client: PolicyClient,
+    /// DiscoveryClient for resolving service QUIC endpoints via ZMQ
+    pub discovery_client: DiscoveryClient,
     /// Issuer URL (e.g., "http://localhost:6791")
     pub issuer_url: String,
     /// Default scopes for new clients
@@ -236,8 +315,9 @@ pub struct OAuthState {
     /// Raw Ed25519 verifying key bytes (32 bytes) for the JWKS endpoint.
     pub verifying_key_bytes: [u8; 32],
     /// User credential store for Ed25519 challenge-response device verification.
-    /// `None` when not configured (keyring unavailable or no credentials dir set).
-    pub user_store: Option<Arc<dyn UserStore + Send + Sync>>,
+    /// Now backed by `user_service`. Legacy code uses `user_store_reader()`.
+    /// Kept as Option for backward-compatible `is_none()` checks.
+    pub user_service: Option<Arc<UserService>>,
     /// Ed25519 signing key for signing entity configurations (OpenID Federation 1.0).
     /// `None` when not configured.
     pub signing_key: Option<ed25519_dalek::SigningKey>,
@@ -256,18 +336,58 @@ pub struct OAuthState {
     pub rsa_jwk: Option<serde_json::Value>,
     /// RSA key kid (for the JWT header).
     pub rsa_kid: Option<String>,
+    /// Seen DPoP JTIs for replay prevention. Value = expiry (iat + 120s).
+    pub dpop_jti_seen: RwLock<HashMap<String, i64>>,
+    /// Server-issued DPoP nonces. Value = expiry unix timestamp.
+    pub dpop_nonces: RwLock<HashMap<String, i64>>,
+    /// Per-client (keyed by DPoP `jkt` thumbprint) nonce-issuance state.
+    /// Once a jkt appears here, RFC 9449 §8 enforcement kicks in: subsequent
+    /// proofs from the same key MUST carry a server-issued nonce. Value =
+    /// expiry unix timestamp (matches nonce TTL; entry pruned when expired
+    /// to allow re-bootstrap after silence).
+    pub dpop_clients_seen: RwLock<HashMap<String, i64>>,
+    /// Trusted external OIDC issuers for the JWT bearer grant (RFC 7523).
+    pub trusted_issuers: std::collections::HashMap<String, crate::config::TrustedIssuerConfig>,
+    /// CA JWT signing key for browser WIT issuance (POST /oauth/wit).
+    /// Derived from the root CA key via derive_purpose_key("hyprstream-jwt-v1").
+    /// None when credentials are unavailable (WIT endpoint returns 503).
+    pub ca_jwt_key: Option<Arc<ed25519_dalek::SigningKey>>,
+    /// Anonymous device identity store.
+    pub device_store: Option<Arc<dyn crate::auth::DeviceStore>>,
+    /// Unix timestamp of when the JWT signing key became active (nbf for JWKS entry).
+    pub jwt_key_nbf: i64,
+    /// Unix timestamp of when the JWT signing key expires (exp for JWKS entry).
+    /// Default: jwt_key_nbf + 14 days.
+    pub jwt_key_exp: i64,
+    /// Multi-slot JWT signing key store for rotation (drain/active/lead lifecycle).
+    /// When present, JWKS serves all slots and issuance uses the active key.
+    pub signing_key_store: Option<Arc<crate::auth::SigningKeyStore>>,
+    /// Shared JWT ID blocklist for access token revocation (shared with PolicyService).
+    pub jti_blocklist: Option<Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>>,
+    /// ES256 (P-256) signing key rotation store for JWKS and DPoP/atproto interop.
+    pub es256_key_store: Option<Arc<crate::auth::Es256SigningKeyStore>>,
+    /// ML-DSA-65 signing key rotation store for PQ-hybrid JWT issuance.
+    #[cfg(feature = "pq-hybrid")]
+    pub ml_dsa_key_store: Option<Arc<crate::auth::MlDsaSigningKeyStore>>,
 }
 
 impl OAuthState {
-    pub fn new(config: &OAuthConfig, policy_client: PolicyClient, verifying_key_bytes: [u8; 32]) -> Self {
+    pub fn new(config: &OAuthConfig, policy_client: PolicyClient, discovery_client: DiscoveryClient, verifying_key_bytes: [u8; 32]) -> Self {
         Self {
             clients: RwLock::new(HashMap::new()),
+            cimd_cache: Arc::new(super::cimd_cache::CimdCache::new(
+                super::cimd_cache::CimdCacheConfig::default(),
+            )),
+            jwks_uri_cache: RwLock::new(HashMap::new()),
+            client_jwks_uri_cache_ttl: Duration::from_secs(config.client_jwks_uri_cache_ttl_secs),
             pending_codes: RwLock::new(HashMap::new()),
             pending_nonces: RwLock::new(HashMap::new()),
+            pending_par_requests: RwLock::new(HashMap::new()),
             pending_device_codes: RwLock::new(HashMap::new()),
             device_code_by_user_code: RwLock::new(HashMap::new()),
-            refresh_tokens: RwLock::new(HashMap::new()),
+            token_db: None,
             policy_client,
+            discovery_client,
             issuer_url: config.issuer_url(),
             default_scopes: config.default_scopes.clone(),
             token_ttl: config.token_ttl_seconds,
@@ -277,7 +397,7 @@ impl OAuthState {
                 .build()
                 .unwrap_or_default(),
             verifying_key_bytes,
-            user_store: None,
+            user_service: None,
             signing_key: None,
             authority_hints: config.authority_hints.clone(),
             pending_external_auths: RwLock::new(HashMap::new()),
@@ -286,19 +406,203 @@ impl OAuthState {
             rsa_encoding_key: None,
             rsa_jwk: None,
             rsa_kid: None,
+            dpop_jti_seen: RwLock::new(HashMap::new()),
+            dpop_nonces: RwLock::new(HashMap::new()),
+            dpop_clients_seen: RwLock::new(HashMap::new()),
+            trusted_issuers: config.trusted_issuers.clone(),
+            ca_jwt_key: None,
+            device_store: None,
+            jwt_key_nbf: chrono::Utc::now().timestamp(),
+            jwt_key_exp: chrono::Utc::now().timestamp() + 14 * 86400,
+            signing_key_store: None,
+            jti_blocklist: None,
+            es256_key_store: None,
+            #[cfg(feature = "pq-hybrid")]
+            ml_dsa_key_store: None,
         }
     }
 
-    /// Attach a user credential store for Ed25519 challenge-response device verification.
-    pub fn with_user_store(mut self, store: Arc<dyn UserStore + Send + Sync>) -> Self {
-        self.user_store = Some(store);
+    /// Attach the anonymous device store.
+    pub fn with_device_store(mut self, store: Arc<dyn crate::auth::DeviceStore>) -> Self {
+        self.device_store = Some(store);
         self
+    }
+
+    /// Set JWT signing key validity window for the JWKS endpoint.
+    pub fn with_jwt_key_timestamps(mut self, nbf: i64, exp: i64) -> Self {
+        self.jwt_key_nbf = nbf;
+        self.jwt_key_exp = exp;
+        self
+    }
+
+    /// Attach the CA JWT signing key for browser WIT issuance (`POST /oauth/wit`).
+    pub fn with_ca_jwt_key(mut self, key: ed25519_dalek::SigningKey) -> Self {
+        self.ca_jwt_key = Some(Arc::new(key));
+        self
+    }
+
+    /// Attach the multi-slot signing key store (rotation).
+    ///
+    /// When set, JWKS serves all slots and WIT issuance uses the active key.
+    pub fn with_signing_key_store(mut self, store: Arc<crate::auth::SigningKeyStore>) -> Self {
+        self.signing_key_store = Some(store);
+        self
+    }
+
+    /// Attach the ES256 (P-256) key rotation store.
+    pub fn with_es256_key_store(mut self, store: Arc<crate::auth::Es256SigningKeyStore>) -> Self {
+        self.es256_key_store = Some(store);
+        self
+    }
+
+    /// Attach the ML-DSA-65 key rotation store.
+    #[cfg(feature = "pq-hybrid")]
+    pub fn with_ml_dsa_key_store(mut self, store: Arc<crate::auth::MlDsaSigningKeyStore>) -> Self {
+        self.ml_dsa_key_store = Some(store);
+        self
+    }
+
+    /// Return the verifying key to use for JWT bearer token validation.
+    ///
+    /// Prefers the active slot from the signing key store; falls back to the
+    /// legacy `verifying_key_bytes` field (policy-service-issued key).
+    pub async fn jwt_bearer_verifying_key(&self) -> Option<ed25519_dalek::VerifyingKey> {
+        if let Some(store) = &self.signing_key_store {
+            if let Some(bytes) = store.active_verifying_key_bytes().await {
+                return ed25519_dalek::VerifyingKey::from_bytes(&bytes).ok();
+            }
+        }
+        ed25519_dalek::VerifyingKey::from_bytes(&self.verifying_key_bytes).ok()
+    }
+
+    /// Return the active JWT signing key for token issuance (WIT/ADT).
+    ///
+    /// Prefers the active slot from the signing key store; falls back to `ca_jwt_key`.
+    pub async fn active_jwt_signing_key(&self) -> Option<Arc<ed25519_dalek::SigningKey>> {
+        if let Some(store) = &self.signing_key_store {
+            if let Some(key) = store.active_key().await {
+                return Some(key);
+            }
+        }
+        self.ca_jwt_key.clone()
+    }
+
+    /// Attach a user credential store. Creates a `UserService` backed by the store
+    /// for SCIM/RPC access and legacy OAuth handler reads.
+    pub fn with_user_store(mut self, store: Arc<dyn UserStore>) -> Self {
+        self.user_service = Some(Arc::new(UserService::new(store)));
+        self
+    }
+
+    /// Attach a pre-built `UserService`. Used when the service is constructed externally
+    /// (e.g., for testing or when the store is shared across services).
+    pub fn with_user_service(mut self, service: Arc<UserService>) -> Self {
+        self.user_service = Some(service);
+        self
+    }
+
+    /// Get read access to the user store via the UserService.
+    /// Returns None if no user store is configured.
+    pub fn user_store_reader(&self) -> Option<Arc<dyn UserStore>> {
+        self.user_service.as_ref().map(|s| s.store())
+    }
+
+    /// Backward-compatible check: returns true if a user store is configured.
+    pub fn has_user_store(&self) -> bool {
+        self.user_service.is_some()
     }
 
     /// Attach the signing key for OpenID Federation 1.0 entity configuration signing.
     pub fn with_signing_key(mut self, key: ed25519_dalek::SigningKey) -> Self {
         self.signing_key = Some(key);
         self
+    }
+
+    /// Inject a pre-built token store implementation.
+    pub fn with_token_store_impl(&mut self, store: Arc<dyn TokenStore>) {
+        self.token_db = Some(store);
+    }
+
+    /// Persist a refresh token entry to the store.
+    pub async fn put_refresh_token(&self, token: &str, entry: &RefreshTokenEntry, ttl_secs: u64) -> anyhow::Result<()> {
+        let Some(ref store) = self.token_db else {
+            tracing::warn!("Refresh token store not configured — token will not survive restart");
+            return Ok(());
+        };
+        store.put(token, entry, ttl_secs).await
+    }
+
+    /// Look up a refresh token. Returns `None` if not found or expired (lazy expiry).
+    pub async fn get_refresh_token(&self, token: &str) -> anyhow::Result<Option<RefreshTokenEntry>> {
+        let Some(ref store) = self.token_db else {
+            return Ok(None);
+        };
+        store.get(token).await
+    }
+
+    /// Remove a refresh token (revocation / rotation).
+    pub async fn delete_refresh_token(&self, token: &str) -> anyhow::Result<()> {
+        let Some(ref store) = self.token_db else {
+            return Ok(());
+        };
+        store.delete(token).await
+    }
+
+    /// Check a DPoP JTI for replay and record it if new.
+    ///
+    /// Returns `true` when the JTI is fresh (caller should proceed).
+    /// Returns `false` when the JTI has been seen within its validity window (replay).
+    /// Expired entries are pruned opportunistically on each call.
+    pub async fn check_and_record_dpop_jti(&self, jti: &str, iat: i64) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        let expiry = iat + 120; // ±60s window + 60s buffer
+        let mut store = self.dpop_jti_seen.write().await;
+        // Prune expired entries.
+        store.retain(|_, exp| *exp > now);
+        if store.contains_key(jti) {
+            return false;
+        }
+        store.insert(jti.to_owned(), expiry);
+        true
+    }
+
+    /// Issue a fresh server-side DPoP nonce (RFC 9449 §8).
+    ///
+    /// Returns the base64url nonce string that should be placed in the
+    /// `DPoP-Nonce` response header. Stored with a 5-minute TTL.
+    pub async fn issue_dpop_nonce(&self) -> String {
+        use rand::RngCore;
+        let mut bytes = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        let nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let expiry = chrono::Utc::now().timestamp() + 300; // 5-minute TTL
+        self.dpop_nonces.write().await.insert(nonce.clone(), expiry);
+        nonce
+    }
+
+    /// Validate a DPoP nonce issued by this server. Returns `true` if valid and unexpired.
+    pub async fn verify_dpop_nonce(&self, nonce: &str) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        let store = self.dpop_nonces.read().await;
+        store.get(nonce).is_some_and(|&exp| exp > now)
+    }
+
+    /// RFC 9449 §8 nonce-enforcement bookkeeping: has this client (`jkt`)
+    /// previously been issued a nonce that has not yet expired? If so the
+    /// next DPoP proof from this key MUST include a valid nonce.
+    pub async fn dpop_client_requires_nonce(&self, jkt: &str) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        let mut store = self.dpop_clients_seen.write().await;
+        store.retain(|_, exp| *exp > now);
+        store.contains_key(jkt)
+    }
+
+    /// Record that this client (`jkt`) has been issued a server nonce.
+    /// Future proofs from this key are required to carry one (sliding 5-min
+    /// window per nonce TTL).
+    pub async fn mark_dpop_client_nonced(&self, jkt: &str) {
+        let expiry = chrono::Utc::now().timestamp() + 300;
+        self.dpop_clients_seen.write().await.insert(jkt.to_owned(), expiry);
     }
 
     /// Attach an RSA key for RS256 id_token signing (OIDC interop).
@@ -309,10 +613,14 @@ impl OAuthState {
         self.rsa_encoding_key = Some(jsonwebtoken::EncodingKey::from_rsa_der(rsa_der));
 
         // Extract public key components for JWKS using jsonwebtoken's DecodingKey
-        let kid = super::jwks::compute_kid(rsa_der);
-        self.rsa_kid = Some(kid.clone());
-
-        if let Some(jwk) = extract_rsa_jwk_from_der(rsa_der, &kid) {
+        if let Some(mut jwk) = extract_rsa_jwk_from_der(rsa_der, "") {
+            let n = jwk.get("n").and_then(|v| v.as_str()).unwrap_or_default();
+            let e = jwk.get("e").and_then(|v| v.as_str()).unwrap_or_default();
+            let kid = super::jwks::compute_rsa_kid(n, e);
+            if let Some(obj) = jwk.as_object_mut() {
+                obj.insert("kid".to_owned(), serde_json::Value::String(kid.clone()));
+            }
+            self.rsa_kid = Some(kid);
             self.rsa_jwk = Some(jwk);
         }
 
@@ -339,6 +647,12 @@ impl OAuthState {
                     nonces.retain(|_, expiry| *expiry > now);
                 }
 
+                // Sweep expired PAR requests (60s TTL)
+                {
+                    let mut par = state.pending_par_requests.write().await;
+                    par.retain(|_, req| !req.is_expired());
+                }
+
                 // Sweep expired device codes
                 {
                     let mut device_codes = state.pending_device_codes.write().await;
@@ -353,10 +667,12 @@ impl OAuthState {
                     });
                 }
 
-                // Sweep expired refresh tokens
+                // Sweep expired DPoP JTIs and nonces
                 {
-                    let mut tokens = state.refresh_tokens.write().await;
-                    tokens.retain(|_, entry| !entry.is_expired());
+                    let now = chrono::Utc::now().timestamp();
+                    state.dpop_jti_seen.write().await.retain(|_, exp| *exp > now);
+                    state.dpop_nonces.write().await.retain(|_, exp| *exp > now);
+                    state.dpop_clients_seen.write().await.retain(|_, exp| *exp > now);
                 }
 
                 // Sweep expired external auth flows

@@ -10,6 +10,7 @@
 using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".mcpScope;
 using import "/annotations.capnp".mcpDescription;
+using import "/annotations.capnp".optional;
 
 # Unified discovery request with union discriminator
 struct DiscoveryRequest {
@@ -43,6 +44,25 @@ struct DiscoveryRequest {
 
     # Removed: listStreams
     listStreams @8 :Void;
+
+    # Announce a service endpoint (used by services after QUIC binding)
+    announce @9 :ServiceAnnouncement $mcpScope(write) $mcpDescription("Announce a service endpoint for discovery");
+
+    # Phase 0.5 Stage D — federation directory
+    # Push a signed OpenID Federation 1.0 entity statement for an issuer (called by IdP/OAuth service)
+    registerEntityStatement @10 :RegisterEntityStatementRequest $mcpScope(write) $mcpDescription("Register a signed OIDF entity statement for an issuer");
+
+    # Fetch a cached signed entity statement for an issuer (used by FederationKeyResolver before HTTPS fallback)
+    getEntityStatement @11 :Text $mcpScope(query) $mcpDescription("Fetch cached signed entity statement for issuer URL");
+
+    # Push a COSE_KeySet (CBOR) for a service's envelope-signing keys (called by each service at startup + rotation)
+    registerEnvelopeKeyset @12 :RegisterEnvelopeKeysetRequest $mcpScope(write) $mcpDescription("Register envelope COSE_KeySet for a service");
+
+    # Fetch a cached COSE_KeySet for a service's envelope keys
+    getEnvelopeKeyset @13 :Text $mcpScope(query) $mcpDescription("Fetch cached envelope COSE_KeySet for service DID");
+
+    # List all known issuer URLs whose entity statements are cached (authenticated)
+    listKnownIssuers @14 :Void $mcpScope(query) $mcpDescription("List issuers with cached entity statements");
   }
 }
 
@@ -80,6 +100,16 @@ struct DiscoveryResponse {
 
     # Removed: listStreamsResult
     listStreamsResult @9 :Void;
+
+    # Acknowledge endpoint announcement
+    announceResult @10 :Void;
+
+    # Phase 0.5 Stage D — federation directory responses
+    registerEntityStatementResult @11 :Void;
+    getEntityStatementResult @12 :EntityStatement;
+    registerEnvelopeKeysetResult @13 :Void;
+    getEnvelopeKeysetResult @14 :EnvelopeKeyset;
+    listKnownIssuersResult @15 :IssuerList;
   }
 }
 
@@ -101,11 +131,19 @@ struct ServiceList {
 }
 
 # Endpoint information
+# FLAG-DAY: field numbers renumbered in integration-1 (self-proof fields removed).
+# All services and clients must be upgraded together.
 struct EndpointInfo {
   # Socket kind as lowercase text (e.g. "rep", "router")
   socketKind @0 :Text;
   # Endpoint string (e.g. "inproc://hyprstream/policy")
   endpoint @1 :Text;
+  # Service identity JWT (carries sub, pub, exp — replaces self-proof fields)
+  serviceJwt @2 :Text;
+  # TLS endorsement: Sign(tls_key, ed25519_pubkey || domain) — optional
+  tlsEndorsement @3 :Data;
+  # Domain the TLS cert covers — optional, present when tlsEndorsement is set
+  tlsDomain @4 :Text;
 }
 
 # Endpoints for a specific service
@@ -142,3 +180,54 @@ struct AuthMetadataList {
   services @0 :List(AuthMetadata);
 }
 
+# Phase 0.5 Stage D — federation directory types
+
+# Request: push a signed entity statement for an issuer
+struct RegisterEntityStatementRequest {
+  # OAuth issuer URL (e.g. "https://hyprstream.example.com")
+  issuer @0 :Text;
+  # Signed OpenID Federation 1.0 entity statement (compact JWS)
+  jwt @1 :Text;
+}
+
+# Cached signed entity statement
+struct EntityStatement {
+  # OAuth issuer URL this statement is about
+  issuer @0 :Text;
+  # Signed OpenID Federation 1.0 entity statement (compact JWS)
+  jwt @1 :Text;
+  # Unix seconds when this copy was registered in DiscoveryService
+  fetchedAt @2 :Int64;
+}
+
+# Request: push a service's COSE_KeySet (CBOR) for envelope-signing keys
+struct RegisterEnvelopeKeysetRequest {
+  # did:web of the service this keyset belongs to
+  serviceDid @0 :Text;
+  # CBOR-encoded COSE_KeySet (RFC 9052 §7) containing the service's envelope verification keys
+  coseKeysetCbor @1 :Data;
+}
+
+# Cached envelope COSE_KeySet
+struct EnvelopeKeyset {
+  serviceDid @0 :Text;
+  coseKeysetCbor @1 :Data;
+  fetchedAt @2 :Int64;
+}
+
+# List of known issuer URLs
+struct IssuerList {
+  issuers @0 :List(Text);
+}
+
+# Service endpoint announcement (sent by services after QUIC binding)
+struct ServiceAnnouncement {
+  # Service name (e.g. "registry", "policy", "model")
+  serviceName @0 :Text;
+  # Socket kind (e.g. "quic", "rep")
+  socketKind @1 :Text;
+  # Endpoint string (e.g. "quic://localhost:0.0.0.0:4433")
+  endpoint @2 :Text;
+  # Service JWT attesting to the service's pubkey and identity
+  serviceJwt @3 :Text $optional;
+}

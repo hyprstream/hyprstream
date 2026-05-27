@@ -15,8 +15,6 @@ pub fn generate_capnp_runtime() -> String {
 // List pointer:   [offset_words:30 | 0b01:2] [element_size:3 | element_count:29]
 // Text/Data:      List(UInt8) with NUL terminator for Text
 
-import { getHyprstreamWasm } from '../../wasm/hyprstream-rpc/HyprstreamWasm';
-
 const WORD_SIZE = 8;
 
 // Module-level singletons — avoid per-call allocation
@@ -24,30 +22,9 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
 /**
- * WeakMap from the Uint8Array returned by CapnpArena.finish() to the arena that
- * produced it.  Used by call() in client.ts to detect WASM-backed payloads and
- * invoke sign_envelope_into without an extra copy.
- */
-const _wasmArenaMap = new WeakMap<Uint8Array, CapnpArena>();
-
-/**
- * Return the CapnpArena that produced `view`, if it was WASM-backed.
- * Used by HyprstreamClient.call() to detect zero-copy payloads.
- */
-export function getArenaForView(view: Uint8Array): CapnpArena | undefined {
-  return _wasmArenaMap.get(view);
-}
-
-/**
  * Single-segment Cap'n Proto message builder / arena.
  *
- * Two construction modes:
- *   new CapnpArena(dataWords, ptrWords)               — JS-heap backed (Phase 1)
- *   CapnpArena.intoWasm(dataWords, ptrWords, extra)   — WASM-memory backed (Phase 2)
- *
- * WASM-backed arenas allow sign_envelope_into to sign the payload in-place
- * (no JS→WASM copy) and return a SharedArrayBuffer view that stays valid
- * across the async WebTransport send.
+ * JS-heap backed — grows on demand via Uint8Array reallocation.
  */
 export class CapnpArena {
   private buf: DataView;
@@ -62,113 +39,36 @@ export class CapnpArena {
   private readonly rootPtrOffset: number;
   private readonly dataWords: number;
   private readonly ptrWords: number;
-  /** Non-zero when backed by WASM linear memory (pointer value from wasm.alloc). */
-  private _wasmPtr: number = 0;
-  /** Original allocation size in bytes (needed for wasm.dealloc). */
-  private _wasmCapacity: number = 0;
 
-  /**
-   * JS-heap constructor.
-   *
-   * @param dataWords  Number of 64-bit words in the root struct data section
-   * @param ptrWords   Number of pointers in the root struct pointer section
-   * @param externalRaw  Optional externally-allocated buffer (WASM-backed path)
-   * @param wasmPtr    WASM linear-memory pointer matching externalRaw (WASM-backed path)
-   */
   constructor(
     dataWords: number,
     ptrWords: number,
-    externalRaw?: Uint8Array,
-    wasmPtr?: number,
   ) {
     this.dataWords = dataWords;
     this.ptrWords = ptrWords;
 
     const structSize = (dataWords + ptrWords) * WORD_SIZE;
-    // Standard Cap'n Proto format:
-    //   Bytes 0-7:   segment table [num_segments-1=0, segment_size_words]
-    //   Bytes 8-15:  root struct pointer (written by finish())
-    //   Bytes 16+:   root struct data section + pointer section
-    const HEADER = 16; // segment table (8B) + root struct pointer slot (8B)
+    const HEADER = 16;
 
-    if (externalRaw !== undefined && wasmPtr !== undefined) {
-      this.raw = externalRaw;
-      this.capacity = externalRaw.byteLength;
-      this._wasmPtr = wasmPtr;
-      this._wasmCapacity = externalRaw.byteLength;
-    } else {
-      this.capacity = HEADER + structSize + 1024;
-      this.raw = new Uint8Array(this.capacity);
-      this._wasmPtr = 0;
-      this._wasmCapacity = 0;
-    }
+    this.capacity = HEADER + structSize + 1024;
+    this.raw = new Uint8Array(this.capacity);
     this.buf = new DataView(this.raw.buffer, this.raw.byteOffset, this.raw.byteLength);
 
-    this.rootDataOffset = HEADER;                            // 16
-    this.rootPtrOffset  = HEADER + dataWords * WORD_SIZE;   // 16 + dw*8
-    this.allocOffset    = HEADER + structSize;               // 16 + (dw+pw)*8
+    this.rootDataOffset = HEADER;
+    this.rootPtrOffset  = HEADER + dataWords * WORD_SIZE;
+    this.allocOffset    = HEADER + structSize;
   }
-
-  /**
-   * Create a WASM-memory-backed arena.
-   *
-   * The arena allocates `(2 + dataWords + ptrWords + extraWords) * 8` bytes from
-   * WASM linear memory (via wasm.alloc).  finish() returns a subarray view into
-   * that SharedArrayBuffer — valid across async WebTransport sends.
-   *
-   * Call releaseWasm() (or let call() in client.ts do it) to free the WASM memory.
-   *
-   * @param dataWords  Root struct data words
-   * @param ptrWords   Root struct pointer words
-   * @param extraWords Slack for pointer targets (Text/Data/Struct allocations).
-   *                   Defaults to 16 (128 B).  grow() handles overflow automatically.
-   */
-  static intoWasm(dataWords: number, ptrWords: number, extraWords: number = 16): CapnpArena {
-    const wasm = getHyprstreamWasm();
-    // 2 header words (segment table + root ptr slot) + struct + extra
-    const totalBytes = (2 + dataWords + ptrWords + extraWords) * WORD_SIZE;
-    const ptr = wasm.alloc(totalBytes);
-    const view = new Uint8Array(wasm.memory.buffer, ptr, totalBytes);
-    return new CapnpArena(dataWords, ptrWords, view, ptr);
-  }
-
-  /** WASM linear-memory pointer, or 0 if JS-heap backed. */
-  backingPtr(): number { return this._wasmPtr; }
 
   /** The raw backing buffer (for diagnostics / direct access). */
   backingBuffer(): Uint8Array { return this.raw; }
-
-  /**
-   * Free the WASM linear-memory backing (if WASM-backed).
-   * Called automatically by HyprstreamClient.call() after the signed envelope
-   * has been handed to the transport.  Safe to call multiple times.
-   */
-  releaseWasm(): void {
-    if (this._wasmPtr !== 0) {
-      getHyprstreamWasm().dealloc(this._wasmPtr, this._wasmCapacity);
-      this._wasmPtr = 0;
-    }
-  }
 
   /** Ensure capacity for `needed` more bytes, growing if necessary. */
   private ensureCapacity(needed: number): void {
     if (this.allocOffset + needed <= this.capacity) return;
     const newCap = Math.max(this.capacity * 2, this.allocOffset + needed + 256);
-    if (this._wasmPtr !== 0) {
-      // WASM-backed: alloc new WASM buffer, copy, dealloc old
-      const wasm = getHyprstreamWasm();
-      const newPtr = wasm.alloc(newCap);
-      const newRaw = new Uint8Array(wasm.memory.buffer, newPtr, newCap);
-      newRaw.set(this.raw.subarray(0, this.allocOffset));
-      wasm.dealloc(this._wasmPtr, this._wasmCapacity);
-      this._wasmPtr = newPtr;
-      this._wasmCapacity = newCap;
-      this.raw = newRaw;
-    } else {
-      const newBuf = new Uint8Array(newCap);
-      newBuf.set(this.raw);
-      this.raw = newBuf;
-    }
+    const newBuf = new Uint8Array(newCap);
+    newBuf.set(this.raw);
+    this.raw = newBuf;
     this.buf = new DataView(this.raw.buffer, this.raw.byteOffset, this.raw.byteLength);
     this.capacity = newCap;
   }
@@ -435,11 +335,6 @@ export class CapnpArena {
 
     const view = this.raw.subarray(0, 8 + segmentWords * WORD_SIZE);
 
-    // Register WASM-backed views so client.ts can detect zero-copy payloads.
-    if (this._wasmPtr !== 0) {
-      _wasmArenaMap.set(view, this);
-    }
-
     return view;
   }
 
@@ -674,9 +569,11 @@ export class StructBuilder {
 }
 
 /**
- * Single-segment Cap'n Proto message reader.
+ * Cap'n Proto message reader with multi-segment + far pointer support.
  *
  * Reads struct fields at known offsets from a wire-format message.
+ * Handles both single-segment and multi-segment messages, resolving
+ * far pointers (type=2) that reference data in other segments.
  */
 export class CapnpReader {
   private buf: DataView;
@@ -686,6 +583,8 @@ export class CapnpReader {
   /** Byte offset where the root struct's pointer section starts */
   private readonly rootPtrOffset: number;
   private readonly dataWords: number;
+  /** Byte offsets of each segment start (for far pointer resolution) */
+  private readonly segmentOffsets: number[];
 
   /**
    * Parse a Cap'n Proto message from wire-format bytes.
@@ -697,25 +596,61 @@ export class CapnpReader {
     this.raw = bytes;
     this.buf = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     this.dataWords = dataWords;
+    this.segmentOffsets = [];
 
-    // Standard Cap'n Proto format (capnp-rust serialize::write_message):
-    //   Bytes 0-7:  segment table [num_segments-1=0, segment_size_words]
-    //   Bytes 8-15: root struct pointer [offset_words:30 | 0b00:2] [dataWords:16 | ptrWords:16]
-    //   Bytes 16+:  root struct data (when pointer offset_words=0)
-    //
-    // Parse the root struct pointer at byte 8 to find the actual struct data offset.
-    // offset_words=0 means struct data immediately follows the pointer at byte 16.
+    // Standard Cap'n Proto format:
+    //   Segment table: [num_segments-1 (u32), seg0_size (u32), seg1_size (u32), ...]
+    //   Padded to 8-byte boundary, then segment data follows.
+    //   Root struct pointer is the first word of segment 0.
     let rootDataOffset = 8; // fallback for malformed messages
-    if (bytes.length >= 16) {
-      const rootPtrLo = this.buf.getUint32(8, true);
-      if ((rootPtrLo & 3) === 0) {
-        // Struct pointer: upper 30 bits are signed offset_words from end of pointer to struct data
-        const offsetWords = rootPtrLo >> 2; // arithmetic right shift (sign-preserving in JS)
-        rootDataOffset = 16 + offsetWords * 8;
+    if (bytes.length >= 8) {
+      const numSegments = (this.buf.getUint32(0, true)) + 1;
+      const tableBytes = 4 + numSegments * 4;
+      const segDataStart = Math.ceil(tableBytes / 8) * 8;
+
+      // Build segment offset table for far pointer resolution
+      let offset = segDataStart;
+      for (let i = 0; i < numSegments; i++) {
+        this.segmentOffsets.push(offset);
+        const segWords = this.buf.getUint32(4 + i * 4, true);
+        offset += segWords * WORD_SIZE;
+      }
+
+      // Root struct pointer is at segDataStart (first word of segment 0)
+      if (bytes.length >= segDataStart + 8) {
+        const rootPtrLo = this.buf.getUint32(segDataStart, true);
+        if ((rootPtrLo & 3) === 0) {
+          const offsetWords = rootPtrLo >> 2;
+          rootDataOffset = segDataStart + 8 + offsetWords * 8;
+        } else {
+          rootDataOffset = segDataStart;
+        }
       }
     }
     this.rootDataOffset = rootDataOffset;
     this.rootPtrOffset = rootDataOffset + dataWords * WORD_SIZE;
+  }
+
+  /**
+   * Resolve a pointer, following far pointers (type=2) to the target segment.
+   * Returns the resolved pointer words and their byte offset, or null if null pointer.
+   */
+  private resolvePtr(ptrOffset: number): { lo: number; hi: number; offset: number } | null {
+    let lo = this.buf.getUint32(ptrOffset, true);
+    let hi = this.buf.getUint32(ptrOffset + 4, true);
+    if (lo === 0 && hi === 0) return null;
+    if ((lo & 3) === 2) {
+      // Far pointer: follow to target segment
+      const farOffsetWords = lo >>> 3;
+      const segmentId = hi;
+      if (segmentId >= this.segmentOffsets.length) return null;
+      const targetOffset = this.segmentOffsets[segmentId] + farOffsetWords * WORD_SIZE;
+      if ((lo >> 2) & 1) return null; // double-far not supported
+      lo = this.buf.getUint32(targetOffset, true);
+      hi = this.buf.getUint32(targetOffset + 4, true);
+      return { lo, hi, offset: targetOffset };
+    }
+    return { lo, hi, offset: ptrOffset };
   }
 
   // --- Data section getters ---
@@ -769,19 +704,13 @@ export class CapnpReader {
   /** Read a Text pointer at the given pointer index. Returns empty string if null. */
   getText(ptrIndex: number): string {
     const ptrOffset = this.rootPtrOffset + ptrIndex * WORD_SIZE;
-    const lo = this.buf.getUint32(ptrOffset, true);
-    const hi = this.buf.getUint32(ptrOffset + 4, true);
-
-    if (lo === 0 && hi === 0) return ''; // null pointer
-
-    const ptrType = lo & 3;
-    if (ptrType !== 1) return ''; // not a list pointer
-
-    const offsetWords = (lo >> 2) | 0; // signed offset
+    const resolved = this.resolvePtr(ptrOffset);
+    if (!resolved) return '';
+    const { lo, hi, offset } = resolved;
+    if ((lo & 3) !== 1) return '';
+    const offsetWords = (lo >> 2) | 0;
     const byteCount = hi >>> 3;
-    const targetOffset = ptrOffset + WORD_SIZE + offsetWords * WORD_SIZE;
-
-    // Text is NUL-terminated, so actual string length is byteCount - 1
+    const targetOffset = offset + WORD_SIZE + offsetWords * WORD_SIZE;
     const strLen = byteCount > 0 ? byteCount - 1 : 0;
     return decoder.decode(this.raw.subarray(targetOffset, targetOffset + strLen));
   }
@@ -789,56 +718,61 @@ export class CapnpReader {
   /** Read a Data pointer at the given pointer index. Returns empty array if null. */
   getData(ptrIndex: number): Uint8Array {
     const ptrOffset = this.rootPtrOffset + ptrIndex * WORD_SIZE;
-    const lo = this.buf.getUint32(ptrOffset, true);
-    const hi = this.buf.getUint32(ptrOffset + 4, true);
-
-    if (lo === 0 && hi === 0) return new Uint8Array(0);
-
-    const ptrType = lo & 3;
-    if (ptrType !== 1) return new Uint8Array(0);
-
+    const resolved = this.resolvePtr(ptrOffset);
+    if (!resolved) return new Uint8Array(0);
+    const { lo, hi, offset } = resolved;
+    if ((lo & 3) !== 1) return new Uint8Array(0);
     const offsetWords = (lo >> 2) | 0;
     const byteCount = hi >>> 3;
-    const targetOffset = ptrOffset + WORD_SIZE + offsetWords * WORD_SIZE;
-
+    const targetOffset = offset + WORD_SIZE + offsetWords * WORD_SIZE;
     return this.raw.subarray(targetOffset, targetOffset + byteCount);
   }
 
   /** Read a struct pointer and return a StructReader. Returns null if pointer is null. */
   getStruct(ptrIndex: number, dataWords: number, ptrWords: number): StructReader | null {
     const ptrOffset = this.rootPtrOffset + ptrIndex * WORD_SIZE;
-    const lo = this.buf.getUint32(ptrOffset, true);
-    const hi = this.buf.getUint32(ptrOffset + 4, true);
-
-    if (lo === 0 && hi === 0) return null;
-
-    const ptrType = lo & 3;
-    if (ptrType !== 0) return null; // not a struct pointer
-
+    const resolved = this.resolvePtr(ptrOffset);
+    if (!resolved) return null;
+    const { lo, offset } = resolved;
+    if ((lo & 3) !== 0) return null;
     const offsetWords = (lo >> 2) | 0;
-    const targetOffset = ptrOffset + WORD_SIZE + offsetWords * WORD_SIZE;
-
-    return new StructReader(this.raw, this.buf, targetOffset, dataWords, ptrWords);
+    const targetOffset = offset + WORD_SIZE + offsetWords * WORD_SIZE;
+    return new StructReader(this.raw, this.buf, targetOffset, dataWords, ptrWords, this.segmentOffsets);
   }
 
-  /** Read a List(Text) pointer. */
+  /** Read a List(Text) pointer (supports both pointer-list and composite encodings). */
   getTextList(ptrIndex: number): string[] {
     const ptrOffset = this.rootPtrOffset + ptrIndex * WORD_SIZE;
-    const lo = this.buf.getUint32(ptrOffset, true);
-    const hi = this.buf.getUint32(ptrOffset + 4, true);
-
-    if (lo === 0 && hi === 0) return [];
-
-    const ptrType = lo & 3;
-    if (ptrType !== 1) return [];
+    const resolved = this.resolvePtr(ptrOffset);
+    if (!resolved) return [];
+    const { lo, hi, offset } = resolved;
+    if ((lo & 3) !== 1) return [];
 
     const offsetWords = (lo >> 2) | 0;
     const elementSize = hi & 7;
-    const targetOffset = ptrOffset + WORD_SIZE + offsetWords * WORD_SIZE;
+    const targetOffset = offset + WORD_SIZE + offsetWords * WORD_SIZE;
 
-    if (elementSize !== 7) return []; // not composite
+    if (elementSize === 6) {
+      // Pointer list: each element is a pointer to a text blob
+      const elementCount = hi >>> 3;
+      const results: string[] = [];
+      for (let i = 0; i < elementCount; i++) {
+        const elemOffset = targetOffset + i * WORD_SIZE;
+        const elemLo = this.buf.getUint32(elemOffset, true);
+        const elemHi = this.buf.getUint32(elemOffset + 4, true);
+        if (elemLo === 0 && elemHi === 0) { results.push(''); continue; }
+        const elemOffsetWords = (elemLo >> 2) | 0;
+        const byteCount = elemHi >>> 3;
+        const textOffset = elemOffset + WORD_SIZE + elemOffsetWords * WORD_SIZE;
+        const strLen = byteCount > 0 ? byteCount - 1 : 0;
+        results.push(decoder.decode(this.raw.subarray(textOffset, textOffset + strLen)));
+      }
+      return results;
+    }
 
-    // Read tag word
+    if (elementSize !== 7) return []; // unsupported element size
+
+    // Composite list: tag word + elements
     const tagLo = this.buf.getUint32(targetOffset, true);
     const elementCount = (tagLo >> 2) | 0;
 
@@ -866,17 +800,14 @@ export class CapnpReader {
   /** Read a List(Data) pointer. */
   getDataList(ptrIndex: number): Uint8Array[] {
     const ptrOffset = this.rootPtrOffset + ptrIndex * WORD_SIZE;
-    const lo = this.buf.getUint32(ptrOffset, true);
-    const hi = this.buf.getUint32(ptrOffset + 4, true);
-
-    if (lo === 0 && hi === 0) return [];
-
-    const ptrType = lo & 3;
-    if (ptrType !== 1) return [];
+    const resolved = this.resolvePtr(ptrOffset);
+    if (!resolved) return [];
+    const { lo, hi, offset } = resolved;
+    if ((lo & 3) !== 1) return [];
 
     const offsetWords = (lo >> 2) | 0;
     const elementSize = hi & 7;
-    const targetOffset = ptrOffset + WORD_SIZE + offsetWords * WORD_SIZE;
+    const targetOffset = offset + WORD_SIZE + offsetWords * WORD_SIZE;
 
     if (elementSize !== 7) return []; // not composite
 
@@ -906,17 +837,14 @@ export class CapnpReader {
   /** Read a List(Struct) composite list pointer. Returns StructReader[] using wire-format shape from tag word. */
   getStructList(ptrIndex: number, _dataWords: number, _ptrWords: number): StructReader[] {
     const ptrOffset = this.rootPtrOffset + ptrIndex * WORD_SIZE;
-    const lo = this.buf.getUint32(ptrOffset, true);
-    const hi = this.buf.getUint32(ptrOffset + 4, true);
-
-    if (lo === 0 && hi === 0) return [];
-
-    const ptrType = lo & 3;
-    if (ptrType !== 1) return [];
+    const resolved = this.resolvePtr(ptrOffset);
+    if (!resolved) return [];
+    const { lo, hi, offset } = resolved;
+    if ((lo & 3) !== 1) return [];
 
     const offsetWords = (lo >> 2) | 0;
     const elementSize = hi & 7;
-    const targetOffset = ptrOffset + WORD_SIZE + offsetWords * WORD_SIZE;
+    const targetOffset = offset + WORD_SIZE + offsetWords * WORD_SIZE;
 
     if (elementSize !== 7) return []; // not composite
 
@@ -931,7 +859,7 @@ export class CapnpReader {
     const results: StructReader[] = [];
     for (let i = 0; i < elementCount; i++) {
       const elemDataOffset = targetOffset + WORD_SIZE + i * elementWords * WORD_SIZE;
-      results.push(new StructReader(this.raw, this.buf, elemDataOffset, tagDataWords, tagPtrWords));
+      results.push(new StructReader(this.raw, this.buf, elemDataOffset, tagDataWords, tagPtrWords, this.segmentOffsets));
     }
     return results;
   }
@@ -939,6 +867,7 @@ export class CapnpReader {
 
 /**
  * Reader for a sub-struct within a message.
+ * Supports far pointer resolution for multi-segment messages.
  */
 export class StructReader {
   constructor(
@@ -947,7 +876,26 @@ export class StructReader {
     private dataOffset: number,
     private dataWords: number,
     private ptrWords: number,
+    private segmentOffsets: readonly number[] = [],
   ) {}
+
+  /** Resolve a pointer, following far pointers (type=2) to the target segment. */
+  private resolvePtr(ptrOffset: number): { lo: number; hi: number; offset: number } | null {
+    let lo = this.buf.getUint32(ptrOffset, true);
+    let hi = this.buf.getUint32(ptrOffset + 4, true);
+    if (lo === 0 && hi === 0) return null;
+    if ((lo & 3) === 2) {
+      const farOffsetWords = lo >>> 3;
+      const segmentId = hi;
+      if (segmentId >= this.segmentOffsets.length) return null;
+      const targetOffset = this.segmentOffsets[segmentId] + farOffsetWords * WORD_SIZE;
+      if ((lo >> 2) & 1) return null; // double-far not supported
+      lo = this.buf.getUint32(targetOffset, true);
+      hi = this.buf.getUint32(targetOffset + 4, true);
+      return { lo, hi, offset: targetOffset };
+    }
+    return { lo, hi, offset: ptrOffset };
+  }
 
   getBool(byteOffset: number, bitIndex: number): boolean {
     return (this.raw[this.dataOffset + byteOffset] & (1 << bitIndex)) !== 0;
@@ -995,66 +943,70 @@ export class StructReader {
 
   getText(ptrIndex: number): string {
     const ptrOffset = this.dataOffset + this.dataWords * WORD_SIZE + ptrIndex * WORD_SIZE;
-    const lo = this.buf.getUint32(ptrOffset, true);
-    const hi = this.buf.getUint32(ptrOffset + 4, true);
-
-    if (lo === 0 && hi === 0) return '';
-
-    const ptrType = lo & 3;
-    if (ptrType !== 1) return '';
-
+    const resolved = this.resolvePtr(ptrOffset);
+    if (!resolved) return '';
+    const { lo, hi, offset } = resolved;
+    if ((lo & 3) !== 1) return '';
     const offsetWords = (lo >> 2) | 0;
     const byteCount = hi >>> 3;
-    const targetOffset = ptrOffset + WORD_SIZE + offsetWords * WORD_SIZE;
+    const targetOffset = offset + WORD_SIZE + offsetWords * WORD_SIZE;
     const strLen = byteCount > 0 ? byteCount - 1 : 0;
     return decoder.decode(this.raw.subarray(targetOffset, targetOffset + strLen));
   }
 
   getData(ptrIndex: number): Uint8Array {
     const ptrOffset = this.dataOffset + this.dataWords * WORD_SIZE + ptrIndex * WORD_SIZE;
-    const lo = this.buf.getUint32(ptrOffset, true);
-    const hi = this.buf.getUint32(ptrOffset + 4, true);
-
-    if (lo === 0 && hi === 0) return new Uint8Array(0);
-
-    const ptrType = lo & 3;
-    if (ptrType !== 1) return new Uint8Array(0);
-
+    const resolved = this.resolvePtr(ptrOffset);
+    if (!resolved) return new Uint8Array(0);
+    const { lo, hi, offset } = resolved;
+    if ((lo & 3) !== 1) return new Uint8Array(0);
     const offsetWords = (lo >> 2) | 0;
     const byteCount = hi >>> 3;
-    const targetOffset = ptrOffset + WORD_SIZE + offsetWords * WORD_SIZE;
-
+    const targetOffset = offset + WORD_SIZE + offsetWords * WORD_SIZE;
     return this.raw.subarray(targetOffset, targetOffset + byteCount);
   }
 
   getStruct(ptrIndex: number, dataWords: number, ptrWords: number): StructReader | null {
     const ptrOffset = this.dataOffset + this.dataWords * WORD_SIZE + ptrIndex * WORD_SIZE;
-    const lo = this.buf.getUint32(ptrOffset, true);
-    const hi = this.buf.getUint32(ptrOffset + 4, true);
-
-    if (lo === 0 && hi === 0) return null;
-    const ptrType = lo & 3;
-    if (ptrType !== 0) return null;
-
+    const resolved = this.resolvePtr(ptrOffset);
+    if (!resolved) return null;
+    const { lo, offset } = resolved;
+    if ((lo & 3) !== 0) return null;
     const offsetWords = (lo >> 2) | 0;
-    const targetOffset = ptrOffset + WORD_SIZE + offsetWords * WORD_SIZE;
-    return new StructReader(this.raw, this.buf, targetOffset, dataWords, ptrWords);
+    const targetOffset = offset + WORD_SIZE + offsetWords * WORD_SIZE;
+    return new StructReader(this.raw, this.buf, targetOffset, dataWords, ptrWords, this.segmentOffsets);
   }
 
   getTextList(ptrIndex: number): string[] {
     const ptrOffset = this.dataOffset + this.dataWords * WORD_SIZE + ptrIndex * WORD_SIZE;
-    const lo = this.buf.getUint32(ptrOffset, true);
-    const hi = this.buf.getUint32(ptrOffset + 4, true);
-
-    if (lo === 0 && hi === 0) return [];
-    const ptrType = lo & 3;
-    if (ptrType !== 1) return [];
+    const resolved = this.resolvePtr(ptrOffset);
+    if (!resolved) return [];
+    const { lo, hi, offset } = resolved;
+    if ((lo & 3) !== 1) return [];
 
     const offsetWords = (lo >> 2) | 0;
     const elementSize = hi & 7;
-    const targetOffset = ptrOffset + WORD_SIZE + offsetWords * WORD_SIZE;
+    const targetOffset = offset + WORD_SIZE + offsetWords * WORD_SIZE;
+
+    if (elementSize === 6) {
+      const elementCount = hi >>> 3;
+      const results: string[] = [];
+      for (let i = 0; i < elementCount; i++) {
+        const elemOffset = targetOffset + i * WORD_SIZE;
+        const elemLo = this.buf.getUint32(elemOffset, true);
+        const elemHi = this.buf.getUint32(elemOffset + 4, true);
+        if (elemLo === 0 && elemHi === 0) { results.push(''); continue; }
+        const elemOffsetWords = (elemLo >> 2) | 0;
+        const byteCount = elemHi >>> 3;
+        const textOffset = elemOffset + WORD_SIZE + elemOffsetWords * WORD_SIZE;
+        const strLen = byteCount > 0 ? byteCount - 1 : 0;
+        results.push(decoder.decode(this.raw.subarray(textOffset, textOffset + strLen)));
+      }
+      return results;
+    }
 
     if (elementSize !== 7) return [];
+
     const tagLo = this.buf.getUint32(targetOffset, true);
     const elementCount = (tagLo >> 2) | 0;
 
@@ -1075,16 +1027,14 @@ export class StructReader {
 
   getDataList(ptrIndex: number): Uint8Array[] {
     const ptrOffset = this.dataOffset + this.dataWords * WORD_SIZE + ptrIndex * WORD_SIZE;
-    const lo = this.buf.getUint32(ptrOffset, true);
-    const hi = this.buf.getUint32(ptrOffset + 4, true);
-
-    if (lo === 0 && hi === 0) return [];
-    const ptrType = lo & 3;
-    if (ptrType !== 1) return [];
+    const resolved = this.resolvePtr(ptrOffset);
+    if (!resolved) return [];
+    const { lo, hi, offset } = resolved;
+    if ((lo & 3) !== 1) return [];
 
     const offsetWords = (lo >> 2) | 0;
     const elementSize = hi & 7;
-    const targetOffset = ptrOffset + WORD_SIZE + offsetWords * WORD_SIZE;
+    const targetOffset = offset + WORD_SIZE + offsetWords * WORD_SIZE;
 
     if (elementSize !== 7) return [];
     const tagLo = this.buf.getUint32(targetOffset, true);
@@ -1106,16 +1056,14 @@ export class StructReader {
 
   getStructList(ptrIndex: number, _dataWords: number, _ptrWords: number): StructReader[] {
     const ptrOffset = this.dataOffset + this.dataWords * WORD_SIZE + ptrIndex * WORD_SIZE;
-    const lo = this.buf.getUint32(ptrOffset, true);
-    const hi = this.buf.getUint32(ptrOffset + 4, true);
-
-    if (lo === 0 && hi === 0) return [];
-    const ptrType = lo & 3;
-    if (ptrType !== 1) return [];
+    const resolved = this.resolvePtr(ptrOffset);
+    if (!resolved) return [];
+    const { lo, hi, offset } = resolved;
+    if ((lo & 3) !== 1) return [];
 
     const offsetWords = (lo >> 2) | 0;
     const elementSize = hi & 7;
-    const targetOffset = ptrOffset + WORD_SIZE + offsetWords * WORD_SIZE;
+    const targetOffset = offset + WORD_SIZE + offsetWords * WORD_SIZE;
 
     if (elementSize !== 7) return [];
     const tagLo = this.buf.getUint32(targetOffset, true);
@@ -1128,7 +1076,7 @@ export class StructReader {
     const results: StructReader[] = [];
     for (let i = 0; i < elementCount; i++) {
       const elemDataOffset = targetOffset + WORD_SIZE + i * elementWords * WORD_SIZE;
-      results.push(new StructReader(this.raw, this.buf, elemDataOffset, tagDataWords, tagPtrWords));
+      results.push(new StructReader(this.raw, this.buf, elemDataOffset, tagDataWords, tagPtrWords, this.segmentOffsets));
     }
     return results;
   }

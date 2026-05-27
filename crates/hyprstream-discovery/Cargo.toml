@@ -28,6 +28,9 @@ zmq = { workspace = true }
 # Error handling
 anyhow = { workspace = true }
 
+# Concurrency
+parking_lot = { workspace = true }
+
 # Logging
 tracing = { workspace = true }
 

@@ -11,6 +11,20 @@ use crate::capnp::{ToCapnp, FromCapnp};
 use anyhow::Result;
 use serde::{Deserialize, Serialize, Serializer, Deserializer};
 
+/// Compute the RFC 7638 JWK Thumbprint for an Ed25519 key.
+///
+/// The thumbprint is SHA-256 of the lexicographic canonical JWK JSON:
+/// `{"crv":"Ed25519","kty":"OKP","x":"<base64url>"}` — keys in lexicographic order.
+pub fn compute_jkt(key_bytes: &[u8; 32]) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use sha2::{Digest, Sha256};
+    let x = URL_SAFE_NO_PAD.encode(key_bytes);
+    // Keys in lexicographic order per RFC 7638 § 3.
+    let canonical = format!(r#"{{"crv":"Ed25519","kty":"OKP","x":"{x}"}}"#);
+    let hash = Sha256::digest(canonical.as_bytes());
+    URL_SAFE_NO_PAD.encode(hash)
+}
+
 /// Returns true if `iss` belongs to a local node.
 ///
 /// Used for pre-decode key routing (before a `Claims` object exists) and by
@@ -18,15 +32,44 @@ use serde::{Deserialize, Serialize, Serializer, Deserializer};
 /// identical criteria so routing and subject resolution are always consistent.
 ///
 /// Rules:
+/// - Empty `iss` is always local (cluster-internal tokens have no issuer claim).
 /// - If `local_issuers` is non-empty: `iss` must exactly match one entry.
 /// - If `local_issuers` is empty (unconfigured node): only an empty `iss` is
 ///   accepted as local; any non-empty `iss` is treated as federated.
 pub fn is_local_iss(iss: &str, local_issuers: &[&str]) -> bool {
+    if iss.is_empty() {
+        return true;
+    }
     if local_issuers.is_empty() {
-        iss.is_empty()
+        false
     } else {
         local_issuers.contains(&iss)
     }
+}
+
+/// JWK (JSON Web Key) for an Ed25519 public key — RFC 7517 OKP key type.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CnfJwk {
+    pub kty: String,
+    pub crv: String,
+    /// Base64url-encoded Ed25519 public key (32 bytes), RFC 8037 §2.
+    pub x: String,
+}
+
+/// RFC 8705 Proof-of-Possession `cnf` claim.
+///
+/// Two key-binding modes:
+/// - `jwk`: Full OKP JWK object — used for WIMSE service WITs (`cnf.jwk`).
+/// - `jkt`: JWK Thumbprint (RFC 7638 SHA-256, base64url) — used for DPoP user
+///   tokens (`cnf.jkt`, per RFC 9449 § 6).
+///
+/// Both fields are optional so the struct serialises correctly for each mode.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Cnf {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jwk: Option<CnfJwk>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jkt: Option<String>,
 }
 
 /// JWT claims for authentication.
@@ -44,9 +87,20 @@ pub struct Claims {
     pub sub: String,
     pub exp: i64,
     pub iat: i64,
+    /// RFC 7519 JWT ID — unique token identifier for revocation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jti: Option<String>,
     /// RFC 8707 audience claim for resource indicator binding.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aud: Option<String>,
+    /// RFC 8705 / WIMSE proof-of-possession confirmation claim.
+    ///
+    /// Binds the Ed25519 signing key to the JWT-attested identity via a standard
+    /// JWK object (`cnf.jwk`). For service tokens (WIT), derived by the CA from
+    /// the root key. For user tokens, set during OAuth flow from the verified
+    /// Ed25519 challenge-response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cnf: Option<Cnf>,
     /// Original JWT token for end-to-end verification.
     /// When present, downstream services MUST verify this token
     /// independently rather than trusting the envelope claims alone.
@@ -68,7 +122,9 @@ impl std::fmt::Debug for Claims {
             .field("sub", &self.sub)
             .field("exp", &self.exp)
             .field("iat", &self.iat)
+            .field("jti", &self.jti)
             .field("aud", &self.aud)
+            .field("cnf", &self.cnf)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
             .finish()
     }
@@ -90,6 +146,11 @@ impl ToCapnp for Claims {
         }
         if !self.iss.is_empty() {
             builder.set_iss(&self.iss);
+        }
+        if let Some(ref cnf) = self.cnf {
+            if let Some(ref jwk) = cnf.jwk {
+                builder.set_pub_key(&jwk.x);
+            }
         }
         // Write empty scopes list for wire compatibility
         builder.reborrow().init_scopes(0);
@@ -116,12 +177,26 @@ impl FromCapnp for Claims {
             .map(std::borrow::ToOwned::to_owned)
             .unwrap_or_default();
 
+        let cnf = reader.get_pub_key().ok()
+            .and_then(|s| s.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .map(|x| Cnf {
+                jwk: Some(CnfJwk {
+                    kty: "OKP".to_owned(),
+                    crv: "Ed25519".to_owned(),
+                    x: x.to_owned(),
+                }),
+                jkt: None,
+            });
+
         Ok(Self {
             iss,
             sub: reader.get_sub()?.to_str()?.to_owned(),
             exp: reader.get_exp(),
             iat: reader.get_iat(),
+            jti: None,
             aud,
+            cnf,
             token,
         })
     }
@@ -135,9 +210,21 @@ impl Claims {
             sub,
             exp,
             iat,
+            jti: None,
             aud: None,
+            cnf: None,
             token: None,
         }
+    }
+
+    /// Set a random JWT ID (RFC 7519 `jti` claim) for revocation support.
+    pub fn with_jti(mut self) -> Self {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use rand::RngCore as _;
+        let mut bytes = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        self.jti = Some(URL_SAFE_NO_PAD.encode(bytes));
+        self
     }
 
     /// Set the issuer URL (RFC 7519 `iss` claim).
@@ -157,6 +244,49 @@ impl Claims {
     pub fn with_token(mut self, token: String) -> Self {
         self.token = Some(token);
         self
+    }
+
+    /// Set the RFC 8705 `cnf.jwk` confirmation claim (WIMSE WIT key binding).
+    ///
+    /// `key_bytes` is the raw 32-byte Ed25519 public key. Produces a standard
+    /// OKP JWK object with `kty: "OKP"`, `crv: "Ed25519"`, `x: <base64url>`.
+    pub fn with_cnf_jwk(mut self, key_bytes: &[u8; 32]) -> Self {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        self.cnf = Some(Cnf {
+            jwk: Some(CnfJwk {
+                kty: "OKP".to_owned(),
+                crv: "Ed25519".to_owned(),
+                x: URL_SAFE_NO_PAD.encode(key_bytes),
+            }),
+            jkt: None,
+        });
+        self
+    }
+
+    /// Set the RFC 9449 `cnf.jkt` confirmation claim (DPoP JWK thumbprint).
+    ///
+    /// `key_bytes` is the raw 32-byte Ed25519 public key. The thumbprint is
+    /// computed per RFC 7638: SHA-256 of the lexicographic canonical JWK JSON,
+    /// base64url-encoded.
+    pub fn with_cnf_jkt(mut self, key_bytes: &[u8; 32]) -> Self {
+        self.cnf = Some(Cnf {
+            jwk: None,
+            jkt: Some(compute_jkt(key_bytes)),
+        });
+        self
+    }
+
+    /// Extract the raw 32-byte Ed25519 public key from `cnf.jwk.x`, if present.
+    pub fn cnf_key_bytes(&self) -> Option<[u8; 32]> {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let x = self.cnf.as_ref()?.jwk.as_ref()?.x.as_str();
+        let bytes = URL_SAFE_NO_PAD.decode(x).ok()?;
+        bytes.try_into().ok()
+    }
+
+    /// Return the `cnf.jkt` thumbprint string, if present.
+    pub fn cnf_jkt(&self) -> Option<&str> {
+        self.cnf.as_ref()?.jkt.as_deref()
     }
 
     /// Independently verify the embedded JWT token.
@@ -282,9 +412,9 @@ mod tests {
         assert!(local.is_local_to(&["https://local.example.com"]));
         assert!(!local.is_local_to(&["https://other.example.com"]));
         assert!(!federated.is_local_to(&["https://local.example.com"]));
-        // Empty iss is local only when no local issuers configured
+        // Empty iss is always local — cluster-internal tokens have no issuer claim
         assert!(legacy.is_local_to(&[]));
-        assert!(!legacy.is_local_to(&["https://local.example.com"]));
+        assert!(legacy.is_local_to(&["https://local.example.com"]));
     }
 
     #[test]

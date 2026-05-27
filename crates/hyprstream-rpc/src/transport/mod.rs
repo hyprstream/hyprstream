@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 
-pub use traits::{AsyncTransport, Transport};
+pub use crate::transport_traits::{PublishSink, Signer, Transport};
 
 /// Socket bind mode for transport configuration.
 ///
@@ -296,6 +296,18 @@ impl TransportConfig {
     #[inline]
     pub fn to_zmq_string(&self) -> String {
         self.zmq_endpoint()
+    }
+
+    /// Get the WebTransport URL for QUIC endpoints.
+    ///
+    /// Returns `https://{server_name}:{port}` for QUIC endpoints, `None` otherwise.
+    pub fn quic_webtransport_url(&self) -> Option<String> {
+        match &self.endpoint {
+            EndpointType::Quic { addr, server_name } => {
+                Some(format!("https://{}:{}", server_name, addr.port()))
+            }
+            _ => None,
+        }
     }
 
     /// Apply CurveZMQ configuration to a socket (client or server).

@@ -7,10 +7,9 @@
 //!
 //! # Signing Flow
 //!
-//! 1. API server validates bearer token or OS user
-//! 2. Creates `RequestIdentity` with user info
-//! 3. Signs `(request_id || identity || payload)` with server's Ed25519 key
-//! 4. ZMQ service verifies signature before processing
+//! 1. API server validates bearer token or JWT
+//! 2. Signs `RequestEnvelope` (request_id, payload, nonce, iat) with Ed25519 key
+//! 3. ZMQ service verifies signature before processing
 
 use zeroize::Zeroizing;
 

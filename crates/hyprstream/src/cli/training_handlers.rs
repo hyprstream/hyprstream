@@ -25,7 +25,7 @@ use crate::services::{InferenceServiceConfig, RegistryClient, WorktreeClient, IN
 use crate::services::generated::inference_client::InferenceClient;
 use crate::storage::ModelRef;
 use crate::zmq::global_context;
-use hyprstream_rpc::{RequestIdentity, SigningKey, VerifyingKey};
+use hyprstream_rpc::{SigningKey, VerifyingKey};
 use hyprstream_service::ServiceSpawner;
 use std::path::PathBuf;
 
@@ -393,13 +393,30 @@ pub async fn handle_training_infer(
     let mut service_handle = spawner.spawn(service_config).await
         .map_err(|e| anyhow::anyhow!("Failed to spawn inference service: {}", e))?;
 
-    // Create client for service communication
-    let client = InferenceClient::new(signing_key, RequestIdentity::anonymous());
+    // Create client for service communication — resolve inference key via PolicyService
+    let policy_vk = signing_key.verifying_key();
+    let policy_client = crate::services::PolicyClient::for_service(
+        signing_key.clone(), policy_vk, None,
+    );
+    let key_resp = policy_client.resolve_service_key(
+        &crate::services::generated::policy_client::ResolveServiceKey {
+            service_name: "inference".to_owned(),
+        },
+    ).await.map_err(|e| anyhow::anyhow!("Failed to resolve inference key: {e}"))?;
+    let inference_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+        key_resp.verifying_key.as_slice().try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
+    ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?;
+    let client = InferenceClient::for_service(
+        signing_key.clone(),
+        inference_vk,
+        None,
+    );
 
     // Apply chat template
     let messages = vec![ChatMessage { role: "user".into(), content: prompt.into(), tool_calls: vec![], tool_call_id: String::new() }];
 
-    let formatted_prompt = match client.apply_chat_template(&ChatTemplateRequest { messages: messages.clone(), add_generation_prompt: true, tools_json: Some(String::new()), max_tokens: None }).await {
+    let formatted_prompt = match client.apply_chat_template(&ChatTemplateRequest { messages: messages.clone(), add_generation_prompt: true, tools_json: Some(String::new()), max_tokens: None, enable_thinking: None, template_vars_json: None }).await {
         Ok(formatted) => formatted,
         Err(e) => {
             warn!("Could not apply chat template: {}. Using raw prompt.", e);
@@ -685,7 +702,25 @@ pub async fn handle_training_batch(
     let mut service_handle = spawner.spawn(service_config).await
         .map_err(|e| anyhow::anyhow!("Failed to spawn inference service: {}", e))?;
 
-    let client = InferenceClient::new(signing_key, RequestIdentity::anonymous());
+    // Resolve inference key via PolicyService
+    let policy_vk = signing_key.verifying_key();
+    let policy_client = crate::services::PolicyClient::for_service(
+        signing_key.clone(), policy_vk, None,
+    );
+    let key_resp = policy_client.resolve_service_key(
+        &crate::services::generated::policy_client::ResolveServiceKey {
+            service_name: "inference".to_owned(),
+        },
+    ).await.map_err(|e| anyhow::anyhow!("Failed to resolve inference key: {e}"))?;
+    let inference_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+        key_resp.verifying_key.as_slice().try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
+    ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?;
+    let client = InferenceClient::for_service(
+        signing_key.clone(),
+        inference_vk,
+        None,
+    );
 
     // Get adapter info for checkpoint saves
     let adapter_manager = AdapterManager::new(&model_path);

@@ -32,6 +32,7 @@ async-trait.workspace = true
 tokio-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+subsecond.workspace = true
 json-threat-protection.workspace = true
 nix.workspace = true
 users.workspace = true
@@ -47,6 +48,8 @@ serde_yaml.workspace = true
 git2.workspace = true  # Still needed by git2db internally
 git2db = { path = "../git2db", features = ["overlayfs"] }  # High-level git library with overlayfs
 hyprstream-rpc = { path = "../hyprstream-rpc" }  # RPC infrastructure (Cap'n Proto + ZMQ)
+ml-dsa = { workspace = true, optional = true }  # ML-DSA-65 (pq-hybrid JWT signing)
+hyprstream-rpc-std = { path = "../hyprstream-rpc-std" }  # Standard service schemas + clients
 hyprstream-discovery = { path = "../hyprstream-discovery" }  # Service discovery
 hyprstream-service = { path = "../hyprstream-service" }  # Service orchestration
 hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }  # RPC code generation proc macros
@@ -73,7 +76,6 @@ dirs = "5"  # User directory paths for CLI
 
 rmcp = { version = "0.14", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
 http = "1"  # HTTP types (request::Parts) for MCP identity extraction
-schemars = "1.2"
 
 tracing-log.workspace = true
 tracing-appender.workspace = true
@@ -92,6 +94,7 @@ prost.workspace = true
 rcgen.workspace = true  # Self-signed TLS cert generation for QUIC
 rustls.workspace = true  # TLS runtime (ring crypto provider for axum-server)
 rustls-pemfile.workspace = true  # PEM file parsing for TLS certs
+rustls-acme.workspace = true  # ACME (Let's Encrypt / step-ca) automatic cert provisioning
 zeroize.workspace = true  # Zeroing private key material on drop
 time = "0.3"  # Datetime types for certificate validity
 
@@ -138,14 +141,13 @@ notify = { version = "7", default-features = false, features = ["macos_kqueue"] 
 libc = "0.2"  # For system calls in overlay2 driver
 reflink-copy = "0.1"  # COW file copying (reflink when available)
 hyprstream-containedfs.workspace = true  # Path-contained filesystem operations
-age = { version = "0.11.2", features = ["armor"] }
+rocksdb = "0.23"  # User credential store (RocksDbUserStore)
+fred = { version = "9", optional = true }  # Async Redis/Valkey client (ValkeyUserStore, ValkeyTokenStore)
 hyprstream-tui = { path = "../hyprstream-tui" }  # Setup wizard TUI (WizardBackend trait + WizardApp)
 hyprstream-compositor = { path = "../hyprstream-compositor" }  # Pure TUI compositor (chrome state machine)
 waxterm = { path = "../waxterm", features = ["avt"] }  # Terminal abstraction for TUI rendering
-avt = "0.17"  # VTE for ShellClient pane rendering
 ratatui = { version = "0.30", default-features = false }  # TUI framework for pane buffers
 vte = "0.13"  # VT100/ANSI escape sequence parser for TUI pane ingestion
-rtrb = "0.3"  # SPSC ring buffer for VTE parser thread
 
 [target.'cfg(target_os = "linux")'.dependencies]
 lru.workspace = true  # LRU cache for model caching and Git repository handles
@@ -160,10 +162,13 @@ blake3.workspace = true                  # Fast cryptographic hashing for checks
 tempfile.workspace = true                # Temporary files for model conversion
 base64.workspace = true                  # JWT token encoding
 ed25519-dalek.workspace = true           # JWT Ed25519 signatures
+p256.workspace = true                    # ES256 DPoP verification (atproto interop)
 keyring = { version = "3", features = ["linux-native"] }  # OS keyring — Linux keyutils
 curve25519-dalek.workspace = true        # Ristretto255 DH for stream authentication
 hkdf.workspace = true                    # HKDF key derivation
+bs58 = "0.5"                             # Base58 encoding for device fingerprints
 subtle.workspace = true                  # Constant-time operations
+ring = "0.17"                            # TLS endorsement signing (key-type-agnostic)
 
 # HTTP API dependencies
 axum.workspace = true
@@ -171,7 +176,6 @@ axum-server.workspace = true
 tower-http.workspace = true
 url.workspace = true
 urlencoding.workspace = true
-half.workspace = true
 shellexpand.workspace = true
 
 # macOS/iOS: Keychain via apple-native
@@ -189,6 +193,7 @@ keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 [features]
 default = ["gittorrent", "xet", "systemd", "otel"]
 cuda = []
+valkey = ["dep:fred"]  # Enable Valkey/Redis-backed user and token stores
 bnb = ["dep:bitsandbytes-sys"]  # Enable bitsandbytes KV cache quantization (requires compatible ROCm/CUDA)
 xet = ["git2db/xet-storage"]  # Enable XET large file storage
 otel = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:opentelemetry-semantic-conventions", "dep:opentelemetry-stdout"]
@@ -197,6 +202,7 @@ download-libtorch = ["tch/download-libtorch"]
 overlayfs = ["git2db/overlayfs"]  # Enable overlayfs-backed worktrees (delegated to git2db)
 systemd = ["hyprstream-rpc/systemd", "hyprstream-service/systemd", "hyprstream-workers/systemd", "dep:listenfd"]  # Systemd integration (socket activation, service units)
 experimental = ["hyprstream-compositor/experimental"]  # EXPERIMENTAL: Enable service/worker panels, git write operations
+pq-hybrid = ["hyprstream-rpc/pq-hybrid", "hyprstream-service/pq-hybrid", "dep:ml-dsa"]  # Post-quantum hybrid: ML-DSA-65 + ML-KEM-768
 
 [build-dependencies]
 capnpc.workspace = true  # Cap'n Proto schema compiler

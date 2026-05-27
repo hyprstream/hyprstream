@@ -96,8 +96,26 @@ pub fn keyed_mac(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
 
 /// Compute a 16-byte truncated keyed MAC (for wire format).
 ///
-/// Used by streaming protocol where 16-byte MACs reduce overhead
-/// while still providing 128-bit security (adequate for stream auth).
+/// Used by streaming protocol (`StreamHmacState`) where 16-byte MACs reduce
+/// overhead while still providing 128-bit authentication strength.
+///
+/// # Wire format dependency
+///
+/// The 16-byte truncation is part of the on-wire stream block format. **Do not**
+/// widen this to 32 bytes without coordinating a protocol version bump on both
+/// server and client — the receiver expects exactly 16 bytes per block trailer.
+///
+/// # Cryptographic properties
+///
+/// 128-bit MAC tags are the standard floor for authentication (GCM, Poly1305,
+/// SIV, CMAC all operate at 128 bits). Both Blake3 and HMAC-SHA256 are PRFs;
+/// truncating to any prefix preserves PRF security. Online forgery probability
+/// per attempt is 2^-128. The 2^64 collision bound does NOT threaten
+/// authentication; it would only matter if you relied on collision-resistance.
+///
+/// First-N-bytes truncation is the standard safe pattern (NIST SP 800-107,
+/// FIPS 198-1). The myth that you need middle/folded truncation came from
+/// ad-hoc constructions on MD5/SHA-1 and does not apply here.
 ///
 /// # Arguments
 ///
@@ -106,7 +124,7 @@ pub fn keyed_mac(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
 ///
 /// # Returns
 ///
-/// 16-byte truncated MAC tag.
+/// 16-byte truncated MAC tag (first 16 bytes of full output).
 pub fn keyed_mac_truncated(key: &[u8; 32], data: &[u8]) -> [u8; 16] {
     let full = keyed_mac(key, data);
     let mut output = [0u8; 16];

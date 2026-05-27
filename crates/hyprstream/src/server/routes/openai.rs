@@ -30,8 +30,6 @@ use crate::{
     services::generated::model_client::ModelClient,
 };
 
-use hyprstream_rpc::RequestIdentity;
-
 
 /// RAII guard for metrics cleanup
 struct MetricsGuard<'a> {
@@ -199,16 +197,6 @@ fn claims_from_auth(user: &str, jwt_token: Option<&str>, jwt_exp: Option<i64>) -
         claims = claims.with_token(token.to_owned());
     }
     claims
-}
-
-/// Build RequestIdentity from extracted auth user string.
-/// Unauthenticated = anonymous (NEVER local server identity).
-fn identity_from_user(user: &str) -> RequestIdentity {
-    if user == "anonymous" {
-        RequestIdentity::anonymous()
-    } else {
-        RequestIdentity::api_token(user, "openai")
-    }
 }
 
 /// Helper: Resolve model name to filesystem path (also validates inference capability)
@@ -429,6 +417,8 @@ async fn chat_completions(
             add_generation_prompt: true,
             tools_json: Some(tools_str.clone()).filter(|s| !s.is_empty()),
             max_tokens: request.max_tokens.map(|v| v as u32),
+            enable_thinking: None,
+            template_vars_json: None,
         })
         .await
     {
@@ -469,10 +459,34 @@ async fn chat_completions(
     );
 
     // Call inference via collect-stream (per-request ZMQ client preserves caller identity for TTT delta routing)
-    let identity = identity_from_user(&user);
-    let model_client = ModelClient::new((*state.signing_key).clone(), identity);
-    let claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
-    let result = collect_stream_to_result(&model_client.with_claims(claims), &request.model, &gen_request).await;
+    let model_server_vk = match state.policy_client.resolve_service_key(
+        &crate::services::generated::policy_client::ResolveServiceKey {
+            service_name: "model".to_owned(),
+        },
+    ).await {
+        Ok(resp) => match <[u8; 32]>::try_from(resp.verifying_key.as_slice()) {
+            Ok(bytes) => match hyprstream_rpc::crypto::VerifyingKey::from_bytes(&bytes) {
+                Ok(vk) => vk,
+                Err(_) => {
+                    tracing::error!("Invalid Ed25519 key from PolicyService");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "Key resolution failed").into_response();
+                }
+            }
+            Err(_) => {
+                tracing::error!("Invalid key length from PolicyService");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Key resolution failed").into_response();
+            }
+        }
+        Err(e) => {
+            tracing::error!("Failed to resolve model key: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Key resolution failed").into_response();
+        }
+    };
+    let model_client = ModelClient::for_service((*state.signing_key).clone(), model_server_vk, None);
+    let _claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
+    // Note: OAI adapter currently creates a fresh client per request.
+    // For bearer delegation, use: model_client.request().delegated_bearer(jwt).call(payload)
+    let result = collect_stream_to_result(&model_client, &request.model, &gen_request).await;
 
     info!("Generation completed - success: {}", result.is_ok());
 
@@ -639,6 +653,8 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                 add_generation_prompt: true,
                 tools_json: Some(tools_str.clone()).filter(|s| !s.is_empty()),
                 max_tokens: request.max_tokens.map(|v| v as u32),
+                enable_thinking: None,
+                template_vars_json: None,
             })
             .await
         {
@@ -669,12 +685,37 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
         );
 
         // Start ZMQ stream with per-request client (preserves caller identity for TTT delta routing)
-        let identity = identity_from_user(&user);
-        let model_client = ModelClient::new((*state.signing_key).clone(), identity);
-        let claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
-        let client = model_client.with_claims(claims);
+        let model_server_vk = match state.policy_client.resolve_service_key(
+            &crate::services::generated::policy_client::ResolveServiceKey {
+                service_name: "model".to_owned(),
+            },
+        ).await {
+            Ok(resp) => {
+                let bytes: [u8; 32] = match resp.verifying_key.as_slice().try_into() {
+                    Ok(b) => b,
+                    Err(_) => {
+                        tracing::error!("Invalid key length from PolicyService");
+                        return;
+                    }
+                };
+                match hyprstream_rpc::crypto::VerifyingKey::from_bytes(&bytes) {
+                    Ok(vk) => vk,
+                    Err(e) => {
+                        tracing::error!("Invalid Ed25519 key from PolicyService: {e}");
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to resolve model key: {e}");
+                return;
+            }
+        };
+        let model_client = ModelClient::for_service((*state.signing_key).clone(), model_server_vk, None);
+        let _claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
+        // Note: For bearer delegation, use: model_client.request().delegated_bearer(jwt).call(payload)
         use crate::services::generated::model_client::InferRpc;
-        let mut stream_handle = match InferRpc::generate_stream(&client.infer(&model_name), &gen_request).await {
+        let mut stream_handle = match InferRpc::generate_stream(&model_client.infer(&model_name), &gen_request).await {
             Ok(h) => h,
             Err(e) => {
                 error!("Failed to start ZMQ stream: {}", e);
@@ -964,6 +1005,8 @@ async fn completions(
             add_generation_prompt: true,
             tools_json: None,
             max_tokens: request.max_tokens.map(|v| v as u32),
+            enable_thinking: None,
+            template_vars_json: None,
         })
         .await
     {
@@ -993,10 +1036,32 @@ async fn completions(
     );
 
     // Call inference via collect-stream (per-request ZMQ client preserves caller identity for TTT delta routing)
-    let identity = identity_from_user(&user);
-    let model_client = ModelClient::new((*state.signing_key).clone(), identity);
-    let claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
-    let result = collect_stream_to_result(&model_client.with_claims(claims), &request.model, &gen_request).await;
+    let model_server_vk = match state.policy_client.resolve_service_key(
+        &crate::services::generated::policy_client::ResolveServiceKey {
+            service_name: "model".to_owned(),
+        },
+    ).await {
+        Ok(resp) => match <[u8; 32]>::try_from(resp.verifying_key.as_slice()) {
+            Ok(bytes) => match hyprstream_rpc::crypto::VerifyingKey::from_bytes(&bytes) {
+                Ok(vk) => vk,
+                Err(_) => {
+                    tracing::error!("Invalid Ed25519 key from PolicyService");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "Key resolution failed").into_response();
+                }
+            }
+            Err(_) => {
+                tracing::error!("Invalid key length from PolicyService");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Key resolution failed").into_response();
+            }
+        }
+        Err(e) => {
+            tracing::error!("Failed to resolve model key: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Key resolution failed").into_response();
+        }
+    };
+    let model_client = ModelClient::for_service((*state.signing_key).clone(), model_server_vk, None);
+    let _claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
+    let result = collect_stream_to_result(&model_client, &request.model, &gen_request).await;
 
     // Metrics automatically decremented by MetricsGuard on drop
 

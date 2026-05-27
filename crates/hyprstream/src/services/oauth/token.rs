@@ -9,23 +9,28 @@
 //! - `grant_type=refresh_token` — OAuth 2.1 token refresh with rotation
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use axum::{
     extract::State,
-    http::{header, StatusCode},
+    http::{HeaderMap, header, StatusCode},
     response::{IntoResponse, Response},
     Form, Json,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use super::state::{DeviceCodeStatus, OAuthState, RefreshTokenEntry};
 use crate::services::generated::policy_client::IssueToken;
 
 /// Device code grant type URN (RFC 8628).
 const DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+/// JWT bearer grant type URN (RFC 7523).
+const JWT_BEARER_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
+/// Token exchange grant type URN (RFC 8693).
+const TOKEN_EXCHANGE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 
 /// Token exchange request (application/x-www-form-urlencoded).
 ///
@@ -47,11 +52,33 @@ pub struct TokenRequest {
     // refresh_token field
     #[serde(default)]
     pub refresh_token: Option<String>,
+    // jwt-bearer assertion (RFC 7523)
+    #[serde(default)]
+    pub assertion: Option<String>,
+    // private_key_jwt client auth (RFC 7521 §4.2, RFC 7523 §2.2)
+    #[serde(default)]
+    pub client_assertion: Option<String>,
+    #[serde(default)]
+    pub client_assertion_type: Option<String>,
+    // token-exchange fields (RFC 8693)
+    #[serde(default)]
+    pub subject_token: Option<String>,
+    #[serde(default)]
+    pub subject_token_type: Option<String>,
+    #[serde(default)]
+    pub requested_token_type: Option<String>,
+    #[serde(default)]
+    pub actor_token: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub audience: Option<String>,
 }
 
 /// POST /oauth/token — token exchange
 pub async fn exchange_token(
     State(state): State<Arc<OAuthState>>,
+    req_headers: HeaderMap,
     Form(params): Form<TokenRequest>,
 ) -> Response {
     tracing::info!(
@@ -62,34 +89,266 @@ pub async fn exchange_token(
         has_code_verifier = params.code_verifier.is_some(),
         "Token exchange request received"
     );
+    // Extract optional DPoP proof header (RFC 9449).
+    let dpop_header: Option<String> = req_headers
+        .get("DPoP")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
+    // Extract __Secure-VaultDevice cookie for silent device-user linking.
+    let vault_device_cookie: Option<String> = req_headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').find_map(|part| {
+                let part = part.trim();
+                part.strip_prefix("__Secure-VaultDevice=").map(str::to_owned)
+            })
+        });
+
+    // Client authentication gate. For confidential clients (those that
+    // declared token_endpoint_auth_method=private_key_jwt at
+    // registration), verify the client_assertion JWT against the
+    // client's JWKS BEFORE dispatching the grant. Public clients
+    // (auth_method=none or unset) skip this — PKCE substitutes for
+    // client auth per OAuth 2.1.
+    if let Err(resp) = enforce_client_authentication(&state, &params).await {
+        return resp;
+    }
+
     match params.grant_type.as_str() {
-        "authorization_code" => exchange_authorization_code(state, params).await,
-        "refresh_token" => exchange_refresh_token(state, params).await,
-        gt if gt == DEVICE_CODE_GRANT_TYPE => exchange_device_code(state, params).await,
+        "authorization_code" => exchange_authorization_code(state, params, dpop_header, vault_device_cookie).await,
+        "refresh_token" => exchange_refresh_token(state, params, dpop_header, vault_device_cookie).await,
+        gt if gt == DEVICE_CODE_GRANT_TYPE => exchange_device_code(state, params, dpop_header, vault_device_cookie).await,
+        gt if gt == JWT_BEARER_GRANT_TYPE => {
+            let assertion = match params.assertion {
+                Some(a) => a,
+                None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", Some("assertion is required")),
+            };
+            super::jwt_bearer::exchange_jwt_bearer(&state, &params.client_id, &assertion).await
+        }
+        gt if gt == TOKEN_EXCHANGE_GRANT_TYPE => {
+            let subject_token = match params.subject_token {
+                Some(t) => t,
+                None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", Some("subject_token is required")),
+            };
+            let subject_token_type = match params.subject_token_type {
+                Some(t) => t,
+                None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", Some("subject_token_type is required")),
+            };
+            super::token_exchange::exchange_token_exchange(
+                &state,
+                &subject_token,
+                &subject_token_type,
+                params.audience.as_deref(),
+                params.scope.as_deref(),
+                params.actor_token.as_deref(),
+                params.requested_token_type.as_deref(),
+            ).await
+        }
         _ => token_error(
             StatusCode::BAD_REQUEST,
             "unsupported_grant_type",
-            "Supported: authorization_code, refresh_token, device_code",
+            Some("Supported: authorization_code, refresh_token, device_code, jwt-bearer"),
         ),
     }
+}
+
+/// Enforce token endpoint client authentication.
+///
+/// Resolves the registered client (DCR or CIMD-cached), then:
+///   - If the client requires `private_key_jwt`: `client_assertion` and
+///     `client_assertion_type` MUST be present and verify successfully.
+///   - If the client does NOT require it but an assertion was sent
+///     anyway: we still verify it (best-effort, defense in depth).
+///   - Unknown client_ids return invalid_client.
+///
+/// Returns Ok on success; the caller proceeds with the grant. Returns
+/// Err(Response) with the appropriate token error response on failure.
+async fn enforce_client_authentication(
+    state: &OAuthState,
+    params: &TokenRequest,
+) -> Result<(), Response> {
+    // CIMD client_ids are HTTPS URLs; DCR client_ids are UUIDs.
+    //
+    // For CIMD: on cache miss (entry expired between PAR/authorize
+    // admission and now), we MUST re-resolve via resolve_cimd_client,
+    // not fall through. Otherwise a client that declared
+    // token_endpoint_auth_method=private_key_jwt could pass through
+    // without an assertion check just because its cache entry aged
+    // out — a security regression.
+    //
+    // resolve_cimd_client re-runs the federation:register policy check
+    // and re-fetches metadata, so a revocation that happened during
+    // the user's consent step is honored at token time.
+    let client = if params.client_id.starts_with("https://") {
+        match state.cimd_cache.get(&params.client_id).await {
+            Some(c) => Some(c),
+            None => super::registration::resolve_cimd_client(state, &params.client_id)
+                .await
+                .ok(),
+        }
+    } else {
+        state.clients.read().await.get(&params.client_id).cloned()
+    };
+
+    let Some(client) = client else {
+        // Genuinely unknown client_id. For grants that don't need a
+        // RegisteredClient (jwt-bearer, token_exchange) the downstream
+        // handler dispatches without it. For grants that DO need one
+        // (authorization_code, refresh_token, device_code), the
+        // downstream handler's own client_id check on the pending entry
+        // will reject — but only if the IDs don't match. Permitting
+        // pass-through here is safe because:
+        //   - CIMD path above already attempts re-resolve, so a real
+        //     CIMD client_id has had two chances to be found.
+        //   - DCR clients with UUID IDs are only "absent" if they were
+        //     never registered, in which case no pending entry exists.
+        return Ok(());
+    };
+
+    let needs_auth = super::client_auth::requires_private_key_jwt(&client);
+    let has_assertion = params.client_assertion.is_some() && params.client_assertion_type.is_some();
+
+    if needs_auth && !has_assertion {
+        // Client-actionable: the client knows their own
+        // token_endpoint_auth_method registration; we can tell them
+        // what's missing from the request they sent.
+        return Err(token_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_client",
+            Some("client_assertion required"),
+        ));
+    }
+
+    if has_assertion {
+        let assertion = params.client_assertion.as_deref().unwrap_or_else(|| unreachable!());
+        let atype = params.client_assertion_type.as_deref().unwrap_or_else(|| unreachable!());
+        let token_endpoint = format!(
+            "{}/oauth/token",
+            state.issuer_url.trim_end_matches('/')
+        );
+        if let Err(e) = super::client_auth::verify_client_assertion(
+            state, &client, atype, assertion, &token_endpoint,
+        ).await {
+            // Full reason goes to logs; the public response stays
+            // opaque so we don't leak the validation logic / order
+            // (iss/sub/aud/exp/signature) to probing attackers.
+            tracing::warn!(
+                client_id = %params.client_id,
+                error = %e,
+                "client_assertion verification failed"
+            );
+            return Err(token_error(
+                StatusCode::UNAUTHORIZED,
+                "invalid_client",
+                None,
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Verify a DPoP proof for the token endpoint, check JTI replay, enforce
+/// server-side nonces per RFC 9449 §8.
+///
+/// Returns `None` when no DPoP header is present (DPoP is optional at the
+/// token endpoint).
+/// Returns `Some(Ok(jkt))` on success; `Some(Err(response))` on failure.
+///
+/// Nonce enforcement policy:
+/// - First proof from a given `jkt` (no prior nonce issuance recorded for
+///   this key) is accepted as a bootstrap and a fresh nonce is issued in
+///   the response `DPoP-Nonce` header.
+/// - Subsequent proofs from the same `jkt` MUST include a server-issued
+///   nonce; otherwise we reject with `error: "use_dpop_nonce"` and a fresh
+///   nonce in the response header.
+/// - Any presented nonce MUST be one we issued and not expired (5-min
+///   sliding window).
+async fn verify_dpop_at_token_endpoint(
+    state: &OAuthState,
+    dpop_header: Option<&str>,
+) -> Option<Result<String, Response>> {
+    let proof_str = dpop_header?;
+    let token_endpoint = format!("{}/oauth/token", state.issuer_url.trim_end_matches('/'));
+    let proof = match super::dpop::verify_dpop_proof(proof_str, "POST", &token_endpoint, None) {
+        Ok(p) => p,
+        Err(e) => {
+            // The DPoP module's error variants describe internal
+            // checks (signature, jkt match, htm/htu, alg). Keep them
+            // out of the public response; logs carry the detail.
+            tracing::warn!("DPoP proof verification failed: {e}");
+            return Some(Err(token_error(StatusCode::BAD_REQUEST, "invalid_dpop_proof", None)));
+        }
+    };
+    // JTI replay check.
+    if !state.check_and_record_dpop_jti(&proof.jti, proof.iat).await {
+        tracing::warn!(jti = %proof.jti, "DPoP JTI replay detected");
+        return Some(Err(token_error(StatusCode::BAD_REQUEST, "invalid_dpop_proof", Some("DPoP proof jti already used"))));
+    }
+
+    // RFC 9449 §8 nonce enforcement.
+    let client_needs_nonce = state.dpop_client_requires_nonce(&proof.jkt).await;
+    match (client_needs_nonce, proof.nonce.as_deref()) {
+        (true, None) => {
+            // Subsequent request without nonce — reject with fresh nonce.
+            let fresh = state.issue_dpop_nonce().await;
+            state.mark_dpop_client_nonced(&proof.jkt).await;
+            tracing::warn!(jkt = %proof.jkt, "DPoP nonce required but proof omitted it");
+            return Some(Err(use_dpop_nonce_error(&fresh, "DPoP proof must include a server-issued nonce")));
+        }
+        (_, Some(presented)) => {
+            // Whether bootstrap or subsequent: a presented nonce must be one
+            // we issued. If invalid/expired, reject and rotate.
+            if !state.verify_dpop_nonce(presented).await {
+                let fresh = state.issue_dpop_nonce().await;
+                state.mark_dpop_client_nonced(&proof.jkt).await;
+                tracing::warn!(jkt = %proof.jkt, "DPoP nonce invalid or expired");
+                return Some(Err(use_dpop_nonce_error(&fresh, "DPoP nonce invalid or expired")));
+            }
+        }
+        (false, None) => {
+            // Bootstrap: first request from this jkt with no nonce. Accept;
+            // a fresh nonce will be issued on the success path (see
+            // `issue_token_with_refresh`).
+        }
+    }
+
+    Some(Ok(proof.jkt))
+}
+
+/// Build a `400 use_dpop_nonce` response with the current nonce in the
+/// `DPoP-Nonce` header (RFC 9449 §8).
+fn use_dpop_nonce_error(nonce: &str, description: &str) -> Response {
+    // `description` here is always client-actionable ("nonce required",
+    // "nonce expired") — that's the whole point of RFC 9449 §8: tell
+    // the client to retry with the nonce we just issued in the header.
+    let mut resp = token_error(StatusCode::BAD_REQUEST, "use_dpop_nonce", Some(description));
+    if let Ok(val) = axum::http::HeaderValue::from_str(nonce) {
+        resp.headers_mut().insert("DPoP-Nonce", val);
+    }
+    resp
 }
 
 /// Handle authorization_code grant type.
 async fn exchange_authorization_code(
     state: Arc<OAuthState>,
     params: TokenRequest,
+    dpop_header: Option<String>,
+    vault_device_cookie: Option<String>,
 ) -> Response {
     let code = match params.code {
         Some(c) => c,
-        None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", "code is required"),
+        None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", Some("code is required")),
     };
     let redirect_uri = match params.redirect_uri {
         Some(r) => r,
-        None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", "redirect_uri is required"),
+        None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", Some("redirect_uri is required")),
     };
     let code_verifier = match params.code_verifier {
         Some(v) => v,
-        None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", "code_verifier is required"),
+        None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", Some("code_verifier is required")),
     };
 
     // Look up and remove pending code (single-use)
@@ -104,7 +363,7 @@ async fn exchange_authorization_code(
             return token_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_grant",
-                "Authorization code not found or already used",
+                Some("Authorization code not found or already used"),
             );
         }
     };
@@ -113,7 +372,7 @@ async fn exchange_authorization_code(
         return token_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
-            "Authorization code has expired",
+            Some("Authorization code has expired"),
         );
     }
 
@@ -121,7 +380,7 @@ async fn exchange_authorization_code(
         return token_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
-            "client_id does not match",
+            Some("client_id does not match"),
         );
     }
 
@@ -129,7 +388,7 @@ async fn exchange_authorization_code(
         return token_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
-            "redirect_uri does not match",
+            Some("redirect_uri does not match"),
         );
     }
 
@@ -139,76 +398,95 @@ async fn exchange_authorization_code(
         URL_SAFE_NO_PAD.encode(digest)
     };
 
-    if computed_challenge != pending.code_challenge {
+    if computed_challenge.as_bytes().ct_eq(pending.code_challenge.as_bytes()).unwrap_u8() == 0 {
         return token_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
-            "PKCE code_verifier verification failed",
+            Some("PKCE code_verifier verification failed"),
         );
     }
 
+    // Verify DPoP if present.
+    let dpop_jkt = match verify_dpop_at_token_endpoint(&state, dpop_header.as_deref()).await {
+        None => None,
+        Some(Ok(jkt)) => Some(jkt),
+        Some(Err(resp)) => return resp,
+    };
+
     tracing::info!(client_id = %params.client_id, username = %pending.username, "PKCE verified, issuing token");
-    // Use the authenticated username as JWT sub (set during Ed25519 challenge-response on consent page).
     let sub = pending.username.clone();
-    issue_token_with_refresh(&state, &params.client_id, pending.scopes, pending.resource, &sub, pending.oidc_nonce, true).await
+    let vk_ref = pending.verifying_key.as_ref();
+    issue_token_with_refresh(&state, &params.client_id, pending.scopes, pending.resource, &sub, pending.oidc_nonce, true, vk_ref, dpop_jkt, vault_device_cookie).await
 }
 
 /// Handle refresh_token grant type (OAuth 2.1 with rotation).
 async fn exchange_refresh_token(
     state: Arc<OAuthState>,
     params: TokenRequest,
+    dpop_header: Option<String>,
+    vault_device_cookie: Option<String>,
 ) -> Response {
     let refresh_token = match params.refresh_token {
         Some(rt) => rt,
-        None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", "refresh_token is required"),
+        None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", Some("refresh_token is required")),
     };
 
-    // Look up and remove refresh token (single-use rotation)
-    let entry = {
-        let mut tokens = state.refresh_tokens.write().await;
-        tokens.remove(&refresh_token)
-    };
-
-    let entry = match entry {
-        Some(e) => e,
-        None => {
+    // Look up and atomically consume the refresh token (single-use rotation).
+    // get_refresh_token handles lazy expiry; returns None if expired or missing.
+    let entry = match state.get_refresh_token(&refresh_token).await {
+        Ok(Some(e)) => e,
+        Ok(None) => {
             return token_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_grant",
-                "Refresh token not found or already used",
+                Some("Refresh token not found or already used"),
             );
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Refresh token store read failed");
+            return token_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", None);
         }
     };
 
-    if entry.is_expired() {
-        return token_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_grant",
-            "Refresh token has expired",
-        );
+    // Delete before issuing new token (rotation; prevents replay on store errors).
+    if let Err(e) = state.delete_refresh_token(&refresh_token).await {
+        tracing::error!(error = %e, "Refresh token store delete failed");
+        return token_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", None);
     }
 
     if params.client_id != entry.client_id {
         return token_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
-            "client_id does not match",
+            Some("client_id does not match"),
         );
     }
 
-    // Issue new access token + rotated refresh token with the stored scopes/resource and original subject.
-    // No id_token on refresh per OIDC Core Section 12.2.
-    issue_token_with_refresh(&state, &entry.client_id, entry.scopes, entry.resource, &entry.username, None, false).await
+    // Verify DPoP if present.
+    let dpop_jkt = match verify_dpop_at_token_endpoint(&state, dpop_header.as_deref()).await {
+        None => None,
+        Some(Ok(jkt)) => Some(jkt),
+        Some(Err(resp)) => return resp,
+    };
+
+    // Reconstruct verifying key from stored bytes (cnf continuity across refreshes).
+    let stored_vk: Option<ed25519_dalek::VerifyingKey> = entry.verifying_key_bytes
+        .and_then(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).ok());
+
+    // Issue new access token + rotated refresh token. No id_token on refresh (OIDC Core § 12.2).
+    issue_token_with_refresh(&state, &entry.client_id, entry.scopes, entry.resource, &entry.username, None, false, stored_vk.as_ref(), dpop_jkt, vault_device_cookie).await
 }
 
 /// Handle urn:ietf:params:oauth:grant-type:device_code grant type (RFC 8628 Section 3.4).
 async fn exchange_device_code(
     state: Arc<OAuthState>,
     params: TokenRequest,
+    dpop_header: Option<String>,
+    vault_device_cookie: Option<String>,
 ) -> Response {
     let device_code = match params.device_code {
         Some(dc) => dc,
-        None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", "device_code is required"),
+        None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", Some("device_code is required")),
     };
 
     let mut device_codes = state.pending_device_codes.write().await;
@@ -219,7 +497,7 @@ async fn exchange_device_code(
             return token_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_grant",
-                "Device code not found or already used",
+                Some("Device code not found or already used"),
             );
         }
     };
@@ -230,7 +508,7 @@ async fn exchange_device_code(
         device_codes.remove(&device_code);
         let mut user_code_map = state.device_code_by_user_code.write().await;
         user_code_map.remove(&user_code);
-        return token_error(StatusCode::BAD_REQUEST, "expired_token", "The device code has expired");
+        return token_error(StatusCode::BAD_REQUEST, "expired_token", Some("The device code has expired"));
     }
 
     // Validate client_id
@@ -238,7 +516,7 @@ async fn exchange_device_code(
         return token_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
-            "client_id does not match",
+            Some("client_id does not match"),
         );
     }
 
@@ -246,21 +524,21 @@ async fn exchange_device_code(
     let now = Instant::now();
     if let Some(last) = pending.last_polled {
         if now.duration_since(last).as_secs() < pending.interval {
-            return token_error(StatusCode::BAD_REQUEST, "slow_down", "Polling too frequently");
+            return token_error(StatusCode::BAD_REQUEST, "slow_down", Some("Polling too frequently"));
         }
     }
     pending.last_polled = Some(now);
 
     match pending.status {
         DeviceCodeStatus::Pending => {
-            token_error(StatusCode::BAD_REQUEST, "authorization_pending", "The authorization request is still pending")
+            token_error(StatusCode::BAD_REQUEST, "authorization_pending", Some("The authorization request is still pending"))
         }
         DeviceCodeStatus::Denied => {
             let user_code = pending.user_code.clone();
             device_codes.remove(&device_code);
             let mut user_code_map = state.device_code_by_user_code.write().await;
             user_code_map.remove(&user_code);
-            token_error(StatusCode::BAD_REQUEST, "access_denied", "The user denied the authorization request")
+            token_error(StatusCode::BAD_REQUEST, "access_denied", Some("The user denied the authorization request"))
         }
         DeviceCodeStatus::Approved => {
             let client_id = pending.client_id.clone();
@@ -272,20 +550,35 @@ async fn exchange_device_code(
             let approved_by = match pending.approved_by.clone() {
                 Some(u) => u,
                 None => {
+                    // Internal invariant violation; do not surface
+                    // server state shape to the polling client.
+                    tracing::error!(
+                        device_code_prefix = %&device_code[..8.min(device_code.len())],
+                        "Device code approved but no approver identity recorded"
+                    );
                     return token_error(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "server_error",
-                        "Device code approved but no approver identity recorded",
+                        None,
                     );
                 }
             };
+            let device_vk = pending.verifying_key;
             device_codes.remove(&device_code);
             drop(device_codes);
             let mut user_code_map = state.device_code_by_user_code.write().await;
             user_code_map.remove(&user_code);
             drop(user_code_map);
+
+            // Verify DPoP if present.
+            let dpop_jkt = match verify_dpop_at_token_endpoint(&state, dpop_header.as_deref()).await {
+                None => None,
+                Some(Ok(jkt)) => Some(jkt),
+                Some(Err(resp)) => return resp,
+            };
+
             // Device flow: no OIDC nonce and not initial OIDC auth.
-            issue_token_with_refresh(&state, &client_id, scopes, resource, &approved_by, None, false).await
+            issue_token_with_refresh(&state, &client_id, scopes, resource, &approved_by, None, false, device_vk.as_ref(), dpop_jkt, vault_device_cookie).await
         }
     }
 }
@@ -315,8 +608,18 @@ async fn issue_token_with_refresh(
     sub: &str,
     oidc_nonce: Option<String>,
     initial_auth: bool,
+    user_verifying_key: Option<&ed25519_dalek::VerifyingKey>,
+    dpop_jkt: Option<String>,
+    vault_device_cookie: Option<String>,
 ) -> Response {
     let scope_str = scopes.join(" ");
+
+    // DPoP jkt takes priority; fall back to raw key bytes for cnf.jwk.
+    let user_pub_key_b64 = if dpop_jkt.is_none() {
+        user_verifying_key.map(|vk| URL_SAFE_NO_PAD.encode(vk.to_bytes()))
+    } else {
+        None
+    };
 
     let result = state
         .policy_client
@@ -325,26 +628,63 @@ async fn issue_token_with_refresh(
             ttl: Some(state.token_ttl),
             audience: resource.clone(),
             subject: Some(sub.to_owned()),
+            user_pub_key: user_pub_key_b64,
+            dpop_jkt: dpop_jkt.clone(),
         })
         .await;
 
     match result {
         Ok(token_info) => {
             tracing::info!(client_id = %client_id, "Token issued successfully");
+
+            // Silently link device → user when __Secure-VaultDevice cookie accompanies the request.
+            if let (Some(cookie_val), Some(ref ds), Some(ref sk)) =
+                (&vault_device_cookie, &state.device_store, &state.signing_key)
+            {
+                let sk_bytes = sk.to_bytes();
+                if let Some(pubkey) =
+                    crate::auth::device_challenge::verify_vault_device_cookie(&sk_bytes, cookie_val)
+                {
+                    let fingerprint = bs58::encode(&pubkey).into_string();
+                    let ds = ds.clone();
+                    let sub_owned = sub.to_owned();
+                    tokio::spawn(async move {
+                        if let Err(e) = ds.link_device_user(&fingerprint, &sub_owned).await {
+                            tracing::warn!(fingerprint = %fingerprint, error = %e, "device-user link failed");
+                        } else {
+                            tracing::debug!(fingerprint = %fingerprint, sub = %sub_owned, "device linked to user");
+                        }
+                    });
+                }
+            }
+
             let now = chrono::Utc::now().timestamp();
             let expires_in = (token_info.expires_at - now).max(0);
+            // Issue a fresh DPoP nonce when the client used DPoP (RFC 9449 §8).
+            // Also record that this jkt has now been issued a nonce so future
+            // proofs are required to carry one.
+            let dpop_nonce = if let Some(ref jkt) = dpop_jkt {
+                let n = state.issue_dpop_nonce().await;
+                state.mark_dpop_client_nonced(jkt).await;
+                Some(n)
+            } else {
+                None
+            };
 
-            // Generate and store a refresh token
+            // Generate and persist a refresh token (RocksDB).
             let refresh_token = generate_refresh_token();
             {
-                let mut tokens = state.refresh_tokens.write().await;
-                tokens.insert(refresh_token.clone(), RefreshTokenEntry {
+                let entry = RefreshTokenEntry {
                     client_id: client_id.to_owned(),
                     username: sub.to_owned(),
                     scopes: scopes.clone(),
                     resource,
-                    expires_at: Instant::now() + Duration::from_secs(state.refresh_token_ttl as u64),
-                });
+                    expires_at_unix: now + state.refresh_token_ttl as i64,
+                    verifying_key_bytes: user_verifying_key.map(|vk| *vk.as_bytes()),
+                };
+                if let Err(e) = state.put_refresh_token(&refresh_token, &entry, state.refresh_token_ttl as u64).await {
+                    tracing::error!(error = %e, "Failed to persist refresh token");
+                }
             }
 
             // Build OIDC id_token when: scope includes "openid", signing key is available,
@@ -363,8 +703,8 @@ async fn issue_token_with_refresh(
                 .with_auth_time(now);
 
                 // Add profile claims based on requested scopes.
-                if let Some(ref user_store) = state.user_store {
-                    if let Ok(Some(profile)) = user_store.get_profile(sub) {
+                if let Some(user_store) = state.user_store_reader() {
+                    if let Ok(Some(profile)) = user_store.get_profile(sub).await {
                         if scopes.iter().any(|s| s == "profile") {
                             id_claims.preferred_username = Some(sub.to_owned());
                             id_claims.name = profile.name;
@@ -382,7 +722,8 @@ async fn issue_token_with_refresh(
 
                 // SAFETY: signing_key.is_some() checked in the outer condition.
                 let Some(ref sk) = state.signing_key else { unreachable!() };
-                let id_token_jwt = hyprstream_rpc::auth::jwt::encode_id_token(&id_claims, sk);
+                let jwt_key = hyprstream_rpc::node_identity::derive_purpose_key(sk, "hyprstream-jwt-v1");
+                let id_token_jwt = hyprstream_rpc::auth::jwt::encode_id_token(&id_claims, &jwt_key);
                 Some(id_token_jwt)
             } else {
                 None
@@ -399,7 +740,7 @@ async fn issue_token_with_refresh(
                 response_json["id_token"] = serde_json::Value::String(id_token);
             }
 
-            (
+            let mut resp = (
                 StatusCode::OK,
                 [
                     (header::CACHE_CONTROL, "no-store"),
@@ -407,29 +748,114 @@ async fn issue_token_with_refresh(
                 ],
                 Json(response_json),
             )
-                .into_response()
+                .into_response();
+            if let Some(nonce) = dpop_nonce {
+                if let Ok(val) = axum::http::HeaderValue::from_str(&nonce) {
+                    resp.headers_mut().insert("DPoP-Nonce", val);
+                }
+            }
+            resp
         }
         Err(e) => {
             tracing::error!(client_id = %client_id, error = %e, "Token issuance failed");
             token_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "server_error",
-                "Failed to issue access token",
+                None,
             )
         }
     }
 }
 
-fn token_error(status: StatusCode, error: &str, description: &str) -> Response {
+/// Build an OAuth 2.1 §5.3 token-endpoint error response.
+///
+/// `description` is `Some(...)` only when the message is **client-
+/// actionable** (refers to something the client themselves can fix in
+/// their request — missing field, wrong assertion type, redirect_uri
+/// mismatch). For server-internal failures (policy denials, dependency
+/// outages, claim mismatches, signature failures) pass `None`: the
+/// public response carries only the OAuth error code, and the caller
+/// logs the full reason via tracing for operators.
+///
+/// Rationale: returning details like "PolicyService unreachable" or
+/// "iss does not match client_id" leaks internal IAM topology and
+/// validation order to unauthenticated callers. OAuth 2.1 §5.3
+/// permits `error_description` to be omitted; standard practice
+/// among hardened IdPs is to omit it for security-sensitive failures.
+fn token_error(status: StatusCode, error: &str, description: Option<&str>) -> Response {
     (
         status,
         [
             (header::CACHE_CONTROL, "no-store"),
             (header::PRAGMA, "no-cache"),
         ],
-        Json(serde_json::json!({
-            "error": error,
-            "error_description": description,
-        })),
+        Json(token_error_body(error, description)),
     ).into_response()
+}
+
+/// Pure JSON-body construction for `token_error`. Split out so unit
+/// tests can assert on the body shape (notably: `error_description`
+/// is omitted entirely when `description` is `None`, not serialized
+/// as `null`).
+fn token_error_body(error: &str, description: Option<&str>) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    body.insert("error".to_owned(), serde_json::Value::String(error.to_owned()));
+    if let Some(d) = description {
+        body.insert(
+            "error_description".to_owned(),
+            serde_json::Value::String(d.to_owned()),
+        );
+    }
+    serde_json::Value::Object(body)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_error_body_omits_description_when_none() {
+        let body = token_error_body("invalid_client", None);
+        let obj = body.as_object().unwrap();
+        assert_eq!(obj.get("error").and_then(|v| v.as_str()), Some("invalid_client"));
+        assert!(
+            !obj.contains_key("error_description"),
+            "description field MUST be absent when None — leaks happen via null/empty too"
+        );
+        assert_eq!(obj.len(), 1, "no extra fields");
+    }
+
+    #[test]
+    fn token_error_body_includes_description_when_some() {
+        let body = token_error_body("invalid_request", Some("code is required"));
+        let obj = body.as_object().unwrap();
+        assert_eq!(obj.get("error_description").and_then(|v| v.as_str()), Some("code is required"));
+    }
+
+    #[test]
+    fn token_error_body_never_carries_internal_substrings() {
+        // Regression guard: no caller in token.rs should ever pass a
+        // description containing these internal-state markers. The
+        // sweep in 2026-05-26 stripped them all to None. If a future
+        // change adds one back, this test won't catch it directly —
+        // but the documented rule for token_error makes it a code-
+        // review item. The test here pins the API: `None` yields an
+        // empty object, so any leak would have to be explicit in a
+        // caller's `Some(...)`.
+        let body = token_error_body("invalid_client", None);
+        let serialized = body.to_string();
+        for forbidden in &[
+            "PolicyService",
+            "federation:register",
+            "Failed to fetch",
+            "iss does not match",
+            "Token store error",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "opaque response unexpectedly leaks `{forbidden}`: {serialized}"
+            );
+        }
+    }
 }

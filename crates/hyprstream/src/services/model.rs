@@ -39,7 +39,6 @@ use crate::services::generated::inference_client::InferenceClient;
 use crate::services::RegistryClient;
 use crate::services::generated::registry_client::{StageFilesRequest, CommitWithAuthorRequest};
 use crate::services::generated::policy_client::PolicyCheck;
-use hyprstream_rpc::envelope::RequestIdentity;
 use crate::storage::ModelRef;
 use anyhow::{anyhow, Result};
 use hyprstream_rpc::prelude::*;
@@ -145,10 +144,8 @@ pub struct ModelServiceInner {
     transport: TransportConfig,
     /// Expected JWT audience for token validation (RFC 8707).
     expected_audience: Option<String>,
-    /// Local OAuth issuer URL for distinguishing local vs. federated JWTs.
-    local_issuer_url: Option<String>,
-    /// Federation key source for verifying externally-issued JWTs.
-    federation_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>>,
+    /// Unified JWT key source for verifying JWTs (local and federated).
+    jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
     /// Persistent 9P synthetic tree for the fs scope (lazily initialized).
     fs_tree: std::sync::OnceLock<crate::services::fs::SyntheticTree>,
 }
@@ -179,14 +176,14 @@ impl std::ops::Deref for ModelService {
 
 impl ModelService {
     /// Create a new model service with infrastructure
-    pub fn new(
+    pub async fn new(
         config: ModelServiceConfig,
         signing_key: SigningKey,
         policy_client: PolicyClient,
         registry: RegistryClient,
         context: Arc<zmq::Context>,
         transport: TransportConfig,
-    ) -> Self {
+    ) -> Result<Self> {
         // SAFETY: 5 is a valid non-zero value
         const DEFAULT_CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(5) {
             Some(n) => n,
@@ -194,10 +191,23 @@ impl ModelService {
         };
         let cache_size = NonZeroUsize::new(config.max_models).unwrap_or(DEFAULT_CACHE_SIZE);
 
-        let notif_client = NotificationClient::new(signing_key.clone(), RequestIdentity::anonymous());
+        let key_resp = policy_client.resolve_service_key(
+            &crate::services::generated::policy_client::ResolveServiceKey {
+                service_name: "notification".to_owned(),
+            },
+        ).await?;
+        let notif_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+            key_resp.verifying_key.as_slice().try_into()
+                .map_err(|_| anyhow!("Invalid verifying key length"))?,
+        ).map_err(|e| anyhow!("Invalid Ed25519 key: {e}"))?;
+        let notif_client = NotificationClient::for_service(
+            signing_key.clone(),
+            notif_vk,
+            None,
+        );
         let notification_publisher = NotificationPublisher::new(notif_client, signing_key.clone());
 
-        Self { inner: Arc::new(ModelServiceInner {
+        Ok(Self { inner: Arc::new(ModelServiceInner {
             loaded_models: RwLock::new(LruCache::new(cache_size)),
             pending_loads: Mutex::new(HashSet::new()),
             config,
@@ -210,10 +220,9 @@ impl ModelService {
             context,
             transport,
             expected_audience: None,
-            local_issuer_url: None,
-            federation_key_source: None,
+            jwt_key_source: None,
             fs_tree: std::sync::OnceLock::new(),
-        })}
+        })})
     }
 
     /// Set the expected JWT audience for token validation.
@@ -229,35 +238,23 @@ impl ModelService {
         self
     }
 
-    /// Set the local OAuth issuer URL for distinguishing local vs. federated JWTs.
+    /// Set the unified JWT key source for verifying JWTs.
     ///
     /// # Panics
     /// Panics if called after the service has been cloned (Arc refcount > 1).
     #[allow(clippy::expect_used)]
-    pub fn with_local_issuer_url(mut self, url: String) -> Self {
-        Arc::get_mut(&mut self.inner)
-            .expect("with_local_issuer_url must be called before service is shared")
-            .local_issuer_url = Some(url);
-        self
-    }
-
-    /// Set the federation key source for verifying externally-issued JWTs.
-    ///
-    /// # Panics
-    /// Panics if called after the service has been cloned (Arc refcount > 1).
-    #[allow(clippy::expect_used)]
-    pub fn with_federation_key_source(
+    pub fn with_jwt_key_source(
         mut self,
-        src: std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>,
+        src: std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>,
     ) -> Self {
         Arc::get_mut(&mut self.inner)
-            .expect("with_federation_key_source must be called before service is shared")
-            .federation_key_source = Some(src);
+            .expect("with_jwt_key_source must be called before service is shared")
+            .jwt_key_source = Some(src);
         self
     }
 
     /// Create a model service with callback router for spawned mode
-    pub fn with_callback_router(
+    pub async fn with_callback_router(
         config: ModelServiceConfig,
         signing_key: SigningKey,
         policy_client: PolicyClient,
@@ -265,17 +262,30 @@ impl ModelService {
         callback_router: crate::services::callback::CallbackRouter,
         context: Arc<zmq::Context>,
         transport: TransportConfig,
-    ) -> Self {
+    ) -> Result<Self> {
         const DEFAULT_CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(5) {
             Some(n) => n,
             None => unreachable!(),
         };
         let cache_size = NonZeroUsize::new(config.max_models).unwrap_or(DEFAULT_CACHE_SIZE);
 
-        let notif_client = NotificationClient::new(signing_key.clone(), RequestIdentity::anonymous());
+        let key_resp = policy_client.resolve_service_key(
+            &crate::services::generated::policy_client::ResolveServiceKey {
+                service_name: "notification".to_owned(),
+            },
+        ).await?;
+        let notif_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+            key_resp.verifying_key.as_slice().try_into()
+                .map_err(|_| anyhow!("Invalid verifying key length"))?,
+        ).map_err(|e| anyhow!("Invalid Ed25519 key: {e}"))?;
+        let notif_client = NotificationClient::for_service(
+            signing_key.clone(),
+            notif_vk,
+            None,
+        );
         let notification_publisher = NotificationPublisher::new(notif_client, signing_key.clone());
 
-        Self { inner: Arc::new(ModelServiceInner {
+        Ok(Self { inner: Arc::new(ModelServiceInner {
             loaded_models: RwLock::new(LruCache::new(cache_size)),
             pending_loads: Mutex::new(HashSet::new()),
             config,
@@ -288,10 +298,9 @@ impl ModelService {
             context,
             transport,
             expected_audience: None,
-            local_issuer_url: None,
-            federation_key_source: None,
+            jwt_key_source: None,
             fs_tree: std::sync::OnceLock::new(),
-        })}
+        })})
     }
 
     /// Derive the deterministic IPC endpoint for a model reference.
@@ -397,20 +406,20 @@ impl ModelService {
         if let Some(ref aud) = self.expected_audience {
             service_config = service_config.with_expected_audience(aud.clone());
         }
-        if let Some(ref url) = self.local_issuer_url {
-            service_config = service_config.with_local_issuer_url(url.clone());
-        }
-        if let Some(ref fed) = self.federation_key_source {
-            service_config = service_config.with_federation_key_source(fed.clone());
+        if let Some(ref src) = self.jwt_key_source {
+            service_config = service_config.with_jwt_key_source(src.clone());
         }
         let service_handle = spawner.spawn(service_config).await
             .map_err(|e| anyhow!("Failed to spawn inference service: {}", e))?;
 
-        // Create client for this service
-        let client = InferenceClient::with_endpoint(
+        // Create client for this service.
+        // Inference services share the model service's signing key (line 401),
+        // so use our own verifying key directly — no PolicyService lookup needed.
+        let client = InferenceClient::for_endpoint(
             &endpoint,
             self.signing_key.clone(),
-            RequestIdentity::anonymous(),
+            self.signing_key.verifying_key(),
+            None,
         );
 
         // Load TTT config from model's config.json (if TTT is enabled)
@@ -609,10 +618,11 @@ impl ModelService {
             .ok_or_else(|| anyhow!("Model {} not found after loading", model_ref_str))?;
         model.last_used = Instant::now();
         let client = model.client.clone();
-        match ctx.claims() {
-            Some(claims) => Ok(client.with_claims(claims.clone())),
-            None => Ok(client),
-        }
+        // TODO: Forward user JWT to worker via per-call builder (delegated_bearer or
+        // request().jwt(token).call(payload)) once inference methods support CallOptions.
+        // The previous with_jwt() call was mutating shared state — unsafe with pooling.
+        let _ = ctx.jwt_token();
+        Ok(client)
     }
 
     /// Load a LoRA adapter from a file
@@ -731,7 +741,9 @@ impl TttHandler for ModelService {
         model_ref: &str, data: &TrainStepRequest,
     ) -> Result<(crate::services::generated::model_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
         let client = self.get_inference_client(model_ref, ctx).await?;
-        let stream_info = client.train_step_stream(data, ctx.ephemeral_pubkey.unwrap_or([0u8; 32])).await?;
+        let ephemeral_pubkey = ctx.ephemeral_pubkey()
+            .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
+        let stream_info = client.train_step_stream(data, ephemeral_pubkey).await?;
         Ok((stream_info, Box::pin(async {})))
     }
 
@@ -955,7 +967,9 @@ impl InferHandler for ModelService {
         model_ref: &str, data: &GenerationRequest,
     ) -> Result<(crate::services::generated::model_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
         let client = self.get_inference_client(model_ref, ctx).await?;
-        let stream_info = client.generate_stream(data, ctx.ephemeral_pubkey.unwrap_or([0u8; 32])).await?;
+        let ephemeral_pubkey = ctx.ephemeral_pubkey()
+            .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
+        let stream_info = client.generate_stream(data, ephemeral_pubkey).await?;
         Ok((stream_info, Box::pin(async {})))
     }
 
@@ -1409,14 +1423,8 @@ impl crate::services::ZmqService for ModelService {
         self.expected_audience.as_deref()
     }
 
-    fn local_issuer_url(&self) -> Option<&str> {
-        self.inner.local_issuer_url.as_deref()
-    }
-
-    fn federation_key_source(
-        &self,
-    ) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>> {
-        self.inner.federation_key_source.clone()
+    fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>> {
+        self.inner.jwt_key_source.clone()
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {

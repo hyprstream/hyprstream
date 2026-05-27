@@ -9,6 +9,10 @@ pub enum EnvelopeError {
     #[error("signature verification failed: {0}")]
     InvalidSignature(#[from] ed25519_dalek::SignatureError),
 
+    /// Post-quantum signature verification failed.
+    #[error("PQ signature verification failed: {0}")]
+    PqSignatureInvalid(String),
+
     /// Signer public key doesn't match expected key.
     #[error("signer pubkey mismatch: expected {expected}, got {actual}")]
     SignerMismatch { expected: String, actual: String },

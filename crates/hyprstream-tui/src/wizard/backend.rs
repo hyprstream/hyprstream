@@ -267,7 +267,9 @@ impl WizardBackend for MockWizardBackend {
             run_mode: self.mock_run_mode.clone(),
             gpu: self.mock_gpu.clone(),
             libtorch_path: None,
-            current_variant: LibtorchVariant::from_compiled(),
+            // Use Cpu so the mock always recommends an upgrade (UpgradeVariant)
+            // rather than AlreadyCurrent, which depends on the build environment.
+            current_variant: LibtorchVariant::Cpu,
             recommended_variant: recommended,
             installed_variant: None,
         }

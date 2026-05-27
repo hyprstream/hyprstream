@@ -109,6 +109,19 @@ pub trait RuntimeEngine: Send + Sync {
         Ok(formatted)
     }
 
+    /// Apply chat template with extended parameters (thinking mode, extra vars).
+    fn apply_chat_template_with_vars(
+        &self,
+        messages: &[template_engine::ChatMessage],
+        add_generation_prompt: bool,
+        tools: Option<&serde_json::Value>,
+        _enable_thinking: Option<bool>,
+        _template_vars_json: Option<&str>,
+    ) -> Result<String> {
+        // Default: delegate to basic apply_chat_template (ignores extended params)
+        self.apply_chat_template(messages, add_generation_prompt, tools)
+    }
+
 }
 
 /// Create the default runtime engine (now uses PyTorch)

@@ -100,9 +100,7 @@ async fn vfs_proxy_loop(
 
 pub fn build_chat_vfs_namespace(
     signing_key: &ed25519_dalek::SigningKey,
-) -> (Arc<Namespace>, Subject) {
-    use hyprstream_rpc::envelope::RequestIdentity;
-
+) -> anyhow::Result<(Arc<Namespace>, Subject)> {
     let subject = {
         let vk = signing_key.verifying_key();
         let pubkey_hex = hex::encode(vk.as_bytes());
@@ -111,10 +109,34 @@ pub fn build_chat_vfs_namespace(
 
     let mut ns = Namespace::new();
 
-    // Mount /srv/model via RemoteModelMount.
-    let model_client = crate::services::generated::model_client::ModelClient::new(
+    // Resolve the model service's verifying key via PolicyClient.
+    let policy_vk = hyprstream_service::global_trust_store()
+        .resolve_one("policy")
+        .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
+    let policy_client = crate::services::PolicyClient::for_service(
         signing_key.clone(),
-        RequestIdentity::anonymous(),
+        policy_vk,
+        None,
+    );
+    let model_vk_resp = tokio::task::block_in_place(|| {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(policy_client.resolve_service_key(
+            &crate::services::generated::policy_client::ResolveServiceKey {
+                service_name: "model".to_owned(),
+            },
+        ))
+    })
+    .map_err(|e| anyhow::anyhow!("Failed to resolve model service key: {e}"))?;
+    let model_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+        model_vk_resp.verifying_key.as_slice().try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
+    ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?;
+
+    // Mount /srv/model via RemoteModelMount.
+    let model_client = crate::services::generated::model_client::ModelClient::for_service(
+        signing_key.clone(),
+        model_vk,
+        None,
     );
     let remote_model_mount = crate::services::remote_mount::RemoteModelMount::new(model_client);
     let _ = ns.mount("/srv/model", Arc::new(remote_model_mount));
@@ -210,5 +232,5 @@ pub fn build_chat_vfs_namespace(
     let tcl_mount = Arc::new(hyprstream_tcl::TclMount::new(tcl_mount_tx));
     let _ = ns.mount("/lang/tcl", tcl_mount);
 
-    (Arc::new(ns), subject)
+    Ok((Arc::new(ns), subject))
 }

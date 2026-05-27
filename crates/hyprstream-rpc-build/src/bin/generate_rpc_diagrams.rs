@@ -84,9 +84,9 @@ fn client_to_service(client_type: &str) -> Option<&'static str> {
         "InferenceZmqClient" => Some("inference"),
         "NotificationClient" => Some("notification"),
         "NotificationPublisher" => Some("notification"),
-        "WorktreeClient" => Some("registry"),  // scoped sub-client of registry
+        "WorktreeClient" => Some("registry"), // scoped sub-client of registry
         "RepositoryClient" => Some("registry"), // scoped sub-client of registry
-        "CtlClient" => Some("registry"),        // scoped sub-client of registry
+        "CtlClient" => Some("registry"),      // scoped sub-client of registry
         "DiscoveryClient" => Some("discovery"),
         "WorkerClient" => Some("worker"),
         // Streaming: StreamChannel/StreamInfo indicate the service publishes
@@ -120,9 +120,9 @@ const CLIENT_TYPES: &[&str] = &[
 /// Maps a source filename to the service it implements.
 fn filename_to_service(filename: &str) -> Option<&'static str> {
     match filename {
-        "factories.rs" => None, // handled separately
+        "factories.rs" => None,                        // handled separately
         "mod.rs" | "core.rs" | "generated.rs" => None, // infrastructure, not a service
-        "worktree_helpers.rs" => None, // helper, not a service
+        "worktree_helpers.rs" => None,                 // helper, not a service
         "registry.rs" => Some("registry"),
         "model.rs" => Some("model"),
         "inference.rs" => Some("inference"),
@@ -238,8 +238,16 @@ fn build_method_registry(metadata_dir: &Path) -> Vec<MethodDef> {
         for s in structs {
             let struct_name = s.get("name").and_then(|n| n.as_str()).unwrap_or("");
 
-            for field in s.get("fields").and_then(|f| f.as_array()).into_iter().flatten() {
-                let disc = field.get("discriminant").and_then(|d| d.as_u64()).unwrap_or(65535);
+            for field in s
+                .get("fields")
+                .and_then(|f| f.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let disc = field
+                    .get("discriminant")
+                    .and_then(|d| d.as_u64())
+                    .unwrap_or(65535);
                 if disc == 65535 {
                     continue; // not a union variant
                 }
@@ -252,10 +260,16 @@ fn build_method_registry(metadata_dir: &Path) -> Vec<MethodDef> {
                 let mut scope = String::new();
                 let mut description = String::new();
 
-                for ann in field.get("annotations").and_then(|a| a.as_array()).into_iter().flatten() {
+                for ann in field
+                    .get("annotations")
+                    .and_then(|a| a.as_array())
+                    .into_iter()
+                    .flatten()
+                {
                     let ann_name = ann.get("name").and_then(|n| n.as_str()).unwrap_or("");
                     if ann_name == "mcpScope" {
-                        scope = ann.get("value")
+                        scope = ann
+                            .get("value")
                             .and_then(|v| {
                                 v.as_object()
                                     .and_then(|o| o.get("enum_ordinal"))
@@ -266,7 +280,8 @@ fn build_method_registry(metadata_dir: &Path) -> Vec<MethodDef> {
                             .unwrap_or_default();
                     }
                     if ann_name == "mcpDescription" {
-                        description = ann.get("value")
+                        description = ann
+                            .get("value")
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
@@ -289,25 +304,39 @@ fn build_method_registry(metadata_dir: &Path) -> Vec<MethodDef> {
 }
 
 /// Scan all Rust source files for method-level calls to known service methods.
-fn scan_method_calls(
-    src_root: &Path,
-    method_registry: &[MethodDef],
-) -> Vec<MethodCall> {
+fn scan_method_calls(src_root: &Path, method_registry: &[MethodDef]) -> Vec<MethodCall> {
     let mut calls = Vec::new();
 
     // Generic Rust method names that produce too many false positives.
     // These are only matched when preceded by a known client variable pattern.
     const GENERIC_METHODS: &[&str] = &[
-        "clone", "get", "list", "remove", "status", "check", "register",
-        "load", "unload", "connect", "attach", "subscribe", "unsubscribe",
-        "success", "repo", "worktree", "get_by_name",
+        "clone",
+        "get",
+        "list",
+        "remove",
+        "status",
+        "check",
+        "register",
+        "load",
+        "unload",
+        "connect",
+        "attach",
+        "subscribe",
+        "unsubscribe",
+        "success",
+        "repo",
+        "worktree",
+        "get_by_name",
     ];
 
     // Build a lookup: snake_case method name → Vec<MethodDef>
     // (multiple services might have same method name like "status", "list")
     let mut method_lookup: BTreeMap<String, Vec<&MethodDef>> = BTreeMap::new();
     for m in method_registry {
-        method_lookup.entry(m.rust_name.clone()).or_default().push(m);
+        method_lookup
+            .entry(m.rust_name.clone())
+            .or_default()
+            .push(m);
     }
 
     let generic_set: std::collections::HashSet<&str> = GENERIC_METHODS.iter().copied().collect();
@@ -319,7 +348,8 @@ fn scan_method_calls(
             Err(_) => return,
         };
 
-        let relative = path.strip_prefix(src_root)
+        let relative = path
+            .strip_prefix(src_root)
             .unwrap_or(path)
             .to_string_lossy()
             .to_string();
@@ -357,7 +387,9 @@ fn scan_method_calls(
                 }
 
                 // Disambiguate: figure out which client type is being called.
-                if let Some(target_service) = resolve_call_target(trimmed, method_name, defs, &caller) {
+                if let Some(target_service) =
+                    resolve_call_target(trimmed, method_name, defs, &caller)
+                {
                     calls.push(MethodCall {
                         caller: caller.clone(),
                         target_service,
@@ -373,7 +405,9 @@ fn scan_method_calls(
     // Deduplicate (same caller → same target method, keep first occurrence)
     calls.sort();
     calls.dedup_by(|a, b| {
-        a.caller == b.caller && a.target_service == b.target_service && a.target_method == b.target_method
+        a.caller == b.caller
+            && a.target_service == b.target_service
+            && a.target_method == b.target_method
     });
 
     calls
@@ -393,14 +427,26 @@ fn has_client_prefix(line: &str, method_name: &str) -> bool {
 
     // Known client variable patterns
     const CLIENT_PREFIXES: &[&str] = &[
-        "policy_client", "registry_client", "model_client", "worker_client",
-        "inference_client", "notification_client", "discovery_client",
-        "tui_client", "mcp_client",
+        "policy_client",
+        "registry_client",
+        "model_client",
+        "worker_client",
+        "inference_client",
+        "notification_client",
+        "discovery_client",
+        "tui_client",
+        "mcp_client",
         // Short forms used in some code
-        "policy", "registry", "model", "worker", "inference",
-        "notification", "discovery",
+        "policy",
+        "registry",
+        "model",
+        "worker",
+        "inference",
+        "notification",
+        "discovery",
         // Scoped sub-clients
-        "worktree", "repo",
+        "worktree",
+        "repo",
     ];
 
     for prefix in CLIENT_PREFIXES {
@@ -452,7 +498,8 @@ fn resolve_call_target(
     let before_trimmed = before.trim_end();
 
     // Extract the variable/expression before the dot
-    let var = before_trimmed.rsplit(|c: char| !c.is_alphanumeric() && c != '_' && c != '.')
+    let var = before_trimmed
+        .rsplit(|c: char| !c.is_alphanumeric() && c != '_' && c != '.')
         .next()
         .unwrap_or("");
 
@@ -467,13 +514,27 @@ fn resolve_call_target(
         if target == caller {
             continue;
         }
-        if var.contains("policy") && target == "policy" { return Some(target.clone()); }
-        if var.contains("registry") && target == "registry" { return Some(target.clone()); }
-        if var.contains("model") && target == "model" { return Some(target.clone()); }
-        if var.contains("worker") && target == "worker" { return Some(target.clone()); }
-        if var.contains("inference") && target == "inference" { return Some(target.clone()); }
-        if var.contains("notif") && target == "notification" { return Some(target.clone()); }
-        if var.contains("discovery") && target == "discovery" { return Some(target.clone()); }
+        if var.contains("policy") && target == "policy" {
+            return Some(target.clone());
+        }
+        if var.contains("registry") && target == "registry" {
+            return Some(target.clone());
+        }
+        if var.contains("model") && target == "model" {
+            return Some(target.clone());
+        }
+        if var.contains("worker") && target == "worker" {
+            return Some(target.clone());
+        }
+        if var.contains("inference") && target == "inference" {
+            return Some(target.clone());
+        }
+        if var.contains("notif") && target == "notification" {
+            return Some(target.clone());
+        }
+        if var.contains("discovery") && target == "discovery" {
+            return Some(target.clone());
+        }
     }
 
     // Fallback: if caller is known to depend on a specific service, prefer that
@@ -495,10 +556,10 @@ fn path_to_caller(relative: &str) -> String {
         if file.starts_with("oauth") {
             return "oauth".to_string();
         }
-        let stem = file.trim_end_matches(".rs")
-            .trim_end_matches("/mod");
+        let stem = file.trim_end_matches(".rs").trim_end_matches("/mod");
         return match stem {
-            "factories" | "mod" | "core" | "generated" | "worktree_helpers" | "rpc_types" | "callback" => String::new(),
+            "factories" | "mod" | "core" | "generated" | "worktree_helpers" | "rpc_types"
+            | "callback" => String::new(),
             "mcp_service" => "mcp".to_string(),
             "oai" => "oai".to_string(),
             other => other.to_string(),
@@ -511,7 +572,8 @@ fn path_to_caller(relative: &str) -> String {
     }
 
     if relative.starts_with("server/") {
-        let stem = relative.trim_start_matches("server/")
+        let stem = relative
+            .trim_start_matches("server/")
             .trim_start_matches("routes/")
             .trim_end_matches(".rs");
         return format!("server:{stem}");
@@ -546,7 +608,8 @@ fn generate_call_graph(calls: &[MethodCall], method_registry: &[MethodDef]) -> S
     let mut out = String::new();
 
     // Build a method scope lookup for coloring
-    let method_scope: BTreeMap<(&str, &str), &str> = method_registry.iter()
+    let method_scope: BTreeMap<(&str, &str), &str> = method_registry
+        .iter()
         .map(|m| ((m.service.as_str(), m.rust_name.as_str()), m.scope.as_str()))
         .collect();
 
@@ -572,7 +635,10 @@ fn generate_call_graph(calls: &[MethodCall], method_registry: &[MethodDef]) -> S
     // Caller subgraphs (group by category)
     let svc_callers: Vec<&&str> = callers.iter().filter(|c| !c.contains(':')).collect();
     let cli_callers: Vec<&&str> = callers.iter().filter(|c| c.starts_with("cli:")).collect();
-    let server_callers: Vec<&&str> = callers.iter().filter(|c| c.starts_with("server:")).collect();
+    let server_callers: Vec<&&str> = callers
+        .iter()
+        .filter(|c| c.starts_with("server:"))
+        .collect();
 
     if !svc_callers.is_empty() {
         out.push_str("\n    subgraph svc_callers [\"Services\"]\n");
@@ -608,7 +674,10 @@ fn generate_call_graph(calls: &[MethodCall], method_registry: &[MethodDef]) -> S
 
     // Target service + method nodes
     for target in &targets {
-        out.push_str(&format!("\n    subgraph {target}_methods [\"{} Methods\"]\n", title_case(target)));
+        out.push_str(&format!(
+            "\n    subgraph {target}_methods [\"{} Methods\"]\n",
+            title_case(target)
+        ));
         out.push_str("        direction TB\n");
 
         // Collect all methods called on this target
@@ -624,7 +693,11 @@ fn generate_call_graph(calls: &[MethodCall], method_registry: &[MethodDef]) -> S
         for method in &called_methods {
             let node_id = format!("{target}_{method}");
             let scope = method_scope.get(&(target, method)).copied().unwrap_or("");
-            let scope_suffix = if scope.is_empty() { String::new() } else { format!(" [{scope}]") };
+            let scope_suffix = if scope.is_empty() {
+                String::new()
+            } else {
+                format!(" [{scope}]")
+            };
             out.push_str(&format!("        {node_id}[\"{method}{scope_suffix}\"]\n"));
         }
         out.push_str("    end\n");
@@ -660,8 +733,18 @@ fn parse_metadata(path: &Path) -> Option<(String, usize, BTreeMap<String, usize>
     let mut scopes = BTreeMap::new();
 
     for s in json.get("structs")?.as_array()? {
-        for field in s.get("fields").and_then(|f| f.as_array()).into_iter().flatten() {
-            for ann in field.get("annotations").and_then(|a| a.as_array()).into_iter().flatten() {
+        for field in s
+            .get("fields")
+            .and_then(|f| f.as_array())
+            .into_iter()
+            .flatten()
+        {
+            for ann in field
+                .get("annotations")
+                .and_then(|a| a.as_array())
+                .into_iter()
+                .flatten()
+            {
                 if ann.get("name").and_then(|n| n.as_str()) == Some("mcpScope") {
                     methods += 1;
                     let scope = ann
@@ -745,22 +828,33 @@ fn scan_factory_body(lines: &[&str], start: usize) -> (Transport, bool) {
         let trimmed = line.trim();
 
         for ch in trimmed.chars() {
-            if ch == '{' { brace_depth += 1; in_body = true; }
-            if ch == '}' { brace_depth -= 1; }
+            if ch == '{' {
+                brace_depth += 1;
+                in_body = true;
+            }
+            if ch == '}' {
+                brace_depth -= 1;
+            }
         }
 
         if in_body {
             if trimmed.contains("into_spawnable_quic") {
                 has_quic = true;
             }
-            if trimmed.contains("ProxyService") || trimmed.contains("XPubProxy")
-                || trimmed.contains("PullToXPub") {
+            if trimmed.contains("ProxyService")
+                || trimmed.contains("XPubProxy")
+                || trimmed.contains("PullToXPub")
+            {
                 transport = Transport::Proxy;
             }
-            if trimmed.contains("OAIService") || trimmed.contains("ServerState")
-                || trimmed.contains("FlightService") || trimmed.contains("OAuthService")
-                || trimmed.contains("axum") || trimmed.contains("Axum")
-                || trimmed.contains("FlightSqlService") {
+            if trimmed.contains("OAIService")
+                || trimmed.contains("ServerState")
+                || trimmed.contains("FlightService")
+                || trimmed.contains("OAuthService")
+                || trimmed.contains("axum")
+                || trimmed.contains("Axum")
+                || trimmed.contains("FlightSqlService")
+            {
                 transport = Transport::Http;
             }
 
@@ -832,9 +926,7 @@ fn scan_service_sources(services_dir: &Path, services: &mut [ServiceMeta]) {
 
             if path.is_dir() {
                 // Handle subdirectories like oauth/
-                let dirname = path.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
+                let dirname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 let service_name = match dirname {
                     "oauth" => "oauth",
                     _ => continue,
@@ -859,9 +951,7 @@ fn scan_service_sources(services_dir: &Path, services: &mut [ServiceMeta]) {
             }
 
             if path.extension().map(|e| e == "rs").unwrap_or(false) {
-                let filename = path.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
+                let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
                 let service_name = match filename_to_service(filename) {
                     Some(name) => name,
@@ -938,9 +1028,18 @@ fn generate_topology(services: &[ServiceMeta]) -> String {
     out.push_str("graph TD\n\n");
 
     // Group by transport
-    let http: Vec<&ServiceMeta> = services.iter().filter(|s| s.transport == Transport::Http).collect();
-    let zmq: Vec<&ServiceMeta> = services.iter().filter(|s| s.transport == Transport::ZmqRep).collect();
-    let proxies: Vec<&ServiceMeta> = services.iter().filter(|s| s.transport == Transport::Proxy).collect();
+    let http: Vec<&ServiceMeta> = services
+        .iter()
+        .filter(|s| s.transport == Transport::Http)
+        .collect();
+    let zmq: Vec<&ServiceMeta> = services
+        .iter()
+        .filter(|s| s.transport == Transport::ZmqRep)
+        .collect();
+    let proxies: Vec<&ServiceMeta> = services
+        .iter()
+        .filter(|s| s.transport == Transport::Proxy)
+        .collect();
 
     // HTTP subgraph
     if !http.is_empty() {
@@ -984,24 +1083,33 @@ fn generate_topology(services: &[ServiceMeta]) -> String {
         // Group deps by target, collect client types
         let mut target_clients: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for dep in &svc.dependencies {
-            target_clients.entry(dep.target.as_str())
+            target_clients
+                .entry(dep.target.as_str())
                 .or_default()
                 .push(dep.client_type.as_str());
         }
 
         for (target, clients) in &target_clients {
-            let is_stream = clients.iter().any(|c| *c == "StreamChannel" || *c == "StreamInfo");
+            let is_stream = clients
+                .iter()
+                .any(|c| *c == "StreamChannel" || *c == "StreamInfo");
             let is_policy = *target == "policy" && clients.iter().any(|c| *c == "PolicyClient");
-            let has_other = clients.iter().any(|c| *c != "StreamChannel" && *c != "StreamInfo" && *c != "PolicyClient");
+            let has_other = clients
+                .iter()
+                .any(|c| *c != "StreamChannel" && *c != "StreamInfo" && *c != "PolicyClient");
 
             // Policy: dashed line with "authorize" label
             if is_policy {
-                out.push_str(&format!("    {} -.->|\"authorize\"| {}\n", svc.name, target));
+                out.push_str(&format!(
+                    "    {} -.->|\"authorize\"| {}\n",
+                    svc.name, target
+                ));
             }
 
             // Streaming: thick arrow
             if is_stream {
-                let stream_types: Vec<&str> = clients.iter()
+                let stream_types: Vec<&str> = clients
+                    .iter()
                     .filter(|c| **c == "StreamChannel" || **c == "StreamInfo")
                     .copied()
                     .collect();
@@ -1011,8 +1119,11 @@ fn generate_topology(services: &[ServiceMeta]) -> String {
 
             // Other deps: normal arrow with client type labels
             if has_other {
-                let other_clients: Vec<&str> = clients.iter()
-                    .filter(|c| **c != "StreamChannel" && **c != "StreamInfo" && **c != "PolicyClient")
+                let other_clients: Vec<&str> = clients
+                    .iter()
+                    .filter(|c| {
+                        **c != "StreamChannel" && **c != "StreamInfo" && **c != "PolicyClient"
+                    })
                     .copied()
                     .collect();
                 if !other_clients.is_empty() {
@@ -1040,9 +1151,7 @@ fn service_label(s: &ServiceMeta) -> String {
         label.push_str(&format!("<br/>{}", parts.join(" · ")));
     }
     if !s.scopes.is_empty() {
-        let scope_str: Vec<String> = s.scopes.iter()
-            .map(|(k, v)| format!("{k}:{v}"))
-            .collect();
+        let scope_str: Vec<String> = s.scopes.iter().map(|(k, v)| format!("{k}:{v}")).collect();
         label.push_str(&format!("<br/>{}", scope_str.join(" · ")));
     }
     label
@@ -1060,7 +1169,9 @@ fn generate_method_breakdown(services: &[ServiceMeta]) -> String {
         let id = &s.name;
         out.push_str(&format!(
             "    subgraph {id}_svc [\"{} · {} · {} methods\"]\n",
-            title_case(&s.name), s.transport.label(), s.methods
+            title_case(&s.name),
+            s.transport.label(),
+            s.methods
         ));
         out.push_str("        direction TB\n");
 
@@ -1070,7 +1181,9 @@ fn generate_method_breakdown(services: &[ServiceMeta]) -> String {
 
         if s.has_quic {
             out.push_str(&format!("        {id}_quic[\"QUIC\"]\n"));
-            out.push_str(&format!("        style {id}_quic fill:#2d8a4e,stroke:#333,color:#fff\n"));
+            out.push_str(&format!(
+                "        style {id}_quic fill:#2d8a4e,stroke:#333,color:#fff\n"
+            ));
         }
 
         out.push_str("    end\n\n");
@@ -1087,11 +1200,16 @@ fn generate_summary_table(services: &[ServiceMeta]) -> String {
 
     for s in services {
         let quic = if s.has_quic { "yes" } else { "-" };
-        let methods = if s.methods > 0 { s.methods.to_string() } else { "0".to_string() };
+        let methods = if s.methods > 0 {
+            s.methods.to_string()
+        } else {
+            "0".to_string()
+        };
         let scopes = if s.scopes.is_empty() {
             "-".to_string()
         } else {
-            s.scopes.iter()
+            s.scopes
+                .iter()
                 .map(|(k, v)| format!("{k}:{v}"))
                 .collect::<Vec<_>>()
                 .join(" · ")
@@ -1108,7 +1226,12 @@ fn generate_summary_table(services: &[ServiceMeta]) -> String {
 
         out.push_str(&format!(
             "| **{}** | {} | {} | {} | {} | {} |\n",
-            title_case(&s.name), s.transport.label(), quic, methods, scopes, deps
+            title_case(&s.name),
+            s.transport.label(),
+            quic,
+            methods,
+            scopes,
+            deps
         ));
     }
 
@@ -1120,22 +1243,30 @@ fn generate_summary_table(services: &[ServiceMeta]) -> String {
 fn main() {
     let matches = clap::Command::new("generate-rpc-diagrams")
         .about("Generate Mermaid architecture diagrams from Cap'n Proto metadata")
-        .arg(clap::Arg::new("metadata-dir")
-            .long("metadata-dir")
-            .help("Directory containing *_metadata.json files")
-            .default_value("target/rpc-metadata"))
-        .arg(clap::Arg::new("services-dir")
-            .long("services-dir")
-            .help("Path to services/ source directory")
-            .default_value("crates/hyprstream/src/services"))
-        .arg(clap::Arg::new("src-root")
-            .long("src-root")
-            .help("Root source directory for method-level call scanning")
-            .default_value("crates/hyprstream/src"))
-        .arg(clap::Arg::new("output")
-            .short('o')
-            .long("output")
-            .help("Output file path (default: stdout)"))
+        .arg(
+            clap::Arg::new("metadata-dir")
+                .long("metadata-dir")
+                .help("Directory containing *_metadata.json files")
+                .default_value("target/rpc-metadata"),
+        )
+        .arg(
+            clap::Arg::new("services-dir")
+                .long("services-dir")
+                .help("Path to services/ source directory")
+                .default_value("crates/hyprstream/src/services"),
+        )
+        .arg(
+            clap::Arg::new("src-root")
+                .long("src-root")
+                .help("Root source directory for method-level call scanning")
+                .default_value("crates/hyprstream/src"),
+        )
+        .arg(
+            clap::Arg::new("output")
+                .short('o')
+                .long("output")
+                .help("Output file path (default: stdout)"),
+        )
         .get_matches();
 
     let metadata_dir = PathBuf::from(matches.get_one::<String>("metadata-dir").unwrap());
@@ -1155,7 +1286,9 @@ fn main() {
                     .file_name()
                     .map(|n| n.to_string_lossy().ends_with("_metadata.json"))
                     .unwrap_or(false);
-                if !is_metadata { continue; }
+                if !is_metadata {
+                    continue;
+                }
 
                 if let Some((name, methods, scopes)) = parse_metadata(&path) {
                     if let Some(svc) = services.iter_mut().find(|s| s.name == name) {
@@ -1166,7 +1299,10 @@ fn main() {
             }
         }
     } else {
-        eprintln!("Warning: metadata dir {} not found, method counts will be zero", metadata_dir.display());
+        eprintln!(
+            "Warning: metadata dir {} not found, method counts will be zero",
+            metadata_dir.display()
+        );
     }
 
     // 3. Scan service sources for client dependencies
@@ -1212,7 +1348,10 @@ fn main() {
     // Print stats
     eprintln!("\n--- Stats ---");
     eprintln!("Services: {}", services.len());
-    eprintln!("Dependency edges: {}", services.iter().map(|s| s.dependencies.len()).sum::<usize>());
+    eprintln!(
+        "Dependency edges: {}",
+        services.iter().map(|s| s.dependencies.len()).sum::<usize>()
+    );
     eprintln!("Schema methods: {}", method_registry.len());
     eprintln!("Method-level calls: {}", method_calls.len());
-} 
+}

@@ -1,0 +1,26 @@
+[package]
+name = "chat-core"
+version = "0.1.0"
+edition = "2021"
+description = "Chat orchestration state machine — token parsing, tool call detection, agentic loop"
+
+[lib]
+name = "chat_core"
+path = "src/lib.rs"
+crate-type = ["lib", "cdylib"]
+
+[[bin]]
+name = "chat-core"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen = { version = "0.2", optional = true }
+
+[features]
+default = []
+wasm = ["wasm-bindgen"]
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false

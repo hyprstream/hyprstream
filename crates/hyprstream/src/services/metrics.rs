@@ -59,8 +59,7 @@ pub struct MetricsService {
     transport: TransportConfig,
     signing_key: SigningKey,
     expected_audience: Option<String>,
-    local_issuer_url: Option<String>,
-    federation_key_source: Option<Arc<dyn hyprstream_rpc::auth::FederationKeySource>>,
+    jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
 }
 
 impl MetricsService {
@@ -83,8 +82,7 @@ impl MetricsService {
             transport,
             signing_key,
             expected_audience: None,
-            local_issuer_url: None,
-            federation_key_source: None,
+            jwt_key_source: None,
         }
     }
 
@@ -93,16 +91,11 @@ impl MetricsService {
         self
     }
 
-    pub fn with_local_issuer_url(mut self, url: String) -> Self {
-        self.local_issuer_url = Some(url);
-        self
-    }
-
-    pub fn with_federation_key_source(
+    pub fn with_jwt_key_source(
         mut self,
-        src: Arc<dyn hyprstream_rpc::auth::FederationKeySource>,
+        src: std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>,
     ) -> Self {
-        self.federation_key_source = Some(src);
+        self.jwt_key_source = Some(src);
         self
     }
 }
@@ -626,14 +619,8 @@ impl ZmqService for MetricsService {
         self.expected_audience.as_deref()
     }
 
-    fn local_issuer_url(&self) -> Option<&str> {
-        self.local_issuer_url.as_deref()
-    }
-
-    fn federation_key_source(
-        &self,
-    ) -> Option<Arc<dyn hyprstream_rpc::auth::FederationKeySource>> {
-        self.federation_key_source.clone()
+    fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>> {
+        self.jwt_key_source.clone()
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
@@ -659,7 +646,6 @@ mod tests {
     use hyprstream_metrics::query::QueryOrchestrator;
     use hyprstream_metrics::storage::duckdb::DuckDbBackend;
     use hyprstream_rpc::crypto::generate_signing_keypair;
-    use hyprstream_rpc::envelope::RequestIdentity;
     use hyprstream_rpc::transport::TransportConfig;
     use hyprstream_service::{InprocManager, ServiceManager};
 
@@ -704,10 +690,11 @@ mod tests {
             .await
             .expect("spawn policy service");
 
-        let policy_client = PolicyClient::with_endpoint(
+        let policy_client = PolicyClient::for_endpoint(
             &format!("inproc://{policy_tag}"),
             signing_key.clone(),
-            RequestIdentity::anonymous(),
+            signing_key.verifying_key(),
+            None,
         );
 
         // In-memory DuckDB backend + metrics table creation.
@@ -743,10 +730,11 @@ mod tests {
             .await
             .expect("spawn metrics service");
 
-        let client = MetricsClient::with_endpoint(
+        let client = MetricsClient::for_endpoint(
             &format!("inproc://{svc_tag}"),
-            signing_key,
-            RequestIdentity::anonymous(),
+            signing_key.clone(),
+            signing_key.verifying_key(),
+            None,
         );
 
         (client, manager)

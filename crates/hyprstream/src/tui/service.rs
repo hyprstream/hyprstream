@@ -148,11 +148,8 @@ pub struct TuiService {
     policy_client: Option<PolicyClient>,
     /// Expected audience (resource URL) for JWT validation.
     expected_audience: Option<String>,
-    /// Local OAuth issuer URL — JWTs whose `iss` matches this are treated as
-    /// locally-issued tokens rather than federated ones.
-    local_issuer_url: Option<String>,
-    /// Federation key source for verifying externally-issued JWTs.
-    federation_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>>,
+    /// JWT key source for verifying tokens (local and federated).
+    jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
     /// Shared VFS namespace for ChatApps spawned via RPC.
     vfs_ns: Option<std::sync::Arc<hyprstream_vfs::Namespace>>,
     /// VFS subject identity for ChatApps spawned via RPC.
@@ -180,8 +177,7 @@ impl TuiService {
             stdin_queues: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             policy_client: None,
             expected_audience: None,
-            local_issuer_url: None,
-            federation_key_source: None,
+            jwt_key_source: None,
             vfs_ns: None,
             vfs_subject: None,
             vfs_proxy_tx: std::sync::OnceLock::new(),
@@ -200,18 +196,12 @@ impl TuiService {
         self
     }
 
-    /// Set the local OAuth issuer URL so that locally-issued JWTs are accepted.
-    pub fn with_local_issuer_url(mut self, url: String) -> Self {
-        self.local_issuer_url = Some(url);
-        self
-    }
-
-    /// Set the federation key source for verifying externally-issued JWTs.
-    pub fn with_federation_key_source(
+    /// Set the JWT key source for verifying tokens.
+    pub fn with_jwt_key_source(
         mut self,
-        src: std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>,
+        src: std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>,
     ) -> Self {
-        self.federation_key_source = Some(src);
+        self.jwt_key_source = Some(src);
         self
     }
 
@@ -346,7 +336,7 @@ impl TuiService {
         // If no pubkey (local/test connections), generate random standalone contexts.
         let make_stream_ctx = |label: &str| -> Result<StreamContext> {
             match ctx.ephemeral_pubkey() {
-                Some(pubkey) => StreamContext::from_dh(pubkey),
+                Some(pubkey) => StreamContext::from_dh(&pubkey),
                 None => {
                     use rand::RngCore;
                     let mut rng = rand::thread_rng();
@@ -826,20 +816,52 @@ impl TuiService {
         };
 
         let registry_models_dir = std::path::PathBuf::from(registry_dir);
+
+        // Resolve peer service keys via PolicyClient.
+        let policy_vk = hyprstream_service::global_trust_store()
+            .resolve_one("policy")
+            .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
+        let policy_client = PolicyClient::for_service(
+            self.signing_key.clone(),
+            policy_vk,
+            None,
+        );
+
+        let registry_key_resp = policy_client.resolve_service_key(
+            &crate::services::generated::policy_client::ResolveServiceKey {
+                service_name: "registry".to_owned(),
+            },
+        ).await.map_err(|e| anyhow::anyhow!("Failed to resolve registry key: {e}"))?;
+        let registry_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+            registry_key_resp.verifying_key.as_slice().try_into()
+                .map_err(|_| anyhow::anyhow!("Invalid registry key length"))?,
+        ).map_err(|e| anyhow::anyhow!("Invalid registry key: {e}"))?;
+
+        let model_key_resp = policy_client.resolve_service_key(
+            &crate::services::generated::policy_client::ResolveServiceKey {
+                service_name: "model".to_owned(),
+            },
+        ).await.map_err(|e| anyhow::anyhow!("Failed to resolve model key: {e}"))?;
+        let model_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+            model_key_resp.verifying_key.as_slice().try_into()
+                .map_err(|_| anyhow::anyhow!("Invalid model key length"))?,
+        ).map_err(|e| anyhow::anyhow!("Invalid model key: {e}"))?;
+
         let models = {
-            use hyprstream_rpc::envelope::RequestIdentity;
             let registry_endpoint = hyprstream_rpc::registry::global()
                 .endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep)
                 .to_zmq_string();
             let registry_client: crate::services::RegistryClient =
-                crate::services::RegistryClient::with_endpoint(
+                crate::services::RegistryClient::for_endpoint(
                     &registry_endpoint,
                     self.signing_key.clone(),
-                    RequestIdentity::anonymous(),
+                    registry_vk,
+                    None,
                 );
-            let model_client_for_status = crate::services::generated::model_client::ModelClient::new(
+            let model_client_for_status = crate::services::generated::model_client::ModelClient::for_service(
                 self.signing_key.clone(),
-                RequestIdentity::anonymous(),
+                model_vk,
+                None,
             );
             let status_timeout = std::time::Duration::from_millis(500);
             let all_status_req = crate::services::generated::model_client::StatusRequest { model_ref: String::new() };
@@ -867,7 +889,10 @@ impl TuiService {
                             let model_ref = format!("{}:{}", name, branch);
                             let loaded = *status_map.get(&model_ref).unwrap_or(&false);
                             let path = rmd.join(&name).join("worktrees").join(&branch);
-                            hyprstream_tui::shell_app::ModelEntry { model_ref, path, loaded }
+                            hyprstream_tui::shell_app::ModelEntry {
+                                model_ref, path, loaded,
+                                ahead: 0, behind: 0, is_dirty: false,
+                            }
                         }).collect::<Vec<_>>()
                     })
                     .collect::<Vec<_>>(),
@@ -878,16 +903,19 @@ impl TuiService {
         let handle = tokio::runtime::Handle::current();
         let sk_load = self.signing_key.clone();
         let handle_load = handle.clone();
+        let model_vk_load = model_vk;
         let load_fn: Box<dyn Fn(&str, hyprstream_tui::shell_app::ModelStatusSender) + Send> =
             Box::new(move |model_ref: &str, tx: hyprstream_tui::shell_app::ModelStatusSender| {
-                use hyprstream_rpc::envelope::RequestIdentity;
                 let sk  = sk_load.clone();
                 let mr  = model_ref.to_owned();
                 let h   = handle_load.clone();
+                let vk  = model_vk_load;
                 // Submit load — returns "accepted" immediately (Continuation pattern).
                 h.block_on(async {
-                    let client = crate::services::generated::model_client::ModelClient::new(
-                        sk.clone(), RequestIdentity::anonymous(),
+                    let client = crate::services::generated::model_client::ModelClient::for_service(
+                        sk.clone(),
+                        vk,
+                        None,
                     );
                     let _ = client.load(&crate::services::generated::model_client::LoadModelRequest {
                         model_ref: mr.clone(),
@@ -899,12 +927,15 @@ impl TuiService {
                 let sk_poll = sk.clone();
                 let mr_poll = mr.clone();
                 let h_poll  = h.clone();
+                let vk_poll = vk;
                 std::thread::spawn(move || {
                     for _ in 0..60u32 {   // max ~2 minutes (60 × 2 s)
                         std::thread::sleep(std::time::Duration::from_secs(2));
                         let loaded = h_poll.block_on(async {
-                            let client = crate::services::generated::model_client::ModelClient::new(
-                                sk_poll.clone(), RequestIdentity::anonymous(),
+                            let client = crate::services::generated::model_client::ModelClient::for_service(
+                                sk_poll.clone(),
+                                vk_poll,
+                                None,
                             );
                             client.status(&crate::services::generated::model_client::StatusRequest { model_ref: mr_poll.clone() }).await
                                 .is_ok_and(|es| es.iter().any(|e| e.status == "loaded"))
@@ -920,17 +951,225 @@ impl TuiService {
             });
         let sk_unload = self.signing_key.clone();
         let handle_unload = handle.clone();
+        let model_vk_unload = model_vk;
         let unload_fn: Box<dyn Fn(&str) -> bool + Send> = Box::new(move |model_ref: &str| {
-            use hyprstream_rpc::envelope::RequestIdentity;
             let sk = sk_unload.clone();
             let mr = model_ref.to_owned();
             handle_unload.block_on(async move {
-                let client = crate::services::generated::model_client::ModelClient::new(sk, RequestIdentity::anonymous());
+                let client = crate::services::generated::model_client::ModelClient::for_service(
+                    sk.clone(),
+                    model_vk_unload,
+                    None,
+                );
                 client.unload(&crate::services::generated::model_client::UnloadModelRequest { model_ref: mr.clone() }).await.is_ok()
             })
         });
 
-        let app = hyprstream_tui::shell_app::ShellApp::new(models, cols, rows, load_fn, unload_fn);
+        let git_ops = {
+            use hyprstream_tui::shell_app::{GitOps, GitOpProgress, GitProgressSender, ModelEntry as ShellModelEntry};
+            use crate::services::generated::registry_client::{CloneRequest, CreateWorktreeRequest, PushRequest, UpdateRequest, RegistryRpc};
+            use hyprstream_rpc::streaming::StreamPayload;
+
+            let sk_clone = self.signing_key.clone();
+            let h_clone = handle.clone();
+            let rvk_clone = registry_vk;
+            let rmd_clone = registry_models_dir.clone();
+            let clone_fn: hyprstream_tui::shell_app::CloneFn = Box::new(move |url, name, branch, tx: GitProgressSender| {
+                let sk = sk_clone.clone();
+                let h = h_clone.clone();
+                let rvk = rvk_clone;
+                let rmd = rmd_clone.clone();
+                std::thread::spawn(move || {
+                    h.block_on(async {
+                        let registry = crate::services::RegistryClient::for_service(sk, rvk, None);
+                        let model_name = name.unwrap_or_else(|| {
+                            url.rsplit('/').next().unwrap_or("model")
+                                .trim_end_matches(".git").to_owned()
+                        });
+                        let _ = tx.send(GitOpProgress::CloneProgress { stage: "Connecting…".to_owned(), pct: 0 });
+
+                        let mut stream_handle = match RegistryRpc::clone_stream(&registry, &CloneRequest {
+                            url: url.clone(),
+                            name: model_name.clone(),
+                            shallow: false,
+                            depth: 0,
+                            branch: branch.unwrap_or_default(),
+                        }).await {
+                            Ok(h) => h,
+                            Err(e) => {
+                                let _ = tx.send(GitOpProgress::Failed(format!("Clone failed: {e}")));
+                                return;
+                            }
+                        };
+
+                        loop {
+                            match stream_handle.recv_next().await {
+                                Ok(Some(StreamPayload::Data(data))) => {
+                                    if let Ok(text) = String::from_utf8(data) {
+                                        let parts: Vec<&str> = text.split(':').collect();
+                                        if parts.len() >= 3 {
+                                            let stage = parts[0];
+                                            let current: u64 = parts[1].parse().unwrap_or(0);
+                                            let total: u64 = parts[2].parse().unwrap_or(0);
+                                            let pct = if total > 0 { ((current * 70) / total).min(70) as u8 } else { 0 };
+                                            let label = match stage {
+                                                "fetch" => "Fetching objects",
+                                                "indexing" => "Indexing",
+                                                "smudge" => "Downloading model files",
+                                                "lfs" => "Downloading LFS files",
+                                                other => other,
+                                            };
+                                            let _ = tx.send(GitOpProgress::CloneProgress {
+                                                stage: label.to_owned(),
+                                                pct,
+                                            });
+                                        }
+                                    }
+                                }
+                                Ok(Some(StreamPayload::Complete(_))) | Ok(None) => break,
+                                Ok(Some(StreamPayload::Error(message))) => {
+                                    let _ = tx.send(GitOpProgress::Failed(format!("Clone failed: {message}")));
+                                    return;
+                                }
+                                Ok(Some(StreamPayload::Tagged { .. })) => {}
+                                Err(e) => {
+                                    let _ = tx.send(GitOpProgress::Failed(format!("Clone stream error: {e}")));
+                                    return;
+                                }
+                            }
+                        }
+
+                        let _ = tx.send(GitOpProgress::CloneProgress { stage: "Creating worktree…".to_owned(), pct: 80 });
+
+                        let tracked = match registry.get_by_name(&model_name).await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                let _ = tx.send(GitOpProgress::Failed(format!("Failed to get repo: {e}")));
+                                return;
+                            }
+                        };
+                        let repo_client = registry.repo(&tracked.id);
+                        let wt_branch = if tracked.tracking_ref.is_empty() { "main".to_owned() } else { tracked.tracking_ref.clone() };
+                        let _ = repo_client.create_worktree(&CreateWorktreeRequest {
+                            branch: wt_branch.clone(),
+                        }).await;
+
+                        let model_ref = format!("{model_name}:{wt_branch}");
+                        let path = rmd.join(&model_name).join("worktrees").join(&wt_branch);
+                        let _ = tx.send(GitOpProgress::Done {
+                            message: format!("Cloned {model_name} successfully"),
+                            new_model: Some(ShellModelEntry {
+                                model_ref, path, loaded: false,
+                                ahead: 0, behind: 0, is_dirty: false,
+                            }),
+                        });
+                    });
+                });
+            });
+
+            let sk_pull = self.signing_key.clone();
+            let h_pull = handle.clone();
+            let rvk_pull = registry_vk;
+            let pull_fn: hyprstream_tui::shell_app::PullFn = Box::new(move |model_ref, tx: GitProgressSender| {
+                let sk = sk_pull.clone();
+                let h = h_pull.clone();
+                let rvk = rvk_pull;
+                std::thread::spawn(move || {
+                    h.block_on(async {
+                        let registry = crate::services::RegistryClient::for_service(sk, rvk, None);
+                        let model_name = model_ref.split(':').next().unwrap_or(&model_ref);
+                        let tracked = match registry.get_by_name(model_name).await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                let _ = tx.send(GitOpProgress::Failed(format!("Not found: {e}")));
+                                return;
+                            }
+                        };
+                        let repo_client = registry.repo(&tracked.id);
+                        let _ = tx.send(GitOpProgress::Status("Fetching…".to_owned()));
+                        match repo_client.update(&UpdateRequest { refspec: String::new() }).await {
+                            Ok(()) => {
+                                let _ = tx.send(GitOpProgress::Done {
+                                    message: format!("Pulled {model_ref}"),
+                                    new_model: None,
+                                });
+                            }
+                            Err(e) => {
+                                let _ = tx.send(GitOpProgress::Failed(format!("Pull failed: {e}")));
+                            }
+                        }
+                    });
+                });
+            });
+
+            let sk_push = self.signing_key.clone();
+            let h_push = handle.clone();
+            let rvk_push = registry_vk;
+            let push_fn: hyprstream_tui::shell_app::PushFn = Box::new(move |model_ref, tx: GitProgressSender| {
+                let sk = sk_push.clone();
+                let h = h_push.clone();
+                let rvk = rvk_push;
+                std::thread::spawn(move || {
+                    h.block_on(async {
+                        let registry = crate::services::RegistryClient::for_service(sk, rvk, None);
+                        let model_name = model_ref.split(':').next().unwrap_or(&model_ref);
+                        let branch = model_ref.split(':').nth(1).unwrap_or("main");
+                        let tracked = match registry.get_by_name(model_name).await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                let _ = tx.send(GitOpProgress::Failed(format!("Not found: {e}")));
+                                return;
+                            }
+                        };
+                        let repo_client = registry.repo(&tracked.id);
+                        let _ = tx.send(GitOpProgress::Status("Pushing…".to_owned()));
+                        let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+                        match repo_client.push(&PushRequest {
+                            remote: "origin".to_owned(),
+                            refspec,
+                            force: false,
+                        }).await {
+                            Ok(()) => {
+                                let _ = tx.send(GitOpProgress::Done {
+                                    message: format!("Pushed {model_ref}"),
+                                    new_model: None,
+                                });
+                            }
+                            Err(e) => {
+                                let _ = tx.send(GitOpProgress::Failed(format!("Push failed: {e}")));
+                            }
+                        }
+                    });
+                });
+            });
+
+            let sk_status = self.signing_key.clone();
+            let h_status = handle.clone();
+            let rvk_status = registry_vk;
+            let fetch_status_fn: hyprstream_tui::shell_app::FetchStatusFn = Box::new(move |model_refs, tx| {
+                let sk = sk_status.clone();
+                let h = h_status.clone();
+                let rvk = rvk_status;
+                std::thread::spawn(move || {
+                    h.block_on(async {
+                        let registry = crate::services::RegistryClient::for_service(sk, rvk, None);
+                        for mr in model_refs {
+                            let model_name = mr.split(':').next().unwrap_or(&mr);
+                            if let Ok(tracked) = registry.get_by_name(model_name).await {
+                                let repo_client = registry.repo(&tracked.id);
+                                if let Ok(status) = repo_client.status().await {
+                                    let _ = tx.send((mr, status.ahead, status.behind, !status.is_clean));
+                                }
+                            }
+                        }
+                    });
+                });
+            });
+
+            GitOps { clone_fn, pull_fn, push_fn, fetch_status_fn }
+        };
+
+        let app = hyprstream_tui::shell_app::ShellApp::new(models, cols, rows, load_fn, unload_fn, Some(git_ops));
         let config = waxterm::app::TerminalConfig::new().cols(cols).rows(rows);
         let process = super::process::spawn_app_process(app, config);
 
@@ -1514,14 +1753,8 @@ impl ZmqService for TuiService {
         self.expected_audience.as_deref()
     }
 
-    fn local_issuer_url(&self) -> Option<&str> {
-        self.local_issuer_url.as_deref()
-    }
-
-    fn federation_key_source(
-        &self,
-    ) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>> {
-        self.federation_key_source.clone()
+    fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>> {
+        self.jwt_key_source.clone()
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
