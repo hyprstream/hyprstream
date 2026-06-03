@@ -6401,6 +6401,7 @@ dependencies = [
  "indicatif",
  "inquire",
  "inventory",
+ "iroh",
  "json-threat-protection",
  "jsonwebtoken 10.3.0",
  "keyring",
