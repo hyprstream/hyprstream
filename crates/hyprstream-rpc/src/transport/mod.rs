@@ -17,6 +17,8 @@ pub mod iroh_substrate;
 pub mod iroh_rpc;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod iroh_transport;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod iroh_moq;
 
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
