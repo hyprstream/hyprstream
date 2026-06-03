@@ -84,6 +84,12 @@ h3-quinn = { workspace = true }
 h3-webtransport = { workspace = true }
 http = { workspace = true }
 
+# Iroh + MoQ (Epic #131 — Phase 1 substrate). See transport::iroh_substrate.
+iroh = { workspace = true }
+moq-net = { workspace = true }
+web-transport-iroh = { workspace = true }
+web-transport-trait = { workspace = true }
+
 # Async runtime
 tokio = { workspace = true, features = ["io-util", "net"] }
 tokio-util = { workspace = true }

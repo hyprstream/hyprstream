@@ -11,6 +11,8 @@ mod traits;
 pub mod sockopt;
 pub mod zmtp_quic;
 pub mod quic_stream_bridge;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod iroh_substrate;
 
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
