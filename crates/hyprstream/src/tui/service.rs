@@ -1011,7 +1011,7 @@ impl TuiService {
                                             let stage = parts[0];
                                             let current: u64 = parts[1].parse().unwrap_or(0);
                                             let total: u64 = parts[2].parse().unwrap_or(0);
-                                            let pct = if total > 0 { ((current * 70) / total).min(70) as u8 } else { 0 };
+                                            let pct = (current * 70).checked_div(total).map(|v| v.min(70) as u8).unwrap_or(0);
                                             let label = match stage {
                                                 "fetch" => "Fetching objects",
                                                 "indexing" => "Indexing",

@@ -1560,11 +1560,10 @@ pub(crate) async fn watch_policy_file(
     let mut watcher = match notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
         if let Ok(event) = res {
             match event.kind {
-                EventKind::Modify(_) | EventKind::Create(_) => {
-                    // Only trigger for events involving our policy.csv
-                    if event.paths.iter().any(|p| p.ends_with("policy.csv")) {
-                        let _ = tx.blocking_send(());
-                    }
+                EventKind::Modify(_) | EventKind::Create(_)
+                    if event.paths.iter().any(|p| p.ends_with("policy.csv")) =>
+                {
+                    let _ = tx.blocking_send(());
                 }
                 _ => {}
             }
