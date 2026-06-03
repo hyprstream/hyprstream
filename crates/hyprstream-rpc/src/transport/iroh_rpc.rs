@@ -1,64 +1,89 @@
 //! Iroh RPC plane — server-side protocol handler for ALPN `hyprstream-rpc/1`.
 //!
-//! Part of Epic #131 Phase 2 (#133). This module ships the wire layer:
+//! Part of Epic #131 Phase 2 (#133). This module ships:
 //!
-//! - A length-prefixed framing over an iroh bidi stream (`accept_bi`/`open_bi`).
-//! - An [`IrohRpcProtocolHandler`] that plugs into [`crate::transport::iroh_substrate`]
-//!   under the `hyprstream-rpc/1` ALPN.
-//! - An [`IrohRequestProcessor`] trait that callers implement to wire actual
+//! - [`IrohRpcProtocolHandler`] — iroh [`ProtocolHandler`] that plugs into
+//!   [`crate::transport::iroh_substrate`] under the `hyprstream-rpc/1` ALPN.
+//!   Enforces a per-connection cap on concurrent streams (DoS bound) and
+//!   drains in-flight requests on `ProtocolHandler::shutdown`.
+//! - [`IrohRequestProcessor`] — trait callers implement to wire actual
 //!   request processing (envelope verification + service dispatch).
+//! - [`LocalServiceBridge`] — adapts a [`crate::service::ZmqService`]
+//!   (potentially `!Send`) to the Send-bounded [`IrohRequestProcessor`].
 //!
-//! **Trust model**: The protocol handler does not verify `SignedEnvelope`
-//! itself — it forwards the raw bytes to the [`IrohRequestProcessor`], which
-//! is where envelope verification, JWT/DPoP checks, and `authorize_signer`
-//! enforcement happen. This matches the ZMTP path's separation of concerns
-//! (`transport::zmtp_quic::process_request`) and keeps the wire dumb.
+//! **Trust model**: The protocol handler does not parse `SignedEnvelope` —
+//! it forwards opaque bytes to the [`IrohRequestProcessor`]. Envelope
+//! verification, JWT/DPoP, and `authorize_signer` enforcement happen inside
+//! the processor (which is `LocalServiceBridge` in production, delegating
+//! to [`crate::transport::zmtp_quic::process_request`]). The handler does
+//! hold a signing key, but uses it only to produce signed error envelopes
+//! when the processor itself returns `Err` (a wire-level failure), so the
+//! client always sees a parseable `ResponseEnvelope` rather than an opaque
+//! EOF + Cap'n Proto parse error.
 //!
-//! **Wire framing**: each message is a 4-byte big-endian length followed by
-//! that many opaque bytes (Cap'n Proto-encoded `SignedEnvelope`). The bidi
-//! stream is request-response: one request frame, one response frame, then
-//! both sides close. No multipart, no ZMTP framing — both endpoints are our
-//! code; iroh's QUIC TLS handles peer authentication at the transport layer.
-//!
-//! **Service integration** lands in a follow-up: the canary `PolicyClient`
-//! port (the rest of #133) wraps the existing `ZmqService` trait — including
-//! the `Rc<S>`/`!Send` constraint for services like inference — behind an
-//! `IrohRequestProcessor` adapter that bridges to a per-service LocalSet.
+//! **Wire framing**: each request is the opaque bytes of a Cap'n Proto-encoded
+//! [`crate::envelope::SignedEnvelope`] written to a freshly-opened iroh bidi
+//! stream. The response is symmetric. Both endpoints are our code; iroh's
+//! QUIC TLS already authenticates the connection peer's Ed25519 NodeId at
+//! the transport layer.
 
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use ed25519_dalek::SigningKey;
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
 
-/// Hard cap on inbound message size, to avoid unbounded memory growth from
-/// a misbehaving peer. Matches the ZMTP-over-QUIC server-side cap used in
-/// [`crate::transport::zmtp_quic`].
-const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+/// Hard cap on per-frame size (request or response). Mirrors the WebTransport
+/// server-side cap used in [`crate::transport::zmtp_quic`].
+pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+
+/// Default per-connection concurrent-stream cap. Caps memory usage from a
+/// hostile peer to `MAX_FRAME_BYTES × DEFAULT_STREAM_LIMIT` per connection
+/// (4 GiB at defaults). Configurable via [`IrohRpcProtocolHandlerBuilder`].
+pub const DEFAULT_STREAM_LIMIT: usize = 64;
+
+/// Grace period for `SendStream::stopped()` after writing the response — if
+/// the peer crashes without acking the FIN, we don't leak a task forever.
+const STOPPED_GRACE: Duration = Duration::from_secs(5);
+
+// ============================================================================
+// IrohRequestProcessor — pluggable request handling trait
+// ============================================================================
 
 /// Trait implemented by callers to wire actual request processing.
 ///
 /// The processor receives the raw request bytes (a Cap'n Proto-encoded
-/// `SignedEnvelope`) and returns the raw response bytes. Verification,
-/// authorization, and service dispatch all happen inside the implementation.
+/// `SignedEnvelope`) and returns the raw response bytes.
+///
+/// **Contract for `process`**:
+/// - **`Ok(bytes)`** — `bytes` MUST be a valid Cap'n Proto-encoded
+///   `ResponseEnvelope` and is written verbatim to the bidi stream.
+///   Application-layer errors (verification failure, handler error, etc.)
+///   MUST be returned this way as signed error envelopes — the handler
+///   forwards them unchanged.
+/// - **`Err(_)`** — wire-level fatal: the processor cannot produce *any*
+///   response (channel closed during shutdown, etc.). The handler responds
+///   with its own signed error envelope (`request_id = 0`) so the client
+///   sees a parseable error rather than a Cap'n Proto parse failure.
 ///
 /// Implementations MUST be `Send + Sync + 'static` because iroh's accept
 /// loop runs on a multi-threaded tokio runtime. For services that are
-/// `!Send` (e.g. those holding `tch-rs` tensors), implement this trait by
-/// forwarding to a dedicated `LocalSet` via an `mpsc` channel — same
-/// pattern used today for the inference service.
+/// `!Send` (e.g. those holding `tch-rs` tensors), use [`LocalServiceBridge`].
 pub trait IrohRequestProcessor: Send + Sync + 'static {
-    /// Process one request and return the response bytes.
     fn process(
         &self,
         request: Bytes,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>>;
 }
 
-/// Convenience: implement [`IrohRequestProcessor`] from a `Send + Sync`
-/// async closure. Useful for tests and simple processors.
+/// Convenience: build an [`IrohRequestProcessor`] from a `Send + Sync`
+/// async closure. Useful for tests.
 pub fn from_fn<F, Fut>(f: F) -> impl IrohRequestProcessor
 where
     F: Fn(Bytes) -> Fut + Send + Sync + 'static,
@@ -80,98 +105,343 @@ where
     FnProcessor(f)
 }
 
+// ============================================================================
+// IrohRpcProtocolHandler — iroh ProtocolHandler with concurrency cap + drain
+// ============================================================================
+
 /// Iroh protocol handler that terminates `hyprstream-rpc/1` bidi streams,
-/// applies length-prefixed framing, and dispatches each request through
-/// the wrapped [`IrohRequestProcessor`].
+/// dispatches each request through the wrapped [`IrohRequestProcessor`],
+/// caps concurrent streams per connection, and drains in-flight requests
+/// on `ProtocolHandler::shutdown` (called by `Router::shutdown`).
 #[derive(Clone)]
 pub struct IrohRpcProtocolHandler {
+    inner: Arc<HandlerInner>,
+}
+
+struct HandlerInner {
     processor: Arc<dyn IrohRequestProcessor>,
+    /// Used to produce signed error envelopes when the processor itself
+    /// returns `Err` (wire-level fatal). Application errors come back from
+    /// the processor pre-wrapped as signed `ResponseEnvelope` bytes.
+    signing_key: SigningKey,
+    /// Caps concurrent bidi streams in flight. Hold one permit per stream.
+    stream_limit: Arc<Semaphore>,
+    stream_limit_capacity: u32,
+    /// Level-triggered shutdown signal: once `cancel()` is called, every
+    /// future and current `cancelled().await` resolves immediately. Used
+    /// instead of `tokio::sync::Notify` because `Notify::notify_waiters`
+    /// is edge-triggered and a shutdown signal landing between accept-loop
+    /// iterations would be lost.
+    shutdown: CancellationToken,
 }
 
 impl std::fmt::Debug for IrohRpcProtocolHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IrohRpcProtocolHandler").finish_non_exhaustive()
+        f.debug_struct("IrohRpcProtocolHandler")
+            .field("stream_limit", &self.inner.stream_limit_capacity)
+            .finish_non_exhaustive()
     }
 }
 
 impl IrohRpcProtocolHandler {
-    pub fn new<P: IrohRequestProcessor>(processor: P) -> Self {
-        Self {
-            processor: Arc::new(processor),
-        }
+    /// Build a handler with default per-connection stream limit
+    /// ([`DEFAULT_STREAM_LIMIT`]).
+    pub fn new<P: IrohRequestProcessor>(processor: P, signing_key: SigningKey) -> Self {
+        Self::with_stream_limit(Arc::new(processor), signing_key, DEFAULT_STREAM_LIMIT)
     }
 
-    pub fn from_arc(processor: Arc<dyn IrohRequestProcessor>) -> Self {
-        Self { processor }
+    /// Build a handler with an explicit per-connection stream limit.
+    pub fn with_stream_limit(
+        processor: Arc<dyn IrohRequestProcessor>,
+        signing_key: SigningKey,
+        stream_limit: usize,
+    ) -> Self {
+        let stream_limit_capacity = u32::try_from(stream_limit).unwrap_or(u32::MAX);
+        Self {
+            inner: Arc::new(HandlerInner {
+                processor,
+                signing_key,
+                stream_limit: Arc::new(Semaphore::new(stream_limit)),
+                stream_limit_capacity,
+                shutdown: CancellationToken::new(),
+            }),
+        }
     }
 }
 
 impl ProtocolHandler for IrohRpcProtocolHandler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
-        // Accept bidi streams on this connection until the peer goes away.
-        // Each stream is one request-response pair, processed concurrently.
         loop {
-            let (mut send, mut recv) = match conn.accept_bi().await {
-                Ok(streams) => streams,
-                Err(e) => {
-                    tracing::debug!(error = ?e, "iroh-rpc: connection closed");
+            tokio::select! {
+                biased;
+                _ = self.inner.shutdown.cancelled() => {
+                    tracing::debug!("iroh-rpc: accept loop cancelled");
                     return Ok(());
                 }
-            };
+                streams = conn.accept_bi() => {
+                    let (send, recv) = match streams {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            tracing::debug!(error = ?e, "iroh-rpc: connection closed");
+                            return Ok(());
+                        }
+                    };
 
-            let processor = Arc::clone(&self.processor);
-            tokio::spawn(async move {
-                // Read full request (length-prefixed).
-                let request = match recv.read_to_end(MAX_REQUEST_BYTES).await {
-                    Ok(buf) => Bytes::from(buf),
-                    Err(e) => {
-                        tracing::warn!(error = ?e, "iroh-rpc: failed reading request");
-                        return;
-                    }
-                };
+                    // Acquire a permit to cap concurrent streams. If the
+                    // semaphore is closed (shutdown), exit cleanly.
+                    let permit = match Arc::clone(&self.inner.stream_limit).acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => return Ok(()),
+                    };
 
-                // Process.
-                let response = match processor.process(request).await {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        tracing::warn!(error = ?e, "iroh-rpc: processor returned error");
-                        // Close the send side without a body; client will see EOF.
-                        let _ = send.finish();
-                        return;
-                    }
-                };
-
-                // Write response.
-                if let Err(e) = send.write_all(&response).await {
-                    tracing::warn!(error = ?e, "iroh-rpc: failed writing response");
-                    return;
+                    let inner = Arc::clone(&self.inner);
+                    tokio::spawn(handle_stream(send, recv, inner, permit));
                 }
-                if let Err(e) = send.finish() {
-                    tracing::warn!(error = ?e, "iroh-rpc: failed finishing send");
-                }
-                // Optional: wait for peer to read.
-                let _ = send.stopped().await;
-            });
+            }
         }
     }
+
+    async fn shutdown(&self) {
+        // Stop the accept loop from taking new streams. Level-triggered:
+        // even if cancel() lands between iterations, the next time the
+        // loop hits `cancelled().await` it returns immediately.
+        self.inner.shutdown.cancel();
+        // Wait for all in-flight streams to release their permits.
+        // `acquire_many` succeeds only once every permit is returned.
+        let cap = self.inner.stream_limit_capacity;
+        match self.inner.stream_limit.acquire_many(cap).await {
+            Ok(permits) => {
+                // Keep permits drained so any post-shutdown accept also
+                // sees a closed semaphore.
+                permits.forget();
+                self.inner.stream_limit.close();
+            }
+            Err(_) => {
+                // Already closed; nothing to drain.
+            }
+        }
+    }
+}
+
+/// Handle one bidi stream end-to-end: read request, dispatch to processor,
+/// write response (or signed error envelope on processor failure).
+async fn handle_stream(
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
+    inner: Arc<HandlerInner>,
+    permit: OwnedSemaphorePermit,
+) {
+    // Permit is released when this function returns.
+    let _permit = permit;
+
+    let request = match recv.read_to_end(MAX_FRAME_BYTES).await {
+        Ok(buf) => Bytes::from(buf),
+        Err(e) => {
+            tracing::warn!(error = ?e, "iroh-rpc: failed reading request");
+            return;
+        }
+    };
+
+    let response = match inner.processor.process(request).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(error = ?e, "iroh-rpc: processor error, sending stub error envelope");
+            build_error_envelope(&inner.signing_key, &format!("processor error: {e}"))
+        }
+    };
+
+    if let Err(e) = send.write_all(&response).await {
+        tracing::warn!(error = ?e, "iroh-rpc: failed writing response");
+        return;
+    }
+    if let Err(e) = send.finish() {
+        tracing::warn!(error = ?e, "iroh-rpc: failed finishing send");
+        return;
+    }
+    // Wait for the peer to ack the FIN, but cap it so a dead peer can't
+    // leak this task forever.
+    let _ = tokio::time::timeout(STOPPED_GRACE, send.stopped()).await;
+}
+
+/// Build a signed `ResponseEnvelope` (request_id = 0) carrying `message` as
+/// the payload. Used when the processor itself fails — guarantees the client
+/// sees a parseable envelope rather than EOF.
+fn build_error_envelope(signing_key: &SigningKey, message: &str) -> Bytes {
+    use crate::ToCapnp;
+    use capnp::{message::Builder, serialize};
+    let envelope =
+        crate::envelope::ResponseEnvelope::new_signed(0, message.as_bytes().to_vec(), signing_key);
+    let mut msg = Builder::new_default();
+    {
+        let mut builder = msg.init_root::<crate::common_capnp::response_envelope::Builder>();
+        envelope.write_to(&mut builder);
+    }
+    let mut bytes = Vec::new();
+    if let Err(e) = serialize::write_message(&mut bytes, &msg) {
+        // Last-ditch: if even this fails, return empty bytes — client will
+        // see Cap'n Proto parse error, which is no worse than the original
+        // behaviour. This should be unreachable in practice.
+        tracing::error!(error = ?e, "iroh-rpc: failed serializing error envelope");
+        return Bytes::new();
+    }
+    Bytes::from(bytes)
 }
 
 /// Client-side helper: open a bidi stream on `hyprstream-rpc/1` against an
 /// already-connected iroh [`Connection`], write the request, read the response.
 ///
-/// This is a primitive — the real per-service RPC clients (generated by
-/// `hyprstream_rpc_derive::generate_rpc_service!`) will wrap it with their
-/// own envelope construction and response decoding. Used directly only in
-/// tests during Phase 2.
+/// Primitive used by tests and internally by
+/// [`super::iroh_transport::IrohTransport`] — production callers should
+/// construct an `IrohTransport` + [`crate::rpc_client::RpcClientImpl`] instead.
 pub async fn client_request(conn: &Connection, request: &[u8]) -> Result<Bytes> {
     let (mut send, mut recv) = conn.open_bi().await.context("open_bi")?;
     send.write_all(request).await.context("write request")?;
     send.finish().context("finish send")?;
     let buf = recv
-        .read_to_end(MAX_REQUEST_BYTES)
+        .read_to_end(MAX_FRAME_BYTES)
         .await
         .context("read response")?;
     Ok(Bytes::from(buf))
+}
+
+// ============================================================================
+// LocalServiceBridge — adapt a (possibly `!Send`) ZmqService to the Send-bound
+// IrohRequestProcessor trait by running the service on a dedicated LocalSet
+// thread and forwarding requests over an mpsc channel.
+// ============================================================================
+
+/// Per-request payload + response slot exchanged with the bridge thread.
+struct BridgeMessage {
+    request: Bytes,
+    respond: tokio::sync::oneshot::Sender<Result<Bytes>>,
+}
+
+/// Adapt a [`crate::service::ZmqService`] to [`IrohRequestProcessor`].
+///
+/// Spins up a dedicated thread running a single-threaded tokio runtime with
+/// a `LocalSet`. The service runs on that thread (compatible with both `Send`
+/// and `!Send` services like inference); requests arriving on the iroh accept
+/// loop are forwarded via an `mpsc` channel and awaited via `oneshot`.
+///
+/// **Lifecycle**: in-flight requests are drained when the
+/// [`IrohRpcProtocolHandler`] holding this bridge is shut down via
+/// `Router::shutdown` (each in-flight handler task holds a semaphore permit;
+/// the handler's drain waits for all permits to return, which only happens
+/// once the bridge has produced each response). After that, dropping the
+/// last `Arc<LocalServiceBridge>` closes the mpsc Sender, the bridge thread
+/// exits its receive loop, and `LocalSet::block_on` returns.
+pub struct LocalServiceBridge {
+    tx: tokio::sync::mpsc::Sender<BridgeMessage>,
+}
+
+impl LocalServiceBridge {
+    /// Spawn a dedicated bridge thread that owns `service` and forwards
+    /// requests through [`crate::transport::zmtp_quic::process_request`].
+    ///
+    /// The response signing key is taken from `service.signing_key()` — there
+    /// is no separate parameter to avoid drift between the service's identity
+    /// and the key used to sign responses.
+    ///
+    /// `queue_depth` is the mpsc channel capacity — backpressure point when
+    /// the bridge falls behind. Pass `0` for default (128).
+    pub fn spawn<S>(
+        service: S,
+        nonce_cache: Arc<crate::envelope::InMemoryNonceCache>,
+        queue_depth: usize,
+    ) -> Result<Self>
+    where
+        S: crate::service::ZmqService + Send + 'static,
+    {
+        let cap = if queue_depth == 0 { 128 } else { queue_depth };
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<BridgeMessage>(cap);
+        let service_name = service.name().to_owned();
+
+        std::thread::Builder::new()
+            .name(format!("iroh-rpc-bridge:{service_name}"))
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        tracing::error!(error = ?e, "bridge: failed to build runtime");
+                        return;
+                    }
+                };
+                let local = tokio::task::LocalSet::new();
+                local.spawn_local(async move {
+                    let service = std::rc::Rc::new(service);
+                    while let Some(msg) = rx.recv().await {
+                        let service = std::rc::Rc::clone(&service);
+                        let nonce_cache = Arc::clone(&nonce_cache);
+                        // Each request gets its own local task so a slow
+                        // handler doesn't head-of-line the queue.
+                        tokio::task::spawn_local(async move {
+                            // Re-derive the signing key per call: cheap clone,
+                            // tracks any future rotation in the service.
+                            let signing_key = service.signing_key();
+                            let result = crate::transport::zmtp_quic::process_request(
+                                msg.request.as_ref(),
+                                &*service,
+                                crate::envelope::EnvelopeVerification::AnySigner,
+                                &signing_key,
+                                &nonce_cache,
+                            )
+                            .await
+                            .and_then(|(bytes, cont)| {
+                                // Streaming continuations are not wired on
+                                // the iroh RPC plane — streaming moves to
+                                // moq-net (`moql` ALPN, Phase 3, #134). In
+                                // debug, panic loudly; in release, return an
+                                // error so the wire emits a signed error
+                                // envelope (handler's build_error_envelope)
+                                // rather than silently dropping the stream.
+                                if cont.is_some() {
+                                    debug_assert!(
+                                        false,
+                                        "iroh-rpc bridge: streaming continuation not supported \
+                                         — wait for Phase 3 (#134)"
+                                    );
+                                    return Err(anyhow::anyhow!(
+                                        "iroh-rpc bridge: service returned a streaming \
+                                         continuation, which is not supported on the iroh \
+                                         RPC plane (Phase 3 / #134 moves streaming to moq-net)"
+                                    ));
+                                }
+                                Ok(Bytes::from(bytes))
+                            });
+                            let _ = msg.respond.send(result);
+                        });
+                    }
+                });
+                rt.block_on(local);
+            })
+            .map_err(|e| anyhow::anyhow!("spawn iroh-rpc bridge thread: {e}"))?;
+
+        Ok(Self { tx })
+    }
+}
+
+impl IrohRequestProcessor for LocalServiceBridge {
+    fn process(
+        &self,
+        request: Bytes,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>> {
+        let tx = self.tx.clone();
+        Box::pin(async move {
+            let (respond_tx, respond_rx) = tokio::sync::oneshot::channel();
+            tx.send(BridgeMessage {
+                request,
+                respond: respond_tx,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("iroh-rpc bridge: channel closed"))?;
+            respond_rx
+                .await
+                .map_err(|_| anyhow::anyhow!("iroh-rpc bridge: response dropped"))?
+        })
+    }
 }
 
 #[cfg(test)]
@@ -189,6 +459,10 @@ mod tests {
         k
     }
 
+    fn fresh_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&fresh_key())
+    }
+
     fn direct_addr(substrate: &IrohSubstrate) -> EndpointAddr {
         EndpointAddr::from_parts(
             substrate.endpoint_id(),
@@ -200,9 +474,6 @@ mod tests {
         )
     }
 
-    /// End-to-end: server runs an `IrohRpcProtocolHandler` wired to a
-    /// closure-based processor that prepends a magic byte to the request,
-    /// client sends one request and reads the response.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rpc_request_response_round_trip() -> Result<()> {
         let processor = from_fn(|req: Bytes| async move {
@@ -211,14 +482,10 @@ mod tests {
             out.extend_from_slice(&req);
             Ok(Bytes::from(out))
         });
-        let rpc_handler = IrohRpcProtocolHandler::new(processor);
+        let rpc_handler = IrohRpcProtocolHandler::new(processor, fresh_signing_key());
 
-        let server = IrohSubstrate::new(
-            fresh_key(),
-            NoopHandler::new("moq-not-wired"),
-            rpc_handler,
-        )
-        .await?;
+        let server =
+            IrohSubstrate::new(fresh_key(), NoopHandler::new("moq-not-wired"), rpc_handler).await?;
         let server_addr = direct_addr(&server);
 
         let client = IrohSubstrate::new(
@@ -228,13 +495,10 @@ mod tests {
         )
         .await?;
 
-        let conn = client
-            .connect(server_addr, ALPN_HYPRSTREAM_RPC)
-            .await?;
+        let conn = client.connect(server_addr, ALPN_HYPRSTREAM_RPC).await?;
         let resp = client_request(&conn, b"ping").await?;
         assert_eq!(&resp[..], b"\xABping");
 
-        // Sanity: moq ALPN still routes to the noop handler (does not crash).
         let conn2 = client.connect(direct_addr(&server), ALPN_MOQ_LITE).await?;
         drop(conn2);
 
@@ -243,12 +507,9 @@ mod tests {
         Ok(())
     }
 
-    /// Multiple concurrent requests on the same connection round-trip
-    /// independently and arrive at the correct caller.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rpc_concurrent_requests() -> Result<()> {
         let processor = from_fn(|req: Bytes| async move {
-            // Echo with a trailing marker so we can verify correlation.
             let mut out = req.to_vec();
             out.push(b'!');
             Ok(Bytes::from(out))
@@ -256,7 +517,7 @@ mod tests {
         let server = IrohSubstrate::new(
             fresh_key(),
             NoopHandler::new("moq"),
-            IrohRpcProtocolHandler::new(processor),
+            IrohRpcProtocolHandler::new(processor, fresh_signing_key()),
         )
         .await?;
         let server_addr = direct_addr(&server);
@@ -267,11 +528,7 @@ mod tests {
             NoopHandler::new("c-rpc"),
         )
         .await?;
-        let conn = Arc::new(
-            client
-                .connect(server_addr, ALPN_HYPRSTREAM_RPC)
-                .await?,
-        );
+        let conn = Arc::new(client.connect(server_addr, ALPN_HYPRSTREAM_RPC).await?);
 
         let mut handles = Vec::new();
         for i in 0..8u8 {
@@ -288,6 +545,160 @@ mod tests {
 
         client.shutdown().await?;
         server.shutdown().await?;
+        Ok(())
+    }
+
+    /// Processor returns `Err` → client gets a parseable signed
+    /// `ResponseEnvelope` carrying the error message (request_id = 0), not
+    /// an opaque EOF / Cap'n Proto parse failure. (Fix for review finding #4.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_processor_error_yields_parseable_envelope() -> Result<()> {
+        let server_signing = fresh_signing_key();
+        let server_vk = server_signing.verifying_key();
+
+        let processor =
+            from_fn(|_req: Bytes| async move { Err(anyhow::anyhow!("boom from processor")) });
+        let handler = IrohRpcProtocolHandler::new(processor, server_signing);
+
+        let server = IrohSubstrate::new(fresh_key(), NoopHandler::new("moq"), handler).await?;
+        let server_addr = direct_addr(&server);
+
+        let client = IrohSubstrate::new(
+            fresh_key(),
+            NoopHandler::new("c-moq"),
+            NoopHandler::new("c-rpc"),
+        )
+        .await?;
+        let conn = client.connect(server_addr, ALPN_HYPRSTREAM_RPC).await?;
+
+        // Send any bytes; the processor will Err regardless. The interesting
+        // assertion is what comes back: a verifiable ResponseEnvelope.
+        let resp_bytes = client_request(&conn, b"anything").await?;
+        let (request_id, payload) = crate::envelope::unwrap_response(&resp_bytes, Some(&server_vk))?;
+        assert_eq!(request_id, 0, "error envelope uses request_id=0");
+        let body = std::str::from_utf8(&payload)?;
+        assert!(body.contains("boom from processor"), "got: {body}");
+
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// Concurrency cap is enforced: with a stream_limit of 2, a third
+    /// concurrent slow request must wait for one of the first two to finish.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_stream_limit_enforced() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let in_flight_c = Arc::clone(&in_flight);
+        let peak_c = Arc::clone(&peak);
+
+        let processor = from_fn(move |_req: Bytes| {
+            let in_flight = Arc::clone(&in_flight_c);
+            let peak = Arc::clone(&peak_c);
+            async move {
+                let cur = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                // Update peak.
+                let mut p = peak.load(Ordering::SeqCst);
+                while cur > p {
+                    match peak.compare_exchange_weak(p, cur, Ordering::SeqCst, Ordering::SeqCst) {
+                        Ok(_) => break,
+                        Err(prev) => p = prev,
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(Bytes::from_static(b"ok"))
+            }
+        });
+        let handler = IrohRpcProtocolHandler::with_stream_limit(
+            Arc::new(processor),
+            fresh_signing_key(),
+            2,
+        );
+
+        let server = IrohSubstrate::new(fresh_key(), NoopHandler::new("moq"), handler).await?;
+        let server_addr = direct_addr(&server);
+
+        let client = IrohSubstrate::new(
+            fresh_key(),
+            NoopHandler::new("c-moq"),
+            NoopHandler::new("c-rpc"),
+        )
+        .await?;
+        let conn = Arc::new(client.connect(server_addr, ALPN_HYPRSTREAM_RPC).await?);
+
+        let mut handles = Vec::new();
+        for _ in 0..6 {
+            let conn = Arc::clone(&conn);
+            handles.push(tokio::spawn(async move {
+                let _ = client_request(&conn, b"x").await?;
+                anyhow::Ok(())
+            }));
+        }
+        for h in handles {
+            h.await??;
+        }
+
+        assert!(
+            peak.load(Ordering::SeqCst) <= 2,
+            "stream_limit=2 violated, observed peak={}",
+            peak.load(Ordering::SeqCst)
+        );
+
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// `Router::shutdown` (via `IrohSubstrate::shutdown`) drains in-flight
+    /// requests before returning — a request in-progress when shutdown
+    /// starts still gets a clean response. (Fix for review round-1 #1.)
+    ///
+    /// Uses an explicit `Notify` to synchronise "processor has entered the
+    /// long sleep" with "now safe to shut down" — replaces the previous
+    /// 50ms `tokio::sleep` that was flaky on loaded CI runners.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_shutdown_drains_in_flight() -> Result<()> {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let entered_c = Arc::clone(&entered);
+        let processor = from_fn(move |_req: Bytes| {
+            let entered = Arc::clone(&entered_c);
+            async move {
+                entered.notify_one();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                Ok(Bytes::from_static(b"drained-ok"))
+            }
+        });
+        let handler = IrohRpcProtocolHandler::new(processor, fresh_signing_key());
+
+        let server = IrohSubstrate::new(fresh_key(), NoopHandler::new("moq"), handler).await?;
+        let server_addr = direct_addr(&server);
+
+        let client = IrohSubstrate::new(
+            fresh_key(),
+            NoopHandler::new("c-moq"),
+            NoopHandler::new("c-rpc"),
+        )
+        .await?;
+        let conn = client.connect(server_addr, ALPN_HYPRSTREAM_RPC).await?;
+
+        let req_task = {
+            let conn = conn.clone();
+            tokio::spawn(async move { client_request(&conn, b"slow").await })
+        };
+
+        // Synchronise: wait until the processor signals it has entered the
+        // sleep, *then* shut down. No wall-clock guesses.
+        entered.notified().await;
+        server.shutdown().await?;
+
+        let resp = req_task.await??;
+        assert_eq!(&resp[..], b"drained-ok");
+
+        client.shutdown().await?;
         Ok(())
     }
 }
