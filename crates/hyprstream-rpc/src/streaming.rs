@@ -397,44 +397,9 @@ impl StreamBuilder {
         let payloads = std::mem::take(&mut self.pending);
         self.pending_bytes = 0;
 
-        // Build StreamBlock capnp message
-        let mut msg = Builder::new_default();
-        {
-            let mut block = msg.init_root::<streaming_capnp::stream_block::Builder>();
-            block.set_prev_mac(self.hmac_state.prev_mac_bytes());
-
-            // Cap'n Proto uses u32 for list lengths
-            let payloads_len = u32::try_from(payloads.len()).unwrap_or(u32::MAX);
-            let mut list = block.init_payloads(payloads_len);
-            for (i, payload) in payloads.iter().enumerate() {
-                let idx = u32::try_from(i).unwrap_or(u32::MAX);
-                let mut p = list.reborrow().get(idx);
-                match payload {
-                    StreamPayloadData::Data(data) => {
-                        p.set_data(data);
-                    }
-                    StreamPayloadData::Error(message) => {
-                        let mut err = p.init_error();
-                        err.set_message(message);
-                        err.set_code("");
-                        err.set_details("");
-                    }
-                    StreamPayloadData::Complete(data) => {
-                        p.set_complete(data);
-                    }
-                    StreamPayloadData::Tagged { tag, payload, nonce, key_commitment } => {
-                        let mut tagged = p.init_tagged();
-                        tagged.set_tag(tag);
-                        tagged.set_payload(payload);
-                        tagged.set_nonce(nonce);
-                        tagged.set_key_commitment(key_commitment);
-                    }
-                }
-            }
-        }
-
-        let mut capnp_bytes = Vec::new();
-        serialize::write_message(&mut capnp_bytes, &msg)?;
+        // Build StreamBlock capnp message (shared encoder; also used by the
+        // moq plane in `moq_stream.rs`).
+        let capnp_bytes = encode_stream_block(self.hmac_state.prev_mac_bytes(), &payloads)?;
 
         let mac = self.hmac_state.compute_next(&capnp_bytes);
 
@@ -1832,6 +1797,55 @@ impl StreamGuard {
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Encode a `StreamBlock` capnp message from a `prev_mac` + payload list.
+///
+/// Factored out of [`StreamBuilder::flush`] so the moq streaming plane
+/// (`crate::moq_stream`) can produce byte-identical StreamBlocks for the §7.5
+/// chained-HMAC tokenstream.
+pub fn encode_stream_block(
+    prev_mac: &[u8],
+    payloads: &[StreamPayloadData],
+) -> Result<Vec<u8>> {
+    let mut msg = Builder::new_default();
+    {
+        let mut block = msg.init_root::<streaming_capnp::stream_block::Builder>();
+        block.set_prev_mac(prev_mac);
+
+        // Cap'n Proto uses u32 for list lengths
+        let payloads_len = u32::try_from(payloads.len()).unwrap_or(u32::MAX);
+        let mut list = block.init_payloads(payloads_len);
+        for (i, payload) in payloads.iter().enumerate() {
+            let idx = u32::try_from(i).unwrap_or(u32::MAX);
+            let mut p = list.reborrow().get(idx);
+            match payload {
+                StreamPayloadData::Data(data) => {
+                    p.set_data(data);
+                }
+                StreamPayloadData::Error(message) => {
+                    let mut err = p.init_error();
+                    err.set_message(message);
+                    err.set_code("");
+                    err.set_details("");
+                }
+                StreamPayloadData::Complete(data) => {
+                    p.set_complete(data);
+                }
+                StreamPayloadData::Tagged { tag, payload, nonce, key_commitment } => {
+                    let mut tagged = p.init_tagged();
+                    tagged.set_tag(tag);
+                    tagged.set_payload(payload);
+                    tagged.set_nonce(nonce);
+                    tagged.set_key_commitment(key_commitment);
+                }
+            }
+        }
+    }
+
+    let mut capnp_bytes = Vec::new();
+    serialize::write_message(&mut capnp_bytes, &msg)?;
+    Ok(capnp_bytes)
+}
 
 /// Build a StreamRegister message wrapped in SignedEnvelope.
 ///

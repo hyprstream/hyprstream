@@ -403,6 +403,26 @@ fn create_streams_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
     // PULL backend - publishers connect via PUSH
     let pull_transport = global_registry().endpoint("streams", SocketKind::Push);
 
+    // In-process publish gate: only accept signers attested in the trust store.
+    // Shared by the ZMQ StreamRegister path and the moq in-process plane (M2a).
+    let gate = |pubkey: &[u8; 32]| -> bool {
+        use ed25519_dalek::VerifyingKey;
+        let Ok(vk) = VerifyingKey::from_bytes(pubkey) else {
+            return false;
+        };
+        hyprstream_service::global_trust_store().get(&vk).is_some()
+    };
+
+    // moq-lite streaming origin (epic #134 M2a). A standalone origin is built
+    // here so StreamService holds it and in-process publishers can append to it.
+    // When the iroh substrate is wired into bootstrap (M2b), this origin will be
+    // the substrate's shared `IrohMoqProtocolHandler` origin so external moq
+    // subscribers consume the same tree over the `moql` ALPN.
+    let moq_origin = hyprstream_rpc::moq_stream::MoqStreamOrigin::standalone()
+        .with_prefix("local/streams")
+        .with_authorize_signer(gate)
+        .build();
+
     let stream_service = StreamService::new(
         "streams",
         global_context(),
@@ -410,13 +430,8 @@ fn create_streams_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
         pull_transport,
         ctx.verifying_key(),
     )
-    .with_authorize_signer(|pubkey| {
-        use ed25519_dalek::VerifyingKey;
-        let Ok(vk) = VerifyingKey::from_bytes(pubkey) else {
-            return false;
-        };
-        hyprstream_service::global_trust_store().get(&vk).is_some()
-    });
+    .with_authorize_signer(gate)
+    .with_moq_origin(moq_origin);
 
     Ok(Box::new(stream_service))
 }

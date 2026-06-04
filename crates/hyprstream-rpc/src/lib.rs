@@ -136,6 +136,8 @@ pub mod zmq_context;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod streaming;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod moq_stream;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod transport;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod notify;

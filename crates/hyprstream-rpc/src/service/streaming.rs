@@ -150,6 +150,16 @@ pub struct StreamService {
     /// a StreamRegister. Returns `true` if the key is trusted.
     /// When `None`, any valid signature is accepted (testing/bootstrap).
     authorize_signer: Option<Arc<dyn Fn(&[u8; 32]) -> bool + Send + Sync>>,
+
+    /// moq-lite streaming plane (epic #134 M2a).
+    ///
+    /// When set, in-process publishers can append directly to the shared
+    /// `moq_net::Origin` (via [`crate::moq_stream::MoqStreamOrigin::publisher`])
+    /// and external subscribers consume the same origin over the `moql` ALPN.
+    /// The ZMQ PULL→XPUB proxy below remains as a parallel path until the
+    /// substrate is wired into service bootstrap. The in-process publish gate
+    /// (`authorize_signer`) is mirrored onto the moq origin by the factory.
+    moq: Option<crate::moq_stream::MoqStreamOrigin>,
 }
 
 impl StreamService {
@@ -205,7 +215,23 @@ impl StreamService {
             nonce_cache: Arc::new(InMemoryNonceCache::new()),
             verifying_key,
             authorize_signer: None,
+            moq: None,
         }
+    }
+
+    /// Attach a moq-lite streaming origin (epic #134 M2a).
+    ///
+    /// The origin should already carry the same `authorize_signer` gate as this
+    /// service (use `MoqStreamOrigin::builder(..).with_authorize_signer(..)`).
+    /// In-process publishers obtain it via [`Self::moq_origin`].
+    pub fn with_moq_origin(mut self, origin: crate::moq_stream::MoqStreamOrigin) -> Self {
+        self.moq = Some(origin);
+        self
+    }
+
+    /// Borrow the moq streaming origin, if configured.
+    pub fn moq_origin(&self) -> Option<&crate::moq_stream::MoqStreamOrigin> {
+        self.moq.as_ref()
     }
 
     /// Configure buffer sizes and TTL
