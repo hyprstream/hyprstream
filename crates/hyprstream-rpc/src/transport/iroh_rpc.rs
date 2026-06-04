@@ -29,81 +29,21 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use ed25519_dalek::SigningKey;
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-/// Hard cap on per-frame size (request or response). Mirrors the WebTransport
-/// server-side cap used in [`crate::transport::zmtp_quic`].
-pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
-
-/// Default per-connection concurrent-stream cap. Caps memory usage from a
-/// hostile peer to `MAX_FRAME_BYTES × DEFAULT_STREAM_LIMIT` per connection
-/// (4 GiB at defaults). Configurable via [`IrohRpcProtocolHandlerBuilder`].
-pub const DEFAULT_STREAM_LIMIT: usize = 64;
-
-/// Grace period for `SendStream::stopped()` after writing the response — if
-/// the peer crashes without acking the FIN, we don't leak a task forever.
-const STOPPED_GRACE: Duration = Duration::from_secs(5);
-
-// ============================================================================
-// IrohRequestProcessor — pluggable request handling trait
-// ============================================================================
-
-/// Trait implemented by callers to wire actual request processing.
-///
-/// The processor receives the raw request bytes (a Cap'n Proto-encoded
-/// `SignedEnvelope`) and returns the raw response bytes.
-///
-/// **Contract for `process`**:
-/// - **`Ok(bytes)`** — `bytes` MUST be a valid Cap'n Proto-encoded
-///   `ResponseEnvelope` and is written verbatim to the bidi stream.
-///   Application-layer errors (verification failure, handler error, etc.)
-///   MUST be returned this way as signed error envelopes — the handler
-///   forwards them unchanged.
-/// - **`Err(_)`** — wire-level fatal: the processor cannot produce *any*
-///   response (channel closed during shutdown, etc.). The handler responds
-///   with its own signed error envelope (`request_id = 0`) so the client
-///   sees a parseable error rather than a Cap'n Proto parse failure.
-///
-/// Implementations MUST be `Send + Sync + 'static` because iroh's accept
-/// loop runs on a multi-threaded tokio runtime. For services that are
-/// `!Send` (e.g. those holding `tch-rs` tensors), use [`LocalServiceBridge`].
-pub trait IrohRequestProcessor: Send + Sync + 'static {
-    fn process(
-        &self,
-        request: Bytes,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>>;
-}
-
-/// Convenience: build an [`IrohRequestProcessor`] from a `Send + Sync`
-/// async closure. Useful for tests.
-pub fn from_fn<F, Fut>(f: F) -> impl IrohRequestProcessor
-where
-    F: Fn(Bytes) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<Bytes>> + Send + 'static,
-{
-    struct FnProcessor<F>(F);
-    impl<F, Fut> IrohRequestProcessor for FnProcessor<F>
-    where
-        F: Fn(Bytes) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<Bytes>> + Send + 'static,
-    {
-        fn process(
-            &self,
-            request: Bytes,
-        ) -> std::pin::Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>> {
-            Box::pin((self.0)(request))
-        }
-    }
-    FnProcessor(f)
-}
+// Transport-generic core lives in `super::rpc_session`. Re-export the shared
+// surface from here so existing `iroh_rpc::{...}` imports keep working.
+pub use super::rpc_session::{
+    DEFAULT_STREAM_LIMIT, IrohRequestProcessor, MAX_FRAME_BYTES, build_error_envelope, from_fn,
+    read_to_cap, serve_rpc_connection,
+};
 
 // ============================================================================
 // IrohRpcProtocolHandler — iroh ProtocolHandler with concurrency cap + drain
@@ -171,34 +111,19 @@ impl IrohRpcProtocolHandler {
 
 impl ProtocolHandler for IrohRpcProtocolHandler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
-        loop {
-            tokio::select! {
-                biased;
-                _ = self.inner.shutdown.cancelled() => {
-                    tracing::debug!("iroh-rpc: accept loop cancelled");
-                    return Ok(());
-                }
-                streams = conn.accept_bi() => {
-                    let (send, recv) = match streams {
-                        Ok(pair) => pair,
-                        Err(e) => {
-                            tracing::debug!(error = ?e, "iroh-rpc: connection closed");
-                            return Ok(());
-                        }
-                    };
-
-                    // Acquire a permit to cap concurrent streams. If the
-                    // semaphore is closed (shutdown), exit cleanly.
-                    let permit = match Arc::clone(&self.inner.stream_limit).acquire_owned().await {
-                        Ok(p) => p,
-                        Err(_) => return Ok(()),
-                    };
-
-                    let inner = Arc::clone(&self.inner);
-                    tokio::spawn(handle_stream(send, recv, inner, permit));
-                }
-            }
-        }
+        // Adapt the raw iroh `Connection` to the transport-generic `Session`
+        // abstraction and delegate to the shared accept loop. Drain semantics
+        // (`shutdown` below draining the same `Semaphore`) are unchanged.
+        let session = web_transport_iroh::Session::raw(conn);
+        serve_rpc_connection(
+            session,
+            Arc::clone(&self.inner.processor),
+            self.inner.signing_key.clone(),
+            Arc::clone(&self.inner.stream_limit),
+            self.inner.shutdown.clone(),
+        )
+        .await
+        .map_err(|e| AcceptError::from_err(std::io::Error::other(e.to_string())))
     }
 
     async fn shutdown(&self) {
@@ -221,70 +146,6 @@ impl ProtocolHandler for IrohRpcProtocolHandler {
             }
         }
     }
-}
-
-/// Handle one bidi stream end-to-end: read request, dispatch to processor,
-/// write response (or signed error envelope on processor failure).
-async fn handle_stream(
-    mut send: iroh::endpoint::SendStream,
-    mut recv: iroh::endpoint::RecvStream,
-    inner: Arc<HandlerInner>,
-    permit: OwnedSemaphorePermit,
-) {
-    // Permit is released when this function returns.
-    let _permit = permit;
-
-    let request = match recv.read_to_end(MAX_FRAME_BYTES).await {
-        Ok(buf) => Bytes::from(buf),
-        Err(e) => {
-            tracing::warn!(error = ?e, "iroh-rpc: failed reading request");
-            return;
-        }
-    };
-
-    let response = match inner.processor.process(request).await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::warn!(error = ?e, "iroh-rpc: processor error, sending stub error envelope");
-            build_error_envelope(&inner.signing_key, &format!("processor error: {e}"))
-        }
-    };
-
-    if let Err(e) = send.write_all(&response).await {
-        tracing::warn!(error = ?e, "iroh-rpc: failed writing response");
-        return;
-    }
-    if let Err(e) = send.finish() {
-        tracing::warn!(error = ?e, "iroh-rpc: failed finishing send");
-        return;
-    }
-    // Wait for the peer to ack the FIN, but cap it so a dead peer can't
-    // leak this task forever.
-    let _ = tokio::time::timeout(STOPPED_GRACE, send.stopped()).await;
-}
-
-/// Build a signed `ResponseEnvelope` (request_id = 0) carrying `message` as
-/// the payload. Used when the processor itself fails — guarantees the client
-/// sees a parseable envelope rather than EOF.
-fn build_error_envelope(signing_key: &SigningKey, message: &str) -> Bytes {
-    use crate::ToCapnp;
-    use capnp::{message::Builder, serialize};
-    let envelope =
-        crate::envelope::ResponseEnvelope::new_signed(0, message.as_bytes().to_vec(), signing_key);
-    let mut msg = Builder::new_default();
-    {
-        let mut builder = msg.init_root::<crate::common_capnp::response_envelope::Builder>();
-        envelope.write_to(&mut builder);
-    }
-    let mut bytes = Vec::new();
-    if let Err(e) = serialize::write_message(&mut bytes, &msg) {
-        // Last-ditch: if even this fails, return empty bytes — client will
-        // see Cap'n Proto parse error, which is no worse than the original
-        // behaviour. This should be unreachable in practice.
-        tracing::error!(error = ?e, "iroh-rpc: failed serializing error envelope");
-        return Bytes::new();
-    }
-    Bytes::from(bytes)
 }
 
 /// Client-side helper: open a bidi stream on `hyprstream-rpc/1` against an
@@ -452,6 +313,7 @@ mod tests {
     };
     use iroh::{EndpointAddr, TransportAddr};
     use rand::RngCore;
+    use std::time::Duration;
 
     fn fresh_key() -> [u8; 32] {
         let mut k = [0u8; 32];

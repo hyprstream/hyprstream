@@ -88,7 +88,9 @@ http = { workspace = true }
 iroh = { workspace = true }
 moq-net = { workspace = true }
 web-transport-iroh = { workspace = true }
+web-transport-quinn = { workspace = true }
 web-transport-trait = { workspace = true }
+url = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true, features = ["io-util", "net"] }

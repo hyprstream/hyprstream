@@ -5359,8 +5359,8 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link 0.1.3",
- "windows-result 0.3.4",
+ "windows-link 0.2.1",
+ "windows-result 0.4.1",
 ]
 
 [[package]]
@@ -6667,12 +6667,14 @@ dependencies = [
  "tokio-test",
  "tokio-util",
  "tracing",
+ "url",
  "uuid 1.18.1",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
  "web-time",
  "web-transport-iroh",
+ "web-transport-quinn",
  "web-transport-trait",
  "webpki-roots 0.26.11",
  "whoami",
@@ -6880,7 +6882,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -16628,6 +16630,26 @@ dependencies = [
  "thiserror 2.0.17",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "web-transport-quinn"
+version = "0.11.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cac11b6caf163be7f980442a26fcba15e8074a5f22e85fbb71f0f77d11cecf60"
+dependencies = [
+ "bytes",
+ "futures",
+ "http 1.3.1",
+ "quinn",
+ "rustls 0.23.40",
+ "rustls-native-certs",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+ "url",
+ "web-transport-proto",
+ "web-transport-trait",
 ]
 
 [[package]]

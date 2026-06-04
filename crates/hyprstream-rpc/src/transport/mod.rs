@@ -14,7 +14,11 @@ pub mod quic_stream_bridge;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod iroh_substrate;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod rpc_session;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod iroh_rpc;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod quinn_transport;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod iroh_transport;
 #[cfg(not(target_arch = "wasm32"))]

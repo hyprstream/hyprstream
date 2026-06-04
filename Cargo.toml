@@ -137,6 +137,7 @@ http = "1"
 iroh = { version = "=1.0.0-rc.0", default-features = false, features = ["tls-ring"] }
 moq-net = "0.1"
 web-transport-iroh = { version = "0.5.1", default-features = false, features = ["ring"] }
+web-transport-quinn = { version = "0.11.9", default-features = false, features = ["ring"] }
 web-transport-trait = "0.3"
 
 # Data processing
