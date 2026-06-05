@@ -1360,8 +1360,14 @@ impl Stream for StreamHandle {
 pub struct StreamChannel {
     /// ZMQ context (shared)
     context: Arc<zmq::Context>,
-    /// Signing key for stream registration
+    /// Ed25519 signing key for stream registration
     signing_key: SigningKey,
+    /// ML-DSA-65 signing key for the post-quantum half of the StreamRegister
+    /// composite signature. Mirrors `LocalSigner` on the RPC plane so the
+    /// streaming control plane signs under the same policy (#161). Auto-
+    /// generated; the node's persistent ML-DSA identity is wired in via
+    /// [`Self::with_pq_key`] once peer attestation lands (#157).
+    pq_signing_key: Option<crate::crypto::pq::MlDsaSigningKey>,
     /// Lazy-initialized async PUSH socket to StreamService (wrapped in Arc for sharing)
     push_socket: OnceCell<Arc<tokio::sync::Mutex<tmq::push::Push>>>,
     /// Channel to send subscription requests to the ctrl listener task
@@ -1372,14 +1378,30 @@ pub struct StreamChannel {
 
 impl StreamChannel {
     /// Create a new stream channel.
+    ///
+    /// Auto-generates an ML-DSA-65 key for the post-quantum half of the
+    /// StreamRegister composite, mirroring `LocalSigner::new` on the RPC
+    /// plane. Use [`Self::with_pq_key`] to install the node's persistent
+    /// ML-DSA identity (#157).
     pub fn new(context: Arc<zmq::Context>, signing_key: SigningKey) -> Self {
+        let (pq_sk, _) = crate::crypto::pq::ml_dsa_generate_keypair();
         Self {
             context,
             signing_key,
+            pq_signing_key: Some(pq_sk),
             push_socket: OnceCell::new(),
             ctrl_sub_tx: OnceCell::new(),
             cancel_tokens: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Install the node's persistent ML-DSA-65 signing key, replacing the
+    /// auto-generated one. The matching public key must be anchored in the
+    /// StreamService verifier's PQ trust store for Hybrid verification to
+    /// succeed (peer attestation, #157).
+    pub fn with_pq_key(mut self, key: crate::crypto::pq::MlDsaSigningKey) -> Self {
+        self.pq_signing_key = Some(key);
+        self
     }
 
     /// Prepare a stream with DH key exchange and pre-authorization.
@@ -1478,6 +1500,7 @@ impl StreamChannel {
             topic,
             expiry,
             &self.signing_key,
+            self.pq_signing_key.as_ref(),
             claims,
         );
 
@@ -1854,6 +1877,7 @@ fn build_stream_register_envelope(
     topic: &str,
     expiry: i64,
     signing_key: &SigningKey,
+    pq_signing_key: Option<&crate::crypto::pq::MlDsaSigningKey>,
     _claims: Option<Claims>,
 ) -> Vec<u8> {
     use crate::common_capnp;
@@ -1879,7 +1903,18 @@ fn build_stream_register_envelope(
     let envelope = RequestEnvelope::new(inner_bytes);
     // Claims are no longer carried in the envelope — authorization is via JWT/Authorization field
 
-    let signed = SignedEnvelope::new_signed(envelope, signing_key);
+    // Sign under the same policy mechanism as the RPC plane (#161): Hybrid
+    // (EdDSA + ML-DSA-65 SNS composite) when a PQ key is present, else
+    // Classical. This removes the prior unconditional `new_signed` (Classical)
+    // that the StreamService verifier — enforcing the global Hybrid policy —
+    // would either reject or accept as a strict downgrade vs RPC.
+    let policy = if pq_signing_key.is_some() {
+        crate::crypto::CryptoPolicy::Hybrid
+    } else {
+        crate::crypto::CryptoPolicy::Classical
+    };
+    let signed =
+        SignedEnvelope::new_signed_with_policy(envelope, signing_key, pq_signing_key, policy);
 
     let mut msg = Builder::new_default();
     {
@@ -1926,6 +1961,66 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #161: a StreamRegister built with a PQ key is a Hybrid (SNS) composite
+    /// that verifies under the global Hybrid policy when the signer's ML-DSA
+    /// key is anchored in the PQ trust store — and fail-closes when it isn't,
+    /// exactly mirroring the RPC plane (no silent Classical downgrade).
+    #[test]
+    fn stream_register_hybrid_verifies_only_when_pq_anchored() -> anyhow::Result<()> {
+        use crate::crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_from_bytes};
+        use crate::crypto::CryptoPolicy;
+        use crate::envelope::{
+            InMemoryNonceCache, KeyedPqTrustStore, SignedEnvelope,
+        };
+        use crate::common_capnp;
+        use crate::FromCapnp;
+
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let (pq_sk, pq_vk) = ml_dsa_generate_keypair();
+
+        let bytes = build_stream_register_envelope(
+            "deadbeef".repeat(8).as_str(),
+            i64::MAX,
+            &signing_key,
+            Some(&pq_sk),
+            None,
+        );
+        assert!(!bytes.is_empty(), "register envelope must serialize");
+
+        let reader = serialize::read_message(
+            &mut std::io::Cursor::new(&bytes[..]),
+            capnp::message::ReaderOptions::default(),
+        )?;
+        let signed = SignedEnvelope::read_from(
+            reader.get_root::<common_capnp::signed_envelope::Reader>()?,
+        )?;
+
+        assert_eq!(signed.policy, CryptoPolicy::Hybrid, "must sign Hybrid with PQ key");
+
+        // Anchored: the signer's ML-DSA vk is bound to its Ed25519 identity.
+        let mut store = KeyedPqTrustStore::new();
+        let vk = ml_dsa_vk_from_bytes(&crate::crypto::pq::ml_dsa_vk_bytes(&pq_vk))?;
+        store.bind(signing_key.verifying_key().to_bytes(), &vk);
+        let nonce_ok = InMemoryNonceCache::new();
+        assert!(
+            signed
+                .verify_any_signer_with(&nonce_ok, Some(&store), CryptoPolicy::Hybrid)
+                .is_ok(),
+            "anchored Hybrid register must verify"
+        );
+
+        // Not anchored: empty store under Hybrid fails closed.
+        let empty = KeyedPqTrustStore::new();
+        let nonce_empty = InMemoryNonceCache::new();
+        assert!(
+            signed
+                .verify_any_signer_with(&nonce_empty, Some(&empty), CryptoPolicy::Hybrid)
+                .is_err(),
+            "unanchored Hybrid register must fail closed (no Classical downgrade)"
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_batching_config_default() {
