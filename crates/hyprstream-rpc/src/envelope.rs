@@ -841,13 +841,43 @@ pub fn verify_config_installed() -> bool {
     VERIFY_CONFIG.get().is_some()
 }
 
-/// The enforced verify policy: the installed policy, else `Classical`.
+/// The enforced verify policy.
+///
+/// When a config has been installed, its policy is returned verbatim.
+///
+/// When **uninstalled**, the default is **fail-closed**: production builds
+/// default to [`CryptoPolicy::Hybrid`] so that any verify site reached before
+/// `install_verify_config` (subprocess-spawner services, early init) rejects
+/// classical-only envelopes rather than silently accepting EdDSA-only ones
+/// (#160 — this previously defaulted `Classical`, re-opening the M3 fail-open).
+///
+/// Under `cfg(test)` the uninstalled default stays `Classical`: in-process unit
+/// tests share one `OnceLock` and rely on per-call `UnwrapOptions` overrides
+/// rather than a global install. Integration tests (which compile this crate in
+/// non-test mode) must call [`install_verify_config`] explicitly.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn global_verify_policy() -> crate::crypto::CryptoPolicy {
-    VERIFY_CONFIG
-        .get()
-        .map(|c| c.policy)
-        .unwrap_or(crate::crypto::CryptoPolicy::Classical)
+    if let Some(c) = VERIFY_CONFIG.get() {
+        return c.policy;
+    }
+    #[cfg(test)]
+    {
+        crate::crypto::CryptoPolicy::Classical
+    }
+    #[cfg(not(test))]
+    {
+        // Fail-closed default. Loud (once — this is on the per-request verify
+        // path), because reaching a verify site with no installed config in
+        // production is a wiring bug (#160).
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "envelope verify config not installed; defaulting to fail-closed Hybrid \
+                 policy. Production code MUST call install_verify_config() at startup."
+            );
+        });
+        crate::crypto::CryptoPolicy::Hybrid
+    }
 }
 
 /// The installed kid-anchored PQ trust store, if any.
