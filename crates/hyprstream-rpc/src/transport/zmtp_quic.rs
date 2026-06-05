@@ -2010,12 +2010,19 @@ where
     use tracing::warn;
 
     // 1. Unwrap, verify, and optionally decrypt the SignedEnvelope.
-    let opts = match verification {
+    //    The verify policy + kid-anchored PQ trust store come from the
+    //    process-global verify configuration installed at startup (Hybrid
+    //    ENFORCED in the daemon). This closes the prior fail-open where the
+    //    site hardcoded Classical / no PQ store.
+    let pq_store_holder = crate::envelope::global_pq_store();
+    let base = match verification {
         EnvelopeVerification::FixedSigner(pubkey) =>
             crate::envelope::UnwrapOptions::fixed_signer(pubkey, nonce_cache),
         EnvelopeVerification::AnySigner =>
             crate::envelope::UnwrapOptions::any_signer(nonce_cache),
     }.with_decryption_key(signing_key);
+    let opts =
+        crate::envelope::apply_global_verify_config(base, &pq_store_holder);
 
     let (mut ctx, payload) = match crate::envelope::unwrap_envelope(raw_bytes, &opts) {
         Ok(result) => result,

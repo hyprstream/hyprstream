@@ -72,13 +72,18 @@ struct RequestEnvelope {
 #   Decryption: X25519 DH(server_sk, clientEphemeralPublic) -> AES-256-GCM-SIV
 struct SignedEnvelope {
   envelope @0 :RequestEnvelope;    # Cleartext envelope (used when encryptedEnvelope is absent)
-  sig @1 :Data $fixedSize(64);     # Ed25519 signature (64 bytes)
-  cnf @2 :Data $fixedSize(32);     # Ed25519 public key (32 bytes)
+  sig @1 :Data $fixedSize(64);     # Ed25519 signature (64 bytes) — cnf, sig retained for the
+  cnf @2 :Data $fixedSize(32);     # signer-pubkey advertisement + transition; auth comes from `cose`.
   encryptedEnvelope @3 :Data;      # AES-256-GCM-SIV ciphertext of serialized RequestEnvelope
   clientEphemeralPublic @4 :Data $fixedSize(32);  # X25519 ephemeral public key for DH
-  pqSig @5 :Data;                  # ML-DSA-65 signature (3309 bytes when present, pq-hybrid)
-  pqCnf @6 :Data;                  # ML-DSA-65 verifying key (1952 bytes when present, pq-hybrid)
-  pqKemCiphertext @7 :Data;        # ML-KEM-768 ciphertext (1088 bytes when present, pq-hybrid)
+  # M3 (#152): COSE composite signature (RFC 9052 COSE_Sign), detached over the
+  # canonical RequestEnvelope (cleartext) or the encrypted signing-data.
+  #   - Classical mode: ONE EdDSA COSE_Signature entry.
+  #   - Hybrid mode: TWO entries (EdDSA + ML-DSA-65).
+  # The ML-DSA-65 verifying key is NOT carried here; it is resolved by kid from
+  # the trust store (kid-anchored), fixing the prior self-certification gap.
+  cose @5 :Data;                   # CBOR-encoded COSE_Sign (composite signatures)
+  pqKemCiphertext @6 :Data;        # ML-KEM-768 ciphertext (1088 bytes) for hybrid encryption
 }
 
 # Signed response envelope

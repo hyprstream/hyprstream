@@ -338,7 +338,6 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
     let es256_store = crate::auth::key_rotation::global_es256_key_store(&secrets_dir, &config.oauth);
     policy_service = policy_service.with_es256_key_store(es256_store);
-    #[cfg(feature = "pq-hybrid")]
     {
         let ml_dsa_store = crate::auth::key_rotation::global_ml_dsa_key_store(&secrets_dir, &config.oauth);
         policy_service = policy_service.with_ml_dsa_key_store(ml_dsa_store);

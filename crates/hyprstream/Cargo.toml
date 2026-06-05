@@ -48,7 +48,7 @@ serde_yaml.workspace = true
 git2.workspace = true  # Still needed by git2db internally
 git2db = { path = "../git2db", features = ["overlayfs"] }  # High-level git library with overlayfs
 hyprstream-rpc = { path = "../hyprstream-rpc" }  # RPC infrastructure (Cap'n Proto + ZMQ)
-ml-dsa = { workspace = true, optional = true }  # ML-DSA-65 (pq-hybrid JWT signing)
+ml-dsa = { workspace = true }  # ML-DSA-65 — always compiled (runtime CryptoPolicy selects PQ). See M3 #152.
 hyprstream-rpc-std = { path = "../hyprstream-rpc-std" }  # Standard service schemas + clients
 hyprstream-discovery = { path = "../hyprstream-discovery" }  # Service discovery
 hyprstream-service = { path = "../hyprstream-service" }  # Service orchestration
@@ -202,7 +202,7 @@ download-libtorch = ["tch/download-libtorch"]
 overlayfs = ["git2db/overlayfs"]  # Enable overlayfs-backed worktrees (delegated to git2db)
 systemd = ["hyprstream-rpc/systemd", "hyprstream-service/systemd", "hyprstream-workers/systemd", "dep:listenfd"]  # Systemd integration (socket activation, service units)
 experimental = ["hyprstream-compositor/experimental"]  # EXPERIMENTAL: Enable service/worker panels, git write operations
-pq-hybrid = ["hyprstream-rpc/pq-hybrid", "hyprstream-service/pq-hybrid", "dep:ml-dsa"]  # Post-quantum hybrid: ML-DSA-65 + ML-KEM-768
+pq-hybrid = []  # NO-OP alias: PQ primitives always compiled; Classical/Hybrid selected at runtime. See M3 #152.
 
 [build-dependencies]
 capnpc.workspace = true  # Cap'n Proto schema compiler

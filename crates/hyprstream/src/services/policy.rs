@@ -78,7 +78,6 @@ pub struct PolicyService {
     /// ES256 (P-256) key rotation store for DPoP/atproto interop.
     es256_key_store: Option<Arc<crate::auth::Es256SigningKeyStore>>,
     /// ML-DSA-65 key rotation store for PQ-hybrid composite token issuance.
-    #[cfg(feature = "pq-hybrid")]
     ml_dsa_key_store: Option<Arc<crate::auth::MlDsaSigningKeyStore>>,
 }
 
@@ -109,7 +108,6 @@ impl PolicyService {
             event_prefixes: RwLock::new(HashMap::new()),
             jti_blocklist: Arc::new(hyprstream_rpc::auth::InMemoryJtiBlocklist::new()),
             es256_key_store: None,
-            #[cfg(feature = "pq-hybrid")]
             ml_dsa_key_store: None,
         }
     }
@@ -127,7 +125,6 @@ impl PolicyService {
 
     /// Sign a token with composite PQ signature when available, falling back to Ed25519.
     async fn sign_token(&self, claims: &hyprstream_rpc::auth::Claims, is_service: bool) -> String {
-        #[cfg(feature = "pq-hybrid")]
         {
             let ml_dsa_key = if let Some(ref store) = self.ml_dsa_key_store {
                 store.active_key().await
@@ -169,7 +166,6 @@ impl PolicyService {
     }
 
     /// Attach the ML-DSA-65 key rotation store for composite token issuance.
-    #[cfg(feature = "pq-hybrid")]
     pub fn with_ml_dsa_key_store(mut self, store: Arc<crate::auth::MlDsaSigningKeyStore>) -> Self {
         self.ml_dsa_key_store = Some(store);
         self

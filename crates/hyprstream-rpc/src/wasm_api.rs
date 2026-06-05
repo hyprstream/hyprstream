@@ -271,7 +271,12 @@ pub fn verify_signed_envelope(
         .map_err(|e| JsError::new(&format!("invalid verifying key: {}", e)))?;
 
     let nonce_cache = WASM_NONCE_CACHE.with(|c| c.clone());
-    let opts = UnwrapOptions::fixed_signer(&verifying_key, &*nonce_cache);
+    // WASM/browser verify currently uses the classical (EdDSA) verifier: the
+    // in-browser side has no kid-anchored ML-DSA trust store wired yet. A
+    // Hybrid-signed envelope still verifies here via its inner EdDSA layer
+    // (skip-unknown). Provisioning a WASM-side PqTrustStore to enforce the SNS
+    // outer layer in the browser is residual integration work.
+    let opts = UnwrapOptions::fixed_signer(&verifying_key, &*nonce_cache).classical();
 
     let (_signed, payload) = unwrap_and_verify(envelope_bytes, &opts)
         .map_err(|e| JsError::new(&format!("envelope verification failed: {}", e)))?;

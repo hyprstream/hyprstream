@@ -290,8 +290,16 @@ impl StreamService {
         let signed_reader = reader.get_root::<common_capnp::signed_envelope::Reader>()?;
         let signed = SignedEnvelope::read_from(signed_reader)?;
 
-        // Verify signature against the envelope's embedded pubkey.
-        signed.verify_any_signer(&*self.nonce_cache)?;
+        // Verify signature against the envelope's embedded pubkey, enforcing
+        // the process-global crypto policy (Hybrid in the daemon) with the
+        // kid-anchored PQ trust store. Closes the prior fail-open where this
+        // site hardcoded Classical / no PQ store.
+        let pq_store = crate::envelope::global_pq_store();
+        signed.verify_any_signer_with(
+            &*self.nonce_cache,
+            pq_store.as_deref(),
+            crate::envelope::global_verify_policy(),
+        )?;
 
         // Reject signers not attested in the trust store.
         if let Some(ref authorize) = self.authorize_signer {

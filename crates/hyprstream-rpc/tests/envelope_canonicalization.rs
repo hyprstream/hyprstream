@@ -3,12 +3,9 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 
 fn make_signed(envelope: RequestEnvelope, signing_key: &SigningKey) -> SignedEnvelope {
-    #[cfg(feature = "pq-hybrid")]
-    {
-        let (pq_sk, _) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
-        SignedEnvelope::new_signed_hybrid(envelope, signing_key, &pq_sk)
-    }
-    #[cfg(not(feature = "pq-hybrid"))]
+    // Classical so the raw Ed25519 `sig` field is deterministic (ML-DSA-65
+    // signatures are randomized/hedged). Composite behavior is tested in the
+    // envelope `cose::`/`crypto::` suites.
     SignedEnvelope::new_signed(envelope, signing_key)
 }
 
@@ -90,8 +87,8 @@ fn test_envelope_signature_verification_stable() {
         cnf: signed1.cnf,
         encrypted_envelope: None,
         client_ephemeral_public: None,
-        pq_sig: signed1.pq_sig.clone(),
-        pq_cnf: signed1.pq_cnf.clone(),
+        cose: signed1.cose.clone(),
+        policy: signed1.policy,
         pq_kem_ciphertext: None,
     };
 

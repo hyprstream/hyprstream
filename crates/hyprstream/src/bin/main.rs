@@ -1944,7 +1944,6 @@ fn main() -> Result<()> {
                                 }
 
                                 // Populate ML-DSA-65 verifying keys for PQ-hybrid JWT verification.
-                                #[cfg(feature = "pq-hybrid")]
                                 {
                                     let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir();
                                     let ml_dsa_store = hyprstream_core::auth::key_rotation::global_ml_dsa_key_store(
@@ -1956,12 +1955,80 @@ fn main() -> Result<()> {
                                         rt.block_on(ml_dsa_store.all_slots_snapshot())
                                     })
                                     .iter()
-                                    .map(|slot| slot.verifying_key())
+                                    .map(hyprstream_core::auth::MlDsaKeySlot::verifying_key)
                                     .collect();
                                     let shared_vks = hyprstream_core::auth::key_rotation::global_ml_dsa_verifying_keys();
                                     let _ = shared_vks.write().map(|mut guard| *guard = vks);
                                     ctx.set_ml_dsa_verifying_keys(shared_vks);
                                     tracing::info!("PQ-hybrid: ML-DSA-65 verifying keys loaded for JWT verification");
+                                }
+
+                                // M3 (#152): install the process-global envelope
+                                // verify configuration that closes the fail-open
+                                // at the ZMQ RequestLoop + StreamService verify
+                                // sites.
+                                //
+                                // KEY SEPARATION (PQUIP key-reuse restriction):
+                                // the mesh hybrid identity's ML-DSA key MUST be
+                                // distinct from the JWT-signing ML-DSA keyset
+                                // (`global_ml_dsa_verifying_keys`, loaded above).
+                                // We therefore DO NOT seed the mesh PqTrustStore
+                                // from the JWT keyset. The mesh store is keyed by
+                                // Ed25519 signer identity and is populated from
+                                // attested peer identities (peer-attestation
+                                // registry — residual integration work).
+                                //
+                                // Policy: Hybrid is enforced by default. Operators
+                                // mid-rollout (before peer ML-DSA bindings are
+                                // provisioned) may set
+                                // HYPRSTREAM_ENVELOPE_POLICY=classical to keep the
+                                // legacy EdDSA-only verifier. Under Hybrid with no
+                                // anchored key the verifier FAILS CLOSED.
+                                {
+                                    use hyprstream_rpc::envelope::{
+                                        install_verify_config, EnvelopeVerifyConfig, KeyedPqTrustStore,
+                                    };
+                                    use hyprstream_rpc::crypto::CryptoPolicy;
+
+                                    let policy = match std::env::var("HYPRSTREAM_ENVELOPE_POLICY")
+                                        .ok()
+                                        .as_deref()
+                                    {
+                                        Some("classical") => CryptoPolicy::Classical,
+                                        Some("hybrid") | None => CryptoPolicy::Hybrid,
+                                        Some(other) => {
+                                            tracing::warn!(
+                                                "unknown HYPRSTREAM_ENVELOPE_POLICY={other:?}, defaulting to Hybrid"
+                                            );
+                                            CryptoPolicy::Hybrid
+                                        }
+                                    };
+
+                                    // Mesh kid-anchored PQ trust store. Peer
+                                    // bindings (Ed25519 signer -> trusted ML-DSA)
+                                    // are added by the attestation layer; an empty
+                                    // store under Hybrid fails closed for unknown
+                                    // peers (correct, by design).
+                                    let pq_store: std::sync::Arc<dyn hyprstream_rpc::envelope::PqTrustStore> =
+                                        std::sync::Arc::new(KeyedPqTrustStore::new());
+
+                                    if install_verify_config(EnvelopeVerifyConfig {
+                                        policy,
+                                        pq_store: Some(pq_store),
+                                    })
+                                    .is_ok()
+                                    {
+                                        match policy {
+                                            CryptoPolicy::Hybrid => tracing::info!(
+                                                "envelope verify policy: HYBRID enforced (SNS nested COSE); \
+                                                 peer ML-DSA bindings required for cross-node traffic"
+                                            ),
+                                            CryptoPolicy::Classical => tracing::warn!(
+                                                "envelope verify policy: CLASSICAL (EdDSA-only) — \
+                                                 set HYPRSTREAM_ENVELOPE_POLICY=hybrid to enforce PQ"
+                                            ),
+                                        }
+                                    }
                                 }
 
                                 let manager = InprocManager::new();

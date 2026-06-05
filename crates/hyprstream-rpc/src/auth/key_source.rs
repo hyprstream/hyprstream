@@ -23,6 +23,12 @@
 //! let service = MyService::new(...).with_jwt_key_source(key_source);
 //! ```
 
+// The ML-DSA-65 verifying-key list is shared across crates (the rotation task
+// in `hyprstream` and the service factory in `hyprstream-service`) via an
+// `Arc<std::sync::RwLock<..>>` contract, so this module intentionally uses
+// `std::sync::RwLock` for that field rather than `parking_lot::RwLock`.
+#![allow(clippy::disallowed_types)]
+
 use anyhow::Result;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::VerifyingKey;
@@ -64,7 +70,6 @@ pub trait JwtKeySource: Send + Sync + 'static {
     ///
     /// Returns keys for all rotation slots (drain/active/lead) so that tokens
     /// signed by any current slot can be verified. Empty vec disables PQ verification.
-    #[cfg(feature = "pq-hybrid")]
     fn ml_dsa_verifying_keys(&self) -> Vec<crate::crypto::pq::MlDsaVerifyingKey> {
         vec![]
     }
@@ -95,7 +100,6 @@ pub struct ClusterKeySource {
     ca_verifying_key: VerifyingKey,
     local_issuer_url: String,
     local_issuers_vec: Vec<String>,
-    #[cfg(feature = "pq-hybrid")]
     ml_dsa_vks: Arc<std::sync::RwLock<Vec<crate::crypto::pq::MlDsaVerifyingKey>>>,
 }
 
@@ -116,7 +120,6 @@ impl ClusterKeySource {
             ca_verifying_key,
             local_issuer_url,
             local_issuers_vec,
-            #[cfg(feature = "pq-hybrid")]
             ml_dsa_vks: Arc::new(std::sync::RwLock::new(Vec::new())),
         }
     }
@@ -124,7 +127,6 @@ impl ClusterKeySource {
     /// Set the shared ML-DSA-65 verifying key list for PQ-hybrid JWT verification.
     ///
     /// The Arc is shared with the rotation task so keys stay current.
-    #[cfg(feature = "pq-hybrid")]
     pub fn with_ml_dsa_verifying_keys(mut self, vks: Arc<std::sync::RwLock<Vec<crate::crypto::pq::MlDsaVerifyingKey>>>) -> Self {
         self.ml_dsa_vks = vks;
         self
@@ -159,9 +161,8 @@ impl JwtKeySource for ClusterKeySource {
         &self.local_issuers_vec
     }
 
-    #[cfg(feature = "pq-hybrid")]
     fn ml_dsa_verifying_keys(&self) -> Vec<crate::crypto::pq::MlDsaVerifyingKey> {
-        self.ml_dsa_vks.read().unwrap_or_else(|p| p.into_inner()).clone()
+        self.ml_dsa_vks.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 }
 
@@ -214,7 +215,6 @@ impl JwtKeySource for FederatedKeySource {
         self.local.local_issuers()
     }
 
-    #[cfg(feature = "pq-hybrid")]
     fn ml_dsa_verifying_keys(&self) -> Vec<crate::crypto::pq::MlDsaVerifyingKey> {
         self.local.ml_dsa_verifying_keys()
     }
@@ -283,7 +283,6 @@ pub struct JwksKeySource {
     soft_ttl: std::time::Duration,
     /// Negative cache TTL (unknown kids cached as missing for this duration)
     negative_ttl: std::time::Duration,
-    #[cfg(feature = "pq-hybrid")]
     ml_dsa_vks: Arc<std::sync::RwLock<Vec<crate::crypto::pq::MlDsaVerifyingKey>>>,
 }
 
@@ -305,13 +304,11 @@ impl JwksKeySource {
             fetch_semaphore: Semaphore::new(4),
             soft_ttl: std::time::Duration::from_secs(300),
             negative_ttl: std::time::Duration::from_secs(5),
-            #[cfg(feature = "pq-hybrid")]
             ml_dsa_vks: Arc::new(std::sync::RwLock::new(Vec::new())),
         }
     }
 
     /// Set the shared ML-DSA-65 verifying key list for PQ-hybrid JWT verification.
-    #[cfg(feature = "pq-hybrid")]
     pub fn with_ml_dsa_verifying_keys(mut self, vks: Arc<std::sync::RwLock<Vec<crate::crypto::pq::MlDsaVerifyingKey>>>) -> Self {
         self.ml_dsa_vks = vks;
         self
@@ -491,9 +488,8 @@ impl JwtKeySource for JwksKeySource {
         &self.local_issuers_vec
     }
 
-    #[cfg(feature = "pq-hybrid")]
     fn ml_dsa_verifying_keys(&self) -> Vec<crate::crypto::pq::MlDsaVerifyingKey> {
-        self.ml_dsa_vks.read().unwrap_or_else(|p| p.into_inner()).clone()
+        self.ml_dsa_vks.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 
     fn kid_algs(&self, kid: &str) -> Vec<String> {

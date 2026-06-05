@@ -367,7 +367,6 @@ pub struct OAuthState {
     /// ES256 (P-256) signing key rotation store for JWKS and DPoP/atproto interop.
     pub es256_key_store: Option<Arc<crate::auth::Es256SigningKeyStore>>,
     /// ML-DSA-65 signing key rotation store for PQ-hybrid JWT issuance.
-    #[cfg(feature = "pq-hybrid")]
     pub ml_dsa_key_store: Option<Arc<crate::auth::MlDsaSigningKeyStore>>,
 }
 
@@ -417,7 +416,6 @@ impl OAuthState {
             signing_key_store: None,
             jti_blocklist: None,
             es256_key_store: None,
-            #[cfg(feature = "pq-hybrid")]
             ml_dsa_key_store: None,
         }
     }
@@ -456,7 +454,6 @@ impl OAuthState {
     }
 
     /// Attach the ML-DSA-65 key rotation store.
-    #[cfg(feature = "pq-hybrid")]
     pub fn with_ml_dsa_key_store(mut self, store: Arc<crate::auth::MlDsaSigningKeyStore>) -> Self {
         self.ml_dsa_key_store = Some(store);
         self
