@@ -118,6 +118,10 @@ impl IrohRpcProtocolHandler {
     pub fn with_read_timeout(mut self, read_timeout: std::time::Duration) -> Self {
         // `inner` is freshly built here (no other Arc clones yet), so this
         // get_mut always succeeds; fall back to a rebuild if it somehow doesn't.
+        debug_assert!(
+            Arc::strong_count(&self.inner) == 1,
+            "with_read_timeout called on a shared handler; rebuilding inner"
+        );
         match Arc::get_mut(&mut self.inner) {
             Some(inner) => inner.read_timeout = read_timeout,
             None => {
