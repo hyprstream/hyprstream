@@ -438,11 +438,11 @@ impl InferenceService {
         let req = reader.get_root::<inference_capnp::inference_request::Reader>()?;
         let request_id = req.get_id();
 
-        // Create a system-identity context for the internal callback.
+        // Create a service-identity context for the internal callback.
         // Callback mode is an inproc self-call — it does not go through the ZMQ
         // envelope pipeline, so we construct the context directly with
-        // from_verified_as_system to ensure subject() == "system".
-        let ctx = EnvelopeContext::from_callback_system(request_id);
+        // from_callback_service to authenticate as the model service.
+        let ctx = EnvelopeContext::from_callback_service(request_id, "model");
 
         // Dispatch via generated handler — propagate continuation
         dispatch_inference(self, &ctx, request_data).await
@@ -1100,10 +1100,12 @@ impl InferenceService {
         messages: Vec<crate::runtime::template_engine::ChatMessage>,
         add_generation_prompt: bool,
         tools: Option<&serde_json::Value>,
+        enable_thinking: Option<bool>,
+        template_vars_json: Option<&str>,
     ) -> Result<String> {
         self.engine
             .read()
-            .apply_chat_template(&messages, add_generation_prompt, tools)
+            .apply_chat_template_with_vars(&messages, add_generation_prompt, tools, enable_thinking, template_vars_json)
     }
 
     /// Truncate messages to fit within the context budget.
@@ -1272,6 +1274,7 @@ impl InferenceService {
     ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::streaming::StreamContext)> {
         let client_pub_bytes = ctx.ephemeral_pubkey()
             .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
+        let client_pub_ref: &[u8] = &client_pub_bytes;
         let stream_channel = self.stream_channel.as_ref()
             .ok_or_else(|| anyhow!("StreamChannel not initialized"))?;
 
@@ -1281,7 +1284,7 @@ impl InferenceService {
             .max(600);
         let claims = ctx.claims().cloned();
 
-        let stream_ctx = stream_channel.prepare_stream_with_claims(client_pub_bytes, expiry_secs, claims).await?;
+        let stream_ctx = stream_channel.prepare_stream_with_claims(client_pub_ref, expiry_secs, claims).await?;
 
         let stream_id = stream_ctx.stream_id().to_owned();
         let server_pubkey = *stream_ctx.server_pubkey();
@@ -2130,7 +2133,7 @@ impl InferenceHandler for InferenceService {
 
         let client_ephemeral_pubkey = ctx.ephemeral_pubkey();
         let claims = ctx.claims().cloned();
-        let (stream_id, server_pubkey, pending) = self.prepare_stream(request, client_ephemeral_pubkey, claims, expiry_secs, &subject, ttt_overrides).await?;
+        let (stream_id, server_pubkey, pending) = self.prepare_stream(request, client_ephemeral_pubkey.as_ref().map(<[u8; 32]>::as_slice), claims, expiry_secs, &subject, ttt_overrides).await?;
 
         let stream_sub_endpoint = hyprstream_rpc::registry::global()
             .endpoint("streams", hyprstream_rpc::registry::SocketKind::Sub)
@@ -2218,6 +2221,8 @@ impl InferenceHandler for InferenceService {
 
         let result = InferenceService::handle_apply_chat_template(
             self, chat_messages, data.add_generation_prompt, tools.as_ref(),
+            data.enable_thinking,
+            data.template_vars_json.as_deref(),
         ).await?;
         Ok(InferenceResponseVariant::ApplyChatTemplateResult(result))
     }
@@ -2321,6 +2326,7 @@ impl InferenceHandler for InferenceService {
         // DH key derivation
         let client_pub_bytes = ctx.ephemeral_pubkey()
             .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
+        let client_pub_ref: &[u8] = &client_pub_bytes;
         let stream_channel = self.stream_channel.as_ref()
             .ok_or_else(|| anyhow!("StreamChannel not initialized"))?;
 
@@ -2330,7 +2336,7 @@ impl InferenceHandler for InferenceService {
             .max(600);
         let claims = ctx.claims().cloned();
 
-        let stream_ctx = stream_channel.prepare_stream_with_claims(client_pub_bytes, expiry_secs, claims).await?;
+        let stream_ctx = stream_channel.prepare_stream_with_claims(client_pub_ref, expiry_secs, claims).await?;
 
         let stream_id = stream_ctx.stream_id().to_owned();
         let server_pubkey = *stream_ctx.server_pubkey();
@@ -2554,8 +2560,7 @@ struct InferenceZmqAdapter {
     transport: hyprstream_rpc::transport::TransportConfig,
     signing_key: SigningKey,
     expected_audience: Option<String>,
-    local_issuer_url: Option<String>,
-    federation_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>>,
+    jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -2588,14 +2593,8 @@ impl hyprstream_rpc::service::ZmqService for InferenceZmqAdapter {
         self.expected_audience.as_deref()
     }
 
-    fn local_issuer_url(&self) -> Option<&str> {
-        self.local_issuer_url.as_deref()
-    }
-
-    fn federation_key_source(
-        &self,
-    ) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>> {
-        self.federation_key_source.clone()
+    fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>> {
+        self.jwt_key_source.clone()
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
@@ -2631,10 +2630,8 @@ pub struct InferenceServiceConfig {
     fs: Option<WorktreeClient>,
     /// Expected audience for JWT validation (resource URL)
     expected_audience: Option<String>,
-    /// Local OAuth issuer URL for distinguishing local vs. federated JWTs.
-    local_issuer_url: Option<String>,
-    /// Federation key source for verifying externally-issued JWTs.
-    federation_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>>,
+    /// JWT key source for verifying JWTs (local and federated).
+    jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
 }
 
 impl InferenceServiceConfig {
@@ -2666,8 +2663,7 @@ impl InferenceServiceConfig {
             transport,
             fs,
             expected_audience: None,
-            local_issuer_url: None,
-            federation_key_source: None,
+            jwt_key_source: None,
         }
     }
 
@@ -2677,18 +2673,12 @@ impl InferenceServiceConfig {
         self
     }
 
-    /// Set the local OAuth issuer URL for distinguishing local vs. federated JWTs.
-    pub fn with_local_issuer_url(mut self, url: String) -> Self {
-        self.local_issuer_url = Some(url);
-        self
-    }
-
-    /// Set the federation key source for verifying externally-issued JWTs.
-    pub fn with_federation_key_source(
+    /// Set the JWT key source for verifying JWTs (local and federated).
+    pub fn with_jwt_key_source(
         mut self,
-        src: std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>,
+        src: std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>,
     ) -> Self {
-        self.federation_key_source = Some(src);
+        self.jwt_key_source = Some(src);
         self
     }
 }
@@ -2725,11 +2715,20 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
             // Create nonce cache (shared between service and RequestLoop)
             let nonce_cache = Arc::new(InMemoryNonceCache::new());
 
-            // Create PolicyClient HERE, inside the service thread's runtime,
+            // Bootstrap: Create PolicyClient HERE, inside the service thread's runtime,
             // so ZMQ sockets are registered with the correct reactor.
-            let policy_client = PolicyClient::new(
-                self.policy_signing_key,
-                hyprstream_rpc::envelope::RequestIdentity::anonymous(),
+            let policy_vk = match hyprstream_service::global_trust_store().resolve_one("policy") {
+                Some(vk) => vk,
+                None => {
+                    return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                        "trust store has no policy key — startup must populate it".to_owned(),
+                    ));
+                }
+            };
+            let policy_client = PolicyClient::for_service(
+                self.policy_signing_key.clone(),
+                policy_vk,
+                None,
             );
 
             // GPU initialization happens HERE, on the service thread
@@ -2752,8 +2751,7 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                 transport: transport.clone(),
                 signing_key: signing_key.clone(),
                 expected_audience: self.expected_audience,
-                local_issuer_url: self.local_issuer_url,
-                federation_key_source: self.federation_key_source,
+                jwt_key_source: self.jwt_key_source,
             };
 
             // Use shared nonce cache between service and RequestLoop

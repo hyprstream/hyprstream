@@ -433,8 +433,9 @@ fn generate_dispatch_fn(
                 // Generate auth error return for streaming variants
                 let streaming_auth_stmt = if let Some((ref action, ref service)) = auth_check {
                     let err_response_type = format_ident!("{}ResponseVariant", pascal);
+                    let variant_str = variant_pascal.to_string();
                     quote! {
-                        if let Err(e) = #trait_name::authorize(handler, ctx, #service, #action).await {
+                        if let Err(e) = #trait_name::authorize(handler, ctx, &format!("{}:{}", #service, #variant_str), #action).await {
                             let err_variant = #err_response_type::Error(ErrorInfo {
                                 message: e.to_string(),
                                 code: "UNAUTHORIZED".to_string(),
@@ -503,10 +504,11 @@ fn generate_dispatch_fn(
                 CapnpType::Void => {
                     let call = call_handler!();
                     if let Some((ref action, ref service)) = auth_check {
-                        // Void: resource = "{service}"
+                        // Void: resource = "{service}:{VariantName}"
+                        let variant_str = variant_pascal.to_string();
                         quote! {
                             Which::#variant_pascal(()) => {
-                                #trait_name::authorize(handler, ctx, #service, #action).await?;
+                                #trait_name::authorize(handler, ctx, &format!("{}:{}", #service, #variant_str), #action).await?;
                                 #call
                             }
                         }
@@ -549,9 +551,10 @@ fn generate_dispatch_fn(
                         quote! { handler.#handler_method(ctx, request_id, v?).await }
                     };
                     if let Some((ref action, ref service)) = auth_check {
+                        let variant_str = variant_pascal.to_string();
                         quote! {
                             Which::#variant_pascal(v) => {
-                                #trait_name::authorize(handler, ctx, #service, #action).await?;
+                                #trait_name::authorize(handler, ctx, &format!("{}:{}", #service, #variant_str), #action).await?;
                                 #call
                             }
                         }
@@ -568,9 +571,10 @@ fn generate_dispatch_fn(
                         quote! { handler.#handler_method(ctx, request_id, v).await }
                     };
                     if let Some((ref action, ref service)) = auth_check {
+                        let variant_str = variant_pascal.to_string();
                         quote! {
                             Which::#variant_pascal(v) => {
-                                #trait_name::authorize(handler, ctx, #service, #action).await?;
+                                #trait_name::authorize(handler, ctx, &format!("{}:{}", #service, #variant_str), #action).await?;
                                 #call
                             }
                         }
@@ -605,8 +609,10 @@ fn generate_dispatch_fn(
                         };
 
                         let auth_stmt = if let Some((ref action, ref service)) = auth_check {
-                            // Struct: resource = "{service}"
-                            quote! { #trait_name::authorize(handler, ctx, #service, #action).await?; }
+                            // Struct: resource = "{service}:{VariantName}"
+                            // e.g. authorize(ctx, "policy:resolveServiceKey", "query")
+                            let variant_str = variant_pascal.to_string();
+                            quote! { #trait_name::authorize(handler, ctx, &format!("{}:{}", #service, #variant_str), #action).await?; }
                         } else {
                             TokenStream::new()
                         };

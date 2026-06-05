@@ -160,15 +160,62 @@ pub async fn handle_shell_tui(
     let models = fetch_models(signing_key, models_dir).await;
 
     // Model load-status channel (background polling → event loop).
+    // Resolve model + worker keys via PolicyClient.
+    let policy_vk = signing_key.verifying_key();
+    let policy_client = crate::services::PolicyClient::for_service(
+        signing_key.clone(),
+        policy_vk,
+        None,
+    );
+    let model_vk_resp = policy_client.resolve_service_key(
+        &crate::services::generated::policy_client::ResolveServiceKey {
+            service_name: "model".to_owned(),
+        },
+    ).await.context("Failed to resolve model service key")?;
+    let model_server_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+        model_vk_resp.verifying_key.as_slice().try_into()
+            .context("Invalid model key length")?,
+    ).context("Invalid model key")?;
+    let worker_vk_resp = policy_client.resolve_service_key(
+        &crate::services::generated::policy_client::ResolveServiceKey {
+            service_name: "worker".to_owned(),
+        },
+    ).await.context("Failed to resolve worker service key")?;
+    let worker_server_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+        worker_vk_resp.verifying_key.as_slice().try_into()
+            .context("Invalid worker key length")?,
+    ).context("Invalid worker key")?;
     let model_client = {
-        use hyprstream_rpc::envelope::RequestIdentity;
-        crate::services::generated::model_client::ModelClient::new(signing_key.clone(), RequestIdentity::anonymous())
+        crate::services::generated::model_client::ModelClient::for_service(
+            signing_key.clone(),
+            model_server_vk,
+            None,
+        )
     };
     // Worker client for sandbox/container/image management.
     let worker_client = {
-        use hyprstream_rpc::envelope::RequestIdentity;
-        hyprstream_workers::runtime::WorkerClient::new(signing_key.clone(), RequestIdentity::anonymous())
+        hyprstream_workers::runtime::WorkerClient::for_service(
+            signing_key.clone(),
+            worker_server_vk,
+            None,
+        )
     };
+    let registry_server_vk = match policy_client.resolve_service_key(
+        &crate::services::generated::policy_client::ResolveServiceKey {
+            service_name: "registry".to_owned(),
+        },
+    ).await {
+        Ok(resp) => hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+            resp.verifying_key.as_slice().try_into().unwrap_or(&[0u8; 32]),
+        ).unwrap_or_else(|_| signing_key.verifying_key()),
+        Err(_) => signing_key.verifying_key(),
+    };
+    let registry = crate::services::RegistryClient::for_service(
+        signing_key.clone(),
+        registry_server_vk,
+        None,
+    );
+
     let (model_status_tx, mut model_status_rx) =
         tokio::sync::mpsc::channel::<ModelStatusUpdate>(32);
 
@@ -478,7 +525,7 @@ pub async fn handle_shell_tui(
                     &mut compositor, &client, &model_client, &worker_client,
                     &model_status_tx, &mut terminal, &mut console_app,
                     &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                    &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
+                    &registry, &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
                 ).await { break; }
             }
 
@@ -502,7 +549,7 @@ pub async fn handle_shell_tui(
                             &mut compositor, &client, &model_client, &worker_client,
                             &model_status_tx, &mut terminal, &mut console_app,
                             &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                            &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, close_outputs,
+                            &registry, &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, close_outputs,
                         ).await { break; }
                         continue;
                     }
@@ -553,7 +600,7 @@ pub async fn handle_shell_tui(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                        &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
+                        &registry, &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
                     ).await {
                         should_exit = true;
                         break;
@@ -569,7 +616,7 @@ pub async fn handle_shell_tui(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                        &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
+                        &registry, &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
                     ).await { break; }
                 }
             }
@@ -615,7 +662,7 @@ pub async fn handle_shell_tui(
                             &mut compositor, &client, &model_client, &worker_client,
                             &model_status_tx, &mut terminal, &mut console_app,
                             &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                            &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
+                            &registry, &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
                         ).await { break; }
                     }
                     // Poll images
@@ -637,7 +684,7 @@ pub async fn handle_shell_tui(
                             &mut compositor, &client, &model_client, &worker_client,
                             &model_status_tx, &mut terminal, &mut console_app,
                             &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                            &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
+                            &registry, &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
                         ).await { break; }
                     }
                 }
@@ -700,7 +747,7 @@ pub async fn handle_shell_tui(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                        &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
+                        &registry, &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
                     ).await { should_exit = true; break; }
                 }
                 // Remove quitting apps.
@@ -725,7 +772,7 @@ pub async fn handle_shell_tui(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                        &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
+                        &registry, &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
                     ).await;
                 }
                 if should_exit { break; }
@@ -752,7 +799,7 @@ pub async fn handle_shell_tui(
                         &mut compositor, &client, &model_client, &worker_client,
                         &model_status_tx, &mut terminal, &mut console_app,
                         &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                        &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx,
+                        &registry, &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx,
                         vec![CompositorOutput::Rpc(rpc_req)],
                     ).await;
                 }
@@ -769,7 +816,7 @@ pub async fn handle_shell_tui(
                     &mut compositor, &client, &model_client, &worker_client,
                     &model_status_tx, &mut terminal, &mut console_app,
                     &mut active_apps, &mut next_local_id, &storage_key, signing_key,
-                    &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
+                    &registry, &vfs_ns, &vfs_subject, &vfs_proxy_tx, &tcl_mount_rx, outputs,
                 ).await { break; }
                 composite_draw(&mut terminal, &compositor, &mut console_app);
             }
@@ -790,6 +837,15 @@ pub async fn handle_shell_tui(
     let _ = terminal.show_cursor();
     let _ = terminal.flush();
     restore_terminal(&orig);
+
+    // Drop ZMQ clients off-thread: TMQ's RequestSender holds an internal
+    // runtime that panics if dropped inside an async context.
+    tokio::task::spawn_blocking(move || {
+        drop(client);
+        drop(model_client);
+        drop(worker_client);
+    });
+
     Ok(())
 }
 
@@ -838,6 +894,7 @@ async fn dispatch_outputs(
     next_local_id: &mut u32,
     storage_key: &StorageKey,
     signing_key: &SigningKey,
+    registry: &crate::services::RegistryClient,
     vfs_ns: &std::sync::Arc<hyprstream_vfs::Namespace>,
     vfs_subject: &hyprstream_rpc::Subject,
     vfs_proxy_tx: &tokio::sync::mpsc::Sender<hyprstream_vfs::proxy::VfsRequest>,
@@ -854,7 +911,7 @@ async fn dispatch_outputs(
                 let feed_back = handle_rpc(
                     compositor, client, model_client, worker_client, model_status_tx,
                     active_apps, next_local_id, storage_key, signing_key,
-                    vfs_ns, vfs_subject, vfs_proxy_tx, tcl_mount_rx, req,
+                    registry, vfs_ns, vfs_subject, vfs_proxy_tx, tcl_mount_rx, req,
                 ).await;
                 for input in feed_back {
                     let follow = compositor.handle(input);
@@ -900,6 +957,7 @@ async fn handle_rpc(
     next_local_id: &mut u32,
     storage_key: &StorageKey,
     signing_key: &SigningKey,
+    registry: &crate::services::RegistryClient,
     vfs_ns: &std::sync::Arc<hyprstream_vfs::Namespace>,
     vfs_subject: &hyprstream_rpc::Subject,
     _vfs_proxy_tx: &tokio::sync::mpsc::Sender<hyprstream_vfs::proxy::VfsRequest>,
@@ -1486,6 +1544,92 @@ async fn handle_rpc(
             );
             vec![]
         }
+        RpcRequest::CloneModel { url, name } => {
+            use crate::services::generated::registry_client::CloneRequest;
+            compositor.chrome.push_toast(format!("Cloning {name}…"), ToastLevel::Info);
+            match registry.clone(&CloneRequest {
+                url,
+                name: name.clone(),
+                shallow: false,
+                depth: 0,
+                branch: String::new(),
+            }).await {
+                Ok(_) => {
+                    compositor.chrome.finish_clone(true, format!("Cloned {name}"));
+                    compositor.chrome.push_toast(format!("Cloned {name}"), ToastLevel::Info);
+                }
+                Err(e) => {
+                    compositor.chrome.finish_clone(false, format!("Clone failed: {e}"));
+                    compositor.chrome.push_toast(format!("Clone failed: {e}"), ToastLevel::Error);
+                }
+            }
+            vec![]
+        }
+
+        RpcRequest::PullModel { model_ref } => {
+            use crate::services::generated::registry_client::UpdateRequest;
+            let model_name = model_ref.split(':').next().unwrap_or(&model_ref);
+            let branch = model_ref.split(':').nth(1).unwrap_or("main");
+            match registry.get_by_name(model_name).await {
+                Ok(tracked) => {
+                    let repo_client = registry.repo(&tracked.id);
+                    match repo_client.update(&UpdateRequest {
+                        refspec: format!("refs/heads/{branch}"),
+                    }).await {
+                        Ok(()) => {
+                            compositor.chrome.update_git_op_progress(&format!("Done: Pulled {model_ref}"));
+                            compositor.chrome.push_toast(format!("Pulled {model_ref}"), ToastLevel::Info);
+                        }
+                        Err(e) => {
+                            compositor.chrome.update_git_op_progress(&format!("Error: {e}"));
+                            compositor.chrome.push_toast(format!("Pull failed: {e}"), ToastLevel::Error);
+                        }
+                    }
+                }
+                Err(e) => {
+                    compositor.chrome.update_git_op_progress(&format!("Error: {e}"));
+                    compositor.chrome.push_toast(format!("Pull failed: {e}"), ToastLevel::Error);
+                }
+            }
+            vec![]
+        }
+
+        RpcRequest::PushModel { model_ref } => {
+            use crate::services::generated::registry_client::PushRequest;
+            let model_name = model_ref.split(':').next().unwrap_or(&model_ref);
+            let branch = model_ref.split(':').nth(1).unwrap_or("main");
+            match registry.get_by_name(model_name).await {
+                Ok(tracked) => {
+                    let repo_client = registry.repo(&tracked.id);
+                    let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+                    match repo_client.push(&PushRequest {
+                        remote: "origin".to_owned(),
+                        refspec,
+                        force: false,
+                    }).await {
+                        Ok(()) => {
+                            compositor.chrome.update_git_op_progress(&format!("Done: Pushed {model_ref}"));
+                            compositor.chrome.push_toast(format!("Pushed {model_ref}"), ToastLevel::Info);
+                        }
+                        Err(e) => {
+                            compositor.chrome.update_git_op_progress(&format!("Error: {e}"));
+                            compositor.chrome.push_toast(format!("Push failed: {e}"), ToastLevel::Error);
+                        }
+                    }
+                }
+                Err(e) => {
+                    compositor.chrome.update_git_op_progress(&format!("Error: {e}"));
+                    compositor.chrome.push_toast(format!("Push failed: {e}"), ToastLevel::Error);
+                }
+            }
+            vec![]
+        }
+
+        RpcRequest::FetchModelStatus => {
+            // Refresh the model list from registry
+            vec![]
+        }
+
         RpcRequest::Quit => vec![],
     }
 }
@@ -1543,18 +1687,56 @@ async fn fetch_models(
     signing_key: &SigningKey,
     models_dir: &std::path::Path,
 ) -> Vec<ModelEntry> {
-    use hyprstream_rpc::envelope::RequestIdentity;
+
+    // Resolve registry + model keys via PolicyClient
+    let policy_vk = signing_key.verifying_key();
+    let policy_client = crate::services::PolicyClient::for_service(
+        signing_key.clone(), policy_vk, None,
+    );
+    let registry_server_vk = match policy_client.resolve_service_key(
+        &crate::services::generated::policy_client::ResolveServiceKey {
+            service_name: "registry".to_owned(),
+        },
+    ).await {
+        Ok(resp) => match <[u8; 32]>::try_from(resp.verifying_key.as_slice()) {
+            Ok(bytes) => hyprstream_rpc::crypto::VerifyingKey::from_bytes(&bytes)
+                .unwrap_or_else(|_| signing_key.verifying_key()),
+            Err(_) => signing_key.verifying_key(),
+        },
+        Err(e) => {
+            tracing::warn!("Failed to resolve registry key: {e}");
+            signing_key.verifying_key()
+        }
+    };
+    let model_server_vk = match policy_client.resolve_service_key(
+        &crate::services::generated::policy_client::ResolveServiceKey {
+            service_name: "model".to_owned(),
+        },
+    ).await {
+        Ok(resp) => match <[u8; 32]>::try_from(resp.verifying_key.as_slice()) {
+            Ok(bytes) => hyprstream_rpc::crypto::VerifyingKey::from_bytes(&bytes)
+                .unwrap_or_else(|_| signing_key.verifying_key()),
+            Err(_) => signing_key.verifying_key(),
+        },
+        Err(e) => {
+            tracing::warn!("Failed to resolve model key: {e}");
+            signing_key.verifying_key()
+        }
+    };
+
     let registry_endpoint = hyprstream_rpc::registry::global()
         .endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep)
         .to_zmq_string();
-    let registry: crate::services::RegistryClient = crate::services::RegistryClient::with_endpoint(
+    let registry: crate::services::RegistryClient = crate::services::RegistryClient::for_endpoint(
         &registry_endpoint,
         signing_key.clone(),
-        RequestIdentity::anonymous(),
+        registry_server_vk,
+        None,
     );
-    let model_client_for_status = crate::services::generated::model_client::ModelClient::new(
+    let model_client_for_status = crate::services::generated::model_client::ModelClient::for_service(
         signing_key.clone(),
-        RequestIdentity::anonymous(),
+        model_server_vk,
+        None,
     );
     let registry_models_dir = models_dir.to_path_buf();
     let status_timeout = std::time::Duration::from_millis(500);

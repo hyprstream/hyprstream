@@ -12,6 +12,7 @@ crate-type = ["rlib"]  # rlib-only: OnceLock singletons must be shared workspace
 [dependencies]
 # Workspace crates
 hyprstream-rpc = { path = "../hyprstream-rpc" }
+hyprstream-discovery = { path = "../hyprstream-discovery" }
 
 # Async runtime
 tokio = { workspace = true }
@@ -43,6 +44,15 @@ zmq-sys = { workspace = true }
 # Ed25519 (for factory::ServiceContext)
 ed25519-dalek = { workspace = true }
 
+# Base64 encoding for x_root_pubkey in RFC 9728 metadata
+base64 = { workspace = true }
+
+# Time for JWT expiry calculation
+chrono = { workspace = true }
+
+# Random key generation
+rand = { workspace = true }
+
 # Key material zeroization
 zeroize = { workspace = true }
 
@@ -57,6 +67,7 @@ zbus_systemd = { version = "0.0.11", features = ["login1", "systemd1"], optional
 [features]
 default = []
 systemd = ["dep:systemd", "dep:zbus_systemd"]
+pq-hybrid = ["hyprstream-rpc/pq-hybrid"]
 
 [lints]
 workspace = true

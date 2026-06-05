@@ -9,7 +9,6 @@
 use anyhow::{bail, Result};
 use clap::{Arg, ArgMatches, Command};
 use ed25519_dalek::SigningKey;
-use hyprstream_rpc::RequestIdentity;
 use hyprstream_service::ScopedClientTreeNode;
 use serde_json::Value;
 
@@ -356,6 +355,29 @@ pub async fn handle_schema_command(
     Ok(())
 }
 
+/// Resolve a service verifying key via PolicyService.
+///
+/// Creates a PolicyClient using the root key (inproc mode) and resolves the
+/// given service name to its verifying key.
+async fn resolve_key_via_policy(
+    signing_key: &SigningKey,
+    service_name: &str,
+) -> Result<hyprstream_rpc::crypto::VerifyingKey> {
+    let policy_vk = signing_key.verifying_key();
+    let policy_client = PolicyClient::for_service(
+        signing_key.clone(), policy_vk, None,
+    );
+    let resp = policy_client.resolve_service_key(
+        &crate::services::generated::policy_client::ResolveServiceKey {
+            service_name: service_name.to_owned(),
+        },
+    ).await.map_err(|e| anyhow::anyhow!("Failed to resolve key for '{}': {e}", service_name))?;
+    hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+        resp.verifying_key.as_slice().try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid key length for '{}'", service_name))?,
+    ).map_err(|e| anyhow::anyhow!("Invalid key for '{}': {e}", service_name))
+}
+
 /// Dispatch a top-level (non-scoped) method call.
 async fn dispatch_top_level(
     service: &str,
@@ -363,25 +385,28 @@ async fn dispatch_top_level(
     args: &Value,
     signing_key: SigningKey,
 ) -> Result<Value> {
-    let identity = RequestIdentity::anonymous();
-
     match service {
         "registry" => {
-            let client: RegistryClient = RegistryClient::new(
-                signing_key, identity,
+            let server_vk = resolve_key_via_policy(&signing_key, "registry").await?;
+            let client: RegistryClient = RegistryClient::for_service(
+                signing_key, server_vk, None,
             );
             client.call_method(method, args).await
         }
         "model" => {
-            let client = ModelClient::new(signing_key, identity);
+            let server_vk = resolve_key_via_policy(&signing_key, "model").await?;
+            let client = ModelClient::for_service(signing_key, server_vk, None);
             client.call_method(method, args).await
         }
         "inference" => {
-            let client = InferenceClient::new(signing_key, identity);
+            let server_vk = resolve_key_via_policy(&signing_key, "inference").await?;
+            let client = InferenceClient::for_service(signing_key, server_vk, None);
             client.call_method(method, args).await
         }
         "policy" => {
-            let client = PolicyClient::new(signing_key, identity);
+            // Bootstrap: PolicyService uses the root key
+            let server_vk = signing_key.verifying_key();
+            let client = PolicyClient::for_service(signing_key, server_vk, None);
             client.call_method(method, args).await
         }
         "worker" => {
@@ -402,21 +427,22 @@ async fn dispatch_scoped_dynamic(
     args: &Value,
     signing_key: SigningKey,
 ) -> Result<Value> {
-    let identity = RequestIdentity::anonymous();
-
     match service {
         "registry" => {
-            let client: RegistryClient = RegistryClient::new(
-                signing_key, identity,
+            let server_vk = resolve_key_via_policy(&signing_key, "registry").await?;
+            let client: RegistryClient = RegistryClient::for_service(
+                signing_key, server_vk, None,
             );
             client.call_scoped_method(scope_chain, method, args).await
         }
         "model" => {
-            let client = ModelClient::new(signing_key, identity);
+            let server_vk = resolve_key_via_policy(&signing_key, "model").await?;
+            let client = ModelClient::for_service(signing_key, server_vk, None);
             client.call_scoped_method(scope_chain, method, args).await
         }
         "worker" => {
-            let client = WorkerClient::new(signing_key, identity);
+            let server_vk = resolve_key_via_policy(&signing_key, "worker").await?;
+            let client = WorkerClient::for_service(signing_key, server_vk, None);
             client.call_scoped_method(scope_chain, method, args).await
         }
         _ => bail!("Service '{}' has no scoped methods", service),

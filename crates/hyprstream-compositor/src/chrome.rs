@@ -269,6 +269,23 @@ pub enum ShellMode {
     },
     /// Pre-chat generation settings before starting a new conversation.
     PreChatSettings(Box<PreChatSettingsState>),
+    /// Clone flow: multi-step clone wizard.
+    CloneFlow(CloneScreen),
+    /// Git operation in progress (pull/push).
+    GitOpInProgress {
+        op_name: String,
+        model_ref: String,
+        progress_msg: String,
+    },
+}
+
+/// Clone flow screens for the model dialog.
+pub enum CloneScreen {
+    EnterUrl(waxterm::widgets::TextInput),
+    EnterName(waxterm::widgets::TextInput, String),
+    Cloning { name: String, progress_msg: String, progress_pct: u8 },
+    Done(String),
+    Failed(String),
 }
 
 /// State for the pre-chat settings modal.
@@ -402,6 +419,10 @@ pub enum RpcRequest {
     WorkerStopContainer { container_id: String },
     WorkerRemoveContainer { container_id: String },
     AttachContainer { sandbox_id: String, container_id: String, cols: u16, rows: u16 },
+    CloneModel { url: String, name: String },
+    PullModel { model_ref: String },
+    PushModel { model_ref: String },
+    FetchModelStatus,
     Quit,
 }
 
@@ -653,6 +674,8 @@ impl ShellChrome {
                     self.handle_worker_manager(key, sandbox_sel, container_sel, show_containers, tab, image_sel)
                 }
             ShellMode::PreChatSettings(_) => self.handle_pre_chat_settings(key),
+            ShellMode::CloneFlow(_) => self.handle_clone_flow(key),
+            ShellMode::GitOpInProgress { .. } => self.handle_git_op(key),
         }
     }
 
@@ -694,6 +717,41 @@ impl ShellChrome {
     // ── ModelList mode ───────────────────────────────────────────────────────
 
     fn handle_model_list(&mut self, key: KeyPress) -> Vec<ChromeOutput> {
+        // c — clone
+        if matches!(key, KeyPress::Char(b'c')) {
+            self.mode = ShellMode::CloneFlow(
+                CloneScreen::EnterUrl(waxterm::widgets::TextInput::new("Repository URL:")),
+            );
+            return vec![ChromeOutput::Redraw];
+        }
+        // p — pull
+        if matches!(key, KeyPress::Char(b'p')) {
+            if let Some(model) = self.model_list.selected_item().cloned() {
+                self.mode = ShellMode::GitOpInProgress {
+                    op_name: "Pull".to_owned(),
+                    model_ref: model.model_ref.clone(),
+                    progress_msg: "Fetching…".to_owned(),
+                };
+                return vec![
+                    ChromeOutput::Rpc(RpcRequest::PullModel { model_ref: model.model_ref }),
+                    ChromeOutput::Redraw,
+                ];
+            }
+        }
+        // P — push
+        if matches!(key, KeyPress::Char(b'P')) {
+            if let Some(model) = self.model_list.selected_item().cloned() {
+                self.mode = ShellMode::GitOpInProgress {
+                    op_name: "Push".to_owned(),
+                    model_ref: model.model_ref.clone(),
+                    progress_msg: "Pushing…".to_owned(),
+                };
+                return vec![
+                    ChromeOutput::Rpc(RpcRequest::PushModel { model_ref: model.model_ref }),
+                    ChromeOutput::Redraw,
+                ];
+            }
+        }
         // l — submit load request (power-user preload, no pending picker)
         if matches!(key, KeyPress::Char(b'l' | b'L')) {
             if let Some(model) = self.model_list.selected_item().cloned() {
@@ -768,6 +826,122 @@ impl ShellChrome {
                 }
             }
             vec![ChromeOutput::Rpc(RpcRequest::LoadModel { model_ref })]
+        }
+    }
+
+    // ── CloneFlow mode ────────────────────────────────────────────────────────
+
+    fn handle_clone_flow(&mut self, key: KeyPress) -> Vec<ChromeOutput> {
+        let screen = match std::mem::replace(&mut self.mode, ShellMode::Normal) {
+            ShellMode::CloneFlow(s) => s,
+            other => { self.mode = other; return vec![]; }
+        };
+        match screen {
+            CloneScreen::EnterUrl(mut input) => {
+                match input.handle_key(&key) {
+                    WidgetResult::Confirmed(url) => {
+                        self.mode = ShellMode::CloneFlow(CloneScreen::EnterName(
+                            waxterm::widgets::TextInput::new("Local name (Enter for default):"),
+                            url,
+                        ));
+                    }
+                    WidgetResult::Cancelled => {
+                        self.mode = ShellMode::ModelList;
+                    }
+                    WidgetResult::Pending => {
+                        self.mode = ShellMode::CloneFlow(CloneScreen::EnterUrl(input));
+                    }
+                }
+                vec![ChromeOutput::Redraw]
+            }
+            CloneScreen::EnterName(mut input, url) => {
+                match input.handle_key(&key) {
+                    WidgetResult::Confirmed(name) => {
+                        let clone_name = if name.is_empty() {
+                            url.rsplit('/').next().unwrap_or("model")
+                                .trim_end_matches(".git").to_owned()
+                        } else {
+                            name
+                        };
+                        let display_name = clone_name.clone();
+                        self.mode = ShellMode::CloneFlow(CloneScreen::Cloning {
+                            name: display_name,
+                            progress_msg: "Starting…".to_owned(),
+                            progress_pct: 0,
+                        });
+                        vec![
+                            ChromeOutput::Rpc(RpcRequest::CloneModel { url, name: clone_name }),
+                            ChromeOutput::Redraw,
+                        ]
+                    }
+                    WidgetResult::Cancelled => {
+                        self.mode = ShellMode::ModelList;
+                        vec![ChromeOutput::Redraw]
+                    }
+                    WidgetResult::Pending => {
+                        self.mode = ShellMode::CloneFlow(CloneScreen::EnterName(input, url));
+                        vec![ChromeOutput::Redraw]
+                    }
+                }
+            }
+            CloneScreen::Cloning { name, progress_msg, progress_pct } => {
+                // No key handling during clone — just put the screen back
+                self.mode = ShellMode::CloneFlow(CloneScreen::Cloning { name, progress_msg, progress_pct });
+                vec![]
+            }
+            CloneScreen::Done(_) | CloneScreen::Failed(_) => {
+                if matches!(key, KeyPress::Enter | KeyPress::Escape) {
+                    self.mode = ShellMode::ModelList;
+                    vec![
+                        ChromeOutput::Rpc(RpcRequest::FetchModelStatus),
+                        ChromeOutput::Redraw,
+                    ]
+                } else {
+                    self.mode = ShellMode::CloneFlow(screen);
+                    vec![]
+                }
+            }
+        }
+    }
+
+    // ── GitOpInProgress mode ─────────────────────────────────────────────────
+
+    fn handle_git_op(&mut self, key: KeyPress) -> Vec<ChromeOutput> {
+        let is_terminal = match &self.mode {
+            ShellMode::GitOpInProgress { progress_msg, .. } =>
+                progress_msg.starts_with("Done:") || progress_msg.starts_with("Error:"),
+            _ => false,
+        };
+        if is_terminal && matches!(key, KeyPress::Enter | KeyPress::Escape) {
+            self.mode = ShellMode::ModelList;
+            return vec![ChromeOutput::Redraw];
+        }
+        vec![]
+    }
+
+    /// Update git operation progress from the service layer.
+    pub fn update_git_op_progress(&mut self, msg: &str) {
+        if let ShellMode::GitOpInProgress { progress_msg, .. } = &mut self.mode {
+            *progress_msg = msg.to_owned();
+        }
+    }
+
+    /// Update clone progress from the service layer.
+    pub fn update_clone_progress(&mut self, stage: &str, pct: u8) {
+        if let ShellMode::CloneFlow(CloneScreen::Cloning { progress_msg, progress_pct, .. }) = &mut self.mode {
+            *progress_msg = stage.to_owned();
+            *progress_pct = pct;
+        }
+    }
+
+    /// Transition clone flow to done/failed.
+    pub fn finish_clone(&mut self, success: bool, msg: String) {
+        if matches!(self.mode, ShellMode::CloneFlow(CloneScreen::Cloning { .. })) {
+            self.mode = if success {
+                ShellMode::CloneFlow(CloneScreen::Done(msg))
+            } else {
+                ShellMode::CloneFlow(CloneScreen::Failed(msg))
+            };
         }
     }
 

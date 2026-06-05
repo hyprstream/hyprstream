@@ -20,6 +20,8 @@ members = [
     "crates/hyprstream-vfs",
     "crates/hyprstream-tcl",
     "crates/hyprstream-vfsd",
+    "crates/chat-core",
+    "crates/hyprstream-rpc-std",
     "crates/hyprstream-9p",
 ]
 # bitsandbytes-sys is standalone - only built when bnb feature is enabled
@@ -114,6 +116,7 @@ pin-project-lite = "0.2"
 tonic = { version = "0.12.3", features = ["transport", "codegen", "prost", "tls"] }
 rustls = { version = "0.23.1", features = ["ring"] }
 rustls-pemfile = "2.1.0"
+rustls-acme = { version = "0.11", features = ["tokio"] }
 axum = { version = "0.7", features = ["macros", "tokio"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower-http = { version = "0.6", features = ["trace", "cors", "timeout"] }
@@ -168,8 +171,11 @@ zmq = "0.10"  # Underlying libzmq bindings
 zmq-sys = "0.12"  # Raw libzmq FFI for ZMQ_USE_FD socket option (version matches zmq 0.10's dependency)
 
 # Cap'n Proto (zero-copy serialization)
-capnp = "0.20"
-capnp-futures = "0.20"
+# All three crates must track together — generated code from capnpc
+# targets specific internal APIs in capnp; mismatched majors break
+# RawStructSchema struct construction.
+capnp = "0.24"
+capnp-futures = "0.24"
 
 # Utilities
 glob = "0.3"
@@ -192,8 +198,20 @@ hmac = "0.12"
 zeroize = { version = "1", features = ["derive"] }
 subtle = "2"
 aes-gcm = "0.10"  # AES-256-GCM for notification broadcast encryption
-p256 = { version = "0.13", features = ["ecdh"] }  # FIPS mode alternative (P-256 ECDH)
-jsonwebtoken = "9"  # RS256/ES256 JWT verification for external OIDC providers
+aes-gcm-siv = "0.11"  # AES-256-GCM-SIV for envelope encryption (nonce-misuse resistant)
+p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }  # P-256 ECDH (FIPS) + ECDSA (ES256 DPoP verification)
+ml-dsa = "0.1.0-rc.11"  # ML-DSA-65 (FIPS 204) post-quantum signatures
+ml-kem = { version = "0.3", features = ["getrandom"] }  # ML-KEM-768 (FIPS 203) post-quantum key encapsulation
+# RS256/ES256/EdDSA JWT verification for external OIDC providers + private_key_jwt.
+# v10 introduced a pluggable CryptoProvider model (similar to rustls). We pin
+# `rust_crypto` to keep the existing all-Rust stack rather than pulling in
+# aws-lc-rs (libcrypto C dep).
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
+coset = "0.4"       # COSE_Sign1 (RFC 9052) envelope signing
+ciborium = "0.2"    # CBOR runtime (external_aad construction)
+
+# Hot-reloading (dev only — zero overhead in release builds)
+subsecond = "0.7"
 
 # Dev dependencies
 proptest = "1.0"
@@ -225,7 +243,7 @@ version = "0.3"
 path = "crates/hyprstream-rpc-build"
 
 [workspace.dependencies.capnpc]
-version = "0.20"
+version = "0.24"
 
 [profile.dev]
 debug = "line-tables-only"

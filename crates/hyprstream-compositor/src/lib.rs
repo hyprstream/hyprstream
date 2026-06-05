@@ -411,13 +411,12 @@ impl Compositor {
                                 return vec![CompositorOutput::Redraw];
                             }
                         }
-                        ShellMode::WorkerManager { ref mut sandbox_sel, show_containers: false, .. } => {
-                            if idx < self.chrome.worker_list.len() {
+                        ShellMode::WorkerManager { ref mut sandbox_sel, show_containers: false, .. }
+                            if idx < self.chrome.worker_list.len() => {
                                 *sandbox_sel = idx;
                                 let out = self.chrome.handle_key(waxterm::input::KeyPress::Enter);
                                 return self.dispatch_chrome(out);
                             }
-                        }
                         _ => {}
                     }
                 }

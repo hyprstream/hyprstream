@@ -46,8 +46,14 @@
 //! Each peer connection is a `NinePClient` mounted via `Namespace::mount()`.
 
 pub mod protocol;
+pub mod msg;
 mod server;
 mod session;
+pub mod client;
+#[cfg(target_arch = "wasm32")]
+pub mod dma;
+#[cfg(target_arch = "wasm32")]
+pub mod wanix_mount;
 
 pub use protocol::{Qid, Tframe, Rframe};
 pub use server::NinePServer;

@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "9P2000.L wire protocol bridge for hyprstream VFS federation"
 
+[lib]
+crate-type = ["rlib"]
+
 [dependencies]
 # VFS types (Mount trait, Fid, DirEntry, Stat)
 hyprstream-vfs = { path = "../hyprstream-vfs" }
@@ -24,6 +27,11 @@ tokio = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util"] }

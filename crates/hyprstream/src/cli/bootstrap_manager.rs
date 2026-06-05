@@ -15,12 +15,14 @@ use ed25519_dalek::SigningKey;
 
 use hyprstream_tui::wizard::backend::*;
 
+use crate::auth::identity_store;
 use crate::auth::policy_templates::{get_template, get_templates};
-use crate::auth::{LocalKeyStore, PolicyManager, UserStore, write_policy_file};
+use crate::auth::{RocksDbUserStore, PolicyManager, UserStore};
 use crate::cli::gpu_detect;
 use crate::cli::policy_handlers::{
-    ensure_user_signing_key, load_or_generate_signing_key, mint_local_token, parse_duration,
+    load_or_generate_signing_key, mint_local_token, parse_duration,
 };
+
 
 
 /// Pre-service bootstrap manager for the wizard TUI.
@@ -31,6 +33,7 @@ use crate::cli::policy_handlers::{
 pub struct BootstrapManager {
     rt: tokio::runtime::Handle,
     models_dir: PathBuf,
+    config_services: Vec<String>,
     signing_key: Option<SigningKey>,
 
     // Install phase state
@@ -74,24 +77,38 @@ impl Drop for BootstrapManager {
     }
 }
 
-/// Returns true if this is the first run (no signing key exists yet).
+/// Returns true if this is the first run (no bootstrap completed yet).
 ///
 /// Used by the no-args entry point to decide between wizard and ShellClient.
-/// Checks the OS keyring directly — the canonical store for signing keys.
+/// Checks for the presence of `bootstrap-pubkeys` in the credentials directory,
+/// which is written at the end of a successful bootstrap.
 pub fn is_first_run(_models_dir: &std::path::Path) -> bool {
-    let entry = match keyring::Entry::new("hyprstream", "signing-key") {
-        Ok(e) => e,
-        Err(_) => return true,
-    };
-    matches!(entry.get_secret(), Err(keyring::Error::NoEntry))
+    // Check env var first — if signing key is provided externally, not first run
+    if std::env::var("HYPRSTREAM__SIGNING_KEY").is_ok() {
+        return false;
+    }
+
+    // Resolve credentials directory
+    let credentials_dir = crate::config::HyprConfig::load()
+        .map(|c| c.config_dir().join("credentials"))
+        .unwrap_or_else(|_| {
+            dirs::config_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("hyprstream")
+                .join("credentials")
+        });
+
+    // bootstrap-pubkeys is written last during bootstrap — best indicator
+    !credentials_dir.join("bootstrap-pubkeys").exists()
 }
 
 impl BootstrapManager {
     /// Create a new bootstrap manager.
-    pub fn new(rt: tokio::runtime::Handle, models_dir: PathBuf) -> Self {
+    pub fn new(rt: tokio::runtime::Handle, models_dir: PathBuf, config_services: Vec<String>) -> Self {
         Self {
             rt,
             models_dir,
+            config_services,
             signing_key: None,
             install_rx: None,
             install_handle: None,
@@ -137,7 +154,7 @@ impl BootstrapManager {
             return;
         }
         let credentials_dir = self.credentials_dir();
-        let mut store = match LocalKeyStore::load(&credentials_dir) {
+        let store = match RocksDbUserStore::open(&credentials_dir) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(
@@ -147,20 +164,10 @@ impl BootstrapManager {
                 return;
             }
         };
-        if store.get_pubkey(username).ok().flatten().is_some() {
+        if self.rt.block_on(store.get_profile(username)).ok().flatten().is_some() {
             return; // already registered
         }
-        let (_sk, vk) = match ensure_user_signing_key() {
-            Ok(pair) => pair,
-            Err(e) => {
-                tracing::warn!(
-                    username,
-                    "Failed to generate/load user identity key — user OAuth identity will not be registered: {e}"
-                );
-                return;
-            }
-        };
-        if let Err(e) = store.register(username, vk) {
+        if let Err(e) = self.rt.block_on(store.register(username)) {
             tracing::warn!(
                 username,
                 "Failed to register user identity in UserStore — user OAuth identity will not be registered: {e}"
@@ -320,14 +327,12 @@ impl WizardBackend for BootstrapManager {
 
     fn apply_template(&mut self, name: &str) {
         if let Some(template) = get_template(name) {
-            let content = template.expanded_rules();
-            let policy_csv = self.policies_dir().join("policy.csv");
-            let _ = self.rt.block_on(async {
-                write_policy_file(&policy_csv, content.as_bytes()).await
-            });
-            // Reload policy manager
-            self.policy_manager = None;
             self.ensure_policy_manager();
+            if let Some(ref pm) = self.policy_manager {
+                let _ = self.rt.block_on(async {
+                    pm.apply_template(template).await
+                });
+            }
         }
     }
 
@@ -404,10 +409,11 @@ impl WizardBackend for BootstrapManager {
     fn start_services(&mut self) {
         let (tx, rx) = mpsc::sync_channel(8);
         self.service_rx = Some(rx);
+        let services = self.config_services.clone();
 
         self.service_handle = Some(self.rt.spawn(async move {
             let _ = tx.send(OpStatus::InProgress);
-            match crate::cli::handle_service_start(&[], None, false).await {
+            match crate::cli::handle_service_start(&services, None, false).await {
                 Ok(()) => {
                     let _ = tx.send(OpStatus::Done);
                 }
@@ -439,9 +445,7 @@ impl WizardBackend for BootstrapManager {
     }
 
     fn local_username(&self) -> String {
-        hyprstream_rpc::envelope::RequestIdentity::anonymous()
-            .user()
-            .to_owned()
+        "anonymous".to_owned()
     }
 
     fn templates(&self) -> Vec<TemplateInfo> {
@@ -613,10 +617,86 @@ async fn do_bootstrap(
             .context("Failed to create default policy files")?;
     }
 
-    // ── 4. Signing key ──────────────────────────────────────────────────────
+    // ── 4. Signing key (becomes the CA key for PolicyService) ────────────
     let _ = tx.send(BootstrapPoll::InProgress("Loading signing key...".to_owned()));
-    load_or_generate_signing_key(keys_dir).await?;
-    steps.push("Signing key OK".to_owned());
+    let root_key = load_or_generate_signing_key(keys_dir).await?;
+
+    // ── 4b. Per-service independent keys + CA credentials ────────────────
+    let _ = tx.send(BootstrapPoll::InProgress("Generating service keys...".to_owned()));
+    {
+        let credentials_dir = crate::config::HyprConfig::load()
+            .map(|c| c.config_dir().join("credentials"))
+            .unwrap_or_else(|_| {
+                dirs::config_dir()
+                    .unwrap_or_else(|| models_dir.to_path_buf())
+                    .join("hyprstream")
+                    .join("credentials")
+            });
+
+        // CA JWT signing key (purpose-derived for JWT signature separation).
+        // Derived BEFORE writing ca-pubkey so we can store the JWT key's verifying key,
+        // not the root key's verifying key. Services verify JWTs with the derived key.
+        let ca_jwt_key = hyprstream_rpc::node_identity::derive_purpose_key(
+            &root_key, "hyprstream-jwt-v1",
+        );
+
+        // Write CA signing key only if not already present (idempotent)
+        match identity_store::load_ca_signing_key(&credentials_dir) {
+            Ok(_) => {
+                // CA key exists; preserve it so running services stay valid
+            }
+            Err(_) => {
+                identity_store::write_ca_signing_key(&credentials_dir, &root_key)?;
+                // Write the JWT-derived verifying key as ca-pubkey (not the root key).
+                // PolicyService signs JWTs with ca_jwt_key; services must verify with its pubkey.
+                identity_store::write_ca_verifying_key(&credentials_dir, &ca_jwt_key.verifying_key())?;
+            }
+        }
+        // Always sync signing-key and verifying key (derived from root_key, harmless to overwrite)
+        identity_store::write_secret(&credentials_dir, "signing-key", &root_key.to_bytes())?;
+        identity_store::write_ca_verifying_key(&credentials_dir, &ca_jwt_key.verifying_key())?;
+
+        // Generate independent keypairs for each registered service
+        use hyprstream_service::list_factories;
+
+        let mut bootstrap_pubkeys = std::collections::HashMap::new();
+        let now = chrono::Utc::now().timestamp();
+
+        for factory in list_factories() {
+            let service_name = factory.name;
+
+            if service_name == "policy" {
+                // PolicyService uses the root/CA key directly — no independent key needed.
+                bootstrap_pubkeys.insert(
+                    service_name.to_owned(),
+                    root_key.verifying_key(),
+                );
+                continue;
+            }
+
+            // Load or generate independent Ed25519 keypair
+            let service_key = identity_store::load_or_generate_service_signing_key(
+                &credentials_dir, service_name,
+            )?;
+            let service_vk = service_key.verifying_key();
+
+            let jwt = crate::auth::service_jwt::issue_or_load_service_jwt(
+                &credentials_dir, service_name, &ca_jwt_key, &service_vk, now,
+            )?;
+            identity_store::write_service_jwt(&credentials_dir, service_name, &jwt)?;
+
+            bootstrap_pubkeys.insert(service_name.to_owned(), service_vk);
+        }
+
+        // Write bootstrap pubkeys for all services
+        identity_store::write_bootstrap_pubkeys(&credentials_dir, &bootstrap_pubkeys)?;
+
+        tracing::info!(
+            "Generated {} independent service keypairs + JWTs",
+            bootstrap_pubkeys.len(),
+        );
+    }
+    steps.push("Service keys OK".to_owned());
 
     // ── 5. Done ─────────────────────────────────────────────────────────────
     let _ = tx.send(BootstrapPoll::InProgress("Validating environment...".to_owned()));

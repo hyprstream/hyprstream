@@ -110,7 +110,8 @@ impl TclMount {
     }
 }
 
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl Mount for TclMount {
     async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
         let kind = match components {

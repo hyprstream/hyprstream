@@ -73,7 +73,8 @@ fn generate_scope_trait_recursive(sc: &ScopedClient, resolved: &ResolvedSchema, 
 
     tokens.extend(quote! {
         #[doc = #doc]
-        #[async_trait::async_trait]
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
         pub trait #trait_ident: Send + Sync {
             #(#nested_assoc_types)*
             #(#nested_factory_methods)*
@@ -121,7 +122,8 @@ fn generate_top_level_trait(service_name: &str, resolved: &ResolvedSchema, types
 
     quote! {
         #[doc = #doc]
-        #[async_trait::async_trait]
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
         pub trait #trait_name: Send + Sync {
             #(#assoc_types)*
             #(#factory_methods)*
@@ -312,7 +314,8 @@ pub fn generate_trait_impls(service_name: &str, resolved: &ResolvedSchema, types
         .collect();
 
     tokens.extend(quote! {
-        #[async_trait::async_trait]
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
         impl #trait_ident for #client_ident {
             #(#assoc_bindings)*
             #(#factory_impls)*
@@ -362,7 +365,8 @@ fn generate_scope_trait_impl_recursive(sc: &ScopedClient, resolved: &ResolvedSch
         .collect();
 
     tokens.extend(quote! {
-        #[async_trait::async_trait]
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
         impl #trait_ident for #client_ident {
             #(#nested_assoc)*
             #(#nested_factory_impls)*
@@ -481,11 +485,17 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
 
             /// Create a new client by looking up the service endpoint from the global registry.
             ///
-            /// If the registry is not yet initialized (D9), falls back to the default
-            /// inproc endpoint. Use `with_endpoint()` or `from_resolver()` for explicit control.
-            pub fn new(
+            /// `destination` is the Ed25519 verifying key of the target service,
+            /// used to verify response envelope signatures. This must be the target service's
+            /// actual pubkey (obtained via service JWT / discovery), NOT the caller's key.
+            ///
+            /// `token` is an optional CA-signed JWT certificate for trust establishment.
+            /// When provided, the token is included in request envelopes so the server
+            /// can bind the caller's Ed25519 key to a subject.
+            pub fn for_service(
                 signing_key: hyprstream_rpc::crypto::SigningKey,
-                identity: hyprstream_rpc::envelope::RequestIdentity,
+                destination: hyprstream_rpc::crypto::VerifyingKey,
+                token: Option<String>,
             ) -> Self {
                 let endpoint = hyprstream_rpc::registry::try_global()
                     .map(|r| r.endpoint(#service_name_lit, hyprstream_rpc::registry::SocketKind::Rep))
@@ -493,31 +503,79 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
                         concat!("hyprstream/", #service_name_lit)
                     ))
                     .to_zmq_string();
-                Self::with_endpoint(&endpoint, signing_key, identity)
+                Self::for_endpoint(&endpoint, signing_key, destination, token)
             }
 
             /// Create a new client connected to a specific endpoint.
-            pub fn with_endpoint(
+            ///
+            /// `destination` is the target service's Ed25519 verifying key,
+            /// used to verify response signatures.
+            pub fn for_endpoint(
                 endpoint: &str,
                 signing_key: hyprstream_rpc::crypto::SigningKey,
-                identity: hyprstream_rpc::envelope::RequestIdentity,
+                destination: hyprstream_rpc::crypto::VerifyingKey,
+                token: Option<String>,
             ) -> Self {
-                Self::from_zmq(
-                    hyprstream_rpc::zmq_context::create_service_client_base(endpoint, signing_key, identity)
-                )
+                let signer = hyprstream_rpc::signer::LocalSigner::new(signing_key);
+                let transport = hyprstream_rpc::zmq_connection::ZmqConnection::new(
+                    endpoint,
+                    hyprstream_rpc::zmq_context::global_context(),
+                );
+                let rpc = hyprstream_rpc::rpc_client::RpcClientImpl::new(
+                    signer, transport, Some(destination),
+                );
+                let rpc = match token {
+                    Some(t) => rpc.with_default_jwt(t),
+                    None => rpc,
+                };
+                Self::new(std::sync::Arc::new(rpc) as std::sync::Arc<dyn hyprstream_rpc::RpcClient>)
             }
 
             /// Create a new client by resolving the service endpoint via a `Resolver`.
             pub async fn from_resolver(
                 resolver: &dyn hyprstream_rpc::Resolver,
                 signing_key: hyprstream_rpc::crypto::SigningKey,
-                identity: hyprstream_rpc::envelope::RequestIdentity,
+                destination: hyprstream_rpc::crypto::VerifyingKey,
+                token: Option<String>,
             ) -> anyhow::Result<Self> {
                 let endpoint = resolver
                     .resolve(Self::SERVICE_NAME, hyprstream_rpc::registry::SocketKind::Rep)
                     .await?
                     .to_zmq_string();
-                Ok(Self::with_endpoint(&endpoint, signing_key, identity))
+                Ok(Self::for_endpoint(&endpoint, signing_key, destination, token))
+            }
+
+            /// Create a client from an `IdentityProvider` with automatic endpoint resolution.
+            pub async fn from_provider(
+                provider: &dyn hyprstream_rpc::identity::IdentityProvider,
+            ) -> anyhow::Result<Self> {
+                let endpoint = hyprstream_rpc::registry::try_global()
+                    .map(|r| r.endpoint(#service_name_lit, hyprstream_rpc::registry::SocketKind::Rep))
+                    .unwrap_or_else(|| hyprstream_rpc::transport::TransportConfig::inproc(
+                        concat!("hyprstream/", #service_name_lit)
+                    ))
+                    .to_zmq_string();
+                Self::from_provider_at(&endpoint, provider).await
+            }
+
+            /// Create a client from an `IdentityProvider` at a specific endpoint.
+            pub async fn from_provider_at(
+                endpoint: &str,
+                provider: &dyn hyprstream_rpc::identity::IdentityProvider,
+            ) -> anyhow::Result<Self> {
+                let handle = provider.identity_open(concat!("hyprstream-", #service_name_lit, "-v1")).await?;
+                let pubkey = handle.pubkey();
+                let server_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(&pubkey)
+                    .map_err(|e| anyhow::anyhow!("invalid derived pubkey: {}", e))?;
+                let signer = hyprstream_rpc::signer::IdentitySigner::new(handle);
+                let transport = hyprstream_rpc::zmq_connection::ZmqConnection::new(
+                    endpoint,
+                    hyprstream_rpc::zmq_context::global_context(),
+                );
+                let rpc = hyprstream_rpc::rpc_client::RpcClientImpl::new(
+                    signer, transport, Some(server_vk),
+                );
+                Ok(Self::new(std::sync::Arc::new(rpc) as std::sync::Arc<dyn hyprstream_rpc::RpcClient>))
             }
         }
     }
@@ -648,13 +706,13 @@ pub fn generate_client(service_name: &str, resolved: &ResolvedSchema, types_crat
         .map(|sc| sc.factory_name.as_str())
         .collect();
 
-    // Request methods (skip scoped variants)
+    // Request methods (portable — uses self.client.call(), not CallOptions)
     let request_methods: Vec<TokenStream> = resolved.raw
         .request_variants
         .iter()
         .filter(|v| !scoped_variant_names.contains(&v.name.as_str()))
         .map(|v| {
-            generate_request_method(
+            generate_request_method_inner(
                 &capnp_mod,
                 &req_type,
                 &response_type,
@@ -682,72 +740,44 @@ pub fn generate_client(service_name: &str, resolved: &ResolvedSchema, types_crat
     let factory_methods: Vec<TokenStream> = resolved.raw
         .scoped_clients
         .iter()
-        .map(generate_scoped_factory_method)
+        .map(generate_portable_scoped_factory_method)
         .collect();
-
-    // ServiceClient impl
-    let service_name_lit = service_name;
 
     quote! {
         #[doc = #doc]
         #[derive(Clone)]
         pub struct #client_name {
-            client: Arc<ZmqClientBase>,
-            claims: Option<std::sync::Arc<hyprstream_rpc::auth::Claims>>,
-        }
-
-        impl ServiceClient for #client_name {
-            const SERVICE_NAME: &'static str = #service_name_lit;
-
-            fn from_zmq(client: ZmqClientBase) -> Self {
-                Self { client: Arc::new(client), claims: None }
-            }
+            client: std::sync::Arc<dyn hyprstream_rpc::RpcClient>,
         }
 
         impl #client_name {
+            /// Create from any RpcClient implementation.
+            pub fn new(client: std::sync::Arc<dyn hyprstream_rpc::RpcClient>) -> Self {
+                Self { client }
+            }
+
             /// Get the next request ID.
             pub fn next_id(&self) -> u64 {
                 self.client.next_id()
             }
 
-            /// Attach claims for e2e verification. All subsequent calls include these claims.
-            pub fn with_claims(mut self, claims: hyprstream_rpc::auth::Claims) -> Self {
-                self.claims = Some(std::sync::Arc::new(claims));
-                self
+            /// Create a per-call request builder for custom authentication options.
+            ///
+            /// The builder is Send+Sync and idempotent — it stores per-call auth
+            /// context without mutating the shared client. Safe for use with
+            /// connection pooling.
+            pub fn request(&self) -> hyprstream_rpc::RequestBuilder<'_> {
+                hyprstream_rpc::RequestBuilder::new(&self.client)
             }
 
             /// Send a raw request and return the raw response bytes.
             pub async fn call(&self, payload: Vec<u8>) -> anyhow::Result<Vec<u8>> {
-                let opts = match &self.claims {
-                    Some(c) => CallOptions::default().claims((**c).clone()),
-                    None => CallOptions::default(),
-                };
-                self.client.call(payload, opts).await
+                self.client.call(payload).await
             }
 
-            /// Send a raw request with custom options and return the raw response bytes.
-            pub async fn call_with_options(&self, payload: Vec<u8>, mut opts: CallOptions) -> anyhow::Result<Vec<u8>> {
-                if opts.claims.is_none() {
-                    if let Some(ref c) = self.claims {
-                        opts = opts.claims((**c).clone());
-                    }
-                }
-                self.client.call(payload, opts).await
-            }
-
-            /// Get the endpoint this client is connected to.
-            pub fn endpoint(&self) -> &str {
-                self.client.endpoint()
-            }
-
-            /// Get the signing key used by this client.
-            pub fn signing_key(&self) -> &hyprstream_rpc::crypto::SigningKey {
-                self.client.signing_key()
-            }
-
-            /// Get the request identity used by this client.
-            pub fn identity(&self) -> &hyprstream_rpc::envelope::RequestIdentity {
-                self.client.identity()
+            /// Send a streaming request with ephemeral DH pubkey.
+            pub async fn call_streaming(&self, payload: Vec<u8>, ephemeral_pubkey: [u8; 32]) -> anyhow::Result<Vec<u8>> {
+                self.client.call_streaming(payload, ephemeral_pubkey).await
             }
 
             #(#request_methods)*
@@ -763,9 +793,25 @@ pub fn generate_client(service_name: &str, resolved: &ResolvedSchema, types_crat
 // Request Method Generation
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Generate a single request method. Used for both top-level and scoped clients.
+/// Generate a portable request method (no CallOptions, no ZMQ deps).
 #[allow(clippy::too_many_arguments)]
-pub fn generate_request_method(
+pub fn generate_portable_request_method(
+    capnp_mod: &TokenStream,
+    req_type: &syn::Ident,
+    response_type: &syn::Ident,
+    variant: &UnionVariant,
+    resolved: &ResolvedSchema,
+    scope: Option<&ScopedMethodContext>,
+    response_variants: Option<&[UnionVariant]>,
+    is_scoped: bool,
+    types_crate: Option<&syn::Path>,
+) -> TokenStream {
+    generate_request_method_inner(capnp_mod, req_type, response_type, variant, resolved, scope, response_variants, is_scoped, types_crate)
+}
+
+/// Inner request method generation (transport-agnostic).
+#[allow(clippy::too_many_arguments)]
+fn generate_request_method_inner(
     capnp_mod: &TokenStream,
     req_type: &syn::Ident,
     response_type: &syn::Ident,
@@ -777,7 +823,12 @@ pub fn generate_request_method(
     types_crate: Option<&syn::Path>,
 ) -> TokenStream {
     let method_name = format_ident!("{}", to_snake_case(&variant.name));
-    let doc = format!("{} ({} variant)", to_snake_case(&variant.name), variant.type_name);
+    let doc = if variant.description.is_empty() {
+        format!("{} ({} variant)", to_snake_case(&variant.name), variant.type_name)
+    } else {
+        let scope_info = if variant.scope.is_empty() { String::new() } else { format!("\n\nScope: {}", variant.scope) };
+        format!("{}{}", variant.description, scope_info)
+    };
 
     // For scoped methods, walk the ScopedMethodContext chain and shadow `req`
     let (outer_req_setup, parse_call) = if let Some(sc) = scope {
@@ -834,24 +885,34 @@ pub fn generate_request_method(
         .map(|v| is_rpc_stream_info(&v.type_name, resolved))
         .unwrap_or(false);
 
-    let (return_type, response_handling) = if let Some(ref info) = typed_info {
-        let ret = &info.return_type;
-        let match_body = &info.match_body;
-        (quote! { #ret }, quote! { #match_body })
-    } else {
-        (quote! { #response_type }, quote! { #parse_call })
-    };
-
-    let (extra_param, call_expr) = if is_streaming {
+    // For streaming methods, use call_streaming with ephemeral pubkey
+    let (return_type, response_handling, extra_param, call_expr) = if is_streaming {
+        let (rt, rh) = if let Some(ref info) = typed_info {
+            let ret = &info.return_type;
+            let match_body = &info.match_body;
+            (quote! { #ret }, quote! { #match_body })
+        } else {
+            (quote! { #response_type }, quote! { #parse_call })
+        };
         (
+            rt,
+            rh,
             quote! { , ephemeral_pubkey: [u8; 32] },
             quote! {
-                let opts = CallOptions::default().ephemeral_pubkey(ephemeral_pubkey);
-                let response = self.call_with_options(payload, opts).await?;
+                let response = self.call_streaming(payload, ephemeral_pubkey).await?;
             },
         )
     } else {
+        let (rt, rh) = if let Some(ref info) = typed_info {
+            let ret = &info.return_type;
+            let match_body = &info.match_body;
+            (quote! { #ret }, quote! { #match_body })
+        } else {
+            (quote! { #response_type }, quote! { #parse_call })
+        };
         (
+            rt,
+            rh,
             TokenStream::new(),
             quote! { let response = self.call(payload).await?; },
         )
@@ -1334,7 +1395,9 @@ fn generate_list_parse_arm(
 // Scoped Factory Method
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn generate_scoped_factory_method(sc: &ScopedClient) -> TokenStream {
+
+/// Generate a scoped factory method for portable clients (no jwt_token field).
+fn generate_portable_scoped_factory_method(sc: &ScopedClient) -> TokenStream {
     let method_name = format_ident!("{}", to_snake_case(&sc.factory_name));
     let client_name_ident = format_ident!("{}", sc.client_name);
     let doc = format!("Create a scoped {} client.", sc.factory_name);
@@ -1357,8 +1420,7 @@ fn generate_scoped_factory_method(sc: &ScopedClient) -> TokenStream {
         #[doc = #doc]
         pub fn #method_name(&self #(, #params)*) -> #client_name_ident {
             #client_name_ident {
-                client: Arc::clone(&self.client),
-                claims: self.claims.clone(),
+                client: std::sync::Arc::clone(&self.client),
                 #(#field_inits,)*
             }
         }

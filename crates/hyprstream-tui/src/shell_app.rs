@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use waxterm::app::TerminalApp;
 use waxterm::input::KeyPress;
-use waxterm::widgets::{SelectList, WidgetResult};
+use waxterm::widgets::{SelectList, TextInput, WidgetResult};
 
 use crate::background::{BackgroundState, BackgroundStyle, ALL_STYLES, PREVIEW_H, PREVIEW_W};
 use crate::shell::{kill_shell, spawn_shell, ShellInput};
@@ -21,24 +21,60 @@ use crate::vt_pane::VtPane;
 type LoadFn = Box<dyn Fn(&str, ModelStatusSender) + Send>;
 
 // ============================================================================
+// Git operation types
+// ============================================================================
+
+/// Progress update from a background git operation.
+#[derive(Debug, Clone)]
+pub enum GitOpProgress {
+    CloneProgress { stage: String, pct: u8 },
+    Status(String),
+    Done { message: String, new_model: Option<ModelEntry> },
+    Failed(String),
+}
+
+pub type GitProgressSender = std::sync::mpsc::Sender<GitOpProgress>;
+pub type CloneFn = Box<dyn Fn(String, Option<String>, Option<String>, GitProgressSender) + Send>;
+pub type PullFn = Box<dyn Fn(String, GitProgressSender) + Send>;
+pub type PushFn = Box<dyn Fn(String, GitProgressSender) + Send>;
+pub type FetchStatusFn = Box<dyn Fn(Vec<String>, std::sync::mpsc::Sender<(String, u32, u32, bool)>) + Send>;
+
+/// Bundled git operation callbacks injected by the service layer.
+pub struct GitOps {
+    pub clone_fn: CloneFn,
+    pub pull_fn: PullFn,
+    pub push_fn: PushFn,
+    pub fetch_status_fn: FetchStatusFn,
+}
+
+// ============================================================================
 // Model discovery
 // ============================================================================
 
 /// A model repo discovered in the registry directory.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ModelEntry {
     pub model_ref: String,  // "name:branch"
     pub path: PathBuf,
     pub loaded: bool,
+    pub ahead: u32,
+    pub behind: u32,
+    pub is_dirty: bool,
 }
 
 impl std::fmt::Display for ModelEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.model_ref)?;
         if self.loaded {
-            write!(f, "{} [loaded]", self.model_ref)
-        } else {
-            write!(f, "{}", self.model_ref)
+            write!(f, " [loaded]")?;
         }
+        if self.ahead > 0 || self.behind > 0 {
+            write!(f, " [+{}/-{}]", self.ahead, self.behind)?;
+        }
+        if self.is_dirty {
+            write!(f, " [dirty]")?;
+        }
+        Ok(())
     }
 }
 
@@ -54,6 +90,9 @@ pub fn discover_models(registry: &std::path::Path) -> Vec<ModelEntry> {
             model_ref: e.file_name().to_string_lossy().into_owned(),
             path: e.path(),
             loaded: false,
+            ahead: 0,
+            behind: 0,
+            is_dirty: false,
         })
         .collect();
     models.sort_by(|a, b| a.model_ref.cmp(&b.model_ref));
@@ -120,6 +159,20 @@ impl Drop for PaneWindow {
 // App mode
 // ============================================================================
 
+/// Clone flow sub-screens.
+pub enum CloneScreen {
+    /// Prompting for the repository URL.
+    EnterUrl(TextInput),
+    /// Prompting for an optional local name (URL stored from previous step).
+    EnterName(TextInput, String),
+    /// Clone in progress — progress updates driven by tick().
+    Cloning { url: String, name: String, progress_msg: String, progress_pct: u8 },
+    /// Clone completed successfully.
+    Done(String),
+    /// Clone failed.
+    Failed(String),
+}
+
 pub enum ShellMode {
     /// Keys forwarded directly to the active shell.
     Normal,
@@ -129,6 +182,10 @@ pub enum ShellMode {
     Settings,
     /// Start-menu popup (Ctrl+Space).
     StartMenu { selected: usize },
+    /// Multi-step clone flow.
+    CloneFlow(CloneScreen),
+    /// Pull/push in progress.
+    GitOpInProgress { op_name: String, model_ref: String, progress_msg: String },
 }
 
 /// Menu items: (label, chord hint shown in popup).
@@ -190,6 +247,15 @@ pub struct ShellApp {
     /// `(model_ref, true/false)` result once the model is actually loaded.
     load_fn: LoadFn,
     unload_fn: Box<dyn Fn(&str) -> bool + Send>,
+    /// Git operation callbacks (clone, pull, push, status fetch).
+    git_ops: Option<GitOps>,
+    /// Receives progress updates from background git operations.
+    git_progress_rx: std::sync::mpsc::Receiver<GitOpProgress>,
+    /// Sender cloned into git operation callbacks.
+    git_progress_tx: GitProgressSender,
+    /// Receives per-model status updates (model_ref, ahead, behind, dirty).
+    git_status_rx: std::sync::mpsc::Receiver<(String, u32, u32, bool)>,
+    git_status_tx: std::sync::mpsc::Sender<(String, u32, u32, bool)>,
 }
 
 impl ShellApp {
@@ -199,6 +265,7 @@ impl ShellApp {
         rows: u16,
         load_fn: LoadFn,
         unload_fn: Box<dyn Fn(&str) -> bool + Send>,
+        git_ops: Option<GitOps>,
     ) -> Self {
         let pane_rows = rows.saturating_sub(2);
         let initial = PaneWindow::new("shell".to_owned(), None, cols, pane_rows)
@@ -213,6 +280,8 @@ impl ShellApp {
         ).with_selected(1); // Stars is index 1
 
         let (status_tx, status_rx) = std::sync::mpsc::channel();
+        let (git_progress_tx, git_progress_rx) = std::sync::mpsc::channel();
+        let (git_status_tx, git_status_rx) = std::sync::mpsc::channel();
 
         Self {
             mode: ShellMode::Normal,
@@ -232,6 +301,11 @@ impl ShellApp {
             ctrl_b_pending: false,
             load_fn,
             unload_fn,
+            git_ops,
+            git_progress_rx,
+            git_progress_tx,
+            git_status_rx,
+            git_status_tx,
         }
     }
 
@@ -313,19 +387,53 @@ impl ShellApp {
     }
 
     fn handle_model_list(&mut self, key: KeyPress) -> bool {
+        // Clone — opens the clone flow (no model selection needed).
+        if matches!(key, KeyPress::Char(b'c')) && self.git_ops.is_some() {
+            self.mode = ShellMode::CloneFlow(
+                CloneScreen::EnterUrl(TextInput::new("Repository URL:")),
+            );
+            return true;
+        }
+
+        // Pull — fetch+merge for the selected model.
+        if matches!(key, KeyPress::Char(b'p')) {
+            if let (Some(git_ops), Some(model)) =
+                (&self.git_ops, self.model_list.selected_item().cloned())
+            {
+                (git_ops.pull_fn)(model.model_ref.clone(), self.git_progress_tx.clone());
+                self.mode = ShellMode::GitOpInProgress {
+                    op_name: "Pull".to_owned(),
+                    model_ref: model.model_ref,
+                    progress_msg: "Fetching…".to_owned(),
+                };
+                return true;
+            }
+        }
+
+        // Push — push commits for the selected model.
+        if matches!(key, KeyPress::Char(b'P')) {
+            if let (Some(git_ops), Some(model)) =
+                (&self.git_ops, self.model_list.selected_item().cloned())
+            {
+                (git_ops.push_fn)(model.model_ref.clone(), self.git_progress_tx.clone());
+                self.mode = ShellMode::GitOpInProgress {
+                    op_name: "Push".to_owned(),
+                    model_ref: model.model_ref,
+                    progress_msg: "Pushing…".to_owned(),
+                };
+                return true;
+            }
+        }
+
         if matches!(key, KeyPress::Char(b'l' | b'L')) {
             if let Some(model) = self.model_list.selected_item().cloned() {
-                // Submit the load request; the closure polls status and sends
-                // (model_ref, true) back via status_tx when actually loaded.
                 (self.load_fn)(&model.model_ref, self.status_tx.clone());
                 self.load_status = Some(format!("Loading {}…", model.model_ref));
-                // Do NOT mark loaded=true here — wait for status_rx confirmation.
                 return true;
             }
         }
         if matches!(key, KeyPress::Char(b'u' | b'U')) {
             if let Some(model) = self.model_list.selected_item().cloned() {
-                // Unload is synchronous — the RPC blocks until unloaded.
                 let ok = (self.unload_fn)(&model.model_ref);
                 if ok {
                     let idx = self.model_list.selected_index();
@@ -337,9 +445,6 @@ impl ShellApp {
             }
         }
 
-        // T / Enter open a terminal scoped to the model worktree.
-        // Only available on platforms with filesystem sandbox support (Linux, OpenBSD).
-        // On other platforms the key is a no-op; a Worker-based approach will be added later.
         #[cfg(any(target_os = "linux", target_os = "openbsd"))]
         if matches!(key, KeyPress::Char(b't' | b'T') | KeyPress::Enter) {
             if let Some(model) = self.model_list.selected_item().cloned() {
@@ -355,16 +460,103 @@ impl ShellApp {
                 true
             }
             WidgetResult::Confirmed(model) => {
-                // Scoped terminal: only on platforms with sandbox support.
                 #[cfg(any(target_os = "linux", target_os = "openbsd"))]
                 self.open_terminal(Some(model.path), format!("{} shell", model.model_ref));
                 #[cfg(not(any(target_os = "linux", target_os = "openbsd")))]
-                let _ = model; // worktree terminal not available on this platform
+                let _ = model;
                 self.mode = ShellMode::Normal;
                 true
             }
             WidgetResult::Pending => true,
         }
+    }
+
+    fn handle_clone_flow(&mut self, key: KeyPress) -> bool {
+        let screen = std::mem::replace(
+            &mut self.mode,
+            ShellMode::Normal, // temporary placeholder
+        );
+        let ShellMode::CloneFlow(screen) = screen else {
+            self.mode = screen;
+            return false;
+        };
+
+        match screen {
+            CloneScreen::EnterUrl(mut input) => {
+                match input.handle_key(&key) {
+                    WidgetResult::Confirmed(url) => {
+                        if url.trim().is_empty() {
+                            self.mode = ShellMode::ModelList;
+                        } else {
+                            self.mode = ShellMode::CloneFlow(CloneScreen::EnterName(
+                                TextInput::new("Local name (Enter for default):"),
+                                url,
+                            ));
+                        }
+                    }
+                    WidgetResult::Cancelled => {
+                        self.mode = ShellMode::ModelList;
+                    }
+                    WidgetResult::Pending => {
+                        self.mode = ShellMode::CloneFlow(CloneScreen::EnterUrl(input));
+                    }
+                }
+            }
+            CloneScreen::EnterName(mut input, url) => {
+                match input.handle_key(&key) {
+                    WidgetResult::Confirmed(name) => {
+                        let name_opt = if name.trim().is_empty() { None } else { Some(name) };
+                        let display_name = name_opt.clone().unwrap_or_else(|| url.clone());
+                        if let Some(ref git_ops) = self.git_ops {
+                            (git_ops.clone_fn)(
+                                url.clone(),
+                                name_opt,
+                                None,
+                                self.git_progress_tx.clone(),
+                            );
+                        }
+                        self.mode = ShellMode::CloneFlow(CloneScreen::Cloning {
+                            url,
+                            name: display_name,
+                            progress_msg: "Starting…".to_owned(),
+                            progress_pct: 0,
+                        });
+                    }
+                    WidgetResult::Cancelled => {
+                        self.mode = ShellMode::ModelList;
+                    }
+                    WidgetResult::Pending => {
+                        self.mode = ShellMode::CloneFlow(CloneScreen::EnterName(input, url));
+                    }
+                }
+            }
+            CloneScreen::Cloning { url, name, progress_msg, progress_pct } => {
+                // No key handling during clone — progress driven by tick().
+                self.mode = ShellMode::CloneFlow(CloneScreen::Cloning {
+                    url, name, progress_msg, progress_pct,
+                });
+            }
+            CloneScreen::Done(_) | CloneScreen::Failed(_) => {
+                if matches!(key, KeyPress::Enter | KeyPress::Escape) {
+                    self.mode = ShellMode::ModelList;
+                } else {
+                    self.mode = ShellMode::CloneFlow(screen);
+                }
+            }
+        }
+        true
+    }
+
+    fn handle_git_op_progress(&mut self, key: KeyPress) -> bool {
+        // Allow Esc/Enter to dismiss after completion (detected by "Done:" or "Error:" prefix).
+        if let ShellMode::GitOpInProgress { ref progress_msg, .. } = self.mode {
+            if (progress_msg.starts_with("Done:") || progress_msg.starts_with("Error:"))
+                && matches!(key, KeyPress::Enter | KeyPress::Escape)
+            {
+                self.mode = ShellMode::ModelList;
+            }
+        }
+        true
     }
 
     fn handle_start_menu(&mut self, key: KeyPress, selected: usize) -> bool {
@@ -407,7 +599,10 @@ impl ShellApp {
             0 => self.open_terminal(None, "shell".to_owned()),
             1 => self.close_active(),
             2 => self.cycle_window(),
-            3 => { self.mode = ShellMode::ModelList; }
+            3 => {
+                self.mode = ShellMode::ModelList;
+                self.fetch_git_status();
+            }
             4 => {
                 self.saved_style = self.bg.style;
                 let i = ALL_STYLES.iter().position(|s| *s == self.bg.style).unwrap_or(0);
@@ -420,6 +615,17 @@ impl ShellApp {
             _ => {}
         }
         true
+    }
+
+    fn fetch_git_status(&self) {
+        if let Some(ref git_ops) = self.git_ops {
+            let refs: Vec<String> = self.model_list.items().iter()
+                .map(|e| e.model_ref.clone())
+                .collect();
+            if !refs.is_empty() {
+                (git_ops.fetch_status_fn)(refs, self.git_status_tx.clone());
+            }
+        }
     }
 
     fn handle_settings(&mut self, key: KeyPress) -> bool {
@@ -459,10 +665,12 @@ impl TerminalApp for ShellApp {
     fn handle_input(&mut self, cmd: ShellCmd) -> bool {
         let ShellCmd::Key(key) = cmd;
         match self.mode {
-            ShellMode::Normal                 => self.handle_normal(key),
-            ShellMode::ModelList              => self.handle_model_list(key),
-            ShellMode::Settings               => self.handle_settings(key),
-            ShellMode::StartMenu { selected } => self.handle_start_menu(key, selected),
+            ShellMode::Normal                    => self.handle_normal(key),
+            ShellMode::ModelList                 => self.handle_model_list(key),
+            ShellMode::Settings                  => self.handle_settings(key),
+            ShellMode::StartMenu { selected }    => self.handle_start_menu(key, selected),
+            ShellMode::CloneFlow(_)              => self.handle_clone_flow(key),
+            ShellMode::GitOpInProgress { .. }    => self.handle_git_op_progress(key),
         }
     }
 
@@ -494,11 +702,76 @@ impl TerminalApp for ShellApp {
                     entry.loaded = loaded;
                 }
             }
-            // Clear the "Loading…" status once the model responds.
             if self.load_status.as_ref()
                 .is_some_and(|s| s.contains(&model_ref))
             {
                 self.load_status = None;
+            }
+            redraw = true;
+        }
+
+        // Drain git operation progress updates.
+        while let Ok(progress) = self.git_progress_rx.try_recv() {
+            match progress {
+                GitOpProgress::CloneProgress { stage, pct } => {
+                    if let ShellMode::CloneFlow(CloneScreen::Cloning {
+                        ref mut progress_msg, ref mut progress_pct, ..
+                    }) = self.mode {
+                        *progress_msg = stage;
+                        *progress_pct = pct;
+                    }
+                }
+                GitOpProgress::Status(msg) => {
+                    if let ShellMode::GitOpInProgress { ref mut progress_msg, .. } = self.mode {
+                        *progress_msg = msg;
+                    }
+                }
+                GitOpProgress::Done { message, new_model } => {
+                    if let Some(entry) = new_model {
+                        self.model_list.items_mut().push(entry);
+                        self.model_list.items_mut().sort_by(|a, b| a.model_ref.cmp(&b.model_ref));
+                    }
+                    match self.mode {
+                        ShellMode::CloneFlow(_) => {
+                            self.mode = ShellMode::CloneFlow(CloneScreen::Done(message));
+                        }
+                        ShellMode::GitOpInProgress { .. } => {
+                            self.mode = ShellMode::GitOpInProgress {
+                                op_name: String::new(),
+                                model_ref: String::new(),
+                                progress_msg: format!("Done: {message}"),
+                            };
+                        }
+                        _ => {}
+                    }
+                }
+                GitOpProgress::Failed(msg) => {
+                    match self.mode {
+                        ShellMode::CloneFlow(_) => {
+                            self.mode = ShellMode::CloneFlow(CloneScreen::Failed(msg));
+                        }
+                        ShellMode::GitOpInProgress { .. } => {
+                            self.mode = ShellMode::GitOpInProgress {
+                                op_name: String::new(),
+                                model_ref: String::new(),
+                                progress_msg: format!("Error: {msg}"),
+                            };
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            redraw = true;
+        }
+
+        // Drain git status fetch results.
+        while let Ok((model_ref, ahead, behind, dirty)) = self.git_status_rx.try_recv() {
+            for entry in self.model_list.items_mut() {
+                if entry.model_ref == model_ref {
+                    entry.ahead = ahead;
+                    entry.behind = behind;
+                    entry.is_dirty = dirty;
+                }
             }
             redraw = true;
         }

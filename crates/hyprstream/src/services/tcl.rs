@@ -139,7 +139,7 @@ mod tests {
     use hyprstream_rpc::crypto::generate_signing_keypair;
 
     fn make_ctx() -> EnvelopeContext {
-        EnvelopeContext::from_callback_system(1)
+        EnvelopeContext::from_callback_service(1, "tcl")
     }
 
     fn make_service() -> TclService {

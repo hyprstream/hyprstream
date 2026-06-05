@@ -20,14 +20,20 @@ use crate::services::generated::policy_client::{
 use anyhow::{Context, Result};
 use chrono::Duration;
 use ed25519_dalek::SigningKey;
-use hyprstream_rpc::prelude::*;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
 
 /// Create a PolicyClient for RPC calls.
+///
+/// Bootstrap: PolicyService key needed to create the PolicyClient for peer key resolution.
 fn create_policy_client(signing_key: &SigningKey) -> PolicyClient {
-    PolicyClient::new(signing_key.clone(), RequestIdentity::anonymous())
+    PolicyClient::for_service(
+        signing_key.clone(),
+        // Bootstrap: PolicyService uses the root key
+        signing_key.verifying_key(),
+        None,
+    )
 }
 
 /// Handle `policy show` - Display the running policy via RPC
@@ -51,7 +57,7 @@ pub async fn handle_policy_show(
         if policy_info.rules.is_empty() && policy_info.groupings.is_empty() {
             println!("No policies defined.");
             println!("\nTo get started, apply a template:");
-            println!("  hyprstream quick policy apply-template local    # local CLI full access");
+            println!("  hyprstream quick policy list-templates  # see all available templates");
             println!("\nOr edit manually:");
             println!("  hyprstream quick policy edit");
             return Ok(());
@@ -406,7 +412,7 @@ pub async fn load_or_generate_signing_key(_keys_dir: &Path) -> Result<SigningKey
         return Ok(sk);
     }
     let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
-    crate::auth::credentials::load_or_generate_node_signing_key(&secrets_dir)
+    crate::auth::identity_store::load_or_generate_node_signing_key(&secrets_dir)
 }
 
 /// Mint a JWT locally with proper iss/aud claims.
@@ -435,7 +441,8 @@ pub(crate) fn mint_local_token(
         .with_issuer(issuer)
         .with_audience(Some(audience));
 
-    let token = jwt::encode(&claims, signing_key);
+    let jwt_key = hyprstream_rpc::node_identity::derive_purpose_key(signing_key, "hyprstream-jwt-v1");
+    let token = jwt::encode(&claims, &jwt_key);
     (token, exp)
 }
 
@@ -444,19 +451,13 @@ pub(crate) fn mint_local_token(
 /// Loads from `<secrets_dir>/user-signing-key`, generating on first run.
 /// This key is per-OS-user (not per-hyprstream-user). The wizard only
 /// registers it for the local admin. Other users generate their own keys.
+#[allow(dead_code)]
 pub(crate) fn ensure_user_signing_key() -> Result<(SigningKey, ed25519_dalek::VerifyingKey)> {
     if let Some(pair) = crate::config::HyprConfig::user_signing_key_bypass()? {
         return Ok(pair);
     }
     let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
-    crate::auth::credentials::load_or_generate_user_signing_key(&secrets_dir)
-}
-
-/// Deprecated alias kept for call-site compatibility during transition.
-#[deprecated(since = "0.4.1", note = "renamed to ensure_user_signing_key")]
-#[allow(dead_code)]
-pub(crate) fn ensure_user_identity() -> Result<(SigningKey, ed25519_dalek::VerifyingKey)> {
-    ensure_user_signing_key()
+    crate::auth::identity_store::load_or_generate_user_signing_key(&secrets_dir)
 }
 
 /// Parse duration string like "30d", "90d", "1y", "never"
@@ -626,14 +627,14 @@ pub async fn handle_policy_apply_template(
             template_name
         ))?;
 
-    let new_content = template.expanded_rules();
+    let rules_csv = template.to_csv();
 
     println!("Applying template: {template_name}");
     println!("Description: {}", template.description);
     println!();
     println!("Rules:");
-    for line in new_content.lines() {
-        if !line.trim().is_empty() && !line.starts_with('#') {
+    for line in rules_csv.lines() {
+        if !line.trim().is_empty() {
             println!("  {line}");
         }
     }

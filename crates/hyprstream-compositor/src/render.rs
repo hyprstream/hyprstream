@@ -21,7 +21,7 @@ use ratatui::Frame;
 use waxterm::avt_style::avt_pen_to_style;
 
 use crate::background::PREVIEW_W;
-use crate::chrome::{ServiceMode, ShellChrome, ShellMode, ToastLevel, MENU_ITEMS};
+use crate::chrome::{CloneScreen, ServiceMode, ShellChrome, ShellMode, ToastLevel, MENU_ITEMS};
 use crate::layout::{CursorState, LayoutTree, PaneStorage};
 use crate::theme;
 
@@ -67,6 +67,8 @@ pub fn draw(frame: &mut Frame, chrome: &ShellChrome, layout: &LayoutTree) {
                 }
             }
         ShellMode::PreChatSettings(ref state) => draw_pre_chat_settings(frame, area, state),
+        ShellMode::CloneFlow(_) => draw_clone_modal(frame, area, chrome),
+        ShellMode::GitOpInProgress { .. } => draw_git_op_modal(frame, area, chrome),
         ShellMode::Normal | ShellMode::Fullscreen => {}
     }
 
@@ -341,23 +343,142 @@ fn draw_model_modal(frame: &mut Frame, full_area: Rect, chrome: &ShellChrome) {
         let hint_area = Rect { y: inner.y + inner.height.saturating_sub(1), height: 1, ..inner };
         let list_area = Rect { height: inner.height.saturating_sub(2), ..inner };
 
-        let hint = Paragraph::new(Line::from(vec![
+        let hint_spans = vec![
+            Span::styled("c",     theme::help_key()),
+            Span::styled(" clone  ",    theme::help_text()),
+            Span::styled("p",     theme::help_key()),
+            Span::styled(" pull  ",     theme::help_text()),
+            Span::styled("P",     theme::help_key()),
+            Span::styled(" push  ",     theme::help_text()),
             Span::styled("Enter", theme::help_key()),
             Span::styled(" chat  ",     theme::help_text()),
-            Span::styled("T",     theme::help_key()),
-            Span::styled(" terminal  ", theme::help_text()),
             Span::styled("l",     theme::help_key()),
             Span::styled(" load  ",     theme::help_text()),
             Span::styled("u",     theme::help_key()),
             Span::styled(" unload  ",   theme::help_text()),
+            Span::styled("T",     theme::help_key()),
+            Span::styled(" term  ",     theme::help_text()),
             Span::styled("Esc",   theme::help_key()),
             Span::styled(" close",      theme::help_text()),
-        ]))
+        ];
+        let hint = Paragraph::new(Line::from(hint_spans))
         .style(Style::default().bg(theme::BG_MODAL));
         frame.render_widget(hint, hint_area);
 
         chrome.model_list.render(frame, list_area);
     });
+}
+
+// ============================================================================
+// Clone flow modal
+// ============================================================================
+
+fn draw_clone_modal(frame: &mut Frame, full_area: Rect, chrome: &ShellChrome) {
+    let modal = centered_rect(55, 30, full_area);
+    frame.render_widget(Clear, modal);
+
+    let title = match &chrome.mode {
+        ShellMode::CloneFlow(CloneScreen::EnterUrl(_)) => " Clone — URL ",
+        ShellMode::CloneFlow(CloneScreen::EnterName(..)) => " Clone — Name ",
+        ShellMode::CloneFlow(CloneScreen::Cloning { .. }) => " Cloning… ",
+        ShellMode::CloneFlow(CloneScreen::Done(_)) => " Clone Complete ",
+        ShellMode::CloneFlow(CloneScreen::Failed(_)) => " Clone Failed ",
+        _ => " Clone ",
+    };
+
+    let block = theme::modal_block(Line::from(title));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    match &chrome.mode {
+        ShellMode::CloneFlow(CloneScreen::EnterUrl(input)) => {
+            input.render(frame, inner);
+        }
+        ShellMode::CloneFlow(CloneScreen::EnterName(input, _url)) => {
+            input.render(frame, inner);
+        }
+        ShellMode::CloneFlow(CloneScreen::Cloning { name, progress_msg, progress_pct }) => {
+            let bar_width = inner.width.saturating_sub(8) as usize;
+            let filled = (bar_width as u16 * (*progress_pct as u16) / 100) as usize;
+            let empty = bar_width.saturating_sub(filled);
+            let bar = format!("[{}{}] {:>3}%", "#".repeat(filled), " ".repeat(empty), progress_pct);
+
+            let text = vec![
+                Line::from(Span::styled(name.as_str(), theme::help_text())),
+                Line::from(""),
+                Line::from(Span::styled(bar, Style::default().fg(Color::Green))),
+                Line::from(Span::styled(progress_msg.as_str(), theme::help_text())),
+            ];
+            frame.render_widget(Paragraph::new(text), inner);
+        }
+        ShellMode::CloneFlow(CloneScreen::Done(msg)) => {
+            let text = vec![
+                Line::from(Span::styled(msg.as_str(), Style::default().fg(Color::Green))),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Enter", theme::help_key()),
+                    Span::styled(" to continue", theme::help_text()),
+                ]),
+            ];
+            frame.render_widget(Paragraph::new(text), inner);
+        }
+        ShellMode::CloneFlow(CloneScreen::Failed(msg)) => {
+            let text = vec![
+                Line::from(Span::styled(msg.as_str(), Style::default().fg(Color::Red))),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Enter", theme::help_key()),
+                    Span::styled(" to continue", theme::help_text()),
+                ]),
+            ];
+            frame.render_widget(Paragraph::new(text), inner);
+        }
+        _ => {}
+    }
+}
+
+// ============================================================================
+// Git operation progress modal
+// ============================================================================
+
+fn draw_git_op_modal(frame: &mut Frame, full_area: Rect, chrome: &ShellChrome) {
+    let modal = centered_rect(50, 25, full_area);
+    frame.render_widget(Clear, modal);
+
+    let (title, model_ref, progress_msg) = match &chrome.mode {
+        ShellMode::GitOpInProgress { op_name, model_ref, progress_msg } => {
+            (op_name.as_str(), model_ref.as_str(), progress_msg.as_str())
+        }
+        _ => return,
+    };
+
+    let display_title = if title.is_empty() { "Git" } else { title };
+    let block = theme::modal_block(Line::from(format!(" {display_title} ")));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    let is_terminal = progress_msg.starts_with("Done:") || progress_msg.starts_with("Error:");
+    let msg_style = if progress_msg.starts_with("Error:") {
+        Style::default().fg(Color::Red)
+    } else if progress_msg.starts_with("Done:") {
+        Style::default().fg(Color::Green)
+    } else {
+        theme::help_text()
+    };
+
+    let mut lines = vec![
+        Line::from(Span::styled(model_ref, theme::help_text())),
+        Line::from(""),
+        Line::from(Span::styled(progress_msg, msg_style)),
+    ];
+    if is_terminal {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("Enter", theme::help_key()),
+            Span::styled(" to continue", theme::help_text()),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 // ============================================================================

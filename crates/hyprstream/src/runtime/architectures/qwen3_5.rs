@@ -424,10 +424,14 @@ fn chunked_delta_rule(
         state = &state * decay + update;
     }
 
-    // Stack chunks: [B, nv, nc, C, hv] → flatten → trim padding
+    // Stack chunks: [B, nv, nc, C, hv] → flatten → trim padding → contiguous
+    // The .contiguous() after narrow is critical: without it, the resulting tensor has
+    // padded strides (stride[0] = nv*seq_p*hv instead of nv*seq*hv) which causes
+    // libtorch to miscalculate buffer sizes during subsequent permute+reshape operations.
     let out = Tensor::stack(&chunks_out, 2) // [B, nv, nc, C, hv]
         .reshape([batch, nv, seq_p, hv])
-        .narrow(2, 0, seq);
+        .narrow(2, 0, seq)
+        .contiguous();
 
     Ok((out, state))
 }
@@ -554,10 +558,10 @@ impl GatedDeltaNetLayer {
         let all_proj = self.in_proj_all.apply(&h2); // [batch*seq, conv_dim+val_dim+2*nv]
         let [cd, vd, nv_d, _] = self.proj_split;
         let mut off = 0i64;
-        let mixed_qkv = all_proj.narrow(1, off, cd).reshape([batch, seq, cd]); off += cd;
-        let z         = all_proj.narrow(1, off, vd).reshape([batch, seq, vd]); off += vd;
-        let b         = all_proj.narrow(1, off, nv_d).reshape([batch, seq, nv_d]); off += nv_d;
-        let a_in      = all_proj.narrow(1, off, nv_d).reshape([batch, seq, nv_d]);
+        let mixed_qkv = all_proj.narrow(1, off, cd).contiguous().reshape([batch, seq, cd]); off += cd;
+        let z         = all_proj.narrow(1, off, vd).contiguous().reshape([batch, seq, vd]); off += vd;
+        let b         = all_proj.narrow(1, off, nv_d).contiguous().reshape([batch, seq, nv_d]); off += nv_d;
+        let a_in      = all_proj.narrow(1, off, nv_d).contiguous().reshape([batch, seq, nv_d]);
 
         // Depthwise causal conv1d on mixed_qkv
         // mixed_qkv: [batch, seq, conv_dim] → need [batch, conv_dim, seq] for conv1d
@@ -682,8 +686,8 @@ impl GatedDeltaNetLayer {
             let out_t = q_col.bmm(&state_3d).reshape([batch, nv, hv]);
 
             *rec_state = Some(state);
-            // out_t: [batch, nv, hv] → [batch, 1, nv, hv] → [batch, 1, val_dim]
-            out_t.unsqueeze(1).reshape([batch, 1, val_dim])
+            // out_t: [batch, nv, hv] → [batch, 1, nv*hv]
+            out_t.unsqueeze(1).reshape([batch, 1, -1])
         } else {
             // --- Prefill path: chunked GatedDeltaNet ---
             // Reorder to [batch, nv, seq, dim] for chunked_delta_rule
@@ -698,20 +702,25 @@ impl GatedDeltaNetLayer {
             // out_h: [B, nv, T, hv]
             *rec_state = Some(new_state);
 
-            // Transpose back to [B, T, nv, hv] and flatten
-            out_h.permute([0, 2, 1, 3]).reshape([batch, seq, val_dim])
+            // Transpose back to [B, T, nv, hv] and flatten to [B, T, nv*hv]
+            // Flatten [B, nv, T, hv] → [B, T, nv*hv]
+            out_h.permute([0, 2, 1, 3]).contiguous().reshape([batch, seq, -1])
         };
 
         // Gated norm and output projection
-        // RMSNormGated weight is [head_v_dim]; reshape to per-head before norm
-        let z_f = z; // [batch, seq, value_dim]
+        // RMSNormGated weight is [head_v_dim]; reshape to per-head before norm.
+        // Derive actual value dim from out tensor (may differ from config for small models).
+        let actual_vd = out.size()[2];
+        let actual_hv = self.norm.weight.size()[0]; // norm weight shape = [head_v_dim]
+        let actual_nv = actual_vd / actual_hv;
+        let z_f = z.narrow(2, 0, actual_vd).contiguous(); // trim z to match actual value dim
 
-        let out_4d = out.reshape([batch, seq, nv, hv]);
-        let z_4d = z_f.reshape([batch, seq, nv, hv]);
+        let out_4d = out.reshape([batch, seq, actual_nv, actual_hv]);
+        let z_4d = z_f.reshape([batch, seq, actual_nv, actual_hv]);
         let normed = self.norm.forward(&out_4d, &z_4d)?;  // out_4d may be F32 from recurrent step; RMSNormGated handles both
         // Ensure output matches model dtype for out_proj matmul (weight is BF16)
         let normed = if normed.kind() != dtype { normed.to_kind(dtype) } else { normed };
-        let flat = normed.reshape([batch * seq, val_dim]);
+        let flat = normed.reshape([batch * seq, actual_vd]);
 
         let projected = self.out_proj.apply(&flat);
         // Standard LoRA: add correction in the OUTPUT space of out_proj (y = Wx + BAx).
@@ -731,8 +740,8 @@ impl GatedDeltaNetLayer {
     }
 
     fn hidden_size_from_out_proj(&self) -> i64 {
-        // weight is stored [out_features, in_features]; size()[0] = out_features = hidden_size
-        self.out_proj.weight.size()[0]
+        // weight is stored [in_features, out_features] after transpose at load; size()[1] = out_features = hidden_size
+        self.out_proj.weight.size()[1]
     }
 }
 

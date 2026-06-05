@@ -5,8 +5,13 @@
 //! - `get_or_init_tls_materials()`: OnceLock-based lazy generation (self-signed or file-loaded)
 //! - `resolve_rustls_config()`: Resolves per-service or shared TLS config
 //! - `serve_app()`: Serves an Axum router over HTTPS or HTTP with graceful shutdown
+//!
+//! TLS modes (set via `[tls] mode`):
+//!  - `self-signed` (default) — rcgen-generated, dev/air-gapped only
+//!  - `acme` — automatic via RFC 8555 (Let's Encrypt or self-hosted step-ca / Pebble)
+//!  - `files` — operator-supplied PEM paths
 
-use crate::config::TlsConfig;
+use crate::config::{TlsConfig, TlsMode};
 use hyprstream_rpc::error::RpcError;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -50,7 +55,7 @@ pub fn get_or_init_tls_materials(config: &TlsConfig) -> anyhow::Result<Arc<TlsMa
             "Loading/generating TLS materials (365-day validity) from '{}'",
             secrets_dir.display()
         );
-        crate::auth::credentials::load_or_generate_tls_materials(&secrets_dir, server_name, 365)?
+        crate::auth::identity_store::load_or_generate_tls_materials(&secrets_dir, server_name, 365)?
     } else {
         // Both paths guaranteed Some when use_self_signed() returns false
         let cert_path = config.cert_path.as_ref()
@@ -88,8 +93,9 @@ pub fn get_or_init_tls_materials(config: &TlsConfig) -> anyhow::Result<Arc<TlsMa
 ///
 /// Resolution order:
 /// 1. `tls_config.enabled == false` → `None` (plain HTTP)
-/// 2. Both `service_cert` + `service_key` set → per-service PEM files
-/// 3. Otherwise → shared self-signed/configured materials
+/// 2. Both `service_cert` + `service_key` set → per-service PEM files (overrides mode)
+/// 3. `mode = "acme"` → obtain/renew via ACME; spawns background renewal task
+/// 4. Otherwise → shared self-signed / `files` mode materials
 pub async fn resolve_rustls_config(
     tls_config: &TlsConfig,
     service_cert: Option<&PathBuf>,
@@ -119,16 +125,86 @@ pub async fn resolve_rustls_config(
         );
     }
 
-    // Shared materials (self-signed or from global [tls] config)
-    let materials = get_or_init_tls_materials(tls_config)?;
-    let rustls_config = axum_server::tls_rustls::RustlsConfig::from_der(
-        vec![materials.cert_der.clone()],
-        (*materials.key_der).clone(),
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("failed to build RustlsConfig from DER: {}", e))?;
+    match tls_config.effective_mode() {
+        TlsMode::Acme => {
+            let config = init_acme_rustls_config(tls_config).await?;
+            Ok(Some(config))
+        }
+        _ => {
+            // Shared materials (self-signed or Files mode)
+            let materials = get_or_init_tls_materials(tls_config)?;
+            let rustls_config = axum_server::tls_rustls::RustlsConfig::from_der(
+                vec![materials.cert_der.clone()],
+                (*materials.key_der).clone(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to build RustlsConfig from DER: {}", e))?;
+            Ok(Some(rustls_config))
+        }
+    }
+}
 
-    Ok(Some(rustls_config))
+/// Initialize an ACME-managed TLS config and spawn the renewal event-loop task.
+///
+/// Uses `rustls-acme` which handles ACME-01 TLS-ALPN challenges internally and
+/// updates the `Arc<rustls::ServerConfig>` in-place on each renewal — no explicit
+/// hot-swap needed.
+///
+/// For self-hosted ACME, point `acme_directory` at a step-ca or Pebble URL.
+/// See `docs/tls.md` for operator guidance.
+async fn init_acme_rustls_config(
+    tls_config: &TlsConfig,
+) -> anyhow::Result<axum_server::tls_rustls::RustlsConfig> {
+    use rustls_acme::AcmeConfig;
+
+    let domain = tls_config.acme_domain.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("[tls] mode = \"acme\" requires acme_domain to be set")
+    })?;
+    let contact = tls_config.acme_contact.as_deref().unwrap_or("");
+    let cache_dir = tls_config.acme_cache_dir.clone().unwrap_or_else(|| {
+        dirs::cache_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("/var/cache"))
+            .join("hyprstream")
+            .join("acme")
+    });
+
+    std::fs::create_dir_all(&cache_dir)
+        .map_err(|e| anyhow::anyhow!("cannot create ACME cache dir {:?}: {e}", cache_dir))?;
+
+    let mut acme = AcmeConfig::new([domain])
+        .contact_push(contact)
+        .cache_option(Some(rustls_acme::caches::DirCache::new(cache_dir)));
+
+    if let Some(dir_url) = tls_config.acme_directory.as_deref() {
+        acme = acme.directory(dir_url);
+    }
+
+    info!("ACME TLS: obtaining certificate for domain '{}' from {}", domain,
+        tls_config.acme_directory.as_deref().unwrap_or("Let's Encrypt"));
+
+    let mut state = acme.state();
+    let rustls_server_config = state.challenge_rustls_config();
+
+    // Spawn the ACME event loop — handles challenge responses and renewals.
+    tokio::spawn(async move {
+        use tokio_stream::StreamExt;
+        loop {
+            match state.next().await {
+                Some(Ok(event)) => {
+                    info!("ACME event: {event:?}");
+                }
+                Some(Err(e)) => {
+                    tracing::warn!("ACME error (will retry): {e}");
+                }
+                None => break,
+            }
+        }
+    });
+
+    // Wrap the rustls ServerConfig in an axum-server RustlsConfig.
+    // rustls-acme updates the Arc<ServerConfig> in-place on renewal.
+    let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(rustls_server_config);
+    Ok(rustls_config)
 }
 
 /// Serve an Axum router over HTTPS (if rustls_config is Some) or plain HTTP.

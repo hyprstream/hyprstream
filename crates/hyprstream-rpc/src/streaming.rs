@@ -67,46 +67,10 @@ use crate::crypto::{p256_dh as dh_compute, P256PublicKey as DhPublic, P256Secret
 use crate::streaming_capnp;
 
 // ============================================================================
-// StreamInfo — canonical type for streaming RPC responses
+// StreamInfo — re-exported from target-independent module
 // ============================================================================
 
-/// Canonical stream info returned by streaming RPC methods.
-///
-/// Defined once here; service codegen modules emit `pub type StreamInfo =
-/// hyprstream_rpc::streaming::StreamInfo;` instead of generating duplicates.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct StreamInfo {
-    pub stream_id: String,
-    pub endpoint: String,
-    pub server_pubkey: [u8; 32],
-}
-
-impl crate::capnp::ToCapnp for StreamInfo {
-    type Builder<'a> = streaming_capnp::stream_info::Builder<'a>;
-
-    fn write_to(&self, builder: &mut Self::Builder<'_>) {
-        builder.set_stream_id(&self.stream_id);
-        builder.set_endpoint(&self.endpoint);
-        builder.set_server_pubkey(&self.server_pubkey);
-    }
-}
-
-impl crate::capnp::FromCapnp for StreamInfo {
-    type Reader<'a> = streaming_capnp::stream_info::Reader<'a>;
-
-    fn read_from(reader: Self::Reader<'_>) -> anyhow::Result<Self> {
-        let pubkey_data = reader.get_server_pubkey()?;
-        let mut server_pubkey = [0u8; 32];
-        if pubkey_data.len() == 32 {
-            server_pubkey.copy_from_slice(pubkey_data);
-        }
-        Ok(Self {
-            stream_id: reader.get_stream_id()?.to_str()?.to_owned(),
-            endpoint: reader.get_endpoint()?.to_str()?.to_owned(),
-            server_pubkey,
-        })
-    }
-}
+pub use crate::stream_info::StreamInfo;
 
 // ============================================================================
 // Configuration
@@ -218,23 +182,8 @@ pub enum StreamPayloadData {
 
 /// Output payload from StreamVerifier (what gets parsed).
 ///
-/// Stream identity comes from the DH-derived topic, not from payload fields.
-#[derive(Clone, Debug)]
-pub enum StreamPayload {
-    /// Generic binary data (tokens, I/O, etc.)
-    Data(Vec<u8>),
-    /// Error during streaming
-    Error(String),
-    /// Completion with app-specific metadata
-    Complete(Vec<u8>),
-    /// Encrypted tagged payload with key commitment
-    Tagged {
-        tag: Vec<u8>,
-        payload: Vec<u8>,
-        nonce: Vec<u8>,
-        key_commitment: Vec<u8>,
-    },
-}
+/// Re-exported from `stream_consumer` for backwards compatibility.
+pub use crate::stream_consumer::StreamPayload;
 
 // ============================================================================
 // HMAC Chain State
@@ -243,54 +192,9 @@ pub enum StreamPayload {
 /// HMAC chain state for StreamBlock with 16-byte truncated MACs.
 ///
 /// MAC chain:
-/// - Block 0: HMAC(key, topic || capnp)[..16]
-/// - Block N: HMAC(key, prev_mac || capnp)[..16]
-#[derive(Clone)]
-pub struct StreamHmacState {
-    key: [u8; 32],
-    prev_mac: Option<[u8; 16]>,
-    topic: String,
-}
-
-impl StreamHmacState {
-    /// Create new HMAC chain state.
-    pub fn new(key: [u8; 32], topic: String) -> Self {
-        Self {
-            key,
-            prev_mac: None,
-            topic,
-        }
-    }
-
-    /// Compute 16-byte truncated MAC for next block.
-    pub fn compute_next(&mut self, capnp_data: &[u8]) -> [u8; 16] {
-        // Build input: (prev_mac or topic) || capnp_data
-        let mut input = Vec::with_capacity(64 + capnp_data.len());
-        match &self.prev_mac {
-            None => input.extend_from_slice(self.topic.as_bytes()),
-            Some(prev) => input.extend_from_slice(prev),
-        }
-        input.extend_from_slice(capnp_data);
-
-        // Compute 16-byte truncated MAC using backend
-        let truncated = keyed_mac_truncated(&self.key, &input);
-        self.prev_mac = Some(truncated);
-        truncated
-    }
-
-    /// Get the topic.
-    pub fn topic(&self) -> &str {
-        &self.topic
-    }
-
-    /// Get previous MAC bytes (for prevMac field in StreamBlock).
-    pub fn prev_mac_bytes(&self) -> &[u8] {
-        match &self.prev_mac {
-            Some(mac) => mac,
-            None => &self.topic.as_bytes()[..16.min(self.topic.len())],
-        }
-    }
-}
+// StreamHmacState was moved to crypto::hmac for cross-platform availability.
+// Re-exported here for backward compatibility.
+pub use crate::crypto::StreamHmacState;
 
 // ============================================================================
 // Stream Frames
@@ -1497,8 +1401,8 @@ pub struct StreamChannel {
     push_socket: OnceCell<Arc<tokio::sync::Mutex<tmq::push::Push>>>,
     /// Channel to send subscription requests to the ctrl listener task
     ctrl_sub_tx: OnceCell<tokio::sync::mpsc::Sender<Vec<u8>>>,
-    /// Active cancel tokens keyed by ctrl_topic
-    cancel_tokens: Arc<DashMap<String, CancellationToken>>,
+    /// Active cancel tokens keyed by ctrl_topic, with ctrl_mac_key for verification
+    cancel_tokens: Arc<DashMap<String, (CancellationToken, [u8; 32])>>,
 }
 
 impl StreamChannel {
@@ -1565,7 +1469,7 @@ impl StreamChannel {
             .map_err(|_| anyhow::anyhow!("ctrl listener closed"))?;
         self.cancel_tokens.insert(
             stream_ctx.ctrl_topic().to_owned(),
-            stream_ctx.cancel_token().clone(),
+            (stream_ctx.cancel_token().clone(), *stream_ctx.ctrl_mac_key()),
         );
 
         // 4. Spawn JWT expiry timeout as universal backstop
@@ -1703,15 +1607,28 @@ impl StreamChannel {
                         };
 
                         // Wire format: [ctrl_topic, capnp, mac]
-                        if multipart.is_empty() {
+                        if multipart.len() < 3 {
+                            tracing::warn!("ctrl message missing frames (got {})", multipart.len());
                             continue;
                         }
                         let topic = String::from_utf8_lossy(&multipart[0]);
+                        let capnp_data = &multipart[1];
+                        let mac_bytes = &multipart[2];
 
-                        // Fire the cancel token if we have one for this topic
-                        if let Some((_, token)) = tokens.remove(topic.as_ref()) {
-                            tracing::debug!(ctrl_topic = %topic, "control cancel received");
-                            token.cancel();
+                        // Look up the token + mac_key for this topic
+                        if let Some(entry) = tokens.get(topic.as_ref()) {
+                            let (ref token, ref ctrl_mac_key) = *entry;
+
+                            // Verify MAC before acting on the control message
+                            let expected_mac = keyed_mac_truncated(ctrl_mac_key, capnp_data);
+                            if subtle::ConstantTimeEq::ct_eq(&mac_bytes[..], &expected_mac[..]).into() {
+                                tracing::debug!(ctrl_topic = %topic, "control cancel received (MAC verified)");
+                                token.cancel();
+                                drop(entry);
+                                tokens.remove(topic.as_ref());
+                            } else {
+                                tracing::warn!(ctrl_topic = %topic, "control message MAC verification failed — ignoring");
+                            }
                         }
                     }
                 }
@@ -1923,10 +1840,10 @@ fn build_stream_register_envelope(
     topic: &str,
     expiry: i64,
     signing_key: &SigningKey,
-    claims: Option<Claims>,
+    _claims: Option<Claims>,
 ) -> Vec<u8> {
     use crate::common_capnp;
-    use crate::envelope::{RequestEnvelope, RequestIdentity, SignedEnvelope};
+    use crate::envelope::{RequestEnvelope, SignedEnvelope};
     use crate::ToCapnp;
 
     // Build StreamRegister message
@@ -1945,10 +1862,8 @@ fn build_stream_register_envelope(
     }
 
     // Wrap in SignedEnvelope
-    let mut envelope = RequestEnvelope::new(RequestIdentity::anonymous(), inner_bytes);
-    if let Some(c) = claims {
-        envelope = envelope.with_claims(c);
-    }
+    let envelope = RequestEnvelope::new(inner_bytes);
+    // Claims are no longer carried in the envelope — authorization is via JWT/Authorization field
 
     let signed = SignedEnvelope::new_signed(envelope, signing_key);
 
@@ -2035,7 +1950,7 @@ mod tests {
         // MACs should be different
         assert_ne!(mac1, mac2);
 
-        // Chain state should update
-        assert_eq!(state.prev_mac, Some(mac2));
+        // Chain state should advance to mac2
+        assert_eq!(state.prev_mac_bytes(), &mac2[..]);
     }
 }

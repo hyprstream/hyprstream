@@ -28,9 +28,11 @@ pub use service::spawner::{
 };
 
 pub use service::factory::{
-    get_factory, list_factories, QuicSharedConfig, ServiceClient, ServiceContext, ServiceFactory,
+    get_factory, list_factories, QuicSharedConfig, ServiceContext, ServiceFactory,
     ServiceFactoryFn,
 };
+
+pub use service::trust_store::{TrustStore, Attestation, global_trust_store};
 
 pub use service::manager::{detect as detect_service_manager, ServiceManager, StandaloneManager};
 

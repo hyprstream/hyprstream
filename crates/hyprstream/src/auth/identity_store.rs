@@ -16,8 +16,8 @@
 //!   the systemd credentials ramfs), missing secrets are a hard error rather than
 //!   triggering key generation.
 
-use age::secrecy::ExposeSecret;
 use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -67,6 +67,38 @@ pub fn write_secret(dir: &std::path::Path, name: &str, value: &[u8]) -> Result<(
     Ok(())
 }
 
+/// Write a secret only if the file does not already exist (atomic O_EXCL).
+///
+/// Returns `Ok(true)` if the file was created, `Ok(false)` if it already
+/// existed (another process won the race). This eliminates the TOCTOU race
+/// between checking if a key exists and generating a new one.
+pub fn write_secret_exclusive(dir: &std::path::Path, name: &str, value: &[u8]) -> Result<bool> {
+    use std::io::Write as _;
+    ensure_secrets_dir(dir)?;
+    let path = dir.join(name);
+
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true) // O_EXCL — atomic check-and-create
+        .open(&path)
+    {
+        Ok(mut f) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                    .with_context(|| format!("failed to chmod '{}'", path.display()))?;
+            }
+            f.write_all(value)
+                .with_context(|| format!("failed to write secret to '{}'", path.display()))?;
+            tracing::debug!("exclusively wrote secret '{}'", path.display());
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("failed to create '{}'", path.display())),
+    }
+}
+
 /// Returns `true` if `dir` exists and is writable (or can be created).
 ///
 /// Uses `tempfile::tempfile_in` so no named probe file is left on disk,
@@ -110,6 +142,229 @@ fn missing_in_readonly(secrets_dir: &std::path::Path, name: &str) -> anyhow::Err
 
 // ─── High-level key loaders ─────────────────────────────────────────────────
 
+// ─── Per-service key management ──────────────────────────────────────────────
+
+/// Per-service credential directory layout:
+///
+/// ```text
+/// credentials/
+///   ca-key            # CA private key (policy service only)
+///   ca-pubkey         # CA verifying key (public, all services)
+///   {service}/
+///     signing-key     # service's own Ed25519 private key
+///     service-jwt     # CA-signed JWT certificate
+///   bootstrap-pubkeys # JSON: { "policy": "base64...", "discovery": "base64..." }
+/// ```
+///
+/// Load or generate an independent Ed25519 signing key for a specific service.
+///
+/// Each service gets its own randomly-generated keypair stored in
+/// `credentials/{service_name}/signing-key`. This is NOT derived from the root
+/// key — it's an independent key that the CA (PolicyService) certifies via a
+/// service JWT.
+///
+/// # Arguments
+///
+/// * `credentials_dir` — Base credentials directory (e.g., `~/.config/hyprstream/credentials`)
+/// * `service_name` — Service name (e.g., "model", "discovery")
+///
+/// Validate a service name for use in filesystem paths.
+///
+/// Rejects names containing path separators, `..`, or characters
+/// outside `[a-z0-9-]`. Prevents directory traversal when service
+/// names are used in path construction.
+pub fn validate_service_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("service name cannot be empty");
+    }
+    if name.len() > 64 {
+        anyhow::bail!("service name too long (max 64 chars): '{name}'");
+    }
+    if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+        anyhow::bail!(
+            "service name '{name}' contains invalid characters; \
+             only lowercase ASCII, digits, and hyphens are allowed"
+        );
+    }
+    if name.starts_with('-') {
+        anyhow::bail!("service name cannot start with a hyphen: '{name}'");
+    }
+    Ok(())
+}
+
+pub fn load_or_generate_service_signing_key(
+    credentials_dir: &std::path::Path,
+    service_name: &str,
+) -> Result<SigningKey> {
+    validate_service_name(service_name)?;
+    let service_dir = credentials_dir.join(service_name);
+    const NAME: &str = "signing-key";
+
+    if let Some(mut bytes) = read_secret(&service_dir, NAME)? {
+        let mut arr: [u8; 32] = bytes.as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("service '{service_name}' signing-key must be 32 bytes (Ed25519 seed)"))?;
+        let sk = SigningKey::from_bytes(&arr);
+        bytes.zeroize();
+        arr.zeroize();
+        tracing::info!("Loaded Ed25519 signing key for service '{service_name}'");
+        return Ok(sk);
+    }
+
+    if !is_writable(&service_dir) && !is_writable(credentials_dir) {
+        return Err(missing_in_readonly(&service_dir, NAME));
+    }
+
+    let key = SigningKey::generate(&mut rand::rngs::OsRng);
+    let mut raw = key.to_bytes();
+    match write_secret_exclusive(&service_dir, NAME, &raw) {
+        Ok(true) => {
+            raw.zeroize();
+            tracing::info!("Generated new Ed25519 signing key for service '{service_name}'");
+            Ok(key)
+        }
+        Ok(false) => {
+            // Another process won the race — reload their key
+            raw.zeroize();
+            tracing::info!(
+                "Key for '{service_name}' created by another process — reloading"
+            );
+            // Re-read (not recursive — file now exists)
+            let mut bytes = read_secret(&service_dir, NAME)?
+                .ok_or_else(|| anyhow!("race loser: key file disappeared"))?;
+            let mut arr: [u8; 32] = bytes.as_slice()
+                .try_into()
+                .map_err(|_| anyhow!("service '{service_name}' signing-key must be 32 bytes"))?;
+            let sk = SigningKey::from_bytes(&arr);
+            bytes.zeroize();
+            arr.zeroize();
+            Ok(sk)
+        }
+        Err(e) => {
+            raw.zeroize();
+            Err(e)
+        }
+    }
+}
+
+/// Load the CA signing key (PolicyService only).
+///
+/// The CA key is the PolicyService's own signing key — it signs service JWTs
+/// that bind service names to their Ed25519 pubkeys.
+pub fn load_ca_signing_key(credentials_dir: &std::path::Path) -> Result<SigningKey> {
+    const NAME: &str = "ca-key";
+    if let Some(mut bytes) = read_secret(credentials_dir, NAME)? {
+        let mut arr: [u8; 32] = bytes.as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("ca-key must be 32 bytes (Ed25519 seed)"))?;
+        let sk = SigningKey::from_bytes(&arr);
+        bytes.zeroize();
+        arr.zeroize();
+        tracing::info!("Loaded CA signing key");
+        return Ok(sk);
+    }
+    Err(missing_in_readonly(credentials_dir, NAME))
+}
+
+/// Write the CA signing key to the credentials directory.
+///
+/// Used during wizard bootstrap to persist the generated CA key.
+pub fn write_ca_signing_key(credentials_dir: &std::path::Path, key: &SigningKey) -> Result<()> {
+    write_secret(credentials_dir, "ca-key", &key.to_bytes())
+}
+
+/// Load the CA verifying key (public, distributed to all services).
+///
+/// This is the trust anchor for verifying service JWTs.
+pub fn load_ca_verifying_key(credentials_dir: &std::path::Path) -> Result<VerifyingKey> {
+    const NAME: &str = "ca-pubkey";
+    if let Some(bytes) = read_secret(credentials_dir, NAME)? {
+        let arr: [u8; 32] = bytes.as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("ca-pubkey must be 32 bytes (Ed25519 pubkey)"))?;
+        VerifyingKey::from_bytes(&arr)
+            .map_err(|e| anyhow!("invalid ca-pubkey: {e}"))
+    } else {
+        Err(missing_in_readonly(credentials_dir, NAME))
+    }
+}
+
+/// Write the CA verifying key to the credentials directory.
+pub fn write_ca_verifying_key(credentials_dir: &std::path::Path, key: &VerifyingKey) -> Result<()> {
+    write_secret(credentials_dir, "ca-pubkey", key.as_bytes())
+}
+
+/// Load a service JWT (CA-signed certificate binding service name → pubkey).
+pub fn load_service_jwt(credentials_dir: &std::path::Path, service_name: &str) -> Result<Option<String>> {
+    let service_dir = credentials_dir.join(service_name);
+    match read_secret(&service_dir, "service-jwt") {
+        Ok(Some(bytes)) => {
+            let jwt = String::from_utf8(bytes)
+                .context("service-jwt is not valid UTF-8")?;
+            Ok(Some(jwt))
+        }
+        Ok(None) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Write a service JWT to the service's credential directory.
+pub fn write_service_jwt(
+    credentials_dir: &std::path::Path,
+    service_name: &str,
+    jwt: &str,
+) -> Result<()> {
+    let service_dir = credentials_dir.join(service_name);
+    write_secret(&service_dir, "service-jwt", jwt.as_bytes())
+}
+
+/// Bootstrap pubkeys — the pubkeys of services needed before discovery is available.
+///
+/// Contains the pubkeys of PolicyService and DiscoveryService, which must be
+/// known to all services so they can verify RPC responses from these bootstrap
+/// services without querying discovery (chicken-and-egg).
+pub fn load_bootstrap_pubkeys(
+    credentials_dir: &std::path::Path,
+) -> Result<std::collections::HashMap<String, VerifyingKey>> {
+    const NAME: &str = "bootstrap-pubkeys";
+    match read_secret(credentials_dir, NAME) {
+        Ok(Some(bytes)) => {
+            let json: std::collections::HashMap<String, String> = serde_json::from_slice(&bytes)
+                .context("bootstrap-pubkeys is not valid JSON")?;
+            let mut map = std::collections::HashMap::new();
+            for (name, b64) in json {
+                let pubkey_bytes: Vec<u8> = URL_SAFE_NO_PAD.decode(b64)
+                    .with_context(|| format!("invalid base64 in bootstrap-pubkeys for '{name}'"))?;
+                let arr: [u8; 32] = pubkey_bytes.try_into()
+                    .map_err(|_| anyhow!("bootstrap-pubkey for '{name}' must be 32 bytes"))?;
+                let vk = VerifyingKey::from_bytes(&arr)
+                    .map_err(|e| anyhow!("invalid bootstrap-pubkey for '{name}': {e}"))?;
+                map.insert(name, vk);
+            }
+            Ok(map)
+        }
+        Ok(None) => Ok(std::collections::HashMap::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Write bootstrap pubkeys to the credentials directory.
+pub fn write_bootstrap_pubkeys(
+    credentials_dir: &std::path::Path,
+    pubkeys: &std::collections::HashMap<String, VerifyingKey>,
+) -> Result<()> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let json: std::collections::HashMap<String, String> = pubkeys
+        .iter()
+        .map(|(name, vk)| (name.clone(), URL_SAFE_NO_PAD.encode(vk.as_bytes())))
+        .collect();
+    let data = serde_json::to_vec(&json)
+        .context("failed to serialize bootstrap-pubkeys")?;
+    write_secret(credentials_dir, "bootstrap-pubkeys", &data)
+}
+
+// ─── Node-level key loaders ──────────────────────────────────────────────────
+
 /// Load or generate the Ed25519 **node** signing key (the root-of-trust key
 /// that identifies this Hyprstream instance).
 ///
@@ -150,84 +405,16 @@ pub fn load_or_generate_node_signing_key(secrets_dir: &std::path::Path) -> Resul
     Ok(key)
 }
 
-/// Deprecated alias for [`load_or_generate_node_signing_key`].
-#[deprecated(since = "0.4.1", note = "renamed to load_or_generate_node_signing_key")]
-pub fn load_or_generate_signing_key(secrets_dir: &std::path::Path) -> Result<SigningKey> {
-    load_or_generate_node_signing_key(secrets_dir)
-}
-
-/// Load or generate the age credential-store key.
-///
-/// Callers **must** check the `config.oauth.credential_store_key` bypass before
-/// calling this.
-///
-/// When `store_file_path` already exists on disk and the key is missing from a
-/// read-only secrets directory, the error includes recovery instructions (since
-/// generating a new key would make the existing store unreadable).
-pub fn load_or_generate_credential_store_key(
-    secrets_dir: &std::path::Path,
-    store_file_path: &std::path::Path,
-) -> Result<age::x25519::Identity> {
-    const NAME: &str = "credential-store-key";
-
-    if let Some(bytes) = read_secret(secrets_dir, NAME)? {
-        let s = String::from_utf8(bytes)
-            .context("credential-store-key is not valid UTF-8")?;
-        return s
-            .trim()
-            .parse::<age::x25519::Identity>()
-            .map_err(|e| anyhow!("failed to parse credential-store-key: {}", e));
-    }
-
-    let store_exists = store_file_path.exists();
-
-    if !is_writable(secrets_dir) {
-        if store_exists {
-            return Err(anyhow!(
-                "Credential store key not found in credentials directory '{}'.\n\
-                 The encrypted store exists at '{}' but cannot be decrypted.\n\
-                 Recovery options:\n\
-                 - Set HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY=<age-secret-key-...> \
-                   if you have a backup of the original key.\n\
-                 - Delete the store file to start fresh (existing users will be lost).",
-                secrets_dir.display(),
-                store_file_path.display()
-            ));
-        }
-        return Err(missing_in_readonly(secrets_dir, NAME));
-    }
-
-    if store_exists {
-        // Store exists but key is gone — generating a new key would make the
-        // existing store unreadable (age "no matching keys" error).
-        return Err(anyhow!(
-            "Credential store key not found in secrets directory '{}'.\n\
-             The encrypted store exists at '{}' but cannot be decrypted.\n\
-             Recovery options:\n\
-             - Set HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY=<age-secret-key-...> \
-               if you have a backup of the original key.\n\
-             - Delete the store file to start fresh (existing users will be lost).",
-            secrets_dir.display(),
-            store_file_path.display()
-        ));
-    }
-
-    // First run — no store file, safe to generate a new key.
-    let identity = age::x25519::Identity::generate();
-    let secret_str = identity.to_string();
-    let result = write_secret(
-        secrets_dir,
-        NAME,
-        secret_str.expose_secret().as_bytes(),
-    );
-    drop(secret_str); // SecretString zeroizes on drop
-    result?;
-    tracing::info!(
-        "Generated new age credential-store key → '{}/{}'",
-        secrets_dir.display(),
-        NAME
-    );
-    Ok(identity)
+/// Return the Unix mtime of `secrets_dir/signing-key`, or `now` if missing.
+/// Used to populate the `nbf` field in JWKS entries (key was valid since written).
+pub fn node_signing_key_mtime(secrets_dir: &std::path::Path) -> i64 {
+    let path = secrets_dir.join("signing-key");
+    path.metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_else(|| chrono::Utc::now().timestamp())
 }
 
 /// Load or generate the user signing key (Ed25519).
@@ -574,35 +761,6 @@ mod tests {
     }
 
     #[test]
-    fn test_credential_store_key_roundtrip() {
-        let dir = TempDir::new().unwrap();
-        let store_path = dir.path().join("users.toml.age");
-        let id1 = load_or_generate_credential_store_key(dir.path(), &store_path).unwrap();
-        // Load again from disk
-        let id2 = load_or_generate_credential_store_key(dir.path(), &store_path).unwrap();
-        // Both identities should produce the same public key
-        assert_eq!(
-            id1.to_public().to_string(),
-            id2.to_public().to_string()
-        );
-    }
-
-    #[test]
-    fn test_credential_store_key_missing_with_existing_store_errors() {
-        let dir = TempDir::new().unwrap();
-        let store_path = dir.path().join("users.toml.age");
-        // Simulate: store exists but key file does not
-        std::fs::write(&store_path, b"fake encrypted data").unwrap();
-        match load_or_generate_credential_store_key(dir.path(), &store_path) {
-            Ok(_) => panic!("expected error when store exists but key is missing"),
-            Err(e) => assert!(
-                e.to_string().contains("cannot be decrypted"),
-                "unexpected error message: {e}"
-            ),
-        }
-    }
-
-    #[test]
     fn test_user_signing_key_roundtrip() {
         let dir = TempDir::new().unwrap();
         let (sk1, vk1) = load_or_generate_user_signing_key(dir.path()).unwrap();
@@ -785,18 +943,4 @@ mod tests {
         assert_ne!(h1, h2, "renewed cert should have different DER due to new timestamps");
     }
 
-    // ── Credential store key: readonly + no store ────────────────────────────
-
-    #[test]
-    #[cfg(unix)]
-    fn test_credential_store_key_readonly_no_store_fails() {
-        use std::os::unix::fs::PermissionsExt;
-        let parent = TempDir::new().unwrap();
-        let secrets_dir = parent.path().join("secrets");
-        std::fs::create_dir(&secrets_dir).unwrap();
-        std::fs::set_permissions(&secrets_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let store_path = secrets_dir.join("users.toml.age");
-        let result = load_or_generate_credential_store_key(&secrets_dir, &store_path);
-        assert!(result.is_err());
-    }
 }

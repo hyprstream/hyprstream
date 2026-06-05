@@ -69,6 +69,25 @@ struct PolicyRequest {
 
     # Deposit wrapped keys for subscribers
     depositWrappedKeys @17 :DepositWrappedKeys $mcpScope(manage) $mcpDescription("Deposit wrapped keys for subscribers");
+
+    # Resolve a service name to its Ed25519 verifying key
+    resolveServiceKey @18 :ResolveServiceKey $mcpScope(query) $mcpDescription("Resolve a service name to its Ed25519 verifying key");
+
+    # Register a service's verifying key with the CA
+    # Internal CA operation — any caller with a valid CA-signed JWT can register.
+    # No authorization scope required; the JWT itself proves CA attestation.
+    registerServiceKey @19 :RegisterServiceKey $mcpDescription("Register a service verifying key with the CA");
+
+    # Renew the caller's service JWT. Identity is taken from the signed envelope —
+    # no explicit subject field; the CA signs a fresh 30-day JWT for the caller.
+    refreshServiceToken @20 :RefreshServiceTokenRequest
+      $mcpScope(manage) $mcpDescription("Renew the caller's service JWT; identity from signed envelope");
+
+    # Exchange the caller's envelope WIT for an OAuth at+jwt.
+    # Identity and cnf.jwk are read from the verified envelope — no credential submission.
+    # Requires 'exchange' permission on 'policy:exchange-wit' in Casbin policy.
+    exchangeWit @21 :ExchangeWit
+      $mcpScope(manage) $mcpDescription("Exchange the caller's envelope WIT for an OAuth at+jwt; identity from signed envelope");
   }
 }
 
@@ -99,8 +118,20 @@ struct IssueToken {
   audience @2 :Text $optional;
 
   # Explicit subject for token (empty = use envelope identity).
-  # Requires caller to have `manage` permission on `policy:issue-token`.
+  # Requires caller to have `manage` permission on `policy:IssueToken` (capnp type name).
+  # For service tokens: sub = "service:{name}" (e.g. "service:model").
+  # The "pub" claim is derived from the root key by the CA — not caller-provided.
   subject @3 :Text $optional;
+
+  # User's Ed25519 verifying key (base64url, 32 bytes) for user tokens.
+  # When present, included in the JWT `pub_key` claim to bind the user's key identity.
+  # Ignored for service tokens (pubkey is CA-derived).
+  userPubKey @4 :Text $optional;
+
+  # DPoP JWK thumbprint (RFC 7638 SHA-256 base64url) for DPoP user tokens.
+  # When present, the issued token carries cnf.jkt instead of cnf.jwk.
+  # Takes precedence over userPubKey.
+  dpopJkt @5 :Text $optional;
 }
 
 # Apply a built-in policy template
@@ -195,6 +226,18 @@ struct PolicyResponse {
 
     # Wrapped keys deposit result
     depositWrappedKeysResult @18 :Void;
+
+    # Service key resolution result
+    resolveServiceKeyResult @19 :ServiceKeyResponse;
+
+    # Service key registration result
+    registerServiceKeyResult @20 :Void;
+
+    # Fresh JWT from refreshServiceToken
+    refreshServiceTokenResult @21 :TokenInfo;
+
+    # at+jwt from exchangeWit
+    exchangeWitResult @22 :TokenInfo;
   }
 }
 
@@ -307,4 +350,50 @@ struct EventPrefixAccess {
 # List of pending subscriber public keys
 struct PendingSubscribers {
   pubkeys @0 :List(Data);
+}
+
+# Resolve a service name to its Ed25519 verifying key
+struct ResolveServiceKey {
+  serviceName @0 :Text;
+}
+
+# Response containing a service's verifying key and optional CA-signed attestation
+struct ServiceKeyResponse {
+  # Ed25519 verifying key (32 bytes)
+  verifyingKey @0 :Data;
+  # CA-signed JWT attesting this key (optional, for verification)
+  serviceJwt @1 :Text $optional;
+}
+
+# Register a service's verifying key with the CA (PolicyService)
+struct RegisterServiceKey {
+  # Service name (e.g. "model", "registry")
+  serviceName @0 :Text;
+  # Ed25519 verifying key (32 bytes)
+  verifyingKey @1 :Data;
+  # CA-signed JWT proving key ownership (subject must be "service:{serviceName}")
+  serviceJwt @2 :Text;
+}
+
+# Request to renew the caller's service JWT. Subject is taken from the
+# signed envelope context — the caller does not specify it.
+struct RefreshServiceTokenRequest {
+  # Requested TTL in seconds. Server clamps to [3600, 2592000] (1h – 30d).
+  ttlSeconds @0 :Int64 = 2592000;
+}
+
+# Exchange the caller's envelope WIT for an OAuth at+jwt (ZMQ-native token bridge).
+# The caller's identity and cnf.jwk are read from the verified envelope WIT —
+# no credential is submitted in the request body.
+struct ExchangeWit {
+  # RFC 8707 resource indicator for audience binding.
+  # If absent, PolicyService applies the configured default audience.
+  audience @0 :Text $optional;
+
+  # Requested scopes (space-delimited).
+  # PolicyService intersects with Casbin-permitted scopes for the caller.
+  scopes @1 :Text $optional;
+
+  # TTL override in seconds. Server clamps to configured [min, max].
+  ttl @2 :Opt.OptionUint32;
 }

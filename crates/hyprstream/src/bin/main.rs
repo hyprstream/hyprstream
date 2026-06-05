@@ -25,7 +25,8 @@ use hyprstream_core::cli::{
     handle_sign_challenge, handle_status, handle_token_create, handle_unload, handle_training_batch,
     handle_training_checkpoint, handle_training_infer, handle_training_init, handle_worktree_add,
     handle_worktree_info, handle_worktree_list, handle_worktree_remove,
-    handle_user_list, handle_user_register, handle_user_remove, handle_user_show,
+    handle_user_list, handle_user_register, handle_user_remove,
+    handle_user_keys_list, handle_user_keys_import, handle_user_keys_remove,
     load_or_generate_signing_key, AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
     // Worker handlers
     handle_images_df, handle_images_list, handle_images_pull, handle_images_rm,
@@ -37,7 +38,7 @@ use hyprstream_core::cli::{
     handle_service_start, handle_service_status,
     handle_service_stop, handle_service_uninstall,
 };
-use hyprstream_core::cli::commands::{PolicyCommand, RoleCommand, TokenCommand, UserCommand};
+use hyprstream_core::cli::commands::{PolicyCommand, RoleCommand, TokenCommand, UserCommand, UserKeysCommand};
 
 #[cfg(feature = "experimental")]
 use hyprstream_core::cli::{handle_commit, handle_merge, handle_push, MergeOptions};
@@ -48,15 +49,34 @@ use hyprstream_core::storage::{GitRef, ModelRef};
 use hyprstream_core::services::{PolicyClient, RegistryClient};
 // Worker service for Kata-based workload execution
 use hyprstream_workers::runtime::WorkerService;
-use hyprstream_workers::workflow::WorkflowService;
-use hyprstream_workers::{ImageConfig, PoolConfig, SpawnedService};
+use hyprstream_workers::{ImageConfig, PoolConfig};
 // ZMQ context for service startup
 use hyprstream_core::zmq::global_context;
 use std::sync::Arc;
 // Unified service manager API
 use hyprstream_service::{get_factory, InprocManager, ServiceContext, ServiceManager};
 use hyprstream_rpc::transport::TransportConfig;
-use hyprstream_rpc::{RequestIdentity, SigningKey, VerifyingKey};
+use hyprstream_rpc::{SigningKey, VerifyingKey};
+
+fn supports_tui() -> bool {
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
+        return false;
+    }
+    match std::env::var("TERM").as_deref() {
+        Ok("dumb") | Ok("") | Err(_) => return false,
+        _ => {}
+    }
+    #[cfg(unix)]
+    {
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        let ok = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
+        if ok == 0 {
+            return ws.ws_col >= 60 && ws.ws_row >= 20;
+        }
+    }
+    true
+}
 // Tracing imports (feature-gated)
 #[cfg(feature = "otel")]
 use opentelemetry::trace::TracerProvider;
@@ -160,7 +180,19 @@ fn build_cli() -> ClapCommand {
                 Arg::new("tui")
                     .long("tui")
                     .action(clap::ArgAction::SetTrue)
-                    .help("Use TUI wizard with GPU detection and install phase"),
+                    .help("Force TUI wizard (auto-detected when terminal supports it)"),
+            )
+            .arg(
+                Arg::new("bootstrap_only")
+                    .long("bootstrap-only")
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Run only the trust-root bootstrap (phase 1); skip binary install, policy templates, user creation, token mint, and systemd"),
+            )
+            .arg(
+                Arg::new("enable_federation")
+                    .long("enable-federation")
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Apply the federation-open policy template — accept third-party apps AND remote peer servers from any HTTPS origin (atproto-style federation). Default is disabled; under -y this flag is the only way to enable it."),
             ),
     );
 
@@ -452,9 +484,12 @@ fn handle_quick_command(
             || async move {
                 let keys_dir = ctx.models_dir().join(".registry").join("keys");
                 let signing_key = load_or_generate_signing_key(&keys_dir).await?;
-                let model_client = hyprstream_core::services::generated::model_client::ModelClient::new(
+                let model_server_vk = resolve_service_vk("model")
+                    .ok_or_else(|| anyhow::anyhow!("Cannot resolve model service pubkey. Run 'hyprstream wizard -y' to generate bootstrap credentials."))?;
+                let model_client = hyprstream_core::services::generated::model_client::ModelClient::for_service(
                     signing_key,
-                    RequestIdentity::anonymous(),
+                    model_server_vk,
+                    None,
                 );
                 let filters = parse_filters(&filter)?;
                 let status_filter = parse_status_filter(&status)?;
@@ -1050,9 +1085,11 @@ fn handle_quick_command(
                         )?;
 
                         // Wire up policy-backed authorization
-                        let worker_policy_client = PolicyClient::new(
+                        let worker_policy_client = PolicyClient::for_service(
                             signing_key.clone(),
-                            RequestIdentity::anonymous(),
+                            resolve_service_vk("policy")
+                                .ok_or_else(|| anyhow::anyhow!("Cannot resolve policy pubkey. Run wizard."))?,
+                            None,
                         );
                         worker_service.set_authorize_fn(
                             hyprstream_core::services::build_authorize_fn(worker_policy_client),
@@ -1070,8 +1107,10 @@ fn handle_quick_command(
                     };
 
                     use hyprstream_workers::runtime::WorkerClient;
+                    let worker_server_vk = resolve_service_vk("worker")
+                        .ok_or_else(|| anyhow::anyhow!("Cannot resolve worker pubkey. Run wizard."))?;
                     let worker_client =
-                        WorkerClient::new(signing_key, RequestIdentity::anonymous());
+                        WorkerClient::for_service(signing_key, worker_server_vk, None);
 
                     match action {
                         WorkerAction::List {
@@ -1224,8 +1263,40 @@ fn handle_quick_command(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Main entry point
+// CLI pubkey resolution helper
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Resolve a service's verifying key via the global trust store.
+///
+/// On first call in CLI mode, seeds the trust store from bootstrap-pubkeys.
+/// Used by CLI command handlers that don't have a ServiceContext but need
+/// to verify responses from a target service.
+///
+/// Returns `None` if bootstrap-pubkeys is not available (wizard not run).
+fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
+    let trust = hyprstream_service::global_trust_store();
+    // Fast path: already populated (service startup seeded it)
+    if let Some(vk) = trust.resolve_one(service_name) {
+        return Some(vk);
+    }
+    // CLI mode: seed from bootstrap-pubkeys on first use
+    let secrets_dir = HyprConfig::resolve_secrets_dir();
+    if let Ok(pubkeys) = hyprstream_core::auth::identity_store::load_bootstrap_pubkeys(&secrets_dir) {
+        for (name, vk) in &pubkeys {
+            trust.insert(
+                *vk,
+                hyprstream_service::Attestation {
+                    scopes: std::iter::once(name.clone()).collect(),
+                    subject: None,
+                    jwt: None,
+                    expires_at: 0,
+                    attested_by: None,
+                },
+            );
+        }
+    }
+    trust.resolve_one(service_name)
+}
 
 fn main() -> Result<()> {
     // ROCm allocator and BLAS optimizations — must be set before any tch/libtorch init.
@@ -1434,6 +1505,59 @@ fn main() -> Result<()> {
     }
     // ========== END ENDPOINT REGISTRY INITIALIZATION ==========
 
+    // ── Wizard / first-run early dispatch ───────────────────────────────────
+    // The wizard is a bootstrap command: it creates credentials that the
+    // registry client init (below) depends on. Handle both `wizard` and the
+    // no-subcommand first-run path here so they work on a completely fresh
+    // machine with no credentials yet. Neither path needs registry_client/ctx.
+    {
+        let models_dir = config.models_dir().clone();
+        let is_wizard = matches!(matches.subcommand_name(), Some("wizard"));
+        let is_first_run = is_wizard
+            || (matches.subcommand_name().is_none()
+                && hyprstream_core::cli::bootstrap_manager::is_first_run(&models_dir));
+
+        if is_first_run {
+            let services = config.services.startup.clone();
+            if let Some(("wizard", sub_m)) = matches.subcommand() {
+                let tui_mode = sub_m.get_flag("tui");
+                let non_interactive = sub_m.get_flag("non_interactive");
+                let start_services = sub_m.get_flag("start");
+                let bootstrap_only = sub_m.get_flag("bootstrap_only");
+                let enable_federation = sub_m.get_flag("enable_federation");
+                let use_tui = tui_mode || (!non_interactive && !bootstrap_only && supports_tui());
+                return with_runtime(
+                    RuntimeConfig { device: DeviceConfig::request_cpu(), multi_threaded: true },
+                    || async move {
+                        if use_tui {
+                            hyprstream_core::cli::handle_wizard_tui(&models_dir, &services).await
+                        } else {
+                            hyprstream_core::cli::handle_wizard(
+                                &models_dir, &services, non_interactive, start_services,
+                                bootstrap_only, enable_federation,
+                            ).await
+                        }
+                    },
+                );
+            }
+            // No subcommand + first run → TUI wizard (with text fallback)
+            return with_runtime(
+                RuntimeConfig { device: DeviceConfig::request_cpu(), multi_threaded: true },
+                || async move {
+                    if supports_tui() {
+                        hyprstream_core::cli::handle_wizard_tui(&models_dir, &services).await
+                    } else {
+                        // First-run fallback (no `wizard` subcommand) defaults
+                        // federation to off — explicit opt-in only.
+                        hyprstream_core::cli::handle_wizard(
+                            &models_dir, &services, false, false, false, false,
+                        ).await
+                    }
+                },
+            );
+        }
+    }
+
     // Start registry service ONCE at CLI level
     let _registry_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1441,113 +1565,32 @@ fn main() -> Result<()> {
         .context("Failed to create registry runtime")?;
 
     // Start ZMQ-based services and create keypair
-    let (registry_client, mut _service_handles, _workflow_service, signing_key, verifying_key): (
+    let (registry_client, signing_key, verifying_key): (
         RegistryClient,
-        Vec<SpawnedService>,
-        Option<Arc<WorkflowService>>,
         SigningKey,
         VerifyingKey,
-    ) = if execution_mode == ExecutionMode::Inproc {
-        _registry_runtime
-            .block_on(async {
-                let models_dir = config.models_dir();
-                let keys_dir = models_dir.join(".registry").join("keys");
-                let signing_key = load_or_generate_signing_key(&keys_dir).await?;
-                let verifying_key = signing_key.verifying_key();
+    ) = _registry_runtime
+        .block_on(async {
+            let models_dir = config.models_dir();
+            let keys_dir = models_dir.join(".registry").join("keys");
+            let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+            let verifying_key = signing_key.verifying_key();
 
-                let fed_src: Arc<dyn hyprstream_rpc::auth::FederationKeySource> =
-                    Arc::new(hyprstream_core::auth::FederationKeyResolver::new(
-                        &config.oauth.trusted_issuers,
-                    ));
-                let ctx = ServiceContext::new(
-                    global_context(),
-                    signing_key.clone(),
-                    verifying_key,
-                    false,
-                    models_dir.clone(),
-                )
-                .with_oauth_issuer(config.oauth.issuer_url())
-                .with_federation_key_source(fed_src);
+            // Resolve the registry service's verifying key from bootstrap pubkeys.
+            // CLI mode doesn't have a ServiceContext, so we look up the target
+            // pubkey directly from the credential store.
+            let registry_vk = resolve_service_vk("registry")
+                .ok_or_else(|| anyhow::anyhow!("Cannot resolve registry pubkey. Run wizard."))?;
 
-                let manager = InprocManager::new();
-                let mut handles = Vec::new();
+            let client = hyprstream_core::services::RegistryClient::for_service(
+                signing_key.clone(),
+                registry_vk,
+                None,
+            );
 
-                for service_name in &config.services.startup {
-                    if service_name == "workflow" {
-                        continue;
-                    }
-
-                    let factory = get_factory(service_name).ok_or_else(|| {
-                        anyhow::anyhow!("Unknown service in startup config: {}", service_name)
-                    })?;
-
-                    info!("Starting {} service via factory", service_name);
-                    let spawnable = (factory.factory)(&ctx)
-                        .context(format!("Failed to create {} service", service_name))?;
-                    let handle = manager
-                        .spawn(spawnable)
-                        .await
-                        .context(format!("Failed to start {} service", service_name))?;
-                    handles.push(handle);
-                }
-
-                let workflow_service =
-                    if config.services.startup.iter().any(|s| s == "workflow") {
-                        let mut wf_svc = WorkflowService::new(
-                            global_context(),
-                            TransportConfig::inproc("hyprstream/workflow"),
-                            signing_key.clone(),
-                        );
-                        // Wire up policy-backed authorization
-                        let wf_policy_client = PolicyClient::new(
-                            signing_key.clone(),
-                            RequestIdentity::anonymous(),
-                        );
-                        wf_svc.set_authorize_fn(
-                            hyprstream_core::services::build_authorize_fn(wf_policy_client),
-                        );
-                        let ws = Arc::new(wf_svc);
-                        ws.clone()
-                            .start()
-                            .await
-                            .context("Failed to start workflow service")?;
-                        info!("WorkflowService started, subscribed to worker.* events");
-                        Some(ws)
-                    } else {
-                        None
-                    };
-
-                let client = hyprstream_core::services::RegistryClient::new(
-                    signing_key.clone(),
-                    RequestIdentity::anonymous(),
-                );
-
-                Ok::<_, anyhow::Error>((
-                    client,
-                    handles,
-                    workflow_service,
-                    signing_key,
-                    verifying_key,
-                ))
-            })
-            .context("Failed to initialize services")?
-    } else {
-        _registry_runtime
-            .block_on(async {
-                let models_dir = config.models_dir();
-                let keys_dir = models_dir.join(".registry").join("keys");
-                let signing_key = load_or_generate_signing_key(&keys_dir).await?;
-                let verifying_key = signing_key.verifying_key();
-
-                let client = hyprstream_core::services::RegistryClient::new(
-                    signing_key.clone(),
-                    RequestIdentity::anonymous(),
-                );
-
-                Ok::<_, anyhow::Error>((client, Vec::new(), None, signing_key, verifying_key))
-            })
-            .context("Failed to connect to services")?
-    };
+            Ok::<_, anyhow::Error>((client, signing_key, verifying_key))
+        })
+        .context("Failed to connect to services")?;
 
     // Create application context with shared registry client
     let config_for_service = config.clone();
@@ -1615,15 +1658,21 @@ fn main() -> Result<()> {
                     services: multi_services,
                     quic_bind,
                     print_cert_hash,
+                    standalone,
                 } => {
-                    if foreground {
-                        // --foreground requires either a service name or --services list
-                        let name = match (name, &multi_services) {
-                            (Some(n), _) => n,
-                            (None, Some(_)) => String::from("multi"), // placeholder for multi-service mode
-                            (None, None) => return Err(anyhow::anyhow!(
-                                "--foreground requires a service name or --services list"
-                            )),
+                    if foreground || standalone {
+                        // --foreground requires a service name or --services list;
+                        // --standalone uses all configured services.
+                        let (name, multi_services) = if standalone {
+                            (String::from("standalone"), Some(services.clone()))
+                        } else {
+                            match (name, &multi_services) {
+                                (Some(n), _) => (n, multi_services),
+                                (None, Some(_)) => (String::from("multi"), multi_services),
+                                (None, None) => return Err(anyhow::anyhow!(
+                                    "--foreground requires a service name or --services list"
+                                )),
+                            }
                         };
 
                         // Check if this is inference callback mode
@@ -1657,9 +1706,11 @@ fn main() -> Result<()> {
                                     let keys_dir = data_dir.join("keys");
                                     let signing_key =
                                         load_or_generate_signing_key(&keys_dir).await?;
-                                    let policy_client = PolicyClient::new(
+                                    let policy_client = PolicyClient::for_service(
                                         signing_key.clone(),
-                                        hyprstream_rpc::RequestIdentity::anonymous(),
+                                        resolve_service_vk("policy")
+                                            .ok_or_else(|| anyhow::anyhow!("Cannot resolve policy pubkey. Run wizard."))?,
+                                        None,
                                     );
 
                                     let runtime_config =
@@ -1740,33 +1791,178 @@ fn main() -> Result<()> {
                                     config.quic.clone()
                                 };
 
-                                if quic_cfg.enabled {
-                                    let qc = quic_cfg;
-                                    let (cert_der, key_der) = qc.load_tls_materials()
-                                        .context("Failed to load QUIC TLS materials")?;
-
-                                    // Print cert hash if requested
-                                    if print_cert_hash {
-                                        let hash = hyprstream_rpc::transport::zmtp_quic::cert_hash(&cert_der);
-                                        println!("QUIC/WebTransport cert hash: {}", hash);
-                                    }
-
-                                    let shared = hyprstream_service::QuicSharedConfig {
-                                        cert_der,
-                                        key_der,
-                                        base_ip: qc.socket_addr()?.ip(),
-                                        server_name: qc.server_name.clone(),
-                                        oauth_issuer_url: Some(config.oauth.issuer_url()),
-                                    };
-                                    ctx = ctx.with_quic(shared);
-                                }
-
                                 // Determine which services to start
                                 let service_names: Vec<String> = if let Some(ref svc_list) = multi_services {
                                     svc_list.clone()
                                 } else {
                                     vec![name.clone()]
                                 };
+
+                                if ipc {
+                                    // Multi-process mode: each service gets its own independent key.
+                                    let secrets_dir = std::path::PathBuf::from(
+                                        std::env::var("HYPRSTREAM__SECRETS__PATH")
+                                            .unwrap_or_else(|_| {
+                                                dirs::config_dir()
+                                                    .map(|d| d.join("hyprstream").join("credentials"))
+                                                    .unwrap_or_default()
+                                                    .to_str()
+                                                    .unwrap_or("")
+                                                    .to_owned()
+                                            }),
+                                    );
+
+                                    // Load CA verifying key (trust anchor) for JWT verification only.
+                                    // Do NOT insert into the trust store as "policy" scope — the trust
+                                    // store maps ZMQ signing keys to subjects, and the policy service
+                                    // signs ZMQ responses with its own independent keypair (not the CA
+                                    // key). The CA key is only used to verify service JWTs (at+jwt).
+                                    if let Ok(ca_vk) = hyprstream_core::auth::identity_store::load_ca_verifying_key(&secrets_dir) {
+                                        ctx = ctx.with_ca_verifying_key(ca_vk);
+                                    }
+
+                                    // Load bootstrap pubkeys (all service pubkeys) into trust store
+                                    if let Ok(pubkeys) = hyprstream_core::auth::identity_store::load_bootstrap_pubkeys(&secrets_dir) {
+                                        for (svc_name, vk) in &pubkeys {
+                                            hyprstream_service::global_trust_store().insert(
+                                                *vk,
+                                                hyprstream_service::Attestation {
+                                                    scopes: std::iter::once(svc_name.clone()).collect(),
+                                                    subject: None,
+                                                    jwt: None,
+                                                    expires_at: 0,
+                                                    attested_by: None,
+                                                },
+                                            );
+                                        }
+                                    }
+
+                                    // C3 fix: systemd uses flat %d/signing-key, standalone uses subdirectory.
+                                    let systemd_mode = std::env::var("HYPRSTREAM__SECRETS__PATH").is_ok();
+                                    let own_key = if systemd_mode {
+                                        hyprstream_core::auth::identity_store::load_or_generate_node_signing_key(&secrets_dir)?
+                                    } else {
+                                        hyprstream_core::auth::identity_store::load_or_generate_service_signing_key(&secrets_dir, &name)?
+                                    };
+
+                                    if name == "policy" {
+                                        // PolicyService: signing_key IS the CA key (already loaded).
+                                        ctx = ctx.with_service_key(&name, own_key);
+                                    } else {
+                                        // Non-policy: swap signing_key to service's own independent key.
+                                        // CA key is no longer accessible via ctx.signing_key().
+                                        ctx = ctx.swap_signing_key(own_key.clone());
+                                        ctx = ctx.with_service_key(&name, own_key);
+                                    }
+                                } else {
+                                    // Single-process mode: load keys from disk (same as IPC).
+                                    // Wizard must have run to create credentials.
+                                    let secrets_dir = dirs::config_dir()
+                                        .map(|d| d.join("hyprstream").join("credentials"))
+                                        .ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))?;
+
+                                    // Load CA verifying key (trust anchor)
+                                    let ca_vk = hyprstream_core::auth::identity_store::load_ca_verifying_key(&secrets_dir)
+                                        .context("CA key not found — run 'hyprstream wizard' first")?;
+                                    // CA key is for JWT verification only — not a ZMQ signing key.
+                                    ctx = ctx.with_ca_verifying_key(ca_vk);
+
+                                    // Load bootstrap pubkeys (all service pubkeys) into trust store
+                                    let pubkeys = hyprstream_core::auth::identity_store::load_bootstrap_pubkeys(&secrets_dir)
+                                        .context("Bootstrap pubkeys not found — run 'hyprstream wizard' first")?;
+                                    if pubkeys.is_empty() {
+                                        anyhow::bail!("Bootstrap pubkeys file is empty — run 'hyprstream wizard' first");
+                                    }
+                                    for (svc_name, vk) in &pubkeys {
+                                        hyprstream_service::global_trust_store().insert(
+                                            *vk,
+                                            hyprstream_service::Attestation {
+                                                scopes: std::iter::once(svc_name.clone()).collect(),
+                                                subject: None,
+                                                jwt: None,
+                                                expires_at: 0,
+                                                attested_by: None,
+                                            },
+                                        );
+                                    }
+                                    tracing::debug!(
+                                        "Loaded {} bootstrap pubkeys from {}",
+                                        pubkeys.len(),
+                                        secrets_dir.display()
+                                    );
+
+                                    // Load signing keys for each service being started
+                                    for svc_name in &service_names {
+                                        let svc_key = hyprstream_core::auth::identity_store::load_or_generate_service_signing_key(&secrets_dir, svc_name)
+                                            .with_context(|| format!("Failed to load signing key for service '{}'", svc_name))?;
+                                        ctx = ctx.with_service_key(svc_name, svc_key);
+                                    }
+                                }
+
+                                // Wire QUIC shared config (must be after key generation so jwt_verifying_key is set)
+                                if quic_cfg.enabled {
+                                    let qc = quic_cfg;
+                                    let (cert_chain, key_der) = qc.load_tls_materials()
+                                        .context("Failed to load QUIC TLS materials")?;
+
+                                    // Print cert hash if requested (hash of leaf cert)
+                                    if print_cert_hash {
+                                        let hash = hyprstream_rpc::transport::zmtp_quic::cert_hash(&cert_chain[0]);
+                                        println!("QUIC/WebTransport cert hash: {}", hash);
+                                    }
+
+                                    let shared = hyprstream_service::QuicSharedConfig {
+                                        cert_chain,
+                                        key_der,
+                                        base_ip: qc.socket_addr()?.ip(),
+                                        server_name: qc.server_name.clone(),
+                                        oauth_issuer_url: Some(config.oauth.issuer_url()),
+                                        jwt_verifying_key: Some(ctx.jwt_verifying_key()),
+                                    };
+                                    ctx = ctx.with_quic(shared);
+                                }
+
+                                // Wire JWKS-backed key resolution (kid-based, on-miss-refetch).
+                                {
+                                    let issuer_url = config.oauth.issuer_url();
+                                    let jwks_url = format!("{}/oauth/jwks", issuer_url.trim_end_matches('/'));
+                                    let fetcher: hyprstream_rpc::auth::JwksFetcher = std::sync::Arc::new(move |url: String| {
+                                        Box::pin(async move {
+                                            let resp = reqwest::Client::builder()
+                                                .danger_accept_invalid_certs(true)
+                                                .build()?
+                                                .get(&url)
+                                                .send()
+                                                .await?
+                                                .error_for_status()?;
+                                            let json: serde_json::Value = resp.json().await?;
+                                            Ok(json)
+                                        })
+                                    });
+                                    ctx.set_jwks_fetcher(fetcher);
+                                    tracing::debug!("JWKS-backed key source configured: {}", jwks_url);
+                                }
+
+                                // Populate ML-DSA-65 verifying keys for PQ-hybrid JWT verification.
+                                #[cfg(feature = "pq-hybrid")]
+                                {
+                                    let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir();
+                                    let ml_dsa_store = hyprstream_core::auth::key_rotation::global_ml_dsa_key_store(
+                                        &secrets_dir,
+                                        &config.oauth,
+                                    );
+                                    let vks: Vec<_> = tokio::task::block_in_place(|| {
+                                        let rt = tokio::runtime::Handle::current();
+                                        rt.block_on(ml_dsa_store.all_slots_snapshot())
+                                    })
+                                    .iter()
+                                    .map(|slot| slot.verifying_key())
+                                    .collect();
+                                    let shared_vks = hyprstream_core::auth::key_rotation::global_ml_dsa_verifying_keys();
+                                    let _ = shared_vks.write().map(|mut guard| *guard = vks);
+                                    ctx.set_ml_dsa_verifying_keys(shared_vks);
+                                    tracing::info!("PQ-hybrid: ML-DSA-65 verifying keys loaded for JWT verification");
+                                }
 
                                 let manager = InprocManager::new();
                                 let mut handles = Vec::new();
@@ -1907,21 +2103,37 @@ fn main() -> Result<()> {
         Some(("user", sub_m)) => {
             let cmd = UserCommand::from_arg_matches(sub_m)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let credentials_dir = ctx.models_dir().join(".registry").join("credentials");
-            match cmd {
-                UserCommand::Register { username, pubkey_base64 } => {
-                    handle_user_register(&credentials_dir, &username, &pubkey_base64)?;
+            let credentials_dir = ctx.config_dir().join("credentials");
+            // User handlers are async, run them in a minimal runtime
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("Failed to create runtime for user command")?;
+            rt.block_on(async {
+                match cmd {
+                    UserCommand::Register { username } => {
+                        handle_user_register(&credentials_dir, &username).await?;
+                    }
+                    UserCommand::List => {
+                        handle_user_list(&credentials_dir).await?;
+                    }
+                    UserCommand::Remove { username, force } => {
+                        handle_user_remove(&credentials_dir, &username, force).await?;
+                    }
+                    UserCommand::Keys { command } => match command {
+                        UserKeysCommand::List { username } => {
+                            handle_user_keys_list(&credentials_dir, &username).await?;
+                        }
+                        UserKeysCommand::Import { username, format } => {
+                            handle_user_keys_import(&credentials_dir, &username, &format).await?;
+                        }
+                        UserKeysCommand::Remove { username, fingerprint } => {
+                            handle_user_keys_remove(&credentials_dir, &username, &fingerprint).await?;
+                        }
+                    },
                 }
-                UserCommand::List => {
-                    handle_user_list(&credentials_dir)?;
-                }
-                UserCommand::Remove { username, force } => {
-                    handle_user_remove(&credentials_dir, &username, force)?;
-                }
-                UserCommand::Show { username } => {
-                    handle_user_show(&credentials_dir, &username)?;
-                }
-            }
+                Ok::<_, anyhow::Error>(())
+            })?;
         }
 
         // ── TUI display server ──────────────────────────────────────────
@@ -2030,32 +2242,9 @@ fn main() -> Result<()> {
             )?;
         }
 
-        // ── Interactive setup wizard ─────────────────────────────────────
-        Some(("wizard", sub_m)) => {
-            let tui_mode = sub_m.get_flag("tui");
-            let non_interactive = sub_m.get_flag("non_interactive");
-            let start_services = sub_m.get_flag("start");
-            let models_dir = config_for_service.models_dir().clone();
-            let services = config_for_service.services.startup.clone();
-            with_runtime(
-                RuntimeConfig {
-                    device: DeviceConfig::request_cpu(),
-                    multi_threaded: true,
-                },
-                || async move {
-                    if tui_mode {
-                        hyprstream_core::cli::handle_wizard_tui(&models_dir).await
-                    } else {
-                        hyprstream_core::cli::handle_wizard(
-                            &models_dir,
-                            &services,
-                            non_interactive,
-                            start_services,
-                        )
-                        .await
-                    }
-                },
-            )?;
+        // ── Wizard ── handled early (before registry init) above ────────────
+        Some(("wizard", _)) => {
+            unreachable!("wizard command is dispatched before registry init")
         }
 
         // ── Self-update ──────────────────────────────────────────────────
@@ -2077,10 +2266,18 @@ fn main() -> Result<()> {
         _ => {
             let models_dir = config_for_service.models_dir().clone();
             if hyprstream_core::cli::bootstrap_manager::is_first_run(&models_dir) {
+                let services = config_for_service.services.startup.clone();
                 with_runtime(
                     RuntimeConfig { device: DeviceConfig::request_cpu(), multi_threaded: true },
                     || async move {
-                        hyprstream_core::cli::handle_wizard_tui(&models_dir).await
+                        if supports_tui() {
+                            hyprstream_core::cli::handle_wizard_tui(&models_dir, &services).await
+                        } else {
+                            // First-run auto-wizard defaults federation to off.
+                            hyprstream_core::cli::handle_wizard(
+                                &models_dir, &services, false, false, false, false,
+                            ).await
+                        }
                     },
                 )?;
             } else {
@@ -2098,15 +2295,6 @@ fn main() -> Result<()> {
             }
         }
     };
-
-    // Gracefully stop services before exiting (only for Inproc mode)
-    _registry_runtime.block_on(async {
-        for mut handle in _service_handles {
-            if let Err(e) = handle.stop().await {
-                tracing::warn!("Failed to stop service: {}", e);
-            }
-        }
-    });
 
     Ok(())
 }

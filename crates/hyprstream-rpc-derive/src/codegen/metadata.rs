@@ -7,6 +7,35 @@ use crate::resolve::ResolvedSchema;
 use crate::schema::types::*;
 use crate::util::*;
 
+/// Generate schema metadata + render_doc only (no JSON dispatcher).
+/// Used by `generate_rpc_client!` (client-only, compiles on all targets).
+pub fn generate_metadata_client_only(service_name: &str, resolved: &ResolvedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
+    let metadata_structs = generate_metadata_structs();
+    let pascal = to_pascal_case(service_name);
+    let schema_metadata = generate_schema_metadata_fn(
+        service_name,
+        &pascal,
+        &resolved.raw.request_variants,
+        &resolved.raw.response_variants,
+        resolved,
+        &resolved.raw.scoped_clients,
+    );
+    let scoped_client_tree = generate_scoped_client_tree(&resolved.raw.scoped_clients, types_crate);
+    let render_doc = generate_render_doc(
+        service_name,
+        &resolved.raw.request_variants,
+        &resolved.raw.response_variants,
+        resolved,
+        &resolved.raw.scoped_clients,
+    );
+    quote! {
+        #metadata_structs
+        #schema_metadata
+        #scoped_client_tree
+        #render_doc
+    }
+}
+
 /// Generate schema metadata functions + JSON dispatchers.
 pub fn generate_metadata(service_name: &str, resolved: &ResolvedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
     let pascal = to_pascal_case(service_name);
@@ -28,18 +57,26 @@ pub fn generate_metadata(service_name: &str, resolved: &ResolvedSchema, types_cr
         &resolved.raw.scoped_clients,
     );
     let scoped_client_tree = generate_scoped_client_tree(&resolved.raw.scoped_clients, types_crate);
+    let render_doc = generate_render_doc(
+        service_name,
+        &resolved.raw.request_variants,
+        &resolved.raw.response_variants,
+        resolved,
+        &resolved.raw.scoped_clients,
+    );
 
     quote! {
         #metadata_structs
         #schema_metadata
         #json_dispatcher
         #scoped_client_tree
+        #render_doc
     }
 }
 
 fn generate_metadata_structs() -> TokenStream {
     quote! {
-        pub use hyprstream_rpc::service::metadata::{ParamMeta as ParamSchema, MethodMeta as MethodSchema};
+        pub use hyprstream_rpc::metadata::{ParamMeta as ParamSchema, MethodMeta as MethodSchema};
     }
 }
 
@@ -90,6 +127,7 @@ fn generate_method_schema_entry(
     let method_name = to_snake_case(&v.name);
     let method_desc = &v.description;
     let scope_str = v.scope.as_str();
+    let doc_example = &v.doc_example;
     let is_streaming = is_streaming_variant(&v.name, response_variants, is_scoped_streaming_check);
     let cli_hidden = v.cli_hidden;
     let ct = CapnpType::classify_primitive(&v.type_name);
@@ -133,6 +171,7 @@ fn generate_method_schema_entry(
             scope: #scope_str,
             is_streaming: #is_streaming,
             hidden: #cli_hidden,
+            doc_example: #doc_example,
         }
     }
 }
@@ -734,8 +773,8 @@ fn generate_scoped_client_tree(
 
     quote! {
         /// Returns the scoped client tree metadata for dynamic CLI/MCP dispatch.
-        pub fn scoped_client_tree() -> &'static [hyprstream_rpc::service::metadata::ScopedClientTreeNode] {
-            use hyprstream_rpc::service::metadata::ScopedClientTreeNode;
+        pub fn scoped_client_tree() -> &'static [hyprstream_rpc::metadata::ScopedClientTreeNode] {
+            use hyprstream_rpc::metadata::ScopedClientTreeNode;
             #(#consts)*
             static TREE: &[ScopedClientTreeNode] = &[#(#top_refs),*];
             TREE
@@ -784,5 +823,293 @@ fn generate_tree_consts(
     });
 
     names_out.push(const_name);
+}
+
+// ---------------------------------------------------------------------------
+// render_doc() generation — man page rendering from schema metadata
+// ---------------------------------------------------------------------------
+
+/// Generate `render_doc(path: &[&str]) -> Option<String>` for service documentation.
+fn generate_render_doc(
+    service_name: &str,
+    request_variants: &[UnionVariant],
+    _response_variants: &[UnionVariant],
+    resolved: &ResolvedSchema,
+    scoped_clients: &[ScopedClient],
+) -> TokenStream {
+    let scoped_names: Vec<&str> = scoped_clients
+        .iter()
+        .map(|sc| sc.factory_name.as_str())
+        .collect();
+
+    let overview = format_service_overview(service_name, request_variants, &scoped_names, scoped_clients);
+
+    let method_arms: Vec<TokenStream> = request_variants
+        .iter()
+        .filter(|v| !scoped_names.contains(&v.name.as_str()) && !v.cli_hidden)
+        .map(|v| {
+            let method_snake = to_snake_case(&v.name);
+            let page = format_man_page(service_name, &method_snake, v, resolved, request_variants, &scoped_names);
+            quote! { #method_snake => ::core::option::Option::Some(#page.to_owned()), }
+        })
+        .collect();
+
+    let mut scope_single_arms = Vec::new();
+    let mut scope_multi_arms = Vec::new();
+
+    for sc in scoped_clients {
+        let scope_snake = to_snake_case(&sc.factory_name);
+        let scope_overview = format_scope_overview(service_name, &scope_snake, sc);
+
+        let scope_method_arms: Vec<TokenStream> = sc
+            .inner_request_variants
+            .iter()
+            .filter(|v| !v.cli_hidden)
+            .map(|v| {
+                let m_name = to_snake_case(&v.name);
+                let page = format_scoped_man_page(service_name, &scope_snake, &m_name, v, resolved, &sc.inner_request_variants);
+                quote! { #m_name => ::core::option::Option::Some(#page.to_owned()), }
+            })
+            .collect();
+
+        let nested_single_arms: Vec<TokenStream> = sc
+            .nested_clients
+            .iter()
+            .map(|nsc| {
+                let nscope_snake = to_snake_case(&nsc.factory_name);
+                let nested_overview = format_scope_overview(service_name, &format!("{} {}", scope_snake, nscope_snake), nsc);
+                quote! { [#nscope_snake] => ::core::option::Option::Some(#nested_overview.to_owned()), }
+            })
+            .collect();
+
+        let nested_multi_arms: Vec<TokenStream> = sc
+            .nested_clients
+            .iter()
+            .map(|nsc| {
+                let nscope_snake = to_snake_case(&nsc.factory_name);
+                let nested_method_arms: Vec<TokenStream> = nsc
+                    .inner_request_variants
+                    .iter()
+                    .filter(|v| !v.cli_hidden)
+                    .map(|v| {
+                        let m_name = to_snake_case(&v.name);
+                        let page = format_scoped_man_page(
+                            service_name,
+                            &format!("{} {}", scope_snake, nscope_snake),
+                            &m_name, v, resolved, &nsc.inner_request_variants,
+                        );
+                        quote! { [#nscope_snake, #m_name] => ::core::option::Option::Some(#page.to_owned()), }
+                    })
+                    .collect();
+                quote! { #(#nested_method_arms)* }
+            })
+            .collect();
+
+        scope_single_arms.push(quote! {
+            #scope_snake => ::core::option::Option::Some(#scope_overview.to_owned()),
+        });
+
+        scope_multi_arms.push(quote! {
+            [#scope_snake, method] => match *method {
+                #(#scope_method_arms)*
+                _ => ::core::option::Option::None,
+            },
+            [#scope_snake, rest @ ..] => match rest {
+                #(#nested_single_arms)*
+                #(#nested_multi_arms)*
+                _ => ::core::option::Option::None,
+            },
+        });
+    }
+
+    quote! {
+        /// Render documentation for this service.
+        pub fn render_doc(path: &[&str]) -> ::core::option::Option<String> {
+            match path {
+                [] | [""] => ::core::option::Option::Some(#overview.to_owned()),
+                [single] => match *single {
+                    #(#method_arms)*
+                    #(#scope_single_arms)*
+                    _ => ::core::option::Option::None,
+                },
+                multi => match multi {
+                    #(#scope_multi_arms)*
+                    _ => ::core::option::Option::None,
+                },
+            }
+        }
+    }
+}
+
+fn format_service_overview(
+    service_name: &str, request_variants: &[UnionVariant],
+    scoped_names: &[&str], scoped_clients: &[ScopedClient],
+) -> String {
+    let mut out = format!("NAME\n    {} \u{2014} service\n\nMETHODS\n", service_name);
+    for v in request_variants {
+        if scoped_names.contains(&v.name.as_str()) || v.cli_hidden { continue; }
+        let name = to_snake_case(&v.name);
+        let desc = doc_first_sentence(&v.description);
+        if desc.is_empty() {
+            out.push_str(&format!("    {}\n", name));
+        } else {
+            out.push_str(&format!("    {:20} {}\n", name, desc));
+        }
+    }
+    if !scoped_clients.is_empty() {
+        out.push_str("\nSCOPED\n");
+        for sc in scoped_clients {
+            let scope_name = to_snake_case(&sc.factory_name);
+            let n = sc.inner_request_variants.iter().filter(|v| !v.cli_hidden).count();
+            out.push_str(&format!("    {:20} ({} methods)\n", format!("{}/", scope_name), n));
+        }
+    }
+    out.push_str(&format!("\nUsage: man {} <method>\n", service_name));
+    out
+}
+
+fn format_scope_overview(service_name: &str, scope_path: &str, sc: &ScopedClient) -> String {
+    let scope_field = sc.scope_fields.first().map(|f| to_snake_case(&f.name)).unwrap_or_default();
+    let mut out = format!("NAME\n    {} {} \u{2014} scoped operations (by {})\n\nMETHODS\n", service_name, scope_path, scope_field);
+    for v in &sc.inner_request_variants {
+        if v.cli_hidden { continue; }
+        let name = to_snake_case(&v.name);
+        let desc = doc_first_sentence(&v.description);
+        if desc.is_empty() {
+            out.push_str(&format!("    {}\n", name));
+        } else {
+            out.push_str(&format!("    {:20} {}\n", name, desc));
+        }
+    }
+    if !sc.nested_clients.is_empty() {
+        out.push_str("\nNESTED\n");
+        for nsc in &sc.nested_clients {
+            let n = to_snake_case(&nsc.factory_name);
+            let cnt = nsc.inner_request_variants.iter().filter(|v| !v.cli_hidden).count();
+            out.push_str(&format!("    {:20} ({} methods)\n", format!("{}/", n), cnt));
+        }
+    }
+    out.push_str(&format!("\nUsage: man {} {} <method>\n", service_name, scope_path));
+    out
+}
+
+fn format_man_page(
+    service_name: &str, method_name: &str, v: &UnionVariant,
+    resolved: &ResolvedSchema, all_variants: &[UnionVariant], scoped_names: &[&str],
+) -> String {
+    let mut out = String::new();
+    let desc = doc_first_sentence(&v.description);
+    if desc.is_empty() {
+        out.push_str(&format!("NAME\n    {} {}\n", service_name, method_name));
+    } else {
+        out.push_str(&format!("NAME\n    {} {} \u{2014} {}\n", service_name, method_name, desc));
+    }
+    let synopsis = doc_format_synopsis(service_name, method_name, v, resolved);
+    out.push_str(&format!("\nSYNOPSIS\n    {}\n", synopsis));
+    let scope = if v.scope.is_empty() { "query" } else { &v.scope };
+    out.push_str(&format!("\nSCOPE\n    {}\n", scope));
+    if !v.description.is_empty() {
+        out.push_str(&format!("\nDESCRIPTION\n    {}\n", v.description));
+    }
+    let params = doc_format_params(v, resolved);
+    if !params.is_empty() { out.push_str(&format!("\nPARAMETERS\n{}", params)); }
+    if !v.doc_example.is_empty() {
+        out.push_str(&format!("\nEXAMPLES\n    {}\n", v.doc_example));
+    }
+    let see_also = doc_format_see_also(service_name, method_name, all_variants, scoped_names);
+    if !see_also.is_empty() { out.push_str(&format!("\nSEE ALSO\n    {}\n", see_also)); }
+    out
+}
+
+fn format_scoped_man_page(
+    service_name: &str, scope_path: &str, method_name: &str,
+    v: &UnionVariant, resolved: &ResolvedSchema, sibling_variants: &[UnionVariant],
+) -> String {
+    let mut out = String::new();
+    let desc = doc_first_sentence(&v.description);
+    if desc.is_empty() {
+        out.push_str(&format!("NAME\n    {} {} {}\n", service_name, scope_path, method_name));
+    } else {
+        out.push_str(&format!("NAME\n    {} {} {} \u{2014} {}\n", service_name, scope_path, method_name, desc));
+    }
+    let scope = if v.scope.is_empty() { "query" } else { &v.scope };
+    out.push_str(&format!("\nSCOPE\n    {}\n", scope));
+    if !v.description.is_empty() {
+        out.push_str(&format!("\nDESCRIPTION\n    {}\n", v.description));
+    }
+    let params = doc_format_params(v, resolved);
+    if !params.is_empty() { out.push_str(&format!("\nPARAMETERS\n{}", params)); }
+    if !v.doc_example.is_empty() {
+        out.push_str(&format!("\nEXAMPLES\n    {}\n", v.doc_example));
+    }
+    let siblings: Vec<String> = sibling_variants.iter()
+        .filter(|sv| !sv.cli_hidden && to_snake_case(&sv.name) != method_name)
+        .map(|sv| format!("{} {} {}", service_name, scope_path, to_snake_case(&sv.name)))
+        .collect();
+    if !siblings.is_empty() { out.push_str(&format!("\nSEE ALSO\n    {}\n", siblings.join(", "))); }
+    out
+}
+
+fn doc_format_synopsis(service_name: &str, method_name: &str, v: &UnionVariant, resolved: &ResolvedSchema) -> String {
+    let ct = CapnpType::classify_primitive(&v.type_name);
+    match ct {
+        CapnpType::Void => format!("ctl /srv/{} {}", service_name, method_name),
+        CapnpType::Struct(_) | CapnpType::Unknown(_) => {
+            if let Some(sdef) = resolved.find_struct(&v.type_name) {
+                let fields: Vec<String> = sdef.non_union_fields()
+                    .map(|f: &FieldDef| format!("\"{}\": ...", to_snake_case(&f.name)))
+                    .collect();
+                if fields.is_empty() {
+                    format!("ctl /srv/{} {}", service_name, method_name)
+                } else {
+                    format!("ctl /srv/{} {} '{{{{ {} }}}}'", service_name, method_name, fields.join(", "))
+                }
+            } else {
+                format!("ctl /srv/{} {} <{}>", service_name, method_name, v.type_name)
+            }
+        }
+        _ => format!("ctl /srv/{} {} <{}>", service_name, method_name, v.type_name),
+    }
+}
+
+fn doc_format_params(v: &UnionVariant, resolved: &ResolvedSchema) -> String {
+    let ct = CapnpType::classify_primitive(&v.type_name);
+    match ct {
+        CapnpType::Struct(_) | CapnpType::Unknown(_) => {
+            if let Some(sdef) = resolved.find_struct(&v.type_name) {
+                let mut out = String::new();
+                for f in sdef.non_union_fields() {
+                    let fname = to_snake_case(&f.name);
+                    let req = if f.optional || f.type_name == "Bool" { "optional" } else { "required" };
+                    if f.description.is_empty() {
+                        out.push_str(&format!("    {:16} {:10} ({})\n", fname, f.type_name, req));
+                    } else {
+                        out.push_str(&format!("    {:16} {:10} ({}) \u{2014} {}\n", fname, f.type_name, req, f.description));
+                    }
+                }
+                out
+            } else {
+                String::new()
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+fn doc_format_see_also(service_name: &str, method_name: &str, all_variants: &[UnionVariant], scoped_names: &[&str]) -> String {
+    let siblings: Vec<String> = all_variants.iter()
+        .filter(|v| !v.cli_hidden && !scoped_names.contains(&v.name.as_str()) && to_snake_case(&v.name) != method_name)
+        .map(|v| format!("{} {}", service_name, to_snake_case(&v.name)))
+        .collect();
+    siblings.join(", ")
+}
+
+fn doc_first_sentence(desc: &str) -> &str {
+    if desc.is_empty() { return desc; }
+    if let Some(pos) = desc.find(". ") {
+        &desc[..pos + 1]
+    } else {
+        desc
+    }
 }
 

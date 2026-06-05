@@ -6,7 +6,9 @@
 //! Scoped response variants (structs that themselves contain unions) are
 //! parsed recursively, returning nested `{ variant, data }` objects.
 
-use hyprstream_rpc_build::schema::types::{FieldDef, FieldSection, ParsedSchema, ScopedClient, StructDef};
+use hyprstream_rpc_build::schema::types::{
+    FieldDef, FieldSection, ParsedSchema, ScopedClient, StructDef,
+};
 use hyprstream_rpc_build::util::{to_camel_case, to_pascal_case};
 
 use super::{bool_bit_index, capnp_to_ts_type, data_byte_offset, is_data_scalar};
@@ -32,9 +34,7 @@ pub fn generate_parsers(out: &mut String, service_name: &str, schema: &ParsedSch
         .collect();
 
     // Response result interface
-    out.push_str(&format!(
-        "export interface {pascal}ResponseResult {{\n"
-    ));
+    out.push_str(&format!("export interface {pascal}ResponseResult {{\n"));
     for f in &non_union_fields {
         out.push_str(&format!(
             "  {}: {};\n",
@@ -165,7 +165,15 @@ pub fn generate_parsers(out: &mut String, service_name: &str, schema: &ParsedSch
             if let Some(vf) = variant_field {
                 let struct_def = schema.structs.iter().find(|s| s.name == variant.type_name);
                 if let Some(sd) = struct_def {
-                    emit_struct_read(out, "reader", vf, sd, &non_union_fields, &variant.name, schema);
+                    emit_struct_read(
+                        out,
+                        "reader",
+                        vf,
+                        sd,
+                        &non_union_fields,
+                        &variant.name,
+                        schema,
+                    );
                 } else {
                     emit_return(out, &non_union_fields, &variant.name, "null");
                 }
@@ -244,11 +252,7 @@ pub fn generate_struct_parsers(out: &mut String, schema: &ParsedSchema) {
             } else {
                 ts_type
             };
-            out.push_str(&format!(
-                "  {}: {};\n",
-                to_camel_case(&f.name),
-                ts_type
-            ));
+            out.push_str(&format!("  {}: {};\n", to_camel_case(&f.name), ts_type));
         }
         out.push_str("  variant: string;\n");
         out.push_str("  data: unknown;\n");
@@ -338,7 +342,8 @@ pub fn generate_struct_parsers(out: &mut String, schema: &ParsedSchema) {
                 }
             } else {
                 // Struct type
-                if let Some(struct_def) = schema.structs.iter().find(|s| s.name == variant.type_name)
+                if let Some(struct_def) =
+                    schema.structs.iter().find(|s| s.name == variant.type_name)
                 {
                     emit_struct_read(
                         out,
@@ -478,33 +483,149 @@ fn emit_scoped_response_parse(
         ));
     }
 
-    // Also handle nested scoped response variants
+    // Handle nested scoped response variants by recursively parsing
     for nc in &sc.nested_clients {
         let nested_resp_name = format!("{}Result", nc.factory_name);
-        let nested_resp = sc
+
+        // Skip if already handled in inner_response_variants loop
+        if sc
             .inner_response_variants
             .iter()
-            .find(|v| v.name == nested_resp_name);
-
-        // If this was already handled above, skip
-        // (nested client variants are filtered from inner_response_variants in CGR reader)
-        // They won't appear in the loop above, so we handle them here.
-        if nested_resp.is_some() {
-            // Already emitted in the inner_response_variants loop
+            .any(|v| v.name == nested_resp_name)
+        {
             continue;
         }
 
-        // Check if there's a matching field in the inner response struct
+        // Find the matching discriminant field
         let nested_field = irs
             .fields
             .iter()
             .find(|f| f.name == nested_resp_name && f.discriminant_value != 0xFFFF);
 
-        if let Some(nf) = nested_field {
+        let Some(nf) = nested_field else { continue };
+
+        // Find the nested response struct to know its layout
+        let nested_resp_struct = schema.structs.iter().find(|s| s.name == nf.type_name);
+
+        out.push_str(&format!(
+            "        case {}: // {} (nested scope)\n",
+            nf.discriminant_value, nested_resp_name
+        ));
+
+        if let Some(nrs) = nested_resp_struct {
+            // Read the nested struct and recursively parse its union
             out.push_str(&format!(
-                "        case {}: // {} (nested scope)\n",
-                nf.discriminant_value, nested_resp_name
+                "        {{\n          const _nested = _inner.getStruct({}, {}, {});\n",
+                nf.slot_offset, nrs.data_words, nrs.pointer_words
             ));
+            out.push_str(&format!(
+                "          if (!_nested) return {{ {fields_str}{comma}variant: '{variant_name}', data: {{ variant: '{}', data: null }} }};\n",
+                nested_resp_name
+            ));
+
+            // Read nested discriminant and switch
+            let nested_disc_byte_off = nrs.discriminant_offset * 2;
+            out.push_str(&format!(
+                "          const _nestedDisc = _nested.getUint16({nested_disc_byte_off});\n"
+            ));
+            out.push_str("          switch (_nestedDisc) {\n");
+
+            // Emit each variant of the nested response
+            for nv in &nc.inner_response_variants {
+                let nv_field = nrs
+                    .fields
+                    .iter()
+                    .find(|f| f.name == nv.name && f.discriminant_value != 0xFFFF);
+                let nv_disc = nv_field.map(|f| f.discriminant_value).unwrap_or(0);
+                let nv_data =
+                    emit_inner_variant_read_from("_nested", nv_field, &nv.type_name, schema, 0);
+                out.push_str(&format!("            case {nv_disc}: // {}\n", nv.name));
+                out.push_str(&format!(
+                    "              return {{ {fields_str}{comma}variant: '{variant_name}', data: {{ variant: '{}', data: {{ variant: '{}', data: {nv_data} }} }} }};\n",
+                    nested_resp_name, nv.name
+                ));
+            }
+
+            // Handle nested-nested clients (e.g., worktree → ctl)
+            for nnc in &nc.nested_clients {
+                let nn_resp_name = format!("{}Result", nnc.factory_name);
+                if nc
+                    .inner_response_variants
+                    .iter()
+                    .any(|v| v.name == nn_resp_name)
+                {
+                    continue;
+                }
+                let nn_field = nrs
+                    .fields
+                    .iter()
+                    .find(|f| f.name == nn_resp_name && f.discriminant_value != 0xFFFF);
+                let Some(nnf) = nn_field else { continue };
+                let nn_struct = schema.structs.iter().find(|s| s.name == nnf.type_name);
+
+                out.push_str(&format!(
+                    "            case {}: // {} (nested scope)\n",
+                    nnf.discriminant_value, nn_resp_name
+                ));
+
+                if let Some(nns) = nn_struct {
+                    out.push_str(&format!(
+                        "            {{\n              const _deep = _nested.getStruct({}, {}, {});\n",
+                        nnf.slot_offset, nns.data_words, nns.pointer_words
+                    ));
+                    out.push_str(&format!(
+                        "              if (!_deep) return {{ {fields_str}{comma}variant: '{variant_name}', data: {{ variant: '{}', data: {{ variant: '{}', data: null }} }} }};\n",
+                        nested_resp_name, nn_resp_name
+                    ));
+                    let nn_disc_off = nns.discriminant_offset * 2;
+                    out.push_str(&format!(
+                        "              const _deepDisc = _deep.getUint16({nn_disc_off});\n"
+                    ));
+                    out.push_str("              switch (_deepDisc) {\n");
+                    for nnv in &nnc.inner_response_variants {
+                        let nnv_field = nns
+                            .fields
+                            .iter()
+                            .find(|f| f.name == nnv.name && f.discriminant_value != 0xFFFF);
+                        let nnv_disc = nnv_field.map(|f| f.discriminant_value).unwrap_or(0);
+                        let nnv_data = emit_inner_variant_read_from(
+                            "_deep",
+                            nnv_field,
+                            &nnv.type_name,
+                            schema,
+                            0,
+                        );
+                        out.push_str(&format!(
+                            "                case {nnv_disc}: // {}\n",
+                            nnv.name
+                        ));
+                        out.push_str(&format!(
+                            "                  return {{ {fields_str}{comma}variant: '{variant_name}', data: {{ variant: '{}', data: {{ variant: '{}', data: {{ variant: '{}', data: {nnv_data} }} }} }} }};\n",
+                            nested_resp_name, nn_resp_name, nnv.name
+                        ));
+                    }
+                    out.push_str(&format!(
+                        "                default:\n                  return {{ {fields_str}{comma}variant: '{variant_name}', data: {{ variant: '{}', data: {{ variant: '{}', data: {{ variant: 'unknown', data: null }} }} }} }};\n",
+                        nested_resp_name, nn_resp_name
+                    ));
+                    out.push_str("              }\n");
+                    out.push_str("            }\n");
+                } else {
+                    out.push_str(&format!(
+                        "              return {{ {fields_str}{comma}variant: '{variant_name}', data: {{ variant: '{}', data: {{ variant: '{}', data: null }} }} }};\n",
+                        nested_resp_name, nn_resp_name
+                    ));
+                }
+            }
+
+            out.push_str(&format!(
+                "            default:\n              return {{ {fields_str}{comma}variant: '{variant_name}', data: {{ variant: '{}', data: {{ variant: 'unknown', data: null }} }} }};\n",
+                nested_resp_name
+            ));
+            out.push_str("          }\n");
+            out.push_str("        }\n");
+        } else {
+            // Can't find nested struct — fall back to null
             out.push_str(&format!(
                 "          return {{ {fields_str}{comma}variant: '{variant_name}', data: {{ variant: '{}', data: null }} }};\n",
                 nested_resp_name
@@ -624,12 +745,15 @@ fn emit_struct_pointer_expr(
         let nuf_str = nuf_names.join(", ");
         let nuf_comma = if nuf_str.is_empty() { "" } else { ", " };
 
-        s.push_str(&format!("  const _disc = {var_name}.getUint16({disc_byte_off});\n"));
+        s.push_str(&format!(
+            "  const _disc = {var_name}.getUint16({disc_byte_off});\n"
+        ));
         s.push_str("  switch (_disc) {\n");
 
         for uf in &union_fields {
             s.push_str(&format!("    case {}: {{\n", uf.discriminant_value));
-            let data_expr = emit_inner_variant_read_from(&var_name, Some(uf), &uf.type_name, schema, depth + 1);
+            let data_expr =
+                emit_inner_variant_read_from(&var_name, Some(uf), &uf.type_name, schema, depth + 1);
             s.push_str(&format!(
                 "      return {{ {nuf_str}{nuf_comma}variant: '{}' as const, data: {data_expr} }};\n",
                 uf.name
@@ -772,7 +896,10 @@ fn emit_struct_list_field_expr(
         .collect();
     format!(
         "{reader_var}.getStructList({}, {}, {}).map(_el => ({{ {} }}))",
-        slot, sd.data_words, sd.pointer_words, fields.join(", ")
+        slot,
+        sd.data_words,
+        sd.pointer_words,
+        fields.join(", ")
     )
 }
 
@@ -808,7 +935,9 @@ fn emit_union_struct_list_field_expr(
     let nuf_str = nuf_names.join(", ");
     let nuf_comma = if nuf_str.is_empty() { "" } else { ", " };
 
-    s.push_str(&format!("    const _disc = _el.getUint16({disc_byte_off});\n"));
+    s.push_str(&format!(
+        "    const _disc = _el.getUint16({disc_byte_off});\n"
+    ));
     s.push_str("    switch (_disc) {\n");
 
     for uf in &union_fields {
@@ -862,9 +991,7 @@ fn emit_reader_field(
     match field.section {
         FieldSection::Data => {
             if field.type_name == "Void" {
-                out.push_str(&format!(
-                    "{indent}const {local_name} = undefined;\n"
-                ));
+                out.push_str(&format!("{indent}const {local_name} = undefined;\n"));
                 return;
             }
             let byte_off = data_byte_offset(field);
@@ -876,7 +1003,8 @@ fn emit_reader_field(
             } else if !super::is_data_scalar(&field.type_name) {
                 // Enum type — stored as UInt16 in data section
                 if let Some(ed) = schema.enums.iter().find(|e| e.name == field.type_name) {
-                    let expr = super::emit_enum_getter_expr(reader_var, byte_off, &field.type_name, ed);
+                    let expr =
+                        super::emit_enum_getter_expr(reader_var, byte_off, &field.type_name, ed);
                     out.push_str(&format!("{indent}const {local_name} = {expr};\n"));
                 } else {
                     out.push_str(&format!(
@@ -892,9 +1020,7 @@ fn emit_reader_field(
         }
         FieldSection::Pointer => {
             let read_expr = emit_pointer_read_expr(reader_var, field, schema, 0);
-            out.push_str(&format!(
-                "{indent}const {local_name} = {read_expr};\n"
-            ));
+            out.push_str(&format!("{indent}const {local_name} = {read_expr};\n"));
         }
         FieldSection::Group => {
             out.push_str(&format!(
@@ -982,6 +1108,9 @@ fn emit_option_read_expr(
             // Enum types are stored as UInt16 — generate array lookup + cast
             if let Some(ed) = schema.enums.iter().find(|e| e.name == inner_type_name) {
                 super::emit_enum_getter_expr("_optR", some_byte_off, inner_type_name, ed)
+            } else if inner_type_name == "Bool" {
+                let bit = super::bool_bit_index(sf);
+                format!("_optR.getBool({some_byte_off}, {bit})")
             } else {
                 let getter = super::getter_method(inner_type_name);
                 format!("_optR.{getter}({some_byte_off})")

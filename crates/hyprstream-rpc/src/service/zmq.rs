@@ -15,13 +15,12 @@ use crate::transport::TransportConfig;
 use anyhow::{anyhow, Result};
 use zeroize::Zeroizing;
 use async_trait::async_trait;
-use chrono::Utc;
-use std::sync::atomic::{AtomicU64, Ordering};
+// AtomicU64 and Ordering removed — were unused
 use std::rc::Rc;
 use std::sync::Arc;
-use tmq::{FromZmqSocket, Multipart, RequestSender};
+use tmq::{FromZmqSocket, Multipart};
 use tokio::sync::Notify;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 
 /// Authorization callback for policy checks.
 ///
@@ -31,6 +30,24 @@ use tracing::{debug, error, info, trace, warn};
 ///
 /// Returns a boxed future to support async policy checks on single-threaded runtimes.
 pub type AuthorizeFn = Arc<dyn Fn(String, String, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send>> + Send + Sync>;
+
+/// Decompose a composite JWT alg into its underlying component algs.
+///
+/// Used by the stripping defense in `verify_claims`: when a JWKS lists
+/// multiple algs under one kid, the verifier needs to know that an
+/// incoming alg like `ML-DSA-65-Ed25519` covers both `ML-DSA-65` and
+/// `EdDSA`, so a composite-signed JWT is sufficient. Single algs return
+/// just themselves.
+fn composite_alg_components(alg: &str) -> Vec<&'static str> {
+    match alg {
+        "ML-DSA-65-Ed25519" => vec!["ML-DSA-65", "EdDSA", "ML-DSA-65-Ed25519"],
+        "ML-DSA-65" => vec!["ML-DSA-65"],
+        "EdDSA" => vec!["EdDSA"],
+        "ES256" => vec!["ES256"],
+        "RS256" => vec!["RS256"],
+        _ => Vec::new(),
+    }
+}
 
 /// Work to execute after the REP response is sent (e.g., stream publishing).
 ///
@@ -45,7 +62,6 @@ pub type Continuation = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>
 /// has verified the envelope signature. Handlers use this for:
 /// - Authorization checks via `subject()`
 /// - Correlation via `request_id`
-/// - Stream HMAC key derivation via `ephemeral_pubkey`
 ///
 /// # Example
 ///
@@ -64,25 +80,18 @@ pub struct EnvelopeContext {
     /// Unique request ID for correlation and logging
     pub request_id: u64,
 
-    /// Claimed identity from the envelope (caller-asserted, NOT authoritative).
-    ///
-    /// This field is preserved for logging and legacy compatibility only.
-    /// Authorization decisions MUST use `subject()`, which is derived from
-    /// the verified Ed25519 signer key via `KeyRegistry`.
-    pub identity: RequestIdentity,
-
-    /// Ephemeral public key for stream HMAC derivation (if streaming)
-    pub ephemeral_pubkey: Option<[u8; 32]>,
-
-    /// User claims from envelope (protected by envelope signature)
-    /// Already verified by envelope signature verification
+    /// User claims decoded from jwt_token (or legacy claims field).
+    /// Populated by `verify_claims()` after JWT signature verification.
     claims: Option<crate::auth::Claims>,
+
+    /// Raw JWT token from the envelope. Server decodes and verifies this.
+    /// Preferred over the legacy `claims` field when present.
+    jwt_token: Option<String>,
 
     /// Authorization subject derived from the verified Ed25519 signer key.
     ///
-    /// Set by `from_verified_as_system()` (FixedSigner path) or
-    /// `from_verified_with_registry()` (custom registry). `Anonymous` when
-    /// neither has been applied (e.g., AnySigner/WebTransport callers).
+    /// Set by `from_verified_as_system()` (FixedSigner path).
+    /// `Anonymous` when AnySigner/WebTransport callers (identity from JWT/trust store).
     key_derived_subject: Subject,
 
     /// Authorization subject resolved from a verified JWT token.
@@ -92,29 +101,37 @@ pub struct EnvelopeContext {
     /// `None` until `verify_claims()` runs, or when no JWT is present.
     pub(crate) jwt_subject: Option<Subject>,
 
-    /// Raw signer pubkey bytes from the verified `SignedEnvelope`.
+    /// Ed25519 public key of the envelope signer (RFC 7800 confirmation key).
     /// Cryptographically verified by Ed25519 signature check.
-    pub signer_pubkey: [u8; 32],
+    pub cnf: [u8; 32],
+
+    /// WIMSE wth binding: SHA-256 of the WIT JWT from the envelope (if present).
+    /// Populated from `RequestEnvelope.wit_hash` during context construction.
+    pub(crate) envelope_wit_hash: Option<[u8; 32]>,
+
+    /// Client's ephemeral DH public key for stream key derivation.
+    /// Present on streaming requests; extracted from `RequestEnvelope.client_dh_public`.
+    client_dh_public: Option<[u8; 32]>,
 }
 
 impl EnvelopeContext {
     /// Create context from a verified SignedEnvelope (AnySigner path).
     ///
     /// `key_derived_subject` is `Anonymous`. Use `from_verified_as_system()` for
-    /// FixedSigner/inproc callers or `from_verified_with_registry()` for custom
-    /// key mappings.
+    /// FixedSigner/inproc callers.
     ///
     /// `pub(crate)` — external callers should use the named constructors above
     /// to make the trust level explicit.
     pub(crate) fn from_verified(envelope: &SignedEnvelope) -> Self {
         Self {
             request_id: envelope.request_id(),
-            identity: envelope.identity().clone(),
-            ephemeral_pubkey: envelope.ephemeral_pubkey().copied(),
-            claims: envelope.envelope.claims.clone(),
+            claims: None,
+            jwt_token: envelope.envelope.jwt_token().map(ToOwned::to_owned),
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
-            signer_pubkey: envelope.signer_pubkey,
+            cnf: envelope.cnf,
+            envelope_wit_hash: envelope.envelope.wth,
+            client_dh_public: envelope.envelope.client_dh_public,
         }
     }
 
@@ -122,58 +139,39 @@ impl EnvelopeContext {
     ///
     /// Sets `key_derived_subject = Subject::new("system")`, so `subject()` always
     /// returns `"system"` for this context regardless of any caller-asserted
-    /// `RequestIdentity` field. Used in `process_request` for the ZMQ path.
+    /// authorization field. Used in `process_request` for the ZMQ path.
     pub fn from_verified_as_system(envelope: &SignedEnvelope) -> Self {
         Self {
             request_id: envelope.request_id(),
-            identity: envelope.identity().clone(),
-            ephemeral_pubkey: envelope.ephemeral_pubkey().copied(),
-            claims: envelope.envelope.claims.clone(),
+            claims: None,
+            jwt_token: envelope.envelope.jwt_token().map(ToOwned::to_owned),
             key_derived_subject: Subject::new("system"),
             jwt_subject: None,
-            signer_pubkey: envelope.signer_pubkey,
+            cnf: envelope.cnf,
+            envelope_wit_hash: envelope.envelope.wth,
+            client_dh_public: envelope.envelope.client_dh_public,
         }
     }
 
-    /// Create context using a `KeyRegistry` to resolve the signer's subject.
-    ///
-    /// The registry maps the verified `signer_pubkey` to an authorization subject.
-    /// This is the general form; `from_verified_as_system` is a convenience wrapper
-    /// that uses `NodeKeyRegistry`.
-    pub fn from_verified_with_registry(
-        envelope: &SignedEnvelope,
-        registry: &dyn crate::envelope::KeyRegistry,
-    ) -> Self {
-        let key_derived_subject = registry.resolve(&envelope.signer_pubkey);
-        Self {
-            request_id: envelope.request_id(),
-            identity: envelope.identity().clone(),
-            ephemeral_pubkey: envelope.ephemeral_pubkey().copied(),
-            claims: envelope.envelope.claims.clone(),
-            key_derived_subject,
-            jwt_subject: None,
-            signer_pubkey: envelope.signer_pubkey,
-        }
-    }
-
-    /// Create a system-identity context for internal callbacks that bypass the ZMQ envelope pipeline.
+    /// Create a service-identity context for internal callbacks that bypass the ZMQ envelope pipeline.
     ///
     /// Used by services that make inproc self-calls without a real `SignedEnvelope`
-    /// (e.g., `InferenceService` callback mode). Sets `key_derived_subject = "system"`
-    /// so that `subject()` correctly returns the system subject for authorization.
+    /// (e.g., `InferenceService` callback mode). Sets `key_derived_subject = "service:{name}"`
+    /// so that `subject()` returns a proper service identity for authorization.
     ///
-    /// `signer_pubkey` is zeroed because there is no real envelope; the system subject
+    /// `cnf` is zeroed because there is no real envelope; the service subject
     /// is asserted directly and is trusted because this constructor is only reachable
     /// from internal code paths that never cross a network boundary.
-    pub fn from_callback_system(request_id: u64) -> Self {
+    pub fn from_callback_service(request_id: u64, service_name: &str) -> Self {
         Self {
             request_id,
-            identity: RequestIdentity::Anonymous,
-            ephemeral_pubkey: None,
             claims: None,
-            key_derived_subject: Subject::new("system"),
+            jwt_token: None,
+            key_derived_subject: Subject::new(format!("service:{service_name}")),
             jwt_subject: None,
-            signer_pubkey: [0u8; 32],
+            cnf: [0u8; 32],
+            envelope_wit_hash: None,
+            client_dh_public: None,
         }
     }
 
@@ -186,8 +184,8 @@ impl EnvelopeContext {
     ///    Federated JWTs (`iss` non-empty) produce `Subject::federated(iss, sub)`.
     /// 3. `Subject::anonymous()` — no verified identity.
     ///
-    /// The caller-asserted `RequestIdentity` field is never consulted for
-    /// authorization. It is preserved only for logging.
+    /// The caller-asserted envelope authorization is not preserved in the
+    /// context — only verified state is available to handlers.
     pub fn subject(&self) -> Subject {
         // Prefer key-derived subject (cryptographically proven via signer key)
         if !self.key_derived_subject.is_anonymous() {
@@ -204,19 +202,29 @@ impl EnvelopeContext {
 
     /// Get the bare username string.
     pub fn user(&self) -> &str {
-        self.identity.user()
+        // Resolution order mirrors subject(): prefer key-derived, then JWT, then anonymous.
+        if !self.key_derived_subject.is_anonymous() {
+            return self.key_derived_subject.name().unwrap_or("anonymous");
+        }
+        if let Some(ref s) = self.jwt_subject {
+            return s.name().unwrap_or("anonymous");
+        }
+        "anonymous"
     }
 
     /// Check if the identity is authenticated (not anonymous).
     pub fn is_authenticated(&self) -> bool {
-        self.identity.is_authenticated()
+        !self.subject().is_anonymous()
     }
 
-    /// Get user claims (if present in envelope)
-    ///
-    /// Claims are already verified by the envelope signature.
+    /// Get user claims (if present, after verify_claims has run).
     pub fn claims(&self) -> Option<&crate::auth::Claims> {
         self.claims.as_ref()
+    }
+
+    /// Get the raw JWT token from the envelope (if present).
+    pub fn jwt_token(&self) -> Option<&str> {
+        self.jwt_token.as_deref()
     }
 
     /// Check if request has user context
@@ -224,13 +232,12 @@ impl EnvelopeContext {
         self.claims.is_some()
     }
 
-    /// Get the client's ephemeral public key for DH key exchange (if provided).
-    ///
-    /// This is used for deriving stream keys in E2E authenticated streaming.
-    /// Returns None if the client didn't include an ephemeral pubkey.
-    pub fn ephemeral_pubkey(&self) -> Option<&[u8]> {
-        self.ephemeral_pubkey.as_ref().map(<[u8; 32]>::as_slice)
+    /// Get the client's ephemeral DH public key (if present).
+    /// Used by streaming handlers to derive shared secrets for HMAC chain keys.
+    pub fn ephemeral_pubkey(&self) -> Option<[u8; 32]> {
+        self.client_dh_public
     }
+
 }
 
 /// Trait for ZMQ-based REQ/REP services.
@@ -309,6 +316,19 @@ pub trait ZmqService: 'static {
         self.signing_key().verifying_key()
     }
 
+    /// JWT key source for token verification.
+    ///
+    /// Returns the key source used to verify JWT signatures. Services must
+    /// provide this to enable JWT verification. Returns `None` by default,
+    /// which means JWT verification is skipped (anonymous access only).
+    ///
+    /// Most services should return a `ClusterKeySource` that trusts the
+    /// cluster's CA key. PolicyService may return a `FederatedKeySource`
+    /// for cross-cluster token exchange.
+    fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn crate::auth::JwtKeySource>> {
+        None
+    }
+
     /// Expected audience (resource URL) for JWT validation.
     ///
     /// When `Some`, `verify_claims()` rejects tokens whose `aud` claim doesn't match.
@@ -317,147 +337,295 @@ pub trait ZmqService: 'static {
         None
     }
 
-    /// Local OAuth issuer URL used to distinguish locally-issued JWTs from
-    /// federated ones. Return `None` to treat all tokens as local.
+    /// Whether to reject JWTs that lack a `cnf` key binding (jwk or jkt).
     ///
-    /// When `Some(url)`, a JWT whose `iss` matches `url` (or is empty) is
-    /// verified with `self.verifying_key()`. Any other non-empty `iss` falls
-    /// through to `federation_key_source()`.
-    fn local_issuer_url(&self) -> Option<&str> {
+    /// When `true`, `verify_claims()` will reject any JWT that does not carry
+    /// a `cnf` confirmation key, ensuring every authenticated request is
+    /// cryptographically bound to its envelope signer.
+    ///
+    /// Default is `true` — override to `false` only for services that
+    /// intentionally accept unbound JWTs (e.g., legacy compatibility).
+    fn require_cnf_binding(&self) -> bool {
+        true
+    }
+
+    /// JWT ID blocklist for access token revocation.
+    ///
+    /// When `Some`, `verify_claims()` rejects tokens whose `jti` appears
+    /// in the blocklist. Override to provide a shared blocklist instance.
+    fn jti_blocklist(&self) -> Option<&dyn crate::auth::JtiBlocklist> {
         None
     }
 
-    /// Federation key resolver for multi-issuer JWT verification on the ZMQ path.
+    /// Resolve a signer key to an authorization subject via the trust store.
     ///
-    /// Return `None` (default) to disable federated JWT acceptance. Services that
-    /// accept external / network traffic should return `Some(Arc<dyn FederationKeySource>)`.
-    /// Internal-only services (workers, workflows) keep the default.
-    fn federation_key_source(
+    /// Returns `Some(subject)` if the key is cached and not expired.
+    /// Default implementation returns `None` (no trust store available).
+    fn resolve_key_subject(&self, _signer_pubkey: &[u8; 32]) -> Option<crate::envelope::Subject> {
+        None
+    }
+
+    /// Cache a verified key→subject binding in the trust store.
+    ///
+    /// Called after successful JWT verification when the JWT's `pub_key` matches
+    /// the envelope signer. Default implementation is a no-op.
+    fn cache_key_binding(
         &self,
-    ) -> Option<std::sync::Arc<dyn crate::auth::FederationKeySource>> {
-        None
+        _verifying_key: ed25519_dalek::VerifyingKey,
+        _subject: &str,
+        _jwt: &str,
+        _expires_at: i64,
+    ) {
     }
 
-    /// Key registry for resolving verified signer public keys to subjects.
-    ///
-    /// Return `None` (default) to use the automatic `FixedSigner → system`
-    /// resolution in `process_request`. Override to provide custom key→subject
-    /// mappings (e.g., for multi-key or peer-trust scenarios).
-    fn key_registry(&self) -> Option<std::sync::Arc<dyn crate::envelope::KeyRegistry>> {
-        None
-    }
-
-    /// E2E JWT verification with federation and downgrade attack protection.
+    /// E2E JWT verification with unified key source.
     ///
     /// Called by `process_request` after envelope signature verification.
     /// Takes `&mut EnvelopeContext` to store the resolved `jwt_subject` directly,
     /// which correctly distinguishes local tokens (bare `sub`) from federated
-    /// ones (`iss:sub` format) using this service's `local_issuer_url()`.
+    /// ones (`iss:sub` format) using the key source's `local_issuers()`.
     /// Async because federated key resolution may require an HTTP JWKS fetch.
+    ///
+    /// Prefers `jwt_token` (opaque token string) over legacy `claims` field.
+    /// When `jwt_token` is present, the server decodes and verifies it directly.
+    /// The legacy `claims` path is kept for backwards compat with older clients.
     async fn verify_claims(&self, ctx: &mut EnvelopeContext) -> anyhow::Result<()> {
-        if let Some(claims) = ctx.claims() {
-            let local_url = self.local_issuer_url();
-            let local_issuers: &[&str] = match local_url {
-                Some(ref u) => std::slice::from_ref(u),
-                None => &[],
-            };
+        // Prefer jwt_token (new path) over legacy claims
+        let token = ctx.jwt_token.clone()
+            .or_else(|| ctx.claims().and_then(|c| c.token.clone()));
 
-            if claims.is_local_to(local_issuers) {
-                // --- Local token path ---
-                match claims.verify_token(&self.verifying_key(), self.expected_audience()) {
-                    Ok(Some(verified)) => {
-                        if verified.sub != claims.sub {
-                            tracing::warn!(
-                                "Claims sub mismatch: envelope={} jwt={}",
-                                claims.sub,
-                                verified.sub
-                            );
-                            anyhow::bail!("Claims subject mismatch");
-                        }
-                        if verified.iss != claims.iss {
-                            tracing::warn!(
-                                "Claims iss mismatch: envelope={} jwt={}",
-                                claims.iss,
-                                verified.iss
-                            );
-                            anyhow::bail!("Claims issuer mismatch");
-                        }
+        let Some(token) = token else {
+            // No JWT — try trust store lookup for cached key bindings
+            if let Some(subject) = self.resolve_key_subject(&ctx.cnf) {
+                ctx.key_derived_subject = subject;
+                return Ok(());
+            }
+            // No JWT and no trust store entry — subject stays anonymous
+            return Ok(());
+        };
+
+        // Get key source — if not configured, JWT verification is disabled
+        let key_source = match self.jwt_key_source() {
+            Some(ks) => ks,
+            None => {
+                tracing::warn!(
+                    service = self.name(),
+                    "JWT present but jwt_key_source() not configured — rejecting"
+                );
+                anyhow::bail!("JWT verification not configured for this service");
+            }
+        };
+
+        // Decode the JWT to get claims for issuer routing
+        let unverified = crate::auth::decode_unverified(&token)
+            .map_err(|e| anyhow::anyhow!("JWT decode failed: {}", e))?;
+
+        // Extract kid from JOSE header for key selection
+        let kid = crate::auth::header_kid(&token)
+            .map_err(|e| anyhow::anyhow!("JWT header parse failed: {}", e))?;
+
+        // Check if issuer is trusted
+        if !key_source.is_trusted(&unverified.iss) {
+            tracing::warn!(
+                "JWT from untrusted issuer rejected (iss={})",
+                unverified.iss
+            );
+            anyhow::bail!("JWT issuer not trusted: {}", unverified.iss);
+        }
+
+        // Extract algorithm for routing
+        let alg = crate::auth::header_alg(&token)
+            .map_err(|e| anyhow::anyhow!("JWT header parse failed: {}", e))?
+            .unwrap_or_default();
+
+        // ── Stripping defense (composite signature hardening) ───────────────
+        //
+        // If the JWKS lists this kid with one or more `alg` values, the JWT's
+        // header alg MUST exactly match a JWKS alg, AND when the JWKS lists
+        // multiple algs for this kid, the JWT MUST use a composite alg that
+        // covers all of them. This prevents an attacker from stripping the
+        // post-quantum half of a composite signature and presenting only the
+        // classical EdDSA half under the composite kid.
+        if let Some(ref kid_str) = kid {
+            let listed_algs = key_source.kid_algs(kid_str);
+            if !listed_algs.is_empty() {
+                if !listed_algs.iter().any(|a| a == &alg) {
+                    tracing::warn!(
+                        "JWT alg={} not listed in JWKS for kid={} (listed: {:?}) — possible stripping attack",
+                        alg, kid_str, listed_algs
+                    );
+                    anyhow::bail!("JWT alg does not match JWKS for kid (stripping defense)");
+                }
+                // When the JWKS lists multiple algs for the kid (e.g. a
+                // composite-signature publication that names both halves),
+                // require ALL of them — i.e. require a composite alg whose
+                // covered components include every listed alg.
+                if listed_algs.len() > 1 {
+                    let covered = composite_alg_components(&alg);
+                    let all_covered = listed_algs.iter().all(|need| covered.iter().any(|c| c == need) || need == &alg);
+                    if !all_covered {
+                        tracing::warn!(
+                            "JWT alg={} does not cover all JWKS-listed algs {:?} for kid={} — stripping rejected",
+                            alg, listed_algs, kid_str
+                        );
+                        anyhow::bail!("JWT alg does not cover all JWKS-listed algs (stripping defense)");
                     }
-                    Ok(None) => {
-                        // No JWT token — subject is derived from the signer key via
-                        // KeyRegistry (FixedSigner callers → "system"). No bypass needed.
+                }
+            }
+        }
+
+        // Route verification by algorithm
+        let verified = match alg.as_str() {
+            #[cfg(feature = "pq-hybrid")]
+            "ML-DSA-65" => {
+                let vks = key_source.ml_dsa_verifying_keys();
+                if vks.is_empty() {
+                    anyhow::bail!("ML-DSA-65 JWT received but no PQ verifying keys available");
+                }
+                let aud = self.expected_audience();
+                let mut last_err = None;
+                let mut result = None;
+                for vk in &vks {
+                    match crate::auth::jwt::decode_ml_dsa_65(&token, vk, aud) {
+                        Ok(claims) => { result = Some(claims); break; }
+                        Err(e) => { last_err = Some(e); }
                     }
-                    Err(e) => {
-                        tracing::warn!("E2E JWT verification failed: {}", e);
+                }
+                match result {
+                    Some(claims) => claims,
+                    None => {
+                        tracing::warn!("ML-DSA-65 JWT verification failed (tried {} keys): {:?}", vks.len(), last_err);
                         anyhow::bail!("JWT verification failed");
                     }
                 }
-            } else {
-                // --- Federated token path ---
-                let resolver = self.federation_key_source().ok_or_else(|| {
-                    tracing::warn!(
-                        "Federated JWT rejected: no FederationKeySource configured \
-                         (iss={})",
-                        claims.iss
-                    );
-                    anyhow::anyhow!("Federated JWT rejected: federation not configured")
-                })?;
-
-                if !resolver.is_trusted(&claims.iss) {
-                    tracing::warn!(
-                        "Federated JWT from untrusted issuer rejected (iss={})",
-                        claims.iss
-                    );
-                    anyhow::bail!("Federated JWT issuer not trusted");
+            }
+            #[cfg(feature = "pq-hybrid")]
+            "ML-DSA-65-Ed25519" => {
+                let vks = key_source.ml_dsa_verifying_keys();
+                if vks.is_empty() {
+                    anyhow::bail!("Composite JWT received but no PQ verifying keys available");
                 }
-
-                let fed_key = resolver.get_key(&claims.iss).await.map_err(|e| {
-                    tracing::warn!(
-                        "Federation key resolution failed for iss={}: {}",
-                        claims.iss,
-                        e
-                    );
-                    anyhow::anyhow!("Federation key resolution failed")
+                let verifying_key = key_source.get_key(&unverified.iss, kid.as_deref()).await.map_err(|e| {
+                    tracing::warn!("JWT key resolution failed for iss={}: {}", unverified.iss, e);
+                    anyhow::anyhow!("JWT key resolution failed")
                 })?;
-
-                let token = claims.token.as_deref().ok_or_else(|| {
-                    tracing::warn!(
-                        "Federated JWT (iss={}) missing raw token field",
-                        claims.iss
-                    );
-                    anyhow::anyhow!("Federated JWT missing token")
-                })?;
-
-                let verified = crate::auth::decode_with_key(token, &fed_key, self.expected_audience())
-                    .map_err(|e| {
-                        anyhow::anyhow!("Federated JWT signature invalid: {}", e)
-                    })?;
-
-                if verified.sub != claims.sub {
-                    tracing::warn!(
-                        "Federated claims sub mismatch: envelope={} jwt={}",
-                        claims.sub,
-                        verified.sub
-                    );
-                    anyhow::bail!("Federated claims subject mismatch");
+                let aud = self.expected_audience();
+                let mut last_err = None;
+                let mut result = None;
+                for vk in &vks {
+                    match crate::auth::jwt::decode_composite(&token, vk, &verifying_key, aud) {
+                        Ok(claims) => { result = Some(claims); break; }
+                        Err(e) => { last_err = Some(e); }
+                    }
                 }
-                if verified.iss != claims.iss {
-                    tracing::warn!(
-                        "Federated claims iss mismatch: envelope={} jwt={}",
-                        claims.iss,
-                        verified.iss
-                    );
-                    anyhow::bail!("Federated claims issuer mismatch");
+                match result {
+                    Some(claims) => claims,
+                    None => {
+                        tracing::warn!("Composite ML-DSA-65-Ed25519 JWT verification failed (tried {} keys): {:?}", vks.len(), last_err);
+                        anyhow::bail!("JWT verification failed");
+                    }
                 }
             }
+            _ => {
+                // EdDSA (default path)
+                let verifying_key = key_source.get_key(&unverified.iss, kid.as_deref()).await.map_err(|e| {
+                    tracing::warn!("JWT key resolution failed for iss={}: {}", unverified.iss, e);
+                    anyhow::anyhow!("JWT key resolution failed")
+                })?;
+                crate::auth::decode_with_key(&token, &verifying_key, self.expected_audience())
+                    .map_err(|e| {
+                        tracing::warn!("JWT verification failed: {}", e);
+                        anyhow::anyhow!("JWT verification failed")
+                    })?
+            }
+        };
 
-            // Derive the authorization subject via Claims::subject(), which
-            // produces bare "sub" for local tokens and "iss:sub" for federated ones.
-            let s = claims.subject(local_issuers);
-            if !s.is_anonymous() {
-                ctx.jwt_subject = Some(s);
+        // Check jti against blocklist (revoked access tokens)
+        if let Some(ref jti) = verified.jti {
+            if let Some(blocklist) = self.jti_blocklist() {
+                if blocklist.is_revoked(jti) {
+                    tracing::warn!(jti = %jti, sub = %verified.sub, "Revoked JWT rejected");
+                    anyhow::bail!("JWT has been revoked");
+                }
             }
         }
+
+        // Store verified claims on context for downstream use
+        let local_issuers = key_source.local_issuers();
+        let local_issuers_refs: Vec<&str> = local_issuers.iter().map(String::as_str).collect();
+        let s = verified.subject(&local_issuers_refs);
+        if !s.is_anonymous() {
+            ctx.jwt_subject = Some(s);
+        }
+        ctx.claims = Some(verified.clone());
+
+        // R2: Bind JWT cnf.jwk claim to envelope signer (WIMSE WIT key binding).
+        // When a JWT carries a cnf.jwk (Ed25519 pubkey), the envelope signer must
+        // match. Prevents a valid JWT holder from signing envelopes with a different
+        // key and being attributed the JWT's subject identity.
+        if let Some(ref claims) = ctx.claims {
+            if let Some(expected) = claims.cnf_key_bytes() {
+                use subtle::ConstantTimeEq as _;
+                if expected.ct_ne(&ctx.cnf).into() {
+                    tracing::warn!("JWT cnf.jwk mismatch: sub={}", claims.sub);
+                    anyhow::bail!("JWT cnf.jwk does not match envelope signer");
+                }
+
+                // Cache the (key → subject) binding in the trust store.
+                let vk = match ed25519_dalek::VerifyingKey::from_bytes(&expected) {
+                    Ok(vk) => vk,
+                    Err(_) => {
+                        tracing::warn!("Invalid Ed25519 verifying key in JWT cnf.jwk");
+                        anyhow::bail!("Invalid Ed25519 verifying key in JWT cnf.jwk");
+                    }
+                };
+                let subject_str = claims.subject(&local_issuers_refs);
+                if let Some(subject_name) = subject_str.name() {
+                    self.cache_key_binding(vk, subject_name, &token, claims.exp);
+                    tracing::info!(subject = %subject_name, "Cached key binding in trust store");
+                }
+            } else if let Some(jkt) = claims.cnf_jkt() {
+                // R2b: DPoP path — JWT has cnf.jkt (thumbprint) instead of cnf.jwk.
+                // Compute the JWK thumbprint of the envelope signer and compare.
+                use subtle::ConstantTimeEq as _;
+                let envelope_jkt = crate::auth::jwk_thumbprint(
+                    &crate::auth::JwkThumbprintInput::Ed25519 { x: &ctx.cnf },
+                );
+                if envelope_jkt.as_bytes().ct_ne(jkt.as_bytes()).into() {
+                    tracing::warn!("JWT cnf.jkt mismatch: sub={}", claims.sub);
+                    anyhow::bail!("JWT cnf.jkt does not match envelope signer");
+                }
+
+                let vk = match ed25519_dalek::VerifyingKey::from_bytes(&ctx.cnf) {
+                    Ok(vk) => vk,
+                    Err(_) => {
+                        tracing::warn!("Invalid Ed25519 verifying key in envelope cnf");
+                        anyhow::bail!("Invalid Ed25519 verifying key in envelope cnf");
+                    }
+                };
+                let subject_str = claims.subject(&local_issuers_refs);
+                if let Some(subject_name) = subject_str.name() {
+                    self.cache_key_binding(vk, subject_name, &token, claims.exp);
+                    tracing::info!(subject = %subject_name, "Cached key binding from cnf.jkt");
+                }
+            } else if self.require_cnf_binding() {
+                tracing::warn!("JWT missing cnf binding (jwk or jkt): sub={}", claims.sub);
+                anyhow::bail!("JWT must include cnf binding for key binding (required by this service)");
+            }
+        }
+
+        // R3: Verify WIMSE wth binding — envelope proof is committed to a specific WIT.
+        // If the envelope carries a witHash, it must match SHA-256(jwtToken we just verified).
+        if let Some(ref claimed_hash) = ctx.envelope_wit_hash {
+            use sha2::{Digest, Sha256};
+            use subtle::ConstantTimeEq as _;
+            let expected: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+            if expected.ct_ne(claimed_hash.as_slice()).into() {
+                tracing::warn!("witHash mismatch — possible rotation-window replay");
+                anyhow::bail!("witHash does not match WIT — possible rotation-window replay");
+            }
+        }
+
         Ok(())
     }
 
@@ -536,10 +704,9 @@ pub struct RequestLoop {
 }
 
 /// QUIC server configuration for `RequestLoop`.
-#[derive(Clone)]
 pub struct QuicLoopConfig {
-    /// DER-encoded certificate
-    pub cert_der: Vec<u8>,
+    /// DER-encoded certificate chain (leaf first, then intermediates/CA)
+    pub cert_chain: Vec<Vec<u8>>,
     /// DER-encoded private key — zeroed on drop.
     pub key_der: Zeroizing<Vec<u8>>,
     /// Address to bind the WebTransport server
@@ -548,6 +715,9 @@ pub struct QuicLoopConfig {
     pub server_name: String,
     /// Pre-serialized RFC 9728 JSON for HTTP/3 `.well-known/oauth-protected-resource`
     pub protected_resource_json: Option<Vec<u8>>,
+    /// Callback invoked after QUIC binding succeeds, with (service_name, actual_addr, server_name).
+    /// Used to announce endpoints to the DiscoveryService.
+    pub on_quic_bound: Option<Box<dyn FnOnce(String, std::net::SocketAddr, String) + Send>>,
 }
 
 impl RequestLoop {
@@ -632,7 +802,7 @@ impl RequestLoop {
         server_pubkey: VerifyingKey,
         signing_key: SigningKey,
         nonce_cache: Arc<InMemoryNonceCache>,
-        quic_config: Option<QuicLoopConfig>,
+        mut quic_config: Option<QuicLoopConfig>,
         shutdown: Arc<Notify>,
         ready_tx: Option<tokio::sync::oneshot::Sender<Result<()>>>,
     ) -> Result<()> {
@@ -650,9 +820,11 @@ impl RequestLoop {
             }
         };
         socket.set_linger(0).ok();
-        // ROUTER_MANDATORY: return errors instead of silently dropping messages
-        // when routing identity is unknown
-        socket.set_router_mandatory(true).ok();
+        // Do NOT set ROUTER_MANDATORY: EHOSTUNREACH errors on send can
+        // poison TMQ's Sink state, preventing subsequent recv. Silently
+        // dropping responses to disconnected clients is acceptable — the
+        // client already timed out.
+        // socket.set_router_mandatory(true).ok();
 
         // Bind or connect
         let bind_result = match transport.bind_mode() {
@@ -680,10 +852,10 @@ impl RequestLoop {
         };
 
         // Optionally create WebTransport server
-        let wt_server = if let Some(ref qc) = quic_config {
+        let wt_server = if let Some(ref mut qc) = quic_config {
             match crate::transport::zmtp_quic::WebTransportServer::bind(
                 qc.bind_addr,
-                qc.cert_der.clone(),
+                qc.cert_chain.clone(),
                 (*qc.key_der).clone(),
             ) {
                 Ok(mut wts) => {
@@ -691,7 +863,8 @@ impl RequestLoop {
                         wts = wts.with_protected_resource_metadata(meta.clone());
                     }
                     let actual_addr = wts.local_addr().unwrap_or(qc.bind_addr);
-                    let cert_hash = crate::transport::zmtp_quic::cert_hash(&qc.cert_der);
+                    // Cert hash is computed from the leaf cert (first in chain)
+                    let cert_hash = crate::transport::zmtp_quic::cert_hash(&qc.cert_chain[0]);
                     info!(
                         "{} QUIC/WebTransport bound to {} (cert hash: {})",
                         service.name(),
@@ -706,6 +879,10 @@ impl RequestLoop {
                             crate::transport::TransportConfig::quic(actual_addr, &qc.server_name),
                             None,
                         );
+                    }
+                    // Announce to DiscoveryService (cross-process)
+                    if let Some(cb) = qc.on_quic_bound.take() {
+                        cb(service.name().to_owned(), actual_addr, qc.server_name.clone());
                     }
                     Some(wts)
                 }
@@ -816,14 +993,18 @@ impl RequestLoop {
                         continue;
                     }
 
-                    // Process through shared envelope pipeline (FixedSigner: ZMQ peers pre-share keys)
-                    let (response_bytes, continuation) = match crate::transport::zmtp_quic::process_request(
+                    // Process through shared envelope pipeline.
+                    // AnySigner: per-service keys mean each caller signs with its own key,
+                    // not a shared root key. The envelope signature is still verified —
+                    // JWT claims + Casbin handle authorization.
+                    // subsecond::call wraps the dispatch so handler code can be hot-patched during dev.
+                    let (response_bytes, continuation) = match subsecond::call(|| crate::transport::zmtp_quic::process_request(
                         &request,
                         &*service,
-                        crate::transport::zmtp_quic::EnvelopeVerification::FixedSigner(&server_pubkey),
+                        crate::transport::zmtp_quic::EnvelopeVerification::AnySigner,
                         &signing_key,
                         &nonce_cache,
-                    ).await {
+                    )).await {
                         Ok(result) => result,
                         Err(e) => {
                             error!("{} request processing error: {}", service.name(), e);
@@ -944,592 +1125,39 @@ impl ServiceHandle {
     }
 }
 
-/// Authenticated ZMQ client with automatic request signing and response verification.
-///
-/// This is the unified client for all ZMQ-based services. All requests are
-/// automatically wrapped in `SignedEnvelope` for authentication, and all
-/// responses are cryptographically verified.
-///
-/// # E2E Authentication
-///
-/// - **Requests**: Automatically wrapped in `SignedEnvelope` (Ed25519 signed)
-/// - **Responses**: Automatically verified against server's public key (Ed25519)
-///
-/// There is NO way to receive unverified response data from this client.
-/// This prevents MITM attacks on response data (e.g., DH public keys).
-///
-/// # Resilience
-///
-/// Uses a persistent socket with ZMQ's built-in reliability features:
-/// - `ZMQ_REQ_RELAXED`: Allows sending new requests after timeout (no stuck state)
-/// - `ZMQ_REQ_CORRELATE`: Matches replies to requests automatically
-/// - `ZMQ_RECONNECT_IVL/MAX`: Automatic reconnection with exponential backoff
-///
-/// # Usage
-///
-/// Use extension traits (`RegistryOps`, `InferenceOps`) to add service-specific
-/// methods to this client:
-///
-/// ```ignore
-/// use hyprstream_rpc::service::{ZmqClient};
-///
-/// let client = ZmqClient::new("inproc://hyprstream/registry", context, signing_key, server_verifying_key, identity);
-/// let repos = client.list().await?;  // Extension trait method
-/// ```
-pub struct ZmqClient {
-    /// ZMQ endpoint
-    endpoint: String,
-    /// ZMQ context for socket creation (required for inproc:// connectivity)
-    context: Arc<zmq::Context>,
-    /// Ed25519 signing key for request authentication
-    signing_key: SigningKey,
-    /// Server's Ed25519 verifying key for response verification (mandatory)
-    server_verifying_key: VerifyingKey,
-    /// Identity included in requests for authorization
-    identity: RequestIdentity,
-    /// Monotonic request ID counter
-    request_id: AtomicU64,
-    /// Persistent socket wrapped in TMQ RequestSender (protected by async mutex)
-    /// Using Option to allow re-initialization on connection errors
-    sender: tokio::sync::Mutex<Option<RequestSender>>,
-}
-
-/// Options for ZMQ RPC calls.
-///
-/// Consolidates all optional parameters for `call()` into a single struct.
-/// Use `Default::default()` for basic calls, or builder-style methods for options.
-///
-/// # Example
-/// ```ignore
-/// // Basic call (no options)
-/// client.call(payload, CallOptions::default()).await?;
-///
-/// // With timeout
-/// client.call(payload, CallOptions::default().timeout(5000)).await?;
-///
-/// // With user claims
-/// client.call(payload, CallOptions::default().claims(user_claims)).await?;
-///
-/// // With ephemeral pubkey for E2E authenticated streaming
-/// client.call(payload, CallOptions::default().ephemeral_pubkey(pubkey)).await?;
-/// ```
-#[derive(Debug, Clone, Default)]
-pub struct CallOptions {
-    /// Explicit timeout in milliseconds (defaults to 30s)
-    pub timeout_ms: Option<i32>,
-    /// Requested lifetime for this request
-    pub requested_lifetime_ms: Option<i32>,
-    /// User authorization claims (for authenticated calls)
-    pub claims: Option<crate::auth::Claims>,
-    /// Ephemeral Ristretto255 public key for stream HMAC key derivation
-    pub ephemeral_pubkey: Option<[u8; 32]>,
-}
-
-impl CallOptions {
-    /// Set explicit timeout in milliseconds.
-    pub fn timeout(mut self, ms: i32) -> Self {
-        self.timeout_ms = Some(ms);
-        self
-    }
-
-    /// Set requested lifetime in milliseconds.
-    pub fn lifetime(mut self, ms: i32) -> Self {
-        self.requested_lifetime_ms = Some(ms);
-        self
-    }
-
-    /// Set user authorization claims.
-    pub fn claims(mut self, claims: crate::auth::Claims) -> Self {
-        self.claims = Some(claims);
-        self
-    }
-
-    /// Set ephemeral public key for E2E authenticated streaming.
-    pub fn ephemeral_pubkey(mut self, pubkey: [u8; 32]) -> Self {
-        self.ephemeral_pubkey = Some(pubkey);
-        self
-    }
-
-    /// Create options from EnvelopeContext (preserves user claims).
-    pub fn from_context(ctx: &EnvelopeContext) -> Self {
-        Self {
-            claims: ctx.claims().cloned(),
-            ..Default::default()
-        }
-    }
-}
-
-/// Calculate ZMQ timeout using min() of multiple constraints.
-///
-/// Returns the smaller of:
-/// - Explicit timeout parameter (if provided)
-/// - Requested lifetime (if provided)
-/// - JWT remaining time (with 1s safety buffer)
-/// - Default timeout (30 seconds)
-///
-/// This ensures:
-/// - We don't wait past JWT expiration (security)
-/// - We respect service-specific timeout requirements (practicality)
-/// - We respect user-requested lifetime (quality of service)
-/// - We don't have excessively long timeouts (practicality)
-fn calculate_timeout(
-    explicit_timeout: Option<i32>,
-    requested_lifetime_ms: Option<i32>,
-    claims: Option<&crate::auth::Claims>,
-) -> i32 {
-    const DEFAULT_TIMEOUT_MS: i32 = 30000; // 30 seconds
-    const SAFETY_BUFFER_MS: i64 = 1000; // 1 second buffer
-
-    // Start with explicit timeout or default
-    let mut timeout = explicit_timeout.unwrap_or(DEFAULT_TIMEOUT_MS);
-
-    // Apply requested lifetime constraint (if provided)
-    if let Some(lifetime) = requested_lifetime_ms {
-        timeout = timeout.min(lifetime);
-    }
-
-    // Apply Claims expiration constraint (if provided)
-    if let Some(claims) = claims {
-        let now = Utc::now().timestamp();
-        let remaining_ms = (claims.exp - now) * 1000 - SAFETY_BUFFER_MS;
-
-        if remaining_ms > 0 {
-            // Cap at i32::MAX for ZMQ timeout (about 24 days, more than enough)
-            let remaining_i32 = i32::try_from(remaining_ms).unwrap_or(i32::MAX);
-            timeout = timeout.min(remaining_i32);
-        } else {
-            warn!("Claims have expired or will expire immediately, using minimal timeout");
-            return 100; // 100ms minimal timeout
-        }
-    }
-
-    timeout
-}
-
-impl ZmqClient {
-    /// Create a new client with signing credentials and server verification key.
-    ///
-    /// Creates a persistent socket with ZMQ's reliability options enabled:
-    /// - `ZMQ_REQ_RELAXED`: Don't get stuck waiting for replies
-    /// - `ZMQ_REQ_CORRELATE`: Match replies to requests
-    /// - Auto-reconnect with exponential backoff (100ms to 5s)
-    ///
-    /// # Arguments
-    /// * `endpoint` - ZMQ endpoint (e.g., `inproc://hyprstream/registry`)
-    /// * `context` - ZMQ context (must be shared for inproc:// to work)
-    /// * `signing_key` - Ed25519 signing key for request authentication
-    /// * `server_verifying_key` - Server's Ed25519 public key for response verification
-    /// * `identity` - Identity to include in requests (for authorization)
-    ///
-    /// # Security
-    ///
-    /// The `server_verifying_key` is MANDATORY. All responses are verified against
-    /// this key before being returned. There is no way to bypass verification.
-    pub fn new(
-        endpoint: &str,
-        context: Arc<zmq::Context>,
-        signing_key: SigningKey,
-        server_verifying_key: VerifyingKey,
-        identity: RequestIdentity,
-    ) -> Self {
-        // Socket is lazily initialized on first call to allow construction without errors
-        Self {
-            endpoint: endpoint.to_owned(),
-            context,
-            signing_key,
-            server_verifying_key,
-            identity,
-            request_id: AtomicU64::new(1),
-            sender: tokio::sync::Mutex::new(None),
-        }
-    }
-
-    /// Create and configure a new REQ socket with resilience options.
-    fn create_socket(&self) -> Result<zmq::Socket> {
-        let socket = self.context.socket(zmq::REQ)
-            .map_err(|e| anyhow!("Failed to create REQ socket: {}", e))?;
-
-        // Enable relaxed REQ mode - allows sending new request after timeout
-        // without getting stuck in send/recv state machine
-        socket.set_req_relaxed(true)
-            .map_err(|e| anyhow!("Failed to set REQ_RELAXED: {}", e))?;
-
-        // Enable request correlation - ZMQ automatically matches replies to requests
-        // Required when using REQ_RELAXED to handle out-of-order/late replies
-        socket.set_req_correlate(true)
-            .map_err(|e| anyhow!("Failed to set REQ_CORRELATE: {}", e))?;
-
-        // Auto-reconnect settings for resilience
-        socket.set_reconnect_ivl(100)  // Start with 100ms
-            .map_err(|e| anyhow!("Failed to set reconnect interval: {}", e))?;
-        socket.set_reconnect_ivl_max(5000)  // Max 5s with exponential backoff
-            .map_err(|e| anyhow!("Failed to set max reconnect interval: {}", e))?;
-
-        // Don't block on close
-        socket.set_linger(0)
-            .map_err(|e| anyhow!("Failed to set linger: {}", e))?;
-
-        // Connect to endpoint
-        socket.connect(&self.endpoint)
-            .map_err(|e| anyhow!("Failed to connect to {}: {}", self.endpoint, e))?;
-
-        debug!("ZmqClient connected to {} with REQ_RELAXED+REQ_CORRELATE", self.endpoint);
-
-        Ok(socket)
-    }
-
-    /// Get or create the RequestSender, reconnecting if necessary.
-    async fn get_or_create_sender(&self) -> Result<RequestSender> {
-        let mut guard = self.sender.lock().await;
-
-        if let Some(sender) = guard.take() {
-            return Ok(sender);
-        }
-
-        // Create new socket and wrap with TMQ
-        let socket = self.create_socket()?;
-        let sender = RequestSender::from_zmq_socket(socket)
-            .map_err(|e| anyhow!("Failed to wrap socket in TMQ: {}", e))?;
-
-        Ok(sender)
-    }
-
-    /// Store the sender for reuse after a successful call.
-    async fn store_sender(&self, sender: RequestSender) {
-        let mut guard = self.sender.lock().await;
-        *guard = Some(sender);
-    }
-
-    /// Get the next request ID (monotonically increasing).
-    pub fn next_id(&self) -> u64 {
-        self.request_id.fetch_add(1, Ordering::Relaxed)
-    }
-
-    /// Get the endpoint this client is connected to.
-    pub fn endpoint(&self) -> &str {
-        &self.endpoint
-    }
-
-    /// Get the identity used for requests.
-    pub fn identity(&self) -> &RequestIdentity {
-        &self.identity
-    }
-
-    /// Get the signing key.
-    pub fn signing_key(&self) -> &SigningKey {
-        &self.signing_key
-    }
-
-    /// Get the server's verifying key for response verification.
-    pub fn server_verifying_key(&self) -> &VerifyingKey {
-        &self.server_verifying_key
-    }
-
-    /// Get the ZMQ context.
-    pub fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
-    }
-
-    /// Sign and send a request, verify and return the response.
-    ///
-    /// # E2E Authentication
-    ///
-    /// - **Requests**: Automatically wrapped in `SignedEnvelope` (Ed25519 signed)
-    /// - **Responses**: Automatically verified against server's public key (Ed25519)
-    ///
-    /// There is NO way to receive unverified response data. If signature
-    /// verification fails, an error is returned. This prevents MITM attacks.
-    ///
-    /// Uses a persistent socket with automatic reconnection. If the service
-    /// is temporarily unavailable, ZMQ will automatically reconnect when it
-    /// becomes available.
-    ///
-    /// # Arguments
-    /// * `payload` - Request payload bytes
-    /// * `opts` - Call options (timeout, claims, ephemeral_pubkey)
-    ///
-    /// # Returns
-    /// The verified response payload bytes. The outer envelope signature has
-    /// been verified and stripped - only the inner payload is returned.
-    ///
-    /// # Resilience
-    /// - Socket auto-reconnects if connection is lost
-    /// - REQ_RELAXED prevents getting stuck if reply is lost
-    /// - On timeout, socket is reset and will be recreated on next call
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Basic call
-    /// client.call(payload, CallOptions::default()).await?;
-    ///
-    /// // With timeout
-    /// client.call(payload, CallOptions::default().timeout(5000)).await?;
-    ///
-    /// // With user claims
-    /// client.call(payload, CallOptions::default().claims(user_claims)).await?;
-    ///
-    /// // With ephemeral pubkey for E2E streaming
-    /// client.call(payload, CallOptions::default().ephemeral_pubkey(pubkey)).await?;
-    /// ```
-    pub async fn call(&self, payload: Vec<u8>, opts: CallOptions) -> Result<Vec<u8>> {
-        let signed = self.sign_request(payload, &opts)?;
-        let timeout = calculate_timeout(opts.timeout_ms, opts.requested_lifetime_ms, opts.claims.as_ref());
-
-        trace!(
-            "ZmqClient sending {} bytes to {} (timeout: {}ms)",
-            signed.len(),
-            self.endpoint,
-            timeout
-        );
-
-        // Get or create the persistent sender
-        let sender = self.get_or_create_sender().await?;
-
-        // TMQ REQ pattern: send returns RequestReceiver
-        let receiver = sender
-            .send(tmq::Multipart::from(vec![signed]))
-            .await
-            .map_err(|e| anyhow!("Failed to send request to {}: {}", self.endpoint, e))?;
-
-        // Receive response with timeout
-        // Use tokio::time::timeout since ZMQ socket timeout may not work with TMQ async
-        // Ensure timeout is non-negative before converting to u64
-        let timeout_ms = u64::try_from(timeout.max(0)).unwrap_or(0);
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(timeout_ms),
-            receiver.recv()
-        ).await;
-
-        match result {
-            Ok(Ok((response, sender))) => {
-                // Success - store sender for reuse
-                self.store_sender(sender).await;
-
-                // Extract bytes from multipart message
-                let wire_bytes: Vec<u8> = response
-                    .into_iter()
-                    .flat_map(|frame| frame.to_vec())
-                    .collect();
-
-                trace!("ZmqClient received {} bytes from {}", wire_bytes.len(), self.endpoint);
-
-                // MANDATORY: Verify response signature before returning
-                // There is no way to bypass this - all responses must be verified
-                let (_request_id, payload) = crate::envelope::unwrap_response(
-                    &wire_bytes,
-                    Some(&self.server_verifying_key),
-                )?;
-
-                trace!("ZmqClient verified response ({} bytes payload)", payload.len());
-                Ok(payload)
-            }
-            Ok(Err(e)) => {
-                // Recv error - don't store sender, will recreate on next call
-                warn!("ZmqClient recv error from {}: {}", self.endpoint, e);
-                Err(anyhow!("Failed to receive response from {}: {}", self.endpoint, e))
-            }
-            Err(_) => {
-                // Timeout - don't store sender (it's stuck with the receiver)
-                // REQ_RELAXED allows the next call to work with a fresh socket
-                warn!("ZmqClient timeout after {}ms waiting for {}", timeout, self.endpoint);
-                Err(anyhow!("Request to {} timed out after {}ms", self.endpoint, timeout))
-            }
-        }
-    }
-
-    /// Wrap a payload in a SignedEnvelope and serialize to bytes.
-    fn sign_request(&self, payload: Vec<u8>, opts: &CallOptions) -> Result<Vec<u8>> {
-        use capnp::message::Builder;
-        use capnp::serialize;
-
-        let mut envelope = RequestEnvelope::new(self.identity.clone(), payload);
-
-        // Apply optional claims
-        if let Some(ref claims) = opts.claims {
-            envelope = envelope.with_claims(claims.clone());
-        }
-
-        // Apply optional ephemeral pubkey for E2E streaming
-        if let Some(pubkey) = opts.ephemeral_pubkey {
-            envelope = envelope.with_ephemeral_pubkey(pubkey);
-        }
-
-        let signed = SignedEnvelope::new_signed(envelope, &self.signing_key);
-
-        let mut message = Builder::new_default();
-        {
-            let mut builder =
-                message.init_root::<crate::common_capnp::signed_envelope::Builder>();
-            signed.write_to(&mut builder);
-        }
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-        Ok(bytes)
-    }
-
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::crypto::generate_signing_keypair;
+mod stripping_defense_tests {
+    use super::composite_alg_components;
 
-    /// Test service with infrastructure (new pattern)
-    struct EchoService {
-        context: Arc<zmq::Context>,
-        transport: TransportConfig,
-        signing_key: SigningKey,
+    /// stripping_composite_covers_components:
+    /// `ML-DSA-65-Ed25519` (composite) MUST cover both component algs so a
+    /// JWKS that lists both `EdDSA` and `ML-DSA-65` under one kid still
+    /// accepts a composite-signed token.
+    #[test]
+    fn stripping_composite_covers_components() {
+        let c = composite_alg_components("ML-DSA-65-Ed25519");
+        assert!(c.contains(&"ML-DSA-65"));
+        assert!(c.contains(&"EdDSA"));
+        assert!(c.contains(&"ML-DSA-65-Ed25519"));
     }
 
-    impl EchoService {
-        fn new(context: Arc<zmq::Context>, transport: TransportConfig, signing_key: SigningKey) -> Self {
-            Self { context, transport, signing_key }
-        }
+    /// stripping_eddsa_does_not_cover_ml_dsa:
+    /// Classical-only EdDSA must NOT cover ML-DSA-65; this is the core
+    /// stripping defense — an attacker presenting an EdDSA JWT under a kid
+    /// that the JWKS lists with ML-DSA-65 (or composite) must be rejected.
+    #[test]
+    fn stripping_eddsa_does_not_cover_ml_dsa() {
+        let c = composite_alg_components("EdDSA");
+        assert!(!c.contains(&"ML-DSA-65"));
+        assert!(!c.contains(&"ML-DSA-65-Ed25519"));
     }
 
-    #[async_trait(?Send)]
-    impl ZmqService for EchoService {
-        async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<Continuation>)> {
-            // Echo back the payload, but prepend the user
-            let user = ctx.user();
-            let mut response = format!("from {user}:").into_bytes();
-            response.extend_from_slice(payload);
-            Ok((response, None))
-        }
-
-        fn name(&self) -> &str {
-            "echo"
-        }
-
-        fn context(&self) -> &Arc<zmq::Context> {
-            &self.context
-        }
-
-        fn transport(&self) -> &TransportConfig {
-            &self.transport
-        }
-
-        fn signing_key(&self) -> SigningKey {
-            self.signing_key.clone()
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_request_loop() -> Result<(), Box<dyn std::error::Error>> {
-        let local = tokio::task::LocalSet::new();
-        local.run_until(async {
-            let context = Arc::new(zmq::Context::new());
-            let transport = TransportConfig::inproc("test-echo-service-rpc");
-            let endpoint = transport.zmq_endpoint();
-
-            // Generate keypair for this test (same key for client and server)
-            let (signing_key, verifying_key) = generate_signing_keypair();
-
-            // Create service with infrastructure
-            let service = EchoService::new(Arc::clone(&context), transport.clone(), signing_key.clone());
-
-            // Start the service (waits for socket binding)
-            let runner = RequestLoop::new(transport, Arc::clone(&context), signing_key.clone());
-            let mut handle = runner.run(service).await?;
-
-            // Use ZmqClient with server's verifying key for response verification
-            let client = ZmqClient::new(&endpoint, context, signing_key, verifying_key, RequestIdentity::anonymous());
-            let response = client.call(b"hello".to_vec(), CallOptions::default()).await?;
-
-            // Response should start with "from <user>:"
-            let response_str = String::from_utf8_lossy(&response);
-            assert!(
-                response_str.contains("hello"),
-                "Response should contain 'hello': {response_str}"
-            );
-
-            // Stop the service
-            handle.stop().await;
-            Ok(())
-        }).await
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_invalid_request_signature_rejected() -> Result<(), Box<dyn std::error::Error>> {
-        let local = tokio::task::LocalSet::new();
-        local.run_until(async {
-            let context = Arc::new(zmq::Context::new());
-            let transport = TransportConfig::inproc("test-invalid-req-sig-rpc");
-            let endpoint = transport.zmq_endpoint();
-
-            // Generate two keypairs - service uses one, client uses other
-            let (server_signing_key, server_verifying_key) = generate_signing_keypair();
-            let (client_signing_key, _client_verifying_key) = generate_signing_keypair();
-
-            // Create service with server's key
-            let service = EchoService::new(Arc::clone(&context), transport.clone(), server_signing_key.clone());
-
-            // Start the service (waits for socket binding)
-            let runner = RequestLoop::new(transport, Arc::clone(&context), server_signing_key);
-            let mut handle = runner.run(service).await?;
-
-            // Sign request with different key than service expects
-            // But verify responses with server's key
-            let client = ZmqClient::new(&endpoint, context, client_signing_key, server_verifying_key, RequestIdentity::anonymous());
-            let result = client
-                .call(b"should fail".to_vec(), CallOptions::default())
-                .await;
-
-            // Request should be rejected by server (empty response or error)
-            // The response is still signed, but empty
-            match result {
-                Ok(response) => {
-                    // Empty response from server means request was rejected
-                    assert!(
-                        response.is_empty(),
-                        "Invalid request signature should return empty response"
-                    );
-                }
-                Err(_) => {
-                    // Error is also acceptable (deserialization of empty response may fail)
-                }
-            }
-
-            handle.stop().await;
-            Ok(())
-        }).await
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_invalid_response_signature_rejected() -> Result<(), Box<dyn std::error::Error>> {
-        let local = tokio::task::LocalSet::new();
-        local.run_until(async {
-            let context = Arc::new(zmq::Context::new());
-            let transport = TransportConfig::inproc("test-invalid-resp-sig-rpc");
-            let endpoint = transport.zmq_endpoint();
-
-            // Generate two keypairs - server signs with one, client expects other
-            let (server_signing_key, _server_verifying_key) = generate_signing_keypair();
-            let (_different_signing_key, different_verifying_key) = generate_signing_keypair();
-
-            // Create service with server's signing key
-            let service = EchoService::new(Arc::clone(&context), transport.clone(), server_signing_key.clone());
-
-            // Start the service (waits for socket binding)
-            let runner = RequestLoop::new(transport, Arc::clone(&context), server_signing_key.clone());
-            let mut handle = runner.run(service).await?;
-
-            // Client expects responses signed by a DIFFERENT key than server uses
-            // This simulates a MITM attack or misconfigured client
-            let client = ZmqClient::new(&endpoint, context, server_signing_key, different_verifying_key, RequestIdentity::anonymous());
-            let result = client
-                .call(b"should fail verification".to_vec(), CallOptions::default())
-                .await;
-
-            // Response signature verification should fail
-            assert!(
-                result.is_err(),
-                "Response with wrong signature should be rejected: {result:?}"
-            );
-
-            handle.stop().await;
-            Ok(())
-        }).await
+    /// stripping_unknown_alg_is_empty:
+    /// Unknown algs return an empty component list so the verifier's
+    /// "all-covered" check fails closed.
+    #[test]
+    fn stripping_unknown_alg_is_empty() {
+        assert!(composite_alg_components("HS256").is_empty());
+        assert!(composite_alg_components("none").is_empty());
     }
 }

@@ -162,6 +162,17 @@ impl TemplateEngine {
         add_generation_prompt: Option<bool>,
         tools: Option<&serde_json::Value>,
     ) -> Result<String> {
+        self.apply_chat_template_with_vars(messages, add_generation_prompt, tools, None, None)
+    }
+
+    pub fn apply_chat_template_with_vars(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: Option<bool>,
+        tools: Option<&serde_json::Value>,
+        enable_thinking: Option<bool>,
+        template_vars_json: Option<&str>,
+    ) -> Result<String> {
         // Use provided template or fall back to a default
         let template_str = self
             .config
@@ -195,10 +206,14 @@ impl TemplateEngine {
             None => Value::UNDEFINED,
         };
 
-        // Render the template.
-        // Messages use TemplateToolCall (with parsed arguments as Value, not String)
-        // so templates can iterate arguments with |items.
-        let rendered = tmpl.render(context! {
+        // enable_thinking: pass as Value so None → UNDEFINED (template uses its own default)
+        let thinking_value = match enable_thinking {
+            Some(v) => Value::from(v),
+            None => Value::UNDEFINED,
+        };
+
+        // Build base context
+        let mut ctx = context! {
             messages => messages,
             tools => tools_value,
             bos_token => self.config.bos_token.as_deref().unwrap_or(""),
@@ -209,7 +224,22 @@ impl TemplateEngine {
             cls_token => self.config.cls_token.as_deref().unwrap_or(""),
             additional_special_tokens => &self.config.additional_special_tokens,
             add_generation_prompt => add_gen,
-        })?;
+            enable_thinking => thinking_value,
+        };
+
+        // Merge additional template variables from JSON into context.
+        // minijinja's context! macro doesn't support dynamic keys, so we
+        // build a BTreeMap and merge via from_serialize.
+        if let Some(vars_json) = template_vars_json {
+            if !vars_json.is_empty() {
+                if let Ok(vars) = serde_json::from_str::<serde_json::Value>(vars_json) {
+                    ctx = context! { ..ctx, ..Value::from_serialize(&vars) };
+                }
+            }
+        }
+
+        // Render the template
+        let rendered = tmpl.render(ctx)?;
 
         Ok(rendered)
     }

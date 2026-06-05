@@ -73,7 +73,8 @@ fn main() {
     for (name, path) in &cgr_files {
         match hyprstream_rpc_build::schema::cgr_reader::parse_from_cgr_path(path, name) {
             Ok(schema) => {
-                println!("  Parsed {name}: {} request variants, {} response variants, {} structs",
+                println!(
+                    "  Parsed {name}: {} request variants, {} response variants, {} structs",
                     schema.request_variants.len(),
                     schema.response_variants.len(),
                     schema.structs.len(),

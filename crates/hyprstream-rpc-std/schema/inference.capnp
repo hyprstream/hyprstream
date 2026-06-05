@@ -246,6 +246,10 @@ struct ChatTemplateRequest {
   toolsJson @2 :Text $optional;  # JSON-serialized tools array (empty string = no tools)
   maxTokens @3 :Opt.OptionUint32
       $paramDescription("Tokens reserved for generation. When set, oldest non-system messages are truncated so the rendered prompt fits in max_seq_len - maxTokens.");
+  enableThinking @4 :Opt.OptionBool
+      $paramDescription("Enable reasoning/thinking mode. True: emit <think> block. False: suppress thinking. Unset: use model template default.");
+  templateVarsJson @5 :Text $optional
+      $paramDescription("JSON object of additional template variables merged into the render context. Use for model-specific knobs not covered by first-class fields (e.g. {\"add_vision_id\": true}).");
 }
 
 # Tool call function details

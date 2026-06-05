@@ -3,7 +3,6 @@
 //! This service wraps git2db and provides a ZMQ REQ/REP interface for
 //! repository operations. It uses Cap'n Proto for serialization.
 
-use crate::auth::Operation;
 use crate::services::PolicyClient;
 use crate::services::types::{MAX_FDS_GLOBAL, MAX_FDS_PER_CLIENT};
 use hyprstream_containedfs::{ContainedFs, FsError, FsHandle};
@@ -318,10 +317,8 @@ pub struct RegistryService {
     editing_table: Arc<EditingTable>,
     /// Expected JWT audience for token validation (RFC 8707).
     expected_audience: Option<String>,
-    /// Local OAuth issuer URL for distinguishing local vs. federated JWTs.
-    local_issuer_url: Option<String>,
-    /// Federation key source for verifying externally-issued JWTs.
-    federation_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>>,
+    /// JWT key source for token verification.
+    jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
 }
 
 /// Progress reporter that sends updates via a tokio mpsc channel.
@@ -396,8 +393,7 @@ impl RegistryService {
             contained_roots: DashMap::new(),
             editing_table,
             expected_audience: None,
-            local_issuer_url: None,
-            federation_key_source: None,
+            jwt_key_source: None,
         };
 
         Ok(service)
@@ -409,18 +405,12 @@ impl RegistryService {
         self
     }
 
-    /// Set the local OAuth issuer URL for distinguishing local vs. federated JWTs.
-    pub fn with_local_issuer_url(mut self, url: String) -> Self {
-        self.local_issuer_url = Some(url);
-        self
-    }
-
-    /// Set the federation key source for verifying externally-issued JWTs.
-    pub fn with_federation_key_source(
+    /// Set the JWT key source for token verification.
+    pub fn with_jwt_key_source(
         mut self,
-        src: std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>,
+        src: std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>,
     ) -> Self {
-        self.federation_key_source = Some(src);
+        self.jwt_key_source = Some(src);
         self
     }
 
@@ -558,16 +548,7 @@ impl RegistryService {
         }
     }
 
-    /// Check if a request is authorized (returns bool for generated handler methods).
-    async fn is_authorized(&self, ctx: &EnvelopeContext, resource: &str, operation: Operation) -> bool {
-        let subject = ctx.subject();
-        self.policy_client.check(&PolicyCheck { subject: subject.to_string(), domain: "*".to_owned(), resource: resource.to_owned(), operation: operation.as_str().to_owned() })
-            .await
-            .unwrap_or_else(|e| {
-                warn!("Policy check failed for {} on {}: {} - denying access", subject, resource, e);
-                false
-            })
-    }
+
 
     /// Parse a RepoId from string
     fn parse_repo_id(id_str: &str) -> Result<RepoId> {
@@ -1369,11 +1350,22 @@ fn reg_error(msg: &str) -> RegistryResponseVariant {
 #[async_trait::async_trait(?Send)]
 impl RegistryHandler for RegistryService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
-        let op = operation.parse::<Operation>()?;
-        if self.is_authorized(ctx, resource, op).await {
+        // Pass the operation string as-is to the policy check rather than
+        // round-tripping through Operation enum (which maps "query" → "query.status").
+        let subject = ctx.subject();
+        let allowed = self.policy_client.check(&PolicyCheck {
+            subject: subject.to_string(),
+            domain: "*".to_owned(),
+            resource: resource.to_owned(),
+            operation: operation.to_owned(),
+        }).await.unwrap_or_else(|e| {
+            warn!("Policy check RPC error: sub={} obj={} act={} err={} - denying access", subject, resource, operation, e);
+            false
+        });
+        if allowed {
             Ok(())
         } else {
-            anyhow::bail!("Unauthorized: {} cannot {} on {}", ctx.subject(), operation, resource)
+            anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource)
         }
     }
 
@@ -1446,7 +1438,7 @@ impl RegistryHandler for RegistryService {
         let name_opt = if data.name.is_empty() { None } else { Some(data.name.as_str()) };
         let branch_opt = if data.branch.is_empty() { None } else { Some(data.branch.as_str()) };
         let client_ephemeral_pubkey = ctx.ephemeral_pubkey();
-        self.prepare_clone_stream(&data.url, name_opt, data.shallow, Some(data.depth), branch_opt, client_ephemeral_pubkey).await
+        self.prepare_clone_stream(&data.url, name_opt, data.shallow, Some(data.depth), branch_opt, client_ephemeral_pubkey.as_ref().map(<[u8; 32]>::as_slice)).await
     }
 
     async fn handle_register(&self, _ctx: &EnvelopeContext, _request_id: u64,
@@ -2693,14 +2685,8 @@ impl ZmqService for RegistryService {
         self.expected_audience.as_deref()
     }
 
-    fn local_issuer_url(&self) -> Option<&str> {
-        self.local_issuer_url.as_deref()
-    }
-
-    fn federation_key_source(
-        &self,
-    ) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::FederationKeySource>> {
-        self.federation_key_source.clone()
+    fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>> {
+        self.jwt_key_source.clone()
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
@@ -2800,10 +2786,11 @@ mod tests {
         let _policy_handle = manager.spawn(Box::new(policy_service)).await.expect("test: start policy service");
 
         // Create policy client for RegistryService
-        let policy_client: PolicyClient = PolicyClient::with_endpoint(
+        let policy_client: PolicyClient = PolicyClient::for_endpoint(
             "inproc://test-policy-health",
             signing_key.clone(),
-            RequestIdentity::anonymous(),
+            signing_key.verifying_key(),
+            None,
         );
 
         // Start the registry service with policy client
@@ -2818,10 +2805,11 @@ mod tests {
         let mut handle = manager.spawn(Box::new(registry_service)).await.expect("test: start registry service");
 
         // Create signed client with matching key and local identity
-        let client: RegistryClient = RegistryClient::with_endpoint(
+        let client: RegistryClient = RegistryClient::for_endpoint(
             "inproc://test-registry-health",
-            signing_key,
-            RequestIdentity::anonymous(),
+            signing_key.clone(),
+            signing_key.verifying_key(),
+            None,
         );
         // health_check returns () on success
         let result = client.health_check().await;

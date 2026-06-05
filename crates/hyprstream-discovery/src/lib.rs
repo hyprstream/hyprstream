@@ -48,6 +48,6 @@ pub use service::{AuthorizationProvider, DiscoveryService};
 pub use generated::discovery_client::{
     DiscoveryClient, DiscoveryHandler, DiscoveryResponseVariant,
     ErrorInfo, ServiceList, ServiceSummary, ServiceEndpoints, EndpointInfo,
-    PingInfo, AuthMetadata, AuthMetadataList,
+    PingInfo, AuthMetadata, AuthMetadataList, ServiceAnnouncement,
     dispatch_discovery, serialize_response,
 };

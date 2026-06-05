@@ -27,14 +27,18 @@
 //! - `fips`: ECDH P-256 for FIPS 140-2 compliance
 
 pub mod backend;
+pub mod cose_sign1;
+pub mod envelope_crypto;
 pub mod event_crypto;
 pub mod hmac;
 pub mod key_exchange;
 pub mod notification;
+#[cfg(feature = "pq-hybrid")]
+pub mod pq;
 pub mod signing;
 
 pub use backend::{derive_key, keyed_mac, keyed_mac_truncated};
-pub use hmac::{ChainedStreamHmac, HmacKey};
+pub use hmac::StreamHmacState;
 pub use key_exchange::{
     derive_notification_keys, derive_stream_keys, DefaultKeyExchange, KeyExchange,
     NotificationKeys, SharedSecret, StreamKeys,

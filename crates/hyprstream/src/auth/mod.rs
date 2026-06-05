@@ -5,20 +5,33 @@
 //!
 //! Also provides JWT token authentication with Ed25519 signatures.
 
-pub mod credentials;
+pub mod device_challenge;
+pub mod identity_store;
+pub mod key_rotation;
+pub mod service_jwt;
 pub mod federation;
+pub mod id_token_verify;
 pub mod jwt;
 mod policy_manager;
 pub mod policy_migration;
 pub mod policy_templates;
 pub mod user_store;
+pub mod rocksdb_store;
+#[cfg(feature = "valkey")]
+pub mod valkey;
 
 pub use federation::FederationKeyResolver;
 pub use jwt::{Claims, JwtError};
-pub use policy_manager::{PolicyManager, PolicyError, write_policy_file};
+pub use key_rotation::{SigningKeyStore, Es256SigningKeyStore, Es256KeySlot, RotationStores};
+#[cfg(feature = "pq-hybrid")]
+pub use key_rotation::{MlDsaSigningKeyStore, MlDsaKeySlot};
+pub use policy_manager::{PolicyManager, PolicyError, write_policy_file, global_policy_manager, set_global_policy_manager};
 pub use policy_migration::migrate_policy_csv;
-pub use policy_templates::{PolicyTemplate, get_template, get_templates};
-pub use user_store::{LocalKeyStore, UserStore};
+pub use policy_templates::{PolicyTemplate, ServicePolicyRule, SERVICE_BASE_POLICIES, get_template, get_templates};
+pub use user_store::{DeviceRecord, DeviceStore, UserFilter, UserProfile, UserStore, PubkeyEntry, pubkey_fingerprint, decode_pubkey_base64};
+pub use rocksdb_store::RocksDbUserStore;
+#[cfg(feature = "valkey")]
+pub use valkey::ValkeyUserStore;
 
 /// Operation types that can be controlled via policies
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

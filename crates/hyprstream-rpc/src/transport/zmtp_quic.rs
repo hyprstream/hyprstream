@@ -503,7 +503,7 @@ impl QuicRep {
         send: quinn::SendStream,
         recv: quinn::RecvStream,
         service: Rc<S>,
-        server_pubkey: ed25519_dalek::VerifyingKey,
+        _server_pubkey: ed25519_dalek::VerifyingKey,
         signing_key: ed25519_dalek::SigningKey,
         nonce_cache: Arc<crate::envelope::InMemoryNonceCache>,
     ) -> Result<()>
@@ -523,14 +523,19 @@ impl QuicRep {
 
         let raw_bytes = &request.parts[0];
 
-        // Process through envelope pipeline (FixedSigner: QUIC peers pre-share keys)
-        let (response_bytes, continuation) = process_request(
+        // Process through envelope pipeline.
+        // AnySigner: per-service keys mean each client signs with its own key,
+        // not a shared root key. The envelope signature is still verified — we
+        // just don't pin it to the server's own key. JWT claims + Casbin handle
+        // authorization.
+        // subsecond::call wraps dispatch for hot-patching during dev
+        let (response_bytes, continuation) = subsecond::call(|| process_request(
             raw_bytes,
             &*service,
-            EnvelopeVerification::FixedSigner(&server_pubkey),
+            EnvelopeVerification::AnySigner,
             &signing_key,
             &nonce_cache,
-        ).await?;
+        )).await?;
 
         // Send response
         let response = Multipart {
@@ -1173,6 +1178,53 @@ impl AsyncWrite for QuicStream {
     }
 }
 
+/// Wrapper for h3-webtransport bidi stream halves to implement AsyncRead/AsyncWrite.
+/// Same pattern as QuicStream above, but for the H3 WebTransport layer.
+struct WtStream<S, R> {
+    send: S,
+    recv: R,
+}
+
+impl<S: Unpin, R: AsyncRead + Unpin> AsyncRead for WtStream<S, R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.recv).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin, R: Unpin> AsyncWrite for WtStream<S, R> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.send)
+            .poll_write(cx, buf)
+            .map_err(std::io::Error::other)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.send)
+            .poll_flush(cx)
+            .map_err(std::io::Error::other)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.send)
+            .poll_shutdown(cx)
+            .map_err(std::io::Error::other)
+    }
+}
+
 // ============================================================================
 // QuicServiceLoop - QUIC Transport Service Loop
 // ============================================================================
@@ -1358,16 +1410,18 @@ impl WebTransportServer {
     /// * `key_der` - DER-encoded private key
     pub fn bind(
         addr: SocketAddr,
-        cert_der: Vec<u8>,
+        cert_chain: Vec<Vec<u8>>,
         key_der: Vec<u8>,
     ) -> Result<Self> {
-        let tls = webtransport_tls_config(cert_der.clone(), key_der)?;
+        let tls = webtransport_tls_config(cert_chain.clone(), key_der)?;
         let quic_cfg = quinn::ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(tls)
                 .map_err(|e| anyhow!("QUIC server config failed: {}", e))?
         ));
         let endpoint = quinn::Endpoint::server(quic_cfg, addr)?;
 
+        // Store leaf cert for cert-hash endpoint
+        let cert_der = cert_chain.into_iter().next().unwrap_or_default();
         Ok(Self { endpoint, protected_resource_json: None, cert_der })
     }
 
@@ -1450,6 +1504,7 @@ impl WebTransportServer {
         let h3_conn = h3_quinn::Connection::new(quinn_conn);
         let mut h3_server: H3QuinnConnection = h3::server::builder()
             .enable_webtransport(true)
+            .max_webtransport_sessions(64)
             .enable_datagram(true)
             .enable_extended_connect(true)
             .build(h3_conn)
@@ -1557,7 +1612,7 @@ impl WebTransportServer {
                         if let Err(e) = Self::handle_wt_stream(
                             stream, service, server_pubkey, signing_key, nonce_cache,
                         ).await {
-                            debug!("WebTransport stream error: {}", e);
+                            warn!("WebTransport stream error: {}", e);
                         }
                     });
                 }
@@ -1584,6 +1639,12 @@ impl WebTransportServer {
     /// first 4 bytes are typically 0x00000000 (1 segment). A subscription topic is a
     /// short UTF-8 hex string (10-100 bytes). We try RPC first; on envelope verification
     /// failure, fall back to subscription.
+    /// Handle a WebTransport bidi stream using ZMTP-Lite framing.
+    ///
+    /// Protocol: first frame is a ZMTP command with name "STREAM_TYPE" and body
+    /// "REQ" (RPC) or "SUB" (subscription). Remaining frames use standard ZMTP
+    /// multipart framing. No ZMTP greeting/READY exchange — both endpoints are
+    /// our code and TLS 1.3 via H3 handles authentication.
     async fn handle_wt_stream<S>(
         stream: WtBidiStream,
         service: Rc<S>,
@@ -1595,92 +1656,97 @@ impl WebTransportServer {
         S: crate::service::ZmqService + 'static,
     {
         use h3::quic::BidiStream as H3BidiStream;
-        let (mut send, mut recv) = H3BidiStream::split(stream);
+        let (send, recv) = H3BidiStream::split(stream);
+        let mut zmtp = ZmtpStream::new(WtStream { send, recv });
 
-        // Read request bytes (length-prefixed)
-        const MAX_WEBTRANSPORT_REQUEST_SIZE: usize = 16 * 1024 * 1024;
-        let mut len_buf = [0u8; 4];
-        recv.read_exact(&mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf) as usize;
-        ensure!(
-            len <= MAX_WEBTRANSPORT_REQUEST_SIZE,
-            "WebTransport request size {} exceeds maximum {}",
-            len,
-            MAX_WEBTRANSPORT_REQUEST_SIZE
-        );
+        // Read first frame — must be a STREAM_TYPE command
+        let cmd = zmtp.recv_command().await?;
+        ensure!(cmd.name == "STREAM_TYPE", "Expected STREAM_TYPE command, got '{}'", cmd.name);
 
-        let mut request_buf = vec![0u8; len];
-        recv.read_exact(&mut request_buf).await?;
+        let stream_type = std::str::from_utf8(&cmd.body)
+            .map_err(|_| anyhow!("Invalid STREAM_TYPE body"))?;
 
-        // Detect whether this is an RPC envelope or a subscription topic.
-        // A Cap'n Proto SignedEnvelope starts with a segment table: the first 4 bytes
-        // are 0x00000000 (segment_count - 1 = 0 for single-segment messages).
-        // A subscription topic is a UTF-8 string that won't start with 4 null bytes.
-        let is_capnp = request_buf.len() >= 4 && request_buf[..4] == [0, 0, 0, 0];
+        match stream_type {
+            "REQ" => {
+                // RPC path: read multipart request, process, send multipart response
+                let request = zmtp.recv_multipart().await?;
+                ensure!(!request.parts.is_empty(), "Empty RPC request");
+                let raw_bytes = &request.parts[0];
 
-        if is_capnp {
-            // RPC path: process as signed envelope
-            match process_request(
-                &request_buf,
-                &*service,
-                EnvelopeVerification::AnySigner,
-                &signing_key,
-                &nonce_cache,
-            ).await {
-                Ok((response_bytes, continuation)) => {
-                    send.write_all(&(response_bytes.len() as u32).to_be_bytes()).await?;
-                    send.write_all(&response_bytes).await?;
-                    send.shutdown().await?;
+                match subsecond::call(|| process_request(
+                    raw_bytes,
+                    &*service,
+                    EnvelopeVerification::AnySigner,
+                    &signing_key,
+                    &nonce_cache,
+                )).await {
+                    Ok((response_bytes, continuation)) => {
+                        zmtp.send_multipart(&[Bytes::from(response_bytes)]).await?;
+                        zmtp.stream.send.shutdown().await
+                            .map_err(std::io::Error::other)?;
 
-                    if let Some(cont) = continuation {
-                        tokio::task::spawn_local(cont);
+                        if let Some(cont) = continuation {
+                            tokio::task::spawn_local(cont);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("WebTransport RPC error: {}", e);
+                        // Send error as a single-frame multipart so client gets a response
+                        let error_msg = format!("RPC error: {}", e);
+                        zmtp.send_multipart(&[Bytes::from(error_msg.into_bytes())]).await?;
+                        zmtp.stream.send.shutdown().await
+                            .map_err(std::io::Error::other)?;
                     }
                 }
-                Err(e) => {
-                    debug!("WebTransport RPC error: {}", e);
-                }
             }
-        } else {
-            // Subscription path: topic string
-            debug!("WebTransport stream: detected subscription topic ({} bytes)", request_buf.len());
-            Self::handle_stream_subscription(send, &request_buf).await?;
+            "SUB" => {
+                // Subscription path: read topic from next multipart, then forward blocks
+                let topic_msg = zmtp.recv_multipart().await?;
+                ensure!(!topic_msg.parts.is_empty(), "SUB: missing topic");
+                let topic_bytes = &topic_msg.parts[0];
+
+                debug!(topic_len = topic_bytes.len(), "WebTransport SUB stream");
+                Self::handle_stream_subscription_zmtp(zmtp, topic_bytes).await?;
+            }
+            "PUB" => {
+                // Client→server publish: read topic, forward ZMTP multipart into ZMQ PUSH.
+                // Used for ctrl channel messages (cancel, etc.) from browser clients.
+                let topic_msg = zmtp.recv_multipart().await?;
+                ensure!(!topic_msg.parts.is_empty(), "PUB: missing topic");
+                let topic_bytes = &topic_msg.parts[0];
+
+                debug!(topic_len = topic_bytes.len(), "WebTransport PUB stream");
+                Self::handle_stream_publish_zmtp(zmtp, topic_bytes).await?;
+            }
+            other => bail!("Unknown STREAM_TYPE: {}", other),
         }
 
         Ok(())
     }
 
-    /// Handle a stream subscription on a WebTransport bidi stream.
+
+
+    /// Handle a stream subscription using ZMTP multipart framing.
     ///
-    /// The client sends a length-prefixed UTF-8 topic string. We create a ZMQ SUB
-    /// socket, subscribe to that topic on the XPUB endpoint, and forward multipart
-    /// StreamBlock messages as length-prefixed blocks back to the WebTransport stream.
-    ///
-    /// Wire format (per block written to WebTransport):
-    ///   [4-byte BE length] [capnp StreamBlock bytes]
-    async fn handle_stream_subscription<W>(
-        mut send: W,
+    /// Like `handle_stream_subscription` but sends each block as a ZMTP multipart
+    /// message (3 frames: topic, capnp, mac) instead of length-prefixed bytes.
+    async fn handle_stream_subscription_zmtp<S: AsyncRead + AsyncWrite + Unpin>(
+        mut zmtp: ZmtpStream<S>,
         topic_bytes: &[u8],
-    ) -> Result<()>
-    where
-        W: AsyncWrite + Unpin,
-    {
+    ) -> Result<()> {
         use crate::registry::{global as endpoint_registry, SocketKind};
 
-        // Decode topic from request buffer (UTF-8 string)
         let topic = std::str::from_utf8(topic_bytes)
             .map_err(|e| anyhow!("Invalid UTF-8 subscription topic: {}", e))?;
 
-        debug!(topic = %topic, "WebTransport stream subscription started");
+        debug!(topic = %topic, "WebTransport ZMTP stream subscription started");
 
-        // Get XPUB endpoint for the streams service
         let sub_endpoint = endpoint_registry()
             .endpoint("streams", SocketKind::Sub)
             .to_zmq_string();
 
-        // Spawn ZMQ SUB recv on a dedicated thread to avoid blocking the
-        // Quinn/H3 event loop (which runs on the same local set).
-        // Messages are forwarded via an async channel.
-        let (block_tx, mut block_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        // Channel carries multipart frames: Vec<Vec<u8>>
+        let (block_tx, mut block_rx) = tokio::sync::mpsc::channel::<Vec<Vec<u8>>>(64);
         let topic_owned = topic.to_owned();
         let sub_endpoint_owned = sub_endpoint.clone();
 
@@ -1688,10 +1754,7 @@ impl WebTransportServer {
             let zmq_ctx = zmq::Context::new();
             let sub_socket = match zmq_ctx.socket(zmq::SUB) {
                 Ok(s) => s,
-                Err(e) => {
-                    warn!("Failed to create SUB socket: {}", e);
-                    return;
-                }
+                Err(e) => { warn!("Failed to create SUB socket: {}", e); return; }
             };
             if let Err(e) = sub_socket.connect(&sub_endpoint_owned) {
                 warn!("SUB connect failed: {} endpoint={}", e, sub_endpoint_owned);
@@ -1705,61 +1768,84 @@ impl WebTransportServer {
             let _ = sub_socket.set_rcvtimeo(100);
 
             loop {
-                if block_tx.is_closed() {
-                    break;
-                }
+                if block_tx.is_closed() { break; }
 
-                // Receive multipart: [topic, capnp_block, mac?]
-                let _topic_frame = match sub_socket.recv_bytes(0) {
-                    Ok(bytes) => bytes,
+                // Receive full multipart: [topic, capnp_block, mac?]
+                match sub_socket.recv_multipart(0) {
+                    Ok(frames) => {
+                        if block_tx.blocking_send(frames).is_err() { break; }
+                    }
                     Err(zmq::Error::EAGAIN) => continue,
-                    Err(e) => {
-                        warn!("ZMQ SUB recv error: {}", e);
-                        break;
-                    }
-                };
-
-                let has_more = sub_socket.get_rcvmore().unwrap_or(false);
-                if !has_more {
-                    continue;
-                }
-
-                let capnp_block = match sub_socket.recv_bytes(0) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        warn!("ZMQ SUB recv capnp error: {}", e);
-                        break;
-                    }
-                };
-
-                // Drain remaining frames (MAC etc)
-                while sub_socket.get_rcvmore().unwrap_or(false) {
-                    let _ = sub_socket.recv_bytes(0);
-                }
-
-                // Send to async side; if channel full or closed, stop
-                if block_tx.blocking_send(capnp_block).is_err() {
-                    break;
+                    Err(e) => { warn!("ZMQ SUB recv error: {}", e); break; }
                 }
             }
         });
 
-        debug!(topic = %topic, endpoint = %sub_endpoint, "ZMQ SUB connected for WebTransport bridge");
+        debug!(topic = %topic, endpoint = %sub_endpoint, "ZMQ SUB connected for ZMTP bridge");
 
-        // Async forward loop: channel → WebTransport send stream
-        while let Some(capnp_block) = block_rx.recv().await {
-            let len = capnp_block.len() as u32;
-            if let Err(e) = send.write_all(&len.to_be_bytes()).await {
-                debug!(topic = %topic, "WebTransport send error: {}", e);
-                break;
-            }
-            if let Err(e) = send.write_all(&capnp_block).await {
-                debug!(topic = %topic, "WebTransport send error: {}", e);
+        // Forward loop: channel → ZMTP multipart on WebTransport stream
+        while let Some(frames) = block_rx.recv().await {
+            let parts: Vec<Bytes> = frames.into_iter().map(Bytes::from).collect();
+            if let Err(e) = zmtp.send_multipart(&parts).await {
+                debug!(topic = %topic, "ZMTP send error: {}", e);
                 break;
             }
         }
 
-        debug!(topic = %topic, "WebTransport stream subscription ended");
+        debug!(topic = %topic, "WebTransport ZMTP stream subscription ended");
+        Ok(())
+    }
+
+    /// Handle a client→server PUB stream using ZMTP multipart framing.
+    ///
+    /// Reads ZMTP multipart messages from the WebTransport stream and forwards
+    /// them into the ZMQ PUSH infrastructure. The existing `spawn_ctrl_listener`
+    /// SUB socket picks them up — same path as native ZMQ PUSH ctrl messages.
+    ///
+    /// Wire format per message: `[ctrl_topic, capnp_payload, mac]`
+    async fn handle_stream_publish_zmtp<S: AsyncRead + AsyncWrite + Unpin>(
+        mut zmtp: ZmtpStream<S>,
+        topic_bytes: &[u8],
+    ) -> Result<()> {
+        use crate::registry::{global as endpoint_registry, SocketKind};
+
+        let topic = std::str::from_utf8(topic_bytes)
+            .map_err(|e| anyhow!("Invalid UTF-8 PUB topic: {}", e))?;
+
+        debug!(topic = %topic, "WebTransport ZMTP PUB stream started");
+
+        let push_endpoint = endpoint_registry()
+            .endpoint("streams", SocketKind::Push)
+            .to_zmq_string();
+
+        // Create a sync ZMQ PUSH socket to forward ctrl messages
+        let zmq_ctx = zmq::Context::new();
+        let push_socket = zmq_ctx.socket(zmq::PUSH)
+            .map_err(|e| anyhow!("Failed to create PUSH socket: {}", e))?;
+        push_socket.connect(&push_endpoint)
+            .map_err(|e| anyhow!("PUSH connect to {}: {}", push_endpoint, e))?;
+        let _ = push_socket.set_linger(0);
+
+        // Read loop: ZMTP multipart from WebTransport → ZMQ PUSH
+        while let Ok(msg) = zmtp.recv_multipart().await {
+            if msg.parts.is_empty() {
+                continue;
+            }
+            // Forward all frames via ZMQ PUSH
+            for (i, frame) in msg.parts.iter().enumerate() {
+                let flags = if i < msg.parts.len() - 1 {
+                    zmq::SNDMORE | zmq::DONTWAIT
+                } else {
+                    zmq::DONTWAIT
+                };
+                if let Err(e) = push_socket.send(frame.as_ref(), flags) {
+                    warn!(topic = %topic, "PUSH send failed: {}", e);
+                    break;
+                }
+            }
+        }
+
+        debug!(topic = %topic, "WebTransport ZMTP PUB stream ended");
         Ok(())
     }
 }
@@ -1794,17 +1880,22 @@ pub fn ensure_crypto_provider() {
 }
 
 /// Build TLS config for HTTP/3 + WebTransport (ALPN: h3).
+///
+/// Accepts a certificate chain (leaf first, then intermediates/CA).
+/// For self-signed certs, the chain is just `vec![leaf]`.
+/// For CA-signed certs (e.g. mkcert), include leaf + CA cert.
 fn webtransport_tls_config(
-    cert_der: Vec<u8>,
+    cert_chain: Vec<Vec<u8>>,
     key_der: Vec<u8>,
 ) -> Result<rustls::ServerConfig> {
     ensure_crypto_provider();
     let key = rustls::pki_types::PrivateKeyDer::from(
         rustls::pki_types::PrivatePkcs8KeyDer::from(key_der)
     );
+    let certs = cert_chain.into_iter().map(Into::into).collect();
     let mut cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(vec![cert_der.into()], key)?;
+        .with_single_cert(certs, key)?;
     cfg.alpn_protocols = vec![b"h3".to_vec()];
     Ok(cfg)
 }
@@ -1876,14 +1967,7 @@ pub fn client_tls_system_roots() -> Result<rustls::ClientConfig> {
 ///
 /// Both modes share: timestamp window (5 min), nonce replay protection, JWT claims
 /// verification. The only difference is step 1 of 4 in the verification pipeline.
-pub enum EnvelopeVerification<'a> {
-    /// Require the envelope signer to match this specific verifying key.
-    /// Used for ZMQ transport where peers pre-share Ed25519 keys.
-    FixedSigner(&'a ed25519_dalek::VerifyingKey),
-    /// Accept any valid Ed25519 signer.
-    /// Used for WebTransport where TLS 1.3 provides channel authentication.
-    AnySigner,
-}
+pub use crate::envelope::EnvelopeVerification;
 
 /// Process a request through the full envelope verification pipeline.
 ///
@@ -1925,20 +2009,15 @@ where
     use capnp::serialize;
     use tracing::warn;
 
-    // 1. Unwrap and verify SignedEnvelope based on verification mode.
-    //
-    // FixedSigner: all callers sign with the node key → key_derived_subject = "system".
-    // AnySigner: external callers (WebTransport) use their own key → Anonymous until JWT.
-    let (mut ctx, payload) = match match verification {
+    // 1. Unwrap, verify, and optionally decrypt the SignedEnvelope.
+    let opts = match verification {
         EnvelopeVerification::FixedSigner(pubkey) =>
-            if let Some(registry) = service.key_registry() {
-                crate::envelope::unwrap_envelope_with_registry(raw_bytes, pubkey, nonce_cache, &*registry)
-            } else {
-                crate::envelope::unwrap_envelope_as_system(raw_bytes, pubkey, nonce_cache)
-            },
+            crate::envelope::UnwrapOptions::fixed_signer(pubkey, nonce_cache),
         EnvelopeVerification::AnySigner =>
-            crate::envelope::unwrap_envelope_any_signer(raw_bytes, nonce_cache),
-    } {
+            crate::envelope::UnwrapOptions::any_signer(nonce_cache),
+    }.with_decryption_key(signing_key);
+
+    let (mut ctx, payload) = match crate::envelope::unwrap_envelope(raw_bytes, &opts) {
         Ok(result) => result,
         Err(e) => {
             warn!("{} envelope verification failed: {}", service.name(), e);

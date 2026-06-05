@@ -17,6 +17,8 @@ fn base_metadata(issuer: &str, scopes: &[String]) -> serde_json::Value {
         "token_endpoint": format!("{}/oauth/token", issuer),
         "registration_endpoint": format!("{}/oauth/register", issuer),
         "device_authorization_endpoint": format!("{}/oauth/device", issuer),
+        "pushed_authorization_request_endpoint": format!("{}/oauth/par", issuer),
+        "require_pushed_authorization_requests": false,
         "jwks_uri": format!("{}/oauth/jwks", issuer),
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code"],

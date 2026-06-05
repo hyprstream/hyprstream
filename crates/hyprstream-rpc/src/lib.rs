@@ -103,9 +103,25 @@ pub mod envelope;
 pub mod error;
 pub mod fs_client;
 pub mod platform;
+pub mod rpc_client;
+pub mod stream_info;
 pub mod zmtp_framing;
 
 // ============================================================================
+// Cross-platform modules (available on all targets including wasm32)
+// ============================================================================
+
+/// Schema introspection metadata types — used by proc macro codegen on all targets.
+pub mod metadata {
+    pub use crate::_metadata::*;
+}
+mod _metadata;
+
+// ============================================================================
+// Transport traits (available on ALL targets)
+pub mod transport_traits;
+pub mod stream_consumer;
+
 // Native-only modules (not compiled for wasm32)
 // ============================================================================
 
@@ -135,6 +151,8 @@ pub mod socket;
 
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_api;
+#[cfg(target_arch = "wasm32")]
+pub mod web_transport;
 
 // ============================================================================
 // Re-exports available on ALL targets
@@ -142,24 +160,32 @@ pub mod wasm_api;
 
 pub use capnp::{serialize_message, FromCapnp, ToCapnp};
 pub use fs_client::{FsClient, FsOpenResult, FsStatResult, FsWalkResult};
+pub use rpc_client::{CallOptions, RequestBuilder, RpcClient, RpcClientImpl};
+pub use transport_traits::{PublishSink, Signer, Transport};
+pub mod identity;
+pub mod node_identity;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod federated_identity;
+pub mod signer;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod zmq_connection;
+pub use stream_info::StreamInfo;
 pub use crypto::{
-    generate_signing_keypair, signing_key_from_bytes, verifying_key_from_bytes, ChainedStreamHmac,
-    DefaultKeyExchange, HmacKey, KeyExchange, SharedSecret, SigningKey, VerifyingKey,
+    generate_signing_keypair, signing_key_from_bytes, verifying_key_from_bytes,
+    DefaultKeyExchange, KeyExchange, SharedSecret, SigningKey, StreamHmacState, VerifyingKey,
 };
 
 #[cfg(not(feature = "fips"))]
 pub use crypto::{generate_ephemeral_keypair, ristretto_dh, RistrettoPublic, RistrettoSecret};
 
 pub use envelope::{
-    unwrap_and_verify, InMemoryNonceCache, KeyRegistry, NodeKeyRegistry, NonceCache,
-    RequestEnvelope, RequestIdentity, ResponseEnvelope, SignedEnvelope, Subject,
+    unwrap_and_verify,
+    Authorization, EnvelopeVerification, FederatedToken, InMemoryNonceCache, NonceCache,
+    RequestEnvelope, ResponseEnvelope, SignedEnvelope, Subject, TokenClaims, UnwrapOptions,
     MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
 };
 #[cfg(not(target_arch = "wasm32"))]
-pub use envelope::{
-    unwrap_envelope, unwrap_envelope_as_system, unwrap_envelope_with_registry,
-    unwrap_envelope_any_signer,
-};
+pub use envelope::unwrap_envelope;
 pub use error::{EnvelopeError, EnvelopeResult, Result, RpcError};
 
 // ============================================================================
@@ -176,7 +202,7 @@ pub use resolver::Resolver;
 pub use registry::SocketKind;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use service::{Continuation, EnvelopeContext, RequestLoop, Spawnable, ServiceHandle, ZmqClient, ZmqService};
+pub use service::{Continuation, EnvelopeContext, RequestLoop, Spawnable, ServiceHandle, ZmqService};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use streaming::{
@@ -186,7 +212,7 @@ pub use streaming::{
 };
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use zmq_context::{global_context, create_service_client_base};
+pub use zmq_context::global_context;
 
 // ============================================================================
 // Prelude (native only — too many native-only types)
@@ -199,16 +225,16 @@ pub mod prelude {
         serialize_message, FromCapnp, ToCapnp,
         // Crypto
         generate_signing_keypair, signing_key_from_bytes, verifying_key_from_bytes,
-        ChainedStreamHmac, DefaultKeyExchange, HmacKey, KeyExchange, SharedSecret,
-        SigningKey, VerifyingKey,
+        DefaultKeyExchange, KeyExchange, SharedSecret, SigningKey, StreamHmacState, VerifyingKey,
         // Envelope
-        unwrap_envelope, unwrap_and_verify, InMemoryNonceCache, NonceCache, RequestEnvelope,
-        RequestIdentity, ResponseEnvelope, SignedEnvelope, Subject,
+        unwrap_envelope, unwrap_and_verify, Authorization, EnvelopeVerification,
+        InMemoryNonceCache, NonceCache, RequestEnvelope, ResponseEnvelope,
+        SignedEnvelope, Subject, UnwrapOptions,
         MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
         // Error
         EnvelopeError, EnvelopeResult, Result, RpcError,
         // Service (transport)
-        EnvelopeContext, RequestLoop, ServiceHandle, ZmqClient, ZmqService,
+        EnvelopeContext, RequestLoop, ServiceHandle, ZmqService,
         // Streaming
         StreamContext, StreamPublisher,
     };
@@ -217,7 +243,7 @@ pub mod prelude {
     pub use crate::{generate_ephemeral_keypair, ristretto_dh, RistrettoPublic, RistrettoSecret};
 
     // ZMQ context
-    pub use crate::zmq_context::{global_context, create_service_client_base};
+    pub use crate::zmq_context::global_context;
 
     // Registry (with renamed imports for convenience)
     pub use crate::registry::{
@@ -226,7 +252,7 @@ pub mod prelude {
     };
 
     // Transport
-    pub use crate::transport::{AsyncTransport, Transport, TransportConfig};
+    pub use crate::transport::TransportConfig;
 }
 
 // ============================================================================

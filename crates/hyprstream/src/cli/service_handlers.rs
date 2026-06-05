@@ -560,7 +560,7 @@ pub(crate) async fn run_repair_checks(
     {
         let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
         // HTTP TLS (365-day self-signed)
-        match crate::auth::credentials::load_or_generate_tls_materials(&secrets_dir, "localhost", 365) {
+        match crate::auth::identity_store::load_or_generate_tls_materials(&secrets_dir, "localhost", 365) {
             Ok(_) => print_check("TLS key+cert", CheckStatus::Ok, "HTTP (365d)"),
             Err(e) => {
                 print_check("TLS key+cert", CheckStatus::Fail, &format!("{e}"));
@@ -568,7 +568,7 @@ pub(crate) async fn run_repair_checks(
             }
         }
         // QUIC TLS (14-day per WebTransport spec)
-        match crate::auth::credentials::load_or_generate_tls_materials_named(
+        match crate::auth::identity_store::load_or_generate_tls_materials_named(
             &secrets_dir, "localhost", 14, "quic-key", "quic-cert",
         ) {
             Ok(_) => print_check("QUIC key+cert", CheckStatus::Ok, "WebTransport (14d)"),
@@ -582,7 +582,7 @@ pub(crate) async fn run_repair_checks(
     // 4c. RSA key for RS256 JWT signing (OIDC interop)
     {
         let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
-        match crate::auth::credentials::load_or_generate_rsa_key(&secrets_dir) {
+        match crate::auth::identity_store::load_or_generate_rsa_key(&secrets_dir) {
             Ok(_) => print_check("RSA key", CheckStatus::Ok, "RS256 (2048-bit)"),
             Err(e) => {
                 // Non-fatal: EdDSA still works, RS256 is for interop
@@ -620,7 +620,42 @@ pub(crate) async fn run_repair_checks(
         }
     }
 
-    // 6. Policy active
+    // 6. Service JWT presence
+    {
+        let credentials_dir = crate::config::HyprConfig::load()
+            .map(|c| c.config_dir().join("credentials"))
+            .unwrap_or_else(|_| {
+                dirs::config_dir()
+                    .unwrap_or_else(|| models_dir.to_path_buf())
+                    .join("hyprstream")
+                    .join("credentials")
+            });
+
+        let mut missing_jwts = Vec::new();
+        for factory in hyprstream_service::list_factories() {
+            let svc = factory.name;
+            if svc == "policy" {
+                continue; // PolicyService uses the root CA key, not a per-service JWT
+            }
+            match crate::auth::identity_store::load_service_jwt(&credentials_dir, svc) {
+                Ok(Some(_)) => {}
+                _ => missing_jwts.push(svc),
+            }
+        }
+
+        if missing_jwts.is_empty() {
+            print_check("Service JWTs", CheckStatus::Ok, "all present");
+        } else {
+            print_check(
+                "Service JWTs",
+                CheckStatus::Warn,
+                &format!("missing for: {}. Run: hyprstream wizard", missing_jwts.join(", ")),
+            );
+            warnings.push("Run 'hyprstream wizard' to generate missing service JWTs".to_owned());
+        }
+    }
+
+    // 7. Policy active
     {
         let label = "Policy active";
         let policies_dir = models_dir.join(".registry").join("policies");
@@ -643,7 +678,7 @@ pub(crate) async fn run_repair_checks(
                         print_check(label, CheckStatus::Ok, &format!("{rule_count} allow rule(s) ({first_subject})"));
                     } else {
                         print_check(label, CheckStatus::Warn, "no allow rules (deny-by-default)");
-                        warnings.push("Apply a template: hyprstream quick policy apply-template local".to_owned());
+                        warnings.push("Apply a template: hyprstream quick policy list-templates".to_owned());
                     }
                 }
                 Err(e) => {
@@ -678,6 +713,7 @@ pub(crate) async fn run_repair_checks(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub(crate) enum CheckStatus {
     Ok,
     Fixed,
@@ -1067,10 +1103,10 @@ fn remove_if_exists(path: &Path) -> Result<()> {
 /// the base64-encoded SHA-256 hash, suitable for use in the browser's
 /// `serverCertificateHashes` WebTransport option.
 pub fn handle_print_cert_hash(quic_config: &crate::config::QuicConfig) -> Result<()> {
-    let (cert_der, _key_der) = quic_config.load_tls_materials()
+    let (cert_chain, _key_der) = quic_config.load_tls_materials()
         .context("Failed to load/generate QUIC TLS certificate")?;
 
-    let hash = hyprstream_rpc::transport::zmtp_quic::cert_hash(&cert_der);
+    let hash = hyprstream_rpc::transport::zmtp_quic::cert_hash(&cert_chain[0]);
     println!("{}", hash);
     Ok(())
 }

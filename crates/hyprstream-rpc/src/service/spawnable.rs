@@ -79,7 +79,7 @@ impl<S: ZmqService + Send + Sync> Spawnable for S {
         let context = Arc::clone(ZmqService::context(&*self));
         let signing_key = ZmqService::signing_key(&*self);
 
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|e| RpcError::SpawnFailed(format!("runtime: {e}")))?;

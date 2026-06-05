@@ -85,6 +85,10 @@ pub struct HyprConfig {
     #[serde(default)]
     pub oauth: OAuthConfig,
 
+    /// Credentials storage backend (user profiles, pubkeys, refresh tokens).
+    #[serde(default)]
+    pub credentials: CredentialsConfig,
+
     /// StreamService configuration (buffer sizes, TTL, etc.)
     #[serde(default)]
     pub streaming: StreamingConfig,
@@ -138,8 +142,8 @@ pub struct HyprConfig {
 
     /// Persistent secrets storage configuration.
     ///
-    /// Controls where signing keys, TLS materials, and credential store keys are
-    /// read from and written to. On systemd, overridden at runtime by
+    /// Controls where signing keys and TLS materials are read from and written to.
+    /// On systemd, overridden at runtime by
     /// `HYPRSTREAM__SECRETS__PATH=%d` in the service unit (pointing to the
     /// systemd credentials directory).
     #[serde(default)]
@@ -149,7 +153,7 @@ pub struct HyprConfig {
 /// Persistent secrets storage configuration.
 ///
 /// Determines the directory used for reading and writing persistent secret key
-/// material: signing keys, TLS certificates/keys, and the age credential store key.
+/// material: signing keys and TLS certificates/keys.
 ///
 /// On systemd, the generated service unit sets
 /// `Environment=HYPRSTREAM__SECRETS__PATH=%d` so that at runtime `path` resolves
@@ -195,64 +199,97 @@ impl SecretsConfig {
 ///
 /// ```toml
 /// [tls]
-/// enabled = true
+/// mode = "self-signed"   # or "acme" or "files"
 /// server_name = "localhost"
-/// # Leave cert_path/key_path unset for auto-generated self-signed cert
+/// # ACME mode:
+/// # acme_domain = "node.example.com"
+/// # acme_contact = "mailto:ops@example.com"
+/// # acme_cache_dir = "/var/lib/hyprstream/acme"
 /// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TlsMode {
+    /// Auto-generate a self-signed certificate at startup (dev/air-gapped only).
+    #[default]
+    SelfSigned,
+    /// Obtain a certificate automatically via ACME (RFC 8555) — Let's Encrypt or step-ca.
+    Acme,
+    /// Load certificate and key from `cert_path`/`key_path` (operator-managed).
+    Files,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsConfig {
     /// Whether TLS is enabled for HTTP services (defaults to true)
     #[serde(default = "default_tls_enabled")]
     pub enabled: bool,
 
-    /// Path to TLS certificate (PEM). None = generate self-signed.
+    /// TLS provisioning mode. Defaults to `self-signed` when cert_path/key_path are unset.
+    #[serde(default)]
+    pub mode: TlsMode,
+
+    /// Path to TLS certificate (PEM). Used when mode = "files".
     #[serde(default)]
     pub cert_path: Option<PathBuf>,
 
-    /// Path to TLS private key (PEM). None = generate self-signed.
+    /// Path to TLS private key (PEM). Used when mode = "files".
     #[serde(default)]
     pub key_path: Option<PathBuf>,
 
-    /// Server name for TLS certificate (used in self-signed cert generation)
+    /// Server name for TLS certificate (self-signed CN or ACME domain).
     #[serde(default = "default_tls_server_name")]
     pub server_name: String,
+
+    /// ACME: domain to obtain a certificate for. Required when mode = "acme".
+    #[serde(default)]
+    pub acme_domain: Option<String>,
+
+    /// ACME: contact email URI, e.g. "mailto:ops@example.com".
+    #[serde(default)]
+    pub acme_contact: Option<String>,
+
+    /// ACME: directory URL. Defaults to Let's Encrypt production.
+    /// Set to a step-ca or Pebble URL for self-hosted ACME.
+    #[serde(default)]
+    pub acme_directory: Option<String>,
+
+    /// ACME: directory for certificate cache and account keys.
+    #[serde(default)]
+    pub acme_cache_dir: Option<PathBuf>,
 }
 
 impl Default for TlsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            mode: TlsMode::SelfSigned,
             cert_path: None,
             key_path: None,
             server_name: default_tls_server_name(),
+            acme_domain: None,
+            acme_contact: None,
+            acme_directory: None,
+            acme_cache_dir: None,
         }
     }
 }
 
 impl TlsConfig {
-    /// Check if self-signed certificate should be generated.
-    ///
-    /// Returns `true` when both cert_path and key_path are None.
-    /// Warns if only one is set (likely misconfiguration).
-    pub fn use_self_signed(&self) -> bool {
-        match (&self.cert_path, &self.key_path) {
-            (None, None) => true,
-            (Some(_), Some(_)) => false,
-            (Some(cert), None) => {
-                tracing::warn!(
-                    "tls.cert_path is set ({}) but tls.key_path is missing — generating self-signed cert instead",
-                    cert.display()
-                );
-                true
-            }
-            (None, Some(key)) => {
-                tracing::warn!(
-                    "tls.key_path is set ({}) but tls.cert_path is missing — generating self-signed cert instead",
-                    key.display()
-                );
-                true
-            }
+    /// Effective TLS mode, resolving legacy cert_path/key_path into Files mode.
+    pub fn effective_mode(&self) -> TlsMode {
+        // Explicit mode overrides; legacy cert_path/key_path implies Files.
+        if self.mode != TlsMode::SelfSigned {
+            return self.mode.clone();
         }
+        if self.cert_path.is_some() && self.key_path.is_some() {
+            return TlsMode::Files;
+        }
+        TlsMode::SelfSigned
+    }
+
+    /// Check if self-signed certificate should be generated.
+    pub fn use_self_signed(&self) -> bool {
+        self.effective_mode() == TlsMode::SelfSigned
     }
 }
 
@@ -347,19 +384,26 @@ impl QuicConfig {
     ///
     /// QUIC uses a separate cert (`quic-cert`) from the HTTP cert (`tls-cert`) because
     /// WebTransport requires ≤14-day validity while HTTP allows 365 days.
-    pub fn load_tls_materials(&self) -> anyhow::Result<(Vec<u8>, Zeroizing<Vec<u8>>)> {
+    /// Load TLS materials for QUIC/WebTransport.
+    ///
+    /// Returns a certificate **chain** (leaf first, then intermediates/CA) and the
+    /// private key. When loading from PEM files, all certificates in the file are
+    /// included — this allows CA-signed certs (e.g. mkcert) to work by bundling
+    /// the leaf + CA cert in a single PEM file.
+    pub fn load_tls_materials(&self) -> anyhow::Result<(Vec<Vec<u8>>, Zeroizing<Vec<u8>>)> {
         if self.use_self_signed() {
             let secrets_dir = HyprConfig::resolve_secrets_dir();
             // Use quic-specific secret names so QUIC and HTTP certs have different
             // validity windows without stomping each other's files.
-            let materials = crate::auth::credentials::load_or_generate_tls_materials_named(
+            let materials = crate::auth::identity_store::load_or_generate_tls_materials_named(
                 &secrets_dir,
                 &self.server_name,
                 14,
                 "quic-key",
                 "quic-cert",
             )?;
-            Ok((materials.cert_der, materials.key_der))
+            // Self-signed: chain is just the leaf cert
+            Ok((vec![materials.cert_der], materials.key_der))
         } else {
             // Load from files
             let cert_pem = std::fs::read(&self.cert_path)
@@ -367,12 +411,16 @@ impl QuicConfig {
             let key_pem = std::fs::read(&self.key_path)
                 .map_err(|e| anyhow::anyhow!("failed to read key_path '{}': {}", self.key_path, e))?;
 
-            // Parse PEM to DER
-            let cert_der = rustls_pemfile::certs(&mut &cert_pem[..])
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("no certificate found in {}", self.cert_path))?
+            // Parse ALL certs from PEM (leaf + intermediates + CA)
+            let cert_chain: Vec<Vec<u8>> = rustls_pemfile::certs(&mut &cert_pem[..])
+                .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| anyhow::anyhow!("invalid certificate PEM: {}", e))?
-                .to_vec();
+                .into_iter()
+                .map(|c| c.to_vec())
+                .collect();
+            if cert_chain.is_empty() {
+                return Err(anyhow::anyhow!("no certificate found in {}", self.cert_path));
+            }
 
             let key_der = Zeroizing::new(
                 rustls_pemfile::private_key(&mut &key_pem[..])
@@ -382,7 +430,7 @@ impl QuicConfig {
                     .to_vec(),
             );
 
-            Ok((cert_der, key_der))
+            Ok((cert_chain, key_der))
         }
     }
 
@@ -396,7 +444,7 @@ impl QuicConfig {
         oauth_issuer_url: Option<&str>,
     ) -> anyhow::Result<hyprstream_rpc::service::QuicLoopConfig> {
         let addr = self.socket_addr()?;
-        let (cert_der, key_der) = self.load_tls_materials()?;
+        let (cert_chain, key_der) = self.load_tls_materials()?;
         let meta_json = oauth_issuer_url.map(|issuer| {
             let meta = crate::services::oauth::protected_resource_metadata(
                 &format!("https://{}/{}", self.server_name, service_name),
@@ -405,11 +453,12 @@ impl QuicConfig {
             serde_json::to_vec(&meta).unwrap_or_default()
         });
         Ok(hyprstream_rpc::service::QuicLoopConfig {
-            cert_der,
+            cert_chain,
             key_der,
             bind_addr: addr,
             server_name: self.server_name.clone(),
             protected_resource_json: meta_json,
+            on_quic_bound: None,
         })
     }
 }
@@ -649,6 +698,54 @@ pub struct TrustedIssuerConfig {
 
 fn default_jwks_cache_ttl() -> u64 { 300 }
 
+/// Protocol kind for an external OAuth/OIDC provider.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderKind {
+    /// Full OpenID Connect — discovery document + id_token JWT verification. Default.
+    #[default]
+    Oidc,
+    /// Generic OAuth 2.0 with a userinfo endpoint. No discovery, no id_token.
+    /// Requires `authorization_endpoint`, `token_endpoint_url`, and `userinfo_endpoint`.
+    OAuth2,
+}
+
+/// Claim field name overrides for mapping a userinfo JSON response to standard claims.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimMapping {
+    /// Field name for the stable subject identifier. Default: `"sub"`.
+    /// GitHub uses `"id"` (numeric integer, coerced to string).
+    /// Discord uses `"id"` (string snowflake).
+    #[serde(default = "default_claim_sub")]
+    pub sub: String,
+    /// Field name for display name. `None` omits the name from the synthetic claims.
+    #[serde(default = "default_claim_name")]
+    pub name: Option<String>,
+    /// Field name for email address. `None` omits email.
+    #[serde(default = "default_claim_email")]
+    pub email: Option<String>,
+    /// Field name for the email-verified boolean.
+    /// `None`, or a field that is absent/null in the response, is treated as `false`.
+    #[serde(default = "default_claim_email_verified")]
+    pub email_verified: Option<String>,
+}
+
+impl Default for ClaimMapping {
+    fn default() -> Self {
+        Self {
+            sub: default_claim_sub(),
+            name: default_claim_name(),
+            email: default_claim_email(),
+            email_verified: default_claim_email_verified(),
+        }
+    }
+}
+
+fn default_claim_sub() -> String { "sub".into() }
+fn default_claim_name() -> Option<String> { Some("name".into()) }
+fn default_claim_email() -> Option<String> { Some("email".into()) }
+fn default_claim_email_verified() -> Option<String> { Some("email_verified".into()) }
+
 /// Configuration for an external OIDC provider (login delegation).
 ///
 /// Hyprstream acts as an OIDC Relying Party to this provider. Users authenticate
@@ -656,17 +753,39 @@ fn default_jwks_cache_ttl() -> u64 { 300 }
 /// own JWT with scopes from the policy engine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OidcProviderConfig {
-    /// OIDC issuer URL (must support `/.well-known/openid-configuration`).
-    pub issuer_url: String,
+    /// Provider protocol kind. Default: `"oidc"`.
+    #[serde(default)]
+    pub kind: ProviderKind,
+    /// OIDC issuer URL. Required for `kind = "oidc"`.
+    /// Must support `/.well-known/openid-configuration`.
+    #[serde(default)]
+    pub issuer_url: Option<String>,
+    /// Authorization endpoint URL. Required for `kind = "oauth2"`.
+    #[serde(default)]
+    pub authorization_endpoint: Option<String>,
+    /// Token endpoint URL. Required for `kind = "oauth2"`. Named `token_endpoint_url`
+    /// to avoid collision with method names on OIDC metadata types.
+    #[serde(default)]
+    pub token_endpoint_url: Option<String>,
+    /// Userinfo endpoint URL. Required for `kind = "oauth2"`.
+    #[serde(default)]
+    pub userinfo_endpoint: Option<String>,
+    /// Whether the provider supports PKCE (`code_challenge`). Default: `true`.
+    /// Set to `false` for providers that reject the parameter (e.g. GitHub).
+    #[serde(default = "default_pkce_supported")]
+    pub pkce_supported: bool,
+    /// Claim field name overrides for mapping userinfo JSON to synthetic claims.
+    #[serde(default)]
+    pub claim_mapping: ClaimMapping,
     /// Client ID registered with the external provider.
     pub client_id: String,
     /// Client secret (optional — omit for public client with PKCE).
     #[serde(default)]
     pub client_secret: Option<String>,
     /// Scopes to request from the provider.
-    #[serde(default = "default_oidc_scopes")]
+    #[serde(default)]
     pub scopes: Vec<String>,
-    /// Display name for the login UI (e.g., "Corporate SSO").
+    /// Display name for the login UI (e.g., "Sign in with GitHub").
     #[serde(default)]
     pub display_name: Option<String>,
     /// Allow plain HTTP for discovery (dev only).
@@ -684,9 +803,43 @@ pub struct OidcProviderConfig {
     /// Default hyprstream scopes for auto-provisioned users.
     #[serde(default)]
     pub default_scopes: Vec<String>,
-    /// Clock skew tolerance for JWT validation (seconds).
+    /// Clock skew tolerance for JWT validation (seconds). OIDC only.
     #[serde(default = "default_clock_skew")]
     pub clock_skew_seconds: u64,
+}
+
+fn default_pkce_supported() -> bool { true }
+
+impl OidcProviderConfig {
+    pub fn effective_authorization_endpoint(&self) -> Option<&str> {
+        self.authorization_endpoint.as_deref()
+    }
+
+    pub fn effective_token_endpoint_url(&self) -> Option<&str> {
+        self.token_endpoint_url.as_deref()
+    }
+
+    pub fn effective_userinfo_endpoint(&self) -> Option<&str> {
+        self.userinfo_endpoint.as_deref()
+    }
+
+    pub fn effective_pkce_supported(&self) -> bool {
+        self.pkce_supported
+    }
+
+    pub fn effective_claim_mapping(&self) -> ClaimMapping {
+        self.claim_mapping.clone()
+    }
+
+    pub fn effective_scopes(&self) -> Vec<String> {
+        if !self.scopes.is_empty() {
+            return self.scopes.clone();
+        }
+        match self.kind {
+            ProviderKind::Oidc => default_oidc_scopes(),
+            ProviderKind::OAuth2 => vec![],
+        }
+    }
 }
 
 fn default_oidc_scopes() -> Vec<String> {
@@ -708,6 +861,18 @@ pub enum UserMappingStrategy {
         /// The claim name to use as the local subject.
         name: String,
     },
+    /// `did:web:{issuer_authority}:users:{external_sub}` per Phase 0.5
+    /// architecture-doc Subject Identity Format.
+    ///
+    /// Uses the OAuth issuer URL's authority (host[:port]) as the DID
+    /// method-specific identifier and the external `sub` claim as the
+    /// user path component. Example: `did:web:hyprstream.example.com:users:12345`.
+    ///
+    /// **Opt-in**: existing deployments continue to use [`Namespaced`] by
+    /// default so Casbin policies don't break. Operators migrating to
+    /// did:web should land Phase 0e (Casbin policy migration) before
+    /// switching this strategy.
+    DidWeb,
 }
 
 /// Whether to auto-create users on first external login.
@@ -793,14 +958,6 @@ pub struct OAuthConfig {
     #[serde(default)]
     pub oidc_providers: std::collections::HashMap<String, OidcProviderConfig>,
 
-    /// age x25519 identity string for the credential store (bypasses OS keyring lookup).
-    ///
-    /// **TEST USE ONLY.** Set via `HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY` env var.
-    /// Allows isolated test environments to encrypt/decrypt `users.toml.age` without
-    /// a keyring daemon. Never set this in production config files.
-    #[serde(default, skip_serializing)]
-    pub credential_store_key: Option<String>,
-
     /// Hex-encoded Ed25519 private key bytes for the local user identity (bypasses OS keyring).
     ///
     /// **TEST USE ONLY.** Set via `HYPRSTREAM__OAUTH__USER_SIGNING_KEY` env var.
@@ -809,6 +966,49 @@ pub struct OAuthConfig {
     /// Never set this in production config files.
     #[serde(default, skip_serializing)]
     pub user_signing_key: Option<String>,
+
+    /// How long to cache a third-party OAuth client's JWKS fetched
+    /// via `jwks_uri` (RFC 7591 §2.1). Applies to `private_key_jwt`
+    /// client authentication at the token endpoint.
+    ///
+    /// Clients that rotate signing keys faster than this should keep
+    /// the old key in their JWKS for at least one cache window so
+    /// verification spans the rotation (standard JWKS rotation
+    /// hygiene). Default: 3600 seconds (1 hour).
+    ///
+    /// Distinct from `trusted_issuers[*].jwks_cache_ttl_secs` (which
+    /// configures hyprstream federation peers, not OAuth clients).
+    #[serde(default = "default_client_jwks_uri_cache_ttl")]
+    pub client_jwks_uri_cache_ttl_secs: u64,
+
+    /// How many days a JWT signing key remains in the active (issuance) slot.
+    #[serde(default = "default_jwt_key_active_days")]
+    pub jwt_key_active_days: u32,
+
+    /// How many days before active-key expiry a lead key is pre-generated.
+    #[serde(default = "default_jwt_key_lead_days")]
+    pub jwt_key_lead_days: u32,
+
+    /// How many extra days after active-key expiry the drain key remains in JWKS for verification.
+    #[serde(default = "default_jwt_key_drain_days")]
+    pub jwt_key_drain_days: u32,
+
+    /// Override active key lifetime in seconds (takes precedence over `jwt_key_active_days`).
+    /// Intended for integration tests with short rotation cycles.
+    #[serde(default)]
+    pub jwt_key_active_secs: Option<u32>,
+
+    /// Override lead key pre-generation window in seconds (takes precedence over `jwt_key_lead_days`).
+    #[serde(default)]
+    pub jwt_key_lead_secs: Option<u32>,
+
+    /// Override drain key retention window in seconds (takes precedence over `jwt_key_drain_days`).
+    #[serde(default)]
+    pub jwt_key_drain_secs: Option<u32>,
+
+    /// Override rotation check interval in seconds (default: 21600 = 6 hours).
+    #[serde(default)]
+    pub jwt_key_rotation_check_secs: Option<u64>,
 }
 
 fn default_oauth_cors() -> server::CorsConfig {
@@ -824,6 +1024,7 @@ impl Default for OAuthConfig {
             default_scopes: default_oauth_scopes(),
             token_ttl_seconds: default_oauth_token_ttl(),
             refresh_token_ttl_seconds: default_refresh_token_ttl(),
+            client_jwks_uri_cache_ttl_secs: default_client_jwks_uri_cache_ttl(),
             tls_cert: None,
             tls_key: None,
             quic_port: None,
@@ -831,13 +1032,48 @@ impl Default for OAuthConfig {
             trusted_issuers: std::collections::HashMap::new(),
             authority_hints: Vec::new(),
             oidc_providers: std::collections::HashMap::new(),
-            credential_store_key: None,
             user_signing_key: None,
+            jwt_key_active_days: default_jwt_key_active_days(),
+            jwt_key_lead_days: default_jwt_key_lead_days(),
+            jwt_key_drain_days: default_jwt_key_drain_days(),
+            jwt_key_active_secs: None,
+            jwt_key_lead_secs: None,
+            jwt_key_drain_secs: None,
+            jwt_key_rotation_check_secs: None,
         }
     }
 }
 
 impl OAuthConfig {
+    /// Active key lifetime in seconds (`_secs` override wins over `_days * 86400`).
+    pub fn active_secs(&self) -> i64 {
+        self.jwt_key_active_secs.map_or_else(
+            || i64::from(self.jwt_key_active_days) * 86400,
+            i64::from,
+        )
+    }
+
+    /// Lead pre-generation window in seconds.
+    pub fn lead_secs(&self) -> i64 {
+        self.jwt_key_lead_secs.map_or_else(
+            || i64::from(self.jwt_key_lead_days) * 86400,
+            i64::from,
+        )
+    }
+
+    /// Drain retention window in seconds.
+    pub fn drain_secs(&self) -> i64 {
+        self.jwt_key_drain_secs.map_or_else(
+            || i64::from(self.jwt_key_drain_days) * 86400,
+            i64::from,
+        )
+    }
+
+    /// Rotation check interval (default 6 hours).
+    pub fn rotation_check_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.jwt_key_rotation_check_secs.unwrap_or(6 * 3600))
+    }
+
     /// Get the issuer URL, using external_url if set, otherwise deriving from host:port.
     /// Auto-derives `https://` when global TLS is enabled.
     pub fn issuer_url(&self) -> String {
@@ -857,6 +1093,47 @@ impl OAuthConfig {
 
 fn default_oauth_host() -> String { "0.0.0.0".to_owned() }
 fn default_oauth_port() -> u16 { 6791 }
+
+/// Which backend stores user credentials and refresh tokens.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CredentialsBackend {
+    #[default]
+    Rocksdb,
+    Valkey,
+}
+
+/// Valkey connection settings (used when `backend = "valkey"`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValkeyCredentialsConfig {
+    #[serde(default = "default_valkey_url")]
+    pub url: String,
+}
+
+fn default_valkey_url() -> String { "redis://127.0.0.1:6379".to_owned() }
+
+impl Default for ValkeyCredentialsConfig {
+    fn default() -> Self { Self { url: default_valkey_url() } }
+}
+
+/// Credentials storage configuration.
+///
+/// Selects the backend for user profiles, pubkeys, and refresh tokens.
+///
+/// # Example TOML
+/// ```toml
+/// [credentials]
+/// backend = "valkey"
+/// [credentials.valkey]
+/// url = "redis://127.0.0.1:6379"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CredentialsConfig {
+    #[serde(default)]
+    pub backend: CredentialsBackend,
+    #[serde(default)]
+    pub valkey: ValkeyCredentialsConfig,
+}
 fn default_oauth_scopes() -> Vec<String> {
     vec![
         "read:*:*".to_owned(),
@@ -865,7 +1142,11 @@ fn default_oauth_scopes() -> Vec<String> {
     ]
 }
 fn default_oauth_token_ttl() -> u32 { 3600 }
-fn default_refresh_token_ttl() -> u32 { 259_200 } // 72 hours
+fn default_refresh_token_ttl() -> u32 { 2_628_000 } // 730 hours (~30 days)
+fn default_client_jwks_uri_cache_ttl() -> u64 { 3600 } // 1 hour
+fn default_jwt_key_active_days() -> u32 { 14 }
+fn default_jwt_key_lead_days() -> u32 { 7 }
+fn default_jwt_key_drain_days() -> u32 { 30 }
 
 /// StreamService configuration
 ///
@@ -1385,6 +1666,7 @@ impl HyprConfigBuilder {
             flight: self.flight,
             mcp: self.mcp,
             oauth: self.oauth,
+            credentials: Default::default(),
             streaming: self.streaming,
             tls: self.tls,
             quic: self.quic,
@@ -1605,23 +1887,6 @@ impl HyprConfig {
                 let vk = sk.verifying_key();
                 tracing::info!("Using user signing key from config (test bypass)");
                 return Ok(Some((sk, vk)));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Check for the `HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY` test bypass.
-    ///
-    /// Returns `Ok(Some(identity))` when the bypass is set and valid,
-    /// `Ok(None)` when not configured, `Err` when malformed.
-    pub fn credential_store_key_bypass() -> anyhow::Result<Option<age::x25519::Identity>> {
-        if let Ok(cfg) = Self::load() {
-            if let Some(ref age_key) = cfg.oauth.credential_store_key {
-                let identity = age_key
-                    .trim()
-                    .parse::<age::x25519::Identity>()
-                    .map_err(|e| anyhow::anyhow!("HYPRSTREAM__OAUTH__CREDENTIAL_STORE_KEY: invalid age identity: {e}"))?;
-                return Ok(Some(identity));
             }
         }
         Ok(None)
@@ -1993,6 +2258,36 @@ mod tests {
         assert_eq!(resolved.top_p, 0.95);
         assert_eq!(resolved.repeat_penalty, 1.0);
         assert!(resolved.do_sample);
+    }
+
+    #[test]
+    fn test_oauth_secs_overrides() {
+        let mut config = OAuthConfig::default();
+        assert_eq!(config.active_secs(), i64::from(config.jwt_key_active_days) * 86400);
+        config.jwt_key_active_secs = Some(30);
+        config.jwt_key_lead_secs = Some(25);
+        config.jwt_key_drain_secs = Some(20);
+        config.jwt_key_rotation_check_secs = Some(3);
+        assert_eq!(config.active_secs(), 30);
+        assert_eq!(config.lead_secs(), 25);
+        assert_eq!(config.drain_secs(), 20);
+        assert_eq!(config.rotation_check_interval(), std::time::Duration::from_secs(3));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn test_oauth_secs_from_env() {
+        // Simulate env vars the same way HyprConfig::load() does
+        std::env::set_var("HYPRSTREAM__OAUTH__JWT_KEY_ACTIVE_SECS", "30");
+        let result = config::Config::builder()
+            .add_source(config::Config::try_from(&HyprConfig::default()).unwrap())
+            .add_source(config::Environment::with_prefix("HYPRSTREAM").separator("__").try_parsing(true))
+            .build()
+            .and_then(config::Config::try_deserialize::<HyprConfig>);
+        std::env::remove_var("HYPRSTREAM__OAUTH__JWT_KEY_ACTIVE_SECS");
+        let cfg = result.expect("config should parse with env var");
+        assert_eq!(cfg.oauth.jwt_key_active_secs, Some(30), "jwt_key_active_secs should be 30 from env");
+        assert_eq!(cfg.oauth.active_secs(), 30);
     }
 }
 

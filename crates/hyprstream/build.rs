@@ -61,8 +61,8 @@ fn compile_capnp_schemas() {
     let out_path = Path::new(&out_dir);
     let import_paths: &[&Path] = &[&rpc_schema_dir, schema_dir];
 
-    // Schemas from hyprstream/schema/
-    let schemas = ["events", "inference", "registry", "policy", "model", "mcp", "notification", "tui", "compositor_ipc", "metrics"];
+    // TUI-specific schemas only. Service schemas moved to hyprstream-rpc-std.
+    let schemas = ["tui", "compositor_ipc"];
 
     // Schemas from hyprstream-rpc/schema/ (need TS codegen but live in the RPC crate)
     let rpc_schemas = ["streaming", "nine"];
@@ -72,6 +72,26 @@ fn compile_capnp_schemas() {
 
     // Compile hyprstream-rpc schemas with rpc_schema_dir as src_prefix
     hyprstream_rpc_build::compile_schemas(&rpc_schema_dir, out_path, import_paths, &rpc_schemas);
+
+    // Copy CGR files from hyprstream-rpc-std so the proc macro can find them.
+    // DEP_HYPRSTREAM_RPC_STD_OUT_DIR is set by hyprstream-rpc-std's build.rs.
+    if let Ok(std_out_dir) = env::var("DEP_HYPRSTREAM_RPC_STD_OUT_DIR") {
+        let std_schemas = ["inference", "model", "registry", "policy", "mcp",
+                          "metrics", "notification", "service_events", "chat_core", "oauth"];
+        for name in &std_schemas {
+            let cgr_src = Path::new(&std_out_dir).join(format!("{name}.cgr"));
+            let cgr_dst = out_path.join(format!("{name}.cgr"));
+            if cgr_src.exists() {
+                let _ = std::fs::copy(&cgr_src, &cgr_dst);
+            }
+            // Also copy metadata JSON if present
+            let meta_src = Path::new(&std_out_dir).join(format!("{name}_metadata.json"));
+            let meta_dst = out_path.join(format!("{name}_metadata.json"));
+            if meta_src.exists() {
+                let _ = std::fs::copy(&meta_src, &meta_dst);
+            }
+        }
+    }
 
     // Copy CGR files to stable codegen-out/ for TypeScript codegen
     let codegen_dir = Path::new(&manifest_dir).join("../../codegen-out");

@@ -275,10 +275,90 @@ pub fn encrypt_credentials_if_available(secrets_dir: Option<&std::path::Path>) -
     }
 
     let mut encrypted_count = 0usize;
-    for name in units::ALL_CREDENTIAL_NAMES {
+
+    // Encrypt node-level credentials (flat: signing-key, ca-pubkey, bootstrap-pubkeys, rsa-key, TLS)
+    // Note: signing-key is written as a copy of the CA key so PolicyService can load it
+    for name in units::NODE_CREDENTIAL_NAMES.iter().chain(std::iter::once(&"signing-key")) {
         let secret_path = dir.join(name);
         if !secret_path.exists() {
-            debug!("Skipping credential '{}' (not yet generated)", name);
+            debug!("Skipping node credential '{}' (not yet generated)", name);
+            continue;
+        }
+        let plaintext = match std::fs::read(&secret_path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("Could not read secret '{}': {e}", secret_path.display());
+                continue;
+            }
+        };
+        match systemd_creds_encrypt(name, &plaintext, &credstore) {
+            Ok(()) => encrypted_count += 1,
+            Err(e) => tracing::warn!("Failed to encrypt credential '{name}': {e}"),
+        }
+    }
+
+    // Encrypt per-service credentials with service-prefixed names
+    // e.g., credentials/model/signing-key → credstore.encrypted/model-signing-key
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let service_name = match entry.file_name().to_str() {
+                Some(n) => n.to_owned(),
+                None => continue,
+            };
+            for name in units::SERVICE_CREDENTIAL_NAMES {
+                let secret_path = path.join(name);
+                if !secret_path.exists() {
+                    continue;
+                }
+                let plaintext = match std::fs::read(&secret_path) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!("Could not read secret '{}': {e}", secret_path.display());
+                        continue;
+                    }
+                };
+                let prefixed_name = format!("{service_name}-{name}");
+                match systemd_creds_encrypt(&prefixed_name, &plaintext, &credstore) {
+                    Ok(()) => encrypted_count += 1,
+                    Err(e) => tracing::warn!(
+                        "Failed to encrypt credential '{prefixed_name}': {e}"
+                    ),
+                }
+            }
+        }
+    }
+    // Note: per-service credentials are now stored with prefixed names in the
+    // flat credstore (e.g., model-signing-key, model-service-jwt) so that
+    // ImportCredential can decrypt them. Subdirectory encryption was removed
+    // because SetLoadCredential doesn't decrypt systemd-creds encrypted files.
+
+    // Encrypt application-level credentials (oauth)
+    for name in units::OAUTH_CREDENTIAL_NAMES {
+        let secret_path = dir.join(name);
+        if !secret_path.exists() {
+            continue;
+        }
+        let plaintext = match std::fs::read(&secret_path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("Could not read secret '{}': {e}", secret_path.display());
+                continue;
+            }
+        };
+        match systemd_creds_encrypt(name, &plaintext, &credstore) {
+            Ok(()) => encrypted_count += 1,
+            Err(e) => tracing::warn!("Failed to encrypt credential '{name}': {e}"),
+        }
+    }
+
+    // Encrypt policy-only credentials (ca-key)
+    for name in units::POLICY_CREDENTIAL_NAMES {
+        let secret_path = dir.join(name);
+        if !secret_path.exists() {
             continue;
         }
         let plaintext = match std::fs::read(&secret_path) {

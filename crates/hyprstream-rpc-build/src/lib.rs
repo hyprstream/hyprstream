@@ -22,12 +22,7 @@ use std::path::Path;
 /// metadata to `{out_dir}/{name}_metadata.json`.
 ///
 /// `import_paths` are passed to capnpc for resolving `using import` directives.
-pub fn compile_schemas(
-    schema_dir: &Path,
-    out_dir: &Path,
-    import_paths: &[&Path],
-    names: &[&str],
-) {
+pub fn compile_schemas(schema_dir: &Path, out_dir: &Path, import_paths: &[&Path], names: &[&str]) {
     for name in names {
         let path = schema_dir.join(format!("{name}.capnp"));
         if !path.exists() {
