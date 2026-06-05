@@ -13,6 +13,10 @@ pub mod zmtp_quic;
 pub mod quic_stream_bridge;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod iroh_substrate;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod iroh_rpc;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod iroh_transport;
 
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
