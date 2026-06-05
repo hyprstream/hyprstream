@@ -72,6 +72,19 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// processor or transport can't hang shutdown forever (#159).
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(40);
 
+/// Default cap on concurrent accepted connections per server (#162). Bounds
+/// fd/memory from a peer that opens many connections that each sit idle (no
+/// streams) — the per-stream [`DEFAULT_STREAM_LIMIT`] does not cover that.
+/// Connections beyond the cap are rejected (dropped) rather than queued, so a
+/// flood can't build unbounded backpressure.
+pub const DEFAULT_CONNECTION_LIMIT: usize = 256;
+
+/// Maximum time the server waits for a peer's WebTransport/QUIC handshake to
+/// complete before abandoning it (#162). Bounds a peer that completes the QUIC
+/// handshake then stalls the WebTransport CONNECT. Resolved inside the
+/// per-connection task so a slow handshake never blocks the accept loop.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
 // ============================================================================
 // IrohRequestProcessor — pluggable request handling trait
 // ============================================================================

@@ -49,6 +49,9 @@ pub struct QuinnRpcServer {
     /// `acquire_many` to wait for every in-flight stream to complete.
     stream_limit: Arc<Semaphore>,
     stream_limit_capacity: u32,
+    /// Cap on concurrent accepted connections (#162). One permit per live
+    /// connection; connections beyond the cap are rejected, not queued.
+    connection_limit: Arc<Semaphore>,
     /// Per-stream request-read timeout (#159 slowloris bound).
     read_timeout: Duration,
     shutdown: CancellationToken,
@@ -78,9 +81,18 @@ impl QuinnRpcServer {
             signing_key,
             stream_limit: Arc::new(Semaphore::new(stream_limit)),
             stream_limit_capacity: u32::try_from(stream_limit).unwrap_or(u32::MAX),
+            connection_limit: Arc::new(Semaphore::new(
+                super::rpc_session::DEFAULT_CONNECTION_LIMIT,
+            )),
             read_timeout: super::rpc_session::REQUEST_READ_TIMEOUT,
             shutdown: CancellationToken::new(),
         }
+    }
+
+    /// Override the concurrent-connection cap (#162, builder style).
+    pub fn with_connection_limit(mut self, limit: usize) -> Self {
+        self.connection_limit = Arc::new(Semaphore::new(limit));
+        self
     }
 
     /// Override the server-wide concurrent-stream cap (builder style).
@@ -176,19 +188,47 @@ impl QuinnRpcServer {
                         tracing::debug!("quinn-rpc: server endpoint closed");
                         return Ok(());
                     };
-                    let session = match request.ok().await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::warn!(error = ?e, "quinn-rpc: handshake failed");
+
+                    // Connection cap (#162): take a permit before doing any
+                    // per-connection work. try_acquire → reject (drop) when at
+                    // cap rather than queueing, so a flood can't build backlog.
+                    let conn_permit = match Arc::clone(&self.connection_limit).try_acquire_owned() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            tracing::warn!("quinn-rpc: connection cap reached, rejecting connection");
+                            drop(request);
                             continue;
                         }
                     };
+
                     let processor = Arc::clone(&self.processor);
                     let signing_key = self.signing_key.clone();
                     let stream_limit = Arc::clone(&self.stream_limit);
                     let read_timeout = self.read_timeout;
                     let shutdown = self.shutdown.clone();
                     tokio::spawn(async move {
+                        let _conn_permit = conn_permit; // released when this connection ends
+                        // Resolve the handshake INSIDE the task, bounded (#162),
+                        // so a slow/stalled CONNECT never blocks the accept loop.
+                        let session = match tokio::time::timeout(
+                            super::rpc_session::HANDSHAKE_TIMEOUT,
+                            request.ok(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(s)) => s,
+                            Ok(Err(e)) => {
+                                tracing::warn!(error = ?e, "quinn-rpc: handshake failed");
+                                return;
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    timeout = ?super::rpc_session::HANDSHAKE_TIMEOUT,
+                                    "quinn-rpc: handshake timed out"
+                                );
+                                return;
+                            }
+                        };
                         if let Err(e) = serve_rpc_connection(
                             session,
                             processor,
@@ -326,6 +366,51 @@ mod tests {
 
         let resp = client.send(b"ping".to_vec(), Some(5_000)).await?;
         assert_eq!(&resp[..], b"\xCDping");
+
+        shutdown.cancel();
+        let _ = server_task.await;
+        Ok(())
+    }
+
+    /// #162: with a connection cap of 1, a second concurrent connection is
+    /// rejected while the first is still live. The first keeps working.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quinn_connection_cap_rejects_excess() -> Result<()> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let processor =
+            crate::transport::rpc_session::from_fn(|req: Bytes| async move { Ok(req) });
+
+        let (server, addr, cert_der) = build_server()?;
+        let rpc_server =
+            QuinnRpcServer::new(server, processor, fresh_signing_key()).with_connection_limit(1);
+        let shutdown = rpc_server.shutdown_token();
+        let server_task = tokio::spawn(rpc_server.run());
+
+        // First connection takes the only permit and works.
+        let session1 = connect_pinned(addr, &cert_der).await?;
+        let client1 = QuinnTransport::new(session1);
+        let resp1 = client1.send(b"one".to_vec(), Some(5_000)).await?;
+        assert_eq!(&resp1[..], b"one");
+
+        // Second connection: the server rejects it (drops the request before
+        // accepting), so a request on it must fail rather than be served.
+        // connect_pinned itself may or may not error depending on timing; the
+        // load-bearing assertion is that no request succeeds on conn #2.
+        let second = async {
+            let session2 = connect_pinned(addr, &cert_der).await?;
+            let client2 = QuinnTransport::new(session2);
+            client2.send(b"two".to_vec(), Some(2_000)).await
+        }
+        .await;
+        assert!(
+            second.is_err(),
+            "second connection over the cap must not be served, got {second:?}"
+        );
+
+        // First connection still works after the rejection.
+        let resp1b = client1.send(b"again".to_vec(), Some(5_000)).await?;
+        assert_eq!(&resp1b[..], b"again");
 
         shutdown.cancel();
         let _ = server_task.await;
