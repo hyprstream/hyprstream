@@ -4,7 +4,7 @@
 //!
 //! - [`IrohRpcProtocolHandler`] — iroh [`ProtocolHandler`] that plugs into
 //!   [`crate::transport::iroh_substrate`] under the `hyprstream-rpc/1` ALPN.
-//!   Enforces a per-connection cap on concurrent streams (DoS bound) and
+//!   Enforces a server-wide cap on concurrent streams (DoS bound) and
 //!   drains in-flight requests on `ProtocolHandler::shutdown`.
 //! - [`IrohRequestProcessor`] — trait callers implement to wire actual
 //!   request processing (envelope verification + service dispatch).
@@ -51,7 +51,8 @@ pub use super::rpc_session::{
 
 /// Iroh protocol handler that terminates `hyprstream-rpc/1` bidi streams,
 /// dispatches each request through the wrapped [`IrohRequestProcessor`],
-/// caps concurrent streams per connection, and drains in-flight requests
+/// caps concurrent streams server-wide (shared semaphore), and drains
+/// in-flight requests
 /// on `ProtocolHandler::shutdown` (called by `Router::shutdown`).
 #[derive(Clone)]
 pub struct IrohRpcProtocolHandler {
@@ -67,6 +68,8 @@ struct HandlerInner {
     /// Caps concurrent bidi streams in flight. Hold one permit per stream.
     stream_limit: Arc<Semaphore>,
     stream_limit_capacity: u32,
+    /// Per-stream request-read timeout (#159 slowloris bound).
+    read_timeout: std::time::Duration,
     /// Level-triggered shutdown signal: once `cancel()` is called, every
     /// future and current `cancelled().await` resolves immediately. Used
     /// instead of `tokio::sync::Notify` because `Notify::notify_waiters`
@@ -84,13 +87,13 @@ impl std::fmt::Debug for IrohRpcProtocolHandler {
 }
 
 impl IrohRpcProtocolHandler {
-    /// Build a handler with default per-connection stream limit
+    /// Build a handler with the default server-wide stream limit
     /// ([`DEFAULT_STREAM_LIMIT`]).
     pub fn new<P: IrohRequestProcessor>(processor: P, signing_key: SigningKey) -> Self {
         Self::with_stream_limit(Arc::new(processor), signing_key, DEFAULT_STREAM_LIMIT)
     }
 
-    /// Build a handler with an explicit per-connection stream limit.
+    /// Build a handler with an explicit server-wide stream limit.
     pub fn with_stream_limit(
         processor: Arc<dyn IrohRequestProcessor>,
         signing_key: SigningKey,
@@ -103,9 +106,33 @@ impl IrohRpcProtocolHandler {
                 signing_key,
                 stream_limit: Arc::new(Semaphore::new(stream_limit)),
                 stream_limit_capacity,
+                read_timeout: super::rpc_session::REQUEST_READ_TIMEOUT,
                 shutdown: CancellationToken::new(),
             }),
         }
+    }
+
+    /// Override the per-stream request-read timeout (#159). Primarily for
+    /// tests that need a short slowloris bound; production uses the default
+    /// [`super::rpc_session::REQUEST_READ_TIMEOUT`].
+    pub fn with_read_timeout(mut self, read_timeout: std::time::Duration) -> Self {
+        // `inner` is freshly built here (no other Arc clones yet), so this
+        // get_mut always succeeds; fall back to a rebuild if it somehow doesn't.
+        match Arc::get_mut(&mut self.inner) {
+            Some(inner) => inner.read_timeout = read_timeout,
+            None => {
+                let i = &self.inner;
+                self.inner = Arc::new(HandlerInner {
+                    processor: Arc::clone(&i.processor),
+                    signing_key: i.signing_key.clone(),
+                    stream_limit: Arc::clone(&i.stream_limit),
+                    stream_limit_capacity: i.stream_limit_capacity,
+                    read_timeout,
+                    shutdown: i.shutdown.clone(),
+                });
+            }
+        }
+        self
     }
 }
 
@@ -120,6 +147,7 @@ impl ProtocolHandler for IrohRpcProtocolHandler {
             Arc::clone(&self.inner.processor),
             self.inner.signing_key.clone(),
             Arc::clone(&self.inner.stream_limit),
+            self.inner.read_timeout,
             self.inner.shutdown.clone(),
         )
         .await
@@ -132,17 +160,31 @@ impl ProtocolHandler for IrohRpcProtocolHandler {
         // loop hits `cancelled().await` it returns immediately.
         self.inner.shutdown.cancel();
         // Wait for all in-flight streams to release their permits.
-        // `acquire_many` succeeds only once every permit is returned.
+        // `acquire_many` succeeds only once every permit is returned. Bounded
+        // (#159) so a wedged processor/transport can't hang shutdown forever;
+        // on timeout we close() and proceed (remaining tasks die with the conn).
         let cap = self.inner.stream_limit_capacity;
-        match self.inner.stream_limit.acquire_many(cap).await {
-            Ok(permits) => {
+        match tokio::time::timeout(
+            super::rpc_session::DRAIN_TIMEOUT,
+            self.inner.stream_limit.acquire_many(cap),
+        )
+        .await
+        {
+            Ok(Ok(permits)) => {
                 // Keep permits drained so any post-shutdown accept also
                 // sees a closed semaphore.
                 permits.forget();
                 self.inner.stream_limit.close();
             }
-            Err(_) => {
+            Ok(Err(_)) => {
                 // Already closed; nothing to drain.
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout = ?super::rpc_session::DRAIN_TIMEOUT,
+                    "iroh-rpc: drain timed out, forcing teardown"
+                );
+                self.inner.stream_limit.close();
             }
         }
     }
@@ -510,6 +552,52 @@ mod tests {
             peak.load(Ordering::SeqCst)
         );
 
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// #159: a stalled (slowloris) stream that holds a permit without sending
+    /// FIN must be abandoned after the read timeout, releasing its permit so a
+    /// well-behaved request can still be served. With `stream_limit=1`, the
+    /// stall grabs the only permit; without the read-timeout fix the normal
+    /// request would block forever and this test would hang.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_slowloris_stream_is_timed_out_and_permit_released() -> Result<()> {
+        let processor = from_fn(move |_req: Bytes| async move { Ok(Bytes::from_static(b"ok")) });
+        let handler = IrohRpcProtocolHandler::with_stream_limit(
+            Arc::new(processor),
+            fresh_signing_key(),
+            1,
+        )
+        .with_read_timeout(Duration::from_millis(300));
+
+        let server = IrohSubstrate::new(fresh_key(), NoopHandler::new("moq"), handler).await?;
+        let server_addr = direct_addr(&server);
+
+        let client = IrohSubstrate::new(
+            fresh_key(),
+            NoopHandler::new("c-moq"),
+            NoopHandler::new("c-rpc"),
+        )
+        .await?;
+        let conn = client.connect(server_addr, ALPN_HYPRSTREAM_RPC).await?;
+
+        // Slowloris: open a bidi stream, dribble one byte, never finish.
+        let (mut stall_send, _stall_recv) = conn.open_bi().await.context("open_bi stall")?;
+        stall_send.write_all(b"x").await.context("write stall byte")?;
+        // Deliberately DO NOT call finish(); keep the stream (and its server-side
+        // permit) alive. Hold the handle so it isn't dropped/reset early.
+
+        // A normal request must still succeed once the stalled stream's read
+        // times out (~300ms) and its permit is released. Bound the wait well
+        // above the read timeout but far below "forever".
+        let resp = tokio::time::timeout(Duration::from_secs(5), client_request(&conn, b"req"))
+            .await
+            .context("normal request hung — permit was not released (slowloris not bounded)")??;
+        assert_eq!(&resp[..], b"ok");
+
+        drop(stall_send);
         client.shutdown().await?;
         server.shutdown().await?;
         Ok(())

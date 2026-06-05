@@ -42,17 +42,35 @@ use crate::transport_traits::{PublishSink, Transport};
 /// server-side cap used in [`crate::transport::zmtp_quic`].
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 
-/// Default per-connection concurrent-stream cap. Caps memory usage from a
-/// hostile peer to `MAX_FRAME_BYTES × DEFAULT_STREAM_LIMIT` per connection
-/// (4 GiB at defaults).
+/// Default concurrent-stream cap. NOTE: the `Arc<Semaphore>` this sizes is
+/// shared **server-wide** across all connections (one `Arc<HandlerInner>`),
+/// not per-connection — so this bounds total in-flight streams for the whole
+/// server, capping memory to `MAX_FRAME_BYTES × DEFAULT_STREAM_LIMIT`.
 pub const DEFAULT_STREAM_LIMIT: usize = 64;
 
 /// Grace period for [`SendStream::closed`] after writing the response — if
 /// the peer crashes without acking the FIN, we don't leak a task forever.
 pub const STOPPED_GRACE: Duration = Duration::from_secs(5);
 
+/// Maximum wall-clock time the server will spend reading a single request
+/// frame before abandoning the stream and releasing its semaphore permit.
+///
+/// SECURITY (#159): without this bound an UNAUTHENTICATED peer can open
+/// `DEFAULT_STREAM_LIMIT` bidi streams, send one byte on each, and stall —
+/// each stalled read holds a server-wide permit forever, wedging the whole
+/// server before any envelope is verified (a pre-auth slowloris) and hanging
+/// the shutdown drain. Bounding the *total* read (not just per-`read()` idle)
+/// also defeats a trickle attacker who dribbles one byte per idle window.
+pub const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Default per-call timeout when the caller passes `None` on the client side.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Upper bound on how long graceful shutdown waits for in-flight streams to
+/// drain before forcing teardown. With [`REQUEST_READ_TIMEOUT`] bounding each
+/// read, well-behaved drains finish quickly; this is a backstop so a wedged
+/// processor or transport can't hang shutdown forever (#159).
+pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(40);
 
 // ============================================================================
 // IrohRequestProcessor — pluggable request handling trait
@@ -160,6 +178,7 @@ pub async fn serve_rpc_connection<S>(
     processor: Arc<dyn IrohRequestProcessor>,
     signing_key: SigningKey,
     stream_limit: Arc<Semaphore>,
+    read_timeout: Duration,
     shutdown: CancellationToken,
 ) -> Result<()>
 where
@@ -199,7 +218,7 @@ where
                 tokio::spawn(async move {
                     let _permit = permit; // released on task end
                     let _keepalive = session_keepalive;
-                    handle_stream::<S>(send, recv, processor, signing_key).await;
+                    handle_stream::<S>(send, recv, processor, signing_key, read_timeout).await;
                 });
             }
         }
@@ -213,13 +232,25 @@ async fn handle_stream<S>(
     mut recv: S::RecvStream,
     processor: Arc<dyn IrohRequestProcessor>,
     signing_key: SigningKey,
+    read_timeout: Duration,
 ) where
     S: Session,
 {
-    let request = match read_to_cap(&mut recv, MAX_FRAME_BYTES).await {
-        Ok(buf) => buf,
-        Err(e) => {
+    // SECURITY (#159): bound the request read in wall-clock time. On timeout
+    // we return, dropping `recv`/`send` (which resets the stream) and releasing
+    // the semaphore permit held by the caller — so a stalled/trickling peer
+    // cannot pin a server-wide permit indefinitely.
+    let request = match tokio::time::timeout(read_timeout, read_to_cap(&mut recv, MAX_FRAME_BYTES)).await {
+        Ok(Ok(buf)) => buf,
+        Ok(Err(e)) => {
             tracing::warn!(error = ?e, "rpc-session: failed reading request");
+            return;
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout = ?read_timeout,
+                "rpc-session: request read timed out, abandoning stream"
+            );
             return;
         }
     };

@@ -17,6 +17,7 @@
 //! identical, so the generic core is reused unchanged.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -48,6 +49,8 @@ pub struct QuinnRpcServer {
     /// `acquire_many` to wait for every in-flight stream to complete.
     stream_limit: Arc<Semaphore>,
     stream_limit_capacity: u32,
+    /// Per-stream request-read timeout (#159 slowloris bound).
+    read_timeout: Duration,
     shutdown: CancellationToken,
 }
 
@@ -75,6 +78,7 @@ impl QuinnRpcServer {
             signing_key,
             stream_limit: Arc::new(Semaphore::new(stream_limit)),
             stream_limit_capacity: u32::try_from(stream_limit).unwrap_or(u32::MAX),
+            read_timeout: super::rpc_session::REQUEST_READ_TIMEOUT,
             shutdown: CancellationToken::new(),
         }
     }
@@ -83,6 +87,13 @@ impl QuinnRpcServer {
     pub fn with_stream_limit(mut self, limit: usize) -> Self {
         self.stream_limit = Arc::new(Semaphore::new(limit));
         self.stream_limit_capacity = u32::try_from(limit).unwrap_or(u32::MAX);
+        self
+    }
+
+    /// Override the per-stream request-read timeout (#159). Primarily for
+    /// tests; production uses [`super::rpc_session::REQUEST_READ_TIMEOUT`].
+    pub fn with_read_timeout(mut self, read_timeout: Duration) -> Self {
+        self.read_timeout = read_timeout;
         self
     }
 
@@ -109,14 +120,29 @@ impl QuinnRpcServer {
     pub async fn shutdown(stream_limit: &Arc<Semaphore>, capacity: u32, token: &CancellationToken) {
         // Stop accepting new streams (level-triggered).
         token.cancel();
-        // Wait for all in-flight streams to release their permits.
-        match stream_limit.acquire_many(capacity).await {
-            Ok(permits) => {
+        // Wait for all in-flight streams to release their permits, but bound
+        // the wait (#159): a wedged processor/transport must not hang shutdown
+        // forever. On timeout we close() and proceed — remaining tasks are torn
+        // down when the connection drops.
+        match tokio::time::timeout(
+            super::rpc_session::DRAIN_TIMEOUT,
+            stream_limit.acquire_many(capacity),
+        )
+        .await
+        {
+            Ok(Ok(permits)) => {
                 permits.forget();
                 stream_limit.close();
             }
-            Err(_) => {
+            Ok(Err(_)) => {
                 // Already closed; nothing to drain.
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout = ?super::rpc_session::DRAIN_TIMEOUT,
+                    "quinn-rpc: drain timed out, forcing teardown"
+                );
+                stream_limit.close();
             }
         }
     }
@@ -160,6 +186,7 @@ impl QuinnRpcServer {
                     let processor = Arc::clone(&self.processor);
                     let signing_key = self.signing_key.clone();
                     let stream_limit = Arc::clone(&self.stream_limit);
+                    let read_timeout = self.read_timeout;
                     let shutdown = self.shutdown.clone();
                     tokio::spawn(async move {
                         if let Err(e) = serve_rpc_connection(
@@ -167,6 +194,7 @@ impl QuinnRpcServer {
                             processor,
                             signing_key,
                             stream_limit,
+                            read_timeout,
                             shutdown,
                         )
                         .await
