@@ -8,7 +8,7 @@
 //!   drains in-flight requests on `ProtocolHandler::shutdown`.
 //! - [`IrohRequestProcessor`] — trait callers implement to wire actual
 //!   request processing (envelope verification + service dispatch).
-//! - [`LocalServiceBridge`] — adapts a [`crate::service::ZmqService`]
+//! - [`LocalServiceBridge`] — adapts a [`crate::service::RequestService`]
 //!   (potentially `!Send`) to the Send-bounded [`IrohRequestProcessor`].
 //!
 //! **Trust model**: The protocol handler does not parse `SignedEnvelope` —
@@ -212,7 +212,7 @@ pub async fn client_request(conn: &Connection, request: &[u8]) -> Result<Bytes> 
 }
 
 // ============================================================================
-// LocalServiceBridge — adapt a (possibly `!Send`) ZmqService to the Send-bound
+// LocalServiceBridge — adapt a (possibly `!Send`) RequestService to the Send-bound
 // IrohRequestProcessor trait by running the service on a dedicated LocalSet
 // thread and forwarding requests over an mpsc channel.
 // ============================================================================
@@ -223,7 +223,7 @@ struct BridgeMessage {
     respond: tokio::sync::oneshot::Sender<Result<Bytes>>,
 }
 
-/// Adapt a [`crate::service::ZmqService`] to [`IrohRequestProcessor`].
+/// Adapt a [`crate::service::RequestService`] to [`IrohRequestProcessor`].
 ///
 /// Spins up a dedicated thread running a single-threaded tokio runtime with
 /// a `LocalSet`. The service runs on that thread (compatible with both `Send`
@@ -257,7 +257,7 @@ impl LocalServiceBridge {
         queue_depth: usize,
     ) -> Result<Self>
     where
-        S: crate::service::ZmqService + Send + 'static,
+        S: crate::service::RequestService + Send + 'static,
     {
         let cap = if queue_depth == 0 { 128 } else { queue_depth };
         let (tx, mut rx) = tokio::sync::mpsc::channel::<BridgeMessage>(cap);

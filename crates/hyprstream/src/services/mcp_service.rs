@@ -34,7 +34,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures::future::BoxFuture;
 use hyprstream_rpc::auth::jwt;
 use hyprstream_service::ServiceContext;
-use hyprstream_rpc::service::ZmqService;
+use hyprstream_rpc::service::RequestService;
 use hyprstream_rpc::streaming::{StreamHandle, StreamPayload};
 use hyprstream_rpc::transport::TransportConfig;
 use rmcp::{
@@ -712,7 +712,7 @@ pub struct McpService {
     stdio_token: Option<String>,
     /// Verifying key for JWT validation
     verifying_key: VerifyingKey,
-    // === ZmqService infrastructure ===
+    // === RequestService infrastructure ===
     context: Arc<zmq::Context>,
     transport: TransportConfig,
     signing_key: SigningKey,
@@ -1136,11 +1136,11 @@ impl McpHandler for McpService {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ZmqService Implementation (internal control plane)
+// RequestService Implementation (internal control plane)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[async_trait(?Send)]
-impl ZmqService for McpService {
+impl RequestService for McpService {
     async fn handle_request(&self, ctx: &crate::services::EnvelopeContext, payload: &[u8]) -> anyhow::Result<(Vec<u8>, Option<crate::services::Continuation>)> {
         trace!(
             "McpService request from {} (id={})",

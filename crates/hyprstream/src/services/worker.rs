@@ -45,7 +45,7 @@ use crate::services::PolicyClient;
 /// Build an `AuthorizeFn` backed by a `PolicyClient`.
 ///
 /// The returned closure is async-compatible (returns a boxed future) so it
-/// works on single-threaded runtimes used by ZmqService.
+/// works on single-threaded runtimes used by RequestService.
 pub fn build_authorize_fn(policy_client: PolicyClient) -> AuthorizeFn {
     Arc::new(move |subject: String, resource: String, operation: String| {
         let client = policy_client.clone();

@@ -1,7 +1,7 @@
 //! ZMQ RPC handler for user CRUD operations.
 //!
 //! Implements the `OauthHandler` trait (generated from `oauth.capnp`)
-//! and `ZmqService` for ZMQ transport. Delegates to `UserService` for
+//! and `RequestService` for ZMQ transport. Delegates to `UserService` for
 //! shared CRUD logic.
 
 use std::sync::Arc;
@@ -9,7 +9,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use hyprstream_rpc::prelude::*;
-use hyprstream_rpc::service::{Continuation, EnvelopeContext, ZmqService};
+use hyprstream_rpc::service::{Continuation, EnvelopeContext, RequestService};
 use hyprstream_rpc::transport::TransportConfig;
 
 use crate::auth::{UserFilter, decode_pubkey_base64};
@@ -25,7 +25,7 @@ use super::state::OAuthState;
 /// ZMQ RPC handler for OAuth user management.
 ///
 /// Wraps `UserService` and implements the generated `OauthHandler` trait
-/// for Cap'n Proto serialization, and `ZmqService` for ZMQ transport.
+/// for Cap'n Proto serialization, and `RequestService` for ZMQ transport.
 pub struct OAuthZmqHandler {
     state: Arc<OAuthState>,
     context: Arc<zmq::Context>,
@@ -266,7 +266,7 @@ impl OauthHandler for OAuthZmqHandler {
 
 
 #[async_trait(?Send)]
-impl ZmqService for OAuthZmqHandler {
+impl RequestService for OAuthZmqHandler {
     async fn handle_request(
         &self,
         ctx: &EnvelopeContext,

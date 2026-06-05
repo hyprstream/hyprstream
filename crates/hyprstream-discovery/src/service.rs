@@ -4,7 +4,7 @@
 //! socket kinds, and schemas via the standard ZMQ REQ/REP transport.
 
 use async_trait::async_trait;
-use hyprstream_rpc::service::{EnvelopeContext, ZmqService};
+use hyprstream_rpc::service::{EnvelopeContext, RequestService};
 use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_rpc::registry::{self, EndpointRegistry, SocketKind};
 use hyprstream_rpc::resolver::Resolver;
@@ -94,7 +94,7 @@ pub struct DiscoveryService {
     signing_key: Arc<SigningKey>,
     /// JWT verifying key for service JWT verification (derived from root via HKDF)
     jwt_verifying_key: hyprstream_rpc::prelude::VerifyingKey,
-    /// JWT key source for client JWT verification (ZmqService trait)
+    /// JWT key source for client JWT verification (RequestService trait)
     jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
     /// OAuth issuer URL for RFC 9728 metadata (None = not configured)
     oauth_issuer_url: Option<String>,
@@ -110,7 +110,7 @@ pub struct DiscoveryService {
     /// Consumed by FederationKeyResolver before falling back to HTTPS.
     entity_statements: RwLock<HashMap<String, CachedEntityStatement>>,
     /// Phase 0.5 Stage D — cached envelope COSE_KeySets per service did:web.
-    /// Pushed by each service at startup + rotation. Consumed by ZmqService
+    /// Pushed by each service at startup + rotation. Consumed by RequestService
     /// receivers verifying COSE_Sign1 envelope signatures.
     envelope_keysets: RwLock<HashMap<String, CachedEnvelopeKeyset>>,
     /// Pre-computed TLS endorsement: Sign(tls_key, ed25519_pubkey || domain).
@@ -723,11 +723,11 @@ impl DiscoveryHandler for DiscoveryService {
 }
 
 // ============================================================================
-// ZmqService implementation
+// RequestService implementation
 // ============================================================================
 
 #[async_trait(?Send)]
-impl ZmqService for DiscoveryService {
+impl RequestService for DiscoveryService {
     async fn handle_request(
         &self,
         ctx: &EnvelopeContext,

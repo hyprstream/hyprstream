@@ -244,7 +244,7 @@ impl EnvelopeContext {
 ///
 /// This is the unified trait for services that:
 /// 1. Handle requests via `handle_request()`
-/// 2. Are automatically spawnable (blanket `impl Spawnable for S: ZmqService`)
+/// 2. Are automatically spawnable (blanket `impl Spawnable for S: RequestService`)
 ///
 /// Services include their infrastructure (context, transport, verifying key) so they
 /// can be spawned directly without wrapping.
@@ -266,7 +266,7 @@ impl EnvelopeContext {
 ///     verifying_key: VerifyingKey,
 /// }
 ///
-/// impl ZmqService for MyService {
+/// impl RequestService for MyService {
 ///     fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<Continuation>)> {
 ///         // ctx.identity is already verified
 ///         info!("Request from {} (id={})", ctx.subject(), ctx.request_id);
@@ -283,7 +283,7 @@ impl EnvelopeContext {
 /// manager.spawn(Box::new(my_service)).await?;
 /// ```
 #[async_trait(?Send)]
-pub trait ZmqService: 'static {
+pub trait RequestService: 'static {
     /// Process a request and return a response with optional continuation.
     ///
     /// # Arguments
@@ -645,7 +645,7 @@ pub trait ZmqService: 'static {
     }
 }
 
-/// REQ/REP message loop for ZmqService.
+/// REQ/REP message loop for RequestService.
 ///
 /// Runs the REQ/REP message loop as an async task with TMQ for I/O.
 /// Uses proper async/await with epoll integration instead of blocking threads.
@@ -662,7 +662,7 @@ pub trait ZmqService: 'static {
 ///
 /// # Usage
 ///
-/// Typically used internally by the blanket `Spawnable` impl for `ZmqService`.
+/// Typically used internally by the blanket `Spawnable` impl for `RequestService`.
 /// Direct usage is for advanced cases only.
 /// REQ/REP message loop with ZMQ ROUTER + optional QUIC accept.
 ///
@@ -748,7 +748,7 @@ impl RequestLoop {
     /// Run the unified service loop as an async task.
     ///
     /// Spawns on `LocalSet` via `spawn_local` — supports `!Send` services.
-    pub async fn run<S: ZmqService>(self, service: S) -> Result<ServiceHandle> {
+    pub async fn run<S: RequestService>(self, service: S) -> Result<ServiceHandle> {
         let transport = self.transport.clone();
         let context = Arc::clone(&self.context);
         let server_pubkey = self.server_pubkey;
@@ -795,7 +795,7 @@ impl RequestLoop {
     /// Accepts requests from both ZMQ ROUTER and WebTransport server,
     /// dispatching both through `process_request`.
     #[allow(clippy::too_many_arguments)]
-    async fn unified_loop<S: ZmqService>(
+    async fn unified_loop<S: RequestService>(
         transport: TransportConfig,
         context: Arc<zmq::Context>,
         service: Rc<S>,
