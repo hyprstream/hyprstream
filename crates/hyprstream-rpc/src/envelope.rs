@@ -618,42 +618,28 @@ impl RequestEnvelope {
     /// These bytes are what gets signed in a SignedEnvelope.
     pub fn to_bytes(&self) -> Vec<u8> {
         use capnp::message::Builder;
-        use capnp::serialize;
         use capnp::Word;
 
-        // Step 1: Build the message
+        // Build the message.
         let mut message = Builder::new_default();
         {
             let mut builder = message.init_root::<common_capnp::request_envelope::Builder>();
             self.write_to(&mut builder);
         }
 
-        // Step 2: Serialize to bytes first (to create a reader)
-        let mut temp_bytes = Vec::new();
-        if let Err(_e) = serialize::write_message(&mut temp_bytes, &message) {
-            #[cfg(not(target_arch = "wasm32"))]
-            tracing::error!("RequestEnvelope temporary serialization failed: {}", _e);
-            return Vec::new();
-        }
-
-        // Step 3: Read back to get a Reader
-        let reader = match serialize::read_message(
-            &mut std::io::Cursor::new(&temp_bytes),
-            envelope_reader_options(),
-        ) {
-            Ok(r) => r,
-            Err(_e) => {
-                #[cfg(not(target_arch = "wasm32"))]
-                tracing::error!("RequestEnvelope reader creation failed: {}", _e);
-                return Vec::new();
-            }
-        };
-
-        // Step 4: CRITICAL - Canonicalize before signing
-        // This ensures deterministic serialization as required by Cap'n Proto spec.
-        // Non-canonical serialization can produce different bytes for identical data,
-        // breaking signature verification across platforms/versions.
-        let canonical_words = match reader.canonicalize() {
+        // Canonicalize directly from the builder (#178). Cap'n Proto is
+        // zero-copy; the previous implementation defeated that on the signing
+        // hot path by serializing to a temp Vec and reparsing it just to obtain
+        // a Reader. `Builder::into_reader()` reads the builder's own segments in
+        // place — no temp serialize, no reparse. Canonicalization is still
+        // REQUIRED: capnp messages aren't canonical by default, and signatures
+        // must be over deterministic bytes for cross-platform verification.
+        //
+        // `into_reader()` uses unlimited traversal, which is correct here: the
+        // message is self-produced (not untrusted input), and it removes a
+        // latent bug where the old 1-MiB-limited reader silently returned empty
+        // bytes — breaking signing — for envelopes larger than 1 MiB.
+        let canonical_words = match message.into_reader().canonicalize() {
             Ok(words) => words,
             Err(_e) => {
                 #[cfg(not(target_arch = "wasm32"))]
@@ -662,7 +648,7 @@ impl RequestEnvelope {
             }
         };
 
-        // Step 5: Convert Words to bytes (raw segment data, NO stream framing)
+        // Convert Words to bytes (raw segment data, NO stream framing).
         Word::words_to_bytes(&canonical_words).to_vec()
     }
 }
