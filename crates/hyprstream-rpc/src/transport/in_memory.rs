@@ -43,6 +43,12 @@ use crate::transport_traits::Transport;
 /// Default ceiling on a single in-process request, mirroring the networked
 /// RPC transport. A wedged co-located handler should surface as a timeout
 /// rather than hanging the caller indefinitely.
+///
+/// Note this deadline also covers *enqueue* latency: `LocalServiceBridge`
+/// forwards over a bounded mpsc, so a saturated bridge can make `send()` block
+/// on the channel and eventually trip this timeout. The error therefore
+/// conflates "handler wedged" with "bridge backpressure" — acceptable for the
+/// transport surface, but not a substitute for a real backpressure signal.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// In-process RPC transport over an [`IrohRequestProcessor`].
