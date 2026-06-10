@@ -145,7 +145,7 @@ where
     //    reply is all the transport front-end has to deal with (#186). The pump
     //    is bounded by a process-wide permit; see spawn_stream_pump.
     if let Some(cont) = continuation {
-        crate::streaming::spawn_stream_pump(cont);
+        crate::streaming::spawn_stream_pump(service.name(), cont);
     }
 
     Ok(bytes)

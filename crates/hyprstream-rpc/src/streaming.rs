@@ -1821,31 +1821,58 @@ impl StreamGuard {
 // Streaming pump spawning (#186)
 // ============================================================================
 
-/// Process-wide ceiling on concurrently-running streaming pumps.
+/// Ceiling on concurrently-running streaming pumps **per service**.
 ///
-/// This is the former per-`RequestLoop` `MAX_INFLIGHT_CONTINUATIONS`, relocated
-/// here when the pump-spawn moved out of the transport front-ends and into the
-/// dispatch core (#186). The bound is now process-wide rather than per-loop —
-/// a deliberate consequence of centralizing the spawn; sized generously so a
-/// single busy front-end does not starve others.
-const MAX_INFLIGHT_STREAM_PUMPS: usize = 64;
+/// This is the former per-`RequestLoop` `MAX_INFLIGHT_CONTINUATIONS` (16). When
+/// the pump-spawn moved out of the transport front-ends into the dispatch core
+/// (#186) the bound is keyed by service name rather than living on each loop —
+/// which is the *same* granularity, since each service has exactly one
+/// `RequestLoop`. Keeping it per-service (not process-wide) preserves the
+/// original isolation: one service's stuck or long-lived pumps cannot starve
+/// streaming on every other service.
+const MAX_INFLIGHT_STREAM_PUMPS_PER_SERVICE: usize = 16;
 
-fn stream_pump_semaphore() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
-    static SEM: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+/// Per-service pump semaphores, created on first use. A permit is held for the
+/// full lifetime of a pump (which is itself bounded by the stream's JWT/TTL
+/// cancel token in `StreamChannel`, so permits are always eventually released —
+/// there is no unbounded hold). The map only ever grows by the number of
+/// distinct services (small, bounded), so it is never pruned.
+fn stream_pump_semaphore(service_name: &str) -> std::sync::Arc<tokio::sync::Semaphore> {
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    static MAP: std::sync::OnceLock<RwLock<HashMap<String, std::sync::Arc<tokio::sync::Semaphore>>>> =
         std::sync::OnceLock::new();
-    SEM.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_STREAM_PUMPS)))
+    let map = MAP.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Some(sem) = map.read().get(service_name) {
+        return std::sync::Arc::clone(sem);
+    }
+    std::sync::Arc::clone(
+        map.write()
+            .entry(service_name.to_owned())
+            .or_insert_with(|| {
+                std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    MAX_INFLIGHT_STREAM_PUMPS_PER_SERVICE,
+                ))
+            }),
+    )
 }
 
 /// Spawn a streaming pump — the server-side half of a streaming RPC that runs
 /// *after* the StreamInfo reply has been sent — onto the current `LocalSet`,
-/// bounded by a process-wide permit.
+/// bounded by a per-service permit.
 ///
 /// Replaces the former "transport front-end spawns the continuation it got back
 /// from `process_request`" model (#186): the dispatch core now spawns the pump
 /// itself and returns only the reply bytes, so the streaming lifecycle is no
 /// longer threaded through every transport's request/response path. This is the
 /// M1 shape; in M2 the pump's transport (`StreamChannel`) moves to a
-/// service-owned moq broadcast and this per-RPC spawn goes away entirely.
+/// service-owned moq broadcast and this coarse per-service cap is replaced by
+/// the StreamPolicy backpressure axes (#134).
+///
+/// `service_name` keys the per-service permit pool (see
+/// [`MAX_INFLIGHT_STREAM_PUMPS_PER_SERVICE`]). When the pool is saturated the
+/// pump waits for a permit rather than being dropped — but the wait is logged
+/// so saturation is observable rather than a silent stall.
 ///
 /// # Invariant
 ///
@@ -1856,13 +1883,31 @@ fn stream_pump_semaphore() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
 /// runs on a `LocalSet` (ZMQ `RequestLoop`, the WebTransport server, and the
 /// generic plane's `LocalServiceBridge`), which is the only place this is
 /// invoked.
-pub fn spawn_stream_pump(continuation: crate::service::Continuation) {
-    let sem = std::sync::Arc::clone(stream_pump_semaphore());
+pub fn spawn_stream_pump(service_name: &str, continuation: crate::service::Continuation) {
+    let sem = stream_pump_semaphore(service_name);
+    let service_name = service_name.to_owned();
     tokio::task::spawn_local(async move {
-        let Ok(_permit) = sem.acquire_owned().await else {
-            tracing::warn!("stream pump semaphore closed; dropping streaming pump");
-            return;
+        // Observe saturation: a permit that isn't immediately available means
+        // this service is at its concurrent-stream cap and new streams are
+        // queueing behind running ones.
+        let permit = match sem.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::warn!(
+                    service = %service_name,
+                    cap = MAX_INFLIGHT_STREAM_PUMPS_PER_SERVICE,
+                    "streaming pump cap reached; new stream waiting for a slot"
+                );
+                // The semaphore is a static that is never closed, so
+                // acquire_owned cannot fail; if it somehow did, drop the pump.
+                let Ok(p) = sem.acquire_owned().await else {
+                    tracing::error!(service = %service_name, "stream pump semaphore closed; dropping pump");
+                    return;
+                };
+                p
+            }
         };
+        let _permit = permit; // held for the pump's lifetime
         continuation.await;
     });
 }
