@@ -288,6 +288,13 @@ impl LocalServiceBridge {
                             // Re-derive the signing key per call: cheap clone,
                             // tracks any future rotation in the service.
                             let signing_key = service.signing_key();
+                            // As of #186 process_request spawns any streaming
+                            // pump itself (onto this bridge's LocalSet, where
+                            // this task already runs) and returns only the reply
+                            // bytes, so the generic plane no longer has to reject
+                            // continuations it cannot return. The pump's
+                            // transport moves to moq-net in M2 (#134); until then
+                            // it uses StreamChannel exactly as on the ZMQ path.
                             let result = crate::service::dispatch::process_request(
                                 msg.request.as_ref(),
                                 &*service,
@@ -296,28 +303,7 @@ impl LocalServiceBridge {
                                 &nonce_cache,
                             )
                             .await
-                            .and_then(|(bytes, cont)| {
-                                // Streaming continuations are not wired on
-                                // the iroh RPC plane — streaming moves to
-                                // moq-net (`moql` ALPN, Phase 3, #134). In
-                                // debug, panic loudly; in release, return an
-                                // error so the wire emits a signed error
-                                // envelope (handler's build_error_envelope)
-                                // rather than silently dropping the stream.
-                                if cont.is_some() {
-                                    debug_assert!(
-                                        false,
-                                        "iroh-rpc bridge: streaming continuation not supported \
-                                         — wait for Phase 3 (#134)"
-                                    );
-                                    return Err(anyhow::anyhow!(
-                                        "iroh-rpc bridge: service returned a streaming \
-                                         continuation, which is not supported on the iroh \
-                                         RPC plane (Phase 3 / #134 moves streaming to moq-net)"
-                                    ));
-                                }
-                                Ok(Bytes::from(bytes))
-                            });
+                            .map(Bytes::from);
                             let _ = msg.respond.send(result);
                         });
                     }

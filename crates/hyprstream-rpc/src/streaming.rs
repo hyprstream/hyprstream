@@ -1818,6 +1818,56 @@ impl StreamGuard {
 }
 
 // ============================================================================
+// Streaming pump spawning (#186)
+// ============================================================================
+
+/// Process-wide ceiling on concurrently-running streaming pumps.
+///
+/// This is the former per-`RequestLoop` `MAX_INFLIGHT_CONTINUATIONS`, relocated
+/// here when the pump-spawn moved out of the transport front-ends and into the
+/// dispatch core (#186). The bound is now process-wide rather than per-loop —
+/// a deliberate consequence of centralizing the spawn; sized generously so a
+/// single busy front-end does not starve others.
+const MAX_INFLIGHT_STREAM_PUMPS: usize = 64;
+
+fn stream_pump_semaphore() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static SEM: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    SEM.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_STREAM_PUMPS)))
+}
+
+/// Spawn a streaming pump — the server-side half of a streaming RPC that runs
+/// *after* the StreamInfo reply has been sent — onto the current `LocalSet`,
+/// bounded by a process-wide permit.
+///
+/// Replaces the former "transport front-end spawns the continuation it got back
+/// from `process_request`" model (#186): the dispatch core now spawns the pump
+/// itself and returns only the reply bytes, so the streaming lifecycle is no
+/// longer threaded through every transport's request/response path. This is the
+/// M1 shape; in M2 the pump's transport (`StreamChannel`) moves to a
+/// service-owned moq broadcast and this per-RPC spawn goes away entirely.
+///
+/// # Invariant
+///
+/// MUST be called from within a `tokio::task::LocalSet`: the pump is `?Send`
+/// (like every [`RequestService`](crate::service::RequestService)), and
+/// `spawn_local` panics outside a `LocalSet`. Every
+/// [`process_request`](crate::service::dispatch::process_request) caller already
+/// runs on a `LocalSet` (ZMQ `RequestLoop`, the WebTransport server, and the
+/// generic plane's `LocalServiceBridge`), which is the only place this is
+/// invoked.
+pub fn spawn_stream_pump(continuation: crate::service::Continuation) {
+    let sem = std::sync::Arc::clone(stream_pump_semaphore());
+    tokio::task::spawn_local(async move {
+        let Ok(_permit) = sem.acquire_owned().await else {
+            tracing::warn!("stream pump semaphore closed; dropping streaming pump");
+            return;
+        };
+        continuation.await;
+    });
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
 

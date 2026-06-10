@@ -529,7 +529,7 @@ impl QuicRep {
         // just don't pin it to the server's own key. JWT claims + Casbin handle
         // authorization.
         // subsecond::call wraps dispatch for hot-patching during dev
-        let (response_bytes, continuation) = subsecond::call(|| crate::service::dispatch::process_request(
+        let response_bytes = subsecond::call(|| crate::service::dispatch::process_request(
             raw_bytes,
             &*service,
             EnvelopeVerification::AnySigner,
@@ -543,14 +543,9 @@ impl QuicRep {
         };
         stream.send_multipart(&response.parts).await?;
 
-        // Signal end of response
+        // Signal end of response. Any streaming pump was already spawned inside
+        // process_request (#186).
         stream.stream.send.finish()?;
-
-        // Handle continuation if present (for streaming)
-        if let Some(cont) = continuation {
-            // Spawn continuation on LocalSet (streaming handler is ?Send)
-            tokio::task::spawn_local(cont);
-        }
 
         Ok(())
     }
@@ -1680,14 +1675,12 @@ impl WebTransportServer {
                     &signing_key,
                     &nonce_cache,
                 )).await {
-                    Ok((response_bytes, continuation)) => {
+                    Ok(response_bytes) => {
                         zmtp.send_multipart(&[Bytes::from(response_bytes)]).await?;
                         zmtp.stream.send.shutdown().await
                             .map_err(std::io::Error::other)?;
-
-                        if let Some(cont) = continuation {
-                            tokio::task::spawn_local(cont);
-                        }
+                        // Any streaming pump was already spawned inside
+                        // process_request (#186).
                     }
                     Err(e) => {
                         warn!("WebTransport RPC error: {}", e);
