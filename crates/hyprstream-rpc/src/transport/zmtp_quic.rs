@@ -529,7 +529,7 @@ impl QuicRep {
         // just don't pin it to the server's own key. JWT claims + Casbin handle
         // authorization.
         // subsecond::call wraps dispatch for hot-patching during dev
-        let (response_bytes, continuation) = subsecond::call(|| process_request(
+        let (response_bytes, continuation) = subsecond::call(|| crate::service::dispatch::process_request(
             raw_bytes,
             &*service,
             EnvelopeVerification::AnySigner,
@@ -1673,7 +1673,7 @@ impl WebTransportServer {
                 ensure!(!request.parts.is_empty(), "Empty RPC request");
                 let raw_bytes = &request.parts[0];
 
-                match subsecond::call(|| process_request(
+                match subsecond::call(|| crate::service::dispatch::process_request(
                     raw_bytes,
                     &*service,
                     EnvelopeVerification::AnySigner,
@@ -1969,126 +1969,8 @@ pub fn client_tls_system_roots() -> Result<rustls::ClientConfig> {
 /// verification. The only difference is step 1 of 4 in the verification pipeline.
 pub use crate::envelope::EnvelopeVerification;
 
-/// Process a request through the full envelope verification pipeline.
-///
-/// Unified handler for both ZMQ (ROUTER) and WebTransport paths. The only
-/// difference is envelope signer verification, controlled by `verification`.
-///
-/// # Pipeline
-///
-/// 1. Unwrap `SignedEnvelope` and verify Ed25519 signature (mode-dependent)
-/// 2. Verify JWT claims (`sub`, `exp`, `aud`, `scope`, downgrade protection)
-/// 3. Dispatch to `service.handle_request()` with verified `EnvelopeContext`
-/// 4. Sign response with server's `signing_key`
-///
-/// # Arguments
-///
-/// * `raw_bytes` - Raw Cap'n Proto bytes containing a `SignedEnvelope`
-/// * `service` - The RequestService to dispatch to
-/// * `verification` - Envelope signer verification mode
-/// * `signing_key` - Server's signing key for response
-/// * `nonce_cache` - Nonce cache for replay protection
-///
-/// # Returns
-///
-/// * `Ok((response_bytes, continuation))` - Signed response and optional continuation
-/// * `Err(e)` - Processing error (already logged)
-pub async fn process_request<S>(
-    raw_bytes: &[u8],
-    service: &S,
-    verification: EnvelopeVerification<'_>,
-    signing_key: &ed25519_dalek::SigningKey,
-    nonce_cache: &crate::envelope::InMemoryNonceCache,
-) -> Result<(Vec<u8>, Option<crate::service::Continuation>)>
-where
-    S: crate::service::RequestService,
-{
-    use crate::ToCapnp;
-    use crate::envelope::ResponseEnvelope;
-    use capnp::message::Builder;
-    use capnp::serialize;
-    use tracing::warn;
-
-    // 1. Unwrap, verify, and optionally decrypt the SignedEnvelope.
-    //    The verify policy + kid-anchored PQ trust store come from the
-    //    process-global verify configuration installed at startup (Hybrid
-    //    ENFORCED in the daemon). This closes the prior fail-open where the
-    //    site hardcoded Classical / no PQ store.
-    let pq_store_holder = crate::envelope::global_pq_store();
-    let base = match verification {
-        EnvelopeVerification::FixedSigner(pubkey) =>
-            crate::envelope::UnwrapOptions::fixed_signer(pubkey, nonce_cache),
-        EnvelopeVerification::AnySigner =>
-            crate::envelope::UnwrapOptions::any_signer(nonce_cache),
-    }.with_decryption_key(signing_key);
-    let opts =
-        crate::envelope::apply_global_verify_config(base, &pq_store_holder);
-
-    let (mut ctx, payload) = match crate::envelope::unwrap_envelope(raw_bytes, &opts) {
-        Ok(result) => result,
-        Err(e) => {
-            warn!("{} envelope verification failed: {}", service.name(), e);
-            // Build error response with request_id=0 (envelope is invalid)
-            let error_payload = service.build_error_payload(0, &format!("envelope verification failed: {}", e));
-            let signed_response = ResponseEnvelope::new_signed(0, error_payload, signing_key);
-
-            let mut message = Builder::new_default();
-            let mut builder = message.init_root::<crate::common_capnp::response_envelope::Builder>();
-            signed_response.write_to(&mut builder);
-
-            let mut bytes = Vec::new();
-            serialize::write_message(&mut bytes, &message)?;
-            return Ok((bytes, None));
-        }
-    };
-
-    let request_id = ctx.request_id;
-    debug!(
-        "{} verified request from {} (id={})",
-        service.name(),
-        ctx.subject(),
-        request_id
-    );
-
-    // 2. Verify claims (E2E JWT, downgrade protection)
-    if let Err(e) = service.verify_claims(&mut ctx).await {
-        warn!(
-            "{} claims verification failed for {} (id={}): {}",
-            service.name(), ctx.subject(), request_id, e
-        );
-        let error_payload = service.build_error_payload(request_id, &e.to_string());
-        let signed_response = ResponseEnvelope::new_signed(request_id, error_payload, signing_key);
-
-        let mut message = Builder::new_default();
-        let mut builder = message.init_root::<crate::common_capnp::response_envelope::Builder>();
-        signed_response.write_to(&mut builder);
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-        return Ok((bytes, None));
-    }
-
-    // 3. Handle request
-    let (response_payload, continuation) = match service.handle_request(&ctx, &payload).await {
-        Ok((resp, cont)) => (resp, cont),
-        Err(e) => {
-            error!("{} request handling error: {}", service.name(), e);
-            (service.build_error_payload(request_id, &e.to_string()), None)
-        }
-    };
-
-    // 4. Sign and serialize response
-    let signed_response = ResponseEnvelope::new_signed(request_id, response_payload, signing_key);
-
-    let mut message = Builder::new_default();
-    let mut builder = message.init_root::<crate::common_capnp::response_envelope::Builder>();
-    signed_response.write_to(&mut builder);
-
-    let mut bytes = Vec::new();
-    serialize::write_message(&mut bytes, &message)?;
-
-    Ok((bytes, continuation))
-}
+// process_request moved to crate::service::dispatch (#148) — transport-neutral
+// dispatch core, shared by RequestLoop / WebTransport / LocalServiceBridge.
 
 // ============================================================================
 // Tests

@@ -15,7 +15,7 @@
 //! it forwards opaque bytes to the [`IrohRequestProcessor`]. Envelope
 //! verification, JWT/DPoP, and `authorize_signer` enforcement happen inside
 //! the processor (which is `LocalServiceBridge` in production, delegating
-//! to [`crate::transport::zmtp_quic::process_request`]). The handler does
+//! to [`crate::service::dispatch::process_request`]). The handler does
 //! hold a signing key, but uses it only to produce signed error envelopes
 //! when the processor itself returns `Err` (a wire-level failure), so the
 //! client always sees a parseable `ResponseEnvelope` rather than an opaque
@@ -243,7 +243,7 @@ pub struct LocalServiceBridge {
 
 impl LocalServiceBridge {
     /// Spawn a dedicated bridge thread that owns `service` and forwards
-    /// requests through [`crate::transport::zmtp_quic::process_request`].
+    /// requests through [`crate::service::dispatch::process_request`].
     ///
     /// The response signing key is taken from `service.signing_key()` — there
     /// is no separate parameter to avoid drift between the service's identity
@@ -288,7 +288,7 @@ impl LocalServiceBridge {
                             // Re-derive the signing key per call: cheap clone,
                             // tracks any future rotation in the service.
                             let signing_key = service.signing_key();
-                            let result = crate::transport::zmtp_quic::process_request(
+                            let result = crate::service::dispatch::process_request(
                                 msg.request.as_ref(),
                                 &*service,
                                 crate::envelope::EnvelopeVerification::AnySigner,

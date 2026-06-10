@@ -996,10 +996,10 @@ impl RequestLoop {
                     // not a shared root key. The envelope signature is still verified —
                     // JWT claims + Casbin handle authorization.
                     // subsecond::call wraps the dispatch so handler code can be hot-patched during dev.
-                    let (response_bytes, continuation) = match subsecond::call(|| crate::transport::zmtp_quic::process_request(
+                    let (response_bytes, continuation) = match subsecond::call(|| crate::service::dispatch::process_request(
                         &request,
                         &*service,
-                        crate::transport::zmtp_quic::EnvelopeVerification::AnySigner,
+                        crate::envelope::EnvelopeVerification::AnySigner,
                         &signing_key,
                         &nonce_cache,
                     )).await {
