@@ -8,7 +8,12 @@
 //! remainder of that file can be deleted in #138 without touching this.
 
 use anyhow::Result;
+use capnp::message::Builder;
+use capnp::serialize;
 use tracing::{debug, error, warn};
+
+use crate::envelope::ResponseEnvelope;
+use crate::ToCapnp;
 
 /// Envelope signer verification mode (re-exported from `crate::envelope`).
 ///
@@ -45,11 +50,6 @@ pub async fn process_request<S>(
 where
     S: crate::service::RequestService,
 {
-    use crate::ToCapnp;
-    use crate::envelope::ResponseEnvelope;
-    use capnp::message::Builder;
-    use capnp::serialize;
-
     // 1. Unwrap, verify, and optionally decrypt the SignedEnvelope.
     //    The verify policy + kid-anchored PQ trust store come from the
     //    process-global verify configuration installed at startup (Hybrid
