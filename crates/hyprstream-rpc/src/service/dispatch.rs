@@ -38,15 +38,15 @@ pub use crate::envelope::EnvelopeVerification;
 ///
 /// # Streaming
 ///
-/// A streaming handler returns a `Continuation` (the server-side pump that runs
-/// after the reply). As of #186 that pump is spawned **here**, via
-/// [`crate::streaming::spawn_stream_pump`], rather than handed back to the
-/// transport front-end — so every front-end (ZMQ `RequestLoop`, WebTransport
-/// server, generic-plane `LocalServiceBridge`) is uniform "bytes in → bytes
-/// out" and the generic plane no longer has to reject continuations it cannot
-/// return. **Invariant:** `process_request` must therefore run on a
-/// `tokio::task::LocalSet` (it already did — `RequestService` is `?Send`); the
-/// spawned pump is `?Send`.
+/// A streaming handler returns a `Continuation` (the server-side streaming
+/// response that runs after the reply). As of #186 that task is spawned
+/// **here**, via [`crate::streaming::spawn_streaming_response`], rather than
+/// handed back to the transport front-end — so every front-end (ZMQ
+/// `RequestLoop`, WebTransport server, generic-plane `LocalServiceBridge`) is
+/// uniform "bytes in → bytes out" and the generic plane no longer has to reject
+/// continuations it cannot return. **Invariant:** `process_request` must
+/// therefore run on a `tokio::task::LocalSet` (it already did — `RequestService`
+/// is `?Send`); the spawned task is `?Send`.
 ///
 /// # Returns
 ///
@@ -141,11 +141,12 @@ where
     let mut bytes = Vec::new();
     serialize::write_message(&mut bytes, &message)?;
 
-    // 5. Spawn the streaming pump (if any) onto the current LocalSet, so the
-    //    reply is all the transport front-end has to deal with (#186). The pump
-    //    is bounded by a process-wide permit; see spawn_stream_pump.
+    // 5. Spawn the server-side streaming response (if any) onto the current
+    //    LocalSet, so the reply is all the transport front-end has to deal with
+    //    (#186). Bounded by a per-service admission permit; see
+    //    spawn_streaming_response.
     if let Some(cont) = continuation {
-        crate::streaming::spawn_stream_pump(service.name(), cont);
+        crate::streaming::spawn_streaming_response(service.name(), cont);
     }
 
     Ok(bytes)
