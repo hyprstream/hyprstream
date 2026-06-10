@@ -140,6 +140,8 @@ pub mod moq_stream;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod transport;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod dial;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod notify;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod paths;

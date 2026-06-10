@@ -23,6 +23,8 @@ pub mod quinn_transport;
 pub mod iroh_transport;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod iroh_moq;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod in_memory;
 
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
