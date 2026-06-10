@@ -1,19 +1,45 @@
-//! Nested-COSE **Strong-Non-Separable (SNS)** composite signing for the
-//! hyprstream `SignedEnvelope` (EdDSA + ML-DSA-65).
+//! Nested-COSE hybrid composite signing for the hyprstream `SignedEnvelope`
+//! (EdDSA + ML-DSA-65).
 //!
-//! M3 (#152) migrates envelope authentication to a **nested COSE composite**.
-//! A prior design used a `COSE_Sign` with two *independent* signatures over the
-//! same payload (concatenation / Weak-Non-Separable, WNS). A security review
-//! found that scheme **fail-open + strippable**: an attacker could remove the
-//! ML-DSA-65 signature and the remaining EdDSA-only object still verified under
-//! a verifier that did not actively require the PQ entry. This module replaces
-//! it with a **Strong-Non-Separable (SNS)** nesting:
+//! ## Where this sits in the PQUIP hybrid-signature taxonomy
+//!
+//! In the taxonomy of `draft-ietf-pquip-hybrid-signature-spectrums` §1.3.4 this
+//! construction is **Weak Non-Separable (WNS)**, *not* Strong Non-Separable
+//! (SNS). SNS requires *fusion* — the two algorithms' signatures combined into a
+//! single object that cannot be verified by either component alone. We do not do
+//! that: we emit two distinct COSE_Sign1 signatures and bind them by nesting
+//! (the outer signs `payload ‖ inner_sig`). A classical-only verifier can — and,
+//! per [`verify_composite`]'s `require_pq = false` path, deliberately does —
+//! accept the inner EdDSA signature on its own. That standalone-acceptability is
+//! exactly what SNS precludes, so labelling this SNS would overstate the
+//! cryptographic guarantee.
+//!
+//! **Downgrade resistance here is enforced by *verifier policy*, not by the
+//! crypto.** It rests on two policy mechanisms, not on non-separability:
+//!   1. `require_pq` (fail-closed Hybrid policy): a Hybrid verifier rejects any
+//!      envelope lacking a valid outer ML-DSA-65 layer, so an attacker who strips
+//!      the outer layer is rejected by *policy* (not because the inner is
+//!      cryptographically unusable without it).
+//!   2. kid-anchoring: the PQ key is resolved from a [`PqTrustStore`] keyed by
+//!      the EdDSA signer identity, never self-asserted in the COSE object —
+//!      closing the self-certification gap a naïve two-signature scheme has.
+//!
+//! ## What the nesting *does* buy
+//!
+//! M3 (#152) replaced an earlier `COSE_Sign` with two *independent* signatures
+//! over the same payload (a fail-open, trivially strippable scheme). The nesting
+//! below is a real improvement over that: because the outer ML-DSA-65 signature
+//! covers `payload ‖ inner_eddsa_signature`, the inner signature is part of the
+//! outer's signed message — so once a verifier has *committed to checking the
+//! outer* (Hybrid policy), it cannot be fed a mismatched inner/outer pair. The
+//! nesting binds the two layers together; the *requirement* to check the outer
+//! at all comes from policy.
 //!
 //! ```text
 //! Classical:
 //!   inner  = EdDSA   COSE_Sign1 over  payload                       (detached)
 //!
-//! Hybrid (SNS):
+//! Hybrid (WNS, policy-enforced):
 //!   inner  = EdDSA   COSE_Sign1 over  payload                       (detached)
 //!   outer  = ML-DSA  COSE_Sign1 over  payload ‖ inner_eddsa_sig     (detached)
 //! ```
@@ -21,17 +47,12 @@
 //! Both layers bind the same `external_aad` (the CBOR `[envelope_schema_id,
 //! inner_type_id]` schema binding, see [`crate::crypto::cose_sign1::build_external_aad`]).
 //!
-//! # Why this is SNS
-//!
-//! - The OUTER ML-DSA-65 signature covers `payload ‖ inner_eddsa_signature`, so
-//!   the inner signature is *part of the outer's signed message*. Tampering with
-//!   or removing the inner EdDSA signature invalidates the outer.
-//! - Under Hybrid policy the verifier REQUIRES the outer ML-DSA-65 layer and an
-//!   anchored PQ key. **Stripping the outer fails the policy** (there is no
-//!   valid outer to verify), so a downgrade-to-classical attack is rejected.
-//! - The PQ key is kid-anchored: it is resolved from a [`PqTrustStore`] keyed by
-//!   the EdDSA signer identity, never self-asserted in the COSE object. This
-//!   closes the prior self-certification weakness.
+//! Note the `external_aad` does **not** currently carry a hybrid-composite
+//! algorithm identifier, so the inner EdDSA COSE_Sign1 produced in Hybrid mode is
+//! byte-identical to one produced in Classical mode. Binding a composite alg-id
+//! into the AAD would move this construction closer to true non-separability —
+//! but at the cost of the deliberate classical-verifier interop documented on
+//! [`verify_composite`]. That trade-off is tracked as a follow-up; see #152.
 //!
 //! # Wire shape (`SignedEnvelope.cose`)
 //!
@@ -87,7 +108,7 @@ fn build_inner_eddsa(
 }
 
 /// Build the outer ML-DSA-65 `COSE_Sign1` over the detached
-/// `payload ‖ inner_eddsa_signature` (the SNS binding).
+/// `payload ‖ inner_eddsa_signature` (the inner→outer binding).
 fn build_outer_mldsa(
     pq_sk: &MlDsaSigningKey,
     outer_payload: &[u8],
@@ -149,7 +170,7 @@ fn inner_signature_bytes(inner: &CoseSign1) -> &[u8] {
     &inner.signature
 }
 
-/// Compute the outer payload for the SNS binding: `payload ‖ inner_eddsa_sig`.
+/// Compute the outer payload for the inner→outer binding: `payload ‖ inner_eddsa_sig`.
 fn outer_payload(payload: &[u8], inner_sig: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(payload.len() + inner_sig.len());
     v.extend_from_slice(payload);
@@ -161,7 +182,7 @@ fn outer_payload(payload: &[u8], inner_sig: &[u8]) -> Vec<u8> {
 ///
 /// - Classical (`pq_sk = None`): single inner EdDSA COSE_Sign1, outer = null.
 /// - Hybrid (`pq_sk = Some`): inner EdDSA over `payload`, outer ML-DSA-65 over
-///   `payload ‖ inner_eddsa_signature` (SNS).
+///   `payload ‖ inner_eddsa_signature` (the inner→outer binding).
 pub fn sign_composite(
     ed_sk: &ed25519_dalek::SigningKey,
     pq_sk: Option<&MlDsaSigningKey>,
@@ -191,11 +212,11 @@ pub fn sign_composite(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Out-of-band (async / WASM) signing API for the nested SNS composite.
+// Out-of-band (async / WASM) signing API for the nested WNS composite.
 //
 // Abstract signers (e.g. the WASM `JsSigner`) cannot run inside a synchronous
 // signing closure, so they compute each layer's to-be-signed bytes, sign them
-// out-of-band, and assemble the composite here. The SNS nesting REQUIRES the
+// out-of-band, and assemble the composite here. The nesting REQUIRES the
 // outer ML-DSA layer to sign `payload ‖ inner_eddsa_signature`, so callers MUST
 // sign the inner first, take its signature, then sign the outer over
 // [`outer_tbs`].
@@ -231,7 +252,7 @@ pub fn inner_tbs(ed_kid: Vec<u8>, payload: &[u8], external_aad: &[u8]) -> Vec<u8
 }
 
 /// Compute the outer ML-DSA-65 layer's detached to-be-signed bytes over
-/// `payload ‖ inner_eddsa_signature` (the SNS binding).
+/// `payload ‖ inner_eddsa_signature` (the inner→outer binding).
 pub fn outer_tbs(
     pq_kid: Vec<u8>,
     payload: &[u8],
@@ -242,7 +263,7 @@ pub fn outer_tbs(
     unsigned_outer(pq_kid).tbs_detached_data(&outer_pl, external_aad)
 }
 
-/// Assemble the nested SNS composite from out-of-band signatures.
+/// Assemble the nested WNS composite from out-of-band signatures.
 ///
 /// - `ed = (ed_kid, ed_signature)` — required; `ed_signature` is the raw 64-byte
 ///   Ed25519 signature over [`inner_tbs`].
@@ -295,7 +316,7 @@ pub fn encode_composite_for_test(inner: Vec<u8>, outer: Option<Vec<u8>>) -> Resu
 pub struct CompositeVerified {
     /// Inner EdDSA was verified.
     pub eddsa: bool,
-    /// Outer ML-DSA-65 (SNS) was verified.
+    /// Outer ML-DSA-65 layer was verified.
     pub ml_dsa: bool,
 }
 
@@ -347,10 +368,10 @@ pub fn verify_composite(
         .context("inner EdDSA signature verification failed")?;
     let eddsa_ok = true;
 
-    // Capture the inner signature; it is the SNS binding for the outer layer.
+    // Capture the inner signature; it is bound into the outer layer's signed message.
     let inner_sig = inner_signature_bytes(&inner).to_vec();
 
-    // --- Outer ML-DSA-65 layer (SNS) ---
+    // --- Outer ML-DSA-65 layer (inner→outer binding) ---
     let mut ml_dsa_ok = false;
 
     match outer_bytes {
@@ -509,7 +530,7 @@ mod tests {
         assert!(res.is_err());
     }
 
-    /// SNS: stripping the outer ML-DSA layer (set to null) must be rejected
+    /// Policy-enforced: stripping the outer ML-DSA layer (set to null) must be rejected
     /// under Hybrid policy. This is the attack the review found accepted before.
     #[test]
     fn strip_outer_mldsa_rejected_under_hybrid() {
@@ -526,7 +547,7 @@ mod tests {
         assert!(res.is_err(), "stripping the outer ML-DSA layer must fail Hybrid policy");
     }
 
-    /// SNS: tampering with the inner EdDSA signature invalidates the outer,
+    /// inner→outer binding: tampering with the inner EdDSA signature invalidates the outer,
     /// because the outer signs `payload ‖ inner_sig`.
     #[test]
     fn tamper_inner_eddsa_invalidates_outer() {
