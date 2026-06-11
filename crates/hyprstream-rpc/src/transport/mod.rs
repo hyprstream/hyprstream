@@ -31,6 +31,8 @@ pub mod lazy_quinn;
 pub mod lazy_iroh;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod uds_session;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod lazy_uds;
 
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;

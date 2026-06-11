@@ -180,11 +180,23 @@ where
             Ok(Arc::new(RpcClientImpl::new(signer, transport, server_verifying_key))
                 as Arc<dyn RpcClient>)
         }
-        endpoint @ (EndpointType::Ipc { .. } | EndpointType::SystemdFd { .. }) => bail!(
-            "dial(): endpoint {endpoint:?} is not served by the dial factory — \
-             ZMQ ipc/systemd endpoints stay on the codegen path during the transition; \
-             iroh/moq lazy transports land in a later #151(a) increment"
-        ),
+        // Same-host `ipc` plane: connect a UdsSession (RPC plane) at the socket
+        // path. systemd socket-activation is the same client-side dial — the fd
+        // is the *server's* pre-bound listener; clients connect by `client_path`.
+        // UDS has no transport-level peer identity; the app-layer SignedEnvelope
+        // is the authentication (a `None` server_verifying_key leaves the
+        // response identity unpinned but still signature-verified). Socket perms
+        // + SO_PEERCRED are daemon-owned defense-in-depth (#207).
+        EndpointType::Ipc { path } => {
+            let transport = crate::transport::lazy_uds::LazyUdsTransport::new(path.clone());
+            Ok(Arc::new(RpcClientImpl::new(signer, transport, server_verifying_key))
+                as Arc<dyn RpcClient>)
+        }
+        EndpointType::SystemdFd { client_path, .. } => {
+            let transport = crate::transport::lazy_uds::LazyUdsTransport::new(client_path.clone());
+            Ok(Arc::new(RpcClientImpl::new(signer, transport, server_verifying_key))
+                as Arc<dyn RpcClient>)
+        }
     }
 }
 
@@ -251,10 +263,20 @@ mod tests {
     }
 
     #[test]
-    fn dial_unsupported_endpoint_errors() {
-        let cfg = TransportConfig::ipc("/tmp/hyprstream-test.sock");
-        let err = dial(&cfg, test_signer(), None);
-        assert!(err.is_err(), "ipc dial is not yet served by the factory");
+    fn dial_ipc_builds_lazy_client() {
+        // ipc dial builds a lazy UdsSession client — sync, no I/O, connects on
+        // first send (the socket need not exist yet at dial() time).
+        let cfg = TransportConfig::ipc("/tmp/hyprstream-test-dial.sock");
+        let client = dial(&cfg, test_signer(), None);
+        assert!(client.is_ok(), "ipc dial must build a lazy client without connecting");
+    }
+
+    #[test]
+    fn dial_systemd_fd_builds_lazy_client() {
+        // systemd socket-activation: client dials the client_path via UDS.
+        let cfg = TransportConfig::systemd_fd(7, "/tmp/hyprstream-test-systemd.sock");
+        let client = dial(&cfg, test_signer(), None);
+        assert!(client.is_ok(), "systemd-fd dial must build a lazy client via client_path");
     }
 
     #[test]
