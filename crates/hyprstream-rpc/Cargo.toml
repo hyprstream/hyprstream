@@ -92,6 +92,7 @@ moq-net = { workspace = true }
 web-transport-iroh = { workspace = true }
 web-transport-quinn = { workspace = true }
 web-transport-trait = { workspace = true }
+yamux = { workspace = true }  # UDS transport: stream-multiplexer for Session-over-UnixStream
 url = { workspace = true }
 
 # Async runtime
