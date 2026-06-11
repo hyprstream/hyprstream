@@ -36,7 +36,7 @@ use crate::crypto::VerifyingKey;
 use crate::rpc_client::{RpcClient, RpcClientImpl};
 use crate::transport::in_memory::InMemoryTransport;
 use crate::transport::rpc_session::IrohRequestProcessor;
-use crate::transport::{EndpointType, QuicServerAuth, TransportConfig};
+use crate::transport::{EndpointType, TransportConfig};
 use crate::transport_traits::Signer;
 
 /// Process-local map of inproc endpoint name → co-located request processor.
@@ -132,19 +132,15 @@ where
             Ok(Arc::new(RpcClientImpl::new(signer, transport, server_verifying_key))
                 as Arc<dyn RpcClient>)
         }
-        EndpointType::Quic { auth: QuicServerAuth::RawPublicKey(_), .. } => bail!(
-            "dial(): QUIC RFC 7250 raw-public-key auth is not yet implemented (#200) — \
-             use iroh for identity-bound transport, or QuicServerAuth::Pinned / WebPki"
-        ),
         EndpointType::Quic { addr, server_name, auth } => {
-            // SECURITY (#185): WebPki/Pinned authenticate the TLS *channel* (a CA
-            // chain, or a specific cert), not the peer's DID identity. Identity
-            // comes from the response signature, which is still verified against
-            // the envelope-embedded key when `server_verifying_key` is `None` —
+            // SECURITY (#185): QUIC channel auth (WebPKI / cert-hash pin) binds the
+            // *channel*, not the peer's DID identity. Identity is established at the
+            // application layer — the response signature is verified against the
+            // envelope-embedded key even when `server_verifying_key` is `None`,
             // just not *pinned* to an expected identity. For a networked peer,
             // prefer passing the resolver-known key; note (debug) when we can't.
             // (iroh's arm needs no such note — it is identity-bound at the
-            // transport.)
+            // transport, RFC 7250.)
             if server_verifying_key.is_none() {
                 tracing::debug!(
                     %addr,
@@ -197,6 +193,7 @@ where
 mod tests {
     use super::*;
     use crate::crypto::SigningKey;
+    use crate::transport::QuicServerAuth;
     use crate::signer::LocalSigner;
     use crate::transport::rpc_session::from_fn;
     use bytes::Bytes;
@@ -278,18 +275,25 @@ mod tests {
     }
 
     #[test]
-    fn dial_quic_raw_public_key_errors() {
-        // RFC 7250 raw-public-key auth is not yet implemented → fail fast.
+    fn dial_quic_web_pki_pinned_builds_client() {
+        // WebPKI + pin (defence in depth): builds a lazy client.
         let cfg = TransportConfig {
             endpoint: EndpointType::Quic {
                 addr: "127.0.0.1:9999".parse().unwrap(),
                 server_name: "localhost".to_owned(),
-                auth: QuicServerAuth::RawPublicKey([9u8; 32]),
+                auth: QuicServerAuth::web_pki_pinned(vec![[9u8; 32]]).unwrap(),
             },
             curve: None,
             bind_mode: crate::transport::BindMode::Connect,
         };
-        let err = dial(&cfg, test_signer(), None);
-        assert!(err.is_err(), "RFC 7250 QUIC auth must error until implemented");
+        let client = dial(&cfg, test_signer(), None);
+        assert!(client.is_ok(), "WebPKI+pin QUIC dial must build a client");
+    }
+
+    #[test]
+    fn quic_server_auth_rejects_no_requirement() {
+        assert!(QuicServerAuth::pinned(vec![]).is_err(), "empty pin set is no auth");
+        assert!(QuicServerAuth::web_pki_pinned(vec![]).is_err(), "empty pin set is no auth");
+        assert!(QuicServerAuth::web_pki().require_web_pki());
     }
 }
