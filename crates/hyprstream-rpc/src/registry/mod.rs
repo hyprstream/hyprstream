@@ -254,7 +254,12 @@ impl EndpointRegistry {
 
     /// Generate a default endpoint for a service and socket type.
     fn default_endpoint(&self, name: &str, socket_kind: SocketKind) -> TransportConfig {
-        // QUIC endpoints are always TCP-based, independent of ZMQ endpoint mode
+        // QUIC endpoints are always TCP-based, independent of ZMQ endpoint mode.
+        // This is a non-dialable PLACEHOLDER (port 0), returned only when a
+        // service has no real registration; a genuine QUIC endpoint is
+        // registered by the serving loop *pinned* with its cert hash (see
+        // QuicServiceLoop::registrations and the unified loop's QUIC
+        // registration). The WebPki policy here is moot — :0 can't be connected.
         if socket_kind == SocketKind::Quic {
             return TransportConfig::quic(
                 std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),

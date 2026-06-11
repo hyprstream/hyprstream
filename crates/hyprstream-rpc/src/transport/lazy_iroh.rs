@@ -42,6 +42,11 @@ use crate::transport_traits::Transport;
 /// Default per-request deadline when the caller passes `None`.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Ceiling on the lazy connect (iroh dial + handshake). The per-request deadline
+/// wraps only the request; without this an unreachable peer would hang the first
+/// `send()` indefinitely.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Process-wide client iroh endpoint, installed once at startup.
 static IROH_CLIENT_ENDPOINT: OnceLock<iroh::Endpoint> = OnceLock::new();
 
@@ -111,9 +116,9 @@ impl LazyIrohTransport {
             )
         })?;
         let addr = self.endpoint_addr()?;
-        let conn = endpoint
-            .connect(addr, ALPN_HYPRSTREAM_RPC)
+        let conn = tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(addr, ALPN_HYPRSTREAM_RPC))
             .await
+            .map_err(|_| anyhow!("iroh connect timed out after {CONNECT_TIMEOUT:?}"))?
             .map_err(|e| anyhow!("iroh connect: {e}"))?;
         let transport = IrohTransport::new(conn);
         *guard = Some(transport.clone());

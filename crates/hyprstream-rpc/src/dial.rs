@@ -142,8 +142,9 @@ where
             // comes from the response signature, which is still verified against
             // the envelope-embedded key when `server_verifying_key` is `None` —
             // just not *pinned* to an expected identity. For a networked peer,
-            // prefer passing the resolver-known key; warn when we can't. (iroh's
-            // arm needs no such warning — it is identity-bound at the transport.)
+            // prefer passing the resolver-known key; note (debug) when we can't.
+            // (iroh's arm needs no such note — it is identity-bound at the
+            // transport.)
             if server_verifying_key.is_none() {
                 tracing::debug!(
                     %addr,

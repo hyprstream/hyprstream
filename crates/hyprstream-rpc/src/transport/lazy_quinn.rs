@@ -2,10 +2,12 @@
 //!
 //! The [`dial`](crate::dial::dial) factory is synchronous and does no I/O, but a
 //! networked QUIC peer must be connected before the first request. This wrapper
-//! bridges that: it holds the dial target (`addr` + the server cert's SHA-256
-//! pin) and connects on the **first `send()`**, caching the established session
-//! for subsequent calls — exactly the lazy-connect model `ZmqConnection` uses,
-//! so sync construction + zero I/O at dial time is preserved (A1 spike).
+//! bridges that: it holds the dial target (`addr` + `server_name` + the
+//! [`QuicServerAuth`](crate::transport::QuicServerAuth) policy) and connects on
+//! the **first `send()`**, caching the established session for subsequent calls
+//! — exactly the lazy-connect model `ZmqConnection` uses, so sync construction +
+//! zero I/O at dial time is preserved (A1 spike). The connect path (WebPKI vs
+//! cert-hash pin) is selected by the auth policy.
 //!
 //! # Re-dial / self-heal
 //!
@@ -39,6 +41,11 @@ use crate::transport_traits::Transport;
 /// `SessionRpcTransport`.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Ceiling on the lazy connect itself (TLS handshake + dial). The per-request
+/// deadline wraps only the *request*; without this a dead/misrouted address (or
+/// a stalled handshake) would hang the first `send()` indefinitely.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// A quinn RPC transport that connects on first use and caches the session.
 pub struct LazyQuinnTransport {
     addr: SocketAddr,
@@ -70,14 +77,19 @@ impl LazyQuinnTransport {
         if let Some(transport) = guard.as_ref() {
             return Ok(transport.clone());
         }
-        let session = match &self.auth {
-            QuicServerAuth::WebPki => connect_webpki(&self.server_name, self.addr.port()).await?,
-            QuicServerAuth::Pinned(hash) => connect_pinned_sha256(self.addr, *hash).await?,
-            QuicServerAuth::RawPublicKey(_) => bail!(
-                "RFC 7250 raw-public-key QUIC auth is not yet implemented (#200) — use iroh \
-                 for identity-bound transport, or QuicServerAuth::Pinned / WebPki"
-            ),
+        let connect = async {
+            match &self.auth {
+                QuicServerAuth::WebPki => connect_webpki(&self.server_name, self.addr.port()).await,
+                QuicServerAuth::Pinned(hash) => connect_pinned_sha256(self.addr, *hash).await,
+                QuicServerAuth::RawPublicKey(_) => bail!(
+                    "RFC 7250 raw-public-key QUIC auth is not yet implemented (#200) — use iroh \
+                     for identity-bound transport, or QuicServerAuth::Pinned / WebPki"
+                ),
+            }
         };
+        let session = tokio::time::timeout(CONNECT_TIMEOUT, connect)
+            .await
+            .map_err(|_| anyhow!("quinn connect timed out after {CONNECT_TIMEOUT:?}"))??;
         let transport = QuinnTransport::new(session);
         *guard = Some(transport.clone());
         Ok(transport)
@@ -217,6 +229,23 @@ mod tests {
         assert!(res.is_err(), "a wrong cert pin must make send fail");
         assert!(t.cached.lock().await.is_none(), "failed dial leaves nothing cached");
         shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dead_address_send_fails_fast_not_hang() {
+        // No server at 127.0.0.1:1 → the lazy connect must fail (or hit
+        // CONNECT_TIMEOUT) so `send()` returns an error rather than hanging
+        // forever. The guard (> CONNECT_TIMEOUT) fails the test if it hangs.
+        let t = LazyQuinnTransport::new(
+            "127.0.0.1:1".parse().unwrap(),
+            "localhost",
+            QuicServerAuth::Pinned([0u8; 32]),
+        );
+        let res = tokio::time::timeout(Duration::from_secs(13), t.send(b"x".to_vec(), Some(2_000)))
+            .await
+            .expect("send must complete (with an error) within the connect timeout, not hang");
+        assert!(res.is_err(), "a dead address must yield an error, not a connection");
+        assert!(t.cached.lock().await.is_none(), "a failed connect caches nothing");
     }
 
     #[tokio::test]

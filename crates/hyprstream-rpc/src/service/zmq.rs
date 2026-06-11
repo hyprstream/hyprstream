@@ -869,12 +869,21 @@ impl RequestLoop {
                         actual_addr,
                         cert_hash,
                     );
-                    // Register QUIC endpoint in the global registry for discovery
+                    // Register QUIC endpoint in the global registry for discovery.
+                    // The server is self-signed, so register it *pinned* by the
+                    // leaf cert's SHA-256 — otherwise a client dialing this config
+                    // would attempt CA validation (WebPki) against a self-signed
+                    // cert and fail.
                     if let Some(reg) = crate::registry::try_global() {
+                        let pin = crate::transport::zmtp_quic::cert_sha256(&qc.cert_chain[0]);
                         reg.register(
                             service.name(),
                             crate::registry::SocketKind::Quic,
-                            crate::transport::TransportConfig::quic(actual_addr, &qc.server_name),
+                            crate::transport::TransportConfig::quic_pinned(
+                                actual_addr,
+                                &qc.server_name,
+                                pin,
+                            ),
                             None,
                         );
                     }
