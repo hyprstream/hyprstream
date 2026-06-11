@@ -206,8 +206,51 @@ mod tests {
         assert_eq!(resp, b"ping");
         assert!(t.cached.lock().await.is_some(), "session cached after first send");
 
-        client.shutdown().await.unwrap();
         server.shutdown().await.unwrap();
+        // NOTE: do NOT shut down `client` — its endpoint is installed in the
+        // process-global IROH_CLIENT_ENDPOINT (install-once), so tearing it down
+        // would break the shared dialer for any other test. Drop it; the global
+        // Arc clone keeps the endpoint alive (matches the never-reset prod lifecycle).
+        drop(client);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wrong_node_id_rejected() {
+        // Server we'll dial the *address* of, but with a different identity.
+        let server = IrohSubstrate::new(fresh_key(), EchoHandler, EchoHandler).await.unwrap();
+        let direct: Vec<SocketAddr> = server.endpoint().bound_sockets().into_iter().collect();
+
+        let client = IrohSubstrate::new(
+            fresh_key(),
+            NoopHandler::new("client moq"),
+            NoopHandler::new("client rpc"),
+        )
+        .await
+        .unwrap();
+        // First-write-wins; may already be installed by another test (same global).
+        let _ = install_iroh_client_endpoint(client.endpoint().clone());
+
+        // A *valid* but wrong EndpointId (a third node's), so this tests handshake
+        // identity rejection — not a malformed key.
+        let other = IrohSubstrate::new(fresh_key(), NoopHandler::new("o1"), NoopHandler::new("o2"))
+            .await
+            .unwrap();
+        let wrong_id: [u8; 32] = *other.endpoint_id().as_bytes();
+
+        let t = LazyIrohTransport::new(wrong_id, direct, None);
+        let res = tokio::time::timeout(Duration::from_secs(8), t.send(b"x".to_vec(), Some(3_000)))
+            .await
+            .expect("send must complete (with an error) — wrong identity should reject, not hang");
+        assert!(res.is_err(), "dialing a server's address under a wrong EndpointId must fail");
+        assert!(t.cached.lock().await.is_none(), "a failed handshake caches nothing");
+
+        other.shutdown().await.unwrap();
+        server.shutdown().await.unwrap();
+        // NOTE: do NOT shut down `client` — its endpoint is installed in the
+        // process-global IROH_CLIENT_ENDPOINT (install-once), so tearing it down
+        // would break the shared dialer for any other test. Drop it; the global
+        // Arc clone keeps the endpoint alive (matches the never-reset prod lifecycle).
+        drop(client);
     }
 
     #[tokio::test]

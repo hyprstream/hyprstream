@@ -155,6 +155,17 @@ where
              The resolver must supply EndpointType::Quic.cert_pin (the server cert's \
              SHA-256), e.g. via TransportConfig::quic_pinned"
         ),
+        EndpointType::Iroh { direct_addrs, relay_url, .. }
+            if direct_addrs.is_empty() && relay_url.is_none() =>
+        {
+            // Fail fast rather than hand iroh an EndpointId with no reachability,
+            // which would fall through to discovery and time out (~10-30s). The
+            // resolver is expected to supply at least one direct addr or a relay.
+            bail!(
+                "dial(): iroh endpoint has neither direct addrs nor a relay URL — \
+                 not dialable; the resolver must supply reachability"
+            )
+        }
         EndpointType::Iroh { node_id, direct_addrs, relay_url } => {
             // iroh binds the connection to the peer's EndpointId (its pubkey),
             // so the transport authenticates the peer *identity* — a `None`
