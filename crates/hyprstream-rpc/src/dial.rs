@@ -132,12 +132,23 @@ where
             Ok(Arc::new(RpcClientImpl::new(signer, transport, server_verifying_key))
                 as Arc<dyn RpcClient>)
         }
-        endpoint @ (EndpointType::Ipc { .. }
-        | EndpointType::SystemdFd { .. }
-        | EndpointType::Quic { .. }) => bail!(
-            "dial(): endpoint {endpoint:?} is not yet served by the dial factory \
-             — lazy quinn/iroh/moq transports land in a later #151(a) increment; \
-             ZMQ ipc/systemd endpoints stay on the codegen path during the transition"
+        EndpointType::Quic { addr, cert_pin: Some(pin), .. } => {
+            // Pinned QUIC peer: the transport authenticates the server (pinned
+            // TLS), so a `None` server_verifying_key is sound here — response
+            // signatures are still verified against the envelope-embedded key.
+            let transport = crate::transport::lazy_quinn::LazyQuinnTransport::new(*addr, *pin);
+            Ok(Arc::new(RpcClientImpl::new(signer, transport, server_verifying_key))
+                as Arc<dyn RpcClient>)
+        }
+        EndpointType::Quic { cert_pin: None, .. } => bail!(
+            "dial(): QUIC endpoint has no cert pin — cannot authenticate the server. \
+             The resolver must supply EndpointType::Quic.cert_pin (the server cert's \
+             SHA-256), e.g. via TransportConfig::quic_pinned"
+        ),
+        endpoint @ (EndpointType::Ipc { .. } | EndpointType::SystemdFd { .. }) => bail!(
+            "dial(): endpoint {endpoint:?} is not served by the dial factory — \
+             ZMQ ipc/systemd endpoints stay on the codegen path during the transition; \
+             iroh/moq lazy transports land in a later #151(a) increment"
         ),
     }
 }
@@ -208,5 +219,21 @@ mod tests {
         let cfg = TransportConfig::ipc("/tmp/hyprstream-test.sock");
         let err = dial(&cfg, test_signer(), None);
         assert!(err.is_err(), "ipc dial is not yet served by the factory");
+    }
+
+    #[test]
+    fn dial_quic_without_cert_pin_errors() {
+        // Plain `quic()` has no pin → cannot authenticate the server → must bail.
+        let cfg = TransportConfig::quic("127.0.0.1:9999".parse().unwrap(), "localhost");
+        let err = dial(&cfg, test_signer(), None);
+        assert!(err.is_err(), "QUIC dial without a cert pin must error");
+    }
+
+    #[test]
+    fn dial_quic_with_cert_pin_builds_client() {
+        // With a pin, dial() builds a (lazy, not-yet-connected) client — sync, no I/O.
+        let cfg = TransportConfig::quic_pinned("127.0.0.1:9999".parse().unwrap(), "localhost", [7u8; 32]);
+        let client = dial(&cfg, test_signer(), None);
+        assert!(client.is_ok(), "pinned QUIC dial must build a client without connecting");
     }
 }
