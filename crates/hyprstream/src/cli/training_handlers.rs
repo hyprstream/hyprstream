@@ -397,7 +397,7 @@ pub async fn handle_training_infer(
     let policy_vk = signing_key.verifying_key();
     let policy_client = crate::services::PolicyClient::for_service(
         signing_key.clone(), policy_vk, None,
-    );
+    )?;
     let key_resp = policy_client.resolve_service_key(
         &crate::services::generated::policy_client::ResolveServiceKey {
             service_name: "inference".to_owned(),
@@ -411,7 +411,7 @@ pub async fn handle_training_infer(
         signing_key.clone(),
         inference_vk,
         None,
-    );
+    )?;
 
     // Apply chat template
     let messages = vec![ChatMessage { role: "user".into(), content: prompt.into(), tool_calls: vec![], tool_call_id: String::new() }];
@@ -706,7 +706,7 @@ pub async fn handle_training_batch(
     let policy_vk = signing_key.verifying_key();
     let policy_client = crate::services::PolicyClient::for_service(
         signing_key.clone(), policy_vk, None,
-    );
+    )?;
     let key_resp = policy_client.resolve_service_key(
         &crate::services::generated::policy_client::ResolveServiceKey {
             service_name: "inference".to_owned(),
@@ -720,7 +720,7 @@ pub async fn handle_training_batch(
         signing_key.clone(),
         inference_vk,
         None,
-    );
+    )?;
 
     // Get adapter info for checkpoint saves
     let adapter_manager = AdapterManager::new(&model_path);

@@ -13,6 +13,7 @@ mod traits;
 mod zmq;
 pub mod dispatch;
 pub mod streaming;
+pub mod serve;
 pub mod spawnable;
 pub mod metadata;
 pub mod doc;

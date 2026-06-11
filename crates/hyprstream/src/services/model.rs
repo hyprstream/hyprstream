@@ -204,7 +204,7 @@ impl ModelService {
             signing_key.clone(),
             notif_vk,
             None,
-        );
+        )?;
         let notification_publisher = NotificationPublisher::new(notif_client, signing_key.clone());
 
         Ok(Self { inner: Arc::new(ModelServiceInner {
@@ -282,7 +282,7 @@ impl ModelService {
             signing_key.clone(),
             notif_vk,
             None,
-        );
+        )?;
         let notification_publisher = NotificationPublisher::new(notif_client, signing_key.clone());
 
         Ok(Self { inner: Arc::new(ModelServiceInner {
@@ -420,7 +420,7 @@ impl ModelService {
             self.signing_key.clone(),
             self.signing_key.verifying_key(),
             None,
-        );
+        )?;
 
         // Load TTT config from model's config.json (if TTT is enabled)
         let ttt_config = crate::runtime::model_config::ModelConfig::load_training_config(&model_path)

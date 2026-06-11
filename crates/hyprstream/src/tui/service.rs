@@ -825,7 +825,7 @@ impl TuiService {
             self.signing_key.clone(),
             policy_vk,
             None,
-        );
+        )?;
 
         let registry_key_resp = policy_client.resolve_service_key(
             &crate::services::generated::policy_client::ResolveServiceKey {
@@ -857,12 +857,12 @@ impl TuiService {
                     self.signing_key.clone(),
                     registry_vk,
                     None,
-                );
+                )?;
             let model_client_for_status = crate::services::generated::model_client::ModelClient::for_service(
                 self.signing_key.clone(),
                 model_vk,
                 None,
-            );
+            )?;
             let status_timeout = std::time::Duration::from_millis(500);
             let all_status_req = crate::services::generated::model_client::StatusRequest { model_ref: String::new() };
             let (repos_result, status_result) = tokio::join!(
@@ -912,11 +912,17 @@ impl TuiService {
                 let vk  = model_vk_load;
                 // Submit load — returns "accepted" immediately (Continuation pattern).
                 h.block_on(async {
-                    let client = crate::services::generated::model_client::ModelClient::for_service(
+                    let client = match crate::services::generated::model_client::ModelClient::for_service(
                         sk.clone(),
                         vk,
                         None,
-                    );
+                    ) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!("Failed to create ModelClient: {e}");
+                            return;
+                        }
+                    };
                     let _ = client.load(&crate::services::generated::model_client::LoadModelRequest {
                         model_ref: mr.clone(),
                         max_context: None,
@@ -932,11 +938,17 @@ impl TuiService {
                     for _ in 0..60u32 {   // max ~2 minutes (60 × 2 s)
                         std::thread::sleep(std::time::Duration::from_secs(2));
                         let loaded = h_poll.block_on(async {
-                            let client = crate::services::generated::model_client::ModelClient::for_service(
+                            let client = match crate::services::generated::model_client::ModelClient::for_service(
                                 sk_poll.clone(),
                                 vk_poll,
                                 None,
-                            );
+                            ) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    tracing::warn!("Failed to create ModelClient: {e}");
+                                    return false;
+                                }
+                            };
                             client.status(&crate::services::generated::model_client::StatusRequest { model_ref: mr_poll.clone() }).await
                                 .is_ok_and(|es| es.iter().any(|e| e.status == "loaded"))
                         });
@@ -956,11 +968,17 @@ impl TuiService {
             let sk = sk_unload.clone();
             let mr = model_ref.to_owned();
             handle_unload.block_on(async move {
-                let client = crate::services::generated::model_client::ModelClient::for_service(
+                let client = match crate::services::generated::model_client::ModelClient::for_service(
                     sk.clone(),
                     model_vk_unload,
                     None,
-                );
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!("Failed to create ModelClient: {e}");
+                        return false;
+                    }
+                };
                 client.unload(&crate::services::generated::model_client::UnloadModelRequest { model_ref: mr.clone() }).await.is_ok()
             })
         });
@@ -981,7 +999,13 @@ impl TuiService {
                 let rmd = rmd_clone.clone();
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry = crate::services::RegistryClient::for_service(sk, rvk, None);
+                        let registry = match crate::services::RegistryClient::for_service(sk, rvk, None) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                let _ = tx.send(GitOpProgress::Failed(format!("Failed to create RegistryClient: {e}")));
+                                return;
+                            }
+                        };
                         let model_name = name.unwrap_or_else(|| {
                             url.rsplit('/').next().unwrap_or("model")
                                 .trim_end_matches(".git").to_owned()
@@ -1076,7 +1100,13 @@ impl TuiService {
                 let rvk = rvk_pull;
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry = crate::services::RegistryClient::for_service(sk, rvk, None);
+                        let registry = match crate::services::RegistryClient::for_service(sk, rvk, None) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                let _ = tx.send(GitOpProgress::Failed(format!("Failed to create RegistryClient: {e}")));
+                                return;
+                            }
+                        };
                         let model_name = model_ref.split(':').next().unwrap_or(&model_ref);
                         let tracked = match registry.get_by_name(model_name).await {
                             Ok(t) => t,
@@ -1111,7 +1141,13 @@ impl TuiService {
                 let rvk = rvk_push;
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry = crate::services::RegistryClient::for_service(sk, rvk, None);
+                        let registry = match crate::services::RegistryClient::for_service(sk, rvk, None) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                let _ = tx.send(GitOpProgress::Failed(format!("Failed to create RegistryClient: {e}")));
+                                return;
+                            }
+                        };
                         let model_name = model_ref.split(':').next().unwrap_or(&model_ref);
                         let branch = model_ref.split(':').nth(1).unwrap_or("main");
                         let tracked = match registry.get_by_name(model_name).await {
@@ -1152,7 +1188,13 @@ impl TuiService {
                 let rvk = rvk_status;
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry = crate::services::RegistryClient::for_service(sk, rvk, None);
+                        let registry = match crate::services::RegistryClient::for_service(sk, rvk, None) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::warn!("Failed to create RegistryClient: {e}");
+                                return;
+                            }
+                        };
                         for mr in model_refs {
                             let model_name = mr.split(':').next().unwrap_or(&mr);
                             if let Ok(tracked) = registry.get_by_name(model_name).await {

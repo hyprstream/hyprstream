@@ -32,9 +32,12 @@ pub fn create_tui_client(signing_key: &SigningKey) -> TuiClient {
 
     // Bootstrap: PolicyService uses the root key in inproc mode
     let policy_vk = signing_key.verifying_key();
-    let policy_client = crate::services::PolicyClient::for_service(
+    let policy_client = match crate::services::PolicyClient::for_service(
         sk.clone(), policy_vk, None,
-    );
+    ) {
+        Ok(c) => c,
+        Err(e) => panic!("Failed to create PolicyClient: {e}"),
+    };
     let server_vk = {
         let resp = tokio::task::block_in_place(|| {
             let rt = tokio::runtime::Handle::current();
@@ -56,7 +59,10 @@ pub fn create_tui_client(signing_key: &SigningKey) -> TuiClient {
         }
     };
 
-    TuiClient::for_endpoint(&endpoint, sk, server_vk, None)
+    match TuiClient::for_endpoint(&endpoint, sk, server_vk, None) {
+        Ok(c) => c,
+        Err(e) => panic!("Failed to create TuiClient: {e}"),
+    }
 }
 
 /// Attach to an existing TUI session.
