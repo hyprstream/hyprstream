@@ -33,6 +33,8 @@ pub mod lazy_iroh;
 pub mod uds_session;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod lazy_uds;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod uds_server;
 
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
