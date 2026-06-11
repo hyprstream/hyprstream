@@ -155,6 +155,19 @@ where
              The resolver must supply EndpointType::Quic.cert_pin (the server cert's \
              SHA-256), e.g. via TransportConfig::quic_pinned"
         ),
+        EndpointType::Iroh { node_id, direct_addrs, relay_url } => {
+            // iroh binds the connection to the peer's EndpointId (its pubkey),
+            // so the transport authenticates the peer *identity* — a `None`
+            // server_verifying_key is sound (response sig still verified, and
+            // the channel is identity-bound, unlike QUIC's cert pin).
+            let transport = crate::transport::lazy_iroh::LazyIrohTransport::new(
+                *node_id,
+                direct_addrs.clone(),
+                relay_url.clone(),
+            );
+            Ok(Arc::new(RpcClientImpl::new(signer, transport, server_verifying_key))
+                as Arc<dyn RpcClient>)
+        }
         endpoint @ (EndpointType::Ipc { .. } | EndpointType::SystemdFd { .. }) => bail!(
             "dial(): endpoint {endpoint:?} is not served by the dial factory — \
              ZMQ ipc/systemd endpoints stay on the codegen path during the transition; \

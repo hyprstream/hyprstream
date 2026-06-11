@@ -27,6 +27,8 @@ pub mod iroh_moq;
 pub mod in_memory;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod lazy_quinn;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod lazy_iroh;
 
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
@@ -172,6 +174,24 @@ pub enum EndpointType {
         /// wire-publishable. Public fingerprint — not secret.
         cert_pin: Option<[u8; 32]>,
     },
+
+    /// iroh transport endpoint (RPC over `ALPN_HYPRSTREAM_RPC`).
+    ///
+    /// The optional NAT-traversing dial. Unlike QUIC's channel-only cert pin,
+    /// iroh binds the connection to the peer's `EndpointId` (its Ed25519 public
+    /// key), so the transport itself authenticates the peer *identity*. All
+    /// fields are serializable primitives so `TransportConfig` stays
+    /// `Clone + Eq` and wire-publishable (a DID-doc `service` entry).
+    ///
+    /// Format: `iroh://{hex node_id}`
+    Iroh {
+        /// Peer's iroh `EndpointId` = its Ed25519 public key (32 bytes).
+        node_id: [u8; 32],
+        /// Known direct socket addresses for hole-punching / direct dial.
+        direct_addrs: Vec<SocketAddr>,
+        /// Optional relay URL for NAT traversal when no direct path exists.
+        relay_url: Option<String>,
+    },
 }
 
 impl TransportConfig {
@@ -244,6 +264,25 @@ impl TransportConfig {
                 addr,
                 server_name: server_name.into(),
                 cert_pin: Some(cert_pin),
+            },
+            curve: None,
+            bind_mode: BindMode::Connect,
+        }
+    }
+
+    /// Create a client iroh endpoint dialing the peer identified by `node_id`
+    /// (its `EndpointId` / Ed25519 public key), with optional direct addresses
+    /// and relay URL for NAT traversal.
+    pub fn iroh(
+        node_id: [u8; 32],
+        direct_addrs: Vec<SocketAddr>,
+        relay_url: Option<String>,
+    ) -> Self {
+        Self {
+            endpoint: EndpointType::Iroh {
+                node_id,
+                direct_addrs,
+                relay_url,
             },
             curve: None,
             bind_mode: BindMode::Connect,
@@ -327,6 +366,10 @@ impl TransportConfig {
             }
             EndpointType::Quic { addr, server_name, .. } => {
                 format!("quic://{server_name}:{addr}")
+            }
+            EndpointType::Iroh { node_id, .. } => {
+                let hex: String = node_id.iter().map(|b| format!("{b:02x}")).collect();
+                format!("iroh://{hex}")
             }
         }
     }
@@ -439,8 +482,11 @@ impl TransportConfig {
                 socket.bind(&self.zmq_endpoint())?;
                 Ok(())
             }
-            EndpointType::Quic { .. } => {
-                anyhow::bail!("QUIC endpoints require QuicRep::bind(), not ZMQ socket bind")
+            EndpointType::Quic { .. } | EndpointType::Iroh { .. } => {
+                anyhow::bail!(
+                    "QUIC/iroh endpoints are not ZMQ sockets — they are dialed via \
+                     the transport/dial() layer, not bound here"
+                )
             }
         }
     }
@@ -462,8 +508,11 @@ impl TransportConfig {
                 socket.connect(&self.zmq_endpoint())?;
                 Ok(())
             }
-            EndpointType::Quic { .. } => {
-                anyhow::bail!("QUIC endpoints require QuicReq::connect(), not ZMQ socket connect")
+            EndpointType::Quic { .. } | EndpointType::Iroh { .. } => {
+                anyhow::bail!(
+                    "QUIC/iroh endpoints are not ZMQ sockets — they are dialed via \
+                     the transport/dial() layer, not connected here"
+                )
             }
         }
     }
