@@ -23,8 +23,9 @@
 //! lock — only the dial does.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
@@ -32,6 +33,10 @@ use crate::transport::quinn_transport::{
     connect_pinned_sha256, QuinnPendingStream, QuinnPublishStub, QuinnTransport,
 };
 use crate::transport_traits::Transport;
+
+/// Default per-request deadline when the caller passes `None`, mirroring
+/// `SessionRpcTransport`.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A quinn RPC transport that connects on first use and caches the session.
 pub struct LazyQuinnTransport {
@@ -79,9 +84,28 @@ impl Transport for LazyQuinnTransport {
 
     async fn send(&self, payload: Vec<u8>, timeout_ms: Option<i32>) -> Result<Vec<u8>> {
         let transport = self.connected().await?;
-        match transport.send(payload, timeout_ms).await {
-            Ok(resp) => Ok(resp),
-            Err(e) => {
+
+        // Make *our* deadline authoritative so we can tell a per-request timeout
+        // (the connection is probably fine — keep it) apart from a transport-fatal
+        // error (re-dial). The inner transport gets a generous ceiling that fires
+        // only if ours somehow doesn't.
+        let deadline = timeout_ms
+            .map(|ms| Duration::from_millis(ms.max(0) as u64))
+            .unwrap_or(DEFAULT_TIMEOUT);
+        let inner_ceiling_ms = deadline
+            .as_millis()
+            .saturating_mul(2)
+            .min(i32::MAX as u128) as i32;
+
+        match tokio::time::timeout(deadline, transport.send(payload, Some(inner_ceiling_ms))).await {
+            // Our deadline fired: a slow/stalled request, not necessarily a dead
+            // connection. Keep the cached session — re-dialing on every timeout
+            // would thrash a merely-busy peer. (#156 owns liveness-based re-dial.)
+            Err(_elapsed) => Err(anyhow!("quinn RPC timeout after {deadline:?}")),
+            Ok(Ok(resp)) => Ok(resp),
+            // Transport-fatal (open_bi/write/read failed): the session is likely
+            // dead — drop it so the next call re-dials, like ZmqConnection.
+            Ok(Err(e)) => {
                 self.invalidate().await;
                 Err(e)
             }
@@ -172,11 +196,13 @@ mod tests {
     async fn wrong_cert_pin_does_not_connect() {
         let (addr, _pin, shutdown) = spawn_echo_server();
         let t = LazyQuinnTransport::new(addr, [0u8; 32]); // wrong fingerprint
-        let res = tokio::time::timeout(Duration::from_secs(5), t.send(b"x".to_vec(), Some(2_000)))
-            .await;
-        // Either the dial errors, or it times out — never a successful echo.
-        let connected = matches!(&res, Ok(Ok(_)));
-        assert!(!connected, "a wrong cert pin must not yield a working connection");
+        // The TLS handshake must *promptly reject* a wrong pin: the send must
+        // COMPLETE with an error well within the hang-guard. If the guard fires
+        // (i.e. send hung), the test fails — so a hang can't masquerade as a pass.
+        let res = tokio::time::timeout(Duration::from_secs(8), t.send(b"x".to_vec(), Some(3_000)))
+            .await
+            .expect("send must complete (with an error) — a wrong pin should reject, not hang");
+        assert!(res.is_err(), "a wrong cert pin must make send fail");
         assert!(t.cached.lock().await.is_none(), "failed dial leaves nothing cached");
         shutdown.cancel();
     }

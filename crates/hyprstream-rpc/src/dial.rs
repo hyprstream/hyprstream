@@ -133,9 +133,19 @@ where
                 as Arc<dyn RpcClient>)
         }
         EndpointType::Quic { addr, cert_pin: Some(pin), .. } => {
-            // Pinned QUIC peer: the transport authenticates the server (pinned
-            // TLS), so a `None` server_verifying_key is sound here — response
-            // signatures are still verified against the envelope-embedded key.
+            // SECURITY (#185): the pin authenticates the TLS *channel* ("a server
+            // presenting this cert"), not the peer's DID identity. Identity comes
+            // from the response signature. With `None` here that signature is
+            // still verified, but only against the envelope-embedded key (no
+            // identity pinning) — so for a *networked* peer, prefer passing the
+            // resolver-known verifying key. Warn when we can't.
+            if server_verifying_key.is_none() {
+                tracing::debug!(
+                    %addr,
+                    "dial: networked QUIC peer with no expected verifying key — \
+                     response identity is unpinned (cert pin authenticates the channel only, #185)"
+                );
+            }
             let transport = crate::transport::lazy_quinn::LazyQuinnTransport::new(*addr, *pin);
             Ok(Arc::new(RpcClientImpl::new(signer, transport, server_verifying_key))
                 as Arc<dyn RpcClient>)
