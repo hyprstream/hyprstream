@@ -30,8 +30,9 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::transport::quinn_transport::{
-    connect_pinned_sha256, QuinnPendingStream, QuinnPublishStub, QuinnTransport,
+    connect_pinned_sha256, connect_webpki, QuinnPendingStream, QuinnPublishStub, QuinnTransport,
 };
+use crate::transport::QuicServerAuth;
 use crate::transport_traits::Transport;
 
 /// Default per-request deadline when the caller passes `None`, mirroring
@@ -41,31 +42,42 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// A quinn RPC transport that connects on first use and caches the session.
 pub struct LazyQuinnTransport {
     addr: SocketAddr,
-    cert_pin: [u8; 32],
+    server_name: String,
+    auth: QuicServerAuth,
     /// `None` until the first successful dial, and reset to `None` after a
     /// `send()` failure so the next call re-dials.
     cached: Mutex<Option<QuinnTransport>>,
 }
 
 impl LazyQuinnTransport {
-    /// Create a lazy transport for a QUIC peer pinned by `cert_pin` (the SHA-256
-    /// of its self-signed cert). No connection is made until the first `send()`.
-    pub fn new(addr: SocketAddr, cert_pin: [u8; 32]) -> Self {
+    /// Create a lazy transport for a QUIC peer, authenticated per `auth`
+    /// (WebPKI, cert-hash pin, or — later — RFC 7250 raw key). No connection is
+    /// made until the first `send()`.
+    pub fn new(addr: SocketAddr, server_name: impl Into<String>, auth: QuicServerAuth) -> Self {
         Self {
             addr,
-            cert_pin,
+            server_name: server_name.into(),
+            auth,
             cached: Mutex::new(None),
         }
     }
 
     /// Return the cached connected transport, dialing once (under the lock —
-    /// single-flight) if not yet connected.
+    /// single-flight) if not yet connected. The connect path is chosen by the
+    /// server-auth policy.
     async fn connected(&self) -> Result<QuinnTransport> {
         let mut guard = self.cached.lock().await;
         if let Some(transport) = guard.as_ref() {
             return Ok(transport.clone());
         }
-        let session = connect_pinned_sha256(self.addr, self.cert_pin).await?;
+        let session = match &self.auth {
+            QuicServerAuth::WebPki => connect_webpki(&self.server_name, self.addr.port()).await?,
+            QuicServerAuth::Pinned(hash) => connect_pinned_sha256(self.addr, *hash).await?,
+            QuicServerAuth::RawPublicKey(_) => bail!(
+                "RFC 7250 raw-public-key QUIC auth is not yet implemented (#200) — use iroh \
+                 for identity-bound transport, or QuicServerAuth::Pinned / WebPki"
+            ),
+        };
         let transport = QuinnTransport::new(session);
         *guard = Some(transport.clone());
         Ok(transport)
@@ -178,7 +190,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn lazy_connects_on_first_send_and_caches() {
         let (addr, pin, shutdown) = spawn_echo_server();
-        let t = LazyQuinnTransport::new(addr, pin);
+        let t = LazyQuinnTransport::new(addr, "localhost", QuicServerAuth::Pinned(pin));
 
         assert!(t.cached.lock().await.is_none(), "no connection before first send");
 
@@ -195,7 +207,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wrong_cert_pin_does_not_connect() {
         let (addr, _pin, shutdown) = spawn_echo_server();
-        let t = LazyQuinnTransport::new(addr, [0u8; 32]); // wrong fingerprint
+        let t = LazyQuinnTransport::new(addr, "localhost", QuicServerAuth::Pinned([0u8; 32])); // wrong fingerprint
         // The TLS handshake must *promptly reject* a wrong pin: the send must
         // COMPLETE with an error well within the hang-guard. If the guard fires
         // (i.e. send hung), the test fails — so a hang can't masquerade as a pass.
@@ -209,7 +221,11 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_publish_bail() {
-        let t = LazyQuinnTransport::new("127.0.0.1:1".parse().unwrap(), [0u8; 32]);
+        let t = LazyQuinnTransport::new(
+            "127.0.0.1:1".parse().unwrap(),
+            "localhost",
+            QuicServerAuth::Pinned([0u8; 32]),
+        );
         assert!(t.subscribe(b"topic").await.is_err());
         assert!(t.publish(b"topic").await.is_err());
     }

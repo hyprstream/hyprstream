@@ -286,13 +286,31 @@ impl Transport for QuinnTransport {
     }
 }
 
+/// Build a quinn WebTransport client session against a server with a CA-issued
+/// certificate, validated via the system root store and the DNS `server_name`
+/// (`QuicServerAuth::WebPki`). Dials `https://{server_name}:{port}/`.
+pub async fn connect_webpki(
+    server_name: &str,
+    port: u16,
+) -> Result<web_transport_quinn::Session> {
+    let client = web_transport_quinn::ClientBuilder::new()
+        .with_system_roots()
+        .map_err(|e| anyhow!("quinn client (system roots): {e}"))?;
+    let url = url::Url::parse(&format!("https://{server_name}:{port}/"))
+        .map_err(|e| anyhow!("quinn url: {e}"))?;
+    client
+        .connect(url)
+        .await
+        .map_err(|e| anyhow!("quinn connect (webpki): {e}"))
+}
+
 /// Build a quinn WebTransport client session against a self-signed server,
 /// pinning the server cert by its **SHA-256 fingerprint** (the 32-byte hash
-/// carried in `EndpointType::Quic { cert_pin }`). Hermetic: dials an IP-literal
-/// URL so no DNS lookup or network egress occurs.
+/// carried in `QuicServerAuth::Pinned`). Hermetic: dials an IP-literal URL so no
+/// DNS lookup or network egress occurs.
 ///
-/// This is the connect path the lazy dial transport uses — the resolver/DID doc
-/// publishes the compact hash, not the full cert.
+/// This is the connect path the lazy dial transport uses for internal-mesh
+/// peers — the resolver/DID doc publishes the compact hash, not the full cert.
 pub async fn connect_pinned_sha256(
     addr: std::net::SocketAddr,
     cert_sha256: [u8; 32],

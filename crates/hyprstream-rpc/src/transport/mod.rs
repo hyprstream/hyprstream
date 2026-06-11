@@ -129,6 +129,38 @@ pub struct TransportConfig {
     pub bind_mode: BindMode,
 }
 
+/// How a QUIC client authenticates the server it dials.
+///
+/// Server authentication is a *policy*, not a single mechanism — this replaces
+/// the earlier hardcoded SHA-256 cert pin. All variants carry only
+/// serializable, public material so `TransportConfig` stays `Clone + Eq` and
+/// wire-publishable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuicServerAuth {
+    /// Standard WebPKI / CA-chain validation against the system root store,
+    /// matching the server's DNS `server_name`. For public peers fronted by a
+    /// CA-issued certificate (dialed by hostname).
+    WebPki,
+    /// Pin the server's (self-signed) certificate by its SHA-256 fingerprint
+    /// (`with_server_certificate_hashes`) — the internal-mesh model, dialed by
+    /// IP. The resolver / DID doc vouches for the hash.
+    ///
+    /// SECURITY: authenticates the *channel* ("a server holding this cert"), not
+    /// the peer's DID *identity* (#185). For identity-bound transport use iroh
+    /// (which is RFC 7250 — the connection is bound to the peer's public key).
+    Pinned([u8; 32]),
+    /// RFC 7250 raw-public-key identity binding: the server proves possession of
+    /// this Ed25519 key during the TLS handshake.
+    ///
+    /// **Not yet implemented** — `web_transport_quinn`'s builder exposes no
+    /// raw-key/custom-verifier hook, so this needs a custom rustls verifier + a
+    /// raw `quinn` connect + `Session::raw`, plus a server-side raw-key config.
+    /// It is also browser-incompatible (WebTransport mandates cert hashes) and
+    /// overlaps iroh (which already provides RFC 7250). Tracked in #200; use
+    /// iroh for identity-bound native transport today.
+    RawPublicKey([u8; 32]),
+}
+
 /// Endpoint type (without encryption config)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EndpointType {
@@ -164,15 +196,13 @@ pub enum EndpointType {
     Quic {
         /// Socket address to bind (server) or connect (client)
         addr: SocketAddr,
-        /// Server hostname for TLS certificate validation
+        /// Server hostname — used as the WebPKI validation name (`WebPki`) and
+        /// the TLS SNI. Ignored by `Pinned` (which dials by IP and matches the
+        /// cert hash).
         server_name: String,
-        /// SHA-256 fingerprint of the server's self-signed certificate, for
-        /// client-side cert pinning (`with_server_certificate_hashes`). `None`
-        /// for the server/bind side or when peer authentication is provided
-        /// some other way (e.g. an expected response-signing key). Carrying the
-        /// 32-byte hash (not the full cert) keeps `TransportConfig` compact and
-        /// wire-publishable. Public fingerprint — not secret.
-        cert_pin: Option<[u8; 32]>,
+        /// How the client authenticates this server (WebPKI, cert-hash pin, or
+        /// — later — RFC 7250 raw key). Public material only.
+        auth: QuicServerAuth,
     },
 
     /// iroh transport endpoint (RPC over `ALPN_HYPRSTREAM_RPC`).
@@ -248,7 +278,7 @@ impl TransportConfig {
             endpoint: EndpointType::Quic {
                 addr,
                 server_name: server_name.into(),
-                cert_pin: None,
+                auth: QuicServerAuth::WebPki,
             },
             curve: None, // QUIC has TLS 1.3 built-in, no CurveZMQ needed
             bind_mode: BindMode::Bind,
@@ -256,14 +286,14 @@ impl TransportConfig {
     }
 
     /// Create a client QUIC endpoint that pins the server's self-signed cert by
-    /// its SHA-256 fingerprint (`cert_pin`). This is the dial target the
-    /// resolver/`dial()` produce for a networked RPC peer.
-    pub fn quic_pinned(addr: SocketAddr, server_name: impl Into<String>, cert_pin: [u8; 32]) -> Self {
+    /// its SHA-256 fingerprint. This is the dial target the resolver/`dial()`
+    /// produce for an internal-mesh RPC peer (dialed by IP).
+    pub fn quic_pinned(addr: SocketAddr, server_name: impl Into<String>, cert_hash: [u8; 32]) -> Self {
         Self {
             endpoint: EndpointType::Quic {
                 addr,
                 server_name: server_name.into(),
-                cert_pin: Some(cert_pin),
+                auth: QuicServerAuth::Pinned(cert_hash),
             },
             curve: None,
             bind_mode: BindMode::Connect,
