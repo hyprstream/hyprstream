@@ -40,7 +40,7 @@ libc = "0.2"
 
 # Async runtime
 tokio = { version = "1.43.0", features = ["rt-multi-thread", "signal", "fs", "process", "sync", "time", "macros"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["rt", "compat"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
 tokio-test = "0.4"
 tokio-rustls = "0.26.1"
@@ -139,6 +139,9 @@ moq-net = "0.1"
 web-transport-iroh = { version = "0.5.1", default-features = false, features = ["ring"] }
 web-transport-quinn = { version = "0.11.9", default-features = false, features = ["ring"] }
 web-transport-trait = "0.3"
+# Stream multiplexer for the UDS transport (`web_transport_trait::Session` over a
+# single UnixStream). Already in the lock graph via libp2p/iroh — no new tree.
+yamux = "0.13"
 
 # Data processing
 polars = "0.45.1"

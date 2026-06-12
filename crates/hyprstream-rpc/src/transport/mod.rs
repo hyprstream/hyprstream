@@ -29,6 +29,8 @@ pub mod in_memory;
 pub mod lazy_quinn;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod lazy_iroh;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod uds_session;
 
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;

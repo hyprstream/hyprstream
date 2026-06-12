@@ -6679,6 +6679,7 @@ dependencies = [
  "web-transport-trait",
  "webpki-roots 0.26.11",
  "whoami",
+ "yamux 0.13.7",
  "zeroize",
  "zmq",
  "zmq-sys",
