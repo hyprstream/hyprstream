@@ -490,7 +490,7 @@ fn handle_quick_command(
                     signing_key,
                     model_server_vk,
                     None,
-                );
+                )?;
                 let filters = parse_filters(&filter)?;
                 let status_filter = parse_status_filter(&status)?;
                 handle_list(ctx.registry(), model_client, &filters, &status_filter).await
@@ -1090,7 +1090,7 @@ fn handle_quick_command(
                             resolve_service_vk("policy")
                                 .ok_or_else(|| anyhow::anyhow!("Cannot resolve policy pubkey. Run wizard."))?,
                             None,
-                        );
+                        )?;
                         worker_service.set_authorize_fn(
                             hyprstream_core::services::build_authorize_fn(worker_policy_client),
                         );
@@ -1115,7 +1115,7 @@ fn handle_quick_command(
                     let worker_server_vk = resolve_service_vk("worker")
                         .ok_or_else(|| anyhow::anyhow!("Cannot resolve worker pubkey. Run wizard."))?;
                     let worker_client =
-                        WorkerClient::for_service(signing_key, worker_server_vk, None);
+                        WorkerClient::for_service(signing_key, worker_server_vk, None)?;
 
                     match action {
                         WorkerAction::List {
@@ -1643,7 +1643,7 @@ fn main() -> Result<()> {
                 signing_key.clone(),
                 registry_vk,
                 None,
-            );
+            )?;
 
             Ok::<_, anyhow::Error>((client, signing_key, verifying_key))
         })
@@ -1768,7 +1768,7 @@ fn main() -> Result<()> {
                                         resolve_service_vk("policy")
                                             .ok_or_else(|| anyhow::anyhow!("Cannot resolve policy pubkey. Run wizard."))?,
                                         None,
-                                    );
+                                    )?;
 
                                     let runtime_config =
                                         hyprstream_core::runtime::RuntimeConfig::default();

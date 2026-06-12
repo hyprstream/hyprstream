@@ -9,7 +9,7 @@ use tokio::sync::Notify;
 
 use crate::error::{Result, RpcError};
 use crate::registry::SocketKind;
-use crate::service::{RequestLoop, RequestService};
+use crate::service::RequestService;
 use crate::transport::TransportConfig;
 
 /// Trait for services that can be spawned by ServiceSpawner.
@@ -76,7 +76,6 @@ impl<S: RequestService + Send + Sync> Spawnable for S {
         on_ready: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<()> {
         let transport = RequestService::transport(&*self).clone();
-        let context = Arc::clone(RequestService::context(&*self));
         let signing_key = RequestService::signing_key(&*self);
 
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -84,22 +83,18 @@ impl<S: RequestService + Send + Sync> Spawnable for S {
             .build()
             .map_err(|e| RpcError::SpawnFailed(format!("runtime: {e}")))?;
 
-        let local = tokio::task::LocalSet::new();
-        local.block_on(&rt, async move {
-            let runner = RequestLoop::new(transport, context, signing_key);
-
-            match runner.run(*self).await {
-                Ok(mut handle) => {
-                    if let Some(tx) = on_ready {
-                        let _ = tx.send(());
-                    }
-                    let _ = crate::notify::ready();
-                    shutdown.notified().await;
-                    handle.stop().await;
-                    Ok(())
-                }
-                Err(e) => Err(RpcError::SpawnFailed(e.to_string())),
-            }
+        // Post-ZMQ serve (#136): bridge the service to a Send processor on its own
+        // LocalSet thread, then serve it over its registered transport (inproc →
+        // in-memory dial registry; ipc/systemd → UdsRpcServer). No ZMQ ROUTER.
+        rt.block_on(async move {
+            let nonce_cache = Arc::new(crate::envelope::InMemoryNonceCache::new());
+            let bridge = crate::transport::iroh_rpc::LocalServiceBridge::spawn(*self, nonce_cache, 0)
+                .map_err(|e| RpcError::SpawnFailed(format!("bridge: {e}")))?;
+            let processor: Arc<dyn crate::transport::rpc_session::IrohRequestProcessor> =
+                Arc::new(bridge);
+            crate::service::serve::serve_bridged(&transport, processor, signing_key, shutdown, on_ready)
+                .await
+                .map_err(|e| RpcError::SpawnFailed(e.to_string()))
         })
     }
 }

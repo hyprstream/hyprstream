@@ -116,10 +116,31 @@ pub fn dial<S>(
     target: &TransportConfig,
     signer: S,
     server_verifying_key: Option<VerifyingKey>,
+    token: Option<String>,
 ) -> Result<Arc<dyn RpcClient>>
 where
     S: Signer + 'static,
 {
+    /// Wrap a built transport as an `RpcClient`, applying the optional default
+    /// JWT (CA-signed trust cert included in request envelopes) if present.
+    fn build_client<S2, T2>(
+        signer: S2,
+        transport: T2,
+        vk: Option<VerifyingKey>,
+        token: Option<String>,
+    ) -> Arc<dyn RpcClient>
+    where
+        S2: Signer + 'static,
+        T2: crate::transport_traits::Transport + 'static,
+    {
+        let rpc = RpcClientImpl::new(signer, transport, vk);
+        let rpc = match token {
+            Some(t) => rpc.with_default_jwt(t),
+            None => rpc,
+        };
+        Arc::new(rpc) as Arc<dyn RpcClient>
+    }
+
     // Matched exhaustively on purpose: this is the one place transport choice is
     // made, so a newly-added EndpointType variant MUST be a compile error here
     // rather than silently falling through to a runtime bail.
@@ -129,8 +150,7 @@ where
                 anyhow!("no in-process service registered for inproc endpoint '{endpoint}'")
             })?;
             let transport = InMemoryTransport::new(processor);
-            Ok(Arc::new(RpcClientImpl::new(signer, transport, server_verifying_key))
-                as Arc<dyn RpcClient>)
+            Ok(build_client(signer, transport, server_verifying_key, token))
         }
         EndpointType::Quic { addr, server_name, auth } => {
             // SECURITY (#185): QUIC channel auth (WebPKI / cert-hash pin) binds the
@@ -153,8 +173,7 @@ where
                 server_name.clone(),
                 auth.clone(),
             );
-            Ok(Arc::new(RpcClientImpl::new(signer, transport, server_verifying_key))
-                as Arc<dyn RpcClient>)
+            Ok(build_client(signer, transport, server_verifying_key, token))
         }
         EndpointType::Iroh { direct_addrs, relay_url, .. }
             if direct_addrs.is_empty() && relay_url.is_none() =>
@@ -177,14 +196,23 @@ where
                 direct_addrs.clone(),
                 relay_url.clone(),
             );
-            Ok(Arc::new(RpcClientImpl::new(signer, transport, server_verifying_key))
-                as Arc<dyn RpcClient>)
+            Ok(build_client(signer, transport, server_verifying_key, token))
         }
-        endpoint @ (EndpointType::Ipc { .. } | EndpointType::SystemdFd { .. }) => bail!(
-            "dial(): endpoint {endpoint:?} is not served by the dial factory — \
-             ZMQ ipc/systemd endpoints stay on the codegen path during the transition; \
-             iroh/moq lazy transports land in a later #151(a) increment"
-        ),
+        // Same-host `ipc` plane: connect a UdsSession (RPC plane) at the socket
+        // path. systemd socket-activation is the same client-side dial — the fd
+        // is the *server's* pre-bound listener; clients connect by `client_path`.
+        // UDS has no transport-level peer identity; the app-layer SignedEnvelope
+        // is the authentication (a `None` server_verifying_key leaves the
+        // response identity unpinned but still signature-verified). Socket perms
+        // + SO_PEERCRED are daemon-owned defense-in-depth (#207).
+        EndpointType::Ipc { path } => {
+            let transport = crate::transport::lazy_uds::LazyUdsTransport::new(path.clone());
+            Ok(build_client(signer, transport, server_verifying_key, token))
+        }
+        EndpointType::SystemdFd { client_path, .. } => {
+            let transport = crate::transport::lazy_uds::LazyUdsTransport::new(client_path.clone());
+            Ok(build_client(signer, transport, server_verifying_key, token))
+        }
     }
 }
 
@@ -237,7 +265,7 @@ mod tests {
         register_inproc(name, &proc);
 
         let cfg = TransportConfig::inproc(name);
-        let client = dial(&cfg, test_signer(), None);
+        let client = dial(&cfg, test_signer(), None, None);
         assert!(client.is_ok(), "dialing a registered inproc endpoint must succeed");
 
         unregister_inproc(name);
@@ -246,15 +274,25 @@ mod tests {
     #[test]
     fn dial_inproc_unregistered_errors() {
         let cfg = TransportConfig::inproc("test/dial/never_registered");
-        let err = dial(&cfg, test_signer(), None);
+        let err = dial(&cfg, test_signer(), None, None);
         assert!(err.is_err(), "dialing an unregistered inproc endpoint must error");
     }
 
     #[test]
-    fn dial_unsupported_endpoint_errors() {
-        let cfg = TransportConfig::ipc("/tmp/hyprstream-test.sock");
-        let err = dial(&cfg, test_signer(), None);
-        assert!(err.is_err(), "ipc dial is not yet served by the factory");
+    fn dial_ipc_builds_lazy_client() {
+        // ipc dial builds a lazy UdsSession client — sync, no I/O, connects on
+        // first send (the socket need not exist yet at dial() time).
+        let cfg = TransportConfig::ipc("/tmp/hyprstream-test-dial.sock");
+        let client = dial(&cfg, test_signer(), None, None);
+        assert!(client.is_ok(), "ipc dial must build a lazy client without connecting");
+    }
+
+    #[test]
+    fn dial_systemd_fd_builds_lazy_client() {
+        // systemd socket-activation: client dials the client_path via UDS.
+        let cfg = TransportConfig::systemd_fd(7, "/tmp/hyprstream-test-systemd.sock");
+        let client = dial(&cfg, test_signer(), None, None);
+        assert!(client.is_ok(), "systemd-fd dial must build a lazy client via client_path");
     }
 
     #[test]
@@ -262,7 +300,7 @@ mod tests {
         // Plain `quic()` = WebPKI/CA validation — a valid auth policy, so dial()
         // builds a (lazy, not-yet-connected) client.
         let cfg = TransportConfig::quic("127.0.0.1:9999".parse().unwrap(), "localhost");
-        let client = dial(&cfg, test_signer(), None);
+        let client = dial(&cfg, test_signer(), None, None);
         assert!(client.is_ok(), "WebPKI QUIC dial must build a client without connecting");
     }
 
@@ -270,7 +308,7 @@ mod tests {
     fn dial_quic_pinned_builds_client() {
         // Cert-hash-pinned QUIC: builds a lazy client — sync, no I/O.
         let cfg = TransportConfig::quic_pinned("127.0.0.1:9999".parse().unwrap(), "localhost", [7u8; 32]);
-        let client = dial(&cfg, test_signer(), None);
+        let client = dial(&cfg, test_signer(), None, None);
         assert!(client.is_ok(), "pinned QUIC dial must build a client without connecting");
     }
 
@@ -286,7 +324,7 @@ mod tests {
             curve: None,
             bind_mode: crate::transport::BindMode::Connect,
         };
-        let client = dial(&cfg, test_signer(), None);
+        let client = dial(&cfg, test_signer(), None, None);
         assert!(client.is_ok(), "WebPKI+pin QUIC dial must build a client");
     }
 

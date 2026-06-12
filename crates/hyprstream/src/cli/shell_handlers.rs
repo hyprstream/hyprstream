@@ -166,7 +166,7 @@ pub async fn handle_shell_tui(
         signing_key.clone(),
         policy_vk,
         None,
-    );
+    )?;
     let model_vk_resp = policy_client.resolve_service_key(
         &crate::services::generated::policy_client::ResolveServiceKey {
             service_name: "model".to_owned(),
@@ -190,7 +190,7 @@ pub async fn handle_shell_tui(
             signing_key.clone(),
             model_server_vk,
             None,
-        )
+        )?
     };
     // Worker client for sandbox/container/image management.
     let worker_client = {
@@ -198,7 +198,7 @@ pub async fn handle_shell_tui(
             signing_key.clone(),
             worker_server_vk,
             None,
-        )
+        )?
     };
     let registry_server_vk = match policy_client.resolve_service_key(
         &crate::services::generated::policy_client::ResolveServiceKey {
@@ -214,7 +214,7 @@ pub async fn handle_shell_tui(
         signing_key.clone(),
         registry_server_vk,
         None,
-    );
+    )?;
 
     let (model_status_tx, mut model_status_rx) =
         tokio::sync::mpsc::channel::<ModelStatusUpdate>(32);
@@ -1688,9 +1688,15 @@ async fn fetch_models(
 
     // Resolve registry + model keys via PolicyClient
     let policy_vk = signing_key.verifying_key();
-    let policy_client = crate::services::PolicyClient::for_service(
+    let policy_client = match crate::services::PolicyClient::for_service(
         signing_key.clone(), policy_vk, None,
-    );
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("Failed to create PolicyClient: {e}");
+            return Vec::new();
+        }
+    };
     let registry_server_vk = match policy_client.resolve_service_key(
         &crate::services::generated::policy_client::ResolveServiceKey {
             service_name: "registry".to_owned(),
@@ -1725,17 +1731,29 @@ async fn fetch_models(
     let registry_endpoint = hyprstream_rpc::registry::global()
         .endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep)
         .to_zmq_string();
-    let registry: crate::services::RegistryClient = crate::services::RegistryClient::for_endpoint(
+    let registry: crate::services::RegistryClient = match crate::services::RegistryClient::for_endpoint(
         &registry_endpoint,
         signing_key.clone(),
         registry_server_vk,
         None,
-    );
-    let model_client_for_status = crate::services::generated::model_client::ModelClient::for_service(
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("Failed to create RegistryClient: {e}");
+            return Vec::new();
+        }
+    };
+    let model_client_for_status = match crate::services::generated::model_client::ModelClient::for_service(
         signing_key.clone(),
         model_server_vk,
         None,
-    );
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("Failed to create ModelClient: {e}");
+            return Vec::new();
+        }
+    };
     let registry_models_dir = models_dir.to_path_buf();
     let status_timeout = std::time::Duration::from_millis(500);
 

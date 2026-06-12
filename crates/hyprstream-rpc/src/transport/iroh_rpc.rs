@@ -296,27 +296,19 @@ impl LocalServiceBridge {
                                 &nonce_cache,
                             )
                             .await
-                            .and_then(|(bytes, cont)| {
-                                // Streaming continuations are not wired on
-                                // the iroh RPC plane — streaming moves to
-                                // moq-net (`moql` ALPN, Phase 3, #134). In
-                                // debug, panic loudly; in release, return an
-                                // error so the wire emits a signed error
-                                // envelope (handler's build_error_envelope)
-                                // rather than silently dropping the stream.
-                                if cont.is_some() {
-                                    debug_assert!(
-                                        false,
-                                        "iroh-rpc bridge: streaming continuation not supported \
-                                         — wait for Phase 3 (#134)"
-                                    );
-                                    return Err(anyhow::anyhow!(
-                                        "iroh-rpc bridge: service returned a streaming \
-                                         continuation, which is not supported on the iroh \
-                                         RPC plane (Phase 3 / #134 moves streaming to moq-net)"
-                                    ));
+                            .map(|(bytes, cont)| {
+                                // The continuation is the streaming pump — it
+                                // publishes to the moq/notification plane,
+                                // independent of the RPC transport — so spawn it
+                                // on this bridge LocalSet after the response,
+                                // exactly as RequestLoop / WebTransportServer do.
+                                // (Without this, streaming services like model /
+                                // tui would have their continuation dropped and
+                                // the stream would never be served.)
+                                if let Some(cont) = cont {
+                                    tokio::task::spawn_local(cont);
                                 }
-                                Ok(Bytes::from(bytes))
+                                Bytes::from(bytes)
                             });
                             let _ = msg.respond.send(result);
                         });
@@ -327,6 +319,90 @@ impl LocalServiceBridge {
             .map_err(|e| anyhow::anyhow!("spawn iroh-rpc bridge thread: {e}"))?;
 
         Ok(Self { tx })
+    }
+
+    /// Like [`LocalServiceBridge::spawn`], but constructs the service ON the
+    /// bridge thread via the async `build` closure. For services whose
+    /// construction is itself `!Send` or async (e.g. GPU init that must happen on
+    /// the serve thread, like `InferenceService`): the built service value never
+    /// has to be `Send`-moved across threads — only the builder's captured inputs
+    /// do (`F: Send`), and the `!Send` result lives only on the bridge thread.
+    ///
+    /// Returns the bridge plus a readiness receiver that resolves once `build`
+    /// completes: `Ok(())` when the service is built and serving, or the build
+    /// error. Callers MUST await it before advertising the service (a build
+    /// failure otherwise surfaces only as "channel closed" on the first request).
+    pub fn spawn_with<F, Fut, S>(
+        thread_name: impl Into<String>,
+        build: F,
+        nonce_cache: Arc<crate::envelope::InMemoryNonceCache>,
+        queue_depth: usize,
+    ) -> Result<(Self, tokio::sync::oneshot::Receiver<Result<()>>)>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<S>>,
+        S: crate::service::RequestService + 'static,
+    {
+        let cap = if queue_depth == 0 { 128 } else { queue_depth };
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<BridgeMessage>(cap);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<()>>();
+        let thread_name = thread_name.into();
+
+        std::thread::Builder::new()
+            .name(format!("rpc-bridge:{thread_name}"))
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(anyhow::anyhow!("bridge runtime: {e}")));
+                        return;
+                    }
+                };
+                let local = tokio::task::LocalSet::new();
+                local.spawn_local(async move {
+                    // Build on-thread; a failure (e.g. GPU init) is reported via
+                    // the readiness channel and the bridge thread exits.
+                    let service = match build().await {
+                        Ok(s) => std::rc::Rc::new(s),
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(e));
+                            return;
+                        }
+                    };
+                    if ready_tx.send(Ok(())).is_err() {
+                        // Caller gave up waiting; no point serving.
+                        return;
+                    }
+                    while let Some(msg) = rx.recv().await {
+                        let service = std::rc::Rc::clone(&service);
+                        let nonce_cache = Arc::clone(&nonce_cache);
+                        tokio::task::spawn_local(async move {
+                            let signing_key = service.signing_key();
+                            let result = crate::service::dispatch::process_request(
+                                msg.request.as_ref(),
+                                &*service,
+                                crate::envelope::EnvelopeVerification::AnySigner,
+                                &signing_key,
+                                &nonce_cache,
+                            )
+                            .await
+                            .map(|(bytes, cont)| {
+                                // Spawn the streaming pump on this bridge LocalSet
+                                // (see spawn() for the rationale).
+                                if let Some(cont) = cont {
+                                    tokio::task::spawn_local(cont);
+                                }
+                                Bytes::from(bytes)
+                            });
+                            let _ = msg.respond.send(result);
+                        });
+                    }
+                });
+                rt.block_on(local);
+            })
+            .map_err(|e| anyhow::anyhow!("spawn rpc bridge thread: {e}"))?;
+
+        Ok((Self { tx }, ready_rx))
     }
 }
 
@@ -380,6 +456,78 @@ mod tests {
                 .into_iter()
                 .map(TransportAddr::Ip),
         )
+    }
+
+    /// Minimal `RequestService` for `spawn_with` tests.
+    struct BridgeEcho {
+        name: String,
+        ctx: Arc<zmq::Context>,
+        transport: crate::transport::TransportConfig,
+        signing_key: SigningKey,
+    }
+    impl BridgeEcho {
+        fn new(signing_key: SigningKey) -> Self {
+            Self {
+                name: "bridge-echo".to_owned(),
+                ctx: Arc::new(zmq::Context::new()),
+                transport: crate::transport::TransportConfig::inproc("bridge-echo-unused"),
+                signing_key,
+            }
+        }
+    }
+    #[async_trait::async_trait(?Send)]
+    impl crate::service::RequestService for BridgeEcho {
+        async fn handle_request(
+            &self,
+            _ctx: &crate::service::EnvelopeContext,
+            payload: &[u8],
+        ) -> Result<(Vec<u8>, Option<crate::service::Continuation>)> {
+            let mut out = vec![0xBE];
+            out.extend_from_slice(payload);
+            Ok((out, None))
+        }
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn context(&self) -> &Arc<zmq::Context> {
+            &self.ctx
+        }
+        fn transport(&self) -> &crate::transport::TransportConfig {
+            &self.transport
+        }
+        fn signing_key(&self) -> SigningKey {
+            self.signing_key.clone()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_with_readiness_ok_on_success_err_on_failure() -> Result<()> {
+        let nonce = Arc::new(crate::envelope::InMemoryNonceCache::new());
+
+        // Builder succeeds → readiness resolves Ok and the bridge serves.
+        let sk = fresh_signing_key();
+        let (_bridge, ready) = LocalServiceBridge::spawn_with(
+            "ok",
+            move || async move { Ok(BridgeEcho::new(sk)) },
+            Arc::clone(&nonce),
+            0,
+        )?;
+        ready.await.map_err(|_| anyhow::anyhow!("readiness dropped"))??;
+
+        // Builder fails (e.g. GPU init error) → the error surfaces on readiness,
+        // not silently as a later channel-closed.
+        let (_bridge2, ready2) = LocalServiceBridge::spawn_with::<_, _, BridgeEcho>(
+            "fail",
+            move || async move { Err(anyhow::anyhow!("boom")) },
+            nonce,
+            0,
+        )?;
+        let build_result = ready2.await.map_err(|_| anyhow::anyhow!("readiness dropped"))?;
+        assert!(
+            build_result.is_err(),
+            "a build failure must surface on the readiness channel"
+        );
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

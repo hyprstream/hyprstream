@@ -159,11 +159,17 @@ impl QuicSharedConfig {
                         let _ = policy_vk; // suppress unused warning
                     }
 
-                    let client = hyprstream_discovery::DiscoveryClient::for_service(
+                    let client = match hyprstream_discovery::DiscoveryClient::for_service(
                         sk,
                         discovery_vk,
                         None,
-                    );
+                    ) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!("Failed to build DiscoveryClient: {}", e);
+                            return;
+                        }
+                    };
                     match client.announce(&hyprstream_discovery::ServiceAnnouncement {
                         service_name: svc_name,
                         socket_kind: "quic".to_owned(),

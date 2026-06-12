@@ -2702,74 +2702,94 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
         on_ready: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> hyprstream_rpc::error::Result<()> {
         let transport = self.transport.clone();
-        let context = Arc::clone(&self.zmq_context);
-        let signing_key = self.signing_key.clone();
+        let server_signing_key = self.signing_key.clone();
 
-        let rt = tokio::runtime::Builder::new_current_thread()
+        // Post-ZMQ serve (#136): the GPU `InferenceService` is `!Send`, so build it
+        // on a dedicated LocalServiceBridge thread via `spawn_with`, then serve the
+        // resulting processor over the registered transport with `serve_bridged`.
+        // No ZMQ ROUTER. (QUIC is not enabled on this service.)
+        let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("runtime: {e}")))?;
 
-        let local = tokio::task::LocalSet::new();
-        local.block_on(&rt, async move {
-            // Create nonce cache (shared between service and RequestLoop)
+        rt.block_on(async move {
+            // Shared between the bridge dispatch and the InferenceService.
             let nonce_cache = Arc::new(InMemoryNonceCache::new());
+            let bridge_nonce = Arc::clone(&nonce_cache);
 
-            // Bootstrap: Create PolicyClient HERE, inside the service thread's runtime,
-            // so ZMQ sockets are registered with the correct reactor.
-            let policy_vk = match hyprstream_service::global_trust_store().resolve_one("policy") {
-                Some(vk) => vk,
-                None => {
-                    return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
-                        "trust store has no policy key — startup must populate it".to_owned(),
-                    ));
-                }
-            };
-            let policy_client = PolicyClient::for_service(
-                self.policy_signing_key.clone(),
-                policy_vk,
-                None,
-            );
+            // Destructure so the (Send) config moves into the on-thread builder.
+            let InferenceServiceConfig {
+                model_path,
+                config,
+                server_pubkey,
+                signing_key: svc_signing_key,
+                policy_signing_key,
+                zmq_context,
+                transport: _transport,
+                fs,
+                expected_audience,
+                jwt_key_source,
+            } = *self;
+            let adapter_transport = transport.clone();
 
-            // GPU initialization happens HERE, on the service thread
-            let service = InferenceService::initialize(
-                self.model_path,
-                self.config,
-                self.server_pubkey,
-                self.signing_key.clone(),
-                Arc::clone(&nonce_cache),
-                policy_client,
-                self.fs,
+            // Build PolicyClient + GPU service + adapter ON the bridge thread.
+            let (bridge, ready) = hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge::spawn_with(
+                "inference",
+                move || async move {
+                    let policy_vk = hyprstream_service::global_trust_store()
+                        .resolve_one("policy")
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("trust store has no policy key — startup must populate it")
+                        })?;
+                    let policy_client =
+                        PolicyClient::for_service(policy_signing_key, policy_vk, None)?;
+                    let service = InferenceService::initialize(
+                        model_path,
+                        config,
+                        server_pubkey,
+                        svc_signing_key.clone(),
+                        Arc::clone(&bridge_nonce),
+                        policy_client,
+                        fs,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("inference init: {e}"))?;
+                    Ok(InferenceZmqAdapter {
+                        service,
+                        zmq_context,
+                        transport: adapter_transport,
+                        signing_key: svc_signing_key,
+                        expected_audience,
+                        jwt_key_source,
+                    })
+                },
+                nonce_cache,
+                0,
+            )
+            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("bridge: {e}")))?;
+
+            // Surface GPU-init failure before advertising readiness.
+            ready
+                .await
+                .map_err(|_| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(
+                        "inference bridge readiness dropped".to_owned(),
+                    )
+                })?
+                .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("init: {e}")))?;
+
+            let processor: Arc<dyn hyprstream_rpc::transport::rpc_session::IrohRequestProcessor> =
+                Arc::new(bridge);
+            hyprstream_rpc::service::serve::serve_bridged(
+                &transport,
+                processor,
+                server_signing_key,
+                shutdown,
+                on_ready,
             )
             .await
-            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("init: {e}")))?;
-
-            // Create RequestService adapter for RequestLoop
-            let adapter = InferenceZmqAdapter {
-                service,
-                zmq_context: context.clone(),
-                transport: transport.clone(),
-                signing_key: signing_key.clone(),
-                expected_audience: self.expected_audience,
-                jwt_key_source: self.jwt_key_source,
-            };
-
-            // Use shared nonce cache between service and RequestLoop
-            let runner = RequestLoop::new(transport, context, signing_key)
-                .with_nonce_cache(nonce_cache);
-            let mut handle = runner.run(adapter).await
-                .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("loop: {e}")))?;
-
-            if let Some(tx) = on_ready {
-                let _ = tx.send(());
-            }
-
-            // Notify systemd that service is ready (for Type=notify services)
-            let _ = hyprstream_rpc::notify::ready();
-
-            shutdown.notified().await;
-            handle.stop().await;
-            Ok::<_, hyprstream_rpc::error::RpcError>(())
+            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(e.to_string()))
         })
     }
 }

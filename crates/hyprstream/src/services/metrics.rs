@@ -695,7 +695,7 @@ mod tests {
             signing_key.clone(),
             signing_key.verifying_key(),
             None,
-        );
+        ).expect("create policy client");
 
         // In-memory DuckDB backend + metrics table creation.
         let backend = Arc::new(
@@ -735,7 +735,7 @@ mod tests {
             signing_key.clone(),
             signing_key.verifying_key(),
             None,
-        );
+        ).expect("create metrics client");
 
         (client, manager)
     }

@@ -70,7 +70,6 @@ use axum::{
     Router,
 };
 use hyprstream_rpc::registry::SocketKind;
-use hyprstream_rpc::service::{RequestLoop, RequestService};
 use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_service::Spawnable;
 use tokio::sync::Notify;
@@ -360,7 +359,9 @@ impl Spawnable for OAuthService {
                 self.signing_key.clone(),
                 policy_vk,
                 None,
-            );
+            ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
+                format!("failed to create PolicyClient: {e}"),
+            ))?;
 
             // Get discovery key from trust store (populated by depends_on = ["discovery"]).
             // Using trust store avoids RPC calls which require LocalSet context.
@@ -376,7 +377,9 @@ impl Spawnable for OAuthService {
                 self.signing_key.clone(),
                 discovery_vk,
                 None,
-            );
+            ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
+                format!("failed to create DiscoveryClient: {e}"),
+            ))?;
 
             let credentials_dir = crate::config::HyprConfig::load()
                 .map(|c| c.config_dir().join("credentials"))
@@ -638,32 +641,59 @@ impl Spawnable for OAuthService {
 
             let _ = hyprstream_rpc::notify::ready();
 
-            // ZMQ RPC loop for user CRUD (alongside HTTP server)
-            // Must use spawn_local because RequestLoop uses spawn_local internally
-            let zmq_transport = self.control_transport.clone();
-            let zmq_context = Arc::clone(&self.context);
-            let zmq_signing_key = self.signing_key.clone();
-            let zmq_state = state.clone();
-            let zmq_loop = tokio::task::spawn_local(async move {
+            // User-CRUD RPC serve, alongside the HTTP server. #136: bridged
+            // dispatch over the registered transport (inproc/ipc) instead of the
+            // ZMQ ROUTER. A dedicated `serve_shutdown` stops it once the HTTP
+            // server exits, so the task joins cleanly.
+            let control_transport = self.control_transport.clone();
+            let rpc_context = Arc::clone(&self.context);
+            let rpc_signing_key = self.signing_key.clone();
+            let rpc_state = state.clone();
+            let serve_shutdown = Arc::new(Notify::new());
+            let serve_shutdown_task = Arc::clone(&serve_shutdown);
+            let rpc_loop = tokio::task::spawn_local(async move {
                 let handler = zmq_handler::OAuthZmqHandler::new(
-                    zmq_state,
-                    zmq_context,
-                    zmq_transport,
-                    zmq_signing_key,
+                    rpc_state,
+                    rpc_context,
+                    control_transport.clone(),
+                    rpc_signing_key.clone(),
                 );
-                let zmq_transport = RequestService::transport(&handler).clone();
-                let zmq_context = Arc::clone(RequestService::context(&handler));
-                let zmq_signing_key = RequestService::signing_key(&handler);
-                let loop_ = RequestLoop::new(zmq_transport, zmq_context, zmq_signing_key);
-                if let Err(e) = loop_.run(handler).await {
-                    tracing::error!("OAuth ZMQ loop error: {}", e);
+                let nonce_cache = Arc::new(hyprstream_rpc::envelope::InMemoryNonceCache::new());
+                let bridge = match hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge::spawn(
+                    handler,
+                    nonce_cache,
+                    0,
+                ) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::error!("OAuth RPC bridge spawn error: {}", e);
+                        return;
+                    }
+                };
+                let processor: Arc<dyn hyprstream_rpc::transport::rpc_session::IrohRequestProcessor> =
+                    Arc::new(bridge);
+                if let Err(e) = hyprstream_rpc::service::serve::serve_bridged(
+                    &control_transport,
+                    processor,
+                    rpc_signing_key,
+                    serve_shutdown_task,
+                    None,
+                )
+                .await
+                {
+                    tracing::error!("OAuth RPC serve error: {}", e);
                 }
             });
 
             // Run HTTP(S) server with graceful shutdown
             let _ = crate::server::tls::serve_app(addr, app, rustls_config, shutdown, "OAuthService").await;
 
-            let _ = zmq_loop.await;
+            // HTTP server stopped — stop the RPC serve and join it. notify_one
+            // (not notify_waiters) stores a permit if the serve task hasn't yet
+            // armed its `notified()` await, so the signal can't be missed even if
+            // the HTTP server exited before the RPC task reached serve_bridged.
+            serve_shutdown.notify_one();
+            let _ = rpc_loop.await;
 
             Ok(())
         })

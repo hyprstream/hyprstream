@@ -2791,7 +2791,7 @@ mod tests {
             signing_key.clone(),
             signing_key.verifying_key(),
             None,
-        );
+        ).expect("test: create policy client");
 
         // Start the registry service with policy client
         let registry_transport = TransportConfig::inproc("test-registry-health");
@@ -2810,7 +2810,7 @@ mod tests {
             signing_key.clone(),
             signing_key.verifying_key(),
             None,
-        );
+        ).expect("test: create registry client");
         // health_check returns () on success
         let result = client.health_check().await;
         assert!(result.is_ok(), "health_check should succeed: {:?}", result.err());
