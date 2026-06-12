@@ -60,6 +60,25 @@ struct StreamPolicy {
 annotation streamPolicy(field) :StreamPolicy;
 ```
 
+**Schema-modeling decision (2026-06-12):** fixed **struct** with one named field per axis
+(Option 1), *not* an open `List(PolicyFacet)`. Rationale: strongly typed, total/simple
+resolution (type guarantees exactly-one-of-each axis), and capnp ordinal-evolution gives
+wire forward/backward compat for the runtime data structs. Two disciplines this commits us to:
+- **Ordinal hygiene** — add fields/variants only; never renumber/reuse/retype (codegen-gated).
+- **Explicit-or-safe defaults** — codegen **requires every axis to be set** for a compile-time
+  policy (absence = build error, not a silent zero-default), so the `@0`-ordering of the policy
+  enums is not load-bearing internally. Where capnp *can* zero-default — the runtime wire structs
+  (`StreamBlock`/`StreamInfo` security fields) and any policy we later advertise to an external
+  peer — the `@0` variant MUST be the strict/safe choice. Unknown union *variants* are detectable
+  (`NotInSchema`) and rejected; unknown struct *fields* are silently defaulted — so security-bearing
+  strictness is carried as variants, not bare fields.
+
+The policy is **compile-time** (annotation → codegen drives both ends); it is not serialized,
+so producer/consumer match is structural. capnp wire-versioning applies to `StreamInfo`/
+`StreamBlock` and to any policy value we later choose to advertise to a relay. If federated
+cross-version policy *negotiation* is ever needed (#168), wrap the struct in a
+`List(PolicyFacet)` + criticality bits then — a non-breaking evolution.
+
 Reference points (NOT codegen presets — just how the axes compose):
 - **durable-ordered inference tokens**: `ordering=ordered, delivery=atLeastOnce, completion=none, retention=256, backpressure=block`
 - **live event/media fan-out**: `ordering=unordered, delivery=atMostOnce, completion=none, retention=0, backpressure=dropOldest`
