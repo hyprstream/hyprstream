@@ -11,12 +11,15 @@
 
 mod traits;
 mod zmq;
+pub mod dispatch;
 pub mod streaming;
 pub mod spawnable;
 pub mod metadata;
 pub mod doc;
 
 pub use traits::{RpcHandler, RpcRequest, RpcService};
+/// Transport-neutral request dispatch core (#148) — shared by all front-ends.
+pub use dispatch::process_request;
 #[allow(deprecated)]
 pub use zmq::{AuthorizeFn, Continuation, EnvelopeContext, QuicLoopConfig, ServiceHandle, RequestLoop, UnifiedRequestLoop, RequestService};
 /// Transitional compatibility alias for the former `ZmqService` name (#166).
