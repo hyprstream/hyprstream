@@ -19,7 +19,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
 use tokio::sync::Semaphore;
@@ -288,7 +288,7 @@ impl Transport for QuinnTransport {
 
 /// Build a quinn WebTransport client session against a server with a CA-issued
 /// certificate, validated via the system root store and the DNS `server_name`
-/// (`QuicServerAuth::WebPki`). Dials `https://{server_name}:{port}/`.
+/// (`QuicServerAuth::web_pki`). Dials `https://{server_name}:{port}/`.
 pub async fn connect_webpki(
     server_name: &str,
     port: u16,
@@ -305,18 +305,17 @@ pub async fn connect_webpki(
 }
 
 /// Build a quinn WebTransport client session against a self-signed server,
-/// pinning the server cert by its **SHA-256 fingerprint** (the 32-byte hash
-/// carried in `QuicServerAuth::Pinned`). Hermetic: dials an IP-literal URL so no
-/// DNS lookup or network egress occurs.
-///
-/// This is the connect path the lazy dial transport uses for internal-mesh
-/// peers — the resolver/DID doc publishes the compact hash, not the full cert.
-pub async fn connect_pinned_sha256(
+/// accepting the leaf cert if its **SHA-256 fingerprint** is any of
+/// `cert_hashes` (`QuicServerAuth::accept_cert_hashes` — a set so rotation can
+/// overlap). Hermetic: dials an IP-literal URL so no DNS lookup or network
+/// egress occurs.
+pub async fn connect_pinned_hashes(
     addr: std::net::SocketAddr,
-    cert_sha256: [u8; 32],
+    cert_hashes: &[[u8; 32]],
 ) -> Result<web_transport_quinn::Session> {
+    let hashes: Vec<Vec<u8>> = cert_hashes.iter().map(|h| h.to_vec()).collect();
     let client = web_transport_quinn::ClientBuilder::new()
-        .with_server_certificate_hashes(vec![cert_sha256.to_vec()])
+        .with_server_certificate_hashes(hashes)
         .map_err(|e| anyhow!("quinn client build: {e}"))?;
     let url = url::Url::parse(&format!("https://{addr}/"))
         .map_err(|e| anyhow!("quinn url: {e}"))?;
@@ -324,6 +323,33 @@ pub async fn connect_pinned_sha256(
         .connect(url)
         .await
         .map_err(|e| anyhow!("quinn connect: {e}"))
+}
+
+/// Verify the peer's leaf-cert SHA-256 is one of `accept` — the post-connect pin
+/// check for the WebPKI+pin mode (CA validation runs in the handshake; this adds
+/// the pin on top). Call immediately after connect, before any RPC. The cert
+/// fingerprint is public, so a plain comparison is fine (no secret to leak).
+pub fn verify_peer_cert_pinned(
+    session: &web_transport_quinn::Session,
+    accept: &[[u8; 32]],
+) -> Result<()> {
+    // `Session` derefs to `quinn::Connection`, exposing `peer_identity()`.
+    let identity = session
+        .peer_identity()
+        .ok_or_else(|| anyhow!("peer presented no certificate"))?;
+    let certs = identity
+        .downcast_ref::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+        .ok_or_else(|| anyhow!("unexpected peer-identity type (not an X.509 chain)"))?;
+    let leaf = certs
+        .first()
+        .ok_or_else(|| anyhow!("peer cert chain is empty"))?;
+    let mut leaf_hash = [0u8; 32];
+    leaf_hash.copy_from_slice(&sha256(leaf.as_ref()));
+    if accept.contains(&leaf_hash) {
+        Ok(())
+    } else {
+        bail!("peer leaf-cert SHA-256 is not in the configured pin set")
+    }
 }
 
 /// Convenience: pin by the full server cert DER (hashes it for you). Used by
@@ -334,7 +360,7 @@ pub async fn connect_pinned(
 ) -> Result<web_transport_quinn::Session> {
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&sha256(cert_der));
-    connect_pinned_sha256(addr, hash).await
+    connect_pinned_hashes(addr, &[hash]).await
 }
 
 fn sha256(bytes: &[u8]) -> Vec<u8> {
@@ -399,6 +425,32 @@ mod tests {
 
         let resp = client.send(b"ping".to_vec(), Some(5_000)).await?;
         assert_eq!(&resp[..], b"\xCDping");
+
+        shutdown.cancel();
+        let _ = server_task.await;
+        Ok(())
+    }
+
+    /// Isolated test of the WebPKI+pin post-connect check: against the hermetic
+    /// self-signed server, the leaf hash must match the pin set (right => Ok,
+    /// wrong => Err, empty set => Err = fail-closed).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn verify_peer_cert_pinned_accepts_right_rejects_wrong() -> Result<()> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let processor =
+            crate::transport::rpc_session::from_fn(|req: Bytes| async move { Ok(req) });
+        let (server, addr, cert_der) = build_server()?;
+        let rpc_server = QuinnRpcServer::new(server, processor, fresh_signing_key());
+        let shutdown = rpc_server.shutdown_token();
+        let server_task = tokio::spawn(rpc_server.run());
+
+        let session = connect_pinned(addr, &cert_der).await?;
+        let mut right = [0u8; 32];
+        right.copy_from_slice(&sha256(&cert_der));
+
+        assert!(verify_peer_cert_pinned(&session, &[right]).is_ok(), "matching leaf hash must pass");
+        assert!(verify_peer_cert_pinned(&session, &[[0u8; 32]]).is_err(), "wrong hash must reject");
+        assert!(verify_peer_cert_pinned(&session, &[]).is_err(), "empty pin set must reject (fail-closed)");
 
         shutdown.cancel();
         let _ = server_task.await;

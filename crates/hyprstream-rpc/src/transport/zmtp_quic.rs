@@ -1863,7 +1863,7 @@ pub fn cert_hash(cert_der: &[u8]) -> String {
 }
 
 /// SHA-256 fingerprint of a certificate as raw bytes — the pin carried in
-/// `QuicServerAuth::Pinned` and matched by `connect_pinned_sha256`. A
+/// `QuicServerAuth::accept_cert_hashes` and matched by `connect_pinned_hashes`. A
 /// self-signed QUIC server registers `TransportConfig::quic_pinned(addr, name,
 /// cert_sha256(leaf_cert))` so clients can pin it.
 pub fn cert_sha256(cert_der: &[u8]) -> [u8; 32] {

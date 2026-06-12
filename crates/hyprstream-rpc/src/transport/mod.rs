@@ -129,36 +129,70 @@ pub struct TransportConfig {
     pub bind_mode: BindMode,
 }
 
-/// How a QUIC client authenticates the server it dials.
+/// How a QUIC client authenticates the **channel** to the server it dials.
 ///
-/// Server authentication is a *policy*, not a single mechanism — this replaces
-/// the earlier hardcoded SHA-256 cert pin. All variants carry only
-/// serializable, public material so `TransportConfig` stays `Clone + Eq` and
-/// wire-publishable.
+/// # This is channel auth, not identity auth
+///
+/// Peer *identity* ("which node is this") is established at the **application
+/// layer** — every response is a signed COSE `SignedEnvelope` verified against
+/// the peer's published keys (the DID-doc `#mesh` verification method / JWKS).
+/// That works identically on native and in WASM, because it is our code, not the
+/// browser's TLS stack. This type only decides how the *TLS channel* is
+/// authenticated (confidentiality + anti-active-MITM); it is defence in depth,
+/// not the trust root (#185).
+///
+/// Channel auth is a small lattice of independent requirements, not a fixed set
+/// of modes, so it is a validated struct rather than an enum of combinations:
+///   - `require_web_pki` — the leaf must chain to a system-trusted CA and match
+///     `server_name` (public peers, dialed by hostname).
+///   - `accept_cert_hashes` — a **set** of acceptable leaf-cert SHA-256s. A set
+///     (not one hash) so cert rotation can overlap (`{current, next}`) and
+///     load-balanced endpoints with distinct certs work. The resolver / DID doc
+///     supplies these — they are directory-distributed pins, not trust-on-first-
+///     use. (For browsers this is the *only* knob the WebTransport API exposes.)
+///
+/// The verifier ANDs the active requirements. At least one must be active —
+/// `{web_pki: false, hashes: []}` is no auth and is rejected at construction.
+///
+/// RFC 7250 raw-public-key binding (bind the channel to the published key
+/// directly, so native QUIC reuses the identity key instead of a cert hash) is
+/// tracked in #200; it is channel hygiene, not an identity requirement (identity
+/// is app-layer regardless). iroh already does it natively.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum QuicServerAuth {
-    /// Standard WebPKI / CA-chain validation against the system root store,
-    /// matching the server's DNS `server_name`. For public peers fronted by a
-    /// CA-issued certificate (dialed by hostname).
-    WebPki,
-    /// Pin the server's (self-signed) certificate by its SHA-256 fingerprint
-    /// (`with_server_certificate_hashes`) — the internal-mesh model, dialed by
-    /// IP. The resolver / DID doc vouches for the hash.
-    ///
-    /// SECURITY: authenticates the *channel* ("a server holding this cert"), not
-    /// the peer's DID *identity* (#185). For identity-bound transport use iroh
-    /// (which is RFC 7250 — the connection is bound to the peer's public key).
-    Pinned([u8; 32]),
-    /// RFC 7250 raw-public-key identity binding: the server proves possession of
-    /// this Ed25519 key during the TLS handshake.
-    ///
-    /// **Not yet implemented** — `web_transport_quinn`'s builder exposes no
-    /// raw-key/custom-verifier hook, so this needs a custom rustls verifier + a
-    /// raw `quinn` connect + `Session::raw`, plus a server-side raw-key config.
-    /// It is also browser-incompatible (WebTransport mandates cert hashes) and
-    /// overlaps iroh (which already provides RFC 7250). Tracked in #200; use
-    /// iroh for identity-bound native transport today.
-    RawPublicKey([u8; 32]),
+pub struct QuicServerAuth {
+    require_web_pki: bool,
+    accept_cert_hashes: Vec<[u8; 32]>,
+}
+
+impl QuicServerAuth {
+    /// WebPKI / CA-chain validation only (public, CA-fronted peer).
+    pub fn web_pki() -> Self {
+        Self { require_web_pki: true, accept_cert_hashes: Vec::new() }
+    }
+
+    /// Pin the leaf cert to one of `hashes` (SHA-256), no CA requirement — the
+    /// self-signed internal-mesh model. Errors if `hashes` is empty.
+    pub fn pinned(hashes: Vec<[u8; 32]>) -> anyhow::Result<Self> {
+        anyhow::ensure!(!hashes.is_empty(), "QuicServerAuth::pinned requires >= 1 cert hash");
+        Ok(Self { require_web_pki: false, accept_cert_hashes: hashes })
+    }
+
+    /// WebPKI validation **and** the leaf must be one of `hashes` — defence in
+    /// depth against CA mis-issuance (HPKP-style). Errors if `hashes` is empty.
+    pub fn web_pki_pinned(hashes: Vec<[u8; 32]>) -> anyhow::Result<Self> {
+        anyhow::ensure!(!hashes.is_empty(), "QuicServerAuth::web_pki_pinned requires >= 1 cert hash");
+        Ok(Self { require_web_pki: true, accept_cert_hashes: hashes })
+    }
+
+    /// Whether CA-chain validation is required.
+    pub fn require_web_pki(&self) -> bool {
+        self.require_web_pki
+    }
+
+    /// The set of accepted leaf-cert SHA-256 pins (empty => no pin requirement).
+    pub fn accept_cert_hashes(&self) -> &[[u8; 32]] {
+        &self.accept_cert_hashes
+    }
 }
 
 /// Endpoint type (without encryption config)
@@ -278,7 +312,7 @@ impl TransportConfig {
             endpoint: EndpointType::Quic {
                 addr,
                 server_name: server_name.into(),
-                auth: QuicServerAuth::WebPki,
+                auth: QuicServerAuth::web_pki(),
             },
             curve: None, // QUIC has TLS 1.3 built-in, no CurveZMQ needed
             bind_mode: BindMode::Bind,
@@ -293,7 +327,8 @@ impl TransportConfig {
             endpoint: EndpointType::Quic {
                 addr,
                 server_name: server_name.into(),
-                auth: QuicServerAuth::Pinned(cert_hash),
+                // In-module: construct directly (a one-element set is always valid).
+                auth: QuicServerAuth { require_web_pki: false, accept_cert_hashes: vec![cert_hash] },
             },
             curve: None,
             bind_mode: BindMode::Connect,

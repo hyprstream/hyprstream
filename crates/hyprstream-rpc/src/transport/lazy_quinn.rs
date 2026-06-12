@@ -32,7 +32,8 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::transport::quinn_transport::{
-    connect_pinned_sha256, connect_webpki, QuinnPendingStream, QuinnPublishStub, QuinnTransport,
+    connect_pinned_hashes, connect_webpki, verify_peer_cert_pinned, QuinnPendingStream,
+    QuinnPublishStub, QuinnTransport,
 };
 use crate::transport::QuicServerAuth;
 use crate::transport_traits::Transport;
@@ -78,13 +79,22 @@ impl LazyQuinnTransport {
             return Ok(transport.clone());
         }
         let connect = async {
-            match &self.auth {
-                QuicServerAuth::WebPki => connect_webpki(&self.server_name, self.addr.port()).await,
-                QuicServerAuth::Pinned(hash) => connect_pinned_sha256(self.addr, *hash).await,
-                QuicServerAuth::RawPublicKey(_) => bail!(
-                    "RFC 7250 raw-public-key QUIC auth is not yet implemented (#200) — use iroh \
-                     for identity-bound transport, or QuicServerAuth::Pinned / WebPki"
-                ),
+            let hashes = self.auth.accept_cert_hashes();
+            match (self.auth.require_web_pki(), hashes.is_empty()) {
+                // WebPKI only.
+                (true, true) => connect_webpki(&self.server_name, self.addr.port()).await,
+                // Pin only (self-signed) — verified in-handshake by cert-hash.
+                (false, false) => connect_pinned_hashes(self.addr, hashes).await,
+                // WebPKI + pin: CA-validate in the handshake, then enforce the
+                // pin on the established session before any RPC flows.
+                (true, false) => {
+                    let session = connect_webpki(&self.server_name, self.addr.port()).await?;
+                    verify_peer_cert_pinned(&session, hashes)?;
+                    Ok(session)
+                }
+                // No auth at all — unreachable: QuicServerAuth's constructors
+                // reject the empty case.
+                (false, true) => bail!("QUIC endpoint has no server-auth requirement"),
             }
         };
         let session = tokio::time::timeout(CONNECT_TIMEOUT, connect)
@@ -202,7 +212,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn lazy_connects_on_first_send_and_caches() {
         let (addr, pin, shutdown) = spawn_echo_server();
-        let t = LazyQuinnTransport::new(addr, "localhost", QuicServerAuth::Pinned(pin));
+        let t = LazyQuinnTransport::new(addr, "localhost", QuicServerAuth::pinned(vec![pin]).unwrap());
 
         assert!(t.cached.lock().await.is_none(), "no connection before first send");
 
@@ -219,7 +229,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wrong_cert_pin_does_not_connect() {
         let (addr, _pin, shutdown) = spawn_echo_server();
-        let t = LazyQuinnTransport::new(addr, "localhost", QuicServerAuth::Pinned([0u8; 32])); // wrong fingerprint
+        let t = LazyQuinnTransport::new(addr, "localhost", QuicServerAuth::pinned(vec![[0u8; 32]]).unwrap()); // wrong fingerprint
         // The TLS handshake must *promptly reject* a wrong pin: the send must
         // COMPLETE with an error well within the hang-guard. If the guard fires
         // (i.e. send hung), the test fails — so a hang can't masquerade as a pass.
@@ -239,7 +249,7 @@ mod tests {
         let t = LazyQuinnTransport::new(
             "127.0.0.1:1".parse().unwrap(),
             "localhost",
-            QuicServerAuth::Pinned([0u8; 32]),
+            QuicServerAuth::pinned(vec![[0u8; 32]]).unwrap(),
         );
         let res = tokio::time::timeout(Duration::from_secs(13), t.send(b"x".to_vec(), Some(2_000)))
             .await
@@ -253,7 +263,7 @@ mod tests {
         let t = LazyQuinnTransport::new(
             "127.0.0.1:1".parse().unwrap(),
             "localhost",
-            QuicServerAuth::Pinned([0u8; 32]),
+            QuicServerAuth::pinned(vec![[0u8; 32]]).unwrap(),
         );
         assert!(t.subscribe(b"topic").await.is_err());
         assert!(t.publish(b"topic").await.is_err());
