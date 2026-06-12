@@ -335,6 +335,17 @@ impl TransportConfig {
         }
     }
 
+    /// Create a client QUIC endpoint with an explicit channel-auth policy
+    /// (used by the DID-doc service-entry codec, which may produce any of
+    /// WebPKI / Pinned / WebPKI+pin).
+    pub fn quic_with_auth(addr: SocketAddr, server_name: impl Into<String>, auth: QuicServerAuth) -> Self {
+        Self {
+            endpoint: EndpointType::Quic { addr, server_name: server_name.into(), auth },
+            curve: None,
+            bind_mode: BindMode::Connect,
+        }
+    }
+
     /// Create a client iroh endpoint dialing the peer identified by `node_id`
     /// (its `EndpointId` / Ed25519 public key), with optional direct addresses
     /// and relay URL for NAT traversal.
