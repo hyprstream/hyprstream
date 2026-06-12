@@ -31,12 +31,81 @@ framing where it conflicts with ground truth below.
 
 ---
 
+## Stream QoS — schema-declared, codegen-enforced (cross-cutting; lands in Phase A)
+
+**Requirement:** a stream's delivery semantics — *durable & ordered* ↔ *out-of-order
+media* — are an **application choice, declared in the schema and realized by codegen** on
+both ends. Today streaming is detected *structurally* (response variant ==
+`StreamInfo`, `derive/src/codegen/client.rs:15`); there is no policy surface. We add one.
+
+### Declaration: a `$streamPolicy` capnp annotation
+Define in `schema/annotations.capnp` (alongside `$fixedSize`) and apply to the
+streaming response variant:
+
+```capnp
+struct StreamPolicy {
+  ordering    @0 :Ordering;     # ordered | unordered
+  delivery    @1 :Delivery;     # atLeastOnce | atMostOnce
+  retention   @2 :UInt32;       # Groups (or seconds); 0 = live-only
+  backpressure@3 :Backpressure; # block (EAGAIN) | dropOldest
+}
+annotation streamPolicy(field) :StreamPolicy;
+
+# usage
+union { streamInfo @0 :StreamInfo $streamPolicy(ordering = ordered, delivery = atLeastOnce, retention = 1024); ... }
+```
+Named presets are sugar over the axes: **`DurableOrdered`** (ordered+atLeastOnce+retain+terminal),
+**`Job`** (ordered+atLeastOnce, bounded retention — desktop tokens), **`Log`**
+(ordered+atLeastOnce+resume — mobile tokens), **`Live`** (unordered+atMostOnce+drop — events/media).
+
+### Codegen emits a *matched* producer + consumer from the one declaration
+The schema resolver lifts the annotation into method metadata; **both** backends
+(Rust derive + `ts_codegen` for browser/M4) read it and emit:
+- **producer/service stub** → moq Track config: retention window, terminal-block emission, MAC mode;
+- **client/consumer** → `StreamHandle`/`StreamVerifier` in the matching mode.
+
+Single source of truth ⇒ **producer/consumer QoS + integrity can never silently
+mismatch** (a mismatch would otherwise be a correctness/security bug).
+
+### The integrity model is policy-selected (this *generalizes* #163)
+There is no longer one consumer verifier; the policy picks it:
+
+| | **Ordered / Durable** | **Unordered / Media** |
+|---|---|---|
+| Group sequence | `seq == expected_next`; gap = **fatal** | gaps **allowed** (skip-to-live) |
+| MAC scheme | chained `prevMac`, **seq bound into MAC** | **per-Group** MAC over `(track ‖ seq ‖ payload)` — self-authenticating |
+| Terminal block | **required** (EOF-without-terminal = reject) | not required |
+| Eviction-by-age | bounded by retention floor (durability) | expected |
+| Replay defense | sequence monotonicity + chain | reject `seq ≤ last-seen` (per-Group) |
+
+The chained `prevMac` (what `StreamBlock` carries today, `streaming.capnp:62`) is the
+**ordered** path. Media needs **per-Group self-authentication** so a deliberate gap
+doesn't break verification — a different MAC derivation, selected by the annotation.
+
+### Wire/schema evolution
+`StreamBlock` gains `groupSeq @N :UInt64` (the moq Group sequence) bound into the MAC
+input for **both** modes:
+- ordered: `MAC = HMAC(key, prevMac ‖ groupSeq ‖ payload)`
+- media:   `MAC = HMAC(key, track ‖ groupSeq ‖ payload)`
+One `StreamBlock` shape across policies; only the MAC input + consumer enforcement differ.
+**Note:** binding `groupSeq` changes the bytes vs the legacy ZMQ frame, so the Phase-A
+parallel-run differential test compares **semantics**, not raw bytes (supersedes the
+earlier "byte-identical" note).
+
+### New ticket
+File **"Stream QoS: schema-declared StreamPolicy annotation → codegen-matched
+producer/consumer + policy-selected integrity (durable-ordered vs media)"** — spans
+#134 (substrate), #163 (integrity, now a mode not a fixed guard), and the
+derive/ts codegen. Phase A absorbs it.
+
 ## Sequencing & dependencies
 
 ```
-Phase A (substrate + integrity) ── critical path, blocks everything
+Phase A (substrate + QoS + integrity) ── critical path, blocks everything
   #134-M2a   StreamService holds a moq Origin; flip primary path; port §7.5; delete rejoin
-  #163       consumer Group-ordering + terminal-block guards  ← lands in the same consumer
+  NEW-qos    $streamPolicy annotation → codegen-matched producer/consumer (both backends)
+  #163       policy-selected consumer integrity (ordered: gap-fatal+chain+terminal;
+             media: per-Group self-auth) — see "Stream QoS" above
         │
         ▼
 Phase B (rewire producers) ── two parallel tracks off post-A epic-moq
@@ -104,13 +173,17 @@ consumers enforce ordering + completeness.
 3. **Delete the custom late-join rejoin** (`streaming.rs:~1553-1620`) and collapse the
    `notification`-side pre-registration — moq Groups give native late-join (subscriber
    starts at latest Group, catches up within retention).
-4. **#163 consumer guards** (lands here so all consumers inherit them):
-   - feed the moq Group **sequence** into `verify_moq_frame` and assert
-     `group.sequence == expected_next` (gap = fatal); optionally bind sequence into the MAC input.
-   - require a terminal `Complete`/`Error` payload before treating a stream as complete;
-     **EOF-without-terminal = reject** (truncation defense).
-5. **Retention window** replaces the rejoin buffer; expose a `StreamPolicy` knob
-   (preset substrate referenced by #169). Caps tie into #162/#174 thinking.
+4. **`$streamPolicy` annotation + codegen** (see "Stream QoS" above): add the annotation
+   to `annotations.capnp`, lift it into the resolved method metadata, and emit matched
+   producer/consumer in **both** the Rust derive and `ts_codegen` backends. Add
+   `groupSeq` to `StreamBlock`, bound into the MAC for both modes.
+5. **#163 policy-selected integrity** (lands here so all consumers inherit it):
+   - **ordered**: assert `group.sequence == expected_next` (gap = fatal), chained `prevMac`
+     with `groupSeq` bound in, **require terminal** `Complete`/`Error` (EOF-without-terminal = reject).
+   - **media**: per-Group self-authenticating MAC `(track ‖ groupSeq ‖ payload)`, gaps/eviction
+     tolerated, reject `seq ≤ last-seen` (replay), no terminal requirement.
+6. **Retention window** replaces the rejoin buffer; depth comes from the policy's
+   `retention`. Caps tie into #162/#174 thinking.
 
 **Exit:** tokenstream end-to-end (in-proc publisher → Origin → external `moql` subscriber);
 native late-join; `authorize_signer` enforced; consumer rejects reordered/truncated streams.
