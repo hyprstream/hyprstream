@@ -688,8 +688,11 @@ impl Spawnable for OAuthService {
             // Run HTTP(S) server with graceful shutdown
             let _ = crate::server::tls::serve_app(addr, app, rustls_config, shutdown, "OAuthService").await;
 
-            // HTTP server stopped — stop the RPC serve and join it.
-            serve_shutdown.notify_waiters();
+            // HTTP server stopped — stop the RPC serve and join it. notify_one
+            // (not notify_waiters) stores a permit if the serve task hasn't yet
+            // armed its `notified()` await, so the signal can't be missed even if
+            // the HTTP server exited before the RPC task reached serve_bridged.
+            serve_shutdown.notify_one();
             let _ = rpc_loop.await;
 
             Ok(())

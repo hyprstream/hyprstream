@@ -296,27 +296,19 @@ impl LocalServiceBridge {
                                 &nonce_cache,
                             )
                             .await
-                            .and_then(|(bytes, cont)| {
-                                // Streaming continuations are not wired on
-                                // the iroh RPC plane — streaming moves to
-                                // moq-net (`moql` ALPN, Phase 3, #134). In
-                                // debug, panic loudly; in release, return an
-                                // error so the wire emits a signed error
-                                // envelope (handler's build_error_envelope)
-                                // rather than silently dropping the stream.
-                                if cont.is_some() {
-                                    debug_assert!(
-                                        false,
-                                        "iroh-rpc bridge: streaming continuation not supported \
-                                         — wait for Phase 3 (#134)"
-                                    );
-                                    return Err(anyhow::anyhow!(
-                                        "iroh-rpc bridge: service returned a streaming \
-                                         continuation, which is not supported on the iroh \
-                                         RPC plane (Phase 3 / #134 moves streaming to moq-net)"
-                                    ));
+                            .map(|(bytes, cont)| {
+                                // The continuation is the streaming pump — it
+                                // publishes to the moq/notification plane,
+                                // independent of the RPC transport — so spawn it
+                                // on this bridge LocalSet after the response,
+                                // exactly as RequestLoop / WebTransportServer do.
+                                // (Without this, streaming services like model /
+                                // tui would have their continuation dropped and
+                                // the stream would never be served.)
+                                if let Some(cont) = cont {
+                                    tokio::task::spawn_local(cont);
                                 }
-                                Ok(Bytes::from(bytes))
+                                Bytes::from(bytes)
                             });
                             let _ = msg.respond.send(result);
                         });
@@ -394,14 +386,13 @@ impl LocalServiceBridge {
                                 &nonce_cache,
                             )
                             .await
-                            .and_then(|(bytes, cont)| {
-                                if cont.is_some() {
-                                    return Err(anyhow::anyhow!(
-                                        "rpc bridge: streaming continuation unsupported \
-                                         (streaming is on the moq plane, #134)"
-                                    ));
+                            .map(|(bytes, cont)| {
+                                // Spawn the streaming pump on this bridge LocalSet
+                                // (see spawn() for the rationale).
+                                if let Some(cont) = cont {
+                                    tokio::task::spawn_local(cont);
                                 }
-                                Ok(Bytes::from(bytes))
+                                Bytes::from(bytes)
                             });
                             let _ = msg.respond.send(result);
                         });
