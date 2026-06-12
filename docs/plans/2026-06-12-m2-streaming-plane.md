@@ -38,25 +38,36 @@ media* — are an **application choice, declared in the schema and realized by c
 both ends. Today streaming is detected *structurally* (response variant ==
 `StreamInfo`, `derive/src/codegen/client.rs:15`); there is no policy surface. We add one.
 
-### Declaration: a `$streamPolicy` capnp annotation
-Define in `schema/annotations.capnp` (alongside `$fixedSize`) and apply to the
-streaming response variant:
+### Declaration: a `$streamPolicy` capnp annotation (raw axes, explicit)
+No preset sugar — every stream spells out its full contract. **`completion` is its own
+axis** (decoupled from ordering/durability): streaming inference "just stops," so a
+terminal frame must be *opt-in*, not implied by durable-ordered.
 
 ```capnp
+# schema/annotations.capnp
+enum Ordering     { ordered @0; unordered @1; }
+enum Delivery     { atLeastOnce @0; atMostOnce @1; }
+enum Completion   { none @0; terminal @1; }      # terminal => require a Complete/Error payload before EOF
+enum Backpressure { block @0; dropOldest @1; }
+
 struct StreamPolicy {
-  ordering    @0 :Ordering;     # ordered | unordered
-  delivery    @1 :Delivery;     # atLeastOnce | atMostOnce
-  retention   @2 :UInt32;       # Groups (or seconds); 0 = live-only
-  backpressure@3 :Backpressure; # block (EAGAIN) | dropOldest
+  ordering     @0 :Ordering;
+  delivery     @1 :Delivery;
+  completion   @2 :Completion;
+  retention    @3 :UInt32;        # Groups retained for late-join/resume; 0 = live-only
+  backpressure @4 :Backpressure;
 }
 annotation streamPolicy(field) :StreamPolicy;
-
-# usage
-union { streamInfo @0 :StreamInfo $streamPolicy(ordering = ordered, delivery = atLeastOnce, retention = 1024); ... }
 ```
-Named presets are sugar over the axes: **`DurableOrdered`** (ordered+atLeastOnce+retain+terminal),
-**`Job`** (ordered+atLeastOnce, bounded retention — desktop tokens), **`Log`**
-(ordered+atLeastOnce+resume — mobile tokens), **`Live`** (unordered+atMostOnce+drop — events/media).
+
+Reference points (NOT codegen presets — just how the axes compose):
+- **durable-ordered inference tokens**: `ordering=ordered, delivery=atLeastOnce, completion=none, retention=256, backpressure=block`
+- **live event/media fan-out**: `ordering=unordered, delivery=atMostOnce, completion=none, retention=0, backpressure=dropOldest`
+- **audit/training log (wants truncation detection)**: `ordering=ordered, delivery=atLeastOnce, completion=terminal, retention=4096, backpressure=block`
+
+The terminal marker reuses the existing `StreamPayload.complete`/`error` variants
+(`streaming.capnp:84-85`) — `completion=terminal` requires one before EOF; `completion=none`
+accepts EOF (a producer may still send `complete` with stats, but consumers won't reject its absence).
 
 ### Codegen emits a *matched* producer + consumer from the one declaration
 The schema resolver lifts the annotation into method metadata; **both** backends
@@ -67,20 +78,27 @@ The schema resolver lifts the annotation into method metadata; **both** backends
 Single source of truth ⇒ **producer/consumer QoS + integrity can never silently
 mismatch** (a mismatch would otherwise be a correctness/security bug).
 
-### The integrity model is policy-selected (this *generalizes* #163)
-There is no longer one consumer verifier; the policy picks it:
+### The integrity model is policy-selected, fail-closed (this *generalizes* #163)
+There is no longer one consumer verifier; the `ordering` axis picks the MAC scheme,
+`completion` picks the truncation check, and **any checkable violation is fatal —
+the stream terminates with an error** (fail-closed, matching #160's RPC posture).
 
-| | **Ordered / Durable** | **Unordered / Media** |
+| | **`ordering=ordered`** | **`ordering=unordered` (media)** |
 |---|---|---|
 | Group sequence | `seq == expected_next`; gap = **fatal** | gaps **allowed** (skip-to-live) |
-| MAC scheme | chained `prevMac`, **seq bound into MAC** | **per-Group** MAC over `(track ‖ seq ‖ payload)` — self-authenticating |
-| Terminal block | **required** (EOF-without-terminal = reject) | not required |
-| Eviction-by-age | bounded by retention floor (durability) | expected |
-| Replay defense | sequence monotonicity + chain | reject `seq ≤ last-seen` (per-Group) |
+| MAC scheme | chained `prevMac`, `groupSeq` bound into MAC | **per-Group** MAC over `(track ‖ groupSeq ‖ payload)` — self-authenticating |
+| MAC verify fail | **fatal** (terminate) | **fatal** (terminate) |
+| Replay (`seq ≤ last-seen`) | caught by chain | **fatal** (terminate) |
+| Eviction-by-age | bounded by `retention` floor | expected |
 
-The chained `prevMac` (what `StreamBlock` carries today, `streaming.capnp:62`) is the
-**ordered** path. Media needs **per-Group self-authentication** so a deliberate gap
-doesn't break verification — a different MAC derivation, selected by the annotation.
+Orthogonal, set by the **`completion`** axis (not by ordering):
+- `completion=terminal` → require a `Complete`/`Error` payload before EOF; **EOF-without-terminal = fatal** (truncation defense).
+- `completion=none` → EOF accepted; truncation not detectable (the explicit choice for inference/live streams).
+
+The chained `prevMac` (`streaming.capnp:62`) is the **ordered** MAC; **media** uses a
+**per-Group self-authenticating** MAC so a deliberate gap doesn't break verification —
+the derivation is selected by the annotation. Fail-closed everywhere a check exists; the
+only mode difference is *what counts as a violation* (a gap is fatal when ordered, fine when media).
 
 ### Wire/schema evolution
 `StreamBlock` gains `groupSeq @N :UInt64` (the moq Group sequence) bound into the MAC
@@ -177,11 +195,13 @@ consumers enforce ordering + completeness.
    to `annotations.capnp`, lift it into the resolved method metadata, and emit matched
    producer/consumer in **both** the Rust derive and `ts_codegen` backends. Add
    `groupSeq` to `StreamBlock`, bound into the MAC for both modes.
-5. **#163 policy-selected integrity** (lands here so all consumers inherit it):
+5. **#163 policy-selected integrity, fail-closed** (lands here so all consumers inherit it):
    - **ordered**: assert `group.sequence == expected_next` (gap = fatal), chained `prevMac`
-     with `groupSeq` bound in, **require terminal** `Complete`/`Error` (EOF-without-terminal = reject).
+     with `groupSeq` bound in.
    - **media**: per-Group self-authenticating MAC `(track ‖ groupSeq ‖ payload)`, gaps/eviction
-     tolerated, reject `seq ≤ last-seen` (replay), no terminal requirement.
+     tolerated, reject `seq ≤ last-seen` (replay → fatal).
+   - **completion axis** (orthogonal): `terminal` requires a `Complete`/`Error` before EOF;
+     `none` accepts EOF (inference default). Any checkable violation **terminates the stream**.
 6. **Retention window** replaces the rejoin buffer; depth comes from the policy's
    `retention`. Caps tie into #162/#174 thinking.
 
