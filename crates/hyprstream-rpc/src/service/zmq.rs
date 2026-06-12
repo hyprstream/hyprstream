@@ -938,10 +938,6 @@ impl RequestLoop {
             });
         }
 
-        // Bounded semaphore for continuations
-        const MAX_INFLIGHT_CONTINUATIONS: usize = 16;
-        let continuation_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_CONTINUATIONS));
-
         // Use futures traits for Router async I/O
         use futures::{SinkExt, StreamExt};
         let mut router_stream = router;
@@ -1005,18 +1001,18 @@ impl RequestLoop {
                     // not a shared root key. The envelope signature is still verified —
                     // JWT claims + Casbin handle authorization.
                     // subsecond::call wraps the dispatch so handler code can be hot-patched during dev.
-                    let (response_bytes, continuation) = match subsecond::call(|| crate::service::dispatch::process_request(
+                    let response_bytes = match subsecond::call(|| crate::service::dispatch::process_request(
                         &request,
                         &*service,
                         crate::envelope::EnvelopeVerification::AnySigner,
                         &signing_key,
                         &nonce_cache,
                     )).await {
-                        Ok(result) => result,
+                        Ok(bytes) => bytes,
                         Err(e) => {
                             error!("{} request processing error: {}", service.name(), e);
                             let error_payload = service.build_error_payload(0, &e.to_string());
-                            (Self::wrap_response(0, error_payload, &signing_key)?, None)
+                            Self::wrap_response(0, error_payload, &signing_key)?
                         }
                     };
 
@@ -1030,18 +1026,8 @@ impl RequestLoop {
                     if let Err(e) = router_stream.send(response_msg).await {
                         error!("{} ROUTER send error: {}", service.name(), e);
                     }
-
-                    // Spawn continuation after response is sent
-                    if let Some(future) = continuation {
-                        let sem = continuation_semaphore.clone();
-                        tokio::task::spawn_local(async move {
-                            let Ok(_permit) = sem.acquire_owned().await else {
-                                warn!("continuation semaphore closed");
-                                return;
-                            };
-                            future.await;
-                        });
-                    }
+                    // Any streaming pump was already spawned inside
+                    // process_request (#186); nothing to do here.
                 }
             }
         }
