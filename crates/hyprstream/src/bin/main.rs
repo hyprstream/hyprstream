@@ -1442,6 +1442,13 @@ fn main() -> Result<()> {
         .validate()
         .context("Configuration validation failed")?;
 
+    // Install the per-service streaming-response concurrency cap from config
+    // (#186) before any RPC service starts. First-write-wins; ignore if already
+    // installed on this process.
+    let _ = hyprstream_rpc::streaming::install_max_concurrent_streams_per_service(
+        config.server.max_concurrent_streams_per_service,
+    );
+
     // ========== TRACING INITIALIZATION (before service startup) ==========
     let is_service_command = matches.subcommand_name() == Some("service");
     let _log_guard: Option<tracing_appender::non_blocking::WorkerGuard>;

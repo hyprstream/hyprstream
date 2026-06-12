@@ -288,6 +288,14 @@ impl LocalServiceBridge {
                             // Re-derive the signing key per call: cheap clone,
                             // tracks any future rotation in the service.
                             let signing_key = service.signing_key();
+                            // As of #186 process_request spawns any streaming
+                            // pump itself (onto this bridge's LocalSet, where
+                            // this task already runs, bounded by a per-service
+                            // admission permit) and returns only the reply bytes,
+                            // so the generic plane is uniform "bytes in → bytes
+                            // out" like every other front-end. (Previously the
+                            // bridge spawned the continuation here; that worked
+                            // but duplicated the spawn logic per transport.)
                             let result = crate::service::dispatch::process_request(
                                 msg.request.as_ref(),
                                 &*service,
@@ -296,20 +304,7 @@ impl LocalServiceBridge {
                                 &nonce_cache,
                             )
                             .await
-                            .map(|(bytes, cont)| {
-                                // The continuation is the streaming pump — it
-                                // publishes to the moq/notification plane,
-                                // independent of the RPC transport — so spawn it
-                                // on this bridge LocalSet after the response,
-                                // exactly as RequestLoop / WebTransportServer do.
-                                // (Without this, streaming services like model /
-                                // tui would have their continuation dropped and
-                                // the stream would never be served.)
-                                if let Some(cont) = cont {
-                                    tokio::task::spawn_local(cont);
-                                }
-                                Bytes::from(bytes)
-                            });
+                            .map(Bytes::from);
                             let _ = msg.respond.send(result);
                         });
                     }
@@ -378,6 +373,8 @@ impl LocalServiceBridge {
                         let nonce_cache = Arc::clone(&nonce_cache);
                         tokio::task::spawn_local(async move {
                             let signing_key = service.signing_key();
+                            // process_request spawns any streaming pump itself
+                            // (#186); the bridge just relays the reply bytes.
                             let result = crate::service::dispatch::process_request(
                                 msg.request.as_ref(),
                                 &*service,
@@ -386,14 +383,7 @@ impl LocalServiceBridge {
                                 &nonce_cache,
                             )
                             .await
-                            .map(|(bytes, cont)| {
-                                // Spawn the streaming pump on this bridge LocalSet
-                                // (see spawn() for the rationale).
-                                if let Some(cont) = cont {
-                                    tokio::task::spawn_local(cont);
-                                }
-                                Bytes::from(bytes)
-                            });
+                            .map(Bytes::from);
                             let _ = msg.respond.send(result);
                         });
                     }

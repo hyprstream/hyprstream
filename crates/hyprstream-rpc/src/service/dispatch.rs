@@ -36,9 +36,22 @@ pub use crate::envelope::EnvelopeVerification;
 /// 3. Dispatch to `service.handle_request()` with a verified `EnvelopeContext`.
 /// 4. Sign the response with the server's `signing_key`.
 ///
+/// # Streaming
+///
+/// A streaming handler returns a `Continuation` (the server-side streaming
+/// response that runs after the reply). As of #186 that task is spawned
+/// **here**, via [`crate::streaming::spawn_streaming_response`], rather than
+/// handed back to the transport front-end — so every front-end (ZMQ
+/// `RequestLoop`, WebTransport server, generic-plane `LocalServiceBridge`) is
+/// uniform "bytes in → bytes out" and the generic plane no longer has to spawn
+/// (or, worse, reject) continuations itself. **Invariant:** `process_request`
+/// must therefore run on a `tokio::task::LocalSet` (it already did —
+/// `RequestService` is `?Send`); the spawned task is `?Send`.
+///
 /// # Returns
 ///
-/// * `Ok((response_bytes, continuation))` - Signed response and optional continuation
+/// * `Ok(response_bytes)` - Signed response. Any streaming pump has already been
+///   spawned onto the current `LocalSet`.
 /// * `Err(e)` - Processing error (already logged)
 pub async fn process_request<S>(
     raw_bytes: &[u8],
@@ -46,7 +59,7 @@ pub async fn process_request<S>(
     verification: EnvelopeVerification<'_>,
     signing_key: &ed25519_dalek::SigningKey,
     nonce_cache: &crate::envelope::InMemoryNonceCache,
-) -> Result<(Vec<u8>, Option<crate::service::Continuation>)>
+) -> Result<Vec<u8>>
 where
     S: crate::service::RequestService,
 {
@@ -79,7 +92,7 @@ where
 
             let mut bytes = Vec::new();
             serialize::write_message(&mut bytes, &message)?;
-            return Ok((bytes, None));
+            return Ok(bytes);
         }
     };
 
@@ -106,7 +119,7 @@ where
 
         let mut bytes = Vec::new();
         serialize::write_message(&mut bytes, &message)?;
-        return Ok((bytes, None));
+        return Ok(bytes);
     }
 
     // 3. Handle request
@@ -128,5 +141,13 @@ where
     let mut bytes = Vec::new();
     serialize::write_message(&mut bytes, &message)?;
 
-    Ok((bytes, continuation))
+    // 5. Spawn the server-side streaming response (if any) onto the current
+    //    LocalSet, so the reply is all the transport front-end has to deal with
+    //    (#186). Bounded by a per-service admission permit; see
+    //    spawn_streaming_response.
+    if let Some(cont) = continuation {
+        crate::streaming::spawn_streaming_response(service.name(), cont);
+    }
+
+    Ok(bytes)
 }
